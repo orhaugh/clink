@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +31,8 @@
 
 #include "clink/checkpoint/checkpoint_coordinator.hpp"
 #include "clink/core/record.hpp"
+#include "clink/operators/map_operator.hpp"
+#include "clink/operators/operator_base.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/dag.hpp"
@@ -330,4 +334,264 @@ TEST(CancelTeardown, ASinkPreparesItsTransactionBeforeTheSnapshotThatMustContain
     EXPECT_TRUE(checked) << "no checkpoint produced both a barrier hook and a snapshot, so the "
                             "ordering was never observed: "
                          << sink->events.size() << " events recorded";
+}
+
+// --- The same ordering, when the sink is CHAINED behind an operator ---------
+//
+// Follow-up item 36: the other half of item 31. That fix ordered the sink's
+// barrier hook before the snapshot INSIDE the sink runner, which is the whole
+// story only when the sink is the (sub)task's checkpoint owner - a plain
+// source -> sink subtask, which is what the test above builds.
+//
+// Put an operator in front and the ownership moves. `add_operator` makes the
+// most-downstream OPERATOR the chain's checkpoint owner and demotes everything
+// before it (dag.hpp, chain_checkpoint_owner_); a sink added afterwards never
+// becomes the owner, so `sink_owns_checkpoint` is false and the sink does not
+// snapshot at all. The owner's runner snapshots the shared backend and only THEN
+// forwards the barrier downstream, where the sink's on_barrier finally runs and a
+// CommittingSink stages its handle - into the backend, after the snapshot that
+// was supposed to contain it.
+//
+// So the handle for checkpoint N lands in snapshot N+1 on every chained sink,
+// deterministically, not as a race. A job restored from N finds no handle for N
+// and never commits N's staged transaction.
+//
+// The log has to be mutex-guarded here, unlike the test above: the snapshot runs
+// on the owner operator's runner thread and the barrier hook on the sink's, so
+// two threads append to it.
+
+namespace {
+
+class ChainOrderLog {
+public:
+    void record(std::string what) {
+        std::lock_guard lock(mu_);
+        events_.push_back(std::move(what));
+    }
+    std::vector<std::string> snapshot_events() const {
+        std::lock_guard lock(mu_);
+        return events_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::vector<std::string> events_;
+};
+
+class ChainedOrderRecordingSink final : public Sink<int> {
+public:
+    explicit ChainedOrderRecordingSink(ChainOrderLog* log) : log_(log) {}
+    void on_data(const Batch<int>&) override {}
+    void on_barrier(CheckpointBarrier b) override {
+        log_->record("barrier-" + std::to_string(b.id().value()));
+    }
+    std::string name() const override { return "chained_order_recording.sink"; }
+
+private:
+    ChainOrderLog* log_;
+};
+
+class ChainedOrderRecordingBackend final : public StateBackend {
+public:
+    explicit ChainedOrderRecordingBackend(ChainOrderLog* log) : log_(log) {}
+
+    void put(OperatorId op, KeyView key, ValueView value) override { inner_.put(op, key, value); }
+    std::optional<Value> get(OperatorId op, KeyView key) const override {
+        return inner_.get(op, key);
+    }
+    void erase(OperatorId op, KeyView key) override { inner_.erase(op, key); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { inner_.scan(op, visit); }
+    void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
+        inner_.restore(snap, kg);
+    }
+    std::string description() const override { return "chained_order_recording"; }
+
+    Snapshot snapshot(CheckpointId id) override {
+        log_->record("snapshot-" + std::to_string(id.value()));
+        return inner_.snapshot(id);
+    }
+
+private:
+    InMemoryStateBackend inner_;
+    ChainOrderLog* log_;
+};
+
+}  // namespace
+
+TEST(CancelTeardown, AChainedSinkPreparesItsTransactionBeforeTheSnapshotThatMustContainIt) {
+    ChainOrderLog log;
+    auto sink = std::make_shared<ChainedOrderRecordingSink>(&log);
+    auto backend = std::make_shared<ChainedOrderRecordingBackend>(&log);
+
+    Dag dag;
+    auto src = std::make_shared<CancelTeardownEndlessSource>();
+    auto h = dag.add_source<int>(src);
+    // The operator is what moves checkpoint ownership off the sink.
+    // A plain identity map. Its only job is to exist: an operator in the chain is
+    // what moves checkpoint ownership off the sink.
+    auto op_h = dag.add_operator<int, int>(
+        h,
+        std::make_shared<MapOperator<int, int>>([](const int& v) { return v; }, "chain_identity"));
+    dag.add_sink<int>(op_h, sink);
+
+    CheckpointCoordinator::Config ccfg;
+    ccfg.interval = std::chrono::milliseconds{20};
+    CheckpointCoordinator coord(backend, ccfg);
+    for (const auto& r : dag.runners()) {
+        coord.register_operator(r.id);
+    }
+    coord.set_source_injectors(dag.source_injectors());
+
+    JobConfig cfg;
+    cfg.state_backend = backend;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.start();
+    coord.start_periodic_trigger();
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    coord.stop_periodic_trigger();
+    exec.cancel();
+    exec.await_termination();
+
+    const auto events = log.snapshot_events();
+    bool checked = false;
+    for (std::size_t i = 0; i + 1 < events.size(); ++i) {
+        if (!events[i].starts_with("barrier-")) {
+            continue;
+        }
+        const auto id = events[i].substr(std::string("barrier-").size());
+        const auto snap_at = std::find(events.begin(), events.end(), "snapshot-" + id);
+        if (snap_at == events.end()) {
+            continue;
+        }
+        const auto snap_idx = static_cast<std::size_t>(snap_at - events.begin());
+        EXPECT_GT(snap_idx, i)
+            << "the state snapshot for checkpoint " << id
+            << " ran BEFORE the CHAINED sink's barrier hook. The chain's owner operator "
+               "snapshots the shared backend and only then forwards the barrier, so a "
+               "CommittingSink's handle for that checkpoint is staged into the NEXT snapshot. A "
+               "job restored from this checkpoint finds no handle and never commits the staged "
+               "transaction.";
+        checked = true;
+        break;
+    }
+    EXPECT_TRUE(checked) << "no checkpoint produced both a barrier hook and a snapshot, so the "
+                            "ordering was never observed: "
+                         << events.size() << " events recorded";
+}
+
+// --- Two-input operators sit OUTSIDE the single-writer ownership scheme ------
+//
+// Found while fixing item 36, and recorded because it is a violation of an
+// invariant this file states rather than a style point.
+//
+// `add_operator` maintains chain_checkpoint_owner_ so that exactly ONE element in
+// a fused chain snapshots the shared backend per barrier. The sink barrier path
+// gives the reason: "a delta-commit backend (RemoteReadBackend) must be
+// single-writer per barrier".
+//
+// `add_co_operator` never touches that flag, and its runner snapshots
+// unconditionally whenever a state backend is present. So a subtask holding a
+// two-input operator AND a sink has two elements snapshotting the same backend
+// for the same checkpoint id. This predates the item-36 ownership move - it was
+// already true when the most-downstream OPERATOR owned the checkpoint, because
+// the co-operator ignored the flag then too.
+//
+// This test asserts the invariant, so it FAILS while that is the case. It is
+// written to be precise about what it measures: how many times snapshot() is
+// called for one checkpoint id, not whether the job works. Full-state backends
+// tolerate the second write, which is why nothing noticed.
+
+namespace {
+
+class SnapshotCountingBackend final : public StateBackend {
+public:
+    void put(OperatorId op, KeyView key, ValueView value) override { inner_.put(op, key, value); }
+    std::optional<Value> get(OperatorId op, KeyView key) const override {
+        return inner_.get(op, key);
+    }
+    void erase(OperatorId op, KeyView key) override { inner_.erase(op, key); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { inner_.scan(op, visit); }
+    void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
+        inner_.restore(snap, kg);
+    }
+    std::string description() const override { return "snapshot_counting"; }
+
+    Snapshot snapshot(CheckpointId id) override {
+        {
+            std::lock_guard lock(mu_);
+            ++counts_[id.value()];
+        }
+        return inner_.snapshot(id);
+    }
+
+    std::map<std::uint64_t, int> counts() const {
+        std::lock_guard lock(mu_);
+        return counts_;
+    }
+
+private:
+    InMemoryStateBackend inner_;
+    mutable std::mutex mu_;
+    std::map<std::uint64_t, int> counts_;
+};
+
+class TeardownPassThroughCoOp final : public CoOperator<int, int, int> {
+public:
+    void process_element1(const StreamElement<int>& el, Emitter<int>& out) override {
+        if (el.is_data()) {
+            Batch<int> copy = el.as_data();
+            (void)out.emit_data(std::move(copy));
+        }
+    }
+    void process_element2(const StreamElement<int>& el, Emitter<int>& out) override {
+        if (el.is_data()) {
+            Batch<int> copy = el.as_data();
+            (void)out.emit_data(std::move(copy));
+        }
+    }
+    std::string name() const override { return "teardown_passthrough.coop"; }
+};
+
+}  // namespace
+
+TEST(CancelTeardown, OneCheckpointProducesExactlyOneSnapshotOfASharedBackend) {
+    auto backend = std::make_shared<SnapshotCountingBackend>();
+
+    Dag dag;
+    auto left = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+    auto right = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+    auto joined = dag.add_co_operator<int, int, int>(
+        left, right, std::make_shared<TeardownPassThroughCoOp>());
+    // The sink's identity is irrelevant here; only the snapshot count is. It gets
+    // its own log so nothing is shared with the ordering tests above.
+    static ChainOrderLog unused_log;
+    dag.add_sink<int>(joined, std::make_shared<ChainedOrderRecordingSink>(&unused_log));
+
+    CheckpointCoordinator::Config ccfg;
+    ccfg.interval = std::chrono::milliseconds{25};
+    CheckpointCoordinator coord(backend, ccfg);
+    for (const auto& r : dag.runners()) {
+        coord.register_operator(r.id);
+    }
+    coord.set_source_injectors(dag.source_injectors());
+
+    JobConfig cfg;
+    cfg.state_backend = backend;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.start();
+    coord.start_periodic_trigger();
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    coord.stop_periodic_trigger();
+    exec.cancel();
+    exec.await_termination();
+
+    const auto counts = backend->counts();
+    ASSERT_FALSE(counts.empty()) << "no checkpoint snapshotted at all, so nothing was measured";
+    for (const auto& [id, n] : counts) {
+        EXPECT_LE(n, 1) << "checkpoint " << id << " snapshotted the shared backend " << n
+                        << " times. add_co_operator does not participate in the chain's "
+                           "checkpoint-ownership scheme (chain_checkpoint_owner_), so a subtask "
+                           "with a two-input operator and a sink has two writers per barrier. A "
+                           "delta-commit backend such as RemoteReadBackend requires exactly one.";
+    }
 }

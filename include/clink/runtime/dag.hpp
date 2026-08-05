@@ -2862,14 +2862,34 @@ public:
         auto left_ch = left.output;
         auto right_ch = right.output;
 
+        // Join the chain's checkpoint-ownership scheme, on the same terms as
+        // add_operator. This used to be skipped entirely, and the runner below
+        // snapshotted unconditionally - so a subtask holding a two-input operator
+        // AND a sink had TWO elements writing a snapshot of the same shared backend
+        // for the same barrier. A full-state backend tolerates the second write,
+        // which is why it went unseen; a delta-commit backend (RemoteReadBackend)
+        // requires exactly one writer per barrier, as the sink path says.
+        auto owner_flag = std::make_shared<bool>(true);
+        if (chain_checkpoint_owner_) {
+            *chain_checkpoint_owner_ = false;
+        }
+        chain_checkpoint_owner_ = owner_flag;
+
         detail::OperatorRunner runner;
         runner.name = op->name();
         runner.id = id;
         runner.spec_node_id = op->spec_node_id();
         runner.spec_uid = op->uid();
         auto side_channels = side_channels_ptr_(runners_.size());
-        runner.run = [op, left_ch, right_ch, out_channel, side_channels, id, in1_codec, in2_codec](
-                         RuntimeContext& ctx, const std::function<bool()>& should_stop) {
+        runner.run = [op,
+                      left_ch,
+                      right_ch,
+                      out_channel,
+                      side_channels,
+                      id,
+                      in1_codec,
+                      in2_codec,
+                      owner_flag](RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
             // ASYNC-10 transparent read coalescing (opt-in), same recipe as the
             // single-input runner: wrap the backend BEFORE open() so the
@@ -3071,6 +3091,20 @@ public:
                     return;
                 }
                 auto* backend = ctx.state_backend();
+                if (!*owner_flag) {
+                    // Non-owner in a fused chain: stage this op's timer slice into
+                    // the shared backend (the owner, downstream, commits it in its
+                    // single snapshot) and forward the barrier. Mirrors the
+                    // single-input runner's non-owner path.
+                    try {
+                        op->snapshot_timers(*backend, id);
+                    } catch (...) {
+                        // A timer-stage failure surfaces at the owner's snapshot,
+                        // which reads the same shared dirty set.
+                    }
+                    op->on_barrier(barrier, out_emitter);
+                    return;
+                }
                 // Any in-flight capture has already put() its rows into the
                 // backend before this runs (see handle_left/handle_right),
                 // so capture()/snapshot() here includes them.
@@ -3913,15 +3947,41 @@ public:
         sink->set_id(id);
         sinks_.push_back(sink);
         auto in_channel = upstream.output;
-        // The sink snapshots the shared backend only when it is the (sub)task's
-        // checkpoint owner - i.e. NO upstream operator already owns it. In a
-        // fused chain the most-downstream operator owns + commits the shared
-        // backend (including any state the sink staged via put), so the sink
-        // must NOT snapshot it again: a delta-commit backend (RemoteReadBackend)
-        // must be single-writer per barrier. A pure source->sink subtask has no
-        // operator owner, so the sink owns + commits as before. on_barrier and
-        // the terminal on_commit always run regardless.
-        const bool sink_owns_checkpoint = (chain_checkpoint_owner_ == nullptr);
+        // The SINK owns the chain's checkpoint, because a sink terminates the
+        // chain and the owner has to be the most-downstream element sharing the
+        // backend. Any upstream operator holding ownership is demoted here; it
+        // keeps staging its timer slice into the shared backend and forwarding
+        // the barrier, which is the non-owner path it already had.
+        //
+        // It used to be the reverse: the most-downstream OPERATOR owned it and a
+        // sink behind one never snapshotted. That ordering is wrong for the same
+        // reason recorded on the sink barrier path below - the owner snapshots and
+        // only THEN forwards the barrier, so a CommittingSink chained behind an
+        // operator staged its handle for checkpoint N into snapshot N+1, every
+        // time, deterministically. A job restored from N found no handle for N and
+        // never committed N's staged transaction. Follow-up item 36; the sink's own
+        // runner already orders on_barrier before the snapshot (item 31), and this
+        // is what puts the sink back in the position where that ordering applies.
+        //
+        // Single-writer per barrier is preserved, which a delta-commit backend
+        // (RemoteReadBackend) requires: ownership MOVES to the sink rather than
+        // being added to it, so there is still exactly one snapshotting element.
+        //
+        // LIMITATION, deliberately not papered over: if a chain fans out to more
+        // than one sink in the same subtask, only the first sink to be added takes
+        // ownership. The others behave as before - handle staged after the snapshot
+        // - because two sinks on different runner threads cannot both precede one
+        // snapshot without a rendezvous that does not exist yet. Recorded as its
+        // own follow-up rather than left implicit.
+        bool sink_owns_checkpoint = true;
+        if (chain_sink_owns_checkpoint_) {
+            sink_owns_checkpoint = false;  // a second sink on this chain: see above
+        } else {
+            if (chain_checkpoint_owner_) {
+                *chain_checkpoint_owner_ = false;
+            }
+            chain_sink_owns_checkpoint_ = true;
+        }
 
         detail::OperatorRunner runner;
         runner.name = sink->name();
@@ -4397,6 +4457,9 @@ private:
     // adding a later operator flips it false. The cluster builds one Dag per
     // subtask, so this is naturally per-subtask.
     std::shared_ptr<bool> chain_checkpoint_owner_;
+    // Set once a sink on this chain has taken checkpoint ownership, so a fan-out
+    // to a second sink cannot produce two snapshotting elements per barrier.
+    bool chain_sink_owns_checkpoint_{false};
     std::vector<BarrierInjector> source_injectors_;
     std::vector<OperatorId> source_ids_;
     // Boundedness recorded at registration, parallel to source_ids_ (BATCH-1).

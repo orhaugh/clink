@@ -2014,6 +2014,68 @@ The integration quarantine is consequently EMPTY, and the mechanism has been
 removed from `ci.yml` along with the advisory arm: the gate runs the whole label
 with no exclusion, so nothing can sit red without failing the build.
 
+### F60. A chained sink's commit handle landed in the wrong checkpoint, every time
+
+Item 36, the other half of F53 - and where F53 was an intermittent race, this one
+was deterministic.
+
+F53 ordered a sink's barrier hook before the state snapshot INSIDE the sink runner,
+which is the whole story only when the sink is its subtask's checkpoint owner: a
+plain source -> sink subtask. Put an operator in front and ownership moves.
+`add_operator` made the most-downstream OPERATOR the chain's checkpoint owner and
+demoted everything before it, and a sink added afterwards never became the owner -
+so it never snapshotted at all. The owner snapshots the shared backend and only THEN
+forwards the barrier, where the sink's `on_barrier` finally runs and a
+`CommittingSink` stages its handle. Into the backend, after the snapshot that was
+supposed to contain it.
+
+So for every chained 2PC sink, the handle for checkpoint N landed in snapshot N+1.
+A job restored from N found no handle for N and never committed N's staged
+transaction. Not a race - the ordering was fixed and always wrong.
+
+**Fixed by moving ownership to the sink**, which is where the code's own stated rule
+puts it: the owner must be the most-downstream element sharing the backend, and a
+sink terminates the chain. Upstream operators take the non-owner path they already
+had (stage the timer slice, forward the barrier). Single-writer per barrier is
+preserved because ownership MOVES rather than being added.
+
+Demonstrated before and after by an in-process test that logs the two events
+against each other and asserts the order - `snapshot-1` sat at index 0 and
+`barrier-1` at index 1 beforehand. Mutation-checked: restoring the old rule fails
+that test and only that test.
+
+**Limitation, stated rather than papered over.** If a chain fans out to more than
+one sink in the same subtask, only the first sink to be added takes ownership; the
+others still stage their handle after the snapshot. Two sinks on different runner
+threads cannot both precede one snapshot without a rendezvous that does not exist.
+Recorded as its own follow-up.
+
+### F61. Two-input operators were outside the single-writer scheme entirely
+
+Found while fixing F60, and a violation of an invariant the code states about
+itself.
+
+`add_operator` maintains `chain_checkpoint_owner_` so exactly one element in a
+fused chain snapshots the shared backend per barrier, and the sink path gives the
+reason: "a delta-commit backend (RemoteReadBackend) must be single-writer per
+barrier". `add_co_operator` never touched that flag, and its runner snapshotted
+unconditionally whenever a state backend was present.
+
+So any subtask holding a two-input operator AND a sink had TWO writers per barrier.
+Measured, not inferred: a snapshot-counting backend recorded **2 snapshots for every
+checkpoint id** in a `source x2 -> co-operator -> sink` job. Pre-existing - it was
+equally true when the most-downstream operator owned the checkpoint, because the
+co-operator ignored the flag then too. A full-state backend tolerates the second
+write, which is why nothing noticed; a delta-commit backend does not.
+
+Fixed by having `add_co_operator` join the scheme on the same terms as
+`add_operator`, with the same non-owner behaviour. The test asserts the invariant
+directly - how many times `snapshot()` is called for one checkpoint id - so it
+fails if either path stops participating.
+
+Verified: core 1989/1994 (5 platform skips) and SQL 983/983, the latter because
+two-input operators carry the join paths.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
