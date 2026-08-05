@@ -2163,6 +2163,31 @@ test could only enter it by luck, which is not evidence; the same reasoning as
 This is NOT the cause of F62: it produces missing or foreign state, whereas F62's
 signature is a counter one too HIGH.
 
+### F64. A worker killed and restarted immediately leaves the job hung
+
+Found while writing the side-output failure test (W22 / follow-up 14), which
+originally killed a worker and brought it straight back.
+
+The coordinator logged `worker=worker-0 re-registered; previous session retired`
+and then nothing for the remaining 120 seconds - no worker-loss detection, no job
+restart, no failure. The job stayed at the two records it had committed before the
+kill, its subtasks were never redeployed, and the submitter timed out.
+
+Every passing fault test kills a worker and leaves it dead, letting the job recover
+onto the survivor, so this path had no coverage at all. A worker that dies and is
+restarted quickly is not an exotic case - it is what a container orchestrator does
+by default.
+
+The hypothesis from that one log is that the re-registration arrives before the
+coordinator has processed the loss, "previous session retired" drops the old
+session's task records, and nothing then marks those subtasks lost. It is a guess
+from a single observation and is recorded as such (follow-up 46) rather than fixed
+on the strength of it. What is not in doubt is the OUTCOME: the job hung
+indefinitely instead of recovering or failing.
+
+Not worked around in the side-output test, which now uses the kill-and-leave-dead
+pattern so that it measures side outputs rather than this.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

@@ -334,6 +334,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_commit_group_atomicity.cpp
         integration/test_cli_lint.cpp
         integration/test_rescale_exactly_once.cpp
+        integration/test_side_output_recovery.cpp
         integration/test_split_brain.cpp
         integration/test_graceful_stop.cpp
         integration/test_graceful_shutdown.cpp
@@ -392,10 +393,12 @@ if(CLINK_INTEGRATION_TESTS)
         CLINK_TWO_SINK_JOB_PATH=\"$<TARGET_FILE:clink_two_sink_commit_group_job>\"
         CLINK_SCHEMA_EVO_JOB_PATH=\"$<TARGET_FILE:clink_schema_evo_test_job>\"
         CLINK_CLI_BINARY=\"$<TARGET_FILE:clink>\"
-        CLINK_RESCALE_XO_JOB_PATH=\"$<TARGET_FILE:clink_rescale_exactly_once_job>\")
+        CLINK_RESCALE_XO_JOB_PATH=\"$<TARGET_FILE:clink_rescale_exactly_once_job>\"
+        CLINK_SIDE_OUTPUT_RECOVERY_JOB_PATH=\"$<TARGET_FILE:clink_side_output_recovery_job>\")
     add_dependencies(clink_integration_tests
         clink
         clink_rescale_exactly_once_job
+        clink_side_output_recovery_job
         clink_two_sink_commit_group_job
         clink_node
         clink_submit_job

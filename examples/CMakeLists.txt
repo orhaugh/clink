@@ -88,6 +88,11 @@ clink_set_warnings(clink_cancel_test_job)
 # Drives test_two_phase_commit.cpp.
 add_library(clink_two_phase_commit_job MODULE two_phase_commit_job.cpp)
 target_link_libraries(clink_two_phase_commit_job PRIVATE clink::core)
+
+# Follow-up 14: a job whose SIDE OUTPUT is held to the same exactly-once
+# standard as its main branch across a worker failure.
+add_library(clink_side_output_recovery_job MODULE side_output_recovery_job.cpp)
+target_link_libraries(clink_side_output_recovery_job PRIVATE clink::core)
 set_target_properties(clink_two_phase_commit_job PROPERTIES
     PREFIX ""
     OUTPUT_NAME "two_phase_commit_job"
