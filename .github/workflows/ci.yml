@@ -125,7 +125,7 @@ jobs:
       # excludes it, the advisory step selects it. One literal, so the two
       # cannot drift apart - which is exactly what the old pair of
       # hand-maintained regexes did.
-      IT_QUARANTINE: 'HaFailoverTest\.ExactlyOnceSurvivesACoordinatorFailover'
+      IT_QUARANTINE: 'RescaleExactlyOnceTest\.ScalingAKeyedOperatorUpPreservesExactlyOnceOutput'
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
@@ -234,11 +234,17 @@ jobs:
         # visible rather than forgotten. Every entry needs a follow-up item;
         # an entry without one is a bug in this file.
         #
-        #   HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover
-        #       follow-up 31. Failed once in a serial Linux sweep with three
-        #       records lost across a failover; passes 3/3 alone. Rare, and
-        #       attribution not established - gating on it would make the
-        #       pipeline intermittently red for a reason nobody can act on yet.
+        #   RescaleExactlyOnceTest.ScalingAKeyedOperatorUpPreservesExactlyOnce...
+        #       follow-up 35. The rescaled job intermittently stops producing
+        #       after the replan - about one run in three under repetition, and
+        #       green on any single run, which is why it was not seen when the
+        #       test was written. Pre-existing: it fails identically with the
+        #       item-31 sink-ordering fix reverted.
+        #
+        # HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover LEFT the
+        # quarantine: item 31 was reproduced under load, root-caused to a sink
+        # commit handle landing in the wrong checkpoint, fixed, and re-verified
+        # 40/40 under the load that reproduced it at iteration 3.
         #
         # TwoPhaseCommit and WorkerCrashRecovery left the quarantine once their
         # worker-registration sleeps became conditions (follow-up 16): two were

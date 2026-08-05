@@ -17,19 +17,24 @@
 // whether a cancelled job drained depended on how many inputs an operator happened
 // to have.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "clink/checkpoint/checkpoint_coordinator.hpp"
 #include "clink/core/record.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/dag.hpp"
+#include "clink/runtime/job_config.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 
 using namespace clink;
 using namespace std::chrono_literals;
@@ -202,4 +207,127 @@ TEST(CancelTeardown, ACleanCompletionOfAFanInSinkAlsoFlushes) {
     EXPECT_EQ(sink->flushes.load(), 1)
         << "gating flush on a clean exit also suppressed it at end of input for the fan-in "
            "runner, which loses the tail of every bounded job that fans in";
+}
+
+// --- A 2PC sink's handle must be inside the checkpoint it names ------
+//
+// The defect behind follow-up item 31, pinned at the level it actually lives:
+// the ORDER of the sink's barrier hook against the state snapshot.
+//
+// CommittingSink::on_barrier prepares the transaction for checkpoint N and
+// records its handle in operator state. recover_all_() re-commits that handle
+// after a restart. So the handle has to be inside snapshot N - if the runner
+// snapshots first, the handle for N lands in snapshot N+1, a job restored from N
+// finds no handle for N, never commits N's staged transaction, and resumes past
+// the records it covered. They are gone.
+//
+// Rare in the field because the coordinator's CommitCheckpoint normally arrives
+// and commits N while the job is alive. The window only bites on a restart whose
+// restore point is exactly N. Reproduced under load at iteration 3 of 40, and
+// 40/40 clean after the fix.
+//
+// This test does not need a cluster: it asserts the ordering directly, which is
+// the property the integration test can only observe by luck.
+
+namespace {
+
+// Records the order of the two events that matter.
+class OrderRecordingSink final : public Sink<int> {
+public:
+    void on_data(const Batch<int>&) override {}
+    void on_barrier(CheckpointBarrier b) override {
+        events.push_back("barrier-" + std::to_string(b.id().value()));
+    }
+    std::string name() const override { return "order_recording.sink"; }
+
+    std::vector<std::string> events;
+};
+
+// Notes when it is snapshotted, into the same log the sink writes to, so the two
+// events are ordered against each other. Delegates everything else -
+// InMemoryStateBackend is final, so this wraps rather than derives.
+class OrderRecordingBackend final : public StateBackend {
+public:
+    explicit OrderRecordingBackend(std::vector<std::string>* log) : log_(log) {}
+
+    void put(OperatorId op, KeyView key, ValueView value) override { inner_.put(op, key, value); }
+    std::optional<Value> get(OperatorId op, KeyView key) const override {
+        return inner_.get(op, key);
+    }
+    void erase(OperatorId op, KeyView key) override { inner_.erase(op, key); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { inner_.scan(op, visit); }
+    void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
+        inner_.restore(snap, kg);
+    }
+    std::string description() const override { return "order_recording"; }
+
+    Snapshot snapshot(CheckpointId id) override {
+        log_->push_back("snapshot-" + std::to_string(id.value()));
+        return inner_.snapshot(id);
+    }
+
+private:
+    InMemoryStateBackend inner_;
+    std::vector<std::string>* log_;
+};
+
+}  // namespace
+
+TEST(CancelTeardown, ASinkPreparesItsTransactionBeforeTheSnapshotThatMustContainIt) {
+    auto sink = std::make_shared<OrderRecordingSink>();
+    auto backend = std::make_shared<OrderRecordingBackend>(&sink->events);
+
+    Dag dag;
+    auto src = std::make_shared<CancelTeardownEndlessSource>();
+    auto h = dag.add_source<int>(src);
+    dag.add_sink<int>(h, sink);
+
+    // Drive real barriers through a CheckpointCoordinator, the same way
+    // test_periodic_checkpoint.cpp does - the ordering under test only happens
+    // on the barrier path.
+    CheckpointCoordinator::Config ccfg;
+    ccfg.interval = std::chrono::milliseconds{20};
+    CheckpointCoordinator coord(backend, ccfg);
+    for (const auto& r : dag.runners()) {
+        coord.register_operator(r.id);
+    }
+    coord.set_source_injectors(dag.source_injectors());
+
+    JobConfig cfg;
+    cfg.state_backend = backend;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.start();
+    coord.start_periodic_trigger();
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    coord.stop_periodic_trigger();
+    exec.cancel();
+    exec.await_termination();
+
+    // Find the first checkpoint that produced both events and assert the order.
+    // Asserting on a specific id would make the test depend on how many
+    // checkpoints the interval happened to fire.
+    bool checked = false;
+    for (std::size_t i = 0; i + 1 < sink->events.size(); ++i) {
+        if (!sink->events[i].starts_with("barrier-")) {
+            continue;
+        }
+        const auto id = sink->events[i].substr(std::string("barrier-").size());
+        const auto want_snapshot = "snapshot-" + id;
+        // The snapshot for this id must come AFTER the barrier hook for it.
+        const auto snap_at = std::find(sink->events.begin(), sink->events.end(), want_snapshot);
+        if (snap_at == sink->events.end()) {
+            continue;
+        }
+        const auto snap_idx = static_cast<std::size_t>(snap_at - sink->events.begin());
+        EXPECT_GT(snap_idx, i)
+            << "the state snapshot for checkpoint " << id
+            << " ran BEFORE the sink's barrier hook, so a CommittingSink's handle for that "
+               "checkpoint lands in the NEXT snapshot. A job restored from it finds no handle, "
+               "never commits the staged transaction, and loses the records it covered";
+        checked = true;
+        break;
+    }
+    EXPECT_TRUE(checked) << "no checkpoint produced both a barrier hook and a snapshot, so the "
+                            "ordering was never observed: "
+                         << sink->events.size() << " events recorded";
 }

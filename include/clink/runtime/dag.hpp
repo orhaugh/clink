@@ -3988,13 +3988,40 @@ public:
                         std::string err;
                         bool ok = true;
                         CaptureHandle handle;
+                        // The sink's barrier hook runs BEFORE the capture, and the
+                        // order is load-bearing rather than incidental.
+                        //
+                        // A CommittingSink prepares its transaction in on_barrier
+                        // and records the handle in operator state. That handle is
+                        // what recover_all_() re-commits after a restart, so it
+                        // has to be inside the snapshot of the checkpoint it
+                        // belongs to. Capturing first put the handle for
+                        // checkpoint N into snapshot N+1, so a job restored from N
+                        // found no handle for N, never committed N's staged
+                        // transaction, and resumed past the records it covered.
+                        // They were lost.
+                        //
+                        // Rare, because the coordinator's CommitCheckpoint
+                        // normally arrives and commits N while the job is alive.
+                        // The window only bites when the job restarts with its
+                        // restore point exactly at N - a leader that died between
+                        // writing COMPLETED-N and the commit broadcast landing.
+                        // Reproduced under load at iteration 3 of 40; follow-up
+                        // item 31.
+                        //
+                        // Sinks are the only operators for which this is right:
+                        // an OPERATOR's on_barrier must stay after the snapshot,
+                        // because its state is supposed to be captured as of the
+                        // barrier, before any barrier-triggered mutation. A sink
+                        // emits nothing downstream and its only state IS the
+                        // pending handles.
+                        sink->on_barrier(barrier);
                         try {
                             handle = ctx.state_backend()->capture(ckpt_id);
                         } catch (const std::exception& e) {
                             ok = false;
                             err = e.what();
                         }
-                        sink->on_barrier(barrier);
                         if (!ok) {
                             if (const auto& cb = ctx.checkpoint_ack(); cb) {
                                 cb(ckpt_id, false, std::move(err));
@@ -4010,6 +4037,10 @@ public:
                         // non-async backends.
                         std::string err;
                         bool ok = true;
+                        // Before the snapshot - see the async path above for why
+                        // the sink's handle must be inside the checkpoint it
+                        // names.
+                        sink->on_barrier(barrier);
                         if (ctx.has_state_backend() && !barrier.is_terminal()) {
                             try {
                                 ctx.state_backend()->snapshot(ckpt_id);
@@ -4018,7 +4049,6 @@ public:
                                 err = e.what();
                             }
                         }
-                        sink->on_barrier(barrier);
                         if (barrier.is_terminal()) {
                             // Terminal barriers don't go through the coordinator
                             // commit broadcast - there's no recovery

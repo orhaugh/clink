@@ -1746,6 +1746,66 @@ compatibility WAS partly tested end to end, `state.during_flush` was six points 
 one, and item 9's cap was the smaller half of its own problem. An item written from
 a code read is a hypothesis, and this round is the argument for treating it as one.
 
+### F53. A 2PC sink's commit handle was written into the wrong checkpoint
+
+The sharpest defect this workstream has found, and the one that had survived
+longest, because it only bites in a window a few milliseconds wide.
+
+`CommittingSink::on_barrier` prepares the transaction for checkpoint N and records
+its handle in operator state; `recover_all_()` re-commits that handle after a
+restart. Every sink runner took the state snapshot BEFORE calling
+`sink->on_barrier`, so the handle for N landed in snapshot N+1. A job restored from
+N found no handle for N, never committed N's staged transaction, and resumed past
+the records it covered.
+
+The coordinator's own comment describes the intended contract - it writes
+`COMPLETED-N` durably before broadcasting the commit precisely so that "a crash
+mid-broadcast still lets recovery find COMPLETED-N and commit on restore". Recovery
+could not, because the handle it needed was in a checkpoint that never completed.
+
+**Reproduced before it was diagnosed**, which is the only reason it could be fixed
+with confidence. `scripts/repeat-until-fail.sh` runs a case under CPU load until it
+fails and keeps the artefacts - load being the difference between "fails in a full
+sweep" and "passes 3/3 alone". It reproduced at iteration 3 of 40. The artefacts
+then settled the mechanism rather than suggesting it: the old leader had completed
+checkpoints 1 and 2, the new leader recovered from 2, and the lost records were
+1, 2 and 3 - one checkpoint's window exactly.
+
+Fixed by running the sink's barrier hook before the capture. That ordering is right
+for sinks and wrong for operators: an operator's state must be captured as of the
+barrier, before any barrier-triggered mutation, whereas a sink emits nothing
+downstream and its only state IS the pending handles. **40/40 after the fix, under
+the load that reproduced it at iteration 3.**
+
+Two things this did not close, both recorded rather than implied:
+
+- **A chained sink still has the bug** (item 36). When an upstream operator owns
+  the shared backend it snapshots and only then forwards the barrier, so the sink's
+  handle is post-snapshot whatever the sink runner does. Not exercised by the
+  failing test, whose job puts the sink in its own subtask.
+- **The two-ungrouped-sinks split (item 29) is NOT attributed to this.** The
+  mechanism fits, but 30 runs under the load that caught item 31 at iteration 3 did
+  not reproduce it, with the fix reverted. Reasoning, not measurement.
+
+### F54. A claim this document made two days earlier was wrong
+
+Verifying F53 turned up an intermittent failure in
+`RescaleExactlyOnceTest.ScalingAKeyedOperatorUpPreservesExactlyOnceOutput`: about
+one run in three, the replan lands and the job then stops producing, committing
+roughly 42 of 160 records. Pre-existing - it fails identically with the F53 fix
+reverted, at iteration 2 of 6.
+
+This document and the follow-up list both record that exactly-once across a rescale
+is demonstrated. The output-equality assertions do hold on a green run, so the
+statement was true of every run observed - but each measurement taken when that
+work landed was a SINGLE run, and the rescale only completes about two times in
+three. "Demonstrated" described the runs, not the feature.
+
+Recorded as item 35 and quarantined in CI, taking the place of F53's test, which
+left the quarantine. The general lesson is the cheap one: a feature verified by
+single runs of a multi-process test has been verified against luck, and the
+repetition harness that found this took twenty minutes to write.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
