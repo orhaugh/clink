@@ -172,6 +172,18 @@ jobs:
           restore-keys: ccache-sanitizer-${{ matrix.mode }}-
       - name: Sanitizer build + tests [blocking gate]
         run: ./build_and_test.sh --sanitizer ${{ matrix.mode }}
+      # A nightly run tests whatever main was at 02:30, which is not necessarily
+      # what main is now. One TSan failure here was diagnosed twice because of
+      # that: the race it named had been fixed 28 minutes after the run fired, and
+      # the report gave no way to tell without going and looking up the sha. Print
+      # it next to the failure, with the command that settles the question.
+      - name: What this run actually tested
+        if: failure()
+        run: |
+          echo "This gate tested commit ${{ github.sha }} (${{ github.event_name }})."
+          echo "Before diagnosing, check whether a fix already landed after it:"
+          echo "  git merge-base --is-ancestor <fix-sha> ${{ github.sha }} && echo 'fix WAS present' || echo 'fix was NOT present'"
+          git log -1 --format='  %h %ci  %s' ${{ github.sha }} || true
       - name: Upload sanitizer logs
         if: failure()
         uses: actions/upload-artifact@v4
