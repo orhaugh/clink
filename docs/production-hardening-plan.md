@@ -1673,6 +1673,79 @@ leader. Closing it properly needs a conditional write - an object store's
 than a code change. What has changed is that the gap is now a race window rather
 than an unguarded write.
 
+### F46 to F52. The overnight follow-up round, 2026-08-05
+
+Twelve follow-up items worked in one stretch. Seven produced defects rather than
+just tests, and three of those were sharper than the item that led to them.
+
+**F46. One silent connection wedged all admission.** The coordinator reads a new
+peer's FIRST frame on the ACCEPT THREAD with no deadline, so a connection that
+opened a socket and sent nothing parked the only thread that admits anything:
+no client could connect, no worker could register, and `max_client_connections` -
+the cap meant to bound exactly this - became unreachable, because reaching it
+requires being admitted. Found while investigating a request for a frame-RATE
+limit, which would not have helped: the peer sends no frames. Bounded now at
+`heartbeat_timeout`, reused rather than invented - a peer that cannot get its first
+frame out inside the window this coordinator uses to declare an established peer
+dead is not live by the engine's own definition. With the bound removed the test
+HANGS rather than failing, which is what a wedge looks like from outside and why
+nothing had caught it.
+
+**F47. The plugin cache took its filename from the peer.** `handle_submit_` writes
+plugin bytes to disk and dlopens them BEFORE any slot or admission check, and the
+filename was `content_hash` off the wire, unvalidated, used as a path component -
+so an unauthenticated peer could write one file per frame, up to 256 MiB each, at a
+path it partly chose, into a directory nothing prunes. Now derived from the bytes,
+with a declared hash that disagrees refused rather than corrected (every reuse
+decision keys on that name), and a failed load removes its file. The traversal test
+demonstrates the escape rather than asserting about it: the mutated build writes
+outside the cache directory.
+
+**F48. Every worker registration leaked a thread and a socket.** A lost worker's
+reader returns but nothing joined it, and `shutdown_read()` is `shutdown(SHUT_RD)`,
+not `close`. Bounded by distinct worker ids ever seen rather than cluster size, so
+any supervisor minting fresh ids leaks one fd per restart until the coordinator
+cannot accept at all - taking client admission down with it. The item asked for a
+cap; the cap was the smaller half, and a cap without the reap would have been a
+lifetime quota on distinct ids rather than a concurrency limit.
+
+**F49. `refresh_active_leader_` was the one unfenced metadata write.** Recorded
+above as F45.
+
+**F50. A cancel drained a fan-in sink and discarded a single-input one.** The
+multi-input runners called `flush()` unconditionally after their loop where the
+single-input ones gate it on a clean exit, so whether a cancelled job drained
+depended on the shape of its graph. That matters because `clink stop` had just been
+built as the graceful path specifically so cancel could stay abrupt.
+
+**F51. Six fault points promised failures they could not cause.** Declared with no
+call site, so `CLINK_FAULT_INJECT` naming one ran green having injected nothing and
+the run read as coverage. Removed, with `scripts/check-fault-points.sh` in the
+pre-commit hook so a seventh cannot appear.
+
+**F52. Two data races, taking the cluster suite from 8 TSan warnings to zero.** The
+substantive one is in the logging facade: `legacy_emit` streamed into `std::cerr`
+part by part, racing on the stream's own state, reached from the watchdog declaring
+a worker lost. The other is a test helper that propagated by imitation.
+
+**Three tests were caught being vacuous by their own mutation checks**, which is
+worth more than the fixes:
+
+- The cancel test built its "multi-input" case with `union_streams`, which feeds a
+  SINGLE-input sink. It exercised the runner that was already correct and passed
+  with the fix reverted. A genuine fan-in needs `add_parallel_sink`.
+- The graceful-stop test would have passed on a stop that did nothing, because the
+  source is bounded and the job finishes either way. Only
+  `EXPECT_LT(committed, total)` separates them.
+- The first mutation run for the stop rebuilt `clink_node` when the source runner
+  compiles into the job `.so`, so it proved nothing while looking like a clean pass.
+
+**What the round says about the follow-up list itself.** Of twelve items worked,
+four had premises that were wrong or overstated: submission DOES queue, protocol
+compatibility WAS partly tested end to end, `state.during_flush` was six points not
+one, and item 9's cap was the smaller half of its own problem. An item written from
+a code read is a hypothesis, and this round is the argument for treating it as one.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

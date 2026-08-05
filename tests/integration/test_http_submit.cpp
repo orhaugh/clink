@@ -31,6 +31,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -431,25 +433,34 @@ TEST(HttpBackpressure, WorkerMetricsExposeOperatorInputGauges) {
                                                  bytes);
     ASSERT_EQ(submit.status, 200) << "submit body: " << submit.body;
 
-    // Give the workers ~1s to start the executor + metrics-poll thread.
-    std::this_thread::sleep_for(1500ms);
-
-    // Scrape both workers via the coordinator proxy; at least one must report
-    // operator input gauges.
+    // Scrape both workers via the coordinator proxy until one reports operator
+    // input gauges, rather than sleeping a guess at how long deploy takes.
+    //
+    // The guess was 1500ms, and it does not hold on Linux: a job plugin is 84 MB
+    // there because each one statically links clink_core, so the submit alone
+    // takes about 2.7s and the scrape ran before any operator existed. Same
+    // premise that broke nine other tests in this suite - see follow-up item 28.
     bool saw_depth = false;
     bool saw_capacity = false;
-    for (const auto& worker_id : c->worker_ids) {
-        const auto m = http_get(
-            "127.0.0.1", c->coordinator_http_port, "/api/v1/workers/" + worker_id + "/metrics");
-        if (m.status != 200)
-            continue;
-        if (m.body.find("clink_op_input_depth{op_id=") != std::string::npos) {
-            saw_depth = true;
-        }
-        if (m.body.find("clink_op_input_capacity{op_id=") != std::string::npos) {
-            saw_capacity = true;
-        }
-    }
+    (void)clink::itest::await_condition(
+        [&] {
+            for (const auto& worker_id : c->worker_ids) {
+                const auto m = http_get("127.0.0.1",
+                                        c->coordinator_http_port,
+                                        "/api/v1/workers/" + worker_id + "/metrics");
+                if (m.status != 200) {
+                    continue;
+                }
+                if (m.body.find("clink_op_input_depth{op_id=") != std::string::npos) {
+                    saw_depth = true;
+                }
+                if (m.body.find("clink_op_input_capacity{op_id=") != std::string::npos) {
+                    saw_capacity = true;
+                }
+            }
+            return saw_depth && saw_capacity;
+        },
+        std::chrono::seconds(60));
     EXPECT_TRUE(saw_depth) << "no clink_op_input_depth{op_id} gauge on any worker";
     EXPECT_TRUE(saw_capacity) << "no clink_op_input_capacity{op_id} gauge on any worker";
 
