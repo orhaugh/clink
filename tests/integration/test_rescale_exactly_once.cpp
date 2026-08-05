@@ -32,6 +32,7 @@
 // a rescale that is declined must not corrupt anything. Both outcomes are
 // distinguished in the failure messages so a red test says which happened.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -143,6 +144,119 @@ std::vector<std::string> committed_records(const std::filesystem::path& out_dir)
         }
     }
     return lines;
+}
+
+// Per-key ORDER, which the multiset comparison below cannot see.
+//
+// Follow-up item 13: every exactly-once assertion in this round is a MULTISET
+// comparison. A recovery that produced every record exactly once but reordered a
+// key's records would pass all of them. Ordering within a key is a guarantee the
+// engine makes - one subtask owns a key at a time and processes its records in
+// source order - so nothing was checking a property the engine is supposed to hold.
+//
+// The read order has to be defined before order can mean anything. The 2PC sink
+// names its files "sub<N>-<ckpt>.dat", so the committed stream is those files sorted
+// by CHECKPOINT first and subtask second, then line order within each file.
+// Checkpoints are globally ordered, which is what makes this well defined across a
+// rescale: a key that moves from one subtask to another appears in the old subtask's
+// earlier files and the new one's later files, in that order.
+//
+// The invariant asserted: for each key, the indices of its records must be strictly
+// ascending in that stream. `key = idx % keys` is how the job assigns them.
+struct CommittedFile {
+    std::uint64_t ckpt{};
+    std::uint64_t subtask{};
+    std::filesystem::path path;
+};
+
+std::vector<CommittedFile> committed_files_in_order(const std::filesystem::path& out_dir) {
+    std::vector<CommittedFile> files;
+    const auto dir = out_dir / "committed";
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) {
+        return files;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        // sub<N>-<ckpt>.dat
+        const auto name = entry.path().filename().string();
+        if (!name.starts_with("sub")) {
+            continue;
+        }
+        const auto dash = name.find('-', 3);
+        const auto dot = name.rfind('.');
+        if (dash == std::string::npos || dot == std::string::npos || dot < dash) {
+            continue;
+        }
+        try {
+            files.push_back(
+                CommittedFile{.ckpt = std::stoull(name.substr(dash + 1, dot - dash - 1)),
+                              .subtask = std::stoull(name.substr(3, dash - 3)),
+                              .path = entry.path()});
+        } catch (const std::exception&) {
+            continue;  // not a name this verifier understands; the multiset check still sees it
+        }
+    }
+    std::sort(files.begin(), files.end(), [](const CommittedFile& a, const CommittedFile& b) {
+        return a.ckpt != b.ckpt ? a.ckpt < b.ckpt : a.subtask < b.subtask;
+    });
+    return files;
+}
+
+// Where a key's records went backwards, plus how many records were actually
+// examined. The count is not decoration: this verifier parses file NAMES to order
+// the stream, so a change to the sink's naming would make it read zero files and
+// report zero violations - a green result from a check that ran on nothing. Every
+// caller asserts the count as well.
+struct OrderVerdict {
+    std::vector<std::string> violations;
+    std::size_t records_checked{0};
+};
+
+OrderVerdict per_key_order_violations(const std::filesystem::path& out_dir, int keys) {
+    OrderVerdict verdict;
+    std::map<int, int> last_index_for_key;
+    for (const auto& file : committed_files_in_order(out_dir)) {
+        std::ifstream in(file.path);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.starts_with("record-")) {
+                continue;  // STATE-MISMATCH markers and anything else: not ordered data
+            }
+            int idx = 0;
+            try {
+                idx = std::stoi(line.substr(std::string("record-").size()));
+            } catch (const std::exception&) {
+                continue;
+            }
+            ++verdict.records_checked;
+            const int key = keys > 0 ? idx % keys : 0;
+            const auto prev = last_index_for_key.find(key);
+            if (prev != last_index_for_key.end() && idx <= prev->second) {
+                verdict.violations.push_back("key " + std::to_string(key) + ": record-" +
+                                             std::to_string(idx) + " committed after record-" +
+                                             std::to_string(prev->second) + " (in " +
+                                             file.path.filename().string() + ")");
+            }
+            last_index_for_key[key] = idx;
+        }
+    }
+    return verdict;
+}
+
+std::string describe_order(const OrderVerdict& v) {
+    std::ostringstream os;
+    os << v.violations.size() << " out-of-order record(s) over " << v.records_checked
+       << " examined";
+    for (std::size_t i = 0; i < v.violations.size() && i < 6; ++i) {
+        os << "; " << v.violations[i];
+    }
+    if (v.violations.size() > 6) {
+        os << "; ... (+" << (v.violations.size() - 6) << ")";
+    }
+    return os.str();
 }
 
 struct OutputVerdict {
@@ -324,6 +438,18 @@ TEST_F(RescaleExactlyOnceTest, TheJobCommitsEveryRecordExactlyOnceWithNoRescale)
         << "a CLEAN run produced records the source never emitted - a STATE-MISMATCH here means "
            "the operator's own per-key check failed without any rescale: "
         << describe(v);
+
+    // The premise for the ORDER assertions in the rescale tests below. If a clean
+    // run cannot hold per-key order, a violation after a rescale says nothing about
+    // rescale. Item 13: everything else here is a multiset comparison, which cannot
+    // see a reordering at all.
+    const auto order = per_key_order_violations(out_dir_, kKeys);
+    EXPECT_GT(order.records_checked, 0u)
+        << "the order check examined NO records, so it proved nothing. It orders the stream by "
+           "parsing the sink's 'sub<N>-<ckpt>.dat' file names; if those changed it reads nothing "
+           "and reports success.";
+    EXPECT_TRUE(order.violations.empty())
+        << "a CLEAN run committed a key's records out of order: " << describe_order(order);
 }
 
 // The thing this file was written for: change a running job's parallelism and
@@ -422,6 +548,17 @@ TEST_F(RescaleExactlyOnceTest, ScalingAKeyedOperatorUpPreservesExactlyOnceOutput
            "key-group state was lost or duplicated when the operator resized. "
         << context;
     EXPECT_TRUE(v.missing.empty()) << "records were LOST across the rescale. " << context;
+
+    // Item 13. Exactly-once is a multiset property and says nothing about order; a
+    // rescale that moved a key's state to a new subtask could replay that key's
+    // records ahead of ones already committed and still satisfy every assertion
+    // above.
+    const auto order = per_key_order_violations(out_dir_, kKeys);
+    EXPECT_GT(order.records_checked, 0u) << "the order check examined NO records " << context;
+    EXPECT_TRUE(order.violations.empty())
+        << "a key's records were committed out of order across the rescale, which the multiset "
+           "assertions above cannot see: "
+        << describe_order(order) << " | " << context;
 }
 
 // The same, downwards. Scale-down is the harder direction for state: one new
@@ -472,6 +609,16 @@ TEST_F(RescaleExactlyOnceTest, ScalingAKeyedOperatorDownPreservesExactlyOnceOutp
            "merge of the four parent snapshots into one subtask lost or double-counted state. "
         << context;
     EXPECT_TRUE(v.missing.empty()) << "records were LOST across the scale-down. " << context;
+
+    // Item 13. Scale-down is where a key most plausibly reorders: four subtasks'
+    // worth of keys collapse onto one, so a key that was being processed by parent 3
+    // resumes on the merged subtask behind keys that came from parent 0.
+    const auto order = per_key_order_violations(out_dir_, kKeys);
+    EXPECT_GT(order.records_checked, 0u) << "the order check examined NO records " << context;
+    EXPECT_TRUE(order.violations.empty())
+        << "a key's records were committed out of order across the scale-down, which the multiset "
+           "assertions above cannot see: "
+        << describe_order(order) << " | " << context;
 }
 
 // Refusals. Each is a decision the coordinator has to take BEFORE draining the
