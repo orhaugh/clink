@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <signal.h>
 #include <spawn.h>
 #include <string>
@@ -233,19 +234,37 @@ TEST(CancelJobE2E, ClientInitiatedCancelStopsRunningPipeline) {
     EXPECT_EQ(cancel_exit, 0) << "clink_cancel_job exited non-zero (" << cancel_exit << ")";
 
     ASSERT_TRUE(submit_done) << "clink_submit_job did not exit within 30s";
-    // The job was cancelled - submit_exit should be non-zero. The
-    // exact code (8 = !completed, 9 = !ok) depends on whether the
-    // submit tool's JobCompleted arrived before the wait timeout;
-    // either way we want a clear "didn't succeed" signal.
-    EXPECT_NE(submit_exit, 0)
-        << "clink_submit_job exited 0 after cancel - expected non-zero (cancelled)";
+    // EXACTLY 9, not merely non-zero. The two failure codes mean opposite things:
+    //
+    //   8 = the submitter's own --wait-timeout-s expired without a JobCompleted.
+    //       It gave up. It heard nothing about a cancel.
+    //   9 = the job COMPLETED and reported not-ok, i.e. the coordinator told the
+    //       submitter it was cancelled.
+    //
+    // Only 9 shows the cancel travelled the whole path. Accepting either let the
+    // timeout path - the very thing this test exists to rule out - pass as success.
+    EXPECT_EQ(submit_exit, 9)
+        << "expected exit 9 (the coordinator reported the job cancelled); got " << submit_exit
+        << (submit_exit == 8 ? ". 8 means the submitter's own wait expired without hearing "
+                               "anything, which is the outcome a working cancel prevents."
+                             : "");
 
-    // Cancel arrived ~500 ms in; the submit tool should exit within
-    // a few seconds after that, NOT after the source's natural
-    // duration. 10 s is a generous ceiling.
+    // The wall time is REPORTED, not asserted against an absolute.
+    //
+    // It used to be `EXPECT_LT(wall_ms, 10'000)`, and that ceiling failed at
+    // 10143ms on a busy machine - a 1.4% miss reported as "cancel didn't shorten
+    // the run", which was untrue. The number was also standing in for something it
+    // could not measure: this source runs FOREVER, so there is no "natural
+    // duration" to beat. What the test actually has to exclude is the submitter
+    // giving up, and the exit code above says that directly and without a
+    // stopwatch.
+    //
+    // Keeping the figure visible still has value - a cancel that suddenly takes
+    // twenty seconds is worth seeing - but a printed number cannot fail a build on
+    // a loaded machine.
     const auto wall_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(t_submit_end - t_submit_start)
             .count();
-    EXPECT_LT(wall_ms, 10'000) << "submit wall time " << wall_ms
-                               << "ms exceeds ceiling - cancel didn't shorten the run";
+    std::cerr << "cancel_job_e2e: submit wall time " << wall_ms << "ms (reported, not asserted; "
+              << "the exit code above is what proves the cancel landed)\n";
 }

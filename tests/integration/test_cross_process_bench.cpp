@@ -206,13 +206,27 @@ TEST(CrossProcessBench, PipelineWallTimeAcrossThreeWorkers) {
     }
     EXPECT_EQ(sink_count, kRecords);
 
-    // Generous wall-time ceiling: 10 s for 10 k records = 1000 r/s
-    // floor. Real measured throughput on commodity hardware is in the
-    // 10k-100k r/s range for this cross-process path, so this is ~10x
-    // slack and shouldn't flake on sanitizer / docker / slow CI.
-    constexpr double kCeilingMs = 10'000.0;
-    EXPECT_LT(static_cast<double>(wall_ns) / 1e6, kCeilingMs)
-        << "cross-process bench wall time exceeded ceiling";
+    // The wall time is REPORTED, not asserted. What the sink received is the
+    // gating check, and it is above.
+    //
+    // There used to be a 10 s ceiling here, justified as "~10x slack" on the
+    // grounds that this path runs at 10k-100k records/sec. That premise is wrong by
+    // roughly two orders of magnitude: measured on an idle machine this test does
+    // 10,000 records in 8.2 s, or about 1,200 records/sec. The ceiling was 1.2x
+    // slack, not 10x - which is why it failed at 10,427 ms during one label run and
+    // 11,001 ms on a cold container, and was reported as a throughput regression
+    // both times.
+    //
+    // The figure is dominated by process start-up and deploy for a 10k-record run,
+    // not by steady-state throughput, so it was never a throughput floor in the
+    // first place. Keeping it visible is useful; failing a build on it is not, and
+    // a floor that goes red on a busy machine teaches people to ignore red.
+    //
+    // The engine's actual throughput floors live in benchmarks/, which run on a
+    // quiet machine against a pinned premise.
+    std::cerr << "cross_process_bench: wall time " << static_cast<double>(wall_ns) / 1e6
+              << " ms (reported, not asserted - see the comment here; the gating check is "
+                 "that the sink received every record)\n";
 
     std::filesystem::remove(out_path);
 }
