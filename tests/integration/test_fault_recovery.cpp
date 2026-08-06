@@ -333,6 +333,79 @@ TEST_F(FaultRecoveryTest, TwoSeparatedWorkerFailuresAreSurvived) {
     EXPECT_EQ(*code, 0) << "the job did not survive two separated worker failures";
 }
 
+// The restart BUDGET is spent, and the job fails rather than restarting forever.
+//
+// Follow-up 24. `JobState::restart_attempts` gates every restart
+// (`restart_attempts < effective_max_restarts`), and nothing asserted it anywhere -
+// it is also the only field of `CompletedJobRecord` no test looks at. If it never
+// incremented, a job would restart on every worker loss indefinitely, and every
+// existing test would still pass: they all give a budget large enough that they
+// never reach the end of it.
+//
+// So this one gives a budget of exactly ONE and spends it. The first loss must be
+// survived (proving the budget is not zero and recovery works) and the second must
+// end the job (proving the counter advanced and the gate holds). Asserting only the
+// second would pass against a coordinator that never restarts at all.
+//
+// The losses are SEPARATED by a completed checkpoint, like the test above: two
+// overlapping restarts are a different scenario with a known gap (F12), and mixing
+// them in would make a failure here ambiguous.
+TEST_F(FaultRecoveryTest, AJobFailsOnceItsRestartBudgetIsSpent) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+
+    auto sub = submit(c, /*max_restarts=*/1);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
+                                    std::chrono::seconds(45)))
+        << "no checkpoint completed before the first kill; the scenario never ran";
+    const auto before_first = latest_completed(c.checkpoint_dir());
+
+    // First loss: inside the budget, so the job must recover.
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    ASSERT_TRUE(
+        clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > before_first; },
+                            std::chrono::seconds(60)))
+        << "the job never checkpointed again after the FIRST worker loss, so the budget was "
+           "never actually spent and what follows would prove nothing";
+
+    // Bring worker 0 back BEFORE the second kill, so the job has somewhere to run.
+    //
+    // Without this the test is vacuous, and it was: with only two workers, killing
+    // the second leaves nowhere to redeploy and the job fails for lack of capacity
+    // whatever the budget says. Mutating the gate to `true` (budget never runs out)
+    // still passed. Restoring capacity makes the BUDGET the only thing that can end
+    // the job, which is what this test is named for.
+    ASSERT_TRUE(c.restart_worker(0));
+    ASSERT_TRUE(c.await_workers_registered(3))
+        << "worker 0 never re-registered, so the second kill would leave the cluster empty and "
+           "this test would prove nothing about the budget";
+
+    // Second loss: the budget is gone. The job must END, not restart again - even
+    // though a worker is available to run it.
+    c.worker(1).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(1));
+
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value())
+        << "the submitter never exited after the budget was spent: the job neither recovered nor "
+           "failed, which is the outcome an un-incremented counter produces - it would keep "
+           "restarting";
+    EXPECT_NE(*code, 0)
+        << "the job reported SUCCESS after losing a worker with no restart budget left. Either "
+           "the budget is not being enforced or restart_attempts is not advancing.";
+
+    // The coordinator must say it refused, and name the budget. Without this the
+    // assertion above also passes for a job that failed for an unrelated reason.
+    EXPECT_TRUE(c.coordinator().log_contains("attempt 1/1") ||
+                c.coordinator().log_contains("restart budget"))
+        << "the coordinator never reported spending the restart budget, so this test did not "
+           "observe the gate it is named for";
+}
+
 // --- coordinator death -----------------------------------------------------
 
 TEST_F(FaultRecoveryTest, CoordinatorDeathIsReportedNotSilentlyHung) {
