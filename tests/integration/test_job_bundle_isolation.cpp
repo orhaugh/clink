@@ -161,8 +161,15 @@ TEST(JobBundleIsolation, ConcurrentJobsWithCollidingInlineNamesDontTrample) {
     ::setenv("CLINK_COLLISION_OUT_B", out_b.c_str(), 1);
 
     const auto coordinator_port = probe_free_port();
-    const pid_t coordinator_pid = spawn_proc(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    // Captured so worker registration below is observable rather than guessed.
+    const auto coordinator_log =
+        std::filesystem::temp_directory_path() /
+        ("clink_bundle_coordinator_" + std::to_string(::getpid()) + ".log");
+    std::filesystem::remove(coordinator_log);
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        node,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     // Wait for the coordinator to be ACCEPTING, not for a duration. A sleep here
     // is a guess at process start-up: too short and the submit below races the
@@ -182,7 +189,11 @@ TEST(JobBundleIsolation, ConcurrentJobsWithCollidingInlineNamesDontTrample) {
                                      node));
         ASSERT_GT(workers.back(), 0);
     }
-    std::this_thread::sleep_for(400ms);
+    // All 4 by the coordinator's own count. A submission that lands before the
+    // slots exist is refused outright, and the sleep this replaces was a guess
+    // made on macOS - on Linux each of these processes dlopens an 84 MB plugin.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 4))
+        << "not all 4 workers registered with the coordinator";
 
     // Submit both jobs concurrently. The submit CLI is one-shot per
     // invocation; we spawn two processes in parallel so the coordinator sees
