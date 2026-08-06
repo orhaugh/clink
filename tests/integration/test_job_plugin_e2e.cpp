@@ -36,6 +36,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -140,10 +142,20 @@ TEST(JobPluginE2E, CanonicalPipelineRunsAcrossSeparateProcesses) {
     ::setenv("CLINK_CANONICAL_OUT_PATH", out_path.c_str(), 1);
 
     const auto coordinator_port = probe_free_port();
-    const pid_t coordinator_pid = spawn_proc(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    // Captured so worker registration becomes observable - see the wait below.
+    const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                 ("clink_jpe2e_coordinator_" + std::to_string(::getpid()) + ".log");
+    std::filesystem::remove(coordinator_log);
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        node,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    // Wait for the coordinator to be ACCEPTING, not for a duration. A sleep here
+    // is a guess at process start-up: too short and the submit below races the
+    // bind on a loaded machine, too long and every run pays for it.
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "the coordinator never accepted on its control port";
 
     // Pipeline subtask slots: from_elements + map + filter +
     // ts_monotonic + sliding_aggregate + sink = 6 (each at par=1).
@@ -157,7 +169,11 @@ TEST(JobPluginE2E, CanonicalPipelineRunsAcrossSeparateProcesses) {
                                      node));
         ASSERT_GT(workers.back(), 0);
     }
-    std::this_thread::sleep_for(400ms);
+    // All six, by the coordinator's own count. A submission that arrives before
+    // the slots exist is rejected outright, and 400ms was a guess made on macOS -
+    // on Linux these processes each dlopen an 84 MB plugin.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 6))
+        << "not all six workers registered with the coordinator";
 
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),

@@ -26,6 +26,14 @@ if ! ./scripts/check-nested-timeouts.py; then
     exit 1
 fi
 
+echo "pre-commit: checking for new sleep-instead-of-a-condition..."
+if ! ./scripts/check-bare-sleeps.py; then
+    echo ""
+    echo "pre-commit: an integration test gained a sleep where it should wait for a"
+    echo "condition, or a baseline entry is now stale. See the message above."
+    exit 1
+fi
+
 echo "pre-commit: checking clang-format..."
 if ! cmake --build "$BUILD_DIR" --target format-check 2>&1; then
     echo ""

@@ -39,6 +39,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -145,7 +147,11 @@ TEST(CrossProcessBench, PipelineWallTimeAcrossThreeWorkers) {
     const pid_t coordinator_pid = spawn_proc(
         {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    // Wait for the coordinator to be ACCEPTING, not for a duration. A sleep here
+    // is a guess at process start-up: too short and the submit below races the
+    // bind on a loaded machine, too long and every run pays for it.
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "the coordinator never accepted on its control port";
 
     std::vector<pid_t> workers;
     for (int i = 1; i <= 3; ++i) {

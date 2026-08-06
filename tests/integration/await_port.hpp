@@ -22,12 +22,21 @@
 
 #include <chrono>
 #include <cstdint>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <spawn.h>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+
+extern "C" char** environ;
 
 namespace clink::itest {
 
@@ -81,6 +90,68 @@ template <typename Cond>
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     }
+}
+
+// Spawn a child with BOTH streams captured into `log_path`.
+//
+// The pre-harness tests all define their own spawn_proc with `nullptr` file
+// actions, so the child's output goes to the test's own stdout and there is
+// nothing to observe. That is WHY those tests sleep: they have no way to see that
+// a worker registered, so they guess at how long it takes. A captured log turns
+// that guess into a condition - see await_log_matches below.
+//
+// Returns the pid, or -1.
+inline pid_t spawn_logged(const std::vector<std::string>& argv,
+                          const std::filesystem::path& binary,
+                          const std::filesystem::path& log_path) {
+    std::vector<char*> raw;
+    raw.reserve(argv.size() + 1);
+    for (const auto& a : argv) {
+        raw.push_back(const_cast<char*>(a.c_str()));
+    }
+    raw.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(
+        &actions, STDOUT_FILENO, log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+
+    pid_t pid = -1;
+    const int rc = posix_spawn(&pid, binary.c_str(), &actions, nullptr, raw.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    return rc == 0 ? pid : -1;
+}
+
+// How many times `needle` appears in the file at `path`. 0 if it does not exist.
+[[nodiscard]] inline std::size_t log_count(const std::filesystem::path& path,
+                                           std::string_view needle) {
+    std::ifstream in(path);
+    if (!in || needle.empty()) {
+        return 0;
+    }
+    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::size_t n = 0;
+    for (std::size_t pos = body.find(needle); pos != std::string::npos;
+         pos = body.find(needle, pos + needle.size())) {
+        ++n;
+    }
+    return n;
+}
+
+// Wait until `needle` appears at least `want` times in the log at `path`.
+//
+// This is what replaces "sleep 400ms after spawning the workers". The
+// coordinator logs a line per registration, so the number of registrations is
+// directly observable; sleeping instead means a slow machine submits a job before
+// a slot exists, and the coordinator rejects it - which reads as a submission bug
+// rather than as the race it is.
+[[nodiscard]] inline bool await_log_matches(
+    const std::filesystem::path& path,
+    std::string_view needle,
+    std::size_t want = 1,
+    std::chrono::milliseconds timeout = std::chrono::seconds{30}) {
+    return await_condition([&] { return log_count(path, needle) >= want; }, timeout);
 }
 
 }  // namespace clink::itest

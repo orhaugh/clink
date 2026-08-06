@@ -23,6 +23,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -78,10 +80,21 @@ TEST(ListJobs, SubmitterCanEnumerateRunningAndCompletedJobs) {
     const auto out_path = std::filesystem::temp_directory_path() / "clink_list_jobs_test.txt";
     std::filesystem::remove(out_path);
 
-    const pid_t coordinator_pid = spawn_node(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    // Captured so worker registration becomes observable - see the wait below.
+    const auto coordinator_log =
+        std::filesystem::temp_directory_path() /
+        ("clink_list_jobs_coordinator_" + std::to_string(::getpid()) + ".log");
+    std::filesystem::remove(coordinator_log);
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        binary,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    // Wait for the coordinator to be ACCEPTING, not for a duration. A sleep here
+    // is a guess at process start-up: too short and the submit below races the
+    // bind on a loaded machine, too long and every run pays for it.
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "the coordinator never accepted on its control port";
 
     const pid_t worker_pid = spawn_node({"clink_node",
                                          "--role=worker",
@@ -90,7 +103,11 @@ TEST(ListJobs, SubmitterCanEnumerateRunningAndCompletedJobs) {
                                          "--coordinator-port=" + std::to_string(coordinator_port)},
                                         binary);
     ASSERT_GT(worker_pid, 0);
-    std::this_thread::sleep_for(300ms);
+    // The coordinator logs a line per registration, so the condition is directly
+    // observable. Sleeping instead means a slow machine submits before a slot
+    // exists and the coordinator refuses - which reads as a submission bug.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 1))
+        << "the worker never registered with the coordinator";
 
     application::JobSubmitter submitter("127.0.0.1", coordinator_port);
 
