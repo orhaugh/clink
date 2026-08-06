@@ -2243,6 +2243,68 @@ back", with the fix it passes.
 Every other fault test kills a worker and leaves it dead, so this path had no
 coverage at all.
 
+### F65. State directories are addressed by an index that a rescale reassigns
+
+The root cause behind F62, found by instrumenting the writer rather than reasoning
+about it, and the fourth appearance of a single underlying mistake.
+
+**The evidence.** Logging every backend construction with the directory it claims,
+across a failing scale-down run:
+
+    pre-rescale   worker-0: subtask 0 -> dir 0, subtask 2 -> dir 2, subtask 4 -> dir 4
+                  worker-1: subtask 1 -> dir 1, subtask 3 -> dir 3, subtask 5 -> dir 5
+    post-rescale  worker-0: subtask 1 -> dir 1  (restore_from=1, parents=4)
+                  worker-1: subtask 0 -> dir 0, subtask 2 -> dir 2 (restore_from=5)
+
+The post-rescale topology writes into the SAME directories the pre-rescale one used.
+Logging every snapshot write then shows the consequence directly - two writes of the
+restore point into one directory:
+
+    SNAPWRITE ckpt=21 bytes=744  dir=.../checkpoints/1   <- pre-rescale counter slice
+    SNAPWRITE ckpt=21 bytes=1392 dir=.../checkpoints/1   <- post-rescale merged state
+
+and 1392 is what is on disk afterwards. Dirs 3, 4 and 5 are no longer used by the new
+topology, so they keep their pre-rescale files.
+
+**So checkpoint 21 no longer describes one moment.** A restore from it reads
+post-rescale state out of dirs 0, 1 and 2 and pre-rescale state out of 3, 4 and 5.
+The keyed counter comes back ahead of the source's offset, and the operator's
+self-check reports `got=4 want=3` - which is exactly the F62 signature, and why
+`restored_baseline_for_key=4` showed the state arriving already ahead.
+
+**This is the same root cause as F38, F59 and F63**, now for the fourth time: a
+job-global subtask index is not stable across a topology change, and everything that
+addresses state by it is wrong in a different way.
+
+  * F38 computed the index arithmetic wrongly.
+  * F59 WROTE through it, aliasing other subtasks' parents.
+  * F63 skipped the translation on a restart.
+  * F65 keeps writing new-topology state into old-topology directories.
+
+Each was fixed where it was found. The pattern says the fix belongs one level down.
+
+**The designed fix, NOT implemented here: namespace state by topology generation.**
+`JobState::topology_version` already exists, is already incremented on every replan,
+and is already logged in the replan line. Making the state path
+`<base>/v<topology_version>/<subtask_idx>` gives each generation its own namespace,
+so a generation's files are immutable with respect to every other - which is the
+invariant all four defects violate. A restore reads the generation that produced the
+checkpoint; the translation logic in F63 then decides only WHICH parent index within
+that generation, never which directory a live subtask may scribble on.
+
+It is deliberately not done in this pass. It changes the on-disk layout, needs a
+compatibility story for existing checkpoint directories, and touches every backend -
+which is not something to land without room to validate it. Recorded as follow-up 48
+with the evidence above, so the next person starts from a measured root cause rather
+than a symptom.
+
+**Note on the diagnosis, because the method mattered more than the answer.** Five
+rounds of careful reading eliminated six hypotheses and produced no answer. One
+printed value (`restored_baseline_for_key`) moved it from the replay side to the
+checkpoint side in a single run. Two more printed lines - who constructs a backend
+for which directory, and who writes which checkpoint id where - finished it. When a
+defect resists inference, instrument the write path.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
