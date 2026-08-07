@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <spawn.h>
 #include <string>
 #include <string_view>
@@ -152,6 +153,113 @@ inline pid_t spawn_logged(const std::vector<std::string>& argv,
     std::size_t want = 1,
     std::chrono::milliseconds timeout = std::chrono::seconds{30}) {
     return await_condition([&] { return log_count(path, needle) >= want; }, timeout);
+}
+
+// Verify a checkpoint directory ACROSS subtasks, not file by file.
+//
+// `clink checkpoint-verify` answers "is this file intact" - payload against its
+// sidecar. That cannot see the failure this exists for: F65 was a snapshot file
+// appearing for a checkpoint it was never part of, written by a later topology into
+// a directory the checkpoint's restore point still named. Every file involved was
+// individually valid; what was wrong was the SET.
+//
+// The coordinator now records, in each COMPLETED-<id> marker, the state generation
+// holding that checkpoint and the subtask indices that acked it. So the set is
+// checkable: under <base>/v<generation>/, exactly those subtasks may hold a snapshot
+// for that id.
+//
+// EXTRAS are the assertion. A subtask directory holding a file for a checkpoint it
+// never participated in is always wrong. Missing files are reported but not failed:
+// a stateless subtask acks a checkpoint without writing state, so absence is
+// legitimate and asserting on it would be a false positive.
+//
+// Returns a human-readable description of every violation; empty means consistent.
+[[nodiscard]] inline std::vector<std::string> checkpoint_set_violations(
+    const std::filesystem::path& checkpoint_dir) {
+    std::vector<std::string> bad;
+    std::error_code ec;
+    const auto jobs_dir = checkpoint_dir / "_jobs";
+    if (!std::filesystem::exists(jobs_dir, ec)) {
+        return bad;
+    }
+    for (const auto& job_entry : std::filesystem::directory_iterator(jobs_dir, ec)) {
+        if (ec || !job_entry.is_directory(ec)) {
+            continue;
+        }
+        for (const auto& marker : std::filesystem::directory_iterator(job_entry.path(), ec)) {
+            if (ec || !marker.is_regular_file(ec)) {
+                continue;
+            }
+            const auto name = marker.path().filename().string();
+            if (!name.starts_with("COMPLETED-")) {
+                continue;
+            }
+            std::ifstream in(marker.path());
+            if (!in) {
+                continue;
+            }
+            std::string body((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+            const auto field = [&body](std::string_view key) -> std::string {
+                const auto k = std::string{key} + "=";
+                const auto pos = body.find(k);
+                if (pos == std::string::npos) {
+                    return {};
+                }
+                const auto start = pos + k.size();
+                const auto end = body.find('\n', start);
+                return body.substr(start, end == std::string::npos ? end : end - start);
+            };
+            const auto gen_s = field("generation");
+            const auto subs_s = field("subtasks");
+            const auto ckpt_s = name.substr(std::string("COMPLETED-").size());
+            if (gen_s.empty()) {
+                continue;  // marker predates the participant record; nothing to check
+            }
+            std::set<std::string> expected;
+            for (std::size_t p = 0; p <= subs_s.size();) {
+                const auto comma = subs_s.find(',', p);
+                const auto tok = subs_s.substr(p, comma == std::string::npos ? comma : comma - p);
+                if (!tok.empty()) {
+                    expected.insert(tok);
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                p = comma + 1;
+            }
+            // Anything holding a snapshot for this id, in ANY generation.
+            const std::string snap = "checkpoint-" + ckpt_s + ".snap";
+            for (const auto& gen_entry : std::filesystem::directory_iterator(checkpoint_dir, ec)) {
+                if (ec || !gen_entry.is_directory(ec)) {
+                    continue;
+                }
+                const auto gname = gen_entry.path().filename().string();
+                if (gname.empty() || gname[0] != 'v') {
+                    continue;  // _jobs and anything else that is not a generation
+                }
+                for (const auto& sub : std::filesystem::directory_iterator(gen_entry.path(), ec)) {
+                    if (ec || !sub.is_directory(ec)) {
+                        continue;
+                    }
+                    if (!std::filesystem::exists(sub.path() / snap, ec)) {
+                        continue;
+                    }
+                    const auto idx = sub.path().filename().string();
+                    const bool right_generation = (gname == "v" + gen_s);
+                    if (!right_generation || expected.count(idx) == 0) {
+                        bad.push_back("checkpoint " + ckpt_s + " has a snapshot at " + gname + "/" +
+                                      idx + " but completed with generation=" + gen_s +
+                                      " subtasks=" + subs_s +
+                                      ". A file for a checkpoint the subtask never participated "
+                                      "in means a later topology wrote where an earlier one's "
+                                      "restore point still points.");
+                    }
+                }
+            }
+        }
+    }
+    return bad;
 }
 
 }  // namespace clink::itest

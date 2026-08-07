@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <thread>
@@ -677,6 +678,14 @@ private:
         // instead sent a restarted job looking for state under a generation nothing
         // had ever written, and it replayed from offset zero - caught by four
         // worker-kill tests duplicating record-0.
+        // Which subtasks a checkpoint was TRIGGERED for, kept until it completes.
+        //
+        // pending_checkpoint_acks cannot answer this: acks are removed from it as
+        // they arrive, so by the time the checkpoint completes it is empty. Recorded
+        // separately so the COMPLETED marker can say what the checkpoint consists
+        // of - the first cut read the drained set and wrote "subtasks=" empty, which
+        // the consistency check caught immediately.
+        std::unordered_map<std::uint64_t, std::set<std::uint32_t>> checkpoint_participants;
         std::uint32_t state_generation{1};
         // The checkpoint id at which the CURRENT state generation began; anything at
         // or below it was written by the previous generation.

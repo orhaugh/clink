@@ -2068,6 +2068,24 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
             pending.insert(key);
         }
         job.pending_checkpoint_acks[ckpt_id] = std::move(pending);
+        {
+            // What this checkpoint consists of, for the COMPLETED marker. Captured at
+            // TRIGGER because the ack set above is drained as acks arrive.
+            auto& participants = job.checkpoint_participants[ckpt_id];
+            participants.clear();
+            for (const auto& [key, _unused] : job.task_records) {
+                const auto colon = key.rfind(':');
+                if (colon == std::string::npos) {
+                    continue;
+                }
+                try {
+                    participants.insert(
+                        static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1))));
+                } catch (const std::exception&) {
+                    continue;
+                }
+            }
+        }
         job.pending_checkpoint_start_times[ckpt_id] = std::chrono::steady_clock::now();
         clink::metrics::ckpt::triggered();
         for (const auto& [worker_id, _] : job.tasks_by_worker) {
@@ -4750,6 +4768,28 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
                         pending.insert(tkey);
                     }
                     job.pending_checkpoint_acks[final_id] = std::move(pending);
+                    {
+                        // Same participant record as the periodic and savepoint
+                        // triggers. Missing it here left the END-OF-STREAM final
+                        // checkpoint with an empty set in its marker, which the
+                        // consistency check reported as every subtask being an
+                        // outsider - three trigger sites, and the check found the
+                        // one that was forgotten.
+                        auto& participants = job.checkpoint_participants[final_id];
+                        participants.clear();
+                        for (const auto& [tkey, _p] : job.task_records) {
+                            const auto colon = tkey.rfind(':');
+                            if (colon == std::string::npos) {
+                                continue;
+                            }
+                            try {
+                                participants.insert(
+                                    static_cast<std::uint32_t>(std::stoul(tkey.substr(colon + 1))));
+                            } catch (const std::exception&) {
+                                continue;
+                            }
+                        }
+                    }
                     job.pending_checkpoint_start_times[final_id] = std::chrono::steady_clock::now();
                     clink::metrics::ckpt::triggered();
                     log::info("coordinator.final_checkpoint",
@@ -4773,7 +4813,17 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
 
 void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     auto msg = decode_subtask_checkpointed(r);
-    std::vector<std::pair<JobId, std::uint64_t>> just_completed;
+    // What a completed checkpoint CONSISTS OF, not just that it happened: the
+    // generation whose directories hold it, and the subtask indices that acked it.
+    // Recorded in the marker so a checkpoint can be verified across subtasks
+    // afterwards - see the COMPLETED-N write below.
+    struct CompletedCheckpoint {
+        JobId job_id{};
+        std::uint64_t checkpoint_id{};
+        std::uint32_t generation{1};
+        std::set<std::uint32_t> subtasks;
+    };
+    std::vector<CompletedCheckpoint> just_completed;
     std::string completed_marker_dir;
     // A group whose member failed gets AbortCheckpoint
     // broadcast to every worker hosting any of its members. Collected
@@ -4933,7 +4983,20 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 job.stale_layout_blocks.clear();
                 job.stale_layout_through = 0;
             }
-            just_completed.emplace_back(msg.job_id, msg.checkpoint_id);
+            {
+                // The acking set is about to be erased; capture which subtasks it
+                // covered. Keys are "role:subtask_idx".
+                CompletedCheckpoint done;
+                done.job_id = msg.job_id;
+                done.checkpoint_id = msg.checkpoint_id;
+                done.generation = job.state_generation;
+                if (auto pit = job.checkpoint_participants.find(msg.checkpoint_id);
+                    pit != job.checkpoint_participants.end()) {
+                    done.subtasks = pit->second;
+                    job.checkpoint_participants.erase(pit);
+                }
+                just_completed.push_back(std::move(done));
+            }
             completed_marker_dir = job.checkpoint.checkpoint_dir;
             job.pending_checkpoint_acks.erase(ckpt_it);
             if (auto sit = job.pending_checkpoint_start_times.find(msg.checkpoint_id);
@@ -5017,7 +5080,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     }
     // Write the COMPLETED marker outside the lock so a slow filesystem
     // doesn't block reader threads.
-    for (const auto& [jid, ckpt_id] : just_completed) {
+    for (const auto& [jid, ckpt_id, gen, subtasks] : just_completed) {
         // The COMPLETED-N marker is the authoritative record that a
         // checkpoint reached global completion, and the 2PC sinks key their
         // commit-on-restore on finding it. It therefore has to be durable
@@ -5068,9 +5131,24 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             std::filesystem::create_directories(marker.parent_path(), ec);
             CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCompletedMarker);
             try {
+                // The marker records what the checkpoint CONSISTS OF, not only
+                // that it completed: the state generation whose directories hold
+                // it, and the subtask indices that acked it.
+                //
+                // That is what makes a checkpoint verifiable across subtasks rather
+                // than only file by file. F65 was a file appearing for a checkpoint
+                // it was never part of - written by a later topology into a
+                // directory the checkpoint's restore point still named - and no
+                // per-file integrity check can see that, because each file is
+                // individually valid. A recorded participant set can.
+                std::string subtask_list;
+                for (const auto idx : subtasks) {
+                    subtask_list += (subtask_list.empty() ? "" : ",") + std::to_string(idx);
+                }
                 clink::state::detail::write_string_fsync_rename(
                     marker,
                     "job=" + std::to_string(jid) + "\ncheckpoint=" + std::to_string(ckpt_id) +
+                        "\ngeneration=" + std::to_string(gen) + "\nsubtasks=" + subtask_list +
                         "\n");
             } catch (const std::exception& e) {
                 clink::log::error(
@@ -5163,6 +5241,24 @@ void Coordinator::checkpoint_trigger_loop_() {
                     pending.insert(key);
                 }
                 job.pending_checkpoint_acks[next_id] = std::move(pending);
+                {
+                    // What this checkpoint consists of, for the COMPLETED marker. Captured at
+                    // TRIGGER because the ack set above is drained as acks arrive.
+                    auto& participants = job.checkpoint_participants[next_id];
+                    participants.clear();
+                    for (const auto& [key, _unused] : job.task_records) {
+                        const auto colon = key.rfind(':');
+                        if (colon == std::string::npos) {
+                            continue;
+                        }
+                        try {
+                            participants.insert(
+                                static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1))));
+                        } catch (const std::exception&) {
+                            continue;
+                        }
+                    }
+                }
                 job.pending_checkpoint_start_times[next_id] = std::chrono::steady_clock::now();
                 clink::metrics::ckpt::triggered();
                 std::vector<std::string> worker_ids;
