@@ -95,11 +95,20 @@ struct RunnerContext {
     // means "no checkpointing" - the runner falls back to an in-memory
     // backend with no persistence. When checkpoint_dir is set the
     // runner wires a FileBackedStateBackend rooted at
-    // `<checkpoint_dir>/<subtask_idx>` so each subtask owns a private
-    // snapshot directory.
+    // `<checkpoint_dir>/v<generation>/<subtask_idx>` so each subtask owns a
+    // private snapshot directory within its topology generation.
     std::string checkpoint_dir;
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
+    // Topology generation. State is rooted at
+    // `<checkpoint_dir>/v<generation>/<subtask_idx>` rather than
+    // `<checkpoint_dir>/<subtask_idx>`, because a job-global subtask index is
+    // reassigned whenever an operator is resized. `restore_from_generation` is the
+    // generation that produced the checkpoint being restored, which differs from
+    // `generation` exactly when a restore crosses a rescale.
+    // See docs/design/state-generations.md.
+    std::uint32_t generation{1};
+    std::uint32_t restore_from_generation{1};
     // Record-capture flight recorder (echoed from DeployMsg via the worker's
     // per-job checkpoint state); empty = capture off. Copied onto
     // JobConfig by make_subtask_job_config.

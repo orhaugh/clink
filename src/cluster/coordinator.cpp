@@ -38,6 +38,47 @@
 
 namespace clink::cluster {
 
+namespace {
+
+// The highest generation directory (v<N>) present under a state root, or 1 if there
+// is none.
+//
+// Needed only for a restore from an EXTERNAL directory - a savepoint, or an explicit
+// --restore-from-checkpoint-id. For its own checkpoints the coordinator knows the
+// generation exactly and never guesses. A savepoint carries no metadata naming its
+// generation, so the highest one present is the best available answer, and it is the
+// right one for the ordinary case of a savepoint taken from a job's final state.
+[[nodiscard]] std::uint32_t highest_generation_in(const std::string& root) {
+    std::uint32_t best = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!e.is_directory(ec)) {
+            continue;
+        }
+        const auto name = e.path().filename().string();
+        if (name.size() < 2 || name[0] != 'v') {
+            continue;
+        }
+        const auto digits = name.substr(1);
+        if (!std::all_of(digits.begin(), digits.end(), [](unsigned char c) {
+                return std::isdigit(c) != 0;
+            })) {
+            continue;
+        }
+        try {
+            best = std::max(best, static_cast<std::uint32_t>(std::stoul(digits)));
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+    return best == 0 ? 1u : best;
+}
+
+}  // namespace
+
 // Out-of-line so the unique_ptr<JobBundle> field can hold a
 // forward-declared type in the header; the .cpp pulls in
 // job_bundle.hpp so JobBundle is complete here.
@@ -2807,6 +2848,14 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.capture_records = checkpoint.capture_records;
         deploy_msg.restore_from_dir = checkpoint.restore_from_dir;
         deploy_msg.restore_from_checkpoint_id = checkpoint.restore_from_checkpoint_id;
+        // Generation 1 is an initial deploy. A restore here reads an EXTERNAL
+        // directory (a savepoint, or an explicit --restore-from-checkpoint-id), so
+        // its generation is whatever that directory holds rather than anything this
+        // job knows - discovered by listing it. See docs/design/state-generations.md.
+        deploy_msg.generation = job->state_generation;
+        deploy_msg.restore_generation = checkpoint.restore_from_dir.empty()
+                                            ? job->state_generation
+                                            : highest_generation_in(checkpoint.restore_from_dir);
         deploy_msg.unaligned_checkpoints = checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.expected_state_versions_packed = job->expected_state_versions_packed;
         deploy_msg.udfs_packed = job->udfs_packed;
@@ -3912,6 +3961,19 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         // restore source, last completed checkpoint id we acknowledged.
         deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
         deploy_msg.restore_from_checkpoint_id = job.latest_completed_checkpoint_id;
+        // Which generation this deploy WRITES, and which one produced the restore
+        // point. They differ exactly when the restore crosses a rescale, and the
+        // boundary is the same one that decides whether the parent INDEX needs
+        // translating - so the two answers are taken from one predicate and cannot
+        // disagree. A restore that reads generation N-1's directories while
+        // translating indices as though it were generation N is precisely the
+        // mismatch F63 and F65 came from.
+        deploy_msg.generation = job.state_generation;
+        deploy_msg.restore_generation =
+            (job.state_generation > 1 && job.latest_completed_checkpoint_id != 0 &&
+             job.latest_completed_checkpoint_id <= job.state_generation_after_checkpoint)
+                ? job.state_generation - 1
+                : job.state_generation;
         deploy_msg.unaligned_checkpoints =
             job.checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;

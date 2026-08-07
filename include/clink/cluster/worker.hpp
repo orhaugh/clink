@@ -182,6 +182,8 @@ private:
                    const std::string& checkpoint_dir,
                    const std::string& restore_from_dir,
                    std::uint64_t restore_from_checkpoint_id,
+                   std::uint32_t generation,
+                   std::uint32_t restore_from_generation,
                    bool unaligned_checkpoints,
                    const std::string& expected_state_versions_packed,
                    const std::string& udfs_packed = {});
@@ -190,6 +192,8 @@ private:
                               const std::string& checkpoint_dir,
                               const std::string& restore_from_dir,
                               std::uint64_t restore_from_checkpoint_id,
+                              std::uint32_t generation,
+                              std::uint32_t restore_from_generation,
                               bool unaligned_checkpoints,
                               const std::string& expected_state_versions_packed);
     void handle_trigger_checkpoint_(MessageReader& r);
@@ -288,6 +292,10 @@ private:
         std::string checkpoint_dir;
         std::string restore_from_dir;
         std::uint64_t restore_from_checkpoint_id{0};
+        // Topology generation this deploy writes, and the one that produced the
+        // checkpoint it restores from. See docs/design/state-generations.md.
+        std::uint32_t generation{1};
+        std::uint32_t restore_from_generation{1};
         // Per-subtask state-backend URI (decoupled from checkpoint_dir).
         // Empty -> checkpoint_dir is the backend URI (legacy).
         std::string state_backend_uri;

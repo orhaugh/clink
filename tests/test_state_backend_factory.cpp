@@ -38,6 +38,15 @@ void publish_snapshot(const std::filesystem::path& path,
     clink::state::write_checkpoint_meta(path, ckpt_id, bytes.data(), bytes.size());
 }
 
+// Compose a parent's directory the way production does, through the same helper.
+// Writing "<root>/<idx>" by hand here is how these fixtures silently stopped
+// describing the real layout when state gained a generation namespace.
+std::filesystem::path gen_dir(const std::filesystem::path& root,
+                              std::uint32_t idx,
+                              std::uint32_t generation = 1) {
+    return std::filesystem::path{clink::state_dir_for(root.string(), generation, idx)};
+}
+
 std::filesystem::path make_temp_dir(const std::string& label) {
     const auto p = std::filesystem::temp_directory_path() /
                    ("clink_factory_test_" + label + "_" +
@@ -74,7 +83,9 @@ TEST(StateBackendFactory, BarePathSelectsFileBackend) {
     ASSERT_NE(built.backend, nullptr);
     auto* fb = dynamic_cast<clink::FileBackedStateBackend*>(built.backend.get());
     ASSERT_NE(fb, nullptr) << "bare path should select FileBackedStateBackend";
-    EXPECT_EQ(fb->snapshot_dir(), dir / "2");
+    // Generation-scoped: <base>/v<generation>/<subtask idx>. A bare path still
+    // selects the file backend; what changed is the namespace beneath it.
+    EXPECT_EQ(fb->snapshot_dir(), gen_dir(dir, 2));
     std::filesystem::remove_all(dir);
 }
 
@@ -103,10 +114,10 @@ TEST(StateBackendFactory, FileSchemeRestoresFromAnotherDirWithoutWritingToTheWor
                  clink::StateBackend::KeyView{"restored_key"},
                  clink::StateBackend::ValueView{"restored_value"});
         auto snap = seed.snapshot(clink::CheckpointId{ckpt_id});
-        publish_snapshot(restore_root / std::to_string(subtask) /
-                             ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
-                         snap.bytes,
-                         ckpt_id);
+        publish_snapshot(
+            gen_dir(restore_root, subtask) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+            snap.bytes,
+            ckpt_id);
     }
 
     clink::StateBackendSpec spec;
@@ -159,7 +170,7 @@ TEST(StateBackendFactory, ScaleDownMergesMultipleParentSnapshotFiles) {
         clink::InMemoryStateBackend backend;
         backend.put(op, clink::StateBackend::KeyView{key}, clink::StateBackend::ValueView{value});
         auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
-        const auto dir = restore_root / std::to_string(parent_idx);
+        const auto dir = gen_dir(restore_root, parent_idx);
         publish_snapshot(
             dir / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"), snap.bytes, ckpt_id);
     };
@@ -210,7 +221,7 @@ TEST(StateBackendFactory, RescaleUnionsOperatorStateFromAllParents) {
         backend.put_operator_state(
             op, clink::StateBackend::KeyView{off_key}, clink::StateBackend::ValueView{off_val});
         auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
-        const auto dir = restore_root / std::to_string(idx);
+        const auto dir = gen_dir(restore_root, idx);
         publish_snapshot(
             dir / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"), snap.bytes, ckpt_id);
     };
@@ -384,10 +395,9 @@ TEST(StateBackendFactory, ARescaleRestoreLeavesEveryParentSnapshotUntouched) {
         clink::InMemoryStateBackend backend;
         backend.put(op, clink::StateBackend::KeyView{keyed}, clink::StateBackend::ValueView{val});
         auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
-        publish_snapshot(
-            base / std::to_string(idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
-            snap.bytes,
-            ckpt_id);
+        publish_snapshot(gen_dir(base, idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
     };
     write_parent(0, "source_offset_row", "SRC");
     write_parent(1, "counter_key", "CNT");
@@ -444,10 +454,9 @@ TEST(StateBackendFactory, TheSinkStillRestoresItsOwnStateAfterAnOperatorBeforeIt
         clink::InMemoryStateBackend backend;
         backend.put(op, clink::StateBackend::KeyView{keyed}, clink::StateBackend::ValueView{"V"});
         auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
-        publish_snapshot(
-            base / std::to_string(idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
-            snap.bytes,
-            ckpt_id);
+        publish_snapshot(gen_dir(base, idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
     };
     write_parent(0, "source_offset_row");
     write_parent(1, "counter_key");
@@ -583,10 +592,10 @@ TEST(StateBackendFactory, ScaleDownMergeKeepsEveryParentsCountExactly) {
                         clink::StateBackend::ValueView{std::to_string(expected_count(key))});
         }
         auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
-        publish_snapshot(
-            base / std::to_string(p + 1) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
-            snap.bytes,
-            ckpt_id);
+        publish_snapshot(gen_dir(base, static_cast<std::uint32_t>(p + 1)) /
+                             ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
     }
 
     // One new subtask inheriting all four parents (global indices 1..4).
@@ -615,6 +624,121 @@ TEST(StateBackendFactory, ScaleDownMergeKeepsEveryParentsCountExactly) {
             << " came back with the wrong count after the merge. A value one too "
                "high is the signature reported in follow-up 44.";
     }
+
+    std::filesystem::remove_all(base);
+}
+
+// The state-path namespace, which is the whole point of the generation change.
+//
+// Eleven call sites across six backends compose this. They all go through these two
+// helpers precisely so they cannot drift, and the property that matters is the one
+// asserted first: two generations of the same subtask index never share a directory.
+// That is the invariant F38, F59, F63 and F65 each broke a different way.
+TEST(StateGenerations, TwoGenerationsOfOneSubtaskNeverShareADirectory) {
+    const auto g1 = clink::state_dir_for("/ckpt", 1, 2);
+    const auto g2 = clink::state_dir_for("/ckpt", 2, 2);
+    EXPECT_NE(g1, g2) << "generation 1 and 2 of subtask 2 share a directory, which is exactly "
+                         "how a rescaled topology overwrote the state its restore point named";
+    EXPECT_EQ(g1, "/ckpt/v1/2");
+    EXPECT_EQ(g2, "/ckpt/v2/2");
+
+    // And the other half: within ONE generation, two subtasks still differ.
+    EXPECT_NE(clink::state_dir_for("/ckpt", 1, 1), clink::state_dir_for("/ckpt", 1, 2));
+}
+
+// The object-store form has to describe the same namespace, or the s3 backends land
+// in a different place from the local ones and a rescale means something different
+// depending on where state lives.
+TEST(StateGenerations, ThePrefixFormDescribesTheSameNamespace) {
+    EXPECT_EQ(clink::state_prefix_for("jobs/1", 3, 7), "jobs/1/v3/7/");
+    // Idempotent on a trailing separator - a config with or without one is the same
+    // prefix, rather than silently producing an empty path segment.
+    EXPECT_EQ(clink::state_prefix_for("jobs/1/", 3, 7), "jobs/1/v3/7/");
+    EXPECT_NE(clink::state_prefix_for("jobs/1", 1, 7), clink::state_prefix_for("jobs/1", 2, 7));
+}
+
+// A new generation writing cannot touch the generation it restored FROM.
+//
+// This is the property the whole change exists for, asserted end to end through the
+// factory rather than through the path helper alone. F65 was exactly this: after a
+// rescale the new topology wrote into the previous topology's directories and
+// overwrote the checkpoint its own restore point named, so that checkpoint stopped
+// describing one moment and a restore from it mixed two topologies.
+//
+// The shape below is the one that failed: counter 4 -> 1, where the merged subtask
+// lands on index 1 and the sink moves onto index 2, both of which belonged to
+// counter subtasks in the previous generation.
+TEST(StateGenerations, ANewGenerationCannotOverwriteTheOneItRestoredFrom) {
+    const auto base = make_temp_dir("generation_isolation");
+    const std::uint64_t ckpt_id = 21;
+    const clink::OperatorId op{1};
+
+    // Generation 1: source at 0, counter at 1-4, sink at 5. Each counter holds its
+    // own slice, and the values differ so a clobber is attributable.
+    for (std::uint32_t idx = 0; idx <= 5; ++idx) {
+        clink::InMemoryStateBackend b;
+        b.put(op,
+              clink::StateBackend::KeyView{"owner"},
+              clink::StateBackend::ValueView{"gen1-subtask-" + std::to_string(idx)});
+        auto snap = b.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(
+            gen_dir(base, idx, 1) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+            snap.bytes,
+            ckpt_id);
+    }
+
+    // Fingerprint generation 1 before generation 2 runs.
+    std::map<std::string, std::string> before;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(base / "v1")) {
+        if (!e.is_regular_file()) {
+            continue;
+        }
+        std::ifstream in(e.path(), std::ios::binary);
+        before[std::filesystem::relative(e.path(), base).string()] =
+            std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    ASSERT_EQ(before.size(), 12u) << "fixture did not publish six snapshots and six sidecars";
+
+    // Generation 2: the merged counter at index 1 (inheriting parents 1-4 of
+    // generation 1), and the sink now at index 2 (inheriting parent 5).
+    const std::string uri = "file://" + base.string();
+    for (const auto& [idx, parent, count] :
+         std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>>{
+             {0u, 0u, 1u}, {1u, 1u, 4u}, {2u, 5u, 1u}}) {
+        clink::StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = idx;
+        spec.generation = 2;
+        spec.restore_uri = uri;
+        spec.restore_generation = 1;
+        spec.restore_checkpoint_id = ckpt_id;
+        spec.restore_from_subtask_idx = parent;
+        spec.restore_from_parent_count = count;
+        auto built = clink::StateBackendFactory::default_instance().build(spec);
+        ASSERT_NE(built.backend, nullptr);
+        if (built.restore_from.has_value()) {
+            built.backend->restore(*built.restore_from);
+        }
+        // And now generation 2 WRITES, at the same checkpoint id it restored from -
+        // which is precisely what overwrote generation 1's files before.
+        built.backend->snapshot(clink::CheckpointId{ckpt_id});
+    }
+
+    for (const auto& [rel, body] : before) {
+        std::ifstream in(base / rel, std::ios::binary);
+        const std::string now((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+        EXPECT_EQ(now, body)
+            << "generation 2 modified " << rel
+            << ", which belongs to generation 1 - the restore point it was reading. That is F65: "
+               "the checkpoint stops describing one moment and a later restore from it mixes two "
+               "topologies.";
+    }
+
+    // And the new generation's own state really did land, under v2.
+    EXPECT_TRUE(std::filesystem::exists(gen_dir(base, 1, 2) /
+                                        ("checkpoint-" + std::to_string(ckpt_id) + ".snap")))
+        << "generation 2 wrote nothing, so the assertion above passed for the wrong reason";
 
     std::filesystem::remove_all(base);
 }

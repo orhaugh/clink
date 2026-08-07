@@ -663,6 +663,24 @@ private:
         // longer current, the client knows the topology shifted and
         // refetches.
         std::uint64_t topology_version{0};
+        // The generation of the STATE LAYOUT, which is not the same thing as
+        // topology_version and must not be conflated with it.
+        //
+        // topology_version bumps on every restart, including a plain worker-loss
+        // redeploy, because the PLACEMENT may have changed and route caches need
+        // invalidating. The state layout does not change then: the same operators
+        // hold the same job-global subtask indices, so their directories still mean
+        // what they meant before.
+        //
+        // state_generation bumps only when the index -> operator mapping actually
+        // moves, which is a rescale. Using topology_version for the state path
+        // instead sent a restarted job looking for state under a generation nothing
+        // had ever written, and it replayed from offset zero - caught by four
+        // worker-kill tests duplicating record-0.
+        std::uint32_t state_generation{1};
+        // The checkpoint id at which the CURRENT state generation began; anything at
+        // or below it was written by the previous generation.
+        std::uint64_t state_generation_after_checkpoint{0};
         std::vector<std::string> errors;
         // Structured counterpart to `errors`, built from each SubtaskFinished
         // failure report (role/subtask/worker + message, with the executor's

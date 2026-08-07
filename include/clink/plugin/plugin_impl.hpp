@@ -200,6 +200,8 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     spec.subtask_idx = rctx.chain.subtask_idx;
     spec.restore_uri = rctx.restore_from_dir;
     spec.restore_checkpoint_id = rctx.restore_from_checkpoint_id;
+    spec.generation = rctx.generation;
+    spec.restore_generation = rctx.restore_from_generation;
     spec.restore_from_subtask_idx = rctx.restore_from_subtask_idx;
     spec.restore_from_parent_count = rctx.restore_from_parent_count;
     // Build through the HOST's factory when provided (rctx.state_backend_factory):

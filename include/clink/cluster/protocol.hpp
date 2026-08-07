@@ -322,6 +322,15 @@ struct DeployMsg {
     std::string checkpoint_dir;
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
+    // TOPOLOGY GENERATION. State lives under <base>/v<generation>/<subtask idx>,
+    // because a job-global subtask index is reassigned whenever an operator is
+    // resized - see docs/design/state-generations.md. `generation` is where these
+    // subtasks WRITE; `restore_generation` is the one that produced the checkpoint
+    // they read, which differs exactly when a restore crosses a rescale.
+    //
+    // Both default to 1, the generation of an initial deploy.
+    std::uint32_t generation{1};
+    std::uint32_t restore_generation{1};
     // Unaligned-checkpoint mode for this job, echoed from
     // CheckpointConfig.alignment. The worker passes it through to each
     // RunnerContext so multi-input operator runners can switch

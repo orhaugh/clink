@@ -110,8 +110,16 @@ Cfg parse_cfg(const std::string& base) {
     return c;
 }
 
-std::string subtask_prefix(const Cfg& c, std::uint32_t subtask) {
-    return c.prefix.empty() ? std::to_string(subtask) : (c.prefix + "/" + std::to_string(subtask));
+// Generation-scoped, exactly as the filesystem backends are - state_prefix_for is
+// the same namespace expressed as an object-store prefix. A backend that omitted the
+// generation here would write into another generation's state (F65) while the local
+// backends did not, which is worse than either behaviour on its own.
+std::string subtask_prefix(const Cfg& c, std::uint32_t generation, std::uint32_t subtask) {
+    auto p = clink::state_prefix_for(c.prefix, generation, subtask);
+    if (!p.empty() && p.back() == '/') {
+        p.pop_back();  // callers append "/<object>"
+    }
+    return p;
 }
 
 clink::BuiltStateBackend build_remote_read(const clink::StateBackendSpec& spec) {
@@ -124,7 +132,7 @@ clink::BuiltStateBackend build_remote_read(const clink::StateBackendSpec& spec) 
 
     S3RemotePool::Options o;
     o.bucket = cfg.bucket;
-    o.prefix = subtask_prefix(cfg, spec.subtask_idx);
+    o.prefix = subtask_prefix(cfg, spec.generation, spec.subtask_idx);
     if (!cfg.region.empty()) {
         o.region = cfg.region;
     }
@@ -148,7 +156,7 @@ clink::BuiltStateBackend build_remote_read(const clink::StateBackendSpec& spec) 
         std::vector<std::string> parents;
         parents.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
-            parents.push_back(subtask_prefix(cfg, first + i));
+            parents.push_back(subtask_prefix(cfg, spec.restore_generation, first + i));
         }
         pool->set_restore_sources(std::move(parents));
     }

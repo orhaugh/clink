@@ -110,8 +110,12 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // Trailing packed UDF declarations. Older workers see EOF and leave it
     // empty (no deploy-time registration).
     b.put_string(m.udfs_packed);
-    // Fencing epoch, appended last so an older peer that stops
-    // reading here still decodes the rest correctly.
+    // Topology generation pair. A peer that stops reading here keeps the default
+    // of 1/1, which is the correct answer for a job that has never rescaled.
+    b.put_u32_be(m.generation);
+    b.put_u32_be(m.restore_generation);
+    // Fencing epoch, appended last so an older peer that stops reading here still
+    // decodes the rest correctly. Anything new goes BEFORE this, not after.
     b.put_u64_be(m.coordinator_epoch);
 }
 
@@ -477,6 +481,16 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     }
     // Fencing epoch. Absent from a pre-fencing peer, which reads
     // as 0 = unfenced and preserves the old behaviour.
+    // Topology generation pair. Absent from a peer that predates it, which reads
+    // as 1/1 - the generation of a job that has never rescaled.
+    if (!r.eof()) {
+        m.generation = r.read_u32_be();
+    }
+    if (!r.eof()) {
+        m.restore_generation = r.read_u32_be();
+    }
+    // Fencing epoch LAST, matching the encoder. It is deliberately the final field
+    // so a peer that stops reading earlier still decodes everything before it.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }

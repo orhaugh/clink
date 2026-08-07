@@ -999,6 +999,8 @@ void Worker::handle_deploy_(MessageReader& r) {
             .checkpoint_dir = msg.checkpoint_dir,
             .restore_from_dir = msg.restore_from_dir,
             .restore_from_checkpoint_id = msg.restore_from_checkpoint_id,
+            .generation = msg.generation,
+            .restore_from_generation = msg.restore_generation,
             .state_backend_uri = msg.state_backend_uri,
             .capture_dir = msg.capture_dir,
             .capture_records = msg.capture_records,
@@ -1009,6 +1011,8 @@ void Worker::handle_deploy_(MessageReader& r) {
         const std::string ckpt_dir = msg.checkpoint_dir;
         const std::string restore_dir = msg.restore_from_dir;
         const std::uint64_t restore_id = msg.restore_from_checkpoint_id;
+        const std::uint32_t generation = msg.generation;
+        const std::uint32_t restore_generation = msg.restore_generation;
         const bool unaligned = msg.unaligned_checkpoints;
         const std::string expected_versions = msg.expected_state_versions_packed;
         const std::string udfs = msg.udfs_packed;
@@ -1018,11 +1022,21 @@ void Worker::handle_deploy_(MessageReader& r) {
                                     ckpt_dir,
                                     restore_dir,
                                     restore_id,
+                                    generation,
+                                    restore_generation,
                                     unaligned,
                                     expected_versions,
                                     udfs] {
-            run_task_(
-                jid, task, ckpt_dir, restore_dir, restore_id, unaligned, expected_versions, udfs);
+            run_task_(jid,
+                      task,
+                      ckpt_dir,
+                      restore_dir,
+                      restore_id,
+                      generation,
+                      restore_generation,
+                      unaligned,
+                      expected_versions,
+                      udfs);
         });
     }
 }
@@ -1095,6 +1109,8 @@ void Worker::run_task_(JobId job_id,
                        const std::string& checkpoint_dir,
                        const std::string& restore_from_dir,
                        std::uint64_t restore_from_checkpoint_id,
+                       std::uint32_t generation,
+                       std::uint32_t restore_from_generation,
                        bool unaligned_checkpoints,
                        const std::string& expected_state_versions_packed,
                        const std::string& udfs_packed) {
@@ -1116,6 +1132,8 @@ void Worker::run_task_(JobId job_id,
                                  checkpoint_dir,
                                  restore_from_dir,
                                  restore_from_checkpoint_id,
+                                 generation,
+                                 restore_from_generation,
                                  unaligned_checkpoints,
                                  expected_state_versions_packed);
         } else {
@@ -1175,6 +1193,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                                   const std::string& checkpoint_dir,
                                   const std::string& restore_from_dir,
                                   std::uint64_t restore_from_checkpoint_id,
+                                  std::uint32_t generation,
+                                  std::uint32_t restore_from_generation,
                                   bool unaligned_ckpt,
                                   const std::string& expected_state_versions_packed) {
     // Built-in channels and op-runners must be present before we look
@@ -1571,6 +1591,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .checkpoint_dir = checkpoint_dir,
                 .restore_from_dir = restore_from_dir,
                 .restore_from_checkpoint_id = restore_from_checkpoint_id,
+                .generation = generation,
+                .restore_from_generation = restore_from_generation,
                 .capture_dir = capture_dir,
                 .capture_records = capture_records,
                 .state_backend_uri = state_backend_uri,
@@ -1934,6 +1956,8 @@ void Worker::run_generic_subtask_(JobId job_id,
             .checkpoint_dir = checkpoint_dir,
             .restore_from_dir = restore_from_dir,
             .restore_from_checkpoint_id = restore_from_checkpoint_id,
+            .generation = generation,
+            .restore_from_generation = restore_from_generation,
             .capture_dir = capture_dir,
             .capture_records = capture_records,
             .state_backend_uri = state_backend_uri,

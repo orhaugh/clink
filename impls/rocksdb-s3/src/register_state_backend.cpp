@@ -169,18 +169,22 @@ std::shared_ptr<clink::s3::S3MaterializationStore> make_mat_store(const S3Cfg& c
     return std::make_shared<clink::s3::S3MaterializationStore>(std::move(o));
 }
 
-// Read N local framing blobs (changelog-<id>.snap, self-persisted by the
-// changelog backend's set_snapshot_dir) under <root>/<src+i>/ and pack them.
+// Read N local framing blobs (changelog-<id>.snap, self-persisted by the changelog
+// backend's set_snapshot_dir) under <root>/v<restore_generation>/<src+i>/ and pack
+// them - the generation being the one that PRODUCED the checkpoint, which differs
+// from the writing generation exactly when a restore crosses a rescale.
 // Mirrors build_changelog_file's restore; the materialization PAYLOADS they
 // reference live in S3 and are fetched by the S3 mat store during restore.
 std::vector<std::byte> read_local_framing_blobs(const fs::path& root,
+                                                std::uint32_t restore_generation,
                                                 std::uint32_t src_first,
                                                 std::uint32_t parent_count,
                                                 std::uint64_t cp_id) {
     std::vector<std::vector<std::byte>> blobs;
     for (std::uint32_t i = 0; i < parent_count; ++i) {
-        const fs::path blob =
-            root / std::to_string(src_first + i) / ("changelog-" + std::to_string(cp_id) + ".snap");
+        const fs::path blob = std::filesystem::path{clink::state_dir_for(
+                                  root.string(), restore_generation, src_first + i)} /
+                              ("changelog-" + std::to_string(cp_id) + ".snap");
         std::ifstream in(blob, std::ios::binary);
         if (!in) {
             throw std::runtime_error("changelog+s3 restore: framing blob not found: " +
@@ -205,7 +209,8 @@ BuiltStateBackend build_s3_rocksdb(const StateBackendSpec& spec) {
     if (cfg.bucket.empty()) {
         throw std::runtime_error("s3+rocksdb scheme requires a bucket");
     }
-    const fs::path subtask_local = local_root(cfg) / std::to_string(spec.subtask_idx);
+    const fs::path subtask_local =
+        clink::state_dir_for(local_root(cfg).string(), spec.generation, spec.subtask_idx);
     std::error_code ec;
     fs::create_directories(subtask_local, ec);  // RocksDB::Open mkdirs only the leaf
 
@@ -263,7 +268,8 @@ BuiltStateBackend build_changelog_s3_inner(const StateBackendSpec& spec, bool ro
     if (cfg.bucket.empty()) {
         throw std::runtime_error("changelog+s3 scheme requires a bucket");
     }
-    const fs::path subtask_dir = local_root(cfg) / std::to_string(spec.subtask_idx);
+    const fs::path subtask_dir =
+        clink::state_dir_for(local_root(cfg).string(), spec.generation, spec.subtask_idx);
     std::error_code ec;
     fs::create_directories(subtask_dir, ec);
 
@@ -295,10 +301,12 @@ BuiltStateBackend build_changelog_s3_inner(const StateBackendSpec& spec, bool ro
             is_rescale ? spec.restore_from_subtask_idx : spec.subtask_idx;
         const std::uint32_t parent_count =
             spec.restore_from_parent_count == 0 ? 1 : spec.restore_from_parent_count;
-        out.restore_from =
-            Snapshot{CheckpointId{spec.restore_checkpoint_id},
-                     read_local_framing_blobs(
-                         local_root(rcfg), src_first, parent_count, spec.restore_checkpoint_id)};
+        out.restore_from = Snapshot{CheckpointId{spec.restore_checkpoint_id},
+                                    read_local_framing_blobs(local_root(rcfg),
+                                                             spec.restore_generation,
+                                                             src_first,
+                                                             parent_count,
+                                                             spec.restore_checkpoint_id)};
     }
     return out;
 }

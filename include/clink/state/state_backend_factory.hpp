@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include "clink/state/state_backend.hpp"
@@ -54,7 +55,54 @@ struct StateBackendSpec {
     // parent (scale-up / non-rescale) semantics.
     std::uint32_t restore_from_subtask_idx{std::numeric_limits<std::uint32_t>::max()};
     std::uint32_t restore_from_parent_count{1};
+    // TOPOLOGY GENERATION. State lives under <base>/v<generation>/<subtask idx>,
+    // because the job-global subtask index is NOT stable across a topology change:
+    // the planner allocates one contiguous block of indices per operator in graph
+    // order, so resizing one operator moves every later operator's block and a
+    // directory silently changes owner.
+    //
+    // Four defects came from addressing state by that index alone - F38 (wrong
+    // arithmetic), F59 (writing through it), F63 (skipping the translation on a
+    // restart) and F65 (a new topology writing into the old one's directories).
+    // Namespacing by generation makes each generation's files immutable with
+    // respect to every other, which is the invariant all four break. See
+    // docs/design/state-generations.md.
+    //
+    // `generation` is where this subtask WRITES. `restore_generation` is the one
+    // that produced the checkpoint it reads, which differs exactly when a restore
+    // crosses a rescale. Both default to 1, the generation of an initial deploy,
+    // so a job that never rescales sees <base>/v1/<idx> for its whole life.
+    std::uint32_t generation{1};
+    std::uint32_t restore_generation{1};
 };
+
+// The ONE place a state path is composed, so eleven call sites across six backends
+// cannot drift apart on it.
+//
+//     <base>/v<generation>/<subtask index>
+//
+// Every backend keeps its own file naming inside that directory; what has to be
+// identical everywhere is the namespace, because a backend that forgets the
+// generation writes into another generation's state and reintroduces F65.
+[[nodiscard]] inline std::string state_dir_for(std::string_view base,
+                                               std::uint32_t generation,
+                                               std::uint32_t subtask_idx) {
+    return std::string{base} + "/v" + std::to_string(generation) + "/" +
+           std::to_string(subtask_idx);
+}
+
+// The same namespace as an object-store PREFIX rather than a filesystem path: no
+// leading separator, always a trailing one, so callers append an object name.
+[[nodiscard]] inline std::string state_prefix_for(std::string_view base,
+                                                  std::uint32_t generation,
+                                                  std::uint32_t subtask_idx) {
+    std::string out{base};
+    if (!out.empty() && out.back() != '/') {
+        out.push_back('/');
+    }
+    out += "v" + std::to_string(generation) + "/" + std::to_string(subtask_idx) + "/";
+    return out;
+}
 
 // What the factory returns. The caller is expected to install
 // `backend` on JobConfig.state_backend and forward `restore_from` (when

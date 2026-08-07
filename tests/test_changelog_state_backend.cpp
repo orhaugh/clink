@@ -473,7 +473,9 @@ TEST(ChangelogBackendExternal, FactoryChangelogFileRestoreRecoversSameParallelis
         (void)built.backend->snapshot(CheckpointId{7});
     }
     // The framing blob is on disk now - the durability the gap lacked.
-    EXPECT_TRUE(std::filesystem::exists(dir / "0" / "changelog-7.snap"));
+    // Generation-scoped: <base>/v<generation>/<subtask idx>. See
+    // docs/design/state-generations.md.
+    EXPECT_TRUE(std::filesystem::exists(dir / "v1" / "0" / "changelog-7.snap"));
 
     StateBackendSpec spec;
     spec.uri = uri;

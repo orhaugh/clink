@@ -88,7 +88,7 @@ BuiltStateBackend build_forst(const StateBackendSpec& spec) {
         spec.restore_from_parent_count == 0 ? 1 : spec.restore_from_parent_count;
 
     const std::filesystem::path subtask_dir =
-        std::filesystem::path{base_path} / std::to_string(spec.subtask_idx);
+        std::filesystem::path{clink::state_dir_for(base_path, spec.generation, spec.subtask_idx)};
     // The engine's Open only mkdirs the leaf dir, so the parents must
     // exist first (mirrors build_changelog_forst). Without this, opening
     // <base>/<subtask_idx> fails whenever <base> isn't already present.
@@ -122,7 +122,7 @@ BuiltStateBackend build_forst(const StateBackendSpec& spec) {
         std::string joined;
         for (std::uint32_t i = 0; i < parent_count; ++i) {
             const std::string dir =
-                (std::filesystem::path{restore_base} / std::to_string(src_first + i)).string() +
+                clink::state_dir_for(restore_base, spec.restore_generation, src_first + i) +
                 ".cp-" + std::to_string(spec.restore_checkpoint_id);
             if (!std::filesystem::exists(dir)) {
                 throw std::runtime_error(
@@ -159,7 +159,7 @@ BuiltStateBackend build_changelog_forst(const StateBackendSpec& spec) {
         spec.restore_from_parent_count == 0 ? 1 : spec.restore_from_parent_count;
 
     const std::filesystem::path subtask_dir =
-        std::filesystem::path{base_path} / std::to_string(spec.subtask_idx);
+        std::filesystem::path{clink::state_dir_for(base_path, spec.generation, spec.subtask_idx)};
     const std::filesystem::path inner_dir = subtask_dir / "inner";
     const std::filesystem::path mat_dir = subtask_dir / "mat";
     // The engine's Open only mkdirs the leaf - the subtask dir must exist
@@ -197,7 +197,8 @@ BuiltStateBackend build_changelog_forst(const StateBackendSpec& spec) {
         std::vector<std::vector<std::byte>> blobs;
         for (std::uint32_t i = 0; i < parent_count; ++i) {
             const std::filesystem::path blob =
-                std::filesystem::path{restore_base} / std::to_string(src_first + i) /
+                std::filesystem::path{
+                    clink::state_dir_for(restore_base, spec.restore_generation, src_first + i)} /
                 ("changelog-" + std::to_string(spec.restore_checkpoint_id) + ".snap");
             std::ifstream in(blob, std::ios::binary);
             if (!in) {

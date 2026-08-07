@@ -142,7 +142,7 @@ BuiltStateBackend build_changelog_file(const StateBackendSpec& spec) {
         spec.restore_from_parent_count == 0 ? 1 : spec.restore_from_parent_count;
 
     const std::filesystem::path subtask_dir =
-        std::filesystem::path{base_path} / std::to_string(spec.subtask_idx);
+        state_dir_for(base_path, spec.generation, spec.subtask_idx);
     const std::filesystem::path mat_dir = subtask_dir / "materializations";
     auto changelog = std::make_shared<ChangelogStateBackend>(
         std::make_shared<InMemoryStateBackend>(),
@@ -168,7 +168,8 @@ BuiltStateBackend build_changelog_file(const StateBackendSpec& spec) {
         std::vector<std::vector<std::byte>> blobs;
         for (std::uint32_t i = 0; i < parent_count; ++i) {
             const std::filesystem::path blob_path =
-                std::filesystem::path{restore_base} / std::to_string(src_first + i) /
+                std::filesystem::path{
+                    state_dir_for(restore_base, spec.restore_generation, src_first + i)} /
                 ("changelog-" + std::to_string(spec.restore_checkpoint_id) + ".snap");
             std::ifstream in(blob_path, std::ios::binary);
             if (!in) {
@@ -198,7 +199,7 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
         throw std::runtime_error("state_backend_factory: 'file' scheme requires a path");
     }
     const std::filesystem::path subtask_dir =
-        std::filesystem::path{base_path} / std::to_string(spec.subtask_idx);
+        state_dir_for(base_path, spec.generation, spec.subtask_idx);
 
     BuiltStateBackend out;
     out.backend = std::make_shared<FileBackedStateBackend>(subtask_dir);
@@ -256,7 +257,8 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
         std::vector<std::vector<std::byte>> parts;
         parts.reserve(parent_count);
         for (std::uint32_t i = 0; i < parent_count; ++i) {
-            auto b = read_file(std::filesystem::path{restore_path} / std::to_string(src_first + i) /
+            auto b = read_file(std::filesystem::path{state_dir_for(
+                                   restore_path, spec.restore_generation, src_first + i)} /
                                ckpt_name);
             if (!b.empty()) {
                 parts.push_back(std::move(b));
@@ -268,12 +270,20 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
         // operator rows, then narrow at the source (Kafka's apply-once
         // rebalance cb). So union the operator-only rows from every OTHER
         // parent. The old parallelism is discovered by listing the numeric
-        // subdirs of the restore base - no wire change. Same-parallelism
+        // subdirs of the restore GENERATION - no wire change. Same-parallelism
         // restore skips this (each subtask's own dir already has its state),
         // so a large keyed job pays nothing on a plain resubmit.
+        //
+        // Scoped to the generation that produced the checkpoint, not to the base:
+        // scanning the base would now walk every generation the job has ever had
+        // and union operator rows from topologies this restore has nothing to do
+        // with.
         if (is_rescale) {
             std::error_code dec;
-            for (const auto& entry : std::filesystem::directory_iterator(restore_path, dec)) {
+            const std::filesystem::path restore_gen_dir =
+                std::filesystem::path{restore_path} /
+                ("v" + std::to_string(spec.restore_generation));
+            for (const auto& entry : std::filesystem::directory_iterator(restore_gen_dir, dec)) {
                 if (dec) {
                     break;
                 }
