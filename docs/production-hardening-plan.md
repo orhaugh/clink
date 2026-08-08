@@ -2756,6 +2756,15 @@ leaves the second passing, so the second is pinning the narrowness rather than t
 Core suite 2004 passed, including the pre-existing two-plain-sink chain test, which the
 capability check leaves alone.
 
+**Confirmed narrow on the real fan-out job.** `two_sink_commit_group_job` fans one source
+out to two `file_2pc_sink_string` sinks - the exact shape this refuses - and
+`CommitGroupAtomicityTest` still passes, with the refusal message appearing zero times
+across a full Linux integration run. Those two sinks are deployed as separate subtasks,
+so they are on separate chains and the per-chain rule correctly leaves them alone. The
+refusal bites only when both land in ONE subtask, which is the case that cannot be
+ordered. Checked deliberately, because a refusal that broke ordinary fan-out to two
+transactional sinks would be a worse defect than the one it fixes.
+
 ### F75. A restore read state from subtasks the checkpoint never named
 
 Answers the question follow-up 49 left open, and the answer was the bad one.
