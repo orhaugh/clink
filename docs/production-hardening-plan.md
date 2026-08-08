@@ -2604,6 +2604,40 @@ fallback to name in most real configurations. Raising it trades disk for a recov
 option, which is a deployment decision rather than something to change silently under
 existing users.
 
+### F72. The state docs claimed a snapshot reclaims expired TTL entries. It cannot.
+
+Found by sweeping for the F71 pattern - functions with tests and no production callers -
+which turned up `KeyedState::cleanup_all`, whose own comment offers it for "a snapshot
+path that wants to avoid persisting known-dead entries". No snapshot path calls it.
+
+`docs/internals/state-and-backends.md` said an unread expired key "keeps occupying its
+slot until the next snapshot drops it". The next snapshot does not drop it, and cannot:
+the expiry stamp is a `KeyedState` convention over the value's first eight bytes, and
+the backends store opaque bytes with no TTL awareness whatsoever. `snapshot()` persists
+expired entries and `restore()` brings them back.
+
+**What actually reclaims memory.** Only `KeyedState::cleanup_batch`, which either scans
+a bounded slice of the slot or delegates to backend compaction where
+`supports_expiry_compaction()` is true. Both RocksDB and ForSt implement that seam
+properly - but it is entered *from inside* `cleanup_batch`, so even the LSM route is not
+automatic.
+
+**And nothing in the runtime calls it.** The SQL runtime calls it on its own keyed
+operators, at two sites. An operator written against the typed C++ API must call it
+itself. So a consumer who sets a TTL expecting bounded memory, and does not know to
+sweep, grows without bound - and the page they would check to find that out told them
+the snapshot handled it.
+
+The header comments were right throughout (`keyed_state.hpp` says plainly "Without this,
+expiry is lazy only... a TTL that was supposed to bound memory does not"). The published
+page contradicted them, which is the version a consumer reads.
+
+**Fixed as documentation, not code.** Making the runtime sweep automatically would need a
+registry of the states an operator declared, which does not exist - operators hold their
+`KeyedState` objects directly. That is a real design option and a larger change than
+correcting a false claim, so the claim is corrected and the requirement stated where a
+consumer will see it.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
