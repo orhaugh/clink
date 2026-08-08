@@ -17,7 +17,6 @@
 3      tests/integration/test_coordinator_rescale.cpp
 1      tests/integration/test_fault_recovery.cpp
 1      tests/integration/test_gateway_pipeline.cpp
-1      tests/integration/test_http_federation.cpp
 1      tests/integration/test_http_observability.cpp
 1      tests/integration/test_http_read_api.cpp
 2      tests/integration/test_http_submit.cpp
