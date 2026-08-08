@@ -45,6 +45,7 @@ using namespace std::chrono_literals;
 namespace {
 
 constexpr int kKeys = 12;
+constexpr std::size_t kCounterSubtasks = 4;
 
 // Per-checkpoint ledger, written by both ends.
 struct ShuffleLedger {
@@ -53,6 +54,12 @@ struct ShuffleLedger {
     std::map<CheckpointId, std::int64_t> source_offset;
     // Per-checkpoint, per-key counts as the keyed operators had them at the barrier.
     std::map<CheckpointId, std::map<int, std::int64_t>> counts_at_barrier;
+    // How many keyed subtasks have recorded this barrier. A cut can only be judged
+    // once EVERY subtask has reported: at teardown the executor cancels mid-stream, so
+    // some subtasks process a barrier and others never do, and comparing a partially
+    // observed barrier against the source's offset reports a violation that is purely
+    // an artefact of when the test stopped.
+    std::map<CheckpointId, std::size_t> subtasks_at_barrier;
     // Every record index seen by any keyed subtask, to catch a duplicate directly.
     std::map<int, int> arrivals;
     // Which subtask saw each key, so a key routed to two subtasks is visible.
@@ -157,6 +164,7 @@ public:
             for (const auto& [key, n] : counts_) {
                 at[key] += n;
             }
+            ++ledger_.subtasks_at_barrier[b.id()];
         }
         Operator<int, int>::on_barrier(b, out);
     }
@@ -228,7 +236,7 @@ void run_shuffle_job(ShuffleLedger& ledger,
         [&](std::size_t sub) {
             return std::make_shared<ShuffleCounter>(ledger, sub, consumer_delay, tag);
         },
-        4,
+        kCounterSubtasks,
         [](const int& v) { return static_cast<std::size_t>(v % kKeys); });
     dag.add_parallel_sink<int>(
         counted, [&](std::size_t) { return std::make_shared<ShuffleSink>(tag); }, 1);
@@ -289,6 +297,11 @@ void assert_cut_holds(const ShuffleLedger& ledger, const char* what) {
         if (it == ledger.counts_at_barrier.end()) {
             continue;
         }
+        // Judge only barriers every keyed subtask reported. See subtasks_at_barrier.
+        const auto seen = ledger.subtasks_at_barrier.find(id);
+        if (seen == ledger.subtasks_at_barrier.end() || seen->second != kCounterSubtasks) {
+            continue;
+        }
         std::int64_t total = 0;
         for (const auto& [key, n] : it->second) {
             total += n;
@@ -325,21 +338,20 @@ TEST(KeyedShuffleCut, TheCutHoldsAcrossAKeyedShuffleAtParallelismFour) {
     assert_cut_holds(ledger, "unthrottled");
 }
 
-// LIMITATION - the engine's, not this test's: one parallel in-process Dag per process.
+// The same invariant with the channels SATURATED - the one window the run above never
+// reaches.
 //
-// clear_for_testing() above helps but does NOT make repeats reliable: some
-// --gtest_repeat invocations still fail. The cause is a teardown race rather than a
-// stale registration, which is why clearing at start cannot fix it - the previous
-// job's runners call unregister_endpoint during shutdown, the registry is keyed by
-// host:port, and they erase a key the NEXT job has already registered.
+// Capacity 1 plus a slow consumer means every emit_barrier blocks part-way through its
+// broadcast: the source pushes the barrier to channel 0, blocks because channel 1 is
+// full, and sits there while downstream subtasks drain pre-barrier records. If a record
+// could land on the wrong side of a cut, this is where - the source's offset is already
+// recorded (snapshot_offset runs before emit_barrier) while some subtasks hold the
+// barrier and others do not.
 //
-// So the guarantee is narrow and worth stating exactly: this test is sound run ONCE,
-// which is how the suite runs it and how the cluster uses the API (one Dag per worker
-// process). It is not safe under --gtest_repeat, and a second parallel-Dag test in
-// this binary is not safe either.
-//
-// A saturated-channel variant is therefore not shipped here. It is the most
-// interesting remaining in-process window for F67 - forcing emit_barrier to block
-// part-way through its broadcast, with the source offset already recorded and only
-// some subtasks holding the barrier - and it needs either per-process test isolation
-// or endpoint keys scoped per Dag. See F78.
+// Deterministic in the way that matters: the window is FORCED on every barrier rather
+// than waited for. No rescale, no processes, no rare interleaving.
+TEST(KeyedShuffleCut, TheCutHoldsWhenTheBarrierBroadcastBlocksOnBackpressure) {
+    ShuffleLedger ledger;
+    run_shuffle_job(ledger, /*channel_capacity=*/1, /*consumer_delay=*/2ms, "saturated");
+    assert_cut_holds(ledger, "saturated");
+}

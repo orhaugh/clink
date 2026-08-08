@@ -3009,44 +3009,44 @@ disproved; a run against a stale binary that did not contain the new test; and a
 pattern (`FAILED \]`, one space) that never matches gtest's `[  FAILED  ]`, which
 reported a failing run as "PASSED 0 tests".
 
-### F78. Only one parallel Dag can run per process
+### F78. WITHDRAWN - it was my test's teardown, not an engine constraint
 
-Found while trying to add a backpressure variant to the F67 shuffle test, and it is a
-real constraint rather than a test artefact.
+Recorded as "only one parallel in-process Dag per process, because a second cross-wires
+through the global `LocalDataPlane` endpoint registry". That is wrong, and the way it was
+wrong is the point.
 
-A second in-process parallel Dag cross-wires with the first through the process-global
-`LocalDataPlane` endpoint registry that parallel stages register into. Demonstrated
-three ways, each ruling out an explanation for the one before:
+**The evidence looked strong.** Two tests each passed alone and the first failed when the
+second ran after it; unique operator names did not help; a single test failed under
+`--gtest_repeat`. Three independent symptoms, all consistent with shared global state -
+so a mechanism was reached for that fitted them, and `LocalDataPlane` was the obvious
+suspect because it is a process-global registry keyed by host:port.
 
-1. Two tests each passed alone; the FIRST failed when the second ran after it.
-2. Giving every run unique operator names did not fix it - so it is not the
-   `derive_id` name hashing producing colliding `OperatorId`s, which was the obvious
-   suspect.
-3. A single test fails under `--gtest_repeat`, where the same job is built twice in one
-   process. Nothing about naming can explain that one.
+**It was never involved.** The in-process parallel Dag wires stages with `BoundedChannel`
+directly and does not touch `LocalDataPlane` at all. That could have been checked in one
+grep before the theory was written down, and was not.
 
-**Why it does not break anything today.** The cluster runs one Dag per worker process,
-which is exactly the supported shape. The in-process `add_parallel_*` API is used by
-tests and by embedded single-job runs, and one at a time is fine.
+**The actual cause was in the test.** `LocalExecutor::cancel()` stops the job mid-stream,
+so at teardown some keyed subtasks have processed the final barrier and others never
+will. The check then compared a PARTIALLY observed barrier - three subtasks' counts
+against the source's full offset - and reported a cut violation that was an artefact of
+when the test stopped. Recording how many subtasks reported each barrier, and judging
+only those every subtask reported, makes it stable: zero failures across three
+`--gtest_repeat=5` invocations, where before it failed most of them.
 
-**Why it is worth recording.** A second parallel-Dag test in the same binary looks like
-a flake and will cost somebody a day. The constraint is now written on
-`tests/test_keyed_shuffle_cut.cpp`, which is where they will be standing.
+**What it unblocked.** The saturated-channel variant now ships. Capacity 1 plus a slow
+consumer forces `emit_barrier` to block part-way through its broadcast on EVERY barrier -
+the source's offset already recorded, some subtasks holding the barrier and others not -
+which is the most interesting in-process window for F67. It passes, and both variants
+fail under a one-record double-count mutation.
 
-**The mechanism, narrowed.** The registry is keyed by **host:port**, and two in-process
-Dags pick colliding endpoints - which is exactly why unique operator names did not help:
-the collision is on the endpoint key, not the `OperatorId`. A
-`LocalDataPlane::clear_for_testing()` was added and helps, but does not make repeats
-reliable, because the failure is a TEARDOWN RACE rather than a stale registration: the
-previous job's runners call `unregister_endpoint` during shutdown and erase a key the
-next job has already registered. Clearing at start cannot fix an unregister that arrives
-late.
+**The lesson, which is the same one F12 taught.** A mechanism that explains every symptom
+is not thereby true. Three consistent symptoms produced a confident, wrong diagnosis and
+a `clear_for_testing()` hook that addressed nothing. Checking whether the suspect was on
+the code path at all would have cost one grep.
 
-**What it cost here.** A saturated-channel variant of the shuffle cut test - forcing
-`emit_barrier` to block part-way through its broadcast, the one window that file does
-not exercise - could not be shipped. It is the most interesting remaining in-process
-condition for F67. Closing it needs endpoint keys scoped per Dag (so two Dags cannot
-collide at all), not just a reset hook.
+`LocalDataPlane::clear_for_testing()` is kept: it is harmless, correctly scoped to tests,
+and genuinely useful if a test ever does build two socket-backed Dags. But it is not what
+fixed this.
 
 ## 3. Work items
 
