@@ -2669,12 +2669,21 @@ likely to have a good answer at 3am on a cluster somebody else deployed.
 Seven fields now come straight off the retained `CheckpointConfig`, not re-derived, so
 what the endpoint reports cannot drift from what the coordinator acts on.
 
-This is also the prerequisite for the rest of follow-up 24. `clink lint` reads flags
-rather than deployed configuration, so drift between what was linted and what runs is
-undetectable - and it stays that way until the coordinator publishes what it is running.
-It now does. The remaining work is a client that fetches it and compares, which needs
-JSON reading in the CLI (simdjson is already vendored for `config::parse`, so the
-dependency exists).
+**And the lint that uses it: `clink lint --from-job=<host>:<port>/<id>`.** Every other
+path in that command assembles a `CheckpointConfig` from flags, so a clean verdict said
+"this command line is coherent" and never "the running job is coherent". Those diverge
+the moment somebody edits a deployment without re-running the lint, and nothing detected
+it. `--from-job` fetches the live configuration over HTTP, parses it with the vendored
+simdjson via `config::parse`, and lints that.
+
+One case is handled explicitly rather than defaulted: a coordinator too old to report
+these fields. Linting an absent configuration as an empty one would read as
+"checkpointing is disabled" - a confident, wrong verdict, which is precisely what this
+command exists to prevent - so it refuses with exit 2 and says why.
+
+Exit codes are the contract (0 clean, 1 findings, 2 usage/unreachable), checked
+directly: a malformed `--from-job`, an unreachable coordinator and a non-numeric job id
+all give 2, and a clean flag-based lint still gives 0.
 
 **Verification.** The integration test asserts every one of the seven fields is present
 in the response body. Full core suite 2002 passed, `HttpSubmit` 2/2 on Linux.

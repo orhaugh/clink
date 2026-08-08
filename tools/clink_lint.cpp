@@ -27,6 +27,8 @@
 
 #include "clink/cluster/config_lint.hpp"
 #include "clink/cluster/job_graph.hpp"
+#include "clink/config/json.hpp"
+#include "clink/http/http_client.hpp"
 
 #include "cli_config_args.hpp"
 
@@ -54,6 +56,8 @@ void usage() {
               << "flags it does not recognise are ignored rather than rejected.\n"
               << "\n"
               << "Job configuration (as `clink run`):\n"
+              << "  --from-job=<host>:<port>/<id>          lint a RUNNING job's deployed\n"
+              << "                                         configuration instead of flags\n"
               << "  --checkpoint-dir=<dir>                 enable checkpointing\n"
               << "  --state-backend=<scheme>[:<path>]      shorthand that composes the dir\n"
               << "  --checkpoint-interval-ms=N             periodic checkpoint cadence\n"
@@ -90,11 +94,92 @@ int clink_cmd_lint(int argc, char** argv) {
         return 0;
     }
 
-    auto resolved_dir = clink::cli::resolve_checkpoint_dir(argc, argv);
-    if (!resolved_dir.has_value()) {
-        return 2;  // unknown --state-backend scheme; already reported
+    // --from-job=<host>:<port>/<job_id> lints what is DEPLOYED, not what was typed.
+    //
+    // The gap this closes (follow-up 24): every other path here assembles a
+    // CheckpointConfig from flags, so a clean verdict says "this command line is
+    // coherent" and never "the running job is coherent". Those diverge the moment
+    // anyone edits a deployment without re-running the lint, and nothing detected it.
+    //
+    // The coordinator now reports a job's live checkpoint configuration on
+    // /api/v1/jobs/:id (F73), so the drift is checkable at the source: fetch the
+    // configuration the coordinator is ACTING on and lint that.
+    clink::cluster::CheckpointConfig config;
+    if (const auto from_job = get_arg(argc, argv, "from-job"); !from_job.empty()) {
+        const auto slash = from_job.rfind('/');
+        const auto colon =
+            from_job.rfind(':', slash == std::string::npos ? from_job.size() : slash);
+        if (slash == std::string::npos || colon == std::string::npos || colon >= slash) {
+            std::cerr << "lint: --from-job needs <host>:<port>/<job_id>, got '" << from_job
+                      << "'\n";
+            return 2;
+        }
+        const std::string host = from_job.substr(0, colon);
+        std::uint16_t port = 0;
+        std::string job_id;
+        try {
+            port = static_cast<std::uint16_t>(
+                std::stoul(from_job.substr(colon + 1, slash - colon - 1)));
+            job_id = from_job.substr(slash + 1);
+            (void)std::stoull(job_id);  // reject a non-numeric id before the request
+        } catch (const std::exception&) {
+            std::cerr << "lint: --from-job needs <host>:<port>/<job_id>, got '" << from_job
+                      << "'\n";
+            return 2;
+        }
+
+        clink::http::HttpClient client(host, port);
+        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr) {
+            client.set_bearer_token(tok);
+        }
+        const auto resp = client.get("/api/v1/jobs/" + job_id);
+        if (resp.status == 0) {
+            std::cerr << "lint: cannot reach coordinator at " << host << ":" << port << " - "
+                      << resp.error << "\n";
+            return 2;
+        }
+        if (resp.status != 200) {
+            std::cerr << "lint: coordinator returned HTTP " << resp.status << " for job " << job_id
+                      << "; is that job id running?\n";
+            return 2;
+        }
+
+        clink::config::JsonValue doc;
+        try {
+            doc = clink::config::parse(resp.body);
+        } catch (const std::exception& e) {
+            std::cerr << "lint: could not parse the coordinator's response: " << e.what() << "\n";
+            return 2;
+        }
+        // A coordinator too old to report its configuration must not be linted as
+        // though it reported an empty one - that would read as "checkpointing is
+        // disabled" and is the exact false verdict this command exists to avoid.
+        if (!doc.contains("checkpoint_interval_ms")) {
+            std::cerr << "lint: this coordinator does not report a job's checkpoint "
+                         "configuration, so there is nothing deployed to lint. It predates "
+                         "the field being published; lint the flags instead.\n";
+            return 2;
+        }
+        config.checkpoint_dir = doc.string_or("checkpoint_dir", "");
+        config.interval_ms = doc.int_or("checkpoint_interval_ms", 0);
+        config.state_backend_uri = doc.string_or("state_backend_uri", "");
+        config.restore_from_dir = doc.string_or("restore_from_dir", "");
+        config.restore_from_checkpoint_id =
+            static_cast<std::uint64_t>(doc.int_or("restore_from_checkpoint_id", 0));
+        config.max_restarts_on_worker_loss =
+            static_cast<std::uint32_t>(doc.int_or("max_restarts_on_worker_loss", 0));
+        if (doc.bool_or("unaligned_checkpoints", false)) {
+            config.alignment = clink::cluster::CheckpointAlignment::Unaligned;
+        }
+        std::cerr << "lint: checking job " << job_id << " as deployed on " << host << ":" << port
+                  << "\n";
+    } else {
+        auto resolved_dir = clink::cli::resolve_checkpoint_dir(argc, argv);
+        if (!resolved_dir.has_value()) {
+            return 2;  // unknown --state-backend scheme; already reported
+        }
+        config = clink::cli::build_checkpoint_config(argc, argv, *resolved_dir);
     }
-    auto config = clink::cli::build_checkpoint_config(argc, argv, *resolved_dir);
 
     auto lint = clink::cli::apply_profile_and_lint(argc, argv, config);
     if (!lint.ok) {

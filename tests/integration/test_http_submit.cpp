@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <signal.h>
 #include <spawn.h>
 #include <string>
@@ -44,6 +45,14 @@ using namespace std::chrono_literals;
 std::filesystem::path node_binary_path() {
 #ifdef CLINK_NODE_BINARY
     return std::filesystem::path{CLINK_NODE_BINARY};
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path cli_binary_path() {
+#ifdef CLINK_CLI_BINARY
+    return std::filesystem::path{CLINK_CLI_BINARY};
 #else
     return {};
 #endif
@@ -341,6 +350,39 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
                               "\"unaligned_checkpoints\""}) {
         EXPECT_NE(detail.body.find(field), std::string::npos)
             << field << " missing from /api/v1/jobs/1: " << detail.body;
+    }
+
+    // `clink lint --from-job` must lint what is DEPLOYED, end to end.
+    //
+    // Every other lint path assembles a CheckpointConfig from flags, so a clean
+    // verdict says "this command line is coherent" and never "the running job is
+    // coherent". Those diverge the moment somebody edits a deployment without
+    // re-running the lint, and nothing detected it (follow-up 24). This exercises
+    // the whole chain: coordinator reports the live config, the CLI fetches it over
+    // HTTP, parses it, and lints that instead of a command line.
+    const auto cli = cli_binary_path();
+    if (!cli.empty() && std::filesystem::exists(cli)) {
+        const std::string cmd = cli.string() + " lint --from-job=127.0.0.1:" +
+                                std::to_string(c->coordinator_http_port) + "/1 2>&1";
+        std::string out;
+        {
+            std::unique_ptr<FILE, int (*)(FILE*)> pipe(::popen(cmd.c_str(), "r"), ::pclose);
+            ASSERT_NE(pipe, nullptr);
+            char buf[512];
+            while (::fgets(buf, sizeof(buf), pipe.get()) != nullptr) {
+                out += buf;
+            }
+        }
+        // It must have reached the coordinator and read job 1 - not fallen back to
+        // linting flags, and not failed to parse. Either of those would make a clean
+        // exit code meaningless, which is the whole point of the command.
+        EXPECT_NE(out.find("checking job 1 as deployed"), std::string::npos)
+            << "clink lint --from-job did not lint the deployed job. Output:\n"
+            << out;
+        EXPECT_EQ(out.find("does not report a job's checkpoint configuration"), std::string::npos)
+            << "the coordinator did not publish its job checkpoint config, so lint had "
+               "nothing deployed to check. Output:\n"
+            << out;
     }
 
     // Tidy up so the coordinator doesn't hang waiting for the never-ending job.
