@@ -3009,6 +3009,36 @@ disproved; a run against a stale binary that did not contain the new test; and a
 pattern (`FAILED \]`, one space) that never matches gtest's `[  FAILED  ]`, which
 reported a failing run as "PASSED 0 tests".
 
+### F78. Only one parallel Dag can run per process
+
+Found while trying to add a backpressure variant to the F67 shuffle test, and it is a
+real constraint rather than a test artefact.
+
+A second in-process parallel Dag cross-wires with the first through the process-global
+`LocalDataPlane` endpoint registry that parallel stages register into. Demonstrated
+three ways, each ruling out an explanation for the one before:
+
+1. Two tests each passed alone; the FIRST failed when the second ran after it.
+2. Giving every run unique operator names did not fix it - so it is not the
+   `derive_id` name hashing producing colliding `OperatorId`s, which was the obvious
+   suspect.
+3. A single test fails under `--gtest_repeat`, where the same job is built twice in one
+   process. Nothing about naming can explain that one.
+
+**Why it does not break anything today.** The cluster runs one Dag per worker process,
+which is exactly the supported shape. The in-process `add_parallel_*` API is used by
+tests and by embedded single-job runs, and one at a time is fine.
+
+**Why it is worth recording.** A second parallel-Dag test in the same binary looks like
+a flake and will cost somebody a day. The constraint is now written on
+`tests/test_keyed_shuffle_cut.cpp`, which is where they will be standing.
+
+**What it cost here.** A saturated-channel variant of the shuffle cut test - forcing
+`emit_barrier` to block part-way through its broadcast, the one window that file does
+not exercise - could not be shipped. It is the most interesting remaining in-process
+condition for F67 and it needs either per-process test isolation or a scoped
+`LocalDataPlane`.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
