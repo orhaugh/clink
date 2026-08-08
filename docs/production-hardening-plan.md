@@ -2889,6 +2889,42 @@ and the expected-drain set is EMPTY - there is nothing to wait for and it times 
 anyway. So the failure is not survivors failing to drain, and no amount of folding
 subtasks OUT of that set can help: it is already empty.
 
+### FIXED 2026-08-08 - the kick was gated on the tick's events, not the job's state
+
+The coordinator's own log gave the answer in four lines:
+
+    [watchdog] job_id=1 awaiting_restart (attempt 1/3) drain_expected=0
+    [restart]  job_id=1 attempt=1 survivors=1 tasks=2        <- restart RAN
+    [register] job_id=1 awaiting_restart (attempt 2/3) drain_expected=0
+               ... no [coordinator.restart] line ever follows ...
+    [watchdog] job_id=1 restart drain timed out; failing job
+
+Attempt 1 works. Attempt 2 does not, and the only structural difference is which path
+entered `awaiting_restart`.
+
+`restart_job_locked_` is fired for an empty drain set by a kick inside the watchdog's
+lost-worker block - which is gated on `job_touched`, i.e. on a worker having been newly
+declared lost in THAT tick. Attempt 2 was entered from the REGISTER path, when the
+killed worker came back and its previous session was retired. That path sets
+`awaiting_restart` with an empty drain set and has no kick behind it, so nothing ever
+called `restart_job_locked_`. The job waited 30s for a drain of zero subtasks and was
+failed with "survivors did not drain" - which is exactly why the recorded diagnosis
+pointed at draining survivors for so long.
+
+**The fix** moves the empty-drain check to the unconditional per-tick sweep, beside the
+deadline check that already runs every tick for the same reason: the condition is a
+property of the job's STATE, not of what happened in that tick.
+
+**Verification.** The test fails with the kick disabled and passes with it enabled -
+mutation-checked properly, after two earlier attempts silently no-op'd because
+clang-format had reflowed the target string and the replace matched nothing. Both are
+now diffed against the backup before the result is trusted. Full Linux integration
+label: 126 tests, zero failures. Core suite 2006.
+
+**Method note, since this took three wrong turns first.** The fold and capacity theories
+were both argued from the code and both wrong. The log settled it in one read. Reading
+the evidence before forming a hypothesis would have found this immediately.
+
 **Capacity is ruled out too.** The obvious second theory - the redeploy had nowhere to
 land, since two of three workers were dead at that moment - is wrong, and cheaply so.
 `restart_job_locked_` has an explicit no-room path that synthesises

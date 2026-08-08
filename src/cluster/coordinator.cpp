@@ -3175,6 +3175,35 @@ void Coordinator::watchdog_loop_() {
             // neither acks the cancel nor dies. Failing is the safe
             // escalation; force-restarting could double-run a slow-but-alive
             // survivor's subtask against shared state.
+            // Empty-drain kick, unconditional (F12).
+            //
+            // A job awaiting_restart with an EMPTY expected-drain set has nothing to
+            // wait for and must be restarted now. There is a kick for this inside the
+            // lost-worker block above, but that block is gated on a worker having been
+            // newly declared lost in THIS tick - so it only ever rescues a job whose
+            // restart was entered from the watchdog itself.
+            //
+            // A restart entered from the REGISTER path (a worker coming back and its
+            // previous session being retired) sets awaiting_restart with an empty drain
+            // set and no kick behind it. Nothing then called restart_job_locked_, the
+            // job sat waiting for a drain of zero subtasks, and the deadline below
+            // failed it 30s later with "survivors did not drain" - when there were no
+            // survivors to drain and the real fault was that the restart was never
+            // fired.
+            //
+            // Placed with the deadline sweep rather than in the lost-worker block
+            // because both need to run every tick regardless of what happened in it:
+            // the condition is a property of the job's state, not of this tick's
+            // events.
+            for (auto& [_, job] : jobs_) {
+                if (job->awaiting_restart && !job->completion_signalled && !job->cancel_requested &&
+                    job->restart_drain_expected.empty()) {
+                    auto deploys = restart_job_locked_(*job);
+                    for (auto& d : deploys) {
+                        deferred_restart_deploys.push_back(std::move(d));
+                    }
+                }
+            }
             for (auto& [_, job] : jobs_) {
                 if (job->awaiting_restart && !job->completion_signalled &&
                     job->restart_deadline != std::chrono::steady_clock::time_point{} &&

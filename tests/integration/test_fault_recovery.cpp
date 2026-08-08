@@ -306,11 +306,8 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
     EXPECT_EQ(*code, 0) << "the job did not survive two consecutive worker failures";
 }
 
-// KNOWN GAP - F12, confirmed still open 2026-08-08. Disabled for the same reason the
-// previous version of this scenario was: it asserts the CORRECT behaviour, which does
-// not hold yet, and a test weakened to assert the bug is worse than a red one.
-//
-// A second worker loss that arrives WHILE the first restart is still draining.
+// F12 - the regression test for it. A second worker loss that arrives WHILE the first
+// restart is still draining.
 //
 // This is F12's window, and the one the two tests either side of it miss: the
 // "consecutive" case waits for a re-registration first, and the "separated" case
@@ -327,16 +324,24 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
 // Observed symptom, which matches F12's original description exactly:
 //   [coordinator.watchdog] job_id=1 restart drain timed out; failing job
 //
-// The fold is NOT the problem, and F12's "survivors did not drain" description is
-// wrong. The coordinator logs drain_expected=0 at both restart attempts - the
-// expected-drain set is EMPTY and it times out anyway - so folding subtasks out of
-// that set cannot help. Restructuring the fold to cover a survivor with no
-// pending_per_worker entry was tried and made no difference; it was reverted.
+// The cause, from the coordinator's own log rather than from the follow-up's
+// description (which blamed draining survivors and was wrong - drain_expected was 0
+// at both attempts):
 //
-// Next lead: why the restart is not fired when drain_expected is zero. The
-// coordinator refers to an "empty-drain kick in watchdog_loop_" for exactly that
-// case. See docs/production-hardening-plan.md F77.
-TEST_F(FaultRecoveryTest, DISABLED_AJobSurvivesASecondLossDuringTheFirstRestartsDrain) {
+//   attempt 1, entered from the WATCHDOG: restart fires, job redeploys.
+//   attempt 2, entered from the REGISTER path when the killed worker comes back and
+//   its previous session is retired: awaiting_restart set, drain_expected=0, and no
+//   [coordinator.restart] line ever follows. Nothing called restart_job_locked_.
+//
+// The empty-drain kick existed but sat inside the watchdog's lost-worker block, gated
+// on a worker having been newly declared lost in THAT tick. A restart entered from any
+// other path had nothing to fire it, so the job waited 30s for a drain of zero
+// subtasks and was failed with "survivors did not drain".
+//
+// Fixed by moving the kick to the unconditional per-tick sweep, beside the deadline
+// check that already runs every tick for the same reason: the condition is a property
+// of the job's state, not of what happened in that tick.
+TEST_F(FaultRecoveryTest, AJobSurvivesASecondLossDuringTheFirstRestartsDrain) {
     Cluster c(spec());
     ScopedDiagnostics diag(c);
     bring_up(c);
