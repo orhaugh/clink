@@ -2871,14 +2871,31 @@ green.**
 
    which is F12's originally recorded symptom, word for word.
 
-**Where to look next.** `fold_dead_subtasks_into_restart_locked_` handles this case in
-principle - it drops the dead worker's subtasks from the expected-drain set and queues
-them for redeploy without consuming a restart attempt. It does not fire here. The
-specific suspect is its first statement: it returns immediately when the worker has no
-`pending_per_worker` entry at all. The comment beneath that guard is deliberate that an
-EMPTY list must still proceed, but a MISSING one returns - and a worker whose subtasks
-were survivors of the first loss may have no entry by that point. Not confirmed, and
-recorded as a lead rather than a diagnosis.
+**The fold is not the problem, and F12's original diagnosis is wrong.** That lead was
+tried and disproved. Restructuring
+`fold_dead_subtasks_into_restart_locked_` to run before the `pending_per_worker` lookup
+and to drive itself from `tasks_by_worker` - so a survivor with no in-flight entry is
+still folded - did not change the outcome. The change was reverted rather than left in:
+it alters the recovery path and does not fix the bug.
+
+What the coordinator's own log says during the failure:
+
+    [coordinator.watchdog] job_id=1 awaiting_restart (attempt 1/3) drain_expected=0
+    [coordinator.register] job_id=1 awaiting_restart (attempt 2/3) drain_expected=0
+    [coordinator.watchdog] job_id=1 restart drain timed out; failing job
+
+**`drain_expected=0` at both restarts.** F12 is recorded as "survivors did not drain",
+and the expected-drain set is EMPTY - there is nothing to wait for and it times out
+anyway. So the failure is not survivors failing to drain, and no amount of folding
+subtasks OUT of that set can help: it is already empty.
+
+The redirection for the next attempt: find why the restart is not fired when
+`drain_expected` is zero. `fold_dead_subtasks_into_restart_locked_` refers to "the
+empty-drain kick in `watchdog_loop_`" as what fires the restart in exactly that case.
+Either that kick is not running, or something downstream of it is. Note also that the
+second restart (attempt 2/3) is triggered from the REGISTER path, by the replacement
+worker coming back - so the attempt counter advances on re-registration while the job is
+still stuck.
 
 The new test is left DISABLED, matching the convention already in that file: it asserts
 the correct behaviour, that behaviour does not hold, and a test weakened to assert the

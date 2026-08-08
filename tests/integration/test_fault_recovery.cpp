@@ -327,14 +327,15 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
 // Observed symptom, which matches F12's original description exactly:
 //   [coordinator.watchdog] job_id=1 restart drain timed out; failing job
 //
-// The folding path added for F64 (fold_dead_subtasks_into_restart_locked_) handles
-// this case in principle - it drops the dead worker's subtasks from the expected-drain
-// set and queues them for redeploy - but it does not fire here. The specific suspect is
-// its first statement: it returns immediately when the worker has no pending_per_worker
-// entry at all. The comment beneath that guard is careful that an EMPTY list must still
-// proceed, but a MISSING one returns, and a worker whose subtasks were survivors of the
-// first loss may have no entry by this point. That is where to look next; it has not
-// been confirmed.
+// The fold is NOT the problem, and F12's "survivors did not drain" description is
+// wrong. The coordinator logs drain_expected=0 at both restart attempts - the
+// expected-drain set is EMPTY and it times out anyway - so folding subtasks out of
+// that set cannot help. Restructuring the fold to cover a survivor with no
+// pending_per_worker entry was tried and made no difference; it was reverted.
+//
+// Next lead: why the restart is not fired when drain_expected is zero. The
+// coordinator refers to an "empty-drain kick in watchdog_loop_" for exactly that
+// case. See docs/production-hardening-plan.md F77.
 TEST_F(FaultRecoveryTest, DISABLED_AJobSurvivesASecondLossDuringTheFirstRestartsDrain) {
     Cluster c(spec());
     ScopedDiagnostics diag(c);
