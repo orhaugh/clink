@@ -201,13 +201,22 @@ TEST(CoordinatorHaFailover, StandbyTakesOverAndRecoversJob) {
     ::setenv("CLINK_2PC_TICK_MS", "60", 1);
 
     // Spawn coordinator-A (lower port - likely to be leader first).
+    // Capture both coordinators' logs so worker REGISTRATION becomes observable.
+    // Keyed by pid: ctest runs each test as its own process, and a fixed path would
+    // have concurrent tests counting each other's registrations.
+    const auto log_a = std::filesystem::temp_directory_path() /
+                       ("clink_ha_coordinator_a_" + std::to_string(::getpid()) + ".log");
+    const auto log_b = std::filesystem::temp_directory_path() /
+                       ("clink_ha_coordinator_b_" + std::to_string(::getpid()) + ".log");
+
     const auto port_a = probe_free_port();
-    const pid_t coordinator_a = spawn_proc({"clink_node",
-                                            "--role=coordinator",
-                                            "--port=" + std::to_string(port_a),
-                                            "--bind-host=127.0.0.1",
-                                            "--ha-dir=" + ha_dir.string()},
-                                           node);
+    const pid_t coordinator_a = clink::itest::spawn_logged({"clink_node",
+                                                            "--role=coordinator",
+                                                            "--port=" + std::to_string(port_a),
+                                                            "--bind-host=127.0.0.1",
+                                                            "--ha-dir=" + ha_dir.string()},
+                                                           node,
+                                                           log_a);
     ASSERT_GT(coordinator_a, 0);
     // coordinator-A should bind within ~500ms (poll interval).
     ASSERT_TRUE(await_port_open(port_a, 2s)) << "coordinator-A never bound port " << port_a;
@@ -215,13 +224,22 @@ TEST(CoordinatorHaFailover, StandbyTakesOverAndRecoversJob) {
     // Spawn coordinator-B as standby. Its port is different; it sits on the
     // coordinator until coordinator-A dies.
     const auto port_b = probe_free_port();
-    const pid_t coordinator_b = spawn_proc({"clink_node",
-                                            "--role=coordinator",
-                                            "--port=" + std::to_string(port_b),
-                                            "--bind-host=127.0.0.1",
-                                            "--ha-dir=" + ha_dir.string()},
-                                           node);
+    const pid_t coordinator_b = clink::itest::spawn_logged({"clink_node",
+                                                            "--role=coordinator",
+                                                            "--port=" + std::to_string(port_b),
+                                                            "--bind-host=127.0.0.1",
+                                                            "--ha-dir=" + ha_dir.string()},
+                                                           node,
+                                                           log_b);
     ASSERT_GT(coordinator_b, 0);
+    // Deliberately still a duration, and the one sleep in this file that stays.
+    //
+    // A STANDBY has no positive signal to wait for: it logs nothing until it wins
+    // leadership ("coordinator became leader"), which by definition has not happened
+    // yet and must not happen until coordinator-A is killed further down. Waiting on
+    // its port would be wrong for the same reason. This is not load-bearing either -
+    // coordinator-A is not killed until after the job has checkpointed, seconds
+    // later - so a short settle is honest here where a condition is not available.
     std::this_thread::sleep_for(500ms);
 
     // worker: discovers coordinator-A via active-leader.json, connects, registers.
@@ -235,7 +253,11 @@ TEST(CoordinatorHaFailover, StandbyTakesOverAndRecoversJob) {
     };
     pid_t worker = spawn_worker();
     ASSERT_GT(worker, 0);
-    std::this_thread::sleep_for(800ms);  // worker register settle
+    // The worker REGISTERED with coordinator-A, from A's own log. Spawning the
+    // worker process is a different event from the coordinator accepting its
+    // registration, and submitting before the slots exist is refused outright.
+    ASSERT_TRUE(clink::itest::await_log_matches(log_a, " slots=", 1))
+        << "coordinator-A never registered the worker";
 
     // Submit a job to coordinator-A. Lasts ~1.8s; we wait for at least one
     // COMPLETED-N marker, then kill coordinator-A.
@@ -282,7 +304,12 @@ TEST(CoordinatorHaFailover, StandbyTakesOverAndRecoversJob) {
     EXPECT_TRUE(wait_for_exit(worker, 4s)) << "worker didn't exit after coordinator-A crash";
     worker = spawn_worker();
     ASSERT_GT(worker, 0);
-    std::this_thread::sleep_for(800ms);
+    // The replacement worker registered with coordinator-B, the NEW leader. Checked
+    // against B's log rather than a duration: this is the point of the test, so
+    // proceeding before it happened would test nothing and fail further down for an
+    // unrelated-looking reason.
+    ASSERT_TRUE(clink::itest::await_log_matches(log_b, " slots=", 1))
+        << "coordinator-B never registered the replacement worker after failover";
 
     // The recovered job should make further checkpoint progress under
     // coordinator-B. Wait a few seconds and confirm ckpt_after > ckpt_before.

@@ -257,8 +257,17 @@ TEST(CoordinatorRescale, RescaleRequestSurvivesTheWireRoundTrip) {
     ::setenv("CLINK_RESCALE_INITIAL_P", "2", 1);
 
     const auto coordinator_port = probe_free_port();
-    const pid_t coordinator_pid = spawn_proc(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    // Capture the coordinator's log, so worker REGISTRATION is observable rather
+    // than guessed at. Keyed by pid and port: ctest runs each test as its own
+    // process, and a fixed path would have concurrent tests counting each other's
+    // registrations.
+    const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                 ("clink_rescale_coordinator_" + std::to_string(::getpid()) + "_" +
+                                  std::to_string(coordinator_port) + ".log");
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        node,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     // Wait for the coordinator to be ACCEPTING, not for a duration. A sleep here
     // is a guess at process start-up: too short and the submit below races the
@@ -278,7 +287,12 @@ TEST(CoordinatorRescale, RescaleRequestSurvivesTheWireRoundTrip) {
                                      node));
         ASSERT_GT(workers.back(), 0);
     }
-    std::this_thread::sleep_for(400ms);
+    // Both workers REGISTERED, from the coordinator's own log. A worker process
+    // existing is not the same event as the coordinator having taken its
+    // registration, and a submission that lands before the slots exist is refused
+    // outright - which reads as a rescale defect rather than as a startup race.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers";
 
     // Submit the slow keyed pipeline with checkpoint enabled.
     // --wait-timeout-s deliberately short so the submitter doesn't
@@ -424,8 +438,17 @@ TEST(CoordinatorRescale, WholeRoleRescaleOfMultiOperatorJobIsRefusedAndLeavesJob
     ::setenv("CLINK_RESCALE_INITIAL_P", "2", 1);
 
     const auto coordinator_port = probe_free_port();
-    const pid_t coordinator_pid = spawn_proc(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    // Capture the coordinator's log, so worker REGISTRATION is observable rather
+    // than guessed at. Keyed by pid and port: ctest runs each test as its own
+    // process, and a fixed path would have concurrent tests counting each other's
+    // registrations.
+    const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                 ("clink_rescale_coordinator_" + std::to_string(::getpid()) + "_" +
+                                  std::to_string(coordinator_port) + ".log");
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        node,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     // Wait for the coordinator to be ACCEPTING, not for a duration. A sleep here
     // is a guess at process start-up: too short and the submit below races the
@@ -443,7 +466,12 @@ TEST(CoordinatorRescale, WholeRoleRescaleOfMultiOperatorJobIsRefusedAndLeavesJob
                                      node));
         ASSERT_GT(workers.back(), 0);
     }
-    std::this_thread::sleep_for(400ms);
+    // Both workers REGISTERED, from the coordinator's own log. A worker process
+    // existing is not the same event as the coordinator having taken its
+    // registration, and a submission that lands before the slots exist is refused
+    // outright - which reads as a rescale defect rather than as a startup race.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers";
 
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
@@ -582,8 +610,17 @@ TEST(CoordinatorCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess)
     ::setenv("CLINK_RESCALE_INITIAL_P", "2", 1);
 
     const auto coordinator_port = probe_free_port();
-    const pid_t coordinator_pid = spawn_proc(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    // Capture the coordinator's log, so worker REGISTRATION is observable rather
+    // than guessed at. Keyed by pid and port: ctest runs each test as its own
+    // process, and a fixed path would have concurrent tests counting each other's
+    // registrations.
+    const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                 ("clink_rescale_coordinator_" + std::to_string(::getpid()) + "_" +
+                                  std::to_string(coordinator_port) + ".log");
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        node,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     // Wait for the coordinator to be ACCEPTING, not for a duration. A sleep here
     // is a guess at process start-up: too short and the submit below races the
@@ -599,7 +636,12 @@ TEST(CoordinatorCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess)
                                          "--coordinator-port=" + std::to_string(coordinator_port)},
                                         node);
     ASSERT_GT(worker_pid, 0);
-    std::this_thread::sleep_for(400ms);
+    // Both workers REGISTERED, from the coordinator's own log. A worker process
+    // existing is not the same event as the coordinator having taken its
+    // registration, and a submission that lands before the slots exist is refused
+    // outright - which reads as a rescale defect rather than as a startup race.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers";
 
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),

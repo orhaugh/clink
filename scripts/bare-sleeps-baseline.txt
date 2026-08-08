@@ -13,8 +13,7 @@
 # count  path
 1      tests/integration/test_application_mode.cpp
 1      tests/integration/test_cluster_tls.cpp
-3      tests/integration/test_coordinator_ha_failover.cpp
-3      tests/integration/test_coordinator_rescale.cpp
+1      tests/integration/test_coordinator_ha_failover.cpp
 1      tests/integration/test_fault_recovery.cpp
 1      tests/integration/test_gateway_pipeline.cpp
 1      tests/integration/test_http_observability.cpp
