@@ -258,19 +258,29 @@ TEST_F(FaultRecoveryTest, WorkerDeathAfterCheckpointRecoversAndCompletes) {
 
 // --- multiple consecutive worker failures ----------------------------------
 
-// KNOWN GAP - see docs/production-hardening-plan.md, finding F12.
+// Two consecutive worker losses, with the first worker back before the second dies.
 //
-// A second worker loss that arrives while the FIRST loss's restart is
-// still draining is not folded into a new restart. The submitter fails
-// with "restart drain timed out after 30000ms (survivors did not drain)"
-// rather than the coordinator noticing that a survivor it is waiting on
-// has itself gone and re-planning.
+// The gap: a second worker loss arriving while the FIRST loss's restart was still
+// draining was not folded into that restart. Its subtasks had been survivors at the
+// first loss, so they sat in restart_drain_expected and could never drain - their
+// worker was dead - and the submitter failed with "restart drain timed out after
+// 30000ms (survivors did not drain)" instead of the coordinator noticing and
+// re-planning.
 //
-// This test is written to assert the CORRECT behaviour and is expected to
-// fail until that is implemented. It is excluded from the CI gate BY NAME
-// (see the ci.yml step) rather than deleted or weakened to assert the bug:
-// a test that encodes a defect as correct is worse than a red one.
-TEST_F(FaultRecoveryTest, DISABLED_TwoConsecutiveWorkerFailuresAreSurvived) {
+// It was written asserting the CORRECT behaviour and left disabled rather than
+// weakened to assert the bug, because a test that encodes a defect as correct is
+// worse than a red one. It now passes and is enabled: a disabled test that would
+// pass is coverage the suite is not getting.
+//
+// But it is NOT the F12 regression test, and was nearly mislabelled as one. It waits
+// for worker 0 to RE-REGISTER before killing worker 1, and that wait is long enough
+// that the first restart has already settled - so the second loss does not arrive
+// during the first restart's drain, which is the whole of F12. Proved rather than
+// assumed: with the folding path hard-disabled, this test still passes.
+//
+// AJobSurvivesASecondLossDuringTheFirstRestartsDrain below is the one that actually
+// gates that window.
+TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
     Cluster c(spec());
     ScopedDiagnostics diag(c);
     bring_up(c);
@@ -294,6 +304,72 @@ TEST_F(FaultRecoveryTest, DISABLED_TwoConsecutiveWorkerFailuresAreSurvived) {
     const auto code = sub->await_exit(std::chrono::seconds(120));
     ASSERT_TRUE(code.has_value()) << "submitter never exited after two worker losses";
     EXPECT_EQ(*code, 0) << "the job did not survive two consecutive worker failures";
+}
+
+// KNOWN GAP - F12, confirmed still open 2026-08-08. Disabled for the same reason the
+// previous version of this scenario was: it asserts the CORRECT behaviour, which does
+// not hold yet, and a test weakened to assert the bug is worse than a red one.
+//
+// A second worker loss that arrives WHILE the first restart is still draining.
+//
+// This is F12's window, and the one the two tests either side of it miss: the
+// "consecutive" case waits for a re-registration first, and the "separated" case
+// waits for a whole checkpoint. Both let the first restart finish.
+//
+// Entered deterministically rather than by racing a sleep against it. The
+// coordinator logs "awaiting_restart (attempt" the moment it begins draining for a
+// restart, so the second kill waits for THAT line and cannot land early or late. The
+// second worker's subtasks were survivors at the first loss, so they sit in
+// restart_drain_expected and can never drain - their worker is now dead - and the
+// drain never completes, so the job wedges in awaiting_restart until the submitter
+// times out.
+//
+// Observed symptom, which matches F12's original description exactly:
+//   [coordinator.watchdog] job_id=1 restart drain timed out; failing job
+//
+// The folding path added for F64 (fold_dead_subtasks_into_restart_locked_) handles
+// this case in principle - it drops the dead worker's subtasks from the expected-drain
+// set and queues them for redeploy - but it does not fire here. The specific suspect is
+// its first statement: it returns immediately when the worker has no pending_per_worker
+// entry at all. The comment beneath that guard is careful that an EMPTY list must still
+// proceed, but a MISSING one returns, and a worker whose subtasks were survivors of the
+// first loss may have no entry by this point. That is where to look next; it has not
+// been confirmed.
+TEST_F(FaultRecoveryTest, DISABLED_AJobSurvivesASecondLossDuringTheFirstRestartsDrain) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+
+    auto sub = submit(c, /*max_restarts=*/3);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
+                                    std::chrono::seconds(45)));
+
+    const auto restarts_before = c.count_in_coordinator_log("awaiting_restart (attempt");
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    // The drain is now in progress. Kill the second worker inside that window.
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return c.count_in_coordinator_log("awaiting_restart (attempt") > restarts_before; },
+        std::chrono::seconds(60)))
+        << "the coordinator never began a restart drain, so there was no window to kill "
+           "the second worker inside";
+
+    c.worker(1).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(1));
+    // Give the redeploy somewhere to land - two of three workers are now dead.
+    ASSERT_TRUE(c.restart_worker(0));
+    ASSERT_TRUE(c.restart_worker(1));
+
+    const auto code = sub->await_exit(std::chrono::seconds(180));
+    ASSERT_TRUE(code.has_value())
+        << "submitter never exited; the job wedged in awaiting_restart waiting on a drain "
+           "from subtasks whose worker had died";
+    EXPECT_EQ(*code, 0) << "the job did not survive a second loss during the first restart's "
+                           "drain";
 }
 
 // The SEQUENTIAL form of the same scenario, which does gate: the second

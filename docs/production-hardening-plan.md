@@ -2842,6 +2842,54 @@ It has NOT been run under libFuzzer. The build image has clang-19 but not
 name. Saying the data plane is "fuzzed" would overstate what has happened: it has a
 target and a seeded corpus, and the corpus replays.
 
+### F77. F12 is still open, and the test that looked like its gate never reached it
+
+`FaultRecoveryTest.TwoConsecutiveWorkerFailuresAreSurvived` was disabled as a known
+failure for F12 - a second worker loss arriving while the first loss's restart is still
+draining is not folded into that restart, so the drain never completes. Run with
+`--gtest_also_run_disabled_tests`, it now PASSES, which looks like the gap having closed
+behind the folding path added for F64.
+
+It has not. The test never enters the window.
+
+**How that was established, and it took three attempts because each wrong answer looked
+green.**
+
+1. Hypothesis: F64's `fold_dead_subtasks_into_restart_locked_` closed it. Mutation-checked
+   by hard-disabling the fold - the test still passed. So the fold is not what makes it
+   pass, and something else explains the green.
+2. Reading the test: it waits for worker 0 to RE-REGISTER before killing worker 1, and
+   that wait is long enough that the first restart has already settled. The second loss
+   therefore arrives after the drain, not during it. It is a real test of consecutive
+   losses and it is now enabled - a disabled test that would pass is coverage the suite
+   is not getting - but it is not the F12 gate, and its comment now says so.
+3. A new test enters the window deterministically: the coordinator logs
+   `awaiting_restart (attempt` the instant it begins draining, so the second kill waits
+   on that line rather than racing a sleep. It FAILS with the fold fully enabled:
+
+       [coordinator.watchdog] job_id=1 restart drain timed out; failing job
+
+   which is F12's originally recorded symptom, word for word.
+
+**Where to look next.** `fold_dead_subtasks_into_restart_locked_` handles this case in
+principle - it drops the dead worker's subtasks from the expected-drain set and queues
+them for redeploy without consuming a restart attempt. It does not fire here. The
+specific suspect is its first statement: it returns immediately when the worker has no
+`pending_per_worker` entry at all. The comment beneath that guard is deliberate that an
+EMPTY list must still proceed, but a MISSING one returns - and a worker whose subtasks
+were survivors of the first loss may have no entry by that point. Not confirmed, and
+recorded as a lead rather than a diagnosis.
+
+The new test is left DISABLED, matching the convention already in that file: it asserts
+the correct behaviour, that behaviour does not hold, and a test weakened to assert the
+bug is worse than a red one.
+
+**Three ways to a wrong green, all hit in this one investigation.** Worth recording
+because each is cheap to repeat: a plausible fix hypothesis that mutation testing
+disproved; a run against a stale binary that did not contain the new test; and a grep
+pattern (`FAILED \]`, one space) that never matches gtest's `[  FAILED  ]`, which
+reported a failing run as "PASSED 0 tests".
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
