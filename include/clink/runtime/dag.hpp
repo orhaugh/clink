@@ -3536,9 +3536,20 @@ public:
                         if (ctx.has_state_backend()) {
                             source->snapshot_offset(*ctx.state_backend(), id, b->id());
                         }
-                        typed_emitter.emit_barrier(*b);
+                        // Ack what actually happened, as the single-subtask source
+                        // runner does. This is the runner a PARALLEL source uses,
+                        // so it is the one a distributed job goes through - fixing
+                        // only the other path would leave the defect exactly where
+                        // it matters most.
+                        const bool delivered = typed_emitter.emit_barrier(*b);
                         if (ack_cb) {
-                            ack_cb(b->id(), true, std::string{});
+                            ack_cb(b->id(),
+                                   delivered,
+                                   delivered ? std::string{}
+                                             : std::string{"source could not deliver the barrier "
+                                                           "to every downstream channel (a "
+                                                           "channel is closed or a remote push "
+                                                           "failed)"});
                         }
                     }
                 };

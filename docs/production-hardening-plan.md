@@ -2512,6 +2512,19 @@ failure and thrown away.
 that cannot be started now fails fast and says why, instead of hanging until somebody
 notices the recovery point has stopped advancing.
 
+Applied at **both** source runners. The single-subtask one was found first; the
+parallel-source runner had the identical two lines, and that is the runner a
+distributed job actually goes through - fixing one and not the other would have left
+the defect exactly where it matters most. This is the construction-path asymmetry that
+has bitten this codebase before: a feature that belongs to a family has to be applied
+to every member in the same pass.
+
+**Related, not fixed.** All six `emit_drain` call sites discard their return value the
+same way. The shape is different - a drain marker is a one-way signal with no ack to
+correct, so a failed send stalls a rescale drain rather than misreporting it - and
+there is no test that can currently observe the failure. Recorded rather than changed,
+because six untested logging edits is churn, not hardening.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
