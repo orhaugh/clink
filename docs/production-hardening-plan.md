@@ -2889,6 +2889,13 @@ and the expected-drain set is EMPTY - there is nothing to wait for and it times 
 anyway. So the failure is not survivors failing to drain, and no amount of folding
 subtasks OUT of that set can help: it is already empty.
 
+**Capacity is ruled out too.** The obvious second theory - the redeploy had nowhere to
+land, since two of three workers were dead at that moment - is wrong, and cheaply so.
+`restart_job_locked_` has an explicit no-room path that synthesises
+`"restart: no slot available for <role>[<n>]"`, clears `awaiting_restart` and signals
+completion. The observed failure is `restart drain timed out`, a different message from a
+different place, so the restart did not abort for capacity.
+
 The redirection for the next attempt: find why the restart is not fired when
 `drain_expected` is zero. `fold_dead_subtasks_into_restart_locked_` refers to "the
 empty-drain kick in `watchdog_loop_`" as what fires the restart in exactly that case.
