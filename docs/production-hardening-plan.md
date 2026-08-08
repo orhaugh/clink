@@ -2460,6 +2460,26 @@ engine. The parallel-stage runner routes barriers to `op->on_barrier(adv.barrier
 after alignment, not through `process()`. A test that watches the wrong hook reports the
 engine as catastrophically broken rather than reporting itself as wrong.
 
+**The send path does not duplicate.** `NetworkChannelSink::send_frame` takes
+`send_mu_`, writes the length header then the payload, and on any `send_all` failure
+returns false without retrying. There is no resend, so a duplicate cannot originate
+there. (It does have a separate hazard - a header that lands with a failed payload
+leaves the peer's stream desynchronised - but that fails the task rather than
+duplicating a record.)
+
+**The hypothesis left standing, and it is not "the shuffle duplicates".** The failing
+job is a RESCALE test, so it restarts and restores. If the source restores to offset X
+while the keyed operator restores state reflecting MORE than X records, the arithmetic
+on disk follows exactly: the counter holds one extra for a key whose next record is the
+one the source has not yet re-emitted. That is a restore-PAIRING question - are both
+halves restored from the same checkpoint - rather than a delivery question, and it is
+consistent with every in-process delivery path now testing clean.
+
+F75 (a restore reading state from subtasks the checkpoint never named) was one instance
+of that class and is fixed. Whether another remains is the next thing to check, and the
+cheap way in is `clink state-cat` on a captured failing run's restore point comparing
+what the source and the counter each restored FROM, rather than what they hold.
+
 This is deliberately left open rather than closed on a guess. What has been established
 is worth more than a speculative fix: the defect is a duplicate delivery, not a
 mistimed checkpoint, and the local path is not where it happens.
