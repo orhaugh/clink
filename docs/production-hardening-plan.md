@@ -2467,6 +2467,22 @@ there. (It does have a separate hazard - a header that lands with a failed paylo
 leaves the peer's stream desynchronised - but that fails the task rather than
 duplicating a record.)
 
+**Two assumptions behind the arithmetic, now verified rather than assumed.**
+
+*The key derivation.* `rescale_exactly_once_job` computes `key = idx % keys_` and its own
+check computes `expected_before = idx / keys_`. With 12 keys, record 41 lands on key 5
+and that key should hold 3 before processing it. So the reading stands: key 5 holding 4
+means record-41 was processed, while the source's offset of 41 means it was never
+emitted. Had the job hashed its key instead, the whole expected-count table would have
+been wrong and there would have been no defect to chase.
+
+*Whether checkpoint 21 was one event.* All six of its `.snap` files were written within
+the same second. That rules out the remaining overwrite theory - a later epoch rewriting
+one subtask's file for an id it reused - which the id assignment made plausible:
+`next_checkpoint_id = restore_from_checkpoint_id + 1` on resume means ids ARE reused
+across a restore. Generations keep those writes apart between topologies; within one
+generation the mtimes say this checkpoint was taken once.
+
 **The hypothesis left standing, and it is not "the shuffle duplicates".** The failing
 job is a RESCALE test, so it restarts and restores. If the source restores to offset X
 while the keyed operator restores state reflecting MORE than X records, the arithmetic
