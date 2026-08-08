@@ -2654,6 +2654,31 @@ registry of the states an operator declared, which does not exist - operators ho
 correcting a false claim, so the claim is corrected and the requirement stated where a
 consumer will see it.
 
+### F73. A running job's checkpoint configuration was reported nowhere
+
+`/api/v1/jobs/:id` returned completion counts, errors, task placement and checkpoint
+IDs. It did not report the configuration the job is actually RUNNING with - not the
+checkpoint directory, not the interval, not the state backend, not the restart budget,
+not the alignment mode.
+
+That is the whole of a job's recovery behaviour, and it was invisible from outside. The
+only way to answer "is this job even checkpointing?" was to find the command line that
+submitted it, which is the first question any recovery incident asks and the one least
+likely to have a good answer at 3am on a cluster somebody else deployed.
+
+Seven fields now come straight off the retained `CheckpointConfig`, not re-derived, so
+what the endpoint reports cannot drift from what the coordinator acts on.
+
+This is also the prerequisite for the rest of follow-up 24. `clink lint` reads flags
+rather than deployed configuration, so drift between what was linted and what runs is
+undetectable - and it stays that way until the coordinator publishes what it is running.
+It now does. The remaining work is a client that fetches it and compares, which needs
+JSON reading in the CLI (simdjson is already vendored for `config::parse`, so the
+dependency exists).
+
+**Verification.** The integration test asserts every one of the seven fields is present
+in the response body. Full core suite 2002 passed, `HttpSubmit` 2/2 on Linux.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

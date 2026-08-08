@@ -82,6 +82,27 @@ struct JobDetail {
     std::vector<JobTaskRecord> tasks;
     std::uint64_t latest_completed_checkpoint_id{0};
     std::vector<std::uint64_t> pending_checkpoint_ids;
+
+    // The checkpoint configuration this job is actually RUNNING with.
+    //
+    // It was not reported anywhere. A job's recovery behaviour is decided
+    // entirely by these values - whether it checkpoints at all, how often, where
+    // the state goes, how many restarts it gets - and the only way to know what a
+    // running job had been given was to find the command line that submitted it.
+    // Answering "is this job actually checkpointing?" from the outside was not
+    // possible, which is the first question any recovery incident asks.
+    //
+    // This is also what `clink lint` needs to stop linting flags and start linting
+    // what is deployed (follow-up 24): the drift it cannot currently detect is
+    // between the command line someone typed and the configuration the coordinator
+    // is running.
+    std::string checkpoint_dir;
+    std::int64_t checkpoint_interval_ms{0};
+    std::string state_backend_uri;
+    std::string restore_from_dir;
+    std::uint64_t restore_from_checkpoint_id{0};
+    std::uint32_t max_restarts_on_worker_loss{0};
+    bool unaligned_checkpoints{false};
 };
 
 // --- Job DAG (GET /api/v1/jobs/:id/graph) ----------------------------------

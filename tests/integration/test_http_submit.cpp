@@ -324,6 +324,25 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
     EXPECT_EQ(list.status, 200);
     EXPECT_NE(list.body.find("\"id\":1"), std::string::npos) << "jobs list: " << list.body;
 
+    // The job detail must report the checkpoint configuration the job is RUNNING
+    // with. Until this was added, a job's recovery behaviour - whether it
+    // checkpoints at all, how often, where the state goes, how many restarts it
+    // gets - was not observable from outside at all: the only way to answer "is
+    // this job actually checkpointing?" was to find the command line that
+    // submitted it, which is the first question a recovery incident asks.
+    const auto detail = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1");
+    EXPECT_EQ(detail.status, 200);
+    for (const auto* field : {"\"checkpoint_dir\"",
+                              "\"checkpoint_interval_ms\"",
+                              "\"state_backend_uri\"",
+                              "\"restore_from_dir\"",
+                              "\"restore_from_checkpoint_id\"",
+                              "\"max_restarts_on_worker_loss\"",
+                              "\"unaligned_checkpoints\""}) {
+        EXPECT_NE(detail.body.find(field), std::string::npos)
+            << field << " missing from /api/v1/jobs/1: " << detail.body;
+    }
+
     // Tidy up so the coordinator doesn't hang waiting for the never-ending job.
     http_post_empty("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
 }

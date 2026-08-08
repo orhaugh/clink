@@ -376,6 +376,16 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
     }
     w.end_array();
     w.kv("latest_completed_checkpoint_id", j.latest_completed_checkpoint_id);
+    // What this job is actually running with. Reported because "is this job even
+    // checkpointing?" is the first question a recovery incident asks, and until now
+    // the only way to answer it was to find the command line that submitted the job.
+    w.kv("checkpoint_dir", j.checkpoint_dir);
+    w.kv("checkpoint_interval_ms", j.checkpoint_interval_ms);
+    w.kv("state_backend_uri", j.state_backend_uri);
+    w.kv("restore_from_dir", j.restore_from_dir);
+    w.kv("restore_from_checkpoint_id", static_cast<std::int64_t>(j.restore_from_checkpoint_id));
+    w.kv("max_restarts_on_worker_loss", static_cast<std::int64_t>(j.max_restarts_on_worker_loss));
+    w.kv("unaligned_checkpoints", j.unaligned_checkpoints);
     w.key("pending_checkpoint_ids").begin_array();
     for (auto id : j.pending_checkpoint_ids) {
         w.uint_value(id);

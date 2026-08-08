@@ -312,6 +312,12 @@ see `ClinkFencedFrames`.
 failing looks like activity. `clink jobs` shows the terminal status; the coordinator
 log shows the attempt count against the budget.
 
+**What is this job actually configured to do?** `/api/v1/jobs/:id` reports the
+checkpoint configuration the job is running with - directory, interval, state backend,
+restore source, restart budget and alignment. Check it before assuming a job that is
+not checkpointing is broken: an interval of 0, or an empty checkpoint_dir, means it was
+never asked to.
+
 **Is the recovery point moving?** `clink_ckpt_last_completed_unix_seconds` advancing
 is the single best signal that a job is healthy. A job that is running, consuming and
 producing, but not completing checkpoints, is accumulating unbounded replay on its

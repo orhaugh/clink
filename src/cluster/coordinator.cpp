@@ -1261,6 +1261,16 @@ std::optional<JobDetail> Coordinator::snapshot_job(JobId job_id) const {
     for (const auto& [ckpt_id, _] : job.pending_checkpoint_acks) {
         d.pending_checkpoint_ids.push_back(ckpt_id);
     }
+    // The configuration this job is RUNNING with, straight off the retained
+    // CheckpointConfig rather than re-derived, so what the endpoint reports cannot
+    // drift from what the coordinator is acting on.
+    d.checkpoint_dir = job.checkpoint.checkpoint_dir;
+    d.checkpoint_interval_ms = job.checkpoint.interval_ms;
+    d.state_backend_uri = job.checkpoint.state_backend_uri;
+    d.restore_from_dir = job.checkpoint.restore_from_dir;
+    d.restore_from_checkpoint_id = job.checkpoint.restore_from_checkpoint_id;
+    d.max_restarts_on_worker_loss = job.checkpoint.max_restarts_on_worker_loss;
+    d.unaligned_checkpoints = job.checkpoint.alignment == CheckpointAlignment::Unaligned;
     return d;
 }
 
