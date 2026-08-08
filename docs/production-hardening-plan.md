@@ -2604,6 +2604,22 @@ fallback to name in most real configurations. Raising it trades disk for a recov
 option, which is a deployment decision rather than something to change silently under
 existing users.
 
+**The sweep this prompted, and its result.** F71 raised an obvious question: what else
+has tests and no callers? Twenty-six candidates across the state, checkpoint and
+rescale headers were checked. Two were real - this one and F72. The rest fall into
+three legitimate groups, and the distinction is worth recording so the question does
+not get re-asked:
+
+| Group | Examples | Why it is fine |
+|---|---|---|
+| Test-visible counters | `hot_hits`, `remote_loads`, `read_calls`, `log_entries` | Instrumentation that exists to be asserted on. Having no production caller is the point. |
+| Disclosed seams | `set_mode_resolver` | An extension point the engine deliberately does not use. `docs/internals/checkpointing.md` says outright "Adaptive mode is a seam, not wired end-to-end", and the README repeats it. Documented honestly. |
+| Found by a header-only grep | `materialize_now`, `set_materialization_threshold_bytes` | The changelog materialisation threshold looked unread because it is compared in `changelog_state_backend.cpp:71` inside `capture()`, not in the header. Automatic materialisation does work. A false alarm from grepping one file. |
+
+So the pattern is real but not endemic: two genuine cases out of twenty-six. The one that
+matters is the shape, not the count - a function with passing tests and no callers reads
+as a working feature to anyone auditing by test name.
+
 ### F72. The state docs claimed a snapshot reclaims expired TTL entries. It cannot.
 
 Found by sweeping for the F71 pattern - functions with tests and no production callers -
