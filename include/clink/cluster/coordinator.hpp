@@ -685,7 +685,16 @@ private:
         // separately so the COMPLETED marker can say what the checkpoint consists
         // of - the first cut read the drained set and wrote "subtasks=" empty, which
         // the consistency check caught immediately.
-        std::unordered_map<std::uint64_t, std::set<std::uint32_t>> checkpoint_participants;
+        // Both the generation and the subtask set are captured at TRIGGER. Reading
+        // either at completion misattributes a checkpoint that spans a rescale: the
+        // ack set is drained by then, and state_generation may already have bumped,
+        // so a checkpoint triggered by the old topology gets labelled with the new
+        // generation and every one of its files then looks like an outsider.
+        struct CheckpointParticipants {
+            std::uint32_t generation{1};
+            std::set<std::uint32_t> subtasks;
+        };
+        std::unordered_map<std::uint64_t, CheckpointParticipants> checkpoint_participants;
         std::uint32_t state_generation{1};
         // The checkpoint id at which the CURRENT state generation began; anything at
         // or below it was written by the previous generation.

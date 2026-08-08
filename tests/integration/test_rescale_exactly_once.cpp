@@ -450,19 +450,28 @@ TEST_F(RescaleExactlyOnceTest, TheJobCommitsEveryRecordExactlyOnceWithNoRescale)
     // never part of, and every file involved was individually valid, so no per-file
     // integrity check could see it.
     //
-    // ASSERTED on the no-rescale premise, where it holds. REPORTED on the rescale
-    // cases, because it currently flags something in the scale-UP path that is not
-    // yet explained - a snapshot at v1/4 for a checkpoint that completed in
-    // generation 1 with subtasks 0,1,2, when generation 1 has no subtask 4. That is
-    // either a real defect or a wrong expectation in the checker, and gating on it
-    // before knowing which would be asserting a conclusion rather than a fact.
-    // Follow-up 49.
+    // REPORTED across a rescale, not gated - see follow-up 49.
+    //
+    // Capturing the generation at TRIGGER rather than completion removed the
+    // systematic violations (a checkpoint spanning a rescale used to be labelled
+    // with the generation that came after it). What remains is intermittent: this
+    // passes in isolation and violated twice in five during one suite run.
+    //
+    // The likely shape is the transition window. A checkpoint triggered while the
+    // task set is being replaced records one topology's participants while the
+    // other's subtasks are still writing files, so a leftover looks like an
+    // outsider. Whether those leftovers can ever be READ as though they belonged is
+    // the question that decides between "harmless residue" and "F65 again", and it
+    // is not answered yet. Gating on a check whose own behaviour in that window is
+    // unestablished would just make the gate flaky.
     {
         const auto violations = clink::itest::checkpoint_set_violations(c.checkpoint_dir());
-        if (!violations.empty()) {
-            std::cerr << "CHECKPOINT-SET " << violations.size()
-                      << " violation(s); first: " << violations[0] << "\n";
-        }
+        EXPECT_TRUE(violations.empty())
+            << violations.size()
+            << " checkpoint(s) contain a snapshot from outside their participant set on a "
+               "run with NO rescale at all, where the transition window of follow-up 49 "
+               "cannot apply; first: "
+            << violations[0];
     }
     const auto order = per_key_order_violations(out_dir_, kKeys);
     EXPECT_GT(order.records_checked, 0u)
@@ -580,13 +589,20 @@ TEST_F(RescaleExactlyOnceTest, ScalingAKeyedOperatorUpPreservesExactlyOnceOutput
     // never part of, and every file involved was individually valid, so no per-file
     // integrity check could see it.
     //
-    // ASSERTED on the no-rescale premise, where it holds. REPORTED on the rescale
-    // cases, because it currently flags something in the scale-UP path that is not
-    // yet explained - a snapshot at v1/4 for a checkpoint that completed in
-    // generation 1 with subtasks 0,1,2, when generation 1 has no subtask 4. That is
-    // either a real defect or a wrong expectation in the checker, and gating on it
-    // before knowing which would be asserting a conclusion rather than a fact.
-    // Follow-up 49.
+    // REPORTED across a rescale, not gated - see follow-up 49.
+    //
+    // Capturing the generation at TRIGGER rather than completion removed the
+    // systematic violations (a checkpoint spanning a rescale used to be labelled
+    // with the generation that came after it). What remains is intermittent: this
+    // passes in isolation and violated twice in five during one suite run.
+    //
+    // The likely shape is the transition window. A checkpoint triggered while the
+    // task set is being replaced records one topology's participants while the
+    // other's subtasks are still writing files, so a leftover looks like an
+    // outsider. Whether those leftovers can ever be READ as though they belonged is
+    // the question that decides between "harmless residue" and "F65 again", and it
+    // is not answered yet. Gating on a check whose own behaviour in that window is
+    // unestablished would just make the gate flaky.
     {
         const auto violations = clink::itest::checkpoint_set_violations(c.checkpoint_dir());
         if (!violations.empty()) {
@@ -660,13 +676,20 @@ TEST_F(RescaleExactlyOnceTest, ScalingAKeyedOperatorDownPreservesExactlyOnceOutp
     // never part of, and every file involved was individually valid, so no per-file
     // integrity check could see it.
     //
-    // ASSERTED on the no-rescale premise, where it holds. REPORTED on the rescale
-    // cases, because it currently flags something in the scale-UP path that is not
-    // yet explained - a snapshot at v1/4 for a checkpoint that completed in
-    // generation 1 with subtasks 0,1,2, when generation 1 has no subtask 4. That is
-    // either a real defect or a wrong expectation in the checker, and gating on it
-    // before knowing which would be asserting a conclusion rather than a fact.
-    // Follow-up 49.
+    // REPORTED across a rescale, not gated - see follow-up 49.
+    //
+    // Capturing the generation at TRIGGER rather than completion removed the
+    // systematic violations (a checkpoint spanning a rescale used to be labelled
+    // with the generation that came after it). What remains is intermittent: this
+    // passes in isolation and violated twice in five during one suite run.
+    //
+    // The likely shape is the transition window. A checkpoint triggered while the
+    // task set is being replaced records one topology's participants while the
+    // other's subtasks are still writing files, so a leftover looks like an
+    // outsider. Whether those leftovers can ever be READ as though they belonged is
+    // the question that decides between "harmless residue" and "F65 again", and it
+    // is not answered yet. Gating on a check whose own behaviour in that window is
+    // unestablished would just make the gate flaky.
     {
         const auto violations = clink::itest::checkpoint_set_violations(c.checkpoint_dir());
         if (!violations.empty()) {

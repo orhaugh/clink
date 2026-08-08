@@ -2071,7 +2071,9 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
         {
             // What this checkpoint consists of, for the COMPLETED marker. Captured at
             // TRIGGER because the ack set above is drained as acks arrive.
-            auto& participants = job.checkpoint_participants[ckpt_id];
+            auto& rec = job.checkpoint_participants[ckpt_id];
+            rec.generation = job.state_generation;
+            auto& participants = rec.subtasks;
             participants.clear();
             for (const auto& [key, _unused] : job.task_records) {
                 const auto colon = key.rfind(':');
@@ -4775,7 +4777,9 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
                         // consistency check reported as every subtask being an
                         // outsider - three trigger sites, and the check found the
                         // one that was forgotten.
-                        auto& participants = job.checkpoint_participants[final_id];
+                        auto& rec = job.checkpoint_participants[final_id];
+                        rec.generation = job.state_generation;
+                        auto& participants = rec.subtasks;
                         participants.clear();
                         for (const auto& [tkey, _p] : job.task_records) {
                             const auto colon = tkey.rfind(':');
@@ -4989,10 +4993,12 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 CompletedCheckpoint done;
                 done.job_id = msg.job_id;
                 done.checkpoint_id = msg.checkpoint_id;
-                done.generation = job.state_generation;
+
                 if (auto pit = job.checkpoint_participants.find(msg.checkpoint_id);
                     pit != job.checkpoint_participants.end()) {
-                    done.subtasks = pit->second;
+                    // Both from the TRIGGER record - see CheckpointParticipants.
+                    done.generation = pit->second.generation;
+                    done.subtasks = pit->second.subtasks;
                     job.checkpoint_participants.erase(pit);
                 }
                 just_completed.push_back(std::move(done));
@@ -5244,7 +5250,9 @@ void Coordinator::checkpoint_trigger_loop_() {
                 {
                     // What this checkpoint consists of, for the COMPLETED marker. Captured at
                     // TRIGGER because the ack set above is drained as acks arrive.
-                    auto& participants = job.checkpoint_participants[next_id];
+                    auto& rec = job.checkpoint_participants[next_id];
+                    rec.generation = job.state_generation;
+                    auto& participants = rec.subtasks;
                     participants.clear();
                     for (const auto& [key, _unused] : job.task_records) {
                         const auto colon = key.rfind(':');
