@@ -2431,11 +2431,34 @@ barrier 21**. In program order the source emitted the barrier first, so the two 
 reordered somewhere between the emitter and that subtask's input - the keyed shuffle
 and its channels, the one part of the path the in-process test does not cover.
 
-**What has been ruled out, so the next attempt does not redo it:** the source drain
-(atomic), the operator capture point (before the barrier, both paths), cross-generation
-overwrite (generations are live and correct here), and the whole single-input local path
-(tested, both shapes, mutation-checked). What remains is barrier-versus-record ordering
-in the keyed shuffle.
+**The in-process keyed shuffle is now ruled out too.**
+`tests/test_keyed_shuffle_cut.cpp` builds the failing job's exact shape in one process -
+parallel source, `add_parallel_operator_shuffled` at parallelism 4 partitioned by key,
+sink - and asserts three things at every barrier over ~86 checkpoints: no record
+delivered twice, no key routed to two subtasks, and the summed keyed counts equal the
+source's recorded offset. It passes.
+
+Mutation-checked, and the mutation reproduces F67's arithmetic exactly. Injecting a
+single double-count yields:
+
+    checkpoint 2: source emitted 12 but the keyed operators held 13
+    checkpoint 3: source emitted 18 but the keyed operators held 19
+
+which is the same "one too many" signature found on disk. So the test would catch the
+defect if it lived here, and it does not.
+
+**What that leaves.** Every in-process path is now excluded: the source drain, the
+operator capture point on both paths, the single-input forward path, and the keyed
+shuffle at parallelism 4. The failing job's remaining difference is that its shuffle
+crosses a PROCESS boundary - `NetworkChannelSink` to `NetworkChannelSource` over a
+socket, with credit-based flow control and Arrow IPC framing - rather than an in-process
+channel. That is where to look next, and it is a much smaller surface than "the shuffle".
+
+**A test-wiring trap worth recording.** The first version of this test watched
+`process()` for barriers and saw ZERO across 86 checkpoints, which reads as a broken
+engine. The parallel-stage runner routes barriers to `op->on_barrier(adv.barrier, out)`
+after alignment, not through `process()`. A test that watches the wrong hook reports the
+engine as catastrophically broken rather than reporting itself as wrong.
 
 This is deliberately left open rather than closed on a guess. What has been established
 is worth more than a speculative fix: the defect is a duplicate delivery, not a
