@@ -23,6 +23,8 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 
+#include "tests/integration/await_port.hpp"
+
 namespace {
 
 // Wait until something is accepting on `port`.
@@ -117,8 +119,17 @@ TEST(ApplicationMode, JobSubmitterPushesAndWaitsForCompletion) {
         std::filesystem::temp_directory_path() / "clink_application_mode_test.txt";
     std::filesystem::remove(out_path);
 
-    const pid_t coordinator_pid = spawn_node(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    // Capture the coordinator's log, so worker REGISTRATION is observable instead
+    // of being guessed at. Keyed by pid and port: ctest runs each test as its own
+    // process, so a fixed path would have concurrent tests counting each other's
+    // registrations.
+    const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                 ("clink_appmode_coordinator_" + std::to_string(::getpid()) + "_" +
+                                  std::to_string(coordinator_port) + ".log");
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        binary,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     ASSERT_TRUE(await_port_accepting(coordinator_port))
         << "coordinator never accepted; nothing below can register or submit";
@@ -130,10 +141,13 @@ TEST(ApplicationMode, JobSubmitterPushesAndWaitsForCompletion) {
                                          "--coordinator-port=" + std::to_string(coordinator_port)},
                                         binary);
     ASSERT_GT(worker_pid, 0);
-    // The worker exposes no port of its own here, so this stays a duration -
-    // but a generous one rather than a tight guess, since the submission
-    // below needs the worker registered and a slot free.
-    std::this_thread::sleep_for(1500ms);
+    // Wait for the coordinator to have REGISTERED every worker, from its own log.
+    // Spawning a worker process is a different event from the coordinator taking its
+    // registration, and a submission that arrives before the slots exist is refused
+    // outright - which reads as a submission or wire defect rather than the startup
+    // race it is.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 1))
+        << "the coordinator never registered the worker";
 
     // Build the job graph programmatically rather than reading JSON
     // from disk. This is the whole point of the API: applications

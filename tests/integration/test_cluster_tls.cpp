@@ -29,6 +29,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -185,8 +187,18 @@ TEST(ClusterTls, WorkerRegistersOverTlsControlPlane) {
     ASSERT_GT(worker, 0);
     ASSERT_TRUE(await_http_ready(worker_http, 3s)) << "worker didn't come up";
 
-    // Give the worker ~500ms to complete its TLS handshake + Register frame.
-    std::this_thread::sleep_for(500ms);
+    // Wait for the worker to APPEAR in the coordinator's view, which is precisely
+    // what the assertions below check. The 500ms this replaces was a guess at how
+    // long a TLS handshake plus a Register frame takes - and on a loaded machine a
+    // handshake that had not finished yet read as "TLS registration is broken".
+    ASSERT_TRUE(clink::itest::await_condition(
+        [&] {
+            const auto probe = http_get("127.0.0.1", http_port, "/api/v1/workers");
+            return probe.status == 200 &&
+                   probe.body.find("\"worker_id\":\"" + worker_id + "\"") != std::string::npos;
+        },
+        std::chrono::seconds(20)))
+        << "the worker never registered over TLS";
     const auto r = http_get("127.0.0.1", http_port, "/api/v1/workers");
     EXPECT_EQ(r.status, 200);
     EXPECT_NE(r.body.find("\"worker_id\":\"" + worker_id + "\""), std::string::npos)

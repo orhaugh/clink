@@ -250,7 +250,30 @@ std::optional<Cluster> start_cluster(int n_workers) {
         c.worker_pids.push_back(pid);
         c.worker_ids.push_back(worker_id);
     }
-    std::this_thread::sleep_for(400ms);  // worker registration settle
+    // Wait for the coordinator to have REGISTERED every worker, rather than guessing
+    // at a settle time.
+    //
+    // A worker's own HTTP port accepting says its process is up; it says nothing
+    // about the coordinator having taken its registration, which is a separate
+    // exchange on the control port. /api/v1/workers is the coordinator's own view of
+    // who has registered, so it is the exact condition. The deadline is a failure
+    // bound - this returns as soon as the count is right.
+    if (!clink::itest::await_condition(
+            [&] {
+                const auto r = http_get("127.0.0.1", c.coordinator_http_port, "/api/v1/workers");
+                if (r.status != 200) {
+                    return false;
+                }
+                std::size_t seen = 0;
+                for (std::size_t at = r.body.find("\"worker_id\""); at != std::string::npos;
+                     at = r.body.find("\"worker_id\"", at + 1)) {
+                    ++seen;
+                }
+                return seen >= static_cast<std::size_t>(n_workers);
+            },
+            std::chrono::seconds(20))) {
+        return std::nullopt;
+    }
     return c;
 }
 
@@ -287,8 +310,16 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
     EXPECT_NE(resp.body.find("\"ok\":true"), std::string::npos) << "submit body: " << resp.body;
     EXPECT_NE(resp.body.find("\"job_id\":1"), std::string::npos) << "submit body: " << resp.body;
 
-    // /api/v1/jobs should now list the submitted job.
-    std::this_thread::sleep_for(500ms);
+    // /api/v1/jobs should now list the submitted job. Wait for it to appear rather
+    // than sleeping 500ms and hoping: submission is acknowledged before the job is
+    // registered in the listing, so this is a real ordering gap, not slowness.
+    ASSERT_TRUE(clink::itest::await_condition(
+        [&] {
+            const auto probe = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs");
+            return probe.status == 200 && probe.body.find("\"id\":1") != std::string::npos;
+        },
+        std::chrono::seconds(20)))
+        << "the submitted job never appeared in /api/v1/jobs";
     const auto list = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs");
     EXPECT_EQ(list.status, 200);
     EXPECT_NE(list.body.find("\"id\":1"), std::string::npos) << "jobs list: " << list.body;

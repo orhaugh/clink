@@ -636,12 +636,12 @@ TEST(CoordinatorCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess)
                                          "--coordinator-port=" + std::to_string(coordinator_port)},
                                         node);
     ASSERT_GT(worker_pid, 0);
-    // Both workers REGISTERED, from the coordinator's own log. A worker process
+    // The single worker REGISTERED, from the coordinator's own log. A worker process
     // existing is not the same event as the coordinator having taken its
     // registration, and a submission that lands before the slots exist is refused
     // outright - which reads as a rescale defect rather than as a startup race.
-    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
-        << "the coordinator never registered both workers";
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 1))
+        << "the coordinator never registered the worker";
 
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),

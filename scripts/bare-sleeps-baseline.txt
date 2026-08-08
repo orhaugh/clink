@@ -11,15 +11,6 @@
 # cluster_harness.hpp. New tests should use the harness and add nothing here.
 #
 # count  path
-1      tests/integration/test_application_mode.cpp
-1      tests/integration/test_cluster_tls.cpp
 1      tests/integration/test_coordinator_ha_failover.cpp
-1      tests/integration/test_fault_recovery.cpp
-1      tests/integration/test_gateway_pipeline.cpp
-1      tests/integration/test_http_observability.cpp
-1      tests/integration/test_http_read_api.cpp
-2      tests/integration/test_http_submit.cpp
-1      tests/integration/test_multiprocess_cluster.cpp
 1      tests/integration/test_postgres_cdc.cpp
 1      tests/integration/test_postgres_pipeline.cpp
-2      tests/integration/test_sigterm_shutdown.cpp

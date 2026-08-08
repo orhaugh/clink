@@ -71,6 +71,17 @@ def is_poll_interval(lines, i):
     return False
 
 
+def is_comment(line):
+    """A line that is only a comment.
+
+    Needed because this file's own explanatory comments mention sleep_for, and so do
+    several tests' - test_fault_recovery.cpp's header describes the sleeps it does NOT
+    use, and was counted as having one. A detector that flags prose is a detector
+    people learn to work around by not writing the prose.
+    """
+    return line.lstrip().startswith(("//", "*", "/*", "#"))
+
+
 def bare_sleeps(path):
     """Count sleeps that are NOT the poll interval of a wait."""
     with open(path, errors="replace") as fh:
@@ -78,7 +89,7 @@ def bare_sleeps(path):
     return sum(
         1
         for i, line in enumerate(lines)
-        if "sleep_for" in line and not is_poll_interval(lines, i)
+        if "sleep_for" in line and not is_comment(line) and not is_poll_interval(lines, i)
     )
 
 

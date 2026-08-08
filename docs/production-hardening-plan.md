@@ -2475,6 +2475,24 @@ by its own test so the check cannot later be widened into it.
 `CLINK_ALLOW_MISSING_RESTORE_STATE=1` covers the one legitimate case: a stateful
 operator newly added to an existing job has no prior state and must still start.
 
+**Open question, recorded rather than assumed away.** Across most full-label runs the
+refusal fires ZERO times. In one heavily contended run - four concurrent build
+containers, load average 14 on a 12-core machine - it fired three times, alongside
+four worker-kill failures that all passed when re-run serially. So it is not firing on
+healthy recovery, but something under contention reaches it.
+
+The hypothesis worth testing first is a retention race: if checkpoint retention purges
+checkpoint N while a restore from N is in flight, the snapshot is genuinely gone and
+the refusal is correct - which would make this a real defect it has surfaced rather
+than a false positive in the check. The alternative, that there is a legitimate
+recovery case where a subtask has no snapshot for the named checkpoint, would mean the
+refusal is too strict and needs narrowing.
+
+Not resolved here. The capture attempt overwrote the log it was reading (ctest rewrites
+LastTest.log per invocation) and the reproduction did not recur on the next run. Left
+explicitly open rather than closed on the clean run, because a check that fires under
+load and not otherwise is exactly the kind that gets dismissed as flakiness.
+
 **Verification.** Three tests - the refusal fires, the override lets it through, and a
 scale-up with two absent parents is still accepted. The refusal was mutation-checked
 (removing it fails the first test and leaves the other two passing, so they are
@@ -2524,6 +2542,23 @@ same way. The shape is different - a drain marker is a one-way signal with no ac
 correct, so a failed send stalls a rescale drain rather than misreporting it - and
 there is no test that can currently observe the failure. Recorded rather than changed,
 because six untested logging edits is churn, not hardening.
+
+### F70. The bare-sleep detector counted its own prose
+
+Found while converting the last of the integration-test sleeps. `check-bare-sleeps.py`
+counted any line containing `sleep_for`, including comments - so
+`test_fault_recovery.cpp`, whose header comment describes the sleeps it deliberately
+does NOT use, was recorded as having one. Two files were carrying a baseline entry for
+a sentence.
+
+That is worse than a miscount. A detector that flags prose teaches people to stop
+writing the prose, and the explanatory comment is usually the most valuable part of a
+test that had to reason about timing.
+
+Fixed by skipping comment-only lines, and mutation-checked in both directions: with the
+fix, the comment stops being counted; with a genuine bare sleep injected into the same
+file, the count returns to 1. Checking only the first direction would have accepted a
+detector that had stopped counting anything.
 
 ## 3. Work items
 

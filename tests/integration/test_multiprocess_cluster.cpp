@@ -134,7 +134,14 @@ TEST(MultiprocessCluster, SubmitJobOverWireProducesExpectedOutput) {
         "--role=coordinator",
         "--port=" + std::to_string(coordinator_port),
     };
-    const pid_t coordinator_pid = spawn_node(coordinator_argv, binary);
+    // Capture the coordinator's log, so worker REGISTRATION is observable. Keyed by
+    // pid and port: ctest runs each test as its own process, so a fixed path would
+    // have concurrent tests counting each other's registrations.
+    const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                 ("clink_mpc_coordinator_" + std::to_string(::getpid()) + "_" +
+                                  std::to_string(coordinator_port) + ".log");
+    const pid_t coordinator_pid =
+        clink::itest::spawn_logged(coordinator_argv, binary, coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
         << "coordinator never accepted on its port";
@@ -158,13 +165,17 @@ TEST(MultiprocessCluster, SubmitJobOverWireProducesExpectedOutput) {
     const pid_t worker_b_pid = spawn_node(worker_b_argv, binary);
     ASSERT_GT(worker_a_pid, 0);
     ASSERT_GT(worker_b_pid, 0);
-    // Workers expose no port of their own here and the coordinator is
-    // started without an HTTP API, so registration has no observable to poll
-    // - this stays a duration. Raised from 300ms, which passed in isolation
-    // and lost when 109 multi-process tests ran back to back: the submission
-    // below is rejected outright if no slot has registered yet, and the test
+    // Both workers REGISTERED, from the coordinator's own log.
+    //
+    // The comment this replaces said registration had no observable to poll, and
+    // raised the sleep to 3s after 300ms lost in a full-label sweep. The coordinator
+    // logs a "slots=" line per registration, so the count is directly checkable and
+    // no duration has to be guessed at all. The failure it was chasing is real: the
+    // submission below is rejected outright if no slot has registered, and the test
     // then reports a wire-protocol failure that is really a startup race.
-    std::this_thread::sleep_for(3s);
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers; the submission below would "
+           "be refused for lack of slots and read as a wire-protocol failure";
 
     // 3. Submit the graph in-process via JobSubmitter and wait for completion.
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);

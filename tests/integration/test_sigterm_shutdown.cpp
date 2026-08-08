@@ -26,6 +26,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -165,8 +167,15 @@ TEST(SigtermShutdown, WorkerExitsCleanlyOnSIGTERM) {
     // worker exits with an error immediately and the test asserts nothing
     // useful about shutdown handling.
     const auto port = probe_free_port();
-    const pid_t coordinator_pid =
-        spawn_proc({"clink_node", "--role=coordinator", "--port=" + std::to_string(port)}, node);
+    // Capture the coordinator's log so the worker's REGISTRATION is observable.
+    // Keyed by pid and port: ctest runs each test in its own process.
+    const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                 ("clink_sigterm_coordinator_" + std::to_string(::getpid()) + "_" +
+                                  std::to_string(port) + ".log");
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(port)},
+        node,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     ASSERT_TRUE(await_port_accepting(port))
         << "coordinator never accepted, so the worker below has nothing to register against";
@@ -178,11 +187,16 @@ TEST(SigtermShutdown, WorkerExitsCleanlyOnSIGTERM) {
                                          "--coordinator-port=" + std::to_string(port)},
                                         node);
     ASSERT_GT(worker_pid, 0);
-    // The worker exposes no port to poll, so this one stays a duration - but
-    // a generous one, and the assertion below distinguishes the two failure
-    // modes anyway: signalled-too-early shows up as WIFSIGNALED, whereas a
-    // genuinely broken handler shows up as a timeout.
-    std::this_thread::sleep_for(1500ms);
+    // The worker has REGISTERED, from the coordinator's log. The worker exposes no
+    // port of its own, but the coordinator logs a "slots=" line per registration, so
+    // the event this test needs is directly observable rather than approximated.
+    //
+    // It matters here because the whole point is what SIGTERM does to a settled
+    // worker: signalling one still mid-registration exercises a different path, and
+    // that failure surfaces as WIFSIGNALED, which reads as a broken signal handler.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 1))
+        << "the worker never registered, so SIGTERM below would hit a worker that is "
+           "still starting rather than a settled one";
 
     ::kill(worker_pid, SIGTERM);
     const auto info = wait_for_exit(worker_pid, 5s);

@@ -228,7 +228,30 @@ std::optional<Cluster> start_cluster(int n_workers) {
         c.worker_ids.push_back(worker_id);
         c.worker_http_ports.push_back(http_port);
     }
-    std::this_thread::sleep_for(400ms);
+    // Wait for the coordinator to have REGISTERED every worker, rather than guessing
+    // at a settle time.
+    //
+    // A worker's own HTTP port accepting says its process is up; it says nothing
+    // about the coordinator having taken its registration, which is a separate
+    // exchange on the control port. /api/v1/workers is the coordinator's own view of
+    // who has registered, so it is the exact condition. The deadline is a failure
+    // bound - this returns as soon as the count is right.
+    if (!clink::itest::await_condition(
+            [&] {
+                const auto r = http_get("127.0.0.1", c.coordinator_http_port, "/api/v1/workers");
+                if (r.status != 200) {
+                    return false;
+                }
+                std::size_t seen = 0;
+                for (std::size_t at = r.body.find("\"worker_id\""); at != std::string::npos;
+                     at = r.body.find("\"worker_id\"", at + 1)) {
+                    ++seen;
+                }
+                return seen >= static_cast<std::size_t>(n_workers);
+            },
+            std::chrono::seconds(20))) {
+        return std::nullopt;
+    }
     return c;
 }
 

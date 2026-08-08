@@ -213,8 +213,17 @@ TEST(GatewayPipeline, ReassemblyJoinAndLivenessSideOutputCrossWire) {
         graph.ops.push_back(std::move(op));
     }
 
-    const pid_t coordinator_pid = spawn_node(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    // Capture the coordinator's log, so worker REGISTRATION is observable instead
+    // of being guessed at. Keyed by pid and port: ctest runs each test as its own
+    // process, so a fixed path would have concurrent tests counting each other's
+    // registrations.
+    const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                 ("clink_gateway_coordinator_" + std::to_string(::getpid()) + "_" +
+                                  std::to_string(coordinator_port) + ".log");
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        binary,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     // Was a 200ms guess at bind time, which lost in a full-label sweep on
     // Linux: the submission below then failed with "connect_to(...) failed"
@@ -235,10 +244,13 @@ TEST(GatewayPipeline, ReassemblyJoinAndLivenessSideOutputCrossWire) {
                                      binary));
         ASSERT_GT(workers.back(), 0);
     }
-    // Worker registration has no observable here (no HTTP API on the
-    // coordinator, no port on the workers), so this stays a duration -
-    // generous rather than a tight guess.
-    std::this_thread::sleep_for(3s);
+    // Wait for the coordinator to have REGISTERED every worker, from its own log.
+    // Spawning a worker process is a different event from the coordinator taking its
+    // registration, and a submission that arrives before the slots exist is refused
+    // outright - which reads as a submission or wire defect rather than the startup
+    // race it is.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 9))
+        << "the coordinator never registered all nine workers";
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
