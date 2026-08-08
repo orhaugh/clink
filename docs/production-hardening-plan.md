@@ -2534,6 +2534,26 @@ by its own test so the check cannot later be widened into it.
 `CLINK_ALLOW_MISSING_RESTORE_STATE=1` covers the one legitimate case: a stateful
 operator newly added to an existing job has no prior state and must still start.
 
+**Retention is ruled out, and so is a missing ack.** Two theories eliminated by reading
+the code rather than by argument:
+
+*Retention.* `CheckpointRetention::record_completed` only returns ids beyond the retained
+window, and the worker rebuilds its retention set from empty after a restart - so it
+never holds the id a job restored from and cannot purge it. `purge_checkpoint` is the
+only deleter in the tree.
+
+*A checkpoint completing without every participant.* The COMPLETED marker is written only
+under `all_subtasks_answered && !checkpoint_failed`, and a subtask acks success only when
+`backend->snapshot(id)` returned without throwing - which means its file was persisted. So
+COMPLETED does imply every participant wrote its snapshot.
+
+Those two together say the file existed when the checkpoint completed and nothing deletes
+it. The refusal firing therefore points at the restore looking in the wrong PLACE rather
+than at the file being absent - a subtask index or generation resolving differently
+between write and read, which is the F38/F63/F65 family and is exactly what generation
+namespacing and F75's participant scoping were aimed at. Whether a path remains is
+unresolved.
+
 **Open question, recorded rather than assumed away.** Across most full-label runs the
 refusal fires ZERO times. In one heavily contended run - four concurrent build
 containers, load average 14 on a 12-core machine - it fired three times, alongside
