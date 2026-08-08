@@ -2402,12 +2402,40 @@ mutation-checked (an offset recorded one behind trips the first on all 62 checkp
 a single duplicated delivery trips the second). Both pass, which exonerates the
 single-input local path for either failure shape.
 
-**What that leaves.** Two differences remain between the passing local case and the
-failing distributed one: the keyed shuffle to four subtasks over network channels, and
-the restart-and-restore pairing (the failing run had restarts before checkpoint 21, and
-a source resuming from one checkpoint while an operator restored state from another
-produces exactly this signature). The second is the stronger hypothesis, and it is the
-same family as F38 and F63 rather than something new.
+**The full cut, key by key.** The captured tree reads cleanly - v1 holds the six
+pre-rescale subtasks, v2 the three post-rescale ones, so generation namespacing is
+doing its job. At checkpoint 21, subtask 0 is the source (offset 41), subtasks 1-4 are
+the counters (three keys each, twelve keys total), subtask 5 is the sink.
+
+With 41 records emitted (indices 0-40) over 12 keys, keys 0-4 should hold 4 and keys
+5-11 should hold 3:
+
+| key | expected | actual | |
+|---|---|---|---|
+| 0, 1, 2, 3, 4 | 4 | 4 | correct |
+| 6, 7, 8, 9, 10, 11 | 3 | 3 | correct |
+| **5** | **3** | **4** | one too many |
+
+Eleven of twelve keys are exactly right. Key 5 holds one extra, and key 5's records are
+5, 17, 29 and **41** - the 42nd record, which the source does not consider emitted.
+This is a single misplaced record, not a systemic miscount.
+
+**Both snapshots are provably taken at the right instant.** The source writes its offset
+and emits the barrier back to back on its own thread, with `produce()` unable to run
+between them. The keyed operator captures its backend BEFORE processing the barrier, on
+both the synchronous and the async-persist paths (`capture()` then `op->process(barrier)`,
+never the reverse). Neither side can produce this on its own.
+
+Which leaves one explanation standing: **record-41 reached subtask 2 ahead of
+barrier 21**. In program order the source emitted the barrier first, so the two are
+reordered somewhere between the emitter and that subtask's input - the keyed shuffle
+and its channels, the one part of the path the in-process test does not cover.
+
+**What has been ruled out, so the next attempt does not redo it:** the source drain
+(atomic), the operator capture point (before the barrier, both paths), cross-generation
+overwrite (generations are live and correct here), and the whole single-input local path
+(tested, both shapes, mutation-checked). What remains is barrier-versus-record ordering
+in the keyed shuffle.
 
 This is deliberately left open rather than closed on a guess. What has been established
 is worth more than a speculative fix: the defect is a duplicate delivery, not a
