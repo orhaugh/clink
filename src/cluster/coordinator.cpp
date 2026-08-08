@@ -895,6 +895,7 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     worker->conn = std::move(conn);
     worker->last_seen = std::chrono::steady_clock::now();
     worker->slot_capacity = reg.slot_count == 0 ? std::uint32_t{1} : reg.slot_count;
+    worker->protocol_version = reg.protocol_version;
     worker->http_port = reg.http_port;
 
     // Install the registration and send RegisterAck under ONE mu_ hold, in
@@ -1180,6 +1181,7 @@ ClusterSnapshot Coordinator::snapshot_cluster() const {
         ts.slots_in_use = worker->slots_in_use;
         ts.lost = worker->lost;
         ts.http_port = worker->http_port;
+        ts.protocol_version = worker->protocol_version;
         if (!worker->lost) {
             s.total_slot_capacity += worker->slot_capacity;
             s.slots_in_use += worker->slots_in_use;

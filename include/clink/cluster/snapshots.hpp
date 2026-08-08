@@ -32,6 +32,10 @@ struct WorkerSummary {
     std::uint32_t slots_in_use{0};
     bool lost{false};
     std::uint16_t http_port{0};  // 0 = worker not exposing HTTP; non-zero for federation
+    // The cluster protocol version this worker registered with. 0 means a peer that
+    // predates the field. Surfaced so a mixed-version cluster is visible from the
+    // read API rather than only from the coordinator's logs.
+    std::uint32_t protocol_version{0};
 };
 
 // One submitted job. Keeps just the surface fields; full per-subtask

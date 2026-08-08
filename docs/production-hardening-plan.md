@@ -2342,6 +2342,55 @@ asserted the generation had ever changed. The check that would have caught it
 immediately is the one that reads the artefact: `ls` the checkpoint directory and see
 whether a `v2` exists at all.
 
+### F67. An aligned checkpoint captured one more record than the source had emitted
+
+The actual cause of follow-up 44, and it is not a rescale defect at all. F65 was
+real and is fixed, but it was the wrong suspect.
+
+**The evidence, read off a failing run's checkpoint tree with generations live.** At
+the restore point, checkpoint 21:
+
+| | |
+|---|---|
+| source's recorded offset | **41** (records 0 to 40 emitted) |
+| sum of the keyed counters | **42** |
+| key 5 specifically | 4, where the record index implies 3 |
+
+The counters had collectively counted one more record than the source said it had
+emitted. Checkpoint 21's cut was internally inconsistent **at the moment it was
+taken**. Nothing overwrote it - with generation namespacing in place, checkpoint 21
+existed only under `v1`, for all six pre-rescale subtasks, exactly as it should.
+
+On restore the source replays from 41, the operator counts record-41 a second time,
+and its self-check reports `got=4 want=3`. That is the whole reported symptom.
+
+**Why a rescale seemed to be involved.** It is not the rescale that corrupts
+anything - it is that a rescale forces a RESTORE from a completed checkpoint. A job
+that never restores never reads the inconsistent cut, so nobody notices. Every
+symptom appeared downstream of a rescale for that reason alone, which is what sent
+four rounds of investigation into the rescale path.
+
+**What is ruled out.** The source's barrier drain is atomic on the source thread -
+`snapshot_offset` then `emit_barrier`, adjacent, with `produce()` unable to run
+between them - so the offset and the barrier's position in the stream agree by
+construction. The operator captures state BEFORE processing the barrier. Both halves
+look right in isolation, which is why the off-by-one needs measuring rather than
+reasoning about: something between them admits one extra record into the cut.
+
+**Why this is worth more than the four defects before it.** F38, F59, F63 and F65 were
+all rescale-path defects, and all were found because a rescale made them visible.
+This one is in the checkpoint itself. Any job that restores - a worker loss, a
+coordinator failover, an explicit resume - reads a cut that may include a record its
+source will replay. That is an exactly-once hole on the ordinary recovery path, and
+the only reason it has shown up as "a rescale bug" is that the rescale tests are the
+ones that restore often enough to catch it.
+
+**Next step, and it is now narrow.** Instrument the counter's state and the source's
+offset at the same barrier, in-process, and find which of the two moves without the
+other. The `rescale.*` fault points added alongside this make the surrounding windows
+reachable on demand, but this needs the barrier path itself, not the rescale
+lifecycle.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

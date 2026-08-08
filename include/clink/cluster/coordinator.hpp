@@ -620,6 +620,11 @@ private:
     struct WorkerConnection {
         std::string worker_id;
         std::string data_host;
+        // The protocol version this peer registered with. Checked at register and
+        // then discarded, which left a mixed-version cluster diagnosable only by
+        // reading logs - the version that refused a peer was reported, the versions
+        // that were ACCEPTED were not. Retained so the read API can show them.
+        std::uint32_t protocol_version{0};
         // Transport. Owns the underlying fd (or TLS session). Reader
         // thread borrows; close() runs on watchdog teardown.
         std::unique_ptr<network::Connection> conn;

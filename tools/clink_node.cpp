@@ -306,6 +306,10 @@ void write_worker_summary(clink::http::JsonWriter& w, const clink::cluster::Work
     w.kv("slots_in_use", t.slots_in_use);
     w.kv("lost", t.lost);
     w.kv("http_port", t.http_port);
+    // The cluster protocol version this worker registered with. 0 is a peer that
+    // predates the field. Reported so a mixed-version cluster is visible here
+    // rather than only in the coordinator's logs, which is where it used to be.
+    w.kv("protocol_version", t.protocol_version);
     w.end_object();
 }
 
