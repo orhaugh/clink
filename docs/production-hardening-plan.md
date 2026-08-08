@@ -2305,6 +2305,43 @@ checkpoint side in a single run. Two more printed lines - who constructs a backe
 for which directory, and who writes which checkpoint id where - finished it. When a
 defect resists inference, instrument the write path.
 
+### F66. The generation fix was inert for three commits, and a correction to F65
+
+Recorded because the failure mode is more useful than the fix.
+
+`++job.state_generation` was never applied. The edit that added it was a multi-part
+script that threw partway through and only wrote its file at the end, so the
+coordinator changes were discarded silently; the two `deploy_msg.generation` lines
+were repaired separately afterwards, which made the wiring LOOK complete. The header
+field landed because it was written earlier in the same script.
+
+So for three commits every job wrote `v1/` and nothing else. The layout change was the
+flat layout with a prefix, and the tests that "verified" it passed for that reason -
+including the one named for the property, because it passes explicit generations and
+never exercised the coordinator at all.
+
+**Two consequences, both corrections to what was claimed:**
+
+1. F65's fix was not in effect when it was reported as fixed.
+2. With the bump applied, the scale-down case still fails with the original
+   `got=4 want=3` signature. **Generation namespacing does not fix follow-up 44.**
+   The cross-generation overwrite is real and is now prevented, but it was not the
+   cause of that defect, or not the only one.
+
+**What the check now shows.** With generations live, the consistency check reports
+generation 2 holding a snapshot for a checkpoint that completed in generation 1. That
+is unexplained. It is not corrupting - generation 1's own copy is untouched, which is
+exactly the property the change buys - but a subtask writing a file for a checkpoint id
+that belongs to another generation is a loose end, not a detail.
+
+**The lesson, which is not about state at all.** A build that succeeds is not evidence
+that an edit was applied. Three separate signals said this change was working - it
+compiled, its unit test passed, the integration suite passed - and none of them could
+distinguish "the generation is 2" from "the generation is always 1", because nothing
+asserted the generation had ever changed. The check that would have caught it
+immediately is the one that reads the artefact: `ls` the checkpoint directory and see
+whether a `v2` exists at all.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

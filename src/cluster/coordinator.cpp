@@ -3911,6 +3911,21 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     // also bumps - the placement might land on different workers.
     ++job.topology_version;
 
+    // The STATE generation bumps only for a rescale, because only a rescale moves
+    // the index -> operator mapping that state directories are addressed by. A plain
+    // restart redeploys the same shape, so its state is still where it was - using
+    // topology_version here instead sent a restarted job looking under a generation
+    // nothing had written, and it replayed from offset zero.
+    if (is_rescale || is_replan_rescale) {
+        job.state_generation_after_checkpoint = job.latest_completed_checkpoint_id;
+        ++job.state_generation;
+        // The new generation exists but has written nothing yet. Until its first
+        // checkpoint completes the job's restore point still names the PREVIOUS
+        // generation - the window F65 corrupted. A kill armed here reproduces it
+        // deliberately instead of waiting for a sweep to land in it.
+        CLINK_FAULT_POINT(clink::fault::points::kRescaleBeforeFirstCheckpoint);
+    }
+
     log::info(is_rescale ? "coordinator.rescale" : "coordinator.restart",
               "job_id=" + std::to_string(job.id) +
                   " attempt=" + std::to_string(job.restart_attempts) +
@@ -3938,6 +3953,10 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                                                                 : std::string{"?"}) +
                 "->" + std::to_string(new_p);
         }
+        // The replan has produced the new task set but nothing is deployed yet: the
+        // old topology is gone and the new one has not arrived. That is the window
+        // F63 lives in.
+        CLINK_FAULT_POINT(clink::fault::points::kRescaleAfterReplan);
         log::info(
             "coordinator.rescale",
             "replanned job_id=" + std::to_string(job.id) + " " + changed +
@@ -4255,6 +4274,9 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
         if (job.rescale_coordinator) {
             if (auto st = job.rescale_coordinator->status(msg.role);
                 st.has_value() && st->state == RescaleState::Draining) {
+                // An old subtask has finished draining. Between the last of these
+                // and the redeploy the job has no running topology.
+                CLINK_FAULT_POINT(clink::fault::points::kRescaleAfterDrain);
                 job.rescale_coordinator->mark_old_drained(msg.role, msg.subtask_idx);
                 was_drain = true;
                 if (auto post = job.rescale_coordinator->status(msg.role);

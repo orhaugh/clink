@@ -294,6 +294,23 @@ inline constexpr char kSinkAfterExternalCommit[] = "sink.after_external_commit";
 // State backend + restore.
 inline constexpr char kStateBeforeRestore[] = "state.before_restore";
 
+// ----- Rescale lifecycle -----
+//
+// A rescale is not one moment, it is a sequence: accept, drain the old subtasks,
+// replan at the new parallelism, redeploy from the last completed checkpoint, then
+// checkpoint again under the new topology. Three defects have lived in the gaps
+// between those steps - F63 (a restart before the first post-rescale checkpoint
+// restored by raw index), F65 (the new topology writing into the old one's state
+// directories) and follow-up 49's residual - and every one was found by a sweep
+// happening to land in the right window rather than by aiming at it.
+//
+// These points make the windows reachable on purpose. Arming one and killing there
+// turns "run it thirty times and hope" into a scenario that runs the same way every
+// time, which is the difference between a test and a coin flip.
+inline constexpr char kRescaleAfterDrain[] = "rescale.after_drain";
+inline constexpr char kRescaleAfterReplan[] = "rescale.after_replan";
+inline constexpr char kRescaleBeforeFirstCheckpoint[] = "rescale.before_first_checkpoint";
+
 // Every name here MUST have a CLINK_FAULT_POINT somewhere in include/ or src/.
 // `scripts/check-fault-points.sh` enforces that, and it is not a style rule.
 //
