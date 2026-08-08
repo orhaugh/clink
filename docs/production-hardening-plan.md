@@ -3033,11 +3033,20 @@ tests and by embedded single-job runs, and one at a time is fine.
 a flake and will cost somebody a day. The constraint is now written on
 `tests/test_keyed_shuffle_cut.cpp`, which is where they will be standing.
 
+**The mechanism, narrowed.** The registry is keyed by **host:port**, and two in-process
+Dags pick colliding endpoints - which is exactly why unique operator names did not help:
+the collision is on the endpoint key, not the `OperatorId`. A
+`LocalDataPlane::clear_for_testing()` was added and helps, but does not make repeats
+reliable, because the failure is a TEARDOWN RACE rather than a stale registration: the
+previous job's runners call `unregister_endpoint` during shutdown and erase a key the
+next job has already registered. Clearing at start cannot fix an unregister that arrives
+late.
+
 **What it cost here.** A saturated-channel variant of the shuffle cut test - forcing
 `emit_barrier` to block part-way through its broadcast, the one window that file does
 not exercise - could not be shipped. It is the most interesting remaining in-process
-condition for F67 and it needs either per-process test isolation or a scoped
-`LocalDataPlane`.
+condition for F67. Closing it needs endpoint keys scoped per Dag (so two Dags cannot
+collide at all), not just a reset hook.
 
 ## 3. Work items
 

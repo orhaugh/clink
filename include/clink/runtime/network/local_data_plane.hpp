@@ -92,6 +92,22 @@ public:
         }
     }
 
+    // Drop EVERY registration. For tests that build more than one in-process
+    // parallel Dag in a single process.
+    //
+    // The registry is keyed by host:port, and two in-process Dags pick colliding
+    // endpoints - so the second one's stages resolve to the FIRST one's channels and
+    // the two jobs cross-wire. That is why giving the operators unique names does not
+    // help: the collision is on the endpoint key, not on the OperatorId (F78).
+    //
+    // Not for production use. A worker process runs one Dag, and unregister_endpoint
+    // is the path for reclaiming a port on a fresh deploy; clearing the whole
+    // registry mid-job would strand every live channel.
+    void clear_for_testing() {
+        std::lock_guard lock(mu_);
+        entries_.clear();
+    }
+
     // Hit/miss counters so a silent regression of the fast path is visible
     // instead of merely slow. Incremented by NetworkChannelSink::connect.
     void note_local_hit() { local_hits_.fetch_add(1, std::memory_order_relaxed); }

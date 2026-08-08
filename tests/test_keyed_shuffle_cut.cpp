@@ -36,6 +36,7 @@
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/runtime/network/local_data_plane.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
 using namespace clink;
@@ -207,6 +208,12 @@ void run_shuffle_job(ShuffleLedger& ledger,
     // across every run in the process.
     static std::atomic<unsigned> run_seq{0};
     const std::string tag = label + "." + std::to_string(run_seq.fetch_add(1));
+    // Drop the previous run's endpoint registrations. The registry is keyed by
+    // host:port and two in-process Dags pick colliding endpoints, so without this the
+    // second job's stages resolve to the FIRST job's channels and the two cross-wire
+    // (F78). Unique operator names do not help - the collision is on the endpoint key,
+    // not the OperatorId, which is why that fix failed.
+    clink::network::LocalDataPlane::instance().clear_for_testing();
     auto backend = std::make_shared<InMemoryStateBackend>();
     CheckpointCoordinator::Config cfg;
     cfg.interval = 7ms;
@@ -318,28 +325,21 @@ TEST(KeyedShuffleCut, TheCutHoldsAcrossAKeyedShuffleAtParallelismFour) {
     assert_cut_holds(ledger, "unthrottled");
 }
 
-// LIMITATION, and it is the engine's, not this test's: exactly ONE parallel Dag may
-// run per process.
+// LIMITATION - the engine's, not this test's: one parallel in-process Dag per process.
 //
-// A second in-process parallel Dag cross-wires with the first through the global
-// LocalDataPlane endpoint registry that parallel stages register into. Observed three
-// ways: a second test failed only when it ran after this one; giving each run unique
-// operator names did not help (so it is not the OperatorId derivation); and this test
-// alone fails under --gtest_repeat, where the same job is built twice in one process.
+// clear_for_testing() above helps but does NOT make repeats reliable: some
+// --gtest_repeat invocations still fail. The cause is a teardown race rather than a
+// stale registration, which is why clearing at start cannot fix it - the previous
+// job's runners call unregister_endpoint during shutdown, the registry is keyed by
+// host:port, and they erase a key the NEXT job has already registered.
 //
-// It passes in the suite because it runs once there, which is also how the cluster
-// uses the API - one Dag per worker process. Recorded here so nobody adds a second
-// parallel-Dag test to this binary and spends a day on the resulting "flake".
+// So the guarantee is narrow and worth stating exactly: this test is sound run ONCE,
+// which is how the suite runs it and how the cluster uses the API (one Dag per worker
+// process). It is not safe under --gtest_repeat, and a second parallel-Dag test in
+// this binary is not safe either.
 //
-// NOT ADDED: a saturated-channel variant.
-//
-// A second run in the same process cross-wires with the first through the
-// process-global LocalDataPlane endpoint registry, which in-process parallel Dags
-// register into. Two symptoms, both observed here: with shared operator names the
-// first test failed only when a second ran after it, and with per-run unique names it
-// still failed under --gtest_repeat. Unique naming is not sufficient, so the sharing is
-// not (only) the OperatorId derivation.
-//
-// A backpressure variant is worth having - a barrier broadcast that blocks part-way is
-// the one window this file does not exercise - but not at the cost of a test that fails
-// depending on what ran before it. Recorded in the plan rather than shipped flaky.
+// A saturated-channel variant is therefore not shipped here. It is the most
+// interesting remaining in-process window for F67 - forcing emit_barrier to block
+// part-way through its broadcast, with the source offset already recorded and only
+// some subtasks holding the barrier - and it needs either per-process test isolation
+// or endpoint keys scoped per Dag. See F78.
