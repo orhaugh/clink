@@ -2413,6 +2413,47 @@ This is deliberately left open rather than closed on a guess. What has been esta
 is worth more than a speculative fix: the defect is a duplicate delivery, not a
 mistimed checkpoint, and the local path is not where it happens.
 
+### F68. A restore whose own snapshot was missing came up with empty state and said nothing
+
+Found while investigating F67, in the same restore path, and it is the more clearly
+actionable of the two.
+
+`state_backend_factory` reads each assigned parent snapshot with absence treated as
+non-fatal, then does the restore only `if (!parts.empty())`. On the RESCALE path that
+tolerance is correct: a new subtask is assigned a contiguous range of parent indices
+and not every one necessarily has a snapshot.
+
+On the **same-subtask** path it is not. The coordinator only ever names a checkpoint
+it marked COMPLETED, and COMPLETED means every participant acknowledged it, so the
+file is supposed to be there. `snapshot()` is unconditional - `persist(capture(id))` -
+so even a subtask holding no state writes one. An absent file is not "this operator
+had nothing to save"; it means the checkpoint directory is not what the coordinator
+believes it to be.
+
+**What happened instead.** `parts` stayed empty, the restore was skipped, and the
+subtask came up holding NOTHING while its peers restored fully. A keyed counter
+silently resets to zero; a source replays from offset zero. No error, no warning, no
+metric. The job resumes looking healthy with one operator's state gone.
+
+This is silent state loss on the ordinary recovery path - worker loss, coordinator
+failover, plain resume - and it is the same shape as the quiet fallback that let F59
+survive unnoticed: a recovery path that degrades instead of refusing hides a storage
+problem for as long as nobody reconciles the output.
+
+**The fix.** A non-rescale restore whose own snapshot is absent refuses, naming the
+path, the checkpoint id and the override. The rescale path keeps its tolerance, pinned
+by its own test so the check cannot later be widened into it.
+
+`CLINK_ALLOW_MISSING_RESTORE_STATE=1` covers the one legitimate case: a stateful
+operator newly added to an existing job has no prior state and must still start.
+
+**Verification.** Three tests - the refusal fires, the override lets it through, and a
+scale-up with two absent parents is still accepted. The refusal was mutation-checked
+(removing it fails the first test and leaves the other two passing, so they are
+pinning the tolerance rather than the refusal). Core suite 1997 passed. The full Linux
+integration label ran 123 tests with the refusal live and the message appears zero
+times, so no legitimate restore in the suite trips it.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

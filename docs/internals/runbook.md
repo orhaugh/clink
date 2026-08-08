@@ -211,6 +211,35 @@ recognising: if state appears in the wrong subtask, suspect index reuse.
 
 ---
 
+## A job refuses to start with "refusing to restore subtask N with empty state"
+
+Not an alert - a hard refusal at deploy. The coordinator named a completed checkpoint
+to restore from, and that subtask's snapshot file is not in the checkpoint directory.
+
+**This is the engine declining to lose your state quietly.** It used to bring the
+subtask up holding nothing while its peers restored fully, which resumes a job that
+looks healthy with one operator's state gone.
+
+**Look at:** the path in the message, and `clink checkpoint-verify` over the
+checkpoint directory. A completed checkpoint should have a snapshot for every
+participant, and the COMPLETED marker records which subtasks those were.
+
+**Likely causes, in order:**
+
+1. **The directory was pruned by hand.** Deleting snapshot files to reclaim disk is
+   the usual way one goes missing. Drop whole checkpoints oldest first instead, and
+   see `ClinkDiskFillingWhereStateLives`.
+2. **Storage lost it.** A volume that was remounted, restored from a backup taken
+   mid-checkpoint, or is silently dropping writes.
+3. **The operator is genuinely new.** A stateful operator added to an existing job has
+   no prior state. That case is legitimate and is what
+   `CLINK_ALLOW_MISSING_RESTORE_STATE=1` is for.
+
+**Do not set the override to make a restore start.** It converts the refusal back into
+silent state loss for every subtask, not just the new one. Confirm which subtask is
+missing and why first; if the answer is not case 3, the checkpoint is not safe to
+restore from and an older complete one is the better recovery point.
+
 ## ClinkSubtaskFailures
 
 Subtasks are failing on a worker. The job restarts if it has budget; if not, it

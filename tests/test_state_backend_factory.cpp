@@ -742,3 +742,86 @@ TEST(StateGenerations, ANewGenerationCannotOverwriteTheOneItRestoredFrom) {
 
     std::filesystem::remove_all(base);
 }
+
+// A same-subtask restore whose own snapshot is absent must REFUSE, not come up
+// empty.
+//
+// The coordinator only names a checkpoint it marked COMPLETED, and COMPLETED
+// means every participant acknowledged it, so the file is supposed to be there.
+// snapshot() is unconditional - persist(capture(id)) - so even a subtask holding
+// no state writes one; an absent file is not "this operator had nothing to save".
+//
+// The old behaviour read no parts, skipped the restore, and brought the subtask up
+// with EMPTY state while its peers restored fully. A keyed counter silently resets
+// to zero and a source replays from offset zero, and nothing is reported. That is
+// silent state loss on the ordinary recovery path.
+TEST(StateBackendFactory, ASameSubtaskRestoreRefusesWhenItsOwnSnapshotIsAbsent) {
+    const auto base = make_temp_dir("missing_own_snapshot");
+    const std::uint64_t ckpt_id = 7;
+    const clink::OperatorId op{1};
+
+    // Subtask 0 published its snapshot for this checkpoint; subtask 1 did not.
+    {
+        clink::InMemoryStateBackend backend;
+        backend.put(
+            op, clink::StateBackend::KeyView{"peer_key"}, clink::StateBackend::ValueView{"PEER"});
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(base, 0) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
+    }
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 1;  // no snapshot was ever written here
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    // Not a rescale: the sentinel leaves src_first == subtask_idx.
+
+    EXPECT_THROW(
+        { (void)clink::StateBackendFactory::default_instance().build(spec); }, std::runtime_error)
+        << "a subtask whose own snapshot is missing came up with empty state instead of "
+           "refusing. Its peers restore fully, so the job resumes with one operator's state "
+           "silently gone.";
+}
+
+// The escape hatch, for the one legitimate case: a stateful operator newly added
+// to an existing job has no prior state and must still be able to start.
+TEST(StateBackendFactory, AMissingOwnSnapshotIsAllowedWhenExplicitlyOptedInto) {
+    const auto base = make_temp_dir("missing_own_snapshot_optin");
+    const std::uint64_t ckpt_id = 7;
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 1;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+
+    ::setenv("CLINK_ALLOW_MISSING_RESTORE_STATE", "1", 1);
+    clink::BuiltStateBackend built;
+    EXPECT_NO_THROW({ built = clink::StateBackendFactory::default_instance().build(spec); });
+    ::unsetenv("CLINK_ALLOW_MISSING_RESTORE_STATE");
+    EXPECT_NE(built.backend, nullptr);
+}
+
+// A RESCALE restore must keep tolerating an absent parent: a new subtask is
+// assigned a contiguous range of parent indices and not every one necessarily has
+// a snapshot. Pinned so the check above cannot be widened into the rescale path,
+// where it would refuse a legitimate scale-up.
+TEST(StateBackendFactory, ARescaleRestoreStillToleratesAnAbsentParent) {
+    const auto base = make_temp_dir("rescale_absent_parent");
+    const std::uint64_t ckpt_id = 9;
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 3;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    spec.restore_from_subtask_idx = 1;  // a rescale: parents 1..2, neither present
+    spec.restore_from_parent_count = 2;
+
+    clink::BuiltStateBackend built;
+    EXPECT_NO_THROW({ built = clink::StateBackendFactory::default_instance().build(spec); })
+        << "a scale-up refused a parent index that legitimately has no snapshot.";
+    EXPECT_NE(built.backend, nullptr);
+}

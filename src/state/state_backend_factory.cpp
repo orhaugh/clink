@@ -265,6 +265,42 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             }
         }
 
+        // A NON-rescale restore whose own snapshot is absent must not proceed.
+        //
+        // The read above treats an absent file as non-fatal, which is right for a
+        // rescale: a new subtask is assigned a range of parent indices and not
+        // every one of them necessarily has a snapshot. On the same-subtask path
+        // it is not right. The coordinator only ever names a checkpoint it marked
+        // COMPLETED, and COMPLETED means every participant acknowledged it - so
+        // the file is supposed to be there. snapshot() is unconditional
+        // (persist(capture(id))), so even a subtask holding no state writes one;
+        // absence is not "this operator had nothing to save".
+        //
+        // What the old behaviour did with it: `parts` stayed empty, the restore
+        // below was skipped, and the subtask came up with EMPTY state while its
+        // peers restored fully. A keyed counter silently resets to zero and a
+        // source replays from offset zero, and the job reports nothing at all.
+        // That is silent state loss on the ordinary recovery path - worker loss,
+        // coordinator failover, plain resume - and it is exactly the class of
+        // defect where a quiet fallback hides a storage problem for weeks.
+        //
+        // The escape hatch is for a genuinely new stateful operator added to an
+        // existing job, which legitimately has no prior state to restore.
+        if (!is_rescale && parts.empty() && !clink::state::allow_missing_restore_state()) {
+            const auto missing = std::filesystem::path{state_dir_for(
+                                     restore_path, spec.restore_generation, src_first)} /
+                                 ckpt_name;
+            throw std::runtime_error(
+                "refusing to restore subtask " + std::to_string(spec.subtask_idx) +
+                " with empty state: checkpoint " + std::to_string(spec.restore_checkpoint_id) +
+                " named it as a participant but " + missing.string() +
+                " is absent. Continuing would bring this subtask up holding nothing while its "
+                "peers restore fully, which loses its state silently. Check whether the "
+                "checkpoint directory is complete (clink checkpoint-verify). If this operator "
+                "is genuinely new and has no prior state, set "
+                "CLINK_ALLOW_MISSING_RESTORE_STATE=1.");
+        }
+
         // On rescale, OPERATOR state (source offsets, broadcast slots) is
         // broadcast, not partitioned: every new subtask must see all parents'
         // operator rows, then narrow at the source (Kafka's apply-once

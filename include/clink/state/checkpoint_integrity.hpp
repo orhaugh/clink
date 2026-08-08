@@ -300,6 +300,20 @@ inline void write_checkpoint_meta(const std::filesystem::path& payload_path,
            *p != '\0';
 }
 
+// Opt out of the "a named checkpoint's own snapshot must exist" check on the
+// same-subtask restore path.
+//
+// The one legitimate case: a stateful operator added to an existing job, which
+// has no prior state to restore and would otherwise be refused. Everything else
+// that reaches it - a partially deleted checkpoint directory, a hand-pruned
+// snapshot, a storage layer that lost a file - is a real problem, and coming up
+// with empty state instead of saying so loses that subtask's state silently.
+[[nodiscard]] inline bool allow_missing_restore_state() {
+    const char* p = std::getenv("CLINK_ALLOW_MISSING_RESTORE_STATE");
+    return p != nullptr && std::string_view(p) != "0" && std::string_view(p) != "false" &&
+           *p != '\0';
+}
+
 // True when `verdict` is the specific "legacy directory, no sidecar" case
 // AND the operator has opted into tolerating it.
 [[nodiscard]] inline bool unverified_checkpoints_allowed(const VerifyResult& verdict) {
