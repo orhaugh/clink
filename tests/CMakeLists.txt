@@ -419,9 +419,28 @@ if(CLINK_INTEGRATION_TESTS)
         clink_rescale_test_job
         clink_schema_evo_test_job)
     clink_set_warnings(clink_integration_tests)
+    # RESOURCE_LOCK on the whole integration binary, so ctest runs its cases one at a
+    # time while every OTHER label still runs in parallel.
+    #
+    # These cases spawn a coordinator, two or three workers and a submitter, then kill
+    # workers and wait for a real recovery. Four at once under `-j4` oversubscribes a
+    # 12-core machine several times over, and the symptom is a DIFFERENT one or two
+    # failing per run - the rotating "flakes" that cost this workstream a day of
+    # misattribution before the cause was pinned to load. Every one of them passes
+    # serially.
+    #
+    # This is a resource declaration, not a weakened test: no timeout is raised, no
+    # retry is added, nothing is marked advisory. It states what these tests need in
+    # order to run at all.
+    #
+    # Applied to the whole binary rather than the ~12 heavy cases because
+    # DISCOVERY_MODE PRE_TEST registers test names at TEST time, so
+    # set_tests_properties cannot see them at configure time. Narrowing it would mean
+    # moving to POST_BUILD discovery, which is a larger change than this is worth.
     gtest_discover_tests(clink_integration_tests
         DISCOVERY_MODE PRE_TEST
-        PROPERTIES TIMEOUT 120 LABELS integration)
+        PROPERTIES TIMEOUT 120 LABELS integration
+                   RESOURCE_LOCK clink_multiprocess_cluster)
 
     # Failover + cold-start benchmark. A standalone (non-gtest) driver that
     # spawns real clink_node coordinator/worker processes, times the cold-start path and

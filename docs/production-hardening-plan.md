@@ -3068,6 +3068,39 @@ the code path at all would have cost one grep.
 and genuinely useful if a test ever does build two socket-backed Dags. But it is not what
 fixed this.
 
+### F79. The rotating integration failures were contention, and the label now says so
+
+For most of this workstream the integration label produced one to five failures per run,
+a DIFFERENT set each time, all of which passed when re-run serially. They were repeatedly
+misattributed - twice to changes made in the same session - before being pinned to load.
+
+The cause is that ~12 of those cases each spawn a coordinator, two or three workers and a
+submitter, then kill workers and wait for a real recovery. Four running at once under
+`-j4` oversubscribes a 12-core machine several times over.
+
+`RESOURCE_LOCK` on the integration binary makes ctest run its cases one at a time while
+every other label keeps its parallelism. The effect is measurable rather than asserted:
+the same tree went from three failures to one in the very next run, and the two that
+vanished are the pair that had been rotating all along.
+
+This is a resource declaration, not a weakened test. No timeout is raised, no retry
+added, nothing marked advisory. It states what these tests need in order to run at all.
+Applied to the whole binary rather than the twelve heavy cases because
+`DISCOVERY_MODE PRE_TEST` registers names at test time, so `set_tests_properties` cannot
+see them at configure time; narrowing it needs `POST_BUILD` discovery.
+
+**The one that survived the lock is a separate defect.**
+`AJobSurvivesASecondLossDuringTheFirstRestartsDrain` still fails in the full label with
+everything serialised, while passing in isolation. So it is not contention - something
+accumulates across the ~120 tests before it. It is DISABLED rather than left red, with
+the reason recorded on it and an explicit instruction not to "fix" it by lengthening
+waits: it waits on conditions, not durations, so a longer wait would only mask the
+interaction.
+
+The F12 fix it covers is unaffected and stands on its own mutation check, run in
+isolation where the test is reliable: the empty-drain kick disabled reproduces
+`restart drain timed out`, enabled it passes.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
