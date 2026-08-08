@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -12,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/state/changelog_state_backend.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/durable_file_write.hpp"
@@ -35,6 +38,69 @@ std::pair<std::string, std::string> split_uri(const std::string& uri) {
         return {{}, uri};
     }
     return {uri.substr(0, pos), uri.substr(pos + sep.size())};
+}
+
+// The subtask indices a checkpoint's COMPLETED marker records as participants.
+//
+// Returns nullopt when no single marker can be identified - no _jobs directory, no
+// marker for this id, several jobs sharing the checkpoint root, or a marker with no
+// subtasks= line. The caller then falls back to directory listing and says so, rather
+// than treating "unknown" as "nobody participated" and restoring nothing.
+[[nodiscard]] std::optional<std::set<std::uint32_t>> completed_participants(
+    const std::string& restore_path, std::uint64_t checkpoint_id) {
+    const std::filesystem::path jobs_dir = std::filesystem::path{restore_path} / "_jobs";
+    std::error_code ec;
+    std::vector<std::filesystem::path> markers;
+    for (const auto& entry : std::filesystem::directory_iterator(jobs_dir, ec)) {
+        if (ec) {
+            return std::nullopt;
+        }
+        if (!entry.is_directory(ec)) {
+            continue;
+        }
+        auto candidate = entry.path() / ("COMPLETED-" + std::to_string(checkpoint_id));
+        if (std::filesystem::exists(candidate, ec)) {
+            markers.push_back(std::move(candidate));
+        }
+    }
+    // Exactly one, or the answer is ambiguous and guessing would be worse than
+    // falling back.
+    if (markers.size() != 1) {
+        return std::nullopt;
+    }
+    std::ifstream in(markers.front());
+    if (!in) {
+        return std::nullopt;
+    }
+    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    constexpr std::string_view kKey = "subtasks=";
+    const auto at = body.find(kKey);
+    if (at == std::string::npos) {
+        return std::nullopt;  // a marker predating the participant set
+    }
+    auto line = body.substr(at + kKey.size());
+    if (const auto nl = line.find('\n'); nl != std::string::npos) {
+        line = line.substr(0, nl);
+    }
+    std::set<std::uint32_t> out;
+    std::size_t start = 0;
+    while (start <= line.size()) {
+        const auto comma = line.find(',', start);
+        const auto piece =
+            line.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (!piece.empty()) {
+            try {
+                out.insert(static_cast<std::uint32_t>(std::stoul(piece)));
+            } catch (const std::exception&) {
+                return std::nullopt;  // malformed; do not half-trust it
+            }
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return out;
 }
 
 BuiltStateBackend build_memory(const StateBackendSpec& /*spec*/) {
@@ -345,6 +411,8 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
         // and union operator rows from topologies this restore has nothing to do
         // with.
         if (is_rescale) {
+            const auto participants =
+                completed_participants(restore_path, spec.restore_checkpoint_id);
             std::error_code dec;
             const std::filesystem::path restore_gen_dir =
                 std::filesystem::path{restore_path} /
@@ -370,6 +438,30 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                 }
                 if (pidx >= src_first && pidx < src_first + parent_count) {
                     continue;  // an assigned parent: already a full part above
+                }
+                // Skip a directory that this checkpoint's participant set does not
+                // name (follow-up 49).
+                //
+                // Parents were discovered purely by LISTING numeric subdirs of the
+                // restore generation, so a directory left behind by a topology that
+                // never participated in this checkpoint was read like any other and
+                // its operator rows - source offsets, broadcast slots - unioned into
+                // every restoring subtask. That is the question follow-up 49 left
+                // open: whether such a leftover can be READ as though it belonged.
+                // It could.
+                //
+                // The COMPLETED marker already records exactly who participated, so
+                // the answer is to consult it rather than to trust the directory
+                // listing. When it cannot be identified the listing still stands, and
+                // the log says so - "unknown" must not silently become "nobody".
+                if (participants.has_value() && participants->count(pidx) == 0) {
+                    clink::log::warn(
+                        "state.restore",
+                        "ignoring " + entry.path().string() + ": checkpoint " +
+                            std::to_string(spec.restore_checkpoint_id) +
+                            " did not record subtask " + std::to_string(pidx) +
+                            " as a participant, so its state belongs to another topology");
+                    continue;
                 }
                 auto b = read_file(entry.path() / ckpt_name);
                 if (!b.empty()) {

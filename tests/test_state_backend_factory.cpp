@@ -930,3 +930,116 @@ TEST(StateBackendFactory, ACorruptRestoreSaysWhenThereIsNoOlderFallback) {
             << msg;
     }
 }
+
+// A leftover snapshot from a topology that never participated must NOT be read.
+//
+// This is the question follow-up 49 left open: parents were discovered purely by
+// LISTING numeric subdirs of the restore generation, so a directory written by a
+// later topology into a generation it was never part of was read like any other and
+// its operator rows - source offsets, broadcast slots - unioned into every restoring
+// subtask. The answer is that it could be read, so the participant set the COMPLETED
+// marker already records is now consulted instead of trusting the listing.
+TEST(StateBackendFactory, ARestoreIgnoresASubtaskTheCheckpointNeverNamed) {
+    const auto base = make_temp_dir("participants_scope");
+    const std::uint64_t ckpt_id = 18;
+    const clink::OperatorId op{1};
+
+    const auto publish_at = [&](std::uint32_t idx, const std::string& key, const std::string& val) {
+        clink::InMemoryStateBackend backend;
+        // OPERATOR state, not keyed: the other-parents union extracts operator rows
+        // only (extract_operator_state_bytes), so a keyed put would not exercise the
+        // path at all - and a test that writes the wrong kind of state passes whatever
+        // the code does.
+        backend.put_operator_state(
+            op, clink::StateBackend::KeyView{key}, clink::StateBackend::ValueView{val});
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(base, idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
+    };
+    // Generation 1 is source=0, counter=1, sink=2 - and a stray directory 4 that a
+    // later topology left behind, exactly as the follow-up observed.
+    publish_at(0, "src_offset", "LEGITIMATE");
+    publish_at(1, "counter", "LEGITIMATE");
+    publish_at(2, "sink_handle", "LEGITIMATE");
+    // The stray uses a key NO legitimate parent has. Reusing src_offset would make
+    // the test vacuous: the assigned parent's row wins the merge whether or not the
+    // stray was read, so it passed with the participant filter disabled. A key only
+    // the stray owns is present exactly when the stray was read.
+    publish_at(4, "stray_row", "FROM_ANOTHER_TOPOLOGY");
+
+    // The COMPLETED marker names who actually participated.
+    const auto jobs_dir = base / "_jobs" / "1";
+    std::filesystem::create_directories(jobs_dir);
+    {
+        std::ofstream m(jobs_dir / ("COMPLETED-" + std::to_string(ckpt_id)));
+        m << "job=1\ncheckpoint=" << ckpt_id << "\ngeneration=1\nsubtasks=0,1,2\n";
+    }
+
+    // A rescale restore, which is the path that unions other parents' operator rows.
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 0;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    spec.restore_from_subtask_idx = 0;
+    spec.restore_from_parent_count = 1;
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    ASSERT_NE(built.backend, nullptr);
+    ASSERT_TRUE(built.restore_from.has_value()) << "the restore produced nothing at all";
+    built.backend->restore(*built.restore_from);
+
+    // The legitimate parent is still there.
+    const auto kept =
+        built.backend->get_operator_state(op, clink::StateBackend::KeyView{"src_offset"});
+    ASSERT_TRUE(kept.has_value()) << "the legitimate parent's operator row was lost";
+
+    // And the stray is not.
+    const auto stray =
+        built.backend->get_operator_state(op, clink::StateBackend::KeyView{"stray_row"});
+    EXPECT_FALSE(stray.has_value())
+        << "a snapshot from subtask 4 - which checkpoint " << ckpt_id
+        << " never recorded as a participant - was read into the restore. Its operator "
+           "rows belong to a different topology.";
+}
+
+// When no participant set can be identified the listing must still stand.
+//
+// "Unknown" must not become "nobody": a checkpoint directory without markers, or one
+// shared by several jobs, would otherwise restore nothing at all - turning a missing
+// piece of metadata into total state loss.
+TEST(StateBackendFactory, ARestoreFallsBackToListingWhenNoMarkerIdentifiesParticipants) {
+    const auto base = make_temp_dir("participants_absent");
+    const std::uint64_t ckpt_id = 18;
+    const clink::OperatorId op{1};
+
+    clink::InMemoryStateBackend backend;
+    backend.put(op,
+                clink::StateBackend::KeyView{"src_offset"},
+                clink::StateBackend::ValueView{"LEGITIMATE"});
+    auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+    publish_snapshot(gen_dir(base, 0) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                     snap.bytes,
+                     ckpt_id);
+    // No _jobs/ directory at all.
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 0;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    spec.restore_from_subtask_idx = 0;
+    spec.restore_from_parent_count = 1;
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    ASSERT_NE(built.backend, nullptr);
+    ASSERT_TRUE(built.restore_from.has_value()) << "the restore produced nothing at all";
+    built.backend->restore(*built.restore_from);
+
+    const auto v =
+        built.backend->get_operator_state(op, clink::StateBackend::KeyView{"src_offset"});
+    ASSERT_TRUE(v.has_value())
+        << "with no marker to consult, the restore read nothing - an absent participant "
+           "set became 'nobody participated' rather than 'fall back to the listing'";
+    const std::string got(reinterpret_cast<const char*>(v->data()), v->size());
+    EXPECT_EQ(got, "LEGITIMATE");
+}

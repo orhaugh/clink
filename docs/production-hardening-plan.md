@@ -2756,6 +2756,48 @@ leaves the second passing, so the second is pinning the narrowness rather than t
 Core suite 2004 passed, including the pre-existing two-plain-sink chain test, which the
 capability check leaves alone.
 
+### F75. A restore read state from subtasks the checkpoint never named
+
+Answers the question follow-up 49 left open, and the answer was the bad one.
+
+Item 49 found a snapshot at `v1/4` for a checkpoint whose COMPLETED marker recorded
+`subtasks=0,1,2`. The deciding question was written down as: can such a leftover ever be
+READ as though it belonged? It could.
+
+On the rescale path, `state_backend_factory` discovers "other parents" - the subtasks
+whose OPERATOR state (source offsets, broadcast slots) is broadcast rather than
+partitioned - by **listing the numeric subdirectories** of the restore generation. A
+directory written by a topology that never participated in that checkpoint is
+indistinguishable from a real parent under that rule, so its operator rows were unioned
+into every restoring subtask.
+
+The COMPLETED marker already records exactly who participated. The loop now consults it
+and skips any directory the checkpoint did not name, logging what it ignored and why.
+
+**"Unknown" must not become "nobody".** When no single marker can be identified - no
+`_jobs` directory, no marker for that id, several jobs sharing the checkpoint root, or a
+marker predating the participant set - the directory listing still stands. Treating an
+absent participant set as an empty one would turn a missing piece of metadata into total
+state loss, which is a far worse failure than the one being fixed. Pinned by its own
+test.
+
+**Two vacuous versions of the test, both caught by mutation.** Worth recording because
+each looked correct:
+
+1. The stray subtask wrote the SAME key as a legitimate parent. The legitimate row wins
+   the merge whether or not the stray is read, so the test passed with the filter
+   disabled. Fixed by giving the stray a key no legitimate parent has - present exactly
+   when the stray was read.
+2. Both wrote KEYED state via `put`, but the union extracts operator rows only
+   (`extract_operator_state_bytes`). The test never exercised the path at all. Fixed by
+   writing through `put_operator_state`.
+
+Only after both were fixed did disabling the filter fail the test - which is the point
+of mutation-checking rather than trusting a green run.
+
+**Verification.** Two tests, mutation-checked in the form above, restore confirmed by
+diff. Core suite 2006 passed.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
