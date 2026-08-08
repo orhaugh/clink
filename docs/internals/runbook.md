@@ -45,6 +45,12 @@ names the subtasks that could not snapshot.
 2. **A subtask is wedged, not failing.** No FAILED line at all, just silence. The
    barrier has not reached it. Check `clink_operator_input_queue_depth` for a
    backpressured operator upstream of the quiet one.
+
+   One cause of this used to be invisible: a source whose barrier could not be sent
+   acked the checkpoint as successful anyway, so the component that knew the send had
+   failed reported success and the checkpoint simply stopped. That now fails fast with
+   `source could not deliver the barrier to every downstream channel` (F69). Silence
+   with no such line means the barrier did leave the source.
 3. **The interval is longer than you think.** `--checkpoint-interval-ms` is per job.
    A job configured at 600000 will trip a 300s alert permanently and correctly.
 

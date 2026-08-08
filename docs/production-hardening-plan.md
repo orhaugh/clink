@@ -2482,6 +2482,36 @@ pinning the tolerance rather than the refusal). Core suite 1997 passed. The full
 integration label ran 123 tests with the refusal live and the message appears zero
 times, so no legitimate restore in the suite trips it.
 
+### F69. A source acked a checkpoint as successful for a barrier it had failed to send
+
+Found while tracing F67 through the shuffle. Independent of it, and simpler.
+
+The source's barrier drain emitted the barrier and then acked:
+
+```
+emitter.emit_barrier(*b);
+if (*ack_ref) {
+    (*ack_ref)(b->id(), true, std::string{});   // <- always true
+}
+```
+
+`emit_barrier` returns a bool. It is false when a downstream channel is closed, and
+false when a remote push fails - `BoundedChannel::push` blocks while full and returns
+false once closed, and `push_remote_` returns false on a socket error. The return value
+was discarded and the ack hardcoded to success.
+
+**What that costs is diagnosability, not correctness.** The downstream subtask that
+never received the barrier never acks either, so the checkpoint does not complete - it
+is not that a bad checkpoint is marked good. But it stops with no failure line naming a
+cause, because the one component that knew the send had failed reported success. That
+is exactly the runbook's "a subtask is wedged, not failing - no FAILED line at all,
+just silence", and the information needed to diagnose it was available at the point of
+failure and thrown away.
+
+**The fix** acks the actual result, with a message naming the condition. A checkpoint
+that cannot be started now fails fast and says why, instead of hanging until somebody
+notices the recovery point has stopped advancing.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
