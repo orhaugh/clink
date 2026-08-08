@@ -20,7 +20,6 @@
 1      tests/integration/test_http_federation.cpp
 1      tests/integration/test_http_observability.cpp
 1      tests/integration/test_http_read_api.cpp
-3      tests/integration/test_http_sse.cpp
 2      tests/integration/test_http_submit.cpp
 1      tests/integration/test_multiprocess_cluster.cpp
 6      tests/integration/test_plugin_submission.cpp

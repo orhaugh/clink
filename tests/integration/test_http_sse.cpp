@@ -171,6 +171,27 @@ bool drain_until(SseReader& reader,
     return predicate(reader.buf);
 }
 
+// Wait until the SSE stream is genuinely LIVE, rather than guessing at how long
+// attaching takes.
+//
+// The readiness signal is exact. make_event_bus_sse_factory() creates the event-bus
+// subscription inside the factory call, and the puller it returns emits a heartbeat
+// on its FIRST invocation unconditionally (it exists to flush the response headers).
+// So the subscription is registered strictly before the first ": heartbeat" byte can
+// reach us - seeing that byte proves any event published from now on will be
+// delivered to this reader.
+//
+// What this replaces was a 150ms sleep. Under load the attach can take longer, and
+// when it does the coordinator publishes job_submitted to a bus this reader is not on
+// yet. The event is then gone for good, and no timeout on the LATER wait can recover
+// it - which is why this failed as "no coordinator.job_submitted seen in stream"
+// despite a 30s bound on that wait.
+bool await_sse_live(SseReader& reader) {
+    return drain_until(reader, std::chrono::seconds(10), [](const std::string& s) {
+        return s.find(": heartbeat") != std::string::npos;
+    });
+}
+
 struct HttpResult {
     int status{0};
     std::string body;
@@ -318,8 +339,8 @@ TEST(HttpSse, SseSurfacesWorkerRegistered) {
 
     auto reader = open_sse("127.0.0.1", c.coordinator_http_port, "/api/v1/events");
     ASSERT_TRUE(reader.has_value());
-    // Give the SSE handler a moment to set up the chunked provider.
-    std::this_thread::sleep_for(150ms);
+    ASSERT_TRUE(await_sse_live(*reader)) << "the SSE stream never went live, so any event "
+                                            "published from here would be missed";
 
     // Now register a worker. The SSE stream should surface coordinator.worker_registered.
     const auto http_port = probe_free_port();
@@ -361,7 +382,8 @@ TEST(HttpSse, SseSurfacesJobLifecycleEvents) {
     // first events we see are the upcoming job lifecycle ones.
     auto reader = open_sse("127.0.0.1", c->coordinator_http_port, "/api/v1/events");
     ASSERT_TRUE(reader.has_value());
-    std::this_thread::sleep_for(150ms);
+    ASSERT_TRUE(await_sse_live(*reader)) << "the SSE stream never went live, so any event "
+                                            "published from here would be missed";
 
     ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
     {
@@ -434,7 +456,7 @@ TEST(HttpSse, SseStreamSendsHeartbeatsWhenIdle) {
     ASSERT_TRUE(reader.has_value());
     // Drain whatever's already buffered, then look ONLY for the
     // heartbeat that should arrive after ~15s of silence.
-    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(await_sse_live(*reader)) << "the SSE stream never went live";
     // We don't actually want to wait 15s in tests. Confirm the stream
     // is at least reachable + chunk-decoded by checking that the
     // headers are HTTP/1.1 200 with text/event-stream.
