@@ -19,6 +19,7 @@
 #include <array>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -186,4 +187,78 @@ TEST_F(CliLintTest, TheNodeDefaultsAreWhatGetLinted) {
                                  "so either the defaults here drifted from clink_node.cpp or the "
                                  "shipped defaults are genuinely bad. Both matter: "
                               << r.output;
+}
+
+// --- guarantee cross-check (follow-up 24) -----------------------------------
+//
+// The config linter and the delivery-guarantee analyser answer adjacent
+// questions and used to never compare notes. The linter asks "is this
+// configuration self-consistent"; the analyser asks "what can this pipeline
+// actually deliver". A configuration passes the first and still not support
+// what it looks like it is asking for.
+
+namespace {
+
+// Write a graph JSON to a unique path. Keyed by pid and name because ctest runs
+// each test as its own process and a fixed path would have concurrent tests
+// reading each other's fixture.
+std::filesystem::path write_graph(const std::string& name, const std::string& body) {
+    const auto p = std::filesystem::temp_directory_path() /
+                   ("clink_lint_graph_" + std::to_string(::getpid()) + "_" + name + ".json");
+    std::ofstream out(p);
+    out << body;
+    return p;
+}
+
+constexpr const char* kNonReplayableSourceToFileSink = R"({"ops":[
+ {"id":"src","type":"int64_range_source","out_channel":"int64","inputs":[],"params":{"start":"0","end":"10"}},
+ {"id":"snk","type":"file_line_sink","out_channel":"int64","inputs":["src"],"params":{"path":"/tmp/clink_lint_sink"}}
+]})";
+
+constexpr const char* kSameGraphAskingForExactlyOnce = R"({"ops":[
+ {"id":"src","type":"int64_range_source","out_channel":"int64","inputs":[],"params":{"start":"0","end":"10"}},
+ {"id":"snk","type":"file_line_sink","out_channel":"int64","inputs":["src"],"params":{"path":"/tmp/clink_lint_sink","delivery_guarantee":"exactly_once"}}
+]})";
+
+}  // namespace
+
+// A coherent configuration whose pipeline still cannot deliver much. This is the
+// case the cross-check exists for: every flag is fine, so the config linter alone
+// says "no problems found" and the operator learns nothing about the guarantee
+// they are actually getting.
+TEST(CliLint, ReportsTheDeliveryGuaranteeAlongsideACleanConfig) {
+    if (cli_binary().empty() || !std::filesystem::exists(cli_binary())) {
+        GTEST_SKIP() << "clink CLI not built";
+    }
+    const auto graph = write_graph("clean", kNonReplayableSourceToFileSink);
+    const auto r = run_lint("--graph-json=" + graph.string() +
+                            " --checkpoint-dir=/tmp/clink_lint_ck --checkpoint-interval-ms=1000");
+    std::filesystem::remove(graph);
+
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+    EXPECT_TRUE(r.mentions("delivery guarantee")) << "the guarantee was not reported at all:\n"
+                                                  << r.output;
+    // The source cannot replay, so nothing stronger is reachable however coherent
+    // the checkpoint flags are. Naming the limiting factor is the useful part.
+    EXPECT_TRUE(r.mentions("int64_range_source"))
+        << "the report did not name what limits the guarantee:\n"
+        << r.output;
+}
+
+// The same pipeline, now ASKING for exactly-once. The submission gate would refuse
+// it, so the lint must too - a clean lint followed by a refused submission is
+// exactly the disagreement this command exists to rule out.
+TEST(CliLint, RefusesWhenThePipelineCannotProvideTheRequestedGuarantee) {
+    if (cli_binary().empty() || !std::filesystem::exists(cli_binary())) {
+        GTEST_SKIP() << "clink CLI not built";
+    }
+    const auto graph = write_graph("requested", kSameGraphAskingForExactlyOnce);
+    const auto r = run_lint("--graph-json=" + graph.string() +
+                            " --checkpoint-dir=/tmp/clink_lint_ck --checkpoint-interval-ms=1000");
+    std::filesystem::remove(graph);
+
+    EXPECT_EQ(r.exit_code, 1) << "a pipeline that would be REFUSED at submission linted clean:\n"
+                              << r.output;
+    EXPECT_TRUE(r.mentions("cannot provide the requested guarantee")) << r.output;
+    EXPECT_TRUE(r.mentions("REFUSED at submission")) << r.output;
 }

@@ -2685,6 +2685,24 @@ Exit codes are the contract (0 clean, 1 findings, 2 usage/unreachable), checked
 directly: a malformed `--from-job`, an unreachable coordinator and a non-numeric job id
 all give 2, and a clean flag-based lint still gives 0.
 
+**The guarantee cross-check, which closes the item.** The config linter and the
+delivery-guarantee analyser answered adjacent questions and never compared notes. The
+linter asks "is this configuration self-consistent"; the analyser asks "what can this
+pipeline actually deliver". A configuration passes the first while the pipeline cannot
+support what it looks like it is asking for.
+
+With `--graph-json`, lint now runs the same analyser the submission gate runs and reports
+its verdict. The value shows up immediately on a trivial pipeline: a non-replayable
+source into a file sink, with checkpointing enabled and an interval set, lints clean on
+config and is **AT_MOST_ONCE_SOURCE** - and the report names the source as the limiting
+factor. Previously the operator saw only "no problems found".
+
+When the graph REQUESTS more than the pipeline can provide, lint now exits 1 with the
+gate's own reasoning. A clean lint followed by a refused submission is exactly the
+disagreement this command exists to rule out, and it was possible until now.
+
+Follow-up 24 is closed.
+
 **Verification.** The integration test asserts every one of the seven fields is present
 in the response body. Full core suite 2002 passed, `HttpSubmit` 2/2 on Linux.
 

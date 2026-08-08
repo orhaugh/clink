@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "clink/cluster/config_lint.hpp"
+#include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/config/json.hpp"
 #include "clink/http/http_client.hpp"
@@ -229,6 +230,41 @@ int clink_cmd_lint(int argc, char** argv) {
             const auto graph = clink::cluster::JobGraphSpec::from_json(body);
             for (auto& p : clink::cluster::lint_job_graph(graph, config, slots)) {
                 problems.push_back(std::move(p));
+            }
+
+            // Cross-check against the delivery-guarantee analyser (follow-up 24).
+            //
+            // The two answer adjacent questions and never compared notes. The config
+            // linter asks "is this configuration self-consistent"; the guarantee
+            // analyser asks "what can this pipeline actually deliver". A
+            // configuration can pass the first and still not support what it looks
+            // like it is asking for - checkpointing enabled, an interval set, and a
+            // sink with no transactional commit, which is at-least-once however
+            // coherent the flags are.
+            //
+            // Reporting the analyser's verdict here means one command answers both,
+            // and the operator does not have to know that the second analysis exists
+            // to benefit from it. Same analyser the submission gate runs, so a clean
+            // lint and an accepted submission cannot disagree.
+            clink::connectors::GuaranteeReport report;
+            const auto rejection = clink::cluster::check_delivery_guarantee(graph, config, &report);
+            std::cout << "lint: end-to-end delivery guarantee: "
+                      << clink::connectors::to_string(report.level);
+            if (!report.limiting_factor.empty()) {
+                std::cout << " (limited by " << report.limiting_factor << ")";
+            }
+            std::cout << "\n";
+            for (const auto& warn : report.warnings) {
+                std::cout << "lint:   note: " << warn << "\n";
+            }
+            if (!rejection.empty()) {
+                // The submission gate would refuse this, so the lint must too -
+                // otherwise a clean lint followed by a refused submission is exactly
+                // the disagreement this command exists to rule out.
+                std::cout << "lint: the pipeline cannot provide the requested guarantee:\n"
+                          << rejection << "\n"
+                          << "lint: this configuration would be REFUSED at submission\n";
+                return 1;
             }
         } catch (const std::exception& e) {
             std::cerr << "lint: --graph-json did not parse: " << e.what() << "\n";
