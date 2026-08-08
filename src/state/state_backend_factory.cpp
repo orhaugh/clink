@@ -238,7 +238,37 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                 return bytes;
             }
             if (!verdict.ok() && !clink::state::unverified_checkpoints_allowed(verdict)) {
-                throw clink::state::CheckpointIntegrityError(verdict.status, verdict.detail);
+                // Say whether an older USABLE checkpoint exists, and name it.
+                //
+                // state::latest_valid_checkpoint_in encodes the fallback rule, and
+                // until now nothing on the recovery path consulted it - it had eight
+                // tests and zero production callers, so the engine looked like it
+                // could survive a corrupt newest checkpoint and could not. A restore
+                // that hit one threw this error and the job failed, with no indication
+                // that a good older checkpoint was sitting right beside it.
+                //
+                // It reports rather than rewinds, deliberately. Rewinding
+                // automatically is not obviously safe: the coordinator marked the
+                // failing checkpoint COMPLETED, so a sink may already have committed
+                // its transactions, and silently replaying from an earlier point would
+                // duplicate that output. Naming the option leaves that judgement with
+                // the operator, who can restore from it explicitly.
+                std::string hint;
+                if (const auto older = clink::state::latest_valid_checkpoint_in(
+                        p.parent_path(),
+                        spec.restore_checkpoint_id == 0 ? 0 : spec.restore_checkpoint_id - 1);
+                    older.has_value()) {
+                    hint = " An older checkpoint in the same directory does verify: " +
+                           std::to_string(*older) +
+                           ". Restoring from it explicitly is a recovery option, but it "
+                           "replays everything after it - check whether any sink has "
+                           "already committed output for a later checkpoint first.";
+                } else {
+                    hint =
+                        " No older checkpoint in the same directory verifies either, so "
+                        "there is no earlier recovery point to fall back to.";
+                }
+                throw clink::state::CheckpointIntegrityError(verdict.status, verdict.detail + hint);
             }
             std::ifstream in(p, std::ios::binary);
             if (!in) {

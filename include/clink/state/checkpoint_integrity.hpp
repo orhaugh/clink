@@ -41,12 +41,14 @@
 //                binary understands. Do NOT guess. Refuse and report.
 //   Valid        length and checksum both agree.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -298,6 +300,58 @@ inline void write_checkpoint_meta(const std::filesystem::path& payload_path,
     const char* p = std::getenv("CLINK_ALLOW_UNVERIFIED_CHECKPOINTS");
     return p != nullptr && std::string_view(p) != "0" && std::string_view(p) != "false" &&
            *p != '\0';
+}
+
+// The newest checkpoint in `dir` that passes verification, considering only ids
+// <= `at_most` (0 = no ceiling).
+//
+// Lives here rather than only on FileBackedStateBackend because the RESTORE path
+// needs it and does not have a backend to ask - it is deciding whether a restore
+// can happen at all. FileBackedStateBackend::latest_valid_checkpoint delegates to
+// this, so there is one implementation of the rule.
+[[nodiscard]] inline std::optional<std::uint64_t> latest_valid_checkpoint_in(
+    const std::filesystem::path& dir, std::uint64_t at_most = 0) {
+    std::vector<std::uint64_t> ids;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const auto name = entry.path().filename().string();
+        constexpr std::string_view kPrefix = "checkpoint-";
+        constexpr std::string_view kSuffix = ".snap";
+        if (name.rfind(kPrefix, 0) != 0 || name.size() <= kPrefix.size() + kSuffix.size()) {
+            continue;
+        }
+        if (name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+            continue;
+        }
+        const auto digits =
+            name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
+        if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+            continue;
+        }
+        std::uint64_t id = 0;
+        try {
+            id = std::stoull(digits);
+        } catch (const std::exception&) {
+            continue;  // an overlong run of digits; not a checkpoint this build wrote
+        }
+        if (at_most != 0 && id > at_most) {
+            continue;
+        }
+        ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end(), std::greater<>());
+    for (const auto id : ids) {
+        if (verify_checkpoint(dir / ("checkpoint-" + std::to_string(id) + ".snap")).ok()) {
+            return id;
+        }
+    }
+    return std::nullopt;
 }
 
 // Opt out of the "a named checkpoint's own snapshot must exist" check on the

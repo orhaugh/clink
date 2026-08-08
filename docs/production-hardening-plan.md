@@ -2560,6 +2560,50 @@ fix, the comment stops being counted; with a genuine bare sleep injected into th
 file, the count returns to 1. Checking only the first direction would have accepted a
 detector that had stopped counting anything.
 
+### F71. The corrupt-checkpoint fallback had eight tests and no callers
+
+`FileBackedStateBackend::latest_valid_checkpoint` is documented in its own comment as
+"the fallback rule the recovery path needs: a corrupt or half-written NEWEST checkpoint
+must not strand a job that has a perfectly good older one." It is covered by eight
+tests in `test_checkpoint_integrity.cpp`.
+
+The recovery path never calls it. Nothing outside those tests calls it at all.
+
+So a restore that hits a corrupt checkpoint throws `CheckpointIntegrityError`, the
+subtask fails, and the job dies - with no indication that a good older checkpoint is
+sitting beside it in the same directory. The engine reads, from its tests, as though it
+survives a corrupt newest checkpoint. It does not.
+
+This is the most misleading shape a gap can take. A dead function with no tests is
+obviously dead; a dead function with eight passing tests looks like a working feature,
+and an audit that reads the test names concludes the property holds.
+
+**Compounded by the retention default.** `checkpoint_num_retained` defaults to **1**, so
+each `CommitCheckpoint` purges the previous checkpoint immediately. Even wired, the
+fallback would usually have nothing to find: there is exactly one recovery point at any
+moment, and it is deleted the instant the next one completes.
+
+**What was changed, and what deliberately was not.** The restore path now consults the
+rule and reports the result: the failure names the older checkpoint that does verify, or
+states plainly that none does. `state::latest_valid_checkpoint_in` was extracted so the
+restore path and the backend share one implementation of the rule.
+
+It reports rather than rewinds, on purpose. Rewinding automatically is not obviously
+safe: the coordinator marked the failing checkpoint COMPLETED, so a sink may already
+have committed transactions for it, and silently replaying from an earlier point would
+duplicate that committed output. That is a worse failure than stopping. Naming the
+option leaves the judgement with the operator, who can check the sinks and restore
+explicitly.
+
+**Verification.** Two tests, one per branch (an older checkpoint exists and is named; no
+older one exists and the message says so), both mutation-checked - dropping the hint
+from the thrown message fails both. Core suite 2000 passed.
+
+**Still open, and stated rather than fixed:** the retention default of 1 leaves no
+fallback to name in most real configurations. Raising it trades disk for a recovery
+option, which is a deployment decision rather than something to change silently under
+existing users.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

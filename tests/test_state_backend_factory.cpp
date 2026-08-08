@@ -825,3 +825,108 @@ TEST(StateBackendFactory, ARescaleRestoreStillToleratesAnAbsentParent) {
         << "a scale-up refused a parent index that legitimately has no snapshot.";
     EXPECT_NE(built.backend, nullptr);
 }
+
+// A restore that hits a corrupt checkpoint must SAY whether an older one is usable.
+//
+// state::latest_valid_checkpoint_in encodes the fallback rule the recovery path
+// needs, and until this change nothing on that path consulted it: eight tests, zero
+// production callers. So the engine looked like it could survive a corrupt newest
+// checkpoint and could not - the restore threw and the job failed with no indication
+// that a good older checkpoint sat right beside it in the same directory.
+//
+// It reports rather than rewinds, deliberately. The coordinator marked the failing
+// checkpoint COMPLETED, so a sink may already have committed transactions for it, and
+// replaying from an earlier point automatically would duplicate that output. Naming
+// the option leaves the judgement with the operator.
+TEST(StateBackendFactory, ACorruptRestoreNamesTheOlderCheckpointThatStillVerifies) {
+    const auto base = make_temp_dir("corrupt_names_older");
+    const clink::OperatorId op{1};
+
+    const auto publish = [&](std::uint64_t ckpt, const std::string& val) {
+        clink::InMemoryStateBackend backend;
+        backend.put(op, clink::StateBackend::KeyView{"k"}, clink::StateBackend::ValueView{val});
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt});
+        publish_snapshot(
+            gen_dir(base, 0) / ("checkpoint-" + std::to_string(ckpt) + ".snap"), snap.bytes, ckpt);
+    };
+    publish(4, "GOOD");
+    publish(9, "NEWER");
+
+    // Corrupt checkpoint 9's payload while leaving its sidecar's length intact, so it
+    // verifies as Corrupt rather than Incomplete - storage changed bytes it had
+    // already certified.
+    {
+        const auto victim = gen_dir(base, 0) / "checkpoint-9.snap";
+        const auto size = std::filesystem::file_size(victim);
+        std::string body(size, '\0');
+        {
+            std::ifstream in(victim, std::ios::binary);
+            in.read(body.data(), static_cast<std::streamsize>(size));
+        }
+        ASSERT_GT(body.size(), 8u);
+        body[body.size() / 2] = static_cast<char>(body[body.size() / 2] ^ 0xFF);
+        std::ofstream out(victim, std::ios::binary | std::ios::trunc);
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+    }
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 0;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = 9;
+
+    try {
+        (void)clink::StateBackendFactory::default_instance().build(spec);
+        FAIL() << "a corrupt checkpoint was restored instead of being refused";
+    } catch (const std::exception& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("does verify: 4"), std::string::npos)
+            << "the failure did not name checkpoint 4, which verifies and is the "
+               "recovery option an operator needs to be told about. Message was:\n"
+            << msg;
+    }
+}
+
+// The other half: when nothing older verifies, say THAT rather than implying a
+// fallback exists. An operator told "an older checkpoint may work" when none does
+// wastes the outage looking for it.
+TEST(StateBackendFactory, ACorruptRestoreSaysWhenThereIsNoOlderFallback) {
+    const auto base = make_temp_dir("corrupt_no_older");
+    const clink::OperatorId op{1};
+
+    {
+        clink::InMemoryStateBackend backend;
+        backend.put(op, clink::StateBackend::KeyView{"k"}, clink::StateBackend::ValueView{"ONLY"});
+        auto snap = backend.snapshot(clink::CheckpointId{9});
+        publish_snapshot(gen_dir(base, 0) / "checkpoint-9.snap", snap.bytes, 9);
+    }
+    {
+        const auto victim = gen_dir(base, 0) / "checkpoint-9.snap";
+        const auto size = std::filesystem::file_size(victim);
+        std::string body(size, '\0');
+        {
+            std::ifstream in(victim, std::ios::binary);
+            in.read(body.data(), static_cast<std::streamsize>(size));
+        }
+        ASSERT_GT(body.size(), 8u);
+        body[body.size() / 2] = static_cast<char>(body[body.size() / 2] ^ 0xFF);
+        std::ofstream out(victim, std::ios::binary | std::ios::trunc);
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+    }
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 0;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = 9;
+
+    try {
+        (void)clink::StateBackendFactory::default_instance().build(spec);
+        FAIL() << "a corrupt checkpoint was restored instead of being refused";
+    } catch (const std::exception& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("no earlier recovery point"), std::string::npos)
+            << "the failure did not state that there is no fallback. Message was:\n"
+            << msg;
+    }
+}

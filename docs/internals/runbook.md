@@ -66,6 +66,15 @@ Checkpoints are being attempted and none are completing. Same investigation as
 `ClinkCheckpointsStalled`, but the coordinator is definitely seeing attempts, so
 skip straight to the FAILED lines and the named subtasks.
 
+**If a restore fails on integrity, read the whole message.** It now names the older
+checkpoint in the same directory that still verifies, or says plainly that none does.
+That older one is a recovery option, not an automatic one: the failing checkpoint was
+marked COMPLETED, so a sink may already have committed output for it, and restoring
+further back replays everything after it. Check the sinks before taking it.
+
+Note that `--checkpoint-num-retained` defaults to 1, which means there is usually no
+older checkpoint to name. Raising it is what buys a fallback.
+
 One specific cause worth knowing: a checkpoint whose payload and sidecar disagree is
 refused at restore, not at write. If the log shows
 `checkpoint-N.snap is X bytes, sidecar declares Y`, something wrote that file twice.

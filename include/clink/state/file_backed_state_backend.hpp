@@ -259,6 +259,10 @@ public:
         return std::nullopt;
     }
 
+    // The same rule as state::latest_valid_checkpoint_in over this backend's own
+    // directory. Kept as a named check so a caller holding a backend does not have
+    // to know where its snapshots live.
+
     std::string description() const override {
         return "file-backed state backend at " + snapshot_dir_.string();
     }
