@@ -2706,6 +2706,56 @@ Follow-up 24 is closed.
 **Verification.** The integration test asserts every one of the seven fields is present
 in the response body. Full core suite 2002 passed, `HttpSubmit` 2/2 on Linux.
 
+### F74. Two 2PC sinks on one chain built a job that silently lost a transaction
+
+Follow-up 42, addressed by refusing rather than by the rendezvous it asks for.
+
+A `CommittingSink` stages its prepared-transaction handle into operator state during
+`on_barrier`, and that handle must be inside the snapshot of the checkpoint it names -
+`recover_all_()` re-commits from it after a restart. With two such sinks on one chain
+there is no ordering that works: they run on separate runner threads, whichever
+snapshots does so before the other has staged, and the loser's handle for checkpoint N
+lands in N+1. A job restored from N never commits N's staged transaction and resumes
+past the records it covered. Lost, and nothing reports it.
+
+`Dag::add_sink` now refuses that configuration, naming the fix (separate subtasks, or
+only one transactional sink). One 2PC sink alongside any number of ordinary sinks is
+orderable and common, and still builds - pinned by its own test so the check cannot be
+widened into breaking fan-out to a 2PC sink plus a metrics sink.
+
+Detection is a new `Sink::stages_state_at_barrier()`, defaulting false and overridden
+`final` in `CommittingSink`. Keying on the capability rather than on a type name means a
+connector that does not follow a naming convention is still caught.
+
+**Why refuse instead of building the rendezvous.** The follow-up proposes that the
+owner forwards the barrier and waits for every sink to finish `on_barrier` before
+snapshotting. That collides with an invariant stated in the same file, and the collision
+is not recorded in the follow-up:
+
+- With two sinks, ownership reverts to the OPERATOR (a second sink re-promotes the
+  operator the first demoted).
+- The operator runner forwards the barrier by calling `op->process(barrier)` - forwarding
+  and the operator's own barrier handling are the same call.
+- To wait for the sinks it would have to forward first, then capture. But
+  `dag.hpp` states that an operator's `on_barrier` must stay AFTER the snapshot,
+  "because its state is supposed to be captured as of the barrier, before any
+  barrier-triggered mutation".
+
+So the naive design captures the operator's state after its own barrier-triggered
+mutations, trading one correctness bug for another. Making it work needs the forward
+separated from the operator's handler, which is a real refactor of the checkpoint hot
+path - not something to attempt alongside other work.
+
+Refusing costs nothing on any path that works today, cannot deadlock, and turns silent
+data loss into a build error with an actionable message. The rendezvous remains the right
+eventual fix; this stops the loss in the meantime.
+
+**Verification.** Two tests - the refusal fires, and one transactional sink alongside two
+plain ones still builds. Mutation-checked: disabling the refusal fails the first and
+leaves the second passing, so the second is pinning the narrowness rather than the rule.
+Core suite 2004 passed, including the pre-existing two-plain-sink chain test, which the
+capability check leaves alone.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

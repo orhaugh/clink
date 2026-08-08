@@ -652,3 +652,64 @@ TEST(CancelTeardown, ATwoSinkChainStillSnapshotsExactlyOncePerCheckpoint) {
                            "means two elements own it.";
     }
 }
+
+namespace {
+
+// A sink that reports it stages state at the barrier, as a CommittingSink does.
+// A real CommittingSink needs codecs and a backend; the refusal being tested keys
+// only on the capability, so a minimal stand-in keeps the test about the rule.
+class BarrierStagingSink final : public Sink<int> {
+public:
+    void on_data(const Batch<int>& /*batch*/) override {}
+    [[nodiscard]] bool stages_state_at_barrier() const noexcept override { return true; }
+    std::string name() const override { return "barrier_staging_sink"; }
+};
+
+class PlainTeardownSink final : public Sink<int> {
+public:
+    void on_data(const Batch<int>& /*batch*/) override {}
+    std::string name() const override { return "plain_sink"; }
+};
+
+}  // namespace
+
+// Two 2PC sinks on one chain must be REFUSED, not silently mis-ordered.
+//
+// Both stage a prepared-transaction handle into operator state during on_barrier,
+// and that handle has to be inside the snapshot of the checkpoint it names -
+// recover_all_() re-commits from it after a restart. They run on separate runner
+// threads, so whichever one snapshots does so before the other has staged, and the
+// loser's handle for checkpoint N lands in N+1. A job restored from N never commits
+// N's staged transaction and resumes past the records it covered. Lost, silently.
+//
+// Ordering it properly needs a rendezvous that does not exist (follow-up 42). Until
+// it does, refusing to build the job is the honest answer.
+TEST(CancelTeardown, TwoBarrierStagingSinksOnOneChainAreRefused) {
+    Dag dag;
+    auto h = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+    auto op_h = dag.add_operator<int, int>(
+        h, std::make_shared<MapOperator<int, int>>([](const int& v) { return v; }, "refuse_id"));
+    dag.add_sink<int>(op_h, std::make_shared<BarrierStagingSink>());
+
+    EXPECT_THROW(dag.add_sink<int>(op_h, std::make_shared<BarrierStagingSink>()), std::logic_error)
+        << "a chain with two barrier-staging sinks was built. One of their handles would "
+           "land in the following checkpoint, and a restore from the checkpoint it named "
+           "would lose that transaction's records without reporting anything.";
+}
+
+// The refusal must be narrow. One transactional sink alongside any number of
+// ordinary ones is orderable and common, and must still build - a check that
+// refused this would break fan-out to a 2PC sink plus a metrics or debug sink.
+TEST(CancelTeardown, OneBarrierStagingSinkAlongsidePlainSinksStillBuilds) {
+    Dag dag;
+    auto h = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+    auto op_h = dag.add_operator<int, int>(
+        h, std::make_shared<MapOperator<int, int>>([](const int& v) { return v; }, "mixed_id"));
+
+    EXPECT_NO_THROW({
+        dag.add_sink<int>(op_h, std::make_shared<PlainTeardownSink>());
+        dag.add_sink<int>(op_h, std::make_shared<BarrierStagingSink>());
+        dag.add_sink<int>(op_h, std::make_shared<PlainTeardownSink>());
+    }) << "a chain with exactly one transactional sink was refused; only two or more "
+          "are unorderable.";
+}

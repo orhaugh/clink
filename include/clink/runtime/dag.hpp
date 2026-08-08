@@ -4005,6 +4005,40 @@ public:
         // A shared flag, not a captured bool, because adding a SECOND sink to this
         // chain has to be able to revoke the first one's ownership - see below.
         auto sink_owns_checkpoint = std::make_shared<bool>(true);
+
+        // Refuse a chain carrying more than one barrier-staging sink, rather than
+        // building one that silently loses a transaction.
+        //
+        // A CommittingSink stages its prepared-transaction handle into operator
+        // state during on_barrier, and that handle has to be inside the snapshot of
+        // the checkpoint it names - recover_all_() re-commits from it after a
+        // restart. With two such sinks on one chain there is no ordering that works:
+        // they run on separate runner threads, whichever one snapshots does so
+        // before the other has staged, and the loser's handle for checkpoint N lands
+        // in N+1. A job restored from N then never commits N's staged transaction
+        // and resumes past the records it covered. They are lost, silently.
+        //
+        // Ordering it properly needs a barrier-completion rendezvous between runner
+        // threads (follow-up 42), and the obvious design collides with an invariant
+        // this file states elsewhere - see that follow-up for why. Until that is
+        // designed, refusing the configuration is the honest answer: the job cannot
+        // be built correctly, so it is not built. One 2PC sink per chain, plus any
+        // number of ordinary sinks, is unaffected.
+        if (sink->stages_state_at_barrier()) {
+            if (chain_has_barrier_staging_sink_) {
+                throw std::logic_error(
+                    "Dag::add_sink: this chain already has a sink that stages state at the "
+                    "checkpoint barrier (a 2PC / CommittingSink), and a second one cannot be "
+                    "ordered correctly against it - the two run on separate runner threads, so "
+                    "one of them would stage its prepared-transaction handle into the FOLLOWING "
+                    "checkpoint. A restore from the checkpoint it named would never commit that "
+                    "transaction and would resume past the records it covered, losing them "
+                    "silently. Give the second sink its own subtask, or make only one of them "
+                    "transactional.");
+            }
+            chain_has_barrier_staging_sink_ = true;
+        }
+
         if (chain_first_sink_owner_) {
             // A second sink on the same chain. Neither sink can be ordered
             // correctly here: whichever one snapshots would have to do so after
@@ -4522,6 +4556,10 @@ private:
     // keeps the pre-existing operator-owner arrangement. See add_sink.
     std::shared_ptr<bool> chain_first_sink_owner_;
     std::shared_ptr<bool> chain_demoted_operator_owner_;
+    // Whether this chain already carries a sink that stages state at the barrier
+    // (a 2PC / CommittingSink). A second one cannot be ordered against the first,
+    // so add_sink refuses rather than building a job that loses a transaction.
+    bool chain_has_barrier_staging_sink_{false};
     std::vector<BarrierInjector> source_injectors_;
     std::vector<OperatorId> source_ids_;
     // Boundedness recorded at registration, parallel to source_ids_ (BATCH-1).

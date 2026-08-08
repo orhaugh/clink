@@ -1181,6 +1181,18 @@ public:
 
     virtual void on_watermark(Watermark /*wm*/) {}
     virtual void on_barrier(CheckpointBarrier /*b*/) {}
+    // True when this sink WRITES STATE during on_barrier that the checkpoint must
+    // capture - a CommittingSink staging its prepared-transaction handle.
+    //
+    // The runtime needs to know because such a sink's handle has to be inside the
+    // snapshot of the checkpoint it names: recover_all_() re-commits from it after
+    // a restart, and a handle that lands in checkpoint N+1 leaves N's staged
+    // transaction uncommitted forever.
+    //
+    // Ordering that correctly is why a chain may contain at most one of these
+    // (see Dag::add_sink). A sink that only writes records and commits on
+    // on_commit - the common case - leaves this false and is unaffected.
+    [[nodiscard]] virtual bool stages_state_at_barrier() const noexcept { return false; }
     // 2PC phase-2 hook. Called when the coordinator has confirmed checkpoint
     // `checkpoint_id` is globally durable (every subtask acked, the
     // COMPLETED-N marker is on disk, the coordinator broadcast CommitCheckpoint).

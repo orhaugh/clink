@@ -105,6 +105,10 @@ public:
 
     void on_data(const Batch<In>& batch) final { write(batch); }
 
+    // This sink stages its prepared-transaction handle into operator state during
+    // on_barrier, so the checkpoint must capture it. See Sink::stages_state_at_barrier.
+    [[nodiscard]] bool stages_state_at_barrier() const noexcept final { return true; }
+
     void on_barrier(CheckpointBarrier b) final {
         const auto ckpt = b.id().value();
         // Fault windows around prepare. Dying BEFORE prepare must leave no
