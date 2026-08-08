@@ -22,9 +22,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <spawn.h>
 #include <string>
@@ -174,6 +176,134 @@ inline pid_t spawn_logged(const std::vector<std::string>& argv,
 // legitimate and asserting on it would be a false positive.
 //
 // Returns a human-readable description of every violation; empty means consistent.
+// Is a completed checkpoint's CUT internally consistent - does the source's recorded
+// offset agree with the keyed counts taken at the same barrier?
+//
+// This automates the forensics that found F67 by hand. A failing run of the rescale
+// exactly-once job left checkpoint 21 holding source offset 41 while its keyed counters
+// summed to 42: the operators had counted a record the source did not consider emitted,
+// so on restore the source replays it, the operator counts it twice, and the job reports
+// a state mismatch. Reading that required `clink state-cat` over six files and a
+// per-key expected-count table worked out on paper.
+//
+// The invariant is arithmetic, not a guess. The job keys by `idx % keys` and its own
+// check expects `idx / keys` for each key before processing record idx, so with an
+// offset of N (records 0..N-1 emitted) the counts must sum to exactly N.
+//
+// Scoped to the rescale exactly-once job's slot names, deliberately: a generic version
+// would have to know every job's state layout. Returns one string per violating
+// checkpoint, empty when the cut holds or when the files needed are not present (a
+// checkpoint retention may have purged them, which is not a violation).
+//
+// ONLY VALID WHERE NO RESCALE HAS HAPPENED. After a rescale a subtask's snapshot
+// legitimately contains keyed rows inherited from a WIDER parent, which the restore
+// drops by key-group range (the entries clink_state_restore_keys_dropped_total
+// counts). Summing raw rows then over-counts - a healthy scale-up run reported
+// "offset 40 but the counters sum to 160", exactly 4x for four new subtasks. The
+// caller must not use this on a rescaled generation.
+[[nodiscard]] inline std::vector<std::string> checkpoint_cut_violations(
+    const std::filesystem::path& checkpoint_dir, const std::filesystem::path& state_cat_binary) {
+    std::vector<std::string> bad;
+    std::error_code ec;
+    if (state_cat_binary.empty() || !std::filesystem::exists(state_cat_binary, ec)) {
+        return bad;  // no tool to read snapshots with; not a violation
+    }
+    for (const auto& gen : std::filesystem::directory_iterator(checkpoint_dir, ec)) {
+        if (ec || !gen.is_directory(ec)) {
+            continue;
+        }
+        const auto gname = gen.path().filename().string();
+        if (gname.empty() || gname[0] != 'v') {
+            continue;
+        }
+        // Collect every checkpoint id present in this generation.
+        std::set<std::string> ids;
+        for (const auto& sub : std::filesystem::directory_iterator(gen.path(), ec)) {
+            if (ec || !sub.is_directory(ec)) {
+                continue;
+            }
+            for (const auto& f : std::filesystem::directory_iterator(sub.path(), ec)) {
+                if (ec || !f.is_regular_file(ec)) {
+                    continue;
+                }
+                const auto n = f.path().filename().string();
+                if (n.starts_with("checkpoint-") && n.ends_with(".snap")) {
+                    ids.insert(n.substr(std::string("checkpoint-").size(),
+                                        n.size() - std::string("checkpoint-").size() -
+                                            std::string(".snap").size()));
+                }
+            }
+        }
+        for (const auto& id : ids) {
+            std::optional<std::int64_t> offset;
+            std::int64_t counted = 0;
+            bool saw_counts = false;
+            for (const auto& sub : std::filesystem::directory_iterator(gen.path(), ec)) {
+                if (ec || !sub.is_directory(ec)) {
+                    continue;
+                }
+                const auto snap = sub.path() / ("checkpoint-" + id + ".snap");
+                if (!std::filesystem::exists(snap, ec)) {
+                    continue;
+                }
+                const std::string cmd = state_cat_binary.string() +
+                                        " state-cat --file=" + snap.string() +
+                                        " --max-rows=0 2>/dev/null";
+                std::string out;
+                if (FILE* pipe = ::popen(cmd.c_str(), "r"); pipe != nullptr) {
+                    char buf[4096];
+                    while (::fgets(buf, sizeof(buf), pipe) != nullptr) {
+                        out += buf;
+                    }
+                    ::pclose(pipe);
+                }
+                // The source's offset row renders its key as hex, so it is matched by
+                // the slot name on the `op ... slot` line rather than by the key.
+                if (out.find("rescale_xo_counts") != std::string::npos) {
+                    // "(int64 <key>) = 0x... (int64 <count>)" - take the second int64.
+                    for (std::size_t at = out.find(") = 0x"); at != std::string::npos;
+                         at = out.find(") = 0x", at + 1)) {
+                        const auto open = out.find("(int64 ", at);
+                        if (open == std::string::npos) {
+                            break;
+                        }
+                        const auto close = out.find(')', open);
+                        if (close == std::string::npos) {
+                            break;
+                        }
+                        try {
+                            counted += std::stoll(out.substr(open + 7, close - open - 7));
+                            saw_counts = true;
+                        } catch (const std::exception&) {
+                            // not a number we recognise; skip rather than mis-report
+                        }
+                    }
+                } else if (out.find("(int64 ") != std::string::npos &&
+                           out.find("slot \"<raw>\"") != std::string::npos) {
+                    // The source subtask: a single raw operator row holding the offset.
+                    const auto open = out.rfind("(int64 ");
+                    const auto close = out.find(')', open);
+                    if (open != std::string::npos && close != std::string::npos) {
+                        try {
+                            offset = std::stoll(out.substr(open + 7, close - open - 7));
+                        } catch (const std::exception&) {
+                            // leave unset
+                        }
+                    }
+                }
+            }
+            if (offset.has_value() && saw_counts && *offset != counted) {
+                bad.push_back("checkpoint " + id + " in " + gname + ": source recorded offset " +
+                              std::to_string(*offset) + " but the keyed counters sum to " +
+                              std::to_string(counted) +
+                              " - the cut does not describe one moment, so a restore from it "
+                              "replays records the operators have already counted");
+            }
+        }
+    }
+    return bad;
+}
+
 [[nodiscard]] inline std::vector<std::string> checkpoint_set_violations(
     const std::filesystem::path& checkpoint_dir) {
     std::vector<std::string> bad;

@@ -465,6 +465,14 @@ TEST_F(RescaleExactlyOnceTest, TheJobCommitsEveryRecordExactlyOnceWithNoRescale)
     // is not answered yet. Gating on a check whose own behaviour in that window is
     // unestablished would just make the gate flaky.
     {
+        // The CUT check is deliberately NOT run on the rescale paths. It sums the
+        // counter rows in each subtask's snapshot, and after a rescale a subtask's
+        // snapshot legitimately contains rows inherited from a WIDER parent that the
+        // restore then drops by key-group range (the same entries
+        // clink_state_restore_keys_dropped_total counts). Summing raw rows therefore
+        // over-counts: a healthy scale-up run reported "offset 40 but the counters sum
+        // to 160" - exactly 4x, one multiple per new subtask. Reporting that would be
+        // pure noise, and the kind that teaches people to ignore the check.
         const auto violations = clink::itest::checkpoint_set_violations(c.checkpoint_dir());
         EXPECT_TRUE(violations.empty())
             << violations.size()
@@ -472,6 +480,18 @@ TEST_F(RescaleExactlyOnceTest, TheJobCommitsEveryRecordExactlyOnceWithNoRescale)
                "run with NO rescale at all, where the transition window of follow-up 49 "
                "cannot apply; first: "
             << violations[0];
+    }
+    // The CUT check (F67): does each completed checkpoint's source offset agree with
+    // the keyed counts taken at the same barrier? Asserted here because this run has
+    // no rescale, so there is no transition window to excuse a disagreement.
+    //
+    // This automates what found F67 by hand - `clink state-cat` over six files and a
+    // per-key expected-count table on paper. When it next fails, the artefacts say so
+    // directly instead of needing that forensics repeated.
+    {
+        const auto cuts = clink::itest::checkpoint_cut_violations(c.checkpoint_dir(), cli_binary());
+        EXPECT_TRUE(cuts.empty()) << cuts.size()
+                                  << " checkpoint(s) have an inconsistent cut; first: " << cuts[0];
     }
     const auto order = per_key_order_violations(out_dir_, kKeys);
     EXPECT_GT(order.records_checked, 0u)
@@ -604,6 +624,14 @@ TEST_F(RescaleExactlyOnceTest, ScalingAKeyedOperatorUpPreservesExactlyOnceOutput
     // is not answered yet. Gating on a check whose own behaviour in that window is
     // unestablished would just make the gate flaky.
     {
+        // The CUT check is deliberately NOT run on the rescale paths. It sums the
+        // counter rows in each subtask's snapshot, and after a rescale a subtask's
+        // snapshot legitimately contains rows inherited from a WIDER parent that the
+        // restore then drops by key-group range (the same entries
+        // clink_state_restore_keys_dropped_total counts). Summing raw rows therefore
+        // over-counts: a healthy scale-up run reported "offset 40 but the counters sum
+        // to 160" - exactly 4x, one multiple per new subtask. Reporting that would be
+        // pure noise, and the kind that teaches people to ignore the check.
         const auto violations = clink::itest::checkpoint_set_violations(c.checkpoint_dir());
         if (!violations.empty()) {
             std::cerr << "CHECKPOINT-SET " << violations.size()
@@ -691,6 +719,14 @@ TEST_F(RescaleExactlyOnceTest, ScalingAKeyedOperatorDownPreservesExactlyOnceOutp
     // is not answered yet. Gating on a check whose own behaviour in that window is
     // unestablished would just make the gate flaky.
     {
+        // The CUT check is deliberately NOT run on the rescale paths. It sums the
+        // counter rows in each subtask's snapshot, and after a rescale a subtask's
+        // snapshot legitimately contains rows inherited from a WIDER parent that the
+        // restore then drops by key-group range (the same entries
+        // clink_state_restore_keys_dropped_total counts). Summing raw rows therefore
+        // over-counts: a healthy scale-up run reported "offset 40 but the counters sum
+        // to 160" - exactly 4x, one multiple per new subtask. Reporting that would be
+        // pure noise, and the kind that teaches people to ignore the check.
         const auto violations = clink::itest::checkpoint_set_violations(c.checkpoint_dir());
         if (!violations.empty()) {
             std::cerr << "CHECKPOINT-SET " << violations.size()
