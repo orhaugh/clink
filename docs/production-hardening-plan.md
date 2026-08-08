@@ -2385,11 +2385,33 @@ source will replay. That is an exactly-once hole on the ordinary recovery path, 
 the only reason it has shown up as "a rescale bug" is that the rescale tests are the
 ones that restore often enough to catch it.
 
-**Next step, and it is now narrow.** Instrument the counter's state and the source's
-offset at the same barrier, in-process, and find which of the two moves without the
-other. The `rescale.*` fault points added alongside this make the surrounding windows
-reachable on demand, but this needs the barrier path itself, not the rescale
-lifecycle.
+**The arithmetic, read again, changes the suspect.** The source's drain is atomic on
+its own thread and the operator's state capture is synchronous at the barrier
+("capture on this thread, forward the barrier, persist off-thread"). Both cuts are
+taken at the right instant. So an operator holding 42 where the source recorded 41 is
+not a mistimed cut at all - it is **one record delivered twice**. A duplicate inflates
+the operator's state above what the offset accounts for while both sides snapshot
+correctly, which is precisely the shape on disk.
+
+**What is now tested, and what it rules out.** `tests/test_checkpoint_cut_consistency.cpp`
+asserts the invariant directly and in-process, over 62 checkpoints of a live stream, in
+under a second - no rescale, no worker processes, no sleeps standing in for waits. It
+checks both shapes at once: the source's recorded offset equals the downstream count at
+every barrier, AND no record index arrives more than once. Both gates were
+mutation-checked (an offset recorded one behind trips the first on all 62 checkpoints;
+a single duplicated delivery trips the second). Both pass, which exonerates the
+single-input local path for either failure shape.
+
+**What that leaves.** Two differences remain between the passing local case and the
+failing distributed one: the keyed shuffle to four subtasks over network channels, and
+the restart-and-restore pairing (the failing run had restarts before checkpoint 21, and
+a source resuming from one checkpoint while an operator restored state from another
+produces exactly this signature). The second is the stronger hypothesis, and it is the
+same family as F38 and F63 rather than something new.
+
+This is deliberately left open rather than closed on a guess. What has been established
+is worth more than a speculative fix: the defect is a duplicate delivery, not a
+mistimed checkpoint, and the local path is not where it happens.
 
 ## 3. Work items
 
