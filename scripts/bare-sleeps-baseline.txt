@@ -21,7 +21,6 @@
 1      tests/integration/test_http_read_api.cpp
 2      tests/integration/test_http_submit.cpp
 1      tests/integration/test_multiprocess_cluster.cpp
-6      tests/integration/test_plugin_submission.cpp
 1      tests/integration/test_postgres_cdc.cpp
 1      tests/integration/test_postgres_pipeline.cpp
 2      tests/integration/test_sigterm_shutdown.cpp

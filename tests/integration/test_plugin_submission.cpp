@@ -63,6 +63,18 @@ std::filesystem::path hello_plugin_path() {
 #endif
 }
 
+// A per-process, per-test log path for a spawned coordinator.
+//
+// ctest runs each test in its own process, so keying only by test name would still
+// collide when the same test runs concurrently in different configurations; the pid
+// makes it unique. A shared path means one test waits on another's registrations.
+std::filesystem::path coordinator_log_path() {
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    const std::string name = info != nullptr ? std::string{info->name()} : std::string{"unknown"};
+    return std::filesystem::temp_directory_path() /
+           ("clink_ps_coordinator_" + std::to_string(::getpid()) + "_" + name + ".log");
+}
+
 pid_t spawn_node(const std::vector<std::string>& argv, const std::filesystem::path& binary_path) {
     std::vector<char*> raw_argv;
     raw_argv.reserve(argv.size() + 1);
@@ -145,8 +157,15 @@ TEST(PluginSubmission, ClientShipsPluginAndClusterRunsUserTypes) {
     snk.params = {{"path", out_path.string()}};
     graph.ops.push_back(std::move(snk));
 
-    const pid_t coordinator_pid = spawn_node(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    // Capture the coordinator's log so worker registration becomes OBSERVABLE.
+    // Keyed by pid and test name: ctest runs each test as its own process, and a
+    // fixed path would have concurrent tests overwriting each other's log and
+    // waiting on the wrong registrations.
+    const auto coordinator_log = coordinator_log_path();
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        binary,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
         << "coordinator never accepted on its port";
@@ -167,11 +186,18 @@ TEST(PluginSubmission, ClientShipsPluginAndClusterRunsUserTypes) {
                    binary);
     ASSERT_GT(worker_a_pid, 0);
     ASSERT_GT(worker_b_pid, 0);
-    // No observable for worker registration here (workers expose no port,
-    // the coordinator no HTTP API), so this stays a duration - generous
-    // rather than a tight guess, since a submission that arrives before a
-    // slot registers is rejected outright and reads as a submission bug.
-    std::this_thread::sleep_for(3s);
+    // Wait for BOTH workers to have registered, observed in the coordinator's own
+    // log rather than guessed at.
+    //
+    // The comment this replaces said there was no observable, because workers expose
+    // no port and this coordinator runs without the HTTP API. There is one: the
+    // coordinator logs a "slots=" line per registration, and capturing its stdout
+    // makes the count directly checkable. A submission that arrives before a slot
+    // exists is rejected outright and reads as a submission bug, which is exactly the
+    // failure a 3s guess produces on a loaded machine.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers; a submission now would be "
+           "refused for lack of slots and read as a submission defect";
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -240,8 +266,15 @@ TEST(PluginSubmission, KeyedStateCountersAccumulateInPluginOperator) {
     snk.params = {{"path", out_path.string()}};
     graph.ops.push_back(std::move(snk));
 
-    const pid_t coordinator_pid = spawn_node(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    // Capture the coordinator's log so worker registration becomes OBSERVABLE.
+    // Keyed by pid and test name: ctest runs each test as its own process, and a
+    // fixed path would have concurrent tests overwriting each other's log and
+    // waiting on the wrong registrations.
+    const auto coordinator_log = coordinator_log_path();
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        binary,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
         << "coordinator never accepted on its port";
@@ -267,11 +300,18 @@ TEST(PluginSubmission, KeyedStateCountersAccumulateInPluginOperator) {
     ASSERT_GT(worker_pid, 0);
     ASSERT_GT(tm2_pid, 0);
     ASSERT_GT(tm3_pid, 0);
-    // No observable for worker registration here (workers expose no port,
-    // the coordinator no HTTP API), so this stays a duration - generous
-    // rather than a tight guess, since a submission that arrives before a
-    // slot registers is rejected outright and reads as a submission bug.
-    std::this_thread::sleep_for(3s);
+    // Wait for BOTH workers to have registered, observed in the coordinator's own
+    // log rather than guessed at.
+    //
+    // The comment this replaces said there was no observable, because workers expose
+    // no port and this coordinator runs without the HTTP API. There is one: the
+    // coordinator logs a "slots=" line per registration, and capturing its stdout
+    // makes the count directly checkable. A submission that arrives before a slot
+    // exists is rejected outright and reads as a submission bug, which is exactly the
+    // failure a 3s guess produces on a loaded machine.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers; a submission now would be "
+           "refused for lack of slots and read as a submission defect";
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -353,8 +393,15 @@ TEST(PluginSubmission, CoOperatorRunsTwoHeterogeneousInputs) {
         graph.ops.push_back(std::move(op));
     }
 
-    const pid_t coordinator_pid = spawn_node(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    // Capture the coordinator's log so worker registration becomes OBSERVABLE.
+    // Keyed by pid and test name: ctest runs each test as its own process, and a
+    // fixed path would have concurrent tests overwriting each other's log and
+    // waiting on the wrong registrations.
+    const auto coordinator_log = coordinator_log_path();
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        binary,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
         << "coordinator never accepted on its port";
@@ -387,11 +434,18 @@ TEST(PluginSubmission, CoOperatorRunsTwoHeterogeneousInputs) {
     ASSERT_GT(worker2, 0);
     ASSERT_GT(worker3, 0);
     ASSERT_GT(worker4, 0);
-    // No observable for worker registration here (workers expose no port,
-    // the coordinator no HTTP API), so this stays a duration - generous
-    // rather than a tight guess, since a submission that arrives before a
-    // slot registers is rejected outright and reads as a submission bug.
-    std::this_thread::sleep_for(3s);
+    // Wait for BOTH workers to have registered, observed in the coordinator's own
+    // log rather than guessed at.
+    //
+    // The comment this replaces said there was no observable, because workers expose
+    // no port and this coordinator runs without the HTTP API. There is one: the
+    // coordinator logs a "slots=" line per registration, and capturing its stdout
+    // makes the count directly checkable. A submission that arrives before a slot
+    // exists is rejected outright and reads as a submission bug, which is exactly the
+    // failure a 3s guess produces on a loaded machine.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers; a submission now would be "
+           "refused for lack of slots and read as a submission defect";
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -492,8 +546,15 @@ TEST(PluginSubmission, SideOutputCrossesTheClusterWire) {
         graph.ops.push_back(std::move(op));
     }
 
-    const pid_t coordinator_pid = spawn_node(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    // Capture the coordinator's log so worker registration becomes OBSERVABLE.
+    // Keyed by pid and test name: ctest runs each test as its own process, and a
+    // fixed path would have concurrent tests overwriting each other's log and
+    // waiting on the wrong registrations.
+    const auto coordinator_log = coordinator_log_path();
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        binary,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
         << "coordinator never accepted on its port";
@@ -507,11 +568,18 @@ TEST(PluginSubmission, SideOutputCrossesTheClusterWire) {
                                      binary));
         ASSERT_GT(workers.back(), 0);
     }
-    // No observable for worker registration here (workers expose no port,
-    // the coordinator no HTTP API), so this stays a duration - generous
-    // rather than a tight guess, since a submission that arrives before a
-    // slot registers is rejected outright and reads as a submission bug.
-    std::this_thread::sleep_for(3s);
+    // Wait for BOTH workers to have registered, observed in the coordinator's own
+    // log rather than guessed at.
+    //
+    // The comment this replaces said there was no observable, because workers expose
+    // no port and this coordinator runs without the HTTP API. There is one: the
+    // coordinator logs a "slots=" line per registration, and capturing its stdout
+    // makes the count directly checkable. A submission that arrives before a slot
+    // exists is rejected outright and reads as a submission bug, which is exactly the
+    // failure a 3s guess produces on a loaded machine.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers; a submission now would be "
+           "refused for lack of slots and read as a submission defect";
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -602,8 +670,15 @@ TEST(PluginSubmission, KeyByPartitionsRecordsAcrossParallelSubtasks) {
         graph.ops.push_back(std::move(op));
     }
 
-    const pid_t coordinator_pid = spawn_node(
-        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    // Capture the coordinator's log so worker registration becomes OBSERVABLE.
+    // Keyed by pid and test name: ctest runs each test as its own process, and a
+    // fixed path would have concurrent tests overwriting each other's log and
+    // waiting on the wrong registrations.
+    const auto coordinator_log = coordinator_log_path();
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        binary,
+        coordinator_log);
     ASSERT_GT(coordinator_pid, 0);
     ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
         << "coordinator never accepted on its port";
@@ -619,11 +694,18 @@ TEST(PluginSubmission, KeyByPartitionsRecordsAcrossParallelSubtasks) {
                                      binary));
         ASSERT_GT(workers.back(), 0);
     }
-    // No observable for worker registration here (workers expose no port,
-    // the coordinator no HTTP API), so this stays a duration - generous
-    // rather than a tight guess, since a submission that arrives before a
-    // slot registers is rejected outright and reads as a submission bug.
-    std::this_thread::sleep_for(3s);
+    // Wait for BOTH workers to have registered, observed in the coordinator's own
+    // log rather than guessed at.
+    //
+    // The comment this replaces said there was no observable, because workers expose
+    // no port and this coordinator runs without the HTTP API. There is one: the
+    // coordinator logs a "slots=" line per registration, and capturing its stdout
+    // makes the count directly checkable. A submission that arrives before a slot
+    // exists is rejected outright and reads as a submission bug, which is exactly the
+    // failure a 3s guess produces on a loaded machine.
+    ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 2))
+        << "the coordinator never registered both workers; a submission now would be "
+           "refused for lack of slots and read as a submission defect";
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -788,13 +870,23 @@ TEST(PluginSubmission, CheckpointAndRestoreAcrossJobRuns) {
         struct Cluster {
             std::uint16_t coordinator_port;
             pid_t coordinator_pid;
+            std::filesystem::path coordinator_log;
             std::vector<pid_t> workers;
         };
         Cluster c;
         c.coordinator_port = probe_free_port();
-        c.coordinator_pid = spawn_node(
+        // Per-CLUSTER log path. This lambda spawns more than one cluster in a run,
+        // so the name is keyed by the coordinator's port as well as the pid -
+        // reusing one path would have the second cluster's wait counting the
+        // first's registrations.
+        const auto coordinator_log = std::filesystem::temp_directory_path() /
+                                     ("clink_ps_ckpt_coordinator_" + std::to_string(::getpid()) +
+                                      "_" + std::to_string(c.coordinator_port) + ".log");
+        c.coordinator_log = coordinator_log;
+        c.coordinator_pid = clink::itest::spawn_logged(
             {"clink_node", "--role=coordinator", "--port=" + std::to_string(c.coordinator_port)},
-            binary);
+            binary,
+            coordinator_log);
         // EXPECT, not ASSERT: this is inside a lambda returning Cluster, and
         // ASSERT_ expands to a bare `return`. A false here still fails the
         // test, via the submission that follows.
@@ -809,12 +901,11 @@ TEST(PluginSubmission, CheckpointAndRestoreAcrossJobRuns) {
                             "--coordinator-port=" + std::to_string(c.coordinator_port)},
                            binary));
         }
-        // No observable for worker registration here (workers expose no
-        // port, the coordinator no HTTP API), so this stays a duration -
-        // generous rather than a tight guess, since a submission arriving
-        // before a slot registers is rejected outright and reads as a
-        // submission bug.
-        std::this_thread::sleep_for(3s);
+        // Wait for all THREE workers to register, from the coordinator's own log.
+        // EXPECT, not ASSERT: this is inside a lambda returning Cluster, and ASSERT_
+        // expands to a bare `return`.
+        EXPECT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 3))
+            << "the coordinator never registered all three workers";
         return c;
     };
     auto teardown = [](auto& cluster) {
