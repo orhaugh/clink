@@ -2807,6 +2807,41 @@ of mutation-checking rather than trusting a green run.
 **Verification.** Two tests, mutation-checked in the form above, restore confirmed by
 diff. Core suite 2006 passed.
 
+### F76. The data plane had no fuzz target, and item 10's other claim was stale
+
+Follow-up 10 says the data plane "carries no version field, has no frame bound of its
+own, and is not fuzzed". Checked one at a time:
+
+| Claim | Verdict |
+|---|---|
+| no frame bound of its own | **Stale.** `kMaxFrameBytes` (256 MiB) is checked at both data-plane read sites, explicitly as the memory-amplification guard - "ends the connection rather than allocating an attacker-chosen size". |
+| carries no version field | True. |
+| is not fuzzed | True. Every existing target - `cluster_frame`, `checkpoint_meta`, `state_version_map`, `fault_spec`, `sql_parse` - covers the control plane. |
+
+A `data_frame` target now decodes an operator-to-operator frame from untrusted bytes,
+with byte 0 selecting the element kind so one corpus entry can steer at any branch
+rather than only the one it happened to hit. The branch that matters is `ArrowBatch`,
+which reaches `arrow_batch_from_ipc` - the decoder run on every columnar hop, handed
+whatever a peer sends.
+
+Nine seeds, generated from the real encoders rather than hand-written: a valid Arrow IPC
+batch through `arrow_batch_to_ipc`, the same batch truncated at its midpoint (the shape a
+dropped connection produces), and the short/empty bodies for each scalar kind. Seeding
+only with garbage would leave the fuzzer to discover Arrow's stream header by chance and
+spend its entire budget being rejected at the first bytes.
+
+**What is verified, and what is not.** The target is replayed by
+`tests/test_fuzz_corpus.cpp` under plain gtest on every build - that is the harness's own
+design, so a reproducer becomes a permanent regression test on machines that cannot run a
+fuzzer - and all three corpus tests pass over the new seeds, including the
+empty-and-single-byte case that every target must survive.
+
+It has NOT been run under libFuzzer. The build image has clang-19 but not
+`libclang-rt-19-dev`, so the fuzzer cannot link. That is follow-up 21's recorded blocker
+("the CI image carrying libclang-rt"), now confirmed and narrowed to an exact package
+name. Saying the data plane is "fuzzed" would overstate what has happened: it has a
+target and a seeded corpus, and the corpus replays.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

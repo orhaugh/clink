@@ -72,6 +72,7 @@ endif()
 # cannot host two entry points.
 set(CLINK_FUZZ_TARGETS
     cluster_frame
+    data_frame
     checkpoint_meta
     state_version_map)
 

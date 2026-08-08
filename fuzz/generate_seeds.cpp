@@ -23,6 +23,8 @@
 
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/core/arrow_batcher.hpp"
+#include "clink/runtime/network/wire.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/schema_version.hpp"
 
@@ -65,6 +67,60 @@ void write_frame_seed(const std::string& name, MessageKind kind, const Msg& m) {
         out.push_back(static_cast<std::uint8_t>(framed[i]));
     }
     write_seed("cluster_frame", name, out);
+}
+
+// Data-plane seeds (follow-up 10): an operator-to-operator frame body.
+//
+// Byte 0 is the element kind, matching what fuzz_data_frame expects, so the
+// kind is steerable by mutation rather than fixed per seed.
+//
+// The ArrowBatch seed carries a REAL IPC stream produced by the same encoder the
+// wire uses. Seeding only with garbage would leave the fuzzer to discover Arrow's
+// stream header by chance, and it would spend its whole budget being rejected at
+// the first bytes - the interesting inputs are the ones that get far enough into
+// the decoder to matter.
+void seed_data_frames() {
+    const auto emit =
+        [](const std::string& name, network::Kind kind, const std::vector<std::uint8_t>& payload) {
+            std::vector<std::uint8_t> out;
+            out.push_back(static_cast<std::uint8_t>(kind));
+            out.insert(out.end(), payload.begin(), payload.end());
+            write_seed("data_frame", name, out);
+        };
+
+    emit("watermark", network::Kind::Watermark, {0, 0, 0, 0, 0, 0, 0, 42});
+    emit("idle_watermark", network::Kind::WatermarkIdle, {0, 0, 0, 0, 0, 0, 0, 7});
+    emit("barrier", network::Kind::Barrier, {0, 0, 0, 0, 0, 0, 0, 3});
+    emit("credit_update", network::Kind::CreditUpdate, {0, 0, 8, 0});
+    // Short bodies: the receive loop must not read past the end when a peer
+    // truncates a frame mid-field.
+    emit("watermark_truncated", network::Kind::Watermark, {0, 0, 1});
+    emit("barrier_empty", network::Kind::Barrier, {});
+    emit("arrow_batch_empty", network::Kind::ArrowBatch, {});
+
+#ifdef CLINK_HAS_ARROW
+    // A valid single-column batch through the real encoder.
+    arrow::Int64Builder b;
+    (void)b.Append(1);
+    (void)b.Append(2);
+    (void)b.Append(3);
+    std::shared_ptr<arrow::Array> arr;
+    if (b.Finish(&arr).ok()) {
+        auto schema = arrow::schema({arrow::field("v", arrow::int64())});
+        auto batch = arrow::RecordBatch::Make(schema, arr->length(), {arr});
+        const auto ipc = clink::arrow_batch_to_ipc(*batch);
+        std::vector<std::uint8_t> payload;
+        payload.reserve(ipc.size());
+        for (const auto byte : ipc) {
+            payload.push_back(static_cast<std::uint8_t>(byte));
+        }
+        emit("arrow_batch_valid", network::Kind::ArrowBatch, payload);
+        // Truncated at the halfway point: an openable header with a body that
+        // stops early is the shape a dropped connection produces.
+        payload.resize(payload.size() / 2);
+        emit("arrow_batch_truncated", network::Kind::ArrowBatch, payload);
+    }
+#endif
 }
 
 void seed_cluster_frames() {
@@ -239,6 +295,7 @@ int main(int argc, char** argv) {
     std::error_code ec;
     std::filesystem::create_directories(g_root, ec);
     seed_cluster_frames();
+    seed_data_frames();
     seed_checkpoint_meta();
     seed_state_version_map();
     seed_fault_spec();

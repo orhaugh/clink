@@ -31,7 +31,9 @@
 
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/core/arrow_batcher.hpp"
 #include "clink/fault/fault_injection.hpp"
+#include "clink/runtime/network/wire.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/schema_version.hpp"
 
@@ -56,6 +58,75 @@ struct Target {
 // requesting a 4 GB allocation, eleven unbounded reserves, and a decode
 // throw terminating the process); this is what keeps them fixed against
 // inputs nobody thought to write down.
+// The DATA plane: an operator-to-operator frame, decoded from untrusted bytes.
+//
+// Every other target here covers the CONTROL plane. The data path carries Arrow
+// IPC between operators and its decoder is reached with whatever a peer sends -
+// a corrupt batch, a truncated stream, a schema that does not match what this
+// channel expects. It was the one untested decoder (follow-up 10).
+//
+// Byte 0 selects the element kind, mirroring the wire's own framing, so one
+// corpus entry can steer at any branch rather than only the one it happened to
+// hit. The remainder is the frame body.
+//
+// What this asserts is only "does not crash, does not read out of bounds, does
+// not overflow" - the sanitizers make that meaningful. arrow_batch_from_ipc is
+// expected to return nullptr on garbage; returning a batch for a corrupt stream
+// would be a different and much worse defect, but it is not what this target can
+// judge.
+inline void fuzz_data_frame(const std::uint8_t* data, std::size_t size) {
+    if (size < 1) {
+        return;
+    }
+    const auto kind = static_cast<network::Kind>(data[0]);
+    const std::uint8_t* payload = data + 1;
+    const std::size_t payload_size = size - 1;
+
+    switch (kind) {
+        case network::Kind::ArrowBatch: {
+#ifdef CLINK_HAS_ARROW
+            // The decoder that runs on every columnar hop. Copies into an
+            // Arrow-owned buffer and opens a stream reader over it.
+            auto batch =
+                arrow_batch_from_ipc(reinterpret_cast<const std::byte*>(payload), payload_size);
+            if (batch) {
+                // Touch the shape the receive loop touches: a decoded batch whose
+                // schema or row count disagrees with the channel's expectation is
+                // rejected there, and reading them here is what makes a malformed
+                // but openable stream visible to the fuzzer.
+                (void)batch->num_rows();
+                (void)batch->num_columns();
+                (void)batch->schema()->ToString();
+            }
+#else
+            (void)payload;
+            (void)payload_size;
+#endif
+            break;
+        }
+        case network::Kind::Watermark:
+        case network::Kind::WatermarkIdle:
+            // [i64 timestamp_be]. Short frames are the interesting case: the
+            // receive loop must not read past the end when a peer truncates.
+            if (payload_size >= 8) {
+                (void)network::read_i64_be(reinterpret_cast<const std::byte*>(payload));
+            }
+            break;
+        case network::Kind::Barrier:
+            if (payload_size >= 8) {
+                (void)network::read_u64_be(reinterpret_cast<const std::byte*>(payload));
+            }
+            break;
+        case network::Kind::CreditUpdate:
+            if (payload_size >= 4) {
+                (void)network::read_u32_be(reinterpret_cast<const std::byte*>(payload));
+            }
+            break;
+        default:
+            break;
+    }
+}
+
 inline void fuzz_cluster_frame(const std::uint8_t* data, std::size_t size) {
     if (size < 1) {
         return;
@@ -222,6 +293,7 @@ inline void fuzz_sql_parse(const std::uint8_t* data, std::size_t size) {
 [[nodiscard]] inline const std::vector<Target>& all_targets() {
     static const std::vector<Target> targets = {
         {"cluster_frame", &fuzz_cluster_frame},
+        {"data_frame", &fuzz_data_frame},
         {"checkpoint_meta", &fuzz_checkpoint_meta},
         {"state_version_map", &fuzz_state_version_map},
 #ifdef CLINK_FAULT_INJECTION
