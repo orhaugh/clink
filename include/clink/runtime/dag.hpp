@@ -71,6 +71,57 @@ class Dag;
 
 namespace detail {
 
+// Rendezvous between a chain's checkpoint OWNER and the members upstream of it.
+//
+// One subtask's dag is a chain of runners - separate THREADS - sharing one state
+// backend, and the single-writer scheme hands the snapshot to the most-downstream
+// element. Capture-before-process protects only the owner's own stream position: a
+// non-owner processes the barrier, forwards it, and nothing stopped it writing the
+// shared backend while the barrier was still queued between it and the owner. Those
+// post-barrier writes landed inside the owner's capture, so a completed checkpoint
+// held MORE than its cut - a keyed counter one record ahead of the source's offset,
+// which a restore then replays and double-counts (F67/F81; deterministic repro in
+// tests/test_chain_barrier_quiescence.cpp).
+//
+// The rule this enforces: after forwarding barrier N, a non-owner may not process
+// further elements until the owner's capture of N has completed. The owner never
+// waits, so there is no cycle; a waiting member produces nothing, so the channels
+// between it and the owner only drain. abort() is wired into every chain runner's
+// cancel, so teardown releases any waiter - the wait needs no deadline because both
+// of its exits are events, not guesses.
+struct ChainBarrierEpoch {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::uint64_t captured{0};
+    bool aborted{false};
+
+    // Owner side, called for EVERY barrier outcome - successful capture, failed
+    // capture, terminal - because a non-owner is waiting regardless of the outcome
+    // and the checkpoint's fate is reported through the ack, not through this.
+    void mark_captured(std::uint64_t id) {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (id > captured) {
+                captured = id;
+            }
+        }
+        cv.notify_all();
+    }
+
+    void abort() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            aborted = true;
+        }
+        cv.notify_all();
+    }
+
+    void await_captured(std::uint64_t id) {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return aborted || captured >= id; });
+    }
+};
+
 // Type-erased runner: a function that, given a runtime context and a "stop"
 // predicate, drives one operator until upstream is closed (or stop becomes
 // true). The runner attaches the context to its operator before open().
@@ -540,8 +591,15 @@ public:
         // Dag::side_output() calls made between add_operator and run()
         // are observed by the closure at runtime.
         auto side_channels = side_channels_ptr_(runners_.size());
-        runner.run = [op, in_channel, out_channel, side_channels, id, owner_flag, capture_codec](
-                         RuntimeContext& ctx, const std::function<bool()>& should_stop) {
+        runner.run = [op,
+                      in_channel,
+                      out_channel,
+                      side_channels,
+                      id,
+                      owner_flag,
+                      capture_codec,
+                      chain_epoch = chain_epoch_](RuntimeContext& ctx,
+                                                  const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
             // Record-capture flight recorder (see record_capture.hpp): armed
             // only when the job names a capture_dir AND this operator's input
@@ -873,6 +931,10 @@ public:
                                     ok = false;
                                     err = e.what();
                                 }
+                                // The cut is fixed the moment capture returns
+                                // (or fails): release the upstream members the
+                                // rendezvous is holding at this barrier.
+                                chain_epoch->mark_captured(ckpt_id.value());
                                 op->process(*maybe, emitter);
                                 if (!ok) {
                                     // Capture failed on-thread: ack the failure
@@ -898,6 +960,7 @@ public:
                                     ok = false;
                                     err = e.what();
                                 }
+                                chain_epoch->mark_captured(ckpt_id.value());
                                 op->process(*maybe, emitter);
                                 if (const auto& cb = ctx.checkpoint_ack(); cb) {
                                     cb(ckpt_id, ok, std::move(err));
@@ -916,6 +979,12 @@ public:
                                 // snapshot (it reads the same shared dirty set).
                             }
                             op->process(*maybe, emitter);
+                            // Forwarded. The owner - downstream, on another thread -
+                            // has not captured yet, and this member's next element
+                            // would write the shared backend PAST the cut. Hold here
+                            // until the owner's capture of this barrier completes
+                            // (any outcome) or the chain tears down.
+                            chain_epoch->await_captured(ckpt_id.value());
                         }
                     } else if (aec && maybe->is_watermark()) {
                         // Async mode: the watermark forwards (and fires its due
@@ -1064,7 +1133,8 @@ public:
                 }
             }
         };
-        runner.cancel = [in_channel, out_channel] {
+        runner.cancel = [in_channel, out_channel, chain_epoch = chain_epoch_] {
+            chain_epoch->abort();
             in_channel->close();
             out_channel->close();
         };
@@ -1245,7 +1315,8 @@ public:
                     " worker(s) failed; first: " + stage.worker_errors().front().second);
             }
         };
-        runner.cancel = [in_channel, out_channel] {
+        runner.cancel = [in_channel, out_channel, chain_epoch = chain_epoch_] {
+            chain_epoch->abort();
             in_channel->close();
             out_channel->close();
         };
@@ -2907,7 +2978,9 @@ public:
                       id,
                       in1_codec,
                       in2_codec,
-                      owner_flag](RuntimeContext& ctx, const std::function<bool()>& should_stop) {
+                      owner_flag,
+                      chain_epoch = chain_epoch_](RuntimeContext& ctx,
+                                                  const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
             // ASYNC-10 transparent read coalescing (opt-in), same recipe as the
             // single-input runner: wrap the backend BEFORE open() so the
@@ -3121,6 +3194,10 @@ public:
                         // which reads the same shared dirty set.
                     }
                     op->on_barrier(barrier, out_emitter);
+                    // Forwarded; hold until the owner's capture of this barrier
+                    // completes, so this member cannot write the shared backend
+                    // past the cut. See ChainBarrierEpoch.
+                    chain_epoch->await_captured(barrier.id().value());
                     return;
                 }
                 // Any in-flight capture has already put() its rows into the
@@ -3137,6 +3214,7 @@ public:
                         ok = false;
                         err = e.what();
                     }
+                    chain_epoch->mark_captured(barrier.id().value());
                     op->on_barrier(barrier, out_emitter);
                     if (!ok) {
                         if (const auto& cb = ctx.checkpoint_ack(); cb) {
@@ -3157,6 +3235,7 @@ public:
                         ok = false;
                         err = e.what();
                     }
+                    chain_epoch->mark_captured(barrier.id().value());
                     op->on_barrier(barrier, out_emitter);
                     if (const auto& cb = ctx.checkpoint_ack(); cb) {
                         cb(barrier.id(), ok, std::move(err));
@@ -4081,7 +4160,7 @@ public:
         runner.id = id;
         runner.spec_node_id = sink->spec_node_id();
         runner.spec_uid = sink->uid();
-        runner.run = [sink, in_channel, sink_owns_checkpoint, id](
+        runner.run = [sink, in_channel, sink_owns_checkpoint, id, chain_epoch = chain_epoch_](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             sink->attach_runtime(&ctx);
             sink->open();
@@ -4175,6 +4254,9 @@ public:
                             ok = false;
                             err = e.what();
                         }
+                        // The cut is fixed once capture returns (or fails):
+                        // release the chain members held at this barrier.
+                        chain_epoch->mark_captured(ckpt_id.value());
                         if (!ok) {
                             if (const auto& cb = ctx.checkpoint_ack(); cb) {
                                 cb(ckpt_id, false, std::move(err));
@@ -4202,6 +4284,9 @@ public:
                                 err = e.what();
                             }
                         }
+                        // Terminal included: a waiting member upstream is released
+                        // by the owner REACHING the barrier, whatever its kind.
+                        chain_epoch->mark_captured(ckpt_id.value());
                         if (barrier.is_terminal()) {
                             // Terminal barriers don't go through the coordinator
                             // commit broadcast - there's no recovery
@@ -4231,7 +4316,10 @@ public:
             sink->close();
             sink->attach_runtime(nullptr);
         };
-        runner.cancel = [in_channel] { in_channel->close(); };
+        runner.cancel = [in_channel, chain_epoch = chain_epoch_] {
+            chain_epoch->abort();
+            in_channel->close();
+        };
         runner.input_depth = [in_channel] { return in_channel->size(); };
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
         runner.input_high_water = [in_channel] { return in_channel->high_water_mark(); };
@@ -4550,6 +4638,9 @@ private:
     // adding a later operator flips it false. The cluster builds one Dag per
     // subtask, so this is naturally per-subtask.
     std::shared_ptr<bool> chain_checkpoint_owner_;
+    // One rendezvous per Dag, shared by every chain runner. See ChainBarrierEpoch.
+    std::shared_ptr<detail::ChainBarrierEpoch> chain_epoch_ =
+        std::make_shared<detail::ChainBarrierEpoch>();
     // The first sink on this chain to take checkpoint ownership, and the operator
     // it demoted. Held so that a fan-out to a SECOND sink can undo both: two sinks
     // cannot both precede one snapshot without a rendezvous, so a multi-sink chain

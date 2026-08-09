@@ -25,6 +25,7 @@ add_executable(clink_core_tests
     test_watermark_propagation.cpp
     test_watermark_strategy.cpp
     test_dag_fork.cpp
+    test_chain_barrier_quiescence.cpp
     test_checkpoint_cut_consistency.cpp
     test_keyed_shuffle_cut.cpp
     test_periodic_checkpoint.cpp

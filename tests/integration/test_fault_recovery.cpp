@@ -863,3 +863,143 @@ TEST_F(FaultRecoveryTest, NoUncommittedOutputIsVisibleAfterAKill) {
 }
 
 }  // namespace
+
+// --- item 19: the two fault moments the suite did not cover ----------------
+
+// A worker dies immediately AFTER its sink's external commit - the transaction is
+// published, the death lands before anything else happens. The recovery contract
+// is idempotent re-commit: the restore point's snapshot holds the sink's handle
+// for that checkpoint (staged before capture, F31), recover_all_() re-commits it,
+// and an already-committed rename is a no-op. The output must still be exactly
+// once - death-after-publish is precisely where a naive recovery double-publishes.
+//
+// Both workers are armed with the same fault because placement decides which of
+// them hosts the sink subtask, and arming only one would make the scenario
+// depend on the planner. Whichever worker commits first dies at that instant
+// (_exit(71), first hit); the other never reaches a sink point and survives.
+// The respawn is UNARMED - restart_worker takes fresh options - so the fault
+// fires exactly once per test, deterministically.
+TEST_F(FaultRecoveryTest, WorkerKilledAfterExternalCommitStillCommitsExactlyOnce) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0, ProcOptions{.fault = "sink.after_external_commit=exit:71@1"}));
+    ASSERT_TRUE(c.start_worker(1, ProcOptions{.fault = "sink.after_external_commit=exit:71@1"}));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/3, "file:" + (c.root() / "state").string());
+    ASSERT_NE(sub, nullptr);
+
+    // The armed worker dies at the FIRST external commit, which is the first
+    // CommitCheckpoint broadcast. Verify the fault landed where it was aimed
+    // rather than assuming it - the exit code is the fault's own.
+    std::size_t died = 2;
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            for (std::size_t i = 0; i < 2; ++i) {
+                if (!c.worker(i).running()) {
+                    died = i;
+                    return true;
+                }
+            }
+            return false;
+        },
+        std::chrono::seconds(60)))
+        << "no worker reached sink.after_external_commit, so the scenario did not run";
+    const auto armed_exit = c.worker(died).poll_exit();
+    ASSERT_TRUE(armed_exit.has_value());
+    ASSERT_EQ(*armed_exit, 71) << "the worker exited for a reason other than the injected fault";
+
+    // Bring the dead worker back CLEAN and let recovery finish the job.
+    ASSERT_TRUE(c.restart_worker(died));
+
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value()) << "submitter never exited after the mid-commit death";
+    EXPECT_EQ(*code, 0) << "the job did not survive a death immediately after external commit";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << v.duplicated.size() << " record(s) published MORE THAN ONCE after a death "
+        << "immediately following external commit; first: " << v.duplicated.front()
+        << ". recover_all_'s re-commit of an already-committed transaction must be "
+           "idempotent, and was not.";
+    EXPECT_TRUE(v.missing.empty())
+        << v.missing.size() << " record(s) never published; first: " << v.missing.front();
+}
+
+// The coordinator and a worker die TOGETHER - the compound failure item 19 lists
+// as uncovered.
+//
+// Job resume across a coordinator restart is an HA-DIR feature, and that contract
+// was established by this test's own first failure: recover_persisted_jobs()
+// returns immediately when ha_dir_ is empty, and its only caller is the
+// leadership callback. Without --ha-dir, a restarted coordinator abandons every
+// running job - the COMPLETED markers preserve a restore POINT, but nothing
+// re-submits the job. The first version of this test assumed checkpoint_dir alone
+// sufficed, converged on nothing for 60s, and the respawned coordinator's log
+// showed no deploy at all. So the scenario runs on the engine's actual durability
+// contract: one coordinator WITH an ha-dir (leadership self-acquired, manifests
+// persisted under <ha_dir>/jobs), workers that discover the leader through it.
+//
+// The judgement is on DISK, not on the submitter: the submitter's connection died
+// with the coordinator, so its exit code reflects the connection, not the job.
+// What an external consumer sees is committed/, and that must converge to exactly
+// the promised multiset once the coordinator returns (same ha-dir, so it wins
+// leadership and recovers the persisted job) and the workers are back.
+TEST_F(FaultRecoveryTest, CoordinatorAndWorkerDyingTogetherStillCommitsExactlyOnce) {
+    auto sp = spec();
+    sp.ha = true;  // start_ha_coordinators refuses on a non-HA spec
+    Cluster c(sp);
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_ha_coordinators(1));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.start_ha_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/3, "file:" + (c.root() / "state").string());
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
+                                    std::chrono::seconds(45)))
+        << "no checkpoint completed before the compound failure";
+
+    // Both at once, hard. No ordering between the two kills is assumed anywhere
+    // below - that is the point of the scenario. Worker 1 will ALSO exit shortly
+    // after, by design (a worker watches its coordinator connection), which is why
+    // the recovery below restarts both workers, not just the killed one.
+    c.ha_coordinator(0).kill_hard();
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    ASSERT_TRUE(clink::itest::await([&] { return !c.ha_coordinator(0).running(); },
+                                    std::chrono::seconds(10)));
+
+    // Reap the orphaned submitter; its verdict is about the dead connection.
+    (void)sub->await_exit(std::chrono::seconds(15));
+
+    // Fresh coordinator on the SAME ha-dir: it wins the leader lock, runs
+    // recover_persisted_jobs(), and redeploys from the latest COMPLETED marker.
+    ASSERT_TRUE(c.start_ha_coordinators(1));
+    ASSERT_TRUE(c.restart_worker_ha(0));
+    ASSERT_TRUE(c.restart_worker_ha(1));
+
+    // 60s, NOT 120: ctest's per-test ceiling is 120s and a bound that equals it
+    // means a genuine non-convergence is killed by ctest with no output at all -
+    // which is exactly how this test's first version "failed", as a silent
+    // 120.13s timeout. The bound must leave the failure message room to speak.
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+            return v.duplicated.empty() && v.missing.empty();
+        },
+        std::chrono::seconds(60)))
+        << [&] {
+               const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+               std::ostringstream os;
+               os << "output never converged to exactly-once after the compound failure: "
+                  << v.duplicated.size() << " duplicated, " << v.missing.size() << " missing (of "
+                  << kTotalRecords << ")";
+               if (!v.duplicated.empty()) {
+                   os << "; first duplicate: " << v.duplicated.front();
+               }
+               return os.str();
+           }();
+}

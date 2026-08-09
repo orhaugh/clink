@@ -312,6 +312,13 @@ see `ClinkFencedFrames`.
 failing looks like activity. `clink jobs` shows the terminal status; the coordinator
 log shows the attempt count against the budget.
 
+**A restarted coordinator shows no jobs.** That is the contract, not a loss, when the
+coordinator runs without `--ha-dir`: job manifests are persisted (and recovered on
+leadership) only under an HA directory, so a plain restart abandons running jobs while
+their `COMPLETED-N` markers remain intact. Recover manually by resubmitting with
+`--restore-from-checkpoint-id=<latest N>`, or run the coordinator with `--ha-dir` -
+one node is enough - so restarts recover jobs on their own.
+
 **What is this job actually configured to do?** `/api/v1/jobs/:id` reports the
 checkpoint configuration the job is running with - directory, interval, state backend,
 restore source, restart budget and alignment. Check it before assuming a job that is

@@ -522,6 +522,12 @@ public:
     // Index of the process currently holding leadership, by its own log.
     // A coordinator that has been superseded keeps its old "became leader"
     // line, so liveness is checked too.
+    // The i-th HA coordinator process, for tests that need to kill or inspect a
+    // specific one - the single-coordinator-with-ha-dir restart scenario kills
+    // index 0 directly, where kill_leader_and_await_failover would wait for a
+    // standby that deliberately does not exist.
+    [[nodiscard]] Process& ha_coordinator(std::size_t idx) { return *ha_coordinators_.at(idx); }
+
     [[nodiscard]] std::optional<std::size_t> current_leader_index() const {
         for (std::size_t i = 0; i < ha_coordinators_.size(); ++i) {
             const auto& p = ha_coordinators_[i];

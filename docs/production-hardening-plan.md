@@ -3149,6 +3149,102 @@ Once that is done, F76's `data_frame` target can have its first real fuzz run in
 corpus replay alone, and item 21's "45 seconds per target, discovery not in CI" becomes
 actionable rather than blocked.
 
+### F81. ROOT CAUSE OF F67, FIXED: a chain's checkpoint owner captured a backend its upstream members were still writing
+
+The defect chased since follow-up 44 opened, found by reading the artefacts of one
+failing run rather than by another reproduction lottery, then proven and fixed
+deterministically.
+
+**The mechanism.** One subtask's in-process dag is a CHAIN of runners - for the failing
+job's counter subtask: bridge-source -> counter -> bridge-sink. Separate threads, one
+shared state backend, and the single-writer scheme hands the snapshot to the
+most-downstream element. Capture-before-process protects only the owner's own stream
+position: a non-owner processed the barrier, forwarded it, and nothing stopped it
+popping the next record and writing the shared backend while the barrier was still
+queued between it and the owner. Those post-barrier writes landed inside the owner's
+capture, so a COMPLETED checkpoint held more than its cut.
+
+**Why the evidence looked the way it did.**
+
+| Observation | Explanation |
+|---|---|
+| counter one record ahead, source offset exact | the source writes its backend row only at its own barrier drain, never per record - immune by asymmetry. The counter writes per record - exposed |
+| roughly 1 failure in 30 | the skew needs the owner's thread to lag at the precise barrier |
+| every in-process test passed | in all of them the capturing thread and the mutating thread were the same thread |
+| the wire looked suspect and was clean | per-channel FIFO holds everywhere; the reorder was never in transit, it was in WHEN the capture ran |
+
+**The false trails, each killed by evidence rather than argument:** cross-generation
+overwrite (generations live and correct), checkpoint-id reuse (ids monotonic in-memory;
+the :2700 reset is the resume path and is itself a fix), a rewrite-at-completion scare
+(artefact copy mtimes - `cp` without `-p` carries no write-order information), ghost
+writers from restarts (the failing run's coordinator log shows NO restarts at all), and
+lazy capture (capture() is eager; the handle owns its bytes).
+
+**The deterministic reproduction** is `tests/test_chain_barrier_quiescence.cpp`: every
+step is a gate, no timing anywhere. The sink's `on_barrier` - which on the owner path
+runs immediately before capture - parks until released; the source emits exactly one
+post-barrier record; the counter provably processes it; only then is the owner released.
+Against the unfixed engine it failed every run in 1 ms with "capture contains 6 where
+the cut is 5". The 1-in-30 lottery became a certainty.
+
+**The fix: a chain barrier rendezvous** (`detail::ChainBarrierEpoch`, dag.hpp). After
+forwarding barrier N, a non-owner chain member may not process further elements until
+the owner's capture of N has completed. The owner never waits, so there is no cycle; a
+waiting member produces nothing, so the channels between it and the owner only drain.
+The owner marks for EVERY outcome - successful capture, failed capture, terminal - and
+every chain runner's cancel aborts the epoch, so the wait has no deadline because both
+of its exits are events. Owner mark sites: single-input sync+async, co-operator
+sync+async, sink sync+async(+terminal). Wait sites: single-input and co-operator
+non-owner branches. Sinks do not wait (nothing downstream of them), and the source does
+not wait (it never writes the backend outside its drain - the same asymmetry that kept
+the offset exact).
+
+Cost: one condition-variable wait per non-owner per barrier, at checkpoint cadence.
+Nothing per record.
+
+**Verification.**
+
+- The repro fails every run without the fix and passes in 1 ms with it.
+- Mutation-checked, diff-verified both ways: removing the single-input wait resurrects
+  "contains 6" exactly; restoring returns green.
+- Full core suite 2009 - the rendezvous deadlocks nothing across every checkpoint,
+  cancel-teardown and exactly-once suite.
+- Linux serialised integration label + the rescale family recorded with the commit.
+
+**Scope stated plainly:** the co-operator wait is implemented from the same analysis but
+has no dedicated mutation test yet (the single-input one does). The in-process PARALLEL
+stage runners share one backend in embedded mode and sit outside the chain-owner scheme
+entirely; the cluster gives each subtask its own backend, so this is an embedded-mode
+caveat, not a cluster one.
+
+**What this closes and touches:** follow-up 44 (root-caused and fixed - the "checkpoint
+defect, not a rescale one" re-diagnosis was right); item 37's duplicate mode is exactly
+what a restore from a skewed cut produces, so its sensor should now stay quiet for this
+cause; item 29's split-commit sighting is plausibly the same family (a skewed cut on a
+sink-handle write), unproven.
+
+### F82. A coordinator without --ha-dir does not resume jobs after a restart
+
+Established by item 19's compound-failure test rather than assumed from the code. The
+test killed the coordinator and a worker together, respawned the coordinator on the
+same checkpoint directory, and expected the job to resume from its COMPLETED markers.
+It converged on nothing for its full bound, and the respawned coordinator's log showed
+no deploy at all.
+
+The contract: `recover_persisted_jobs()` reads manifests from `<ha_dir>/jobs/` and is
+called only from the leadership callback; with an empty `ha_dir_` it returns
+immediately. The COMPLETED markers preserve a restore POINT - a resubmit with
+`--restore-from-checkpoint-id` resumes manually - but automatic resume is an HA-dir
+feature, even for a single-node deployment.
+
+Judgement call, recorded: this is treated as a contract to DOCUMENT rather than a
+defect to fix. Making a bare coordinator persist and resume jobs would duplicate the
+HA manifest machinery behind a second flag, and a single coordinator with `--ha-dir`
+already provides exactly that behaviour at no extra operational cost. What was missing
+was the sentence saying so - it is now in `checkpointing.md` and the runbook, and the
+compound-failure test runs on the real contract (one HA coordinator, joint kill,
+respawn on the same ha-dir, exactly-once convergence judged on disk).
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
