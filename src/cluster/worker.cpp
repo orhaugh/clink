@@ -696,6 +696,9 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
             case MessageKind::BeginRescale:
                 handle_begin_rescale_(r);
                 break;
+            case MessageKind::CutoverPeerUpdate:
+                handle_cutover_peer_update_(r);
+                break;
             default:
                 break;
         }
@@ -884,6 +887,46 @@ void Worker::handle_begin_rescale_(MessageReader& r) {
             // rescale if the SubtaskFinished ack never arrives.
         }
     }
+}
+
+void Worker::handle_cutover_peer_update_(MessageReader& r) {
+    auto msg = decode_cutover_peer_update(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "CutoverPeerUpdate")) {
+        return;
+    }
+    // Snapshot the registered hooks under the lock, apply outside it: each
+    // apply_swap blocks until its group has flushed the armed barrier,
+    // which is data-volume work. Same inline-on-the-reader precedent as
+    // commit dispatch; the flush is bounded by the branch queues draining
+    // through C, which the held split guarantees is finite.
+    std::vector<RunnerContext::GroupCutoverHooks> to_apply;
+    {
+        std::lock_guard lock(mu_);
+        auto job_it = per_job_group_cutovers_.find(msg.job_id);
+        if (job_it != per_job_group_cutovers_.end()) {
+            auto op_it = job_it->second.find(msg.op_id);
+            if (op_it != job_it->second.end()) {
+                to_apply = op_it->second;
+            }
+        }
+    }
+    std::size_t applied = 0;
+    for (auto& hooks : to_apply) {
+        try {
+            if (hooks.apply_swap && hooks.apply_swap(msg.peers)) {
+                ++applied;
+            }
+        } catch (const std::exception& e) {
+            log::warn("worker.rescale",
+                      "cutover peer swap failed for op '" + msg.op_id + "' of job " +
+                          std::to_string(msg.job_id) + ": " + e.what());
+        }
+    }
+    log::info("worker.rescale",
+              "cutover peer update applied job_id=" + std::to_string(msg.job_id) +
+                  " op_id=" + msg.op_id + " groups=" + std::to_string(applied) + "/" +
+                  std::to_string(to_apply.size()) +
+                  " new_parallelism=" + std::to_string(msg.peers.size()));
 }
 
 void Worker::handle_abort_checkpoint_(MessageReader& r) {
@@ -1383,6 +1426,8 @@ void Worker::run_generic_subtask_(JobId job_id,
         rg.mode = g.mode;
         rg.key_extractor_fn = g.key_extractor_fn;
         rg.side_output_tag = g.side_output_tag;
+        rg.downstream_op_id = g.downstream_op_id;
+        rg.downstream_max_parallelism = g.downstream_max_parallelism;
         if (!g.edges.empty()) {
             rg.channel_type = g.edges.front().channel_type;
         }
@@ -1669,6 +1714,23 @@ void Worker::run_generic_subtask_(JobId job_id,
                             bucket.push_back(cb);
                     }
                 };
+            // Rescale-eligible output groups register their hold-and-swap
+            // hooks here. Keyed by the DOWNSTREAM op the group feeds (the
+            // op a rescale request names), not by this task's own ops:
+            // BeginRescale(op=X) must arm the groups feeding X on every
+            // upstream task, and CutoverPeerUpdate(op=X) must reach their
+            // swaps. The gate also joins the arm map under the same key so
+            // the arm dispatch stays one code path.
+            auto register_group_cutover = [this, job_id](RunnerContext::GroupCutoverHooks hooks) {
+                if (hooks.downstream_op_id.empty() || !hooks.gate) {
+                    return;
+                }
+                std::lock_guard lock(mu_);
+                auto gate = hooks.gate;
+                per_job_arm_callbacks_[job_id][hooks.downstream_op_id].push_back(
+                    [gate](std::uint64_t cutover_ckpt) { (void)gate->arm(cutover_ckpt); });
+                per_job_group_cutovers_[job_id][hooks.downstream_op_id].push_back(std::move(hooks));
+            };
             // Graceful stop. Keyed by job only: a stop addresses every subtask,
             // so there is no role to select on.
             auto register_stops = [this, job_id](std::vector<RunnerContext::StopFn> cbs) {
@@ -1740,6 +1802,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .register_abort_callbacks = std::move(register_aborts),
                 .register_drain_callbacks = std::move(register_drains),
                 .register_cutover_arm_callbacks = std::move(register_arms),
+                .register_group_cutover = std::move(register_group_cutover),
                 .register_stop_callbacks = std::move(register_stops),
                 .register_checkpoint_backend = std::move(register_backend),
                 .runner_role = task.role,

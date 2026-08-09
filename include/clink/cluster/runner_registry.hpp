@@ -14,6 +14,7 @@
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/runtime/cutover_gate.hpp"
 #include "clink/state/state_backend.hpp"
 
 namespace spdlog {
@@ -73,6 +74,13 @@ struct ResolvedOutputGroup {
     // same payload type). Copied from the underlying SubtaskEdge so
     // the side-output attacher can look up the right TypeOps.
     std::string channel_type;
+    // Rescale annotation (hot rescale, design record 008), copied from
+    // the SubtaskOutputGroup: the op this group feeds, and its declared
+    // max_parallelism. A non-zero max makes the group build with parked
+    // branches up to the ceiling behind a GroupCutoverGate; zero builds
+    // it exactly as before.
+    std::string downstream_op_id;
+    std::uint32_t downstream_max_parallelism{0};
 };
 
 // What a SubtaskRunner receives from the generic role on the worker. The
@@ -244,6 +252,22 @@ struct RunnerContext {
     // the named barrier.
     using CutoverArmFn = std::function<void(std::uint64_t /*cutover_checkpoint_id*/)>;
     std::function<void(std::vector<CutoverArmFn>)> register_cutover_arm_callbacks;
+
+    // Rescale-eligible output group registration (hot rescale, design
+    // record 008). The output-attach path calls this once per group built
+    // with a GroupCutoverGate; the worker indexes the hooks by
+    // (job, downstream op) so BeginRescale's arm reaches the gate and a
+    // CutoverPeerUpdate's endpoint list reaches the swap. apply_swap blocks
+    // until every branch has flushed the armed barrier, swaps the branch
+    // endpoints to the given peers (in index-within-operator order), parks
+    // the rest, and releases the split with the new live count; false means
+    // the flush wait failed (abort or bound) and the swap was not applied.
+    struct GroupCutoverHooks {
+        std::string downstream_op_id;
+        std::shared_ptr<GroupCutoverGate> gate;
+        std::function<bool(const std::vector<PeerAddress>&)> apply_swap;
+    };
+    std::function<void(GroupCutoverHooks)> register_group_cutover;
 
     // Graceful-stop hook, and deliberately separate from the drain above.
     //

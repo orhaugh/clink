@@ -17,6 +17,7 @@
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/cluster/checkpoint_retention.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/snapshots.hpp"
 #include "clink/runtime/network/connection.hpp"
 #include "clink/state/state_backend.hpp"
@@ -212,6 +213,7 @@ private:
     // the lock with the target_parallelism. Subtask runners
     // belonging to other operators are unaffected.
     void handle_begin_rescale_(MessageReader& r);
+    void handle_cutover_peer_update_(MessageReader& r);
     void handle_stop_subtasks_(MessageReader& r);
     // Sum the last snapshot size of every backend this worker hosts, per job, and
     // publish it as a gauge. Called from the heartbeat loop.
@@ -380,6 +382,16 @@ private:
     using CutoverArmCallback = std::function<void(std::uint64_t cutover_checkpoint_id)>;
     std::unordered_map<JobId, std::unordered_map<std::string, std::vector<CutoverArmCallback>>>
         per_job_arm_callbacks_;
+
+    // Per-(job_id, downstream op) hold-and-swap hooks for rescale-eligible
+    // output groups, registered by the output-attach path. BeginRescale's
+    // arm reaches the gates through the arm map above (the registration
+    // adds a gate-arming callback there too); CutoverPeerUpdate dispatches
+    // the endpoint swap through these.
+    std::unordered_map<
+        JobId,
+        std::unordered_map<std::string, std::vector<RunnerContext::GroupCutoverHooks>>>
+        per_job_group_cutovers_;
 
     // Graceful-stop closures, per job. Not keyed by role, unlike the drain map:
     // a stop addresses the WHOLE job, so there is nothing to select on. Same

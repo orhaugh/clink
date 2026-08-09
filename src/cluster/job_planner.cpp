@@ -217,6 +217,16 @@ std::string OperatorChainSpec::to_json() const {
             out += ",\"side_output_tag\":";
             out += escape_json_string(g.side_output_tag);
         }
+        // Rescale annotation, emitted only when set so pre-annotation
+        // consumers see byte-identical JSON for unannotated groups.
+        if (!g.downstream_op_id.empty()) {
+            out += ",\"downstream_op_id\":";
+            out += escape_json_string(g.downstream_op_id);
+        }
+        if (g.downstream_max_parallelism != 0) {
+            out += ",\"downstream_max_parallelism\":";
+            out += std::to_string(g.downstream_max_parallelism);
+        }
         out += ",\"edges\":[";
         for (std::size_t j = 0; j < g.edges.size(); ++j) {
             const auto& e = g.edges[j];
@@ -360,6 +370,9 @@ OperatorChainSpec OperatorChainSpec::from_json(std::string_view json_text) {
             }
             g.key_extractor_fn = gv.string_or("key_extractor_fn", "");
             g.side_output_tag = gv.string_or("side_output_tag", "");
+            g.downstream_op_id = gv.string_or("downstream_op_id", "");
+            g.downstream_max_parallelism =
+                static_cast<std::uint32_t>(gv.int_or("downstream_max_parallelism", 0));
             if (gv.contains("edges")) {
                 for (const auto& ev : gv.at("edges").as_array()) {
                     g.edges.push_back(edge_from_json(ev, "output_groups.edges"));
@@ -1242,6 +1255,12 @@ JobPlan plan_job(const JobGraphSpec& graph,
                 const auto& d_subs = op_subtasks.at(dop->id);
                 SubtaskOutputGroup group;
                 group.side_output_tag = ds.side_tag;
+                // Rescale annotation: which op this group feeds, and its
+                // declared ceiling. max_parallelism > 0 is the eligibility
+                // signal (`.rescalable(min, max)`); without it the group
+                // builds with no cutover machinery at all.
+                group.downstream_op_id = dop->id;
+                group.downstream_max_parallelism = dop->max_parallelism;
                 const bool forward = (dop->parallelism == tail.parallelism);
                 // Side outputs carry a different channel type than the
                 // main output. Resolve it across ALL inner ops in the

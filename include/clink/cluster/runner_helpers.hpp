@@ -38,10 +38,12 @@
 namespace clink::cluster {
 
 template <typename T>
-void attach_typed_group_output(Dag& dag,
-                               StageHandle<T> handle,
-                               const ResolvedOutputGroup& group,
-                               const TypeOps& type_ops);
+void attach_typed_group_output(
+    Dag& dag,
+    StageHandle<T> handle,
+    const ResolvedOutputGroup& group,
+    const TypeOps& type_ops,
+    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover = {});
 
 // SideOutputAttacherRegistry stores per-channel-name closures that
 // build a typed side-output network sink. Registration is templated on
@@ -183,15 +185,106 @@ StageHandle<T> build_typed_input_stage(Dag& dag,
 //                    NetworkBridgeSink<T> per branch
 //   * Forward N    : fork (defensive; planner emits only Rebalance
 //                    when N>1)
+//
+// A rescale-eligible Hash group (non-zero downstream_max_parallelism and a
+// register hook) instead builds the hold-and-swap shape from design record
+// 008: a gated split sized to the downstream's ceiling, SwappableBridgeSink
+// branches (parked above the live count), a selector that reads the gate's
+// live divisor, and a registered {gate, apply_swap} pair the worker
+// dispatches arms and CutoverPeerUpdates to.
 template <typename T>
-void attach_typed_group_output(Dag& dag,
-                               StageHandle<T> handle,
-                               const ResolvedOutputGroup& group,
-                               const TypeOps& type_ops) {
+void attach_typed_group_output(
+    Dag& dag,
+    StageHandle<T> handle,
+    const ResolvedOutputGroup& group,
+    const TypeOps& type_ops,
+    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover) {
     auto make_sink = [&](const PeerAddress& peer) {
         auto bridge_void = type_ops.connect_outbound_bridge(peer.host, peer.data_port);
         return std::static_pointer_cast<network::NetworkBridgeSink<T>>(bridge_void);
     };
+
+    const bool rescale_eligible = group.downstream_max_parallelism > 0 &&
+                                  group.mode == RoutingMode::Hash &&
+                                  static_cast<bool>(register_group_cutover);
+    if (rescale_eligible) {
+        if (group.key_extractor_fn.empty()) {
+            throw std::runtime_error(
+                "runner: Hash routing but no key_extractor_fn set on the output group");
+        }
+        auto extractor = KeyExtractorRegistry::default_instance().find<T>(type_ops.channel_name,
+                                                                          group.key_extractor_fn);
+        if (!extractor) {
+            throw std::runtime_error("runner: key extractor '" + group.key_extractor_fn +
+                                     "' not registered for channel '" + type_ops.channel_name +
+                                     "'");
+        }
+        const std::uint32_t live = static_cast<std::uint32_t>(group.peers.size());
+        // Defensive max: a declared ceiling below the current parallelism
+        // would park live branches; the planner validates bounds, this
+        // keeps the group buildable regardless.
+        const std::size_t max_branches =
+            std::max<std::size_t>(group.downstream_max_parallelism, group.peers.size());
+        auto gate = std::make_shared<GroupCutoverGate>(live);
+        auto selector = [extractor, gate](const T& v) {
+            const auto k = extractor(v);
+            const auto k_bytes =
+                std::span<const std::byte>{reinterpret_cast<const std::byte*>(&k), sizeof(k)};
+            const auto group_id = key_group_for_key(k_bytes);
+            return static_cast<int>(subtask_for_key_group(group_id, gate->live()));
+        };
+        // No columnar split on eligible groups yet: the columnar splitter
+        // bakes its divisor at build time, and a divisor that disagrees
+        // with the gate's live count after a swap would route key groups
+        // to the wrong peers. Row-split routing through the live-reading
+        // selector is byte-identical in DESTINATION, just not columnar.
+        // Making the columnar splitter live-aware is a follow-up with its
+        // own A/B; SQL paths are unaffected today because SQL operators
+        // declare no rescale bounds.
+        auto branches =
+            dag.template add_split<T>(handle, std::move(selector), max_branches, "hash", {}, gate);
+        // Swap-time inner sinks come from the SAME erased builder the
+        // original deploy used, so a swapped endpoint is wired exactly as a
+        // deployed one would be.
+        auto connect = [connect_outbound = type_ops.connect_outbound_bridge](
+                           const typename network::SwappableBridgeSink<T>::Endpoint& ep) {
+            return std::static_pointer_cast<network::NetworkBridgeSink<T>>(
+                connect_outbound(ep.host, ep.port));
+        };
+        std::vector<std::shared_ptr<network::SwappableBridgeSink<T>>> sinks;
+        sinks.reserve(max_branches);
+        for (std::size_t i = 0; i < max_branches; ++i) {
+            std::optional<typename network::SwappableBridgeSink<T>::Endpoint> ep;
+            if (i < group.peers.size()) {
+                ep = {group.peers[i].host, group.peers[i].data_port};
+            }
+            auto sink = std::make_shared<network::SwappableBridgeSink<T>>(
+                connect, std::move(ep), gate, "cutover.branch" + std::to_string(i));
+            sinks.push_back(sink);
+            dag.template add_sink<T>(branches[i], sink);
+        }
+        RunnerContext::GroupCutoverHooks hooks;
+        hooks.downstream_op_id = group.downstream_op_id;
+        hooks.gate = gate;
+        hooks.apply_swap =
+            [gate, sinks, max_branches](const std::vector<PeerAddress>& new_peers) -> bool {
+            if (!gate->await_all_flushed(
+                    static_cast<std::uint32_t>(max_branches), cutover_hold_timeout(), nullptr)) {
+                return false;
+            }
+            for (std::size_t i = 0; i < sinks.size(); ++i) {
+                std::optional<typename network::SwappableBridgeSink<T>::Endpoint> ep;
+                if (i < new_peers.size()) {
+                    ep = {new_peers[i].host, new_peers[i].data_port};
+                }
+                sinks[i]->swap(std::move(ep));
+            }
+            gate->release(static_cast<std::uint32_t>(new_peers.size()));
+            return true;
+        };
+        register_group_cutover(std::move(hooks));
+        return;
+    }
 
     if (group.peers.size() == 1) {
         dag.template add_sink<T>(handle, make_sink(group.peers.front()));
@@ -271,17 +364,19 @@ void attach_typed_group_output(Dag& dag,
 // a named selector when chain.output_routing == Split. The selector is
 // looked up in SelectorRegistry keyed on T's channel name.
 template <typename T>
-void attach_typed_output_groups(Dag& dag,
-                                StageHandle<T> handle,
-                                const std::vector<ResolvedOutputGroup>& groups,
-                                const TypeOps& type_ops,
-                                OperatorChainSpec::OutputRouting routing,
-                                const std::string& selector_fn) {
+void attach_typed_output_groups(
+    Dag& dag,
+    StageHandle<T> handle,
+    const std::vector<ResolvedOutputGroup>& groups,
+    const TypeOps& type_ops,
+    OperatorChainSpec::OutputRouting routing,
+    const std::string& selector_fn,
+    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover = {}) {
     if (groups.empty()) {
         return;
     }
     if (groups.size() == 1) {
-        attach_typed_group_output<T>(dag, handle, groups.front(), type_ops);
+        attach_typed_group_output<T>(dag, handle, groups.front(), type_ops, register_group_cutover);
         return;
     }
     if (routing == OperatorChainSpec::OutputRouting::Split) {
@@ -306,13 +401,14 @@ void attach_typed_output_groups(Dag& dag,
         auto branches =
             dag.template add_split<T>(handle, std::move(selector), groups.size(), "split");
         for (std::size_t i = 0; i < groups.size(); ++i) {
-            attach_typed_group_output<T>(dag, branches[i], groups[i], type_ops);
+            attach_typed_group_output<T>(
+                dag, branches[i], groups[i], type_ops, register_group_cutover);
         }
         return;
     }
     auto branches = dag.template fork<T>(handle, groups.size());
     for (std::size_t i = 0; i < groups.size(); ++i) {
-        attach_typed_group_output<T>(dag, branches[i], groups[i], type_ops);
+        attach_typed_group_output<T>(dag, branches[i], groups[i], type_ops, register_group_cutover);
     }
 }
 

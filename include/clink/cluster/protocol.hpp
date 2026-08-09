@@ -202,6 +202,13 @@ enum class MessageKind : std::uint8_t {
     StopSubtasks = 117,
     // coordinator → client. Reply to StopJob.
     StopJobAck = 118,
+    // coordinator → worker. The post-cutover peer endpoints for a
+    // rescale-eligible output group feeding `op_id` (hot rescale, design
+    // record 008). The worker's registered group hooks await the group's
+    // flush of the armed barrier, swap the branch endpoints to these peers
+    // (index-within-operator order), park the rest, and release the held
+    // split with the new live count.
+    CutoverPeerUpdate = 119,
 };
 
 // Sentinel marking "no rescale-specific restore override" on a
@@ -801,6 +808,16 @@ struct BeginRescaleMsg {
     // Fencing epoch of the sending coordinator; see CommitCheckpointMsg.
     // Zero means an unfenced coordinator and reproduces the pre-fencing
     // behaviour, so a mixed-version cluster keeps working mid-upgrade.
+    std::uint64_t coordinator_epoch{0};
+};
+
+// coordinator → worker. Post-cutover endpoints for every group feeding
+// `op_id` on this worker. `peers` is ordered by index within the operator;
+// its size is the new live branch count. See MessageKind::CutoverPeerUpdate.
+struct CutoverPeerUpdateMsg {
+    JobId job_id{};
+    std::string op_id;
+    std::vector<PeerAddress> peers;
     std::uint64_t coordinator_epoch{0};
 };
 

@@ -272,6 +272,21 @@ inline void encode_body(MessageBuilder& b, const BeginRescaleMsg& m) {
     b.put_u64_be(m.coordinator_epoch);
 }
 
+inline void encode_body(MessageBuilder& b, const CutoverPeerUpdateMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_string(m.op_id);
+    b.put_u32_be(static_cast<std::uint32_t>(m.peers.size()));
+    for (const auto& p : m.peers) {
+        b.put_string(p.role);
+        b.put_u32_be(p.subtask_idx);
+        b.put_string(p.host);
+        b.put_u16_be(p.data_port);
+    }
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
+}
+
 inline void encode_body(MessageBuilder& b, const SubtaskCheckpointedMsg& m) {
     b.put_u64_be(m.job_id);
     b.put_u64_be(m.checkpoint_id);
@@ -711,6 +726,26 @@ inline BeginRescaleMsg decode_begin_rescale(MessageReader& r) {
     m.op_id = r.read_string();
     m.target_parallelism = r.read_u32_be();
     m.cutover_checkpoint = r.read_u64_be();
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    return m;
+}
+
+inline CutoverPeerUpdateMsg decode_cutover_peer_update(MessageReader& r) {
+    CutoverPeerUpdateMsg m;
+    m.job_id = r.read_u64_be();
+    m.op_id = r.read_string();
+    const std::uint32_t n = r.read_count();
+    m.peers.reserve(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        PeerAddress p;
+        p.role = r.read_string();
+        p.subtask_idx = r.read_u32_be();
+        p.host = r.read_string();
+        p.data_port = r.read_u16_be();
+        m.peers.push_back(std::move(p));
+    }
     // Fencing epoch. Absent from a pre-fencing peer, which reads
     // as 0 = unfenced and preserves the old behaviour.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();

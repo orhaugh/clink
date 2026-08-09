@@ -18,17 +18,20 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
+#include "clink/cluster/runner_helpers.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/cutover_gate.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
+#include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/local_executor.hpp"
 #include "clink/runtime/network/local_data_plane.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
@@ -188,6 +191,10 @@ TEST(GroupCutover, TheSplitHoldsAtTheArmedBarrierAndResumesOnTheNewPeerSet) {
         "cutover.split." + tag,
         {},
         gate);
+    auto connect_fn = [](const network::SwappableBridgeSink<std::int64_t>::Endpoint& ep) {
+        return std::make_shared<network::NetworkBridgeSink<std::int64_t>>(
+            ep.host, ep.port, int64_codec());
+    };
     std::vector<std::shared_ptr<network::SwappableBridgeSink<std::int64_t>>> sinks;
     for (std::size_t i = 0; i < kMaxBranches; ++i) {
         std::optional<network::SwappableBridgeSink<std::int64_t>::Endpoint> ep;
@@ -197,11 +204,7 @@ TEST(GroupCutover, TheSplitHoldsAtTheArmedBarrierAndResumesOnTheNewPeerSet) {
             ep = {"127.0.0.1", a1.port};
         }
         auto sink = std::make_shared<network::SwappableBridgeSink<std::int64_t>>(
-            int64_codec(),
-            ArrowBatcher<std::int64_t>{},
-            ep,
-            gate,
-            "cutover.branch" + std::to_string(i) + "." + tag);
+            connect_fn, ep, gate, "cutover.branch" + std::to_string(i) + "." + tag);
         sinks.push_back(sink);
         dag.add_sink<std::int64_t>(branches[i], sink);
     }
@@ -310,8 +313,10 @@ TEST(GroupCutover, AnAbortReleasesTheHeldSplitToWindDown) {
     auto branches = dag.add_split<std::int64_t>(
         h0, [](const std::int64_t&) { return 0; }, 1, "cutabort.split." + tag, {}, gate);
     auto sink = std::make_shared<network::SwappableBridgeSink<std::int64_t>>(
-        int64_codec(),
-        ArrowBatcher<std::int64_t>{},
+        [](const network::SwappableBridgeSink<std::int64_t>::Endpoint& ep) {
+            return std::make_shared<network::NetworkBridgeSink<std::int64_t>>(
+                ep.host, ep.port, int64_codec());
+        },
         network::SwappableBridgeSink<std::int64_t>::Endpoint{"127.0.0.1", a0.port},
         gate,
         "cutabort.branch0." + tag);
@@ -366,4 +371,163 @@ TEST(GroupCutover, TheGatePinsItsOwnBookkeeping) {
     EXPECT_EQ(gate.live(), 6u);
     EXPECT_FALSE(gate.is_armed_for(7));
     EXPECT_TRUE(gate.arm(9)) << "the gate did not re-arm after release";
+}
+
+// --- the production attach path ---------------------------------------------
+//
+// The tests above hand-build the gate, split and sinks. These drive
+// attach_typed_group_output itself: an ELIGIBLE group (non-zero
+// downstream_max_parallelism, Hash mode, register hook present) must build
+// the hold-and-swap shape and register working hooks; an ineligible group
+// must register nothing and build classically.
+
+TEST(GroupCutover, TheAttachPathBuildsAndRegistersAWorkingSwapForEligibleGroups) {
+    network::LocalDataPlane::instance().clear_for_testing();
+    const auto tag = cutover_tag();
+
+    Peer a0("attach.a0." + tag), a1("attach.a1." + tag);
+    Peer b0("attach.b0." + tag), b1("attach.b1." + tag), b2("attach.b2." + tag),
+        b3("attach.b3." + tag);
+
+    cluster::TypeRegistry type_reg;
+    type_reg.register_typed<std::int64_t>(std::string{cluster::kChannelInt64}, int64_codec());
+    const auto* type_ops = type_reg.find(std::string{cluster::kChannelInt64});
+    ASSERT_NE(type_ops, nullptr);
+    const std::string extractor_name = "cutover_identity_" + tag;
+    cluster::KeyExtractorRegistry::default_instance().register_extractor<std::int64_t>(
+        std::string{cluster::kChannelInt64}, extractor_name, [](const std::int64_t& v) {
+            return v;
+        });
+
+    cluster::ResolvedOutputGroup group;
+    group.mode = cluster::RoutingMode::Hash;
+    group.key_extractor_fn = extractor_name;
+    group.channel_type = std::string{cluster::kChannelInt64};
+    group.downstream_op_id = "agg";
+    group.downstream_max_parallelism = 4;
+    group.peers = {
+        cluster::PeerAddress{
+            .role = "__clink_subtask", .subtask_idx = 1, .host = "127.0.0.1", .data_port = a0.port},
+        cluster::PeerAddress{
+            .role = "__clink_subtask", .subtask_idx = 2, .host = "127.0.0.1", .data_port = a1.port},
+    };
+
+    CutoverStepGate fed_all;
+    CutoverStepGate resume;
+    auto src = std::make_shared<CutoverScriptedSource>(fed_all, resume);
+    src->set_name("attach.source." + tag);
+
+    std::vector<cluster::RunnerContext::GroupCutoverHooks> registered;
+    Dag dag;
+    auto h0 = dag.add_source<std::int64_t>(src);
+    cluster::attach_typed_group_output<std::int64_t>(
+        dag, h0, group, *type_ops, [&](cluster::RunnerContext::GroupCutoverHooks hooks) {
+            registered.push_back(std::move(hooks));
+        });
+
+    ASSERT_EQ(registered.size(), 1u) << "an eligible group registered no cutover hooks";
+    EXPECT_EQ(registered[0].downstream_op_id, "agg");
+    ASSERT_TRUE(registered[0].gate);
+    ASSERT_TRUE(registered[0].apply_swap);
+    EXPECT_EQ(registered[0].gate->live(), 2u);
+
+    // Arm through the gate exactly as the worker's BeginRescale dispatch
+    // would, then run the scripted feed.
+    ASSERT_TRUE(registered[0].gate->arm(1));
+    JobConfig cfg;
+    LocalExecutor exec(std::move(dag), cfg);
+    exec.start();
+    ASSERT_TRUE(fed_all.await());
+
+    // The swap is the registered hook, fed the post-cutover endpoints the
+    // way CutoverPeerUpdate carries them (index-within-operator order).
+    const std::vector<cluster::PeerAddress> new_peers = {
+        {.role = "__clink_subtask", .subtask_idx = 10, .host = "127.0.0.1", .data_port = b0.port},
+        {.role = "__clink_subtask", .subtask_idx = 11, .host = "127.0.0.1", .data_port = b1.port},
+        {.role = "__clink_subtask", .subtask_idx = 12, .host = "127.0.0.1", .data_port = b2.port},
+        {.role = "__clink_subtask", .subtask_idx = 13, .host = "127.0.0.1", .data_port = b3.port},
+    };
+    ASSERT_TRUE(registered[0].apply_swap(new_peers))
+        << "the registered swap did not complete: the group never flushed the armed barrier";
+    EXPECT_EQ(registered[0].gate->live(), 4u);
+
+    resume.signal();
+    exec.await_termination();
+
+    // Old peers end at exactly C.
+    for (Peer* p : {&a0, &a1}) {
+        const auto events = p->drain();
+        ASSERT_FALSE(events.empty());
+        EXPECT_TRUE(events.back().kind == PeerEvent::Kind::Barrier && events.back().value == 1)
+            << "an old peer's stream does not end at the cutover barrier";
+    }
+    // New peers: watermark first, then only records whose key group maps to
+    // them at the new parallelism - the SAME arithmetic keyed state
+    // ownership uses, which is what makes the swap correct.
+    const std::vector<Peer*> new_ps{&b0, &b1, &b2, &b3};
+    std::size_t new_data_total = 0;
+    for (std::size_t i = 0; i < new_ps.size(); ++i) {
+        const auto events = new_ps[i]->drain();
+        ASSERT_FALSE(events.empty()) << "new peer b" << i << " received nothing";
+        EXPECT_EQ(events.front().kind, PeerEvent::Kind::Watermark);
+        for (const auto& e : events) {
+            if (e.kind != PeerEvent::Kind::Data) {
+                continue;
+            }
+            ++new_data_total;
+            EXPECT_GE(e.value, 8) << "a pre-cutover record leaked to a new peer";
+            const auto k = e.value;
+            const auto k_bytes =
+                std::span<const std::byte>{reinterpret_cast<const std::byte*>(&k), sizeof(k)};
+            const auto expected = subtask_for_key_group(key_group_for_key(k_bytes), 4u);
+            EXPECT_EQ(expected, i) << "record " << e.value << " landed on new peer " << i
+                                   << " but its key group belongs to subtask " << expected;
+        }
+    }
+    EXPECT_EQ(new_data_total, 8u) << "keys 8..15 must all arrive across the new peers";
+}
+
+TEST(GroupCutover, AnIneligibleGroupRegistersNothing) {
+    network::LocalDataPlane::instance().clear_for_testing();
+    const auto tag = cutover_tag();
+    Peer a0("plain.a0." + tag);
+
+    cluster::TypeRegistry type_reg;
+    type_reg.register_typed<std::int64_t>(std::string{cluster::kChannelInt64}, int64_codec());
+    const auto* type_ops = type_reg.find(std::string{cluster::kChannelInt64});
+    ASSERT_NE(type_ops, nullptr);
+
+    cluster::ResolvedOutputGroup group;
+    group.mode = cluster::RoutingMode::Forward;
+    group.channel_type = std::string{cluster::kChannelInt64};
+    group.downstream_op_id = "snk";
+    group.downstream_max_parallelism = 0;  // no declared bounds -> ineligible
+    group.peers = {cluster::PeerAddress{
+        .role = "__clink_subtask", .subtask_idx = 1, .host = "127.0.0.1", .data_port = a0.port}};
+
+    std::vector<cluster::RunnerContext::GroupCutoverHooks> registered;
+    Dag dag;
+    CutoverStepGate fed_all;
+    CutoverStepGate resume;
+    resume.signal();
+    auto src = std::make_shared<CutoverScriptedSource>(fed_all, resume);
+    src->set_name("plain.source." + tag);
+    auto h0 = dag.add_source<std::int64_t>(src);
+    cluster::attach_typed_group_output<std::int64_t>(
+        dag, h0, group, *type_ops, [&](cluster::RunnerContext::GroupCutoverHooks hooks) {
+            registered.push_back(std::move(hooks));
+        });
+    EXPECT_TRUE(registered.empty())
+        << "a group with no declared downstream bounds built cutover machinery anyway";
+
+    JobConfig cfg;
+    LocalExecutor exec(std::move(dag), cfg);
+    exec.start();
+    exec.await_termination();
+    const auto events = a0.drain();
+    std::size_t data_count = 0;
+    for (const auto& e : events) {
+        data_count += e.kind == PeerEvent::Kind::Data ? 1u : 0u;
+    }
+    EXPECT_EQ(data_count, 16u) << "the classic single-peer build lost records";
 }

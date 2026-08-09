@@ -107,6 +107,16 @@ struct SubtaskOutputGroup {
     // edge channel_type and uses the typed side-attach hook to wire a
     // dedicated network bridge sourced from the operator's side channel.
     std::string side_output_tag;
+    // The operator this group feeds, and its declared max_parallelism
+    // (hot rescale, design record 008). A non-zero max marks the group
+    // rescale-eligible: the worker builds it with one branch per unit of
+    // max_parallelism (branches above the live count parked) behind a
+    // GroupCutoverGate, and the arm/swap dispatch addresses it by this op
+    // id. Zero max = not eligible; the group builds exactly as before.
+    // Both absent from pre-annotation extra_config JSON, which decodes to
+    // the ineligible defaults.
+    std::string downstream_op_id;
+    std::uint32_t downstream_max_parallelism{0};
 };
 
 // What gets serialised into DeploymentTask.extra_config. The worker's generic

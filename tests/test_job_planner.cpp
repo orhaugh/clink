@@ -1374,3 +1374,70 @@ TEST(DrainRegistrationKeys, FusedEndpointsAreAddressableAndBlanksFallBackToTheRo
     ASSERT_EQ(fallback.size(), 1u);
     EXPECT_EQ(fallback[0], "my_role");
 }
+
+// --- rescale annotation on output groups -------------------------------------
+//
+// A group feeding an operator that declares rescale bounds carries that op's
+// id and max_parallelism; the worker's attach path keys the hold-and-swap
+// machinery off exactly these two fields, so a plan that loses them builds a
+// job no rescale request can ever cut over.
+
+TEST(JobPlanner, OutputGroupsCarryTheDownstreamRescaleAnnotation) {
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "src",
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "8"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "identity_int64",
+        .id = "agg",
+        .inputs = {"src"},
+        .parallelism = 2,
+        .min_parallelism = 1,
+        .max_parallelism = 8,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .key_by = "identity",
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "file_int64_sink",
+        .id = "snk",
+        .inputs = {"agg"},
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"path", "/tmp/x"}},
+    });
+    auto plan = plan_job(g, OperatorRegistry::default_instance());
+
+    bool saw_feed_into_agg = false;
+    bool saw_feed_into_snk = false;
+    for (const auto& t : plan.tasks) {
+        const auto chain = OperatorChainSpec::from_json(t.extra_config);
+        for (const auto& grp : chain.output_groups) {
+            if (grp.downstream_op_id == "agg") {
+                saw_feed_into_agg = true;
+                EXPECT_EQ(grp.downstream_max_parallelism, 8u)
+                    << "the group feeding the bounded op lost its ceiling - the attach path "
+                       "would build it with no cutover machinery";
+                EXPECT_EQ(grp.mode, RoutingMode::Hash);
+            }
+            if (grp.downstream_op_id == "snk") {
+                saw_feed_into_snk = true;
+                EXPECT_EQ(grp.downstream_max_parallelism, 0u)
+                    << "an op with no declared bounds must not be marked eligible";
+            }
+        }
+        // And the annotation survives the wire format the worker parses.
+        const auto reparsed = OperatorChainSpec::from_json(chain.to_json());
+        ASSERT_EQ(reparsed.output_groups.size(), chain.output_groups.size());
+        for (std::size_t i = 0; i < chain.output_groups.size(); ++i) {
+            EXPECT_EQ(reparsed.output_groups[i].downstream_op_id,
+                      chain.output_groups[i].downstream_op_id);
+            EXPECT_EQ(reparsed.output_groups[i].downstream_max_parallelism,
+                      chain.output_groups[i].downstream_max_parallelism);
+        }
+    }
+    EXPECT_TRUE(saw_feed_into_agg) << "no group feeds the keyed op; the topology under test "
+                                      "is not the one this test believes it plans";
+    EXPECT_TRUE(saw_feed_into_snk);
+}

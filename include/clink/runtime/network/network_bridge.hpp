@@ -282,13 +282,17 @@ public:
         std::uint16_t port{0};
     };
 
-    SwappableBridgeSink(Codec<T> codec,
-                        ArrowBatcher<T> batcher,
+    // Builds the inner sink for an endpoint. Supplied by the attach path
+    // (which wraps the type registry's erased connect_outbound_bridge) so
+    // this class needs no codec of its own and swap-time construction uses
+    // exactly the builder the original deploy used.
+    using ConnectFn = std::function<std::shared_ptr<NetworkBridgeSink<T>>(const Endpoint&)>;
+
+    SwappableBridgeSink(ConnectFn connect,
                         std::optional<Endpoint> endpoint,
                         std::shared_ptr<GroupCutoverGate> gate,
                         std::string name = "swappable_bridge_sink")
-        : codec_(std::move(codec)),
-          batcher_(std::move(batcher)),
+        : connect_(std::move(connect)),
           pending_endpoint_(std::move(endpoint)),
           gate_(std::move(gate)),
           name_(std::move(name)) {}
@@ -369,20 +373,13 @@ public:
 
 private:
     void connect_locked_(const Endpoint& ep) {
-        // Codec-only construction auto-selects the batcher; the 4-arg form
-        // is for callers that resolved an explicit one (the typed
-        // registration path).
-        inner_ = batcher_.build ? std::make_unique<NetworkBridgeSink<T>>(
-                                      ep.host, ep.port, codec_, batcher_, name_ + ".inner")
-                                : std::make_unique<NetworkBridgeSink<T>>(
-                                      ep.host, ep.port, codec_, name_ + ".inner");
+        inner_ = connect_(ep);
         inner_->open();
     }
 
     mutable std::mutex mu_;
-    Codec<T> codec_;
-    ArrowBatcher<T> batcher_;
-    std::unique_ptr<NetworkBridgeSink<T>> inner_;
+    ConnectFn connect_;
+    std::shared_ptr<NetworkBridgeSink<T>> inner_;
     std::optional<Endpoint> pending_endpoint_;
     std::shared_ptr<GroupCutoverGate> gate_;
     std::string name_;
