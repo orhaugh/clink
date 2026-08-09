@@ -77,6 +77,41 @@ jobs:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Report the revision under test
+        # A scheduled run tests main's HEAD AT THE MOMENT IT FIRES, which is not
+        # necessarily the commit anyone is looking at when they read the failure.
+        # That is not hypothetical: the 2026-08-05 nightly reported a TSan race that
+        # had been fixed 28 minutes before the run started, against a revision no
+        # longer on main, and the failure was re-diagnosed from scratch before anyone
+        # checked the sha (follow-up 41).
+        #
+        # Printing it first, in the step summary as well as the log, makes the first
+        # question answerable without leaving the page: is the fix in this tree?
+        #   git merge-base --is-ancestor <fix-sha> <this sha>
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          SUBJ="$(git log -1 --pretty=%s)"
+          WHEN="$(git log -1 --pretty=%cI)"
+          echo "sanitizers: testing ${SHA}"
+          echo "  ${SUBJ}"
+          echo "  committed ${WHEN}, event=${{ github.event_name }}"
+          {
+            echo "### Revision under test"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`${SHA}\` |"
+            echo "| subject | ${SUBJ} |"
+            echo "| committed | ${WHEN} |"
+            echo "| trigger | ${{ github.event_name }} |"
+            echo ""
+            echo "A scheduled run tests main at the moment it fired. Before treating a"
+            echo "failure as live, check the fix is in this tree:"
+            echo '```'
+            echo "git merge-base --is-ancestor <fix-sha> ${SHA}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install ccache
         run: apt-get update -q && apt-get install -y -q --no-install-recommends ccache
       - name: Restore compiler cache
@@ -162,6 +197,41 @@ jobs:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Report the revision under test
+        # A scheduled run tests main's HEAD AT THE MOMENT IT FIRES, which is not
+        # necessarily the commit anyone is looking at when they read the failure.
+        # That is not hypothetical: the 2026-08-05 nightly reported a TSan race that
+        # had been fixed 28 minutes before the run started, against a revision no
+        # longer on main, and the failure was re-diagnosed from scratch before anyone
+        # checked the sha (follow-up 41).
+        #
+        # Printing it first, in the step summary as well as the log, makes the first
+        # question answerable without leaving the page: is the fix in this tree?
+        #   git merge-base --is-ancestor <fix-sha> <this sha>
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          SUBJ="$(git log -1 --pretty=%s)"
+          WHEN="$(git log -1 --pretty=%cI)"
+          echo "sanitizers: testing ${SHA}"
+          echo "  ${SUBJ}"
+          echo "  committed ${WHEN}, event=${{ github.event_name }}"
+          {
+            echo "### Revision under test"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`${SHA}\` |"
+            echo "| subject | ${SUBJ} |"
+            echo "| committed | ${WHEN} |"
+            echo "| trigger | ${{ github.event_name }} |"
+            echo ""
+            echo "A scheduled run tests main at the moment it fired. Before treating a"
+            echo "failure as live, check the fix is in this tree:"
+            echo '```'
+            echo "git merge-base --is-ancestor <fix-sha> ${SHA}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install ccache
         run: apt-get update -q && apt-get install -y -q --no-install-recommends ccache
       - name: Restore compiler cache
