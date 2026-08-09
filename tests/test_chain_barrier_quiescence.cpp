@@ -380,3 +380,148 @@ TEST(ChainBarrierQuiescence, OwnerCaptureExcludesRecordsProcessedUpstreamAfterTh
            "that already includes it: counted twice, exactly the F67 artefact. The "
            "ChainBarrierEpoch rendezvous in dag.hpp exists to make this impossible.";
 }
+
+// --- the CO-OPERATOR non-owner, same contract ------------------------------
+//
+// F81's fix waits at two non-owner sites: the single-input operator runner
+// (gated above) and the co-operator runner. A wait that exists in only one
+// tested path can be deleted from the other without anything going red, so the
+// co-op path gets the same latch choreography: two sources, a co-operator that
+// writes the SHARED backend per record, the owner sink parked in on_barrier,
+// one post-barrier record provably processed... except with the rendezvous it
+// must NOT be processed until the owner captures - which is the assertion.
+//
+// The co-op forwards its barrier only once BOTH inputs' barriers have aligned,
+// so the second source exists purely to deliver its copy of the barrier.
+
+namespace {
+
+class SilentSecondSource final : public Source<int> {
+public:
+    SilentSecondSource(StepGate& resume) : resume_(resume) {}
+
+    bool produce(Emitter<int>& /*out*/) override {
+        if (this->cancelled()) {
+            return false;
+        }
+        if (!waited_) {
+            waited_ = true;
+            (void)resume_.await();
+            return true;  // no emit; the runner's drain emits the queued barrier
+        }
+        return false;
+    }
+
+    std::string name() const override { return "quiescence.source2"; }
+
+private:
+    StepGate& resume_;
+    bool waited_{false};
+};
+
+class SharedCountCoOperator final : public CoOperator<int, int, int> {
+public:
+    SharedCountCoOperator(StateBackend& backend, StepGate& post_processed)
+        : backend_(backend), post_processed_(post_processed) {}
+
+    void process_element1(const StreamElement<int>& el, Emitter<int>& out) override {
+        if (!el.is_data()) {
+            return;  // watermarks/barriers are routed via on_watermark/on_barrier
+        }
+        for (const auto& rec : el.as_data()) {
+            const auto key = StateBackend::KeyView{kCountKey, std::strlen(kCountKey)};
+            const auto next = decode_count(backend_.get(kCountOp, key)) + 1;
+            const auto bytes = encode_count(next);
+            backend_.put(
+                kCountOp,
+                key,
+                StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+            if (rec.value() == kPreBarrierRecords) {
+                post_processed_.signal();
+            }
+        }
+        out.emit_data(el.as_data());
+    }
+
+    void process_element2(const StreamElement<int>& /*el*/, Emitter<int>& /*out*/) override {}
+
+    std::string name() const override { return "quiescence.co_counter"; }
+
+private:
+    StateBackend& backend_;
+    StepGate& post_processed_;
+};
+
+}  // namespace
+
+TEST(ChainBarrierQuiescence, CoOperatorNonOwnerIsAlsoHeldUntilTheOwnerCaptures) {
+    StepGate pre_done;
+    StepGate resume;
+    StepGate resume2;
+    StepGate post_emitted;
+    StepGate post_processed;
+    StepGate sink_entered;
+    StepGate sink_at_barrier;
+    StepGate release_capture;
+
+    auto backend = std::make_shared<SnapshotProbeBackend>();
+    CheckpointCoordinator::Config qcfg;
+    CheckpointCoordinator coord(backend, qcfg);
+
+    Dag dag;
+    auto src1 = std::make_shared<ScriptedSource>(pre_done, resume, post_emitted);
+    auto src2 = std::make_shared<SilentSecondSource>(resume2);
+    auto co = std::make_shared<SharedCountCoOperator>(*backend, post_processed);
+    auto sink = std::make_shared<GatedOwnerSink>(sink_entered, sink_at_barrier, release_capture);
+
+    auto h1 = dag.add_source<int>(src1);
+    auto h2 = dag.add_source<int>(src2);
+    auto merged = dag.add_co_operator<int, int, int>(h1, h2, co);
+    dag.add_sink<int>(merged, sink);
+
+    for (const auto& r : dag.runners()) {
+        coord.register_operator(r.id);
+    }
+    auto injectors = dag.source_injectors();
+    ASSERT_EQ(injectors.size(), 2u);
+    coord.set_source_injectors(dag.source_injectors());
+
+    JobConfig cfg;
+    cfg.state_backend = backend;
+    LocalExecutor exec(std::move(dag), cfg);
+    exec.start();
+
+    ASSERT_TRUE(pre_done.await()) << "source1 never finished its pre-barrier records";
+
+    // Inject to BOTH sources, then release both; the co-op aligns the two
+    // barrier copies and forwards one barrier to the owner.
+    const auto barrier = coord.trigger();
+    injectors[0](barrier);
+    injectors[1](barrier);
+    resume.signal();
+    resume2.signal();
+
+    ASSERT_TRUE(sink_entered.await(std::chrono::seconds{10}))
+        << "the aligned barrier never reached the chain owner";
+    ASSERT_TRUE(sink_at_barrier.await()) << "the owner did not park at the barrier";
+
+    // Source1 is free to emit the post-barrier record; the co-op - held at the
+    // rendezvous after forwarding - must not process it yet.
+    ASSERT_TRUE(post_emitted.await()) << "source1 never emitted the post-barrier record";
+
+    release_capture.signal();
+    ASSERT_TRUE(backend->await_first_capture()) << "the owner never captured";
+    ASSERT_TRUE(post_processed.await())
+        << "the co-operator never resumed after the owner's capture - held but not released";
+
+    exec.cancel();
+    exec.await_termination();
+
+    const auto captured = backend->count_at(1);
+    ASSERT_TRUE(captured.has_value()) << "no capture recorded for checkpoint 1";
+    EXPECT_EQ(*captured, kPreBarrierRecords)
+        << "the owner's capture contains " << *captured << " where the cut is "
+        << kPreBarrierRecords
+        << ": the CO-OPERATOR wrote the shared backend past the barrier before the "
+           "owner captured. The co-op non-owner wait in dag.hpp is not holding.";
+}

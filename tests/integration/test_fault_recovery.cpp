@@ -306,7 +306,23 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
     EXPECT_EQ(*code, 0) << "the job did not survive two consecutive worker failures";
 }
 
-// F12's regression test - DISABLED, and the reason is the test rather than the fix.
+// F12's regression test - DISABLED again, and this time the label interaction is
+// PARTIALLY DIAGNOSED rather than mysterious (F83).
+//
+// Re-enabling it captured the evidence its earlier failures never had. The
+// submitter's own log says "connection closed by the coordinator" (completed=0),
+// and the kept coordinator log TERMINATES mid-tick, right after
+//   awaiting_restart (attempt 1/3) drain_expected=0
+//   worker lost: worker-0
+// with no [coordinator.restart] line and no terminate() message: the COORDINATOR
+// DIES BY SIGNAL inside the first-loss restart_job_locked_ call, before its first
+// log line, and only under whole-label machine timing - isolated runs pass every
+// time, including the F12 mutation checks.
+//
+// clink_node now installs a fatal-signal backtrace handler (see F83), so the next
+// label run that hits this prints the stack into these same kept artefacts. THAT
+// is the re-enable condition: a stack, not another lottery. Do not raise timeouts;
+// the failure is fast and a longer wait changes nothing.
 //
 // It passes in isolation and FAILS in the full integration label, even with the heavy
 // multi-process tests serialised by RESOURCE_LOCK. Running it red in the gate would be
@@ -325,14 +341,12 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
 //       *code  Which is: 9
 //       0
 //
-// So the submitter EXITED with code 9 after 22s. It did not wedge and did not time out -
-// which is a different symptom from the one F12 was about (a 30s "restart drain timed
-// out"). The job failed for some other reason, quickly, and only when three specific
-// tests have run before it in the same binary.
-//
-// Next step: identify which of those three, by running the label's first four tests in
-// order and then bisecting them. Do NOT raise any timeout here - the failure is fast,
-// so a longer wait cannot help and would only obscure it.
+// Exit 9 is now DECODED: the submitter returns `result.ok ? 0 : 9` after completion,
+// so the job RAN TO COMPLETION and reported errors - no wedge, no timeout, no refusal.
+// The submitter prints `errors=<front>` on its stdout, which the harness keeps, so if
+// this fails in the label again the artefacts' submit.log names the cause directly.
+// Do NOT raise any timeout here - the failure is fast (22s of a 180s allowance), so a
+// longer wait cannot help and would only obscure it.
 //
 // The FIX it covers is verified independently and stands: with the empty-drain kick
 // disabled this test fails with "restart drain timed out", and with it enabled it
@@ -638,17 +652,14 @@ TEST_F(FaultRecoveryTest, WorkerKilledAtTheStateRestorePointIsRedeployed) {
 
     const auto code = sub->await_exit(std::chrono::seconds(120));
     ASSERT_TRUE(code.has_value()) << "submitter never exited";
-    // KNOWN GAP - see docs/production-hardening-plan.md, finding F13. Two
-    // losses in the same restart window is the F12 shape again, so the job
-    // does not currently complete. The assertion that DOES hold today, and
-    // is the point of this test, is above: the fault landed exactly where
-    // it was aimed, in a spawned child, driven from the parent's
-    // environment. That is the fault-injection contract this scenario
-    // exists to prove.
-    if (*code != 0) {
-        GTEST_SKIP() << "recovery from a worker lost during state restore is finding F13; "
-                        "the fault-injection assertions above passed";
-    }
+    // F13 - CLOSED by the F12 fix. Two losses in the same restart window used to
+    // wedge because the empty-drain kick was gated on that tick's events; with the
+    // kick moved to the unconditional per-tick sweep, the second loss folds in and
+    // the job completes. This was a GTEST_SKIP for the failure case, which the
+    // fixed engine made dead code - so completion now GATES, and a regression in
+    // the kick fails here rather than skipping silently.
+    EXPECT_EQ(*code, 0) << "the job did not survive a worker lost at the state-restore point - the "
+                           "F12/F13 restart-window fold has regressed";
 }
 
 // --- exactly-once at the SINK, across a process failure -------------------

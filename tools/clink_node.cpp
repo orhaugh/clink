@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -206,6 +207,52 @@ using namespace std::chrono_literals;
 // SIGKILL from above.
 std::atomic<bool> g_shutdown_requested{false};
 
+// Fatal-signal backtrace (F83). A coordinator that dies by SIGSEGV says NOTHING:
+// its log simply stops mid-tick, the submitter reports "connection closed", and
+// the diagnosis degenerates into archaeology - which is exactly what happened
+// when a first-loss restart crashed only under whole-label timing, and the kept
+// artefacts held a truncated log and no cause. This handler writes the signal
+// number and a raw stack to stderr - which spawn_logged captures into the same
+// kept artefacts - then re-raises with the default action so the exit status
+// still tells the truth.
+//
+// Async-signal-safe by construction: write() and backtrace_symbols_fd() only.
+// No malloc, no streams, no formatting. On Linux without -rdynamic the frames
+// print as addresses rather than names; addr2line against the same binary
+// resolves them, and addresses in the artefacts beat silence by a full
+// investigation.
+extern "C" void clink_fatal_signal_handler(int sig) {
+    constexpr char msg[] = "\n=== clink_node FATAL SIGNAL ";
+    ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    const char digits[3] = {
+        static_cast<char>('0' + (sig / 10) % 10), static_cast<char>('0' + sig % 10), '\n'};
+    ::write(STDERR_FILENO, digits, 3);
+    void* frames[64];
+    const int n = ::backtrace(frames, 64);
+    ::backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+
+void install_fatal_signal_handler() {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(undefined_behavior_sanitizer)
+    // A sanitizer's own fatal handler produces a strictly better report than
+    // this one, and installing ours would shadow it. The nightly matrix keeps
+    // sanitizer output; this handler is for production and plain-CI builds.
+    return;
+#endif
+#endif
+    for (const int sig : {SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL}) {
+        struct sigaction sa{};
+        sa.sa_handler = &clink_fatal_signal_handler;
+        sigemptyset(&sa.sa_mask);
+        // NOT SA_RESTART: this handler never returns (re-raise with SIG_DFL).
+        ::sigaction(sig, &sa, nullptr);
+    }
+}
+
 extern "C" void clink_shutdown_signal_handler(int /*sig*/) {
     g_shutdown_requested.store(true, std::memory_order_release);
 }
@@ -220,6 +267,9 @@ void install_shutdown_signal_handler() {
     // default (terminate) so a closed terminal still kills the node.
     ::sigaction(SIGTERM, &sa, nullptr);
     ::sigaction(SIGINT, &sa, nullptr);
+    // Fatal signals too: every clink_node role wants a stack in its log far
+    // more than it wants a silent death (F83).
+    install_fatal_signal_handler();
 }
 
 void wait_for_shutdown(std::chrono::seconds max_duration = std::chrono::seconds{0}) {

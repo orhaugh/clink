@@ -3267,6 +3267,38 @@ was the sentence saying so - it is now in `checkpointing.md` and the runbook, an
 compound-failure test runs on the real contract (one HA coordinator, joint kill,
 respawn on the same ha-dir, exactly-once convergence judged on disk).
 
+### F83. The coordinator can die silently, and once did - now it leaves a stack
+
+Found by re-enabling the F12 label test with its diagnosis instrumented. The submitter's
+kept log said "connection closed by the coordinator" (completed=0), and the kept
+coordinator log TERMINATES mid-tick, immediately after
+
+    awaiting_restart (attempt 1/3) drain_expected=0
+    worker lost: worker-0
+
+with no `[coordinator.restart]` line and no terminate() message. No message means no
+exception: the coordinator dies BY SIGNAL inside the first-loss `restart_job_locked_`
+call, before its first log line - and only under whole-label machine timing. Isolated
+runs pass every time, including the F12 fix's mutation checks, and the enclosing tick
+holds the `mu_` lock (an earlier "the sweep runs unlocked" reading came from a brace
+counter corrupted by `{}` inside log-payload string literals, and is withdrawn).
+
+**What is fixed now is the silence.** clink_node had handlers for SIGTERM/SIGINT only;
+a fatal signal produced a truncated log and nothing else, which is why this diagnosis
+degenerated into archaeology. Every clink_node role now installs an async-signal-safe
+fatal handler (SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL): signal number plus a raw
+backtrace to stderr - which the test harness captures into the kept artefacts - then
+re-raise with the default action so the exit status stays truthful. Proven end to end:
+a live coordinator killed with SIGSEGV exits 139 and leaves a symbolised stack in its
+log. Sanitizer builds skip the handler so ASan/TSan/UBSan keep their strictly better
+reports.
+
+**The crash itself stays open, with its re-enable condition stated.** The F12 label
+test is disabled again; the next label run that hits the crash prints the stack into
+the same artefacts, and THAT stack - not another reproduction lottery - is what reopens
+the investigation. F13, meanwhile, is closed: the worker-lost-at-restore test completes
+end to end under the F12 kick, and its GTEST_SKIP escape hatch is now a hard gate.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
