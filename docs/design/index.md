@@ -17,3 +17,5 @@ subsystems work today, and take precedence wherever detail has evolved.
 | [004](004-jobs-as-compiled-plugins.md) | Jobs deploy as compiled plugins |
 | [005](005-hand-rolled-sql-optimizer.md) | The SQL optimizer is hand-rolled, not adopted |
 | [006](006-deterministic-replay.md) | Incidents replay deterministically from captured input |
+| [007](007-state-generations.md) | State directories are namespaced by topology generation |
+| [008](008-hot-rescale.md) | Rescale one operator at a barrier, without stopping the job |

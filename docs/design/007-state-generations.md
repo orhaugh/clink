@@ -1,4 +1,4 @@
-# State directories are namespaced by topology generation
+# 007: State directories are namespaced by topology generation
 
 **Status:** accepted, implemented 2026-08-07.
 

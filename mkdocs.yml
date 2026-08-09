@@ -142,6 +142,8 @@ nav:
       - design/004-jobs-as-compiled-plugins.md
       - design/005-hand-rolled-sql-optimizer.md
       - design/006-deterministic-replay.md
+      - design/007-state-generations.md
+      - design/008-hot-rescale.md
   - Examples:
       - consumer-examples/README.md
       - consumer-examples/state_as_data/README.md
