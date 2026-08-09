@@ -299,6 +299,67 @@ TEST(PlanOperatorCutover, ClonesTemplatePeersIntoEveryNewSubtask) {
     }
 }
 
+// --- Operator identity translation -----------------------------------
+//
+// The rescale state machine is keyed by operator id; a worker ack names
+// (role, job-global subtask index), and under the chain planner every task
+// shares the generic role. These helpers are the only bridge between the
+// two vocabularies (F40, item 27), so their policy is pinned here: the
+// deploy-time identity record is authoritative when present, and the role
+// fallback exists solely for custom-role tasks that have no record.
+
+TEST(OpScopedAck, TranslatesAGenericRoleAckThroughTheIdentityRecord) {
+    TaskOpIdentityMap identity;
+    // A two-operator job: "src" holds global indices 0..1, "agg" holds 2..5.
+    identity["__clink_subtask:2"] = TaskOpIdentity{.op_id = "agg", .subtask_idx_in_op = 0};
+    identity["__clink_subtask:5"] = TaskOpIdentity{.op_id = "agg", .subtask_idx_in_op = 3};
+
+    const auto a = op_scoped_ack(identity, "__clink_subtask", 2);
+    EXPECT_EQ(a.op_id, "agg");
+    EXPECT_EQ(a.subtask_idx_in_op, 0u);
+    const auto b = op_scoped_ack(identity, "__clink_subtask", 5);
+    EXPECT_EQ(b.op_id, "agg");
+    // The index the state machine counts is the index WITHIN the operator,
+    // not the job-global one - counting global indices against the op's
+    // parallelism would never reach the CuttingOver threshold.
+    EXPECT_EQ(b.subtask_idx_in_op, 3u);
+}
+
+TEST(OpScopedAck, FallsBackToTheRoleForATaskWithNoIdentityRecord) {
+    TaskOpIdentityMap identity;
+    identity["__clink_subtask:0"] = TaskOpIdentity{.op_id = "src", .subtask_idx_in_op = 0};
+
+    // Custom-role task: its role IS its operator id and its index is
+    // op-local already (the pre-planner contract).
+    const auto a = op_scoped_ack(identity, "my_sink", 1);
+    EXPECT_EQ(a.op_id, "my_sink");
+    EXPECT_EQ(a.subtask_idx_in_op, 1u);
+
+    // Defensive: a record with an empty op_id must not translate an ack
+    // into the empty operator, which nothing registered.
+    identity["__clink_subtask:9"] = TaskOpIdentity{.op_id = "", .subtask_idx_in_op = 4};
+    const auto b = op_scoped_ack(identity, "__clink_subtask", 9);
+    EXPECT_EQ(b.op_id, "__clink_subtask");
+    EXPECT_EQ(b.subtask_idx_in_op, 9u);
+}
+
+TEST(TaskHostsOp, TheIdentityRecordIsAuthoritativeWhenPresent) {
+    TaskOpIdentityMap identity;
+    identity["__clink_subtask:3"] = TaskOpIdentity{.op_id = "agg", .subtask_idx_in_op = 1};
+
+    EXPECT_TRUE(task_hosts_op(identity, "__clink_subtask", 3, "agg"));
+    EXPECT_FALSE(task_hosts_op(identity, "__clink_subtask", 3, "src"));
+    // No role fallback for a task WITH identity: otherwise a request naming
+    // the shared generic role would address every task of every operator.
+    EXPECT_FALSE(task_hosts_op(identity, "__clink_subtask", 3, "__clink_subtask"));
+}
+
+TEST(TaskHostsOp, FallsBackToTheRoleOnlyForTasksWithNoRecord) {
+    const TaskOpIdentityMap empty;
+    EXPECT_TRUE(task_hosts_op(empty, "my_sink", 0, "my_sink"));
+    EXPECT_FALSE(task_hosts_op(empty, "my_sink", 0, "other"));
+}
+
 }  // namespace
 }  // namespace clink::cluster
 

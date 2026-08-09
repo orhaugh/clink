@@ -385,6 +385,35 @@ std::size_t total_subtask_count(const JobGraphSpec& graph) {
     return total;
 }
 
+std::vector<std::string> drain_registration_keys(const OperatorChainSpec& chain,
+                                                 const std::string& role) {
+    std::vector<std::string> keys;
+    auto add = [&keys](const std::string& id) {
+        if (id.empty()) {
+            return;
+        }
+        for (const auto& existing : keys) {
+            if (existing == id) {
+                return;
+            }
+        }
+        keys.push_back(id);
+    };
+    for (const auto& op : chain.ops) {
+        add(op.id);
+    }
+    if (chain.fused_source.has_value()) {
+        add(chain.fused_source->id);
+    }
+    if (chain.fused_sink.has_value()) {
+        add(chain.fused_sink->id);
+    }
+    if (keys.empty()) {
+        keys.push_back(role);
+    }
+    return keys;
+}
+
 // Parse one entry of OperatorSpec.inputs.
 //   "id"          -> (id, branch=0, explicit=false, tag="")
 //   "id.N"        -> (id, branch=N, explicit=true,  tag="")

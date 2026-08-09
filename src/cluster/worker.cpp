@@ -1588,16 +1588,22 @@ void Worker::run_generic_subtask_(JobId job_id,
             // Drain-callback registration. Subtasks
             // participating in adaptive rescaling register their
             // drain closure here; the worker keys the registration by
-            // (job_id, role) so BeginRescale dispatch can target the
-            // right operator's subtasks. Multiple subtasks of the
-            // same operator accumulate in the same vector.
-            auto register_drains =
-                [this, job_id, role = task.role](std::vector<RunnerContext::DrainFn> cbs) {
-                    std::lock_guard lock(mu_);
-                    auto& bucket = per_job_drain_callbacks_[job_id][role];
-                    for (auto& cb : cbs)
-                        bucket.push_back(std::move(cb));
-                };
+            // (job_id, operator id) so BeginRescale dispatch can target
+            // the right operator's subtasks. Keying by role matched
+            // nothing under the chain planner, where every task shares
+            // the generic role (F40, item 27) - the chain spec names the
+            // operators this task hosts, and the task is addressable by
+            // any of them. Multiple subtasks of the same operator
+            // accumulate in the same vector.
+            auto register_drains = [this, job_id, keys = drain_registration_keys(chain, task.role)](
+                                       std::vector<RunnerContext::DrainFn> cbs) {
+                std::lock_guard lock(mu_);
+                for (const auto& key : keys) {
+                    auto& bucket = per_job_drain_callbacks_[job_id][key];
+                    for (const auto& cb : cbs)
+                        bucket.push_back(cb);
+                }
+            };
             // Graceful stop. Keyed by job only: a stop addresses every subtask,
             // so there is no role to select on.
             auto register_stops = [this, job_id](std::vector<RunnerContext::StopFn> cbs) {
@@ -1722,11 +1728,11 @@ void Worker::run_generic_subtask_(JobId job_id,
                         per_job_aborters_.erase(ab_it);
                 }
                 // Drain callbacks are keyed by
-                // (job_id, role) not (job_id, subtask_idx). Erasing
-                // the whole role's entry on any subtask exit would
-                // drop callbacks for sibling subtasks still running,
-                // so we leave the entry in place; cleanup happens
-                // when the job ends (jobs_ teardown elsewhere).
+                // (job_id, operator id) not (job_id, subtask_idx).
+                // Erasing the whole operator's entry on any subtask
+                // exit would drop callbacks for sibling subtasks still
+                // running, so we leave the entry in place; cleanup
+                // happens when the job ends (jobs_ teardown elsewhere).
                 // Late BeginRescale for an op whose subtasks have
                 // all exited finds no callbacks invoked (the
                 // closures captured weak refs that no longer lock).

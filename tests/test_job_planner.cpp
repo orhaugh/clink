@@ -1275,3 +1275,102 @@ TEST(JobPlannerReplan, TranslatingAParentThroughTheOldBlockLandsInTheRightOperat
         }
     }
 }
+
+// --- drain_registration_keys ------------------------------------------
+//
+// The keys a worker indexes a task's drain callbacks under. BeginRescale
+// addresses an OPERATOR; the worker must find the task from any operator id
+// the chain hosts, or the dispatch matches nothing (F40, item 27). The
+// chained case matters most: the planner packs adjacent ops into one task,
+// and a request naming the tail op must still reach it.
+
+TEST(DrainRegistrationKeys, AChainedTaskIsAddressableByEveryOpItHosts) {
+    // Same graph shape as AdjacentOperatorsAreChainedIntoOneSubtask: the
+    // two mid-chain ops fold into one task. Planned rather than
+    // hand-built, so the keys are derived from what a worker actually
+    // receives in extra_config.
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "src",
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "4"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "multiply_int64",
+        .id = "mulA",
+        .inputs = {"src"},
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"factor", "2"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "multiply_int64",
+        .id = "mulB",
+        .inputs = {"mulA"},
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"factor", "5"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "file_int64_sink",
+        .id = "snk",
+        .inputs = {"mulB"},
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"path", "/tmp/x"}},
+    });
+    auto plan = plan_job(g, OperatorRegistry::default_instance());
+
+    bool saw_chain = false;
+    for (const auto& t : plan.tasks) {
+        const auto chain = OperatorChainSpec::from_json(t.extra_config);
+        const auto keys = drain_registration_keys(chain, kGenericSubtaskRole);
+        if (chain.ops.size() == 2) {
+            saw_chain = true;
+            ASSERT_EQ(keys.size(), 2u);
+            EXPECT_EQ(keys[0], "mulA");
+            EXPECT_EQ(keys[1], "mulB");
+        } else {
+            ASSERT_EQ(chain.ops.size(), 1u);
+            ASSERT_EQ(keys.size(), 1u);
+            EXPECT_EQ(keys[0], chain.ops[0].id);
+        }
+        // Whatever the shape, the generic role must never be a key: a
+        // BeginRescale can only name real operators, and a role-keyed
+        // entry would be unreachable dead weight.
+        for (const auto& k : keys) {
+            EXPECT_NE(k, kGenericSubtaskRole);
+        }
+    }
+    EXPECT_TRUE(saw_chain) << "the planner stopped chaining mulA+mulB; the chained case above "
+                              "is no longer exercised";
+}
+
+TEST(DrainRegistrationKeys, FusedEndpointsAreAddressableAndBlanksFallBackToTheRole) {
+    // Fused endpoints ride the chain rather than owning a task, but they
+    // are still operators a rescale request can name.
+    OperatorChainSpec fused;
+    fused.ops.push_back(ChainOp{.id = "map", .type = "multiply_int64"});
+    fused.fused_source = ChainOp{.id = "gen", .type = "int64_range_source"};
+    fused.fused_sink = ChainOp{.id = "out", .type = "file_int64_sink"};
+    const auto keys = drain_registration_keys(fused, kGenericSubtaskRole);
+    ASSERT_EQ(keys.size(), 3u);
+    EXPECT_EQ(keys[0], "map");
+    EXPECT_EQ(keys[1], "gen");
+    EXPECT_EQ(keys[2], "out");
+
+    // Duplicate ids collapse to one key, so one BeginRescale fires the
+    // callback set once, not once per mention.
+    OperatorChainSpec dup;
+    dup.ops.push_back(ChainOp{.id = "same", .type = "a"});
+    dup.ops.push_back(ChainOp{.id = "same", .type = "b"});
+    const auto dedup = drain_registration_keys(dup, kGenericSubtaskRole);
+    ASSERT_EQ(dedup.size(), 1u);
+    EXPECT_EQ(dedup[0], "same");
+
+    // A chain that names no ops (custom-role contract): the role is the
+    // operator id, so it is the key.
+    OperatorChainSpec blank;
+    blank.ops.push_back(ChainOp{.id = "", .type = "anon"});
+    const auto fallback = drain_registration_keys(blank, "my_role");
+    ASSERT_EQ(fallback.size(), 1u);
+    EXPECT_EQ(fallback[0], "my_role");
+}

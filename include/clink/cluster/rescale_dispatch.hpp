@@ -37,6 +37,48 @@
 
 namespace clink::cluster {
 
+// Which operator a deployed task hosts, and its index within that operator.
+// Keyed like the coordinator's task_records ("role:subtask_idx") and
+// populated at every deploy from the plan.
+//
+// Two consumers need it. Restore addressing: a snapshot lives at
+// <checkpoint_dir>/<job-global subtask index>/, the planner allocates those
+// indices as one contiguous block per operator in graph order, so resizing
+// one operator moves every later block and a replanned task must translate
+// (operator, index within operator) back to the old global index. And
+// operator addressing: under the chain planner every task shares the generic
+// role, so a rescale request naming an operator can only find that
+// operator's tasks through this record (F40, item 27).
+struct TaskOpIdentity {
+    std::string op_id;
+    std::uint32_t subtask_idx_in_op{};
+};
+
+using TaskOpIdentityMap = std::unordered_map<std::string, TaskOpIdentity>;
+
+// A worker ack names (role, job-global subtask index); the rescale state
+// machine is keyed by operator id and counts indices within the operator.
+// Translate through the deploy-time identity record. A task with no record
+// is a custom-role task, whose role IS its operator id and whose index is
+// op-local already - the pre-planner contract, preserved as the fallback.
+struct OpScopedAck {
+    std::string op_id;
+    std::uint32_t subtask_idx_in_op{};
+};
+[[nodiscard]] OpScopedAck op_scoped_ack(const TaskOpIdentityMap& identity,
+                                        const std::string& role,
+                                        std::uint32_t subtask_idx);
+
+// Does the deployed task (role, job-global subtask index) host the given
+// operator? The identity record is authoritative when present; the role
+// fallback exists only for custom-role tasks with no record. Without the
+// authoritative rule, a request naming the shared generic role would match
+// every task of every operator.
+[[nodiscard]] bool task_hosts_op(const TaskOpIdentityMap& identity,
+                                 const std::string& role,
+                                 std::uint32_t subtask_idx,
+                                 const std::string& op_id);
+
 // Which parent snapshot a rescaled subtask restores from.
 //
 // `parent_idx` is the OLD subtask index whose snapshot file this new subtask

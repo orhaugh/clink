@@ -22,6 +22,7 @@
 #include "clink/cluster/autoscaler.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/cluster/rescale_coordinator.hpp"
+#include "clink/cluster/rescale_dispatch.hpp"
 #include "clink/cluster/snapshots.hpp"
 #include "clink/lineage/lineage_graph.hpp"
 #include "clink/runtime/network/connection.hpp"
@@ -872,21 +873,12 @@ private:
         std::unordered_map<std::string, StaleBlock> stale_layout_blocks;
         std::uint64_t stale_layout_through{0};
         // Which operator each deployed task hosts, keyed like task_records
-        // ("role:subtask_idx"). Populated at every deploy from the plan.
-        //
-        // Needed because a snapshot lives at <checkpoint_dir>/<subtask_idx>/,
-        // addressed by the JOB-GLOBAL index, and the planner allocates those
-        // indices as one contiguous block per operator in graph order. Change
-        // one operator's parallelism and every LATER operator's block moves. So
-        // a replanned task cannot restore from "its own" index - that directory
-        // now belongs to a different operator - and the coordinator has to
-        // translate (operator, index within operator) back to the old global
-        // index. This map is what makes that translation possible.
-        struct TaskOpIdentity {
-            std::string op_id;
-            std::uint32_t subtask_idx_in_op{};
-        };
-        std::unordered_map<std::string, TaskOpIdentity> task_op_identity;
+        // ("role:subtask_idx"). Populated at every deploy from the plan. The
+        // type lives in rescale_dispatch.hpp with the translation helpers
+        // that consume it (op_scoped_ack / task_hosts_op); the alias keeps
+        // the JobState::TaskOpIdentity spelling working.
+        using TaskOpIdentity = clink::cluster::TaskOpIdentity;
+        TaskOpIdentityMap task_op_identity;
         // Surviving-worker subtasks we've already received SubtaskFinished
         // for during the awaiting_restart drain.
         std::unordered_set<std::string> restart_drained_keys;

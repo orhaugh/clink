@@ -6,6 +6,28 @@
 
 namespace clink::cluster {
 
+OpScopedAck op_scoped_ack(const TaskOpIdentityMap& identity,
+                          const std::string& role,
+                          std::uint32_t subtask_idx) {
+    const auto it = identity.find(role + ":" + std::to_string(subtask_idx));
+    if (it != identity.end() && !it->second.op_id.empty()) {
+        return OpScopedAck{.op_id = it->second.op_id,
+                           .subtask_idx_in_op = it->second.subtask_idx_in_op};
+    }
+    return OpScopedAck{.op_id = role, .subtask_idx_in_op = subtask_idx};
+}
+
+bool task_hosts_op(const TaskOpIdentityMap& identity,
+                   const std::string& role,
+                   std::uint32_t subtask_idx,
+                   const std::string& op_id) {
+    const auto it = identity.find(role + ":" + std::to_string(subtask_idx));
+    if (it != identity.end() && !it->second.op_id.empty()) {
+        return it->second.op_id == op_id;
+    }
+    return role == op_id;
+}
+
 RescaleParentMapping rescale_parent_mapping(std::uint32_t old_parallelism,
                                             std::uint32_t new_parallelism,
                                             std::uint32_t subtask_idx_in_op) {

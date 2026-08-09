@@ -3020,15 +3020,18 @@ void Coordinator::handle_subtask_listening_(MessageReader& r) {
         // CuttingOver, treat the SubtaskListening as the readiness
         // signal that closes the rescale. Mark the new subtask
         // ready; when every new subtask has reported the coordinator
-        // transitions CuttingOver -> Complete.
+        // transitions CuttingOver -> Complete. The ack names the shared
+        // generic role; the state machine is keyed by operator, so
+        // translate through the deploy-time identity record (F40).
         if (job.rescale_coordinator) {
-            if (auto st = job.rescale_coordinator->status(msg.role);
+            const auto ack = op_scoped_ack(job.task_op_identity, msg.role, msg.subtask_idx);
+            if (auto st = job.rescale_coordinator->status(ack.op_id);
                 st.has_value() && st->state == RescaleState::CuttingOver) {
-                job.rescale_coordinator->mark_new_ready(msg.role, msg.subtask_idx);
-                if (auto post = job.rescale_coordinator->status(msg.role);
+                job.rescale_coordinator->mark_new_ready(ack.op_id, ack.subtask_idx_in_op);
+                if (auto post = job.rescale_coordinator->status(ack.op_id);
                     post.has_value() && post->state == RescaleState::Complete) {
                     log::info("coordinator.rescale",
-                              "complete job_id=" + std::to_string(job.id) + " op_id=" + msg.role +
+                              "complete job_id=" + std::to_string(job.id) + " op_id=" + ack.op_id +
                                   " new_parallelism=" + std::to_string(post->target_parallelism));
                 }
             }
@@ -4081,7 +4084,7 @@ void Coordinator::dispatch_begin_rescale_locked_(JobState& job,
     std::unordered_set<std::string> workers_with_op;
     for (const auto& [worker_id, tasks] : job.tasks_by_worker) {
         for (const auto& t : tasks) {
-            if (t.role == op_id) {
+            if (task_hosts_op(job.task_op_identity, t.role, t.subtask_idx, op_id)) {
                 workers_with_op.insert(worker_id);
                 break;
             }
@@ -4126,7 +4129,7 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
     std::vector<std::string> old_keys;
     const DeploymentTask* templ = nullptr;
     for (const auto& [key, val] : job.task_records) {
-        if (val.second.role == op_id) {
+        if (task_hosts_op(job.task_op_identity, val.second.role, val.second.subtask_idx, op_id)) {
             old_keys.push_back(key);
             if (templ == nullptr) {
                 templ = &val.second;
@@ -4199,14 +4202,22 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         }
         auto tbt_it = job.tasks_by_worker.find(worker_id);
         if (tbt_it != job.tasks_by_worker.end()) {
+            // Match the record's own (role, subtask_idx), not role == op_id:
+            // planner tasks all share the generic role, so the op_id
+            // comparison erased nothing and left stale entries for
+            // BeginRescale to keep addressing.
             std::erase_if(tbt_it->second, [&](const DeploymentTask& t) {
-                return t.role == op_id && (rec_it->second.second.subtask_idx == t.subtask_idx);
+                return t.role == rec_it->second.second.role &&
+                       rec_it->second.second.subtask_idx == t.subtask_idx;
             });
             if (tbt_it->second.empty()) {
                 job.tasks_by_worker.erase(tbt_it);
             }
         }
         job.task_records.erase(rec_it);
+        // The identity record travels with the task record: a torn-down
+        // subtask's key must not translate to the operator any more.
+        job.task_op_identity.erase(key);
         // The drained subtask's SubtaskFinished arrived with
         // had_error=false, so expected_completion has effectively
         // already been satisfied for it. Counterbalance by REDUCING
@@ -4222,9 +4233,16 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
     // Stash the new subtasks into JobState + claim worker slots, then
     // build per-worker Deploy frames.
     std::unordered_map<std::string, std::vector<DeploymentTask>> by_worker;
+    std::uint32_t idx_in_op = 0;
     for (auto& [worker_id, task] : plan.new_tasks) {
         const std::string key = task.role + ":" + std::to_string(task.subtask_idx);
         job.task_records[key] = {worker_id, task};
+        // Identity for the new subtasks, so their SubtaskListening acks
+        // translate back to this operator (mark_new_ready) and a later
+        // request can address them. plan_operator_cutover emits new_tasks
+        // in operator order, so the position IS the index within the op.
+        job.task_op_identity[key] =
+            TaskOpIdentity{.op_id = op_id, .subtask_idx_in_op = idx_in_op++};
         job.pending_per_worker[worker_id].emplace_back(task.role, task.subtask_idx);
         job.tasks_by_worker[worker_id].push_back(task);
         by_worker[worker_id].push_back(std::move(task));
@@ -4316,16 +4334,19 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
         // job completion.
         bool was_drain = false;
         if (job.rescale_coordinator) {
-            if (auto st = job.rescale_coordinator->status(msg.role);
+            // The ack names the shared generic role; the state machine is
+            // keyed by operator. Translate before consulting it (F40).
+            const auto ack = op_scoped_ack(job.task_op_identity, msg.role, msg.subtask_idx);
+            if (auto st = job.rescale_coordinator->status(ack.op_id);
                 st.has_value() && st->state == RescaleState::Draining) {
                 // An old subtask has finished draining. Between the last of these
                 // and the redeploy the job has no running topology.
                 CLINK_FAULT_POINT(clink::fault::points::kRescaleAfterDrain);
-                job.rescale_coordinator->mark_old_drained(msg.role, msg.subtask_idx);
+                job.rescale_coordinator->mark_old_drained(ack.op_id, ack.subtask_idx_in_op);
                 was_drain = true;
-                if (auto post = job.rescale_coordinator->status(msg.role);
+                if (auto post = job.rescale_coordinator->status(ack.op_id);
                     post.has_value() && post->state == RescaleState::CuttingOver) {
-                    dispatch_cutover_deploy_locked_(job, msg.role, restart_deploys);
+                    dispatch_cutover_deploy_locked_(job, ack.op_id, restart_deploys);
                 }
             }
         }

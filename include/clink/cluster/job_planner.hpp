@@ -121,7 +121,10 @@ struct OperatorChainSpec {
     // parallelism. Built-in factories read this to partition their work
     // (e.g., int64_range_source emits its strided slice based on it).
     std::uint32_t subtask_idx_in_op{};
-    std::vector<ChainOp> ops;  // length 1 in v2
+    // The operators this task hosts, head first. Usually one; the planner
+    // packs fusable adjacent ops (single consumer, single input, equal
+    // parallelism) into one chain, so mid-chain tasks can hold several.
+    std::vector<ChainOp> ops;
     std::vector<SubtaskEdge> input_edges;
     // Output groups: one entry per downstream operator. Multiple groups
     // express multi-consumer fork (broadcast) by default; within a
@@ -162,6 +165,16 @@ struct OperatorChainSpec {
     std::string to_json() const;
     static OperatorChainSpec from_json(std::string_view json_text);
 };
+
+// Registration keys under which a worker indexes a chain task's drain
+// callbacks. BeginRescale addresses an OPERATOR, and every planner task
+// shares the generic role, so keying the registry by role made the dispatch
+// match nothing (F40, item 27). A chain task is addressable by any operator
+// it hosts: each chain op plus the fused endpoints. Falls back to the task's
+// role when the chain names no ops - the custom-role contract, where the
+// role is the operator id.
+[[nodiscard]] std::vector<std::string> drain_registration_keys(const OperatorChainSpec& chain,
+                                                               const std::string& role);
 
 // Plan a JobGraphSpec into a JobPlan against the supplied snapshot of
 // registered workers. Validates the graph, expands each op into its
