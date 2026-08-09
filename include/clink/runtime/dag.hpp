@@ -25,6 +25,7 @@
 #include "clink/runtime/blocking_exchange.hpp"
 #endif
 #include "clink/runtime/bounded_channel.hpp"
+#include "clink/runtime/cutover_gate.hpp"
 #include "clink/runtime/gated_timer_fire.hpp"
 #include "clink/runtime/multi_input_alignment.hpp"
 #include "clink/runtime/output_tag.hpp"
@@ -51,6 +52,26 @@ inline std::chrono::milliseconds eos_final_checkpoint_timeout() {
             }
         }
         return std::chrono::milliseconds{30000};
+    }();
+    return t;
+}
+
+// Bounded time a split stage holds at an armed cutover barrier waiting for
+// the coordinator to deploy the new subtasks and swap this group's peers.
+// Deliberately longer than the EOS bound above: the hold spans a deploy plus
+// a state restore, which for a large-state operator is the slow part of the
+// whole cutover. Expiry without an abort throws - failing the task loudly
+// drives the abort-to-replan fallback instead of leaving the group wedged.
+// Configurable via CLINK_CUTOVER_HOLD_TIMEOUT_MS (default 300s); read once.
+inline std::chrono::milliseconds cutover_hold_timeout() {
+    static const std::chrono::milliseconds t = [] {
+        if (const char* p = std::getenv("CLINK_CUTOVER_HOLD_TIMEOUT_MS"); p != nullptr && *p) {
+            try {
+                return std::chrono::milliseconds{std::stoll(p)};
+            } catch (...) {
+            }
+        }
+        return std::chrono::milliseconds{300000};
     }();
     return t;
 }
@@ -1443,7 +1464,8 @@ public:
         std::function<int(const T&)> selector,
         std::size_t branch_count,
         std::string name = "split",
-        std::function<std::optional<std::vector<Batch<T>>>(const Batch<T>&)> columnar_split = {}) {
+        std::function<std::optional<std::vector<Batch<T>>>(const Batch<T>&)> columnar_split = {},
+        std::shared_ptr<GroupCutoverGate> cutover_gate = nullptr) {
         if (branch_count == 0) {
             throw std::invalid_argument("add_split: branch_count must be > 0");
         }
@@ -1465,8 +1487,13 @@ public:
                       outs,
                       selector = std::move(selector),
                       branch_count,
-                      columnar_split = std::move(columnar_split)](
-                         RuntimeContext& /*ctx*/, const std::function<bool()>& should_stop) {
+                      columnar_split = std::move(columnar_split),
+                      cutover_gate](RuntimeContext& /*ctx*/,
+                                    const std::function<bool()>& should_stop) {
+            // Re-broadcast on cutover release, so freshly-swapped peers
+            // start with the group's current event-time position instead of
+            // stalling downstream mins until the next organic watermark.
+            std::optional<Watermark> last_watermark;
             while (!should_stop()) {
                 auto maybe = in_channel->pop();
                 if (!maybe.has_value()) {
@@ -1506,18 +1533,53 @@ public:
                         }
                     }
                 } else {
+                    if (elem.is_watermark()) {
+                        last_watermark = elem.as_watermark();
+                    }
+                    const bool armed_barrier =
+                        cutover_gate && elem.is_barrier() &&
+                        cutover_gate->is_armed_for(elem.as_barrier().id().value());
                     // Watermarks and barriers broadcast to all branches.
                     for (std::size_t i = 0; i + 1 < outs.size(); ++i) {
                         outs[i]->push(elem);
                     }
                     outs.back()->push(std::move(elem));
+                    // Armed cutover (hot rescale): barrier C has been
+                    // broadcast, so every branch's outbound stream will end
+                    // at exactly C. Hold here - routing anything with the
+                    // old divisor past C would hand a post-cutover record
+                    // to a pre-cutover peer. The worker swaps the branch
+                    // endpoints while this stage is held (the branch queues
+                    // drain through C and then nothing moves), installs the
+                    // new live divisor, and releases. Expiry without an
+                    // abort is a wedged cutover: throw, so the task failure
+                    // drives the abort-to-replan fallback loudly.
+                    if (armed_barrier) {
+                        if (!cutover_gate->wait_released(cutover_hold_timeout(), should_stop)) {
+                            if (cutover_gate->aborted() || should_stop()) {
+                                break;
+                            }
+                            throw std::runtime_error(
+                                "cutover hold: the peer swap did not complete within the "
+                                "bound; failing the task so the rescale falls back to the "
+                                "replan path");
+                        }
+                        if (last_watermark.has_value()) {
+                            for (auto& o : outs) {
+                                o->push(StreamElement<T>::watermark(*last_watermark));
+                            }
+                        }
+                    }
                 }
             }
             for (auto& o : outs) {
                 o->close();
             }
         };
-        runner.cancel = [in_channel, outs] {
+        runner.cancel = [in_channel, outs, cutover_gate] {
+            if (cutover_gate) {
+                cutover_gate->abort();
+            }
             in_channel->close();
             for (auto& o : outs) {
                 o->close();

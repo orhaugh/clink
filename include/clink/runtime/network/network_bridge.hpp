@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -10,6 +12,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/metrics/network_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/runtime/cutover_gate.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
 namespace clink::network {
@@ -255,6 +258,134 @@ private:
     std::atomic<std::uint64_t> drain_at_checkpoint_{0};
     // Runner-thread only: set once the armed barrier has been forwarded.
     bool armed_finished_{false};
+};
+
+// A branch sink whose peer endpoint can be swapped at a held cutover
+// barrier (hot rescale, design record 008). One instance sits at the end of
+// each branch of a rescale-eligible output group, sized to the downstream
+// operator's max_parallelism: branches below the group's live count carry
+// an inner NetworkBridgeSink to their current peer; branches above it are
+// PARKED - they swallow the broadcast control elements (the split never
+// routes data to them) and cost one idle runner thread.
+//
+// The swap contract: the caller (the worker's cutover path) may only call
+// swap() while the group's split stage is held at the armed barrier AND
+// this branch has flushed it (GroupCutoverGate::await_all_flushed) - at
+// that point the branch queue is drained and nothing races the endpoint
+// change. The mutex below is for memory visibility across those two
+// threads, not for concurrency the protocol permits.
+template <typename T>
+class SwappableBridgeSink final : public Sink<T> {
+public:
+    struct Endpoint {
+        std::string host;
+        std::uint16_t port{0};
+    };
+
+    SwappableBridgeSink(Codec<T> codec,
+                        ArrowBatcher<T> batcher,
+                        std::optional<Endpoint> endpoint,
+                        std::shared_ptr<GroupCutoverGate> gate,
+                        std::string name = "swappable_bridge_sink")
+        : codec_(std::move(codec)),
+          batcher_(std::move(batcher)),
+          pending_endpoint_(std::move(endpoint)),
+          gate_(std::move(gate)),
+          name_(std::move(name)) {}
+
+    void open() override {
+        std::lock_guard lock(mu_);
+        if (pending_endpoint_.has_value()) {
+            connect_locked_(*pending_endpoint_);
+            pending_endpoint_.reset();
+        }
+    }
+
+    void on_data(const Batch<T>& batch) override {
+        std::lock_guard lock(mu_);
+        if (inner_) {
+            inner_->on_data(batch);
+        }
+        // Parked: the split's selector never routes data at or above the
+        // live count, so a batch here means the routing divisor and the
+        // endpoint set disagree - fail loudly rather than drop silently.
+        else {
+            throw std::runtime_error(name_ +
+                                     ": data routed to a parked branch - the group's live "
+                                     "divisor disagrees with its endpoint set");
+        }
+    }
+
+    void on_watermark(Watermark wm) override {
+        std::lock_guard lock(mu_);
+        if (inner_) {
+            inner_->on_watermark(wm);
+        }
+    }
+
+    void on_barrier(CheckpointBarrier b) override {
+        {
+            std::lock_guard lock(mu_);
+            if (inner_) {
+                inner_->on_barrier(b);
+            }
+        }
+        // Flushed = this branch's outbound stream is exactly "everything up
+        // to C" (a parked branch's stream is trivially so). Signalled after
+        // the push above, outside the lock - the gate has its own.
+        if (gate_) {
+            gate_->mark_branch_flushed(b.id().value());
+        }
+    }
+
+    // Swap the peer endpoint: nullopt parks the branch (scale-down), a
+    // value connects it (scale-up or moved peer). See the class comment for
+    // when this is legal to call.
+    void swap(std::optional<Endpoint> endpoint) {
+        std::lock_guard lock(mu_);
+        if (inner_) {
+            inner_->close();
+            inner_.reset();
+        }
+        if (endpoint.has_value()) {
+            connect_locked_(*endpoint);
+        }
+    }
+
+    void close() override {
+        std::lock_guard lock(mu_);
+        if (inner_) {
+            inner_->close();
+            inner_.reset();
+        }
+    }
+
+    [[nodiscard]] bool parked() const {
+        std::lock_guard lock(mu_);
+        return inner_ == nullptr;
+    }
+
+    std::string name() const override { return name_; }
+
+private:
+    void connect_locked_(const Endpoint& ep) {
+        // Codec-only construction auto-selects the batcher; the 4-arg form
+        // is for callers that resolved an explicit one (the typed
+        // registration path).
+        inner_ = batcher_.build ? std::make_unique<NetworkBridgeSink<T>>(
+                                      ep.host, ep.port, codec_, batcher_, name_ + ".inner")
+                                : std::make_unique<NetworkBridgeSink<T>>(
+                                      ep.host, ep.port, codec_, name_ + ".inner");
+        inner_->open();
+    }
+
+    mutable std::mutex mu_;
+    Codec<T> codec_;
+    ArrowBatcher<T> batcher_;
+    std::unique_ptr<NetworkBridgeSink<T>> inner_;
+    std::optional<Endpoint> pending_endpoint_;
+    std::shared_ptr<GroupCutoverGate> gate_;
+    std::string name_;
 };
 
 }  // namespace clink::network
