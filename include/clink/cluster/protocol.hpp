@@ -209,6 +209,13 @@ enum class MessageKind : std::uint8_t {
     // (index-within-operator order), park the rest, and release the held
     // split with the new live count.
     CutoverPeerUpdate = 119,
+    // coordinator → worker. Tasks downstream of the rescaled operator
+    // `op_id` bind one new inbound listener per entry of
+    // `new_subtask_indices` (the post-cutover subtasks' job-global
+    // indices) and report the bound ports via a mid-run SubtaskListening,
+    // so the cutover deploy's peer resolution finds them exactly as it
+    // finds at-deploy ports.
+    CutoverRebind = 120,
 };
 
 // Sentinel marking "no rescale-specific restore override" on a
@@ -818,6 +825,19 @@ struct CutoverPeerUpdateMsg {
     JobId job_id{};
     std::string op_id;
     std::vector<PeerAddress> peers;
+    std::uint64_t coordinator_epoch{0};
+};
+
+// coordinator → worker. Bind new inbound listeners for the post-cutover
+// subtasks of `op_id`. `upstream_role` is the role those new tasks will be
+// deployed under (the port map keys edges by role + index, and the worker
+// must not guess it); `new_subtask_indices` are their job-global indices.
+// See MessageKind::CutoverRebind.
+struct CutoverRebindMsg {
+    JobId job_id{};
+    std::string op_id;
+    std::string upstream_role;
+    std::vector<std::uint32_t> new_subtask_indices;
     std::uint64_t coordinator_epoch{0};
 };
 

@@ -188,6 +188,16 @@ std::string OperatorChainSpec::to_json() const {
         out += escape_json_string(channel_type_name(e.channel_type));
         out += ",\"input_index\":";
         out += std::to_string(e.input_index);
+        // Rescale annotation, emitted only when set so unannotated edges
+        // serialise byte-identically to pre-annotation JSON.
+        if (!e.upstream_op_id.empty()) {
+            out += ",\"upstream_op_id\":";
+            out += escape_json_string(e.upstream_op_id);
+        }
+        if (e.upstream_max_parallelism != 0) {
+            out += ",\"upstream_max_parallelism\":";
+            out += std::to_string(e.upstream_max_parallelism);
+        }
         out += '}';
     }
     out += "],\"output_routing\":";
@@ -281,6 +291,9 @@ SubtaskEdge edge_from_json(const config::JsonValue& v, const std::string& ctx) {
     e.peer_subtask_idx = static_cast<std::uint32_t>(v.int_or("peer_subtask_idx", 0));
     e.channel_type = decode_channel_type(v.string_or("channel_type", "int64"), ctx);
     e.input_index = static_cast<std::uint32_t>(v.int_or("input_index", 0));
+    e.upstream_op_id = v.string_or("upstream_op_id", "");
+    e.upstream_max_parallelism =
+        static_cast<std::uint32_t>(v.int_or("upstream_max_parallelism", 0));
     return e;
 }
 
@@ -1218,12 +1231,21 @@ JobPlan plan_job(const JobGraphSpec& graph,
                     } else {
                         // Rebalance or Hash: this downstream subtask
                         // receives records from every upstream subtask.
+                        // Fan-shaped edges carry the rescale annotation:
+                        // if the PRODUCING op rescales, this task gains
+                        // or loses inbound channels mid-run, and the
+                        // rebind machinery needs to know who to listen
+                        // for. Forward edges above stay unannotated on
+                        // purpose (their 1:1 premise does not survive a
+                        // rescale; the replan path owns that case).
                         for (auto up_sub : up_subs) {
                             chain.input_edges.push_back(SubtaskEdge{
                                 .peer_role = kGenericSubtaskRole,
                                 .peer_subtask_idx = up_sub,
                                 .channel_type = edge_ct,
                                 .input_index = logical_in_idx,
+                                .upstream_op_id = ref.id,
+                                .upstream_max_parallelism = up_it->second->max_parallelism,
                             });
                         }
                     }

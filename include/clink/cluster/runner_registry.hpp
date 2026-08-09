@@ -269,6 +269,25 @@ struct RunnerContext {
     };
     std::function<void(GroupCutoverHooks)> register_group_cutover;
 
+    // Input-side rebind registration (hot rescale downstream rebind,
+    // design record 008). A task whose fan-shaped input edges come from a
+    // rescale-eligible operator registers one of these; the worker indexes
+    // it by the UPSTREAM op id, and a CutoverRebind naming that op calls
+    // bind_new_input once per new upstream subtask. The bound listener's
+    // stream is spliced into the task's union input stage; the WORKER owns
+    // the pump thread (it runs `pump`, which blocks until the peer closes
+    // or `cancel` ends it) so runner code never spawns threads.
+    struct BoundNewInput {
+        std::uint16_t port{0};
+        std::function<void()> pump;
+        std::function<void()> cancel;
+    };
+    struct InputRebindHooks {
+        std::string upstream_op_id;
+        std::function<BoundNewInput(std::uint32_t /*new upstream global idx*/)> bind_new_input;
+    };
+    std::function<void(InputRebindHooks)> register_input_rebind;
+
     // Graceful-stop hook, and deliberately separate from the drain above.
     //
     // A drain leaves the source WITHOUT running the end-of-input path, because

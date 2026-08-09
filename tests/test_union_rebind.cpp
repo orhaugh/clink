@@ -18,11 +18,14 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
+#include "clink/cluster/runner_helpers.hpp"
+#include "clink/core/codec.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
@@ -95,18 +98,19 @@ private:
 
 // Ordered capture with a per-kind arrival gate, so the test can wait for
 // "barrier N arrived" instead of sleeping.
-class RebindCaptureSink final : public Sink<int> {
+template <typename T>
+class RebindCaptureSinkT final : public Sink<T> {
 public:
     struct Event {
         enum class Kind { Data, Barrier } kind;
         std::int64_t value{0};
     };
 
-    void on_data(const Batch<int>& batch) override {
+    void on_data(const Batch<T>& batch) override {
         std::lock_guard lock(mu_);
         for (const auto& rec : batch) {
-            events_.push_back({Event::Kind::Data, rec.value()});
-            if (rec.value() == awaited_value_.load()) {
+            events_.push_back({Event::Kind::Data, static_cast<std::int64_t>(rec.value())});
+            if (static_cast<std::int64_t>(rec.value()) == awaited_value_.load()) {
                 arrived_.signal();
             }
         }
@@ -145,6 +149,9 @@ private:
     std::atomic<std::int64_t> awaited_barrier_{-1};
     RebindStepGate arrived_;
 };
+
+using RebindCaptureSink = RebindCaptureSinkT<int>;
+using RebindCaptureSink64 = RebindCaptureSinkT<std::int64_t>;
 
 Batch<int> one(int v) {
     Batch<int> b;
@@ -287,4 +294,154 @@ TEST(UnionRebind, TheUnionAdmitsASplicedChannelAndItsBarriersCountIt) {
     EXPECT_EQ(b2, 1u) << "barrier 2 forwarded other than exactly once";
     EXPECT_TRUE(saw_42);
     EXPECT_TRUE(saw_43);
+}
+
+// --- the production input-stage build -----------------------------------------
+//
+// build_typed_input_stage is what every single-input runner uses to wire its
+// bridges. With annotated fan edges and a register hook it must build the
+// REBINDABLE shape: a union with a splice slot even at one bridge, and a
+// registered bind_new_input that binds a fresh typed listener whose stream
+// joins the union. Driven end to end: original feeders connect to the
+// at-deploy ports, a new feeder connects to a port bound MID-RUN through
+// the registered hook, and its records reach the merged output.
+
+TEST(UnionRebind, TheInputStageBuildsRebindableAndTheBoundListenerJoins) {
+    network::LocalDataPlane::instance().clear_for_testing();
+    const auto tag = rebind_tag();
+
+    cluster::TypeRegistry type_reg;
+    type_reg.register_typed<std::int64_t>(std::string{cluster::kChannelInt64}, int64_codec());
+    const auto* type_ops = type_reg.find(std::string{cluster::kChannelInt64});
+    ASSERT_NE(type_ops, nullptr);
+
+    // Two at-deploy bridges, built exactly as the worker builds them.
+    auto b0 = type_ops->bind_inbound_bridge();
+    auto b1 = type_ops->bind_inbound_bridge();
+    ASSERT_TRUE(b0.bridge);
+    ASSERT_TRUE(b1.bridge);
+    std::vector<std::shared_ptr<void>> bridges{b0.bridge, b1.bridge};
+
+    cluster::OperatorChainSpec chain;
+    chain.ops.push_back(cluster::ChainOp{.id = "consumer", .type = "identity_int64"});
+    chain.input_edges.push_back(cluster::SubtaskEdge{
+        .peer_role = "__clink_subtask",
+        .peer_subtask_idx = 1,
+        .channel_type = std::string{cluster::kChannelInt64},
+        .upstream_op_id = "agg",
+        .upstream_max_parallelism = 8,
+    });
+    chain.input_edges.push_back(cluster::SubtaskEdge{
+        .peer_role = "__clink_subtask",
+        .peer_subtask_idx = 2,
+        .channel_type = std::string{cluster::kChannelInt64},
+        .upstream_op_id = "agg",
+        .upstream_max_parallelism = 8,
+    });
+
+    std::vector<cluster::RunnerContext::InputRebindHooks> registered;
+    auto sink = std::make_shared<RebindCaptureSink64>();
+    Dag dag;
+    auto h0 = cluster::build_typed_input_stage<std::int64_t>(
+        dag, bridges, type_ops, &chain, [&](cluster::RunnerContext::InputRebindHooks hooks) {
+            registered.push_back(std::move(hooks));
+        });
+    dag.add_sink<std::int64_t>(h0, sink);
+
+    ASSERT_EQ(registered.size(), 1u)
+        << "an input stage with eligible fan edges registered no rebind hooks";
+    EXPECT_EQ(registered[0].upstream_op_id, "agg");
+    ASSERT_TRUE(registered[0].bind_new_input);
+
+    JobConfig cfg;
+    LocalExecutor exec(std::move(dag), cfg);
+    exec.start();
+
+    // The at-deploy edges deliver.
+    network::NetworkBridgeSink<std::int64_t> f0("127.0.0.1", b0.port, int64_codec());
+    network::NetworkBridgeSink<std::int64_t> f1("127.0.0.1", b1.port, int64_codec());
+    f0.open();
+    f1.open();
+    sink->await_value(10);
+    {
+        Batch<std::int64_t> b;
+        b.emplace(10);
+        f0.on_data(std::move(b));
+    }
+    ASSERT_TRUE(sink->arrived());
+
+    // Bind a NEW listener mid-run through the registered hook - the worker's
+    // CutoverRebind dispatch in miniature - and run its pump as the worker
+    // would.
+    auto bound = registered[0].bind_new_input(7);
+    ASSERT_GT(bound.port, 0);
+    ASSERT_TRUE(bound.pump);
+    std::thread pump(bound.pump);
+
+    network::NetworkBridgeSink<std::int64_t> f2("127.0.0.1", bound.port, int64_codec());
+    f2.open();
+    sink->rearm();
+    sink->await_value(42);
+    {
+        Batch<std::int64_t> b;
+        b.emplace(42);
+        f2.on_data(std::move(b));
+    }
+    ASSERT_TRUE(sink->arrived())
+        << "a record sent to the mid-run-bound listener never reached the merged output: the "
+           "bound relay is not spliced into the union, or its pump delivers nowhere";
+
+    // Orderly end: feeders close, relays end, the pump drains out, the
+    // union's grown set closes, the executor exits.
+    f0.close();
+    f1.close();
+    f2.close();
+    pump.join();
+    exec.await_termination();
+}
+
+TEST(UnionRebind, AnUnannotatedInputStageRegistersNothing) {
+    network::LocalDataPlane::instance().clear_for_testing();
+
+    cluster::TypeRegistry type_reg;
+    type_reg.register_typed<std::int64_t>(std::string{cluster::kChannelInt64}, int64_codec());
+    const auto* type_ops = type_reg.find(std::string{cluster::kChannelInt64});
+    ASSERT_NE(type_ops, nullptr);
+
+    auto b0 = type_ops->bind_inbound_bridge();
+    std::vector<std::shared_ptr<void>> bridges{b0.bridge};
+    cluster::OperatorChainSpec chain;
+    chain.ops.push_back(cluster::ChainOp{.id = "consumer", .type = "identity_int64"});
+    chain.input_edges.push_back(cluster::SubtaskEdge{
+        .peer_role = "__clink_subtask",
+        .peer_subtask_idx = 1,
+        .channel_type = std::string{cluster::kChannelInt64},
+        // No annotation: forward edge / unbounded upstream.
+    });
+
+    std::vector<cluster::RunnerContext::InputRebindHooks> registered;
+    Dag dag;
+    auto h0 = cluster::build_typed_input_stage<std::int64_t>(
+        dag, bridges, type_ops, &chain, [&](cluster::RunnerContext::InputRebindHooks hooks) {
+            registered.push_back(std::move(hooks));
+        });
+    auto sink = std::make_shared<RebindCaptureSink64>();
+    dag.add_sink<std::int64_t>(h0, sink);
+    EXPECT_TRUE(registered.empty())
+        << "an input stage with no eligible edges built rebind machinery anyway";
+
+    JobConfig cfg;
+    LocalExecutor exec(std::move(dag), cfg);
+    exec.start();
+    network::NetworkBridgeSink<std::int64_t> f0("127.0.0.1", b0.port, int64_codec());
+    f0.open();
+    sink->await_value(5);
+    {
+        Batch<std::int64_t> b;
+        b.emplace(5);
+        f0.on_data(std::move(b));
+    }
+    ASSERT_TRUE(sink->arrived()) << "the classic single-bridge input stage lost its record";
+    f0.close();
+    exec.await_termination();
 }

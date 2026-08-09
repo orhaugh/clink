@@ -1441,3 +1441,64 @@ TEST(JobPlanner, OutputGroupsCarryTheDownstreamRescaleAnnotation) {
                                       "is not the one this test believes it plans";
     EXPECT_TRUE(saw_feed_into_snk);
 }
+
+TEST(JobPlanner, FanInputEdgesCarryTheUpstreamRescaleAnnotation) {
+    // Same graph as above, read from the INPUT side: the tasks fed by a
+    // fan (hash into the keyed op; rebalance into the sink) must know
+    // which op produces their edges and whether it can rescale, because
+    // that is what keys the downstream rebind machinery.
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "src",
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "8"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "identity_int64",
+        .id = "agg",
+        .inputs = {"src"},
+        .parallelism = 2,
+        .min_parallelism = 1,
+        .max_parallelism = 8,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .key_by = "identity",
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "file_int64_sink",
+        .id = "snk",
+        .inputs = {"agg"},
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"path", "/tmp/x"}},
+    });
+    auto plan = plan_job(g, OperatorRegistry::default_instance());
+
+    bool saw_agg_input = false;
+    bool saw_snk_input = false;
+    for (const auto& t : plan.tasks) {
+        const auto chain = OperatorChainSpec::from_json(t.extra_config);
+        if (chain.ops.empty()) {
+            continue;
+        }
+        if (chain.ops[0].id == "agg") {
+            for (const auto& e : chain.input_edges) {
+                saw_agg_input = true;
+                EXPECT_EQ(e.upstream_op_id, "src");
+                EXPECT_EQ(e.upstream_max_parallelism, 0u)
+                    << "the source declares no bounds; marking its edges eligible would build "
+                       "rebind machinery for an op the request path will refuse";
+            }
+        }
+        if (chain.ops[0].id == "snk") {
+            for (const auto& e : chain.input_edges) {
+                saw_snk_input = true;
+                EXPECT_EQ(e.upstream_op_id, "agg")
+                    << "the sink's fan edges lost their producer identity - CutoverRebind(agg) "
+                       "could never find this task";
+                EXPECT_EQ(e.upstream_max_parallelism, 8u);
+            }
+        }
+    }
+    EXPECT_TRUE(saw_agg_input);
+    EXPECT_TRUE(saw_snk_input);
+}

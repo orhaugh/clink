@@ -593,7 +593,8 @@ void PluginRegistry::register_sink(
         throw std::runtime_error(
             "register_sink<T>: T not registered (call register_type<T>(name, codec) first)");
     }
-    clink::cluster::SubtaskRunner runner = [factory](const clink::cluster::RunnerContext& rctx) {
+    clink::cluster::SubtaskRunner runner = [factory, channel, &type_registry = type_registry_](
+                                               const clink::cluster::RunnerContext& rctx) {
         auto sink = factory(detail::build_ctx_from(rctx));
         detail::apply_chain_identity(sink, rctx);
         // A STATEFUL sink (2PC / committing) keys its per-checkpoint
@@ -654,7 +655,12 @@ void PluginRegistry::register_sink(
             });
         }
         clink::Dag dag;
-        auto h0 = clink::cluster::build_typed_input_stage<T>(dag, rctx.in_bridges);
+        auto h0 = clink::cluster::build_typed_input_stage<T>(
+            dag,
+            rctx.in_bridges,
+            &detail::require_type_ops(type_registry, channel),
+            &rctx.chain,
+            rctx.register_input_rebind);
         auto hs = dag.template add_sink<T>(h0, sink);
         // This subtask hosts one logical operator (the sink); its input network
         // bridges' bytes are the sink's bytes_received.
@@ -759,9 +765,15 @@ void PluginRegistry::register_operator(
             detail::apply_chain_identity(op, rctx);
             const auto& chain = rctx.chain;
             const auto& out_channel = chain.ops.empty() ? std::string{} : chain.ops[0].out_channel;
+            const auto& in_channel = chain.ops.empty() ? std::string{} : chain.ops[0].in_channel;
             const auto& ops = detail::require_type_ops(type_registry, out_channel);
             clink::Dag dag;
-            auto h0 = clink::cluster::build_typed_input_stage<In>(dag, rctx.in_bridges);
+            auto h0 = clink::cluster::build_typed_input_stage<In>(
+                dag,
+                rctx.in_bridges,
+                &detail::require_type_ops(type_registry, in_channel),
+                &rctx.chain,
+                rctx.register_input_rebind);
             auto h1 = dag.template add_operator<In, Out>(h0, op, capture_codec);
             // Record-capture op-spec sidecar: persist this op's build spec
             // next to its epochs so `clink replay` can rebuild it offline.

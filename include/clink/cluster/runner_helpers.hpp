@@ -164,19 +164,73 @@ inline std::vector<ResolvedOutputGroup> main_output_groups_of(
 // NetworkBridgeSource<T> shared_ptrs and wire them as Dag sources.
 // Returns a single StageHandle<T> - if there's >1 input bridge, the
 // helper inserts a union_streams to merge them.
+//
+// When the chain's input edges carry the rescale annotation (a fan from an
+// operator with declared bounds) and a register hook is supplied, the
+// input stage is built REBINDABLE: the union gets a UnionRebindSlot even
+// at one bridge (a lone bridge has no union to grow otherwise), and the
+// registered hook's bind_new_input binds a fresh typed listener for a new
+// upstream subtask, hands the worker a pump to run, and splices the stream
+// into the union.
 template <typename T>
-StageHandle<T> build_typed_input_stage(Dag& dag,
-                                       const std::vector<std::shared_ptr<void>>& bridges) {
+StageHandle<T> build_typed_input_stage(
+    Dag& dag,
+    const std::vector<std::shared_ptr<void>>& bridges,
+    const TypeOps* input_type_ops = nullptr,
+    const OperatorChainSpec* chain = nullptr,
+    const std::function<void(RunnerContext::InputRebindHooks)>& register_input_rebind = {}) {
     std::vector<StageHandle<T>> handles;
     handles.reserve(bridges.size());
     for (const auto& b : bridges) {
         auto src = std::static_pointer_cast<network::NetworkBridgeSource<T>>(b);
         handles.push_back(dag.template add_source<T>(src));
     }
-    if (handles.size() == 1) {
-        return handles.front();
+
+    std::string upstream_op;
+    if (chain != nullptr && input_type_ops != nullptr && register_input_rebind &&
+        input_type_ops->bind_inbound_bridge) {
+        for (const auto& e : chain->input_edges) {
+            if (e.upstream_max_parallelism > 0 && !e.upstream_op_id.empty()) {
+                upstream_op = e.upstream_op_id;
+                break;
+            }
+        }
     }
-    return dag.template union_streams<T>(std::move(handles));
+    if (upstream_op.empty()) {
+        if (handles.size() == 1) {
+            return handles.front();
+        }
+        return dag.template union_streams<T>(std::move(handles));
+    }
+
+    auto slot = std::make_shared<UnionRebindSlot<T>>();
+    auto merged = dag.template union_streams<T>(std::move(handles), slot);
+    RunnerContext::InputRebindHooks hooks;
+    hooks.upstream_op_id = upstream_op;
+    hooks.bind_new_input = [slot, bind = input_type_ops->bind_inbound_bridge](
+                               std::uint32_t /*new_idx*/) -> RunnerContext::BoundNewInput {
+        // The SAME erased builder the original deploy used, so the new
+        // listener is wired exactly as a deployed edge would be.
+        auto bound = bind();
+        auto relay = std::static_pointer_cast<network::NetworkBridgeSource<T>>(bound.bridge);
+        // Mirrors the network channel's own receive-queue depth: this
+        // channel replaces the per-edge queue an at-deploy bridge gets.
+        auto ch = std::make_shared<BoundedChannel<StreamElement<T>>>(256);
+        slot->splice(ch);
+        RunnerContext::BoundNewInput out;
+        out.port = bound.port;
+        out.pump = [relay, ch] {
+            relay->open();
+            Emitter<T> em(ch.get());
+            while (relay->produce(em)) {
+            }
+            ch->close();
+        };
+        out.cancel = [relay] { relay->cancel(); };
+        return out;
+    };
+    register_input_rebind(std::move(hooks));
+    return merged;
 }
 
 // Attach one resolved output group to a Dag stage handle. Routing:

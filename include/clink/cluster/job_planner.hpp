@@ -84,6 +84,16 @@ struct SubtaskEdge {
     // are grouped correctly even at parallelism > 1 (where every side
     // contributes one bridge per upstream subtask, not just one total).
     std::uint32_t input_index{0};
+    // Rescale annotation, input side (hot rescale, design record 008): the
+    // op that PRODUCES this edge and its declared max_parallelism. Set only
+    // on fan-shaped edges (hash / rebalance, where this task listens to
+    // every upstream subtask) - rescaling the upstream then means new
+    // inbound channels join mid-run, which is what the rebind machinery
+    // does. Forward (1:1) edges stay unannotated: their premise changes
+    // under rescale and the replan path owns that. Zero max = ineligible;
+    // both absent from pre-annotation JSON.
+    std::string upstream_op_id;
+    std::uint32_t upstream_max_parallelism{0};
 };
 
 // RoutingMode moved to runner_registry.hpp (alongside ResolvedOutputGroup

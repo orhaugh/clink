@@ -214,6 +214,7 @@ private:
     // belonging to other operators are unaffected.
     void handle_begin_rescale_(MessageReader& r);
     void handle_cutover_peer_update_(MessageReader& r);
+    void handle_cutover_rebind_(MessageReader& r);
     void handle_stop_subtasks_(MessageReader& r);
     // Sum the last snapshot size of every backend this worker hosts, per job, and
     // publish it as a gauge. Called from the heartbeat loop.
@@ -392,6 +393,32 @@ private:
         JobId,
         std::unordered_map<std::string, std::vector<RunnerContext::GroupCutoverHooks>>>
         per_job_group_cutovers_;
+
+    // Per-(job_id, UPSTREAM op) input-rebind hooks, registered by the
+    // input-attach path of tasks whose fan-shaped inputs come from a
+    // rescale-eligible operator. CutoverRebind dispatch binds one new
+    // listener per new upstream subtask through these and reports the
+    // ports via a mid-run SubtaskListening. Task identity rides along so
+    // the report names the task the ports belong to.
+    struct RegisteredInputRebind {
+        std::string task_role;
+        std::uint32_t task_subtask_idx{0};
+        RunnerContext::InputRebindHooks hooks;
+    };
+    std::unordered_map<JobId, std::unordered_map<std::string, std::vector<RegisteredInputRebind>>>
+        per_job_rebinds_;
+
+    // Pump threads feeding rebound inputs (one per bound listener),
+    // worker-owned: cancelled at CancelJob for their job and at stop().
+    // jthread joins on destruction, so cancel MUST run first - the pump
+    // blocks in the relay's pop until the peer closes or cancel wakes it.
+    struct RebindPump {
+        std::function<void()> cancel;
+        std::jthread thread;
+    };
+    std::unordered_map<JobId, std::vector<RebindPump>> per_job_rebind_pumps_;
+
+    void cancel_rebind_pumps_locked_(JobId job_id);
 
     // Graceful-stop closures, per job. Not keyed by role, unlike the drain map:
     // a stop addresses the WHOLE job, so there is nothing to select on. Same

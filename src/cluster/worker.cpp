@@ -662,6 +662,9 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
                         }
                     }
                 }
+                // Rebind pump relays block in pop() with no view of any
+                // cancel token; wake them so their jthreads can join.
+                cancel_rebind_pumps_locked_(cj.job_id);
                 cv_.notify_all();
                 // Wake any source blocked in the EOS final-checkpoint waits so
                 // it observes the flipped cancel token at once (its predicate
@@ -698,6 +701,9 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
                 break;
             case MessageKind::CutoverPeerUpdate:
                 handle_cutover_peer_update_(r);
+                break;
+            case MessageKind::CutoverRebind:
+                handle_cutover_rebind_(r);
                 break;
             default:
                 break;
@@ -927,6 +933,90 @@ void Worker::handle_cutover_peer_update_(MessageReader& r) {
                   " op_id=" + msg.op_id + " groups=" + std::to_string(applied) + "/" +
                   std::to_string(to_apply.size()) +
                   " new_parallelism=" + std::to_string(msg.peers.size()));
+}
+
+void Worker::cancel_rebind_pumps_locked_(JobId job_id) {
+    auto it = per_job_rebind_pumps_.find(job_id);
+    if (it == per_job_rebind_pumps_.end()) {
+        return;
+    }
+    // Cancel first - the pumps block in the relay's pop with no view of
+    // any token - then erase, whose jthread destructors join. The join is
+    // prompt once cancelled (the relay's shutdown wakes its recv thread
+    // and produce returns false), and the pump lambdas never take mu_, so
+    // joining under it cannot deadlock.
+    for (auto& pump : it->second) {
+        if (pump.cancel) {
+            try {
+                pump.cancel();
+            } catch (...) {
+            }
+        }
+    }
+    per_job_rebind_pumps_.erase(it);
+}
+
+void Worker::handle_cutover_rebind_(MessageReader& r) {
+    auto msg = decode_cutover_rebind(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "CutoverRebind")) {
+        return;
+    }
+    // Snapshot the registered hooks under the lock; bind outside it (each
+    // bind opens a listener and spawns a pump). One SubtaskListening per
+    // registered TASK, carrying every new edge port it bound, exactly the
+    // shape the at-deploy report uses - so the coordinator's port map and
+    // the cutover deploy's peer resolution work unchanged.
+    std::vector<RegisteredInputRebind> to_bind;
+    {
+        std::lock_guard lock(mu_);
+        auto job_it = per_job_rebinds_.find(msg.job_id);
+        if (job_it != per_job_rebinds_.end()) {
+            auto op_it = job_it->second.find(msg.op_id);
+            if (op_it != job_it->second.end()) {
+                to_bind = op_it->second;
+            }
+        }
+    }
+    std::size_t bound_total = 0;
+    for (auto& reg : to_bind) {
+        SubtaskListeningMsg sl;
+        sl.job_id = msg.job_id;
+        sl.worker_id = worker_id_;
+        sl.role = reg.task_role;
+        sl.subtask_idx = reg.task_subtask_idx;
+        sl.host = data_host_;
+        for (const auto new_idx : msg.new_subtask_indices) {
+            try {
+                auto bound = reg.hooks.bind_new_input(new_idx);
+                {
+                    std::lock_guard lock(mu_);
+                    per_job_rebind_pumps_[msg.job_id].push_back(RebindPump{
+                        .cancel = bound.cancel, .thread = std::jthread{std::move(bound.pump)}});
+                }
+                sl.edge_ports.push_back(SubtaskListeningMsg::EdgePort{
+                    .upstream_role = msg.upstream_role,
+                    .upstream_subtask_idx = new_idx,
+                    .port = bound.port,
+                });
+                ++bound_total;
+            } catch (const std::exception& e) {
+                log::warn("worker.rescale",
+                          "cutover rebind failed to bind a listener for upstream idx " +
+                              std::to_string(new_idx) + " of op '" + msg.op_id + "': " + e.what());
+            }
+        }
+        if (!sl.edge_ports.empty() &&
+            !send_frame_(encode_frame(MessageKind::SubtaskListening, sl))) {
+            log::warn("worker.rescale",
+                      "cutover rebind bound listeners but could not report them "
+                      "(SubtaskListening send failed) for job " +
+                          std::to_string(msg.job_id));
+        }
+    }
+    log::info("worker.rescale",
+              "cutover rebind job_id=" + std::to_string(msg.job_id) + " op_id=" + msg.op_id +
+                  " tasks=" + std::to_string(to_bind.size()) +
+                  " listeners_bound=" + std::to_string(bound_total));
 }
 
 void Worker::handle_abort_checkpoint_(MessageReader& r) {
@@ -1731,6 +1821,20 @@ void Worker::run_generic_subtask_(JobId job_id,
                     [gate](std::uint64_t cutover_ckpt) { (void)gate->arm(cutover_ckpt); });
                 per_job_group_cutovers_[job_id][hooks.downstream_op_id].push_back(std::move(hooks));
             };
+            // Input-side rebind registration, keyed by the UPSTREAM op the
+            // task's fan-shaped input edges come from: CutoverRebind(op=X)
+            // must reach every task LISTENING to X. Task identity rides
+            // along so the mid-run SubtaskListening report names the task
+            // the new ports belong to.
+            auto register_input_rebind = [this, job_id, role = task.role, sub = task.subtask_idx](
+                                             RunnerContext::InputRebindHooks hooks) {
+                if (hooks.upstream_op_id.empty() || !hooks.bind_new_input) {
+                    return;
+                }
+                std::lock_guard lock(mu_);
+                per_job_rebinds_[job_id][hooks.upstream_op_id].push_back(
+                    RegisteredInputRebind{role, sub, std::move(hooks)});
+            };
             // Graceful stop. Keyed by job only: a stop addresses every subtask,
             // so there is no role to select on.
             auto register_stops = [this, job_id](std::vector<RunnerContext::StopFn> cbs) {
@@ -1803,6 +1907,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .register_drain_callbacks = std::move(register_drains),
                 .register_cutover_arm_callbacks = std::move(register_arms),
                 .register_group_cutover = std::move(register_group_cutover),
+                .register_input_rebind = std::move(register_input_rebind),
                 .register_stop_callbacks = std::move(register_stops),
                 .register_checkpoint_backend = std::move(register_backend),
                 .runner_role = task.role,
@@ -2376,6 +2481,16 @@ void Worker::stop() {
                     token->store(true, std::memory_order_release);
                 }
             }
+        }
+        // Same for the rebind pump relays: their jthreads join at map
+        // destruction, which blocks forever unless the relays are woken.
+        std::vector<JobId> pump_jobs;
+        pump_jobs.reserve(per_job_rebind_pumps_.size());
+        for (const auto& [job_id, _] : per_job_rebind_pumps_) {
+            pump_jobs.push_back(job_id);
+        }
+        for (const auto job_id : pump_jobs) {
+            cancel_rebind_pumps_locked_(job_id);
         }
         cv_.notify_all();
     }
