@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -175,6 +176,47 @@ public:
     // Run a watermark recompute (useful after on_input_closed which doesn't
     // emit a watermark advance directly).
     WatermarkAdvance refresh_watermark() { return recompute_watermark_(); }
+
+    // Admit a new input mid-run (hot rescale downstream rebind, design
+    // record 008). Legal only while NO barrier is in flight: the per-
+    // barrier delivery bitmaps were sized to the membership at first
+    // delivery, and growing the membership mid-alignment would let a
+    // barrier complete against a set that never included the newcomer.
+    // The cutover choreography guarantees the window (the checkpoint
+    // clock pauses between the cutover checkpoint and Complete); the
+    // refusal turns a violated guarantee into a visible failure instead
+    // of a mis-aligned snapshot. Completed-but-lingering unaligned
+    // entries (their GC only runs on subsequent deliveries) are swept
+    // before judging, so a quiet single-input history cannot wedge the
+    // add.
+    //
+    // The joining input's watermark starts clamped to the current
+    // emitted global - the idle-reactivation rule. Note what this does
+    // NOT buy: the monotone emit guard already prevents regression, and
+    // an advance still waits for the newcomer's first watermark either
+    // way (the min includes it) - which the upstream's post-swap
+    // re-broadcast delivers immediately. The clamp keeps the rules
+    // uniform and the newcomer's recorded position from reading as
+    // pre-history. Returns the new input's index, or nullopt when
+    // refused.
+    std::optional<std::size_t> add_input() {
+        std::vector<std::uint64_t> ids;
+        ids.reserve(seen_barriers_.size());
+        for (const auto& [id, _] : seen_barriers_) {
+            ids.push_back(id);
+        }
+        for (const auto id : ids) {
+            maybe_drop_seen_(id);
+        }
+        if (!seen_barriers_.empty()) {
+            return std::nullopt;
+        }
+        input_wm_.push_back(Watermark{emitted_wm_.timestamp()});
+        paused_.push_back(false);
+        closed_.push_back(false);
+        idle_.push_back(false);
+        return input_wm_.size() - 1;
+    }
 
     // True if input i should currently be skipped (paused at barrier or
     // closed).

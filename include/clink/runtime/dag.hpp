@@ -34,6 +34,7 @@
 #include "clink/runtime/sharded_keyed_stage.hpp"
 #include "clink/runtime/snapshot_worker.hpp"
 #include "clink/runtime/subtask_emitter.hpp"
+#include "clink/runtime/union_rebind.hpp"
 #include "clink/state/coalescing_backend.hpp"
 #include "clink/state/keyed_state.hpp"
 
@@ -1612,7 +1613,8 @@ public:
     // still processed during alignment - they belong to checkpoint B, not
     // B+1. This is the standard Chandy-Lamport rule.
     template <typename T>
-    StageHandle<T> union_streams(std::vector<StageHandle<T>> upstreams) {
+    StageHandle<T> union_streams(std::vector<StageHandle<T>> upstreams,
+                                 std::shared_ptr<UnionRebindSlot<T>> rebind = nullptr) {
         const std::size_t n = upstreams.size();
         std::vector<std::shared_ptr<BoundedChannel<StreamElement<T>>>> in_channels;
         in_channels.reserve(n);
@@ -1627,8 +1629,8 @@ public:
         detail::OperatorRunner runner;
         runner.name = name;
         runner.id = id;
-        runner.run = [in_channels, out_channel, n](RuntimeContext& ctx,
-                                                   const std::function<bool()>& should_stop) {
+        runner.run = [in_channels, out_channel, n, rebind](
+                         RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             // Unaligned mode flips the alignment state machine so the
             // first barrier from any input forwards immediately. The
             // already-queued records on the other inputs are NOT held
@@ -1647,10 +1649,31 @@ public:
             // when issuing the barrier (defaults derive from
             // JobConfig.unaligned_checkpoints).
             MultiInputAlignment align(n);
+            // Runner-local, growable copy of the input set (hot rescale
+            // downstream rebind): the runner is the single writer, so a
+            // splice is a plain push_back here. The cancel/depth closures
+            // keep the ORIGINAL set - added channels are cancelled through
+            // their worker-owned relay threads, and all_closed still
+            // covers every member because the aligner grew with them.
+            auto channels = in_channels;
             using namespace std::chrono_literals;
             while (!should_stop()) {
+                // Admit spliced channels. The aligner refuses while a
+                // barrier is in flight (its bitmaps were sized at first
+                // delivery); a refused channel goes back to the front of
+                // the slot and is admitted when the barrier completes.
+                if (rebind && !rebind->empty()) {
+                    for (auto& ch : rebind->take()) {
+                        if (align.add_input().has_value()) {
+                            channels.push_back(std::move(ch));
+                        } else {
+                            rebind->requeue_front(std::move(ch));
+                            break;
+                        }
+                    }
+                }
                 bool any_progress = false;
-                for (std::size_t i = 0; i < n; ++i) {
+                for (std::size_t i = 0; i < channels.size(); ++i) {
                     // Even when an input is paused (waiting for barrier
                     // alignment), the producer may have closed its
                     // channel after pushing the barrier and exiting.
@@ -1671,8 +1694,8 @@ public:
                     // showed up as 1-2% pane-count loss at par=4/16 in
                     // an earlier version of this fix.
                     if (align.input_paused(i)) {
-                        if (!align.input_closed(i) && in_channels[i]->closed() &&
-                            in_channels[i]->size() == 0) {
+                        if (!align.input_closed(i) && channels[i]->closed() &&
+                            channels[i]->size() == 0) {
                             align.on_input_closed(i);
                             if (auto wm_adv = align.refresh_watermark(); wm_adv.forward) {
                                 out_channel->push(StreamElement<T>::watermark(wm_adv.watermark));
@@ -1680,12 +1703,12 @@ public:
                         }
                         continue;
                     }
-                    auto maybe = in_channels[i]->try_pop();
+                    auto maybe = channels[i]->try_pop();
                     if (!maybe.has_value()) {
                         // Same closed-AND-drained rule as the paused branch
                         // above: a push+close can land between the failed
                         // try_pop and this check.
-                        if (in_channels[i]->closed() && in_channels[i]->size() == 0) {
+                        if (channels[i]->closed() && channels[i]->size() == 0) {
                             align.on_input_closed(i);
                             if (auto wm_adv = align.refresh_watermark(); wm_adv.forward) {
                                 out_channel->push(StreamElement<T>::watermark(wm_adv.watermark));

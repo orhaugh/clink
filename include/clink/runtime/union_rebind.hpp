@@ -1,0 +1,69 @@
+#pragma once
+
+// Mid-run membership for a union input stage (hot rescale downstream
+// rebind, design record 008).
+//
+// The task downstream of a rescaled operator keeps running across the
+// cutover; what changes is its input set: the old subtasks' channels end
+// (barrier C, then close), and the new subtasks' channels join carrying
+// records after C. The union runner owns its channel vector on its own
+// thread, so the join is a hand-off: the worker's rebind path binds a new
+// inbound bridge, pumps it into a fresh channel on a worker-owned thread,
+// and splices that channel here; the union runner drains the slot at its
+// loop head and grows its poll set - single writer, no live Dag mutation.
+//
+// Admission defers to alignment: MultiInputAlignment::add_input refuses
+// while a barrier is in flight (its delivery bitmaps were sized to the
+// membership at first delivery), so the runner re-queues the channel and
+// admits it once the barrier completes. The cutover choreography makes the
+// wait momentary - the checkpoint clock pauses between the cutover
+// checkpoint and Complete - but correctness never depends on that.
+
+#include <memory>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+#include "clink/core/stream_element.hpp"
+#include "clink/runtime/bounded_channel.hpp"
+
+namespace clink {
+
+template <typename T>
+class UnionRebindSlot {
+public:
+    using Channel = BoundedChannel<StreamElement<T>>;
+
+    // Worker side: hand a new input channel to the union runner.
+    void splice(std::shared_ptr<Channel> ch) {
+        {
+            std::lock_guard lock(mu_);
+            pending_.push_back(std::move(ch));
+        }
+    }
+
+    // Runner side: take everything currently pending. The runner admits
+    // each through alignment and re-queues any the aligner refuses.
+    [[nodiscard]] std::vector<std::shared_ptr<Channel>> take() {
+        std::lock_guard lock(mu_);
+        return std::exchange(pending_, {});
+    }
+
+    // Runner side: put a refused channel back at the front so admission
+    // order is preserved across retries.
+    void requeue_front(std::shared_ptr<Channel> ch) {
+        std::lock_guard lock(mu_);
+        pending_.insert(pending_.begin(), std::move(ch));
+    }
+
+    [[nodiscard]] bool empty() const {
+        std::lock_guard lock(mu_);
+        return pending_.empty();
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::vector<std::shared_ptr<Channel>> pending_;
+};
+
+}  // namespace clink
