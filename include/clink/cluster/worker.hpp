@@ -359,8 +359,9 @@ private:
         per_job_aborters_;
 
     // Per-(job_id, op_id) drain callbacks. Subtask
-    // runners register one or more closures at startup against the
-    // op_id their subtask serves (op_id == DeploymentTask.role).
+    // runners register one or more closures at startup against every
+    // operator id their chain hosts (drain_registration_keys; custom-role
+    // tasks fall back to the role, which IS their op id).
     // BeginRescale dispatch looks up by (job_id, op_id) and invokes
     // every closure with the target_parallelism; the closure runs
     // the drain choreography (emit DrainMarker, close output) on
@@ -370,6 +371,15 @@ private:
     using DrainCallback = std::function<void(std::uint32_t target_parallelism)>;
     std::unordered_map<JobId, std::unordered_map<std::string, std::vector<DrainCallback>>>
         per_job_drain_callbacks_;
+
+    // Per-(job_id, op_id) armed-cutover callbacks, keyed exactly like the
+    // drain map. A BeginRescale that names a cutover checkpoint dispatches
+    // THESE with the id (stop exactly at barrier C); one that names none
+    // dispatches the drain callbacks above (stop now). Same registration
+    // path, same idempotency story.
+    using CutoverArmCallback = std::function<void(std::uint64_t cutover_checkpoint_id)>;
+    std::unordered_map<JobId, std::unordered_map<std::string, std::vector<CutoverArmCallback>>>
+        per_job_arm_callbacks_;
 
     // Graceful-stop closures, per job. Not keyed by role, unlike the drain map:
     // a stop addresses the WHOLE job, so there is nothing to select on. Same

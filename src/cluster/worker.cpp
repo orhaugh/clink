@@ -831,11 +831,36 @@ void Worker::handle_begin_rescale_(MessageReader& r) {
     if (!accept_epoch_(msg.coordinator_epoch, "BeginRescale")) {
         return;
     }
-    // Snapshot the drain callbacks for the addressed (job, op) under
-    // the lock, invoke outside it. Same lock-discipline as
-    // handle_commit_checkpoint_: drain choreography may block on
-    // output-channel push (when downstream is slow), so we must not
-    // hold mu_ across the dispatch.
+    // A message that names a cutover checkpoint ARMS: the addressed
+    // subtasks stop exactly at barrier C (which the coordinator sends
+    // BEFORE triggering C - stopping at a barrier that has already passed
+    // would stop nothing). One that names none is the legacy drain-now.
+    // Snapshot the callbacks for the addressed (job, op) under the lock,
+    // invoke outside it. Same lock-discipline as handle_commit_checkpoint_:
+    // drain choreography may block on output-channel push (when downstream
+    // is slow), so we must not hold mu_ across the dispatch.
+    if (msg.cutover_checkpoint != 0) {
+        std::vector<CutoverArmCallback> to_arm;
+        {
+            std::lock_guard lock(mu_);
+            auto job_it = per_job_arm_callbacks_.find(msg.job_id);
+            if (job_it != per_job_arm_callbacks_.end()) {
+                auto op_it = job_it->second.find(msg.op_id);
+                if (op_it != job_it->second.end()) {
+                    to_arm = op_it->second;
+                }
+            }
+        }
+        for (auto& fn : to_arm) {
+            try {
+                fn(msg.cutover_checkpoint);
+            } catch (...) {
+                // Best-effort, as below: the coordinator times the rescale
+                // out if the drained ack never arrives.
+            }
+        }
+        return;
+    }
     std::vector<DrainCallback> to_invoke;
     {
         std::lock_guard lock(mu_);
@@ -1595,15 +1620,28 @@ void Worker::run_generic_subtask_(JobId job_id,
             // operators this task hosts, and the task is addressable by
             // any of them. Multiple subtasks of the same operator
             // accumulate in the same vector.
-            auto register_drains = [this, job_id, keys = drain_registration_keys(chain, task.role)](
-                                       std::vector<RunnerContext::DrainFn> cbs) {
-                std::lock_guard lock(mu_);
-                for (const auto& key : keys) {
-                    auto& bucket = per_job_drain_callbacks_[job_id][key];
-                    for (const auto& cb : cbs)
-                        bucket.push_back(cb);
-                }
-            };
+            const auto drain_keys = drain_registration_keys(chain, task.role);
+            auto register_drains =
+                [this, job_id, keys = drain_keys](std::vector<RunnerContext::DrainFn> cbs) {
+                    std::lock_guard lock(mu_);
+                    for (const auto& key : keys) {
+                        auto& bucket = per_job_drain_callbacks_[job_id][key];
+                        for (const auto& cb : cbs)
+                            bucket.push_back(cb);
+                    }
+                };
+            // Armed-cutover registration, keyed identically. Which of the
+            // two fires is the dispatch's decision (handle_begin_rescale_):
+            // a named cutover checkpoint arms, none drains now.
+            auto register_arms =
+                [this, job_id, keys = drain_keys](std::vector<RunnerContext::CutoverArmFn> cbs) {
+                    std::lock_guard lock(mu_);
+                    for (const auto& key : keys) {
+                        auto& bucket = per_job_arm_callbacks_[job_id][key];
+                        for (const auto& cb : cbs)
+                            bucket.push_back(cb);
+                    }
+                };
             // Graceful stop. Keyed by job only: a stop addresses every subtask,
             // so there is no role to select on.
             auto register_stops = [this, job_id](std::vector<RunnerContext::StopFn> cbs) {
@@ -1674,6 +1712,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .register_commit_callbacks = std::move(register_commits),
                 .register_abort_callbacks = std::move(register_aborts),
                 .register_drain_callbacks = std::move(register_drains),
+                .register_cutover_arm_callbacks = std::move(register_arms),
                 .register_stop_callbacks = std::move(register_stops),
                 .register_checkpoint_backend = std::move(register_backend),
                 .runner_role = task.role,

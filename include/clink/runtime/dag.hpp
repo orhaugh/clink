@@ -426,6 +426,7 @@ public:
             // current offset, then the barrier emits to downstream, then
             // we ack. produce() running on this same thread means
             // there's no race between record emission and offset capture.
+            bool armed_drained = false;
             auto drain_pending_barriers = [&]() {
                 while (auto b = source->take_pending_barrier()) {
                     if (ctx.has_state_backend()) {
@@ -453,11 +454,23 @@ public:
                                                            "channel is closed or a remote push "
                                                            "failed)"});
                     }
+                    // Armed cutover (hot rescale): barrier C is this source's
+                    // last. Its snapshot and emission above ARE the boundary;
+                    // the flag stops the produce loop before any record can
+                    // follow C. Equality, not >=: the arm names one id, and a
+                    // barrier that is not C changes nothing.
+                    if (const auto armed = ctx.drain_at_checkpoint();
+                        armed != 0 && armed == b->id().value()) {
+                        armed_drained = true;
+                    }
                 }
             };
             drain_pending_barriers();
-            while (!should_stop() && source->produce(emitter)) {
+            while (!should_stop() && !armed_drained && source->produce(emitter)) {
                 drain_pending_barriers();
+                if (armed_drained) {
+                    break;
+                }
                 // Graceful stop. Leaves the loop but NOT via should_stop(), so
                 // the end-of-input path below still runs: flush, then the
                 // coordinator-coordinated final checkpoint that commits the tail
@@ -470,7 +483,19 @@ public:
                 }
             }
             drain_pending_barriers();
-            if (!should_stop()) {
+            if (armed_drained) {
+                // Armed cutover drain: nothing may follow barrier C. The
+                // end-of-input tail is skipped on purpose - this is a handoff
+                // to the post-cutover subtasks (which restore from C and
+                // continue), not an end of input, so firing event-time windows
+                // with a max watermark or committing a final checkpoint here
+                // would act out an ending that is not happening. The marker is
+                // advisory; target_parallelism 0 because the redistribution is
+                // carried by the cutover deploy's restore directives.
+                emitter.emit_drain(
+                    DrainMarker{.subtask_idx = static_cast<std::uint32_t>(ctx.runner_subtask_idx()),
+                                .target_parallelism = 0});
+            } else if (!should_stop()) {
                 source->flush(emitter);
                 // BATCH-1 end-of-input drain: a bounded source that exhausted
                 // cleanly has reached genuine end-of-input, so advance event
@@ -3610,6 +3635,7 @@ public:
                     ctx.unaligned_checkpoints() ? CheckpointBarrier::Mode::Unaligned
                                                 : CheckpointBarrier::Mode::Aligned));
                 const auto& ack_cb = ctx.checkpoint_ack();
+                bool armed_drained = false;
                 auto drain_pending_barriers = [&]() {
                     while (auto b = source->take_pending_barrier()) {
                         if (ctx.has_state_backend()) {
@@ -3630,12 +3656,26 @@ public:
                                                            "channel is closed or a remote push "
                                                            "failed)"});
                         }
+                        // Armed cutover (hot rescale): barrier C is this
+                        // source's last. Same contract as the single-subtask
+                        // runner: equality with the armed id only.
+                        if (const auto armed = ctx.drain_at_checkpoint();
+                            armed != 0 && armed == b->id().value()) {
+                            armed_drained = true;
+                        }
                     }
                 };
                 drain_pending_barriers();
                 bool drained = false;
-                while (!should_stop() && source->produce(typed_emitter)) {
+                while (!should_stop() && !armed_drained && source->produce(typed_emitter)) {
                     drain_pending_barriers();
+                    // Armed cutover (hot rescale): the drain above emitted
+                    // barrier C and set the flag; stop before any record can
+                    // follow it. The marker is emitted once, below, whichever
+                    // call to the drain armed it.
+                    if (armed_drained) {
+                        break;
+                    }
                     // Rescale-driven drain. The worker's
                     // BeginRescale dispatch sets ctx.drain_target() to
                     // the rescale's target_parallelism via the
@@ -3662,6 +3702,14 @@ public:
                     }
                 }
                 drain_pending_barriers();
+                if (armed_drained && !drained) {
+                    // Armed cutover drain: same skip-the-tail semantics as the
+                    // single-source runner - this is a handoff at barrier C,
+                    // not an end of input.
+                    typed_emitter.emit_drain(
+                        DrainMarker{.subtask_idx = subtask_idx_for_drain, .target_parallelism = 0});
+                    drained = true;
+                }
                 if (!should_stop() && !drained) {
                     source->flush(typed_emitter);
                     // BATCH-1 end-of-input drain (parallel-source path): same

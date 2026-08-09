@@ -432,6 +432,20 @@ void PluginRegistry::register_source(
                     },
                 });
             }
+            // Armed cutover, same bridging shape but its own atomic: the
+            // drain signal means "stop now", this one means "stop exactly at
+            // barrier C" (see JobConfig::drain_at_checkpoint for the
+            // contract). The two must stay separate - conflating them would
+            // turn every arm into an immediate drain at whatever record the
+            // source happened to be on.
+            auto arm_signal = std::make_shared<std::atomic<std::uint64_t>>(0);
+            if (rctx.register_cutover_arm_callbacks) {
+                rctx.register_cutover_arm_callbacks({
+                    [arm_signal](std::uint64_t cutover_ckpt) {
+                        arm_signal->store(cutover_ckpt, std::memory_order_release);
+                    },
+                });
+            }
             // Graceful stop: same bridging shape as the drain signal above, but
             // its own atomic, because the source runner treats the two
             // differently - a drain skips the end-of-input tail and a stop runs
@@ -444,6 +458,7 @@ void PluginRegistry::register_source(
             }
             auto cfg = detail::make_subtask_job_config(rctx);
             cfg.drain_target = drain_signal;
+            cfg.drain_at_checkpoint = arm_signal;
             cfg.stop_requested = stop_signal;
             clink::LocalExecutor exec(std::move(dag), std::move(cfg));
             detail::run_subtask_to_completion(exec, rctx.cancel_token);

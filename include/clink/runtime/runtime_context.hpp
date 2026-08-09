@@ -269,6 +269,20 @@ public:
         return drain_target_->load(std::memory_order_acquire);
     }
 
+    // Armed drain-at-checkpoint signal (hot rescale). Non-zero names the
+    // cutover checkpoint: the source runner emits that barrier as usual and
+    // then drains instead of producing past it. See
+    // JobConfig::drain_at_checkpoint for the full contract and how it
+    // differs from the drain-now signal above. Null or 0 = unarmed.
+    void set_drain_at_checkpoint_signal(std::shared_ptr<std::atomic<std::uint64_t>> sig) noexcept {
+        drain_at_checkpoint_ = std::move(sig);
+    }
+    [[nodiscard]] std::uint64_t drain_at_checkpoint() const noexcept {
+        if (!drain_at_checkpoint_)
+            return 0;
+        return drain_at_checkpoint_->load(std::memory_order_acquire);
+    }
+
     // Stop-with-savepoint signal. Set by the cluster's StopJob dispatch; the
     // source runner polls it between produce() calls and leaves the loop
     // WITHOUT marking itself drained, so the runner's end-of-input path still
@@ -540,6 +554,7 @@ private:
     KeyGroupRange restore_kg_range_{};  // default {0, kNumKeyGroups} = covers all
     std::optional<CheckpointBarrier::Mode> barrier_mode_override_;
     std::shared_ptr<std::atomic<std::uint32_t>> drain_target_;
+    std::shared_ptr<std::atomic<std::uint64_t>> drain_at_checkpoint_;
     std::shared_ptr<std::atomic<bool>> stop_requested_;
 };
 

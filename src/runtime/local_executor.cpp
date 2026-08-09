@@ -103,6 +103,7 @@ void LocalExecutor::start() {
         // Null in non-cluster paths; the runner observes 0 and
         // produces normally.
         contexts_.back()->set_drain_target_signal(config_.drain_target);
+        contexts_.back()->set_drain_at_checkpoint_signal(config_.drain_at_checkpoint);
         contexts_.back()->set_stop_requested_signal(config_.stop_requested);
         // Host-owned logger threaded across the plugin boundary by data (see
         // JobConfig::logger). Null in in-process / legacy paths, where the

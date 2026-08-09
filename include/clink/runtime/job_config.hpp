@@ -168,6 +168,22 @@ struct JobConfig {
     // source runner observes a null signal and produces normally.
     std::shared_ptr<std::atomic<std::uint32_t>> drain_target;
 
+    // Armed drain-at-checkpoint signal (hot rescale). 0 = unarmed. Set to a
+    // checkpoint id C, it tells the source runner: barrier C is your last.
+    // The runner emits barrier C exactly as usual - snapshot_offset captures
+    // the offset at that cut, the barrier flows downstream, the ack fires -
+    // and then the source emits NOTHING more: a DrainMarker (advisory; its
+    // target_parallelism is 0 because the cutover redistribution is decided
+    // by the coordinator's restore directives, not by the marker) and a
+    // clean exit, skipping the end-of-input tail exactly as drain_target
+    // does. The difference from drain_target is WHEN: drain-now stops at an
+    // arbitrary record boundary, which is only safe after the cutover
+    // checkpoint has already completed; armed drain stops at the barrier
+    // itself, so the snapshot at C and the emitted stream agree that C is
+    // the boundary - the property the hot-rescale contract (design record
+    // 008) is built on. Null or 0 = unarmed.
+    std::shared_ptr<std::atomic<std::uint64_t>> drain_at_checkpoint;
+
     // Shared stop-with-savepoint signal, and deliberately NOT the same thing as
     // drain_target above.
     //

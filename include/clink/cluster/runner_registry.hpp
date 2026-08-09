@@ -233,6 +233,18 @@ struct RunnerContext {
     using DrainFn = std::function<void(std::uint32_t /*target_parallelism*/)>;
     std::function<void(std::vector<DrainFn>)> register_drain_callbacks;
 
+    // Armed-cutover hook (hot rescale, design record 008). Registered
+    // alongside the drain callbacks and keyed the same way; the worker's
+    // BeginRescale dispatch invokes it with the cutover checkpoint id when
+    // the message names one. The runner-side closure stores the id into the
+    // JobConfig-threaded atomic the source runner polls
+    // (JobConfig::drain_at_checkpoint): barrier C is emitted, snapshotted
+    // and acked as usual, and nothing follows it - where the drain hook
+    // above stops at an arbitrary record boundary NOW, this one stops at
+    // the named barrier.
+    using CutoverArmFn = std::function<void(std::uint64_t /*cutover_checkpoint_id*/)>;
+    std::function<void(std::vector<CutoverArmFn>)> register_cutover_arm_callbacks;
+
     // Graceful-stop hook, and deliberately separate from the drain above.
     //
     // A drain leaves the source WITHOUT running the end-of-input path, because
