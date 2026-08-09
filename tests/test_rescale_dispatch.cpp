@@ -397,3 +397,67 @@ TEST(RestorePreRescaleLayout, TranslatesOnlyWhileTheRestorePointPredatesTheResca
     EXPECT_FALSE(clink::cluster::restore_needs_pre_rescale_layout(true, 0, 20));
     EXPECT_FALSE(clink::cluster::restore_needs_pre_rescale_layout(true, 0, 0));
 }
+
+// --- per-op index blocks ------------------------------------------------------
+//
+// The restore-addressing translation reads each operator's block of
+// job-global indices from the deploy-time identity records. The derivation
+// assumes contiguity only WITHIN an operator - which is exactly what an
+// append-only hot rescale preserves (the rescaled op's new subtasks form
+// one contiguous run at the tail; every other op keeps its original block)
+// and what graph-order arithmetic would get wrong.
+
+TEST(OpIndexBlocks, DerivesContiguousAndAppendedLayoutsAlike) {
+    using clink::cluster::derive_op_index_blocks;
+    clink::cluster::TaskOpIdentityMap identity;
+    // Original contiguous plan: src=0, agg=1..2, snk=3.
+    identity["__clink_subtask:0"] = {.op_id = "src", .subtask_idx_in_op = 0};
+    identity["__clink_subtask:1"] = {.op_id = "agg", .subtask_idx_in_op = 0};
+    identity["__clink_subtask:2"] = {.op_id = "agg", .subtask_idx_in_op = 1};
+    identity["__clink_subtask:3"] = {.op_id = "snk", .subtask_idx_in_op = 0};
+
+    auto blocks = derive_op_index_blocks(identity);
+    ASSERT_TRUE(blocks.at("agg").consistent);
+    EXPECT_EQ(blocks.at("agg").base, 1u);
+    EXPECT_EQ(blocks.at("agg").parallelism, 2u);
+    EXPECT_EQ(blocks.at("snk").base, 3u);
+
+    // Post-cutover appended layout: agg rescaled 2 -> 4, its new subtasks
+    // took global indices 4..7 while src and snk kept theirs. The old agg
+    // records are gone (torn down at the cutover); the new ones must still
+    // derive one consistent block, or the next whole-job restart restores
+    // agg from nowhere.
+    identity.erase("__clink_subtask:1");
+    identity.erase("__clink_subtask:2");
+    identity["__clink_subtask:4"] = {.op_id = "agg", .subtask_idx_in_op = 0};
+    identity["__clink_subtask:5"] = {.op_id = "agg", .subtask_idx_in_op = 1};
+    identity["__clink_subtask:6"] = {.op_id = "agg", .subtask_idx_in_op = 2};
+    identity["__clink_subtask:7"] = {.op_id = "agg", .subtask_idx_in_op = 3};
+
+    blocks = derive_op_index_blocks(identity);
+    ASSERT_TRUE(blocks.at("agg").consistent)
+        << "the appended block read as inconsistent - graph-order arithmetic crept back in";
+    EXPECT_EQ(blocks.at("agg").base, 4u);
+    EXPECT_EQ(blocks.at("agg").parallelism, 4u);
+    EXPECT_EQ(blocks.at("src").base, 0u);
+    EXPECT_EQ(blocks.at("snk").base, 3u);
+}
+
+TEST(OpIndexBlocks, DisagreeingRecordsPoisonTheOpRatherThanGuessing) {
+    using clink::cluster::derive_op_index_blocks;
+    clink::cluster::TaskOpIdentityMap identity;
+    // Two records that imply different bases (5-0 vs 7-1): a layout that
+    // cannot be trusted must be refused, because translating through a
+    // guessed base restores another operator's state.
+    identity["__clink_subtask:5"] = {.op_id = "agg", .subtask_idx_in_op = 0};
+    identity["__clink_subtask:7"] = {.op_id = "agg", .subtask_idx_in_op = 1};
+    auto blocks = derive_op_index_blocks(identity);
+    EXPECT_FALSE(blocks.at("agg").consistent);
+
+    // A record whose global index is below its index-within-op is
+    // self-contradictory; it poisons rather than underflows.
+    clink::cluster::TaskOpIdentityMap impossible;
+    impossible["__clink_subtask:0"] = {.op_id = "x", .subtask_idx_in_op = 3};
+    blocks = derive_op_index_blocks(impossible);
+    EXPECT_FALSE(blocks.at("x").consistent);
+}

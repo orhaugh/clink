@@ -79,6 +79,31 @@ struct OpScopedAck {
                                  std::uint32_t subtask_idx,
                                  const std::string& op_id);
 
+// Where each operator's subtasks live in the job-global index space,
+// derived from the deploy-time identity records: base = global index minus
+// index within the operator, which every task of an op must agree on.
+// `consistent` is false when they do not - the translation consumers
+// restore nothing rather than the wrong slice.
+//
+// This derivation is what makes APPEND-ONLY hot-rescale layouts restorable
+// with no extra bookkeeping: an op whose subtasks were appended at the tail
+// still has one contiguous block (base = the appended start), and every
+// unchanged op keeps its original one. Only per-op contiguity is assumed -
+// never graph-order adjacency across ops.
+struct OpIndexBlock {
+    std::uint32_t base{};
+    std::uint32_t parallelism{};
+    bool consistent{true};
+    bool base_set{false};
+};
+
+// Derive the per-op blocks from an identity map keyed "role:global_idx".
+// Entries with an empty op id or an unparseable key are skipped; a global
+// index smaller than the index-within-op marks the op inconsistent (it
+// would underflow, and a layout that claims it is lying about something).
+[[nodiscard]] std::unordered_map<std::string, OpIndexBlock> derive_op_index_blocks(
+    const TaskOpIdentityMap& identity);
+
 // Which parent snapshot a rescaled subtask restores from.
 //
 // `parent_idx` is the OLD subtask index whose snapshot file this new subtask

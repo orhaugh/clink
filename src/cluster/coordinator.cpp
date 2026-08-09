@@ -3489,44 +3489,14 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         templates[key] = std::move(t);
     }
 
-    // Where each operator's subtasks lived BEFORE this redeploy: the global
-    // index its block started at, and how many subtasks it had. Captured now,
-    // while task_op_identity still describes the deployed set, because a
-    // replan below rebuilds it.
-    //
-    // base = global index - index within operator. Every task of an operator
-    // must agree on that number; the planner allocates a contiguous block per
-    // operator, and the restore addressing below depends on it.
-    struct OldOpBlock {
-        std::uint32_t base{};
-        std::uint32_t parallelism{};
-        bool consistent{true};
-        bool base_set{false};
-    };
-    std::unordered_map<std::string, OldOpBlock> old_op_blocks;
-    for (const auto& [key, ident] : job.task_op_identity) {
-        const auto colon = key.find(':');
-        if (colon == std::string::npos || ident.op_id.empty()) {
-            continue;
-        }
-        std::uint32_t global_idx = 0;
-        try {
-            global_idx = static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1)));
-        } catch (const std::exception&) {
-            continue;
-        }
-        if (global_idx < ident.subtask_idx_in_op) {
-            continue;  // impossible; treat as unknown rather than underflow
-        }
-        const std::uint32_t base = global_idx - ident.subtask_idx_in_op;
-        auto& block = old_op_blocks[ident.op_id];
-        if (block.base_set && block.base != base) {
-            block.consistent = false;
-        }
-        block.base = block.base_set ? std::min(block.base, base) : base;
-        block.base_set = true;
-        ++block.parallelism;
-    }
+    // Where each operator's subtasks lived BEFORE this redeploy. Captured
+    // now, while task_op_identity still describes the deployed set, because
+    // a replan below rebuilds it. The derivation (base = global index minus
+    // index within operator, per-op contiguity only - which is what keeps
+    // append-only hot-rescale layouts restorable) lives in
+    // derive_op_index_blocks so it can be tested against exactly those
+    // layouts without a cluster.
+    auto old_op_blocks = derive_op_index_blocks(job.task_op_identity);
 
     // Replan rescale: the requested per-operator parallelism is applied to the
     // retained job graph and the whole task set is re-derived by the planner.

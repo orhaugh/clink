@@ -17,6 +17,37 @@ OpScopedAck op_scoped_ack(const TaskOpIdentityMap& identity,
     return OpScopedAck{.op_id = role, .subtask_idx_in_op = subtask_idx};
 }
 
+std::unordered_map<std::string, OpIndexBlock> derive_op_index_blocks(
+    const TaskOpIdentityMap& identity) {
+    std::unordered_map<std::string, OpIndexBlock> blocks;
+    for (const auto& [key, ident] : identity) {
+        const auto colon = key.find(':');
+        if (colon == std::string::npos || ident.op_id.empty()) {
+            continue;
+        }
+        std::uint32_t global_idx = 0;
+        try {
+            global_idx = static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1)));
+        } catch (const std::exception&) {
+            continue;
+        }
+        auto& block = blocks[ident.op_id];
+        if (global_idx < ident.subtask_idx_in_op) {
+            // Would underflow: the identity record contradicts itself.
+            block.consistent = false;
+            continue;
+        }
+        const std::uint32_t base = global_idx - ident.subtask_idx_in_op;
+        if (block.base_set && block.base != base) {
+            block.consistent = false;
+        }
+        block.base = block.base_set ? std::min(block.base, base) : base;
+        block.base_set = true;
+        ++block.parallelism;
+    }
+    return blocks;
+}
+
 bool task_hosts_op(const TaskOpIdentityMap& identity,
                    const std::string& role,
                    std::uint32_t subtask_idx,
