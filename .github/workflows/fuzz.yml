@@ -1,0 +1,89 @@
+# Scheduled fuzz DISCOVERY. The corpus replay that gates every PR lives in the
+# core test suite (tests/test_fuzz_corpus.cpp) and needs none of this; this
+# workflow's job is to go LOOKING, on a cadence, with the sanitizers on.
+#
+# Determinism posture, stated because the hardening brief demands it: discovery
+# is stochastic by nature. What is deterministic is everything around it - the
+# seed corpus is generated from the real encoders, any crash artefact is
+# uploaded and, once committed under fuzz/corpus/<target>/, is replayed by
+# plain gtest on every build forever. A red here is a lead, not a gate: the
+# gate is the reproducer it leaves behind.
+#
+# Runs weekly and on demand. NOT on pull requests - 5 x 300s of fuzzing per PR
+# would buy little and cost every contributor ten minutes.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "45 3 * * 1"  # Mondays 03:45 UTC, clear of the 02:30 sanitizer run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [cluster_frame, data_frame, checkpoint_meta, state_version_map, fault_spec]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the revision under test
+        # Same rationale as the sanitizers workflow: a scheduled run tests
+        # main's HEAD at the moment it fires, and a finding means nothing until
+        # it is checked against that sha.
+        run: |
+          echo "fuzz(${{ matrix.target }}): testing $(git rev-parse HEAD)"
+          echo "### Revision under test: \`$(git rev-parse HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            clang libclang-rt-dev cmake ninja-build
+
+      - name: Configure and build the target
+        # SQL off: the fuzz targets do not touch it and the build is the slow
+        # part of this job. The probe in fuzz/CMakeLists.txt compiles a
+        # TestOneInput-only source - see the comment there for why a main()
+        # in the probe reports a working toolchain as broken.
+        run: |
+          cmake -S . -B build-fuzz -G Ninja \
+            -DCLINK_BUILD_FUZZERS=ON -DCLINK_BUILD_SQL=OFF \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build-fuzz --target clink_fuzz_${{ matrix.target }} clink_fuzz_seeds
+
+      - name: Restore discovery corpus
+        # The discovery corpus grows across runs; the committed seeds under
+        # fuzz/corpus/ are the floor, not the ceiling.
+        uses: actions/cache@v4
+        with:
+          path: corpus-work
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        run: |
+          mkdir -p corpus-work artifacts
+          ./build-fuzz/fuzz/clink_fuzz_seeds seeds
+          cp seeds/${{ matrix.target }}/* corpus-work/ 2>/dev/null || true
+          cp fuzz/corpus/${{ matrix.target }}/* corpus-work/ 2>/dev/null || true
+          ./build-fuzz/fuzz/clink_fuzz_${{ matrix.target }} corpus-work \
+            -max_total_time=300 -timeout=5 -artifact_prefix=artifacts/ \
+            -print_final_stats=1 2>&1 | tail -20
+
+      - name: Upload crash artefacts
+        # The whole point of the run. A finding lands here; the fix is to
+        # minimise it and commit it under fuzz/corpus/<target>/ so the gtest
+        # replay owns it forever.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 30

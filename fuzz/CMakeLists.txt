@@ -44,12 +44,17 @@ endif()
 # without libclang-rt-<n>-dev fails at link with a missing
 # libclang_rt.fuzzer.a - both would otherwise look like "Clang, fine".
 include(CheckCXXSourceCompiles)
+# The probe must NOT define main(): -fsanitize=fuzzer links libFuzzer's own main,
+# and a probe with a second main fails at link on a toolchain where fuzzing works
+# perfectly - which is exactly what happened on Debian's clang-19, and how item 21
+# stayed "blocked on the image" after the runtime package was already installed. A
+# direct `clang++ -fsanitize=fuzzer` of a TestOneInput-only file linked fine while
+# this probe said the compiler could not.
 set(CMAKE_REQUIRED_FLAGS "-fsanitize=fuzzer")
 check_cxx_source_compiles("
 #include <cstddef>
 #include <cstdint>
 extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t*, size_t) { return 0; }
-int main() { return 0; }
 " CLINK_HAVE_LIBFUZZER)
 unset(CMAKE_REQUIRED_FLAGS)
 

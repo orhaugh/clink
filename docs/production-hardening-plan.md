@@ -3140,14 +3140,36 @@ cannot link libFuzzer") rather than a stale image. That is a false signal pointi
 from the real cause, which is how item 21 came to be recorded as a toolchain blocker in
 the first place.
 
-**What is needed:** rebuild the image without a cached first layer
-(`docker build --no-cache-filter` or a fresh build), then confirm with
-`clang++-19 -fsanitize=fuzzer` before trusting it. Not attempted here - a full rebuild is
-40-60 minutes.
+**RESOLVED 2026-08-09, and the image was only half the story.** The rebuilt image
+(`clink-build:next`) carries the runtime - and configure STILL failed, because the CMake
+probe defines `main()` alongside `-fsanitize=fuzzer`. libFuzzer provides `main` and
+demands `LLVMFuzzerTestOneInput`, so the probe's duplicate main failed at link and
+reported "this compiler cannot link libFuzzer" on a toolchain where a direct
+`clang++ -fsanitize=fuzzer` of a TestOneInput-only file linked cleanly. Two independent
+false signals - a stale image layer AND a wrong probe - pointed at the same wrong
+conclusion, and the second would have survived any number of image rebuilds. The probe
+now compiles a TestOneInput-only source.
 
-Once that is done, F76's `data_frame` target can have its first real fuzz run instead of
-corpus replay alone, and item 21's "45 seconds per target, discovery not in CI" becomes
-actionable rather than blocked.
+**The first campaign ran clean: one million executions, zero findings.** 200,000 per
+target, `-seed=12345`, ASan+UBSan, seeded from the committed corpus plus the generator:
+
+| target | executions | coverage edges | crashes |
+|---|---|---|---|
+| cluster_frame | 200k | 1045 | 0 |
+| data_frame | 200k | 176 | 0 |
+| checkpoint_meta | 200k | 72 | 0 |
+| state_version_map | 200k | 20 | 0 |
+| fault_spec | 200k | 4 | 0 |
+
+`fault_spec` at 4 edges is suspiciously shallow for a grammar parser and is flagged for
+the property-assertion pass rather than chased here.
+
+**Item 21's remaining tail, stated:** property assertions (round-trip, idempotence)
+inside the targets instead of crash-only; the scheduled discovery workflow
+(`fuzz.yml`, added alongside this) has to be observed green on an actual runner before
+it counts; and `clink-build:next` should replace `:latest` only after a full label run
+on it. Discovery is stochastic by nature - the deterministic artefacts are the probe,
+the corpus, and the gtest replay that turns any find into a permanent regression.
 
 ### F81. ROOT CAUSE OF F67, FIXED: a chain's checkpoint owner captured a backend its upstream members were still writing
 
