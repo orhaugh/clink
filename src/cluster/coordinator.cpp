@@ -4118,6 +4118,17 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
     if (!job.rescale_coordinator) {
         return;
     }
+    // A job draining for a replan redeploys EVERYTHING via
+    // restart_job_locked_; a cutover deployment on top of that is a second
+    // topology. The checkpoint-completed hook already refuses to advance
+    // Preparing ops during the drain; this guards any other route into
+    // CuttingOver while a replan owns the job.
+    if (job.awaiting_restart) {
+        log::warn("coordinator.rescale",
+                  "declining cutover deploy for op '" + op_id + "' of job " +
+                      std::to_string(job.id) + ": a replan drain owns this job");
+        return;
+    }
     auto status = job.rescale_coordinator->status(op_id);
     if (!status.has_value() || status->state != RescaleState::CuttingOver) {
         return;
@@ -5113,7 +5124,18 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             // SubtaskFinished, which calls mark_old_drained,
             // which fires dispatch_cutover_deploy_locked_ when
             // the last old subtask drains.
-            if (job.rescale_coordinator) {
+            //
+            // NOT while the job is draining for a replan. The shipped
+            // per-operator rescale holds its op in Preparing across the
+            // whole-job drain and closes it with mark_replan_complete,
+            // which requires Preparing. Advancing the op to Draining here
+            // would let the drain's own SubtaskFinished acks - which now
+            // translate to the operator - walk the state machine to
+            // CuttingOver and fire a cutover deployment on top of the
+            // replan's: two deployments of one operator. A checkpoint
+            // completing inside the drain window is the only way in, so
+            // this is the one gate needed.
+            if (job.rescale_coordinator && !job.awaiting_restart) {
                 for (const auto& op_status : job.rescale_coordinator->all()) {
                     if (op_status.state != RescaleState::Preparing) {
                         continue;
