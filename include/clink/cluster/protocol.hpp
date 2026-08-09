@@ -727,6 +727,16 @@ struct TriggerCheckpointMsg {
     // Zero means an unfenced coordinator and reproduces the pre-fencing
     // behaviour, so a mixed-version cluster keeps working mid-upgrade.
     std::uint64_t coordinator_epoch{0};
+    // State generation this trigger was issued FOR (F84 / follow-up 49). A
+    // trigger that straddles a rescale - issued against one topology,
+    // arriving after the swap - used to be queued by the worker and replayed
+    // into the NEW generation's sources, which then snapshotted old ids into
+    // the new generation's directories: with the transition window held open,
+    // 120+ snapshots per run landed outside their checkpoint's participant
+    // set. The worker drops a trigger whose generation is not the one it has
+    // deployed. Zero means a pre-F84 coordinator; accepted, preserving the
+    // old behaviour on mixed versions.
+    std::uint64_t generation{0};
 };
 
 // coordinator → worker. The commit phase of the 2PC sink protocol. Broadcast to every worker

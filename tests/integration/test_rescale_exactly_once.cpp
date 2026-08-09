@@ -392,6 +392,52 @@ protected:
     }
 
     // Per-operator rescale: `clink rescale-op --op=<operator id>`.
+    // Item 49's window trio drives one full rescale with a lifecycle window held
+    // open by a coordinator-side Delay fault, then asserts exactly-once AND the
+    // cross-subtask participant invariant outright. See the comment block above
+    // the three tests at the bottom of this file.
+    void rescale_with_window_held(Cluster& c, const char* window_point) {
+        auto sub = submit(c);
+        ASSERT_NE(sub, nullptr);
+
+        ASSERT_TRUE(clink::itest::await(
+            [&] {
+                return verify_exactly_once(out_dir_, kTotalRecords).total_lines >=
+                       kMinCommittedBefore;
+            },
+            std::chrono::seconds(90)))
+            << "too little committed output before the rescale for a bad restore to show up";
+
+        std::string rescale_out;
+        const int rc = rescale_operator(c, "counter", kMaxParallelism, &rescale_out);
+        ASSERT_EQ(rc, 0) << "the rescale request was refused: " << rescale_out;
+        ASSERT_TRUE(clink::itest::await([&] { return c.coordinator().log_contains("replanned"); },
+                                        std::chrono::seconds(60)))
+            << "no replan landed, so the held window (" << window_point << ") was never entered";
+
+        const auto exit_code = sub->await_exit(std::chrono::seconds(180));
+        ASSERT_TRUE(exit_code.has_value()) << "submitter never exited";
+        EXPECT_EQ(*exit_code, 0) << "the job did not complete across the held window";
+
+        const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+        EXPECT_TRUE(v.duplicated.empty())
+            << "records committed MORE than once with the " << window_point << " window held open";
+        EXPECT_TRUE(v.unexpected.empty())
+            << "unexpected output (STATE-MISMATCH = keyed state lost or duplicated) with "
+            << "the " << window_point << " window held open";
+        EXPECT_TRUE(v.missing.empty())
+            << "records LOST with the " << window_point << " window held open";
+
+        // The promotion this trio exists for: with the window DELIBERATE, a snapshot
+        // outside its checkpoint's participant set is a defect, not an artefact of
+        // unexplained timing.
+        const auto violations = clink::itest::checkpoint_set_violations(c.checkpoint_dir());
+        EXPECT_TRUE(violations.empty())
+            << violations.size() << " checkpoint(s) hold a snapshot from outside their "
+            << "participant set with the " << window_point
+            << " window held open; first: " << violations.front();
+    }
+
     int rescale_operator(Cluster& c,
                          const std::string& op_id,
                          int parallelism,
@@ -841,4 +887,61 @@ TEST_F(RescaleExactlyOnceTest, WholeRoleRescaleOfAMultiOperatorJobIsRefused) {
         << "records were duplicated after a refused rescale. " << context;
     EXPECT_TRUE(v.unexpected.empty())
         << "output contains records the source never emitted. " << context;
+}
+
+// --- item 49's transition window, held open on purpose ----------------------
+//
+// The cross-subtask participant check (checkpoint_set_violations) has asserted
+// only on the no-rescale premise until now, because the rescale transition was
+// an UNEXPLAINED window: a checkpoint triggered while the task set is being
+// replaced could plausibly record one topology's participants while the other's
+// subtasks still write files, and gating on a window nobody understood would
+// have made the gate flaky rather than the engine honest.
+//
+// These three tests replace that uncertainty with force. Each holds one of the
+// rescale lifecycle's windows open - delay:1200 at the armed point, an order of
+// magnitude past the 150ms checkpoint cadence - and then asserts BOTH the
+// exactly-once output AND the participant invariant outright. If a leftover
+// writer exists in any window, the file it leaves names it (state-cat on the
+// artefacts gives the operator ids); if none exists, the invariant is proven
+// under deliberately hostile timing rather than assumed from quiet runs.
+//
+// A Delay fault leaves no externally assertable trace of having fired (unlike
+// exit:N, whose code the harness checks elsewhere). The arming grammar and the
+// child-env plumbing are proven by those exit-based tests; here the point's
+// placement inside the rescale path is what guarantees the window, and the
+// coordinator's own "replanned" line still gates that the rescale ran.
+
+TEST_F(RescaleExactlyOnceTest, HoldingTheDrainWindowOpenLeavesEveryCheckpointConsistent) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator(
+        clink::itest::ProcOptions{.fault = "rescale.after_drain=delay:1200@1"}));
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    rescale_with_window_held(c, "rescale.after_drain");
+}
+
+TEST_F(RescaleExactlyOnceTest, HoldingTheReplanWindowOpenLeavesEveryCheckpointConsistent) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator(
+        clink::itest::ProcOptions{.fault = "rescale.after_replan=delay:1200@1"}));
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    rescale_with_window_held(c, "rescale.after_replan");
+}
+
+TEST_F(RescaleExactlyOnceTest,
+       HoldingThePreFirstCheckpointWindowOpenLeavesEveryCheckpointConsistent) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator(
+        clink::itest::ProcOptions{.fault = "rescale.before_first_checkpoint=delay:1200@1"}));
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    rescale_with_window_held(c, "rescale.before_first_checkpoint");
 }

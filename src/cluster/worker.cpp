@@ -908,9 +908,28 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
     std::vector<RunnerContext::SourceInjectorFn> to_invoke;
     {
         std::lock_guard lock(mu_);
+        // Generation fence (F84). A trigger issued against one topology and
+        // arriving after the swap used to be queued below and replayed into
+        // the NEW generation's sources, which then snapshotted the old id
+        // into the new generation's directories - the follow-up 49 leftover,
+        // reproduced at 120+ per run with the transition window held open.
+        // Zero means a pre-F84 coordinator: accepted, old behaviour.
+        if (msg.generation != 0) {
+            if (auto gen_it = per_job_generation_.find(msg.job_id);
+                gen_it != per_job_generation_.end() && gen_it->second != msg.generation) {
+                log::warn("worker.checkpoint",
+                          "dropping checkpoint trigger " + std::to_string(msg.checkpoint_id) +
+                              " for job " + std::to_string(msg.job_id) +
+                              ": issued for generation " + std::to_string(msg.generation) +
+                              " but this worker is deployed at " + std::to_string(gen_it->second) +
+                              " - the trigger straddled a rescale and injecting it would write "
+                              "the old id into the new generation");
+                return;
+            }
+        }
         auto job_it = per_job_injectors_.find(msg.job_id);
         if (job_it == per_job_injectors_.end() || job_it->second.empty()) {
-            pending_triggers_[msg.job_id].push_back(msg.checkpoint_id);
+            pending_triggers_[msg.job_id].push_back({msg.checkpoint_id, msg.generation});
             return;
         }
         for (auto& [sub_idx, entry] : job_it->second) {
@@ -1012,6 +1031,13 @@ void Worker::handle_deploy_(MessageReader& r) {
         const std::string restore_dir = msg.restore_from_dir;
         const std::uint64_t restore_id = msg.restore_from_checkpoint_id;
         const std::uint32_t generation = msg.generation;
+        {
+            // The generation this worker is now RUNNING for the job, for the
+            // trigger fence below (F84): a checkpoint trigger that straddled a
+            // rescale must be dropped, not queued into the new topology.
+            std::lock_guard lock(mu_);
+            per_job_generation_[msg.job_id] = msg.generation;
+        }
         const std::uint32_t restore_generation = msg.restore_generation;
         const bool unaligned = msg.unaligned_checkpoints;
         const std::string expected_versions = msg.expected_state_versions_packed;
@@ -1495,8 +1521,9 @@ void Worker::run_generic_subtask_(JobId job_id,
             // drop the leading interval.
             auto register_injectors = [this, job_id, sub = task.subtask_idx](
                                           std::vector<RunnerContext::SourceInjectorFn> injectors) {
-                std::vector<std::uint64_t> replay;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> replay;
                 std::vector<RunnerContext::SourceInjectorFn> snapshot;
+                std::uint64_t current_gen = 0;
                 {
                     std::lock_guard lock(mu_);
                     auto& entry = per_job_injectors_[job_id][sub];
@@ -1508,9 +1535,25 @@ void Worker::run_generic_subtask_(JobId job_id,
                     }
                     if (!replay.empty()) {
                         snapshot = entry.injectors;
+                        if (auto g = per_job_generation_.find(job_id);
+                            g != per_job_generation_.end()) {
+                            current_gen = g->second;
+                        }
                     }
                 }
-                for (auto ckpt_id : replay) {
+                for (auto [ckpt_id, trig_gen] : replay) {
+                    // Re-validate at REPLAY time (F84): a deploy can land between
+                    // queueing and this drain, and a trigger stamped for the old
+                    // generation replayed into the new one writes the old id into
+                    // the new generation's directories.
+                    if (trig_gen != 0 && current_gen != 0 && trig_gen != current_gen) {
+                        log::warn("worker.checkpoint",
+                                  "dropping queued checkpoint trigger " + std::to_string(ckpt_id) +
+                                      " for job " + std::to_string(job_id) +
+                                      ": stamped generation " + std::to_string(trig_gen) +
+                                      ", deployed generation " + std::to_string(current_gen));
+                        continue;
+                    }
                     CheckpointBarrier barrier(CheckpointId{ckpt_id});
                     for (auto& fn : snapshot) {
                         try {

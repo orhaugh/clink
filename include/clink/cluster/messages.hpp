@@ -239,9 +239,11 @@ inline void encode_body(MessageBuilder& /*b*/, const ListJobsMsg&) {}
 inline void encode_body(MessageBuilder& b, const TriggerCheckpointMsg& m) {
     b.put_u64_be(m.job_id);
     b.put_u64_be(m.checkpoint_id);
-    // Fencing epoch, appended last so an older peer that stops
-    // reading here still decodes the rest correctly.
     b.put_u64_be(m.coordinator_epoch);
+    // Generation tail (F84). After the epoch: an older reader stops at its
+    // own eof and never sees it; an older writer's frame ends early and the
+    // eof-guarded decode below reads 0 = unfenced.
+    b.put_u64_be(m.generation);
 }
 
 inline void encode_body(MessageBuilder& b, const CommitCheckpointMsg& m) {
@@ -678,6 +680,8 @@ inline TriggerCheckpointMsg decode_trigger_checkpoint(MessageReader& r) {
     // Fencing epoch. Absent from a pre-fencing peer, which reads
     // as 0 = unfenced and preserves the old behaviour.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    // Generation (F84). 0 from an older coordinator = accept-all.
+    m.generation = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 

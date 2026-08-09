@@ -2049,6 +2049,7 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
     // job, collect the worker connection list. Send the TriggerCheckpoint
     // frames outside the lock to avoid stalling readers.
     std::uint64_t ckpt_id = 0;
+    std::uint64_t gen_for_trigger = 0;
     std::vector<network::Connection*> worker_conns;
     {
         std::lock_guard lock(mu_);
@@ -2110,11 +2111,13 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
             }
         }
         ack.checkpoint_dir = job.checkpoint.checkpoint_dir;
+        gen_for_trigger = job.state_generation;
     }
 
     TriggerCheckpointMsg tc;
     tc.job_id = job_id;
     tc.checkpoint_id = ckpt_id;
+    tc.generation = gen_for_trigger;
     const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, tc);
     for (auto* c : worker_conns) {
         send_frame(*c, frame);
@@ -5268,7 +5271,8 @@ void Coordinator::checkpoint_trigger_loop_() {
         // wakes at its own interval - we use the minimum live interval
         // as the loop's sleep so we don't oversleep any job.
         std::chrono::milliseconds sleep_for{500};
-        std::vector<std::tuple<JobId, std::uint64_t, std::vector<std::string>>> to_trigger;
+        std::vector<std::tuple<JobId, std::uint64_t, std::uint64_t, std::vector<std::string>>>
+            to_trigger;
         {
             std::lock_guard lock(mu_);
             for (auto& [jid, job_ptr] : jobs_) {
@@ -5293,6 +5297,21 @@ void Coordinator::checkpoint_trigger_loop_() {
                 // injectors are registered. With peer_updates_sent the
                 // chain is at least up; the worker still queues triggers
                 // that race the source's own startup.
+                // A job whose topology is mid-swap must not be checkpointed
+                // (F84 / follow-up 49). Participants are captured from
+                // task_records at trigger, and a trigger issued now STRADDLES
+                // the swap: the worker queues it against no-sources-yet and
+                // replays it into the NEW generation's sources, which snapshot
+                // an id the outgoing generation's ledger owns. With the
+                // transition window held open by a fault point, that produced
+                // 120+ out-of-participant-set snapshots per run.
+                if (job.awaiting_restart) {
+                    const auto interval = std::chrono::milliseconds{job.checkpoint.interval_ms};
+                    if (interval < sleep_for) {
+                        sleep_for = interval;
+                    }
+                    continue;
+                }
                 if (!job.peer_updates_sent) {
                     const auto interval = std::chrono::milliseconds{job.checkpoint.interval_ms};
                     if (interval < sleep_for) {
@@ -5336,13 +5355,14 @@ void Coordinator::checkpoint_trigger_loop_() {
                 for (const auto& [worker_id, _] : job.tasks_by_worker) {
                     worker_ids.push_back(worker_id);
                 }
-                to_trigger.emplace_back(jid, next_id, std::move(worker_ids));
+                to_trigger.emplace_back(jid, next_id, job.state_generation, std::move(worker_ids));
             }
         }
-        for (const auto& [jid, ckpt_id, worker_ids] : to_trigger) {
+        for (const auto& [jid, ckpt_id, gen, worker_ids] : to_trigger) {
             TriggerCheckpointMsg m;
             m.job_id = jid;
             m.checkpoint_id = ckpt_id;
+            m.generation = gen;
             const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, m);
             for (const auto& worker_id : worker_ids) {
                 network::Connection* c = nullptr;

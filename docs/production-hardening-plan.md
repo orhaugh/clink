@@ -3317,6 +3317,60 @@ the same artefacts, and THAT stack - not another reproduction lottery - is what 
 the investigation. F13, meanwhile, is closed: the worker-lost-at-restore test completes
 end to end under the F12 kick, and its GTEST_SKIP escape hatch is now a hard gate.
 
+### F84. Checkpoint triggers straddled rescale transitions - item 49 root-caused and fixed
+
+Item 49's residue - snapshots outside their checkpoint's participant set, seen in 2 of 5
+suite runs and never explained - is now reproduced deterministically, root-caused to a
+line, fixed, and gated.
+
+**The reproduction.** Three tests hold each rescale lifecycle window open with a
+coordinator-side `delay:1200` fault (the `rescale.*` points added earlier for exactly
+this), then assert the participant invariant outright. Two windows reproduced the
+residue MASSIVELY - 132 and 120 violations in single runs, shaped
+`checkpoint 18 has a snapshot at v2/4 but completed with generation=1 subtasks=0,1,2`:
+post-rescale subtasks writing PRE-rescale checkpoint ids into the new generation.
+
+**The mechanism, nailed to the line.** The worker's trigger handler queues a
+`TriggerCheckpoint` that arrives when a job has no registered sources - and replays the
+queue into the FIRST sources that register. During a transition that is precisely the
+NEW generation: every trigger issued against the old topology and landing mid-swap was
+replayed into the new one, which dutifully snapshotted old ids into new-generation
+directories. The natural window is microseconds, so at most one trigger straddled -
+the old 2-in-5 residue; held open for 1200ms, every 150ms tick queued one.
+
+**The fix, two halves with honestly different standing:**
+
+- *The fence (load-bearing, mutation-proven).* `TriggerCheckpointMsg` carries the
+  generation it was issued for - an eof-guarded additive tail after the fencing epoch,
+  zero meaning a pre-F84 coordinator and accept-all, with the wire tests updated for
+  all three peer vintages. The worker drops a mismatched trigger at RECEIPT and
+  re-validates at the queued-REPLAY drain, because a deploy can land between the two.
+- *The gate (justified by reasoning, unexercisable by these windows).* The periodic
+  loop skips jobs in `awaiting_restart`. The mutation matrix showed it cannot be what
+  saves the held-window tests: the delay holds `mu_`, the trigger loop blocks on the
+  same lock, and by the time it observes the job the flag is already cleared. It
+  matters for REAL multi-tick transitions, where the flag persists across lock
+  releases and pointless triggers would otherwise abort (the missing-COMPLETED-22
+  shape in the F67 artefacts).
+
+**The mutation matrix, all four arms run:**
+
+| gate | fence | trio |
+|---|---|---|
+| off | off | RED, 132/120 violations (the original reproduction) |
+| off | on | GREEN - the fence alone stops the flood |
+| on | off | RED, 126/132 - the gate alone cannot |
+| on | on | GREEN |
+
+The arm-2 red is the valuable one: it corrected the author's own model of the fix, and
+the commit says so rather than telling the tidier story.
+
+**What this closes.** Item 49 in full: the transition window is no longer unexplained,
+the participant check asserts under deliberately hostile timing (the trio), and the
+leftover class that F75's restore-side filter guards against is no longer produced on
+the write side. It also explains the F67 artefacts' missing COMPLETED-22 - a transition
+checkpoint that could never complete.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

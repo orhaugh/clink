@@ -824,10 +824,11 @@ TEST(WireProtocolFencing, EveryControlFrameCarriesTheCoordinatorEpoch) {
         EXPECT_EQ(round_trip(MessageKind::CancelJob, in, decode_cancel_job).coordinator_epoch, 9U);
     }
     {
-        TriggerCheckpointMsg in{.job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9};
-        EXPECT_EQ(round_trip(MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint)
-                      .coordinator_epoch,
-                  9U);
+        TriggerCheckpointMsg in{
+            .job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9, .generation = 7};
+        const auto out = round_trip(MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint);
+        EXPECT_EQ(out.coordinator_epoch, 9U);
+        EXPECT_EQ(out.generation, 7U);
     }
     {
         CommitCheckpointMsg in{.job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9};
@@ -929,11 +930,28 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
         EXPECT_EQ(out.coordinator_epoch, 0U);
     }
     {
-        TriggerCheckpointMsg in{.job_id = 1, .checkpoint_id = 33, .coordinator_epoch = 9};
+        // TriggerCheckpoint's tail has grown: the fencing epoch (8 bytes) plus
+        // the F84 generation (8 bytes). A peer that predates BOTH sends
+        // neither, so 16 bytes come off, not 8.
+        TriggerCheckpointMsg in{
+            .job_id = 1, .checkpoint_id = 33, .coordinator_epoch = 9, .generation = 7};
         auto out = round_trip_without_epoch_field(
-            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint);
+            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint, /*tail_bytes=*/16);
         EXPECT_EQ(out.checkpoint_id, 33U);
         EXPECT_EQ(out.coordinator_epoch, 0U);
+        EXPECT_EQ(out.generation, 0U);
+    }
+    {
+        // The intermediate peer: has fencing, predates the F84 generation.
+        // Chops only the generation; the epoch must survive and the
+        // generation must read 0 = accept-all at the worker's fence.
+        TriggerCheckpointMsg in{
+            .job_id = 1, .checkpoint_id = 34, .coordinator_epoch = 9, .generation = 7};
+        auto out = round_trip_without_epoch_field(
+            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint, /*tail_bytes=*/8);
+        EXPECT_EQ(out.checkpoint_id, 34U);
+        EXPECT_EQ(out.coordinator_epoch, 9U);
+        EXPECT_EQ(out.generation, 0U);
     }
     {
         BeginRescaleMsg in;

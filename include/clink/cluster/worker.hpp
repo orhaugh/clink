@@ -321,7 +321,15 @@ private:
     // the job. Drained on the first register_source_injectors() call for
     // that job. Avoids the deploy/trigger race where the coordinator fires a
     // periodic checkpoint while the worker is still bringing up the chain.
-    std::unordered_map<JobId, std::vector<std::uint64_t>> pending_triggers_;
+    // Queued (checkpoint_id, generation) pairs. Generation-stamped so the
+    // replay-at-registration path can re-validate against the CURRENT deploy:
+    // a deploy may land between queueing and replay, and replaying a trigger
+    // stamped for the old generation into the new one is the follow-up 49
+    // leftover (F84).
+    std::unordered_map<JobId, std::vector<std::pair<std::uint64_t, std::uint64_t>>>
+        pending_triggers_;
+    // The generation each job is currently deployed at on this worker (F84).
+    std::unordered_map<JobId, std::uint64_t> per_job_generation_;
 
     // Per-(job_id, subtask_idx) commit callbacks. Sinks implementing the
     // 2PC protocol register a callback at startup; CommitCheckpoint
