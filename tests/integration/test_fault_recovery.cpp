@@ -308,11 +308,31 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
 
 // F12's regression test - DISABLED, and the reason is the test rather than the fix.
 //
-// It passes in isolation and with a handful of siblings, and it FAILS in the full
-// integration label even with the heavy multi-process tests serialised by RESOURCE_LOCK.
-// So it is not simple contention: something accumulates over the ~120 tests that run
-// before it - leftover processes, ports, or filesystem state - and this test is the one
-// sensitive to it. Running it red in the gate would be worse than not running it.
+// It passes in isolation and FAILS in the full integration label, even with the heavy
+// multi-process tests serialised by RESOURCE_LOCK. Running it red in the gate would be
+// worse than not running it, so it is disabled while that is understood.
+//
+// Two theories were tested against the label output and BOTH are wrong:
+//
+//   * "contention" - RESOURCE_LOCK serialises these tests and it still fails.
+//   * "something accumulates over the ~120 tests before it" - it runs 4th of 126. Only
+//     three tests precede it.
+//
+// What the label actually shows:
+//
+//     4/126 Test #2694: ...AJobSurvivesASecondLossDuringTheFirstRestartsDrain ***Failed 22.48 sec
+//     test_fault_recovery.cpp:392: Expected equality of these values:
+//       *code  Which is: 9
+//       0
+//
+// So the submitter EXITED with code 9 after 22s. It did not wedge and did not time out -
+// which is a different symptom from the one F12 was about (a 30s "restart drain timed
+// out"). The job failed for some other reason, quickly, and only when three specific
+// tests have run before it in the same binary.
+//
+// Next step: identify which of those three, by running the label's first four tests in
+// order and then bisecting them. Do NOT raise any timeout here - the failure is fast,
+// so a longer wait cannot help and would only obscure it.
 //
 // The FIX it covers is verified independently and stands: with the empty-drain kick
 // disabled this test fails with "restart drain timed out", and with it enabled it

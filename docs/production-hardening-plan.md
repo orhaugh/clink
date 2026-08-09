@@ -3089,10 +3089,21 @@ Applied to the whole binary rather than the twelve heavy cases because
 `DISCOVERY_MODE PRE_TEST` registers names at test time, so `set_tests_properties` cannot
 see them at configure time; narrowing it needs `POST_BUILD` discovery.
 
-**The one that survived the lock is a separate defect.**
-`AJobSurvivesASecondLossDuringTheFirstRestartsDrain` still fails in the full label with
-everything serialised, while passing in isolation. So it is not contention - something
-accumulates across the ~120 tests before it. It is DISABLED rather than left red, with
+**The one that survived the lock is a separate defect, and both first theories were
+wrong.** `AJobSurvivesASecondLossDuringTheFirstRestartsDrain` passes in isolation and
+fails in the full label. Contention is out - RESOURCE_LOCK serialises it and it still
+fails. Accumulation is out too: it runs **4th of 126**, so only three tests precede it.
+
+The label output says what actually happens:
+
+    4/126 ...AJobSurvivesASecondLossDuringTheFirstRestartsDrain ***Failed 22.48 sec
+    test_fault_recovery.cpp:392: *code Which is: 9, expected 0
+
+The submitter EXITED with code 9 after 22s. It neither wedged nor timed out, which is a
+different symptom from F12's own (a 30s "restart drain timed out"). So the job fails
+quickly, for another reason, and only when three specific tests precede it in the same
+binary. Bisecting those three is the next step, and no timeout should be touched - the
+failure is fast, so a longer wait cannot help. It is DISABLED rather than left red, with
 the reason recorded on it and an explicit instruction not to "fix" it by lengthening
 waits: it waits on conditions, not durations, so a longer wait would only mask the
 interaction.
