@@ -78,6 +78,11 @@ struct PlannedTask {
     // Callers must treat an empty op_id as "unknown", not as a match.
     std::string op_id;
     std::uint32_t subtask_idx_in_op{};
+    // Rescale restore directive, mirrored onto the DeploymentTask at
+    // dispatch. kRestoreFromSelf = no override (ordinary deploys); the hot
+    // cutover planner sets the parents' deployed global index and count.
+    std::uint32_t restore_from_subtask_idx{kRestoreFromSelf};
+    std::uint32_t restore_from_parent_count{1};
 };
 
 struct JobPlan {

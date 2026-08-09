@@ -1502,3 +1502,144 @@ TEST(JobPlanner, FanInputEdgesCarryTheUpstreamRescaleAnnotation) {
     EXPECT_TRUE(saw_agg_input);
     EXPECT_TRUE(saw_snk_input);
 }
+
+// --- plan_hot_cutover ---------------------------------------------------------
+//
+// The post-cutover subtasks of ONE operator, planned by the real planner at
+// the new parallelism and then rewritten: their own indices appended past
+// the deployed allocation, every edge translated back to the DEPLOYED
+// peers (the fresh plan shifts every op after the rescaled one), restores
+// mapped onto the parents' deployed globals. Getting any of these wrong is
+// silent: wrong edges wire the new subtasks to other operators' listeners,
+// wrong restores load other operators' state.
+
+namespace {
+
+clink::cluster::JobGraphSpec hot_cutover_graph() {
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "src",
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "8"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "identity_int64",
+        .id = "agg",
+        .inputs = {"src"},
+        .parallelism = 2,
+        .min_parallelism = 1,
+        .max_parallelism = 8,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .key_by = "identity",
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "file_int64_sink",
+        .id = "snk",
+        .inputs = {"agg"},
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"path", "/tmp/x"}},
+    });
+    return g;
+}
+
+// The deployed layout the graph above plans to: src=0, agg=1..2, snk=3.
+clink::cluster::TaskOpIdentityMap hot_cutover_deployed_identity() {
+    clink::cluster::TaskOpIdentityMap m;
+    m["__clink_subtask:0"] = {.op_id = "src", .subtask_idx_in_op = 0};
+    m["__clink_subtask:1"] = {.op_id = "agg", .subtask_idx_in_op = 0};
+    m["__clink_subtask:2"] = {.op_id = "agg", .subtask_idx_in_op = 1};
+    m["__clink_subtask:3"] = {.op_id = "snk", .subtask_idx_in_op = 0};
+    return m;
+}
+
+}  // namespace
+
+TEST(PlanHotCutover, AppendsIndicesRemapsEdgesAndMapsRestoresToDeployedParents) {
+    const auto g = hot_cutover_graph();
+    const auto deployed = hot_cutover_deployed_identity();
+
+    const auto plan = clink::cluster::plan_hot_cutover(
+        g, "agg", 4, deployed, OperatorRegistry::default_instance());
+    ASSERT_TRUE(plan.ok) << plan.error;
+    ASSERT_EQ(plan.tasks.size(), 4u);
+    EXPECT_EQ(plan.teardown_keys,
+              (std::vector<std::string>{"__clink_subtask:1", "__clink_subtask:2"}));
+
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const auto& t = plan.tasks[i];
+        // Append-only: past the deployed max (3), in op order.
+        EXPECT_EQ(t.subtask_idx, 4u + i);
+        EXPECT_EQ(t.op_id, "agg");
+        EXPECT_EQ(t.subtask_idx_in_op, i);
+        // Restore: parents are agg's DEPLOYED globals 1 and 2, split 2->4.
+        EXPECT_EQ(t.restore_from_subtask_idx, 1u + i / 2)
+            << "subtask " << i << " restores from the wrong deployed parent";
+        EXPECT_EQ(t.restore_from_parent_count, 1u);
+
+        const auto chain = OperatorChainSpec::from_json(t.extra_config);
+        EXPECT_EQ(chain.subtask_idx, t.subtask_idx)
+            << "the chain spec still carries the fresh plan's index - built-in sources "
+               "would partition their work by the wrong subtask";
+        EXPECT_EQ(chain.subtask_idx_in_op, i);
+        // Input edges: the feeding src kept its deployed global 0. The
+        // fresh plan cannot be trusted here - it re-numbers everything.
+        for (const auto& e : chain.input_edges) {
+            EXPECT_EQ(e.peer_subtask_idx, 0u)
+                << "an input edge points at a fresh-plan index instead of the deployed src";
+        }
+        // Output groups: the fed snk kept its deployed global 3 - in the
+        // fresh plan at parallelism 4 it sits at index 5, so an
+        // untranslated edge would target a listener that does not exist.
+        for (const auto& grp : chain.output_groups) {
+            for (const auto& e : grp.edges) {
+                EXPECT_EQ(e.peer_subtask_idx, 3u)
+                    << "an output edge points at the fresh plan's shifted sink index";
+            }
+        }
+        for (const auto& [pr_role, pr_sub] : t.peer_refs) {
+            EXPECT_EQ(pr_sub, 3u) << "a peer ref was not translated to the deployed sink";
+        }
+    }
+}
+
+TEST(PlanHotCutover, ScaleDownMergesDeployedParents) {
+    const auto plan = clink::cluster::plan_hot_cutover(hot_cutover_graph(),
+                                                       "agg",
+                                                       1,
+                                                       hot_cutover_deployed_identity(),
+                                                       OperatorRegistry::default_instance());
+    ASSERT_TRUE(plan.ok) << plan.error;
+    ASSERT_EQ(plan.tasks.size(), 1u);
+    EXPECT_EQ(plan.tasks[0].subtask_idx, 4u);
+    EXPECT_EQ(plan.tasks[0].restore_from_subtask_idx, 1u);
+    EXPECT_EQ(plan.tasks[0].restore_from_parent_count, 2u)
+        << "the single new subtask must merge BOTH deployed parents or half the key space "
+           "restores from nowhere";
+}
+
+TEST(PlanHotCutover, RefusesWhatItCannotTranslate) {
+    const auto g = hot_cutover_graph();
+
+    // Unknown operator.
+    auto plan = clink::cluster::plan_hot_cutover(
+        g, "nope", 4, hot_cutover_deployed_identity(), OperatorRegistry::default_instance());
+    EXPECT_FALSE(plan.ok);
+
+    // An inconsistent deployed block for the rescaled op: refuse rather
+    // than guess a base.
+    auto identity = hot_cutover_deployed_identity();
+    identity["__clink_subtask:9"] = {.op_id = "agg", .subtask_idx_in_op = 0};
+    plan = clink::cluster::plan_hot_cutover(
+        g, "agg", 4, identity, OperatorRegistry::default_instance());
+    EXPECT_FALSE(plan.ok);
+    EXPECT_NE(plan.error.find("inconsistent"), std::string::npos) << plan.error;
+
+    // A neighbour whose deployed parallelism disagrees with the graph
+    // (snk missing from the deployed set): its edges cannot be translated.
+    auto missing_snk = hot_cutover_deployed_identity();
+    missing_snk.erase("__clink_subtask:3");
+    plan = clink::cluster::plan_hot_cutover(
+        g, "agg", 4, missing_snk, OperatorRegistry::default_instance());
+    EXPECT_FALSE(plan.ok) << "edges to an operator with no deployed identity were guessed";
+}

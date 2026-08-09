@@ -1,5 +1,6 @@
 #include "clink/cluster/job_planner.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -409,6 +410,173 @@ std::size_t total_subtask_count(const JobGraphSpec& graph) {
         total += op.parallelism;
     }
     return total;
+}
+
+HotCutoverPlan plan_hot_cutover(const JobGraphSpec& graph,
+                                const std::string& op_id,
+                                std::uint32_t new_parallelism,
+                                const TaskOpIdentityMap& deployed_identity,
+                                const OperatorRegistry& registry) {
+    HotCutoverPlan out;
+
+    // The deployed layout is the translation target; a block that cannot be
+    // trusted means edges or restores would be guesses.
+    const auto deployed_blocks = derive_op_index_blocks(deployed_identity);
+    const auto deployed_op = deployed_blocks.find(op_id);
+    if (deployed_op == deployed_blocks.end()) {
+        out.error = "hot cutover: operator '" + op_id + "' has no deployed identity records";
+        return out;
+    }
+    if (!deployed_op->second.consistent || deployed_op->second.parallelism == 0) {
+        out.error = "hot cutover: operator '" + op_id +
+                    "' has an inconsistent deployed index block; refusing to translate";
+        return out;
+    }
+    const std::uint32_t old_p = deployed_op->second.parallelism;
+
+    // Append-only allocation: the new subtasks take indices past everything
+    // deployed, so no other task's index (or state directory) changes.
+    std::uint32_t appended_base = 0;
+    for (const auto& [key, ident] : deployed_identity) {
+        const auto colon = key.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        try {
+            const auto g = static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1)));
+            appended_base = std::max(appended_base, g + 1);
+        } catch (const std::exception&) {
+        }
+    }
+
+    // Re-run the real planner on the graph at the new parallelism. Chains,
+    // edges, key groups and routing all come out of the same code a submit
+    // uses; only the rescaled op's tasks are kept and their indices
+    // rewritten below.
+    JobGraphSpec updated = graph;
+    bool found = false;
+    for (auto& op : updated.ops) {
+        if (op.id == op_id) {
+            op.parallelism = new_parallelism;
+            found = true;
+        }
+    }
+    if (!found) {
+        out.error = "hot cutover: operator '" + op_id + "' is not in the retained graph";
+        return out;
+    }
+    JobPlan fresh;
+    try {
+        fresh = plan_job(updated, registry);
+    } catch (const std::exception& e) {
+        out.error =
+            std::string{"hot cutover: replanning at the new parallelism failed: "} + e.what();
+        return out;
+    }
+
+    // Fresh-plan global index -> (op, index within op), for edge
+    // translation: the fresh plan shifts every op after the rescaled one.
+    std::unordered_map<std::uint32_t, std::pair<std::string, std::uint32_t>> fresh_owner;
+    for (const auto& t : fresh.tasks) {
+        if (!t.op_id.empty()) {
+            fresh_owner[t.subtask_idx] = {t.op_id, t.subtask_idx_in_op};
+        }
+    }
+    // Translate a fresh-plan global index into the DEPLOYED (or appended)
+    // one. Zero is a valid index, so errors report through the flag.
+    auto translate = [&](std::uint32_t fresh_global,
+                         std::string& err) -> std::optional<std::uint32_t> {
+        const auto owner = fresh_owner.find(fresh_global);
+        if (owner == fresh_owner.end()) {
+            err = "fresh plan index " + std::to_string(fresh_global) + " has no operator identity";
+            return std::nullopt;
+        }
+        const auto& [owner_op, owner_idx] = owner->second;
+        if (owner_op == op_id) {
+            return appended_base + owner_idx;
+        }
+        const auto blk = deployed_blocks.find(owner_op);
+        if (blk == deployed_blocks.end() || !blk->second.consistent ||
+            owner_idx >= blk->second.parallelism) {
+            err = "operator '" + owner_op + "' subtask " + std::to_string(owner_idx) +
+                  " has no trustworthy deployed index (the fresh plan and the deployed set "
+                  "disagree about its parallelism)";
+            return std::nullopt;
+        }
+        return blk->second.base + owner_idx;
+    };
+
+    for (const auto& t : fresh.tasks) {
+        if (t.op_id != op_id) {
+            continue;
+        }
+        PlannedTask nt = t;
+        nt.worker_id.clear();
+        nt.data_port = 0;
+        nt.subtask_idx = appended_base + t.subtask_idx_in_op;
+
+        // Restore directive: parents by the shared mapping, translated to
+        // the op's deployed block.
+        const auto mapping = rescale_parent_mapping(old_p, new_parallelism, t.subtask_idx_in_op);
+        if (!mapping.ok) {
+            out.error = "hot cutover: " + mapping.error;
+            return out;
+        }
+        nt.restore_from_subtask_idx = deployed_op->second.base + mapping.parent_idx;
+        nt.restore_from_parent_count = mapping.parent_count;
+
+        // Rewrite the chain spec the worker will parse: its own indices,
+        // its input edges (feeding tasks keep their deployed indices) and
+        // its output groups (fed tasks likewise).
+        auto chain = OperatorChainSpec::from_json(t.extra_config);
+        chain.subtask_idx = nt.subtask_idx;
+        std::string err;
+        for (auto& e : chain.input_edges) {
+            const auto tr = translate(e.peer_subtask_idx, err);
+            if (!tr.has_value()) {
+                out.error = "hot cutover: input edge of '" + op_id + "': " + err;
+                return out;
+            }
+            e.peer_subtask_idx = *tr;
+        }
+        for (auto& g : chain.output_groups) {
+            for (auto& e : g.edges) {
+                const auto tr = translate(e.peer_subtask_idx, err);
+                if (!tr.has_value()) {
+                    out.error = "hot cutover: output edge of '" + op_id + "': " + err;
+                    return out;
+                }
+                e.peer_subtask_idx = *tr;
+            }
+        }
+        nt.extra_config = chain.to_json();
+
+        nt.peer_refs.clear();
+        for (const auto& [pr_role, pr_sub] : t.peer_refs) {
+            const auto tr = translate(pr_sub, err);
+            if (!tr.has_value()) {
+                out.error = "hot cutover: peer ref of '" + op_id + "': " + err;
+                return out;
+            }
+            nt.peer_refs.emplace_back(pr_role, *tr);
+        }
+        out.tasks.push_back(std::move(nt));
+    }
+    if (out.tasks.size() != new_parallelism) {
+        out.error = "hot cutover: the fresh plan produced " + std::to_string(out.tasks.size()) +
+                    " tasks for '" + op_id + "', expected " + std::to_string(new_parallelism);
+        return out;
+    }
+
+    for (const auto& [key, ident] : deployed_identity) {
+        if (ident.op_id == op_id) {
+            out.teardown_keys.push_back(key);
+        }
+    }
+    std::sort(out.teardown_keys.begin(), out.teardown_keys.end());
+
+    out.ok = true;
+    return out;
 }
 
 std::vector<std::string> drain_registration_keys(const OperatorChainSpec& chain,

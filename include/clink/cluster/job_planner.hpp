@@ -228,4 +228,35 @@ JobPlan plan_job(const JobGraphSpec& graph,
 // plan_job, so it can reject SubmitJob without doing the planning work.
 std::size_t total_subtask_count(const JobGraphSpec& graph);
 
+// Plan the post-cutover subtasks of ONE operator for a hot rescale (design
+// record 008), leaving every other task untouched. The planner is re-run on
+// the graph at the new parallelism - so chains, edges, key groups and
+// routing all come from the same code a submit uses - and then only the
+// rescaled op's tasks are kept, with every index REWRITTEN:
+//
+//   * their own job-global indices are appended past the deployed
+//     allocation (append-only: nothing else moves, nothing else redeploys);
+//   * edge references to other operators are translated from the fresh
+//     plan's indices to the DEPLOYED ones via the per-op index blocks
+//     (the fresh plan shifts every op after the rescaled one);
+//   * restore directives map each new subtask onto its parents' deployed
+//     global indices.
+//
+// ok=false with a reason when the deployed layout cannot be trusted (an
+// inconsistent block) or an edge target does not exist in the deployed set;
+// the caller aborts to the replan path rather than deploying a guess.
+struct HotCutoverPlan {
+    // Unplaced: the coordinator's dispatch does placement, as with submit.
+    std::vector<PlannedTask> tasks;
+    // "role:global_idx" keys of the op's OLD subtasks to tear down.
+    std::vector<std::string> teardown_keys;
+    bool ok{false};
+    std::string error;
+};
+HotCutoverPlan plan_hot_cutover(const JobGraphSpec& graph,
+                                const std::string& op_id,
+                                std::uint32_t new_parallelism,
+                                const TaskOpIdentityMap& deployed_identity,
+                                const OperatorRegistry& registry);
+
 }  // namespace clink::cluster
