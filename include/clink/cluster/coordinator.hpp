@@ -254,6 +254,17 @@ public:
         // returning a rejection ack to the client. 0 means "never wait,
         // reject immediately". Useful when clusters auto-scale.
         std::chrono::milliseconds submit_wait_for_slots{0};
+        // Hot rescale (design record 008). When enabled, an eligible
+        // per-operator rescale runs as an in-place cutover at a checkpoint
+        // barrier - only the rescaled operator's subtasks cycle - and every
+        // ineligible or failed attempt falls back to the stop-the-world
+        // replan. Off = always replan (the proven path).
+        bool hot_rescale_enabled{true};
+        // Bound on each hot-cutover phase (arming acks, the cutover
+        // checkpoint + drains, rebind ports, new-task listenings). Expiry
+        // aborts the cutover to the replan path. Generous because the
+        // deploy phase includes a state restore.
+        std::chrono::milliseconds hot_cutover_phase_timeout{60000};
         // Cluster-level default state-backend URI applied to a submitted job
         // that chose none (empty CheckpointConfig.state_backend_uri). Lets an
         // operator point every job at a deferring backend (e.g.
@@ -911,6 +922,57 @@ private:
         // unordered_map storage.
         std::unique_ptr<RescaleCoordinator> rescale_coordinator;
 
+        // In-flight HOT cutover (design record 008): one operator changing
+        // parallelism while the job keeps running. Engaged from the arming
+        // request until Complete or abort. While engaged, the periodic
+        // trigger sweep skips this job (rule 5: the cutover checkpoint is
+        // the last of the old layout, its successor the first of the new),
+        // which is what lets `cutover_checkpoint` be assigned before it is
+        // triggered. The job does NOT drain: awaiting_restart stays false
+        // and every unaffected subtask keeps running - that is the point.
+        struct HotCutover {
+            std::string op_id;
+            std::uint32_t old_parallelism{0};
+            std::uint32_t target_parallelism{0};
+            std::uint64_t cutover_checkpoint{0};
+            enum class Phase : std::uint8_t {
+                Arming,       // BeginRescale sent, awaiting worker acks
+                AwaitingCut,  // C triggered; awaiting completion + drains
+                Rebinding,    // CutoverRebind sent; awaiting new-edge ports
+                Deploying,    // new tasks deployed; awaiting their listenings
+            };
+            Phase phase{Phase::Arming};
+            std::chrono::steady_clock::time_point phase_deadline{};
+            // The validated post-cutover plan, held from request time so
+            // the deploy uses exactly what eligibility checked.
+            std::vector<PlannedTask> planned_tasks;
+            std::uint32_t appended_base{0};
+            // The op's OLD contiguous block, captured while the identity
+            // records still describe it: Complete writes it into
+            // stale_layout_blocks so a whole-job failure inside
+            // [Complete, C+1] still translates its restore correctly.
+            std::uint32_t old_block_base{0};
+            // Arm-ack accounting: workers still to reply, and the armed
+            // totals accumulated across replies vs what the deployed
+            // identity and graph say should exist.
+            std::unordered_set<std::string> arm_workers_pending;
+            std::uint32_t expected_op_tasks{0};
+            std::uint32_t expected_groups{0};
+            std::uint32_t expected_rebind_tasks{0};
+            std::uint32_t acked_callbacks{0};
+            std::uint32_t acked_groups{0};
+            std::uint32_t acked_rebind_tasks{0};
+            // Feeding / fed task keys ("role:global_idx") captured at
+            // request time; the rebind and swap dispatches address their
+            // workers.
+            std::vector<std::string> feeder_task_keys;
+            std::vector<std::string> fed_task_keys;
+            // (fed task key, new upstream idx) pairs whose rebind port has
+            // not yet arrived.
+            std::set<std::pair<std::string, std::uint32_t>> rebind_ports_pending;
+        };
+        std::optional<HotCutover> hot_cutover;
+
         // Per-job adaptive autoscaler. Created in
         // deploy_internal_ when cfg_.autoscaler is set and at least
         // one of the job's operators carries [min, max] bounds.
@@ -1073,7 +1135,42 @@ private:
     void handle_submit_(network::Connection& conn, MessageReader& r);
     void handle_list_jobs_(network::Connection& conn);
     void handle_cancel_job_(network::Connection& conn, MessageReader& r);
+    // Deferred control-plane frame: staged under mu_, sent outside it.
+    struct PendingDeploy {
+        network::Connection* conn;
+        std::vector<std::byte> frame;
+    };
+
     void handle_subtask_finished_(MessageReader& r);
+    void handle_begin_rescale_ack_(MessageReader& r);
+
+    // ----- Hot cutover (design record 008) -----
+    // Try to run `op_id`'s rescale as an in-place cutover. Returns true when
+    // the hot path was engaged (arm frames staged into `out_frames`); false
+    // means ineligible, with the reason, and the caller falls back to the
+    // replan path. Called under mu_.
+    bool try_begin_hot_cutover_locked_(JobState& job,
+                                       const std::string& op_id,
+                                       std::uint32_t new_parallelism,
+                                       std::uint32_t old_parallelism,
+                                       const JobGraphSpec& graph,
+                                       std::vector<PendingDeploy>& out_frames,
+                                       std::string& reason);
+    // All arm acks arrived and match: trigger the cutover checkpoint.
+    void hot_cutover_trigger_c_locked_(JobState& job, std::vector<PendingDeploy>& out_frames);
+    // Every old subtask drained (CuttingOver): tear down the old tasks and
+    // dispatch CutoverRebind to the fed tasks' workers.
+    void hot_cutover_begin_rebind_locked_(JobState& job, std::vector<PendingDeploy>& out_frames);
+    // Every rebind port arrived: place and deploy the planned new tasks.
+    void hot_cutover_deploy_locked_(JobState& job, std::vector<PendingDeploy>& out_frames);
+    // Every new task listening (Complete): targeted PeerUpdate to the new
+    // tasks, CutoverPeerUpdate to the feeders, durable bookkeeping.
+    void hot_cutover_complete_locked_(JobState& job, std::vector<PendingDeploy>& out_frames);
+    // Abort at any phase: clear the hot state and fall back to the replan
+    // at the requested parallelism. Returns the CancelJob frames to send.
+    void abort_hot_cutover_locked_(JobState& job,
+                                   const std::string& reason,
+                                   std::vector<PendingDeploy>& out_frames);
     void handle_subtask_listening_(MessageReader& r);
     void handle_rescale_job_(network::Connection& conn, MessageReader& r);
     // Per-operator rescale request dispatch.
@@ -1105,10 +1202,6 @@ private:
     // transient JobState fields, and broadcast fresh Deploys with
     // restore_from set to the coordinator's latest_completed_checkpoint_id.
     // Returns the new Deploy frames to send outside the lock.
-    struct PendingDeploy {
-        network::Connection* conn;
-        std::vector<std::byte> frame;
-    };
     std::vector<PendingDeploy> restart_job_locked_(JobState& job);
 
     // Replan a job at a changed per-operator parallelism.

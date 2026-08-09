@@ -853,6 +853,10 @@ void Worker::handle_begin_rescale_(MessageReader& r) {
     // is slow), so we must not hold mu_ across the dispatch.
     if (msg.cutover_checkpoint != 0) {
         std::vector<CutoverArmCallback> to_arm;
+        BeginRescaleAckMsg ack;
+        ack.job_id = msg.job_id;
+        ack.op_id = msg.op_id;
+        ack.worker_id = worker_id_;
         {
             std::lock_guard lock(mu_);
             auto job_it = per_job_arm_callbacks_.find(msg.job_id);
@@ -862,14 +866,35 @@ void Worker::handle_begin_rescale_(MessageReader& r) {
                     to_arm = op_it->second;
                 }
             }
+            if (auto g_it = per_job_group_cutovers_.find(msg.job_id);
+                g_it != per_job_group_cutovers_.end()) {
+                if (auto op_it = g_it->second.find(msg.op_id); op_it != g_it->second.end()) {
+                    ack.armed_groups = static_cast<std::uint32_t>(op_it->second.size());
+                }
+            }
+            if (auto r_it = per_job_rebinds_.find(msg.job_id); r_it != per_job_rebinds_.end()) {
+                if (auto op_it = r_it->second.find(msg.op_id); op_it != r_it->second.end()) {
+                    ack.rebind_tasks = static_cast<std::uint32_t>(op_it->second.size());
+                }
+            }
         }
         for (auto& fn : to_arm) {
             try {
                 fn(msg.cutover_checkpoint);
+                ++ack.armed_callbacks;
             } catch (...) {
-                // Best-effort, as below: the coordinator times the rescale
-                // out if the drained ack never arrives.
+                // Best-effort, as below: an uncounted arm shows up as a
+                // shortfall in the ack and aborts the hot cutover.
             }
+        }
+        // Report what was actually armed. The coordinator compares against
+        // what the deployed identity and the graph say SHOULD exist here;
+        // a shortfall aborts to the replan path before C is triggered.
+        if (!send_frame_(encode_frame(MessageKind::BeginRescaleAck, ack))) {
+            log::warn("worker.rescale",
+                      "armed for cutover but could not report it (BeginRescaleAck send "
+                      "failed) for job " +
+                          std::to_string(msg.job_id));
         }
         return;
     }
@@ -904,35 +929,46 @@ void Worker::handle_cutover_peer_update_(MessageReader& r) {
     // apply_swap blocks until its group has flushed the armed barrier,
     // which is data-volume work. Same inline-on-the-reader precedent as
     // commit dispatch; the flush is bounded by the branch queues draining
-    // through C, which the held split guarantees is finite.
-    std::vector<RunnerContext::GroupCutoverHooks> to_apply;
+    // through C, which the held split guarantees is finite. Each feeding
+    // task gets ITS OWN endpoint list - the new subtasks bind one port per
+    // feeder edge, so applying one list to every group would wire every
+    // feeder to the same ports.
+    std::vector<RegisteredGroupCutover> registered;
     {
         std::lock_guard lock(mu_);
         auto job_it = per_job_group_cutovers_.find(msg.job_id);
         if (job_it != per_job_group_cutovers_.end()) {
             auto op_it = job_it->second.find(msg.op_id);
             if (op_it != job_it->second.end()) {
-                to_apply = op_it->second;
+                registered = op_it->second;
             }
         }
     }
     std::size_t applied = 0;
-    for (auto& hooks : to_apply) {
-        try {
-            if (hooks.apply_swap && hooks.apply_swap(msg.peers)) {
-                ++applied;
+    std::size_t matched = 0;
+    for (const auto& tp : msg.tasks) {
+        for (auto& reg : registered) {
+            if (reg.task_role != tp.task_role || reg.task_subtask_idx != tp.task_subtask_idx) {
+                continue;
             }
-        } catch (const std::exception& e) {
-            log::warn("worker.rescale",
-                      "cutover peer swap failed for op '" + msg.op_id + "' of job " +
-                          std::to_string(msg.job_id) + ": " + e.what());
+            ++matched;
+            try {
+                if (reg.hooks.apply_swap && reg.hooks.apply_swap(tp.peers)) {
+                    ++applied;
+                }
+            } catch (const std::exception& e) {
+                log::warn("worker.rescale",
+                          "cutover peer swap failed for op '" + msg.op_id + "' task " +
+                              tp.task_role + ":" + std::to_string(tp.task_subtask_idx) +
+                              " of job " + std::to_string(msg.job_id) + ": " + e.what());
+            }
         }
     }
     log::info("worker.rescale",
               "cutover peer update applied job_id=" + std::to_string(msg.job_id) +
                   " op_id=" + msg.op_id + " groups=" + std::to_string(applied) + "/" +
-                  std::to_string(to_apply.size()) +
-                  " new_parallelism=" + std::to_string(msg.peers.size()));
+                  std::to_string(matched) + " (registered=" + std::to_string(registered.size()) +
+                  ", addressed=" + std::to_string(msg.tasks.size()) + ")");
 }
 
 void Worker::cancel_rebind_pumps_locked_(JobId job_id) {
@@ -1811,7 +1847,8 @@ void Worker::run_generic_subtask_(JobId job_id,
             // upstream task, and CutoverPeerUpdate(op=X) must reach their
             // swaps. The gate also joins the arm map under the same key so
             // the arm dispatch stays one code path.
-            auto register_group_cutover = [this, job_id](RunnerContext::GroupCutoverHooks hooks) {
+            auto register_group_cutover = [this, job_id, role = task.role, sub = task.subtask_idx](
+                                              RunnerContext::GroupCutoverHooks hooks) {
                 if (hooks.downstream_op_id.empty() || !hooks.gate) {
                     return;
                 }
@@ -1819,7 +1856,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                 auto gate = hooks.gate;
                 per_job_arm_callbacks_[job_id][hooks.downstream_op_id].push_back(
                     [gate](std::uint64_t cutover_ckpt) { (void)gate->arm(cutover_ckpt); });
-                per_job_group_cutovers_[job_id][hooks.downstream_op_id].push_back(std::move(hooks));
+                per_job_group_cutovers_[job_id][hooks.downstream_op_id].push_back(
+                    RegisteredGroupCutover{role, sub, std::move(hooks)});
             };
             // Input-side rebind registration, keyed by the UPSTREAM op the
             // task's fan-shaped input edges come from: CutoverRebind(op=X)

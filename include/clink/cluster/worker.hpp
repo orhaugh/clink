@@ -385,13 +385,18 @@ private:
         per_job_arm_callbacks_;
 
     // Per-(job_id, downstream op) hold-and-swap hooks for rescale-eligible
-    // output groups, registered by the output-attach path. BeginRescale's
-    // arm reaches the gates through the arm map above (the registration
-    // adds a gate-arming callback there too); CutoverPeerUpdate dispatches
-    // the endpoint swap through these.
-    std::unordered_map<
-        JobId,
-        std::unordered_map<std::string, std::vector<RunnerContext::GroupCutoverHooks>>>
+    // output groups, registered by the output-attach path with the identity
+    // of the FEEDING task that owns each group. BeginRescale's arm reaches
+    // the gates through the arm map above (the registration adds a
+    // gate-arming callback there too); CutoverPeerUpdate carries per-task
+    // endpoint lists (each feeder's branches connect to different ports on
+    // the new subtasks) and dispatches each list to its task's hooks here.
+    struct RegisteredGroupCutover {
+        std::string task_role;
+        std::uint32_t task_subtask_idx{0};
+        RunnerContext::GroupCutoverHooks hooks;
+    };
+    std::unordered_map<JobId, std::unordered_map<std::string, std::vector<RegisteredGroupCutover>>>
         per_job_group_cutovers_;
 
     // Per-(job_id, UPSTREAM op) input-rebind hooks, registered by the

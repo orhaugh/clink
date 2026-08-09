@@ -257,6 +257,7 @@ HotCutoverPlan plan_hot_cutover(const JobGraphSpec& graph,
                                 const std::string& op_id,
                                 std::uint32_t new_parallelism,
                                 const TaskOpIdentityMap& deployed_identity,
-                                const OperatorRegistry& registry);
+                                const OperatorRegistry& registry,
+                                const RunnerRegistry* runner_registry = nullptr);
 
 }  // namespace clink::cluster

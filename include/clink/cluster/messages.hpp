@@ -288,13 +288,30 @@ inline void encode_body(MessageBuilder& b, const CutoverRebindMsg& m) {
 inline void encode_body(MessageBuilder& b, const CutoverPeerUpdateMsg& m) {
     b.put_u64_be(m.job_id);
     b.put_string(m.op_id);
-    b.put_u32_be(static_cast<std::uint32_t>(m.peers.size()));
-    for (const auto& p : m.peers) {
-        b.put_string(p.role);
-        b.put_u32_be(p.subtask_idx);
-        b.put_string(p.host);
-        b.put_u16_be(p.data_port);
+    b.put_u32_be(static_cast<std::uint32_t>(m.tasks.size()));
+    for (const auto& tp : m.tasks) {
+        b.put_string(tp.task_role);
+        b.put_u32_be(tp.task_subtask_idx);
+        b.put_u32_be(static_cast<std::uint32_t>(tp.peers.size()));
+        for (const auto& p : tp.peers) {
+            b.put_string(p.role);
+            b.put_u32_be(p.subtask_idx);
+            b.put_string(p.host);
+            b.put_u16_be(p.data_port);
+        }
     }
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
+}
+
+inline void encode_body(MessageBuilder& b, const BeginRescaleAckMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_string(m.op_id);
+    b.put_string(m.worker_id);
+    b.put_u32_be(m.armed_callbacks);
+    b.put_u32_be(m.armed_groups);
+    b.put_u32_be(m.rebind_tasks);
     // Fencing epoch, appended last so an older peer that stops
     // reading here still decodes the rest correctly.
     b.put_u64_be(m.coordinator_epoch);
@@ -766,15 +783,37 @@ inline CutoverPeerUpdateMsg decode_cutover_peer_update(MessageReader& r) {
     m.job_id = r.read_u64_be();
     m.op_id = r.read_string();
     const std::uint32_t n = r.read_count();
-    m.peers.reserve(n);
+    m.tasks.reserve(n);
     for (std::uint32_t i = 0; i < n; ++i) {
-        PeerAddress p;
-        p.role = r.read_string();
-        p.subtask_idx = r.read_u32_be();
-        p.host = r.read_string();
-        p.data_port = r.read_u16_be();
-        m.peers.push_back(std::move(p));
+        CutoverPeerUpdateMsg::TaskPeers tp;
+        tp.task_role = r.read_string();
+        tp.task_subtask_idx = r.read_u32_be();
+        const std::uint32_t pn = r.read_count();
+        tp.peers.reserve(pn);
+        for (std::uint32_t j = 0; j < pn; ++j) {
+            PeerAddress p;
+            p.role = r.read_string();
+            p.subtask_idx = r.read_u32_be();
+            p.host = r.read_string();
+            p.data_port = r.read_u16_be();
+            tp.peers.push_back(std::move(p));
+        }
+        m.tasks.push_back(std::move(tp));
     }
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    return m;
+}
+
+inline BeginRescaleAckMsg decode_begin_rescale_ack(MessageReader& r) {
+    BeginRescaleAckMsg m;
+    m.job_id = r.read_u64_be();
+    m.op_id = r.read_string();
+    m.worker_id = r.read_string();
+    m.armed_callbacks = r.read_u32_be();
+    m.armed_groups = r.read_u32_be();
+    m.rebind_tasks = r.read_u32_be();
     // Fencing epoch. Absent from a pre-fencing peer, which reads
     // as 0 = unfenced and preserves the old behaviour.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();

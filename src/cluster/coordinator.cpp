@@ -1849,6 +1849,8 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
     };
 
     std::vector<network::Connection*> worker_conns;
+    std::vector<PendingDeploy> hot_frames;
+    bool hot_engaged = false;
     std::uint32_t old_parallelism = 0;
     {
         std::lock_guard lock(mu_);
@@ -1987,30 +1989,54 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
             return refuse(sm.reason);
         }
 
-        // Stage the replan and start the drain. handle_subtask_finished_ routes
-        // the drain acks and fires restart_job_locked_ when the last one lands.
-        job.pending_op_parallelism[op_id] = new_parallelism;
-        job.pre_rescale_op_parallelism[op_id] = old_parallelism;
-        job.awaiting_restart = true;
-        job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
-        for (const auto& [worker_id, pending] : job.pending_per_worker) {
-            for (const auto& [role, sub] : pending) {
-                job.restart_drain_expected.insert(role + ":" + std::to_string(sub));
+        // Hot first (design record 008): an eligible operator cuts over in
+        // place at a checkpoint barrier and nothing else stops. Any
+        // ineligibility - and any later failure - lands on the replan
+        // below, which is the proven path.
+        std::string hot_reason;
+        if (try_begin_hot_cutover_locked_(
+                job, op_id, new_parallelism, old_parallelism, graph, hot_frames, hot_reason)) {
+            hot_engaged = true;
+        } else {
+            log::info("coordinator.rescale",
+                      "hot cutover not taken for job_id=" + std::to_string(job_id) +
+                          " op_id=" + op_id + " (" + hot_reason + "); using the replan path");
+            // Stage the replan and start the drain. handle_subtask_finished_
+            // routes the drain acks and fires restart_job_locked_ when the
+            // last one lands.
+            job.pending_op_parallelism[op_id] = new_parallelism;
+            job.pre_rescale_op_parallelism[op_id] = old_parallelism;
+            job.awaiting_restart = true;
+            job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+            for (const auto& [worker_id, pending] : job.pending_per_worker) {
+                for (const auto& [role, sub] : pending) {
+                    job.restart_drain_expected.insert(role + ":" + std::to_string(sub));
+                }
+            }
+            for (const auto& [worker_id, _] : job.tasks_by_worker) {
+                auto worker_it = registered_.find(worker_id);
+                if (worker_it != registered_.end() && !worker_it->second->lost &&
+                    worker_it->second->conn) {
+                    worker_conns.push_back(worker_it->second->conn.get());
+                }
+            }
+            log::info("coordinator.rescale",
+                      "accepted job_id=" + std::to_string(job_id) + " op_id=" + op_id + " " +
+                          std::to_string(old_parallelism) + "->" + std::to_string(new_parallelism) +
+                          "; draining " + std::to_string(worker_conns.size()) +
+                          " worker connection(s) before replanning from checkpoint " +
+                          std::to_string(job.latest_completed_checkpoint_id));
+        }
+    }
+
+    if (hot_engaged) {
+        // Arm frames only; the job keeps running.
+        for (auto& f : hot_frames) {
+            if (f.conn != nullptr) {
+                send_frame(*f.conn, f.frame);
             }
         }
-        for (const auto& [worker_id, _] : job.tasks_by_worker) {
-            auto worker_it = registered_.find(worker_id);
-            if (worker_it != registered_.end() && !worker_it->second->lost &&
-                worker_it->second->conn) {
-                worker_conns.push_back(worker_it->second->conn.get());
-            }
-        }
-        log::info("coordinator.rescale",
-                  "accepted job_id=" + std::to_string(job_id) + " op_id=" + op_id + " " +
-                      std::to_string(old_parallelism) + "->" + std::to_string(new_parallelism) +
-                      "; draining " + std::to_string(worker_conns.size()) +
-                      " worker connection(s) before replanning from checkpoint " +
-                      std::to_string(job.latest_completed_checkpoint_id));
+        return RescaleCoordinator::RequestResult{.ok = true, .accepted_target = new_parallelism};
     }
 
     // Drain outside the lock, as rescale_job does.
@@ -2021,6 +2047,658 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
         send_frame(*c, frame);
     }
     return RescaleCoordinator::RequestResult{.ok = true, .accepted_target = new_parallelism};
+}
+
+namespace {
+// Strip the branch (".N") and side-output ("::tag") suffixes an
+// OperatorSpec.inputs entry may carry, leaving the producer op id. The
+// planner has its own richer parse; the choreography only needs the id.
+std::string producer_id_of_input_ref(const std::string& raw) {
+    if (const auto colons = raw.find("::"); colons != std::string::npos) {
+        return raw.substr(0, colons);
+    }
+    const auto dot = raw.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= raw.size()) {
+        return raw;
+    }
+    for (std::size_t i = dot + 1; i < raw.size(); ++i) {
+        if (raw[i] < '0' || raw[i] > '9') {
+            return raw;
+        }
+    }
+    return raw.substr(0, dot);
+}
+}  // namespace
+
+bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
+                                                const std::string& op_id,
+                                                std::uint32_t new_parallelism,
+                                                std::uint32_t old_parallelism,
+                                                const JobGraphSpec& graph,
+                                                std::vector<PendingDeploy>& out_frames,
+                                                std::string& reason) {
+    if (!cfg_.hot_rescale_enabled) {
+        reason = "hot rescale disabled by configuration";
+        return false;
+    }
+    if (job.hot_cutover.has_value()) {
+        reason = "another hot cutover is in flight for this job";
+        return false;
+    }
+    const OperatorSpec* target = nullptr;
+    for (const auto& op : graph.ops) {
+        if (op.id == op_id) {
+            target = &op;
+        }
+    }
+    if (target == nullptr) {
+        reason = "operator not in the retained graph";
+        return false;
+    }
+    // Every edge INTO the op must be fan-shaped both before and after the
+    // cutover (the deployed groups were only built swappable if they were
+    // fan at deploy), and every edge OUT of it likewise - a forward 1:1
+    // premise does not survive a parallelism change, and the replan path
+    // owns that case.
+    std::vector<std::string> feeder_ops;
+    for (const auto& raw : target->inputs) {
+        const auto fid = producer_id_of_input_ref(raw);
+        for (const auto& op : graph.ops) {
+            if (op.id != fid) {
+                continue;
+            }
+            const bool fan_now = !target->key_by.empty() || op.parallelism != old_parallelism;
+            const bool fan_after = !target->key_by.empty() || op.parallelism != new_parallelism;
+            if (!fan_now || !fan_after) {
+                reason = "edge " + fid + " -> " + op_id +
+                         " is forward-shaped; only fan edges "
+                         "(keyed or parallelism-mismatched) can cut over in place";
+                return false;
+            }
+            feeder_ops.push_back(fid);
+        }
+    }
+    std::vector<std::string> fed_ops;
+    for (const auto& op : graph.ops) {
+        for (const auto& raw : op.inputs) {
+            if (producer_id_of_input_ref(raw) != op_id) {
+                continue;
+            }
+            const bool fan_now = !op.key_by.empty() || op.parallelism != old_parallelism;
+            const bool fan_after = !op.key_by.empty() || op.parallelism != new_parallelism;
+            if (!fan_now || !fan_after) {
+                reason = "edge " + op_id + " -> " + op.id +
+                         " is forward-shaped; only fan edges "
+                         "(keyed or parallelism-mismatched) can cut over in place";
+                return false;
+            }
+            fed_ops.push_back(op.id);
+        }
+    }
+
+    // The op's deployed block, captured while the identity records still
+    // describe it (the teardown erases them).
+    const auto blocks = derive_op_index_blocks(job.task_op_identity);
+    const auto blk = blocks.find(op_id);
+    if (blk == blocks.end() || !blk->second.consistent ||
+        blk->second.parallelism != old_parallelism) {
+        reason = "the deployed identity for '" + op_id + "' cannot be trusted";
+        return false;
+    }
+
+    // The full post-cutover plan, validated before anything is armed.
+    // Plugin jobs plan with their bundle's registries, exactly as the
+    // replan path does.
+    auto plan = job.bundle != nullptr ? plan_hot_cutover(graph,
+                                                         op_id,
+                                                         new_parallelism,
+                                                         job.task_op_identity,
+                                                         job.bundle->operator_registry(),
+                                                         &job.bundle->runner_registry())
+                                      : plan_hot_cutover(graph,
+                                                         op_id,
+                                                         new_parallelism,
+                                                         job.task_op_identity,
+                                                         OperatorRegistry::default_instance());
+    if (!plan.ok) {
+        reason = plan.error;
+        return false;
+    }
+
+    JobState::HotCutover hot;
+    hot.op_id = op_id;
+    hot.old_parallelism = old_parallelism;
+    hot.target_parallelism = new_parallelism;
+    hot.old_block_base = blk->second.base;
+    hot.planned_tasks = std::move(plan.tasks);
+    hot.appended_base = hot.planned_tasks.front().subtask_idx;
+    // Reserve the cutover checkpoint id NOW: the arm names it, the runners
+    // stop exactly at it, and the trigger sweep is already gated off this
+    // job (hot_cutover engages under the same lock hold), so no other id
+    // can be issued in between.
+    hot.cutover_checkpoint = job.next_checkpoint_id++;
+
+    // Task classes, from the identity records.
+    std::unordered_set<std::string> feeder_set(feeder_ops.begin(), feeder_ops.end());
+    std::unordered_set<std::string> fed_set(fed_ops.begin(), fed_ops.end());
+    std::uint32_t op_tasks = 0;
+    for (const auto& [key, ident] : job.task_op_identity) {
+        if (ident.op_id == op_id) {
+            ++op_tasks;
+        } else if (feeder_set.count(ident.op_id) != 0) {
+            hot.feeder_task_keys.push_back(key);
+        } else if (fed_set.count(ident.op_id) != 0) {
+            hot.fed_task_keys.push_back(key);
+        }
+    }
+    hot.expected_op_tasks = op_tasks;
+    hot.expected_groups = static_cast<std::uint32_t>(hot.feeder_task_keys.size());
+    hot.expected_rebind_tasks = static_cast<std::uint32_t>(hot.fed_task_keys.size());
+
+    // Arm every worker hosting any of the three classes. A worker with
+    // nothing registered still acks (with zeros), which is exactly how a
+    // legacy-built task surfaces as a shortfall.
+    std::unordered_set<std::string> arm_workers;
+    auto worker_of = [&](const std::string& key) -> std::string {
+        auto it = job.task_records.find(key);
+        return it == job.task_records.end() ? std::string{} : it->second.first;
+    };
+    for (const auto& [key, ident] : job.task_op_identity) {
+        if (ident.op_id == op_id || feeder_set.count(ident.op_id) != 0 ||
+            fed_set.count(ident.op_id) != 0) {
+            if (auto w = worker_of(key); !w.empty()) {
+                arm_workers.insert(w);
+            }
+        }
+    }
+    if (arm_workers.empty()) {
+        reason = "no live workers host the operator or its neighbours";
+        return false;
+    }
+    hot.arm_workers_pending = arm_workers;
+    hot.phase = JobState::HotCutover::Phase::Arming;
+    hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
+
+    BeginRescaleMsg arm;
+    arm.job_id = job.id;
+    arm.op_id = op_id;
+    arm.target_parallelism = new_parallelism;
+    arm.cutover_checkpoint = hot.cutover_checkpoint;
+    const auto frame = fenced_frame_(MessageKind::BeginRescale, arm);
+    for (const auto& worker_id : arm_workers) {
+        auto it = registered_.find(worker_id);
+        if (it != registered_.end() && !it->second->lost && it->second->conn) {
+            out_frames.push_back({it->second->conn.get(), frame});
+        }
+    }
+
+    job.hot_cutover = std::move(hot);
+    log::info("coordinator.rescale",
+              "hot cutover armed job_id=" + std::to_string(job.id) + " op_id=" + op_id + " " +
+                  std::to_string(old_parallelism) + "->" + std::to_string(new_parallelism) +
+                  " cutover_checkpoint=" + std::to_string(job.hot_cutover->cutover_checkpoint) +
+                  " arm_workers=" + std::to_string(arm_workers.size()) +
+                  " feeders=" + std::to_string(job.hot_cutover->expected_groups) +
+                  " fed=" + std::to_string(job.hot_cutover->expected_rebind_tasks));
+    return true;
+}
+
+void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
+                                                std::vector<PendingDeploy>& out_frames) {
+    auto& hot = *job.hot_cutover;
+    const auto ckpt_id = hot.cutover_checkpoint;
+    std::unordered_set<std::string> pending;
+    for (const auto& [key, _] : job.task_records) {
+        pending.insert(key);
+    }
+    job.pending_checkpoint_acks[ckpt_id] = std::move(pending);
+    {
+        auto& rec = job.checkpoint_participants[ckpt_id];
+        rec.generation = job.state_generation;
+        rec.subtasks.clear();
+        for (const auto& [key, _unused] : job.task_records) {
+            const auto colon = key.rfind(':');
+            if (colon == std::string::npos) {
+                continue;
+            }
+            try {
+                rec.subtasks.insert(static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1))));
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+    }
+    job.pending_checkpoint_start_times[ckpt_id] = std::chrono::steady_clock::now();
+    clink::metrics::ckpt::triggered();
+    TriggerCheckpointMsg tc;
+    tc.job_id = job.id;
+    tc.checkpoint_id = ckpt_id;
+    tc.generation = job.state_generation;
+    const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, tc);
+    for (const auto& [worker_id, _] : job.tasks_by_worker) {
+        auto it = registered_.find(worker_id);
+        if (it != registered_.end() && !it->second->lost && it->second->conn) {
+            out_frames.push_back({it->second->conn.get(), frame});
+        }
+    }
+    hot.phase = JobState::HotCutover::Phase::AwaitingCut;
+    hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
+    log::info("coordinator.rescale",
+              "hot cutover checkpoint triggered job_id=" + std::to_string(job.id) +
+                  " op_id=" + hot.op_id + " ckpt_id=" + std::to_string(ckpt_id));
+}
+
+void Coordinator::hot_cutover_begin_rebind_locked_(JobState& job,
+                                                   std::vector<PendingDeploy>& out_frames) {
+    auto& hot = *job.hot_cutover;
+    // Tear down the drained old subtasks' bookkeeping. Their
+    // SubtaskFinished arrivals were counted as drained acks, not as
+    // completions; remove records, identity and slots so the job's
+    // accounting describes the survivors plus (soon) the new tasks.
+    std::vector<std::string> teardown;
+    for (const auto& [key, ident] : job.task_op_identity) {
+        if (ident.op_id == hot.op_id) {
+            teardown.push_back(key);
+        }
+    }
+    for (const auto& key : teardown) {
+        auto rec_it = job.task_records.find(key);
+        if (rec_it == job.task_records.end()) {
+            continue;
+        }
+        const auto worker_id = rec_it->second.first;
+        if (auto w = registered_.find(worker_id);
+            w != registered_.end() && w->second->slots_in_use > 0) {
+            --w->second->slots_in_use;
+            metrics::coordinator::slots_in_use_delta(-1);
+        }
+        if (auto tbt = job.tasks_by_worker.find(worker_id); tbt != job.tasks_by_worker.end()) {
+            std::erase_if(tbt->second, [&](const DeploymentTask& t) {
+                return t.role == rec_it->second.second.role &&
+                       t.subtask_idx == rec_it->second.second.subtask_idx;
+            });
+            if (tbt->second.empty()) {
+                job.tasks_by_worker.erase(tbt);
+            }
+        }
+        if (auto ppw = job.pending_per_worker.find(worker_id);
+            ppw != job.pending_per_worker.end()) {
+            std::erase_if(ppw->second, [&](const auto& p) {
+                return p.first == rec_it->second.second.role &&
+                       p.second == rec_it->second.second.subtask_idx;
+            });
+        }
+        job.task_records.erase(rec_it);
+        job.task_op_identity.erase(key);
+        if (job.expected_completion > 0) {
+            --job.expected_completion;
+        }
+    }
+
+    // Ask the fed tasks to bind listeners for the new upstream indices.
+    hot.rebind_ports_pending.clear();
+    std::unordered_set<std::string> fed_workers;
+    for (const auto& key : hot.fed_task_keys) {
+        auto rec_it = job.task_records.find(key);
+        if (rec_it == job.task_records.end()) {
+            continue;
+        }
+        fed_workers.insert(rec_it->second.first);
+        for (std::uint32_t i = 0; i < hot.target_parallelism; ++i) {
+            hot.rebind_ports_pending.insert({key, hot.appended_base + i});
+        }
+    }
+    hot.phase = JobState::HotCutover::Phase::Rebinding;
+    hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
+    if (hot.rebind_ports_pending.empty()) {
+        // No fed tasks (the op ends in a sink chain): deploy directly.
+        hot_cutover_deploy_locked_(job, out_frames);
+        return;
+    }
+    CutoverRebindMsg rb;
+    rb.job_id = job.id;
+    rb.op_id = hot.op_id;
+    rb.upstream_role = kGenericSubtaskRole;
+    for (std::uint32_t i = 0; i < hot.target_parallelism; ++i) {
+        rb.new_subtask_indices.push_back(hot.appended_base + i);
+    }
+    const auto frame = fenced_frame_(MessageKind::CutoverRebind, rb);
+    for (const auto& worker_id : fed_workers) {
+        auto it = registered_.find(worker_id);
+        if (it != registered_.end() && !it->second->lost && it->second->conn) {
+            out_frames.push_back({it->second->conn.get(), frame});
+        }
+    }
+    log::info("coordinator.rescale",
+              "hot cutover rebind dispatched job_id=" + std::to_string(job.id) +
+                  " op_id=" + hot.op_id + " fed_workers=" + std::to_string(fed_workers.size()) +
+                  " awaited_ports=" + std::to_string(hot.rebind_ports_pending.size()));
+}
+
+void Coordinator::hot_cutover_deploy_locked_(JobState& job,
+                                             std::vector<PendingDeploy>& out_frames) {
+    auto& hot = *job.hot_cutover;
+    // Place the validated plan onto free slots.
+    std::vector<PlacementWorker> workers;
+    for (const auto& [worker_id, worker] : registered_) {
+        if (worker->lost || !worker->conn) {
+            continue;
+        }
+        const std::uint32_t free = worker->slot_capacity > worker->slots_in_use
+                                       ? worker->slot_capacity - worker->slots_in_use
+                                       : 0;
+        if (free > 0) {
+            workers.push_back(PlacementWorker{worker_id, free});
+        }
+    }
+    auto tasks = hot.planned_tasks;
+    if (!assign_task_placement(tasks, workers)) {
+        abort_hot_cutover_locked_(job, "no free slots for the post-cutover subtasks", out_frames);
+        return;
+    }
+
+    std::unordered_map<std::string, std::vector<DeploymentTask>> by_worker;
+    for (const auto& t : tasks) {
+        DeploymentTask d;
+        d.role = t.role;
+        d.subtask_idx = t.subtask_idx;
+        d.data_port = 0;
+        d.extra_config = t.extra_config;
+        d.key_group_first = t.key_group_first;
+        d.key_group_last = t.key_group_last;
+        d.restore_from_subtask_idx = t.restore_from_subtask_idx;
+        d.restore_from_parent_count = t.restore_from_parent_count;
+        for (const auto& [pr_role, pr_sub] : t.peer_refs) {
+            PeerAddress p;
+            p.role = pr_role;
+            p.subtask_idx = pr_sub;
+            const std::string peer_key = pr_role + ":" + std::to_string(pr_sub);
+            if (auto rec = job.task_records.find(peer_key); rec != job.task_records.end()) {
+                if (auto w = registered_.find(rec->second.first); w != registered_.end()) {
+                    p.host = w->second->data_host;
+                }
+            }
+            d.peers.push_back(std::move(p));
+        }
+        const std::string key = d.role + ":" + std::to_string(d.subtask_idx);
+        job.task_records[key] = {t.worker_id, d};
+        job.task_op_identity[key] = JobState::TaskOpIdentity{
+            .op_id = hot.op_id, .subtask_idx_in_op = t.subtask_idx - hot.appended_base};
+        job.pending_per_worker[t.worker_id].emplace_back(d.role, d.subtask_idx);
+        job.tasks_by_worker[t.worker_id].push_back(d);
+        if (auto w = registered_.find(t.worker_id); w != registered_.end()) {
+            ++w->second->slots_in_use;
+            metrics::coordinator::slots_in_use_delta(1);
+        }
+        ++job.expected_completion;
+        ++job.expected_listenings;
+        by_worker[t.worker_id].push_back(std::move(d));
+    }
+    ++job.topology_version;
+    clink::metrics::orch::rescale_cutover_deploy();
+
+    for (auto& [worker_id, wtasks] : by_worker) {
+        auto it = registered_.find(worker_id);
+        if (it == registered_.end() || it->second->lost || !it->second->conn) {
+            continue;
+        }
+        DeployMsg dm;
+        dm.job_id = job.id;
+        dm.tasks = std::move(wtasks);
+        dm.plugins = job.plugins;
+        dm.checkpoint_dir = job.checkpoint.checkpoint_dir;
+        dm.state_backend_uri = job.checkpoint.state_backend_uri;
+        dm.capture_dir = job.checkpoint.capture_dir;
+        dm.capture_records = job.checkpoint.capture_records;
+        // The new subtasks restore from the CUTOVER checkpoint - the last
+        // thing the old subtasks processed - in the SAME state generation
+        // (their appended directories are fresh; nothing is overwritten).
+        // The dormant path forgot the generation pair and deployed new
+        // tasks at generation 1 regardless of the job's.
+        dm.restore_from_dir = job.checkpoint.checkpoint_dir;
+        dm.restore_from_checkpoint_id = hot.cutover_checkpoint;
+        dm.generation = job.state_generation;
+        dm.restore_generation = job.state_generation;
+        dm.unaligned_checkpoints = job.checkpoint.alignment == CheckpointAlignment::Unaligned;
+        dm.expected_state_versions_packed = job.expected_state_versions_packed;
+        dm.udfs_packed = job.udfs_packed;
+        out_frames.push_back({it->second->conn.get(), fenced_frame_(MessageKind::Deploy, dm)});
+    }
+    hot.phase = JobState::HotCutover::Phase::Deploying;
+    hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
+    log::info("coordinator.rescale",
+              "hot cutover deploy job_id=" + std::to_string(job.id) + " op_id=" + hot.op_id +
+                  " new_parallelism=" + std::to_string(hot.target_parallelism) +
+                  " cutover_checkpoint=" + std::to_string(hot.cutover_checkpoint));
+}
+
+void Coordinator::hot_cutover_complete_locked_(JobState& job,
+                                               std::vector<PendingDeploy>& out_frames) {
+    auto& hot = *job.hot_cutover;
+
+    // Targeted PeerUpdate for the new tasks: peer_updates_sent fired long
+    // ago for the original deploy, and the one-shot path never re-fires -
+    // the dormant cutover left its new tasks waiting for a PeerUpdate that
+    // never came.
+    std::unordered_map<std::string, PeerUpdateMsg> per_worker;
+    for (std::uint32_t i = 0; i < hot.target_parallelism; ++i) {
+        const std::string key =
+            std::string{kGenericSubtaskRole} + ":" + std::to_string(hot.appended_base + i);
+        auto rec = job.task_records.find(key);
+        if (rec == job.task_records.end()) {
+            continue;
+        }
+        const auto& task = rec->second.second;
+        if (task.peers.empty()) {
+            continue;
+        }
+        PeerUpdateMsg::TaskPeers tp;
+        tp.role = task.role;
+        tp.subtask_idx = task.subtask_idx;
+        for (const auto& peer : task.peers) {
+            JobState::EdgeKey ek{
+                .downstream_role = peer.role,
+                .downstream_subtask_idx = peer.subtask_idx,
+                .upstream_role = task.role,
+                .upstream_subtask_idx = task.subtask_idx,
+            };
+            PeerAddress resolved = peer;
+            if (auto pit = job.ports.find(ek); pit != job.ports.end()) {
+                resolved.host = pit->second.first;
+                resolved.data_port = pit->second.second;
+            }
+            tp.peers.push_back(std::move(resolved));
+        }
+        per_worker[rec->second.first].tasks.push_back(std::move(tp));
+    }
+    for (auto& [worker_id, msg] : per_worker) {
+        msg.job_id = job.id;
+        auto it = registered_.find(worker_id);
+        if (it != registered_.end() && !it->second->lost && it->second->conn) {
+            out_frames.push_back(
+                {it->second->conn.get(), fenced_frame_(MessageKind::PeerUpdate, msg)});
+        }
+    }
+
+    // CutoverPeerUpdate to the feeders: per feeding task, the ports the new
+    // subtasks bound for THAT task's edges, in index-within-operator order.
+    // This releases the held splits.
+    std::unordered_map<std::string, CutoverPeerUpdateMsg> per_feeder_worker;
+    bool ports_complete = true;
+    for (const auto& key : hot.feeder_task_keys) {
+        auto rec = job.task_records.find(key);
+        if (rec == job.task_records.end()) {
+            continue;
+        }
+        const auto& feeder = rec->second.second;
+        CutoverPeerUpdateMsg::TaskPeers tp;
+        tp.task_role = feeder.role;
+        tp.task_subtask_idx = feeder.subtask_idx;
+        for (std::uint32_t i = 0; i < hot.target_parallelism; ++i) {
+            JobState::EdgeKey ek{
+                .downstream_role = std::string{kGenericSubtaskRole},
+                .downstream_subtask_idx = hot.appended_base + i,
+                .upstream_role = feeder.role,
+                .upstream_subtask_idx = feeder.subtask_idx,
+            };
+            auto pit = job.ports.find(ek);
+            if (pit == job.ports.end()) {
+                ports_complete = false;
+                break;
+            }
+            PeerAddress p;
+            p.role = std::string{kGenericSubtaskRole};
+            p.subtask_idx = hot.appended_base + i;
+            p.host = pit->second.first;
+            p.data_port = pit->second.second;
+            tp.peers.push_back(std::move(p));
+        }
+        if (!ports_complete) {
+            break;
+        }
+        auto& msg = per_feeder_worker[rec->second.first];
+        msg.tasks.push_back(std::move(tp));
+    }
+    if (!ports_complete) {
+        abort_hot_cutover_locked_(
+            job, "a new subtask's inbound port for a feeder edge never arrived", out_frames);
+        return;
+    }
+    for (auto& [worker_id, msg] : per_feeder_worker) {
+        msg.job_id = job.id;
+        msg.op_id = hot.op_id;
+        auto it = registered_.find(worker_id);
+        if (it != registered_.end() && !it->second->lost && it->second->conn) {
+            out_frames.push_back(
+                {it->second->conn.get(), fenced_frame_(MessageKind::CutoverPeerUpdate, msg)});
+        }
+    }
+
+    // Durable bookkeeping. The retained graph is what every future replan
+    // and HA recovery plans from, so the new parallelism must live there.
+    try {
+        auto graph = JobGraphSpec::from_json(job.graph_json);
+        for (auto& op : graph.ops) {
+            if (op.id == hot.op_id) {
+                op.parallelism = hot.target_parallelism;
+            }
+        }
+        job.graph_json = graph.to_json();
+    } catch (const std::exception& e) {
+        log::warn("coordinator.rescale",
+                  "hot cutover completed but the retained graph could not be rewritten: " +
+                      std::string{e.what()} + "; a future replan would deploy the OLD parallelism");
+    }
+    // A whole-job failure inside [Complete, first post-cutover checkpoint]
+    // restores from the cutover checkpoint, whose directories for this op
+    // are the OLD block's: retain the translation window exactly as the
+    // replan path does.
+    job.stale_layout_blocks[hot.op_id] =
+        JobState::StaleBlock{.base = hot.old_block_base, .parallelism = hot.old_parallelism};
+    job.stale_layout_through = hot.cutover_checkpoint;
+
+    log::info("coordinator.rescale",
+              "hot cutover complete job_id=" + std::to_string(job.id) + " op_id=" + hot.op_id +
+                  " " + std::to_string(hot.old_parallelism) + "->" +
+                  std::to_string(hot.target_parallelism) + " cutover_checkpoint=" +
+                  std::to_string(hot.cutover_checkpoint) + "; the checkpoint clock resumes");
+    job.hot_cutover.reset();
+    cv_.notify_all();
+}
+
+void Coordinator::abort_hot_cutover_locked_(JobState& job,
+                                            const std::string& reason,
+                                            std::vector<PendingDeploy>& out_frames) {
+    if (!job.hot_cutover.has_value()) {
+        return;
+    }
+    const auto op_id = job.hot_cutover->op_id;
+    const auto old_p = job.hot_cutover->old_parallelism;
+    const auto target = job.hot_cutover->target_parallelism;
+    log::warn("coordinator.rescale",
+              "hot cutover ABORTED job_id=" + std::to_string(job.id) + " op_id=" + op_id + " (" +
+                  reason + "); falling back to the replan path at parallelism " +
+                  std::to_string(target));
+    if (job.rescale_coordinator) {
+        job.rescale_coordinator->abort(op_id, reason);
+        // The replan path drives Preparing -> mark_replan_complete, so the
+        // machine must accept a fresh request.
+        (void)job.rescale_coordinator->request_rescale(op_id, target);
+    }
+    job.hot_cutover.reset();
+
+    // The proven stop-the-world staging, exactly as request_operator_rescale
+    // does for the replan mode.
+    job.pending_op_parallelism[op_id] = target;
+    job.pre_rescale_op_parallelism[op_id] = old_p;
+    job.awaiting_restart = true;
+    job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+    job.restart_drain_expected.clear();
+    for (const auto& [worker_id, pending] : job.pending_per_worker) {
+        for (const auto& [role, sub] : pending) {
+            job.restart_drain_expected.insert(role + ":" + std::to_string(sub));
+        }
+    }
+    CancelJobMsg cj;
+    cj.job_id = job.id;
+    const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
+    for (const auto& [worker_id, _] : job.tasks_by_worker) {
+        auto it = registered_.find(worker_id);
+        if (it != registered_.end() && !it->second->lost && it->second->conn) {
+            out_frames.push_back({it->second->conn.get(), frame});
+        }
+    }
+}
+
+void Coordinator::handle_begin_rescale_ack_(MessageReader& r) {
+    auto msg = decode_begin_rescale_ack(r);
+    std::vector<PendingDeploy> frames;
+    {
+        std::lock_guard lock(mu_);
+        auto it = jobs_.find(msg.job_id);
+        if (it == jobs_.end()) {
+            return;
+        }
+        auto& job = *it->second;
+        if (!job.hot_cutover.has_value() || job.hot_cutover->op_id != msg.op_id ||
+            job.hot_cutover->phase != JobState::HotCutover::Phase::Arming) {
+            return;  // stale or duplicate ack
+        }
+        auto& hot = *job.hot_cutover;
+        if (hot.arm_workers_pending.erase(msg.worker_id) == 0) {
+            return;  // not a worker this cutover armed, or a duplicate
+        }
+        hot.acked_callbacks += msg.armed_callbacks;
+        hot.acked_groups += msg.armed_groups;
+        hot.acked_rebind_tasks += msg.rebind_tasks;
+        if (!hot.arm_workers_pending.empty()) {
+            return;
+        }
+        // Every armed worker replied: the counts must cover what the
+        // deployed identity and the graph say exists. A shortfall means a
+        // task was built without the cutover machinery (a legacy path, or
+        // a join side): replan, before C is triggered.
+        if (hot.acked_groups != hot.expected_groups ||
+            hot.acked_rebind_tasks != hot.expected_rebind_tasks ||
+            hot.acked_callbacks < hot.expected_op_tasks) {
+            abort_hot_cutover_locked_(job,
+                                      "arm shortfall: groups " + std::to_string(hot.acked_groups) +
+                                          "/" + std::to_string(hot.expected_groups) + ", rebinds " +
+                                          std::to_string(hot.acked_rebind_tasks) + "/" +
+                                          std::to_string(hot.expected_rebind_tasks) +
+                                          ", callbacks " + std::to_string(hot.acked_callbacks) +
+                                          " for " + std::to_string(hot.expected_op_tasks) +
+                                          " task(s)",
+                                      frames);
+        } else {
+            hot_cutover_trigger_c_locked_(job, frames);
+        }
+    }
+    for (auto& f : frames) {
+        if (f.conn != nullptr) {
+            send_frame(*f.conn, f.frame);
+        }
+    }
 }
 
 std::optional<OperatorRescaleStatus> Coordinator::operator_rescale_status(
@@ -2958,6 +3636,9 @@ void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>
         case MessageKind::SubtaskFinished:
             handle_subtask_finished_(r);
             break;
+        case MessageKind::BeginRescaleAck:
+            handle_begin_rescale_ack_(r);
+            break;
         case MessageKind::SubtaskListening:
             handle_subtask_listening_(r);
             break;
@@ -2979,6 +3660,9 @@ void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>
 
 void Coordinator::handle_subtask_listening_(MessageReader& r) {
     auto msg = decode_subtask_listening(r);
+    // Hot-cutover frames staged under the lock (rebind-complete deploys,
+    // completion peer updates), sent after it.
+    std::vector<PendingDeploy> hot_frames;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(msg.job_id);
@@ -3016,6 +3700,25 @@ void Coordinator::handle_subtask_listening_(MessageReader& r) {
             job.peer_updates_sent = true;
         }
 
+        // Hot cutover, rebind phase: the fed tasks report the listeners
+        // they bound for the NEW upstream indices via mid-run listenings.
+        // The ports landed in job.ports above; once every awaited
+        // (fed task, new index) pair has reported, the new subtasks can
+        // deploy - their PeerUpdate resolution needs these ports.
+        if (job.hot_cutover.has_value() &&
+            job.hot_cutover->phase == JobState::HotCutover::Phase::Rebinding) {
+            auto& hot = *job.hot_cutover;
+            const std::string task_key = msg.role + ":" + std::to_string(msg.subtask_idx);
+            for (const auto& ep : msg.edge_ports) {
+                if (ep.upstream_subtask_idx >= hot.appended_base) {
+                    hot.rebind_ports_pending.erase({task_key, ep.upstream_subtask_idx});
+                }
+            }
+            if (hot.rebind_ports_pending.empty()) {
+                hot_cutover_deploy_locked_(job, hot_frames);
+            }
+        }
+
         // If the listening subtask's operator is in
         // CuttingOver, treat the SubtaskListening as the readiness
         // signal that closes the rescale. Mark the new subtask
@@ -3033,8 +3736,16 @@ void Coordinator::handle_subtask_listening_(MessageReader& r) {
                     log::info("coordinator.rescale",
                               "complete job_id=" + std::to_string(job.id) + " op_id=" + ack.op_id +
                                   " new_parallelism=" + std::to_string(post->target_parallelism));
+                    if (job.hot_cutover.has_value() && job.hot_cutover->op_id == ack.op_id) {
+                        hot_cutover_complete_locked_(job, hot_frames);
+                    }
                 }
             }
+        }
+    }
+    for (auto& f : hot_frames) {
+        if (f.conn != nullptr) {
+            send_frame(*f.conn, f.frame);
         }
     }
 }
@@ -3114,6 +3825,32 @@ void Coordinator::watchdog_loop_() {
         std::this_thread::sleep_for(cfg_.watchdog_interval);
         if (stop_.load(std::memory_order_acquire)) {
             return;
+        }
+        // Hot-cutover phase deadlines: a cutover stuck in any phase past
+        // its bound aborts to the replan path. Checked here rather than in
+        // any handler because the failure mode is precisely that no more
+        // messages arrive.
+        {
+            std::vector<PendingDeploy> abort_frames;
+            {
+                std::lock_guard lock(mu_);
+                const auto now = std::chrono::steady_clock::now();
+                for (auto& [jid, job_ptr] : jobs_) {
+                    auto& job = *job_ptr;
+                    if (job.hot_cutover.has_value() && now > job.hot_cutover->phase_deadline) {
+                        abort_hot_cutover_locked_(
+                            job,
+                            "phase timed out (phase " +
+                                std::to_string(static_cast<int>(job.hot_cutover->phase)) + ")",
+                            abort_frames);
+                    }
+                }
+            }
+            for (auto& f : abort_frames) {
+                if (f.conn != nullptr) {
+                    send_frame(*f.conn, f.frame);
+                }
+            }
         }
         const auto now = std::chrono::steady_clock::now();
         bool any_lost = false;
@@ -3261,6 +3998,18 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
                                                           const std::string& worker_id,
                                                           const char* log_channel,
                                                           const std::string& cause) {
+    // A worker lost mid-hot-cutover ends the cutover: some phase's messages
+    // will never arrive. The abort stages the replan at the requested
+    // parallelism (setting awaiting_restart and the drain expectations),
+    // and the fold below then removes THIS worker's unreachable subtasks
+    // from those expectations, exactly as it does for any in-progress
+    // restart. The abort's own CancelJob frames are dropped on purpose:
+    // the worker-loss path broadcasts survivor cancels itself.
+    if (job.hot_cutover.has_value()) {
+        std::vector<PendingDeploy> dropped;
+        abort_hot_cutover_locked_(
+            job, "worker '" + worker_id + "' lost mid-cutover (" + cause + ")", dropped);
+    }
     auto it = job.pending_per_worker.find(worker_id);
     if (it == job.pending_per_worker.end()) {
         return;
@@ -4327,7 +5076,11 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                 was_drain = true;
                 if (auto post = job.rescale_coordinator->status(ack.op_id);
                     post.has_value() && post->state == RescaleState::CuttingOver) {
-                    dispatch_cutover_deploy_locked_(job, ack.op_id, restart_deploys);
+                    if (job.hot_cutover.has_value() && job.hot_cutover->op_id == ack.op_id) {
+                        hot_cutover_begin_rebind_locked_(job, restart_deploys);
+                    } else {
+                        dispatch_cutover_deploy_locked_(job, ack.op_id, restart_deploys);
+                    }
                 }
             }
         }
@@ -5106,19 +5859,34 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             // completing inside the drain window is the only way in, so
             // this is the one gate needed.
             if (job.rescale_coordinator && !job.awaiting_restart) {
-                for (const auto& op_status : job.rescale_coordinator->all()) {
-                    if (op_status.state != RescaleState::Preparing) {
-                        continue;
+                if (job.hot_cutover.has_value()) {
+                    // Hot cutover: the arm went out BEFORE this checkpoint
+                    // was triggered (stopping at a barrier that has already
+                    // passed would stop nothing), so only the state machine
+                    // advances here - and only for the reserved id.
+                    auto& hot = *job.hot_cutover;
+                    if (msg.checkpoint_id == hot.cutover_checkpoint &&
+                        hot.phase == JobState::HotCutover::Phase::AwaitingCut) {
+                        (void)job.rescale_coordinator->mark_checkpoint_ready(hot.op_id,
+                                                                             msg.checkpoint_id);
+                        hot.phase_deadline =
+                            std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
                     }
-                    if (job.rescale_coordinator->mark_checkpoint_ready(op_status.op_id,
-                                                                       msg.checkpoint_id)) {
-                        auto post = job.rescale_coordinator->status(op_status.op_id);
-                        if (post.has_value()) {
-                            dispatch_begin_rescale_locked_(job,
-                                                           op_status.op_id,
-                                                           msg.checkpoint_id,
-                                                           post->target_parallelism,
-                                                           rescale_frames);
+                } else {
+                    for (const auto& op_status : job.rescale_coordinator->all()) {
+                        if (op_status.state != RescaleState::Preparing) {
+                            continue;
+                        }
+                        if (job.rescale_coordinator->mark_checkpoint_ready(op_status.op_id,
+                                                                           msg.checkpoint_id)) {
+                            auto post = job.rescale_coordinator->status(op_status.op_id);
+                            if (post.has_value()) {
+                                dispatch_begin_rescale_locked_(job,
+                                                               op_status.op_id,
+                                                               msg.checkpoint_id,
+                                                               post->target_parallelism,
+                                                               rescale_frames);
+                            }
                         }
                     }
                 }
@@ -5319,6 +6087,18 @@ void Coordinator::checkpoint_trigger_loop_() {
                 // transition window held open by a fault point, that produced
                 // 120+ out-of-participant-set snapshots per run.
                 if (job.awaiting_restart) {
+                    const auto interval = std::chrono::milliseconds{job.checkpoint.interval_ms};
+                    if (interval < sleep_for) {
+                        sleep_for = interval;
+                    }
+                    continue;
+                }
+                // The checkpoint clock pauses for a hot cutover (design
+                // record 008 rule 5): the cutover checkpoint is the last of
+                // the old layout and its successor the first of the new. A
+                // periodic trigger inside the window would checkpoint a
+                // topology that is mid-swap.
+                if (job.hot_cutover.has_value()) {
                     const auto interval = std::chrono::milliseconds{job.checkpoint.interval_ms};
                     if (interval < sleep_for) {
                         sleep_for = interval;

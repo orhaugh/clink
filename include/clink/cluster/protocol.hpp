@@ -216,6 +216,9 @@ enum class MessageKind : std::uint8_t {
     // so the cutover deploy's peer resolution finds them exactly as it
     // finds at-deploy ports.
     CutoverRebind = 120,
+    // worker → coordinator. Reply to an arming BeginRescale: what this
+    // worker armed for the named operator. See BeginRescaleAckMsg.
+    BeginRescaleAck = 121,
 };
 
 // Sentinel marking "no rescale-specific restore override" on a
@@ -818,13 +821,44 @@ struct BeginRescaleMsg {
     std::uint64_t coordinator_epoch{0};
 };
 
-// coordinator → worker. Post-cutover endpoints for every group feeding
-// `op_id` on this worker. `peers` is ordered by index within the operator;
-// its size is the new live branch count. See MessageKind::CutoverPeerUpdate.
+// coordinator → worker. Post-cutover endpoints for the groups feeding
+// `op_id` on this worker, PER FEEDING TASK: each feeder's branches connect
+// to the ports the new subtasks bound for THAT feeder's edges, so an
+// op-level endpoint list cannot express the swap. Each entry's `peers` is
+// ordered by index within the rescaled operator; its size is the new live
+// branch count. See MessageKind::CutoverPeerUpdate.
 struct CutoverPeerUpdateMsg {
+    struct TaskPeers {
+        std::string task_role;
+        std::uint32_t task_subtask_idx{};
+        std::vector<PeerAddress> peers;
+    };
     JobId job_id{};
     std::string op_id;
-    std::vector<PeerAddress> peers;
+    std::vector<TaskPeers> tasks;
+    std::uint64_t coordinator_epoch{0};
+};
+
+// worker → coordinator. Reply to an ARMING BeginRescale (one that names a
+// cutover checkpoint): what this worker actually armed for `op_id`. The
+// coordinator compares against what it expected from the deployed identity
+// and the graph - a shortfall (a task built before the cutover machinery,
+// or through a path that does not register hooks) aborts the hot cutover
+// to the replan path BEFORE the cutover checkpoint is triggered.
+struct BeginRescaleAckMsg {
+    JobId job_id{};
+    std::string op_id;
+    std::string worker_id;
+    // Arm callbacks invoked (the rescaled op's own tasks: source stops,
+    // relay stops, sink commit gates - plus the feeder groups' gates,
+    // which register under the same key).
+    std::uint32_t armed_callbacks{0};
+    // Hold-and-swap groups registered for op_id on this worker (one per
+    // feeding task built through the eligible attach path).
+    std::uint32_t armed_groups{0};
+    // Input-rebind hooks registered for op_id (one per fed task built
+    // through the eligible input path).
+    std::uint32_t rebind_tasks{0};
     std::uint64_t coordinator_epoch{0};
 };
 

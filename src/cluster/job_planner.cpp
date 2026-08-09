@@ -416,7 +416,8 @@ HotCutoverPlan plan_hot_cutover(const JobGraphSpec& graph,
                                 const std::string& op_id,
                                 std::uint32_t new_parallelism,
                                 const TaskOpIdentityMap& deployed_identity,
-                                const OperatorRegistry& registry) {
+                                const OperatorRegistry& registry,
+                                const RunnerRegistry* runner_registry) {
     HotCutoverPlan out;
 
     // The deployed layout is the translation target; a block that cannot be
@@ -467,7 +468,8 @@ HotCutoverPlan plan_hot_cutover(const JobGraphSpec& graph,
     }
     JobPlan fresh;
     try {
-        fresh = plan_job(updated, registry);
+        fresh = runner_registry != nullptr ? plan_job(updated, registry, *runner_registry)
+                                           : plan_job(updated, registry);
     } catch (const std::exception& e) {
         out.error =
             std::string{"hot cutover: replanning at the new parallelism failed: "} + e.what();
