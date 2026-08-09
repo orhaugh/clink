@@ -3112,6 +3112,43 @@ The F12 fix it covers is unaffected and stands on its own mutation check, run in
 isolation where the test is reliable: the empty-drain kick disabled reproduces
 `restart drain timed out`, enabled it passes.
 
+### F80. The fuzz runtime is declared in the image script but is not in the image
+
+Item 21 records fuzzing as "blocked on the CI image carrying libclang-rt". Tested rather
+than assumed, and the answer is narrower and stranger than the item suggests.
+
+**libFuzzer works.** With `libclang-rt-19-dev` present, `clang++-19 -fsanitize=fuzzer`
+links a target cleanly - verified directly, and the runtime archives
+(`libclang_rt.fuzzer-aarch64.a` and friends) are where the driver expects them. There is
+no toolchain problem.
+
+**The package is already declared.** `scripts/install-system-deps.sh:64` installs
+`libclang-rt-19-dev`, with a comment explaining exactly why ("clang-tidy alone pulls the
+COMPILER but not the sanitizer runtimes, so -fsanitize=fuzzer failed at link").
+
+**It is not in the built image.** `clink-build:latest` was created 2026-08-04; the line
+was committed 2026-08-03. The image is NEWER than the change and still lacks the package -
+`apt-get install` fetched it fresh inside a container from that image. The likely cause is
+Docker layer caching: the script is COPYed into the expensive first layer, and a build
+that reused a cached layer from before the change would carry the old package set while
+appearing up to date.
+
+**Why this matters more than one package.** Anyone reading `install-system-deps.sh` would
+conclude the fuzz runtime is present, and the gap is silent - `CLINK_BUILD_FUZZERS=ON`
+fails at CONFIGURE with a message that reads like a toolchain limitation ("this compiler
+cannot link libFuzzer") rather than a stale image. That is a false signal pointing away
+from the real cause, which is how item 21 came to be recorded as a toolchain blocker in
+the first place.
+
+**What is needed:** rebuild the image without a cached first layer
+(`docker build --no-cache-filter` or a fresh build), then confirm with
+`clang++-19 -fsanitize=fuzzer` before trusting it. Not attempted here - a full rebuild is
+40-60 minutes.
+
+Once that is done, F76's `data_frame` target can have its first real fuzz run instead of
+corpus replay alone, and item 21's "45 seconds per target, discovery not in CI" becomes
+actionable rather than blocked.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
