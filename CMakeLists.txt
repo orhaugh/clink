@@ -49,6 +49,25 @@ option(CLINK_BUILD_EXAMPLES "Build clink examples" ON)
 # the same functions) is part of the normal test suite and needs none of
 # this.
 option(CLINK_BUILD_FUZZERS  "Build libFuzzer discovery targets" OFF)
+# Instrument the WHOLE build for coverage-guided fuzzing, not just the fuzz TUs.
+#
+# The fuzz targets link clink_core, and without this the library is compiled with
+# no fuzzer instrumentation at all - so libFuzzer's coverage feedback sees only
+# the header-inline code in each target's own TU. The first campaign made that
+# measurable: fault_spec covered FOUR edges while genuinely executing a grammar
+# parser, because arm_from_spec lives in src/fault/*.cpp inside the library. The
+# fuzzer still executed the real code (ASan would still catch a crash), but its
+# mutation was blind - coverage-guided in name only.
+#
+# fuzzer-no-link instruments without pulling in libFuzzer's main, so the library
+# stays linkable by every non-fuzz consumer in this build tree; each fuzz target
+# then links -fsanitize=fuzzer on top. ASan+UBSan ride along so a find is a
+# report rather than a plain SIGSEGV. Dedicated build directories only - this is
+# not a flag combination to mix into a normal build.
+if(CLINK_BUILD_FUZZERS)
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 # Connector/backend impls (kafka, postgres, s3, rocksdb, ...). ON by default.
 # Turn OFF for a lean core + test-framework build: the install then carries only
 # clink::core / clink::clink / clink::test_support and a clinkConfig that

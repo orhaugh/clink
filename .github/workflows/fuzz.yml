@@ -52,8 +52,12 @@ jobs:
         # TestOneInput-only source - see the comment there for why a main()
         # in the probe reports a working toolchain as broken.
         run: |
+          # CLINK_ENABLE_FAULT_INJECTION=ON explicitly: it defaults to AUTO,
+          # which follows CLINK_BUILD_TESTS - and with tests off the fault_spec
+          # target simply does not exist and this matrix job fails at build.
           cmake -S . -B build-fuzz -G Ninja \
             -DCLINK_BUILD_FUZZERS=ON -DCLINK_BUILD_SQL=OFF \
+            -DCLINK_ENABLE_FAULT_INJECTION=ON \
             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
           cmake --build build-fuzz --target clink_fuzz_${{ matrix.target }} clink_fuzz_seeds
 

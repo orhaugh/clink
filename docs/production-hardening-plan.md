@@ -3164,12 +3164,30 @@ target, `-seed=12345`, ASan+UBSan, seeded from the committed corpus plus the gen
 `fault_spec` at 4 edges is suspiciously shallow for a grammar parser and is flagged for
 the property-assertion pass rather than chased here.
 
+**The campaign was coverage-guided in name only, and now is not.** The fuzz targets
+link `clink_core`, which was compiled with NO fuzzer instrumentation - so libFuzzer's
+feedback saw only each target's header-inline code, and mutation over library-resident
+parsers ran blind. `fault_spec` made it measurable: FOUR edges while genuinely executing
+a grammar parser. With `CLINK_BUILD_FUZZERS=ON` now instrumenting the whole build
+(`fuzzer-no-link` + ASan/UBSan, dedicated build directories only), the same seeded 200k
+campaign moves exactly the targets whose logic lives in the library:
+
+| target | blind | instrumented |
+|---|---|---|
+| cluster_frame | 1045 | 1045 (header-inline already) |
+| data_frame | 176 | 177 (ceiling: the prebuilt Arrow archive) |
+| checkpoint_meta | 72 | 72 (header-only) |
+| state_version_map | 20 | **358** |
+| fault_spec | 4 | **255** |
+
+Zero findings at 200k per target on both passes. `fuzz.yml` also gains
+`-DCLINK_ENABLE_FAULT_INJECTION=ON`, without which its `fault_spec` matrix job fails at
+build (AUTO follows `CLINK_BUILD_TESTS`, which the workflow turns off).
+
 **Item 21's remaining tail, stated:** property assertions (round-trip, idempotence)
-inside the targets instead of crash-only; the scheduled discovery workflow
-(`fuzz.yml`, added alongside this) has to be observed green on an actual runner before
-it counts; and `clink-build:next` should replace `:latest` only after a full label run
-on it. Discovery is stochastic by nature - the deterministic artefacts are the probe,
-the corpus, and the gtest replay that turns any find into a permanent regression.
+inside the targets instead of crash-only; the workflow observed green on an actual
+runner; instrumenting the pinned Arrow build if `data_frame` depth ever matters; and
+`clink-build:next` replacing `:latest` only after a full label run on it.
 
 ### F81. ROOT CAUSE OF F67, FIXED: a chain's checkpoint owner captured a backend its upstream members were still writing
 
