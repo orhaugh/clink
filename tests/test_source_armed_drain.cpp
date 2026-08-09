@@ -21,16 +21,19 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/local_executor.hpp"
 #include "clink/runtime/network/local_data_plane.hpp"
+#include "clink/runtime/network/network_bridge.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
 using namespace clink;
@@ -410,4 +413,191 @@ TEST(SourceArmedDrain, TheParallelSourceRunnerHonoursTheSameArm) {
     EXPECT_FALSE(saw_max_watermark)
         << "the parallel runner ran the end-of-input tail on an armed drain";
     EXPECT_LE(src->produce_calls(), 8);
+}
+
+// --- the RELAY arm (mid-dag and sink chains) --------------------------------
+//
+// A chain task that does not host the job's source is armed at its INPUT
+// boundary: the NetworkBridgeSource relay forwards the armed barrier and
+// then ends its stream, so the chain downstream sees C then end-of-input and
+// the chain's checkpoint owner snapshots at exactly C. Elements already
+// queued behind C belong to the post-cutover subtasks and must never be
+// consumed here. Driven directly - the relay's produce() into an emitter
+// over an inspectable channel - so the assertion is on the relayed stream
+// itself.
+
+TEST(SourceArmedDrain, AnArmedRelayEndsItsStreamAfterForwardingTheBarrier) {
+    network::LocalDataPlane::instance().clear_for_testing();
+
+    network::NetworkBridgeSource<std::int64_t> relay(0, int64_codec());
+    const auto port = relay.prepare_listen();
+    ASSERT_GT(port, 0);
+    relay.set_drain_at_checkpoint(2);
+
+    network::NetworkBridgeSink<std::int64_t> feeder("127.0.0.1", port, int64_codec());
+    feeder.open();  // local fast path: pushes land in the relay's queue
+
+    auto feed_record = [&](std::int64_t v) {
+        Batch<std::int64_t> b;
+        b.emplace(v);
+        feeder.on_data(std::move(b));
+    };
+    feed_record(10);
+    feeder.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    feed_record(11);
+    feeder.on_barrier(CheckpointBarrier{CheckpointId{2}});
+    feed_record(12);  // behind the armed barrier: must never be relayed
+    // Close AFTER everything is queued. The armed relay must stop at B2
+    // without needing this close - but with the close present, a relay
+    // whose arm is broken runs to end-of-input and FAILS the count
+    // assertion below, instead of blocking forever in pop() on an
+    // open-but-quiet channel. A mutation must fail a test, not hang it.
+    feeder.close();
+
+    relay.open();
+    auto out = std::make_shared<BoundedChannel<StreamElement<std::int64_t>>>(64);
+    Emitter<std::int64_t> emitter(out.get());
+    int produced = 0;
+    while (relay.produce(emitter) && produced < 32) {
+        ++produced;
+    }
+
+    struct Relayed {
+        enum class Kind { Data, Barrier, Drain } kind;
+        std::int64_t value{0};
+    };
+    std::vector<Relayed> relayed;
+    while (auto e = out->try_pop()) {
+        if (e->is_data()) {
+            for (const auto& rec : e->as_data()) {
+                relayed.push_back({Relayed::Kind::Data, rec.value()});
+            }
+        } else if (e->is_drain()) {
+            relayed.push_back({Relayed::Kind::Drain, 0});
+        } else if (e->is_barrier()) {
+            relayed.push_back(
+                {Relayed::Kind::Barrier, static_cast<std::int64_t>(e->as_barrier().id().value())});
+        }
+    }
+    ASSERT_EQ(relayed.size(), 5u)
+        << "expected exactly r10, B1, r11, B2, drain-marker; a sixth element means the relay "
+           "consumed past the armed barrier, handing the post-cutover subtasks' records to a "
+           "task that is about to exit";
+    EXPECT_EQ(relayed[0].kind, Relayed::Kind::Data);
+    EXPECT_EQ(relayed[0].value, 10);
+    EXPECT_EQ(relayed[1].kind, Relayed::Kind::Barrier);
+    EXPECT_EQ(relayed[1].value, 1);
+    EXPECT_EQ(relayed[2].kind, Relayed::Kind::Data);
+    EXPECT_EQ(relayed[2].value, 11);
+    EXPECT_EQ(relayed[3].kind, Relayed::Kind::Barrier);
+    EXPECT_EQ(relayed[3].value, 2);
+    EXPECT_EQ(relayed[4].kind, Relayed::Kind::Drain);
+
+    // And the loop ended because produce() reported end-of-input, not
+    // because the guard tripped.
+    EXPECT_LT(produced, 32);
+}
+
+TEST(SourceArmedDrain, AnUnarmedRelayForwardsEverythingUntilClose) {
+    // Control for the relay arm: same feed, no arm, Close from the feeder.
+    // Everything including the record behind barrier 2 must arrive.
+    network::LocalDataPlane::instance().clear_for_testing();
+
+    network::NetworkBridgeSource<std::int64_t> relay(0, int64_codec());
+    const auto port = relay.prepare_listen();
+    ASSERT_GT(port, 0);
+
+    network::NetworkBridgeSink<std::int64_t> feeder("127.0.0.1", port, int64_codec());
+    feeder.open();
+    auto feed_record = [&](std::int64_t v) {
+        Batch<std::int64_t> b;
+        b.emplace(v);
+        feeder.on_data(std::move(b));
+    };
+    feed_record(10);
+    feeder.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    feed_record(11);
+    feeder.on_barrier(CheckpointBarrier{CheckpointId{2}});
+    feed_record(12);
+    feeder.close();
+
+    relay.open();
+    auto out = std::make_shared<BoundedChannel<StreamElement<std::int64_t>>>(64);
+    Emitter<std::int64_t> emitter(out.get());
+    while (relay.produce(emitter)) {
+    }
+
+    std::size_t data_count = 0;
+    bool saw_r12 = false;
+    while (auto e = out->try_pop()) {
+        if (e->is_data()) {
+            for (const auto& rec : e->as_data()) {
+                ++data_count;
+                saw_r12 |= rec.value() == 12;
+            }
+        }
+    }
+    EXPECT_EQ(data_count, 3u);
+    EXPECT_TRUE(saw_r12) << "the record behind barrier 2 was dropped by an UNARMED relay - "
+                            "the armed test above is asserting a stop that happens anyway";
+}
+
+// --- the sink commit gate ----------------------------------------------------
+//
+// An armed sink chain stages and acks C, its input closes, and the commit
+// for C arrives only after the coordinator completes C. The gate holds the
+// runner until its OWN commit callback has run - waiting on anything the
+// worker owns instead would race the runner-exit cleanup that erases the
+// committer registration.
+
+TEST(SourceArmedDrain, TheCommitGateHoldsAnArmedSinkUntilItsOwnCommitRuns) {
+    using clink::plugin::detail::ArmedCutoverCommitGate;
+    using clink::plugin::detail::await_armed_cutover_commit;
+
+    // Unarmed: nothing to wait for.
+    {
+        ArmedCutoverCommitGate gate;
+        EXPECT_TRUE(await_armed_cutover_commit(gate, nullptr, std::chrono::milliseconds{50}));
+    }
+    // Armed, commit for an EARLIER checkpoint only: the bound expires and
+    // the caller fails the subtask. This is the load-bearing refusal - a
+    // gate that released on any commit would complete the subtask with C
+    // still staged.
+    {
+        ArmedCutoverCommitGate gate;
+        gate.arm(2);
+        gate.record_commit(1);
+        EXPECT_FALSE(await_armed_cutover_commit(gate, nullptr, std::chrono::milliseconds{50}));
+    }
+    // Armed and the cutover commit observed - in either order, because the
+    // arm can arrive while a commit is already in flight.
+    {
+        ArmedCutoverCommitGate gate;
+        gate.arm(2);
+        gate.record_commit(2);
+        EXPECT_TRUE(await_armed_cutover_commit(gate, nullptr, std::chrono::milliseconds{50}));
+    }
+    {
+        ArmedCutoverCommitGate gate;
+        gate.record_commit(2);
+        gate.arm(2);
+        EXPECT_TRUE(await_armed_cutover_commit(gate, nullptr, std::chrono::milliseconds{50}));
+    }
+    // The commit arrives while the runner is already waiting: the wait
+    // releases on the callback's notify, proven by ordering (the recording
+    // thread runs only after the waiter is inside the gate).
+    {
+        ArmedCutoverCommitGate gate;
+        gate.arm(7);
+        std::thread committer([&] { gate.record_commit(7); });
+        EXPECT_TRUE(await_armed_cutover_commit(gate, nullptr, std::chrono::seconds{30}));
+        committer.join();
+    }
+    // Cancelled mid-wait: teardown, not completion - true, promptly.
+    {
+        ArmedCutoverCommitGate gate;
+        gate.arm(9);
+        auto cancel = std::make_shared<std::atomic<bool>>(true);
+        EXPECT_TRUE(await_armed_cutover_commit(gate, cancel, std::chrono::seconds{30}));
+    }
 }

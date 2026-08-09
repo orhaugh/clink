@@ -43,10 +43,21 @@ struct TypeOps {
     // Human-readable channel name, e.g. "hello.Greeting".
     std::string channel_name;
 
+    // One bound inbound bridge, type-erased. `arm_drain_at` is the typed
+    // hook for the armed cutover (hot rescale): the worker cannot call
+    // NetworkBridgeSource<T>::set_drain_at_checkpoint through the erased
+    // pointer, so the closure carries the typed call. Weak-captured: arming
+    // a bridge whose task has already exited is a no-op.
+    struct BoundInboundBridge {
+        std::uint16_t port{0};
+        std::shared_ptr<void> bridge;
+        std::function<void(std::uint64_t /*cutover_checkpoint_id*/)> arm_drain_at;
+    };
+
     // Bind a NetworkBridgeSource<T> on an ephemeral port (port=0) and
-    // return the bound port + a shared_ptr<void> to the typed source.
-    // The generic role calls this once per input edge.
-    std::function<std::pair<std::uint16_t, std::shared_ptr<void>>()> bind_inbound_bridge;
+    // return the bound port + a shared_ptr<void> to the typed source +
+    // the typed arm hook. The generic role calls this once per input edge.
+    std::function<BoundInboundBridge()> bind_inbound_bridge;
 
     // Construct a NetworkBridgeSink<T> targeting the given peer. Used
     // by the role's output stage after PeerUpdate resolves addresses.
@@ -222,11 +233,19 @@ inline void TypeRegistry::register_typed(const std::string& name,
                                          ArrowBatcher<T> batcher) {
     TypeOps ops;
     ops.channel_name = name;
-    ops.bind_inbound_bridge = [codec,
-                               batcher]() -> std::pair<std::uint16_t, std::shared_ptr<void>> {
+    ops.bind_inbound_bridge = [codec, batcher]() -> TypeOps::BoundInboundBridge {
         auto src = std::make_shared<network::NetworkBridgeSource<T>>(/*port=*/0, codec, batcher);
         const auto port = src->prepare_listen();
-        return {port, std::static_pointer_cast<void>(src)};
+        return TypeOps::BoundInboundBridge{
+            .port = port,
+            .bridge = std::static_pointer_cast<void>(src),
+            .arm_drain_at =
+                [weak = std::weak_ptr<network::NetworkBridgeSource<T>>(src)](std::uint64_t id) {
+                    if (auto s = weak.lock()) {
+                        s->set_drain_at_checkpoint(id);
+                    }
+                },
+        };
     };
     ops.connect_outbound_bridge = [codec, batcher](const std::string& host,
                                                    std::uint16_t port) -> std::shared_ptr<void> {

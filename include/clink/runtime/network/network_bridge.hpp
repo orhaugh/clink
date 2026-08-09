@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -182,7 +183,7 @@ public:
     }
 
     bool produce(Emitter<T>& out) override {
-        if (this->cancelled() || channel_.closed()) {
+        if (this->cancelled() || channel_.closed() || armed_finished_) {
             return false;
         }
         auto e = channel_.pop();
@@ -204,8 +205,33 @@ public:
             out.emit_drain(e->as_drain());
         } else {
             out.emit_barrier(e->as_barrier());
+            // Armed cutover (hot rescale, design record 008): barrier C is
+            // the last element this relay forwards. The chain downstream of
+            // this bridge sees C then end-of-input, so the chain's
+            // checkpoint owner snapshots at exactly C and the task drains
+            // cleanly. Records already sitting in the channel behind C
+            // belong to the post-cutover subtasks and must not be consumed
+            // here. Equality with the armed id only, matching the source
+            // runners' contract.
+            if (const auto armed = drain_at_checkpoint_.load(std::memory_order_acquire);
+                armed != 0 && armed == e->as_barrier().id().value()) {
+                std::uint32_t sub = 0;
+                if (const auto* rt = this->runtime()) {
+                    sub = static_cast<std::uint32_t>(rt->runner_subtask_idx());
+                }
+                out.emit_drain(DrainMarker{.subtask_idx = sub, .target_parallelism = 0});
+                armed_finished_ = true;
+            }
         }
         return true;
+    }
+
+    // Arm the relay to end its stream after forwarding the named barrier.
+    // Set by the worker's BeginRescale dispatch (a message that names a
+    // cutover checkpoint); 0 = unarmed. Safe to call while produce() runs
+    // on the runner thread - the flag is read per element.
+    void set_drain_at_checkpoint(std::uint64_t checkpoint_id) noexcept {
+        drain_at_checkpoint_.store(checkpoint_id, std::memory_order_release);
     }
 
     void cancel() override {
@@ -226,6 +252,9 @@ public:
 private:
     NetworkChannelSource<T> channel_;
     std::string name_;
+    std::atomic<std::uint64_t> drain_at_checkpoint_{0};
+    // Runner-thread only: set once the armed barrier has been forwarded.
+    bool armed_finished_{false};
 };
 
 }  // namespace clink::network

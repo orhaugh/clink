@@ -84,9 +84,12 @@ void register_shipped_udfs(const std::string& packed) {
 
 // Type-erased handle for a bound NetworkBridgeSource. The cast back to
 // the typed shared_ptr happens in the channel-type dispatch arms below.
+// `arm_drain_at` carries the typed armed-cutover hook across the erasure
+// (see TypeOps::BoundInboundBridge).
 struct InboundBridge {
     std::uint16_t bound_port{0};
     std::shared_ptr<void> bridge;
+    std::function<void(std::uint64_t)> arm_drain_at;
 };
 
 InboundBridge make_inbound_bridge(const ChannelType& ct, const TypeRegistry& type_registry) {
@@ -99,8 +102,8 @@ InboundBridge make_inbound_bridge(const ChannelType& ct, const TypeRegistry& typ
     if (ops == nullptr || !ops->bind_inbound_bridge) {
         return {};
     }
-    auto [port, bridge] = ops->bind_inbound_bridge();
-    return InboundBridge{port, std::move(bridge)};
+    auto bound = ops->bind_inbound_bridge();
+    return InboundBridge{bound.port, std::move(bound.bridge), std::move(bound.arm_drain_at)};
 }
 
 // Build the input side of a Dag for a typed channel:
@@ -1305,6 +1308,7 @@ void Worker::run_generic_subtask_(JobId job_id,
     // subtask. Single-input is just the N=1 case.
     std::vector<std::shared_ptr<void>> in_bridges;
     in_bridges.reserve(chain.input_edges.size());
+    std::vector<std::function<void(std::uint64_t)>> bridge_arms;
     SubtaskListeningMsg sl;
     sl.job_id = job_id;
     sl.worker_id = worker_id_;
@@ -1317,11 +1321,34 @@ void Worker::run_generic_subtask_(JobId job_id,
             throw std::runtime_error("generic subtask: unsupported in_channel for edge");
         }
         in_bridges.push_back(inb.bridge);
+        if (inb.arm_drain_at) {
+            bridge_arms.push_back(std::move(inb.arm_drain_at));
+        }
         sl.edge_ports.push_back(SubtaskListeningMsg::EdgePort{
             .upstream_role = edge.peer_role,
             .upstream_subtask_idx = edge.peer_subtask_idx,
             .port = inb.bound_port,
         });
+    }
+
+    // 2a. A chain task is armed for a cutover at its INPUT boundary: the
+    // relay stops forwarding after the named barrier, the chain sees C then
+    // end-of-input, the chain's checkpoint owner snapshots at exactly C,
+    // and the task drains through the ordinary close cascade. Register the
+    // typed arm hooks under every operator id this chain hosts, exactly
+    // like the drain callbacks, so a BeginRescale naming any of them (and a
+    // cutover checkpoint) reaches the relays. Source chains have no input
+    // edges; their arm rides the barrier injector instead (the runner-side
+    // registration below).
+    const auto drain_keys = drain_registration_keys(chain, task.role);
+    if (!bridge_arms.empty()) {
+        std::lock_guard lock(mu_);
+        for (const auto& key : drain_keys) {
+            auto& bucket = per_job_arm_callbacks_[job_id][key];
+            for (const auto& fn : bridge_arms) {
+                bucket.push_back(fn);
+            }
+        }
     }
 
     // 3. Report SubtaskListening - one entry per input edge. Sources
@@ -1619,8 +1646,8 @@ void Worker::run_generic_subtask_(JobId job_id,
             // the generic role (F40, item 27) - the chain spec names the
             // operators this task hosts, and the task is addressable by
             // any of them. Multiple subtasks of the same operator
-            // accumulate in the same vector.
-            const auto drain_keys = drain_registration_keys(chain, task.role);
+            // accumulate in the same vector. drain_keys computed once at
+            // the input-bridge arming above.
             auto register_drains =
                 [this, job_id, keys = drain_keys](std::vector<RunnerContext::DrainFn> cbs) {
                     std::lock_guard lock(mu_);

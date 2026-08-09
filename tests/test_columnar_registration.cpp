@@ -310,7 +310,8 @@ TEST(ColumnarRegistration, RegisteredBridgesRoundTripLoopback) {
     ASSERT_NE(ops, nullptr);
 
     // Inbound bridge binds the listener and returns the port.
-    auto [port, src_void] = ops->bind_inbound_bridge();
+    auto [port, src_void, arm_unused] = ops->bind_inbound_bridge();
+    (void)arm_unused;
     auto src = std::static_pointer_cast<NetworkBridgeSource<ColRegTrade>>(src_void);
     ASSERT_GT(port, 0u);
 
@@ -463,7 +464,8 @@ TEST(ColumnarAutoRegistration, ExplicitSendImplicitReceiveRoundTrips) {
     recv_reg.register_typed<ColRegTrade>("test.sym.Trade", trade_codec());
     const auto* recv_ops = recv_reg.find("test.sym.Trade");
     ASSERT_NE(recv_ops, nullptr);
-    auto [port, src_void] = recv_ops->bind_inbound_bridge();
+    auto [port, src_void, arm_unused] = recv_ops->bind_inbound_bridge();
+    (void)arm_unused;
     auto src = std::static_pointer_cast<NetworkBridgeSource<ColRegTrade>>(src_void);
     ASSERT_GT(port, 0u);
 

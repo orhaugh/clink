@@ -298,6 +298,74 @@ inline void run_subtask_to_completion(clink::LocalExecutor& exec,
     }
 }
 
+// Armed-cutover commit gate for sink subtasks (hot rescale, design record
+// 008). An armed sink chain processes barrier C, stages and acks it, and
+// its input then closes - but the CommitCheckpoint for C only arrives once
+// the coordinator completes C across every subtask. If the runner returned
+// immediately, the worker's exit cleanup would erase this subtask's
+// committer registration and the staged transaction would never finalise
+// (and no restart would come to recover it - the job is still running).
+//
+// The gate is runner-owned on purpose: the sink's OWN registered commit
+// callback records the commit here, so "commit observed" cannot race the
+// runner-exit cleanup the way waiting on the worker's commit high-water
+// would (the high-water notify fires before committer dispatch).
+struct ArmedCutoverCommitGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::uint64_t armed_checkpoint{0};
+    std::uint64_t committed_high{0};
+
+    void arm(std::uint64_t checkpoint_id) {
+        {
+            std::lock_guard lock(mu);
+            armed_checkpoint = checkpoint_id;
+        }
+        cv.notify_all();
+    }
+    void record_commit(std::uint64_t checkpoint_id) {
+        {
+            std::lock_guard lock(mu);
+            committed_high = std::max(committed_high, checkpoint_id);
+        }
+        cv.notify_all();
+    }
+};
+
+// Block until the armed checkpoint's commit is observed. Returns true when
+// the gate is unarmed (nothing to wait for), the commit arrived, or the
+// subtask is being cancelled (teardown, not completion); false only on
+// timeout, which the caller turns into a task failure - completing the
+// subtask with an uncommitted staged transaction is exactly the silent
+// wrongness the wait exists to prevent.
+//
+// The wait is sliced because nothing notifies the gate's cv on cancel: the
+// cancel token is set by the worker's CancelJob path, which knows nothing
+// of this runner-owned gate. Each slice re-checks the predicate, bounding
+// cancel latency at one slice without turning the wait into a spin; the
+// overall deadline is unchanged.
+inline bool await_armed_cutover_commit(ArmedCutoverCommitGate& gate,
+                                       const std::shared_ptr<std::atomic<bool>>& cancel_token,
+                                       std::chrono::milliseconds timeout) {
+    auto cancelled = [&] { return cancel_token && cancel_token->load(std::memory_order_acquire); };
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock lock(gate.mu);
+    if (gate.armed_checkpoint == 0) {
+        return true;
+    }
+    auto done = [&] { return gate.committed_high >= gate.armed_checkpoint || cancelled(); };
+    while (!done()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return cancelled();
+        }
+        const auto slice = std::min<std::chrono::steady_clock::duration>(
+            std::chrono::milliseconds{250}, deadline - now);
+        gate.cv.wait_for(lock, slice, done);
+    }
+    return true;
+}
+
 }  // namespace detail
 
 template <typename T>
@@ -540,6 +608,18 @@ void PluginRegistry::register_sink(
         if (sink->uid().empty() && !rctx.chain.ops.empty() && !rctx.chain.ops[0].id.empty()) {
             sink->set_uid(rctx.chain.ops[0].id);
         }
+        // Armed-cutover commit gate: the arm callback records the cutover
+        // checkpoint id; the commit callback below records observed
+        // commits; after the executor exits, an armed runner waits for the
+        // cutover checkpoint's commit before returning (see
+        // detail::ArmedCutoverCommitGate for why the gate must be
+        // runner-owned).
+        auto cutover_gate = std::make_shared<detail::ArmedCutoverCommitGate>();
+        if (rctx.register_cutover_arm_callbacks) {
+            rctx.register_cutover_arm_callbacks({
+                [cutover_gate](std::uint64_t cutover_ckpt) { cutover_gate->arm(cutover_ckpt); },
+            });
+        }
         // 2PC support: route CommitCheckpoint -> sink->on_commit.
         // Non-2PC sinks have the default no-op so this is harmless.
         // Weak-capture the sink: the runner returns when the
@@ -549,10 +629,13 @@ void PluginRegistry::register_sink(
         if (rctx.register_commit_callbacks) {
             std::weak_ptr<clink::Sink<T>> weak_sink = sink;
             rctx.register_commit_callbacks({
-                [weak_sink](std::uint64_t ckpt) {
+                [weak_sink, cutover_gate](std::uint64_t ckpt) {
                     if (auto s = weak_sink.lock()) {
                         s->on_commit(ckpt);
                     }
+                    // After on_commit: "observed" must mean the sink's
+                    // commit work ran, not merely that the frame arrived.
+                    cutover_gate->record_commit(ckpt);
                 },
             });
         }
@@ -577,6 +660,21 @@ void PluginRegistry::register_sink(
         dag.set_all_runners_attributed_op_id(dag.runner_id_at(hs.runner_index));
         clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
         detail::run_subtask_to_completion(exec, rctx.cancel_token);
+        // Armed cutover: C is staged and acked and the input has closed,
+        // but its CommitCheckpoint only arrives once the coordinator
+        // completes C. Returning now would erase this subtask's committer
+        // registration (the worker's exit cleanup) and strand the staged
+        // transaction with no restart coming to recover it. Bounded, and
+        // loud on timeout for the same reason the EOS final-checkpoint
+        // wait is: completing silently without durability is the failure
+        // mode, not the safeguard.
+        if (!detail::await_armed_cutover_commit(
+                *cutover_gate, rctx.cancel_token, clink::eos_final_checkpoint_timeout())) {
+            throw std::runtime_error(
+                "armed cutover: the cutover checkpoint's commit did not arrive within the "
+                "bound; failing the subtask rather than completing it with a staged, "
+                "uncommitted transaction");
+        }
     };
     runner_registry_.register_sink(op_type, channel, std::move(runner));
 
