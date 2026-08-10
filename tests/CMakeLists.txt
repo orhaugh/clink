@@ -29,6 +29,7 @@ add_executable(clink_core_tests
     test_group_cutover.cpp
     test_source_armed_drain.cpp
     test_union_rebind.cpp
+    test_checkpoint_ack_durability.cpp
     test_checkpoint_cut_consistency.cpp
     test_keyed_shuffle_cut.cpp
     test_periodic_checkpoint.cpp

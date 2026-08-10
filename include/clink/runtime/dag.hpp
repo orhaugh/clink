@@ -454,27 +454,34 @@ public:
                     if (ctx.has_state_backend()) {
                         source->snapshot_offset(*ctx.state_backend(), id, b->id());
                     }
-                    // Ack what actually happened. emit_barrier returns false when
-                    // a downstream channel is closed or a remote push fails, and
-                    // this used to discard it and ack `true` unconditionally - the
-                    // source reported a checkpoint successful for a barrier that
-                    // never left it.
+                    // Failure is acked here; success is NOT. emit_barrier
+                    // returns false when a downstream channel is closed or a
+                    // remote push fails, and discarding that used to wedge the
+                    // checkpoint silently - the "no FAILED line at all, just
+                    // silence" case in the runbook - so the failure ack (with
+                    // its cause) stays.
                     //
-                    // The downstream subtask that never saw the barrier then never
-                    // acks either, so the checkpoint does not complete; it just
-                    // stops, with no failure line naming a cause. That is the
-                    // "subtask is wedged, not failing - no FAILED line at all, just
-                    // silence" case in the runbook, and the information needed to
-                    // diagnose it was available here and thrown away.
+                    // The success ack does not belong to this runner. It used
+                    // to fire right here, after an IN-MEMORY offset put and the
+                    // barrier emission, with no capture or persist in sight -
+                    // durability belongs to this subtask's terminal runner
+                    // (the sink attach_typed_output_groups adds), which
+                    // captures the shared backend and acks only after
+                    // persist() returns. Acking success early let the
+                    // coordinator publish COMPLETED-N while this subtask's
+                    // snapshot was still a .part temp file; a SIGKILL in that
+                    // window produced a completed checkpoint whose participant
+                    // snapshot did not exist, and the restore refused
+                    // (production-hardening item 51, pinned by
+                    // test_checkpoint_ack_durability.cpp).
                     const bool delivered = emitter.emit_barrier(*b);
-                    if (*ack_ref) {
+                    if (!delivered && *ack_ref) {
                         (*ack_ref)(b->id(),
-                                   delivered,
-                                   delivered ? std::string{}
-                                             : std::string{"source could not deliver the barrier "
-                                                           "to every downstream channel (a "
-                                                           "channel is closed or a remote push "
-                                                           "failed)"});
+                                   false,
+                                   std::string{"source could not deliver the barrier "
+                                               "to every downstream channel (a "
+                                               "channel is closed or a remote push "
+                                               "failed)"});
                     }
                     // Armed cutover (hot rescale): barrier C is this source's
                     // last. Its snapshot and emission above ARE the boundary;
@@ -3743,20 +3750,24 @@ public:
                         if (ctx.has_state_backend()) {
                             source->snapshot_offset(*ctx.state_backend(), id, b->id());
                         }
-                        // Ack what actually happened, as the single-subtask source
-                        // runner does. This is the runner a PARALLEL source uses,
-                        // so it is the one a distributed job goes through - fixing
-                        // only the other path would leave the defect exactly where
-                        // it matters most.
+                        // Failure acked, success NOT - same contract as the
+                        // single-subtask source runner above, for the same
+                        // reason: the success ack is the terminal runner's to
+                        // send after persist(), and sending it here - after an
+                        // in-memory put - published COMPLETED markers for
+                        // checkpoints whose snapshots were not yet durable
+                        // (item 51). This is the runner a PARALLEL source
+                        // uses, so it is the one a distributed job goes
+                        // through - fixing only the other path would leave the
+                        // defect exactly where it matters most.
                         const bool delivered = typed_emitter.emit_barrier(*b);
-                        if (ack_cb) {
+                        if (!delivered && ack_cb) {
                             ack_cb(b->id(),
-                                   delivered,
-                                   delivered ? std::string{}
-                                             : std::string{"source could not deliver the barrier "
-                                                           "to every downstream channel (a "
-                                                           "channel is closed or a remote push "
-                                                           "failed)"});
+                                   false,
+                                   std::string{"source could not deliver the barrier "
+                                               "to every downstream channel (a "
+                                               "channel is closed or a remote push "
+                                               "failed)"});
                         }
                         // Armed cutover (hot rescale): barrier C is this
                         // source's last. Same contract as the single-subtask
