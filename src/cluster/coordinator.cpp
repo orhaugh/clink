@@ -5396,6 +5396,21 @@ void Coordinator::signal_job_completion_locked_(JobState& job) {
         while (history_.size() > kCoordinatorHistoryCap) {
             history_.pop_front();
         }
+        // Evict the JobState behind jobs that fell out of the ring (item
+        // 32): the public record and the internal state share one
+        // retention window, so "inspectable" means the same thing on both
+        // surfaces. The guard is structural belt-and-braces - only
+        // signalled jobs enter the deque - and the job being signalled
+        // here is the newest entry, never the one evicted.
+        terminal_job_order_.push_back(job.id);
+        while (terminal_job_order_.size() > kCoordinatorHistoryCap) {
+            const JobId evict_id = terminal_job_order_.front();
+            terminal_job_order_.pop_front();
+            auto evict_it = jobs_.find(evict_id);
+            if (evict_it != jobs_.end() && evict_it->second->completion_signalled) {
+                jobs_.erase(evict_it);
+            }
+        }
     }
     if (job.notify_client_conn != nullptr) {
         JobCompletedMsg jc;
@@ -5461,10 +5476,21 @@ std::vector<std::string> Coordinator::errors() const {
 std::vector<std::string> Coordinator::job_errors(JobId job_id) const {
     std::lock_guard lock(mu_);
     auto it = jobs_.find(job_id);
-    if (it == jobs_.end()) {
-        return {};
+    if (it != jobs_.end()) {
+        return it->second->errors;
     }
-    return it->second->errors;
+    // The JobState is evicted at the history cap (item 32), but the
+    // errors travel in the CompletedJobRecord: a caller asking about a
+    // terminal job keeps its answer for exactly as long as the history
+    // ring remembers the job at all. This also answers for jobs that
+    // terminated under a PREVIOUS process, whose records were recovered
+    // from the HA dir and never had a JobState here.
+    for (const auto& rec : history_) {
+        if (rec.job_id == job_id) {
+            return rec.errors;
+        }
+    }
+    return {};
 }
 
 std::vector<CompletedJobRecord> Coordinator::job_history() const {

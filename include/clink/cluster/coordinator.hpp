@@ -1313,6 +1313,20 @@ private:
     // kCoordinatorHistoryCap. Guarded by mu_ so job_history() can take
     // a consistent snapshot.
     std::deque<CompletedJobRecord> history_;
+    // Terminal JobStates, oldest first, evicted from jobs_ at the SAME cap
+    // as history_ (item 32). Without this, jobs_ grew monotonically: the
+    // small public CompletedJobRecord was evicted at 128 while the large
+    // JobState behind it - task records, retained graph, per-subtask
+    // timings - was kept forever, and every snapshot_jobs(), ListJobs and
+    // watchdog tick walked O(jobs ever run) under mu_. Only ids that have
+    // passed through signal_job_completion_locked_ enter this deque, so a
+    // running job can never be evicted; entries are unique because the
+    // signal is idempotence-guarded. Tracks THIS process's terminals only -
+    // history records recovered from the HA dir on leadership have no
+    // JobState to evict and deliberately do not join. jobs_ holds
+    // shared_ptrs, so a reader that copied one under mu_ keeps its state
+    // alive across an eviction.
+    std::deque<JobId> terminal_job_order_;
     JobId next_job_id_{1};
     // Convenience: the legacy `deploy(plan)`/`await_completion`/`errors`
     // path operates on whichever job was last deployed in-process. -1

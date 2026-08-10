@@ -317,7 +317,7 @@ Coordinator (`Coordinator::Config`, defaults from `include/clink/cluster/coordin
 - `restart_drain_timeout` = 30000 ms; bound on a survivor drain before the job is failed.
 - `submit_wait_for_slots` = 0 ms; how long submit waits for spare slots (0 = reject immediately).
 - `default_state_backend_uri` = empty; cluster-wide default backend for jobs that chose none.
-- Default control port `kDefaultCoordinatorPort` = 6123; history ring `kCoordinatorHistoryCap` = 128.
+- Default control port `kDefaultCoordinatorPort` = 6123; history ring `kCoordinatorHistoryCap` = 128. The cap bounds BOTH surfaces of a terminal job: the public `CompletedJobRecord` in the ring and the internal `JobState` behind it are evicted together (oldest first), so the coordinator's per-job memory does not grow with jobs ever run. A running job is never evicted, `job_errors` answers from the ring after the state is gone, and `snapshot_job` returns nothing for a job older than the ring - the same answer it gives for an unknown id.
 
 Worker (`Worker::Config`):
 

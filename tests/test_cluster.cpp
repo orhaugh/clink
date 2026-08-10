@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -1508,5 +1509,150 @@ TEST(WorkerConnections, AreRefusedBeyondTheLimitRatherThanSpawningThreads) {
     w1_again.stop();
     w2.stop();
     w1.stop();
+    coordinator.stop();
+}
+
+// Item 32: a terminal job's JobState is evicted from jobs_ at the SAME cap
+// as its public history record, so "inspectable" means one thing on both
+// surfaces and the coordinator's per-job state stops growing with jobs ever
+// run. The off-by-one is pinned deliberately: a job AT the cap is still
+// fully readable; one past it is gone from both.
+TEST(Cluster, TerminalJobStatesAreEvictedAtTheHistoryCap) {
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-evict"});
+
+    Worker worker("worker-evict", "127.0.0.1");
+    worker.register_role("noop", [](const DeploymentTask&) {});
+    worker.register_role(
+        "boom", [](const DeploymentTask&) { throw std::runtime_error("intentional-evict"); });
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto run_one = [&](const char* role) -> bool {
+        JobPlan plan;
+        plan.tasks.push_back(PlannedTask{
+            .worker_id = "worker-evict",
+            .role = role,
+            .subtask_idx = 0,
+            .data_port = 0,
+            .peer_refs = {},
+            .extra_config = "",
+        });
+        coordinator.deploy(plan);
+        return coordinator.await_completion(5s);
+    };
+
+    ASSERT_TRUE(run_one("boom"));
+    auto hist = coordinator.job_history();
+    ASSERT_EQ(hist.size(), 1u);
+    const JobId boom_id = hist.back().job_id;
+
+    // Fill the ring to EXACTLY the cap: the boom job is entry 1 of 128 and
+    // must still be fully readable on every surface.
+    for (std::size_t i = 1; i < kCoordinatorHistoryCap; ++i) {
+        ASSERT_TRUE(run_one("noop")) << "noop job " << i << " did not complete";
+    }
+    ASSERT_TRUE(coordinator.snapshot_job(boom_id).has_value())
+        << "a terminal job inside the retention window must keep its JobState";
+    {
+        const auto errs = coordinator.job_errors(boom_id);
+        ASSERT_FALSE(errs.empty());
+        EXPECT_NE(errs.front().find("intentional-evict"), std::string::npos);
+    }
+    ASSERT_TRUE(coordinator.job_history(boom_id).has_value());
+
+    // One more terminal pushes it out of the window: the JobState and the
+    // history record leave together, and the read APIs agree it is gone.
+    ASSERT_TRUE(run_one("noop"));
+    EXPECT_FALSE(coordinator.snapshot_job(boom_id).has_value())
+        << "the JobState behind an evicted history record must be evicted with it";
+    EXPECT_TRUE(coordinator.job_errors(boom_id).empty());
+    EXPECT_FALSE(coordinator.job_history(boom_id).has_value());
+
+    // The retained set is exactly the ring's width, and the newest job is
+    // fully readable.
+    EXPECT_EQ(coordinator.snapshot_jobs().size(), kCoordinatorHistoryCap);
+    const auto newest = coordinator.job_history().back().job_id;
+    EXPECT_TRUE(coordinator.snapshot_job(newest).has_value());
+
+    worker.stop();
+    coordinator.stop();
+}
+
+// A RUNNING job can never be evicted, however much terminal churn happens
+// around it: only ids that passed through the completion signal enter the
+// eviction order. The hold job blocks on a latch across a full ring's worth
+// of terminals, stays readable throughout, and still completes cleanly.
+TEST(Cluster, ARunningJobSurvivesAFullRingOfTerminalChurn) {
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-churn"});
+
+    Worker::Config wcfg;
+    wcfg.slot_count = 2;  // the hold job occupies one; churn needs the other
+    Worker worker("worker-churn", "127.0.0.1", wcfg);
+    auto release = std::make_shared<std::latch>(1);
+    // Count down on every exit path: a gtest ASSERT that aborts this test
+    // body must not leave the worker's task thread blocked forever, or the
+    // suite hangs at worker.stop() instead of reporting the failure.
+    struct Releaser {
+        std::shared_ptr<std::latch> l;
+        bool released{false};
+        void fire() {
+            if (!released) {
+                released = true;
+                l->count_down();
+            }
+        }
+        ~Releaser() { fire(); }
+    } releaser{release};
+
+    worker.register_role("noop", [](const DeploymentTask&) {});
+    worker.register_role("hold", [release](const DeploymentTask&) { release->wait(); });
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    JobPlan hold_plan;
+    hold_plan.tasks.push_back(PlannedTask{
+        .worker_id = "worker-churn",
+        .role = "hold",
+        .subtask_idx = 0,
+        .data_port = 0,
+        .peer_refs = {},
+        .extra_config = "",
+    });
+    coordinator.deploy(hold_plan);
+    auto running = coordinator.snapshot_jobs();
+    ASSERT_EQ(running.size(), 1u);
+    const JobId hold_id = running.front().id;
+
+    for (std::size_t i = 0; i <= kCoordinatorHistoryCap; ++i) {
+        JobPlan plan;
+        plan.tasks.push_back(PlannedTask{
+            .worker_id = "worker-churn",
+            .role = "noop",
+            .subtask_idx = 0,
+            .data_port = 0,
+            .peer_refs = {},
+            .extra_config = "",
+        });
+        coordinator.deploy(plan);
+        ASSERT_TRUE(coordinator.await_completion(5s)) << "churn job " << i;
+    }
+
+    auto held = coordinator.snapshot_job(hold_id);
+    ASSERT_TRUE(held.has_value()) << "a running job must never be evicted";
+    EXPECT_FALSE(held->completion_signalled);
+
+    releaser.fire();
+    EXPECT_TRUE(coordinator.await_job_completion(hold_id, 5s))
+        << "the held job must still complete after the churn";
+
+    worker.stop();
     coordinator.stop();
 }
