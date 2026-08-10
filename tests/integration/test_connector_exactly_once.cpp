@@ -1,4 +1,4 @@
-// Multi-connector exactly-once under failure - the Postgres arm.
+// Multi-connector exactly-once under failure: the Postgres and Kafka arms.
 //
 // The file 2PC sink's exactly-once claim is pinned in test_fault_recovery.cpp;
 // nothing held a REAL connector to the same standard under failure. These
@@ -32,8 +32,13 @@
 #include <gtest/gtest.h>
 
 #include "tests/integration/cluster_harness.hpp"
+#include "tests/integration/docker_kafka.hpp"
 #include "tests/integration/docker_postgres.hpp"
 #include "tests/integration/two_pc_output.hpp"
+
+#ifdef CLINK_HAS_KAFKA
+#include "clink/kafka/consume_all.hpp"
+#endif
 
 namespace {
 
@@ -63,6 +68,37 @@ std::filesystem::path postgres_2pc_job() {
 #else
     return {};
 #endif
+}
+std::filesystem::path kafka_2pc_job() {
+#ifdef CLINK_KAFKA_2PC_JOB_PATH
+    return std::filesystem::path{CLINK_KAFKA_2PC_JOB_PATH};
+#else
+    return {};
+#endif
+}
+
+ClusterSpec two_worker_spec() {
+    ClusterSpec s;
+    s.node_binary = node_binary();
+    s.workers = 2;
+    s.slots_per_worker = 4;
+    return s;
+}
+
+std::unique_ptr<Process> submit_job(Cluster& c,
+                                    const std::filesystem::path& job_so,
+                                    int max_restarts) {
+    auto p = std::make_unique<Process>();
+    std::vector<std::string> argv{submit_binary().string(),
+                                  "--job=" + job_so.string(),
+                                  "--coordinator-host=127.0.0.1",
+                                  "--coordinator-port=" + std::to_string(c.coordinator_port()),
+                                  "--wait-timeout-s=90",
+                                  "--checkpoint-dir=" + c.checkpoint_dir().string(),
+                                  "--checkpoint-interval-ms=150",
+                                  "--max-restarts-on-worker-loss=" + std::to_string(max_restarts)};
+    const bool ok = p->spawn("submit", submit_binary(), std::move(argv), c.log_dir());
+    return ok ? std::move(p) : nullptr;
 }
 
 // The highest COMPLETED-N under the checkpoint tree, or 0. Same scan as the
@@ -131,13 +167,7 @@ protected:
         ::setenv("CLINK_PG_TABLE", table_.c_str(), 1);
     }
 
-    static ClusterSpec spec() {
-        ClusterSpec s;
-        s.node_binary = node_binary();
-        s.workers = 2;
-        s.slots_per_worker = 4;
-        return s;
-    }
+    static ClusterSpec spec() { return two_worker_spec(); }
 
     static void bring_up(Cluster& c) {
         ASSERT_TRUE(c.start_coordinator()) << "coordinator did not come up";
@@ -147,18 +177,7 @@ protected:
     }
 
     static std::unique_ptr<Process> submit(Cluster& c, int max_restarts) {
-        auto p = std::make_unique<Process>();
-        std::vector<std::string> argv{
-            submit_binary().string(),
-            "--job=" + postgres_2pc_job().string(),
-            "--coordinator-host=127.0.0.1",
-            "--coordinator-port=" + std::to_string(c.coordinator_port()),
-            "--wait-timeout-s=90",
-            "--checkpoint-dir=" + c.checkpoint_dir().string(),
-            "--checkpoint-interval-ms=150",
-            "--max-restarts-on-worker-loss=" + std::to_string(max_restarts)};
-        const bool ok = p->spawn("submit", submit_binary(), std::move(argv), c.log_dir());
-        return ok ? std::move(p) : nullptr;
+        return submit_job(c, postgres_2pc_job(), max_restarts);
     }
 
     std::vector<std::string> rows() const { return pg_->column("SELECT v FROM " + table_); }
@@ -318,5 +337,240 @@ TEST_F(PostgresExactlyOnceTest, StaysExactlyOnceAcrossTwoSeparatedKillsOnALonger
     EXPECT_EQ(prepared_count(), 0)
         << "the longer run completed with a prepared transaction still pending";
 }
+
+#ifdef CLINK_HAS_KAFKA
+
+// The Kafka arm. Same bounded source, same moments, same verdict - but the
+// sink is a broker transaction (kafka_2pc_sink_string) and the observer is a
+// read_committed consumer draining the topic to EOF, i.e. exactly what a
+// correctly configured downstream application sees. Records inside open or
+// aborted transactions are invisible to it; an ABANDONED transaction caps the
+// last stable offset, so it surfaces as missing tail records.
+class KafkaExactlyOnceTest : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        if (!clink::test::DockerKafka::docker_available()) {
+            return;  // per-test SetUp skips
+        }
+        kafka_ = new clink::test::DockerKafka();
+    }
+
+    static void TearDownTestSuite() {
+        delete kafka_;
+        kafka_ = nullptr;
+    }
+
+    void SetUp() override {
+        if (!clink::test::DockerKafka::docker_available()) {
+            GTEST_SKIP() << "Docker not available; skipping Kafka exactly-once suite";
+        }
+        if (!std::filesystem::exists(node_binary()) || !std::filesystem::exists(submit_binary()) ||
+            !std::filesystem::exists(kafka_2pc_job())) {
+            GTEST_SKIP() << "cluster binaries or the kafka 2PC job plugin are not built";
+        }
+        ASSERT_NE(kafka_, nullptr);
+        topic_ = std::string{"clink_xo_"} +
+                 ::testing::UnitTest::GetInstance()->current_test_info()->name();
+        kafka_->create_topic(topic_);
+        ::setenv("CLINK_KAFKA_BROKERS", kafka_->brokers().c_str(), 1);
+        ::setenv("CLINK_KAFKA_TOPIC", topic_.c_str(), 1);
+    }
+
+    std::vector<std::string> committed() const {
+        return clink::kafka::consume_all_committed(kafka_->brokers(), topic_);
+    }
+
+    static std::unique_ptr<Process> submit(Cluster& c, int max_restarts) {
+        return submit_job(c, kafka_2pc_job(), max_restarts);
+    }
+
+    static clink::test::DockerKafka* kafka_;
+    std::string topic_;
+};
+
+clink::test::DockerKafka* KafkaExactlyOnceTest::kafka_ = nullptr;
+
+// The premise: a clean run's committed output is the exact multiset, through
+// the connector-carrying plugin path and a real broker.
+TEST_F(KafkaExactlyOnceTest, ACleanRunCommitsEveryRecordExactlyOnce) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    auto sub = submit(c, /*max_restarts=*/0);
+    ASSERT_NE(sub, nullptr);
+    const auto code = sub->await_exit(90s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0);
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a CLEAN Kafka 2PC run did not commit each record exactly once: "
+                           << clink::itest::describe(v);
+}
+
+// DISABLED while the restart-window loss is diagnosed (its own unit; this
+// suite's job was to find it, and it did - twice over). Two distinct modes
+// observed, neither Kafka-wrapper-local:
+//
+//   A. The job completes ok with every post-restart record missing from the
+//      committed view (8/40 committed, no commit-callback errors logged).
+//      The read_uncommitted diagnostic in the verdict message classifies
+//      whether the records were never produced or produced-but-never-
+//      committed.
+//   B. The restore REFUSES: "checkpoint 5 named it as a participant but
+//      checkpoint-5.snap is absent" - and the kept artifacts show WHY:
+//      subtask 0's dir held checkpoint-5.snap.part.4, a partial temp file
+//      never renamed, next to a COMPLETED-5 marker. The subtask acked the
+//      checkpoint before its snapshot was durably renamed; the SIGKILL
+//      landed in that window. This is watch-item 51's one-off Linux CI
+//      signature, reproduced locally with the mechanism in hand.
+//
+// Re-enable when the ack-before-rename window is closed (the fix makes the
+// snapshot ack follow the rename) and mode A is classified.
+TEST_F(KafkaExactlyOnceTest, DISABLED_EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto code = sub->await_exit(120s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover from the worker kill";
+    // Vacuity guard, post hoc rather than via a mid-run topic drain (a
+    // read_committed drain chases a live topic's moving EOF, so its answer
+    // dates from whenever it caught the head, not from the kill): a kill
+    // that landed after completion restarts nothing.
+    ASSERT_GT(c.count_in_coordinator_log("restart"), 0)
+        << "the job finished before the kill; the recovery path never ran";
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean())
+        << "a worker kill broke Kafka exactly-once: " << clink::itest::describe(v)
+        << " (read_uncommitted sees "
+        << clink::kafka::consume_all(kafka_->brokers(), topic_, "read_uncommitted").size()
+        << " records - absent there too means never produced; present there means the "
+           "transaction never committed)";
+}
+
+// The moment that decides the claim for a broker transaction: the worker dies
+// IMMEDIATELY after commit_transaction returns, and the commit was held open
+// long enough beforehand that the source demonstrably produced further
+// records while the transaction was still uncommitted. Exactly-once then
+// requires that those post-barrier records were NOT part of the committed
+// transaction - because the checkpoint the job restores from sits at the
+// barrier, and everything after it is replayed and produced again.
+TEST_F(KafkaExactlyOnceTest, AWorkerKilledRightAfterTheBrokerCommitStaysExactlyOnce) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    // ONE worker, so the sink's placement - and therefore the armed fault's
+    // target - is deterministic. The worker dies by the fault; the test then
+    // respawns it WITHOUT the fault (the supervisor's move), and the redeploy
+    // restores from the checkpoint whose commit just ran.
+    ClusterSpec one;
+    one.node_binary = node_binary();
+    one.workers = 1;
+    one.slots_per_worker = 4;
+    Cluster c(one);
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    // Hold the first commit 800ms (sixteen ticks of records arrive while the
+    // transaction is prepared-but-uncommitted), then die the instant the
+    // broker commit returns. The fault registry seeds from the environment
+    // in every module, the job plugin included.
+    ASSERT_TRUE(c.start_worker(
+        0, {.fault = "sink.before_commit=delay:800@1,sink.after_external_commit=exit:1@1"}));
+    ASSERT_TRUE(c.await_workers_registered(1));
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    // The armed exit kills the worker right after the first broker commit.
+    ASSERT_TRUE(c.await_process_gone(0))
+        << "the kill-after-commit fault never fired; the scenario under test never happened";
+    ASSERT_TRUE(c.restart_worker(0));  // fresh process, no fault armed
+
+    const auto code = sub->await_exit(120s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover from a kill right after the broker commit";
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean())
+        << "a kill right after the broker commit broke Kafka exactly-once (records produced "
+           "after the barrier rode the committed transaction, then were replayed): "
+        << clink::itest::describe(v);
+}
+
+// The longer-horizon arm, mirroring the Postgres one: thirty times the
+// records, two separated worker losses, same exact verdict.
+// DISABLED with its sibling above: the same restart window dominates, plus
+// one observed run lost exactly one checkpoint interval (records 70..92)
+// through the fundamental Kafka limitation documented on the wrapper - a
+// checkpoint that COMPLETED whose broker commit had not executed when the
+// worker died cannot be recovered by a new producer (librdkafka has no
+// transaction resume), and the restore replays from past it. Re-enable with
+// the sibling; if the interval-loss mode then still occurs, it is that
+// documented window and needs the commit-confirmed restore protocol to
+// close.
+TEST_F(KafkaExactlyOnceTest, DISABLED_StaysExactlyOnceAcrossTwoSeparatedKillsOnALongerRun) {
+    constexpr int kTotal = 1200;
+    ::setenv("CLINK_2PC_TOTAL", "1200", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "5", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    auto sub = submit(c, /*max_restarts=*/3);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    // Settle on a CONDITION: checkpoints advance again, so the first restart
+    // completed, before the second loss arrives. Markers rather than a topic
+    // drain: a read_committed drain chases a live topic's moving EOF.
+    const auto before_second = latest_completed(c.checkpoint_dir());
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return latest_completed(c.checkpoint_dir()) > before_second; }, 60s))
+        << "no checkpoint progress after the first kill; the restart never drained";
+    ASSERT_TRUE(c.restart_worker(0));
+
+    c.worker(1).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(1));
+
+    const auto code = sub->await_exit(180s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not survive two separated worker losses";
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean()) << "two separated kills on a longer run broke Kafka exactly-once: "
+                           << clink::itest::describe(v);
+}
+
+#endif  // CLINK_HAS_KAFKA
 
 }  // namespace

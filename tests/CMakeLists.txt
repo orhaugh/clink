@@ -385,6 +385,14 @@ if(CLINK_INTEGRATION_TESTS)
         message(WARNING "CLINK_INTEGRATION_TESTS=ON but clink::postgres not built; "
                         "the integration tests will fail to build")
     endif()
+    if(TARGET clink::kafka)
+        # The Kafka arm: the job plugin under test, plus the read_committed
+        # drain helper (clink::kafka::consume_all_committed) the verifier uses.
+        target_link_libraries(clink_integration_tests PRIVATE clink::kafka)
+        target_compile_definitions(clink_integration_tests PRIVATE
+            CLINK_HAS_KAFKA
+            CLINK_KAFKA_2PC_JOB_PATH=\"$<TARGET_FILE:clink_kafka_2pc_job>\")
+    endif()
     target_compile_definitions(clink_integration_tests PRIVATE
         CLINK_NODE_BINARY=\"$<TARGET_FILE:clink_node>\"
         CLINK_SUBMIT_BINARY=\"$<TARGET_FILE:clink_submit_job>\"

@@ -80,6 +80,7 @@ add_library(clink_kafka STATIC
     src/kafka_sink.cpp
     src/pipeline_loader.cpp
     src/register_factories.cpp
+    src/consume_all.cpp
 )
 add_library(clink::kafka ALIAS clink_kafka)
 

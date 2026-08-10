@@ -114,6 +114,19 @@ if(TARGET clink::postgres)
     clink_set_warnings(clink_postgres_2pc_job)
 endif()
 
+# kafka_2pc_job: the Kafka arm of the same coverage - the shared bounded
+# source into a broker transaction committed at CommitCheckpoint. Carries
+# clink::kafka the same way.
+if(TARGET clink::kafka)
+    add_library(clink_kafka_2pc_job MODULE kafka_2pc_job.cpp)
+    target_link_libraries(clink_kafka_2pc_job PRIVATE clink::core clink::kafka)
+    set_target_properties(clink_kafka_2pc_job PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "kafka_2pc_job"
+    )
+    clink_set_warnings(clink_kafka_2pc_job)
+endif()
+
 # rescale_exactly_once_job: replayable source -> keyed self-checking counter
 # (rescale bounds declared) -> 2PC sink. Written to demonstrate exactly-once
 # across a rescale; it instead established that a running job cannot be

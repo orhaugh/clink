@@ -14,7 +14,9 @@
 // register their own KafkaMessage-typed sources/sinks via the same API.
 
 #include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -27,6 +29,7 @@
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/connectors/kafka_source.hpp"
 #include "clink/core/record.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/kafka/install.hpp"
 #include "clink/kafka/kafka_message_codec.hpp"
 #include "clink/kafka/kafka_security.hpp"
@@ -177,12 +180,49 @@ private:
     KafkaSink inner_;
 };
 
-// 2PC-aware Kafka sink. Holds a transactional KafkaSink
-// internally; treats on_data as plain forwarding (records produce
-// inside the open transaction), on_barrier as a flush + record of
-// the pending checkpoint id, on_commit as commitTransaction +
-// begin a fresh transaction, and close as abortTransaction +
-// inner.close().
+// 2PC-aware Kafka sink. Holds a transactional KafkaSink internally. The open
+// broker transaction always carries EXACTLY ONE checkpoint interval's
+// records, and - the load-bearing rule - a checkpoint can only be ACKED once
+// its interval's records are inside that transaction. Invariants, each
+// earned against the Kafka exactly-once integration suite:
+//
+// 1. SERIALISATION. on_commit/on_abort dispatch on the worker's reader
+//    thread while on_data/on_barrier/close run on the task thread, and
+//    librdkafka's transactional API is a single-caller state machine - a
+//    close()-time abort_transaction overlapping an in-flight
+//    commit_transaction failed an assertion inside rdkafka_txnmgr.c and
+//    SIGABRTed the whole worker on a CLEAN run's EOS. Every method takes
+//    mu_.
+//
+// 2. COMMIT-BOUNDARY INTEGRITY. Records arriving after a barrier must not
+//    ride that checkpoint's transaction: the checkpoint's source offset
+//    sits at the barrier, so a worker lost right after the broker commit
+//    replays them - as duplicates, had they been inside the committed
+//    transaction. While a commit is outstanding, on_data buffers into
+//    tail_; the commit produces the buffer into the fresh transaction it
+//    begins.
+//
+// 3. AT MOST ONE UNCOMMITTED CHECKPOINT. on_barrier while the previous
+//    commit is outstanding WAITS (bounded, loud on timeout). A non-blocking
+//    revision queued the interval app-side instead and let its checkpoint
+//    complete - which converted completed checkpoints into memory-only
+//    data: a kill lost every queued interval, because a restore may pick
+//    any completed checkpoint while a broker transaction cannot be resumed
+//    by a new producer. Blocking the barrier blocks the ack, which caps
+//    exposure at the single open transaction. The wait is deliberately
+//    SHORT: a commit round-trip is milliseconds, so fifteen seconds means
+//    the control plane is already broken, and failing the subtask loudly
+//    both surfaces that and frees a cancelled incarnation within the bound
+//    (an earlier 60s wait stalled every post-restart checkpoint behind a
+//    cancelled predecessor).
+//
+// The residual window neither this design nor the client can close: a
+// checkpoint that COMPLETED whose broker commit had not yet executed when
+// the worker died. The transaction dies with the producer (fencing or
+// expiry aborts it), a new producer cannot resume it (librdkafka has no
+// transaction-resume), and the restore replays from the completed
+// checkpoint - past the lost records. See the connector doc's exactly-once
+// caveat.
 class TwoPhaseCommitStringKafkaSink final : public Sink<std::string> {
 public:
     explicit TwoPhaseCommitStringKafkaSink(KafkaSink::Options opts) : inner_(std::move(opts)) {}
@@ -190,6 +230,95 @@ public:
     void open() override { inner_.open(); }
 
     void on_data(const Batch<std::string>& b) override {
+        std::lock_guard lk(mu_);
+        if (open_txn_ckpt_.has_value()) {
+            // A commit is outstanding: these records belong to the next
+            // interval and must not enter the prepared transaction.
+            for (const auto& r : b) {
+                tail_.push_back(r.value());
+            }
+            return;
+        }
+        forward_(b);
+    }
+
+    void on_watermark(Watermark wm) override {
+        std::lock_guard lk(mu_);
+        inner_.on_watermark(wm);
+    }
+
+    void on_barrier(CheckpointBarrier b) override {
+        std::unique_lock lk(mu_);
+        if (!pending_cv_.wait_for(
+                lk, std::chrono::seconds{15}, [&] { return !open_txn_ckpt_.has_value(); })) {
+            throw std::runtime_error(
+                "kafka_2pc_sink_string: the previous checkpoint's commit did not arrive "
+                "within the bound; failing rather than acking a checkpoint whose records "
+                "are not yet inside a broker transaction");
+        }
+        // The live interval's records (tail_ drained by the last commit, or
+        // forwarded directly) are in the open transaction; flush and mark it
+        // as awaiting this checkpoint's commit.
+        inner_.flush();
+        inner_.on_barrier(b);
+        open_txn_ckpt_ = b.id().value();
+    }
+
+    void on_commit(std::uint64_t checkpoint_id) override {
+        // The same fault windows CommittingSink's finalise path exposes, so
+        // the exactly-once suites can hold a broker commit open and kill a
+        // worker immediately after one - the two moments where a 2PC sink's
+        // claim actually gets decided.
+        CLINK_FAULT_POINT(clink::fault::points::kSinkBeforeCommit);
+        std::lock_guard lk(mu_);
+        if (!open_txn_ckpt_.has_value() || *open_txn_ckpt_ != checkpoint_id) {
+            return;
+        }
+        inner_.commit_transaction();  // commits, then begins the next txn
+        CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
+        resolve_open_();
+    }
+
+    // Abort the prepared transaction. Mirrors on_commit but calls
+    // abort_transaction so the broker discards the PREPARED records.
+    // Idempotent against same checkpoint id.
+    void on_abort(std::uint64_t checkpoint_id) override {
+        std::lock_guard lk(mu_);
+        if (!open_txn_ckpt_.has_value() || *open_txn_ckpt_ != checkpoint_id) {
+            return;
+        }
+        inner_.abort_transaction();  // aborts, then begins the next txn
+        // The buffered records were emitted after the aborted checkpoint's
+        // barrier. If the job restarts, this sink is torn down and the
+        // transaction they enter here dies with close()'s abort; if the job
+        // continues, the next checkpoint covers them and its commit
+        // publishes them. Either way releasing them is the correct move -
+        // dropping them would lose data in the continue case.
+        resolve_open_();
+    }
+
+    void flush() override {
+        std::lock_guard lk(mu_);
+        inner_.flush();
+    }
+
+    void close() override {
+        std::lock_guard lk(mu_);
+        // If a transaction is still open at shutdown - meaning the last
+        // barrier wasn't followed by an on_commit - abort it so the broker
+        // doesn't leave records lingering in PREPARED. Buffered records die
+        // with it; the checkpoint they follow was never committed, so the
+        // restore replays them.
+        tail_.clear();
+        inner_.abort_transaction();
+        inner_.close();
+        pending_cv_.notify_all();
+    }
+
+    std::string name() const override { return "kafka_2pc_sink_string"; }
+
+private:
+    void forward_(const Batch<std::string>& b) {
         Batch<KafkaMessage> out_b;
         for (const auto& r : b) {
             out_b.emplace(KafkaMessage{r.value()});
@@ -199,46 +328,26 @@ public:
         }
     }
 
-    void on_watermark(Watermark wm) override { inner_.on_watermark(wm); }
-    void on_barrier(CheckpointBarrier b) override {
-        // Pre-commit: flush in-flight records into the transaction.
-        // The actual broker-side commit happens when the coordinator marks
-        // the checkpoint globally durable via on_commit().
-        inner_.flush();
-        pending_checkpoint_ = b.id().value();
-        inner_.on_barrier(b);
-    }
-    void on_commit(std::uint64_t checkpoint_id) override {
-        if (!pending_checkpoint_.has_value() || *pending_checkpoint_ != checkpoint_id) {
-            return;
+    // After a commit or abort resolved the open interval: the buffered tail
+    // enters the fresh transaction and normal streaming resumes.
+    void resolve_open_() {
+        open_txn_ckpt_.reset();
+        if (!tail_.empty()) {
+            Batch<KafkaMessage> out_b;
+            for (auto& v : tail_) {
+                out_b.emplace(KafkaMessage{std::move(v)});
+            }
+            tail_.clear();
+            inner_.on_data(out_b);
         }
-        inner_.commit_transaction();
-        pending_checkpoint_.reset();
-    }
-    // Abort the prepared transaction. Mirrors on_commit
-    // but calls abort_transaction so the broker discards the
-    // PREPARED records. Idempotent against same checkpoint id.
-    void on_abort(std::uint64_t checkpoint_id) override {
-        if (!pending_checkpoint_.has_value() || *pending_checkpoint_ != checkpoint_id) {
-            return;
-        }
-        inner_.abort_transaction();
-        pending_checkpoint_.reset();
-    }
-    void flush() override { inner_.flush(); }
-    void close() override {
-        // If a transaction is still open at shutdown - meaning the
-        // last barrier wasn't followed by an on_commit - abort it so
-        // the broker doesn't leave records lingering in PREPARED.
-        inner_.abort_transaction();
-        inner_.close();
+        pending_cv_.notify_all();
     }
 
-    std::string name() const override { return "kafka_2pc_sink_string"; }
-
-private:
     KafkaSink inner_;
-    std::optional<std::uint64_t> pending_checkpoint_;
+    std::mutex mu_;
+    std::condition_variable pending_cv_;
+    std::optional<std::uint64_t> open_txn_ckpt_;
+    std::vector<std::string> tail_;
 };
 
 // Upsert-shaped Kafka sink. Takes JSON rows (each row is

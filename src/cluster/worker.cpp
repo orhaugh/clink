@@ -737,10 +737,21 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
     for (auto& fn : to_invoke) {
         try {
             fn(msg.checkpoint_id);
+        } catch (const std::exception& e) {
+            // Best-effort: a single sink failing to commit must not stall
+            // the reader; a recoverable sink's persisted handle is retried
+            // at the next restore. But NEVER silently: a swallowed commit
+            // failure reads as completed-with-missing-output downstream,
+            // and this log line is the only witness.
+            clink::log::error("worker.commit",
+                              "commit callback for checkpoint " +
+                                  std::to_string(msg.checkpoint_id) +
+                                  " failed: " + std::string(e.what()));
         } catch (...) {
-            // Best-effort: a single sink failing to commit must not
-            // stall the reader. The state-backend handle remains; the
-            // next restart's recovery path will retry.
+            clink::log::error("worker.commit",
+                              "commit callback for checkpoint " +
+                                  std::to_string(msg.checkpoint_id) +
+                                  " failed with a non-exception throw");
         }
     }
     // Record the committed high-water mark + wake any source blocked in
