@@ -474,7 +474,8 @@ void PluginRegistry::register_source(
                 ops,
                 chain.output_routing,
                 chain.output_selector_fn,
-                rctx.register_group_cutover);
+                rctx.register_group_cutover,
+                rctx.key_extractors);
             clink::cluster::attach_side_output_groups(
                 dag, h0.runner_index, rctx.output_groups, rctx.side_output_attachers);
             // This subtask hosts one logical operator (the source); attribute
@@ -797,7 +798,8 @@ void PluginRegistry::register_operator(
                 ops,
                 chain.output_routing,
                 chain.output_selector_fn,
-                rctx.register_group_cutover);
+                rctx.register_group_cutover,
+                rctx.key_extractors);
             clink::cluster::attach_side_output_groups(
                 dag, h1.runner_index, rctx.output_groups, rctx.side_output_attachers);
             // This subtask hosts one logical operator; attribute its input
@@ -992,7 +994,8 @@ void PluginRegistry::register_co_operator(
             ops_for_out,
             chain.output_routing,
             chain.output_selector_fn,
-            rctx.register_group_cutover);
+            rctx.register_group_cutover,
+            rctx.key_extractors);
         clink::cluster::attach_side_output_groups(
             dag, h_out.runner_index, rctx.output_groups, rctx.side_output_attachers);
         // This subtask hosts one logical (co-)operator; attribute both input

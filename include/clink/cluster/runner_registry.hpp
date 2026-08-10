@@ -253,6 +253,17 @@ struct RunnerContext {
     using CutoverArmFn = std::function<void(std::uint64_t /*cutover_checkpoint_id*/)>;
     std::function<void(std::vector<CutoverArmFn>)> register_cutover_arm_callbacks;
 
+    // The job's key-extractor registry (the bundle's, parent-falling-back
+    // to the host default). Threaded by data for the same reason as
+    // side_output_attachers and the state factory (F39): inside a dlopen'd
+    // .so, KeyExtractorRegistry::default_instance() is a PRIVATE
+    // per-image static, and which image's copy of a header template
+    // actually executes is a linkage accident - the hot-rescale attach
+    // path demonstrated a job registering its extractor in the bundle and
+    // the .so's instance while the lookup ran against the host's. Null
+    // (in-process paths) falls back to default_instance().
+    const KeyExtractorRegistry* key_extractors{nullptr};
+
     // Rescale-eligible output group registration (hot rescale, design
     // record 008). The output-attach path calls this once per group built
     // with a GroupCutoverGate; the worker indexes the hooks by
@@ -285,6 +296,13 @@ struct RunnerContext {
     struct InputRebindHooks {
         std::string upstream_op_id;
         std::function<BoundNewInput(std::uint32_t /*new upstream global idx*/)> bind_new_input;
+        // Invoked by the ARM dispatch (before the cutover checkpoint): the
+        // old inputs will end and close before the new subtasks exist to
+        // splice, and without the hold the union would read its fully-
+        // closed membership as end-of-input and exit, taking the still-
+        // running task with it. The union clears the hold itself once a
+        // spliced channel is admitted.
+        std::function<void()> hold_open;
     };
     std::function<void(InputRebindHooks)> register_input_rebind;
 

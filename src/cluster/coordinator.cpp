@@ -2245,6 +2245,9 @@ bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
 
 void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
                                                 std::vector<PendingDeploy>& out_frames) {
+    // Every arm ack has landed; the cutover checkpoint has not been
+    // triggered yet. A Delay here holds the pre-C window open.
+    CLINK_FAULT_POINT(clink::fault::points::kHotCutoverBeforeTrigger);
     auto& hot = *job.hot_cutover;
     const auto ckpt_id = hot.cutover_checkpoint;
     std::unordered_set<std::string> pending;
@@ -2290,6 +2293,10 @@ void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
 
 void Coordinator::hot_cutover_begin_rebind_locked_(JobState& job,
                                                    std::vector<PendingDeploy>& out_frames) {
+    // Every old subtask has drained at the cutover checkpoint; the rebind
+    // has not gone out. Between here and the deploy the operator has no
+    // running subtasks - the window a hold-open or a worker kill aims at.
+    CLINK_FAULT_POINT(clink::fault::points::kHotCutoverCuttingOver);
     auto& hot = *job.hot_cutover;
     // Tear down the drained old subtasks' bookkeeping. Their
     // SubtaskFinished arrivals were counted as drained acks, not as
@@ -2474,6 +2481,10 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
 
 void Coordinator::hot_cutover_complete_locked_(JobState& job,
                                                std::vector<PendingDeploy>& out_frames) {
+    // Every new subtask is ready; the peer updates that point the new tasks
+    // at their downstreams and release the held feeder splits have not been
+    // sent. The upstream edge is still held here.
+    CLINK_FAULT_POINT(clink::fault::points::kHotCutoverBeforeComplete);
     auto& hot = *job.hot_cutover;
 
     // Targeted PeerUpdate for the new tasks: peer_updates_sent fired long

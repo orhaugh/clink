@@ -19,6 +19,7 @@
 // wait momentary - the checkpoint clock pauses between the cutover
 // checkpoint and Complete - but correctness never depends on that.
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -61,9 +62,22 @@ public:
         return pending_.empty();
     }
 
+    // Hold the union open across the cutover gap. The old inputs end
+    // (barrier C, then close) BEFORE the new subtasks exist to splice, and
+    // a union whose entire membership has closed normally exits - taking
+    // the still-running downstream task with it. The arm (which precedes
+    // C) sets the hold; the union clears it once it has admitted a spliced
+    // channel, at which point the membership is live again. A cancel
+    // overrides the hold - the runner's stop predicate is checked first.
+    void set_hold_open(bool hold) noexcept { hold_open_.store(hold, std::memory_order_release); }
+    [[nodiscard]] bool holding_open() const noexcept {
+        return hold_open_.load(std::memory_order_acquire);
+    }
+
 private:
     mutable std::mutex mu_;
     std::vector<std::shared_ptr<Channel>> pending_;
+    std::atomic<bool> hold_open_{false};
 };
 
 }  // namespace clink

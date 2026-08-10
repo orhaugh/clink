@@ -14,7 +14,10 @@ A clink job survives infrastructure failure and reconfiguration by redeploying i
 | Restart policy resolution | `include/clink/cluster/protocol.hpp` (`CheckpointConfig`, `effective_max_restarts`, `kRestartAuto`, `kDefaultSelfHealRestarts`) |
 | Key groups (rescale partitioning) | `include/clink/runtime/key_groups.hpp` |
 | Operator-level rescale state machine | `include/clink/cluster/rescale_coordinator.hpp`, `src/cluster/rescale_coordinator.cpp` |
-| Cutover deployment planning | `include/clink/cluster/rescale_dispatch.hpp`, `src/cluster/rescale_dispatch.cpp` |
+| Identity translation + index blocks + parent mapping | `include/clink/cluster/rescale_dispatch.hpp`, `src/cluster/rescale_dispatch.cpp` |
+| Hot cutover: planner | `plan_hot_cutover` in `include/clink/cluster/job_planner.hpp`, `src/cluster/job_planner.cpp` |
+| Hot cutover: choreography | `src/cluster/coordinator.cpp` (`try_begin_hot_cutover_locked_` and the `hot_cutover_*_locked_` family) |
+| Hot cutover: data-plane seams | `include/clink/runtime/cutover_gate.hpp`, `include/clink/runtime/union_rebind.hpp`, `SwappableBridgeSink` in `include/clink/runtime/network/network_bridge.hpp` |
 | Whole-job rescale | `src/cluster/coordinator.cpp` (`rescale_job`, `restart_job_locked_` rescale branch) |
 | Schema version trait + maps + migration registry | `include/clink/state/schema_version.hpp`, `src/state/schema_version.cpp` |
 | Restore-time migration + compatibility check | `include/clink/state/state_migration_on_restore.hpp`, `src/state/state_migration_on_restore.cpp`, `src/runtime/local_executor.cpp` |
@@ -93,7 +96,26 @@ Whole-job rescale refuses the shared role on a multi-operator job, and that refu
 
 **Per-operator rescale** changes one operator's parallelism on a running job. `clink rescale-op --job-id=N --op=<operator id> --parallelism=P`, or the equivalent HTTP surface, or the autoscaler.
 
-The mechanism is a **replan**, not an in-place cutover:
+There are two mechanisms behind one request. An **eligible operator cuts over in place at a checkpoint barrier - the hot cutover - and the rest of the job never stops**; anything ineligible, and any hot attempt that fails at any stage, falls back to the **replan**, which stops the whole job and restarts it from its last completed checkpoint. Hot when possible, correct always. The decision and every phase of the cutover are visible in the coordinator log (`hot cutover armed / checkpoint triggered / rebind dispatched / deploy / complete`, or `hot cutover not taken (<reason>)` followed by the replan lines).
+
+#### The hot cutover (design record [008](../design/008-hot-rescale.md))
+
+Eligibility, decided before anything is disturbed: hot rescale enabled in the coordinator config, every edge into **and** out of the operator fan-shaped (keyed, or parallelism-mismatched) both before and after the change - a forward 1:1 premise does not survive a parallelism change - and a full `plan_hot_cutover` that validates the translation of every edge and restore directive against the deployed layout. One barrier is the boundary throughout:
+
+1. **Arm.** The cutover checkpoint id C is reserved (the periodic trigger sweep is already gated off the job under the same lock hold, so no other id can intervene), and `BeginRescale{op, target, C}` goes to every worker hosting the operator or its neighbours - *before* C is triggered, because stopping at a barrier that has already passed would stop nothing. Arming reaches three kinds of task: the operator's own subtasks (their input relays - or the source itself, for a source operator - will end their streams after forwarding barrier C), the tasks *feeding* it (their output groups' `GroupCutoverGate`s arm: the group's split will broadcast C and then hold), and the tasks it *feeds* (their union input stages hold open across the coming membership gap). Each worker replies with `BeginRescaleAck` naming what it actually armed; a shortfall - a task built through a path that does not register the cutover hooks, such as a join side - aborts to the replan before C is triggered.
+2. **Cut.** C is triggered exactly like a savepoint. The operator's old subtasks process through barrier C, snapshot, ack, forward it, and end: nothing after C ever leaves them. The feeding groups broadcast C to their branches and hold - records keep arriving from upstream and queue behind the held split, which is ordinary backpressure. Every other subtask acks C as normal and keeps running.
+3. **Drain -> rebind -> deploy.** The old subtasks' exits are counted as drained acks (translated from the shared role to the operator through the deploy-time identity records). The fed tasks then bind one new inbound listener per post-cutover subtask (`CutoverRebind`) and report the ports via mid-run `SubtaskListening`s - the same shape as the at-deploy report, so peer resolution is unchanged. The validated plan deploys the new subtasks: job-global indices *appended* past the deployed allocation (append-only - no other task's index, key-group range or state directory changes, and nothing else redeploys), restoring from C in the same state generation, each mapped onto its parents' deployed directories by the same `rescale_parent_mapping` arithmetic the replan uses.
+4. **Complete.** The new subtasks get a targeted `PeerUpdate` (the one-shot at-deploy path never re-fires), the feeders get per-task `CutoverPeerUpdate` endpoint lists that swap their branch endpoints and release the held splits with the new live divisor (plus a re-broadcast of the group's current watermark, so downstream event time does not stall), the retained graph is rewritten to the new parallelism (it is what every future replan and HA recovery plans from), and the operator's old block is retained in `stale_layout_blocks` through C so a whole-job failure inside [Complete, first post-cutover checkpoint] still translates its restore. The checkpoint clock resumes: C is the last checkpoint of the old layout, its successor the first of the new, and no checkpoint ever mixes the two.
+
+The cost is a stall on the rescaled operator's edges - bounded by drain plus deploy plus state restore - while sources do not rewind, unaffected operators do not restart, and sink transaction cycles do not reset. Those non-stopping properties are asserted, not assumed: the `HotRescaleTest` family (`tests/integration/test_rescale_exactly_once.cpp`) gates on the coordinator's own `hot cutover complete` line, the *absence* of `replanned`, the absence of the test source's restore diagnostic on every worker, exactly-once output equality, per-key order, and - unlike the replan tests, which can only report it - the checkpoint participant-set invariant, gated because rule 5 leaves no unexplained window. The same family holds each phase window open with a coordinator-side fault point (`rescale.hot_before_trigger`, `rescale.hot_cutting_over`, `rescale.hot_before_complete`) and kills a worker mid-cutover to prove the abort lands on the replan and stays exactly-once.
+
+Aborts at every stage - an ack shortfall, a phase deadline (watchdog-swept, because the failure mode is precisely that no more messages arrive), an unplaceable deploy, a missing rebind port, a worker loss - stage the replan at the *requested* parallelism, so the rescale still lands, just not seamlessly.
+
+The data-plane machinery under this lives in three seams, each unit-tested with latches and mutation checks: the feeding side's gated split with `SwappableBridgeSink` branches sized to the downstream's declared `max_parallelism` (`include/clink/runtime/cutover_gate.hpp` and the eligible branch of `attach_typed_group_output`); the operator's own armed stop (`JobConfig::drain_at_checkpoint` in the source runners, `NetworkBridgeSource`'s armed relay stop for mid-dag chains, and a runner-owned commit gate that keeps an armed 2PC sink alive until its cutover commit ran); and the fed side's union rebind (`include/clink/runtime/union_rebind.hpp`, `MultiInputAlignment::add_input`, and the hold-open that bridges the gap between the old inputs closing and the new subtasks existing to splice).
+
+#### The replan (the fallback, and the path ineligible requests take)
+
+The replan stops the job and re-derives it:
 
 1. Validate the request against the job's retained graph - the operator exists, it declares `[min_parallelism, max_parallelism]` bounds and the target is inside them, the target is an integer multiple or divisor of what the operator currently runs, a checkpoint has completed, and the cluster has slots for any growth. Everything answerable from the request and the graph is answered before anything is disturbed, because the next step stops the job.
 2. Drain the job. `CancelJob` goes to every worker hosting a task; the existing `awaiting_restart` machinery collects the acks.
@@ -102,7 +124,7 @@ The mechanism is a **replan**, not an in-place cutover:
 
 Why replan rather than resize the deployed task set: a task's operator identity lives inside its packed `OperatorChainSpec`, and cloning a `DeploymentTask` does not rewrite it. That is what the role-based path does, and on a multi-operator job it produced clones of one chain with edges naming subtasks that were no longer deployed (F41). A replanned task set cannot contain that by construction, and `JobPlannerReplan.EveryPeerReferenceNamesATaskThatExists` asserts it without needing a cluster.
 
-**This is a stop, not a seamless cutover.** The job stops and starts again from its last completed checkpoint. Exactly-once across it therefore rests on the same two things exactly-once across a failover rests on - a source that replays from a checkpointed offset, and a sink that only publishes at a completed checkpoint - and not on the rescale being transparent. In-flight records between the checkpoint and the drain are reprocessed.
+**The replan is a stop.** The job stops and starts again from its last completed checkpoint. Exactly-once across it therefore rests on the same two things exactly-once across a failover rests on - a source that replays from a checkpointed offset, and a sink that only publishes at a completed checkpoint - and not on the rescale being transparent. In-flight records between the checkpoint and the drain are reprocessed. This is exactly the cost the hot cutover exists to avoid, and exactly why it remains the fallback: its correctness argument needs nothing from the cutover machinery.
 
 **Restore addressing, and why every task gets a directive.** A snapshot lives at `<checkpoint_dir>/<subtask_idx>/`, addressed by the job-global index, and the planner allocates global indices as one contiguous block per operator in graph order. Change one operator's parallelism and every *later* operator's block moves. So a replan cannot leave the untouched operators on the default "restore from my own index" - that directory now belongs to a different operator. The coordinator therefore records, per deployed task, which operator hosts it and which of that operator's subtasks it is (`JobState::task_op_identity`), and for every task in the new plan it:
 
@@ -112,17 +134,20 @@ Why replan rather than resize the deployed task set: a task's operator identity 
 
 Using the job-global index for that mapping instead of the index within the operator is the same class of error as F38, so the helper's parameter is named `subtask_idx_in_op` and refuses an index outside the new parallelism rather than silently returning parent 0.
 
-**The `RescaleCoordinator` state machine** (`include/clink/cluster/rescale_coordinator.hpp`) is the status record, not the mechanism. It validates bounds, marks the operator `Preparing` when a request is accepted, and `mark_replan_complete` closes it when the redeploy fires - the replan has no `Draining -> CuttingOver` sequence to walk, because the old subtasks and the new ones never coexist. `operator_rescale_status` and the HTTP surface read it, and the autoscaler's cooldown depends on it not sitting at `Preparing` for a rescale that has finished.
+**The `RescaleCoordinator` state machine** (`include/clink/cluster/rescale_coordinator.hpp`) is the status record, not the mechanism, and both paths walk it. The hot cutover drives the full sequence: `Preparing` on accept, `Draining` when the cutover checkpoint completes, `CuttingOver` when the last old subtask's drained ack lands (translated from the shared role to the operator through the identity records), `Complete` when every new subtask reports listening. The replan short-cuts it: `Preparing` on accept, `mark_replan_complete` when the redeploy fires, because its old and new subtasks never coexist. `operator_rescale_status` and the HTTP surface read it, and the autoscaler's cooldown depends on it not sitting at `Preparing` for a rescale that has finished.
 
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
   Idle --> Preparing: request accepted (bounds validated, target marked)
-  Preparing --> Complete: mark_replan_complete (redeploy fired at the new parallelism)
+  Preparing --> Draining: hot - cutover checkpoint C completed
+  Draining --> CuttingOver: hot - every old subtask drained at C
+  CuttingOver --> Complete: hot - every new subtask listening
+  Preparing --> Complete: replan - redeploy fired at the new parallelism
   Preparing --> Aborted: abort (revert parallelism)
+  Draining --> Aborted: abort (falls back to the replan)
+  CuttingOver --> Aborted: abort (falls back to the replan)
 ```
-
-The graceful in-place cutover the state machine originally modelled - `Preparing -> Draining -> CuttingOver -> Complete`, driven by `BeginRescale`, `plan_operator_cutover` and per-subtask drain acks - is still present and unit tested, but is not what a `rescale-op` request drives. It cannot be: every one of its steps addresses an operator's subtasks by matching `DeploymentTask::role` against the operator id, and the planner gives every task the one shared role, so the match never succeeds. Reaching it needs chain-aware addressing on the deploy directive plus fan-out rewiring on the upstream edge, since `plan_operator_cutover` clones the template's peers verbatim. Doing that would remove the stop; it would not change the correctness argument above.
 
 #### Sources as operator state
 

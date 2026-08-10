@@ -1,7 +1,11 @@
 # 008: Rescale one operator at a barrier, without stopping the job
 
-**Status:** accepted 2026-08-09; implementation in progress. The stop-the-world
-replan remains the fallback for every abort path.
+**Status:** accepted 2026-08-09; shipped 2026-08-10. An eligible
+`rescale-op` request now cuts over in place, gated end to end by the
+`HotRescaleTest` family (exactly-once, the non-stopping properties
+themselves, held phase windows, worker-loss fallback). The stop-the-world
+replan remains the fallback for every ineligible request and every abort
+path.
 
 ## Context
 
@@ -101,6 +105,27 @@ at the requested parallelism. Hot when possible, correct always.
   replans contiguously, per [007](007-state-generations.md)) translates
   restore addressing through the map recorded with the checkpoint it
   restores from.
+
+## Deviations at implementation
+
+Recorded rather than rewritten, because two of the specifics above turned
+out to be unnecessary once the code was read closely:
+
+- **No explicit index map was added** (rule 6's second half). The existing
+  restore translation already derives each operator's block from the
+  deploy-time identity records - base = global index minus index within the
+  operator, per-op contiguity only - and append-only allocation preserves
+  per-op contiguity by construction. The derivation was extracted and
+  pinned against an appended layout (`derive_op_index_blocks`) instead of
+  duplicated into new bookkeeping.
+- **No new fields on the deploy directive.** The operator identity was
+  already on the wire inside every task's packed chain spec; the fix was to
+  make the worker and the coordinator consume it, not to ship it twice.
+- One rule earned an addition: rule 4's downstream needs a **hold-open**
+  across the gap between the old inputs closing and the new subtasks
+  existing to splice - a fully-closed union membership otherwise reads as
+  end-of-input and takes the still-running task with it. The arm sets the
+  hold; admitting a spliced channel clears it.
 
 See [Fault tolerance and rescale](../internals/fault-tolerance-and-rescale.md)
 for the shipped mechanism as it lands.

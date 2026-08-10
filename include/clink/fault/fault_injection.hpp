@@ -311,6 +311,18 @@ inline constexpr char kRescaleAfterDrain[] = "rescale.after_drain";
 inline constexpr char kRescaleAfterReplan[] = "rescale.after_replan";
 inline constexpr char kRescaleBeforeFirstCheckpoint[] = "rescale.before_first_checkpoint";
 
+// The HOT cutover's own windows (design record 008), one per phase boundary
+// the choreography crosses while the job keeps running: after every arm ack
+// lands and before the cutover checkpoint is triggered; after the old
+// subtasks drained and before the rebind goes out; and after every new
+// subtask is ready, before the peer updates that release the held splits.
+// Same purpose as the trio above: a Delay here holds the window open so the
+// exactly-once and checkpoint-set assertions run against the window on
+// purpose, and a kill here is a deterministic worker-loss-mid-cutover.
+inline constexpr char kHotCutoverBeforeTrigger[] = "rescale.hot_before_trigger";
+inline constexpr char kHotCutoverCuttingOver[] = "rescale.hot_cutting_over";
+inline constexpr char kHotCutoverBeforeComplete[] = "rescale.hot_before_complete";
+
 // Every name here MUST have a CLINK_FAULT_POINT somewhere in include/ or src/.
 // `scripts/check-fault-points.sh` enforces that, and it is not a style rule.
 //

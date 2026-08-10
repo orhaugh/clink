@@ -945,3 +945,231 @@ TEST_F(RescaleExactlyOnceTest,
     ASSERT_TRUE(c.await_workers_registered(2));
     rescale_with_window_held(c, "rescale.before_first_checkpoint");
 }
+
+// ===== The HOT cutover (design record 008, follow-up item 27) ================
+//
+// Everything above stops the job: drain, replan, redeploy. These run the
+// IN-PLACE cutover - only the rescaled operator's subtasks cycle - and gate
+// the three claims that make "non-stopping" mean something:
+//
+//   1. HOT, not replan: the coordinator's own "hot cutover complete" line,
+//      and never "replanned".
+//   2. Non-stopping: the source's restore diagnostic never prints on any
+//      worker - the source subtask was never restarted, so it never rewound.
+//      (A replan restarts it and the diag prints; that is asserted in the
+//      fallback test below, which keeps THIS assertion honest.)
+//   3. Exactly-once: the committed multiset equals the input, per-key order
+//      holds, and - unlike the replan tests, which can only report it - the
+//      checkpoint participant-set invariant is GATED here, because rule 5
+//      pauses the checkpoint clock across the window and a violation cannot
+//      be unexplained timing.
+//
+// The graph's edges decide eligibility: counter(par 2)->sink(par 1) is fan
+// in both directions, so 2->4 and 4->2 cut over hot; the 1->4 and 4->1
+// tests above keep exercising the replan because their sink edge is forward
+// at parallelism 1. That split is deliberate - both paths stay covered.
+
+namespace {
+
+// The source's restore diagnostic. Printed on ANY restart of the source
+// subtask (replay from a checkpoint); a hot cutover must never produce it.
+constexpr const char* kSourceRestoredDiag = "RXO-DIAG source restored offset=";
+
+}  // namespace
+
+class HotRescaleTest : public RescaleExactlyOnceTest {
+protected:
+    // Submit, wait for meaningful committed output, rescale `counter` to
+    // `target`, and assert the full hot-cutover contract.
+    void run_hot_and_assert(Cluster& c, int target, const std::string& label) {
+        auto sub = submit(c);
+        ASSERT_NE(sub, nullptr);
+
+        ASSERT_TRUE(clink::itest::await(
+            [&] {
+                return verify_exactly_once(out_dir_, kTotalRecords).total_lines >=
+                       kMinCommittedBefore;
+            },
+            std::chrono::seconds(90)))
+            << label
+            << ": too little committed output before the rescale for a bad cutover to show up";
+
+        std::string rescale_out;
+        const int rc = rescale_operator(c, "counter", target, &rescale_out);
+        ASSERT_EQ(rc, 0) << label << ": the rescale request was refused: " << rescale_out;
+
+        // The hot path, by the coordinator's own account.
+        ASSERT_TRUE(
+            clink::itest::await([&] { return c.coordinator().log_contains("hot cutover armed"); },
+                                std::chrono::seconds(30)))
+            << label << ": the request was accepted but the hot path never armed";
+        ASSERT_TRUE(clink::itest::await(
+            [&] { return c.coordinator().log_contains("hot cutover complete"); },
+            std::chrono::seconds(120)))
+            << label
+            << ": the cutover never completed (armed but stuck in a phase, or aborted - "
+               "check for 'hot cutover ABORTED' in the coordinator log)";
+        EXPECT_FALSE(c.coordinator().log_contains("hot cutover ABORTED"))
+            << label << ": the cutover aborted somewhere before completing";
+
+        const auto exit_code = sub->await_exit(std::chrono::seconds(180));
+        ASSERT_TRUE(exit_code.has_value()) << label << ": submitter never exited";
+        EXPECT_EQ(*exit_code, 0) << label << ": the job did not run to completion";
+
+        // Non-stopping, claim by claim. The job was never replanned...
+        EXPECT_FALSE(c.coordinator().log_contains("replanned"))
+            << label << ": the job was stopped and replanned - that is not a hot cutover";
+        // ...and the source subtask never restarted: a restart replays from
+        // the checkpointed offset and prints the restore diagnostic.
+        EXPECT_FALSE(c.worker(0).log_contains(kSourceRestoredDiag))
+            << label << ": the source restored an offset on worker 0 - it was restarted";
+        EXPECT_FALSE(c.worker(1).log_contains(kSourceRestoredDiag))
+            << label << ": the source restored an offset on worker 1 - it was restarted";
+
+        const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+        EXPECT_TRUE(v.duplicated.empty())
+            << label << ": records committed MORE than once across the cutover. " << describe(v);
+        EXPECT_TRUE(v.unexpected.empty())
+            << label
+            << ": unexpected output (STATE-MISMATCH = keyed state lost or duplicated when the "
+               "operator's key groups moved). "
+            << describe(v);
+        EXPECT_TRUE(v.missing.empty())
+            << label << ": records LOST across the cutover. " << describe(v);
+
+        const auto order = per_key_order_violations(out_dir_, kKeys);
+        EXPECT_GT(order.records_checked, 0u) << label;
+        EXPECT_TRUE(order.violations.empty())
+            << label << ": a key's records were committed out of order across the cutover: "
+            << describe_order(order);
+
+        // GATED here, unlike the replan tests: the checkpoint clock pauses
+        // across the cutover window (rule 5), so a snapshot outside its
+        // checkpoint's participant set cannot be unexplained timing.
+        const auto violations = clink::itest::checkpoint_set_violations(c.checkpoint_dir());
+        EXPECT_TRUE(violations.empty())
+            << label << ": " << violations.size()
+            << " checkpoint(s) hold a snapshot from outside their participant set; first: "
+            << violations.front();
+    }
+};
+
+TEST_F(HotRescaleTest, HotCutoverScalesUpWithoutStoppingTheJob) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);  // 2 -> 4: fan edges both sides, hot-eligible
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    run_hot_and_assert(c, kMaxParallelism, "hot scale-up 2->4");
+}
+
+TEST_F(HotRescaleTest, HotCutoverScalesDownWithoutStoppingTheJob) {
+    // The harder direction for state: each new subtask merges TWO parents'
+    // key-group slices, restored from the cutover checkpoint.
+    ::setenv("CLINK_RXO_PAR", "4", 1);
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    run_hot_and_assert(c, 2, "hot scale-down 4->2");
+}
+
+// The three windows the choreography crosses while the job keeps running,
+// each held open by a coordinator-side Delay at its fault point - the same
+// promotion the replan trio above made: with the window DELIBERATE, every
+// assertion runs against it on purpose.
+
+TEST_F(HotRescaleTest, HoldingTheHotPreTriggerWindowOpenStaysExactlyOnce) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator(
+        clink::itest::ProcOptions{.fault = "rescale.hot_before_trigger=delay:1200@1"}));
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    run_hot_and_assert(c, kMaxParallelism, "hot pre-trigger window held");
+}
+
+TEST_F(HotRescaleTest, HoldingTheHotCuttingOverWindowOpenStaysExactlyOnce) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator(
+        clink::itest::ProcOptions{.fault = "rescale.hot_cutting_over=delay:1200@1"}));
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    run_hot_and_assert(c, kMaxParallelism, "hot cutting-over window held");
+}
+
+TEST_F(HotRescaleTest, HoldingTheHotPreCompleteWindowOpenStaysExactlyOnce) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator(
+        clink::itest::ProcOptions{.fault = "rescale.hot_before_complete=delay:1200@1"}));
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    run_hot_and_assert(c, kMaxParallelism, "hot pre-complete window held");
+}
+
+// A worker lost mid-cutover: the hot path aborts and the proven replan
+// finishes the rescale on the survivor - and the output is STILL
+// exactly-once. This is also what keeps the happy-path source assertion
+// honest: here the source IS restarted, and its restore diagnostic prints.
+TEST_F(HotRescaleTest, AWorkerLostMidCutoverFallsBackToTheReplanAndStaysExactlyOnce) {
+    ::setenv("CLINK_RXO_PAR", "4", 1);  // target 2: the replanned job fits one worker
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    // Hold the cutting-over window wide open so the kill lands inside the
+    // cutover deterministically rather than racing its completion.
+    ASSERT_TRUE(c.start_coordinator(
+        clink::itest::ProcOptions{.fault = "rescale.hot_cutting_over=delay:4000@1"}));
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return verify_exactly_once(out_dir_, kTotalRecords).total_lines >= kMinCommittedBefore;
+        },
+        std::chrono::seconds(90)));
+
+    std::string rescale_out;
+    const int rc = rescale_operator(c, "counter", 2, &rescale_out);
+    ASSERT_EQ(rc, 0) << rescale_out;
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return c.coordinator().log_contains("hot cutover checkpoint triggered"); },
+        std::chrono::seconds(60)))
+        << "the cutover never reached its checkpoint";
+
+    // Inside the cutover (the held window guarantees it): lose a worker.
+    c.worker(1).kill_and_reap();
+
+    ASSERT_TRUE(
+        clink::itest::await([&] { return c.coordinator().log_contains("hot cutover ABORTED"); },
+                            std::chrono::seconds(120)))
+        << "the worker loss never aborted the cutover";
+    ASSERT_TRUE(clink::itest::await([&] { return c.coordinator().log_contains("replanned"); },
+                                    std::chrono::seconds(120)))
+        << "the abort never fell back to the replan";
+
+    const auto exit_code = sub->await_exit(std::chrono::seconds(300));
+    ASSERT_TRUE(exit_code.has_value()) << "submitter never exited after the fallback";
+    EXPECT_EQ(*exit_code, 0) << "the job did not complete after the fallback replan";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records committed MORE than once across the abort + replan. " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty())
+        << "STATE-MISMATCH across the abort + replan. " << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << "records LOST across the abort + replan. " << describe(v);
+}

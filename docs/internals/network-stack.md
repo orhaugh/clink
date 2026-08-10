@@ -19,7 +19,9 @@ The same logical channel can also short-circuit: when sender and receiver are co
 | `include/clink/runtime/network/local_data_plane.hpp` | `LocalDataPlane`: process-wide registry that lets a colocated sink find a colocated source's queue. |
 | `include/clink/runtime/network/network_socket.hpp` | `NetworkSocket`: thin POSIX socket wrappers (connect, listen, accept, send_all, recv_all, half-close). |
 | `include/clink/runtime/network/connection.hpp` | `Connection`: the cluster control-plane transport abstraction (plain TCP or TLS). |
-| `include/clink/runtime/multi_input_alignment.hpp` | `MultiInputAlignment`: per-input watermark-min and Chandy-Lamport barrier alignment for union and co-operators. |
+| `include/clink/runtime/multi_input_alignment.hpp` | `MultiInputAlignment`: per-input watermark-min and Chandy-Lamport barrier alignment for union and co-operators. `add_input` admits a member mid-run, between barriers only (hot rescale). |
+| `include/clink/runtime/cutover_gate.hpp` | `GroupCutoverGate`: the hold-and-swap rendezvous for a rescale-eligible output group - the split holds after broadcasting the armed barrier, branch sinks report flushed, the control path swaps endpoints and releases with the new live divisor. |
+| `include/clink/runtime/union_rebind.hpp` | `UnionRebindSlot`: mid-run membership for a union input stage - the worker splices channels for post-cutover upstream subtasks, and the hold-open bridges the gap between the old inputs closing and the new subtasks existing. |
 | `include/clink/core/arrow_batcher.hpp` | `ArrowBatcher<T>`: the Batch-to-RecordBatch seam, built-in columnar batchers, the binary fallback, and the IPC serialise/parse helpers. |
 
 ## How it works
@@ -134,6 +136,7 @@ Fixed by capping a data frame at `kMaxRecordsPerFrame` (half the credit window, 
 
 **A failed send now fails the task.** `NetworkBridgeSink` used to discard `push()`'s `bool` at every call site, so a rejected element left no error, no failed task and no log line - the stream simply carried fewer records than the operator emitted. That silence is what turned the credit defect above into a long investigation: it surfaced as a windowed top-N quietly disagreeing with another engine, six operators downstream of the fault. `require_sent_` now throws on a false return for data, watermarks and barriers alike, and the runner records it as a task failure (`local_executor.cpp` catches operator exceptions). The one exemption is our own shutdown: `close()` sets `closing_` before closing the channel, so an element racing teardown is an orderly stop rather than loss.
 
+
 ### The local fast path (LocalDataPlane)
 
 When two subtasks are colocated on one Worker, the socket path is pure overhead. `LocalDataPlane` (`local_data_plane.hpp`) is a process-wide registry keyed by `(host, port)`. When a `NetworkChannelSource` calls `listen()`, it also registers its receive queue (`local_channel_`, a `LocalEndpointChannel<T>` which is just a `BoundedChannel<StreamElement<T>>` of capacity `kLocalChannelCapacity = 256`) under the port it bound. When a `NetworkChannelSink` calls `connect()`, it first does a typed `lookup_endpoint<T>` against the registry. On a hit it keeps the queue and routes every `push` directly into it, skipping codec encode, Arrow IPC, the TCP loopback and the decode on the other side; the `BoundedChannel`'s own blocking push provides backpressure in place of credit grants. On a miss it opens the socket.
@@ -182,7 +185,8 @@ Operator data and watermarks use the channel/bridge stack above. The cluster con
 | `BoundedChannel<T>` | Thread-safe bounded MPMC queue; the unit of backpressure. Blocking and non-blocking push/pop, one-way close, stuck-warnings. |
 | `NetworkChannelSink<T>` | TCP send half. `connect()`, `push()` (with credit gating), `close_send()`; runs a reader thread for `CreditUpdate` grants. |
 | `NetworkChannelSource<T>` | TCP receive half. `listen()`, `accept()`, `pop()`; runs a recv thread that parses frames into the local channel and issues credit on dequeue. |
-| `NetworkBridgeSink<T>` / `NetworkBridgeSource<T>` | Operator-interface adapters wrapping the channel halves; `prepare_listen()`, `open()`, `produce()`, `cancel()`. |
+| `NetworkBridgeSink<T>` / `NetworkBridgeSource<T>` | Operator-interface adapters wrapping the channel halves; `prepare_listen()`, `open()`, `produce()`, `cancel()`. The source's `set_drain_at_checkpoint(C)` arms the relay to end its stream after forwarding barrier C (hot rescale): the chain downstream sees C then end-of-input, and elements queued behind C stay unconsumed for the post-cutover subtasks. |
+| `SwappableBridgeSink<T>` | A branch sink whose peer endpoint swaps at a held cutover barrier; branches above a group's live count are parked. Legal to swap only while the group's split is held and the branch has flushed the armed barrier. |
 | `ArrowBatcher<T>` | `schema()` / `build()` / `parse()` closures converting `Batch<T>` to/from `arrow::RecordBatch`; columnar for built-ins and `CLINK_ARROW_FIELDS` structs (auto-selected via `make_auto_arrow_batcher`), binary fallback otherwise. |
 | `arrow_batch_to_ipc` / `arrow_batch_from_ipc` | Serialise/deserialise one `RecordBatch` as an Arrow IPC stream blob. |
 | `Kind` | Wire frame tag (Data, Watermark, Barrier, Close, CreditUpdate, Terminal, WatermarkIdle, ArrowBatch, Drain). |

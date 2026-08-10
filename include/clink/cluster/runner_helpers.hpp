@@ -43,7 +43,8 @@ void attach_typed_group_output(
     StageHandle<T> handle,
     const ResolvedOutputGroup& group,
     const TypeOps& type_ops,
-    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover = {});
+    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover = {},
+    const KeyExtractorRegistry* key_extractors = nullptr);
 
 // SideOutputAttacherRegistry stores per-channel-name closures that
 // build a typed side-output network sink. Registration is templated on
@@ -207,6 +208,7 @@ StageHandle<T> build_typed_input_stage(
     auto merged = dag.template union_streams<T>(std::move(handles), slot);
     RunnerContext::InputRebindHooks hooks;
     hooks.upstream_op_id = upstream_op;
+    hooks.hold_open = [slot] { slot->set_hold_open(true); };
     hooks.bind_new_input = [slot, bind = input_type_ops->bind_inbound_bridge](
                                std::uint32_t /*new_idx*/) -> RunnerContext::BoundNewInput {
         // The SAME erased builder the original deploy used, so the new
@@ -252,7 +254,12 @@ void attach_typed_group_output(
     StageHandle<T> handle,
     const ResolvedOutputGroup& group,
     const TypeOps& type_ops,
-    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover) {
+    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover,
+    const KeyExtractorRegistry* key_extractors) {
+    // The job's registry when threaded (dlopen-safe); the process default
+    // for in-process callers. See RunnerContext::key_extractors.
+    const auto& extractor_registry =
+        key_extractors != nullptr ? *key_extractors : KeyExtractorRegistry::default_instance();
     auto make_sink = [&](const PeerAddress& peer) {
         auto bridge_void = type_ops.connect_outbound_bridge(peer.host, peer.data_port);
         return std::static_pointer_cast<network::NetworkBridgeSink<T>>(bridge_void);
@@ -266,8 +273,7 @@ void attach_typed_group_output(
             throw std::runtime_error(
                 "runner: Hash routing but no key_extractor_fn set on the output group");
         }
-        auto extractor = KeyExtractorRegistry::default_instance().find<T>(type_ops.channel_name,
-                                                                          group.key_extractor_fn);
+        auto extractor = extractor_registry.find<T>(type_ops.channel_name, group.key_extractor_fn);
         if (!extractor) {
             throw std::runtime_error("runner: key extractor '" + group.key_extractor_fn +
                                      "' not registered for channel '" + type_ops.channel_name +
@@ -353,8 +359,7 @@ void attach_typed_group_output(
             throw std::runtime_error(
                 "runner: Hash routing but no key_extractor_fn set on the output group");
         }
-        auto extractor = KeyExtractorRegistry::default_instance().find<T>(type_ops.channel_name,
-                                                                          group.key_extractor_fn);
+        auto extractor = extractor_registry.find<T>(type_ops.channel_name, group.key_extractor_fn);
         if (!extractor) {
             throw std::runtime_error("runner: key extractor '" + group.key_extractor_fn +
                                      "' not registered for channel '" + type_ops.channel_name +
@@ -425,12 +430,14 @@ void attach_typed_output_groups(
     const TypeOps& type_ops,
     OperatorChainSpec::OutputRouting routing,
     const std::string& selector_fn,
-    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover = {}) {
+    const std::function<void(RunnerContext::GroupCutoverHooks)>& register_group_cutover = {},
+    const KeyExtractorRegistry* key_extractors = nullptr) {
     if (groups.empty()) {
         return;
     }
     if (groups.size() == 1) {
-        attach_typed_group_output<T>(dag, handle, groups.front(), type_ops, register_group_cutover);
+        attach_typed_group_output<T>(
+            dag, handle, groups.front(), type_ops, register_group_cutover, key_extractors);
         return;
     }
     if (routing == OperatorChainSpec::OutputRouting::Split) {
@@ -456,13 +463,14 @@ void attach_typed_output_groups(
             dag.template add_split<T>(handle, std::move(selector), groups.size(), "split");
         for (std::size_t i = 0; i < groups.size(); ++i) {
             attach_typed_group_output<T>(
-                dag, branches[i], groups[i], type_ops, register_group_cutover);
+                dag, branches[i], groups[i], type_ops, register_group_cutover, key_extractors);
         }
         return;
     }
     auto branches = dag.template fork<T>(handle, groups.size());
     for (std::size_t i = 0; i < groups.size(); ++i) {
-        attach_typed_group_output<T>(dag, branches[i], groups[i], type_ops, register_group_cutover);
+        attach_typed_group_output<T>(
+            dag, branches[i], groups[i], type_ops, register_group_cutover, key_extractors);
     }
 }
 

@@ -1663,13 +1663,21 @@ public:
                 // delivery); a refused channel goes back to the front of
                 // the slot and is admitted when the barrier completes.
                 if (rebind && !rebind->empty()) {
+                    bool admitted = false;
                     for (auto& ch : rebind->take()) {
                         if (align.add_input().has_value()) {
                             channels.push_back(std::move(ch));
+                            admitted = true;
                         } else {
                             rebind->requeue_front(std::move(ch));
                             break;
                         }
+                    }
+                    if (admitted) {
+                        // Membership is live again; the cutover hold (set at
+                        // arm time, before the old inputs could close) has
+                        // done its job.
+                        rebind->set_hold_open(false);
                     }
                 }
                 bool any_progress = false;
@@ -1736,7 +1744,9 @@ public:
                         }
                     }
                 }
-                if (align.all_closed()) {
+                if (align.all_closed() && !(rebind && rebind->holding_open())) {
+                    // Every member closed and no cutover is holding the
+                    // union open for a splice that has not arrived yet.
                     break;
                 }
                 if (!any_progress) {

@@ -1436,6 +1436,7 @@ void Worker::run_generic_subtask_(JobId job_id,
     // into); the .so's own default-instance singleton is a DIFFERENT copy
     // under RTLD_LOCAL, so the process-wide default only covers built-ins.
     const SideOutputAttacherRegistry* job_soar = &SideOutputAttacherRegistry::default_instance();
+    const KeyExtractorRegistry* job_kex = nullptr;
     // Per-subtask state-backend URI (decoupled from checkpoint_dir). Empty
     // keeps the legacy behaviour where checkpoint_dir is the backend URI.
     std::string state_backend_uri;
@@ -1451,6 +1452,7 @@ void Worker::run_generic_subtask_(JobId job_id,
             job_or = &it->second->operator_registry();
             job_dbr = &it->second->dag_builder_registry();
             job_soar = &it->second->side_output_attacher_registry();
+            job_kex = &it->second->key_extractor_registry();
         }
         if (auto ck = per_job_checkpoint_.find(job_id); ck != per_job_checkpoint_.end()) {
             state_backend_uri = ck->second.state_backend_uri;
@@ -1870,6 +1872,14 @@ void Worker::run_generic_subtask_(JobId job_id,
                     return;
                 }
                 std::lock_guard lock(mu_);
+                // The ARM (which precedes the cutover checkpoint) must hold
+                // this task's union open: its old inputs end and close
+                // before the new subtasks exist to splice, and a fully-
+                // closed membership otherwise reads as end-of-input.
+                if (hooks.hold_open) {
+                    per_job_arm_callbacks_[job_id][hooks.upstream_op_id].push_back(
+                        [hold = hooks.hold_open](std::uint64_t /*cutover_ckpt*/) { hold(); });
+                }
                 per_job_rebinds_[job_id][hooks.upstream_op_id].push_back(
                     RegisteredInputRebind{role, sub, std::move(hooks)});
             };
@@ -1944,6 +1954,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .register_abort_callbacks = std::move(register_aborts),
                 .register_drain_callbacks = std::move(register_drains),
                 .register_cutover_arm_callbacks = std::move(register_arms),
+                .key_extractors = job_kex,
                 .register_group_cutover = std::move(register_group_cutover),
                 .register_input_rebind = std::move(register_input_rebind),
                 .register_stop_callbacks = std::move(register_stops),

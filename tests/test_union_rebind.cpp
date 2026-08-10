@@ -122,7 +122,12 @@ public:
             arrived_.signal();
         }
     }
-    void on_watermark(Watermark) override {}
+    void on_watermark(Watermark wm) override {
+        if (wm == Watermark::max()) {
+            max_watermark_seen_.signal();
+        }
+    }
+    [[nodiscard]] bool await_max_watermark() { return max_watermark_seen_.await(); }
 
     void await_value(std::int64_t v) { awaited_value_.store(v); }
     void await_barrier(std::int64_t id) { awaited_barrier_.store(id); }
@@ -148,6 +153,7 @@ private:
     std::atomic<std::int64_t> awaited_value_{-1};
     std::atomic<std::int64_t> awaited_barrier_{-1};
     RebindStepGate arrived_;
+    RebindStepGate max_watermark_seen_;
 };
 
 using RebindCaptureSink = RebindCaptureSinkT<int>;
@@ -443,5 +449,59 @@ TEST(UnionRebind, AnUnannotatedInputStageRegistersNothing) {
     }
     ASSERT_TRUE(sink->arrived()) << "the classic single-bridge input stage lost its record";
     f0.close();
+    exec.await_termination();
+}
+
+TEST(UnionRebind, TheHoldKeepsAFullyClosedUnionAliveUntilTheSpliceArrives) {
+    // The cutover gap this exists for: the old inputs end (barrier C, then
+    // close) BEFORE the new subtasks exist to splice. Without the hold, the
+    // union reads its fully-closed membership as end-of-input and exits -
+    // taking the still-running downstream task with it, which is how the
+    // fed task would have died between the drain and the rebind.
+    const auto tag = rebind_tag();
+    auto s0 = std::make_shared<RebindFedSource>("hold.s0." + tag);
+    auto s1 = std::make_shared<RebindFedSource>("hold.s1." + tag);
+    auto sink = std::make_shared<RebindCaptureSink>();
+    auto slot = std::make_shared<UnionRebindSlot<int>>();
+
+    Dag dag;
+    auto h0 = dag.add_source<int>(s0);
+    auto h1 = dag.add_source<int>(s1);
+    auto merged = dag.union_streams<int>({h0, h1}, slot);
+    dag.add_sink<int>(merged, sink);
+
+    // The arm precedes the cutover checkpoint, and with it the hold.
+    slot->set_hold_open(true);
+
+    JobConfig cfg;
+    LocalExecutor exec(std::move(dag), cfg);
+    exec.start();
+
+    sink->await_value(1);
+    s0->feed()->push(StreamElement<int>::data(one(1)));
+    ASSERT_TRUE(sink->arrived());
+
+    // Both old inputs end. The union processes the closes - provably, via
+    // the all-closed max watermark it forwards - and must NOT exit.
+    s0->feed()->close();
+    s1->feed()->close();
+    ASSERT_TRUE(sink->await_max_watermark())
+        << "the union never processed the closes; the splice below would race them";
+
+    // The splice arrives strictly AFTER the union has seen its whole
+    // membership close. Without the hold the union has already exited and
+    // this record can never be delivered.
+    auto spliced = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    slot->splice(spliced);
+    sink->rearm();
+    sink->await_value(42);
+    spliced->push(StreamElement<int>::data(one(42)));
+    ASSERT_TRUE(sink->arrived())
+        << "a record spliced after the old inputs closed never arrived: the union exited "
+           "through its fully-closed membership despite the cutover hold";
+
+    // The hold cleared on admission, so closing the spliced input now ends
+    // the union normally.
+    spliced->close();
     exec.await_termination();
 }
