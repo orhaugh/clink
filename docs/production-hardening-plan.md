@@ -4,7 +4,25 @@
 > done against it, the evidence for each claim, and - stated as plainly as
 > the rest - what is still not demonstrated.
 
-**Status date:** 2026-08-04 (round CLOSED - see section 8)
+**Reading this document: findings are historical records, not current
+status.** Each finding (F1, F2, ...) describes the defect as it stood when
+found, in past tense, followed by what was done about it. A passage such as
+"integration tests were advisory" records a state that a later entry in the
+same document shows fixed; quoting an early finding as the current state
+misreads the format - an external review made exactly that mistake, which is
+why this note exists. For the current state of the gates, the tree is
+authoritative: `.github/workflows/ci.yml` runs the whole `integration` label
+serially as a blocking step, `.github/workflows/sanitizers.yml` blocks PRs on
+ASan/UBSan with a nightly ASan/TSan/UBSan matrix, and
+`.github/workflows/fuzz.yml` runs the fuzz targets. The follow-up queue named
+below continued past the closing date of this round; its subsequent rounds
+closed, among other things, compound-fault coverage, multi-connector
+exactly-once under real brokers and stores (Kafka, Postgres, S3, with six
+engine defects found and fixed by those suites), and a source-runner
+ack-before-durability defect in the checkpoint completion path.
+
+**Status date:** 2026-08-04 (round CLOSED - see section 8; preface above
+updated 2026-08-10)
 **Follow-up queue:** 24 prioritised items, kept out of the repository
 **Baseline commit:** `d0b8bd0`
 **Scope:** runtime, scheduler, channels, checkpoint coordinator, state
