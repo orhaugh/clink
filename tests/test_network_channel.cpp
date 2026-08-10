@@ -582,3 +582,89 @@ TEST(LocalDataPlaneAdvertisedHost, LookupByAdvertisedNameFindsAWildcardBoundEndp
     EXPECT_EQ(ldp.lookup_endpoint<std::int64_t>("127.0.0.1", port), nullptr);
     ldp.set_advertised_host("");
 }
+
+// ---------------------------------------------------------------------
+// Protocol corruption must FAIL the channel, not end the stream.
+//
+// Found the hard way: a corrupted first frame (its Arrow IPC payload
+// arrived as zeros) made the recv loop exit silently, the consumer saw
+// an ordinary close, every task finished cleanly, and a three-worker
+// pipeline reported "ok" having delivered zero of its 99 records. The
+// contract pinned here: undecodable bytes leave failure_reason()
+// non-null, and the bridge surfaces that as a task error instead of
+// end-of-input.
+// ---------------------------------------------------------------------
+
+namespace {
+
+// Raw TCP client that speaks just enough framing to deliver one
+// deliberately-corrupt ArrowBatch frame: correct length prefix, valid
+// kind byte, garbage (all-zero) IPC payload.
+void send_corrupt_arrow_frame(std::uint16_t port) {
+    const int fd = NetworkSocket::connect_to("127.0.0.1", port);
+    ASSERT_GE(fd, 0) << "raw connect failed";
+    std::vector<std::byte> body;
+    body.push_back(static_cast<std::byte>(Kind::ArrowBatch));
+    body.insert(body.end(), 64, std::byte{0});  // no Arrow stream starts with zeros
+    std::vector<std::byte> header;
+    put_u32_be(header, static_cast<std::uint32_t>(body.size()));
+    ASSERT_TRUE(NetworkSocket::send_all(fd, header.data(), header.size()));
+    ASSERT_TRUE(NetworkSocket::send_all(fd, body.data(), body.size()));
+    NetworkSocket::close(fd);
+}
+
+}  // namespace
+
+TEST(NetworkChannelFailure, ACorruptArrowFrameFailsTheChannelInsteadOfEndingIt) {
+    NetworkChannelSource<std::int64_t> source(/*port*/ 0, int64_codec());
+    const std::uint16_t port = source.listen();
+    std::thread sender([port] { send_corrupt_arrow_frame(port); });
+    source.accept();
+
+    // The recv loop dies on the corrupt frame; the queue drains empty.
+    auto e = source.pop();
+    EXPECT_FALSE(e.has_value());
+    ASSERT_NE(source.failure_reason(), nullptr)
+        << "a corrupt frame must be recorded as a FAILURE, not a clean close";
+    EXPECT_STREQ(source.failure_reason(), "Arrow IPC payload undecodable");
+    sender.join();
+}
+
+TEST(NetworkChannelFailure, ACleanCloseLeavesNoFailureReason) {
+    NetworkChannelSource<std::int64_t> source(/*port*/ 0, int64_codec());
+    const std::uint16_t port = source.listen();
+    std::thread sender([port] {
+        NetworkChannelSink<std::int64_t> sink("127.0.0.1", port, int64_codec());
+        sink.connect();
+        Batch<std::int64_t> b;
+        b.emplace(7);
+        sink.push(StreamElement<std::int64_t>::data(std::move(b)));
+        sink.close_send();
+    });
+    source.accept();
+
+    auto e = source.pop();
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->is_data());
+    EXPECT_FALSE(source.pop().has_value());
+    EXPECT_EQ(source.failure_reason(), nullptr) << "an ordinary close must NOT read as a failure";
+    sender.join();
+}
+
+TEST(NetworkChannelFailure, TheBridgeSurfacesAFailedChannelAsATaskError) {
+    NetworkBridgeSource<std::int64_t> bridge(/*port*/ 0, int64_codec());
+    const std::uint16_t port = bridge.prepare_listen();
+    std::thread sender([port] { send_corrupt_arrow_frame(port); });
+    bridge.open();
+
+    Emitter<std::int64_t> sink_nothing([](StreamElement<std::int64_t>) { return true; });
+    // produce() must THROW once the channel records the corruption -
+    // returning false here is exactly the silent-loss bug this pins.
+    EXPECT_THROW(
+        {
+            while (bridge.produce(sink_nothing)) {
+            }
+        },
+        std::runtime_error);
+    sender.join();
+}

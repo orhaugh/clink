@@ -186,11 +186,20 @@ public:
     }
 
     bool produce(Emitter<T>& out) override {
-        if (this->cancelled() || channel_.closed() || armed_finished_) {
+        if (this->cancelled()) {
+            return false;
+        }
+        throw_if_channel_failed_();
+        if (channel_.closed() || armed_finished_) {
             return false;
         }
         auto e = channel_.pop();
         if (!e.has_value()) {
+            // Drained. Distinguish a clean end-of-stream from a receive
+            // failure BEFORE reporting end-of-input - a corrupt stream
+            // means records were lost, and completing cleanly here lets
+            // the job report success with data missing.
+            throw_if_channel_failed_();
             return false;
         }
         if (e->is_data()) {
@@ -253,6 +262,19 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    // A protocol-corrupt receive stream means records were LOST, not that
+    // the stream ended: completing this task cleanly would let the job
+    // report success with data missing (a corrupted first frame once took
+    // a three-worker pipeline to "ok" with zero of its 99 records
+    // delivered). Failing the task routes the loss into the ordinary
+    // task-failure machinery instead.
+    void throw_if_channel_failed_() const {
+        if (const char* why = channel_.failure_reason()) {
+            throw std::runtime_error("network bridge '" + name_ + "': receive stream failed (" +
+                                     std::string{why} + "); upstream records lost");
+        }
+    }
+
     NetworkChannelSource<T> channel_;
     std::string name_;
     std::atomic<std::uint64_t> drain_at_checkpoint_{0};

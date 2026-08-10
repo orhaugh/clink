@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -601,6 +602,18 @@ public:
     // alone would shortcut produce()-style callers that bail on closed
     // before they finish draining queued records.
     bool closed() const noexcept { return closed_; }
+
+    // Non-null once the recv thread hit unambiguous protocol corruption:
+    // a truncated or oversized frame, an undecodable Arrow IPC payload, a
+    // schema mismatch, or the retired legacy frame kind. The stream's
+    // tail is LOST, so consumers must surface an error - treating this
+    // close as ordinary end-of-stream lets a job complete "ok" with
+    // records missing. A clean EOF at a frame boundary stays a normal
+    // close (nullptr here); the sender vanishing between frames is
+    // indistinguishable from it at this layer and is the cluster
+    // watchdog's job, not this one's.
+    const char* failure_reason() const noexcept { return failure_.load(std::memory_order_acquire); }
+
     std::uint16_t bound_port() const noexcept { return bound_port_; }
 
     // Wake any thread blocked in pop() and the socket-side recv
@@ -662,14 +675,12 @@ private:
             // the connection rather than allocating an attacker-chosen size - the
             // memory-amplification DoS guard.
             if (frame_len == 0 || frame_len > kMaxFrameBytes) {
-                if (frame_len > kMaxFrameBytes) {
-                    clink::metrics::net::recv_error();
-                }
+                fail_("frame length corrupt");
                 break;
             }
             std::vector<std::byte> body(frame_len);
             if (!NetworkSocket::recv_all(peer_fd_, body.data(), body.size())) {
-                clink::metrics::net::recv_error();
+                fail_("frame truncated mid-body");
                 break;
             }
             const auto frame_bytes = header_buf.size() + body.size();
@@ -681,10 +692,12 @@ private:
                 case Kind::Data:
                     // Legacy per-record path: see history comment
                     // below. Hard protocol error.
+                    fail_("legacy Data frame kind");
                     return;
                 case Kind::ArrowBatch: {
                     auto record_batch = arrow_batch_from_ipc(body.data() + pos, body.size() - pos);
                     if (!record_batch) {
+                        fail_("Arrow IPC payload undecodable");
                         return;
                     }
                     // Credit is issued by pop() on consumer dequeue,
@@ -694,11 +707,13 @@ private:
                     if (batcher_.schema) {
                         auto expected = batcher_.schema();
                         if (!record_batch->schema()->Equals(*expected, /*check_metadata=*/false)) {
+                            fail_("Arrow schema mismatch");
                             return;
                         }
                     }
                     auto parsed = batcher_.parse(*record_batch);
                     if (!parsed.has_value()) {
+                        fail_("batch parse failed");
                         return;
                     }
                     if (!local_channel_->push(StreamElement<T>::data(std::move(*parsed)))) {
@@ -771,6 +786,21 @@ private:
         }
     }
 
+    // Record unambiguous protocol corruption seen by the recv thread. The
+    // reason is a string literal so the atomic pointer needs no ownership.
+    // One stderr line plus the recv-error counter make the event visible;
+    // the consumer-facing contract is failure_reason() going non-null
+    // BEFORE the channel closes (release/acquire pairing with the
+    // consumer's read after pop() returns nullopt).
+    void fail_(const char* reason) {
+        failure_.store(reason, std::memory_order_release);
+        clink::metrics::net::recv_error();
+        std::fprintf(stderr,
+                     "CLINK_NETWORK_CHANNEL_FAILED port=%u reason=\"%s\"\n",
+                     static_cast<unsigned>(bound_port_.load()),
+                     reason);
+    }
+
     // Send a CreditUpdate(delta) back to the sender. Best-effort: a
     // failed write just means the sender will run dry on credit sooner
     // than expected. send_mu_ serialises against concurrent grant
@@ -804,6 +834,9 @@ private:
     std::atomic<int> listener_fd_{-1};
     std::atomic<int> peer_fd_{-1};
     std::atomic<bool> closed_{false};
+    // String literal naming the protocol corruption the recv thread hit;
+    // nullptr while the stream is healthy. See failure_reason().
+    std::atomic<const char*> failure_{nullptr};
     std::mutex send_mu_;
     // Unified queue for both socket-recv path and same-process
     // LocalDataPlane pushes. The recv-thread (when a socket peer
