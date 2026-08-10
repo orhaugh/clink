@@ -193,6 +193,13 @@ public:
                                  "--ha-allow-unsafe-locks was given: leadership is NOT fenced, "
                                  "and two coordinators may both believe they lead.");
         }
+        // One line at standby entry, BEFORE any leadership outcome. Operators
+        // could not previously tell a healthy silent standby from a dead
+        // process - its first sign of life was winning leadership - and the
+        // HA failover test had to sleep for the same reason (item 47's last
+        // convertible site): a standby emitted no positive signal to wait
+        // for. Now it does.
+        clink::log::info("coordinator.ha", "standing by for leadership at " + ha_dir_);
         poll_thread_ = std::thread([this] { poll_loop_(); });
     }
 

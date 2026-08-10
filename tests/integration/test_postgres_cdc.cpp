@@ -90,9 +90,22 @@ TEST(PostgresCdcIntegration, StreamsInsertUpdateDeleteThroughPipeline) {
     LocalExecutor exec(std::move(dag));
     exec.start();
 
-    // Give the source a moment to issue START_REPLICATION before we
-    // generate WAL traffic.
-    std::this_thread::sleep_for(500ms);
+    // Wait for START_REPLICATION to actually land, not for a duration
+    // that usually covers it: the walsender for our slot appears in
+    // pg_stat_replication once streaming begins, which is exactly what
+    // the WAL traffic below depends on.
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        bool streaming = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (pg.scalar("SELECT count(*) FROM pg_stat_replication") != "0") {
+                streaming = true;
+                break;
+            }
+            std::this_thread::sleep_for(50ms);
+        }
+        ASSERT_TRUE(streaming) << "walsender never appeared in pg_stat_replication";
+    }
 
     // Drive INSERT/UPDATE/DELETE from a parallel connection. Each
     // statement is its own implicit transaction → 1 BEGIN + 1 row event +

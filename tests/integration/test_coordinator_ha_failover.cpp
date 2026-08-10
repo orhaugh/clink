@@ -232,15 +232,14 @@ TEST(CoordinatorHaFailover, StandbyTakesOverAndRecoversJob) {
                                                            node,
                                                            log_b);
     ASSERT_GT(coordinator_b, 0);
-    // Deliberately still a duration, and the one sleep in this file that stays.
-    //
-    // A STANDBY has no positive signal to wait for: it logs nothing until it wins
-    // leadership ("coordinator became leader"), which by definition has not happened
-    // yet and must not happen until coordinator-A is killed further down. Waiting on
-    // its port would be wrong for the same reason. This is not load-bearing either -
-    // coordinator-A is not killed until after the job has checkpointed, seconds
-    // later - so a short settle is honest here where a condition is not available.
-    std::this_thread::sleep_for(500ms);
+    // A standby used to have no positive signal to wait for - it logged
+    // nothing until it WON leadership, which must not happen until
+    // coordinator-A is killed further down - so this was a bare 500ms
+    // settle for years. The engine now announces standby entry
+    // ("standing by for leadership"), which is exactly the condition this
+    // wait stood for: the standby process is up and watching the HA dir.
+    ASSERT_TRUE(clink::itest::await_log_matches(log_b, "standing by for leadership", 1))
+        << "coordinator-B never reached standby";
 
     // worker: discovers coordinator-A via active-leader.json, connects, registers.
     auto spawn_worker = [&] {

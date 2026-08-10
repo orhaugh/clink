@@ -4,14 +4,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <libpq-fe.h>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <libpq-fe.h>
 
 namespace clink::test {
 
@@ -27,7 +26,7 @@ namespace clink::test {
 // Container is launched detached with `--rm`, so a crashing test still
 // gets cleanup via Docker's own reaper.
 struct DockerPostgresOptions {
-    std::string          image{"postgres:16"};
+    std::string image{"postgres:16"};
     std::chrono::seconds startup_timeout{30};
     // Extra arguments appended after the image name; passed through
     // to the postgres process. Useful for tests that need
@@ -40,17 +39,19 @@ public:
     using Options = DockerPostgresOptions;
 
     explicit DockerPostgres(Options opts = {}) {
-        port_           = pick_port();
+        port_ = pick_port();
         container_name_ = "clink_test_pg_" + std::to_string(port_);
 
         std::string cmd =
             "docker run -d --rm "
-            "-p " + std::to_string(port_) + ":5432 "
+            "-p " +
+            std::to_string(port_) +
+            ":5432 "
             "-e POSTGRES_PASSWORD=test "
             "-e POSTGRES_USER=postgres "
             "-e POSTGRES_DB=postgres "
-            "--name " + container_name_ + " " +
-            opts.image;
+            "--name " +
+            container_name_ + " " + opts.image;
         for (const auto& a : opts.postgres_args) {
             cmd += " ";
             cmd += a;
@@ -78,12 +79,12 @@ public:
 
     ~DockerPostgres() { stop(); }
 
-    DockerPostgres(const DockerPostgres&)            = delete;
+    DockerPostgres(const DockerPostgres&) = delete;
     DockerPostgres& operator=(const DockerPostgres&) = delete;
-    DockerPostgres(DockerPostgres&&)                 = delete;
-    DockerPostgres& operator=(DockerPostgres&&)      = delete;
+    DockerPostgres(DockerPostgres&&) = delete;
+    DockerPostgres& operator=(DockerPostgres&&) = delete;
 
-    int                port() const noexcept { return port_; }
+    int port() const noexcept { return port_; }
     const std::string& container_name() const noexcept { return container_name_; }
 
     std::string conninfo() const {
@@ -107,6 +108,25 @@ public:
         }
     }
 
+    // First field of the first row, as text. For observability polls
+    // ("has the walsender appeared in pg_stat_replication yet?") where
+    // exec()'s discard-the-result shape cannot express the condition.
+    std::string scalar(const std::string& sql) const {
+        std::unique_ptr<PGconn, decltype(&PQfinish)> conn(PQconnectdb(conninfo().c_str()),
+                                                          &PQfinish);
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            throw std::runtime_error("DockerPostgres::scalar: connect failed: " +
+                                     std::string{PQerrorMessage(conn.get())});
+        }
+        std::unique_ptr<PGresult, decltype(&PQclear)> r(PQexec(conn.get(), sql.c_str()), &PQclear);
+        if (PQresultStatus(r.get()) != PGRES_TUPLES_OK || PQntuples(r.get()) < 1) {
+            throw std::runtime_error("DockerPostgres::scalar: " +
+                                     std::string{PQerrorMessage(conn.get())});
+        }
+        const char* v = PQgetvalue(r.get(), 0, 0);
+        return v != nullptr ? std::string{v} : std::string{};
+    }
+
     static bool docker_available() {
         // `docker info` exits 0 only when the daemon is reachable.
         return std::system("docker info > /dev/null 2>&1") == 0;
@@ -122,13 +142,13 @@ private:
     }
 
     static int pick_port() {
-        std::random_device              rd;
-        std::mt19937                    gen(rd());
+        std::random_device rd;
+        std::mt19937 gen(rd());
         std::uniform_int_distribution<> dist(50000, 59999);
         return dist(gen);
     }
 
-    int         port_{0};
+    int port_{0};
     std::string container_name_;
 };
 
