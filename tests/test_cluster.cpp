@@ -2011,3 +2011,204 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
     worker.stop();
     coordinator.stop();
 }
+
+namespace {
+
+// Latest COMPLETED-<id> marker under `dir`, recursively (markers are
+// job-scoped at <dir>/_jobs/<job>/COMPLETED-<id>).
+std::uint64_t clink_latest_completed_marker(const std::filesystem::path& dir) {
+    std::uint64_t latest = 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) {
+        return 0;
+    }
+    for (const auto& e : std::filesystem::recursive_directory_iterator(dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!e.is_regular_file()) {
+            continue;
+        }
+        const auto name = e.path().filename().string();
+        if (name.rfind("COMPLETED-", 0) == 0) {
+            try {
+                latest = std::max<std::uint64_t>(latest, std::stoull(name.substr(10)));
+            } catch (...) {
+            }
+        }
+    }
+    return latest;
+}
+
+clink::cluster::JobGraphSpec clink_parity_graph(std::int64_t start,
+                                                const std::filesystem::path& out) {
+    clink::cluster::JobGraphSpec g;
+    clink::cluster::OperatorSpec src;
+    src.id = "src";
+    src.type = "hello.GreetingSource";
+    src.out_channel = "hello.Greeting";
+    src.params = {{"count", "4"}, {"start", std::to_string(start)}, {"delay_ms", "60"}};
+    g.ops.push_back(std::move(src));
+    clink::cluster::OperatorSpec cnt;
+    cnt.id = "counter";
+    cnt.uid = "parity-counter";
+    cnt.key_by = "hello.by_parity";
+    cnt.type = "hello.ParityCounter";
+    cnt.out_channel = "hello.Greeting";
+    cnt.inputs = {"src"};
+    g.ops.push_back(std::move(cnt));
+    clink::cluster::OperatorSpec snk;
+    snk.id = "snk";
+    snk.type = "hello.GreetingFileSink";
+    snk.out_channel = "hello.Greeting";
+    snk.inputs = {"counter"};
+    snk.params = {{"path", out.string()}};
+    g.ops.push_back(std::move(snk));
+    return g;
+}
+
+}  // namespace
+
+// Item 19: the JOB-LEVEL response to a truncated checkpoint, end to end.
+// The file-level behaviour was already pinned (a truncated write verifies
+// Incomplete/Corrupt); what nothing asserted is the whole journey: the
+// truncated write is INVISIBLE when it happens - the subtask acks, the
+// checkpoint completes, markers advance - and the damage surfaces only at
+// restore, where the job must REFUSE loudly rather than come up holding
+// partial state, while the last good checkpoint still restores correctly.
+TEST(Cluster, ATruncatedCheckpointIsRefusedAtRestoreWhileTheGoodOneStillRestores) {
+    const auto plugin = cluster_hello_plugin_path();
+    if (plugin.empty() || !std::filesystem::exists(plugin)) {
+        GTEST_SKIP() << "hello_plugin not built";
+    }
+    clink::fault::Registry::instance().reset();
+    struct RegistryReset {
+        ~RegistryReset() { clink::fault::Registry::instance().reset(); }
+    } reset_on_exit;
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-trunc"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-trunc", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto tag = std::to_string(::getpid());
+    const auto dir_good = tmp / ("clink_trunc_good_" + tag);
+    const auto dir_bad = tmp / ("clink_trunc_bad_" + tag);
+    const auto out1 = tmp / ("clink_trunc_out1_" + tag);
+    const auto out1b = tmp / ("clink_trunc_out1b_" + tag);
+    const auto out3 = tmp / ("clink_trunc_out3_" + tag);
+    for (const auto& p : {dir_good, dir_bad}) {
+        std::filesystem::remove_all(p);
+    }
+    for (const auto& p : {out1, out1b, out3}) {
+        std::filesystem::remove(p);
+    }
+
+    clink::application::JobSubmitter submitter("127.0.0.1", port);
+
+    // Run 1: clean checkpoints into dir_good, ids 1..4.
+    {
+        clink::application::SubmitOptions opts;
+        opts.wait_for_completion = true;
+        opts.wait_timeout = 20s;
+        opts.checkpoint.checkpoint_dir = dir_good.string();
+        opts.checkpoint.interval_ms = 50;
+        auto r = submitter.submit(clink_parity_graph(1, out1).to_json(), {plugin.string()}, opts);
+        ASSERT_TRUE(r.ok) << r.reject_message;
+    }
+    const auto good_id = clink_latest_completed_marker(dir_good);
+    ASSERT_GT(good_id, 0u) << "run 1 completed no checkpoint";
+
+    // Run 1b: restore from the good point, but every snapshot write is
+    // TRUNCATED. The recorded (and here asserted) behaviour: nothing
+    // notices at write time - the job completes, acks flow, markers
+    // advance past the good id. The damage is invisible until restore.
+    clink::fault::Registry::instance().arm(
+        clink::fault::Rule{.point = clink::fault::points::kCheckpointDuringWrite,
+                           .action = clink::fault::Action::Truncate,
+                           .arg = 8});
+    {
+        clink::application::SubmitOptions opts;
+        opts.wait_for_completion = true;
+        opts.wait_timeout = 20s;
+        opts.checkpoint.checkpoint_dir = dir_bad.string();
+        opts.checkpoint.interval_ms = 50;
+        opts.checkpoint.restore_from_dir = dir_good.string();
+        opts.checkpoint.restore_from_checkpoint_id = good_id;
+        auto r = submitter.submit(clink_parity_graph(5, out1b).to_json(), {plugin.string()}, opts);
+        ASSERT_TRUE(r.ok)
+            << "a truncated WRITE must be invisible at write time (that is the hazard): "
+            << r.reject_message;
+    }
+    // Vacuity guard: the truncation demonstrably fired during run 1b.
+    ASSERT_GT(clink::fault::Registry::instance().hits(clink::fault::points::kCheckpointDuringWrite),
+              0u)
+        << "the truncating fault never fired - everything below would be vacuous";
+    clink::fault::Registry::instance().reset();
+    const auto bad_id = clink_latest_completed_marker(dir_bad);
+    ASSERT_GT(bad_id, 0u)
+        << "the truncated run must still complete checkpoints - the damage is silent";
+
+    // Run 2: restoring from the truncated checkpoint must REFUSE loudly -
+    // the integrity verdict, not an empty comeback and not a hang.
+    {
+        clink::application::SubmitOptions opts;
+        opts.wait_for_completion = true;
+        opts.wait_timeout = 20s;
+        opts.checkpoint.checkpoint_dir = (tmp / ("clink_trunc_scratch_" + tag)).string();
+        opts.checkpoint.interval_ms = 0;
+        opts.checkpoint.restore_from_dir = dir_bad.string();
+        opts.checkpoint.restore_from_checkpoint_id = bad_id;
+        auto r =
+            submitter.submit(clink_parity_graph(9, tmp / ("clink_trunc_out2_" + tag)).to_json(),
+                             {plugin.string()},
+                             opts);
+        // The refusal may surface as a rejection message or as a
+        // completed-with-errors job depending on where the restore runs;
+        // collect every channel before asserting on the content.
+        std::string joined = r.reject_message;
+        for (const auto& e : r.errors) {
+            joined += e + "\n";
+        }
+        EXPECT_FALSE(r.ok && r.errors.empty())
+            << "restoring from a truncated checkpoint came up clean - partial state "
+               "was accepted silently";
+        EXPECT_NE(joined.find("sidecar"), std::string::npos)
+            << "the refusal must carry the integrity verdict; got: " << joined;
+    }
+
+    // Run 3: the GOOD checkpoint still restores - parity counts continue
+    // exactly from run 1's state (ids 1..4 gave each bucket 2).
+    {
+        clink::application::SubmitOptions opts;
+        opts.wait_for_completion = true;
+        opts.wait_timeout = 20s;
+        opts.checkpoint.checkpoint_dir = (tmp / ("clink_trunc_scratch3_" + tag)).string();
+        opts.checkpoint.interval_ms = 0;
+        opts.checkpoint.restore_from_dir = dir_good.string();
+        opts.checkpoint.restore_from_checkpoint_id = good_id;
+        auto r = submitter.submit(clink_parity_graph(5, out3).to_json(), {plugin.string()}, opts);
+        ASSERT_TRUE(r.ok) << r.reject_message;
+        std::ifstream in(out3);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) {
+            lines.push_back(line);
+        }
+        EXPECT_EQ(lines, (std::vector<std::string>{"5:1:3", "6:0:3", "7:1:4", "8:0:4"}))
+            << "the good checkpoint must still restore run 1's counts";
+    }
+
+    for (const auto& p : {dir_good, dir_bad}) {
+        std::filesystem::remove_all(p);
+    }
+    worker.stop();
+    coordinator.stop();
+}

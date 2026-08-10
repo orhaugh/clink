@@ -182,6 +182,9 @@ inline void encode_body(MessageBuilder& b, const SubtaskFinishedMsg& m) {
     b.put_u32_be(m.subtask_idx);
     b.put_u8(m.had_error ? 1 : 0);
     b.put_string(m.error_message);
+    // Tail field (item 19): non-retryable failure marker. Old readers stop
+    // before it; old writers never produce it (defaults false).
+    b.put_u8(m.fatal ? 1 : 0);
 }
 
 inline void encode_body(MessageBuilder& b, const HeartbeatMsg& m) {
@@ -638,6 +641,9 @@ inline SubtaskFinishedMsg decode_subtask_finished(MessageReader& r) {
     m.subtask_idx = r.read_u32_be();
     m.had_error = r.read_u8() != 0;
     m.error_message = r.read_string();
+    if (!r.eof()) {
+        m.fatal = r.read_u8() != 0;
+    }
     return m;
 }
 

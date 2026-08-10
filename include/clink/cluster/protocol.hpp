@@ -508,6 +508,15 @@ struct SubtaskFinishedMsg {
     std::uint32_t subtask_idx{};
     bool had_error{};
     std::string error_message;
+    // The error is NOT retryable: restarting cannot fix it and would
+    // actively make things worse. Today that means a checkpoint-integrity
+    // refusal at restore - the configured restore point is damaged, and a
+    // whole-job restart quietly comes back up on FRESH state, converting a
+    // loud refusal into silently empty output (found by item 19's
+    // truncated-checkpoint test). The coordinator fails the job instead of
+    // restarting when set. Appended at the tail, eof-guarded, defaults
+    // false, so frames from older workers keep their old meaning.
+    bool fatal{false};
 };
 
 struct HeartbeatMsg {

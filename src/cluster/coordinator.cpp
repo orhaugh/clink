@@ -5198,9 +5198,16 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
             if (ready_for_restart) {
                 restart_deploys = restart_job_locked_(job);
             }
-        } else if (!retry && msg.had_error && !job.completion_signalled && !job.cancel_requested &&
-                   !job.checkpoint.checkpoint_dir.empty() &&
+        } else if (!retry && msg.had_error && !msg.fatal && !job.completion_signalled &&
+                   !job.cancel_requested && !job.checkpoint.checkpoint_dir.empty() &&
                    job.restart_attempts < effective_max_restarts(job.checkpoint)) {
+            // !msg.fatal: a FATAL subtask error must not enter this branch.
+            // Restarting cannot fix it (today: the configured restore point
+            // failed its integrity check), and a restart comes back up on
+            // fresh state - converting a loud refusal into silently empty
+            // output (item 19). A fatal error falls through to the ordinary
+            // completion path below, which records the cause, cancels the
+            // peers, and fails the job carrying the verdict.
             // Checkpointed job + restart budget: a subtask error (e.g. a
             // source's EOS final-checkpoint timeout that threw) rolls the WHOLE
             // job back to its last completed checkpoint and replays - exactly as

@@ -42,6 +42,7 @@
 #include "clink/runtime/logging.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_socket.hpp"
+#include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
@@ -1358,6 +1359,7 @@ void Worker::run_task_(JobId job_id,
                        const std::string& udfs_packed) {
     metrics::worker::subtask_started();
     bool had_error = false;
+    bool fatal = false;
     std::string err_msg;
     try {
         // SQL-declared UDFs shipped with the job: register each before any
@@ -1387,6 +1389,17 @@ void Worker::run_task_(JobId job_id,
                 it->second(task);
             }
         }
+    } catch (const clink::state::CheckpointIntegrityError& e) {
+        // Non-retryable by nature: the configured restore point itself is
+        // damaged, so a whole-job restart cannot succeed against it - and
+        // worse, the restart machinery restores the job's OWN latest
+        // checkpoint (of which a fresh attempt has none) and comes back up
+        // on empty state, converting this loud refusal into silently empty
+        // output. Marked fatal so the coordinator fails the job with this
+        // message instead of restarting (item 19).
+        had_error = true;
+        fatal = true;
+        err_msg = e.what();
     } catch (const std::exception& e) {
         had_error = true;
         err_msg = e.what();
@@ -1420,6 +1433,7 @@ void Worker::run_task_(JobId job_id,
     done.subtask_idx = task.subtask_idx;
     done.had_error = had_error;
     done.error_message = err_msg;
+    done.fatal = fatal;
     send_frame_(encode_frame(MessageKind::SubtaskFinished, done));
 
     {

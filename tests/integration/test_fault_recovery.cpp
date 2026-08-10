@@ -306,8 +306,24 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
     EXPECT_EQ(*code, 0) << "the job did not survive two consecutive worker failures";
 }
 
-// F12's regression test - DISABLED again, and this time the label interaction is
-// PARTIALLY DIAGNOSED rather than mysterious (F83).
+// F12's regression test - RE-ENABLED 2026-08-10. The recorded re-enable
+// condition is met: clink_node installs the F83 fatal-signal backtrace
+// handler, so a recurrence of the label-only coordinator death prints a
+// stack into the kept artefacts instead of another lottery ticket. And the
+// death itself now has a plausible, SINCE-FIXED cause: the label-only
+// signal exit matches the F89 family exactly - a second, statically linked
+// Arrow runtime corrupting memory only under full-process context, on this
+// platform, with isolated runs green - and that link was removed on
+// 2026-08-10 (one Arrow runtime per process, gated by
+// single_arrow_runtime). If this test goes red in a label again, read the
+// artefacts' backtrace first; do not re-disable without one.
+//
+// The history below is kept because the diagnosis discipline in it is the
+// point: two plausible theories were tested against the label output and
+// both were WRONG, and the exit code was decoded rather than guessed at.
+//
+// Previously: DISABLED, with the label interaction PARTIALLY DIAGNOSED
+// rather than mysterious (F83).
 //
 // Re-enabling it captured the evidence its earlier failures never had. The
 // submitter's own log says "connection closed by the coordinator" (completed=0),
@@ -390,7 +406,7 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
 // Fixed by moving the kick to the unconditional per-tick sweep, beside the deadline
 // check that already runs every tick for the same reason: the condition is a property
 // of the job's state, not of what happened in that tick.
-TEST_F(FaultRecoveryTest, DISABLED_AJobSurvivesASecondLossDuringTheFirstRestartsDrain) {
+TEST_F(FaultRecoveryTest, AJobSurvivesASecondLossDuringTheFirstRestartsDrain) {
     Cluster c(spec());
     ScopedDiagnostics diag(c);
     bring_up(c);
