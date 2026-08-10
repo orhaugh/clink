@@ -1,0 +1,322 @@
+// Multi-connector exactly-once under failure - the Postgres arm.
+//
+// The file 2PC sink's exactly-once claim is pinned in test_fault_recovery.cpp;
+// nothing held a REAL connector to the same standard under failure. These
+// scenarios run the same bounded source against postgres_2pc_sink (PREPARE
+// TRANSACTION / COMMIT PREPARED riding CommittingSink), SIGKILL workers at the
+// same moments, and compare the table's contents to the exact multiset the
+// source promises. Postgres also offers a witness the file sink cannot:
+// pg_prepared_xacts. A prepared-but-unresolved transaction visible there
+// after the job completed is a leak the row counts would never show - it
+// holds locks and blocks vacuum forever - so every scenario asserts the
+// prepared set drains to empty as well.
+//
+// The job plugin CARRIES the connector (clink_node links no impls), so this
+// also exercises the bundle-registry path for a connector sink factory:
+// examples/postgres_2pc_job.cpp links clink::postgres and installs its
+// factories at define_job time.
+//
+// Server: a throwaway Postgres container per suite (DockerPostgres), started
+// with max_prepared_transactions=64 since 2PC is refused at zero. Skips when
+// Docker is unreachable, like the CDC suites.
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "tests/integration/cluster_harness.hpp"
+#include "tests/integration/docker_postgres.hpp"
+#include "tests/integration/two_pc_output.hpp"
+
+namespace {
+
+using namespace std::chrono_literals;
+using clink::itest::Cluster;
+using clink::itest::ClusterSpec;
+using clink::itest::Process;
+using clink::itest::ScopedDiagnostics;
+
+std::filesystem::path node_binary() {
+#ifdef CLINK_NODE_BINARY
+    return std::filesystem::path{CLINK_NODE_BINARY};
+#else
+    return {};
+#endif
+}
+std::filesystem::path submit_binary() {
+#ifdef CLINK_SUBMIT_BINARY
+    return std::filesystem::path{CLINK_SUBMIT_BINARY};
+#else
+    return {};
+#endif
+}
+std::filesystem::path postgres_2pc_job() {
+#ifdef CLINK_POSTGRES_2PC_JOB_PATH
+    return std::filesystem::path{CLINK_POSTGRES_2PC_JOB_PATH};
+#else
+    return {};
+#endif
+}
+
+// The highest COMPLETED-N under the checkpoint tree, or 0. Same scan as the
+// fault-recovery suite's.
+std::uint64_t latest_completed(const std::filesystem::path& ckpt_root) {
+    std::uint64_t latest = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(ckpt_root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!e.is_regular_file()) {
+            continue;
+        }
+        const auto name = e.path().filename().string();
+        if (name.rfind("COMPLETED-", 0) != 0) {
+            continue;
+        }
+        try {
+            const auto id = static_cast<std::uint64_t>(std::stoull(name.substr(10)));
+            latest = std::max(latest, id);
+        } catch (const std::exception&) {
+        }
+    }
+    return latest;
+}
+
+class PostgresExactlyOnceTest : public ::testing::Test {
+protected:
+    // One container for the whole suite (startup is seconds); one TABLE per
+    // test, so scenarios stay isolated without paying the container again.
+    static void SetUpTestSuite() {
+        if (!clink::test::DockerPostgres::docker_available()) {
+            return;  // per-test SetUp skips
+        }
+        clink::test::DockerPostgresOptions opts;
+        // 2PC is refused outright at the default max_prepared_transactions=0.
+        opts.postgres_args = {"-c", "max_prepared_transactions=64"};
+        pg_ = new clink::test::DockerPostgres(opts);
+    }
+
+    static void TearDownTestSuite() {
+        delete pg_;
+        pg_ = nullptr;
+    }
+
+    void SetUp() override {
+        if (!clink::test::DockerPostgres::docker_available()) {
+            GTEST_SKIP() << "Docker not available; skipping Postgres exactly-once suite";
+        }
+        if (!std::filesystem::exists(node_binary()) || !std::filesystem::exists(submit_binary()) ||
+            !std::filesystem::exists(postgres_2pc_job())) {
+            GTEST_SKIP() << "cluster binaries or the postgres 2PC job plugin are not built";
+        }
+        ASSERT_NE(pg_, nullptr);
+        // Lowercased: the sink quotes the identifier, so a mixed-case name
+        // here would name a DIFFERENT relation than the unquoted CREATE.
+        table_ = std::string{"clink_xo_"} +
+                 ::testing::UnitTest::GetInstance()->current_test_info()->name();
+        std::transform(table_.begin(), table_.end(), table_.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        pg_->exec("DROP TABLE IF EXISTS " + table_);
+        pg_->exec("CREATE TABLE " + table_ + " (v text)");
+        ::setenv("CLINK_PG_DSN", pg_->conninfo().c_str(), 1);
+        ::setenv("CLINK_PG_TABLE", table_.c_str(), 1);
+    }
+
+    static ClusterSpec spec() {
+        ClusterSpec s;
+        s.node_binary = node_binary();
+        s.workers = 2;
+        s.slots_per_worker = 4;
+        return s;
+    }
+
+    static void bring_up(Cluster& c) {
+        ASSERT_TRUE(c.start_coordinator()) << "coordinator did not come up";
+        ASSERT_TRUE(c.start_worker(0));
+        ASSERT_TRUE(c.start_worker(1));
+        ASSERT_TRUE(c.await_workers_registered(2));
+    }
+
+    static std::unique_ptr<Process> submit(Cluster& c, int max_restarts) {
+        auto p = std::make_unique<Process>();
+        std::vector<std::string> argv{
+            submit_binary().string(),
+            "--job=" + postgres_2pc_job().string(),
+            "--coordinator-host=127.0.0.1",
+            "--coordinator-port=" + std::to_string(c.coordinator_port()),
+            "--wait-timeout-s=90",
+            "--checkpoint-dir=" + c.checkpoint_dir().string(),
+            "--checkpoint-interval-ms=150",
+            "--max-restarts-on-worker-loss=" + std::to_string(max_restarts)};
+        const bool ok = p->spawn("submit", submit_binary(), std::move(argv), c.log_dir());
+        return ok ? std::move(p) : nullptr;
+    }
+
+    std::vector<std::string> rows() const { return pg_->column("SELECT v FROM " + table_); }
+    long committed_count() const {
+        return std::stol(pg_->scalar("SELECT count(*) FROM " + table_));
+    }
+    long prepared_count() const {
+        return std::stol(pg_->scalar("SELECT count(*) FROM pg_prepared_xacts"));
+    }
+
+    static clink::test::DockerPostgres* pg_;
+    std::string table_;
+};
+
+clink::test::DockerPostgres* PostgresExactlyOnceTest::pg_ = nullptr;
+
+// The premise, before any fault: a clean run commits each record exactly once
+// and leaves no prepared transaction behind. Without this, a failure below
+// could be the connector, the plugin path, or the verifier - no way to tell.
+TEST_F(PostgresExactlyOnceTest, ACleanRunCommitsEveryRecordExactlyOnce) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+    auto sub = submit(c, /*max_restarts=*/0);
+    ASSERT_NE(sub, nullptr);
+    const auto code = sub->await_exit(90s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0);
+
+    const auto v = clink::itest::verify_exactly_once_records(rows(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a CLEAN Postgres 2PC run did not commit each record exactly "
+                              "once: "
+                           << clink::itest::describe(v);
+    EXPECT_EQ(prepared_count(), 0) << "the job completed but left a prepared transaction behind";
+}
+
+TEST_F(PostgresExactlyOnceTest, EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+    // Vacuity guard: the run must still be mid-flight, or the "recovery"
+    // below recovers nothing.
+    ASSERT_LT(committed_count(), kTotal)
+        << "the job already finished before the kill; the recovery path never ran";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto code = sub->await_exit(120s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover from the worker kill";
+
+    const auto v = clink::itest::verify_exactly_once_records(rows(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a worker kill broke Postgres exactly-once: "
+                           << clink::itest::describe(v);
+    EXPECT_EQ(prepared_count(), 0)
+        << "recovery completed but left a prepared transaction behind (locks and vacuum "
+           "are blocked until someone resolves it by hand)";
+}
+
+TEST_F(PostgresExactlyOnceTest, AWorkerKilledInsideTheCommitWindowStaysExactlyOnce) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    // Hold the first commit open on both workers, whichever hosts the sink.
+    // The fault registry seeds from CLINK_FAULT_INJECT in every module,
+    // including the job plugin's own copy of CommittingSink, so the delay
+    // fires inside the connector sink carried by the .so.
+    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.start_worker(1, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+    // The witness the file sink cannot offer: the transaction is PREPARED
+    // (durable on the server) while its commit is held by the armed delay.
+    // This is the vacuity guard - the kill below provably lands inside a
+    // real commit window, not before or after one.
+    ASSERT_TRUE(clink::itest::await([&] { return prepared_count() > 0; }, 30s))
+        << "no prepared transaction appeared; the commit window never opened";
+    ASSERT_EQ(committed_count(), 0)
+        << "rows are visible while the commit should still be held; the fault did not arm "
+           "inside the plugin";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto code = sub->await_exit(120s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover from a kill inside the commit window";
+
+    const auto v = clink::itest::verify_exactly_once_records(rows(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a kill inside the commit window broke Postgres exactly-once: "
+                           << clink::itest::describe(v);
+    EXPECT_EQ(prepared_count(), 0)
+        << "the run completed but a prepared transaction is still pending; the recovery "
+           "reconcile did not resolve every gid";
+}
+
+// The longer-horizon arm: thirty times the records of the file suite, two
+// separated worker losses, and the same exact verdict. Long enough for many
+// checkpoint cycles (and their prepared-transaction churn) to expose drift a
+// two-second run cannot.
+TEST_F(PostgresExactlyOnceTest, StaysExactlyOnceAcrossTwoSeparatedKillsOnALongerRun) {
+    constexpr int kTotal = 1200;
+    ::setenv("CLINK_2PC_TOTAL", "1200", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "5", 1);
+
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+    auto sub = submit(c, /*max_restarts=*/3);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+    ASSERT_LT(committed_count(), kTotal) << "finished before the first kill; nothing recovered";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    // Settle on a CONDITION: the restarted job has committed further rows,
+    // so the first recovery is complete before the second loss arrives.
+    const auto before_second = committed_count();
+    ASSERT_TRUE(clink::itest::await([&] { return committed_count() > before_second; }, 60s))
+        << "no commit progress after the first kill; the restart never drained";
+    ASSERT_TRUE(c.restart_worker(0));
+
+    c.worker(1).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(1));
+
+    const auto code = sub->await_exit(180s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not survive two separated worker losses";
+
+    const auto v = clink::itest::verify_exactly_once_records(rows(), kTotal);
+    EXPECT_TRUE(v.clean()) << "two separated kills on a longer run broke Postgres "
+                              "exactly-once: "
+                           << clink::itest::describe(v);
+    EXPECT_EQ(prepared_count(), 0)
+        << "the longer run completed with a prepared transaction still pending";
+}
+
+}  // namespace

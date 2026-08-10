@@ -99,6 +99,21 @@ set_target_properties(clink_two_phase_commit_job PROPERTIES
 )
 clink_set_warnings(clink_two_phase_commit_job)
 
+# postgres_2pc_job: the Postgres arm of the multi-connector exactly-once
+# coverage - the same bounded source, committed via PREPARE TRANSACTION /
+# COMMIT PREPARED. The job CARRIES the connector (clink_node links no
+# impls), so it links clink::postgres and installs its factories into the
+# job bundle registry. Only built when the Postgres impl is.
+if(TARGET clink::postgres)
+    add_library(clink_postgres_2pc_job MODULE postgres_2pc_job.cpp)
+    target_link_libraries(clink_postgres_2pc_job PRIVATE clink::core clink::postgres)
+    set_target_properties(clink_postgres_2pc_job PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "postgres_2pc_job"
+    )
+    clink_set_warnings(clink_postgres_2pc_job)
+endif()
+
 # rescale_exactly_once_job: replayable source -> keyed self-checking counter
 # (rescale bounds declared) -> 2PC sink. Written to demonstrate exactly-once
 # across a rescale; it instead established that a running job cannot be

@@ -41,6 +41,17 @@
 // Commit-group and the coordinator round-trip are unchanged: a CommittingSink still
 // participates in set_commit_group() and its on_commit fires from the worker's
 // CommitCheckpoint handling exactly like any other sink.
+//
+// THREADING - the contract a connector's verbs must survive: write(),
+// prepare_commit() and close() run on the subtask's task thread, while
+// commit(), abort() and recover() may run on the worker's dispatch thread
+// CONCURRENTLY with the task thread preparing the NEXT interval. A connector
+// whose client handle is not thread-safe must serialise access itself - a
+// libpq connection shared unsynchronised between a barrier's PREPARE and a
+// dispatched COMMIT PREPARED desyncs the wire protocol and blocks both
+// threads forever (found by the Postgres exactly-once suite; see the
+// conn_mu_ in postgres_json_sink_2pc.hpp). Filesystem-rename sinks and
+// thread-safe clients (AWS SDK, librdkafka) need nothing extra.
 
 #include <cstdint>
 #include <optional>

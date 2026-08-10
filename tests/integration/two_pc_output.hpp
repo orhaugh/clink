@@ -60,12 +60,15 @@ struct OutputVerdict {
     }
 };
 
-// Compare the committed output against "record-0".."record-(total-1)",
-// each exactly once.
-inline OutputVerdict verify_exactly_once(const std::filesystem::path& out_dir, int total) {
+// Compare a set of committed records against "record-0".."record-(total-1)",
+// each exactly once. The records come from wherever the sink under test
+// publishes: lines under committed/ for the file sink, SELECTed rows for the
+// Postgres sink.
+inline OutputVerdict verify_exactly_once_records(const std::vector<std::string>& records,
+                                                 int total) {
     OutputVerdict v;
     std::map<std::string, int> seen;
-    for (const auto& line : committed_records(out_dir)) {
+    for (const auto& line : records) {
         ++seen[line];
         ++v.total_lines;
     }
@@ -83,6 +86,10 @@ inline OutputVerdict verify_exactly_once(const std::filesystem::path& out_dir, i
         v.unexpected.push_back(line + " x" + std::to_string(count));
     }
     return v;
+}
+
+inline OutputVerdict verify_exactly_once(const std::filesystem::path& out_dir, int total) {
+    return verify_exactly_once_records(committed_records(out_dir), total);
 }
 
 inline std::string describe(const OutputVerdict& v) {

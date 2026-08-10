@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <libpq-fe.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -80,11 +81,13 @@ public:
     }
 
     void on_open() override {
+        std::lock_guard lk(conn_mu_);
         connect_();
         reconcile_orphans_();
     }
 
     void write(const Batch<std::string>& batch) override {
+        std::lock_guard lk(conn_mu_);
         for (const auto& rec : batch) {
             pending_bytes_ += rec.value().size();
             pending_.push_back(rec.value());
@@ -99,6 +102,7 @@ public:
     // gid to finalise, or nullopt when no rows flowed this interval (nothing to
     // commit - no empty prepared transaction is left behind).
     std::optional<std::string> prepare_commit(std::uint64_t checkpoint_id) override {
+        std::lock_guard lk(conn_mu_);
         flush_pending_into_txn_();
         if (!in_txn_) {
             return std::nullopt;
@@ -112,6 +116,7 @@ public:
     // COMMIT PREPARED. Idempotent: a gid already gone from pg_prepared_xacts
     // (committed on a prior attempt) is a no-op.
     bool commit(const std::string& gid) override {
+        std::lock_guard lk(conn_mu_);
         if (gid_is_prepared_(gid)) {
             const auto t0 = std::chrono::steady_clock::now();
             exec_("COMMIT PREPARED '" + gid + "'");
@@ -126,6 +131,7 @@ public:
 
     // ROLLBACK PREPARED. Idempotent.
     void abort(const std::string& gid) override {
+        std::lock_guard lk(conn_mu_);
         if (gid_is_prepared_(gid)) {
             exec_("ROLLBACK PREPARED '" + gid + "'");
         }
@@ -135,6 +141,7 @@ public:
     std::string deserialize(std::string_view bytes) const override { return std::string(bytes); }
 
     void close() override {
+        std::lock_guard lk(conn_mu_);
         if (conn_) {
             if (in_txn_) {
                 try {
@@ -230,6 +237,12 @@ private:
     std::string gtxid_(std::uint64_t ckpt) const { return our_prefix_() + std::to_string(ckpt); }
 
     bool gid_is_prepared_(const std::string& gid) {
+        if (!conn_) {
+            // close() won the connection under a racing late dispatch. Refuse
+            // rather than touch a dead handle: the thrown error keeps the
+            // persisted handle in place for restore-time recovery.
+            throw std::runtime_error(opts_.name + ": connection already closed");
+        }
         const char* params[1] = {gid.c_str()};
         PGresult* r = PQexecParams(conn_.get(),
                                    "SELECT 1 FROM pg_prepared_xacts WHERE gid = $1",
@@ -283,6 +296,18 @@ private:
     }
 
     PostgresJsonSink2PCOptions opts_;
+    // Serialises every use of conn_. A libpq connection is NOT thread-safe,
+    // and this sink is genuinely used from two threads: write/prepare_commit/
+    // close run on the subtask's task thread, while on_commit/on_abort
+    // dispatch from the worker's reader thread when CommitCheckpoint arrives.
+    // Unsynchronised, an on_commit overlapping a barrier's BEGIN/INSERT/
+    // PREPARE interleaved protocol messages on the one socket and desynced
+    // the stream - both threads then blocked in poll() forever (found by the
+    // Postgres exactly-once integration suite: the clean run wedged at EOS
+    // with the reader thread stuck in gid_is_prepared_ and the runner
+    // waiting on commit-dispatch drain). Held across the external call by
+    // design; contention is one commit against one barrier, both bounded.
+    std::mutex conn_mu_;
     std::unique_ptr<PGconn, PgconnDeleter> conn_;
     std::vector<std::string> pending_;
     std::size_t pending_bytes_{0};

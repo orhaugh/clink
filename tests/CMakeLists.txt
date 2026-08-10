@@ -312,6 +312,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_postgres_sink.cpp
         integration/test_postgres_cdc.cpp
         integration/test_postgres_cdc_pgoutput.cpp
+        integration/test_connector_exactly_once.cpp
         integration/test_multiprocess_cluster.cpp
         integration/test_plugin_submission.cpp
         integration/test_application_mode.cpp
@@ -376,6 +377,10 @@ if(CLINK_INTEGRATION_TESTS)
         # is reliably visible at this scope.
         find_package(PostgreSQL REQUIRED)
         target_link_libraries(clink_integration_tests PRIVATE PostgreSQL::PostgreSQL)
+        # The Postgres arm of the multi-connector exactly-once coverage
+        # (test_connector_exactly_once.cpp) submits this job plugin.
+        target_compile_definitions(clink_integration_tests PRIVATE
+            CLINK_POSTGRES_2PC_JOB_PATH=\"$<TARGET_FILE:clink_postgres_2pc_job>\")
     else()
         message(WARNING "CLINK_INTEGRATION_TESTS=ON but clink::postgres not built; "
                         "the integration tests will fail to build")

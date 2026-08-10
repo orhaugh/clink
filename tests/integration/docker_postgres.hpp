@@ -127,6 +127,30 @@ public:
         return v != nullptr ? std::string{v} : std::string{};
     }
 
+    // Every row's first field, as text. For output-equality checks ("SELECT v
+    // FROM t"), where scalar()'s single-value shape cannot carry the multiset.
+    std::vector<std::string> column(const std::string& sql) const {
+        std::unique_ptr<PGconn, decltype(&PQfinish)> conn(PQconnectdb(conninfo().c_str()),
+                                                          &PQfinish);
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            throw std::runtime_error("DockerPostgres::column: connect failed: " +
+                                     std::string{PQerrorMessage(conn.get())});
+        }
+        std::unique_ptr<PGresult, decltype(&PQclear)> r(PQexec(conn.get(), sql.c_str()), &PQclear);
+        if (PQresultStatus(r.get()) != PGRES_TUPLES_OK) {
+            throw std::runtime_error("DockerPostgres::column: " +
+                                     std::string{PQerrorMessage(conn.get())});
+        }
+        std::vector<std::string> out;
+        const int n = PQntuples(r.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            const char* v = PQgetvalue(r.get(), i, 0);
+            out.emplace_back(v != nullptr ? v : "");
+        }
+        return out;
+    }
+
     static bool docker_available() {
         // `docker info` exits 0 only when the daemon is reachable.
         return std::system("docker info > /dev/null 2>&1") == 0;

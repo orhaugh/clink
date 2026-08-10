@@ -50,6 +50,15 @@ Key points:
   sink: the coordinator's commit-group gate collects every group member's pre-commit ack,
   then broadcasts `CommitCheckpoint` (or `AbortCheckpoint`); the Worker
   invokes the registered callbacks. See [checkpointing](checkpointing.md).
+- The threading contract for connector verbs: `write`/`prepare_commit`/`close`
+  run on the subtask's task thread, while `commit`/`abort`/`recover` may run on
+  the worker's dispatch thread concurrently with the task thread preparing the
+  next interval. A connector whose client is not thread-safe must serialise
+  access itself - the Postgres sink holds a connection mutex across every
+  libpq call for exactly this reason (an unsynchronised overlap desyncs the
+  wire protocol and blocks both threads forever, found by the Postgres
+  exactly-once suite). Rename-based sinks and thread-safe clients (AWS SDK,
+  librdkafka) need nothing extra.
 - Dispatch is serialised against runner teardown by a per-task
   `CommitDispatchGate` (`include/clink/cluster/commit_dispatch_gate.hpp`). The
   callback runs on the worker's reader thread while the subtask runner owns the
