@@ -7,6 +7,9 @@
 #include <filesystem>
 #include <fstream>
 #include <latch>
+#ifdef __APPLE__
+#include <libproc.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -23,6 +26,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -1801,6 +1805,209 @@ TEST(Cluster, AnUnresolvableHashOnlyPluginReferenceFailsTheDeployLoudly) {
     ASSERT_FALSE(errs.empty()) << "an unresolvable reference must fail the job, not run it";
     EXPECT_NE(errs.front().find("not in this worker's cache"), std::string::npos) << errs.front();
 
+    worker.stop();
+    coordinator.stop();
+}
+
+namespace {
+
+// Live thread count of THIS process. The join assertion below needs an
+// observable, not an inference: jthread members join by construction, but
+// nothing ever ASSERTED that a cancelled job leaves no thread behind
+// (item 12's recorded gap).
+std::size_t clink_test_live_thread_count() {
+#ifdef __APPLE__
+    struct proc_taskinfo info{};
+    const int rc = proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &info, PROC_PIDTASKINFO_SIZE);
+    return rc == PROC_PIDTASKINFO_SIZE ? static_cast<std::size_t>(info.pti_threadnum) : 0;
+#else
+    std::ifstream in("/proc/self/status");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("Threads:", 0) == 0) {
+            return static_cast<std::size_t>(std::stoul(line.substr(8)));
+        }
+    }
+    return 0;
+#endif
+}
+
+clink::cluster::JobGraphSpec clink_cancel_test_graph() {
+    clink::cluster::JobGraphSpec g;
+    clink::cluster::OperatorSpec src;
+    src.id = "src";
+    src.type = "int64_range_source";
+    src.out_channel = std::string{kChannelInt64};
+    // Long enough to still be running at every cancel below; delay keeps
+    // the pipeline gently active rather than CPU-bound.
+    src.params = {{"count", "10000000"}, {"delay_ms", "1"}};
+    g.ops.push_back(std::move(src));
+    clink::cluster::OperatorSpec snk;
+    snk.id = "snk";
+    snk.type = "collecting_int64_sink";
+    snk.out_channel = std::string{kChannelInt64};
+    snk.inputs = {"src"};
+    g.ops.push_back(std::move(snk));
+    return g;
+}
+
+}  // namespace
+
+// A cancelled job's threads are JOINED, not leaked - asserted against the
+// process's live thread count rather than inferred from jthread semantics.
+// The first job doubles as the warm-up that spins any lazily-created
+// engine singletons (metrics, logging, data-plane helpers), so the
+// baseline reflects steady state and the assertion isolates job number two.
+TEST(Cluster, ACancelledJobsThreadsAreJoinedNotLeaked) {
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-join"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-join", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto run_and_cancel = [&]() -> bool {
+        const auto job_id =
+            coordinator.submit_job(clink_cancel_test_graph(), OperatorRegistry::default_instance());
+        // The job is demonstrably RUNNING before the cancel: its sink has
+        // output, so subtask threads exist.
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        bool running = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto d = coordinator.snapshot_job(job_id);
+            if (d.has_value() && d->completed_count == 0 && !d->tasks.empty()) {
+                running = true;
+                break;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+        if (!running) {
+            return false;
+        }
+        (void)coordinator.cancel_job(job_id);
+        return coordinator.await_job_completion(job_id, 5s);
+    };
+
+    // Warm-up: first job wakes every lazy singleton thread.
+    ASSERT_TRUE(run_and_cancel()) << "warm-up job did not cancel cleanly";
+    // Let the warm-up's threads finish exiting before taking the baseline.
+    std::this_thread::sleep_for(200ms);
+    const auto baseline = clink_test_live_thread_count();
+    ASSERT_GT(baseline, 0u) << "thread-count probe unavailable on this platform";
+
+    ASSERT_TRUE(run_and_cancel()) << "the measured job did not cancel cleanly";
+
+    // The job's threads must all exit: poll until the count returns to the
+    // baseline, with the deadline as a failure bound.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    std::size_t now_count = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        now_count = clink_test_live_thread_count();
+        if (now_count <= baseline) {
+            break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_LE(now_count, baseline) << "a cancelled job left threads running: " << now_count
+                                   << " live vs baseline " << baseline;
+
+    worker.stop();
+    coordinator.stop();
+}
+
+// Cancel landing INSIDE an armed checkpoint window: the persist path is
+// held open by a Delay fault while records flow, the cancel arrives
+// mid-window, and the job must still reach its terminal state within a
+// bound - a held checkpoint write must not wedge cancellation (item 12's
+// last recorded gap: no test combined cancel with an armed fault point).
+TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
+    clink::fault::Registry::instance().reset();
+    // Every checkpoint write stalls 1500ms at the fault point - long
+    // enough that the cancel demonstrably lands inside the window.
+    clink::fault::Registry::instance().arm(
+        clink::fault::Rule{.point = clink::fault::points::kCheckpointBeforeWrite,
+                           .action = clink::fault::Action::Delay,
+                           .arg = 1500});
+    struct RegistryReset {
+        ~RegistryReset() { clink::fault::Registry::instance().reset(); }
+    } reset_on_exit;
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-fault-cancel"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-fault-cancel", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto ckpt_dir = std::filesystem::temp_directory_path() /
+                          ("clink_fault_cancel_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(ckpt_dir);
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = ckpt_dir.string();
+    ckpt.interval_ms = 50;
+    const auto job_id = coordinator.submit_job(clink_cancel_test_graph(),
+                                               OperatorRegistry::default_instance(),
+                                               std::vector<PluginBinary>{},
+                                               ckpt);
+
+    // A checkpoint is demonstrably IN FLIGHT (triggered, not yet acked)
+    // before the cancel - the window the Delay holds open.
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        bool in_flight = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto d = coordinator.snapshot_job(job_id);
+            if (d.has_value() && !d->pending_checkpoint_ids.empty()) {
+                in_flight = true;
+                break;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+        ASSERT_TRUE(in_flight) << "no checkpoint entered flight before the cancel";
+    }
+
+    // The window is REAL, not assumed: wait until the write REACHES the
+    // armed point (the hit is counted before the 1500ms hold begins), so
+    // the cancel below demonstrably lands inside the held window. The
+    // pending-ids check above only proved the trigger was sent; the first
+    // version of this test asserted hits instantly and was vacuous.
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        bool reached = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (clink::fault::Registry::instance().hits(
+                    clink::fault::points::kCheckpointBeforeWrite) > 0) {
+                reached = true;
+                break;
+            }
+            std::this_thread::sleep_for(5ms);
+        }
+        ASSERT_TRUE(reached) << "the checkpoint write never reached the armed point";
+    }
+
+    (void)coordinator.cancel_job(job_id);
+    const auto cancel_started = std::chrono::steady_clock::now();
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, 10s))
+        << "cancel wedged behind the held checkpoint write";
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - cancel_started);
+    // Failure bound, not a synchronisation guess: well past the 1500ms
+    // hold plus teardown, far below the 10s wait above.
+    EXPECT_LT(took.count(), 8000) << "cancel took " << took.count() << "ms";
+
+    const auto d = coordinator.snapshot_job(job_id);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(d->cancel_requested);
+
+    std::filesystem::remove_all(ckpt_dir);
     worker.stop();
     coordinator.stop();
 }

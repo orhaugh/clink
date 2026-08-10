@@ -252,7 +252,18 @@ public:
         return {id, ok, std::move(snap), std::move(err)};
     }
 
-    // Close every shard queue; workers drain, flush, and exit.
+    // The stage is being CANCELLED, not drained: workers reaching
+    // end-of-input skip the EOS ceremony (close-time timers + flush) and
+    // just close their operators. Cancel is abrupt by contract - `clink
+    // stop` is the path that drains - and before this gate the sharded
+    // stage was the one runner shape that still flushed on cancel (item
+    // 12's recorded remainder): its workers exit on queue close and had no
+    // cancel signal to consult. Call before close_input(); the owning
+    // runner does so when its own should_stop() says the exit is a cancel.
+    void mark_cancelled() noexcept { cancelled_.store(true, std::memory_order_release); }
+
+    // Close every shard queue; workers drain, flush (unless cancelled), and
+    // exit.
     void close_input() {
         for (auto& s : shards_) {
             if (s->queue) {
@@ -587,14 +598,21 @@ private:
             }
             // EOS: drain in-flight reads, fire any close-time processing-time
             // timers through the gate, drain again so they ran - then flush.
-            if (aec) {
-                aec->drain();
-                fire_due_async();
-                aec->drain();
-            } else {
-                fire_due();
+            // On a CANCEL none of that happens: firing close-time timers and
+            // flushing both EMIT residual records, and a cancel must not,
+            // whatever shape the operator is (the single- and multi-input
+            // runners gate exactly the same way). close() still runs - it is
+            // resource cleanup, not emission.
+            if (!cancelled_.load(std::memory_order_acquire)) {
+                if (aec) {
+                    aec->drain();
+                    fire_due_async();
+                    aec->drain();
+                } else {
+                    fire_due();
+                }
+                sh.op->flush(out);
             }
-            sh.op->flush(out);
             sh.op->close();
         } catch (const std::exception& ex) {
             {
@@ -690,6 +708,10 @@ private:
     typename SubtaskEmitter<In>::Partitioner partition_;
     std::vector<std::unique_ptr<Shard>> shards_;
     std::atomic<bool> running_{false};
+    // Set by mark_cancelled() before the queues close; read by each worker
+    // at its end-of-input to decide between the drain ceremony and an
+    // abrupt exit.
+    std::atomic<bool> cancelled_{false};
     mutable std::mutex errors_mu_;
     std::vector<WorkerError> worker_errors_;
 

@@ -1853,3 +1853,88 @@ TEST(ShardedKeyedStage, DeadlineAwareResumesUrgentShardReadsFirst) {
     EXPECT_EQ(emit_order, (std::vector<std::int64_t>{2, 3, 1}))
         << "shard reads must resume in ascending-deadline order";
 }
+
+namespace {
+
+// Buffers every value and emits ONLY at flush() - so downstream output is a
+// direct observation of whether the EOS flush ceremony ran.
+class ClinkShardedCancelBufferingOp final : public Operator<std::int64_t, std::int64_t> {
+public:
+    void process(const StreamElement<std::int64_t>& el, Emitter<std::int64_t>& out) override {
+        (void)out;
+        if (el.is_data()) {
+            for (const auto& r : el.as_data()) {
+                held_.push_back(r.value());
+            }
+        }
+    }
+    void flush(Emitter<std::int64_t>& out) override {
+        Batch<std::int64_t> b;
+        for (const auto v : held_) {
+            b.emplace(v);
+        }
+        if (b.size() > 0) {
+            out.emit_data(std::move(b));
+        }
+    }
+    std::string name() const override { return "cancel_buffering"; }
+
+private:
+    std::vector<std::int64_t> held_;
+};
+
+}  // namespace
+
+// Item 12's recorded remainder: the sharded stage was the one runner shape
+// that still flushed on cancel - its workers exit on queue close with no
+// cancel signal to consult. The contract everywhere else: a cancel is
+// abrupt and must not emit residual output; only a clean end-of-input
+// drains. Both arms observed through an operator that emits ONLY at flush.
+TEST(ShardedKeyedStage, CancelSkipsTheEosFlushACleanCloseRunsIt) {
+    const auto make_stage = [](std::atomic<std::int64_t>& emits) {
+        return std::make_unique<ShardedKeyedStage<std::int64_t, std::int64_t>>(
+            /*shards=*/3,
+            OperatorId{7},
+            [](std::size_t) { return std::make_unique<ClinkShardedCancelBufferingOp>(); },
+            int64_key_bytes(),
+            [&emits](StreamElement<std::int64_t> e) {
+                if (e.is_data()) {
+                    emits.fetch_add(static_cast<std::int64_t>(e.as_data().size()),
+                                    std::memory_order_relaxed);
+                }
+                return true;
+            });
+    };
+    const auto feed = [](ShardedKeyedStage<std::int64_t, std::int64_t>& stage) {
+        Batch<std::int64_t> b;
+        for (std::int64_t k = 0; k < 12; ++k) {
+            b.emplace(k);
+        }
+        stage.submit(std::move(b));
+    };
+
+    // Clean close: the buffered records arrive via flush.
+    std::atomic<std::int64_t> clean_emits{0};
+    {
+        auto stage = make_stage(clean_emits);
+        stage->start();
+        feed(*stage);
+        stage->close_input();
+        stage->await();
+    }
+    EXPECT_EQ(clean_emits.load(), 12) << "a clean end-of-input must run the flush ceremony";
+
+    // Cancel: the same feed, but the exit is marked as a cancel before the
+    // queues close - nothing may be emitted.
+    std::atomic<std::int64_t> cancel_emits{0};
+    {
+        auto stage = make_stage(cancel_emits);
+        stage->start();
+        feed(*stage);
+        stage->mark_cancelled();
+        stage->close_input();
+        stage->await();
+    }
+    EXPECT_EQ(cancel_emits.load(), 0)
+        << "a cancel must not flush - residual records leaked past the gate";
+}

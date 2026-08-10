@@ -1351,6 +1351,13 @@ public:
             // hang" - that discards flush output and in-flight data. A genuine
             // cancel unblocks any stuck push via the cancel hook, which closes
             // out_channel.
+            if (should_stop()) {
+                // The exit above was a CANCEL, not end-of-input: tell the
+                // stage before closing its queues so workers skip the EOS
+                // flush ceremony, matching every other runner shape (a
+                // cancel must not flush).
+                stage.mark_cancelled();
+            }
             stage.close_input();
             stage.await();
             out_channel->close();
