@@ -23,6 +23,7 @@ if(NOT AWSSDK_FOUND)
 endif()
 
 add_library(clink_s3 STATIC
+    src/read_all.cpp
     src/s3_source.cpp
     src/s3_sink.cpp
     src/s3_sink_2pc.cpp

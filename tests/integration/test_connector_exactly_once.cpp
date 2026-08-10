@@ -34,11 +34,16 @@
 
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_kafka.hpp"
+#include "tests/integration/docker_localstack.hpp"
 #include "tests/integration/docker_postgres.hpp"
 #include "tests/integration/two_pc_output.hpp"
 
 #ifdef CLINK_HAS_KAFKA
 #include "clink/kafka/consume_all.hpp"
+#endif
+#ifdef CLINK_S3_2PC_JOB_PATH
+#include "clink/connectors/arrow_s3_lifecycle.hpp"
+#include "clink/s3/read_all.hpp"
 #endif
 
 namespace {
@@ -73,6 +78,13 @@ std::filesystem::path postgres_2pc_job() {
 std::filesystem::path kafka_2pc_job() {
 #ifdef CLINK_KAFKA_2PC_JOB_PATH
     return std::filesystem::path{CLINK_KAFKA_2PC_JOB_PATH};
+#else
+    return {};
+#endif
+}
+std::filesystem::path s3_2pc_job() {
+#ifdef CLINK_S3_2PC_JOB_PATH
+    return std::filesystem::path{CLINK_S3_2PC_JOB_PATH};
 #else
     return {};
 #endif
@@ -619,5 +631,223 @@ TEST_F(KafkaExactlyOnceTest, StaysExactlyOnceAcrossTwoSeparatedKillsOnALongerRun
 }
 
 #endif  // CLINK_HAS_KAFKA
+
+#ifdef CLINK_S3_2PC_JOB_PATH
+
+// The AWS SDK must be shut down on the main thread after the tests and
+// before static destruction - finalising from atexit is explicitly
+// non-viable (arrow_s3_lifecycle.hpp) - and a test process that initialised
+// S3 (the read_all/ensure_bucket helpers do) and exits without this
+// SEGFAULTS at exit, AFTER every test has already passed: ctest reports the
+// crash, a grep for test results sees only green. A gtest Environment tears
+// down after the last test and before main returns; finalize_arrow_s3() is
+// a no-op when S3 was never touched, so registering it unconditionally is
+// safe for every test in this binary.
+class ClinkS3LifecycleEnvironment final : public ::testing::Environment {
+public:
+    void TearDown() override { clink::connectors::finalize_arrow_s3(); }
+};
+const auto* const kClinkS3Lifecycle =
+    ::testing::AddGlobalTestEnvironment(new ClinkS3LifecycleEnvironment);
+
+// The S3 arm. Same bounded source, same moments - the sink stages one NDJSON
+// object per (subtask, checkpoint) as a multipart upload at the barrier and
+// completes it at CommitCheckpoint, so visibility is atomic and commits are
+// RECOVERABLE (the persisted handle re-completes idempotently at restore).
+// Verdicts are therefore strict, like Postgres and unlike Kafka. The in-doubt
+// witness is ListMultipartUploads: staged-but-uncommitted output sits there,
+// which makes the held-commit window provable from the outside. Orphaned
+// uploads from a killed incarnation whose checkpoint never became durable
+// stay there BY DESIGN (production expires them with a lifecycle rule), so
+// only the clean run asserts the pending set is empty.
+class S3ExactlyOnceTest : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        if (!clink::test::DockerLocalstack::docker_available()) {
+            return;  // per-test SetUp skips
+        }
+        s3_ = new clink::test::DockerLocalstack();
+    }
+
+    static void TearDownTestSuite() {
+        delete s3_;
+        s3_ = nullptr;
+    }
+
+    void SetUp() override {
+        if (!clink::test::DockerLocalstack::docker_available()) {
+            GTEST_SKIP() << "Docker or curl not available; skipping S3 exactly-once suite";
+        }
+        if (!std::filesystem::exists(node_binary()) || !std::filesystem::exists(submit_binary()) ||
+            !std::filesystem::exists(s3_2pc_job())) {
+            GTEST_SKIP() << "cluster binaries or the s3 2PC job plugin are not built";
+        }
+        ASSERT_NE(s3_, nullptr);
+        // One bucket per test; S3 bucket names must be lowercase.
+        bucket_ = std::string{"clink-xo-"} +
+                  ::testing::UnitTest::GetInstance()->current_test_info()->name();
+        std::transform(bucket_.begin(), bucket_.end(), bucket_.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        ::setenv("AWS_ACCESS_KEY_ID", "test", 1);
+        ::setenv("AWS_SECRET_ACCESS_KEY", "test", 1);
+        ::setenv("AWS_EC2_METADATA_DISABLED", "true", 1);
+        clink::s3::ensure_bucket(s3_->endpoint(), "us-east-1", bucket_);
+        ::setenv("CLINK_S3_BUCKET", bucket_.c_str(), 1);
+        ::setenv("CLINK_S3_ENDPOINT", s3_->endpoint().c_str(), 1);
+        ::setenv("CLINK_S3_PREFIX", "xo", 1);
+    }
+
+    std::vector<std::string> committed() const {
+        return clink::s3::read_all_lines(s3_->endpoint(), "us-east-1", bucket_, "xo");
+    }
+    std::size_t pending_multiparts() const {
+        return clink::s3::pending_multipart_count(s3_->endpoint(), "us-east-1", bucket_, "xo");
+    }
+
+    static std::unique_ptr<Process> submit(Cluster& c, int max_restarts) {
+        return submit_job(c, s3_2pc_job(), max_restarts);
+    }
+
+    static clink::test::DockerLocalstack* s3_;
+    std::string bucket_;
+};
+
+clink::test::DockerLocalstack* S3ExactlyOnceTest::s3_ = nullptr;
+
+// The premise: a clean run commits each record exactly once, and no multipart
+// upload is left pending - a clean completion must leave nothing staged.
+TEST_F(S3ExactlyOnceTest, ACleanRunCommitsEveryRecordExactlyOnce) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    auto sub = submit(c, /*max_restarts=*/0);
+    ASSERT_NE(sub, nullptr);
+    const auto code = sub->await_exit(90s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0);
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a CLEAN S3 2PC run did not commit each record exactly once: "
+                           << clink::itest::describe(v);
+    EXPECT_EQ(pending_multiparts(), 0u)
+        << "the job completed cleanly but left a multipart upload staged";
+}
+
+TEST_F(S3ExactlyOnceTest, EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto code = sub->await_exit(120s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover from the worker kill";
+    ASSERT_GT(c.count_in_coordinator_log("restart"), 0)
+        << "the job finished before the kill; the recovery path never ran";
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a worker kill broke S3 exactly-once: " << clink::itest::describe(v);
+}
+
+// The commit window, held open and provable: the checkpoint's object is
+// STAGED (visible in ListMultipartUploads, invisible in the object listing)
+// while the armed delay holds the commit; the kill lands inside that window;
+// recovery re-completes the persisted handle idempotently.
+TEST_F(S3ExactlyOnceTest, AWorkerKilledInsideTheCommitWindowStaysExactlyOnce) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.start_worker(1, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+    // The witness: staged output exists while nothing is visible yet.
+    ASSERT_TRUE(clink::itest::await([&] { return pending_multiparts() > 0; }, 30s))
+        << "no multipart upload appeared; the commit window never opened";
+    ASSERT_TRUE(committed().empty())
+        << "objects are visible while the commit should still be held; the fault did not arm "
+           "inside the plugin";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto code = sub->await_exit(120s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover from a kill inside the commit window";
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a kill inside the commit window broke S3 exactly-once: "
+                           << clink::itest::describe(v);
+}
+
+// The longer-horizon arm: thirty times the records, two separated worker
+// losses, strict verdict - S3 commits are recoverable, so unlike Kafka there
+// is no tolerated loss window.
+TEST_F(S3ExactlyOnceTest, StaysExactlyOnceAcrossTwoSeparatedKillsOnALongerRun) {
+    constexpr int kTotal = 1200;
+    ::setenv("CLINK_2PC_TOTAL", "1200", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "5", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    auto sub = submit(c, /*max_restarts=*/3);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto before_second = latest_completed(c.checkpoint_dir());
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return latest_completed(c.checkpoint_dir()) > before_second; }, 60s))
+        << "no checkpoint progress after the first kill; the restart never drained";
+    ASSERT_TRUE(c.restart_worker(0));
+
+    c.worker(1).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(1));
+
+    const auto code = sub->await_exit(180s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not survive two separated worker losses";
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean()) << "two separated kills on a longer run broke S3 exactly-once: "
+                           << clink::itest::describe(v);
+}
+
+#endif  // CLINK_S3_2PC_JOB_PATH
 
 }  // namespace

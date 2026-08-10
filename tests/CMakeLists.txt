@@ -394,6 +394,13 @@ if(CLINK_INTEGRATION_TESTS)
             CLINK_HAS_KAFKA
             CLINK_KAFKA_2PC_JOB_PATH=\"$<TARGET_FILE:clink_kafka_2pc_job>\")
     endif()
+    if(TARGET clink::s3)
+        # The S3 arm: the job plugin under test, plus the object-drain and
+        # multipart-witness helpers (clink::s3::read_all_lines etc.).
+        target_link_libraries(clink_integration_tests PRIVATE clink::s3)
+        target_compile_definitions(clink_integration_tests PRIVATE
+            CLINK_S3_2PC_JOB_PATH=\"$<TARGET_FILE:clink_s3_2pc_job>\")
+    endif()
     target_compile_definitions(clink_integration_tests PRIVATE
         CLINK_NODE_BINARY=\"$<TARGET_FILE:clink_node>\"
         CLINK_SUBMIT_BINARY=\"$<TARGET_FILE:clink_submit_job>\"

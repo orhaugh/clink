@@ -127,6 +127,19 @@ if(TARGET clink::kafka)
     clink_set_warnings(clink_kafka_2pc_job)
 endif()
 
+# s3_2pc_job: the S3 arm - one NDJSON object per (subtask, checkpoint),
+# staged as a multipart upload at the barrier and completed at
+# CommitCheckpoint. Carries clink::s3 the same way.
+if(TARGET clink::s3)
+    add_library(clink_s3_2pc_job MODULE s3_2pc_job.cpp)
+    target_link_libraries(clink_s3_2pc_job PRIVATE clink::core clink::s3)
+    set_target_properties(clink_s3_2pc_job PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "s3_2pc_job"
+    )
+    clink_set_warnings(clink_s3_2pc_job)
+endif()
+
 # rescale_exactly_once_job: replayable source -> keyed self-checking counter
 # (rescale bounds declared) -> 2PC sink. Written to demonstrate exactly-once
 # across a rescale; it instead established that a running job cannot be

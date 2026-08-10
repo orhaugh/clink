@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -58,6 +59,16 @@ S3MultipartHandle S3Sink2PC::deserialize(std::string_view bytes) const {
 
 struct S3Sink2PC::Impl {
     Options opts;
+    // Serialises every use of client against close(). The S3Client itself is
+    // thread-safe, but its LIFETIME is not: commit/abort dispatch on the
+    // worker's reader thread while close() runs on the task thread, and an
+    // EOS close resetting the client under an in-flight final-commit
+    // dispatch was a SIGSEGV that took the whole worker down (found by the
+    // S3 exactly-once integration suite's CLEAN run - the same
+    // close-versus-dispatch shape as the Postgres sink's connection race).
+    // A dispatch that finds the client already gone throws instead; the
+    // persisted handle stays for restore-time recovery.
+    std::mutex mu;
     std::unique_ptr<Aws::S3::S3Client> client;
     std::string buffer;  // one checkpoint interval, uploaded at the barrier
 };
@@ -78,6 +89,7 @@ S3Sink2PC::S3Sink2PC(Options opts)
 S3Sink2PC::~S3Sink2PC() = default;
 
 void S3Sink2PC::on_open() {
+    std::lock_guard lk(impl_->mu);
     clink::aws_sdk::ensure_initialized();
     Aws::S3::S3ClientConfiguration cfg;
     if (impl_->opts.region.has_value()) {
@@ -121,6 +133,7 @@ std::string object_key(const S3Sink2PC::Options& opts, std::uint64_t ckpt) {
 }  // namespace
 
 std::optional<S3MultipartHandle> S3Sink2PC::prepare_commit(std::uint64_t checkpoint_id) {
+    std::lock_guard lk(impl_->mu);
     if (impl_->buffer.empty()) {
         return std::nullopt;  // no records this interval -> nothing to commit
     }
@@ -174,6 +187,13 @@ std::optional<S3MultipartHandle> S3Sink2PC::prepare_commit(std::uint64_t checkpo
 }
 
 bool S3Sink2PC::commit(const S3MultipartHandle& handle) {
+    std::lock_guard lk(impl_->mu);
+    if (!impl_->client) {
+        // close() won the client under a racing late dispatch. Refuse rather
+        // than touch a dead handle: the thrown error keeps the persisted
+        // committable in place for restore-time recovery.
+        throw std::runtime_error("S3Sink2PC: client already closed");
+    }
     const std::string& bucket = impl_->opts.bucket;
     Aws::S3::Model::CompletedMultipartUpload completed;
     for (const auto& [n, etag] : handle.parts) {
@@ -210,6 +230,10 @@ bool S3Sink2PC::commit(const S3MultipartHandle& handle) {
 }
 
 void S3Sink2PC::abort(const S3MultipartHandle& handle) {
+    std::lock_guard lk(impl_->mu);
+    if (!impl_->client) {
+        throw std::runtime_error("S3Sink2PC: client already closed");
+    }
     Aws::S3::Model::AbortMultipartUploadRequest req;
     req.SetBucket(impl_->opts.bucket);
     req.SetKey(handle.key);
@@ -220,6 +244,7 @@ void S3Sink2PC::abort(const S3MultipartHandle& handle) {
 
 void S3Sink2PC::close() {
     if (impl_) {
+        std::lock_guard lk(impl_->mu);
         impl_->buffer.clear();  // an un-barriered tail is discarded (not committed)
         impl_->client.reset();
     }
