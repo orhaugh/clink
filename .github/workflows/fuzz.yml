@@ -20,6 +20,10 @@ on:
 
 permissions:
   contents: read
+  # The toolchain container is pulled from ghcr with GITHUB_TOKEN, which
+  # needs the packages scope - same as the sanitizers workflow. Without it
+  # the pull is 'denied' and every matrix job dies at container init.
+  packages: read
 
 jobs:
   discover:
