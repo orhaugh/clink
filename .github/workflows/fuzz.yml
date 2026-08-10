@@ -25,12 +25,37 @@ jobs:
   discover:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # The toolchain container, same as ci.yml's build jobs: the pinned Arrow
+    # prefix is baked at /usr/local, without which the project does not even
+    # configure (find_package(Arrow) is unconditional) - the first scheduled
+    # run failed exactly there on the bare runner. A bare runner also cannot
+    # LINK what it configures: the prebuilt Linux deps archive resolves
+    # against the image's system libraries (aws-sdk above all), not the
+    # runner's. libclang-rt for the fuzzer is NOT in the image (F80); it is
+    # installed per-run below.
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/clink-build:main
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # root: the runner mounts its file-command dirs root-owned; checkout
+      # dies with EACCES under the image's non-root default user.
+      options: --user root
+    env:
+      CLINK_DEPS_PREFIX: /usr/local
     strategy:
       fail-fast: false
       matrix:
         target: [cluster_frame, data_frame, checkpoint_meta, state_version_map, fault_spec]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        # The checkout's safe.directory entry lands in the action user's
+        # HOME, which differs from the run-step HOME in a container job;
+        # without this the rev-parse below (and the plugin ABI hash inside
+        # the build) fails with 'dubious ownership'.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Report the revision under test
         # Same rationale as the sanitizers workflow: a scheduled run tests
@@ -40,11 +65,13 @@ jobs:
           echo "fuzz(${{ matrix.target }}): testing $(git rev-parse HEAD)"
           echo "### Revision under test: \`$(git rev-parse HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install toolchain
+      - name: Install the fuzz runtime
+        # Running as root inside the Debian container - no sudo. clang, cmake
+        # and ninja are baked into the image; libclang-rt (the libFuzzer
+        # runtime) is the one piece the image lacks (F80).
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends \
-            clang libclang-rt-dev cmake ninja-build
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends libclang-rt-dev
 
       - name: Configure and build the target
         # SQL off: the fuzz targets do not touch it and the build is the slow
