@@ -139,8 +139,13 @@ TEST(RocksDbMaterializationStore, FactoryChangelogRocksdbBuildsRocksDbInnerWithF
     ASSERT_TRUE(v.has_value());
     EXPECT_EQ(to_string(*v), "v");
 
-    // Inner RocksDB directory must exist under <dir>/<subtask>/inner.
-    EXPECT_TRUE(std::filesystem::exists(dir / "0" / "inner"));
+    // Inner RocksDB directory must exist under the generation-namespaced
+    // subtask directory (state_dir_for: <dir>/v<generation>/<subtask>,
+    // design record 007) - the same rule every backend follows, so the
+    // factory and a restore cannot drift apart on the path.
+    const std::filesystem::path subtask_dir{
+        state_dir_for(dir.string(), /*generation=*/1, /*subtask_idx=*/0)};
+    EXPECT_TRUE(std::filesystem::exists(subtask_dir / "inner"));
 
     // Release the built backend before removing the dir (RocksDB holds
     // a LOCK file under it).
@@ -178,13 +183,15 @@ TEST(RocksDbMaterializationStore, FactoryChangelogRocksdbRoundTripsThroughRocksD
         // packed byte payloads); the bulk of the materialized state
         // lives in the checkpoint dir on disk, NOT the mat file.
         EXPECT_LT(snap.bytes.size(), 2000u);
-        const auto mat_file = dir / "0" / "mat" / "mat-7.bin";
+        const std::filesystem::path subtask_dir{
+            state_dir_for(dir.string(), /*generation=*/1, /*subtask_idx=*/0)};
+        const auto mat_file = subtask_dir / "mat" / "mat-7.bin";
         ASSERT_TRUE(std::filesystem::exists(mat_file));
         EXPECT_GT(std::filesystem::file_size(mat_file), 0u);
         // RocksDB writes its checkpoint into <inner>.cp-<id>; verify
         // it exists and has SST files (proves we exercised the real
         // RocksDB incremental-checkpoint path, not a stub).
-        const auto cp_dir = dir / "0" / "inner.cp-7";
+        const auto cp_dir = subtask_dir / "inner.cp-7";
         ASSERT_TRUE(std::filesystem::exists(cp_dir));
         bool any_sst = false;
         for (const auto& e : std::filesystem::directory_iterator(cp_dir)) {
@@ -237,10 +244,13 @@ TEST(RocksDbMaterializationStore, FactoryChangelogRocksdbRestoreSetsRestoreFromA
         }
         (void)built.backend->snapshot(CheckpointId{7});
     }
-    // The three artifacts restore depends on must all be on disk.
-    EXPECT_TRUE(std::filesystem::exists(dir / "0" / "changelog-7.snap"));
-    EXPECT_TRUE(std::filesystem::exists(dir / "0" / "mat" / "mat-7.bin"));
-    EXPECT_TRUE(std::filesystem::exists(dir / "0" / "inner.cp-7"));
+    // The three artifacts restore depends on must all be on disk, under
+    // the generation-namespaced subtask directory (state_dir_for).
+    const std::filesystem::path subtask_dir{
+        state_dir_for(dir.string(), /*generation=*/1, /*subtask_idx=*/0)};
+    EXPECT_TRUE(std::filesystem::exists(subtask_dir / "changelog-7.snap"));
+    EXPECT_TRUE(std::filesystem::exists(subtask_dir / "mat" / "mat-7.bin"));
+    EXPECT_TRUE(std::filesystem::exists(subtask_dir / "inner.cp-7"));
 
     StateBackendSpec spec;
     spec.uri = "changelog+rocksdb://" + dir.string();
