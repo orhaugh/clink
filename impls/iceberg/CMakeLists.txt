@@ -9,6 +9,10 @@
 # The module reuses the SQL Row columnar batcher for the typed Parquet data files
 # (so it depends on clink::sql), and uses iceberg-cpp for the manifests / table
 # metadata / catalog commit. SINK only in v1 (append-only, single-writer).
+#
+# It MUST link the SAME Arrow INSTANCE as clink::core, not merely the same
+# version - see the imported-target rewrite below. A second static Arrow in
+# the same process corrupts memory-pool handoffs (F87/F89).
 
 if(CLINK_WITH_ICEBERG STREQUAL "OFF")
     message(STATUS "clink::iceberg - CLINK_WITH_ICEBERG=OFF; target not defined")
@@ -51,6 +55,40 @@ if(NOT iceberg_FOUND OR NOT TARGET iceberg::iceberg_bundle_static OR
     return()
 endif()
 
+# iceberg-cpp's exported config links `Arrow::arrow_static` whenever that
+# target EXISTS in the consuming project - and clink's find_package(Arrow)
+# defines both the shared and static targets. Left alone, every binary that
+# links clink::iceberg next to clink::core carries TWO complete Arrow
+# runtimes: the static one smuggled in here (libarrow.a +
+# libarrow_bundled_dependencies.a, with its own bundled mimalloc and its own
+# arrow::default_memory_pool) and the shared libarrow.dylib everything else
+# uses. Which copy a given call binds to is a link-order accident, and a
+# buffer allocated by one runtime's memory pool then Reallocate'd through
+# the other's LOSES ITS CONTENTS without crashing - found as F89 (a state
+# snapshot's op_id column arriving zeroed, so restores came up silently
+# empty) and as F87 (outbound Arrow IPC wire frames with zeroed heads under
+# Debug). Same-version Arrow is NOT the same-instance Arrow the comment at
+# the top of this file once assumed.
+#
+# Rewrite the imported targets' interfaces so the generator expressions
+# resolve to the SHARED Arrow/Parquet - one runtime per process. iceberg-cpp
+# consumes Arrow's public API only, so linking it against the dylib is
+# sound. (libclink, the self-contained C-ABI artefact, keeps static Arrow -
+# it never loads the dylib, so there is exactly one instance there too.)
+foreach(_ice_tgt IN ITEMS iceberg::iceberg_static iceberg::iceberg_data_static
+                          iceberg::iceberg_rest_static iceberg::iceberg_sql_catalog_static
+                          iceberg::iceberg_bundle_static)
+    if(TARGET ${_ice_tgt})
+        get_target_property(_ice_link ${_ice_tgt} INTERFACE_LINK_LIBRARIES)
+        if(_ice_link)
+            string(REPLACE "Arrow::arrow_static" "Arrow::arrow_shared" _ice_link "${_ice_link}")
+            string(REPLACE "Parquet::parquet_static" "Parquet::parquet_shared" _ice_link
+                           "${_ice_link}")
+            set_target_properties(${_ice_tgt} PROPERTIES INTERFACE_LINK_LIBRARIES "${_ice_link}")
+        endif()
+    endif()
+endforeach()
+
 add_library(clink_iceberg STATIC
     src/register_factories.cpp
     src/iceberg_row_sink.cpp
@@ -76,30 +114,12 @@ target_link_libraries(clink_iceberg
             iceberg::iceberg_rest_static
 )
 
-# When Arrow is built with ARROW_AZURE (scripts/build-arrow.sh), azure-sdk-for-cpp is bundled
-# into libarrow's STATIC archive (libarrow_bundled_dependencies.a), which we pull in transitively
-# via iceberg::iceberg_bundle_static. azure-sdk's storage XML layer references SYSTEM libxml2, and
-# Arrow's exported static config does not record that dependency, so consumers of arrow_static
-# must link libxml2 explicitly (declared after the bundle so it resolves left-to-right under GNU
-# ld). clink_core links arrow_shared, where libxml2 is already baked into the dylib, so iceberg -
-# the one arrow_static consumer - is where this bites.
+# The libxml2 workaround that used to live here existed only because the
+# static Arrow bundle (with azure-sdk baked in) reached the link via
+# iceberg's targets. With the interface rewritten to arrow_shared above,
+# azure-sdk and its XML layer live inside libarrow.dylib and no explicit
+# libxml2 link is needed.
 set(_iceberg_find_deps "find_dependency(iceberg CONFIG)")
-if(ARROW_AZURE)
-    find_package(LibXml2 QUIET)
-    if(NOT LibXml2_FOUND)
-        message(FATAL_ERROR
-            "clink::iceberg: the pinned Arrow was built with ARROW_AZURE, so azure-sdk-for-cpp is "
-            "bundled into libarrow_bundled_dependencies.a (pulled in via iceberg::iceberg_bundle_static) "
-            "and system libxml2 is required to resolve its XML symbols when linking. Install libxml2 "
-            "(libxml2-dev on Debian; bundled with the macOS SDK) or rebuild Arrow without -DARROW_AZURE=ON.")
-    endif()
-    target_link_libraries(clink_iceberg PRIVATE LibXml2::LibXml2)
-    # The installed clinkConfig must re-find LibXml2 too: clink_iceberg is a static lib, so this
-    # PRIVATE imported-target dep is recorded as $<LINK_ONLY:LibXml2::LibXml2> in clinkTargets.cmake;
-    # without this a downstream find_package(clink) linking clink::iceberg (or clink::clink) sees an
-    # undefined LibXml2::LibXml2 target at configure time.
-    list(APPEND _iceberg_find_deps "find_dependency(LibXml2)")
-endif()
 
 clink_set_warnings(clink_iceberg)
 clink_install_impl(

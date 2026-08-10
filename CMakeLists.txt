@@ -1187,6 +1187,22 @@ add_executable(clink_node tools/clink_node.cpp)
 target_link_libraries(clink_node PRIVATE clink::clink)
 clink_set_warnings(clink_node)
 
+# Exactly ONE Arrow runtime may exist in this binary. clink_node loads
+# libarrow as a dylib via clink::core; a dependency that additionally drags
+# libarrow.a into the link (iceberg-cpp's exported config did, whenever
+# Arrow::arrow_static exists in the consumer) puts TWO memory-pool instances
+# in one process, and buffers allocated by one and Reallocate'd by the other
+# lose their contents without crashing (F87/F89: zeroed snapshot op_id
+# columns, zeroed wire-frame heads). The check greps the binary for a
+# DEFINED arrow::default_memory_pool, which only a second static Arrow can
+# introduce.
+if(CLINK_BUILD_TESTS)
+    add_test(NAME single_arrow_runtime
+        COMMAND "${CMAKE_COMMAND}" -DBINARY=$<TARGET_FILE:clink_node>
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckSingleArrowRuntime.cmake")
+    set_tests_properties(single_arrow_runtime PROPERTIES LABELS "core")
+endif()
+
 # Tell clink_node which impls it has at compile time so it can wire
 # up clink::<x>::install() calls without #ifdef on macros that
 # leaked from libclink's old build. Each impl sets a CLINK_LINKED_<X>
