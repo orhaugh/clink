@@ -585,3 +585,7 @@ if(CLINK_BUILD_SQL AND TARGET clink::s3)
         PROPERTIES TIMEOUT 120 LABELS "sql;s3"
     )
 endif()
+
+# Item 30: the test plugins ship on every PluginSubmission-family submit;
+# strip them the same way the example jobs are stripped.
+clink_split_debug_and_strip_modules_in_dir()

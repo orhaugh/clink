@@ -220,3 +220,6 @@ set_target_properties(clink_parallel_bench_pipeline PROPERTIES
 clink_set_warnings(clink_parallel_bench_pipeline)
 
 endif()  # TARGET clink::rocksdb
+
+# Item 30: bench pipeline modules are submitted like any job plugin.
+clink_split_debug_and_strip_modules_in_dir()

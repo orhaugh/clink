@@ -142,3 +142,14 @@ set_target_properties(clink_schema_evo_test_job PROPERTIES
     OUTPUT_NAME "schema_evo_test_job"
 )
 clink_set_warnings(clink_schema_evo_test_job)
+
+# Item 30: ship ~5 MB job modules, not ~104 MB ones. Applies to every MODULE
+# target defined above; the DWARF moves whole into <module>.so.debug beside
+# the artefact (see cmake/ClinkPluginDebugSplit.cmake).
+clink_split_debug_and_strip_modules_in_dir()
+if(CLINK_BUILD_TESTS AND UNIX AND NOT APPLE)
+    add_test(NAME job_plugin_ships_stripped
+        COMMAND "${CMAKE_COMMAND}" -DBINARY=$<TARGET_FILE:clink_heavy_pipeline_job>
+                -P "${CMAKE_SOURCE_DIR}/cmake/CheckPluginStripped.cmake")
+    set_tests_properties(job_plugin_ships_stripped PROPERTIES LABELS "core")
+endif()

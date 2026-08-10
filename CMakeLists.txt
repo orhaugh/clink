@@ -212,6 +212,7 @@ option(CLINK_INTEGRATION_TESTS "Build integration tests that need external servi
 include(CompilerWarnings)
 include(GNUInstallDirs)
 include(cmake/ClinkInstall.cmake)
+include(cmake/ClinkPluginDebugSplit.cmake)
 
 # Always emit compile_commands.json so clang-tidy / clangd / IDEs can
 # resolve per-TU flags without extra plumbing. Cheap to leave on.
