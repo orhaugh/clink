@@ -70,12 +70,12 @@ jobs:
           echo "### Revision under test: \`$(git rev-parse HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install the fuzz runtime
-        # Running as root inside the Debian container - no sudo. clang, cmake
-        # and ninja are baked into the image; libclang-rt (the libFuzzer
-        # runtime) is the one piece the image lacks (F80).
+        # Running as root inside the Debian container - no sudo. clang and
+        # cmake are baked into the image; ninja and libclang-rt (the
+        # libFuzzer runtime, F80) are not.
         run: |
           apt-get update -q
-          apt-get install -y -q --no-install-recommends libclang-rt-dev
+          apt-get install -y -q --no-install-recommends libclang-rt-dev ninja-build
 
       - name: Configure and build the target
         # SQL off: the fuzz targets do not touch it and the build is the slow
