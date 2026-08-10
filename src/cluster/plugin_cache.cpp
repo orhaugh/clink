@@ -105,6 +105,22 @@ std::string write_plugin_to_cache(const PluginBinary& blob, const std::string& b
     return path.string();
 }
 
+std::string find_plugin_in_cache(const std::string& content_hash, const std::string& base_dir) {
+    if (content_hash.empty()) {
+        return {};
+    }
+    // Same name derivation as write_plugin_to_cache: the cache is
+    // content-addressed by the recomputed hash, so a lookup by a DECLARED
+    // hash finds exactly the bytes that hash to it or nothing.
+    const auto base = resolve_base_dir(base_dir);
+    const auto path = base / (content_hash + suffix_for_platform());
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) {
+        return {};
+    }
+    return path.string();
+}
+
 PluginBinary make_plugin_binary_from_file(const std::string& path, const std::string& name) {
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {

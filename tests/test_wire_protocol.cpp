@@ -997,3 +997,47 @@ TEST(WireProtocolFencing, ADefaultConstructedControlFrameIsUnfenced) {
     EXPECT_EQ(BeginRescaleMsg{}.coordinator_epoch, 0U);
     EXPECT_EQ(PeerUpdateMsg{}.coordinator_epoch, 0U);
 }
+
+// Content-addressed plugin shipping (item 30): the ack's missing-hash list
+// rides an eof-guarded tail, so a new reader accepts an old writer's frame
+// (empty list) and the new field round-trips when present.
+TEST(WireProtocol, SubmitJobAckMissingPluginHashesRoundTripAndOldFramesDecode) {
+    SubmitJobAckMsg in{
+        .job_id = 0, .ok = false, .message = "plugin bytes required for 2 referenced module(s)"};
+    in.missing_plugin_hashes = {"00deadbeef00cafe", "1122334455667788"};
+    auto out = round_trip(MessageKind::SubmitJobAck, in, decode_submit_job_ack);
+    EXPECT_EQ(out.ok, false);
+    EXPECT_EQ(out.message, in.message);
+    ASSERT_EQ(out.missing_plugin_hashes.size(), 2u);
+    EXPECT_EQ(out.missing_plugin_hashes[0], "00deadbeef00cafe");
+    EXPECT_EQ(out.missing_plugin_hashes[1], "1122334455667788");
+
+    // A frame from a pre-item-30 coordinator ends after `message`; the
+    // decoder must stop at eof with an empty list rather than throw.
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::SubmitJobAck));
+    b.put_u64_be(7);
+    b.put_u8(1);
+    b.put_string("ok");
+    MessageReader r(body_of(b.finalize()));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::SubmitJobAck);
+    const auto old = decode_submit_job_ack(r);
+    EXPECT_TRUE(old.ok);
+    EXPECT_EQ(old.job_id, 7u);
+    EXPECT_TRUE(old.missing_plugin_hashes.empty());
+}
+
+// A PluginBinary with empty bytes and a non-empty hash is a REFERENCE and
+// must survive the wire as one - bytes stay empty, hash intact.
+TEST(WireProtocol, PluginBinaryReferenceRoundTripsInsideDeploy) {
+    DeployMsg in;
+    in.job_id = 42;
+    in.plugins.push_back(
+        PluginBinary{.name = "hello", .content_hash = "aabbccddeeff0011", .bytes = {}});
+    ASSERT_TRUE(in.plugins[0].is_reference());
+    auto out = round_trip(MessageKind::Deploy, in, decode_deploy);
+    ASSERT_EQ(out.plugins.size(), 1u);
+    EXPECT_TRUE(out.plugins[0].is_reference());
+    EXPECT_EQ(out.plugins[0].content_hash, "aabbccddeeff0011");
+    EXPECT_EQ(out.plugins[0].name, "hello");
+}

@@ -30,6 +30,11 @@ std::string fnv1a_64_hex(std::span<const std::byte> bytes);
 // separate processes).
 std::string write_plugin_to_cache(const PluginBinary& blob, const std::string& base_dir = {});
 
+// Path of the cached module for `content_hash`, or empty when the cache
+// does not hold it. The counterpart of write_plugin_to_cache for resolving
+// a hash-only PluginBinary REFERENCE (item 30); same default base dir.
+std::string find_plugin_in_cache(const std::string& content_hash, const std::string& base_dir = {});
+
 // Compute content_hash for a fresh PluginBinary loaded from disk
 // (used by the client when packaging a plugin for SubmitJob).
 PluginBinary make_plugin_binary_from_file(const std::string& path, const std::string& name = {});

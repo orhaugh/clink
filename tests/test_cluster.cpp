@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <latch>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/application/job_submitter.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_graph.hpp"
@@ -1652,6 +1654,152 @@ TEST(Cluster, ARunningJobSurvivesAFullRingOfTerminalChurn) {
     releaser.fire();
     EXPECT_TRUE(coordinator.await_job_completion(hold_id, 5s))
         << "the held job must still complete after the churn";
+
+    worker.stop();
+    coordinator.stop();
+}
+
+namespace {
+
+std::filesystem::path cluster_hello_plugin_path() {
+#ifdef CLINK_HELLO_PLUGIN_PATH
+    return std::filesystem::path{CLINK_HELLO_PLUGIN_PATH};
+#else
+    return {};
+#endif
+}
+
+std::uint64_t counter_value(const char* name) {
+    return MetricsRegistry::global().counter(name).value();
+}
+
+}  // namespace
+
+// Content-addressed plugin shipping (item 30), end to end and in process:
+// the FIRST submit of a module uploads bytes (hash-first, one nack, one
+// retry) and the deploy ships bytes to the worker once; the SECOND submit
+// of the same module resolves from the coordinator's cache with no upload,
+// and its deploy sends a hash-only reference - whose job still runs and
+// produces output, which is the proof the reference resolved through the
+// real dlopen path rather than being silently dropped.
+TEST(Cluster, PluginBytesShipOncePerWorkerConnection) {
+    const auto plugin = cluster_hello_plugin_path();
+    if (plugin.empty() || !std::filesystem::exists(plugin)) {
+        GTEST_SKIP() << "hello_plugin not built";
+    }
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-hash-a"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-hash-a", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto graph_for = [](const std::filesystem::path& out) {
+        clink::cluster::JobGraphSpec g;
+        clink::cluster::OperatorSpec src;
+        src.id = "src";
+        src.type = "hello.GreetingSource";
+        src.out_channel = "hello.Greeting";
+        src.params = {{"count", "4"}, {"start", "1"}};
+        g.ops.push_back(std::move(src));
+        clink::cluster::OperatorSpec snk;
+        snk.id = "snk";
+        snk.type = "hello.GreetingFileSink";
+        snk.out_channel = "hello.Greeting";
+        snk.inputs = {"src"};
+        snk.params = {{"path", out.string()}};
+        g.ops.push_back(std::move(snk));
+        return g;
+    };
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto pid_tag = std::to_string(::getpid());
+
+    clink::application::JobSubmitter submitter("127.0.0.1", port);
+    clink::application::SubmitOptions opts;
+    opts.wait_for_completion = true;
+    opts.wait_timeout = 10s;
+
+    const auto shipped_before = counter_value("clink_coordinator_plugin_bytes_shipped_total");
+    const auto deduped_before = counter_value("clink_coordinator_plugin_ships_deduped_total");
+    const auto cache_hits_before =
+        counter_value("clink_coordinator_submit_plugin_cache_hits_total");
+
+    const auto out1 = tmp / ("clink_hash_ship_1_" + pid_tag + ".out");
+    std::filesystem::remove(out1);
+    auto r1 = submitter.submit(graph_for(out1).to_json(), {plugin.string()}, opts);
+    ASSERT_TRUE(r1.ok) << r1.reject_message;
+    const auto shipped_after_1 = counter_value("clink_coordinator_plugin_bytes_shipped_total");
+    EXPECT_GT(shipped_after_1, shipped_before)
+        << "the first deploy of a module must ship its bytes";
+
+    const auto out2 = tmp / ("clink_hash_ship_2_" + pid_tag + ".out");
+    std::filesystem::remove(out2);
+    auto r2 = submitter.submit(graph_for(out2).to_json(), {plugin.string()}, opts);
+    ASSERT_TRUE(r2.ok) << r2.reject_message;
+
+    EXPECT_EQ(counter_value("clink_coordinator_plugin_bytes_shipped_total"), shipped_after_1)
+        << "a module already on the worker's connection must ship as a reference, not bytes";
+    EXPECT_GT(counter_value("clink_coordinator_plugin_ships_deduped_total"), deduped_before);
+    EXPECT_GT(counter_value("clink_coordinator_submit_plugin_cache_hits_total"), cache_hits_before)
+        << "the second hash-first submit must resolve from the coordinator's cache";
+
+    // The reference-deployed job actually ran: its sink wrote output.
+    std::ifstream in2(out2);
+    std::string line2;
+    ASSERT_TRUE(std::getline(in2, line2)) << "the job deployed by reference produced no output";
+
+    std::filesystem::remove(out1);
+    std::filesystem::remove(out2);
+    worker.stop();
+    coordinator.stop();
+}
+
+// A hash-only reference the worker cannot resolve fails the deploy LOUDLY
+// through the ordinary plugin-failure path - a reference is a claim about
+// the worker's cache, never permission to run without the module. Driven
+// through the real coordinator and worker by submitting a reference whose
+// hash no cache has ever seen.
+TEST(Cluster, AnUnresolvableHashOnlyPluginReferenceFailsTheDeployLoudly) {
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-hash-miss"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-hash-miss", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    clink::cluster::JobGraphSpec g;
+    clink::cluster::OperatorSpec src;
+    src.id = "src";
+    src.type = "int64_range_source";
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "4"}};
+    g.ops.push_back(std::move(src));
+    clink::cluster::OperatorSpec snk;
+    snk.id = "snk";
+    snk.type = "collecting_int64_sink";
+    snk.out_channel = std::string{kChannelInt64};
+    snk.inputs = {"src"};
+    g.ops.push_back(std::move(snk));
+
+    std::vector<PluginBinary> plugins;
+    plugins.push_back(
+        PluginBinary{.name = "phantom", .content_hash = "feedfacefeedface", .bytes = {}});
+    const auto job_id = coordinator.submit_job(
+        g, OperatorRegistry::default_instance(), std::move(plugins), CheckpointConfig{}, nullptr);
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, 5s));
+
+    const auto errs = coordinator.job_errors(job_id);
+    ASSERT_FALSE(errs.empty()) << "an unresolvable reference must fail the job, not run it";
+    EXPECT_NE(errs.front().find("not in this worker's cache"), std::string::npos) << errs.front();
 
     worker.stop();
     coordinator.stop();

@@ -1175,7 +1175,26 @@ void Worker::handle_deploy_(MessageReader& r) {
     std::string plugin_err;
     for (const auto& plug : msg.plugins) {
         try {
-            const auto path = clink::cluster::write_plugin_to_cache(plug);
+            // A hash-only reference (item 30) claims this worker's cache
+            // already holds the bytes - the coordinator shipped them on an
+            // earlier Deploy over this same connection. A miss is a real
+            // fault (someone removed the cache file mid-process), and it
+            // fails the deploy LOUDLY through the same synthetic
+            // SubtaskFinished path as any other plugin failure: a
+            // reference is never permission to run without the module.
+            std::string path;
+            if (plug.is_reference()) {
+                path = clink::cluster::find_plugin_in_cache(plug.content_hash);
+                if (path.empty()) {
+                    plugin_err = "plugin '" + plug.name + "': hash-only reference " +
+                                 plug.content_hash +
+                                 " is not in this worker's cache - the coordinator "
+                                 "believed it was already delivered";
+                    break;
+                }
+            } else {
+                path = clink::cluster::write_plugin_to_cache(plug);
+            }
             auto res =
                 clink::cluster::PluginLoader::default_instance().load_into(path, bundle_preg);
             if (!res.ok) {

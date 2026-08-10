@@ -2452,7 +2452,7 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         DeployMsg dm;
         dm.job_id = job.id;
         dm.tasks = std::move(wtasks);
-        dm.plugins = job.plugins;
+        dm.plugins = plugins_for_worker_locked_(job, *it->second);
         dm.checkpoint_dir = job.checkpoint.checkpoint_dir;
         dm.state_backend_uri = job.checkpoint.state_backend_uri;
         dm.capture_dir = job.checkpoint.capture_dir;
@@ -2985,6 +2985,39 @@ void Coordinator::handle_submit_(network::Connection& conn, MessageReader& r) {
         // other.
         auto bundle = std::make_unique<JobBundle>();
         auto bundle_preg = bundle->as_plugin_registry();
+        // Content-addressed submit (item 30): a hash-only PluginBinary is a
+        // REFERENCE to bytes this coordinator's cache may already hold. Any
+        // reference the cache cannot resolve is answered with the missing
+        // hashes so the submitter can retry once with bytes - the job is
+        // NOT admitted on a partial plugin set. Resolved references are
+        // materialised back into the message, because everything downstream
+        // (the HA manifest, every worker Deploy) needs the full bytes on
+        // the JobState.
+        {
+            std::vector<std::string> missing;
+            for (auto& plug : sj.plugins) {
+                if (!plug.is_reference()) {
+                    continue;
+                }
+                const auto cached = find_plugin_in_cache(plug.content_hash);
+                if (cached.empty()) {
+                    missing.push_back(plug.content_hash);
+                    continue;
+                }
+                auto loaded = make_plugin_binary_from_file(cached, plug.name);
+                plug.bytes = std::move(loaded.bytes);
+                metrics::coordinator::submit_plugin_cache_hit();
+            }
+            if (!missing.empty()) {
+                ack.job_id = 0;
+                ack.ok = false;
+                ack.message = "plugin bytes required for " + std::to_string(missing.size()) +
+                              " referenced module(s)";
+                ack.missing_plugin_hashes = std::move(missing);
+                send_frame(conn, encode_frame(MessageKind::SubmitJobAck, ack));
+                return;
+            }
+        }
         std::vector<std::string> plugin_so_paths;
         plugin_so_paths.reserve(sj.plugins.size());
         for (const auto& plug : sj.plugins) {
@@ -3553,6 +3586,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     // Send Deploy to each affected worker.
     for (auto& [worker_id, tasks] : by_worker) {
         std::shared_ptr<WorkerConnection> conn;
+        std::vector<PluginBinary> worker_plugins;
         {
             std::lock_guard lock(mu_);
             auto it = registered_.find(worker_id);
@@ -3561,11 +3595,12 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                                          worker_id);
             }
             conn = it->second;
+            worker_plugins = plugins_for_worker_locked_(*job, *conn);
         }
         DeployMsg deploy_msg;
         deploy_msg.job_id = job_id;
         deploy_msg.tasks = std::move(tasks);
-        deploy_msg.plugins = plugins;
+        deploy_msg.plugins = std::move(worker_plugins);
         deploy_msg.checkpoint_dir = checkpoint.checkpoint_dir;
         deploy_msg.state_backend_uri = checkpoint.state_backend_uri;
         deploy_msg.capture_dir = checkpoint.capture_dir;
@@ -4768,7 +4803,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         DeployMsg deploy_msg;
         deploy_msg.job_id = job.id;
         deploy_msg.tasks = std::move(tasks);
-        deploy_msg.plugins = job.plugins;
+        deploy_msg.plugins = plugins_for_worker_locked_(job, *worker_it->second);
         deploy_msg.checkpoint_dir = job.checkpoint.checkpoint_dir;
         deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
         deploy_msg.capture_dir = job.checkpoint.capture_dir;
@@ -5011,7 +5046,7 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         DeployMsg deploy_msg;
         deploy_msg.job_id = job.id;
         deploy_msg.tasks = std::move(tasks);
-        deploy_msg.plugins = job.plugins;
+        deploy_msg.plugins = plugins_for_worker_locked_(job, *worker_it->second);
         deploy_msg.checkpoint_dir = job.checkpoint.checkpoint_dir;
         deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
         deploy_msg.capture_dir = job.checkpoint.capture_dir;
@@ -5345,6 +5380,28 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
     }
     // Slot freed: wake any submit_job waiting on capacity.
     cv_.notify_all();
+}
+
+std::vector<PluginBinary> Coordinator::plugins_for_worker_locked_(const JobState& job,
+                                                                  WorkerConnection& worker) {
+    std::vector<PluginBinary> out;
+    out.reserve(job.plugins.size());
+    for (const auto& plug : job.plugins) {
+        if (!plug.content_hash.empty() &&
+            worker.shipped_plugin_hashes.count(plug.content_hash) != 0) {
+            // Already delivered on this connection: send the reference.
+            out.push_back(
+                PluginBinary{.name = plug.name, .content_hash = plug.content_hash, .bytes = {}});
+            metrics::coordinator::plugin_ship_deduped();
+            continue;
+        }
+        out.push_back(plug);
+        if (!plug.content_hash.empty()) {
+            worker.shipped_plugin_hashes.insert(plug.content_hash);
+        }
+        metrics::coordinator::plugin_bytes_shipped(plug.bytes.size());
+    }
+    return out;
 }
 
 void Coordinator::signal_job_completion_locked_(JobState& job) {

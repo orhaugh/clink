@@ -223,6 +223,12 @@ inline void encode_body(MessageBuilder& b, const SubmitJobAckMsg& m) {
     b.put_u64_be(m.job_id);
     b.put_u8(m.ok ? 1 : 0);
     b.put_string(m.message);
+    // Tail field (content-addressed plugin shipping, item 30): old readers
+    // stop before it, old writers never produce it.
+    b.put_u32_be(static_cast<std::uint32_t>(m.missing_plugin_hashes.size()));
+    for (const auto& h : m.missing_plugin_hashes) {
+        b.put_string(h);
+    }
 }
 
 inline void encode_body(MessageBuilder& b, const JobCompletedMsg& m) {
@@ -715,6 +721,15 @@ inline SubmitJobAckMsg decode_submit_job_ack(MessageReader& r) {
     m.job_id = r.read_u64_be();
     m.ok = r.read_u8() != 0;
     m.message = r.read_string();
+    // Eof-guarded tail: a frame from a pre-item-30 coordinator ends here
+    // and the list stays empty.
+    if (!r.eof()) {
+        const auto n = r.read_u32_be();
+        m.missing_plugin_hashes.reserve(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            m.missing_plugin_hashes.push_back(r.read_string());
+        }
+    }
     return m;
 }
 

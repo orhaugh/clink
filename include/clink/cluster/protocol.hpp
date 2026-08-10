@@ -276,14 +276,26 @@ struct DeploymentTask {
 
 // ----- Message bodies -----
 
-// One plugin shared library shipped with a SubmitJob (and re-shipped
-// by the coordinator in each Deploy so workers can dlopen it). v1 inlines the
-// bytes; a future content-addressed-upload variant can avoid
-// re-shipping if the same plugin is submitted multiple times.
+// One plugin shared library shipped with a SubmitJob (and referenced by the
+// coordinator in each Deploy so workers can dlopen it).
+//
+// Content-addressed shipping (item 30): EMPTY bytes with a NON-EMPTY
+// content_hash is a REFERENCE - "you already hold these bytes under this
+// hash". A submitter sends references first and uploads only the hashes the
+// coordinator's cache reports missing (SubmitJobAckMsg.missing_plugin_hashes);
+// the coordinator sends references to any worker connection it has already
+// shipped the bytes to. A receiver that cannot resolve a reference fails the
+// operation loudly - a reference is a claim about the peer's cache, never a
+// permission to run without the module. Empty bytes WITH an empty hash keeps
+// its old meaning (a degenerate empty blob).
 struct PluginBinary {
     std::string name;          // Informational, from the plugin metadata.
     std::string content_hash;  // FNV-64 hex of bytes; cache key on both ends.
     std::vector<std::byte> bytes;
+
+    [[nodiscard]] bool is_reference() const noexcept {
+        return bytes.empty() && !content_hash.empty();
+    }
 };
 
 struct RegisterMsg {
@@ -641,6 +653,11 @@ struct SubmitJobAckMsg {
     JobId job_id{};
     bool ok{};
     std::string message;
+    // Content hashes of plugins the submission REFERENCED (empty bytes +
+    // hash) that this coordinator's cache does not hold. Non-empty means
+    // "re-send with bytes for these"; the submitter retries once on the
+    // same connection. Appended at the tail, eof-guarded, defaults empty.
+    std::vector<std::string> missing_plugin_hashes;
 };
 
 // coordinator → Client. One per submitted job, sent when every subtask has finished

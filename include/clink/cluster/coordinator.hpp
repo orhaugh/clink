@@ -637,6 +637,14 @@ private:
     struct WorkerConnection {
         std::string worker_id;
         std::string data_host;
+        // Content hashes of plugin modules already shipped over THIS
+        // connection (item 30). Deploys send hash-only references for
+        // these; a re-register builds a fresh WorkerConnection, so a
+        // restarted worker (whose pid-keyed cache is gone) starts empty
+        // and receives full bytes again. Recorded at Deploy build under
+        // mu_ - if the send then fails, the worker is on its way to lost
+        // or re-registered, both of which reset this.
+        std::unordered_set<std::string> shipped_plugin_hashes;
         // The protocol version this peer registered with. Checked at register and
         // then discarded, which left a mixed-version cluster diagnosable only by
         // reading logs - the version that refused a peer was reported, the versions
@@ -1195,6 +1203,11 @@ private:
     // Takes the lock itself (called from the register path, outside it).
     void retire_previous_session_subtasks_(const std::string& worker_id);
     void send_peer_updates_locked_(JobState& job);
+    // job.plugins with bytes elided for every hash `worker`'s connection
+    // already received, recording what this call will ship (item 30).
+    // mu_ held by the caller.
+    std::vector<PluginBinary> plugins_for_worker_locked_(const JobState& job,
+                                                         WorkerConnection& worker);
     void signal_job_completion_locked_(JobState& job);
     // After every surviving-worker subtask of `job` has drained on
     // awaiting_restart=true, rebuild tasks_by_worker by round-robin

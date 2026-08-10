@@ -150,30 +150,72 @@ SubmitResult JobSubmitter::submit(const std::string& graph_json,
         result.reject_message = "HelloClient send failed";
         return result;
     }
+    // Content-addressed submit (item 30): send hash-only REFERENCES first.
+    // A coordinator whose cache holds every module admits the job with no
+    // plugin bytes on the wire at all - the common case for every submit
+    // after the first. One retry uploads exactly the hashes the ack names
+    // missing; anything else in the reply is an ordinary rejection.
     SubmitJobMsg sj;
     sj.graph_json = graph_json;
-    sj.plugins = std::move(plugins);
+    sj.plugins.reserve(plugins.size());
+    for (const auto& plug : plugins) {
+        sj.plugins.push_back(
+            PluginBinary{.name = plug.name, .content_hash = plug.content_hash, .bytes = {}});
+    }
     sj.checkpoint = opts.checkpoint;
-    if (!send_one(MessageKind::SubmitJob, sj)) {
-        result.reject_message = "SubmitJob send failed";
-        return result;
-    }
 
-    ReadFailure ack_why = ReadFailure::Timeout;
-    auto ack_frame =
-        read_frame_with_timeout(fd, static_cast<int>(opts.ack_timeout.count()), &ack_why);
-    if (!ack_frame.has_value()) {
-        result.reject_message = std::string{"no SubmitJobAck: "} + describe(ack_why);
+    const auto submit_and_read_ack =
+        [&](const SubmitJobMsg& msg) -> std::optional<SubmitJobAckMsg> {
+        if (!send_one(MessageKind::SubmitJob, msg)) {
+            result.reject_message = "SubmitJob send failed";
+            return std::nullopt;
+        }
+        ReadFailure ack_why = ReadFailure::Timeout;
+        auto ack_frame =
+            read_frame_with_timeout(fd, static_cast<int>(opts.ack_timeout.count()), &ack_why);
+        if (!ack_frame.has_value()) {
+            result.reject_message = std::string{"no SubmitJobAck: "} + describe(ack_why);
+            return std::nullopt;
+        }
+        MessageReader ack_reader(std::move(*ack_frame));
+        const auto ack_kind = static_cast<MessageKind>(ack_reader.read_u8());
+        if (ack_kind != MessageKind::SubmitJobAck) {
+            result.reject_message =
+                "unexpected reply kind " + std::to_string(static_cast<int>(ack_kind));
+            return std::nullopt;
+        }
+        return decode_submit_job_ack(ack_reader);
+    };
+
+    auto ack_opt = submit_and_read_ack(sj);
+    if (!ack_opt.has_value()) {
         return result;
     }
-    MessageReader ack_reader(std::move(*ack_frame));
-    const auto ack_kind = static_cast<MessageKind>(ack_reader.read_u8());
-    if (ack_kind != MessageKind::SubmitJobAck) {
-        result.reject_message =
-            "unexpected reply kind " + std::to_string(static_cast<int>(ack_kind));
-        return result;
+    if (!ack_opt->ok && !ack_opt->missing_plugin_hashes.empty()) {
+        // The coordinator's cache lacks some referenced modules: retry once
+        // with bytes for exactly those. Everything it already holds stays a
+        // reference.
+        for (auto& plug : sj.plugins) {
+            const bool wanted =
+                std::find(ack_opt->missing_plugin_hashes.begin(),
+                          ack_opt->missing_plugin_hashes.end(),
+                          plug.content_hash) != ack_opt->missing_plugin_hashes.end();
+            if (!wanted) {
+                continue;
+            }
+            for (const auto& full : plugins) {
+                if (full.content_hash == plug.content_hash) {
+                    plug.bytes = full.bytes;
+                    break;
+                }
+            }
+        }
+        ack_opt = submit_and_read_ack(sj);
+        if (!ack_opt.has_value()) {
+            return result;
+        }
     }
-    const auto ack = decode_submit_job_ack(ack_reader);
+    const auto& ack = *ack_opt;
     if (!ack.ok) {
         result.reject_message = ack.message;
         return result;

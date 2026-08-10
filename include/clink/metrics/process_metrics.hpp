@@ -155,6 +155,24 @@ inline void slots_in_use_delta(std::int64_t delta) {
     MetricsRegistry::global().gauge(kCoordinatorSlotsInUse).add(delta);
 }
 
+// Content-addressed plugin shipping (item 30). bytes_shipped counts what
+// actually travelled; ships_deduped counts deploys that sent a hash-only
+// reference instead; submit cache hits count hash-only submissions the
+// coordinator resolved from its own cache without an upload.
+inline void plugin_bytes_shipped(std::uint64_t n) {
+    MetricsRegistry::global().counter("clink_coordinator_plugin_bytes_shipped_total").increment(n);
+}
+
+inline void plugin_ship_deduped() {
+    MetricsRegistry::global().counter("clink_coordinator_plugin_ships_deduped_total").increment();
+}
+
+inline void submit_plugin_cache_hit() {
+    MetricsRegistry::global()
+        .counter("clink_coordinator_submit_plugin_cache_hits_total")
+        .increment();
+}
+
 }  // namespace coordinator
 
 namespace worker {
