@@ -27,6 +27,7 @@
 #include "clink/state/checkpoint_integrity.hpp"
 
 #include "tests/integration/cluster_harness.hpp"
+#include "tests/integration/two_pc_output.hpp"
 
 namespace {
 
@@ -699,82 +700,11 @@ TEST_F(FaultRecoveryTest, WorkerKilledAtTheStateRestorePointIsRedeployed) {
 // source had already passed (data loss). A single "mismatch" count would
 // hide which.
 
-// Every line under <out>/committed/, which is the output an external
-// consumer sees.
-std::vector<std::string> committed_records(const std::filesystem::path& out_dir) {
-    std::vector<std::string> lines;
-    const auto dir = out_dir / "committed";
-    std::error_code ec;
-    if (!std::filesystem::exists(dir, ec)) {
-        return lines;
-    }
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (!entry.is_regular_file()) {
-            continue;
-        }
-        std::ifstream in(entry.path());
-        std::string line;
-        while (std::getline(in, line)) {
-            if (!line.empty()) {
-                lines.push_back(line);
-            }
-        }
-    }
-    return lines;
-}
-
-struct OutputVerdict {
-    std::vector<std::string> duplicated;  // published more than once
-    std::vector<std::string> missing;     // never published
-    std::vector<std::string> unexpected;  // published but never emitted
-    std::size_t total_lines{0};
-};
-
-// Compare the committed output against "record-0".."record-(total-1)",
-// each exactly once.
-OutputVerdict verify_exactly_once(const std::filesystem::path& out_dir, int total) {
-    OutputVerdict v;
-    std::map<std::string, int> seen;
-    for (const auto& line : committed_records(out_dir)) {
-        ++seen[line];
-        ++v.total_lines;
-    }
-    for (int i = 0; i < total; ++i) {
-        const auto want = "record-" + std::to_string(i);
-        const auto it = seen.find(want);
-        if (it == seen.end()) {
-            v.missing.push_back(want);
-        } else if (it->second > 1) {
-            v.duplicated.push_back(want + " x" + std::to_string(it->second));
-        }
-        seen.erase(want);
-    }
-    for (const auto& [line, count] : seen) {
-        v.unexpected.push_back(line + " x" + std::to_string(count));
-    }
-    return v;
-}
-
-std::string describe(const OutputVerdict& v) {
-    std::ostringstream os;
-    os << v.total_lines << " committed lines";
-    const auto list = [&os](const char* label, const std::vector<std::string>& xs) {
-        if (xs.empty()) {
-            return;
-        }
-        os << "; " << xs.size() << " " << label << ": ";
-        for (std::size_t i = 0; i < xs.size() && i < 8; ++i) {
-            os << (i ? ", " : "") << xs[i];
-        }
-        if (xs.size() > 8) {
-            os << ", ... (+" << (xs.size() - 8) << ")";
-        }
-    };
-    list("DUPLICATED", v.duplicated);
-    list("MISSING", v.missing);
-    list("UNEXPECTED", v.unexpected);
-    return os.str();
-}
+// The verifier lives in two_pc_output.hpp, shared with the coordinator-HA
+// compound failure test so both compare output against the same contract.
+using clink::itest::committed_records;
+using clink::itest::describe;
+using clink::itest::verify_exactly_once;
 
 // The premise: on a clean run with no faults, the output is exactly the
 // expected multiset. Without this, a failure in the crash tests below could
@@ -1029,4 +959,54 @@ TEST_F(FaultRecoveryTest, CoordinatorAndWorkerDyingTogetherStillCommitsExactlyOn
                }
                return os.str();
            }();
+}
+
+TEST_F(FaultRecoveryTest, AWorkerKilledInsideTheCommitWindowStaysExactlyOnce) {
+    // Item 19's named gap: every kill test above lands BETWEEN commits.
+    // This one lands INSIDE one - the window between the coordinator
+    // completing a checkpoint (marker on disk, CommitCheckpoint broadcast)
+    // and the sink publishing the staged transaction. The sink's first
+    // commit is held open for 4s by a Delay at sink.before_commit (armed in
+    // the worker processes via the environment, ordinal 1 so recovery's own
+    // commits run free), and the worker is SIGKILLed inside that hold.
+    // Recovery must re-commit the staged-but-unpublished transaction
+    // (recover-and-re-commit at open), and the committed output must still
+    // be each record exactly once.
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator()) << "coordinator did not come up";
+    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.start_worker(1, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(c.await_job_checkpointing()) << "the job never started";
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
+                                    std::chrono::seconds(30)))
+        << "no checkpoint completed, so there is no commit window to kill inside";
+
+    // The window is REAL at kill time: a checkpoint has completed (marker
+    // above) while NOTHING has been published - the first commit is inside
+    // its hold. Without this guard the kill could land after the publish
+    // and the test would silently degrade into the between-commits case
+    // the suite already covers.
+    ASSERT_TRUE(committed_records(out_dir_).empty())
+        << "the sink published before the kill - the hold did not produce a window";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value()) << "submitter never exited after the mid-commit kill";
+    ASSERT_EQ(*code, 0) << "the job did not recover from a kill inside the commit window";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "the staged transaction was committed twice across the recovery: " << describe(v);
+    EXPECT_TRUE(v.missing.empty())
+        << "the transaction staged before the kill was never re-committed - records the "
+           "completed checkpoint accounted for are gone: "
+        << describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << describe(v);
 }

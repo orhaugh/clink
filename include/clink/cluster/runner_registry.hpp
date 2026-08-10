@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
+#include "clink/cluster/commit_dispatch_gate.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/runtime/cutover_gate.hpp"
@@ -228,6 +229,16 @@ struct RunnerContext {
     // abort_transaction). Same signature shape as the commit hook.
     using AbortCheckpointFn = std::function<void(std::uint64_t /*checkpoint_id*/)>;
     std::function<void(std::vector<AbortCheckpointFn>)> register_abort_callbacks;
+
+    // Serialises commit/abort dispatch against this runner's teardown. The
+    // worker wraps every callback registered above so it enters this gate for
+    // the duration of the dispatch; the runner retires the gate (blocking
+    // until in-flight dispatch drains) before its LocalExecutor - and the
+    // RuntimeContext + StateBackend the executor owns - is destroyed. See
+    // commit_dispatch_gate.hpp for the failure this closes. Null for
+    // in-process paths, and unused by operator/co-operator runners, which
+    // register no commit callbacks.
+    std::shared_ptr<CommitDispatchGate> commit_dispatch_gate;
 
     // Drain callbacks. Subtask runners that participate in
     // adaptive rescaling register one or more callbacks here. The worker

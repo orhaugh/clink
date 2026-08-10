@@ -50,6 +50,17 @@ Key points:
   sink: the coordinator's commit-group gate collects every group member's pre-commit ack,
   then broadcasts `CommitCheckpoint` (or `AbortCheckpoint`); the Worker
   invokes the registered callbacks. See [checkpointing](checkpointing.md).
+- Dispatch is serialised against runner teardown by a per-task
+  `CommitDispatchGate` (`include/clink/cluster/commit_dispatch_gate.hpp`). The
+  callback runs on the worker's reader thread while the subtask runner owns the
+  `LocalExecutor` - and with it the `RuntimeContext` and `StateBackend` that
+  `finalise_` touches. The worker wraps every registered commit/abort callback
+  to enter the gate for the dispatch's duration, and the runner retires the
+  gate (draining in-flight dispatch) strictly before its executor is destroyed.
+  Without it, a commit held in the external system that overlapped a
+  cancel-for-restart ran `finalise_` against a freed backend and took the whole
+  worker down. A dispatch refused after retirement is safe: the persisted
+  handle is re-committed idempotently by `recover_all_()` at the next restore.
 - `pending_committables()` exposes the persisted-but-unfinalised handles so a
   connector can reconcile an external registry at `on_open()` (e.g. an XA sink
   rolling back prepared transactions that are not in the restored set).

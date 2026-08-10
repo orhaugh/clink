@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "clink/cluster/commit_dispatch_gate.hpp"
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/runner_helpers.hpp"
 #include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
@@ -531,6 +532,11 @@ void PluginRegistry::register_source(
             cfg.drain_at_checkpoint = arm_signal;
             cfg.stop_requested = stop_signal;
             clink::LocalExecutor exec(std::move(dag), std::move(cfg));
+            // Constructed after exec so reverse destruction retires the commit
+            // dispatch gate - draining an in-flight commit/abort dispatch into
+            // this source's ack callbacks - before the executor and everything
+            // it owns are destroyed, on every exit path.
+            clink::cluster::CommitDispatchRetirer commit_retirer(rctx.commit_dispatch_gate);
             detail::run_subtask_to_completion(exec, rctx.cancel_token);
         };
     runner_registry_.register_source(op_type, channel, std::move(runner));
@@ -667,6 +673,14 @@ void PluginRegistry::register_sink(
         // bridges' bytes are the sink's bytes_received.
         dag.set_all_runners_attributed_op_id(dag.runner_id_at(hs.runner_index));
         clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
+        // Constructed after exec so reverse destruction retires the commit
+        // dispatch gate - draining an in-flight CommitCheckpoint dispatch into
+        // this sink's on_commit - before the executor and the StateBackend the
+        // sink's finalise path touches are destroyed. Covers the throw below
+        // (armed-cutover timeout) and cancel-for-restart alike; the cutover
+        // wait itself runs before retirement, so the cutover commit can still
+        // enter the gate.
+        clink::cluster::CommitDispatchRetirer commit_retirer(rctx.commit_dispatch_gate);
         detail::run_subtask_to_completion(exec, rctx.cancel_token);
         // Armed cutover: C is staged and acked and the input has closed,
         // but its CommitCheckpoint only arrives once the coordinator

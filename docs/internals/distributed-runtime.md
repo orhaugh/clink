@@ -181,6 +181,8 @@ Two implementations exist:
 
 In `clink_node`, passing `--ha-dir` (or `--etcd-endpoints`) puts the coordinator in HA mode: `coordinator.start()` is deferred until `on_become_leader` fires, at which point the coordinator binds the control port and calls `recover_persisted_jobs()`. A standby coordinator just sits on the coordinator poll thread.
 
+The takeover path is integration-tested end to end in `tests/integration/test_coordinator_ha_failover.cpp`: a coordinator-only loss (standby recovers the persisted job and drives new checkpoints) and the compound loss where the leader and a worker are SIGKILLed together with no window between them. The compound test asserts the property a consumer actually depends on - the standby restores from the last `COMPLETED-N` marker (a non-zero `restore_from_ckpt`, checked against the recovery log line, since a from-scratch re-run regenerates the same checkpoint ids and atomically overwrites the same committed filenames) and the committed output stays each-record-exactly-once.
+
 #### Shutdown
 
 `clink_node` installs a SIGTERM/SIGINT handler and calls `Worker::stop()` or `Coordinator::stop()` on the way out.

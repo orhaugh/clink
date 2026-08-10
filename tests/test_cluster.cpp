@@ -21,6 +21,7 @@
 
 #include "clink/application/job_submitter.hpp"
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/commit_dispatch_gate.hpp"
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
@@ -2068,6 +2069,33 @@ clink::cluster::JobGraphSpec clink_parity_graph(std::int64_t start,
 }
 
 }  // namespace
+
+// The gate that serialises 2PC commit dispatch against runner teardown (see
+// commit_dispatch_gate.hpp for the worker-killing SIGSEGV it closes). The
+// contract under test: retire_and_drain returns only after every in-flight
+// dispatch has left, and any dispatch arriving after retirement is refused.
+// Looped because the failure mode of a broken drain is a race, not a
+// deterministic wrong answer.
+TEST(CommitDispatchGate, RetireDrainsInFlightDispatchAndRefusesLateOnes) {
+    for (int i = 0; i < 200; ++i) {
+        clink::cluster::CommitDispatchGate gate;
+        ASSERT_TRUE(gate.try_enter());
+        std::atomic<bool> dispatch_finished{false};
+        std::thread dispatcher([&] {
+            dispatch_finished.store(true, std::memory_order_release);
+            gate.leave();
+        });
+        // Retire on this thread while the dispatch is in flight. When it
+        // returns, the dispatch MUST have finished first - that ordering is
+        // exactly what makes destroying the executor behind the callback safe.
+        gate.retire_and_drain();
+        const bool finished = dispatch_finished.load(std::memory_order_acquire);
+        const bool late_entry = gate.try_enter();
+        dispatcher.join();
+        ASSERT_TRUE(finished) << "retire_and_drain returned while a dispatch was still in flight";
+        ASSERT_FALSE(late_entry) << "a retired gate must refuse new dispatch";
+    }
+}
 
 // Item 19: the JOB-LEVEL response to a truncated checkpoint, end to end.
 // The file-level behaviour was already pinned (a truncated write verifies

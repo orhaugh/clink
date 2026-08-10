@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/commit_dispatch_gate.hpp"
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/job_bundle.hpp"
@@ -717,14 +718,6 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
     if (!accept_epoch_(msg.coordinator_epoch, "CommitCheckpoint")) {
         return;
     }
-    // Record the committed high-water mark + wake any source blocked in
-    // wait_final_committed() for its final checkpoint id (see EOS handling).
-    {
-        std::lock_guard lk(final_ckpt_mu_);
-        auto& hw = final_committed_high_water_[msg.job_id];
-        hw = std::max(hw, msg.checkpoint_id);
-    }
-    final_ckpt_cv_.notify_all();
     // Snapshot per-job commit callbacks under the lock, then dispatch
     // without it. The sink's commit work (atomic rename, Kafka commitTx,
     // SQL COMMIT PREPARED) may block on the external system; doing it
@@ -750,6 +743,21 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
             // next restart's recovery path will retry.
         }
     }
+    // Record the committed high-water mark + wake any source blocked in
+    // wait_final_committed() for its final checkpoint id (see EOS handling).
+    // Deliberately AFTER the committer dispatch above: a runner that
+    // unblocks on this notification may exit and retire its commit
+    // dispatch gate, so the high-water must not advance until this
+    // worker's commit work for the checkpoint has actually run.
+    // Notifying first opened a wake-then-retire window in which the final
+    // commit was refused (previously: found its callbacks already erased)
+    // and its staged transaction stranded with no restart coming.
+    {
+        std::lock_guard lk(final_ckpt_mu_);
+        auto& hw = final_committed_high_water_[msg.job_id];
+        hw = std::max(hw, msg.checkpoint_id);
+    }
+    final_ckpt_cv_.notify_all();
 
     // Checkpoint retention: a CommitCheckpoint means this checkpoint is
     // globally complete. Record it and purge any now-subsumed older
@@ -1612,6 +1620,34 @@ void Worker::run_generic_subtask_(JobId job_id,
     // dispatch on a miss so the existing build path keeps working
     // during migration.
     ensure_built_ins_registered();
+    // Commit-dispatch gate for this task run. Every commit/abort callback the
+    // task registers (2PC sink, ack-at-barrier source, fused endpoint hooks)
+    // is wrapped to enter the gate for the duration of its dispatch, and the
+    // runner retires the gate before its LocalExecutor is destroyed. Without
+    // this, a commit held in the external system (broker transaction, SQL
+    // COMMIT PREPARED) that overlaps a cancel-for-restart runs the sink's
+    // finalise path against the freed StateBackend the executor owned and
+    // takes the whole worker down with SIGSEGV. A refused post-retirement
+    // dispatch is safe: the prepared handle stays persisted, so the next
+    // restore re-commits it idempotently.
+    auto dispatch_gate = std::make_shared<CommitDispatchGate>();
+    auto gated = [dispatch_gate](RunnerContext::CommitCheckpointFn fn) {
+        return [gate = dispatch_gate, fn = std::move(fn)](std::uint64_t ckpt) {
+            if (!gate->try_enter()) {
+                clink::log::info("worker.commit",
+                                 "refused a commit/abort dispatch for checkpoint " +
+                                     std::to_string(ckpt) +
+                                     " arriving after runner retirement; the prepared handle "
+                                     "stays persisted for restore-time recovery");
+                return;
+            }
+            struct Leave {
+                CommitDispatchGate* g;
+                ~Leave() { g->leave(); }
+            } leave{gate.get()};
+            fn(ckpt);
+        };
+    };
     // Skip the legacy single-op runner path when fusion is in play:
     // even a chain of one operator with fused source/sink needs the
     // DagBuilder chain dispatch below so the typed source/sink land
@@ -1825,23 +1861,23 @@ void Worker::run_generic_subtask_(JobId job_id,
             // 2PC commit-callback registration. Sink runners that
             // implement the 2PC protocol register one or more callbacks
             // here; the worker dispatches them on CommitCheckpoint.
-            auto register_commits = [this, job_id, sub = task.subtask_idx](
+            auto register_commits = [this, job_id, sub = task.subtask_idx, gated](
                                         std::vector<RunnerContext::CommitCheckpointFn> cbs) {
                 std::lock_guard lock(mu_);
                 auto& bucket = per_job_committers_[job_id][sub];
                 for (auto& cb : cbs)
-                    bucket.push_back(std::move(cb));
+                    bucket.push_back(gated(std::move(cb)));
             };
             // Abort-callback registration. Mirrors the
             // commit-callback path; sink runners register one or more
             // abort callbacks alongside their commits, and the worker
             // dispatches them on AbortCheckpoint.
-            auto register_aborts = [this, job_id, sub = task.subtask_idx](
+            auto register_aborts = [this, job_id, sub = task.subtask_idx, gated](
                                        std::vector<RunnerContext::AbortCheckpointFn> cbs) {
                 std::lock_guard lock(mu_);
                 auto& bucket = per_job_aborters_[job_id][sub];
                 for (auto& cb : cbs)
-                    bucket.push_back(std::move(cb));
+                    bucket.push_back(gated(std::move(cb)));
             };
             // Drain-callback registration. Subtasks
             // participating in adaptive rescaling register their
@@ -1985,6 +2021,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .register_source_injectors = std::move(register_injectors),
                 .register_commit_callbacks = std::move(register_commits),
                 .register_abort_callbacks = std::move(register_aborts),
+                .commit_dispatch_gate = dispatch_gate,
                 .register_drain_callbacks = std::move(register_drains),
                 .register_cutover_arm_callbacks = std::move(register_arms),
                 .key_extractors = job_kex,
@@ -2136,8 +2173,9 @@ void Worker::run_generic_subtask_(JobId job_id,
             if (in_ops->fused_source_commit_hooks) {
                 auto [commit_cb, abort_cb] = in_ops->fused_source_commit_hooks(boxed);
                 std::lock_guard lock(mu_);
-                per_job_committers_[job_id][task.subtask_idx].push_back(std::move(commit_cb));
-                per_job_aborters_[job_id][task.subtask_idx].push_back(std::move(abort_cb));
+                per_job_committers_[job_id][task.subtask_idx].push_back(
+                    gated(std::move(commit_cb)));
+                per_job_aborters_[job_id][task.subtask_idx].push_back(gated(std::move(abort_cb)));
             }
             prev = in_ops->add_fused_source_to_dag(dag, std::move(boxed));
         } else {
@@ -2231,8 +2269,9 @@ void Worker::run_generic_subtask_(JobId job_id,
             if (out_ops->fused_sink_commit_hooks) {
                 auto [commit_cb, abort_cb] = out_ops->fused_sink_commit_hooks(boxed);
                 std::lock_guard lock(mu_);
-                per_job_committers_[job_id][task.subtask_idx].push_back(std::move(commit_cb));
-                per_job_aborters_[job_id][task.subtask_idx].push_back(std::move(abort_cb));
+                per_job_committers_[job_id][task.subtask_idx].push_back(
+                    gated(std::move(commit_cb)));
+                per_job_aborters_[job_id][task.subtask_idx].push_back(gated(std::move(abort_cb)));
             }
             // Stamp the fused sink's stable identity: its uid if set, else
             // its unique graph-local spec id. A stateful sink (2PC /
@@ -2364,6 +2403,12 @@ void Worker::run_generic_subtask_(JobId job_id,
             .runner_role = task.role,
         };
         LocalExecutor exec(std::move(dag), clink::plugin::detail::make_subtask_job_config(rctx));
+        // Constructed after exec so reverse destruction retires the commit
+        // dispatch gate - draining any in-flight CommitCheckpoint/
+        // AbortCheckpoint dispatch into the fused endpoints - before the
+        // executor and the StateBackend it owns are destroyed, on every exit
+        // path including a throw from run().
+        CommitDispatchRetirer commit_retirer(dispatch_gate);
         exec.run();
         // Drop this subtask's fused-source commit/abort callbacks now the runner
         // has exited; a late CommitCheckpoint/AbortCheckpoint then finds none
