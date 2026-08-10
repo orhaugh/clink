@@ -5,9 +5,12 @@
 # property so a toolchain change, a new generator, or a dropped POST_BUILD
 # rule cannot quietly bring the 104 MB submit back. Two assertions, both
 # cheap: the module carries no .debug_info section, and it sits under a
-# hard size budget with generous headroom over the ~5 MB measured (code
-# growth is legitimate; embedded DWARF jumps the size 20x, far past any
-# honest growth).
+# hard size budget calibrated against the FAILURE MODE, not against code
+# growth: a stripped module measured 5.3 MB on a SQL-off container build
+# and 25.8 MB on the full CI configuration (SQL on), while embedding the
+# DWARF jumps past 100 MB - a 4x-plus discontinuity no honest growth
+# produces. The budget sits above every measured legitimate size and far
+# below the fat module.
 #
 # Usage: cmake -DBINARY=<module.so> -P CheckPluginStripped.cmake
 
@@ -15,7 +18,7 @@ if(NOT DEFINED BINARY OR NOT EXISTS "${BINARY}")
     message(FATAL_ERROR "plugin-stripped check: BINARY not set or missing: '${BINARY}'")
 endif()
 
-set(_budget_bytes 26214400)  # 25 MiB: ~5x the measured stripped module
+set(_budget_bytes 67108864)  # 64 MiB: above the 25.8 MB full-config module, far below ~104 MB fat
 
 find_program(READELF_TOOL NAMES readelf llvm-readelf)
 if(NOT READELF_TOOL)
@@ -44,8 +47,8 @@ file(SIZE "${BINARY}" _size)
 if(_size GREATER ${_budget_bytes})
     message(FATAL_ERROR
         "plugin-stripped check: ${BINARY} is ${_size} bytes, over the ${_budget_bytes}-byte "
-        "budget. Measured stripped size is ~5 MB; being 5x past it means something big "
-        "and unintended is riding along.")
+        "budget. Measured stripped sizes are 5.3 MB (SQL off) and 25.8 MB (full CI config); "
+        "being past 64 MiB means the DWARF-class payload is riding along again.")
 endif()
 
 message(STATUS "plugin-stripped check: ${BINARY} carries no DWARF and is ${_size} bytes")
