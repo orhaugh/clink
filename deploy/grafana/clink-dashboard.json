@@ -1,0 +1,172 @@
+{
+  "__comment": "clink operations dashboard. Hand-maintained; every clink_* metric referenced here is checked against the metric constants the code exports by tests/test_dashboard.cpp, the same gate the alert rules have - a renamed metric fails the build rather than leaving a panel silently empty. Panels mirror the alert rules (deploy/prometheus/clink-alerts.yaml) and the runbook (docs/internals/runbook.md) section for section, so the graph an operator looks at during an incident is the one the procedure describes.",
+  "title": "clink",
+  "uid": "clink-ops",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Data source"
+      }
+    ]
+  },
+  "panels": [
+    { "type": "row", "title": "Cluster", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 } },
+    {
+      "type": "stat",
+      "title": "Workers registered",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "targets": [{ "expr": "clink_coordinator_workers_registered", "legendFormat": "workers" }]
+    },
+    {
+      "type": "stat",
+      "title": "Workers lost (1h)",
+      "description": "Any increase pairs with the ClinkWorkerLost alert; the runbook's first question is whether the loss was a kill or a heartbeat timeout.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "targets": [{ "expr": "increase(clink_coordinator_workers_lost_total[1h])", "legendFormat": "lost" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Jobs running",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "targets": [{ "expr": "clink_coordinator_jobs_running", "legendFormat": "jobs" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Slots: in use vs capacity",
+      "description": "In-use pinned at capacity means submissions queue or are refused; see the slot-exhaustion runbook entry.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        { "expr": "clink_coordinator_slots_in_use", "legendFormat": "in use" },
+        { "expr": "clink_coordinator_slots_capacity", "legendFormat": "capacity" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Job restarts",
+      "description": "Whole-job restarts (worker loss or restartable subtask errors). A sustained rate means a crash loop is burning the restart budget.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "targets": [{ "expr": "increase(clink_coordinator_job_restarts_total[5m])", "legendFormat": "restarts (5m)" }]
+    },
+
+    { "type": "row", "title": "Checkpointing", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 } },
+    {
+      "type": "timeseries",
+      "title": "Checkpoint staleness",
+      "description": "time() - last completed checkpoint. The staleness gauge, not the completion counter: a counter that stops moving cannot distinguish a stalled job from an idle one. Pairs with ClinkCheckpointsStalled.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 7 },
+      "targets": [{ "expr": "time() - clink_ckpt_last_completed_unix_seconds", "legendFormat": "seconds since last completed" }],
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 300 } ] } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoints: triggered / completed / failed",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 7 },
+      "targets": [
+        { "expr": "rate(clink_ckpt_triggered_total[5m])", "legendFormat": "triggered/s" },
+        { "expr": "rate(clink_ckpt_completed_total[5m])", "legendFormat": "completed/s" },
+        { "expr": "increase(clink_ckpt_failed_total[5m])", "legendFormat": "failed (5m)" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoint duration p50 / p99",
+      "description": "Quantiles from the histogram buckets; a mean would hide exactly the tail worth alerting on.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 7 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(clink_ckpt_duration_ms_bucket[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(clink_ckpt_duration_ms_bucket[5m])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Subtask snapshot acks and failures",
+      "description": "A failure here is a subtask that could not persist its slice; the checkpoint it belongs to cannot complete.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 13 },
+      "targets": [
+        { "expr": "rate(clink_ckpt_subtask_snapshot_ack_total[5m])", "legendFormat": "acks/s" },
+        { "expr": "increase(clink_ckpt_subtask_snapshot_failure_total[15m])", "legendFormat": "failures (15m)" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Restore duration",
+      "description": "Time spent restoring state at (re)deploy, per restore.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 13 },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(clink_ckpt_restore_ns_bucket[15m])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ns" } }
+    },
+
+    { "type": "row", "title": "Protocol and data plane", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 } },
+    {
+      "type": "timeseries",
+      "title": "Malformed frames",
+      "description": "A control frame that did not decode. Version skew or a foreign writer on the control port; the worker drops the coordinator connection rather than dying.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 20 },
+      "targets": [{ "expr": "increase(clink_malformed_frames_total[15m])", "legendFormat": "malformed (15m)" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Fenced frames",
+      "description": "Control frames refused because they carried a superseded epoch. Any non-zero value means a coordinator that lost leadership is still sending - a split brain being contained.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 20 },
+      "targets": [{ "expr": "increase(clink_worker_fenced_frames_total[15m])", "legendFormat": "fenced (15m)" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Protocol mismatches and failed subtasks",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 20 },
+      "targets": [
+        { "expr": "increase(clink_protocol_mismatches_total[15m])", "legendFormat": "protocol mismatches (15m)" },
+        { "expr": "increase(clink_worker_subtasks_failed_total[15m])", "legendFormat": "subtasks failed (15m)" }
+      ]
+    },
+
+    { "type": "row", "title": "State and disk", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 } },
+    {
+      "type": "timeseries",
+      "title": "Restore keys dropped",
+      "description": "Keys outside the restoring subtask's key-group range are dropped BY DESIGN during rescale; outside a rescale a non-zero value is state loss in progress.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 27 },
+      "targets": [{ "expr": "increase(clink_state_restore_keys_dropped_total[1h])", "legendFormat": "{{backend}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoint volume disk",
+      "description": "Free space on the volume holding the checkpoint directory. Checkpoints stop completing when this hits zero, and the failure reads as snapshot-write errors.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 27 },
+      "targets": [
+        { "expr": "clink_disk_free_bytes", "legendFormat": "free" },
+        { "expr": "clink_disk_total_bytes", "legendFormat": "total" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    }
+  ]
+}

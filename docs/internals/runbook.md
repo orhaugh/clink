@@ -25,6 +25,13 @@ class of problem from handling it badly.
 
 ---
 
+The Grafana dashboard at `deploy/grafana/clink-dashboard.json` charts the same
+metrics these procedures reference, section for section, and is gated the same
+way as the alert rules: every metric a panel queries is checked against the
+metric constants by `tests/test_dashboard.cpp`, so a renamed metric fails the
+build rather than leaving a panel silently empty mid-incident. Import it and
+point its data-source variable at the Prometheus that scrapes the cluster.
+
 ## ClinkCheckpointsStalled
 
 `time() - clink_ckpt_last_completed_unix_seconds > 300`
