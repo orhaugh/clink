@@ -25,7 +25,10 @@
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/install.hpp"
+#include "clink/sql/logical_plan.hpp"
+#include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
+#include "clink/sql/physical_plan.hpp"
 #include "clink/sql/table_option_check.hpp"
 
 namespace {
@@ -373,3 +376,101 @@ TEST(SqlUnsupportedSemantics, CheckerReportsNothingForACleanTable) {
 }
 
 }  // namespace
+
+// --- the query side: clauses must execute or refuse, never decorate --------
+//
+// The DDL cases above pinned options and constraints. The same rule holds
+// for QUERY clauses: libpg_query parses the full Postgres grammar, so the
+// binder/planner sees every clause a user can write, and any it neither
+// implements nor refuses becomes decoration - the query compiles, runs, and
+// silently does something other than what its own text says (an ORDER BY
+// that does not order, a FILTER that does not filter). This battery drives
+// each suspicious clause through the real bind -> optimize -> plan pipeline
+// and requires an exception. A clause that graduates to implemented moves
+// OUT of the battery and into a semantics test - the battery is the fence,
+// not the roadmap.
+
+namespace {
+
+// Compile an INSERT..SELECT end to end; return the error, or "" if it was
+// accepted.
+std::string compile_query_error(const std::string& sql) {
+    ensure_installed();
+    try {
+        Catalog cat;
+        const auto ddl = parse(
+            "CREATE TABLE bat_src (k BIGINT, v BIGINT, ts TIMESTAMP(3)) "
+            "WITH (connector='file', format='json', path='/tmp/bat_src.ndjson');"
+            "CREATE TABLE bat_src2 (k BIGINT, w BIGINT) "
+            "WITH (connector='file', format='json', path='/tmp/bat_src2.ndjson');"
+            "CREATE TABLE bat_out (k BIGINT, v BIGINT) "
+            "WITH (connector='file', format='json', path='/tmp/bat_out.ndjson')");
+        for (const auto& st : ddl.statements) {
+            cat.register_table(std::get<ast::CreateTableStmt>(st));
+        }
+        clink::sql::Binder b(cat);
+        auto plan = b.bind_insert(std::get<ast::InsertStmt>(parse(sql).statements[0]));
+        plan = clink::sql::optimize(std::move(plan));
+        clink::sql::PhysicalPlanner pp;
+        (void)pp.compile(static_cast<const clink::sql::LogicalSink&>(*plan));
+        return {};
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+}
+
+struct QueryClauseCase {
+    const char* label;
+    const char* sql;
+};
+
+}  // namespace
+
+TEST(SqlUnsupportedSemantics, QueryClausesAreImplementedOrRefusedNeverDecorative) {
+    const std::vector<QueryClauseCase> must_refuse = {
+        // Ordering a plain unbounded stream is not implementable and must
+        // not pretend: an ORDER BY that does not order is the canonical
+        // decorative clause.
+        {"top-level ORDER BY without LIMIT",
+         "INSERT INTO bat_out SELECT k, v FROM bat_src ORDER BY v"},
+        {"DISTINCT ON", "INSERT INTO bat_out SELECT DISTINCT ON (k) k, v FROM bat_src"},
+        {"aggregate FILTER clause",
+         "INSERT INTO bat_out SELECT k, SUM(v) FILTER (WHERE v > 0) FROM bat_src GROUP BY k"},
+        {"GROUPING SETS",
+         "INSERT INTO bat_out SELECT k, SUM(v) FROM bat_src GROUP BY GROUPING SETS ((k), ())"},
+        {"ROLLUP", "INSERT INTO bat_out SELECT k, SUM(v) FROM bat_src GROUP BY ROLLUP (k)"},
+        {"CUBE", "INSERT INTO bat_out SELECT k, SUM(v) FROM bat_src GROUP BY CUBE (k)"},
+        {"TABLESAMPLE", "INSERT INTO bat_out SELECT k, v FROM bat_src TABLESAMPLE BERNOULLI (10)"},
+        {"WITH RECURSIVE",
+         "INSERT INTO bat_out WITH RECURSIVE r AS (SELECT k, v FROM bat_src) "
+         "SELECT k, v FROM r"},
+        {"FETCH WITH TIES",
+         "INSERT INTO bat_out SELECT k, v FROM bat_src ORDER BY v "
+         "FETCH FIRST 3 ROWS WITH TIES"},
+        {"window frame EXCLUDE",
+         "INSERT INTO bat_out SELECT k, SUM(v) OVER (PARTITION BY k ORDER BY ts "
+         "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM bat_src"},
+        {"named WINDOW clause",
+         "INSERT INTO bat_out SELECT k, SUM(v) OVER w FROM bat_src "
+         "WINDOW w AS (PARTITION BY k ORDER BY ts)"},
+        {"INTERSECT ALL",
+         "INSERT INTO bat_out SELECT k, v FROM bat_src INTERSECT ALL "
+         "SELECT k, w FROM bat_src2"},
+    };
+    std::vector<std::string> decorative;
+    for (const auto& c : must_refuse) {
+        const auto err = compile_query_error(c.sql);
+        if (err.empty()) {
+            decorative.push_back(c.label);
+        }
+    }
+    std::string joined;
+    for (const auto& d : decorative) {
+        joined += "\n  - " + d;
+    }
+    EXPECT_TRUE(decorative.empty())
+        << decorative.size()
+        << " clause(s) were ACCEPTED but are not implemented - they compiled to a plan "
+           "that silently drops what the query text says:"
+        << joined;
+}

@@ -392,6 +392,17 @@ ast::Expression translate_func_call(const JsonValue& body) {
     // carry it so the binder can lower COUNT(DISTINCT x) etc.
     fc->agg_distinct = body.contains("agg_distinct") && body.at("agg_distinct").is_bool() &&
                        body.at("agg_distinct").as_bool();
+    // agg(...) FILTER (WHERE ...): not implemented, and dropping it is the
+    // worst possible outcome - the aggregate then sums EVERY row while the
+    // query text says filtered, which is a silently wrong number rather
+    // than an error. Refuse it (found decorative by the query-clause
+    // battery in test_sql_unsupported_semantics.cpp).
+    if (body.contains("agg_filter") && !body.at("agg_filter").is_null()) {
+        unsupported(
+            "aggregate FILTER clause (rewrite as CASE WHEN inside the aggregate, e.g. "
+            "SUM(CASE WHEN p THEN v END))",
+            loc.pos);
+    }
     // Within-aggregate ORDER BY (e.g. array_agg(x ORDER BY y)) arrives as
     // agg_order. We don't yet implement ordered aggregation, so reject it
     // explicitly rather than silently dropping the sort (which would make
@@ -1317,6 +1328,14 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
         }
     }
 
+    // FETCH FIRST n ROWS WITH TIES: PG marks it via limitOption. The tie
+    // extension is not implemented, and compiling it as a plain LIMIT
+    // silently emits fewer rows than the query text promises on a tie.
+    // Refuse it (found decorative by the query-clause battery).
+    if (body.contains("limitOption") && body.at("limitOption").is_string() &&
+        body.at("limitOption").as_string() == "LIMIT_OPTION_WITH_TIES") {
+        unsupported("FETCH ... WITH TIES", loc_from(body).pos);
+    }
     // LIMIT n. PG sends limitCount as a wrapped A_Const
     // (or ParamRef). We support integer literals only - bind expr
     // LIMITs and parameterised LIMITs aren't streamable today.
