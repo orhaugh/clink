@@ -189,8 +189,19 @@ clink_set_warnings(clink_schema_evo_test_job)
 # the artefact (see cmake/ClinkPluginDebugSplit.cmake).
 clink_split_debug_and_strip_modules_in_dir()
 if(CLINK_BUILD_TESTS AND UNIX AND NOT APPLE)
+    # Under a sanitizer the instrumentation lands in the module's CODE, which
+    # the strip legitimately keeps - the UBSan build measured 76 MB of
+    # instrumented text against a budget calibrated for uninstrumented
+    # builds. The DWARF-presence check (the load-bearing half: a missing
+    # split rule ships ~20x the bytes) still applies; only the byte budget
+    # is waived, and the script says so rather than silently passing.
+    set(_stripped_check_sanitizer 0)
+    if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+        set(_stripped_check_sanitizer 1)
+    endif()
     add_test(NAME job_plugin_ships_stripped
         COMMAND "${CMAKE_COMMAND}" -DBINARY=$<TARGET_FILE:clink_heavy_pipeline_job>
+                -DSANITIZER_BUILD=${_stripped_check_sanitizer}
                 -P "${CMAKE_SOURCE_DIR}/cmake/CheckPluginStripped.cmake")
     set_tests_properties(job_plugin_ships_stripped PROPERTIES LABELS "core")
 endif()

@@ -44,6 +44,12 @@ if(NOT _dwarf_at EQUAL -1)
 endif()
 
 file(SIZE "${BINARY}" _size)
+if(SANITIZER_BUILD)
+    message(STATUS
+        "plugin-stripped check: sanitizer build - byte budget waived (module is ${_size} "
+        "bytes of instrumented code; the DWARF-presence check above still gated)")
+    return()
+endif()
 if(_size GREATER ${_budget_bytes})
     message(FATAL_ERROR
         "plugin-stripped check: ${BINARY} is ${_size} bytes, over the ${_budget_bytes}-byte "

@@ -36,6 +36,8 @@
 #include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/test_helpers/sanitizer_slack.hpp"
+
 using namespace clink;
 using namespace clink::cluster;
 using namespace clink::network;
@@ -1727,7 +1729,7 @@ TEST(Cluster, PluginBytesShipOncePerWorkerConnection) {
     clink::application::JobSubmitter submitter("127.0.0.1", port);
     clink::application::SubmitOptions opts;
     opts.wait_for_completion = true;
-    opts.wait_timeout = 10s;
+    opts.wait_timeout = clink::test_support::scale_slack(10s);
 
     const auto shipped_before = counter_value("clink_coordinator_plugin_bytes_shipped_total");
     const auto deduped_before = counter_value("clink_coordinator_plugin_ships_deduped_total");
@@ -1981,7 +1983,8 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
     // pending-ids check above only proved the trigger was sent; the first
     // version of this test asserted hits instantly and was vacuous.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        const auto deadline =
+            std::chrono::steady_clock::now() + clink::test_support::scale_slack(5s);
         bool reached = false;
         while (std::chrono::steady_clock::now() < deadline) {
             if (clink::fault::Registry::instance().hits(
@@ -1996,13 +1999,19 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
 
     (void)coordinator.cancel_job(job_id);
     const auto cancel_started = std::chrono::steady_clock::now();
-    ASSERT_TRUE(coordinator.await_job_completion(job_id, 10s))
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, clink::test_support::scale_slack(10s)))
         << "cancel wedged behind the held checkpoint write";
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - cancel_started);
     // Failure bound, not a synchronisation guess: well past the 1500ms
     // hold plus teardown, far below the 10s wait above.
-    EXPECT_LT(took.count(), 8000) << "cancel took " << took.count() << "ms";
+    // Bounded is the contract; the figure is a wall-clock budget sized for
+    // the production runtime, so it scales under sanitizer instrumentation
+    // (TSan alone is a 5-15x slowdown - this failed the nightly at exactly
+    // that multiplier).
+    const auto bound_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        clink::test_support::scale_slack(std::chrono::milliseconds(8000)));
+    EXPECT_LT(took.count(), bound_ms.count()) << "cancel took " << took.count() << "ms";
 
     const auto d = coordinator.snapshot_job(job_id);
     ASSERT_TRUE(d.has_value());
