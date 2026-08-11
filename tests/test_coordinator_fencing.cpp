@@ -42,6 +42,8 @@
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/worker.hpp"
 
+#include "tests/test_helpers/sanitizer_slack.hpp"
+
 using namespace clink;
 using namespace clink::cluster;
 using namespace std::chrono_literals;
@@ -50,9 +52,14 @@ namespace {
 
 // Wait for `pred` or give up after `bound`. The deadline is a FAILURE
 // BOUND, not a synchronisation mechanism: the assertions are about what
-// happened, and the loop only decides how long to keep asking.
+// happened, and the loop only decides how long to keep asking. The default
+// scales under sanitizers: a ctest -j8 sanitizer run schedules this suite
+// alongside the heavyweight cluster e2e tests, and 2s of wall clock is not
+// 2s of progress on a starved box.
 template <typename Pred>
-bool fencing_await(Pred pred, std::chrono::milliseconds bound = 2s) {
+bool fencing_await(Pred pred,
+                   std::chrono::milliseconds bound =
+                       clink::test_support::scale_slack(std::chrono::milliseconds{2000})) {
     const auto deadline = std::chrono::steady_clock::now() + bound;
     while (std::chrono::steady_clock::now() < deadline) {
         if (pred()) {
@@ -108,7 +115,19 @@ public:
     void shutdown_read() override { close(); }
 
     void close() override {
-        open_.store(false, std::memory_order_release);
+        // The store must happen under mu_, exactly like deliver()'s insert.
+        // recv_all's wait predicate runs holding mu_; an unlocked store
+        // could land between a predicate evaluation that saw open_ == true
+        // and the re-block, where the notify finds no waiter yet - after
+        // which the reader sleeps forever and Worker::stop() joins forever.
+        // Caught live under Linux ThreadSanitizer at ~1.5% per run (both
+        // the destructor's close and stop()'s shutdown_read landed inside
+        // one descheduled predicate window); the ctest timeout reported it
+        // as the fencing suite "hanging" in CI.
+        {
+            std::lock_guard lock(mu_);
+            open_.store(false, std::memory_order_release);
+        }
         cv_.notify_all();
     }
 

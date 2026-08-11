@@ -291,9 +291,19 @@ add_dependencies(clink_core_tests
     clink_hello_plugin clink clink_schema_evo_test_job clink_fuzz_seeds)
 target_include_directories(clink_core_tests PRIVATE ${CMAKE_SOURCE_DIR})
 
+# Sanitizer builds run 5-10x slower (the same ratio kTimingSlack in
+# tests/test_helpers/sanitizer_slack.hpp scales in-test budgets by), so the
+# per-test ctest cap scales with them: a heavyweight cluster test that takes
+# 16s under ThreadSanitizer is making progress, not hanging, and killing it
+# at the production 30s bound reports a timeout for code that is correct.
+set(_clink_core_test_timeout 30)
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+    set(_clink_core_test_timeout 300)
+endif()
+
 gtest_discover_tests(clink_core_tests
     DISCOVERY_MODE PRE_TEST
-    PROPERTIES TIMEOUT 30 LABELS core
+    PROPERTIES TIMEOUT ${_clink_core_test_timeout} LABELS core
 )
 
 # ---------------------------------------------------------------------------

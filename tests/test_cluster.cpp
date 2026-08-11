@@ -1731,6 +1731,12 @@ TEST(Cluster, PluginBytesShipOncePerWorkerConnection) {
     clink::application::SubmitOptions opts;
     opts.wait_for_completion = true;
     opts.wait_timeout = clink::test_support::scale_slack(10s);
+    // The ack leg needs the same slack as the completion leg: SubmitJobAck
+    // is sent only after the coordinator has dlopen'd the shipped module,
+    // planned the job and dispatched the deploy, and sanitizer
+    // instrumentation puts that well past the 10s production default
+    // ("no SubmitJobAck: timed out" under TSan in CI).
+    opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
 
     const auto shipped_before = counter_value("clink_coordinator_plugin_bytes_shipped_total");
     const auto deduped_before = counter_value("clink_coordinator_plugin_ships_deduped_total");
