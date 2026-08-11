@@ -18,6 +18,8 @@
 #include <sys/file.h>
 #include <sys/wait.h>
 
+#include "clink/cluster/fenced_metadata.hpp"
+
 // For metadata_write_allowed: the epoch rule this file now shares with the
 // coordinator's metadata writes, so the two cannot drift apart.
 #include "clink/cluster/coordinator.hpp"
@@ -339,42 +341,38 @@ private:
         // the epoch-1 coordinator won 19 of 40 samples of the file and the
         // recorded epoch regressed from 2 to 1.
         //
-        // The rule is metadata_write_allowed, shared with the coordinator's
-        // metadata writes rather than restated, so the two cannot drift. Note
-        // it compares the epoch parsed out of THIS file ("epoch"), not the
-        // "coordinator_epoch" key that metadata_stored_epoch looks for; the two
-        // records spell it differently.
+        // The rule is metadata_write_allowed and the mechanism is
+        // fenced_metadata_cas_write, both shared with the coordinator's
+        // metadata writes rather than restated, so the two cannot drift. The
+        // CAS matters MORE here than for the manifests: both coordinators of
+        // a split brain refresh this file on every leadership poll, so the
+        // old read-then-rename form gave the race a fresh window several
+        // times a second. The epoch extractor reads THIS file's "epoch" key,
+        // not the "coordinator_epoch" key the job records use; the two
+        // families spell it differently.
         const auto mine = epoch_.load(std::memory_order_acquire);
-        if (const auto existing = current_leader_endpoint();
-            existing.has_value() && !metadata_write_allowed(mine, existing->epoch)) {
-            clink::log::error(
-                "coordinator.ha",
-                "refusing to rewrite active-leader.json: it names epoch " +
-                    std::to_string(existing->epoch) + " and this coordinator is epoch " +
-                    std::to_string(mine) +
-                    ". Leadership has moved and this process is no longer authoritative; it is "
-                    "still holding a lock and serving, which is a split brain.");
-            return;
-        }
-
-        // Atomic write: <path>.tmp then rename. Avoids a reader seeing
-        // a partial JSON file.
         clink::http::JsonWriter w;
         w.begin_object();
         w.kv("host", advertise_.host);
         w.kv("port", static_cast<std::int64_t>(advertise_.port));
-        w.kv("epoch", static_cast<std::int64_t>(epoch_.load(std::memory_order_acquire)));
+        w.kv("epoch", static_cast<std::int64_t>(mine));
         w.kv("updated_unix_ms", static_cast<std::int64_t>(unix_ms_now()));
         w.end_object();
-        const auto tmp = active_leader_path_() + ".tmp";
-        {
-            std::ofstream out(tmp, std::ios::trunc);
-            if (!out)
-                return;
-            out << w.str();
-        }
-        std::error_code ec;
-        std::filesystem::rename(tmp, active_leader_path_(), ec);
+        const auto epoch_of = [](const std::string& path) -> std::uint64_t {
+            std::ifstream in(path);
+            if (!in) {
+                return 0;
+            }
+            const std::string body((std::istreambuf_iterator<char>(in)),
+                                   std::istreambuf_iterator<char>());
+            return extract_uint_(body, "epoch");
+        };
+        (void)fenced_metadata_cas_write(
+            active_leader_path_(),
+            w.str(),
+            mine,
+            epoch_of,
+            "It is still holding a lock and serving, which is a split brain.");
     }
 
     void release_lock_() {

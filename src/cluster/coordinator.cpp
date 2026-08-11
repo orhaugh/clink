@@ -15,6 +15,7 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/config_lint.hpp"
+#include "clink/cluster/fenced_metadata.hpp"
 #include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_bundle.hpp"
@@ -207,42 +208,16 @@ namespace {
 // the bytes survive an OS/power loss rather than only a process crash.
 //
 // This used to be an ofstream to a fixed "<path>.tmp" followed by a rename.
-// Two defects: the bytes reached only the page cache, so a machine that lost
-// power after a rename could come back with the job record gone while the
-// work it describes had already happened; and the fixed temp name let two
-// concurrent writers to the same path interleave into one temp file and race
-// the rename. Both are closed by write_string_fsync_rename.
-bool atomic_write_file(const std::filesystem::path& path, const std::string& body) {
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeMetadataWrite);
-    try {
-        clink::state::detail::write_string_fsync_rename(path, body);
-    } catch (const std::exception& e) {
-        clink::log::error("coordinator.metadata",
-                          "durable write failed for " + path.string() + ": " + e.what());
-        return false;
-    }
-    return true;
-}
-
 // Write control-plane metadata only if this coordinator has not been
-// superseded, judged by the epoch already recorded in the file. The rule
-// itself is metadata_write_allowed, in the header alongside the other
-// submit-time policies; see there for what this does and does not close.
+// superseded, judged by the epoch already recorded in the file. The rule is
+// metadata_write_allowed and the mechanism is fenced_metadata_cas_write: the
+// check and the durable rename run inside one per-target critical section,
+// so two racing writers can no longer both pass the check (item 4 - the old
+// read-then-rename form let the staler writer land second and win).
 bool fenced_write_file(const std::filesystem::path& path,
                        const std::string& body,
                        std::uint64_t writer_epoch) {
-    const auto on_disk = metadata_stored_epoch(path.string());
-    if (!metadata_write_allowed(writer_epoch, on_disk)) {
-        clink::log::error("coordinator.metadata",
-                          "refusing to overwrite " + path.string() + ": it was written by epoch " +
-                              std::to_string(on_disk) + " and this coordinator is epoch " +
-                              std::to_string(writer_epoch) +
-                              ". Leadership has moved; this process is no longer authoritative.");
-        return false;
-    }
-    return atomic_write_file(path, body);
+    return fenced_metadata_cas_write(path, body, writer_epoch, metadata_stored_epoch);
 }
 
 }  // namespace

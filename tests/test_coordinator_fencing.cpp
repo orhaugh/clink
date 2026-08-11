@@ -39,8 +39,10 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/fenced_metadata.hpp"
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/worker.hpp"
+#include "clink/fault/fault_injection.hpp"
 
 #include "tests/test_helpers/sanitizer_slack.hpp"
 
@@ -515,6 +517,92 @@ TEST(CoordinatorFencing, TheStoredEpochIsReadBackFromTheManifest) {
 
     // Absent entirely - the first write of a new job.
     EXPECT_EQ(metadata_stored_epoch((dir / "missing.json").string()), 0U);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+namespace {
+
+std::filesystem::path fencing_cas_dir() {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink-fencing-cas-" + std::to_string(::getpid()) + "-" +
+                      ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+std::string epoch_body(std::uint64_t e) {
+    return "{\"coordinator_epoch\":" + std::to_string(e) + "}";
+}
+
+}  // namespace
+
+TEST(CoordinatorFencing, AStaleWriterIsRefusedByTheCasWrite) {
+    const auto dir = fencing_cas_dir();
+    const auto path = dir / "record.json";
+
+    EXPECT_TRUE(fenced_metadata_cas_write(path, epoch_body(5), 5, metadata_stored_epoch));
+    EXPECT_EQ(metadata_stored_epoch(path.string()), 5U);
+
+    EXPECT_FALSE(fenced_metadata_cas_write(path, epoch_body(3), 3, metadata_stored_epoch))
+        << "epoch 3 overwrote epoch 5's record";
+    EXPECT_EQ(metadata_stored_epoch(path.string()), 5U) << "the refused write still landed";
+
+    EXPECT_TRUE(fenced_metadata_cas_write(path, epoch_body(6), 6, metadata_stored_epoch));
+    EXPECT_EQ(metadata_stored_epoch(path.string()), 6U);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST(CoordinatorFencing, TwoWritersCannotStraddleTheCasWindow) {
+    // The race item 4 named: with read-then-rename, a stale writer that READ
+    // before the fresh writer's rename could itself rename AFTER it, putting
+    // the superseded record on top even though both checks passed. The fault
+    // point inside the critical section stretches that historic window to
+    // hundreds of milliseconds; the CAS must make the second writer WAIT
+    // rather than slip inside it.
+    //
+    // Sequencing: writer A (epoch 1) is first through the lock and stalls on
+    // the armed delay AFTER its check, holding the lock. Writer B (epoch 2)
+    // starts once A is provably inside (the fault registry's hit count) and
+    // blocks on the lock. A renames epoch 1, releases; B checks (1 <= 2),
+    // renames epoch 2. Both interleaves of a correct CAS converge on 2; only
+    // the lockless code can finish on 1.
+    const auto dir = fencing_cas_dir();
+    const auto path = dir / "record.json";
+
+    clink::fault::ScopedFault delay_first_writer(
+        clink::fault::Rule{.point = clink::fault::points::kCoordinatorBeforeMetadataWrite,
+                           .ordinal = 1,
+                           .action = clink::fault::Action::Delay,
+                           .arg = 600});
+
+    std::thread a([&] {
+        EXPECT_TRUE(fenced_metadata_cas_write(path, epoch_body(1), 1, metadata_stored_epoch))
+            << "writer A ran against an empty record and must be allowed";
+    });
+    // Wait until A is INSIDE the critical section (it has hit the armed
+    // point), not merely started - starting B any earlier would race A for
+    // the lock and sometimes test nothing.
+    ASSERT_TRUE(fencing_await(
+        [&] {
+            return clink::fault::Registry::instance().hits(
+                       clink::fault::points::kCoordinatorBeforeMetadataWrite) >= 1;
+        },
+        std::chrono::milliseconds{5000}))
+        << "writer A never reached the armed fault point";
+
+    std::thread b([&] {
+        EXPECT_TRUE(fenced_metadata_cas_write(path, epoch_body(2), 2, metadata_stored_epoch))
+            << "writer B follows epoch 1 and must be allowed";
+    });
+    a.join();
+    b.join();
+
+    EXPECT_EQ(metadata_stored_epoch(path.string()), 2U)
+        << "the stale writer straddled the window and its record landed on top";
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
