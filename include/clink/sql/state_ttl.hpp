@@ -68,15 +68,24 @@ public:
     [[nodiscard]] std::size_t tracked() const noexcept { return deadlines_.size(); }
 
     // Record that `key` was touched by data now, pushing its deadline out.
-    // A no-op before event time exists: a deadline computed from a zero
-    // watermark would place the key in 1970 and evict it on the first real
-    // watermark that arrives.
+    //
+    // Before event time exists there is no clock to stamp a deadline from -
+    // a deadline computed from a zero watermark would place the key in 1970
+    // and evict it on the first real watermark. Such keys are HELD rather
+    // than dropped from tracking: they enter the TTL regime when the first
+    // watermark establishes the clock (deadline = first watermark + ttl).
+    // Dropping them instead made every key written before the first
+    // watermark IMMORTAL unless data happened to touch it again - in a real
+    // job that is the whole first batch, silently exempt from the very
+    // bound the state gate accepted (found by the join TTL release probes,
+    // whose write-then-watermark scripts never expired anything).
     void touch(const std::string& key) {
         if (!enabled()) {
             return;
         }
         const auto now = now_ms();
         if (!now.has_value()) {
+            pre_clock_.insert(key);
             return;
         }
         deadlines_[key] = *now + ttl_ms_;
@@ -96,6 +105,18 @@ public:
         }
         watermark_ms_ = ms;
         seen_watermark_ = true;
+        // The clock now exists: keys touched before it entered the TTL
+        // regime here, with the full ttl measured from this first
+        // watermark. Never earlier (they must not expire against a clock
+        // that had not started) and never later (or they never expire at
+        // all).
+        if (!pre_clock_.empty()) {
+            for (const auto& key : pre_clock_) {
+                deadlines_[key] = watermark_ms_ + ttl_ms_;
+                dirty_.insert(key);
+            }
+            pre_clock_.clear();
+        }
         return true;
     }
 
@@ -122,6 +143,7 @@ public:
     void forget(const std::string& key) {
         deadlines_.erase(key);
         dirty_.erase(key);
+        pre_clock_.erase(key);
         ++expired_total_;
     }
 
@@ -153,6 +175,20 @@ public:
         });
     }
 
+    // For a restoring operator scanning its restored DATA keys: a key that
+    // has data but no persisted deadline was pre-clock at snapshot time
+    // (touched before the job's first watermark, crashed before one
+    // arrived). Enrolling it here re-creates exactly the pre-crash
+    // position, so the first post-restore watermark starts its clock.
+    // Without this the restored key would be immortal again until data
+    // happened to touch it.
+    void enrol_restored_key(const std::string& key) {
+        if (!enabled() || deadlines_.count(key) != 0) {
+            return;
+        }
+        pre_clock_.insert(key);
+    }
+
     // The clock this tracker runs on. nullopt means event time has not
     // started; nothing can be judged expired against a clock that has not
     // started.
@@ -172,6 +208,14 @@ private:
     bool seen_watermark_{false};
     std::unordered_map<std::string, std::int64_t> deadlines_;
     std::unordered_set<std::string> dirty_;
+    // Keys touched before the first watermark, awaiting the clock. See
+    // touch(). Runtime-only by design: at flush time each of these either
+    // has no deadline yet (nothing true to persist) or was promoted into
+    // deadlines_ by the first advance. A key restored WITH data but WITHOUT
+    // a persisted deadline was pre-clock at snapshot time; the restoring
+    // operator re-enrols it via touch() on its next write, or it waits for
+    // enrol_restored_key() where the operator scans its restored keys.
+    std::unordered_set<std::string> pre_clock_;
     std::uint64_t expired_total_{0};
 };
 

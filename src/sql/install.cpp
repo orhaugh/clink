@@ -5054,6 +5054,82 @@ public:
         if (effective_async_) {
             columnar_out_.reset();
         }
+        // Sync-path hydrate. The async path reads through KeyedState per
+        // record, so the backend IS its state; the sync path works on the
+        // in-memory maps and must load what snapshot_timers persisted, or a
+        // restore silently loses every buffered row on both sides - the
+        // join then misses every match against pre-crash rows (F99: this
+        // operator had no snapshot hook at all, so on every non-deferring
+        // backend its state was absent from every checkpoint).
+        if (!effective_async_ && this->runtime() != nullptr &&
+            this->runtime()->has_state_backend()) {
+            auto kl = kv_left_();
+            kl.scan([&](const std::string& key, const std::vector<Entry>& entries) {
+                left_state_[key] = entries;
+                persisted_left_.insert(key);
+            });
+            auto kr = kv_right_();
+            kr.scan([&](const std::string& key, const std::vector<Entry>& entries) {
+                right_state_[key] = entries;
+                persisted_right_.insert(key);
+            });
+            auto dl = deadline_state_();
+            ttl_.restore(dl);
+            // A key restored with data but no persisted deadline was
+            // pre-clock at snapshot time; re-enrol it so the first
+            // post-restore watermark starts its clock instead of leaving it
+            // immortal.
+            for (const auto& [key, entries] : left_state_) {
+                ttl_.enrol_restored_key(key);
+            }
+            for (const auto& [key, entries] : right_state_) {
+                ttl_.enrol_restored_key(key);
+            }
+        }
+    }
+
+    // Sync-path persistence, called by the co-op runner at every barrier
+    // just before it captures the backend. Writes both maps into the
+    // KeyedState slots the async path shares (so the two paths restore each
+    // other's state), erases slots for keys the maps no longer hold (a
+    // retraction can empty a key; a stale persisted copy would resurrect it
+    // on restore), and persists the retention deadlines alongside - the
+    // tracker's absolute-deadline contract is only real if the deadlines
+    // survive with the entries they belong to.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot) override {
+        CoOperator<Row, Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (effective_async_ || this->runtime() == nullptr ||
+            !this->runtime()->has_state_backend()) {
+            return;
+        }
+        auto kl = kv_left_();
+        std::unordered_set<std::string> now_left;
+        for (const auto& [key, entries] : left_state_) {
+            kl.put(key, entries);
+            now_left.insert(key);
+        }
+        for (const auto& key : persisted_left_) {
+            if (now_left.count(key) == 0) {
+                kl.erase(key);
+            }
+        }
+        persisted_left_ = std::move(now_left);
+        auto kr = kv_right_();
+        std::unordered_set<std::string> now_right;
+        for (const auto& [key, entries] : right_state_) {
+            kr.put(key, entries);
+            now_right.insert(key);
+        }
+        for (const auto& key : persisted_right_) {
+            if (now_right.count(key) == 0) {
+                kr.erase(key);
+            }
+        }
+        persisted_right_ = std::move(now_right);
+        auto dl = deadline_state_();
+        ttl_.flush(dl);
     }
 
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
@@ -5433,6 +5509,7 @@ private:
                 if (!other_cur.has_value() || other_cur->empty()) {
                     if (this_outer && was_null)
                         emit_outer_(me_row, is_left, kRowKindDelete, batch);
+                    ttl_.touch(key);
                     self.put(key, self_list);
                     if (!batch.empty())
                         out.emit_data(std::move(batch));
@@ -5643,6 +5720,10 @@ private:
         left_state_;
     clink::FlatMap<std::string, std::vector<Entry>, TransparentKeyHash, std::equal_to<>>
         right_state_;
+    // Keys persisted by the last snapshot_timers flush, so the next flush
+    // can erase slots whose keys have since emptied.
+    std::unordered_set<std::string> persisted_left_;
+    std::unordered_set<std::string> persisted_right_;
     std::string key_scratch_;  // key_of_scratch_'s reused buffer
 
     // build_'s precomputed output layout (see the constructor).
@@ -5714,6 +5795,35 @@ public:
         effective_async_ = !null_aware_ && this->runtime() != nullptr &&
                            this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        // The data lives in KeyedState on both paths (read-through), so no
+        // hydrate is needed - but the retention DEADLINES must be restored,
+        // and keys persisted with data but no deadline (pre-clock at
+        // snapshot time) re-enrolled, or every restored key is immortal
+        // until data happens to touch it again.
+        if (ttl_.enabled() && this->runtime() != nullptr && this->runtime()->has_state_backend()) {
+            auto dl = deadline_state_();
+            ttl_.restore(dl);
+            auto kl = kv_left_();
+            kl.scan([&](const std::string& key, const std::vector<LeftEntry>&) {
+                ttl_.enrol_restored_key(key);
+            });
+        }
+    }
+
+    // Persist the retention deadlines alongside the per-key data the
+    // operator already writes through, at the same barrier the runner
+    // captures. Without this the absolute-deadline contract died at every
+    // restore.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot) override {
+        CoOperator<Row, Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (!ttl_.enabled() || this->runtime() == nullptr ||
+            !this->runtime()->has_state_backend()) {
+            return;
+        }
+        auto dl = deadline_state_();
+        ttl_.flush(dl);
     }
 
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -6120,6 +6230,13 @@ private:
             e.emitted = true;
             emit_(e.row, kRowKindInsert, batch);
         }
+        // Retention: the probed side's key is alive while data keeps
+        // arriving for it. Without this the keyed (non-null-aware) path -
+        // the DEFAULT semi join - never tracked anything, so state_ttl was
+        // accepted and enforced nothing: the persisted entries grew without
+        // bound (found by the semi TTL release probe: tracked=0 at every
+        // sweep).
+        ttl_.touch(*key);
         auto list = kv_l.get(*key).value_or(std::vector<LeftEntry>{});
         list.push_back(std::move(e));
         kv_l.put(*key, list);
@@ -6133,6 +6250,7 @@ private:
         if (!key.has_value()) {
             return;  // plain: a NULL-component right tuple matches nothing
         }
+        ttl_.touch(*key);
         const int before = static_cast<int>(kv_r.get(*key).value_or(0));
         kv_r.put(*key, static_cast<std::int64_t>(before + 1));
         if (before != 0) {
@@ -6242,8 +6360,12 @@ private:
         }
         const bool have_backend =
             this->runtime() != nullptr && this->runtime()->has_state_backend();
+        std::optional<KeyedState<std::string, std::vector<LeftEntry>>> kl;
+        std::optional<KeyedState<std::string, std::int64_t>> kr;
         std::optional<StateTtlTracker::DeadlineSlot> dl;
         if (have_backend) {
+            kl.emplace(kv_left_());
+            kr.emplace(kv_right_());
             dl.emplace(deadline_state_());
         }
         for (const auto& key : doomed) {
@@ -6251,6 +6373,15 @@ private:
             right_count_.erase(key);
             ttl_.forget(key);
             if (have_backend) {
+                // The PERSISTED entries too, not only the in-memory maps and
+                // the deadline bookkeeping. Erasing just the maps looked
+                // expired while leaving the backend copy in place - a
+                // restore resurrected every "expired" key, and on a
+                // deferring backend (where the per-key state lives remotely)
+                // nothing was ever reclaimed at all. Found by the semi-join
+                // TTL release probe; the equi join's sweep had this right.
+                kl->erase(key);
+                kr->erase(key);
                 StateTtlTracker::erase_persisted(*dl, key);
             }
         }
