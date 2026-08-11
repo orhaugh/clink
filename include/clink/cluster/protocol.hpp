@@ -197,6 +197,15 @@ enum class MessageKind : std::uint8_t {
     // this id as a normal barrier through its own drain path, then blocks
     // until it observes CommitCheckpoint for it.
     FinalCheckpointAssigned = 116,
+    // worker -> coordinator: a non-recoverable-commit sink subtask's
+
+    // commit callbacks for a checkpoint EXECUTED without throwing. The
+
+    // coordinator gates CONFIRMED-N markers on these (commit-confirmed
+
+    // restore protocol).
+
+    CommitConfirmed = 117,
     // coordinator → worker. Tell every subtask of a job to stop producing and
     // run its end-of-input path. Fired by a client StopJob.
     StopSubtasks = 117,
@@ -802,6 +811,16 @@ struct CommitCheckpointMsg {
     // unfenced peer" and preserves the pre-fencing behaviour exactly, so
     // a mixed-version cluster keeps working while it is being upgraded.
     std::uint64_t coordinator_epoch{0};
+    // Retention floor (commit-confirmed restore protocol). When non-zero,
+    // the worker's checkpoint retention must NOT purge any checkpoint with
+    // id >= this value, whatever its retention window says: for a job
+    // whose restores select CONFIRMED-N, the newest CONFIRMED checkpoint
+    // (and everything after it) must stay restorable even as newer
+    // checkpoints complete unconfirmed. Zero = no constraint (every job
+    // without a non-recoverable-commit sink). Appended at the tail,
+    // eof-guarded, defaulted to 0 by older peers - which yields exactly
+    // the pre-protocol behaviour.
+    std::uint64_t retain_floor{0};
 };
 
 // coordinator → worker. Broadcast when the coordinator decides a checkpoint
@@ -910,6 +929,26 @@ struct SubtaskCheckpointedMsg {
     std::uint32_t subtask_idx{};
     bool ok{};
     std::string error;
+};
+
+// worker -> coordinator. Sent from the CommitCheckpoint dispatch loop, per
+// subtask whose registered commit callbacks all returned without throwing:
+// the external commit for `checkpoint_id` provably EXECUTED on this
+// subtask. Only consulted for jobs on the commit-confirmed restore
+// protocol (a sink whose commit dies with the process - see
+// ConnectorCapabilities::commit_recoverable); the coordinator ignores
+// confirmations from tasks it is not tracking. The coordinator writes
+// CONFIRMED-<id> once every tracked subtask confirmed, and restores for
+// such jobs select the newest CONFIRMED checkpoint rather than the newest
+// COMPLETED one - converting die-before-commit from a silent one-interval
+// loss into a replay, at the documented price that
+// die-after-commit-before-confirmation replays one interval as
+// duplicates.
+struct CommitConfirmedMsg {
+    JobId job_id{};
+    std::uint64_t checkpoint_id{};
+    std::string role;
+    std::uint32_t subtask_idx{};
 };
 
 // worker → coordinator. Sent after the worker has bound its inbound data-plane listeners

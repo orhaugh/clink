@@ -453,6 +453,14 @@ public:
                 while (auto b = source->take_pending_barrier()) {
                     if (ctx.has_state_backend()) {
                         source->snapshot_offset(*ctx.state_backend(), id, b->id());
+                        // Pin the offset AS OF THIS BARRIER. The durable
+                        // capture happens on the terminal runner's thread when
+                        // the barrier reaches it, and this loop will have
+                        // drained later barriers (overwriting the live slot)
+                        // by then - checkpoint N's snapshot recorded
+                        // checkpoint N+1's offset, and a restore of N skipped
+                        // the records in between.
+                        ctx.state_backend()->stage_operator_rows(id, b->id());
                     }
                     // Failure is acked here; success is NOT. emit_barrier
                     // returns false when a downstream channel is closed or a
@@ -3749,6 +3757,11 @@ public:
                     while (auto b = source->take_pending_barrier()) {
                         if (ctx.has_state_backend()) {
                             source->snapshot_offset(*ctx.state_backend(), id, b->id());
+                            // Pin the offset AS OF THIS BARRIER - same tear
+                            // as the single-subtask runner above: the tail
+                            // captures on its own thread after this loop has
+                            // already drained later barriers over the slot.
+                            ctx.state_backend()->stage_operator_rows(id, b->id());
                         }
                         // Failure acked, success NOT - same contract as the
                         // single-subtask source runner above, for the same

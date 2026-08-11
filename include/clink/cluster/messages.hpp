@@ -261,6 +261,7 @@ inline void encode_body(MessageBuilder& b, const CommitCheckpointMsg& m) {
     // Fencing epoch, appended last so an older peer that stops
     // reading here still decodes the rest correctly.
     b.put_u64_be(m.coordinator_epoch);
+    b.put_u64_be(m.retain_floor);
 }
 
 inline void encode_body(MessageBuilder& b, const AbortCheckpointMsg& m) {
@@ -324,6 +325,22 @@ inline void encode_body(MessageBuilder& b, const BeginRescaleAckMsg& m) {
     // Fencing epoch, appended last so an older peer that stops
     // reading here still decodes the rest correctly.
     b.put_u64_be(m.coordinator_epoch);
+}
+
+inline void encode_body(MessageBuilder& b, const CommitConfirmedMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_u64_be(m.checkpoint_id);
+    b.put_string(m.role);
+    b.put_u32_be(m.subtask_idx);
+}
+
+inline CommitConfirmedMsg decode_commit_confirmed(MessageReader& r) {
+    CommitConfirmedMsg m;
+    m.job_id = r.read_u64_be();
+    m.checkpoint_id = r.read_u64_be();
+    m.role = r.read_string();
+    m.subtask_idx = r.read_u32_be();
+    return m;
 }
 
 inline void encode_body(MessageBuilder& b, const SubtaskCheckpointedMsg& m) {
@@ -758,6 +775,9 @@ inline CommitCheckpointMsg decode_commit_checkpoint(MessageReader& r) {
     // Fencing epoch. Absent from a pre-fencing peer, which reads
     // as 0 = unfenced and preserves the old behaviour.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    // Retention floor (commit-confirmed restore). Absent from an older
+    // coordinator: 0 = no constraint, the pre-protocol behaviour.
+    m.retain_floor = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 

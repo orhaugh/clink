@@ -26,6 +26,7 @@
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/worker.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/operators/map_operator.hpp"
@@ -2054,6 +2055,165 @@ std::uint64_t clink_latest_completed_marker(const std::filesystem::path& dir) {
         }
     }
     return latest;
+}
+
+// --- commit-confirmed restore protocol -------------------------------------
+//
+// A job with a sink whose external commit cannot be re-executed after a
+// crash restores from the newest checkpoint whose commits provably
+// EXECUTED (CONFIRMED-N), not the newest completed one. These pin the
+// tracking half in-process: CONFIRMED markers appear exactly for tracked
+// jobs, gated on the worker's CommitConfirmed after successful dispatch.
+// The restore-selection half is pinned end to end by the Kafka
+// exactly-once integration suite (a real broker is the only honest way to
+// exercise a commit that dies with the process).
+
+namespace {
+
+clink::cluster::JobGraphSpec clink_confirm_test_graph(const std::filesystem::path& dir) {
+    clink::cluster::JobGraphSpec g;
+    clink::cluster::OperatorSpec src;
+    src.id = "src";
+    src.type = "int64_range_source";
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "4000"}, {"delay_ms", "1"}};
+    g.ops.push_back(std::move(src));
+    clink::cluster::OperatorSpec conv;
+    conv.id = "conv";
+    conv.type = "int64_to_string";
+    conv.out_channel = std::string{kChannelString};
+    conv.inputs = {"src"};
+    g.ops.push_back(std::move(conv));
+    clink::cluster::OperatorSpec snk;
+    snk.id = "snk";
+    snk.type = "file_2pc_sink_string";
+    snk.out_channel = std::string{kChannelString};
+    snk.inputs = {"conv"};
+    snk.params = {{"dir", dir.string()}};
+    g.ops.push_back(std::move(snk));
+    return g;
+}
+
+// Override file_2pc's capability record for the duration of a test, and
+// put the original back whatever happens - the CapabilityRegistry is
+// process-global and the manifest gate asserts on the real record.
+class ClinkScopedRecordOverride {
+public:
+    explicit ClinkScopedRecordOverride(clink::connectors::ConnectorCapabilities replacement) {
+        const auto* current =
+            clink::connectors::CapabilityRegistry::instance().find(replacement.name);
+        if (current != nullptr) {
+            original_ = *current;
+        }
+        clink::connectors::declare_connector(std::move(replacement));
+    }
+    ~ClinkScopedRecordOverride() {
+        if (original_.has_value()) {
+            clink::connectors::declare_connector(*original_);
+        }
+    }
+    ClinkScopedRecordOverride(const ClinkScopedRecordOverride&) = delete;
+    ClinkScopedRecordOverride& operator=(const ClinkScopedRecordOverride&) = delete;
+    ClinkScopedRecordOverride(ClinkScopedRecordOverride&&) = delete;
+    ClinkScopedRecordOverride& operator=(ClinkScopedRecordOverride&&) = delete;
+
+private:
+    std::optional<clink::connectors::ConnectorCapabilities> original_;
+};
+
+std::uint64_t clink_latest_marker(const std::filesystem::path& ckpt_dir,
+                                  std::uint64_t job_id,
+                                  const std::string& prefix) {
+    std::uint64_t latest = 0;
+    const auto dir = ckpt_dir / "_jobs" / std::to_string(job_id);
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) {
+        return 0;
+    }
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const auto name = e.path().filename().string();
+        if (name.rfind(prefix, 0) != 0) {
+            continue;
+        }
+        try {
+            latest = std::max(latest,
+                              static_cast<std::uint64_t>(std::stoull(name.substr(prefix.size()))));
+        } catch (...) {
+        }
+    }
+    return latest;
+}
+
+void clink_run_confirm_job(const std::filesystem::path& ckpt_dir,
+                           const std::filesystem::path& out_dir,
+                           const std::string& worker_name) {
+    Coordinator coordinator;
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({worker_name});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker(worker_name, "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = ckpt_dir.string();
+    ckpt.interval_ms = 100;
+    const auto job_id = coordinator.submit_job(clink_confirm_test_graph(out_dir),
+                                               OperatorRegistry::default_instance(),
+                                               std::vector<PluginBinary>{},
+                                               ckpt);
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, clink::test_support::scale_slack(30s)));
+    worker.stop();
+    coordinator.stop();
+}
+
+}  // namespace
+
+TEST(Cluster, ATrackedJobsCheckpointsGainConfirmedMarkers) {
+    // The record override is what puts the job on the protocol: same
+    // graph, same built-in sink, but its declared commit is no longer
+    // recoverable, so the planner flags the sink task, the coordinator
+    // tracks it, and every commit the worker executes comes back as a
+    // CONFIRMED-N marker beside the COMPLETED-N one.
+    clink::cluster::ensure_built_ins_registered();
+    const auto* file_2pc = clink::connectors::CapabilityRegistry::instance().find("file_2pc");
+    ASSERT_NE(file_2pc, nullptr) << "built-in capability records not declared";
+    auto flagged = *file_2pc;
+    flagged.commit_recoverable = false;
+    ClinkScopedRecordOverride guard(std::move(flagged));
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto ckpt_dir = tmp / ("clink_confirm_ckpt_" + std::to_string(::getpid()));
+    const auto out_dir = tmp / ("clink_confirm_out_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::remove_all(out_dir);
+    clink_run_confirm_job(ckpt_dir, out_dir, "worker-confirm-tracked");
+
+    const auto completed = clink_latest_marker(ckpt_dir, 1, "COMPLETED-");
+    const auto confirmed = clink_latest_marker(ckpt_dir, 1, "CONFIRMED-");
+    EXPECT_GT(completed, 0u) << "the job never completed a checkpoint; the probe is vacuous";
+    EXPECT_GT(confirmed, 0u)
+        << "no CONFIRMED marker was written for a tracked job whose commits executed";
+    EXPECT_LE(confirmed, completed) << "a checkpoint confirmed before it completed";
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::remove_all(out_dir);
+}
+
+TEST(Cluster, AnUntrackedJobsProtocolStaysDormant) {
+    // Same job, real (recoverable) record: no tracking, no CONFIRMED
+    // markers - the protocol must cost untracked jobs nothing.
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto ckpt_dir = tmp / ("clink_confirm_ckpt_ctl_" + std::to_string(::getpid()));
+    const auto out_dir = tmp / ("clink_confirm_out_ctl_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::remove_all(out_dir);
+    clink_run_confirm_job(ckpt_dir, out_dir, "worker-confirm-untracked");
+
+    EXPECT_GT(clink_latest_marker(ckpt_dir, 1, "COMPLETED-"), 0u);
+    EXPECT_EQ(clink_latest_marker(ckpt_dir, 1, "CONFIRMED-"), 0u)
+        << "an untracked job grew CONFIRMED markers; the protocol is not dormant";
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::remove_all(out_dir);
 }
 
 clink::cluster::JobGraphSpec clink_parity_graph(std::int64_t start,

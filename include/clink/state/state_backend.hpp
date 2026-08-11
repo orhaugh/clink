@@ -213,6 +213,31 @@ public:
     using ScanVisitor = std::function<void(KeyView key, ValueView value)>;
     virtual void scan(OperatorId op, const ScanVisitor& visit) const = 0;
 
+    // Stage a barrier-consistent copy of one operator's rows for checkpoint
+    // `id`. A snapshot/capture for that id must then serialise the STAGED
+    // copy of this operator rather than its live rows.
+    //
+    // Why this exists: a source shares its backend with the rest of its
+    // subtask chain, and the chain's tail performs the durable capture when
+    // the barrier reaches IT - on a different thread from the source's
+    // produce loop. Between the source writing its offset at barrier N and
+    // the tail capturing N, the source drains barrier N+1 and overwrites
+    // the slot, so checkpoint N's persisted snapshot recorded a FUTURE
+    // offset. A restore of N then resumed past records that only existed in
+    // checkpoint N+1's uncommitted sink transaction - silent loss on the
+    // ordinary recovery path (observed live: checkpoint 4's snapshot
+    // holding offset 12 while its committed transaction ended at record 8).
+    // Staging at barrier-drain time pins the rows the checkpoint actually
+    // cut at.
+    //
+    // The default is a no-op: backends that never share a live map across
+    // threads at capture time (or that have not adopted staging yet) keep
+    // their existing semantics. Staged entries are consumed and released by
+    // the snapshot/capture for their id; entries for ids at or below a
+    // consumed id are dropped with it, so aborted checkpoints cannot
+    // accumulate staged copies.
+    virtual void stage_operator_rows(OperatorId /*op*/, CheckpointId /*id*/) {}
+
     // Snapshot the entire state backend at the given checkpoint id.
     // Implementations should make a consistent point-in-time copy.
     virtual Snapshot snapshot(CheckpointId id) = 0;

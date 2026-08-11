@@ -220,8 +220,22 @@ void KafkaSink::open() {
 }
 
 void KafkaSink::commit_transaction() {
-    if (impl_->opts.transactional_id.empty() || !impl_->producer) {
+    if (impl_->opts.transactional_id.empty()) {
         return;
+    }
+    if (!impl_->producer) {
+        // A transactional sink with no live producer has NOTHING to commit -
+        // close() has already torn the producer down (aborting any open
+        // transaction with it). Returning silently here read as success to
+        // the 2PC wrapper, which let the worker CONFIRM a checkpoint whose
+        // transaction had in fact been aborted; the commit-confirmed restore
+        // protocol then selected that checkpoint and replayed PAST its
+        // records - observed live as three records missing from a confirmed
+        // checkpoint, with the broker trace showing three commits and one
+        // teardown abort where the client believed it had committed four.
+        throw std::runtime_error(
+            "KafkaSink: commit_transaction called after the producer was closed; the "
+            "transaction it names was aborted at teardown and cannot be confirmed");
     }
     const auto t0 = std::chrono::steady_clock::now();
     const int timeout_ms = static_cast<int>(impl_->opts.flush_timeout.count());

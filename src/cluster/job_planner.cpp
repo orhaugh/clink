@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/config/json.hpp"
 #include "clink/runtime/key_groups.hpp"
@@ -552,6 +553,15 @@ HotCutoverPlan plan_hot_cutover(const JobGraphSpec& graph,
             }
         }
         nt.extra_config = chain.to_json();
+        for (const auto& cop : chain.ops) {
+            if (op_type_needs_commit_confirmation(cop.type)) {
+                nt.needs_commit_confirmation = true;
+            }
+        }
+        if (chain.fused_sink.has_value() &&
+            op_type_needs_commit_confirmation(chain.fused_sink->type)) {
+            nt.needs_commit_confirmation = true;
+        }
 
         nt.peer_refs.clear();
         for (const auto& [pr_role, pr_sub] : t.peer_refs) {
@@ -1544,6 +1554,15 @@ JobPlan plan_job(const JobGraphSpec& graph,
                 }
             }
             t.extra_config = chain.to_json();
+            for (const auto& cop : chain.ops) {
+                if (op_type_needs_commit_confirmation(cop.type)) {
+                    t.needs_commit_confirmation = true;
+                }
+            }
+            if (chain.fused_sink.has_value() &&
+                op_type_needs_commit_confirmation(chain.fused_sink->type)) {
+                t.needs_commit_confirmation = true;
+            }
             plan.tasks.push_back(std::move(t));
         }
     }

@@ -271,10 +271,35 @@ public:
         // claim actually gets decided.
         CLINK_FAULT_POINT(clink::fault::points::kSinkBeforeCommit);
         std::lock_guard lk(mu_);
+        if (closed_) {
+            // The prepared transaction died with close()'s abort. Executing
+            // "successfully" here would confirm a checkpoint whose records
+            // the broker has already discarded - the restore would then
+            // select it and replay PAST them. Refusing keeps the worker
+            // from sending CommitConfirmed, so the restore falls back to
+            // the last checkpoint whose commit genuinely executed and the
+            // replay re-produces these records.
+            throw std::runtime_error(
+                "kafka_2pc_sink_string: commit for checkpoint " + std::to_string(checkpoint_id) +
+                " arrived after the sink closed; its transaction was aborted at teardown and "
+                "must not be confirmed");
+        }
         if (!open_txn_ckpt_.has_value() || *open_txn_ckpt_ != checkpoint_id) {
-            return;
+            if (checkpoint_id <= last_committed_ckpt_) {
+                // Idempotent re-delivery of a commit this sink already
+                // executed (e.g. the terminal barrier's local commit racing
+                // the coordinator broadcast). Nothing left to do.
+                return;
+            }
+            throw std::runtime_error("kafka_2pc_sink_string: commit for checkpoint " +
+                                     std::to_string(checkpoint_id) +
+                                     " does not match any prepared transaction (open: " +
+                                     (open_txn_ckpt_.has_value() ? std::to_string(*open_txn_ckpt_)
+                                                                 : std::string{"none"}) +
+                                     "); refusing to confirm a commit that did not execute");
         }
         inner_.commit_transaction();  // commits, then begins the next txn
+        last_committed_ckpt_ = checkpoint_id;
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
         resolve_open_();
     }
@@ -308,7 +333,10 @@ public:
         // barrier wasn't followed by an on_commit - abort it so the broker
         // doesn't leave records lingering in PREPARED. Buffered records die
         // with it; the checkpoint they follow was never committed, so the
-        // restore replays them.
+        // restore replays them. closed_ makes any LATER on_commit refuse
+        // loudly: teardown can race the coordinator's commit broadcast, and
+        // a commit dispatched after this abort must not read as executed.
+        closed_ = true;
         tail_.clear();
         inner_.abort_transaction();
         inner_.close();
@@ -348,6 +376,13 @@ private:
     std::condition_variable pending_cv_;
     std::optional<std::uint64_t> open_txn_ckpt_;
     std::vector<std::string> tail_;
+    // Highest checkpoint whose commit this instance EXECUTED. A re-delivered
+    // commit at or below it is idempotent; anything else that misses the
+    // open transaction is a commit that did not happen and must throw.
+    std::uint64_t last_committed_ckpt_{0};
+    // Set by close(). A commit arriving after teardown aborted the prepared
+    // transaction must refuse rather than read as executed.
+    bool closed_{false};
 };
 
 // Upsert-shaped Kafka sink. Takes JSON rows (each row is
@@ -495,6 +530,12 @@ void install(clink::plugin::PluginRegistry& reg) {
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceTwoPhaseCommit,
         .transactional = true,
+        // A broker transaction cannot be resumed by a new producer: the
+        // commit either executed before the crash or the records are gone
+        // from the transaction. The commit-confirmed restore protocol
+        // (CONFIRMED-N markers) turns that from silent loss into a bounded
+        // duplicate window.
+        .commit_recoverable = false,
         .schema_evolution = false,
         .partition_discovery = true,
         .auth_methods = {"none", "sasl_plaintext", "sasl_ssl", "ssl"},

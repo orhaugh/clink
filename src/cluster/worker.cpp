@@ -722,36 +722,54 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
     // without it. The sink's commit work (atomic rename, Kafka commitTx,
     // SQL COMMIT PREPARED) may block on the external system; doing it
     // outside mu_ keeps reader-loop dispatch responsive.
-    std::vector<RunnerContext::CommitCheckpointFn> to_invoke;
+    // Grouped by subtask so success is ATTRIBUTABLE: a subtask whose
+    // callbacks all executed without throwing has provably run its external
+    // commit, and the CommitConfirmed it sends below is what the
+    // commit-confirmed restore protocol gates CONFIRMED-N markers on. The
+    // coordinator ignores confirmations from tasks it is not tracking, so
+    // sending for every committer subtask is correct for unflagged jobs
+    // too (one small frame per subtask per checkpoint).
+    std::vector<std::pair<std::uint32_t, std::vector<RunnerContext::CommitCheckpointFn>>> to_invoke;
     {
         std::lock_guard lock(mu_);
         auto job_it = per_job_committers_.find(msg.job_id);
         if (job_it != per_job_committers_.end()) {
             for (auto& [sub_idx, entry] : job_it->second) {
-                for (auto& fn : entry) {
-                    to_invoke.push_back(fn);
-                }
+                to_invoke.emplace_back(sub_idx, entry);
             }
         }
     }
-    for (auto& fn : to_invoke) {
-        try {
-            fn(msg.checkpoint_id);
-        } catch (const std::exception& e) {
-            // Best-effort: a single sink failing to commit must not stall
-            // the reader; a recoverable sink's persisted handle is retried
-            // at the next restore. But NEVER silently: a swallowed commit
-            // failure reads as completed-with-missing-output downstream,
-            // and this log line is the only witness.
-            clink::log::error("worker.commit",
-                              "commit callback for checkpoint " +
-                                  std::to_string(msg.checkpoint_id) +
-                                  " failed: " + std::string(e.what()));
-        } catch (...) {
-            clink::log::error("worker.commit",
-                              "commit callback for checkpoint " +
-                                  std::to_string(msg.checkpoint_id) +
-                                  " failed with a non-exception throw");
+    for (auto& [sub_idx, fns] : to_invoke) {
+        bool all_ok = true;
+        for (auto& fn : fns) {
+            try {
+                fn(msg.checkpoint_id);
+            } catch (const std::exception& e) {
+                // Best-effort: a single sink failing to commit must not stall
+                // the reader; a recoverable sink's persisted handle is retried
+                // at the next restore. But NEVER silently: a swallowed commit
+                // failure reads as completed-with-missing-output downstream,
+                // and this log line is the only witness.
+                all_ok = false;
+                clink::log::error("worker.commit",
+                                  "commit callback for checkpoint " +
+                                      std::to_string(msg.checkpoint_id) +
+                                      " failed: " + std::string(e.what()));
+            } catch (...) {
+                all_ok = false;
+                clink::log::error("worker.commit",
+                                  "commit callback for checkpoint " +
+                                      std::to_string(msg.checkpoint_id) +
+                                      " failed with a non-exception throw");
+            }
+        }
+        if (all_ok && !fns.empty()) {
+            CommitConfirmedMsg cm;
+            cm.job_id = msg.job_id;
+            cm.checkpoint_id = msg.checkpoint_id;
+            cm.role = kGenericSubtaskRole;
+            cm.subtask_idx = sub_idx;
+            send_frame_(encode_frame(MessageKind::CommitConfirmed, cm));
         }
     }
     // Record the committed high-water mark + wake any source blocked in
@@ -784,7 +802,17 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
                          .emplace(msg.job_id, CheckpointRetention{cfg_.checkpoint_num_retained})
                          .first;
         }
-        const auto purge_ids = ret_it->second.record_completed(CheckpointId{msg.checkpoint_id});
+        auto purge_ids = ret_it->second.record_completed(CheckpointId{msg.checkpoint_id});
+        // Commit-confirmed restore protocol: the coordinator's retention
+        // floor forbids purging anything at or above the newest CONFIRMED
+        // checkpoint - that is the job's restore target while newer
+        // checkpoints sit completed but unconfirmed, and purging it would
+        // erase the only state a correct restore can use. Zero = untracked
+        // job, no constraint (the pre-protocol behaviour, byte for byte).
+        if (msg.retain_floor > 0) {
+            std::erase_if(purge_ids,
+                          [&](const CheckpointId id) { return id.value() >= msg.retain_floor; });
+        }
         if (!purge_ids.empty()) {
             if (auto be_it = per_job_backends_.find(msg.job_id); be_it != per_job_backends_.end()) {
                 for (const auto& [_, backend] : be_it->second) {
@@ -1146,7 +1174,21 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
         }
         auto job_it = per_job_injectors_.find(msg.job_id);
         if (job_it == per_job_injectors_.end() || job_it->second.empty()) {
-            pending_triggers_[msg.job_id].push_back({msg.checkpoint_id, msg.generation});
+            // Keep only the NEWEST queued trigger. Checkpoint N subsumes
+            // N-1, so replaying one barrier is all the leading-interval
+            // race needs - and a worker that hosts no source for this job
+            // (its injectors never register) otherwise accumulates the
+            // job's entire trigger history. A restarted deployment landing
+            // on such a worker had that backlog replayed into its restored
+            // sources from id 1: dozens of stale barriers re-persisted
+            // snapshot files the pre-restart run had already written
+            // (clobbering the restore point's offsets with post-restore
+            // ones) and pre-committed the 2PC sink under checkpoint ids
+            // the coordinator had already retired, wedging it against its
+            // commit-wait bound.
+            auto& q = pending_triggers_[msg.job_id];
+            q.clear();
+            q.push_back({msg.checkpoint_id, msg.generation});
             return;
         }
         for (auto& [sub_idx, entry] : job_it->second) {
@@ -1244,6 +1286,17 @@ void Worker::handle_deploy_(MessageReader& r) {
         std::lock_guard lock(mu_);
         in_flight_tasks_ += msg.tasks.size();
         deployed_ = true;
+        // A Deploy starts a fresh incarnation of the job on this worker:
+        // any trigger queued against a previous incarnation is stale, and
+        // replaying it into the new deployment's sources injects a
+        // checkpoint id the coordinator has already moved past (observed:
+        // a restarted source persisting checkpoint-1..N.snap over the
+        // files its restore point was about to be read from). The
+        // coordinator's next periodic trigger arrives within one interval,
+        // so dropping the backlog costs nothing. Triggers that land AFTER
+        // this Deploy and before the sources register still queue and
+        // replay - that is the leading-interval race the queue exists for.
+        pending_triggers_.erase(msg.job_id);
         for (const auto& task : msg.tasks) {
             const PendingKey key{msg.job_id, task.role, task.subtask_idx};
             pending_[key] = std::make_shared<PendingTask>();

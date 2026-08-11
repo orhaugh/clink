@@ -43,6 +43,12 @@ struct PlannedTask {
     std::uint16_t data_port{};  // 0 if no inbound listener
     std::vector<std::pair<std::string /*role*/, std::uint32_t /*subtask*/>> peer_refs;
     std::string extra_config;
+    // True when this task's chain hosts a sink whose external commit
+    // cannot be re-executed after a crash (guarantee_gate::
+    // op_type_needs_commit_confirmation). The coordinator tracks such
+    // tasks per checkpoint and gates CONFIRMED-N markers on their
+    // CommitConfirmed messages - the commit-confirmed restore protocol.
+    bool needs_commit_confirmation{false};
     // The slice of the key space this task's keyed state belongs to,
     // [first, last). Set by the planner, which is the only place that knows
     // both numbers it depends on: the task's index WITHIN its operator, and
@@ -834,6 +840,17 @@ private:
         // restart_job_locked_, which redeploys the entire task set onto
         // surviving workers with restore_from pointing at the coordinator's checkpoint
         // dir + latest_completed_checkpoint_id, clears the restart
+        // Commit-confirmed restore protocol (jobs with a sink whose
+        // external commit dies with the process -
+        // PlannedTask::needs_commit_confirmation). confirm_task_keys: the
+        // tracked tasks in the CURRENT topology, keyed like task_records.
+        // pending_confirms: per checkpoint, the tracked tasks whose
+        // CommitConfirmed has not arrived; drained -> CONFIRMED-N marker +
+        // latest_confirmed advance. Empty confirm_task_keys = the job is
+        // not on the protocol and none of this is consulted.
+        std::set<std::string> confirm_task_keys;
+        std::map<std::uint64_t, std::set<std::string>> pending_confirms;
+        std::uint64_t latest_confirmed_checkpoint_id{};
         // bookkeeping, and increments restart_attempts.
         bool awaiting_restart{false};
         std::uint32_t restart_attempts{0};
@@ -1263,6 +1280,11 @@ private:
                            std::string expected_state_versions_packed = {},
                            std::string udfs_packed = {});
     void handle_subtask_checkpointed_(MessageReader& r);
+    // Commit-confirmed restore protocol: a tracked task's commit callbacks
+    // for a checkpoint executed without throwing. Drains the checkpoint's
+    // pending-confirmation set; on empty, writes CONFIRMED-<id> and
+    // advances latest_confirmed_checkpoint_id.
+    void handle_commit_confirmed_(MessageReader& r);
     // A bounded source at clean EOS requested a final coordinated checkpoint.
     // Assigns (once per job) the final id, seeds its pending ack set, broadcasts
     // TriggerCheckpoint, and replies FinalCheckpointAssigned on `reply_conn`.

@@ -662,6 +662,18 @@ TEST(WireProtocol, CommitCheckpointRoundTrips) {
     EXPECT_EQ(out.checkpoint_id, 99u);
 }
 
+// CommitConfirmed wire frame round-trips. worker -> coordinator report
+// that one sink subtask's commit callbacks all executed for a checkpoint;
+// the role + subtask_idx pair identifies which confirmation to retire.
+TEST(WireProtocol, CommitConfirmedRoundTrips) {
+    CommitConfirmedMsg in{.job_id = 5, .checkpoint_id = 99, .role = "sink", .subtask_idx = 3};
+    auto out = round_trip(MessageKind::CommitConfirmed, in, decode_commit_confirmed);
+    EXPECT_EQ(out.job_id, 5u);
+    EXPECT_EQ(out.checkpoint_id, 99u);
+    EXPECT_EQ(out.role, "sink");
+    EXPECT_EQ(out.subtask_idx, 3u);
+}
+
 // BeginRescale message frame. coordinator -> worker signal that starts
 // the dual-run rescale: target_parallelism + cutover_checkpoint
 // pinpoint exactly which checkpoint the new subtasks load their
@@ -831,10 +843,11 @@ TEST(WireProtocolFencing, EveryControlFrameCarriesTheCoordinatorEpoch) {
         EXPECT_EQ(out.generation, 7U);
     }
     {
-        CommitCheckpointMsg in{.job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9};
-        EXPECT_EQ(round_trip(MessageKind::CommitCheckpoint, in, decode_commit_checkpoint)
-                      .coordinator_epoch,
-                  9U);
+        CommitCheckpointMsg in{
+            .job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9, .retain_floor = 5};
+        const auto out = round_trip(MessageKind::CommitCheckpoint, in, decode_commit_checkpoint);
+        EXPECT_EQ(out.coordinator_epoch, 9U);
+        EXPECT_EQ(out.retain_floor, 5U);
     }
     {
         AbortCheckpointMsg in{.job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9};
@@ -923,11 +936,28 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
         EXPECT_EQ(out.coordinator_epoch, 0U);
     }
     {
-        CommitCheckpointMsg in{.job_id = 1, .checkpoint_id = 22, .coordinator_epoch = 9};
+        // CommitCheckpoint's tail has grown: the fencing epoch (8 bytes) plus
+        // the commit-confirmed retention floor (8 bytes). A peer that predates
+        // BOTH sends neither, so 16 bytes come off, not 8.
+        CommitCheckpointMsg in{
+            .job_id = 1, .checkpoint_id = 22, .coordinator_epoch = 9, .retain_floor = 5};
         auto out = round_trip_without_epoch_field(
-            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint);
+            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint, /*tail_bytes=*/16);
         EXPECT_EQ(out.checkpoint_id, 22U);
         EXPECT_EQ(out.coordinator_epoch, 0U);
+        EXPECT_EQ(out.retain_floor, 0U);
+    }
+    {
+        // The intermediate peer: has fencing, predates the retention floor.
+        // Chops only the floor; the epoch must survive and the floor must
+        // read 0 = no retention constraint, the pre-protocol behaviour.
+        CommitCheckpointMsg in{
+            .job_id = 1, .checkpoint_id = 23, .coordinator_epoch = 9, .retain_floor = 5};
+        auto out = round_trip_without_epoch_field(
+            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint, /*tail_bytes=*/8);
+        EXPECT_EQ(out.checkpoint_id, 23U);
+        EXPECT_EQ(out.coordinator_epoch, 9U);
+        EXPECT_EQ(out.retain_floor, 0U);
     }
     {
         // TriggerCheckpoint's tail has grown: the fencing epoch (8 bytes) plus

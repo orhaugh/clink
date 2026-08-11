@@ -117,6 +117,18 @@ struct ConnectorCapabilities {
     bool checkpoint_integrated{false};  // participates in barrier/snapshot
     DeliveryGuarantee delivery{DeliveryGuarantee::NoDurableRestartGuarantee};
     bool transactional{false};  // has prepare/commit/abort
+    // Whether a prepared-but-uncommitted transaction can be COMMITTED AGAIN
+    // by a fresh process after a crash (CommittingSink's recover(): COMMIT
+    // PREPARED, re-complete a multipart upload, re-rename a staged file).
+    // False for sinks whose transaction dies with the producer session
+    // (Kafka: librdkafka has no transaction resume). A false here puts the
+    // job on the commit-confirmed restore protocol: restores select the
+    // newest checkpoint whose commits provably EXECUTED (CONFIRMED-N), so
+    // a die-before-commit loses nothing - at the price that a
+    // die-after-commit-before-confirmation replays one interval as
+    // duplicates. Only meaningful when `delivery` is an exactly-once
+    // level.
+    bool commit_recoverable{true};
     // Non-empty when the guarantee is conditional on the user supplying an
     // idempotency key; names the option that carries it.
     std::string idempotency_key_option;

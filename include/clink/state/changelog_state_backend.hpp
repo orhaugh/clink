@@ -120,6 +120,10 @@ public:
 
     void scan(OperatorId op, const ScanVisitor& visit) const override { inner_->scan(op, visit); }
 
+    void stage_operator_rows(OperatorId op, CheckpointId id) override {
+        inner_->stage_operator_rows(op, id);
+    }
+
     // Snapshot/restore use an Arrow IPC stream containing a single
     // record batch with schema:
     //

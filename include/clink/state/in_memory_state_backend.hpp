@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <span>
 #include <string>
@@ -96,6 +97,7 @@ public:
     void clear() {
         std::lock_guard lock(mu_);
         state_.clear();
+        staged_.clear();
     }
 
     void scan(OperatorId op, const ScanVisitor& visit) const override {
@@ -135,6 +137,17 @@ public:
     // to keep Arrow headers out of the widely-included
     // in_memory_state_backend.hpp.
     Snapshot snapshot(CheckpointId id) override;
+    // Pin a barrier-consistent copy of `op`'s rows for checkpoint `id`;
+    // snapshot(id) serialises the pinned copy instead of the live rows and
+    // releases every staged entry at or below id. See StateBackend for the
+    // source-offset tear this closes.
+    void stage_operator_rows(OperatorId op, CheckpointId id) override {
+        std::lock_guard lock(mu_);
+        auto it = state_.find(op);
+        // An op with no rows stages an EMPTY copy on purpose: rows the op
+        // gains after the barrier must not appear in this checkpoint.
+        staged_[id.value()][op] = (it != state_.end()) ? it->second : PerOp{};
+    }
     // Live export: the same canonical bytes snapshot() produces, without
     // the checkpoint bookkeeping/metrics (see StateBackend for the
     // consistency caveat).
@@ -203,6 +216,12 @@ private:
 
     mutable std::mutex mu_;
     State state_;
+    // Barrier-consistent per-checkpoint row copies, keyed by checkpoint id
+    // then operator. Written by stage_operator_rows on the staging thread
+    // (the source runner's barrier drain), consumed and pruned by
+    // snapshot(id). An ordered map so pruning "everything at or below id"
+    // is a range erase.
+    std::map<std::uint64_t, std::unordered_map<OperatorId, PerOp>> staged_;
     StateVersionMap state_versions_;
     // Set at snapshot(). Atomic and outside mu_ so the worker's heartbeat thread
     // can read it while an operator thread is mutating state, which is the whole

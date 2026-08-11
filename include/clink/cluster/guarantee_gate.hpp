@@ -57,4 +57,13 @@ namespace clink::cluster {
 // part most likely to be got wrong by a future connector name.
 [[nodiscard]] std::string connector_name_for_op_type(const std::string& op_type);
 
+// Whether this op type is a sink whose declared capability is an
+// exactly-once level with commit_recoverable == false - a sink whose
+// external commit dies with the process and cannot be re-executed at
+// restore. A task hosting one puts its job on the commit-confirmed
+// restore protocol: the coordinator gates CONFIRMED-N markers on that
+// task's CommitConfirmed messages, and restores for the job select the
+// newest CONFIRMED checkpoint instead of the newest COMPLETED one.
+[[nodiscard]] bool op_type_needs_commit_confirmation(const std::string& op_type);
+
 }  // namespace clink::cluster

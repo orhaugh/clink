@@ -69,6 +69,10 @@ public:
 
     void scan(OperatorId op, const ScanVisitor& visit) const override { inner_.scan(op, visit); }
 
+    void stage_operator_rows(OperatorId op, CheckpointId id) override {
+        inner_.stage_operator_rows(op, id);
+    }
+
     // Synchronous snapshot = capture (serialise) + persist (durable
     // write), fused on the operator thread. The async path drives the two
     // halves separately so the slow write lands on the snapshot worker.

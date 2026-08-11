@@ -96,7 +96,64 @@ std::vector<std::byte> InMemoryStateBackend::export_arrow_snapshot() const {
 
 Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
     const auto t0 = std::chrono::steady_clock::now();
-    auto bytes = export_arrow_snapshot();
+    std::vector<std::byte> bytes;
+    {
+        // Serialise under the lock, substituting any rows STAGED for this
+        // checkpoint id in place of the live rows: the live map may already
+        // contain post-barrier mutations from a runner that raced ahead
+        // (the source-offset tear stage_operator_rows exists to close).
+        std::lock_guard lock(mu_);
+        const auto staged_it = staged_.find(id.value());
+        const auto* staged_ops = staged_it != staged_.end() ? &staged_it->second : nullptr;
+        const auto rows_for = [&](OperatorId op, const PerOp& live) -> const PerOp* {
+            if (staged_ops != nullptr) {
+                if (auto s = staged_ops->find(op); s != staged_ops->end()) {
+                    return &s->second;
+                }
+            }
+            return &live;
+        };
+        std::size_t total_rows = 0;
+        for (const auto& [op, kv] : state_) {
+            total_rows += rows_for(op, kv)->size();
+        }
+        if (staged_ops != nullptr) {
+            // A staged op with no live rows still contributes its staged copy.
+            for (const auto& [op, kv] : *staged_ops) {
+                if (state_.find(op) == state_.end()) {
+                    total_rows += kv.size();
+                }
+            }
+        }
+        SnapshotArrowWriter writer(total_rows);
+        for (const auto& [op, kv] : state_) {
+            const auto op_id_val = op.value();
+            const auto* rows = rows_for(op, kv);
+            for (const auto& [k, v] : *rows) {
+                writer.append(op_id_val,
+                              std::string_view(k.data(), k.size()),
+                              std::string_view(reinterpret_cast<const char*>(v.data()), v.size()));
+            }
+        }
+        if (staged_ops != nullptr) {
+            for (const auto& [op, kv] : *staged_ops) {
+                if (state_.find(op) != state_.end()) {
+                    continue;  // already written (possibly substituted) above
+                }
+                const auto op_id_val = op.value();
+                for (const auto& [k, v] : kv) {
+                    writer.append(
+                        op_id_val,
+                        std::string_view(k.data(), k.size()),
+                        std::string_view(reinterpret_cast<const char*>(v.data()), v.size()));
+                }
+            }
+        }
+        bytes = writer.finish(state_versions_);
+        // Consume: this id's staging is used up, and anything at or below it
+        // (aborted or superseded checkpoints) will never be asked for again.
+        staged_.erase(staged_.begin(), staged_.upper_bound(id.value()));
+    }
     std::lock_guard lock(mu_);
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
@@ -117,6 +174,9 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
     std::lock_guard lock(mu_);
     state_.clear();
     state_versions_.clear();
+    // Staged rows belong to the incarnation that staged them; a restored
+    // instance must not let them substitute into its own checkpoints.
+    staged_.clear();
 
     if (snap.bytes.empty()) {
         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(

@@ -331,7 +331,8 @@ void persist_job_manifest_(const std::string& ha_dir,
                            const std::string& graph_json,
                            const std::vector<PluginBinary>& plugins,
                            const CheckpointConfig& checkpoint,
-                           std::uint64_t writer_epoch) {
+                           std::uint64_t writer_epoch,
+                           bool requires_commit_confirmation) {
     if (ha_dir.empty())
         return;
     const auto job_dir = std::filesystem::path{ha_dir} / "jobs" / std::to_string(job_id);
@@ -359,6 +360,8 @@ void persist_job_manifest_(const std::string& ha_dir,
     manifest += ",\"state_backend_uri\":" + q(checkpoint.state_backend_uri);
     manifest += ",\"interval_ms\":" + std::to_string(checkpoint.interval_ms);
     manifest += ",\"restore_from_dir\":" + q(checkpoint.restore_from_dir);
+    manifest += ",\"requires_commit_confirmation\":";
+    manifest += requires_commit_confirmation ? "true" : "false";
     manifest +=
         ",\"restore_from_checkpoint_id\":" + std::to_string(checkpoint.restore_from_checkpoint_id);
     manifest += ",\"max_restarts_on_worker_loss\":" +
@@ -395,7 +398,9 @@ std::filesystem::path completed_marker_dir_for(const std::string& checkpoint_dir
 // <ckpt_dir>/_jobs/<job_id>/" lookup. coordinator's existing
 // latest_completed_checkpoint_id is updated in-memory but NOT in the file
 // system before a crash.
-std::uint64_t latest_completed_id_on_disk(const std::string& checkpoint_dir, JobId job_id) {
+std::uint64_t latest_marker_id_on_disk(const std::string& checkpoint_dir,
+                                       JobId job_id,
+                                       const std::string& prefix) {
     if (checkpoint_dir.empty())
         return 0;
     const auto job_dir = completed_marker_dir_for(checkpoint_dir, job_id);
@@ -406,16 +411,26 @@ std::uint64_t latest_completed_id_on_disk(const std::string& checkpoint_dir, Job
         if (!e.is_regular_file())
             continue;
         const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0)
+        if (name.rfind(prefix, 0) != 0)
             continue;
         try {
-            const auto id = std::stoull(name.substr(std::string{"COMPLETED-"}.size()));
+            const auto id = std::stoull(name.substr(prefix.size()));
             if (id > latest)
                 latest = id;
         } catch (...) {
         }
     }
     return latest;
+}
+
+std::uint64_t latest_completed_id_on_disk(const std::string& checkpoint_dir, JobId job_id) {
+    return latest_marker_id_on_disk(checkpoint_dir, job_id, "COMPLETED-");
+}
+
+// Commit-confirmed restore protocol: the newest checkpoint whose external
+// commits provably executed (CONFIRMED-N written by handle_commit_confirmed_).
+std::uint64_t latest_confirmed_id_on_disk(const std::string& checkpoint_dir, JobId job_id) {
+    return latest_marker_id_on_disk(checkpoint_dir, job_id, "CONFIRMED-");
 }
 
 // Lift one substring value out of a hand-rolled manifest JSON. Same
@@ -563,7 +578,16 @@ void Coordinator::recover_persisted_jobs() {
         // at the latest COMPLETED-N marker the previous leader managed
         // to write.
         if (!ckpt.checkpoint_dir.empty()) {
-            const auto latest = latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
+            // Commit-confirmed restore protocol: a manifest flagged as
+            // carrying a non-recoverable-commit sink restores from the
+            // newest CONFIRMED checkpoint - a completed-but-unconfirmed one
+            // may hold a broker transaction that died with the previous
+            // leader's workers, and restoring past it loses that interval.
+            const bool needs_confirmation =
+                body.find("\"requires_commit_confirmation\":true") != std::string::npos;
+            const auto latest = needs_confirmation
+                                    ? latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id)
+                                    : latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
             ckpt.restore_from_dir = ckpt.checkpoint_dir;
             ckpt.restore_from_checkpoint_id = latest;
         }
@@ -3313,8 +3337,15 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
             }
         }
         if (!ha_dir_.empty()) {
+            bool confirm_flag = false;
+            {
+                std::lock_guard lock(mu_);
+                if (auto it = jobs_.find(job_id); it != jobs_.end()) {
+                    confirm_flag = !it->second->confirm_task_keys.empty();
+                }
+            }
             persist_job_manifest_(
-                ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy, epoch());
+                ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy, epoch(), confirm_flag);
         }
     }
 
@@ -3444,6 +3475,25 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     // resolved against the lookup. Generic-role peer ports are 0 here
     // and get filled in via PeerUpdate after SubtaskListening arrives.
     std::unordered_map<std::string, std::vector<DeploymentTask>> by_worker;
+    // Commit-confirmed restore protocol: record the tracked-task set from
+    // THIS plan onto the job being built (it is not in jobs_ yet - this is
+    // the submit path constructing it). Empty = the job has no
+    // non-recoverable-commit sink and the protocol stays entirely dormant.
+    job->confirm_task_keys.clear();
+    for (const auto& t : resolved_plan.tasks) {
+        if (t.needs_commit_confirmation) {
+            job->confirm_task_keys.insert(t.role + ":" + std::to_string(t.subtask_idx));
+        }
+    }
+    if (!job->confirm_task_keys.empty() && !checkpoint.checkpoint_dir.empty()) {
+        // A recovered or restarted coordinator starts with in-memory
+        // latest_confirmed at zero while CONFIRMED-N markers sit on disk;
+        // without this seed a later worker-loss restart would restore from
+        // scratch past genuinely confirmed checkpoints.
+        job->latest_confirmed_checkpoint_id =
+            std::max(job->latest_confirmed_checkpoint_id,
+                     latest_confirmed_id_on_disk(checkpoint.checkpoint_dir, job_id));
+    }
     for (const auto& t : resolved_plan.tasks) {
         DeploymentTask d;
         d.role = t.role;
@@ -3693,6 +3743,9 @@ void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>
             break;
         case MessageKind::SubtaskCheckpointed:
             handle_subtask_checkpointed_(r);
+            break;
+        case MessageKind::CommitConfirmed:
+            handle_commit_confirmed_(r);
             break;
         case MessageKind::RequestFinalCheckpoint:
             if (worker->conn) {
@@ -4811,7 +4864,22 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         // Restart point: use the coordinator's own checkpoint dir as the
         // restore source, last completed checkpoint id we acknowledged.
         deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
-        deploy_msg.restore_from_checkpoint_id = job.latest_completed_checkpoint_id;
+        // Tracked jobs (commit-confirmed restore protocol) restore from the
+        // newest checkpoint whose external commits provably EXECUTED, not
+        // the newest completed one: a completed-but-unconfirmed checkpoint
+        // may hold a broker transaction that died with the worker, and
+        // restoring past it silently loses that interval. Zero (nothing
+        // confirmed yet) restores from scratch - replaying everything is
+        // the correct side of the trade for a sink that cannot re-commit.
+        deploy_msg.restore_from_checkpoint_id = job.confirm_task_keys.empty()
+                                                    ? job.latest_completed_checkpoint_id
+                                                    : job.latest_confirmed_checkpoint_id;
+        log::info("coordinator.restart",
+                  "job_id=" + std::to_string(job.id) + " restore point: checkpoint " +
+                      std::to_string(deploy_msg.restore_from_checkpoint_id) +
+                      " (latest_completed=" + std::to_string(job.latest_completed_checkpoint_id) +
+                      " latest_confirmed=" + std::to_string(job.latest_confirmed_checkpoint_id) +
+                      " tracked=" + std::to_string(job.confirm_task_keys.size()) + ")");
         // Which generation this deploy WRITES, and which one produced the restore
         // point. They differ exactly when the restore crosses a rescale, and the
         // boundary is the same one that decides whether the parent INDEX needs
@@ -5737,6 +5805,63 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
     send_frame(reply_conn, fenced_frame_(MessageKind::FinalCheckpointAssigned, reply));
 }
 
+void Coordinator::handle_commit_confirmed_(MessageReader& r) {
+    const auto msg = decode_commit_confirmed(r);
+    const std::string key = msg.role + ":" + std::to_string(msg.subtask_idx);
+    std::filesystem::path marker;
+    std::uint64_t confirmed_id = 0;
+    JobId jid{};
+    {
+        std::lock_guard lock(mu_);
+        auto job_it = jobs_.find(msg.job_id);
+        if (job_it == jobs_.end()) {
+            return;  // late confirmation for a finished/evicted job
+        }
+        auto& job = *job_it->second;
+        auto pend_it = job.pending_confirms.find(msg.checkpoint_id);
+        if (pend_it == job.pending_confirms.end()) {
+            return;  // untracked job, unknown checkpoint, or already drained
+        }
+        pend_it->second.erase(key);
+        if (!pend_it->second.empty()) {
+            return;
+        }
+        // Every tracked task confirmed: the external commits for this
+        // checkpoint provably EXECUTED. Publish that durably so restores
+        // can select it, and prune tracking at and below it - an older
+        // checkpoint that never drains can never become the newest
+        // confirmed one now.
+        job.pending_confirms.erase(job.pending_confirms.begin(),
+                                   job.pending_confirms.upper_bound(msg.checkpoint_id));
+        if (msg.checkpoint_id > job.latest_confirmed_checkpoint_id) {
+            job.latest_confirmed_checkpoint_id = msg.checkpoint_id;
+        }
+        if (!job.checkpoint.checkpoint_dir.empty()) {
+            marker = completed_marker_dir_for(job.checkpoint.checkpoint_dir, msg.job_id) /
+                     ("CONFIRMED-" + std::to_string(msg.checkpoint_id));
+        }
+        confirmed_id = msg.checkpoint_id;
+        jid = msg.job_id;
+    }
+    if (!marker.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(marker.parent_path(), ec);
+        try {
+            clink::state::detail::write_string_fsync_rename(
+                marker,
+                "job=" + std::to_string(jid) + "\ncheckpoint=" + std::to_string(confirmed_id) +
+                    "\n");
+        } catch (const std::exception& e) {
+            clink::log::error("coordinator.checkpoint",
+                              "could not durably record commit confirmation of checkpoint " +
+                                  std::to_string(confirmed_id) + ": " + e.what());
+        }
+        clink::log::info("coordinator.checkpoint",
+                         "job_id=" + std::to_string(jid) + " checkpoint " +
+                             std::to_string(confirmed_id) + " commit-CONFIRMED");
+    }
+}
+
 void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     auto msg = decode_subtask_checkpointed(r);
     // What a completed checkpoint CONSISTS OF, not just that it happened: the
@@ -6138,6 +6263,30 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         CommitCheckpointMsg cc;
         cc.job_id = jid;
         cc.checkpoint_id = ckpt_id;
+        {
+            // Commit-confirmed restore protocol. Seed this checkpoint's
+            // pending-confirmation set from the tracked tasks, and tell the
+            // workers the retention floor: nothing at or above the newest
+            // CONFIRMED checkpoint may be purged, because that is the
+            // restore target while newer checkpoints sit completed but
+            // unconfirmed. max(latest_confirmed, 1): before the first
+            // confirmation NOTHING may be purged for a tracked job, and a
+            // floor of 1 says exactly that; 0 keeps the untracked
+            // behaviour byte-identical.
+            std::lock_guard lock(mu_);
+            auto job_it = jobs_.find(jid);
+            if (job_it != jobs_.end() && !job_it->second->confirm_task_keys.empty()) {
+                auto& job = *job_it->second;
+                job.pending_confirms[ckpt_id] = job.confirm_task_keys;
+                // Bounded: a job whose confirmations stopped arriving must
+                // not grow this map for ever. 64 outstanding checkpoints is
+                // far beyond any healthy commit latency.
+                while (job.pending_confirms.size() > 64) {
+                    job.pending_confirms.erase(job.pending_confirms.begin());
+                }
+                cc.retain_floor = std::max<std::uint64_t>(job.latest_confirmed_checkpoint_id, 1);
+            }
+        }
         const auto frame = fenced_frame_(MessageKind::CommitCheckpoint, cc);
         for (auto* c : worker_conns)
             send_frame(*c, frame);

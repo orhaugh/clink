@@ -353,35 +353,35 @@ TEST_F(PostgresExactlyOnceTest, StaysExactlyOnceAcrossTwoSeparatedKillsOnALonger
 
 #ifdef CLINK_HAS_KAFKA
 
-// The verdict for the transactional Kafka sink under PROCESS LOSS. Strict
-// exactly-once has one documented, client-inherent exception (see
-// docs/connectors/kafka.md and the wrapper's comment): a checkpoint that
-// COMPLETED whose broker commit had not yet executed when the worker died
-// loses that transaction - librdkafka cannot resume it - and the restore
-// replays from past its interval. So under N kills the committed output
-// must contain NO duplicates and NO unexpected records ever, and missing
-// records are tolerated only as at most N contiguous runs, each no longer
-// than one checkpoint interval's worth of records (with 2x slack for
-// commit-dispatch latency stretching the interval under load). Anything
-// outside that shape is a real defect. Closing the window entirely needs a
-// commit-confirmed restore protocol - followups item 52.
+// The verdict for the transactional Kafka sink under PROCESS LOSS, on the
+// commit-confirmed restore protocol: restores select the newest checkpoint
+// whose broker commits provably EXECUTED (CONFIRMED-N), so a commit that
+// died with the worker is REPLAYED rather than skipped - missing records
+// are never acceptable any more. The residual window moved to the other
+// side: a worker that dies after commit_transaction returned but before
+// its confirmation was sent replays an interval whose transaction DID
+// commit, so duplicates bounded by one contiguous checkpoint interval per
+// kill remain the documented cost (librdkafka has no transaction resume;
+// closing that too is not possible from this side of the client).
 void expect_exactly_once_modulo_commit_window(const std::vector<std::string>& records,
                                               int total,
-                                              std::size_t max_lost_runs,
+                                              std::size_t max_dup_runs,
                                               std::size_t max_run_len) {
     const auto v = clink::itest::verify_exactly_once_records(records, total);
-    EXPECT_TRUE(v.duplicated.empty())
-        << "duplicates are never acceptable: " << clink::itest::describe(v);
+    EXPECT_TRUE(v.missing.empty())
+        << "records are MISSING despite the commit-confirmed restore protocol - the restore "
+           "selected past an unexecuted commit: "
+        << clink::itest::describe(v);
     EXPECT_TRUE(v.unexpected.empty())
         << "unexpected records are never acceptable: " << clink::itest::describe(v);
-    if (v.missing.empty()) {
+    if (v.duplicated.empty()) {
         return;
     }
-    // Group the missing records ("record-N") into contiguous runs of N.
+    // Group the duplicated records ("record-N xK") into contiguous runs.
     std::vector<long> ids;
-    ids.reserve(v.missing.size());
-    for (const auto& m : v.missing) {
-        ids.push_back(std::stol(m.substr(std::string{"record-"}.size())));
+    ids.reserve(v.duplicated.size());
+    for (const auto& d : v.duplicated) {
+        ids.push_back(std::stol(d.substr(std::string{"record-"}.size())));
     }
     std::sort(ids.begin(), ids.end());
     std::size_t runs = 1;
@@ -396,18 +396,16 @@ void expect_exactly_once_modulo_commit_window(const std::vector<std::string>& re
         }
         longest = std::max(longest, run_len);
     }
-    EXPECT_LE(runs, max_lost_runs)
-        << "missing records form " << runs << " contiguous runs; at most " << max_lost_runs
-        << " (one per kill) are attributable to the documented completed-but-uncommitted "
-           "transaction window: "
-        << clink::itest::describe(v);
+    EXPECT_LE(runs, max_dup_runs) << "duplicated records form " << runs
+                                  << " contiguous runs; at most " << max_dup_runs
+                                  << " (one per kill) are attributable to the documented "
+                                     "commit-executed-but-unconfirmed window: "
+                                  << clink::itest::describe(v);
     EXPECT_LE(longest, max_run_len)
-        << "a missing run spans " << longest << " records, more than one checkpoint "
-        << "interval's worth (" << max_run_len << " with slack); that is not the documented "
-        << "window: " << clink::itest::describe(v);
-    std::cout << "[kafka-2pc] documented commit-window loss observed: " << v.missing.size()
-              << " record(s) in " << runs << " run(s) - needs the commit-confirmed restore "
-              << "protocol (followups item 52) to close\n";
+        << "a duplicated run spans " << longest << " records, more than one checkpoint "
+        << "interval's worth (" << max_run_len << " with slack): " << clink::itest::describe(v);
+    std::cout << "[kafka-2pc] documented commit-window duplication observed: "
+              << v.duplicated.size() << " record(s) in " << runs << " run(s)\n";
 }
 
 // The Kafka arm. Same bounded source, same moments, same verdict - but the
@@ -570,11 +568,61 @@ TEST_F(KafkaExactlyOnceTest, AWorkerKilledRightAfterTheBrokerCommitStaysExactlyO
     ASSERT_TRUE(code.has_value()) << "submitter never exited";
     ASSERT_EQ(*code, 0) << "the job did not recover from a kill right after the broker commit";
 
+    // Under the commit-confirmed restore protocol this kill lands in the
+    // documented residual window: the commit EXECUTED, the confirmation
+    // died with the process, so the restore replays the interval as
+    // duplicates. Nothing may be missing, and the F94 property this test
+    // was built for still bites through the run-length bound: post-barrier
+    // records riding the committed transaction duplicated SEVENTEEN
+    // records here (the whole hold window), not the interval's handful.
+    expect_exactly_once_modulo_commit_window(committed(),
+                                             kTotal,
+                                             /*max_dup_runs=*/1,
+                                             /*max_run_len=*/6);
+}
+
+// The protocol's decisive case: the worker dies BETWEEN a checkpoint
+// completing and its broker commit executing. Pre-protocol this was the
+// documented one-interval LOSS (the transaction died unresumable and the
+// restore selected the completed checkpoint, skipping its interval). Now
+// the restore selects the newest CONFIRMED checkpoint instead, replays the
+// tail, and re-produces the dead transaction's records into a fresh
+// transaction: nothing may be missing. The exit is armed at
+// sink.before_commit on the SECOND commit, so checkpoint one confirms
+// normally (the restore target exists) and checkpoint two completes but
+// dies pre-commit.
+TEST_F(KafkaExactlyOnceTest, ACommitThatDiesWithTheWorkerIsReplayedNotLost) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    ClusterSpec one;
+    one.node_binary = node_binary();
+    one.workers = 1;
+    one.slots_per_worker = 4;
+    Cluster c(one);
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=exit:1@2"}));
+    ASSERT_TRUE(c.await_workers_registered(1));
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(c.await_process_gone(0))
+        << "the die-before-commit fault never fired; the scenario under test never happened";
+    ASSERT_TRUE(c.restart_worker(0));  // fresh process, no fault armed
+
+    const auto code = sub->await_exit(120s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover from a death between completion and commit";
+
     const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
-    EXPECT_TRUE(v.clean())
-        << "a kill right after the broker commit broke Kafka exactly-once (records produced "
-           "after the barrier rode the committed transaction, then were replayed): "
+    EXPECT_TRUE(v.missing.empty())
+        << "the interval whose commit died with the worker was LOST - the restore did not "
+           "select the confirmed checkpoint: "
         << clink::itest::describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << clink::itest::describe(v);
 }
 
 // The longer-horizon arm, mirroring the Postgres one: thirty times the

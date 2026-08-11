@@ -58,6 +58,9 @@ public:
         return inner_->get(op, key);
     }
     void erase(OperatorId op, KeyView key) override { inner_->erase(op, key); }
+    void stage_operator_rows(OperatorId op, CheckpointId id) override {
+        inner_->stage_operator_rows(op, id);
+    }
     void scan(OperatorId op, const ScanVisitor& visit) const override { inner_->scan(op, visit); }
     Snapshot snapshot(CheckpointId id) override { return inner_->snapshot(id); }
     [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override {

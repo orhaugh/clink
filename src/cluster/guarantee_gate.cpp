@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/runtime/log_buffer.hpp"
 
 namespace clink::cluster {
@@ -51,6 +52,21 @@ std::string connector_name_for_op_type(const std::string& op_type) {
         }
     }
     return best;
+}
+
+bool op_type_needs_commit_confirmation(const std::string& op_type) {
+    const auto name = connector_name_for_op_type(op_type);
+    if (name.empty()) {
+        return false;
+    }
+    const auto* rec = connectors::CapabilityRegistry::instance().find(name);
+    if (rec == nullptr || !rec->is_sink) {
+        return false;
+    }
+    const bool exactly_once =
+        rec->delivery == connectors::DeliveryGuarantee::ExactlyOnceTwoPhaseCommit ||
+        rec->delivery == connectors::DeliveryGuarantee::ExactlyOnceAtomicPublish;
+    return exactly_once && !rec->commit_recoverable;
 }
 
 connectors::PipelineFacts pipeline_facts_from_graph(const JobGraphSpec& graph,
