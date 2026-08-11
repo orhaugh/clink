@@ -11,6 +11,7 @@
 #include <arrow/filesystem/filesystem.h>
 
 #include "clink/azure/install.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_azure_sink.hpp"
 #include "clink/connectors/parquet_azure_source.hpp"
@@ -184,6 +185,58 @@ void register_azure_parquet_2pc_sink(clink::plugin::PluginRegistry& reg,
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "azure_parquet",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"arrow (AzureFileSystem)"},
+        .runtime_dependencies = {"azure blob storage account"},
+        .formats = {"parquet"},
+        .boundedness = clink::connectors::Boundedness::Bounded,
+        // The multi-object source checkpoints (object, row offset) and
+        // resumes from it.
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::FileOffset,
+        .checkpoint_integrated = true,
+        // The PLAIN sink writes an object per rollover: a replay rewrites.
+        // The 2PC variant below is what earns atomic publication.
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"account-key", "connection-string", "default-azure-credential"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"plain sink is at-least-once; use azure_parquet_2pc for exactly-once"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "azure_parquet_2pc",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"arrow (AzureFileSystem)"},
+        .runtime_dependencies = {"azure blob storage account"},
+        .formats = {"parquet"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        // One staged file per checkpoint interval, promoted from
+        // <prefix>/staging to <prefix>/committed on the commit broadcast.
+        .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceAtomicPublish,
+        .transactional = true,
+        .auth_methods = {"account-key", "connection-string", "default-azure-credential"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"a crash can leave orphaned staging objects; expire <prefix>/staging"},
+        .required_options_for_exactly_once = {"container", "prefix"},
+    });
+
     using clink::plugin::BuildContext;
 
     // ---- Parquet over Azure Blob Storage (sink + source pairs, int64 + string channels) ----

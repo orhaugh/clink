@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/redis/install.hpp"
@@ -68,6 +69,54 @@ std::vector<std::string> split_csv(const std::string& s) {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "redis",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"hiredis"},
+        .runtime_dependencies = {"redis >= 5 (streams)"},
+        .formats = {"text", "json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // The source is a consumer-group reader: recovery is PEL replay
+        // plus XACK at the checkpoint, not a client-side offset.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "password"},
+        .tls = false,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"XADD has no dedup: a replayed tail is re-appended to the stream"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "redis_upsert",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"hiredis"},
+        .runtime_dependencies = {"redis >= 5"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent,
+        .transactional = false,
+        .idempotency_key_option = "key_columns",
+        .auth_methods = {"none", "password"},
+        .tls = false,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"changelog contract: deletes are DEL by key"},
+    });
+
     using clink::plugin::BuildContext;
 
     // redis_sink: XADD each record onto a stream. At-least-once. Params:

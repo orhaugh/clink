@@ -6,6 +6,7 @@
 #include <string>
 #include <utility>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/websocket/install.hpp"
 #include "clink/websocket/websocket_source.hpp"
@@ -13,6 +14,31 @@
 namespace clink::websocket {
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "websocket",
+        .version = "1",
+        .is_source = true,
+        .is_sink = false,
+        .build_dependencies = {"in-tree RFC 6455 client"},
+        .runtime_dependencies = {"websocket endpoint"},
+        .formats = {"text"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // A live push stream with no position: messages sent while the
+        // client is down or reconnecting are gone.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = false,
+        .delivery = clink::connectors::DeliveryGuarantee::AtMostOnce,
+        .transactional = false,
+        .auth_methods = {"none", "headers"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"reconnect_backoff_max_ms"},
+        .available_in_sql = true,
+        .limitations = {"no recovery relationship to already-processed messages: the feed is live"},
+    });
+
     using clink::plugin::BuildContext;
 
     // websocket_source_string: one text message = one record. At-most-once

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/iceberg/iceberg_row_sink.hpp"
 #include "clink/iceberg/iceberg_row_source.hpp"
 #include "clink/iceberg/install.hpp"
@@ -66,6 +67,36 @@ std::vector<std::string> split_csv(const std::string& s) {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "iceberg",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"iceberg-cpp", "arrow"},
+        .runtime_dependencies = {"iceberg table (filesystem or s3 warehouse)"},
+        .formats = {"parquet"},
+        .boundedness = clink::connectors::Boundedness::Either,
+        // The source scans a table snapshot; position is the snapshot plus
+        // scan progress, checkpointed and resumed.
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::OpaqueToken,
+        .checkpoint_integrated = true,
+        // One table snapshot per checkpoint interval, single writer. A
+        // replay can re-commit an interval's snapshot: at-least-once.
+        // equality_key turns writes into changelog upserts by key.
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .idempotency_key_option = "equality_key",
+        .schema_evolution = true,
+        .auth_methods = {"filesystem", "s3-credentials"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"single-writer: concurrent committers to one table are not arbitrated"},
+    });
+
     using clink::plugin::BuildContext;
     using clink::sql::Row;
 

@@ -127,9 +127,21 @@ std::vector<std::string> ConnectorCapabilities::self_check() const {
         problems.emplace_back(
             name + ": a replayable source must declare the offset model it replays from");
     }
-    if (is_source && !replayable && strength(delivery) > strength(DeliveryGuarantee::AtMostOnce)) {
+    // A source has two no-loss recovery models: replay from a client-side
+    // offset the checkpoint carries, or BROKER REDELIVERY - the ack is
+    // deferred to checkpoint completion, so everything unacknowledged sits
+    // on the server and comes back after a crash (AMQP/JetStream/Pulsar
+    // acks, Pub/Sub ackDeadline, Redis PEL, MQTT persistent sessions).
+    // The second model has no offset to replay, so `replayable` is
+    // honestly false, yet at-least-once holds; it is recognisable here by
+    // checkpoint participation. A source with NEITHER model cannot offer
+    // better than at-most-once on restart.
+    if (is_source && !replayable && !checkpoint_integrated &&
+        strength(delivery) > strength(DeliveryGuarantee::AtMostOnce)) {
         problems.emplace_back(
-            name + ": a non-replayable source cannot offer better than at-most-once on restart");
+            name +
+            ": a source that neither replays from an offset nor defers acknowledgement to "
+            "checkpoint completion cannot offer better than at-most-once on restart");
     }
     if (!required_options_for_exactly_once.empty() && !claims_exactly_once) {
         problems.emplace_back(name +

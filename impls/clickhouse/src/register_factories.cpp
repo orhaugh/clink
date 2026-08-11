@@ -11,6 +11,7 @@
 #include "clink/clickhouse/clickhouse_row_codec.hpp"
 #include "clink/clickhouse/install.hpp"
 #include "clink/config/json.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/clickhouse_row.hpp"
 #include "clink/connectors/clickhouse_sink.hpp"
 #include "clink/connectors/clickhouse_source.hpp"
@@ -132,6 +133,32 @@ ClickHouseSource::Options parse_source_options(const clink::plugin::BuildContext
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "clickhouse",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"clickhouse-cpp"},
+        .runtime_dependencies = {"clickhouse server (native protocol, port 9000)"},
+        .formats = {"tsv", "json"},
+        // The source runs a query to completion; the sink streams.
+        .boundedness = clink::connectors::Boundedness::Either,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        // Batched INSERTs flushed at the barrier, no dedup key: a replay
+        // re-inserts the tail since the last checkpoint.
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "password"},
+        .tls = false,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {"batch_interval_ms"},
+        .available_in_sql = true,
+        .limitations = {"query source re-reads from the start on restart (no offset state)"},
+    });
+
     using clink::plugin::BuildContext;
 
     // Register the typed channel for ClickHouseRow so pipelines can

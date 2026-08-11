@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/mqtt/install.hpp"
 #include "clink/mqtt/mqtt_client.hpp"
 #include "clink/mqtt/mqtt_sink.hpp"
@@ -50,6 +51,32 @@ std::string client_id_for(const clink::plugin::BuildContext& ctx, const char* fa
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "mqtt",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"paho-mqtt"},
+        .runtime_dependencies = {"mqtt broker >= 3.1.1"},
+        .formats = {"text", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // Recovery is the broker's persistent session redelivering unacked
+        // messages, not a client-side offset: nothing to replay from.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "password"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {"ack_timeout_ms"},
+        .available_in_sql = true,
+        .limitations = {"qos=0 is fire-and-forget (at-most-once) on both sides",
+                        "a clean session discards the redelivery state recovery depends on"},
+    });
+
     using clink::plugin::BuildContext;
 
     // mqtt_sink: PUBLISH each record to a topic. At-least-once (qos >= 1). Params:

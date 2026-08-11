@@ -80,6 +80,21 @@ Compiled into the SQL frontend itself; always available when
 | [Collect (Arrow to host, embedded only)](builtin.md#collect-embedded-only) | sink | `collect` |
 | [Queryable state (another job's live state)](builtin.md#queryable_state-source) | source | `queryable_state` |
 
+## The capability manifest
+
+Every compiled connector declares a machine-readable capability record next
+to its factory registration: identity, formats, boundedness, recovery model
+(replayable offset or broker redelivery), delivery guarantee as implemented
+(not as the external system could theoretically provide), transactionality,
+idempotency-key requirements, auth/TLS surface, and limitations. `clink
+--capabilities` prints the manifest for the binary at hand, the delivery
+analyser computes end-to-end guarantees from it at submission, and each
+record's internal coherence is checked by `self_check()`. Coverage is
+enforced mechanically: a build-generated list of enabled connector modules
+feeds a gate test (`tests/test_connector_manifest_gate.cpp`), so a new
+connector cannot register factories without either declaring its record or
+being explicitly classified as a non-connector module.
+
 ## Notes on delivery semantics
 
 Guarantees vary by connector and are stated on each page. In summary:

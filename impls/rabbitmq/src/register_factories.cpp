@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/rabbitmq/connection_params.hpp"
@@ -31,6 +32,34 @@ RabbitMqConnParams parse_conn(const clink::plugin::BuildContext& ctx) {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "rabbitmq",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"librabbitmq"},
+        .runtime_dependencies = {"rabbitmq >= 3.8"},
+        .formats = {"text", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // Recovery is broker redelivery of unacked messages - the ack is
+        // deferred to checkpoint completion, so nothing acked can be lost,
+        // but there is no client-side offset to replay from.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "token", "password"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations =
+            {"publish has no producer dedup: a replayed tail is re-published",
+             "redelivery order after a crash is queue order, not original consume order"},
+    });
+
     using clink::plugin::BuildContext;
 
     // rabbitmq_source_string: basic.consume from a queue, emit each body as a string.

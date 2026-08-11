@@ -13,6 +13,7 @@
 #include "clink/aws/install.hpp"
 #include "clink/aws/kinesis_sink.hpp"
 #include "clink/aws/kinesis_source.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
@@ -38,6 +39,85 @@ AwsClientOptions client_options_from(const clink::plugin::BuildContext& ctx) {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    // Capability records. One per user-visible connector, not per impl
+    // directory: kinesis, firehose and dynamodb are distinct systems with
+    // distinct guarantees that happen to share the AWS SDK.
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "kinesis",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"aws-sdk-cpp"},
+        .runtime_dependencies = {"kinesis data stream"},
+        .formats = {"text", "json", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // The source checkpoints a per-shard SequenceNumber and resumes
+        // from it, so the clink checkpoint is the read position.
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::OpaqueToken,
+        .checkpoint_integrated = true,
+        // PutRecords with no producer dedup key: a replayed batch is
+        // re-appended.
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .partition_discovery = true,
+        .auth_methods = {"aws-credentials-chain"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"poll_interval_ms"},
+        .available_in_sql = true,
+        .limitations = {"resharding while a job is running is not rebalanced until restart"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "firehose",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"aws-sdk-cpp"},
+        .runtime_dependencies = {"kinesis firehose delivery stream"},
+        .formats = {"text", "json", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"aws-credentials-chain"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations =
+            {"no producer dedup: a replayed batch is re-appended to the delivery stream"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "dynamodb",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"aws-sdk-cpp"},
+        .runtime_dependencies = {"dynamodb table"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        // PutItem overwrites by key, so replays collapse - conditional on
+        // the user's partition_key actually identifying the record.
+        .delivery = clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent,
+        .transactional = false,
+        .idempotency_key_option = "partition_key",
+        .auth_methods = {"aws-credentials-chain"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"UnprocessedItems are retried max_retries times, then the flush fails"},
+    });
+
     using clink::plugin::BuildContext;
 
     // dynamodb_sink: upsert JSON-object records into a DynamoDB table via

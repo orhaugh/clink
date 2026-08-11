@@ -307,6 +307,22 @@ gtest_discover_tests(clink_core_tests
 # CDC + Kafka topics + plugin submission etc. The core-isolation
 # invariant doesn't apply here - these are deliberately cross-cutting.
 # ---------------------------------------------------------------------------
+# Capability-coverage gate: links clink::clink (every enabled impl) and
+# asserts each enabled impl either declares connector capability records or
+# is exempted with a reason. Separate exe because the core suite's
+# no-impl-deps isolation invariant forbids linking impls there. Runs in the
+# default (unlabelled) ctest bucket, so CI's ordinary test step gates it.
+if(CLINK_BUILD_IMPLS)
+    add_executable(clink_manifest_tests test_connector_manifest_gate.cpp)
+    target_link_libraries(clink_manifest_tests PRIVATE
+        clink::clink
+        GTest::gtest_main)
+    clink_set_warnings(clink_manifest_tests)
+    include(GoogleTest)
+    gtest_discover_tests(clink_manifest_tests PROPERTIES LABELS "manifest" DISCOVERY_TIMEOUT 60)
+endif()
+
+# ---------------------------------------------------------------------------
 if(CLINK_INTEGRATION_TESTS)
     add_executable(clink_integration_tests
         integration/test_postgres_pipeline.cpp

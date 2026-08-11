@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/pulsar/connection_params.hpp"
@@ -28,6 +29,33 @@ PulsarConnParams parse_conn(const clink::plugin::BuildContext& ctx) {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "pulsar",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"pulsar-client-cpp"},
+        .runtime_dependencies = {"pulsar >= 2.8"},
+        .formats = {"text", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // Recovery is broker redelivery of unacked messages - the ack is
+        // deferred to checkpoint completion, so nothing acked can be lost,
+        // but there is no client-side offset to replay from.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "token", "password"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"publish has no producer dedup: a replayed tail is re-published",
+                        "a Shared subscription does not preserve per-key order across consumers"},
+    });
+
     using clink::plugin::BuildContext;
 
     // pulsar_source_string: subscribe to a topic, emit each body as a string. At-least-once

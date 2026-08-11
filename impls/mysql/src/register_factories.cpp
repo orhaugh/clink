@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/mysql/install.hpp"
 #include "clink/mysql/mysql_cdc_source.hpp"
 #include "clink/mysql/mysql_client.hpp"
@@ -67,6 +68,56 @@ ConnectOptions conn_options_from(const clink::plugin::BuildContext& ctx) {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "mysql",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"libmysqlclient"},
+        .runtime_dependencies =
+            {"mysql >= 5.7 (CDC needs binlog_format=ROW, binlog_row_image=FULL)"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Either,
+        // The CDC source checkpoints its binlog position and resumes.
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::Lsn,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"password"},
+        .tls = false,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations =
+            {"the plain sink has no transaction tied to the checkpoint; XA is not implemented",
+             "query source re-reads from the start on restart"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "mysql_upsert",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"libmysqlclient"},
+        .runtime_dependencies = {"mysql >= 5.7"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent,
+        .transactional = false,
+        .idempotency_key_option = "key_columns",
+        .auth_methods = {"password"},
+        .tls = false,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"requires a PRIMARY KEY or UNIQUE index matching key_columns"},
+    });
+
     using clink::plugin::BuildContext;
 
     // mysql_sink: batched multi-row INSERT of JSON-object rows into a table.

@@ -75,17 +75,38 @@ TEST_F(ConnectorCapabilityTest, SelfCheckRejectsExactlyOnceWithoutCheckpointing)
     EXPECT_NE(problems[0].find("does not participate in checkpointing"), std::string::npos);
 }
 
-TEST_F(ConnectorCapabilityTest, SelfCheckRejectsNonReplayableSourceClaimingMoreThanAtMostOnce) {
+TEST_F(ConnectorCapabilityTest,
+       SelfCheckRejectsSourceWithNoRecoveryModelClaimingMoreThanAtMostOnce) {
+    // No client-side offset to replay AND no checkpoint participation
+    // (which is what broker-redelivery recovery hangs off): nothing relates
+    // a restart to what was already processed, so at-least-once is an
+    // overclaim.
     const ConnectorCapabilities bad{
         .name = "amnesiac",
+        .is_source = true,
+        .replayable = false,
+        .checkpoint_integrated = false,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+    };
+    const auto problems = bad.self_check();
+    ASSERT_FALSE(problems.empty());
+    EXPECT_NE(problems[0].find("at-most-once"), std::string::npos);
+}
+
+TEST_F(ConnectorCapabilityTest, SelfCheckAcceptsBrokerRedeliverySourceAtLeastOnce) {
+    // The second no-loss recovery model: no offset to replay, but the ack
+    // is deferred to checkpoint completion, so the broker redelivers
+    // everything unacknowledged after a crash (AMQP, JetStream, Pulsar,
+    // Pub/Sub, Redis PEL, MQTT persistent sessions). At-least-once is an
+    // honest claim for this shape and must not be rejected.
+    const ConnectorCapabilities broker_redelivery{
+        .name = "ack_deferred",
         .is_source = true,
         .replayable = false,
         .checkpoint_integrated = true,
         .delivery = DeliveryGuarantee::AtLeastOnce,
     };
-    const auto problems = bad.self_check();
-    ASSERT_FALSE(problems.empty());
-    EXPECT_NE(problems[0].find("non-replayable source"), std::string::npos);
+    EXPECT_TRUE(broker_redelivery.self_check().empty());
 }
 
 TEST_F(ConnectorCapabilityTest, SelfCheckRejectsIdempotentClaimWithNoNamedKey) {

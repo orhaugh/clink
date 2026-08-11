@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/webhdfs_parquet_sink.hpp"
 #include "clink/connectors/webhdfs_parquet_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
@@ -125,6 +126,34 @@ std::shared_ptr<Source<T>> make_source(const clink::plugin::BuildContext& ctx,
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "webhdfs_parquet",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"clink http client", "arrow"},
+        .runtime_dependencies = {"hadoop webhdfs endpoint"},
+        .formats = {"parquet"},
+        .boundedness = clink::connectors::Boundedness::Either,
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::FileOffset,
+        .checkpoint_integrated = true,
+        // With `prefix` the sink stages one file per checkpoint interval
+        // and atomically RENAMEs it to <prefix>/committed on commit; with
+        // `path` it writes a single object, at-least-once.
+        .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceAtomicPublish,
+        .transactional = true,
+        .auth_methods = {"none", "kerberos-proxied"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"path= single-object mode is at-least-once; exactly-once needs prefix=",
+                        "a crash can leave orphaned files under <prefix>/staging"},
+        .required_options_for_exactly_once = {"prefix"},
+    });
+
     using clink::plugin::BuildContext;
 
     // ---- Parquet over WebHDFS / HttpFS (sink + source pairs, int64 + string channels) ----

@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/http_connector/batched_http_bulk_sink.hpp"
 #include "clink/http_connector/bulk_sink_builders.hpp"
 #include "clink/http_connector/http_model_provider.hpp"
@@ -67,6 +68,182 @@ HttpRequest::Options pubsub_http_options(const clink::plugin::BuildContext& ctx)
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    // Capability records. One per user-visible connector: these share an
+    // HTTP client, not semantics.
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "http",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"cpp-httplib"},
+        .runtime_dependencies = {"http endpoint"},
+        .formats = {"text", "json", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Either,
+        // The poll source keeps no cursor the endpoint honours and does
+        // not participate in checkpointing: messages served while the job
+        // is down are gone, so the honest level is at-most-once. The
+        // SINK side posts with retries (at-least-once); the record carries
+        // the weaker end.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = false,
+        .delivery = clink::connectors::DeliveryGuarantee::AtMostOnce,
+        .transactional = false,
+        .auth_methods = {"none", "bearer-token", "headers"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"poll_interval_ms"},
+        .available_in_sql = true,
+        .limitations = {"records between the last poll and a crash can be delivered twice or "
+                        "missed depending on the endpoint's own semantics"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "elasticsearch",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"cpp-httplib"},
+        .runtime_dependencies = {"elasticsearch/opensearch _bulk API"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        // Bulk index with _id from document_id: replays overwrite.
+        .idempotency_key_option = "document_id",
+        .auth_methods = {"none", "basic", "bearer-token"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"effectively-once only when document_id is set; without it replays "
+                        "index duplicate documents"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "opensearch",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"cpp-httplib"},
+        .runtime_dependencies = {"elasticsearch/opensearch _bulk API"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        // Bulk index with _id from document_id: replays overwrite.
+        .idempotency_key_option = "document_id",
+        .auth_methods = {"none", "basic", "bearer-token"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"effectively-once only when document_id is set; without it replays "
+                        "index duplicate documents"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "influxdb",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"cpp-httplib"},
+        .runtime_dependencies = {"influxdb v2 write API"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        // An identical (series, timestamp) point overwrites on replay.
+        .idempotency_key_option = "timestamp_field",
+        .auth_methods = {"token"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"effectively-once only when timestamp_field is set"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "prometheus",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"cpp-httplib"},
+        .runtime_dependencies = {"prometheus pushgateway"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        // Push replaces the group's series: last write wins, so a replay
+        // converges rather than duplicates - but intermediate values are
+        // overwritten, which is pushgateway semantics, not a clink choice.
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "basic"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"pushgateway keeps only the last push per group"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "splunk_hec",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"cpp-httplib"},
+        .runtime_dependencies = {"splunk HTTP event collector"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"hec-token"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"no dedup key: a replayed batch is re-indexed"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "pubsub",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"cpp-httplib"},
+        .runtime_dependencies = {"google cloud pub/sub (or emulator)"},
+        .formats = {"text", "json", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // The subscription's ack state is the position: unacked messages
+        // redeliver after ackDeadline, acks happen at the checkpoint.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"bearer-token", "emulator-unauthenticated"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"publish has no dedup key: a replay re-publishes"},
+    });
+
     using clink::plugin::BuildContext;
 
     // SQL-native AI: register the HTTP model-inference provider so ML_PREDICT with a

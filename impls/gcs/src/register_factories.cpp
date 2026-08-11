@@ -13,6 +13,7 @@
 
 #include <arrow/filesystem/filesystem.h>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_fs_2pc_sink.hpp"
 #include "clink/connectors/parquet_gcs_sink.hpp"
@@ -205,6 +206,54 @@ void register_gcs_parquet_2pc_sink(clink::plugin::PluginRegistry& reg,
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "gcs_parquet",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"arrow (GcsFileSystem)"},
+        .runtime_dependencies = {"google cloud storage bucket"},
+        .formats = {"parquet"},
+        .boundedness = clink::connectors::Boundedness::Bounded,
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::FileOffset,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"application-default-credentials", "access-token"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"plain sink is at-least-once; use gcs_parquet_2pc for exactly-once"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "gcs_parquet_2pc",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"arrow (GcsFileSystem)"},
+        .runtime_dependencies = {"google cloud storage bucket"},
+        .formats = {"parquet"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        // One staged file per checkpoint interval, promoted from
+        // <prefix>/staging to <prefix>/committed on the commit broadcast.
+        .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceAtomicPublish,
+        .transactional = true,
+        .auth_methods = {"application-default-credentials", "access-token"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"a crash can leave orphaned staging objects; expire <prefix>/staging"},
+        .required_options_for_exactly_once = {"bucket", "prefix"},
+    });
+
     using clink::plugin::BuildContext;
 
     // ---- Parquet over GCS (sink + source pairs, int64 + string channels) ----

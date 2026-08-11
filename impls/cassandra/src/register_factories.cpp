@@ -9,6 +9,7 @@
 #include "clink/cassandra/cassandra_upsert_sink.hpp"
 #include "clink/cassandra/connection_params.hpp"
 #include "clink/cassandra/install.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
@@ -42,6 +43,54 @@ std::vector<std::string> split_csv(const std::string& s) {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "cassandra",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"cassandra cpp-driver"},
+        .runtime_dependencies = {"cassandra >= 3"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        // INSERT ... JSON is a CQL upsert, so replays collapse for a
+        // stable primary key - which the user's schema controls, not clink.
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "password"},
+        .tls = false,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {"connect_timeout_ms"},
+        .available_in_sql = true,
+        .limitations = {"effectively-once only when the table's PRIMARY KEY identifies the record"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "cassandra_upsert",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"cassandra cpp-driver"},
+        .runtime_dependencies = {"cassandra >= 3"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent,
+        .transactional = false,
+        .idempotency_key_option = "key_columns",
+        .auth_methods = {"none", "password"},
+        .tls = false,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {"connect_timeout_ms"},
+        .available_in_sql = true,
+        .limitations = {"changelog contract: deletes are DELETE by key, not tombstone-managed"},
+    });
+
     using clink::plugin::BuildContext;
 
     // cassandra_sink_string: write each JSON-object row via `INSERT INTO ks.tbl JSON ?` (Cassandra

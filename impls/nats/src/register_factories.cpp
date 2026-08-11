@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/nats/connection_params.hpp"
 #include "clink/nats/install.hpp"
 #include "clink/nats/nats_sink.hpp"
@@ -29,6 +30,33 @@ NatsConnParams parse_conn(const clink::plugin::BuildContext& ctx) {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "nats",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"nats.c"},
+        .runtime_dependencies = {"nats server with jetstream"},
+        .formats = {"text", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // Recovery is broker redelivery of unacked messages - the ack is
+        // deferred to checkpoint completion, so nothing acked can be lost,
+        // but there is no client-side offset to replay from.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "token", "password"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"publish has no producer dedup: a replayed tail is re-published",
+                        "a consumer whose durable is deleted loses its redelivery state"},
+    });
+
     using clink::plugin::BuildContext;
 
     // nats_source_string: JetStream durable pull consumer; emit each message body as a string.

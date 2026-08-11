@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/mongodb/install.hpp"
 #include "clink/mongodb/mongo_cdc_source.hpp"
 #include "clink/mongodb/mongo_sink.hpp"
@@ -16,6 +17,33 @@
 namespace clink::mongodb {
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "mongo",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"mongo-cxx-driver"},
+        .runtime_dependencies = {"mongodb >= 4 (change streams need a replica set)"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // The CDC source checkpoints the change-stream resume token.
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::OpaqueToken,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        // replace_one upsert by key_field collapses replays.
+        .idempotency_key_option = "key_field",
+        .auth_methods = {"none", "scram"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"effectively-once only with on_duplicate='replace' and a stable key_field",
+                        "a resume token older than the oplog window cannot resume"},
+    });
+
     using clink::plugin::BuildContext;
 
     // mongo_sink: bulk-write JSON-object records into a collection. At-least-once
