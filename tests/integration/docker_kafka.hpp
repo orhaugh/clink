@@ -41,8 +41,15 @@ public:
             throw std::runtime_error("DockerKafka: docker run failed");
         }
         // Readiness is a broker-side condition, not a duration: rpk ships in
-        // the image and exits 0 only once the cluster answers.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        // the image and exits 0 only once the cluster answers. `cluster
+        // info` alone is NOT enough - it answers before the transaction
+        // coordinator is ready, and a transactional producer that connects
+        // in that window burns a full init_transactions timeout plus a
+        // restart cycle (observed as a first-checkpoint stall in the
+        // exactly-once suite). `cluster health` waits for the controller
+        // and leadership to settle, which is the precondition the
+        // transactional path actually needs.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
         const std::string probe =
             "docker exec " + container_name_ + " rpk cluster info > /dev/null 2>&1";
         while (std::system(probe.c_str()) != 0) {
@@ -51,6 +58,13 @@ public:
                 throw std::runtime_error("DockerKafka: broker never became ready");
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        const std::string health = "docker exec " + container_name_ +
+                                   " rpk cluster health --exit-when-healthy --watch"
+                                   " > /dev/null 2>&1";
+        if (std::system(health.c_str()) != 0) {
+            stop();
+            throw std::runtime_error("DockerKafka: cluster never reported healthy");
         }
     }
 
