@@ -10,6 +10,7 @@
 
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/metrics/metrics_registry.hpp"
+#include "clink/runtime/logging.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
 #ifdef CLINK_HAS_KAFKA
@@ -187,9 +188,29 @@ void KafkaSink::open() {
     // so subsequent produce() calls land inside it.
     if (!impl_->opts.transactional_id.empty()) {
         const int timeout_ms = static_cast<int>(impl_->opts.produce_timeout.count());
-        auto err_init = impl_->producer->init_transactions(timeout_ms);
-        if (err_init) {
-            throw std::runtime_error("KafkaSink: init_transactions failed: " + err_init->str());
+        // init_transactions is RETRIABLE by librdkafka's own contract: a
+        // timeout while the broker's transaction coordinator is warming up
+        // or briefly overloaded returns a retriable error whose text says
+        // "retry call to resume" outright. Treating that as fatal threw,
+        // failed the subtask, and burned a whole job restart cycle to
+        // recover from a condition a second call resolves in place -
+        // observed twice against a freshly started broker under load.
+        // Real failures (fenced producer, auth, bad config) are not
+        // retriable and still throw immediately; the retriable case is
+        // bounded by the same overall budget rather than retried for ever.
+        const auto init_deadline =
+            std::chrono::steady_clock::now() + 3 * impl_->opts.produce_timeout;
+        for (;;) {
+            auto err_init = impl_->producer->init_transactions(timeout_ms);
+            if (!err_init) {
+                break;
+            }
+            if (!err_init->is_retriable() || std::chrono::steady_clock::now() >= init_deadline) {
+                throw std::runtime_error("KafkaSink: init_transactions failed: " + err_init->str());
+            }
+            clink::log::info("kafka.sink",
+                             "init_transactions returned a retriable error (" + err_init->str() +
+                                 "); retrying in place");
         }
         auto err_begin = impl_->producer->begin_transaction();
         if (err_begin) {
