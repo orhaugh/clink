@@ -15,7 +15,19 @@ namespace {
 class PlainTcpConnection final : public Connection {
 public:
     explicit PlainTcpConnection(int fd) noexcept : fd_(fd) {}
-    ~PlainTcpConnection() override { close(); }
+    // The actual ::close happens HERE and only here. Connections are held
+    // by shared_ptr, and every thread that touches the socket holds a
+    // reference across the call, so by the time the destructor runs no
+    // reader can be inside recv on this fd - which is the condition
+    // ::close needs: closing a descriptor another thread is blocked on is
+    // an fd-reuse hazard, and TSan rightly reports the close/recv pair as
+    // a race at the descriptor level even with the fd variable atomic.
+    ~PlainTcpConnection() override {
+        const int fd = fd_.exchange(-1, std::memory_order_acq_rel);
+        if (fd >= 0) {
+            NetworkSocket::close(fd);
+        }
+    }
 
     PlainTcpConnection(const PlainTcpConnection&) = delete;
     PlainTcpConnection& operator=(const PlainTcpConnection&) = delete;
@@ -30,14 +42,14 @@ public:
     bool send_all(const std::byte* buf, std::size_t len) override {
         std::lock_guard<std::mutex> lk(send_mu_);
         const int fd = fd_.load(std::memory_order_acquire);
-        if (fd < 0)
+        if (fd < 0 || closed_.load(std::memory_order_acquire))
             return false;
         return NetworkSocket::send_all(fd, buf, len);
     }
 
     bool recv_all(std::byte* buf, std::size_t len) override {
         const int fd = fd_.load(std::memory_order_acquire);
-        if (fd < 0)
+        if (fd < 0 || closed_.load(std::memory_order_acquire))
             return false;
         return NetworkSocket::recv_all(fd, buf, len);
     }
@@ -67,19 +79,21 @@ public:
             NetworkSocket::shutdown_read(fd);
     }
 
-    // Reader threads block in recv_all on this fd while another thread
-    // closes the connection, so the fd is atomic (the plain-int version was
-    // a data race the moment the in-process cluster tests exercised
-    // close-during-recv - the NetworkChannelSource family, same fix).
-    // Exchange first so exactly one closer wins, shut both directions down
-    // so a blocked reader wakes with an error rather than sleeping on a
-    // closed descriptor, then close.
+    // close() is the cross-thread WAKE, not the resource release. Reader
+    // threads block in recv_all on this fd while another thread closes the
+    // connection (the NetworkChannelSource defect family): shutting both
+    // directions down wakes the blocked reader with an error and refuses
+    // new IO, while the descriptor itself stays valid until the destructor
+    // - after every referencing thread has let go - actually closes it.
+    // Exactly one closer performs the shutdown.
     void close() override {
-        const int fd = fd_.exchange(-1, std::memory_order_acq_rel);
+        if (closed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        const int fd = fd_.load(std::memory_order_acquire);
         if (fd >= 0) {
             NetworkSocket::shutdown_read(fd);
             NetworkSocket::shutdown_write(fd);
-            NetworkSocket::close(fd);
         }
     }
 
@@ -87,6 +101,7 @@ public:
 
 private:
     std::atomic<int> fd_;
+    std::atomic<bool> closed_{false};
     std::mutex send_mu_;
 };
 

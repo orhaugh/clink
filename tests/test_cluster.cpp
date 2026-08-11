@@ -1999,7 +1999,13 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
 
     (void)coordinator.cancel_job(job_id);
     const auto cancel_started = std::chrono::steady_clock::now();
-    ASSERT_TRUE(coordinator.await_job_completion(job_id, clink::test_support::scale_slack(10s)))
+    // Base bound 30s: the un-instrumented run takes ~7s of it (a 1500ms
+    // held write plus full in-process cluster teardown), and the UBSan
+    // build - which the slack multiplier deliberately treats as 1x -
+    // measured 10.08s against the old 10s figure. The contract is "far
+    // below the wedge this test was written against", not any particular
+    // single-digit figure.
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, clink::test_support::scale_slack(30s)))
         << "cancel wedged behind the held checkpoint write";
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - cancel_started);
@@ -2010,7 +2016,7 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
     // (TSan alone is a 5-15x slowdown - this failed the nightly at exactly
     // that multiplier).
     const auto bound_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        clink::test_support::scale_slack(std::chrono::milliseconds(8000)));
+        clink::test_support::scale_slack(std::chrono::milliseconds(20000)));
     EXPECT_LT(took.count(), bound_ms.count()) << "cancel took " << took.count() << "ms";
 
     const auto d = coordinator.snapshot_job(job_id);
