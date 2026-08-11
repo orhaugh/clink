@@ -115,6 +115,26 @@ void seed_data_frames() {
             payload.push_back(static_cast<std::uint8_t>(byte));
         }
         emit("arrow_batch_valid", network::Kind::ArrowBatch, payload);
+        // A two-column batch with a null: strings bring offset buffers and
+        // the null brings validity bitmaps, so the round-trip property in
+        // fuzz_data_frame starts from a seed that exercises both.
+        arrow::StringBuilder sb;
+        (void)sb.Append("alpha");
+        (void)sb.AppendNull();
+        (void)sb.Append("gamma");
+        std::shared_ptr<arrow::Array> sarr;
+        if (sb.Finish(&sarr).ok()) {
+            auto schema2 = arrow::schema(
+                {arrow::field("v", arrow::int64()), arrow::field("s", arrow::utf8())});
+            auto batch2 = arrow::RecordBatch::Make(schema2, arr->length(), {arr, sarr});
+            const auto ipc2 = clink::arrow_batch_to_ipc(*batch2);
+            std::vector<std::uint8_t> payload2;
+            payload2.reserve(ipc2.size());
+            for (const auto byte : ipc2) {
+                payload2.push_back(static_cast<std::uint8_t>(byte));
+            }
+            emit("arrow_batch_two_col_null", network::Kind::ArrowBatch, payload2);
+        }
         // Truncated at the halfway point: an openable header with a body that
         // stops early is the shape a dropped connection produces.
         payload.resize(payload.size() / 2);

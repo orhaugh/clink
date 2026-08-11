@@ -25,6 +25,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -97,6 +99,37 @@ inline void fuzz_data_frame(const std::uint8_t* data, std::size_t size) {
                 (void)batch->num_rows();
                 (void)batch->num_columns();
                 (void)batch->schema()->ToString();
+                // Properties, not just absence of crashes. A decoder that
+                // ACCEPTS a batch vouches for it, so:
+                //
+                // 1. The accepted batch must pass Arrow's own full
+                //    validation - offsets in range, buffer sizes coherent.
+                //    An accepted-but-invalid batch is silent corruption
+                //    travelling the wire, exactly what crash-only fuzzing
+                //    cannot see (downstream reads of it are the crash, far
+                //    from the cause).
+                if (const auto st = batch->ValidateFull(); !st.ok()) {
+                    std::fprintf(stderr,
+                                 "fuzz_data_frame: decoder accepted a batch that fails "
+                                 "ValidateFull: %s\n",
+                                 st.ToString().c_str());
+                    std::abort();
+                }
+                // 2. Round-trip: re-encoding through the send path and
+                //    decoding again must reproduce the batch exactly. A
+                //    divergence means one side of the wire format lies.
+                const auto reencoded = arrow_batch_to_ipc(*batch);
+                auto again = arrow_batch_from_ipc(reencoded.data(), reencoded.size());
+                if (!again) {
+                    std::fprintf(stderr, "fuzz_data_frame: re-encoded batch failed to decode\n");
+                    std::abort();
+                }
+                if (!batch->schema()->Equals(*again->schema()) || !batch->Equals(*again)) {
+                    std::fprintf(stderr,
+                                 "fuzz_data_frame: decode -> encode -> decode did not "
+                                 "round-trip\n");
+                    std::abort();
+                }
             }
 #else
             (void)payload;
