@@ -4836,22 +4836,39 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
         deploy_msg.capture_dir = job.checkpoint.capture_dir;
         deploy_msg.capture_records = job.checkpoint.capture_records;
-        // Restart point: use the coordinator's own checkpoint dir as the
-        // restore source, last completed checkpoint id we acknowledged.
-        deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
-        // Tracked jobs (commit-confirmed restore protocol) restore from the
-        // newest checkpoint whose external commits provably EXECUTED, not
-        // the newest completed one: a completed-but-unconfirmed checkpoint
-        // may hold a broker transaction that died with the worker, and
-        // restoring past it silently loses that interval. Zero (nothing
-        // confirmed yet) restores from scratch - replaying everything is
-        // the correct side of the trade for a sink that cannot re-commit.
-        deploy_msg.restore_from_checkpoint_id = job.confirm_task_keys.empty()
-                                                    ? job.latest_completed_checkpoint_id
-                                                    : job.latest_confirmed_checkpoint_id;
+        // Restart point: the job's OWN newest usable checkpoint - confirmed
+        // for tracked jobs (commit-confirmed restore protocol: a
+        // completed-but-unconfirmed checkpoint may hold a broker transaction
+        // that died with the worker), completed otherwise.
+        //
+        // When the job has NO usable checkpoint of its own, fall back to the
+        // restore point it was SUBMITTED with, exactly as the initial deploy
+        // applied it. The restart used to rebuild the restore purely from
+        // the job's own progress, so a restart that fired before the first
+        // checkpoint completed silently DROPPED a submitted savepoint /
+        // restore-from and redeployed with empty state. Observed live: a
+        // restore whose integrity check correctly REFUSED a truncated
+        // checkpoint raced a peer's restartable cancel, the restart
+        // re-deployed without the restore, and the refusal was laundered
+        // into a clean empty run.
+        const auto own_restore_id = job.confirm_task_keys.empty()
+                                        ? job.latest_completed_checkpoint_id
+                                        : job.latest_confirmed_checkpoint_id;
+        const bool resubmit_original_restore =
+            own_restore_id == 0 && !job.checkpoint.restore_from_dir.empty();
+        if (resubmit_original_restore) {
+            deploy_msg.restore_from_dir = job.checkpoint.restore_from_dir;
+            deploy_msg.restore_from_checkpoint_id = job.checkpoint.restore_from_checkpoint_id;
+        } else {
+            deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
+            deploy_msg.restore_from_checkpoint_id = own_restore_id;
+        }
         log::info("coordinator.restart",
                   "job_id=" + std::to_string(job.id) + " restore point: checkpoint " +
                       std::to_string(deploy_msg.restore_from_checkpoint_id) +
+                      (resubmit_original_restore ? " (the SUBMITTED restore point; no own "
+                                                   "checkpoint is usable yet)"
+                                                 : "") +
                       " (latest_completed=" + std::to_string(job.latest_completed_checkpoint_id) +
                       " latest_confirmed=" + std::to_string(job.latest_confirmed_checkpoint_id) +
                       " tracked=" + std::to_string(job.confirm_task_keys.size()) + ")");
@@ -4861,13 +4878,17 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         // translating - so the two answers are taken from one predicate and cannot
         // disagree. A restore that reads generation N-1's directories while
         // translating indices as though it were generation N is precisely the
-        // mismatch F63 and F65 came from.
+        // mismatch F63 and F65 came from. The submitted-restore fallback reads
+        // an EXTERNAL directory, so its generation is whatever that directory
+        // holds - the same discovery the initial deploy performs.
         deploy_msg.generation = job.state_generation;
         deploy_msg.restore_generation =
-            (job.state_generation > 1 && job.latest_completed_checkpoint_id != 0 &&
-             job.latest_completed_checkpoint_id <= job.state_generation_after_checkpoint)
-                ? job.state_generation - 1
-                : job.state_generation;
+            resubmit_original_restore
+                ? highest_generation_in(job.checkpoint.restore_from_dir)
+                : ((job.state_generation > 1 && job.latest_completed_checkpoint_id != 0 &&
+                    job.latest_completed_checkpoint_id <= job.state_generation_after_checkpoint)
+                       ? job.state_generation - 1
+                       : job.state_generation);
         deploy_msg.unaligned_checkpoints =
             job.checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;

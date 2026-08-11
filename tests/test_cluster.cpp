@@ -2421,3 +2421,110 @@ TEST(Cluster, ATruncatedCheckpointIsRefusedAtRestoreWhileTheGoodOneStillRestores
     worker.stop();
     coordinator.stop();
 }
+
+// A whole-job restart that fires BEFORE the job completes its first own
+// checkpoint must re-apply the restore point the job was SUBMITTED with.
+// The restart machinery used to rebuild the restore purely from the job's
+// own progress (latest completed/confirmed, of which a young job has none),
+// so an early restart silently DROPPED a submitted savepoint and the job
+// came back up on empty state. The trigger here is deterministic: a
+// one-shot injected throw at state.before_restore kills attempt 1's
+// restoring subtask with an ordinary (non-fatal) error, which is exactly
+// the restartable class; attempt 2 must restore run 1's counts, not start
+// counting from one.
+TEST(Cluster, ARestartBeforeTheFirstCheckpointKeepsTheSubmittedRestorePoint) {
+    const auto plugin = cluster_hello_plugin_path();
+    if (plugin.empty() || !std::filesystem::exists(plugin)) {
+        GTEST_SKIP() << "hello_plugin not built";
+    }
+    clink::fault::Registry::instance().reset();
+    struct RegistryReset {
+        ~RegistryReset() { clink::fault::Registry::instance().reset(); }
+    } reset_on_exit;
+
+    Coordinator coordinator;
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-keeprestore"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-keeprestore", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto tag = std::to_string(::getpid());
+    const auto dir_good = tmp / ("clink_keeprestore_good_" + tag);
+    const auto dir_scratch = tmp / ("clink_keeprestore_scratch_" + tag);
+    const auto out1 = tmp / ("clink_keeprestore_out1_" + tag);
+    const auto out2 = tmp / ("clink_keeprestore_out2_" + tag);
+    for (const auto& p : {dir_good, dir_scratch}) {
+        std::filesystem::remove_all(p);
+    }
+    for (const auto& p : {out1, out2}) {
+        std::filesystem::remove(p);
+    }
+
+    clink::application::JobSubmitter submitter("127.0.0.1", port);
+
+    // Run 1: clean checkpoints into dir_good; each parity bucket counts to 2.
+    {
+        clink::application::SubmitOptions opts;
+        opts.wait_for_completion = true;
+        opts.wait_timeout = 20s;
+        opts.checkpoint.checkpoint_dir = dir_good.string();
+        opts.checkpoint.interval_ms = 50;
+        auto r = submitter.submit(clink_parity_graph(1, out1).to_json(), {plugin.string()}, opts);
+        ASSERT_TRUE(r.ok) << r.reject_message;
+    }
+    const auto good_id = clink_latest_completed_marker(dir_good);
+    ASSERT_GT(good_id, 0u) << "run 1 completed no checkpoint";
+
+    // Run 2: restore from run 1, with periodic checkpoints OFF so the job
+    // can never form a restore point of its own, and attempt 1's restore
+    // killed by a one-shot ordinary error. The restart must carry the
+    // SUBMITTED restore point into attempt 2.
+    clink::fault::Registry::instance().arm(
+        clink::fault::Rule{.point = clink::fault::points::kStateBeforeRestore,
+                           .ordinal = 1,
+                           .action = clink::fault::Action::Throw});
+    {
+        clink::application::SubmitOptions opts;
+        opts.wait_for_completion = true;
+        opts.wait_timeout = 30s;
+        opts.checkpoint.checkpoint_dir = dir_scratch.string();
+        opts.checkpoint.interval_ms = 0;
+        opts.checkpoint.restore_from_dir = dir_good.string();
+        opts.checkpoint.restore_from_checkpoint_id = good_id;
+        auto r = submitter.submit(clink_parity_graph(5, out2).to_json(), {plugin.string()}, opts);
+        ASSERT_TRUE(r.ok) << "the one-shot restore failure must be survived by a restart: "
+                          << r.reject_message;
+        for (const auto& e : r.errors) {
+            ADD_FAILURE() << "job completed with error: " << e;
+        }
+    }
+    // Vacuity guards, both sides. The armed throw fired (attempt 1 really
+    // died at its restore), and the point fired AGAIN afterwards (the
+    // retry's restore actually ran - with the restore point dropped, the
+    // redeploy carries id 0 and no restore happens at all, so the count
+    // freezes where attempt 1 left it).
+    const auto restore_hits =
+        clink::fault::Registry::instance().hits(clink::fault::points::kStateBeforeRestore);
+    EXPECT_GE(restore_hits, 3u) << "the retry never re-ran the submitted restore";
+
+    {
+        std::ifstream in(out2);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) {
+            lines.push_back(line);
+        }
+        EXPECT_EQ(lines, (std::vector<std::string>{"5:1:3", "6:0:3", "7:1:4", "8:0:4"}))
+            << "the restart dropped the submitted restore point and counted from scratch";
+    }
+
+    for (const auto& p : {dir_good, dir_scratch}) {
+        std::filesystem::remove_all(p);
+    }
+    worker.stop();
+    coordinator.stop();
+}
