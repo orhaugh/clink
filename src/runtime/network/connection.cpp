@@ -1,5 +1,6 @@
 #include "clink/runtime/network/connection.hpp"
 
+#include <atomic>
 #include <mutex>
 
 #include <sys/socket.h>
@@ -28,19 +29,22 @@ public:
     // needs no lock; send + recv are independent directions.
     bool send_all(const std::byte* buf, std::size_t len) override {
         std::lock_guard<std::mutex> lk(send_mu_);
-        if (fd_ < 0)
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd < 0)
             return false;
-        return NetworkSocket::send_all(fd_, buf, len);
+        return NetworkSocket::send_all(fd, buf, len);
     }
 
     bool recv_all(std::byte* buf, std::size_t len) override {
-        if (fd_ < 0)
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd < 0)
             return false;
-        return NetworkSocket::recv_all(fd_, buf, len);
+        return NetworkSocket::recv_all(fd, buf, len);
     }
 
     bool set_recv_timeout(std::chrono::milliseconds timeout) override {
-        if (fd_ < 0) {
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd < 0) {
             return false;
         }
         // Zero clears it (blocking again), which is what the coordinator does
@@ -48,30 +52,41 @@ public:
         struct timeval tv{};
         tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout.count() / 1000);
         tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout.count() % 1000) * 1000);
-        return ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+        return ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
     }
 
     void shutdown_write() override {
-        if (fd_ >= 0)
-            NetworkSocket::shutdown_write(fd_);
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd >= 0)
+            NetworkSocket::shutdown_write(fd);
     }
 
     void shutdown_read() override {
-        if (fd_ >= 0)
-            NetworkSocket::shutdown_read(fd_);
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd >= 0)
+            NetworkSocket::shutdown_read(fd);
     }
 
+    // Reader threads block in recv_all on this fd while another thread
+    // closes the connection, so the fd is atomic (the plain-int version was
+    // a data race the moment the in-process cluster tests exercised
+    // close-during-recv - the NetworkChannelSource family, same fix).
+    // Exchange first so exactly one closer wins, shut both directions down
+    // so a blocked reader wakes with an error rather than sleeping on a
+    // closed descriptor, then close.
     void close() override {
-        if (fd_ >= 0) {
-            NetworkSocket::close(fd_);
-            fd_ = -1;
+        const int fd = fd_.exchange(-1, std::memory_order_acq_rel);
+        if (fd >= 0) {
+            NetworkSocket::shutdown_read(fd);
+            NetworkSocket::shutdown_write(fd);
+            NetworkSocket::close(fd);
         }
     }
 
-    bool is_open() const noexcept override { return fd_ >= 0; }
+    bool is_open() const noexcept override { return fd_.load(std::memory_order_acquire) >= 0; }
 
 private:
-    int fd_;
+    std::atomic<int> fd_;
     std::mutex send_mu_;
 };
 
