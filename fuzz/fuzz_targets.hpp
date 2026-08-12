@@ -118,13 +118,27 @@ inline void fuzz_data_frame(const std::uint8_t* data, std::size_t size) {
                 // 2. Round-trip: re-encoding through the send path and
                 //    decoding again must reproduce the batch exactly. A
                 //    divergence means one side of the wire format lies.
+                //
+                // nans_equal: Arrow's DEFAULT equality follows IEEE-754, so
+                // NaN != NaN and a float column containing one never
+                // compares equal to ITSELF. Without this option the
+                // property fires on a faithful round-trip - a 25-minute
+                // campaign found exactly that (v: double carrying
+                // [5e-324, nan, 3.2377e-319] came back byte-identical and
+                // still "failed"). Bit-identical NaN is what the wire has
+                // to preserve, and it does; asserting IEEE equality on it
+                // asks the transport for something arithmetic, not
+                // transport, and would have cost a future reader a
+                // diagnosis on a scheduled run.
                 const auto reencoded = arrow_batch_to_ipc(*batch);
                 auto again = arrow_batch_from_ipc(reencoded.data(), reencoded.size());
                 if (!again) {
                     std::fprintf(stderr, "fuzz_data_frame: re-encoded batch failed to decode\n");
                     std::abort();
                 }
-                if (!batch->schema()->Equals(*again->schema()) || !batch->Equals(*again)) {
+                const auto nan_aware = arrow::EqualOptions::Defaults().nans_equal(true);
+                if (!batch->schema()->Equals(*again->schema()) ||
+                    !batch->Equals(*again, /*check_metadata=*/false, nan_aware)) {
                     std::fprintf(stderr,
                                  "fuzz_data_frame: decode -> encode -> decode did not "
                                  "round-trip\n");
