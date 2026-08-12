@@ -1074,3 +1074,93 @@ TEST_F(FaultRecoveryTest, ASnapshotKilledBeforeItsFsyncDoesNotCountAsCompleted) 
     EXPECT_TRUE(v.unexpected.empty())
         << "output contains records the source never emitted: " << describe(v);
 }
+
+// The coordinator dies AFTER the COMPLETED marker is durable and BEFORE the
+// commit broadcast (followups item 58).
+//
+// coordinator.after_completed_marker was declared, wired and armed by
+// nothing. It brackets the narrowest window in the 2PC protocol, and the
+// code comment immediately below it states the invariant it exists to
+// test: "the marker write ordering matters - by the time workers commit
+// their pre-staged transactions, the marker is durable, so a crash
+// mid-broadcast still lets recovery find COMPLETED-N and commit on
+// restore." Nothing checked that.
+//
+// What makes this window sharp rather than merely unlucky: at the moment
+// of death a 2PC sink is holding a PREPARED transaction it was never told
+// to commit, and the marker on disk says that checkpoint completed. If
+// recovery does not drive the commit, those records are staged forever and
+// the output is short - a silent loss whose evidence (a prepared
+// transaction) lives in the sink, not in any log. HA is required because a
+// bare coordinator restart abandons its jobs (F82); a fresh coordinator on
+// the SAME ha-dir wins the lock and runs recover_persisted_jobs().
+TEST_F(FaultRecoveryTest, ACoordinatorDyingAfterTheCompletedMarkerStillGetsTheCommitDone) {
+    auto sp = spec();
+    sp.ha = true;  // start_ha_coordinators refuses on a non-HA spec
+    Cluster c(sp);
+    ScopedDiagnostics diag(c);
+    // Ordinal 2, not 1: the first completed checkpoint is allowed through
+    // cleanly so the job has a recovery point that is not the one whose
+    // broadcast we are about to lose. Arming at 1 would test a job whose
+    // only completed checkpoint is the interrupted one - a narrower and
+    // less representative scenario.
+    ASSERT_TRUE(c.start_ha_coordinators(
+        1, ProcOptions{.fault = "coordinator.after_completed_marker=exit:72@2"}));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.start_ha_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/3, "file:" + (c.root() / "state").string());
+    ASSERT_NE(sub, nullptr);
+
+    // Vacuity, proven not assumed: the coordinator must have died AT the
+    // armed point, which its distinctive exit code shows. Without this the
+    // test would still pass if the point were renamed - it would just be a
+    // slow clean run.
+    ASSERT_TRUE(clink::itest::await([&] { return !c.ha_coordinator(0).running(); },
+                                    std::chrono::seconds(60)))
+        << "the coordinator never reached coordinator.after_completed_marker, so the window "
+           "between the durable marker and the commit broadcast never opened";
+    const auto armed_exit = c.ha_coordinator(0).poll_exit();
+    ASSERT_TRUE(armed_exit.has_value());
+    EXPECT_EQ(*armed_exit, 72)
+        << "the coordinator exited for a reason other than the injected fault (expected _exit(72))";
+
+    // A marker for the interrupted checkpoint must be on disk - that is the
+    // half of the window that DID happen, and recovery's whole job is to
+    // honour it.
+    EXPECT_GT(latest_completed(c.checkpoint_dir()), 0u)
+        << "no COMPLETED marker survived, so the fault fired before the write rather than after "
+           "it and this is testing the wrong side of the window";
+
+    // The submitter's connection died with the coordinator; its exit code
+    // describes the connection, not the job. The verdict is on disk.
+    (void)sub->await_exit(std::chrono::seconds(15));
+
+    ASSERT_TRUE(c.start_ha_coordinators(1));
+    ASSERT_TRUE(c.restart_worker_ha(0));
+    ASSERT_TRUE(c.restart_worker_ha(1));
+
+    // 60s rather than the ctest ceiling, for the reason the compound-failure
+    // test above documents: a bound equal to the ceiling turns a genuine
+    // non-convergence into a silent kill with no message.
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+            return v.duplicated.empty() && v.missing.empty();
+        },
+        std::chrono::seconds(60)))
+        << [&] {
+               const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+               std::ostringstream os;
+               os << "output never converged after the coordinator died between the durable "
+                     "COMPLETED marker and the commit broadcast - a prepared transaction was "
+                     "left unpublished: "
+                  << v.duplicated.size() << " duplicated, " << v.missing.size() << " missing (of "
+                  << kTotalRecords << ")";
+               if (!v.missing.empty()) {
+                   os << "; first missing: " << v.missing.front();
+               }
+               return os.str();
+           }();
+}
