@@ -1164,3 +1164,78 @@ TEST_F(FaultRecoveryTest, ACoordinatorDyingAfterTheCompletedMarkerStillGetsTheCo
                return os.str();
            }();
 }
+
+// The coordinator dies after every ack but BEFORE the COMPLETED marker is
+// written (followups item 58 - the last of the three unarmed points).
+//
+// The mirror image of its sibling above, and the assertion is the opposite
+// one. Nothing durable records that this checkpoint completed, and the
+// commit broadcast is downstream of the marker write, so NO sink may have
+// published anything for it. Recovery must therefore fall back to the last
+// checkpoint that DID get a marker and replay from there.
+//
+// The failure this guards against is a coordinator that broadcasts commits
+// before the record of them is durable: sinks would publish output for a
+// checkpoint that recovery cannot see, and replaying from the earlier point
+// would then re-publish it - duplicates in the committed multiset, which is
+// the at-least-once failure the whole 2PC protocol exists to avoid.
+TEST_F(FaultRecoveryTest,
+       ACoordinatorDyingBeforeTheCompletedMarkerCommitsNothingForThatCheckpoint) {
+    auto sp = spec();
+    sp.ha = true;
+    Cluster c(sp);
+    ScopedDiagnostics diag(c);
+    // Ordinal 2: checkpoint one completes and marks cleanly, giving recovery
+    // a fallback point; the second dies before its marker.
+    ASSERT_TRUE(c.start_ha_coordinators(
+        1, ProcOptions{.fault = "coordinator.before_completed_marker=exit:73@2"}));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.start_ha_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/3, "file:" + (c.root() / "state").string());
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return !c.ha_coordinator(0).running(); },
+                                    std::chrono::seconds(60)))
+        << "the coordinator never reached coordinator.before_completed_marker";
+    const auto armed_exit = c.ha_coordinator(0).poll_exit();
+    ASSERT_TRUE(armed_exit.has_value());
+    EXPECT_EQ(*armed_exit, 73)
+        << "the coordinator exited for a reason other than the injected fault (expected _exit(73))";
+
+    // The half of the window that DID happen is an ack set with no marker.
+    // Exactly one marker should exist - checkpoint one's - and the
+    // interrupted checkpoint must have left none. Capturing it here, before
+    // recovery writes more, is what makes the claim checkable at all.
+    const auto marker_at_death = latest_completed(c.checkpoint_dir());
+    EXPECT_GT(marker_at_death, 0u)
+        << "no marker at all survived, so the fault fired before the first checkpoint completed "
+           "and recovery has no fallback - a different scenario from the one under test";
+
+    (void)sub->await_exit(std::chrono::seconds(15));
+
+    ASSERT_TRUE(c.start_ha_coordinators(1));
+    ASSERT_TRUE(c.restart_worker_ha(0));
+    ASSERT_TRUE(c.restart_worker_ha(1));
+
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+            return v.duplicated.empty() && v.missing.empty();
+        },
+        std::chrono::seconds(60)))
+        << [&] {
+               const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+               std::ostringstream os;
+               os << "output never converged after the coordinator died before the COMPLETED "
+                     "marker. Duplicates here mean a sink published for a checkpoint no marker "
+                     "records, and the replay from the earlier point published it again: "
+                  << v.duplicated.size() << " duplicated, " << v.missing.size() << " missing (of "
+                  << kTotalRecords << ")";
+               if (!v.duplicated.empty()) {
+                   os << "; first duplicate: " << v.duplicated.front();
+               }
+               return os.str();
+           }();
+}
