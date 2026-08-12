@@ -747,7 +747,13 @@ inline SubmitJobAckMsg decode_submit_job_ack(MessageReader& r) {
     // Eof-guarded tail: a frame from a pre-item-30 coordinator ends here
     // and the list stays empty.
     if (!r.eof()) {
-        const auto n = r.read_u32_be();
+        // read_count(), not read_u32_be() + reserve(n): the raw count is
+        // untrusted and was reserved before any bounds-checked read could
+        // reject it - fuzz_cluster_frame drove a 147-byte frame into a 10 GB
+        // reserve here. This was the ONE decoder the read_count sweep missed,
+        // because its list sits in a tail added later (item 30). read_count
+        // throws when the count exceeds the bytes left in the frame.
+        const auto n = r.read_count();
         m.missing_plugin_hashes.reserve(n);
         for (std::uint32_t i = 0; i < n; ++i) {
             m.missing_plugin_hashes.push_back(r.read_string());

@@ -520,6 +520,23 @@ inline std::shared_ptr<arrow::RecordBatch> arrow_batch_from_ipc(const std::byte*
     std::shared_ptr<arrow::RecordBatch> batch;
     if (auto s = reader->ReadNext(&batch); !s.ok())
         return nullptr;
+    if (batch == nullptr)
+        return nullptr;
+    // Validate the DECODED buffers, not just the IPC framing. Arrow's stream
+    // reader checks the message envelope and schema but trusts the data
+    // buffers it references - so a frame whose string/binary column carries a
+    // corrupt offset buffer (non-monotonic, or past the values buffer)
+    // decodes "successfully" into a batch that segfaults the first time any
+    // downstream operator reads that column. This is the receive side of the
+    // data plane: the bytes come from a peer over a socket and are untrusted.
+    // ValidateFull walks the offset/child buffers once; the batch is about to
+    // be read in full regardless, so the cost is a constant factor on data we
+    // were going to touch, and it converts a deferred out-of-bounds read far
+    // downstream into a clean rejected frame here. Found by fuzz_data_frame
+    // (a non-monotonic offset the round-trip property surfaced); the caller
+    // treats nullptr as an undecodable frame and fails the task by name.
+    if (auto st = batch->ValidateFull(); !st.ok())
+        return nullptr;
     return batch;
 }
 
