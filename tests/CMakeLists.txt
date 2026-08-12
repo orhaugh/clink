@@ -8,6 +8,8 @@
 
 add_executable(clink_core_tests
     test_sha256.cpp
+    test_base64.cpp
+    test_flat_map.cpp
     test_remote_read_backend.cpp
     test_state_parquet_export.cpp
     test_window_state_codecs.cpp
