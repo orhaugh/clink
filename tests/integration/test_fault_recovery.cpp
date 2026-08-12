@@ -1010,3 +1010,67 @@ TEST_F(FaultRecoveryTest, AWorkerKilledInsideTheCommitWindowStaysExactlyOnce) {
         << describe(v);
     EXPECT_TRUE(v.unexpected.empty()) << describe(v);
 }
+
+// A snapshot write killed BEFORE its fsync must not leave a completed
+// checkpoint behind (followups item 58).
+//
+// checkpoint.before_fsync sits in write_fsync_rename, after the bytes have
+// been written to the temp file and before the fsync that makes them
+// durable. It was declared, wired, and armed by nothing - machinery built
+// for a scenario nobody ran, which the fault-point call-site gate cannot
+// detect (it proves the point is REACHABLE, not that any test opens the
+// window).
+//
+// The invariant under test is item 51/F95's: an ok-ack implies the acked
+// checkpoint's snapshot is already on disk. Dying here means the bytes
+// reached the page cache and the rename never happened, so no snapshot file
+// exists at that id. Recovery must therefore fall back to an earlier
+// checkpoint and replay - which is only observable as exactly-once output,
+// because a checkpoint wrongly treated as complete would resume PAST
+// records whose state was never persisted, and they would be missing.
+TEST_F(FaultRecoveryTest, ASnapshotKilledBeforeItsFsyncDoesNotCountAsCompleted) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    // Ordinal 4, not 1: the earlier writes let at least one checkpoint
+    // complete cleanly, so recovery has a genuine fallback point. Arming at
+    // the very first write would test a job with no checkpoint at all,
+    // which is a different (and already covered) scenario.
+    ASSERT_TRUE(c.start_worker(0, ProcOptions{.fault = "checkpoint.before_fsync=exit:71@4"}));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    // file:// for the same reason the state.before_restore test needs it:
+    // the in-memory backend never reaches a durable write, so the armed
+    // point would never fire and this would silently test nothing.
+    auto sub = submit(c, /*max_restarts=*/3, "file:" + (c.root() / "state").string());
+    ASSERT_NE(sub, nullptr);
+
+    // Vacuity, checked rather than assumed: the armed worker must actually
+    // have died AT the fault, which its distinctive exit code proves. If
+    // the point is ever renamed or moved off this path, this fails here
+    // instead of the test quietly becoming a plain worker-kill.
+    ASSERT_TRUE(
+        clink::itest::await([&] { return !c.worker(0).running(); }, std::chrono::seconds(60)))
+        << "the armed worker never reached checkpoint.before_fsync, so the window never opened";
+    const auto armed_exit = c.worker(0).poll_exit();
+    ASSERT_TRUE(armed_exit.has_value());
+    EXPECT_EQ(*armed_exit, 71)
+        << "the worker exited for a reason other than the injected fault (expected _exit(71))";
+
+    ASSERT_TRUE(c.restart_worker(0));
+
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value()) << "submitter never exited after the mid-snapshot kill";
+    ASSERT_EQ(*code, 0) << "the job did not recover from a snapshot killed before its fsync";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.missing.empty())
+        << "records were LOST: a checkpoint whose snapshot never reached disk was treated as a "
+           "usable restore point, so recovery resumed past state it does not have: "
+        << describe(v);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records were committed more than once across the recovery: " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty())
+        << "output contains records the source never emitted: " << describe(v);
+}
