@@ -37,7 +37,29 @@ namespace {
 //   - "clink.state_versions": packed StateVersionMap. Absent on
 //     v1-format snapshots; restore must tolerate missing metadata.
 std::shared_ptr<arrow::Schema> snapshot_schema() {
-    static const auto schema = arrow::schema({
+    // thread_local, not a plain function-local static: arrow::Schema is
+    // immutable to US but not internally const - Equals() consults a
+    // fingerprint the Schema computes and CACHES on first use. A single
+    // shared instance therefore has that cache lazily initialised by
+    // whichever thread calls Equals() first, and two threads arriving
+    // together race on it inside libarrow.
+    //
+    // Two subtasks restoring at the same moment is the ordinary case in a
+    // worker (run_generic_subtask_ runs one thread per task), so this is a
+    // production race, not a test artifact - it simply had no way to
+    // surface until restores could overlap in one process. ThreadSanitizer
+    // caught it as a write/read pair on a 32-byte block allocated by
+    // arrow::Schema::ComputeFingerprint, both stacks inside
+    // FileBackedStateBackend::restore holding DIFFERENT backend mutexes,
+    // which is the signature of shared state behind two correctly-locked
+    // callers.
+    //
+    // Per-thread costs one three-field Schema per thread that ever
+    // snapshots or restores, built once; the alternative (pre-warming the
+    // cache at init) depends on which Arrow call populates it and would
+    // break silently on an Arrow upgrade. Pointer identity is not required
+    // anywhere - the schema is compared and serialised by value.
+    static thread_local const auto schema = arrow::schema({
         arrow::field("op_id", arrow::uint64(), /*nullable=*/false),
         arrow::field("key_bytes", arrow::binary(), /*nullable=*/false),
         arrow::field("value_bytes", arrow::binary(), /*nullable=*/false),
