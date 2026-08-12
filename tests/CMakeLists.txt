@@ -476,6 +476,19 @@ if(CLINK_INTEGRATION_TESTS)
         clink_two_phase_commit_job
         clink_rescale_test_job
         clink_schema_evo_test_job)
+    # The connector 2PC job plugins test_connector_exactly_once.cpp submits.
+    # Conditional, because each is only built when its impl is - but NOT
+    # optional: without these, `--target clink_integration_tests` leaves them
+    # at whatever commit they were last built at, and since the plugin ABI
+    # fingerprint IS the git SHA, the next commit makes every one of them
+    # stale. The failure that produces is an ABI-fingerprint rejection at
+    # submit time, which reads like an engine regression and costs a
+    # diagnosis to trace back to a build-graph omission.
+    foreach(_job clink_postgres_2pc_job clink_kafka_2pc_job clink_s3_2pc_job)
+        if(TARGET ${_job})
+            add_dependencies(clink_integration_tests ${_job})
+        endif()
+    endforeach()
     clink_set_warnings(clink_integration_tests)
     # RESOURCE_LOCK on the whole integration binary, so ctest runs its cases one at a
     # time while every OTHER label still runs in parallel.
