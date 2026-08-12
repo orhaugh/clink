@@ -4290,6 +4290,28 @@ JobPlan Coordinator::replan_at_new_parallelism_(const JobState& job) const {
 }
 
 std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobState& job) {
+    // A fatal cause recorded during the drain means this restart cannot
+    // succeed - the restore point itself is damaged - so redeploying would
+    // only burn the budget re-hitting the same refusal (and each attempt's
+    // errors.clear() would wipe the verdict). Fail the job NOW, carrying
+    // the diagnosis. Checked here, at the single choke point every restart
+    // path funnels through, rather than at each caller.
+    if (!job.fatal_cause.empty()) {
+        log::warn("coordinator.restart",
+                  "job_id=" + std::to_string(job.id) +
+                      " cancelling the pending restart: a draining subtask reported a FATAL "
+                      "error, which a restart cannot fix: " +
+                      job.fatal_cause);
+        job.errors.push_back(job.fatal_cause);
+        job.awaiting_restart = false;
+        job.restart_deadline = {};
+        job.restart_pending.clear();
+        job.restart_drained_keys.clear();
+        job.restart_drain_expected.clear();
+        job.completed_count = job.expected_completion;
+        signal_job_completion_locked_(job);
+        return {};
+    }
     // 1. Snapshot the task set we need to redeploy. Build a topology
     //    template (extra_config + original peer_refs) from task_records
     //    BEFORE clearing it. Without this, multi-stage jobs would lose
@@ -5238,6 +5260,16 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
             // entirely - the rescale lifecycle owns the bookkeeping
             // for the old subtask now.
         } else if (!retry && job.awaiting_restart) {
+            // A FATAL error reported by a draining subtask must not be
+            // swallowed with the rest of the drain: fatal means the retry
+            // this drain is preparing cannot succeed (the named restore
+            // point is damaged), and the verdict text is the operator's
+            // diagnosis. Record it; restart_job_locked_ turns the pending
+            // restart into a failure carrying this cause.
+            if (msg.had_error && msg.fatal && job.fatal_cause.empty()) {
+                job.fatal_cause = msg.worker_id + "/" + msg.role + "[" +
+                                  std::to_string(msg.subtask_idx) + "]: " + msg.error_message;
+            }
             auto pending_it = job.pending_per_worker.find(msg.worker_id);
             if (pending_it != job.pending_per_worker.end()) {
                 std::erase_if(pending_it->second, [&](const auto& p) {

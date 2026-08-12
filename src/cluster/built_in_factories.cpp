@@ -109,11 +109,21 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
             const auto count = ctx.param_int64_or("count", 0);
             const auto start = ctx.param_int64_or("start", 1);
             const auto step = ctx.param_int64_or("step", 1);
+            // Pace: one record per delay_ms rather than a single drain-speed
+            // batch. The param was accepted and silently IGNORED before this
+            // - a test that asked for a slow source got a fast one and its
+            // premise quietly changed. 0 (the default) keeps the one-batch
+            // VectorSource, which several throughput-shaped tests rely on.
+            const auto delay_ms = ctx.param_int64_or("delay_ms", 0);
             const auto par = static_cast<std::int64_t>(ctx.parallelism == 0 ? 1 : ctx.parallelism);
             const auto idx = static_cast<std::int64_t>(ctx.subtask_idx);
             std::vector<Record<std::int64_t>> records;
             for (std::int64_t k = idx; k < count; k += par) {
                 records.emplace_back(Record<std::int64_t>{start + k * step});
+            }
+            if (delay_ms > 0) {
+                return std::make_shared<PacedVectorSource<std::int64_t>>(
+                    std::move(records), std::chrono::milliseconds{delay_ms}, "int64_range_source");
             }
             return std::make_shared<VectorSource<std::int64_t>>(std::move(records),
                                                                 "int64_range_source");

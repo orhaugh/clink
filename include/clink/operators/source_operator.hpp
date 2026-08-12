@@ -1,9 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -91,6 +93,90 @@ private:
     std::string name_;
     std::size_t next_index_{0};
     bool emitted_{false};
+};
+
+// A VectorSource that emits ONE record per produce() call with a fixed
+// delay between calls: a rate-limited finite stream for tests and soaks
+// whose duration should be wall time, not drain speed. Shares
+// VectorSource's offset contract - same reserved key, same wire format -
+// so a checkpoint written by one restores through the other and the
+// restore machinery cannot tell them apart.
+//
+// The delay lives INSIDE produce(), which is what makes it compatible with
+// checkpointing: the source runner drains pending barriers between
+// produce() calls, so a paced source still takes a barrier every
+// delay_ms rather than holding the whole stream hostage to one long
+// emit (which is exactly what VectorSource's single-batch produce does,
+// and why VectorSource cannot be throttled from the outside).
+template <typename T>
+class PacedVectorSource final : public Source<T> {
+public:
+    PacedVectorSource(std::vector<Record<T>> records,
+                      std::chrono::milliseconds delay,
+                      std::string name = "paced_vector_source")
+        : records_(std::move(records)), delay_(delay), name_(std::move(name)) {}
+
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+
+    bool produce(Emitter<T>& out) override {
+        if (this->cancelled() || next_index_ >= records_.size()) {
+            if (!watermarked_ && !this->cancelled()) {
+                out.emit_watermark(Watermark::max());
+                watermarked_ = true;
+            }
+            return false;
+        }
+        Batch<T> batch;
+        batch.push(records_[next_index_]);
+        ++next_index_;
+        if (!out.emit_data(std::move(batch))) {
+            return false;
+        }
+        if (delay_.count() > 0) {
+            std::this_thread::sleep_for(delay_);
+        }
+        return next_index_ < records_.size() || !watermarked_;
+    }
+
+    void snapshot_offset(StateBackend& backend,
+                         OperatorId op_id,
+                         CheckpointId /*ckpt_id*/) override {
+        std::array<std::byte, 8> bytes{};
+        const auto v = static_cast<std::uint64_t>(next_index_);
+        for (int i = 0; i < 8; ++i) {
+            bytes[static_cast<std::size_t>(i)] = static_cast<std::byte>((v >> (i * 8)) & 0xFF);
+        }
+        backend.put_operator_state(
+            op_id,
+            StateBackend::KeyView{kOffsetKey_, std::strlen(kOffsetKey_)},
+            StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+    }
+
+    bool restore_offset(StateBackend& backend, OperatorId op_id) override {
+        auto v = backend.get_operator_state(
+            op_id, StateBackend::KeyView{kOffsetKey_, std::strlen(kOffsetKey_)});
+        if (!v.has_value() || v->size() < 8) {
+            return false;
+        }
+        std::uint64_t restored = 0;
+        for (int i = 0; i < 8; ++i) {
+            restored |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
+        }
+        next_index_ = static_cast<std::size_t>(restored);
+        return true;
+    }
+
+    std::string name() const override { return name_; }
+
+private:
+    // Deliberately VectorSource's key: the two sources are interchangeable
+    // at restore time.
+    static constexpr const char* kOffsetKey_ = "__vector_source_offset__";
+    std::vector<Record<T>> records_;
+    std::chrono::milliseconds delay_;
+    std::string name_;
+    std::size_t next_index_{0};
+    bool watermarked_{false};
 };
 
 // Generator source: callable produces optional<Record<T>>. Returning nullopt

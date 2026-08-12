@@ -927,6 +927,16 @@ private:
         // firing the restart. Equals tasks_by_worker minus lost-worker tasks
         // at the moment mark_worker_lost_locked_ fires.
         std::unordered_set<std::string> restart_drain_expected;
+        // A FATAL subtask error observed while a restart was already
+        // draining. Fatal means restarting cannot fix it (the named restore
+        // point itself is damaged), so the pending restart must not fire -
+        // but the drain branch used to swallow the report entirely: the
+        // retry redeployed, re-hit the same fatal refusal, and looped until
+        // the restart budget was gone, with each attempt's errors.clear()
+        // wiping the verdict so the job could end carrying a peer's
+        // cancellation noise instead of the diagnosis. restart_job_locked_
+        // checks this at entry and fails the job with the preserved cause.
+        std::string fatal_cause;
         // Deadline by which the awaiting_restart drain must complete.
         // Set when the job enters awaiting_restart (now +
         // Config.restart_drain_timeout); the watchdog fails the job if the

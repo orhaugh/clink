@@ -12,9 +12,19 @@
 #
 # count  path
 #
-# The one remaining entry is not a wait at all: test_postgres_pipeline's
-# source sleeps ON PURPOSE to pace its emissions (a deliberately slow
-# producer is the fixture's point). The HA-standby and CDC waits that used
-# to sit here were converted 2026-08-10 - the engine now announces standby
-# entry, and the CDC test polls pg_stat_replication for its walsender.
+# The remaining entries are not waits at all:
+#  * test_postgres_pipeline's source sleeps ON PURPOSE to pace its emissions
+#    (a deliberately slow producer is the fixture's point). The HA-standby
+#    and CDC waits that used to sit here were converted 2026-08-10 - the
+#    engine now announces standby entry, and the CDC test polls
+#    pg_stat_replication for its walsender.
+#  * test_soak's kill loop sleeps 5s between killing a worker and respawning
+#    it ON PURPOSE: the gap is the scenario. A worker respawned instantly
+#    into its old slot is item 46's path and a DIFFERENT test; the soak
+#    wants the watchdog to declare the loss and the restart to land first,
+#    and there is no observable for "the watchdog has not yet fired" to wait
+#    on - the wait would be for the absence of an event. The 250ms and 10s
+#    sleeps in the same file are poll/sample intervals the checker already
+#    exempts; this is the one deliberate pause.
 1      tests/integration/test_postgres_pipeline.cpp
+1      tests/integration/test_soak.cpp

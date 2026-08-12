@@ -2326,7 +2326,8 @@ TEST(Cluster, ATruncatedCheckpointIsRefusedAtRestoreWhileTheGoodOneStillRestores
     {
         clink::application::SubmitOptions opts;
         opts.wait_for_completion = true;
-        opts.wait_timeout = 20s;
+        opts.wait_timeout = clink::test_support::scale_slack(20s);
+        opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
         opts.checkpoint.checkpoint_dir = dir_good.string();
         opts.checkpoint.interval_ms = 50;
         auto r = submitter.submit(clink_parity_graph(1, out1).to_json(), {plugin.string()}, opts);
@@ -2346,7 +2347,8 @@ TEST(Cluster, ATruncatedCheckpointIsRefusedAtRestoreWhileTheGoodOneStillRestores
     {
         clink::application::SubmitOptions opts;
         opts.wait_for_completion = true;
-        opts.wait_timeout = 20s;
+        opts.wait_timeout = clink::test_support::scale_slack(20s);
+        opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
         opts.checkpoint.checkpoint_dir = dir_bad.string();
         opts.checkpoint.interval_ms = 50;
         opts.checkpoint.restore_from_dir = dir_good.string();
@@ -2370,7 +2372,8 @@ TEST(Cluster, ATruncatedCheckpointIsRefusedAtRestoreWhileTheGoodOneStillRestores
     {
         clink::application::SubmitOptions opts;
         opts.wait_for_completion = true;
-        opts.wait_timeout = 20s;
+        opts.wait_timeout = clink::test_support::scale_slack(20s);
+        opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
         opts.checkpoint.checkpoint_dir = (tmp / ("clink_trunc_scratch_" + tag)).string();
         opts.checkpoint.interval_ms = 0;
         opts.checkpoint.restore_from_dir = dir_bad.string();
@@ -2398,7 +2401,8 @@ TEST(Cluster, ATruncatedCheckpointIsRefusedAtRestoreWhileTheGoodOneStillRestores
     {
         clink::application::SubmitOptions opts;
         opts.wait_for_completion = true;
-        opts.wait_timeout = 20s;
+        opts.wait_timeout = clink::test_support::scale_slack(20s);
+        opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
         opts.checkpoint.checkpoint_dir = (tmp / ("clink_trunc_scratch3_" + tag)).string();
         opts.checkpoint.interval_ms = 0;
         opts.checkpoint.restore_from_dir = dir_good.string();
@@ -2470,7 +2474,8 @@ TEST(Cluster, ARestartBeforeTheFirstCheckpointKeepsTheSubmittedRestorePoint) {
     {
         clink::application::SubmitOptions opts;
         opts.wait_for_completion = true;
-        opts.wait_timeout = 20s;
+        opts.wait_timeout = clink::test_support::scale_slack(20s);
+        opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
         opts.checkpoint.checkpoint_dir = dir_good.string();
         opts.checkpoint.interval_ms = 50;
         auto r = submitter.submit(clink_parity_graph(1, out1).to_json(), {plugin.string()}, opts);
@@ -2490,7 +2495,8 @@ TEST(Cluster, ARestartBeforeTheFirstCheckpointKeepsTheSubmittedRestorePoint) {
     {
         clink::application::SubmitOptions opts;
         opts.wait_for_completion = true;
-        opts.wait_timeout = 30s;
+        opts.wait_timeout = clink::test_support::scale_slack(30s);
+        opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
         opts.checkpoint.checkpoint_dir = dir_scratch.string();
         opts.checkpoint.interval_ms = 0;
         opts.checkpoint.restore_from_dir = dir_good.string();
