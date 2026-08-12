@@ -335,3 +335,154 @@ TEST(InMemoryStateBackend, SnapshotBytesParseAsArrowIPC) {
     EXPECT_EQ(batch->num_rows(), 2);
 }
 #endif
+
+// ---- Barrier-consistent staging (stage_operator_rows) -------------------
+//
+// The API that closes the torn-source-offset defect: a source writes its
+// offset at barrier N on its own thread, but the chain's TAIL performs the
+// durable capture when the barrier reaches IT - by which time the source
+// has drained barrier N+1 over the same slot. Checkpoint N's snapshot then
+// recorded checkpoint N+1's offset, and a restore of N resumed PAST the
+// records in between. Found live via `clink state-cat` (checkpoint 4
+// holding offset 12 while its committed output ended at record 8).
+//
+// Until now its only coverage was the Kafka exactly-once integration suite
+// - a Docker-dependent, minutes-long e2e for a core state-backend
+// contract. These pin the semantics directly, one branch each.
+
+TEST(InMemoryStateBackendStaging, ASnapshotSerialisesTheStagedRowsNotTheLiveOnes) {
+    InMemoryStateBackend b;
+    const OperatorId op{7};
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"AT-BARRIER"}));
+
+    b.stage_operator_rows(op, CheckpointId{4});
+    // The write that used to corrupt checkpoint 4: it happens after the
+    // barrier was staged but before the tail captures.
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"AFTER-BARRIER"}));
+
+    const auto snap = b.snapshot(CheckpointId{4});
+    InMemoryStateBackend restored;
+    restored.restore(snap);
+    const auto v = restored.get_operator_state(op, sv(std::string{"off"}));
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(to_string(*v), "AT-BARRIER")
+        << "checkpoint 4 captured a value written AFTER its barrier - the tear this API closes";
+
+    // The LIVE backend is untouched by staging: the post-barrier write is
+    // still what the running job sees.
+    const auto live = b.get_operator_state(op, sv(std::string{"off"}));
+    ASSERT_TRUE(live.has_value());
+    EXPECT_EQ(to_string(*live), "AFTER-BARRIER");
+}
+
+TEST(InMemoryStateBackendStaging, StagingIsConsumedByItsOwnCheckpointAndNotReused) {
+    InMemoryStateBackend b;
+    const OperatorId op{7};
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"AT-4"}));
+    b.stage_operator_rows(op, CheckpointId{4});
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"AT-5"}));
+
+    (void)b.snapshot(CheckpointId{4});
+    // Checkpoint 5 was never staged, so it must serialise LIVE rows. If
+    // staging leaked past its own id, every later checkpoint would freeze
+    // at the staged value - state that stops advancing, silently.
+    const auto snap5 = b.snapshot(CheckpointId{5});
+    InMemoryStateBackend restored;
+    restored.restore(snap5);
+    const auto v = restored.get_operator_state(op, sv(std::string{"off"}));
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(to_string(*v), "AT-5")
+        << "a consumed staging still substituted into a later snapshot";
+}
+
+TEST(InMemoryStateBackendStaging, AnAbortedCheckpointsStagingIsPrunedByTheNextCompletedOne) {
+    InMemoryStateBackend b;
+    const OperatorId op{7};
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"AT-4"}));
+    b.stage_operator_rows(op, CheckpointId{4});  // this one will never snapshot (aborted)
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"AT-5"}));
+    b.stage_operator_rows(op, CheckpointId{5});
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"AT-6"}));
+
+    // Snapshotting 5 must use 5's staging AND drop 4's - otherwise an
+    // aborted checkpoint's copy accumulates for the life of the job.
+    const auto snap5 = b.snapshot(CheckpointId{5});
+    InMemoryStateBackend restored;
+    restored.restore(snap5);
+    const auto v = restored.get_operator_state(op, sv(std::string{"off"}));
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(to_string(*v), "AT-5");
+
+    // 4's staging is gone: a (nonsensical, but observable) later snapshot
+    // of id 4 now sees live rows rather than the stale staged copy.
+    const auto snap4 = b.snapshot(CheckpointId{4});
+    InMemoryStateBackend restored4;
+    restored4.restore(snap4);
+    const auto v4 = restored4.get_operator_state(op, sv(std::string{"off"}));
+    ASSERT_TRUE(v4.has_value());
+    EXPECT_EQ(to_string(*v4), "AT-6") << "the aborted checkpoint's staged copy was never pruned";
+}
+
+TEST(InMemoryStateBackendStaging, StagingAnOperatorWithNoRowsExcludesRowsItGainsLater) {
+    // The empty-copy branch, stated in the API contract: an operator that
+    // held nothing at the barrier must hold nothing in that checkpoint,
+    // even if it gains rows before the tail captures. Without the explicit
+    // empty stage, the live rows would be serialised and the checkpoint
+    // would contain state that did not exist at its own cut.
+    InMemoryStateBackend b;
+    const OperatorId op{7};
+    b.stage_operator_rows(op, CheckpointId{4});
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"AFTER-BARRIER"}));
+
+    const auto snap = b.snapshot(CheckpointId{4});
+    InMemoryStateBackend restored;
+    restored.restore(snap);
+    EXPECT_FALSE(restored.get_operator_state(op, sv(std::string{"off"})).has_value())
+        << "a row written after the barrier landed inside the checkpoint";
+}
+
+TEST(InMemoryStateBackendStaging, StagingOneOperatorLeavesTheOthersOnTheirLiveRows) {
+    // Only the source stages; every other operator in a shared backend must
+    // still be captured live, or staging would silently freeze the rest of
+    // the chain's state at whatever the source's barrier saw.
+    InMemoryStateBackend b;
+    const OperatorId staged{7};
+    const OperatorId other{9};
+    b.put_operator_state(staged, sv(std::string{"off"}), sv(std::string{"AT-BARRIER"}));
+    b.put(other, sv(std::string{"k"}), sv(std::string{"OLD"}));
+
+    b.stage_operator_rows(staged, CheckpointId{4});
+    b.put_operator_state(staged, sv(std::string{"off"}), sv(std::string{"AFTER"}));
+    b.put(other, sv(std::string{"k"}), sv(std::string{"NEW"}));
+
+    const auto snap = b.snapshot(CheckpointId{4});
+    InMemoryStateBackend restored;
+    restored.restore(snap);
+    EXPECT_EQ(to_string(*restored.get_operator_state(staged, sv(std::string{"off"}))),
+              "AT-BARRIER");
+    const auto v = restored.get(other, sv(std::string{"k"}));
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(to_string(*v), "NEW") << "an unstaged operator was frozen by another's staging";
+}
+
+TEST(InMemoryStateBackendStaging, ARestoreDropsStagingFromThePreviousIncarnation) {
+    // A restored backend is a NEW incarnation of the subtask; staging left
+    // by the one that died must not substitute into its checkpoints.
+    InMemoryStateBackend b;
+    const OperatorId op{7};
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"PRE-RESTORE"}));
+    b.stage_operator_rows(op, CheckpointId{4});
+
+    InMemoryStateBackend source;
+    source.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"RESTORED"}));
+    b.restore(source.snapshot(CheckpointId{1}));
+    b.put_operator_state(op, sv(std::string{"off"}), sv(std::string{"POST-RESTORE"}));
+
+    const auto snap = b.snapshot(CheckpointId{4});
+    InMemoryStateBackend check;
+    check.restore(snap);
+    const auto v = check.get_operator_state(op, sv(std::string{"off"}));
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(to_string(*v), "POST-RESTORE")
+        << "staging from before the restore substituted into the new incarnation's checkpoint";
+}

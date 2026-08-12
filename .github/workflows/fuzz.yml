@@ -17,6 +17,11 @@ on:
   schedule:
     - cron: "45 3 * * 1"  # Mondays 03:45 UTC, clear of the 02:30 sanitizer run
   workflow_dispatch:
+    inputs:
+      seconds:
+        description: "max_total_time per target (a campaign is this knob turned up)"
+        required: false
+        default: "300"
 
 permissions:
   contents: read
@@ -51,6 +56,14 @@ jobs:
       fail-fast: false
       matrix:
         target: [cluster_frame, data_frame, checkpoint_meta, state_version_map, fault_spec]
+        sql: [OFF]
+        include:
+          # The SQL parser is the largest untrusted-input surface the engine
+          # has; it fuzzes under its own matrix entry because it is the one
+          # target that needs the SQL frontend built (the slow part every
+          # other target deliberately skips).
+          - target: sql_parse
+            sql: ON
     steps:
       - uses: actions/checkout@v4
 
@@ -80,8 +93,8 @@ jobs:
           apt-get install -y -q --no-install-recommends clang libclang-rt-dev ninja-build
 
       - name: Configure and build the target
-        # SQL off: the fuzz targets do not touch it and the build is the slow
-        # part of this job. The probe in fuzz/CMakeLists.txt compiles a
+        # SQL follows the matrix: only the sql_parse target needs the
+        # frontend, and the build is the slow part of this job. The probe in fuzz/CMakeLists.txt compiles a
         # TestOneInput-only source - see the comment there for why a main()
         # in the probe reports a working toolchain as broken.
         run: |
@@ -89,7 +102,7 @@ jobs:
           # which follows CLINK_BUILD_TESTS - and with tests off the fault_spec
           # target simply does not exist and this matrix job fails at build.
           cmake -S . -B build-fuzz -G Ninja \
-            -DCLINK_BUILD_FUZZERS=ON -DCLINK_BUILD_SQL=OFF \
+            -DCLINK_BUILD_FUZZERS=ON -DCLINK_BUILD_SQL=${{ matrix.sql }} \
             -DCLINK_ENABLE_FAULT_INJECTION=ON \
             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
           cmake --build build-fuzz --target clink_fuzz_${{ matrix.target }} clink_fuzz_seeds
@@ -110,7 +123,7 @@ jobs:
           cp seeds/${{ matrix.target }}/* corpus-work/ 2>/dev/null || true
           cp fuzz/corpus/${{ matrix.target }}/* corpus-work/ 2>/dev/null || true
           ./build-fuzz/fuzz/clink_fuzz_${{ matrix.target }} corpus-work \
-            -max_total_time=300 -timeout=5 -artifact_prefix=artifacts/ \
+            -max_total_time=${{ inputs.seconds || 300 }} -timeout=5 -artifact_prefix=artifacts/ \
             -print_final_stats=1 2>&1 | tail -20
 
       - name: Upload crash artefacts

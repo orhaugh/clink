@@ -498,6 +498,28 @@ if(CLINK_INTEGRATION_TESTS)
         PROPERTIES TIMEOUT 120 LABELS integration
                    RESOURCE_LOCK clink_multiprocess_cluster)
 
+    # Soak: wall-clock endurance under a kill cadence (hardening item 22).
+    # Its own executable and its own label so `-L integration` stays
+    # minutes-scale; the budget comes from CLINK_SOAK_MINUTES (default 8).
+    # The ctest cap is sized for the LONGEST run anyone is expected to ask
+    # for on demand, not for the default - a soak that outgrows its cap
+    # reports as a timeout, which reads as a hang and buries the real
+    # measurements it took.
+    add_executable(clink_soak_tests integration/test_soak.cpp)
+    target_link_libraries(clink_soak_tests PRIVATE
+        clink::core
+        GTest::gtest_main
+        clink::test_support)
+    target_include_directories(clink_soak_tests PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(clink_soak_tests PRIVATE
+        CLINK_NODE_BINARY=\"$<TARGET_FILE:clink_node>\")
+    add_dependencies(clink_soak_tests clink_node)
+    clink_set_warnings(clink_soak_tests)
+    gtest_discover_tests(clink_soak_tests
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES TIMEOUT 14400 LABELS soak
+                   RESOURCE_LOCK clink_multiprocess_cluster)
+
     # Failover + cold-start benchmark. A standalone (non-gtest) driver that
     # spawns real clink_node coordinator/worker processes, times the cold-start path and
     # a worker-crash recovery, and prints a clink-only scoreboard. It reuses the

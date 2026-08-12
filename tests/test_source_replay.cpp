@@ -376,3 +376,138 @@ TEST(SourceReplay, DefaultCheckpointHooksAreNoOps) {
     std::filesystem::remove(path);
     SUCCEED();
 }
+
+// ---- PacedVectorSource --------------------------------------------------
+//
+// The rate-limited sibling VectorSource cannot be: VectorSource emits its
+// WHOLE vector in one produce() call, so a job wanting wall-clock duration
+// (a soak) or a barrier mid-stream (the checkpoint-confirm tests) cannot
+// get one by slowing anything down from outside. Pacing has to live inside
+// produce(), between which the source runner drains pending barriers.
+//
+// The load-bearing claim is interchangeability: it shares VectorSource's
+// exact offset contract, so a checkpoint written by one restores through
+// the other and the restore machinery cannot tell them apart. That claim
+// was a comment until these tests.
+
+TEST(SourceReplay, PacedVectorSourceEmitsOneRecordPerProduceCall) {
+    std::vector<Record<int>> records;
+    for (int i = 0; i < 4; ++i) {
+        records.emplace_back(Record<int>{i});
+    }
+    // Zero delay: the pacing MECHANISM (one record per call) is what is
+    // under test, not the sleep - a test whose runtime is a duration would
+    // be measuring the clock.
+    PacedVectorSource<int> src(std::move(records), std::chrono::milliseconds{0}, "paced");
+
+    auto channel = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> emitter(channel.get());
+    ASSERT_TRUE(src.produce(emitter));
+    auto after_one = drain_ints(*channel);
+    EXPECT_EQ(after_one, (std::vector<int>{0}))
+        << "a paced source that emits more than one record per call cannot be checkpointed "
+           "mid-stream, which is the entire reason it exists";
+
+    while (src.produce(emitter)) {
+    }
+    auto rest = drain_ints(*channel);
+    EXPECT_EQ(rest, (std::vector<int>{1, 2, 3}));
+}
+
+TEST(SourceReplay, PacedVectorSourceResumesFromItsSnapshottedOffset) {
+    InMemoryStateBackend backend;
+    const OperatorId op_id{78};
+
+    std::vector<Record<int>> records;
+    for (int i = 0; i < 6; ++i) {
+        records.emplace_back(Record<int>{i});
+    }
+    PacedVectorSource<int> src(std::move(records), std::chrono::milliseconds{0}, "paced");
+
+    auto channel = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> emitter(channel.get());
+    src.produce(emitter);
+    src.produce(emitter);
+    src.snapshot_offset(backend, op_id, CheckpointId{1});
+    EXPECT_EQ(drain_ints(*channel), (std::vector<int>{0, 1}));
+
+    std::vector<Record<int>> same;
+    for (int i = 0; i < 6; ++i) {
+        same.emplace_back(Record<int>{i});
+    }
+    PacedVectorSource<int> resumed(std::move(same), std::chrono::milliseconds{0}, "paced");
+    ASSERT_TRUE(resumed.restore_offset(backend, op_id));
+    auto channel2 = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> emitter2(channel2.get());
+    while (resumed.produce(emitter2)) {
+    }
+    EXPECT_EQ(drain_ints(*channel2), (std::vector<int>{2, 3, 4, 5}))
+        << "the resumed source replayed records its prior run already shipped, or skipped some";
+}
+
+TEST(SourceReplay, PacedAndUnpacedSourcesShareOneOffsetContract) {
+    // Interchangeability, both directions. int64_range_source picks between
+    // the two on a `delay_ms` param, so a job that changes that param
+    // between runs - or an engine change that flips the default - must
+    // still restore from the checkpoint the other flavour wrote. A
+    // divergent key or wire format would present as a source silently
+    // replaying from zero, which is duplicate output, not a crash.
+    InMemoryStateBackend backend;
+    const OperatorId op_id{79};
+
+    // Paced writes the offset; unpaced reads it.
+    {
+        std::vector<Record<int>> records;
+        for (int i = 0; i < 5; ++i) {
+            records.emplace_back(Record<int>{i});
+        }
+        PacedVectorSource<int> paced(std::move(records), std::chrono::milliseconds{0}, "paced");
+        auto ch = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+        Emitter<int> em(ch.get());
+        paced.produce(em);
+        paced.produce(em);
+        paced.produce(em);
+        paced.snapshot_offset(backend, op_id, CheckpointId{1});
+    }
+    {
+        std::vector<Record<int>> records;
+        for (int i = 0; i < 5; ++i) {
+            records.emplace_back(Record<int>{i});
+        }
+        VectorSource<int> unpaced(std::move(records), "unpaced");
+        ASSERT_TRUE(unpaced.restore_offset(backend, op_id));
+        auto ch = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+        Emitter<int> em(ch.get());
+        unpaced.produce(em);
+        EXPECT_EQ(drain_ints(*ch), (std::vector<int>{3, 4}))
+            << "an unpaced source could not resume from a paced source's checkpoint";
+    }
+
+    // And the reverse: unpaced writes, paced reads.
+    InMemoryStateBackend backend2;
+    {
+        std::vector<Record<int>> records;
+        for (int i = 0; i < 5; ++i) {
+            records.emplace_back(Record<int>{i});
+        }
+        VectorSource<int> unpaced(std::move(records), "unpaced");
+        auto ch = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+        Emitter<int> em(ch.get());
+        unpaced.produce(em);  // emits all five
+        unpaced.snapshot_offset(backend2, op_id, CheckpointId{1});
+    }
+    {
+        std::vector<Record<int>> records;
+        for (int i = 0; i < 5; ++i) {
+            records.emplace_back(Record<int>{i});
+        }
+        PacedVectorSource<int> paced(std::move(records), std::chrono::milliseconds{0}, "paced");
+        ASSERT_TRUE(paced.restore_offset(backend2, op_id));
+        auto ch = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+        Emitter<int> em(ch.get());
+        while (paced.produce(em)) {
+        }
+        EXPECT_TRUE(drain_ints(*ch).empty())
+            << "a paced source re-emitted records an unpaced run had already shipped";
+    }
+}
