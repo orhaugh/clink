@@ -37,6 +37,7 @@ const auto* const kSinkEnv = ::testing::AddGlobalTestEnvironment(new RegisterBui
 struct FileSink2PCContract {
     using Value = std::string;
     static constexpr std::string_view kCapabilityName = "file_2pc";
+    static bool available() { return true; }
 
     static SinkContractFixture<std::string> make(const std::filesystem::path& dir) {
         const auto out = dir / "out";
@@ -72,6 +73,7 @@ struct FileSink2PCContract {
 struct ParquetSink2PCContract {
     using Value = std::int64_t;
     static constexpr std::string_view kCapabilityName = "parquet_2pc";
+    static bool available() { return true; }
 
     static SinkContractFixture<std::int64_t> make(const std::filesystem::path& dir) {
         const auto out = dir / "out";

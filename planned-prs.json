@@ -101,8 +101,19 @@
       "risk": "A sink's exactly-once claim rests on crash windows nothing exercises uniformly: visible-before-commit, non-idempotent recommit, lost prepared transactions.",
       "files": ["include/clink/test/sink_contract.hpp", "tests/test_sink_contract.cpp"],
       "tests": ["SinkContractSuite (FileSink2PC, ParquetSink2PC instantiations; 8 cases each)"],
-      "dependencies": ["PR-08"],
-      "follow_up": "instantiate for the container-backed 2PC sinks (kafka_2pc, postgres_2pc, s3 multipart) under the live label; upsert-family variant with idempotency-key semantics"
+      "dependencies": ["PR-08"]
+    },
+    {
+      "id": "PR-10",
+      "priority": "P0",
+      "title": "Contract suites live: postgres_2pc + s3_2pc under SinkContractSuite against real servers; new UpsertContractSuite (idempotency-key collapse) instantiated for postgres_upsert; Kafka exclusion documented (non-recoverable commit, KIP-939 the sanctioned future path)",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "The 2PC crash windows were held hermetically but not against real PREPARE TRANSACTION / multipart-upload state; the effectively-once family had no executable collapse obligation at all.",
+      "files": ["include/clink/test/upsert_contract.hpp", "impls/postgres/tests/test_postgres_contract_suites.cpp", "impls/s3/tests/test_s3_contract_suite.cpp", "scripts/run-all-live.sh"],
+      "tests": ["PostgresSink2PC/SinkContractSuite (8, live)", "PostgresUpsert/UpsertContractSuite (5, live)", "S3Sink2PC/SinkContractSuite (8, live)"],
+      "dependencies": ["PR-09"],
+      "follow_up": "upsert instantiations for redis/cassandra/mongodb/mysql upsert sinks; changelog-delete semantics as an optional upsert-contract case"
     }
   ],
   "verified_already_done": [

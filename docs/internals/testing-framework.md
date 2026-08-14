@@ -285,8 +285,36 @@ once however many recoveries run, a crash before prepare publishes
 nothing, and checkpoints commit independently. The capability gate is
 strict: a record claiming anything weaker than transactional exactly-once
 FAILS the suite rather than skipping - either the record under-claims or
-this is the wrong suite for the connector. In-tree instantiations:
-`tests/test_sink_contract.cpp` (`file_2pc`, `parquet_2pc`).
+this is the wrong suite for the connector.
+
+Instantiations: hermetic in `tests/test_sink_contract.cpp` (`file_2pc`,
+`parquet_2pc`), and live against real servers in
+`impls/postgres/tests/test_postgres_contract_suites.cpp` (crash windows on
+genuine `PREPARE TRANSACTION` state) and
+`impls/s3/tests/test_s3_contract_suite.cpp` (genuine multipart-upload
+state), both under `run-all-live.sh`. Live adapters self-skip via the
+required `available()` member when their server is unreachable. Kafka's
+2PC is deliberately NOT instantiated: it is not `CommittingSink`-shaped,
+and its commit is non-recoverable - neither librdkafka nor the Java
+client exposes a supported resume-prepared-transaction API (Flink's sink
+does it by reflecting into the Java producer's private internals; KIP-939
+is the sanctioned future path) - so its contract
+(never-missing/never-foreign, duplicates bounded to one interval per
+kill) is held by the commit-confirmed restore protocol tests in
+`tests/integration/` instead.
+
+## The upsert contract suite
+
+`clink/test/upsert_contract.hpp` holds the third delivery family:
+`EffectivelyOnceIdempotent`. The obligations are collapse, not
+transactions: replaying the identical batch - same instance or a fresh
+one that crashed before acknowledging - must converge the external state
+to one row per idempotency key, and a newer write for a key must replace
+the older row, never sit beside it. The gate requires the record to claim
+`EffectivelyOnceIdempotent` AND name its `idempotency_key_option`: the
+analyser's "your key must be right" warning is only honest while a suite
+holds the collapse behaviour behind it. In-tree instantiation:
+`postgres_upsert` (live, same file as the postgres 2PC instantiation).
 
 ## Related
 

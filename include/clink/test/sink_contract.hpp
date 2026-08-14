@@ -30,6 +30,9 @@
 //   struct MySinkContract {
 //       using Value = <element type T>;
 //       static constexpr std::string_view kCapabilityName = "my_2pc";
+//       // Live instantiations self-skip when their external system is not
+//       // reachable (env unset, server down); hermetic ones return true.
+//       static bool available();
 //       // A fixture over a scratch destination under `dir`:
 //       //   fresh     - a new, identically-configured sink over the SAME
 //       //               destination (the crash cases construct several).
@@ -96,6 +99,10 @@ protected:
     using T = typename Adapter::Value;
 
     void SetUp() override {
+        if (!Adapter::available()) {
+            GTEST_SKIP() << "external system for '" << Adapter::kCapabilityName
+                         << "' is not reachable (live instantiations self-skip)";
+        }
         dir_ = std::filesystem::temp_directory_path() /
                ("clink_sink_contract_" + std::to_string(::getpid()) + "_" +
                 ::testing::UnitTest::GetInstance()->current_test_info()->name());
@@ -116,6 +123,11 @@ protected:
     std::shared_ptr<Sink<T>> wired(const SinkContractFixture<T>& fx) {
         auto sink = fx.fresh();
         sink->set_id(clink::OperatorId{42});
+        // A stable uid: connectors that derive an external transaction
+        // identity from it (the postgres sink's prepared-transaction gid)
+        // must produce the SAME identity across the "restart" the crash
+        // cases simulate, or recovery cannot find its own orphans.
+        sink->set_uid("contract_sink");
         sink->attach_runtime(rctx_.get());
         return sink;
     }
