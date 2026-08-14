@@ -1,0 +1,1 @@
+{"name":"fixture-job","determinism_coverage":"sql-planner","ops":[{"id":"src","type":"file_line_source","uid":"fixture-src","out_channel":"string","parallelism":1,"inputs":[],"params":{}},{"id":"snk","type":"file_line_sink","out_channel":"string","parallelism":1,"inputs":["src"],"params":{"path":"/tmp/out.txt"}}]}

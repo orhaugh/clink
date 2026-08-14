@@ -1,0 +1,5 @@
+clink_checkpoint_meta=1
+checkpoint_id=42
+payload_bytes=1234
+payload_crc32c=3735928559
+a_key_from_the_future=7

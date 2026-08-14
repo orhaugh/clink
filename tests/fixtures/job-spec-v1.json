@@ -1,0 +1,1 @@
+{"ops":[{"id":"src","type":"file_line_source","out_channel":"string","parallelism":1,"inputs":[],"params":{}},{"id":"snk","type":"file_line_sink","out_channel":"string","parallelism":1,"inputs":["src"],"params":{}}]}

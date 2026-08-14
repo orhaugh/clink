@@ -12,6 +12,7 @@ add_executable(clink_core_tests
     test_flat_map.cpp
     test_remote_read_backend.cpp
     test_state_parquet_export.cpp
+    test_format_fixtures.cpp
     test_window_state_codecs.cpp
     test_typed_state.cpp
     test_session_window_persistence.cpp
@@ -285,6 +286,11 @@ target_compile_definitions(clink_core_tests PRIVATE
     # resolves, because a moved path would leave it reporting green over
     # zero inputs - a regression corpus that quietly stopped running.
     CLINK_FUZZ_CORPUS_DIR=\"${CMAKE_SOURCE_DIR}/fuzz/corpus\"
+    # Frozen-bytes compatibility fixtures (test_format_fixtures.cpp): files
+    # written by one build that every later build must keep reading. Same
+    # green-over-nothing concern as the corpus above: the tests fail when a
+    # fixture is missing rather than skipping it.
+    CLINK_FORMAT_FIXTURE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/fixtures\"
     # The shipped Prometheus rules. Asserted against the metric constants so
     # a renamed metric fails here rather than silently disabling an alert.
     CLINK_ALERT_RULES_PATH=\"${CMAKE_SOURCE_DIR}/deploy/prometheus/clink-alerts.yaml\"
