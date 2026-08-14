@@ -438,7 +438,52 @@ endif()
 # in-memory / file state backends. Vendor connectors and the RocksDB
 # state backend live under impls/ and link in as separate static libs.
 # ---------------------------------------------------------------------------
-add_library(clink_core STATIC
+# Experiment gate for followups item 30. STATIC is the shipped model: each
+# job .so links its own copy of the engine, so under RTLD_LOCAL every module
+# gets private singletons. The 2026-08-13 audit argued nothing DEPENDS on
+# that (per-job isolation is JobBundle's, keyed by job id, so it is finer
+# than per-.so anyway) and that the duplication is a pure hazard - five
+# defects, each fixed by hand-threading a host instance onto RunnerContext.
+#
+# ON builds the engine once and links every module against it. That
+# experiment was RUN on 2026-08-13 and it FAILS - the audit's argument was
+# about behaviour and missed LIFETIME. Kept, because one command reproduces
+# the finding and a future attempt should start from the failure rather than
+# from the reasoning:
+#
+#   cmake -S . -B build-shared -DCLINK_SHARED_ENGINE=ON \
+#         -DCLINK_INTEGRATION_TESTS=ON && cmake --build build-shared
+#
+# What breaks, on macOS - the platform MOST likely to tolerate it, since its
+# linker already coalesces these symbols: every failure sits on the
+# dlopen -> register -> call-exported-symbol path. SchemaEvoCheck passes its
+# assertions then SIGSEGVs at exit; check-savepoint's CLI subprocess exits
+# 139; SideOutputRecovery fails a worker-kill assertion.
+#
+# The mechanism is one this tree already carries a scar from - see the
+# RTLD_NODELETE comment in src/cluster/restore_compat_gate.cpp: a plugin's
+# build_fn registers std::function closures whose CODE LIVES IN THE MODULE
+# into "process-wide" registries. With a STATIC engine those registries are
+# per-.so, so closure lifetime and registry lifetime are the same lifetime
+# and the ordering is free. Make the engine shared and the registries become
+# genuinely process-wide, outliving the modules whose closures they hold -
+# a use-after-unload at teardown.
+#
+# So the static link IS load-bearing, for lifetime rather than for the
+# behavioural isolation item 30 claimed. Any future attempt has to answer
+# closure ownership across the boundary first (registry entries owning
+# module handles, or a registration protocol that copies rather than
+# captures) - the linkage change is the easy part.
+option(CLINK_SHARED_ENGINE "Build clink_core as ONE shared library (item 30 experiment - KNOWN BROKEN, see comment)" OFF)
+if(CLINK_SHARED_ENGINE)
+    set(_clink_core_linkage SHARED)
+    message(WARNING "clink::core - SHARED engine: a KNOWN-FAILING experiment (item 30). "
+                    "Plugin-registered closures outlive nothing and the dlopen paths SIGSEGV. "
+                    "See the comment above this option in CMakeLists.txt.")
+else()
+    set(_clink_core_linkage STATIC)
+endif()
+add_library(clink_core ${_clink_core_linkage}
     src/fault/fault_injection.cpp
     src/connectors/capability.cpp
     src/connectors/builtin_capabilities.cpp
