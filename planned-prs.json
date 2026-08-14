@@ -1,0 +1,99 @@
+{
+  "base_revision": "3c47c930c6a6acb47bcde8ab81674d0dfc6c8780",
+  "audit_date": "2026-08-14",
+  "note": "Verify-first round against the 2026-08-14 external audit. Most of the audit's P0 surface was closed by the 2026-08 hardening rounds (docs/production-hardening-followups.md items 1-62); the items below are the residues a fresh sweep of HEAD confirmed as real. Full record: docs/production-hardening-plan.md section 9.",
+  "items": [
+    {
+      "id": "PR-01",
+      "priority": "P0",
+      "title": "SQL: reject silently-dropped SELECT clauses (FOR UPDATE, FOR SHARE, SELECT INTO, bare HAVING, named WINDOW); global-or-refused LIMIT/OFFSET at parallelism > 1",
+      "status": "completed",
+      "result_revision": "11ff9cc",
+      "risk": "A query is accepted and returns numbers that do not mean what the SQL says.",
+      "files": ["src/sql/ast_builder.cpp", "src/sql/physical_plan.cpp", "tests/test_sql_unsupported_semantics.cpp", "tests/test_sql_runtime.cpp"],
+      "tests": ["SqlUnsupportedSemantics.QueryClausesAreImplementedOrRefusedNeverDecorative", "SqlUnsupportedSemantics.SelectIntoIsRefusedNotSilentlyDropped", "SqlRuntime.LimitAndTopNArePlannedAsForcedSingletons", "SqlRuntime.LimitIsGlobalUnderFanOut"],
+      "dependencies": []
+    },
+    {
+      "id": "PR-02",
+      "priority": "P0",
+      "title": "Capabilities manifest: schema_version + git_sha/git_clean in --capabilities-json",
+      "status": "completed",
+      "result_revision": "2ac8ed1",
+      "risk": "Tooling consuming the manifest cannot detect a schema change or map a manifest to a build.",
+      "files": ["include/clink/connectors/capability.hpp", "src/connectors/capability.cpp"],
+      "tests": ["ConnectorCapabilityTest.ManifestJsonDeclaresItsSchemaVersionAndOrigin"],
+      "dependencies": []
+    },
+    {
+      "id": "PR-03",
+      "priority": "P0",
+      "title": "HA: file-backend startup line states its per-host verification scope (etcd CAS + two-contender test verified already present)",
+      "status": "completed",
+      "result_revision": "bfbd1a4",
+      "risk": "An operator reads split-brain safety into a backend that cannot provide it across hosts.",
+      "files": ["tools/clink_node.cpp"],
+      "tests": ["EtcdHaCoordinator.OnlyOneOfTwoCoordinatorsWinsTheElection (live)", "CoordinatorFencing.TwoWritersCannotStraddleTheCasWindow (pre-existing)"],
+      "dependencies": []
+    },
+    {
+      "id": "PR-04",
+      "priority": "P1",
+      "title": "Compatibility inventory (docs/internals/protocol-compatibility.md) + frozen-bytes fixtures under tests/fixtures/",
+      "status": "completed",
+      "result_revision": "b3515c8",
+      "risk": "An incompatible persistent format is consumed silently, or an encode/decode pair co-evolves past its own shipped artefacts.",
+      "files": ["docs/internals/protocol-compatibility.md", "tests/test_format_fixtures.cpp", "tests/fixtures/"],
+      "tests": ["FormatFixtures.*"],
+      "dependencies": []
+    },
+    {
+      "id": "PR-05",
+      "priority": "P1",
+      "title": "DeterminismFacts populated from the job graph; UNKNOWN-vs-clean coverage semantics; surfaced wherever the guarantee report renders",
+      "status": "completed",
+      "result_revision": "a50ac4e",
+      "risk": "A delivery-exactly-once pipeline that replays to different values is reported as if replay-stable.",
+      "files": ["src/cluster/guarantee_gate.cpp", "src/connectors/delivery_guarantee.cpp", "src/sql/physical_plan.cpp", "include/clink/cluster/job_graph.hpp"],
+      "tests": ["GuaranteeGateTest (determinism section)", "SqlRuntime.CompiledSpecsClaimSqlPlannerDeterminismCoverage"],
+      "dependencies": []
+    },
+    {
+      "id": "PR-06",
+      "priority": "P1",
+      "title": "Real OTLP/HTTP export: metrics + lifecycle spans, --otlp-endpoint, no new dependency",
+      "status": "completed",
+      "result_revision": "068db32",
+      "risk": "No production trace/metrics export path; the OTel boundary was a stub.",
+      "files": ["include/clink/metrics/otlp_export.hpp", "src/metrics/otlp_export.cpp", "src/cluster/coordinator.cpp", "tools/clink_node.cpp"],
+      "tests": ["OtlpExport.*", "CheckpointCompletion.ACompletedCheckpointRecordsAnOtlpLifecycleSpan"],
+      "dependencies": []
+    },
+    {
+      "id": "PR-07",
+      "priority": "P2",
+      "title": "Tracking hygiene: W-table statuses reconciled with the follow-ups, round 9 recorded, planned-prs.json committed",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "The plan doc misreports what CI proves - the exact staleness class the doc exists to catch.",
+      "files": ["docs/production-hardening-plan.md", "planned-prs.json"],
+      "tests": [],
+      "dependencies": []
+    }
+  ],
+  "verified_already_done": [
+    {"area": "Exactly-once crash windows", "evidence": "followups items 19/20/51/52/58/61/62: 90-pair fault grid clean, durability-window points armed, output-equality verifier, real-container Kafka/Postgres/S3 arms"},
+    {"area": "Connector capability parity gate", "evidence": "tests/test_connector_manifest_gate.cpp over build-generated enabled-impls list; 21 records / 16 impls; mutation-checked three ways (item 54)"},
+    {"area": "Bounded-state SQL + TTL", "evidence": "items 53/55; test_sql_bounded_state.cpp, test_sql_state_ttl_runtime.cpp, twelve-clause refusal battery"},
+    {"area": "HA CAS on the file backend", "evidence": "fenced_metadata_cas_write under flock, CoordinatorFencing.TwoWritersCannotStraddleTheCasWindow, mutation-checked (item 4); etcd backend atomic create + live two-contender election"},
+    {"area": "Resource/overload limits", "evidence": "frame max/max+1 tests both planes, connection caps tested, first-read deadline, plugin-cache path validation, decode reserve bound, ValidateFull on data plane (items 8/9/10/32/56)"},
+    {"area": "Protocol version negotiation", "evidence": "three enforcement sites driven end to end, protocol_mismatch metric asserted (item 11)"},
+    {"area": "Cancellation/shutdown", "evidence": "items 6/12: operator-level audit + stop-with-savepoint"},
+    {"area": "Fuzz campaign + properties", "evidence": "six targets incl sql_parse, ValidateFull + round-trip properties, committed reproducers replayed in gtest (items 21/56)"}
+  ],
+  "remaining_limitations": [
+    "EXPLAIN does not yet render the guarantee/determinism report inline (it renders at submission and in clink lint)",
+    "OTLP spans cover the checkpoint lifecycle only; submit/recovery/rescale spans and TLS transport are follow-ons",
+    "LIMIT/OFFSET without ORDER BY is global but arrival-order dependent across a fan-in; not yet marked in the determinism report"
+  ]
+}

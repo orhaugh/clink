@@ -3400,26 +3400,34 @@ lives; evidence is in section 4.
 | W2 | Checkpoint integrity: checksums, versioned metadata, incomplete-vs-corrupt, fallback | P0.1, P1.10 | F4 | **Done** |
 | W3 | Durable + race-free coordinator writes; withhold commit on marker failure | P1.10 | F1, F2 | **Done** |
 | W4 | Durable rescale snapshot write with parent verification | P1.10 | F3 | **Done** |
-| W5 | Connector capability contract + runtime/CLI manifest | P0.5 | F5 | **Partial** |
+| W5 | Connector capability contract + runtime/CLI manifest | P0.5 | F5 | **Done** (followups 54; manifest schema_version + git_sha in the 2026-08-14 round) |
 | W6 | End-to-end delivery-guarantee analyser, enforced at submission | P0.6 | F5 | **Done** |
 | W7 | Deterministic multi-process harness | P0.1 | F7 | **Done** |
-| W8 | Fault-tolerance scenarios (gating) + sink exactly-once verified by output equality | P0.1 | F7 | **Partial** |
+| W8 | Fault-tolerance scenarios (gating) + sink exactly-once verified by output equality | P0.1 | F7 | **Done** (followups 19, 20, 51, 52, 58, 61, 62: durability windows armed, real-container Kafka/Postgres/S3 arms, 90-pair fault grid) |
 | W9 | Automated sanitizers (PR subset + nightly full), blocking | P1.7 | F8 | **Done** |
-| W24 | Widen the blocking integration gate; 11 advisory failures had gone unseen | P0.1 | F37, F38 | **Partial** |
+| W24 | Widen the blocking integration gate; 11 advisory failures had gone unseen | P0.1 | F37, F38 | **Done** (followups 16, 17, 18, 28) |
 | W10 | `clink checkpoint-verify` + migration path | P1.10, P1.12 | F4 | **Done** |
 | W11 | SQL bounded-state validator, enforced in the planner | P0.3 | F9 | **Done** |
-| W12 | State TTL depth: event time, incremental cleanup, metrics, SQL `state_ttl` enforced by GROUP BY | P0.3 | F9 | **Partial** |
-| W13 | Strict rejection of unsupported SQL semantics | P0.4 | F14, F15 | **Partial** |
-| W14 | Resource and overload limits: frame size cap, bounded element counts, exception boundaries | P1.9 | F21, F22, F23 | **Partial** |
-| W15 | Coordinator fencing: epoch on the wire, worker enforcement, metadata guard | P1.11 | F16 | **Partial** |
-| W16 | Protocol version negotiation across RPC/frames/state | P1.12 | F19, F20 | **Partial** |
-| W17 | Config linter + recovery profiles, enforced at submission | P1.13 | F31, F36 | **Partial** |
-| W18 | OpenTelemetry tracing | P1.14 | - | **Open** |
-| W19 | Production metrics: staleness gauge, restart counters | P1.15 | F33 | **Partial** |
-| W20 | Non-determinism detection API | P2.16 | - | **Partial** |
-| W21 | Cancellation/shutdown audit | P2.17 | F24 | **Partial** |
-| W22 | Side-output / multi-sink propagation validation | P2.18 | F35 | **Partial** |
-| W23 | Fuzz targets + committed-corpus regression replay | P1.8 | - | **Partial** |
+| W12 | State TTL depth: event time, incremental cleanup, metrics, SQL `state_ttl` enforced by GROUP BY | P0.3 | F9 | **Done** (followups 53, F97-F99) |
+| W13 | Strict rejection of unsupported SQL semantics | P0.4 | F14, F15 | **Done** (followups 55; FOR UPDATE / SELECT INTO / bare HAVING / global LIMIT in the 2026-08-14 round) |
+| W14 | Resource and overload limits: frame size cap, bounded element counts, exception boundaries | P1.9 | F21, F22, F23 | **Done** (followups 8, 9, 10, 32, 56) |
+| W15 | Coordinator fencing: epoch on the wire, worker enforcement, metadata guard | P1.11 | F16 | **Done** (followups 3, 4: flock CAS + split-brain suite) |
+| W16 | Protocol version negotiation across RPC/frames/state | P1.12 | F19, F20 | **Done** (followups 11; inventory + frozen fixtures in the 2026-08-14 round) |
+| W17 | Config linter + recovery profiles, enforced at submission | P1.13 | F31, F36 | **Done** (followups 7) |
+| W18 | OpenTelemetry tracing | P1.14 | - | **Done** (2026-08-14 round: OTLP/HTTP exporter, `--otlp-endpoint`) |
+| W19 | Production metrics: staleness gauge, restart counters | P1.15 | F33 | **Done** (followups 5, 23: per-job state growth, dashboard, alert rules gated) |
+| W20 | Non-determinism detection API | P2.16 | - | **Done** (2026-08-14 round: DeterminismFacts populated from the spec, unknown-vs-clean coverage) |
+| W21 | Cancellation/shutdown audit | P2.17 | F24 | **Done** (followups 6, 12: operator-level audit + stop-with-savepoint) |
+| W22 | Side-output / multi-sink propagation validation | P2.18 | F35 | **Done** (followups 14, 29, 42) |
+| W23 | Fuzz targets + committed-corpus regression replay | P1.8 | - | **Done** (followups 21, 56: six targets incl. sql_parse, properties, committed reproducers) |
+
+Statuses re-verified 2026-08-14. The original round closed with most rows
+Partial because "Partial means has a named gap"; the follow-up backlog
+(docs/production-hardening-followups.md, items 1-62) then closed those gaps
+one at a time, and the 2026-08-14 external re-audit round (section 9)
+closed the remainder. Each row's citation is where the closing evidence
+lives; the historical sections below this table describe the state AT THE
+TIME THEY WERE WRITTEN and are deliberately not rewritten.
 
 ---
 
@@ -5630,3 +5638,129 @@ and the capability behind the removed claim was then built. An engine is product
 an operator can predict how it behaves in the failure modes their deployment
 will actually meet; this round narrowed that gap and documented where it
 remains open.
+
+---
+
+## 9. The 2026-08-14 external re-audit round
+
+A fresh external audit arrived on 2026-08-14, after the follow-up backlog
+had effectively closed (57 of 59 items, findings F1-F101). Its premise was
+verify-first: every recommendation checked against HEAD before any code
+moved. Base revision `3c47c93`; machine-readable tracking in
+`planned-prs.json` at the repo root.
+
+### What the sweep confirmed was already done
+
+Most of the audit's P0 surface was closed by the earlier rounds, and the
+sweep recorded where the evidence lives rather than re-implementing:
+
+| Audit area | Where the evidence lives |
+|---|---|
+| Exactly-once crash-window testing | followups 19, 20, 51, 52, 58, 61, 62: durability-window fault points armed, output-equality verification, real-container Kafka/Postgres/S3 arms, the full 90-pair fault grid clean |
+| Connector capability parity | followups 54: `tests/test_connector_manifest_gate.cpp` over a build-generated enabled-impl list, mutation-checked three ways |
+| SQL bounded state + TTL | followups 53, 55; `test_sql_bounded_state.cpp`, `test_sql_state_ttl_runtime.cpp`, the refusal battery |
+| HA metadata CAS | followups 3, 4: `fenced_metadata_cas_write` under flock (two-writer race pinned, lockless mutant fails), etcd backend with atomic create + two-contender live election test |
+| Resource/overload limits | followups 8, 9, 10, 32, 56: frame max/max+1 both planes, connection caps, first-read deadline, allocation-before-validation fixes, `ValidateFull` on the data plane |
+| Protocol version negotiation | followups 11: all three refusal directions end to end, `protocol_mismatch` metric asserted |
+| Fuzzing + properties | followups 21, 56: six targets incl. `sql_parse`, round-trip/validate properties, committed reproducers replayed under gtest |
+| Cancellation/shutdown | followups 6, 12 |
+
+### What the sweep found open, and what closed it
+
+Each item followed the round's discipline: reproduce first, smallest
+coherent change, mutation-check the gate, run the owning suites.
+
+**R1 - SQL constructs silently dropped (`11ff9cc`).** Probed on HEAD with
+`clink run` + EXPLAIN before touching anything. Three constructs compiled
+and did nothing they said: FOR UPDATE / FOR SHARE vanished at translation;
+SELECT INTO dropped its target table; HAVING without GROUP BY was
+discarded entirely on a non-aggregate SELECT - a filtered query silently
+unfiltered, the worst class this whole programme exists for. All three now
+refuse at translation with position-carrying diagnostics naming the
+alternative. LIMIT and ORDER BY ... LIMIT were per-subtask at
+parallelism > 1; both operators now carry the forced-singleton mark, so
+the count is the result's. The end-to-end gate's fanned mutant emits 12
+rows for LIMIT 5 - below the per-subtask limit on every subtask, which is
+exactly what had kept the defect silent. clink_sql_tests 995/995.
+
+**R2 - capabilities manifest versioning (`2ac8ed1`).** The JSON manifest
+now opens with `schema_version` (1; bumped only for renamed/removed/
+re-typed keys) and the build block carries `git_sha` + `git_clean` from the
+plugin ABI constants. Mutant bumping the constant fails the pin.
+
+**R3 - HA backend scope honesty (`bfbd1a4`).** Verification found the
+substance already present (startup lock probe with refusal, etcd for
+multi-host); the residue was that the probe's per-host scope was stated
+only in docs. The file-HA startup line now names it and points multi-host
+deployments at `--etcd-endpoints`.
+
+**R4/PR-04 - compatibility inventory + frozen fixtures (`b3515c8`).**
+`docs/internals/protocol-compatibility.md` names every independently
+versioned contract (ten domains), each with its version, compatible-change
+rule, enforcement site and failure behaviour - deliberately no shared
+"clink format version". `tests/fixtures/` holds bytes written by one build
+that every later build must keep reading (checkpoint sidecar with an
+unknown future key, RegisterMsg frame, job-spec JSON with and without
+optional tail keys, a keyed snapshot restored through the Savepoint API, a
+v2 capture header), because a round-trip test cannot catch an
+encode/decode pair that co-evolves. Regeneration is env-gated and its
+legitimacy rule is written at the top of the test. Mutation-checked with a
+deleted fixture and a cmp-verified byte flip - the first flip attempt
+wrote 0x00 over a 0x00 padding byte and passed, the no-op-mutation trap
+again.
+
+**R6/PR-05 - determinism facts populated (`a50ac4e`).** `DeterminismFacts`
+existed and nothing populated it, so the analyser's replay-determinism
+warning was unreachable. The gate now classifies from the spec itself
+(ML_PREDICT over http, async lookups, LANGUAGE WASM UDFs, per-op
+`params["determinism"]` declarations), and coverage decides what silence
+means: a planner-compiled spec claims `determinism_coverage=sql-planner`
+so no marks reads deterministic; a plugin graph with no declarations is
+reported UNKNOWN with the undeclared operators named, never inferred
+clean. Delivery and replay determinism stay separate answers in the same
+report. Both cross-component wires mutation-checked.
+
+**R7/PR-06 - real OTLP export (`068db32`).** `--otlp-endpoint=host[:port]`
+ships MetricsRegistry snapshots and lifecycle spans as hand-encoded
+OTLP/HTTP JSON (no opentelemetry-cpp; its Protobuf/gRPC pins fight the
+Arrow pin for nothing at this volume). Off unless asked for; bounded
+drop-oldest span buffer; failures counted, never fatal; `clink.checkpoint`
+is the first span, pinned through the real coordinator by
+`ACompletedCheckpointRecordsAnOtlpLifecycleSpan`. Encoder shape tests
+parse the JSON with the engine's own parser; the 64-bit-as-string
+protobuf-JSON rule and the buffer-arming are both mutation-checked.
+
+### Remaining limitations, explicit
+
+- EXPLAIN prints the logical plan; the guarantee + determinism report
+  renders at submission (coordinator log, ALLOW path included) and in
+  `clink lint`, not yet inline in EXPLAIN output.
+- OTLP spans cover the checkpoint lifecycle only; submit/recovery/rescale
+  spans are follow-ons, as is OTLP over TLS (deployment shape today: a
+  collector agent beside the process).
+- The span-site inventory and the OTLP metric names are documented in
+  `docs/internals/distributed-runtime.md`; Grafana/alerting integration for
+  the new `clink_otlp_*` counters was not added (the Prometheus surface is
+  unchanged and remains primary).
+- LIMIT/OFFSET without ORDER BY selects arrival-order rows - valid SQL,
+  now global, still arrival-dependent across a fan-in; the determinism
+  report does not yet mark it.
+
+### Verification at close of the round
+
+macOS 26.3 (arm64), RelWithDebInfo, SQL ON:
+
+```
+clink_core_tests      2115 ran, 2111 passed, 4 platform skips, 0 failed
+clink_sql_tests        995 passed, 0 failed
+clink_manifest_tests     2 passed
+```
+
+Every new gate was shown red against a compiled mutant before being
+trusted: the SQL refusal battery (three clauses named), the fanned-LIMIT
+output count (12 for LIMIT 5), the manifest schema pin, the fixture reads
+(deleted file, verified byte flip), the determinism unknown-coverage
+warning, the planner coverage stamp, the OTLP integer-as-string encoding,
+and the exporter's buffer arming. CI's push pipeline (sanitizer matrix,
+integration label) provides the Linux and sanitizer evidence for the
+round's commits.
