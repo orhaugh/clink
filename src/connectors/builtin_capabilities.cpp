@@ -95,10 +95,20 @@ void declare_builtin_capabilities() {
         .build_dependencies = {"arrow", "parquet"},
         .formats = {"parquet"},
         .boundedness = Boundedness::Bounded,
-        .replayable = false,
-        .offset_model = OffsetModel::None,
-        .checkpoint_integrated = false,
-        .delivery = DeliveryGuarantee::AtMostOnce,
+        // The source snapshots its batch index (batches_emitted_) between
+        // produce() calls and restore seeks past the already-emitted
+        // batches - see ParquetSource::snapshot_offset/restore_offset.
+        // This record used to claim no position was kept; that was stale
+        // (written before the offset support landed), and it made the
+        // guarantee analyser cap every parquet-source pipeline at
+        // at-most-once and reject exactly-once jobs the engine supports.
+        // The claim is now held by the source contract suite
+        // (tests/test_source_contract.cpp), which replays every produce
+        // boundary.
+        .replayable = true,
+        .offset_model = OffsetModel::FileOffset,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .schema_evolution = true,
         .partition_discovery = true,
@@ -108,8 +118,8 @@ void declare_builtin_capabilities() {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"the source keeps no row-level position, so a mid-file restart "
-                        "restarts that file from the beginning",
+        .limitations = {"offset granularity is the record batch: a restore resumes at the "
+                        "next unread batch",
                         "use parquet_2pc for checkpoint-tied output"},
     });
 

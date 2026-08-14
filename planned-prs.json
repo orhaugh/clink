@@ -74,11 +74,23 @@
       "priority": "P2",
       "title": "Tracking hygiene: W-table statuses reconciled with the follow-ups, round 9 recorded, planned-prs.json committed",
       "status": "completed",
-      "result_revision": "HEAD",
+      "result_revision": "036d73d",
       "risk": "The plan doc misreports what CI proves - the exact staleness class the doc exists to catch.",
       "files": ["docs/production-hardening-plan.md", "planned-prs.json"],
       "tests": [],
       "dependencies": []
+    },
+    {
+      "id": "PR-08",
+      "priority": "P0",
+      "title": "Reusable source contract suite: a capability claim is a test obligation (public clink::test API; file family + parquet instantiated; caught and corrected parquet's stale non-replayable record)",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "A connector's declared semantics drift from its implementation with nothing tying claim to behaviour; the guarantee analyser then reasons from fiction in either direction.",
+      "files": ["include/clink/test/source_contract.hpp", "tests/test_source_contract.cpp", "src/connectors/builtin_capabilities.cpp"],
+      "tests": ["SourceContractSuite (FileSource, DirectoryFileSource, ParquetSource instantiations)"],
+      "dependencies": [],
+      "follow_up": "sink contract suite (2PC windows as reusable templates); per-impl rollout to the container-backed connectors under the live label"
     }
   ],
   "verified_already_done": [

@@ -14,6 +14,7 @@ add_executable(clink_core_tests
     test_state_parquet_export.cpp
     test_format_fixtures.cpp
     test_otlp_export.cpp
+    test_source_contract.cpp
     test_window_state_codecs.cpp
     test_typed_state.cpp
     test_session_window_persistence.cpp

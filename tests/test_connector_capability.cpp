@@ -299,10 +299,24 @@ TEST_F(ConnectorCapabilityTest, MissingRequiredOptionDowngradesAClaimedExactlyOn
 }
 
 TEST_F(ConnectorCapabilityTest, NonReplayableSourceIsAtMostOnceRegardlessOfSink) {
+    // This used to borrow parquet as its non-replayable example, on a
+    // record that claimed "no position is kept" - which was STALE: the
+    // source had grown a real batch-index offset, the source contract
+    // suite proved it replays at every produce boundary, and the record
+    // was corrected. Every built-in source record is now honestly
+    // replayable, so the shape under test gets its own declared record: a
+    // source with no recovery model, which no sink can rescue.
+    CapabilityRegistry::instance().declare(ConnectorCapabilities{
+        .name = "test_amnesiac",
+        .version = "1",
+        .is_source = true,
+        .replayable = false,
+        .offset_model = OffsetModel::None,
+        .checkpoint_integrated = false,
+        .delivery = DeliveryGuarantee::AtMostOnce,
+    });
     PipelineFacts f;
-    // parquet's source keeps no position (declared, verified against the
-    // implementation), so no sink can rescue the pipeline.
-    f.connectors = {src("parquet"), snk("file_2pc", {"dir"})};
+    f.connectors = {src("test_amnesiac"), snk("file_2pc", {"dir"})};
     f.checkpointing_enabled = true;
     f.durable_state_backend = true;
     const auto r = analyse_pipeline(f);

@@ -225,6 +225,49 @@ sequence, and property-testing support with side-output capture. The
 framework's own suite dogfoods it against production operators, and the
 documentation examples compile as tests.
 
+## The source contract suite
+
+`clink/test/source_contract.hpp` turns a connector's capability claims into
+test obligations. You supply a small adapter (element type, the connector's
+`CapabilityRegistry` name, a declared malformed-input policy, and fixture
+factories producing fresh `Source<T>` instances over prepared input); the
+suite then derives what must hold from the connector's own
+`ConnectorCapabilities` record. A record claiming `replayable` +
+`checkpoint_integrated` gets the replay cases run against it: a snapshot
+taken between every pair of `produce()` calls (the boundary the runtime
+itself snapshots at) must restore into a fresh instance whose remainder
+completes the input exactly once, and a snapshot at end-of-input must
+restore to silence. A record claiming neither has those cases skipped with
+the record's own words as the reason. The remaining cases hold uncondi-
+tionally: cancellation stops `produce()` without further data, malformed
+input follows the policy the adapter declared (skip or loud refusal, never
+silent drift between them), and an oversized record arrives intact or
+refuses loudly - truncation is the one outcome that always fails.
+
+```cpp
+struct MySourceContract {
+    using Value = std::string;
+    static constexpr std::string_view kCapabilityName = "my_conn";
+    static constexpr clink::test::MalformedInputPolicy kMalformedPolicy =
+        clink::test::MalformedInputPolicy::Skip;
+    static clink::test::SourceContractFixture<Value> make(
+        const std::filesystem::path& dir, std::size_t count);
+    static std::optional<clink::test::SourceContractFixture<Value>>
+    make_with_malformed(const std::filesystem::path& dir);
+    static std::optional<clink::test::SourceContractFixture<Value>>
+    make_oversized(const std::filesystem::path& dir);
+};
+// In the suite's namespace:
+INSTANTIATE_TYPED_TEST_SUITE_P(MyConn, SourceContractSuite, MySourceContract);
+```
+
+The in-tree instantiations (`tests/test_source_contract.cpp`: the file
+family and Parquet) are worked examples - and the suite's first run
+corrected a record: parquet's claimed "no position is kept" while the
+source had long since grown a batch-index offset that replays cleanly, an
+under-claim that made the guarantee analyser reject exactly-once pipelines
+the engine actually supports.
+
 ## Related
 
 - [./operator-model.md](./operator-model.md) - the operator, emitter and stream-element model the harness drives
