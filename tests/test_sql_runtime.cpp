@@ -13454,6 +13454,26 @@ TEST(SqlRuntime, LimitAndTopNArePlannedAsForcedSingletons) {
         << "top_n_row without the singleton mark emits each shard's own top n";
 }
 
+// Every planner-compiled spec claims its determinism coverage. The
+// delivery-guarantee analyser reads this claim as "an absence of
+// nondeterminism marks means deterministic"; without it a SQL job would be
+// reported as UNKNOWN replay determinism like an uninspectable plugin.
+TEST(SqlRuntime, CompiledSpecsClaimSqlPlannerDeterminismCoverage) {
+    ensure_sql_installed_once();
+    Catalog cat;
+    auto ddl = parse(
+        "CREATE TABLE cov_src (k BIGINT, v BIGINT) "
+        "WITH (connector='kafka', format='json', brokers='b', topic='t', group_id='g');"
+        "CREATE TABLE cov_out (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/cov_out.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    const auto spec = compile(cat, "INSERT INTO cov_out SELECT k, v FROM cov_src");
+    EXPECT_EQ(spec.determinism_coverage, "sql-planner");
+    EXPECT_EQ(cluster::JobGraphSpec::from_json(spec.to_json()).determinism_coverage, "sql-planner")
+        << "the claim must survive the submission round trip";
+}
+
 // End to end: 12 rows, LIMIT 5, the limit's input fanned to parallelism 4.
 // Global semantics emit exactly 5 rows. Under the pre-fix per-subtask
 // semantics the scatter hands each subtask ~3 rows - below the limit - so

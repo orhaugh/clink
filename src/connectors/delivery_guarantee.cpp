@@ -269,6 +269,27 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
             reasons.emplace_back(
                 "delivery is exactly-once, but the OUTPUT is not reproducible across a replay");
         }
+    } else if (!facts.determinism.classification_complete) {
+        // Nothing FOUND is not the same as nothing PRESENT: these operators
+        // are native code the engine cannot inspect, and none of them
+        // declared itself. Report unknown rather than clean - a clean
+        // verdict here would be an inference from silence.
+        std::string which;
+        const auto& ops = facts.determinism.unclassified_operators;
+        for (std::size_t i = 0; i < ops.size() && i < 4; ++i) {
+            if (i > 0) {
+                which += ", ";
+            }
+            which += ops[i];
+        }
+        if (ops.size() > 4) {
+            which += ", +" + std::to_string(ops.size() - 4) + " more";
+        }
+        r.warnings.emplace_back(
+            "replay determinism is UNKNOWN: " + std::to_string(ops.size()) +
+            " operator(s) carry native code with no determinism declaration (" + which +
+            "); declare each with params[\"determinism\"] = \"deterministic\" or "
+            "\"nondeterministic:<reason>\"");
     }
 
     // ---- 6b. Cross-sink atomicity.

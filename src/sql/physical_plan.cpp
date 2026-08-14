@@ -2517,6 +2517,13 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     spec.column_lineage = capture_column_lineage(root, sink_id);
     mark_changelog_producers(spec);
     enable_columnar_output(spec);
+    // Every operator in this spec is planner-emitted engine code: wall-clock
+    // and random functions were rejected at bind time, and the operators
+    // that reach outside the job (ML_PREDICT over http, async lookups) are
+    // identifiable from their specs. The delivery-guarantee analyser reads
+    // this as "an absence of nondeterminism marks means deterministic",
+    // where a plugin-built graph's absence means unknown.
+    spec.determinism_coverage = "sql-planner";
     spec.validate();
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)

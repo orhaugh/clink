@@ -127,6 +127,75 @@ connectors::PipelineFacts pipeline_facts_from_graph(const JobGraphSpec& graph,
             }
         }
     }
+
+    // ---- Replay determinism, classified from the spec itself.
+    //
+    // Delivery and determinism are separate answers: a job can commit each
+    // record exactly once and still emit DIFFERENT values on a replay. The
+    // facts here feed the analyser's warning, and - critically - coverage
+    // decides what silence means. A SQL-compiled graph is fully classified
+    // (determinism_coverage == "sql-planner": wall-clock and random
+    // functions were rejected at bind time, and everything that reaches
+    // outside the job is identifiable below), so no marks means
+    // deterministic. A plugin-built graph's operators are native code the
+    // engine cannot inspect, so no marks means UNKNOWN unless every
+    // operator declares itself via kOpDeterminismParam.
+    auto& det = facts.determinism;
+    det.classification_complete = graph.determinism_coverage == "sql-planner";
+    bool all_ops_declared = !graph.ops.empty();
+    for (const auto& op : graph.ops) {
+        const auto declared = op.params.find(std::string{kOpDeterminismParam});
+        if (declared == op.params.end() || (declared->second != "deterministic" &&
+                                            declared->second.rfind("nondeterministic", 0) != 0)) {
+            all_ops_declared = false;
+            if (!det.classification_complete) {
+                det.unclassified_operators.push_back(op.id + " (" + op.type + ")");
+            }
+        } else if (declared->second.rfind("nondeterministic", 0) == 0) {
+            det.has_nondeterministic_udf = true;
+            const auto colon = declared->second.find(':');
+            det.sources_of_nondeterminism.push_back(
+                "operator '" + op.id + "' declares itself nondeterministic" +
+                (colon == std::string::npos ? "" : ": " + declared->second.substr(colon + 1)));
+        }
+        if (op.type == "ml_predict_row") {
+            // The planner threads the model's WITH options as model.*; a
+            // remote provider means the answer depends on a service outside
+            // the replayed stream.
+            const auto prov = op.params.find("model.provider");
+            if (prov != op.params.end() && prov->second == "http") {
+                det.calls_external_service = true;
+                const auto model = op.params.find("model_name");
+                det.sources_of_nondeterminism.push_back("ML_PREDICT over http" +
+                                                        (model == op.params.end()
+                                                             ? std::string{}
+                                                             : " (model '" + model->second + "')") +
+                                                        " calls a remote inference service");
+            }
+        }
+        if (op.type == "async_lookup_row" || op.type == "async_lookup_join_row") {
+            det.calls_external_service = true;
+            const auto fn = op.params.find("function_name");
+            det.sources_of_nondeterminism.push_back(
+                "async lookup" + (fn == op.params.end() ? std::string{} : " '" + fn->second + "'") +
+                " reads an external system whose answers can change between runs");
+        }
+    }
+    for (const auto& u : graph.udfs) {
+        // LANGUAGE SQL bodies are composed of built-ins the binder already
+        // vets (wall-clock and random are rejected), so they stay clean.
+        // A WASM module is arbitrary guest code with no determinism
+        // metadata: conservative default, assumed nondeterministic.
+        if (u.language == "wasm" || u.language == "WASM") {
+            det.has_nondeterministic_udf = true;
+            det.sources_of_nondeterminism.push_back(
+                "UDF '" + u.name +
+                "' (LANGUAGE WASM) is native guest code with no determinism declaration");
+        }
+    }
+    if (all_ops_declared) {
+        det.classification_complete = true;
+    }
     return facts;
 }
 

@@ -203,4 +203,122 @@ TEST_F(GuaranteeGateTest, ExactlyOnceIsRejectedOnANonDurableStateBackend) {
     EXPECT_NE(reject.find("non-durable state backend"), std::string::npos);
 }
 
+// --- replay determinism -------------------------------------------------
+//
+// Delivery and determinism are orthogonal answers and must not be
+// conflated: a pipeline can commit every record exactly once and still
+// produce different values on a replay. These tests pin the
+// classification the gate derives from the spec, and - as important -
+// what SILENCE means under each coverage claim.
+
+JobGraphSpec sql_graph() {
+    JobGraphSpec g;
+    g.determinism_coverage = "sql-planner";
+    g.ops.push_back(op("kafka_source_string", "src"));
+    g.ops.push_back(op("file_line_sink", "snk", {"src"}));
+    return g;
+}
+
+TEST_F(GuaranteeGateTest, ASqlGraphWithNoOutwardReachingOpsIsDeterministic) {
+    const auto facts = pipeline_facts_from_graph(sql_graph(), durable_checkpointing());
+    EXPECT_TRUE(facts.determinism.deterministic());
+    EXPECT_TRUE(facts.determinism.classification_complete)
+        << "the planner classified every op; silence means deterministic";
+    EXPECT_TRUE(facts.determinism.unclassified_operators.empty());
+}
+
+TEST_F(GuaranteeGateTest, MlPredictOverHttpIsAnExternalServiceCall) {
+    auto g = sql_graph();
+    g.ops.insert(g.ops.begin() + 1,
+                 op("ml_predict_row",
+                    "mlp",
+                    {"src"},
+                    {{"model_name", "scorer"}, {"model.provider", "http"}}));
+    g.ops[2].inputs = {"mlp"};
+    const auto facts = pipeline_facts_from_graph(g, durable_checkpointing());
+    EXPECT_TRUE(facts.determinism.calls_external_service);
+    ASSERT_FALSE(facts.determinism.sources_of_nondeterminism.empty());
+    EXPECT_NE(facts.determinism.sources_of_nondeterminism[0].find("scorer"), std::string::npos);
+    // A LOCAL provider is not an external call: same model file, same answer.
+    auto local = sql_graph();
+    local.ops.insert(local.ops.begin() + 1,
+                     op("ml_predict_row",
+                        "mlp",
+                        {"src"},
+                        {{"model_name", "scorer"}, {"model.provider", "onnx"}}));
+    local.ops[2].inputs = {"mlp"};
+    EXPECT_TRUE(
+        pipeline_facts_from_graph(local, durable_checkpointing()).determinism.deterministic());
+}
+
+TEST_F(GuaranteeGateTest, AsyncLookupsAndWasmUdfsAreClassifiedConservatively) {
+    auto g = sql_graph();
+    g.ops.insert(g.ops.begin() + 1,
+                 op("async_lookup_row", "enrich", {"src"}, {{"function_name", "profile_of"}}));
+    g.ops[2].inputs = {"enrich"};
+    UdfSpec wasm;
+    wasm.name = "custom_score";
+    wasm.language = "wasm";
+    g.udfs.push_back(wasm);
+    const auto facts = pipeline_facts_from_graph(g, durable_checkpointing());
+    EXPECT_TRUE(facts.determinism.calls_external_service);
+    EXPECT_TRUE(facts.determinism.has_nondeterministic_udf);
+    ASSERT_EQ(facts.determinism.sources_of_nondeterminism.size(), 2u);
+    EXPECT_NE(facts.determinism.sources_of_nondeterminism[0].find("profile_of"), std::string::npos);
+    EXPECT_NE(facts.determinism.sources_of_nondeterminism[1].find("custom_score"),
+              std::string::npos);
+}
+
+TEST_F(GuaranteeGateTest, APluginGraphWithNoDeclarationsIsUnknownNotClean) {
+    // No determinism_coverage claim and no per-op declarations: the ops are
+    // native code the engine cannot inspect. "Nothing found" must be
+    // reported as UNKNOWN - a clean verdict would be inferred from silence.
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "src"));
+    g.ops.push_back(op("my_custom_operator", "mid", {"src"}));
+    g.ops.push_back(op("file_line_sink", "snk", {"mid"}));
+    const auto facts = pipeline_facts_from_graph(g, durable_checkpointing());
+    EXPECT_TRUE(facts.determinism.deterministic()) << "nothing was FOUND...";
+    EXPECT_FALSE(facts.determinism.classification_complete) << "...but nothing was CLASSIFIED";
+    EXPECT_EQ(facts.determinism.unclassified_operators.size(), 3u);
+
+    connectors::GuaranteeReport report;
+    (void)check_delivery_guarantee(g, durable_checkpointing(), &report);
+    bool warned_unknown = false;
+    for (const auto& w : report.warnings) {
+        warned_unknown =
+            warned_unknown || w.find("replay determinism is UNKNOWN") != std::string::npos;
+    }
+    EXPECT_TRUE(warned_unknown) << report.render_text();
+}
+
+TEST_F(GuaranteeGateTest, AFullyDeclaredPluginGraphIsClassified) {
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "src", {}, {{"determinism", "deterministic"}}));
+    g.ops.push_back(op("my_custom_operator",
+                       "mid",
+                       {"src"},
+                       {{"determinism", "nondeterministic:reads a remote profile service"}}));
+    g.ops.push_back(op("file_line_sink", "snk", {"mid"}, {{"determinism", "deterministic"}}));
+    const auto facts = pipeline_facts_from_graph(g, durable_checkpointing());
+    EXPECT_TRUE(facts.determinism.classification_complete)
+        << "every op declared itself, so the classification is complete";
+    EXPECT_TRUE(facts.determinism.has_nondeterministic_udf);
+    ASSERT_EQ(facts.determinism.sources_of_nondeterminism.size(), 1u);
+    EXPECT_NE(facts.determinism.sources_of_nondeterminism[0].find("remote profile service"),
+              std::string::npos);
+}
+
+TEST_F(GuaranteeGateTest, DeterminismCoverageSurvivesTheSpecJsonRoundTrip) {
+    // The coverage claim rides the spec through submission; a round trip
+    // that drops it would silently turn every SQL job's report to UNKNOWN.
+    auto g = sql_graph();
+    const auto back = JobGraphSpec::from_json(g.to_json());
+    EXPECT_EQ(back.determinism_coverage, "sql-planner");
+    JobGraphSpec plain;
+    plain.ops.push_back(op("file_line_source", "src"));
+    plain.ops.push_back(op("file_line_sink", "snk", {"src"}));
+    EXPECT_TRUE(JobGraphSpec::from_json(plain.to_json()).determinism_coverage.empty());
+}
+
 }  // namespace

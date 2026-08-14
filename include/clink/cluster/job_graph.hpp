@@ -62,6 +62,19 @@ struct SideOutputDecl {
 // deadlocks the pipeline.
 inline constexpr std::string_view kForcedSingletonParam = "forced_singleton";
 
+// Param an operator author can set to declare replay determinism, consumed
+// by the delivery-guarantee analyser. Values:
+//
+//   "deterministic"            - same input (with event time) => same output.
+//   "nondeterministic:<why>"   - <why> is surfaced verbatim in the report,
+//                                e.g. "reads a remote profile service".
+//
+// SQL-compiled graphs do not need it: the planner classifies every operator
+// it emits (see JobGraphSpec::determinism_coverage). A plugin-built graph
+// that declares nothing is reported as UNKNOWN replay determinism rather
+// than clean - native code the engine cannot inspect defaults conservative.
+inline constexpr std::string_view kOpDeterminismParam = "determinism";
+
 struct JobGraphSpec;
 
 // Fan a compiled plan out to `parallelism` subtasks per operator, leaving any
@@ -182,6 +195,16 @@ struct JobGraphSpec {
     // each before running the job's subtasks. Empty for jobs that use
     // none. Survives HA restart with the rest of the spec.
     std::vector<UdfSpec> udfs;
+
+    // Who classified this graph's replay determinism. "sql-planner" means
+    // every operator is planner-emitted engine code whose nondeterminism
+    // sources (ML_PREDICT over http, async lookups, WASM UDFs) are visible
+    // in the spec, so an absence of marks means DETERMINISTIC. Empty means
+    // nobody did: a plugin-built graph's operators are native code, and the
+    // analyser reports replay determinism as unknown unless every operator
+    // declares itself via kOpDeterminismParam. Absent on the wire when
+    // empty (back-compat).
+    std::string determinism_coverage;
 
     // Compact line-based format. Preserved for the round-trip tests in
     // tests/test_job_graph.cpp and for terse hand-written specs. JSON is

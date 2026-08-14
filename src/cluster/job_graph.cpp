@@ -212,6 +212,11 @@ std::string JobGraphSpec::to_json() const {
         out += escape_json_string(name);
         out += ',';
     }
+    if (!determinism_coverage.empty()) {
+        out += "\"determinism_coverage\":";
+        out += escape_json_string(determinism_coverage);
+        out += ',';
+    }
     out += "\"ops\":[";
     for (std::size_t i = 0; i < ops.size(); ++i) {
         const auto& op = ops[i];
@@ -419,6 +424,8 @@ JobGraphSpec JobGraphSpec::from_json(std::string_view json_text) {
     }
     // Optional human-readable job name (absent for unnamed jobs).
     spec.name = root.string_or("name", "");
+    // Optional determinism-coverage claim (absent for plugin-built specs).
+    spec.determinism_coverage = root.string_or("determinism_coverage", "");
     // Optional column-lineage object (absent for non-SQL jobs); stored as its
     // JSON text so it round-trips without a typed model in the spec layer.
     if (root.contains("column_lineage") && root.at("column_lineage").is_object()) {

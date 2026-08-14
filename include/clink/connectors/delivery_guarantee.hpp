@@ -53,6 +53,18 @@ struct DeterminismFacts {
     bool has_async_side_effects{false};
     std::vector<std::string> sources_of_nondeterminism;
 
+    // Whether the flags above cover the WHOLE graph. A SQL-compiled graph
+    // is fully classified: every operator type the planner emits is engine
+    // code, wall-clock and random functions are rejected at bind time, and
+    // the operators that reach outside (ML_PREDICT over http, async
+    // lookups) are marked. A plugin-built graph carries native operators
+    // the engine cannot inspect, so "no nondeterminism found" means
+    // "none declared", not "none present" - report UNKNOWN, not clean,
+    // unless every such operator declares itself via the
+    // kOpDeterminismParam op param.
+    bool classification_complete{false};
+    std::vector<std::string> unclassified_operators;
+
     [[nodiscard]] bool deterministic() const noexcept {
         return !reads_wall_clock && !uses_random && !calls_external_service &&
                !has_nondeterministic_udf && !has_async_side_effects;
