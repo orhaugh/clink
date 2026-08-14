@@ -268,6 +268,26 @@ source had long since grown a batch-index offset that replays cleanly, an
 under-claim that made the guarantee analyser reject exactly-once pipelines
 the engine actually supports.
 
+## The sink contract suite
+
+`clink/test/sink_contract.hpp` is the sink-side companion, for
+transactional exactly-once sinks: the adapter supplies a fresh-sink
+factory, a committed-output probe, and sample records, and the suite
+drives the real `CommittingSink` choreography (open, on_data, on_barrier,
+on_commit / on_abort, with prepared handles persisted in a shared
+`InMemoryStateBackend` exactly as a worker persists them). The cases are
+the crash windows the guarantee lives in: nothing visible before commit
+(including the prepared-but-uncommitted window), commit publishes exactly
+the written records, a re-delivered commit changes nothing - on the same
+instance and on a fresh one, abort leaves no trace and repeats safely, a
+crash after prepare is finalised by a fresh instance's recovery exactly
+once however many recoveries run, a crash before prepare publishes
+nothing, and checkpoints commit independently. The capability gate is
+strict: a record claiming anything weaker than transactional exactly-once
+FAILS the suite rather than skipping - either the record under-claims or
+this is the wrong suite for the connector. In-tree instantiations:
+`tests/test_sink_contract.cpp` (`file_2pc`, `parquet_2pc`).
+
 ## Related
 
 - [./operator-model.md](./operator-model.md) - the operator, emitter and stream-element model the harness drives

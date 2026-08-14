@@ -90,7 +90,19 @@
       "files": ["include/clink/test/source_contract.hpp", "tests/test_source_contract.cpp", "src/connectors/builtin_capabilities.cpp"],
       "tests": ["SourceContractSuite (FileSource, DirectoryFileSource, ParquetSource instantiations)"],
       "dependencies": [],
-      "follow_up": "sink contract suite (2PC windows as reusable templates); per-impl rollout to the container-backed connectors under the live label"
+      "follow_up": "per-impl rollout to the container-backed connectors under the live label"
+    },
+    {
+      "id": "PR-09",
+      "priority": "P0",
+      "title": "Reusable sink contract suite: the 2PC crash windows as capability-gated obligations (public clink::test API; file_2pc + parquet_2pc instantiated)",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "A sink's exactly-once claim rests on crash windows nothing exercises uniformly: visible-before-commit, non-idempotent recommit, lost prepared transactions.",
+      "files": ["include/clink/test/sink_contract.hpp", "tests/test_sink_contract.cpp"],
+      "tests": ["SinkContractSuite (FileSink2PC, ParquetSink2PC instantiations; 8 cases each)"],
+      "dependencies": ["PR-08"],
+      "follow_up": "instantiate for the container-backed 2PC sinks (kafka_2pc, postgres_2pc, s3 multipart) under the live label; upsert-family variant with idempotency-key semantics"
     }
   ],
   "verified_already_done": [
