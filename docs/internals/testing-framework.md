@@ -313,8 +313,16 @@ to one row per idempotency key, and a newer write for a key must replace
 the older row, never sit beside it. The gate requires the record to claim
 `EffectivelyOnceIdempotent` AND name its `idempotency_key_option`: the
 analyser's "your key must be right" warning is only honest while a suite
-holds the collapse behaviour behind it. In-tree instantiation:
-`postgres_upsert` (live, same file as the postgres 2PC instantiation).
+holds the collapse behaviour behind it. In-tree instantiations, all live:
+`postgres_upsert`, `redis_upsert` (the stored value is the whole row at a
+key-per-row layout), `mysql_upsert` (ON DUPLICATE KEY UPDATE) and
+`cassandra_upsert` (collapse is the storage model itself). Mongo is
+deliberately NOT instantiated: its upsert is a mode
+(`on_duplicate='replace'`) on a single factory whose record honestly
+claims at-least-once, and a dedicated effectively-once record would be
+one no operator type resolves to - giving that mode a first-class,
+analyser-visible identity needs its own factory, which is a taxonomy
+decision, not a test.
 
 ## Related
 

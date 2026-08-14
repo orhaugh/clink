@@ -112,8 +112,30 @@
       "risk": "The 2PC crash windows were held hermetically but not against real PREPARE TRANSACTION / multipart-upload state; the effectively-once family had no executable collapse obligation at all.",
       "files": ["include/clink/test/upsert_contract.hpp", "impls/postgres/tests/test_postgres_contract_suites.cpp", "impls/s3/tests/test_s3_contract_suite.cpp", "scripts/run-all-live.sh"],
       "tests": ["PostgresSink2PC/SinkContractSuite (8, live)", "PostgresUpsert/UpsertContractSuite (5, live)", "S3Sink2PC/SinkContractSuite (8, live)"],
-      "dependencies": ["PR-09"],
-      "follow_up": "upsert instantiations for redis/cassandra/mongodb/mysql upsert sinks; changelog-delete semantics as an optional upsert-contract case"
+      "dependencies": ["PR-09"]
+    },
+    {
+      "id": "PR-11",
+      "priority": "P1",
+      "title": "Upsert contract rollout: redis_upsert, mysql_upsert, cassandra_upsert instantiated live; mongo exclusion documented (upsert is a mode on one factory whose record honestly claims at-least-once)",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "Three connectors carried EffectivelyOnceIdempotent records with nothing holding the collapse behaviour behind the claim.",
+      "files": ["impls/redis/tests/test_redis_upsert_contract.cpp", "impls/mysql/tests/test_mysql_upsert_contract.cpp", "impls/cassandra/tests/test_cassandra_upsert_contract.cpp", "scripts/run-all-live.sh"],
+      "tests": ["RedisUpsert/UpsertContractSuite (5, live)", "MysqlUpsert/UpsertContractSuite (5, live)", "CassandraUpsert/UpsertContractSuite (5, live)"],
+      "dependencies": ["PR-10"],
+      "follow_up": "changelog-delete semantics as an optional upsert-contract case; a mongo_upsert factory/op-type if the replace mode should be analyser-visible"
+    },
+    {
+      "id": "PR-12",
+      "priority": "P1",
+      "title": "Kafka prepared-transaction resume: wire-level FindCoordinator + EndTxn(commit) recovery using pid/epoch captured from librdkafka's stats callback and persisted in the committable, sent BEFORE the successor's init_transactions; falls back to the commit-confirmed contract on any failure",
+      "status": "planned",
+      "risk": "A worker dying between checkpoint confirmation and Kafka commit today costs one bounded duplicate interval; genuine resume closes it on the happy path. Neither librdkafka nor the Java client exposes a supported resume API (Flink reflects into producer internals; KIP-939 is the sanctioned future protocol).",
+      "files": ["impls/kafka/"],
+      "tests": ["unit: EndTxn/FindCoordinator frame encoders, recovery decision logic; live: kill-after-confirm crash windows against a real broker under the fault grid"],
+      "dependencies": [],
+      "notes": "Plaintext + TLS first (reuse the in-tree TLS transport); SASL/SCRAM as a follow-on. Revisit against librdkafka KIP-939 support when it ships."
     }
   ],
   "verified_already_done": [

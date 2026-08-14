@@ -11,6 +11,7 @@ add_executable(clink_redis_tests
     test_redis_source_logic.cpp
     test_redis_live.cpp
     test_redis_upsert_sink.cpp
+    test_redis_upsert_contract.cpp
 )
 target_link_libraries(clink_redis_tests PRIVATE
     clink::core
