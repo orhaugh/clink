@@ -8,6 +8,7 @@
 #include <variant>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/guarantee_gate.hpp"
 #include "clink/core/base64.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/operators/agg_function_registry.hpp"
@@ -241,12 +242,39 @@ int run_script(const std::string& sql,
                     << "' was not re-registered: " << e.what() << "\n";
             }
         }
+        // EXPLAIN trailer: the replay-determinism verdict, so a user learns
+        // BEFORE submitting that (say) their LIMIT keeps arrival-order rows
+        // or their ML_PREDICT reaches a remote service. Computed from the
+        // compiled spec because that is where the marks live; graph-only
+        // facts, so no checkpoint config is needed or invented. Bare-SELECT
+        // EXPLAIN has no sink to compile and carries no trailer. A plan the
+        // planner refuses still explains - the refusal is stated rather
+        // than swallowed, since the submit path would hit it anyway.
+        auto explain_determinism = [&](const LogicalSink& sink) {
+            try {
+                const auto spec = planner.compile(sink);
+                const auto facts =
+                    cluster::pipeline_facts_from_graph(spec, cluster::CheckpointConfig{});
+                if (facts.determinism.deterministic()) {
+                    out << "replay determinism: deterministic\n";
+                } else {
+                    out << "replay determinism: NONDETERMINISTIC\n";
+                    for (const auto& why : facts.determinism.sources_of_nondeterminism) {
+                        out << "  - " << why << "\n";
+                    }
+                }
+            } catch (const std::exception& e) {
+                out << "replay determinism: not computed (the plan does not compile: " << e.what()
+                    << ")\n";
+            }
+        };
         // Bind + optimize + compile an INSERT, then submit (or explain).
         auto handle_insert = [&](const ast::InsertStmt& ins) -> int {
             auto plan = binder.bind_insert(ins);
             plan = optimize(std::move(plan));
             if (opts.explain) {
                 out << explain_with_estimates(*plan);
+                explain_determinism(static_cast<const LogicalSink&>(*plan));
                 return 0;
             }
             const auto& sink = static_cast<const LogicalSink&>(*plan);
@@ -263,6 +291,7 @@ int run_script(const std::string& sql,
                     // would actually run (join reorders, pushdowns applied).
                     auto plan = optimize(binder.bind_insert(std::get<ast::InsertStmt>(exp.query)));
                     out << explain_with_estimates(*plan);
+                    explain_determinism(static_cast<const LogicalSink&>(*plan));
                 } else if (std::holds_alternative<ast::SelectStmt>(exp.query)) {
                     auto plan = optimize(binder.bind_select(std::get<ast::SelectStmt>(exp.query)));
                     out << explain_with_estimates(*plan);

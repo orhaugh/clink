@@ -1931,6 +1931,15 @@ std::string compile_node(const LogicalPlan& node,
             op.params["offset"] = std::to_string(lim.offset());
         }
         op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        // Valid SQL, honest report: without ORDER BY the standard leaves
+        // WHICH n rows implementation-dependent, and this implementation
+        // keeps the first to arrive at the singleton - an order a parallel
+        // upstream does not reproduce across a replay. TopN is not marked:
+        // its sort pins the result (up to ties, noted in its own docs).
+        op.params[std::string{cluster::kOpDeterminismParam}] =
+            "nondeterministic:LIMIT without ORDER BY keeps the first-arriving rows, and "
+            "arrival order is not reproducible across a replay when any upstream runs in "
+            "parallel";
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
         return id;

@@ -13452,6 +13452,22 @@ TEST(SqlRuntime, LimitAndTopNArePlannedAsForcedSingletons) {
     auto topn = compile(cat, "INSERT INTO lim_out SELECT k, v FROM lim_src ORDER BY v LIMIT 3");
     EXPECT_TRUE(has_singleton(topn, "top_n_row"))
         << "top_n_row without the singleton mark emits each shard's own top n";
+
+    // Determinism marks: LIMIT without ORDER BY keeps arrival-order rows
+    // and says so; ORDER BY ... LIMIT is sort-pinned and carries no mark
+    // (marking it would cry wolf on every legitimate TopN).
+    const auto determinism_of = [](const cluster::JobGraphSpec& spec, const char* type) {
+        for (const auto& op : spec.ops) {
+            if (op.type == type) {
+                auto it = op.params.find(std::string{cluster::kOpDeterminismParam});
+                return it == op.params.end() ? std::string{} : it->second;
+            }
+        }
+        return std::string{};
+    };
+    EXPECT_EQ(determinism_of(lim, "limit_row").rfind("nondeterministic:", 0), 0u)
+        << "bare LIMIT must be marked arrival-order dependent";
+    EXPECT_TRUE(determinism_of(topn, "top_n_row").empty());
 }
 
 // Every planner-compiled spec claims its determinism coverage. The

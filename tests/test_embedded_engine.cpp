@@ -445,6 +445,42 @@ TEST(EmbeddedEngine, CancelWhileRunningReturnsCleanly) {
     fs::remove(in_path);
 }
 
+TEST(ScriptRunner, ExplainReportsReplayDeterminism) {
+    // The verdict a user needs BEFORE submitting: does a replay reproduce
+    // this statement's output? LIMIT without ORDER BY keeps arrival-order
+    // rows and must say so; a plain projection and an ORDER BY ... LIMIT
+    // (sort-pinned) must read deterministic rather than crying wolf.
+    clink::sql::Catalog catalog;
+    clink::sql::ScriptRunOptions opts;
+    std::ostringstream out;
+    std::ostringstream err;
+    clink::sql::ScriptIO io{&out, &err};
+    auto submit = [](const clink::cluster::JobGraphSpec&, const std::string&) -> int {
+        ADD_FAILURE() << "EXPLAIN must not submit";
+        return 1;
+    };
+    const std::string script =
+        "CREATE TABLE det_src (k BIGINT, v BIGINT) WITH (connector='kafka', format='json', "
+        "brokers='b', topic='t', group_id='g');"
+        "CREATE TABLE det_out (k BIGINT, v BIGINT) WITH (connector='blackhole');"
+        "EXPLAIN INSERT INTO det_out SELECT k, v FROM det_src LIMIT 5;"
+        "EXPLAIN INSERT INTO det_out SELECT k, v FROM det_src;"
+        "EXPLAIN INSERT INTO det_out SELECT k, v FROM det_src ORDER BY v LIMIT 3";
+    ASSERT_EQ(clink::sql::run_script(script, catalog, opts, io, submit), 0) << err.str();
+
+    const auto text = out.str();
+    EXPECT_NE(text.find("replay determinism: NONDETERMINISTIC"), std::string::npos) << text;
+    EXPECT_NE(text.find("LIMIT without ORDER BY"), std::string::npos) << text;
+    // Exactly one of the three statements is nondeterministic; the other
+    // two must both render the clean verdict.
+    std::size_t clean = 0;
+    for (std::size_t pos = text.find("replay determinism: deterministic"); pos != std::string::npos;
+         pos = text.find("replay determinism: deterministic", pos + 1)) {
+        ++clean;
+    }
+    EXPECT_EQ(clean, 2u) << text;
+}
+
 TEST(ScriptRunner, BareSelectSynthesisesPrintSinkSpec) {
     const auto in_path = fs::temp_directory_path() / "clink_runner_sel_in.ndjson";
     fs::remove(in_path);
