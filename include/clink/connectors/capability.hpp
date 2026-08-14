@@ -208,8 +208,20 @@ inline void declare_connector(ConnectorCapabilities caps) {
 // which optional subsystems were compiled in, and whether the build
 // carries surfaces (fault injection, unverified-checkpoint tolerance) that
 // weaken its guarantees.
+// Version of the JSON manifest's SHAPE, reported as the top-level
+// `schema_version` key so a consumer can detect a layout it does not
+// understand instead of misreading one. Bump it when a key is renamed,
+// removed, or changes meaning or type; ADDING a key is compatible and does
+// not bump it. Pinned by test_connector_capability.
+inline constexpr std::uint32_t kCapabilityManifestSchemaVersion = 1;
+
 struct BuildFacts {
     std::string clink_version;
+    // Exact commit of the source tree this binary was built from, and
+    // whether that tree was clean - the pair that maps a manifest back to
+    // code. Same values the plugin ABI handshake reports.
+    std::string git_sha;
+    bool git_clean{false};
     bool sql{false};
     bool http{false};
     bool tls{false};

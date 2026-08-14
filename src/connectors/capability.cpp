@@ -4,6 +4,7 @@
 #include <sstream>
 
 #include "clink/fault/fault_injection.hpp"
+#include "clink/plugin/abi_version.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 
 namespace clink::connectors {
@@ -203,6 +204,8 @@ BuildFacts current_build_facts() {
 #else
     f.clink_version = "unknown";
 #endif
+    f.git_sha = clink::plugin::kAbiHash;
+    f.git_clean = clink::plugin::kAbiHashIsClean;
     // SQL lives in a higher layer (clink_sql) than this TU, so a compile
     // -time #ifdef here would always read false. The SQL frontend flips
     // this flag from its own install() instead, which is also the honest
@@ -303,6 +306,8 @@ std::string render_manifest_text(const BuildFacts& facts,
     os << "This manifest describes THIS BINARY, not the clink project. A\n";
     os << "connector absent here was not compiled in.\n\n";
     os << "version                       " << facts.clink_version << "\n";
+    os << "built from                    " << facts.git_sha
+       << (facts.git_clean ? "" : " (tree had uncommitted changes)") << "\n";
     os << "sql frontend                  " << yn(facts.sql) << "\n";
     os << "http subsystem                " << yn(facts.http) << "\n";
     os << "tls                           " << yn(facts.tls) << "\n";
@@ -372,9 +377,12 @@ std::string render_manifest_text(const BuildFacts& facts,
 std::string render_manifest_json(const BuildFacts& facts,
                                  const std::vector<ConnectorCapabilities>& caps) {
     std::string out = "{";
-    out += "\"clink_version\":" + jq(facts.clink_version);
+    out += "\"schema_version\":" + std::to_string(kCapabilityManifestSchemaVersion);
+    out += ",\"clink_version\":" + jq(facts.clink_version);
     out += ",\"build\":{";
-    out += "\"sql\":" + jbool(facts.sql);
+    out += "\"git_sha\":" + jq(facts.git_sha);
+    out += ",\"git_clean\":" + jbool(facts.git_clean);
+    out += ",\"sql\":" + jbool(facts.sql);
     out += ",\"http\":" + jbool(facts.http);
     out += ",\"tls\":" + jbool(facts.tls);
     out += ",\"wasm\":" + jbool(facts.wasm);

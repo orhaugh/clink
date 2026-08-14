@@ -156,6 +156,23 @@ TEST_F(ConnectorCapabilityTest, ManifestReportsThisBinaryNotTheProject) {
     EXPECT_NE(text.find("unverified checkpoints"), std::string::npos);
 }
 
+TEST_F(ConnectorCapabilityTest, ManifestJsonDeclaresItsSchemaVersionAndOrigin) {
+    const auto json =
+        render_manifest_json(current_build_facts(), CapabilityRegistry::instance().all());
+    // The schema version is the first key, so a consumer can decide whether
+    // it understands the layout before reading anything else. 1 is pinned:
+    // bumping it is a deliberate act (a key renamed, removed, or changed in
+    // meaning), not a side effect - adding keys does not bump it.
+    EXPECT_EQ(json.rfind("{\"schema_version\":1,", 0), 0u)
+        << "manifest must open with its schema version: " << json.substr(0, 60);
+    // git_sha maps the manifest back to the code that produced it. The
+    // value varies per build; presence and non-emptiness are the contract.
+    EXPECT_NE(json.find("\"git_sha\":\""), std::string::npos);
+    EXPECT_EQ(json.find("\"git_sha\":\"\""), std::string::npos) << "git_sha must not be empty";
+    const auto facts = current_build_facts();
+    EXPECT_FALSE(facts.git_sha.empty());
+}
+
 TEST_F(ConnectorCapabilityTest, ManifestJsonIsWellFormedAndCarriesEveryConnector) {
     const auto all = CapabilityRegistry::instance().all();
     const auto json = render_manifest_json(current_build_facts(), all);
