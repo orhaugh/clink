@@ -150,7 +150,12 @@ std::uint64_t latest_completed(const std::filesystem::path& ckpt_root) {
         }
         const auto name = it->path().filename().string();
         if (name.rfind("COMPLETED-", 0) == 0) {
-            best = std::max(best, std::strtoull(name.c_str() + 10, nullptr, 10));
+            // Explicit cast: strtoull returns unsigned long long, and under
+            // GCC uint64_t is unsigned long - different types, so the bare
+            // std::max fails deduction there (compiles fine on Apple clang,
+            // where the two coincide).
+            best = std::max(
+                best, static_cast<std::uint64_t>(std::strtoull(name.c_str() + 10, nullptr, 10)));
         }
     }
     return best;
