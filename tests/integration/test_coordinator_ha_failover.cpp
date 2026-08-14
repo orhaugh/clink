@@ -319,10 +319,18 @@ TEST(CoordinatorHaFailover, StandbyTakesOverAndRecoversJob) {
     // acquire the lock and bind port_b.
     ASSERT_TRUE(await_port_open(port_b, 3s)) << "coordinator-B never took over";
 
-    // Confirm active-leader.json now points to port_b.
+    // Confirm active-leader.json flips to port_b. AWAITED, not read once:
+    // the flip lands on B's next refresh poll (~500ms) and, since the
+    // fenced CAS write, carries an fsync - on a busy CI disk the
+    // port-open-to-file-flip gap is real, and an immediate read races it.
+    // Seen exactly once on the shared runner (leader_port still A's) while
+    // local disks always won the race. The contract is "flips", which is
+    // inherently eventual; a flip that never comes still fails here.
     std::uint16_t leader_port = 0;
-    EXPECT_TRUE(active_leader_endpoint(ha_dir, &leader_port));
-    EXPECT_EQ(leader_port, port_b) << "active-leader.json didn't flip to coordinator-B";
+    ASSERT_TRUE(clink::itest::await_condition(
+        [&] { return active_leader_endpoint(ha_dir, &leader_port) && leader_port == port_b; }, 10s))
+        << "active-leader.json didn't flip to coordinator-B (still " << leader_port << ", expected "
+        << port_b << ")";
 
     // The worker should have exited (it watches the coordinator connection). Reap
     // and respawn - a supervisor would do this automatically. The new
