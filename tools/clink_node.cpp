@@ -73,6 +73,7 @@
 #include "clink/http/json_writer.hpp"
 #include "clink/http/static_files.hpp"
 #include "clink/metrics/checkpoint_metrics.hpp"
+#include "clink/metrics/otlp_export.hpp"
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/metrics/prometheus.hpp"
 #include "clink/metrics/system_metrics.hpp"
@@ -1831,6 +1832,42 @@ clink::logging::LoggingConfig make_logging_config(int argc, char** argv, std::st
 // coordinator mode. Bind, idle, await jobs. Stops cleanly on SIGINT/SIGTERM. The
 // binary stays up until killed; jobs come and go entirely over the
 // submission protocol.
+// OTLP export (optional, off unless asked for): --otlp-endpoint=host[:port]
+// ships MetricsRegistry snapshots and lifecycle spans to an OpenTelemetry
+// collector's OTLP/HTTP JSON endpoints every --otlp-interval-ms (default
+// 10000). Returns nullptr when the flag is absent; exits loudly when it is
+// given but this binary carries no HTTP client, rather than silently not
+// exporting what the operator asked for.
+std::unique_ptr<clink::metrics::OtlpHttpExporter> make_otlp_exporter(
+    int argc, char** argv, const std::string& service_name, bool& usage_error) {
+    usage_error = false;
+    const auto endpoint = get_arg(argc, argv, "otlp-endpoint", "");
+    if (endpoint.empty()) {
+        return nullptr;
+    }
+#ifdef CLINK_HAS_HTTP
+    clink::metrics::OtlpHttpExporter::Config cfg;
+    cfg.service_name = service_name;
+    if (const auto colon = endpoint.rfind(':'); colon != std::string::npos) {
+        cfg.host = endpoint.substr(0, colon);
+        cfg.port = static_cast<std::uint16_t>(std::stoi(endpoint.substr(colon + 1)));
+    } else {
+        cfg.host = endpoint;  // default OTLP/HTTP port
+    }
+    cfg.interval_ms =
+        static_cast<std::uint32_t>(std::stoul(get_arg(argc, argv, "otlp-interval-ms", "10000")));
+    std::cout << "otlp export to http://" << cfg.host << ":" << cfg.port << " every "
+              << cfg.interval_ms << "ms as service '" << service_name << "'\n";
+    return std::make_unique<clink::metrics::OtlpHttpExporter>(std::move(cfg));
+#else
+    (void)service_name;
+    std::cerr << "--otlp-endpoint given but this build has no HTTP subsystem; "
+                 "rebuild with the HTTP option enabled\n";
+    usage_error = true;
+    return nullptr;
+#endif
+}
+
 int run_coordinator(int argc, char** argv) {
     // Initialise logging before anything emits. Configures console + optional
     // rolling (zstd-compressed) file sink + the /api/v1/logs ring; all
@@ -1840,6 +1877,11 @@ int run_coordinator(int argc, char** argv) {
     clink::metrics::init_coordinator_metrics();
     clink::metrics::init_checkpoint_metrics();
 #endif
+    bool otlp_usage_error = false;
+    const auto otlp = make_otlp_exporter(argc, argv, "clink-coordinator", otlp_usage_error);
+    if (otlp_usage_error) {
+        return 1;
+    }
     const auto port_str = get_arg(argc, argv, "port", std::to_string(kDefaultCoordinatorPort));
     const auto bind_host = get_arg(argc, argv, "bind-host", "127.0.0.1");
     const auto advertise_host = get_arg(argc, argv, "advertise-host", bind_host);
@@ -2689,6 +2731,11 @@ int run_worker(int argc, char** argv) {
     clink::metrics::init_worker_metrics();
     clink::metrics::init_checkpoint_metrics();
 #endif
+    bool otlp_usage_error = false;
+    const auto otlp = make_otlp_exporter(argc, argv, "clink-worker", otlp_usage_error);
+    if (otlp_usage_error) {
+        return 1;
+    }
     const auto worker_id = get_arg(argc, argv, "id");
     const auto coordinator_host = get_arg(argc, argv, "coordinator-host", "127.0.0.1");
     const auto coordinator_port =

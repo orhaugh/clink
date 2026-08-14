@@ -8,20 +8,14 @@
 
 namespace clink {
 
-// Boundary class for the future OpenTelemetry exporter.
+// Test/tooling boundary over MetricsRegistry snapshots.
 //
-// We do not pull in opentelemetry-cpp yet - it has heavy build dependencies
-// (Protobuf, gRPC) and the right time to add it is when we have a real
-// production deployment to feed. For now, the boundary type exposes the shape
-// of the eventual exporter so tests and tooling can use it without needing
-// the OTel libraries:
-//
-//   * register_otlp_endpoint(...)  - configure where metrics will be shipped
-//   * export_loop(...)             - poll the registry and call the exporter
-//   * sink callback                - test harness can substitute its own sink
-//
-// When the real OTel integration lands, only the implementation moves; this
-// header stays.
+// The REAL OpenTelemetry exporter is otlp_export.hpp (OtlpHttpExporter):
+// OTLP/HTTP JSON to a collector, hand-encoded, no opentelemetry-cpp - its
+// heavy Protobuf/gRPC pins would fight this tree's Arrow pin for nothing at
+// this volume. This boundary stays for what it was always used for: letting
+// a test or tool substitute its own sink for a registry snapshot without
+// caring about any wire format.
 class OtelBoundary {
 public:
     using ExportFn = std::function<void(const MetricsRegistry::Snapshot&)>;

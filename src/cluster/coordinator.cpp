@@ -30,6 +30,7 @@
 #include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/checkpoint_metrics.hpp"
 #include "clink/metrics/orchestration_metrics.hpp"
+#include "clink/metrics/otlp_export.hpp"
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/runtime/event_bus.hpp"
 #include "clink/runtime/key_groups.hpp"
@@ -6116,6 +6117,19 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 clink::metrics::ckpt::completed(static_cast<std::uint64_t>(dur_ms));
                 clink::metrics::ckpt::last_completed_now();
                 job.pending_checkpoint_start_times.erase(sit);
+                // Lifecycle span for OTLP export: trigger-to-completion of
+                // this checkpoint. A no-op unless an exporter enabled the
+                // span buffer (SpanBuffer::record checks first).
+                if (clink::metrics::SpanBuffer::global().enabled()) {
+                    clink::metrics::OtlpSpan span;
+                    span.name = "clink.checkpoint";
+                    span.end_unix_nano = clink::metrics::otlp_now_unix_nano();
+                    span.start_unix_nano =
+                        span.end_unix_nano - static_cast<std::uint64_t>(dur_ms) * 1'000'000ULL;
+                    span.attributes = {{"clink.job_id", std::to_string(msg.job_id)},
+                                       {"clink.checkpoint_id", std::to_string(msg.checkpoint_id)}};
+                    clink::metrics::SpanBuffer::global().record(std::move(span));
+                }
             } else {
                 clink::metrics::ckpt::completed(0);
                 clink::metrics::ckpt::last_completed_now();

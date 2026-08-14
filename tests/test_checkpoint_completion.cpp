@@ -47,6 +47,7 @@
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/metrics/otlp_export.hpp"
 #include "clink/runtime/network/connection.hpp"
 
 using namespace clink;
@@ -456,6 +457,43 @@ TEST(CheckpointCompletion, AnAllSuccessCheckpointStillCompletes) {
     })) << "a checkpoint every subtask acked successfully did not complete";
     EXPECT_TRUE(ckpt_await([&] { return fx.marker_exists(job_id, *ckpt_id); }))
         << "no COMPLETED marker for a fully successful checkpoint";
+}
+
+TEST(CheckpointCompletion, ACompletedCheckpointRecordsAnOtlpLifecycleSpan) {
+    // The span SITE, not the exporter (test_otlp_export.cpp owns that): a
+    // checkpoint completing inside the real coordinator must land a
+    // clink.checkpoint span in the buffer when an exporter has armed it,
+    // carrying the ids an operator would filter traces by.
+    auto& buf = clink::metrics::SpanBuffer::global();
+    buf.set_enabled(true);
+    (void)buf.drain();  // other suites may have left spans behind
+
+    CheckpointFixture fx;
+    const auto job_id = fx.bring_up();
+    ASSERT_GT(job_id, 0U);
+    const auto ckpt_id = fx.await_trigger();
+    ASSERT_TRUE(ckpt_id.has_value());
+    ASSERT_TRUE(fx.ack_all(job_id, *ckpt_id, /*ok=*/true));
+    ASSERT_TRUE(ckpt_await(
+        [&] { return fx.coordinator->latest_completed_checkpoint(job_id) >= *ckpt_id; }));
+
+    const auto spans = buf.drain();
+    buf.set_enabled(false);
+    ASSERT_FALSE(spans.empty()) << "no span recorded for a completed checkpoint";
+    const auto& s = spans.front();
+    EXPECT_EQ(s.name, "clink.checkpoint");
+    EXPECT_LE(s.start_unix_nano, s.end_unix_nano);
+    EXPECT_GT(s.end_unix_nano, 0U);
+    const auto attr = [&](const std::string& key) -> std::string {
+        for (const auto& [k, v] : s.attributes) {
+            if (k == key) {
+                return v;
+            }
+        }
+        return {};
+    };
+    EXPECT_EQ(attr("clink.job_id"), std::to_string(job_id));
+    EXPECT_EQ(attr("clink.checkpoint_id"), std::to_string(*ckpt_id));
 }
 
 TEST(CheckpointCompletion, TheRecoveryPointSurvivesALaterFailedCheckpoint) {

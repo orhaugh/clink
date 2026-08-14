@@ -335,6 +335,10 @@ Worker (`Worker::Config`):
 
 Per-job `CheckpointConfig` (`protocol.hpp`): `checkpoint_dir` (empty disables checkpointing), `interval_ms` (0 disables periodic triggers), `restore_from_dir` + `restore_from_checkpoint_id`, `max_restarts_on_worker_loss` (`kRestartAuto` resolves to self-heal when checkpointing is on, else fail-fast), `alignment` (default `Aligned`), and `state_backend_uri`.
 
+### OTLP export (OpenTelemetry)
+
+`clink_node coordinator|worker --otlp-endpoint=host[:port]` (default port 4318) ships the full `MetricsRegistry` snapshot and the engine's lifecycle spans to an OpenTelemetry collector's OTLP/HTTP JSON endpoints (`/v1/metrics`, `/v1/traces`) every `--otlp-interval-ms` (default 10000). Off unless the flag is given: no exporter thread runs and the span sites are no-ops. The wire encoding is hand-rolled protobuf-JSON (`include/clink/metrics/otlp_export.hpp`, no opentelemetry-cpp dependency); transport is plain HTTP, so a TLS hop belongs to a collector agent next to the process. Spans are coarse engine transitions - `clink.checkpoint` (trigger to completion, with job and checkpoint ids) is the first - never per-record. The exporter's own health is visible in `clink_otlp_exports_total`, `clink_otlp_export_failures_total` and `clink_otlp_spans_dropped_total` (bounded span buffer, drop-oldest). The Prometheus `/metrics` endpoint is unaffected and remains the primary scrape surface.
+
 ### Checking a configuration before deploying it
 
 `clink lint` (`tools/clink_lint.cpp`) applies the same checks a submission is

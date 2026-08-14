@@ -490,6 +490,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/connectors/delivery_guarantee.cpp
     src/checkpoint/checkpoint_coordinator.cpp
     src/metrics/metrics_registry.cpp
+    src/metrics/otlp_export.cpp
     src/metrics/prometheus.cpp
     src/metrics/system_metrics.cpp
     src/application/job_submitter.cpp
