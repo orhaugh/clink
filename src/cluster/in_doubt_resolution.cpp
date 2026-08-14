@@ -1,0 +1,223 @@
+#include "clink/cluster/in_doubt_resolution.hpp"
+
+#include <cstdlib>
+#include <fstream>
+#include <optional>
+#include <vector>
+
+#include "clink/config/json.hpp"
+#include "clink/connectors/txn_resume_registry.hpp"
+#include "clink/runtime/key_groups.hpp"
+#include "clink/runtime/log_buffer.hpp"
+#include "clink/state/durable_file_write.hpp"
+#include "clink/state/state_backend_factory.hpp"
+#include "clink/state_processor/savepoint.hpp"
+#include "clink/state_processor/state_diff.hpp"
+
+namespace clink::cluster {
+
+std::filesystem::path completed_marker_dir_for(const std::string& checkpoint_dir, JobId job_id) {
+    return std::filesystem::path{checkpoint_dir} / "_jobs" / std::to_string(job_id);
+}
+
+namespace {
+//
+// A checkpoint that COMPLETED but was never CONFIRMED may hold external
+// transactions its dead worker prepared and never committed. Some of those
+// are finalisable with connector knowledge (a resolver registered in
+// TxnResumeRegistry - Kafka commits the orphan over the wire with the dead
+// producer's identity). Resolution and restore-point selection are ONE
+// decision: only when every staged handle of a checkpoint resolves as
+// committed may CONFIRMED advance to it - finalising an orphan while still
+// restoring from before it would replay its interval as duplicates.
+//
+// Runs on recovery paths that hold no coordinator lock (the resolvers do
+// network round trips). Conservative on every uncertainty: an unreadable
+// marker or snapshot, a checkpoint with no visible handle, a missing
+// resolver, or any resolver failure stops the walk and leaves the
+// commit-confirmed contract (bounded replay) in force.
+
+// generation + acking subtasks recorded in a COMPLETED-<id> marker.
+struct CompletedMarkerInfo {
+    std::uint32_t generation{1};
+    std::vector<std::uint32_t> subtasks;
+};
+
+std::optional<CompletedMarkerInfo> read_completed_marker(const std::filesystem::path& marker) {
+    std::ifstream in(marker);
+    if (!in.is_open()) {
+        return std::nullopt;
+    }
+    CompletedMarkerInfo out;
+    std::string line;
+    bool saw_subtasks = false;
+    while (std::getline(in, line)) {
+        if (line.rfind("generation=", 0) == 0) {
+            out.generation =
+                static_cast<std::uint32_t>(std::strtoul(line.c_str() + 11, nullptr, 10));
+        } else if (line.rfind("subtasks=", 0) == 0) {
+            saw_subtasks = true;
+            std::size_t pos = 9;
+            while (pos < line.size()) {
+                const auto comma = line.find(',', pos);
+                const auto tok =
+                    line.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!tok.empty()) {
+                    out.subtasks.push_back(
+                        static_cast<std::uint32_t>(std::strtoul(tok.c_str(), nullptr, 10)));
+                }
+                pos = comma == std::string::npos ? line.size() : comma + 1;
+            }
+        }
+    }
+    if (!saw_subtasks) {
+        return std::nullopt;  // pre-participant-set marker; nothing to walk
+    }
+    return out;
+}
+
+// The staged resume handles inside one checkpoint's snapshots: operator-state
+// rows (0xFF-prefixed stored keys) whose logical key starts with
+// kTxnResumeStateKeyPrefix. nullopt = a snapshot could not be read, which is
+// different from "no handles" and must stop resolution.
+std::optional<std::vector<std::string>> read_resume_handles(const std::string& checkpoint_dir,
+                                                            const CompletedMarkerInfo& info,
+                                                            std::uint64_t ckpt_id) {
+    std::vector<std::string> handles;
+    for (const auto sub : info.subtasks) {
+        const auto snap =
+            std::filesystem::path(clink::state_dir_for(checkpoint_dir, info.generation, sub)) /
+            ("checkpoint-" + std::to_string(ckpt_id) + ".snap");
+        std::error_code ec;
+        if (!std::filesystem::exists(snap, ec)) {
+            // A subtask that acked but kept no state writes no snapshot;
+            // that is a normal shape, not an error.
+            continue;
+        }
+        try {
+            auto sp = clink::state_processor::Savepoint::load_from_file(snap);
+            const auto entries = clink::state_processor::collect_entries(sp);
+            for (const auto& [op, slots] : entries) {
+                for (const auto& [slot, rows] : slots) {
+                    for (const auto& [key, entry] : rows) {
+                        if (key.size() > 1 &&
+                            static_cast<std::uint8_t>(key.front()) ==
+                                clink::kOperatorStateKeyPrefix &&
+                            key.compare(1,
+                                        clink::connectors::kTxnResumeStateKeyPrefix.size(),
+                                        clink::connectors::kTxnResumeStateKeyPrefix) == 0) {
+                            handles.push_back(entry.value);
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            clink::log::warn("coordinator.recovery",
+                             "in-doubt resolution: snapshot " + snap.string() +
+                                 " could not be read (" + e.what() + "); stopping resolution");
+            return std::nullopt;
+        }
+    }
+    return handles;
+}
+
+// Walk (confirmed, completed], resolving each completed checkpoint's staged
+// handles and durably advancing CONFIRMED on full success. Returns the new
+// confirmed id (== `confirmed` when nothing advanced).
+}  // namespace
+
+std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
+                                       JobId job_id,
+                                       std::uint64_t confirmed,
+                                       std::uint64_t completed) {
+    if (checkpoint_dir.empty() || completed <= confirmed) {
+        return confirmed;
+    }
+    const auto job_dir = completed_marker_dir_for(checkpoint_dir, job_id);
+    for (std::uint64_t id = confirmed + 1; id <= completed; ++id) {
+        const auto marker = job_dir / ("COMPLETED-" + std::to_string(id));
+        std::error_code ec;
+        if (!std::filesystem::exists(marker, ec)) {
+            continue;  // this id never completed; its transaction was aborted
+        }
+        const auto info = read_completed_marker(marker);
+        if (!info.has_value()) {
+            clink::log::info("coordinator.recovery",
+                             "in-doubt resolution: COMPLETED-" + std::to_string(id) +
+                                 " carries no participant set; stopping at confirmed=" +
+                                 std::to_string(confirmed));
+            return confirmed;
+        }
+        const auto handles = read_resume_handles(checkpoint_dir, *info, id);
+        if (!handles.has_value() || handles->empty()) {
+            // Unreadable snapshots, or a checkpoint whose sinks staged no
+            // handle (older binary, different sink family): nothing here
+            // can be PROVEN committed, so the restore point stays put.
+            if (handles.has_value()) {
+                clink::log::info("coordinator.recovery",
+                                 "in-doubt resolution: checkpoint " + std::to_string(id) +
+                                     " staged no resume handles; stopping at confirmed=" +
+                                     std::to_string(confirmed));
+            }
+            return confirmed;
+        }
+        bool all_committed = true;
+        for (const auto& handle : *handles) {
+            std::string resolver_name;
+            try {
+                resolver_name = clink::config::parse(handle).at("resolver").as_string();
+            } catch (const std::exception& e) {
+                clink::log::warn(
+                    "coordinator.recovery",
+                    std::string("in-doubt resolution: handle did not parse: ") + e.what());
+                all_committed = false;
+                break;
+            }
+            const auto resolver =
+                clink::connectors::TxnResumeRegistry::instance().find(resolver_name);
+            if (!resolver.has_value()) {
+                clink::log::info("coordinator.recovery",
+                                 "in-doubt resolution: no resolver registered for '" +
+                                     resolver_name + "' (plugin not loaded in this process?)");
+                all_committed = false;
+                break;
+            }
+            const auto result = (*resolver)(handle);
+            clink::log::info("coordinator.recovery",
+                             "in-doubt resolution: checkpoint " + std::to_string(id) + " via '" +
+                                 resolver_name +
+                                 "': " + (result.committed ? "COMMITTED" : "not committed") + " (" +
+                                 result.detail + ")");
+            if (!result.committed) {
+                all_committed = false;
+                break;
+            }
+        }
+        if (!all_committed) {
+            return confirmed;
+        }
+        // Every handle of this checkpoint provably committed: publish the
+        // confirmation durably, exactly as handle_commit_confirmed_ does,
+        // so THIS and every later recovery selects it.
+        try {
+            clink::state::detail::write_string_fsync_rename(
+                job_dir / ("CONFIRMED-" + std::to_string(id)),
+                "job=" + std::to_string(job_id) + "\ncheckpoint=" + std::to_string(id) +
+                    "\nresolved=in-doubt\n");
+        } catch (const std::exception& e) {
+            clink::log::error("coordinator.recovery",
+                              "in-doubt resolution: checkpoint " + std::to_string(id) +
+                                  " committed but the CONFIRMED marker could not be written (" +
+                                  std::string(e.what()) +
+                                  "); stopping so the restore point never outruns its record");
+            return confirmed;
+        }
+        clink::log::info("coordinator.recovery",
+                         "job_id=" + std::to_string(job_id) + " checkpoint " + std::to_string(id) +
+                             " commit-CONFIRMED by in-doubt resolution");
+        confirmed = id;
+    }
+    return confirmed;
+}
+
+}  // namespace clink::cluster

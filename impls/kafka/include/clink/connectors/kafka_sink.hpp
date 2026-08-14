@@ -103,6 +103,22 @@ public:
     // Last delivery error message; empty if none seen.
     std::string last_error() const;
 
+    // The broker-assigned producer identity of the CURRENT transactional
+    // session, captured from librdkafka's statistics callback (the `eos`
+    // section - there is no direct API for it). nullopt until the first
+    // stats tick after init_transactions delivers it, so a caller that
+    // needs it persisted must tolerate its absence (the 2PC adapter stages
+    // it best-effort; a handle without it simply cannot be resumed and
+    // recovery falls back to the commit-confirmed contract). Only
+    // meaningful while this producer is alive: the pair identifies the
+    // open transaction to the broker, which is exactly what
+    // txn_resume.hpp needs to commit it after this process dies.
+    struct ProducerIdentity {
+        std::int64_t producer_id{-1};
+        std::int16_t producer_epoch{-1};
+    };
+    std::optional<ProducerIdentity> producer_identity() const noexcept;
+
     // Transactional API. Callable only when Options.
     // transactional_id was non-empty. commit_transaction() flushes
     // in-flight records, then commits the current transaction and

@@ -78,6 +78,7 @@ endif()
 add_library(clink_kafka STATIC
     src/kafka_source.cpp
     src/kafka_sink.cpp
+    src/txn_resume.cpp
     src/pipeline_loader.cpp
     src/register_factories.cpp
     src/consume_all.cpp

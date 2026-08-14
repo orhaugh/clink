@@ -512,6 +512,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/cluster/ha_coordinator.cpp
     src/cluster/restore_compat_gate.cpp
     src/cluster/coordinator.cpp
+    src/cluster/in_doubt_resolution.cpp
     src/cluster/worker.cpp
     src/cluster/service_discovery.cpp
     src/cluster/job_graph.cpp

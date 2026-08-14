@@ -65,6 +65,67 @@ private:
     Counter* error_metric_;
 };
 
+// Stats callback capturing the transactional producer's broker-assigned
+// identity. librdkafka exposes producer_id/producer_epoch nowhere in its
+// API; the statistics JSON's `eos` section is the one place they appear.
+// The txn-resume path persists them in the staged handle so a successor
+// process can commit an orphaned prepared transaction (txn_resume.hpp).
+// String scanning instead of a full JSON parse: the stats blob is emitted
+// once per interval on librdkafka's poll thread, and the two fields are
+// flat integers with fixed spellings.
+class ProducerIdentityStats final : public RdKafka::EventCb {
+public:
+    ProducerIdentityStats(std::atomic<std::int64_t>& pid, std::atomic<std::int16_t>& epoch)
+        : pid_(pid), epoch_(epoch) {}
+
+    void event_cb(RdKafka::Event& event) override {
+        if (event.type() != RdKafka::Event::EVENT_STATS) {
+            return;
+        }
+        const std::string& s = event.str();
+        const auto pid = field_(s, "\"producer_id\":");
+        const auto epoch = field_(s, "\"producer_epoch\":");
+        // -1 is librdkafka's "no identity yet"; keep the last real one.
+        if (pid.has_value() && *pid >= 0) {
+            pid_.store(*pid, std::memory_order_release);
+        }
+        if (epoch.has_value() && *epoch >= 0) {
+            epoch_.store(static_cast<std::int16_t>(*epoch), std::memory_order_release);
+        }
+    }
+
+private:
+    static std::optional<std::int64_t> field_(const std::string& s, const std::string& key) {
+        const auto at = s.find(key);
+        if (at == std::string::npos) {
+            return std::nullopt;
+        }
+        std::size_t p = at + key.size();
+        while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) {
+            ++p;  // the eos section is emitted with a space after each colon
+        }
+        bool neg = false;
+        if (p < s.size() && s[p] == '-') {
+            neg = true;
+            ++p;
+        }
+        std::int64_t v = 0;
+        bool any = false;
+        while (p < s.size() && s[p] >= '0' && s[p] <= '9') {
+            v = v * 10 + (s[p] - '0');
+            ++p;
+            any = true;
+        }
+        if (!any) {
+            return std::nullopt;
+        }
+        return neg ? -v : v;
+    }
+
+    std::atomic<std::int64_t>& pid_;
+    std::atomic<std::int16_t>& epoch_;
+};
+
 }  // namespace
 
 // Member declaration order matters here. C++ destroys members in
@@ -90,9 +151,17 @@ struct KafkaSink::Impl {
     mutable std::mutex last_err_mu;
     std::string last_err;
 
+    // Transactional producer identity, captured from the stats callback
+    // (-1 until the first stats tick after init_transactions). Referenced
+    // by `stats`, so declared above it for the same destruction-order
+    // reason as the dr_cb members.
+    std::atomic<std::int64_t> producer_id{-1};
+    std::atomic<std::int16_t> producer_epoch{-1};
+
     // Declared in destruction-order-safe order: `producer` last so it
-    // runs its shutdown poll while `dr` is still live.
+    // runs its shutdown poll while `dr` (and `stats`) are still live.
     std::unique_ptr<DeliveryReportImpl> dr;
+    std::unique_ptr<ProducerIdentityStats> stats;
     std::unique_ptr<RdKafka::Producer> producer;
 };
 
@@ -143,6 +212,11 @@ void KafkaSink::open() {
         set_or_throw("transactional.id", impl_->opts.transactional_id);
         set_or_throw("enable.idempotence", "true");
         set_or_throw("acks", "all");
+        // Stats are how the producer identity (pid/epoch) becomes
+        // observable - see ProducerIdentityStats. 500ms keeps the window
+        // between init_transactions and the first capture short without
+        // being noisy; opts.conf below can still override the interval.
+        set_or_throw("statistics.interval.ms", "500");
     }
     // Tighten message timeout so we don't leak memory waiting forever for
     // a downed broker. Capped at the user's produce_timeout (we'll fail
@@ -173,6 +247,14 @@ void KafkaSink::open() {
 
     if (cfg->set("dr_cb", impl_->dr.get(), err) != RdKafka::Conf::CONF_OK) {
         throw std::runtime_error("KafkaSink: dr_cb: " + err);
+    }
+
+    if (!impl_->opts.transactional_id.empty()) {
+        impl_->stats =
+            std::make_unique<ProducerIdentityStats>(impl_->producer_id, impl_->producer_epoch);
+        if (cfg->set("event_cb", impl_->stats.get(), err) != RdKafka::Conf::CONF_OK) {
+            throw std::runtime_error("KafkaSink: event_cb: " + err);
+        }
     }
 
     auto* producer = RdKafka::Producer::create(cfg.get(), err);
@@ -373,6 +455,18 @@ void KafkaSink::close() {
     }
 }
 
+std::optional<KafkaSink::ProducerIdentity> KafkaSink::producer_identity() const noexcept {
+    if (!impl_) {
+        return std::nullopt;
+    }
+    const auto pid = impl_->producer_id.load(std::memory_order_acquire);
+    const auto epoch = impl_->producer_epoch.load(std::memory_order_acquire);
+    if (pid < 0 || epoch < 0) {
+        return std::nullopt;
+    }
+    return ProducerIdentity{pid, epoch};
+}
+
 std::uint64_t KafkaSink::delivered_count() const noexcept {
     return impl_ ? impl_->delivered.load(std::memory_order_relaxed) : 0;
 }
@@ -410,6 +504,9 @@ void KafkaSink::flush() {}
 void KafkaSink::close() {}
 void KafkaSink::commit_transaction() {}
 void KafkaSink::abort_transaction() {}
+std::optional<KafkaSink::ProducerIdentity> KafkaSink::producer_identity() const noexcept {
+    return std::nullopt;
+}
 std::uint64_t KafkaSink::delivered_count() const noexcept {
     return 0;
 }

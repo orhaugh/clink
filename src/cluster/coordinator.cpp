@@ -18,6 +18,7 @@
 #include "clink/cluster/fenced_metadata.hpp"
 #include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
+#include "clink/cluster/in_doubt_resolution.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/job_planner.hpp"
@@ -366,9 +367,8 @@ namespace {
 // <checkpoint_dir>/0, /1 and /2, so job_id 1 wrote its markers straight into
 // subtask 1's state directory. A prefixed component cannot collide, because
 // a subtask directory is always a bare integer.
-std::filesystem::path completed_marker_dir_for(const std::string& checkpoint_dir, JobId job_id) {
-    return std::filesystem::path{checkpoint_dir} / "_jobs" / std::to_string(job_id);
-}
+// (completed_marker_dir_for now lives in in_doubt_resolution.hpp/.cpp - the
+// layout is shared with the in-doubt resolution walk.)
 
 // Hand-roll the "find latest COMPLETED-N marker under
 // <ckpt_dir>/_jobs/<job_id>/" lookup. coordinator's existing
@@ -596,6 +596,32 @@ void Coordinator::recover_persisted_jobs() {
         }
         if (!plugins_ok)
             continue;
+        // In-doubt commit resolution, AFTER plugin load (the resolvers
+        // register at connector install, which the plugin loads carry) and
+        // BEFORE the restore point is used: a completed-but-unconfirmed
+        // checkpoint whose orphaned transactions a resolver can finalise
+        // gets CONFIRMED here, and the restore point advances past the
+        // interval instead of replaying it. Any failure leaves the
+        // commit-confirmed contract in force.
+        {
+            const bool needs_confirmation =
+                body.find("\"requires_commit_confirmation\":true") != std::string::npos;
+            if (needs_confirmation && !ckpt.checkpoint_dir.empty()) {
+                const auto resolved = resolve_in_doubt_commits(
+                    ckpt.checkpoint_dir,
+                    job_id,
+                    ckpt.restore_from_checkpoint_id,
+                    latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id));
+                if (resolved > ckpt.restore_from_checkpoint_id) {
+                    log::info("coordinator.ha",
+                              "job_id=" + std::to_string(job_id) +
+                                  " restore point advanced by in-doubt resolution: checkpoint " +
+                                  std::to_string(ckpt.restore_from_checkpoint_id) + " -> " +
+                                  std::to_string(resolved));
+                    ckpt.restore_from_checkpoint_id = resolved;
+                }
+            }
+        }
         // Schema-evolution D: skip recovering a job whose persisted
         // savepoint can't migrate to the (possibly newer) binary's
         // expected versions. Best-effort, same contract as the submit gate.

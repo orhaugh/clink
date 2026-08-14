@@ -8,6 +8,8 @@ add_executable(clink_kafka_tests
     register.cpp
     test_factory_registration.cpp
     test_kafka.cpp
+    test_txn_resume.cpp
+    test_txn_resume_live.cpp
     test_kafka_security.cpp
     test_pipeline_loader.cpp
     test_pipeline_config.cpp
@@ -28,3 +30,6 @@ gtest_discover_tests(clink_kafka_tests
     DISCOVERY_MODE PRE_TEST
     PROPERTIES TIMEOUT 30 LABELS kafka
 )
+
+# docker_kafka.hpp (the shared Redpanda fixture) lives under tests/integration/.
+target_include_directories(clink_kafka_tests PRIVATE ${CMAKE_SOURCE_DIR})

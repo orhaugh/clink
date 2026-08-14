@@ -129,13 +129,14 @@
     {
       "id": "PR-12",
       "priority": "P1",
-      "title": "Kafka prepared-transaction resume: wire-level FindCoordinator + EndTxn(commit) recovery using pid/epoch captured from librdkafka's stats callback and persisted in the committable, sent BEFORE the successor's init_transactions; falls back to the commit-confirmed contract on any failure",
-      "status": "planned",
-      "risk": "A worker dying between checkpoint confirmation and Kafka commit today costs one bounded duplicate interval; genuine resume closes it on the happy path. Neither librdkafka nor the Java client exposes a supported resume API (Flink reflects into producer internals; KIP-939 is the sanctioned future protocol).",
-      "files": ["impls/kafka/"],
-      "tests": ["unit: EndTxn/FindCoordinator frame encoders, recovery decision logic; live: kill-after-confirm crash windows against a real broker under the fault grid"],
+      "title": "Kafka prepared-transaction resume: wire-level FindCoordinator + EndTxn(commit) in-doubt resolution at HA restore-point selection, using pid/epoch captured from librdkafka's stats callback and staged in the checkpoint; CONFIRMED advances only on the broker's explicit acknowledgement",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "A checkpoint completing whose broker commit had not executed when the worker died was the one window neither the sink nor the client could close; resolution commits the genuine orphan and advances the restore point past the interval, with the commit-confirmed bounded contract as the floor on every failure.",
+      "files": ["impls/kafka/include/clink/kafka/txn_resume.hpp", "impls/kafka/src/txn_resume.cpp", "impls/kafka/src/kafka_sink.cpp", "impls/kafka/src/register_factories.cpp", "include/clink/connectors/txn_resume_registry.hpp", "include/clink/cluster/in_doubt_resolution.hpp", "src/cluster/in_doubt_resolution.cpp", "src/cluster/coordinator.cpp"],
+      "tests": ["TxnResumeWire/TxnResume (10, hermetic: byte-for-byte golden frame, parsers vs truncation/foreign correlation, fake broker: happy/fenced/unsupported/no-identity/unreachable, resolver through the registry)", "ResolutionFixture (9: walk order, all-handles-must-commit, every conservative stop)", "TxnResumeLive (3, real Redpanda: fork-crashed orphan committed exactly-once end to end, fenced identity refused, wrapper stages resolvable handle and erases on commit)"],
       "dependencies": [],
-      "notes": "Plaintext + TLS first (reuse the in-tree TLS transport); SASL/SCRAM as a follow-on. Revisit against librdkafka KIP-939 support when it ships."
+      "limitations": "resolution runs on HA/lock-free recovery paths only (in-incarnation restarts keep the bounded contract until a lock-free restart phase exists); non-flexible protocol versions only (FindCoordinator v1/v2, EndTxn v1) and no SASL - both fall back, never guess; no single-run whole-chain HA e2e yet (each link is tested; the chain e2e is the named follow-up for the integration label). Revisit against librdkafka KIP-939 support when it ships."
     }
   ],
   "verified_already_done": [

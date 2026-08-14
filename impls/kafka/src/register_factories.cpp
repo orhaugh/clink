@@ -28,14 +28,18 @@
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/connectors/kafka_source.hpp"
+#include "clink/connectors/txn_resume_registry.hpp"
 #include "clink/core/record.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/kafka/install.hpp"
 #include "clink/kafka/kafka_message_codec.hpp"
 #include "clink/kafka/kafka_security.hpp"
+#include "clink/kafka/txn_resume.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/runtime/network/connection.hpp"
+#include "clink/state/state_backend.hpp"
 
 namespace clink::kafka {
 
@@ -216,18 +220,31 @@ private:
 //    (an earlier 60s wait stalled every post-restart checkpoint behind a
 //    cancelled predecessor).
 //
-// The residual window neither this design nor the client can close: a
-// checkpoint that COMPLETED whose broker commit had not yet executed when
-// the worker died. The transaction dies with the producer (fencing or
-// expiry aborts it), a new producer cannot resume it (librdkafka has no
-// transaction-resume), and the restore replays from the completed
-// checkpoint - past the lost records. See the connector doc's exactly-once
-// caveat.
+// The residual window - a checkpoint that COMPLETED whose broker commit
+// had not yet executed when the worker died - now has a recovery path: the
+// barrier stages a resume handle (transactional.id + the producer identity
+// captured from librdkafka's stats) into operator state, and on HA
+// recovery the coordinator's in-doubt resolution commits the orphan over
+// the wire BEFORE choosing the restore point (clink/kafka/txn_resume.hpp,
+// clink/cluster/in_doubt_resolution.hpp). librdkafka itself still cannot
+// resume a transaction, so when resolution cannot run (in-incarnation
+// restart, SASL listener, identity never captured, broker refused) the
+// commit-confirmed contract holds as before: restore from the last
+// CONFIRMED checkpoint, duplicates bounded to one interval. See the
+// connector doc's exactly-once caveat.
 class TwoPhaseCommitStringKafkaSink final : public Sink<std::string> {
 public:
-    explicit TwoPhaseCommitStringKafkaSink(KafkaSink::Options opts) : inner_(std::move(opts)) {}
+    explicit TwoPhaseCommitStringKafkaSink(KafkaSink::Options opts, std::uint32_t subtask_idx = 0)
+        : brokers_(opts.brokers),
+          transactional_id_(opts.transactional_id),
+          subtask_idx_(subtask_idx),
+          inner_(std::move(opts)) {}
 
     void open() override { inner_.open(); }
+
+    // The resume handle staged in on_barrier is state the checkpoint must
+    // capture - same contract as CommittingSink's prepared handles.
+    [[nodiscard]] bool stages_state_at_barrier() const noexcept override { return true; }
 
     void on_data(const Batch<std::string>& b) override {
         std::lock_guard lk(mu_);
@@ -262,6 +279,15 @@ public:
         inner_.flush();
         inner_.on_barrier(b);
         open_txn_ckpt_ = b.id().value();
+        // Stage the resume handle INSIDE this checkpoint: if the worker
+        // dies after this checkpoint completes but before the commit
+        // executes, recovery reads the handle out of the snapshot and can
+        // finalise the orphaned transaction (txn_resume.hpp) - the one
+        // window the design comment above calls residual. Staged even when
+        // the producer identity has not been captured yet: the resolver
+        // then refuses with a message naming the missing capture, which
+        // beats a silently absent handle.
+        stage_resume_handle_(b.id().value());
     }
 
     void on_commit(std::uint64_t checkpoint_id) override {
@@ -301,6 +327,11 @@ public:
         inner_.commit_transaction();  // commits, then begins the next txn
         last_committed_ckpt_ = checkpoint_id;
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
+        // The commit provably executed: the staged handle must not outlive
+        // it, or a later recovery could try to finalise a transaction that
+        // no longer exists (harmless - the broker refuses - but noisy and
+        // wrong on principle).
+        erase_resume_handle_();
         resolve_open_();
     }
 
@@ -371,6 +402,56 @@ private:
         pending_cv_.notify_all();
     }
 
+    // --- prepared-transaction resume handle ------------------------------
+    //
+    // The identity a successor process needs to commit this transaction
+    // via the wire protocol (clink/kafka/txn_resume.hpp), staged as
+    // operator state so it lives and dies with the checkpoint. The 64-bit
+    // producer_id travels as a STRING: the handle is read back through the
+    // engine's JSON parser whose numbers are doubles, and a pid above 2^53
+    // must not round-trip lossily.
+    std::string resume_state_key_() const {
+        return std::string(clink::connectors::kTxnResumeStateKeyPrefix) + "sub" +
+               std::to_string(subtask_idx_);
+    }
+
+    clink::StateBackend* state_backend_() const noexcept {
+        return this->runtime() != nullptr ? this->runtime()->state_backend() : nullptr;
+    }
+
+    void stage_resume_handle_(std::uint64_t ckpt) {
+        auto* state = state_backend_();
+        if (state == nullptr) {
+            return;
+        }
+        const auto ident = inner_.producer_identity();
+        std::string j = "{\"v\":1,\"resolver\":\"kafka_2pc\"";
+        j += ",\"bootstrap\":\"" + brokers_ + "\"";
+        j += ",\"transactional_id\":\"" + transactional_id_ + "\"";
+        j += ",\"producer_id\":\"" + std::to_string(ident.has_value() ? ident->producer_id : -1) +
+             "\"";
+        j += ",\"producer_epoch\":\"" +
+             std::to_string(ident.has_value() ? ident->producer_epoch : -1) + "\"";
+        j += ",\"ckpt\":\"" + std::to_string(ckpt) + "\"}";
+        const auto key = resume_state_key_();
+        state->put_operator_state(this->id(),
+                                  clink::StateBackend::KeyView{key.data(), key.size()},
+                                  clink::StateBackend::ValueView{j.data(), j.size()});
+    }
+
+    void erase_resume_handle_() {
+        auto* state = state_backend_();
+        if (state == nullptr) {
+            return;
+        }
+        const auto key = resume_state_key_();
+        state->erase_operator_state(this->id(),
+                                    clink::StateBackend::KeyView{key.data(), key.size()});
+    }
+
+    std::string brokers_;
+    std::string transactional_id_;
+    std::uint32_t subtask_idx_{0};
     KafkaSink inner_;
     std::mutex mu_;
     std::condition_variable pending_cv_;
@@ -476,7 +557,63 @@ private:
 
 }  // namespace
 
+// In-doubt resolver for kafka_2pc handles (see txn_resume_registry.hpp for
+// the coordinator-side contract). Parses the handle the 2PC sink staged,
+// then walks the bootstrap list attempting the wire-level EndTxn(commit);
+// a broker VERDICT (refused / unsupported) is final at the first broker
+// that gives one, a transport failure tries the next bootstrap entry.
+clink::connectors::InDoubtResolution resolve_kafka_2pc_handle(const std::string& handle_json) {
+    clink::kafka::TxnIdentity txn;
+    std::string bootstrap;
+    try {
+        const auto j = clink::config::parse(handle_json);
+        bootstrap = j.at("bootstrap").as_string();
+        txn.transactional_id = j.at("transactional_id").as_string();
+        txn.producer_id = std::stoll(j.at("producer_id").as_string());
+        txn.producer_epoch =
+            static_cast<std::int16_t>(std::stoi(j.at("producer_epoch").as_string()));
+    } catch (const std::exception& e) {
+        return {false, std::string("kafka_2pc handle did not parse: ") + e.what()};
+    }
+    if (!txn.complete()) {
+        return {false,
+                "kafka_2pc handle for '" + txn.transactional_id +
+                    "' carries no producer identity (the stats capture had not fired before "
+                    "the barrier); nothing can be resumed"};
+    }
+    const auto connect = [](const std::string& host, std::uint16_t port) {
+        return clink::network::connect_plain(host, port);
+    };
+    std::string last;
+    std::size_t pos = 0;
+    while (pos <= bootstrap.size()) {
+        const auto comma = bootstrap.find(',', pos);
+        const auto entry =
+            bootstrap.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos = comma == std::string::npos ? bootstrap.size() + 1 : comma + 1;
+        if (entry.empty()) {
+            continue;
+        }
+        const auto colon = entry.rfind(':');
+        const std::string host = colon == std::string::npos ? entry : entry.substr(0, colon);
+        const std::uint16_t port =
+            colon == std::string::npos
+                ? std::uint16_t{9092}
+                : static_cast<std::uint16_t>(std::stoi(entry.substr(colon + 1)));
+        const auto outcome = clink::kafka::resume_commit(host, port, txn, connect);
+        if (outcome.status != clink::kafka::ResumeOutcome::Status::TransportError) {
+            return {outcome.committed(), outcome.detail};
+        }
+        last = outcome.detail;
+    }
+    return {false, "no bootstrap broker reachable: " + last};
+}
+
 void install(clink::plugin::PluginRegistry& reg) {
+    // The resolver the coordinator's restore-point selection dispatches to
+    // for handles staged by the 2PC sink below.
+    clink::connectors::TxnResumeRegistry::instance().register_resolver("kafka_2pc",
+                                                                       resolve_kafka_2pc_handle);
     // Capability declaration. Read out of this file and kafka_source.hpp,
     // not out of what Kafka is capable of in general.
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
@@ -547,7 +684,12 @@ void install(clink::plugin::PluginRegistry& reg) {
         .limitations = {"transactional_id must be unique per job AND stable across restarts; "
                         "the factory suffixes the subtask index onto it",
                         "consumers must read with isolation.level=read_committed or they will "
-                        "see aborted records"},
+                        "see aborted records",
+                        "die-after-commit-before-confirmation is bounded to one duplicated "
+                        "interval; HA recovery additionally resumes orphaned prepared "
+                        "transactions over the wire (in-doubt resolution), best-effort - a "
+                        "SASL-only listener or an unsupported broker version falls back to "
+                        "the bounded contract"},
         .required_options_for_exactly_once = {"transactional_id"},
     });
 
@@ -688,7 +830,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (ctx.parallelism > 1) {
                 opts.transactional_id += "-" + std::to_string(ctx.subtask_idx);
             }
-            auto sink = std::make_shared<TwoPhaseCommitStringKafkaSink>(std::move(opts));
+            auto sink =
+                std::make_shared<TwoPhaseCommitStringKafkaSink>(std::move(opts), ctx.subtask_idx);
             // Declare commit-group membership so the coordinator can
             // gate this sink's CommitCheckpoint on its group peers.
             if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
