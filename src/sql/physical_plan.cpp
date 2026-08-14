@@ -1901,14 +1901,21 @@ std::string compile_node(const LogicalPlan& node,
         if (topn.offset() > 0) {
             op.params["offset"] = std::to_string(topn.offset());
         }
+        // A total order has no per-subtask decomposition: fanned out, each
+        // subtask would emit its own top n over its own shard - n *
+        // parallelism rows, none of them the global answer. Must run on a
+        // single subtask (see kForcedSingletonParam).
+        op.params[std::string{cluster::kForcedSingletonParam}] = "true";
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
         return id;
     }
     if (node.kind() == "Limit") {
         // LIMIT n. Pass-through schema; runtime emits the
-        // first n records and drops the rest. Per-subtask semantics
-        // at parallelism > 1 - same caveat as the runtime op.
+        // first n records and drops the rest. The count is GLOBAL - "ten
+        // rows" in the SQL means ten rows in the result - so the operator
+        // must see the whole stream: fanned out it would emit n rows PER
+        // SUBTASK. Forced to a single subtask below.
         const auto& lim = static_cast<const LogicalLimit&>(node);
         std::string input_id = compile_node(lim.input(), ch, spec, next_id, async_agg);
         if (ch != Channel::Row) {
@@ -1923,6 +1930,7 @@ std::string compile_node(const LogicalPlan& node,
         if (lim.offset() > 0) {
             op.params["offset"] = std::to_string(lim.offset());
         }
+        op.params[std::string{cluster::kForcedSingletonParam}] = "true";
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
         return id;

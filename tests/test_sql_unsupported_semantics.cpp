@@ -456,6 +456,14 @@ TEST(SqlUnsupportedSemantics, QueryClausesAreImplementedOrRefusedNeverDecorative
         {"INTERSECT ALL",
          "INSERT INTO bat_out SELECT k, v FROM bat_src INTERSECT ALL "
          "SELECT k, w FROM bat_src2"},
+        // Row locking has no meaning over a stream; before the check the
+        // clause was silently discarded and the query compiled as a plain
+        // scan.
+        {"FOR UPDATE row locking", "INSERT INTO bat_out SELECT k, v FROM bat_src FOR UPDATE"},
+        {"FOR SHARE row locking", "INSERT INTO bat_out SELECT k, v FROM bat_src FOR SHARE"},
+        // HAVING without GROUP BY was silently DROPPED on a non-aggregate
+        // SELECT - the filter vanished and every row passed.
+        {"HAVING without GROUP BY", "INSERT INTO bat_out SELECT k, v FROM bat_src HAVING k > 1"},
     };
     std::vector<std::string> decorative;
     for (const auto& c : must_refuse) {
@@ -473,4 +481,20 @@ TEST(SqlUnsupportedSemantics, QueryClausesAreImplementedOrRefusedNeverDecorative
         << " clause(s) were ACCEPTED but are not implemented - they compiled to a plan "
            "that silently drops what the query text says:"
         << joined;
+}
+
+// SELECT INTO cannot ride the INSERT-shaped battery (the grammar only
+// admits it as a top-level statement), so it gets its own case. Before the
+// check the INTO target was silently discarded: the statement compiled as a
+// plain SELECT, no table was created, and nothing said so.
+TEST(SqlUnsupportedSemantics, SelectIntoIsRefusedNotSilentlyDropped) {
+    ensure_installed();
+    try {
+        (void)parse("SELECT k INTO saved FROM bat_src");
+        FAIL() << "SELECT INTO parsed without an error";
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string(e.what()).find("SELECT INTO"), std::string::npos) << e.what();
+        EXPECT_NE(std::string(e.what()).find("INSERT INTO"), std::string::npos)
+            << "the refusal should point at the supported alternative: " << e.what();
+    }
 }

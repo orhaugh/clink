@@ -1200,6 +1200,32 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
     ast::SelectStmt stmt;
     stmt.loc = loc_from(body);
 
+    // Clauses the parser accepts but this engine has no semantics for are
+    // rejected HERE, before anything downstream can quietly drop them. A
+    // dropped clause is worse than a refused one: the query compiles and
+    // returns numbers that do not mean what the SQL says. Each of these was
+    // observed being silently discarded before the check existed.
+    if (body.contains("lockingClause") && body.at("lockingClause").is_array() &&
+        !body.at("lockingClause").as_array().empty()) {
+        unsupported(
+            "FOR UPDATE / FOR SHARE row locking is not supported: a streaming "
+            "SELECT reads a flow of records, not lockable table rows",
+            stmt.loc.pos);
+    }
+    if (body.contains("intoClause") && body.at("intoClause").is_object()) {
+        unsupported(
+            "SELECT INTO is not supported; create the target with CREATE TABLE "
+            "... WITH (...) and write to it with INSERT INTO ... SELECT",
+            stmt.loc.pos);
+    }
+    if (body.contains("windowClause") && body.at("windowClause").is_array() &&
+        !body.at("windowClause").as_array().empty()) {
+        unsupported(
+            "named WINDOW definitions are not supported; write the OVER (...) "
+            "specification inline on the aggregate",
+            stmt.loc.pos);
+    }
+
     // WITH clause. PG emits withClause = {recursive, ctes}.
     // RECURSIVE is rejected; each CTE has ctename (string) and
     // ctequery (a SelectStmt). The CTE bodies are translated as full
@@ -1297,6 +1323,19 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
         }
     }
     if (body.contains("havingClause") && !body.at("havingClause").is_null()) {
+        // HAVING without GROUP BY would mean "the whole stream is one
+        // group", which is the same unbounded single group that makes a
+        // bare aggregate unsupported - and before this check the clause
+        // was silently DROPPED on non-aggregate SELECTs, turning a
+        // filtered query into an unfiltered one. groupClause is
+        // translated above, so the emptiness test is authoritative here.
+        if (stmt.group_clause.empty()) {
+            unsupported(
+                "HAVING without GROUP BY is not supported: a streaming SELECT "
+                "has no single-group result to filter; add a GROUP BY (for "
+                "example a window) or move the predicate to WHERE",
+                stmt.loc.pos);
+        }
         stmt.having_clause = translate_expression(body.at("havingClause"));
     }
     // ORDER BY. Each entry is a SortBy node carrying a

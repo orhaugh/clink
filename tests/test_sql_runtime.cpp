@@ -13419,6 +13419,111 @@ TEST(SqlRuntime, ApplyJobParallelismLeavesForcedSingletonsAtOne) {
     EXPECT_EQ(one.ops[1].parallelism, 1u);
 }
 
+// LIMIT and ORDER BY ... LIMIT count rows in the RESULT, so their operators
+// must see the whole stream: fanned out, limit_row emits `count` rows per
+// subtask and top_n_row emits each shard's own top n. The planner marks
+// both as forced singletons so the submit-time fan-out leaves them at 1.
+TEST(SqlRuntime, LimitAndTopNArePlannedAsForcedSingletons) {
+    ensure_sql_installed_once();
+    Catalog cat;
+    auto ddl = parse(
+        "CREATE TABLE lim_src (k BIGINT, v BIGINT) "
+        "WITH (connector='kafka', format='json', brokers='b', topic='t', group_id='g');"
+        "CREATE TABLE lim_out (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/lim_out.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    const auto has_singleton = [](const cluster::JobGraphSpec& spec, const char* type) {
+        for (const auto& op : spec.ops) {
+            if (op.type == type) {
+                auto it = op.params.find(std::string{cluster::kForcedSingletonParam});
+                return it != op.params.end() && it->second == "true";
+            }
+        }
+        ADD_FAILURE() << "no op of type " << type << " in the plan";
+        return false;
+    };
+
+    auto lim = compile(cat, "INSERT INTO lim_out SELECT k, v FROM lim_src LIMIT 10 OFFSET 20");
+    EXPECT_TRUE(has_singleton(lim, "limit_row"))
+        << "limit_row without the singleton mark emits `count` rows per subtask";
+
+    auto topn = compile(cat, "INSERT INTO lim_out SELECT k, v FROM lim_src ORDER BY v LIMIT 3");
+    EXPECT_TRUE(has_singleton(topn, "top_n_row"))
+        << "top_n_row without the singleton mark emits each shard's own top n";
+}
+
+// End to end: 12 rows, LIMIT 5, the limit's input fanned to parallelism 4.
+// Global semantics emit exactly 5 rows. Under the pre-fix per-subtask
+// semantics the scatter hands each subtask ~3 rows - below the limit - so
+// every row passes and the output is 12, which is what made the defect
+// silent: no run with count > limit * parallelism ever existed to notice.
+TEST(SqlRuntime, LimitIsGlobalUnderFanOut) {
+    ensure_sql_installed_once();
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_limit_fanout_in.ndjson";
+    const auto out_path = tmp / "clink_sql_limit_fanout_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    std::vector<std::string> lines;
+    for (int i = 1; i <= 12; ++i) {
+        lines.push_back(R"({"k":)" + std::to_string(i) + R"(,"v":)" + std::to_string(i * 10) + "}");
+    }
+    write_lines(in_path, lines);
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE lim_bid (k BIGINT, v BIGINT) "
+                                 "WITH (connector='kafka', format='json', brokers='b', topic='t', "
+                                 "group_id='g');"
+                                 "CREATE TABLE lim_fan_out (k BIGINT, v BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, "INSERT INTO lim_fan_out SELECT k, v FROM lim_bid LIMIT 5");
+
+    // Same shape as the aggregate singleton test above: file source and file
+    // sink stay at 1 (their parallel semantics are not under test), every
+    // other op fans out exactly as a parallelism-4 submit would.
+    constexpr std::uint32_t kPar = 4;
+    bool saw_singleton = false;
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = in_path.string();
+            continue;
+        }
+        if (op.type.find("sink") != std::string::npos) {
+            continue;
+        }
+        if (op.params.find(std::string{cluster::kForcedSingletonParam}) != op.params.end()) {
+            saw_singleton = true;
+            continue;
+        }
+        op.parallelism = kPar;
+    }
+    ASSERT_TRUE(saw_singleton) << "the planner did not mark limit_row as a singleton";
+
+    {
+        InProcessCluster cluster("worker-sql-limit-fanout", 24);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 20s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    auto out = read_lines(out_path);
+    EXPECT_EQ(out.size(), 5u) << "LIMIT 5 must emit exactly five rows for the whole "
+                                 "result, not five per subtask and not every row";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Nexmark q14 end-to-end: a float literal in both the WHERE and the SELECT.
 //
 //   SELECT auction, bidder, 0.908 * price AS price, CASE ... END
