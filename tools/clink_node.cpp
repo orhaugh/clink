@@ -2049,6 +2049,13 @@ int run_coordinator(int argc, char** argv) {
                 advertise,
                 std::chrono::milliseconds{200},
                 has_flag(argc, argv, "ha-allow-unsafe-locks"));
+            // The startup probe verifies lock exclusion between processes ON
+            // THIS HOST; it cannot see a mount that honours locks locally but
+            // not between hosts. Say so where an operator will read it,
+            // rather than only in the docs.
+            std::cout << "coordinator HA via file lock dir=" << ha_dir
+                      << " (leadership verified per host; for HA across hosts use "
+                         "--etcd-endpoints)\n";
         }
         ha_coord->set_on_become_leader(
             [&coordinator, want_port, advertise_host, sql_catalog_dir](std::uint64_t epoch) {
