@@ -2128,17 +2128,28 @@ TEST(SqlBinder, TrimVariantsLowerToLtrimRtrimBtrim) {
     EXPECT_NE(project.outputs()[2].expr_json.find("\"op\":\"btrim\""), std::string::npos);
 }
 
-TEST(SqlBinder, NumericFunctionsInferFloat64) {
+TEST(SqlBinder, NumericFunctionTypingPreservesIntegersWhereTheStandardDoes) {
+    // This test used to be NumericFunctionsInferFloat64 and asserted ABS of
+    // a BIGINT types DOUBLE - encoding a binder bug the differential oracle
+    // exposed (a typed BIGINT sink rejected the INSERT, and past 2^53 the
+    // double is silently non-exact). ABS and MOD are type-preserving on
+    // integer arguments (ISO; Postgres and DuckDB agree); the
+    // genuinely-fractional family stays float64.
     Catalog cat;
     register_clicks(cat);
     Binder b(cat);
     auto plan = b.bind_select(
-        as_select(parse("SELECT ABS(user_id) AS a, FLOOR(user_id) AS f, "
-                        "       CEIL(user_id) AS c, ROUND(user_id, 2) AS r FROM clicks")));
+        as_select(parse("SELECT ABS(user_id) AS a, MOD(user_id, 7) AS m, "
+                        "       FLOOR(user_id) AS f, CEIL(user_id) AS c, "
+                        "       ROUND(user_id, 2) AS r, SQRT(user_id) AS s FROM clicks")));
     const auto& project = static_cast<const LogicalProject&>(*plan);
-    for (const auto& out : project.outputs()) {
-        EXPECT_TRUE(out.type->Equals(*arrow::float64())) << out.name;
-    }
+    const auto& outs = project.outputs();
+    EXPECT_TRUE(outs[0].type->Equals(*arrow::int64())) << "ABS(BIGINT) must stay BIGINT";
+    EXPECT_TRUE(outs[1].type->Equals(*arrow::int64())) << "MOD(BIGINT, n) must stay BIGINT";
+    EXPECT_TRUE(outs[2].type->Equals(*arrow::float64())) << outs[2].name;
+    EXPECT_TRUE(outs[3].type->Equals(*arrow::float64())) << outs[3].name;
+    EXPECT_TRUE(outs[4].type->Equals(*arrow::float64())) << outs[4].name;
+    EXPECT_TRUE(outs[5].type->Equals(*arrow::float64())) << outs[5].name;
 }
 
 TEST(SqlBinder, NullIfLowersToNullifOp) {

@@ -211,6 +211,40 @@ The runtime carries a SQL value as a `clink::config::JsonValue`. Numbers are not
 - `MATCH_RECOGNIZE` and the process-table-function clause require the Row channel (`format='json'`); they are rejected on the string channel.
 - `CREATE FUNCTION` declarations are not catalog-persisted; a submitted job ships the declarations it references (module payload included) in its spec and Workers register them at deploy. A worker registration persists for the process lifetime, and a later same-name declaration replaces it - functions shared by concurrent jobs should agree on their definition.
 
+## Differential oracle (DuckDB)
+
+`tests/test_sql_oracle.cpp` (ctest label `oracle`, deliberately not matched
+by `-L sql`) runs the same query over the same data through clink's
+`EmbeddedEngine` and through the `duckdb` CLI, and requires the answers to
+agree. Every other SQL test asserts what we believe the semantics are; the
+oracle compares against an implementation that does not share this
+codebase's beliefs. Its first run found three defects the 990-case suite
+had encoded as correct: `SUM` over an all-NULL group returned 0 instead of
+NULL, `ABS`/`MOD` of a BIGINT were typed DOUBLE (silently non-exact past
+2^53), and `COALESCE` over BIGINTs typed as VARCHAR.
+
+Mechanics worth knowing before extending it:
+
+- **Both sides execute the same SQL text.** The clink side runs the
+  file/json source-to-sink path that `clink run` drives; the DuckDB side
+  pins column types in `read_json` so schema inference cannot diverge.
+- **Streaming vs batch is bridged once, explicitly.** clink's unbounded
+  GROUP BY emits running results; the harness reduces them to the last
+  emission per group key (well defined at parallelism 1) before comparing.
+  Everything else compares directly, order-insensitively, as multisets.
+- **Canonicalisation absorbs representation, not meaning.** Integral
+  doubles unify with integers, non-integral doubles round to 9 significant
+  digits, absent fields equal null. A comparator-blindness vacuity test
+  drives a real one-cell divergence through the full pipeline and requires
+  it to be reported.
+- **The oracle is optional at runtime.** No `duckdb` on PATH (or
+  `CLINK_DUCKDB`) skips the suite, mirroring the docker-gated connector
+  suites. `CLINK_ORACLE_SEED` / `CLINK_ORACLE_N` widen the generated
+  families for exploration; defaults are fixed so CI failures reproduce.
+- **Generated queries avoid measured dialect differences** - integer `/`
+  (float division in DuckDB) stays out of the generator; expression ranges
+  are bounded so nothing leaves exact-double range.
+
 ## Related
 
 - [./operator-model.md](./operator-model.md) - the operator and DAG model the `JobGraphSpec` targets

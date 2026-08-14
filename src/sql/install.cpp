@@ -982,6 +982,15 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
         return clink::config::JsonValue{out};
     }
     if (spec.fn == "sum") {
+        // SUM over zero non-NULL inputs is NULL, not 0 (ISO; Postgres and
+        // DuckDB agree). running_count only moves on non-NULL accumulates,
+        // so 0 means "never saw a value" - the same signal AVG and the
+        // variance family already key their NULL on. Found by the
+        // differential oracle: an accumulator seeded with 0 passes every
+        // self-referential test, because the tests were written by the
+        // same hands that seeded it.
+        if (st.running_count == 0)
+            return clink::config::JsonValue{nullptr};
         // The exact 128-bit accumulator (running_sum_dec) covers integers and
         // decimals; it is authoritative unless a fractional double was summed
         // or it overflowed 128-bit (either clears sum_dec_complete).

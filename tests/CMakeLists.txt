@@ -614,6 +614,23 @@ if(CLINK_BUILD_SQL)
         PROPERTIES TIMEOUT 30 LABELS sql
     )
 
+    # Differential SQL oracle: the same query and data through clink's
+    # EmbeddedEngine and through DuckDB, answers compared as multisets.
+    # Needs a duckdb binary at runtime (CLINK_DUCKDB or PATH) and SKIPS
+    # without one - same posture as the docker-gated suites. Own label so
+    # `-L oracle` runs it alone; deliberately NOT matched by `-L sql`.
+    add_executable(clink_sql_oracle_tests test_sql_oracle.cpp)
+    target_link_libraries(clink_sql_oracle_tests PRIVATE
+        clink::sql
+        clink::embed
+        GTest::gtest_main
+    )
+    clink_set_warnings(clink_sql_oracle_tests)
+    gtest_discover_tests(clink_sql_oracle_tests
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES TIMEOUT 120 LABELS oracle
+    )
+
     # libclink C ABI. The gtest suite links ONLY the shared library (plus
     # Arrow C++ to import the C stream on the consumer side) - the engine,
     # its registries and every connector live inside libclink, mirroring a

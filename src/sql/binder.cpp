@@ -621,10 +621,25 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
             }
             return t;
         }
-        if (fc.name == "abs" || fc.name == "floor" || fc.name == "ceil" || fc.name == "ceiling" ||
-            fc.name == "round" || fc.name == "sqrt" || fc.name == "exp" || fc.name == "ln" ||
-            fc.name == "log10" || fc.name == "sign" || fc.name == "power" || fc.name == "pow" ||
-            fc.name == "trunc" || fc.name == "mod") {
+        if (fc.name == "abs" || fc.name == "mod") {
+            // Type-preserving on integers: ABS(BIGINT) is BIGINT and
+            // MOD(BIGINT, n) is BIGINT (ISO; Postgres and DuckDB agree).
+            // These were typed float64 alongside sqrt/exp, which is not a
+            // cosmetic difference - beyond 2^53 a double silently loses
+            // int64 exactness, and a typed BIGINT sink rejects the INSERT
+            // outright. Found by the differential oracle. Non-integer
+            // arguments keep the double typing below.
+            if (!fc.args.empty()) {
+                auto t = infer_expr_type(fc.args[0], source);
+                if (t->id() == arrow::Type::INT64 || t->id() == arrow::Type::DECIMAL128) {
+                    return t;
+                }
+            }
+            return arrow::float64();
+        }
+        if (fc.name == "floor" || fc.name == "ceil" || fc.name == "ceiling" || fc.name == "round" ||
+            fc.name == "sqrt" || fc.name == "exp" || fc.name == "ln" || fc.name == "log10" ||
+            fc.name == "sign" || fc.name == "power" || fc.name == "pow" || fc.name == "trunc") {
             return arrow::float64();
         }
         if (fc.name == "starts_with")
@@ -634,10 +649,15 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
             fc.name == "split_index") {
             return arrow::utf8();
         }
-        if ((fc.name == "nullif" || fc.name == "greatest" || fc.name == "least") &&
+        if ((fc.name == "nullif" || fc.name == "greatest" || fc.name == "least" ||
+             fc.name == "coalesce") &&
             !fc.args.empty()) {
             // Result type follows the first argument; binder does no
-            // type unification across siblings.
+            // type unification across siblings. coalesce belongs here and
+            // used to fall through to the utf8 default, so COALESCE(v, -99)
+            // over BIGINTs typed as VARCHAR - and an enclosing arithmetic
+            // expression widened to DOUBLE. Found by the differential
+            // oracle.
             return infer_expr_type(fc.args[0], source);
         }
         // Date/time: EXTRACT / DATE_TRUNC / TO_TIMESTAMP return epoch-
