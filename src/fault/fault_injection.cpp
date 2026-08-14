@@ -274,6 +274,7 @@ Outcome Registry::reach(std::string_view point) {
     // the macOS scheduler almost always won.
     std::uint64_t point_epoch_at_entry = 0;
     std::uint64_t global_epoch_at_entry = 0;
+    std::uint64_t hit_for_log = 0;
     {
         std::lock_guard lock(mu_);
         if (rules_.empty()) {
@@ -281,6 +282,7 @@ Outcome Registry::reach(std::string_view point) {
         }
         const std::string key(point);
         const std::uint64_t hit = ++hits_[key];
+        hit_for_log = hit;
         for (const auto& r : rules_) {
             if (r.point != key) {
                 continue;
@@ -300,6 +302,23 @@ Outcome Registry::reach(std::string_view point) {
     if (!found) {
         return Outcome{};
     }
+
+    // Fire-time witness, on unbuffered stderr rather than the log facade,
+    // because the very next line may be _exit() - no atexit, no stream
+    // flushing - and a buffered line would die with the process. Without
+    // this, whether an armed fault actually FIRED is unobservable from
+    // outside the process: a test can arm a point the run never reaches
+    // and pass as a clean run wearing a scary name. The pair sampler greps
+    // for these lines as its engagement evidence, and item 58's audit
+    // found three points that had been armed by nothing for exactly this
+    // lack of a witness.
+    std::fprintf(stderr,
+                 "[fault.injection] fired: %s action=%d ordinal=%llu arg=%lld\n",
+                 matched.point.c_str(),
+                 static_cast<int>(matched.action),
+                 static_cast<unsigned long long>(hit_for_log),
+                 static_cast<long long>(matched.arg));
+    std::fflush(stderr);
 
     switch (matched.action) {
         case Action::Throw:

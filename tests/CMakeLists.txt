@@ -371,6 +371,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_two_phase_commit.cpp
         integration/test_worker_crash_recovery.cpp
         integration/test_fault_recovery.cpp
+        integration/test_fault_pairs.cpp
         integration/test_ha_failover.cpp
         integration/test_commit_group_atomicity.cpp
         integration/test_cli_lint.cpp
