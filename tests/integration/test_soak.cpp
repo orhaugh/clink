@@ -49,6 +49,7 @@
 using namespace std::chrono_literals;
 using clink::itest::Cluster;
 using clink::itest::ClusterSpec;
+using clink::itest::ScopedDiagnostics;
 
 namespace {
 
@@ -163,6 +164,11 @@ TEST(Soak, HoursOfWorkerKillsStayExactlyOnceWithFlatMemory) {
     spec.workers = 2;
     spec.slots_per_worker = 4;
     Cluster c(spec);
+    // On failure, dump every process log and keep the scratch tree: this
+    // gate failed once in CI with a bare "r.ok = false" and nothing else,
+    // which is undiagnosable from a transcript (the cluster's own logs
+    // were never uploaded). Never fail silent again.
+    ScopedDiagnostics diag(c);
     ASSERT_TRUE(c.start_coordinator());
     ASSERT_TRUE(c.start_worker(0));
     ASSERT_TRUE(c.start_worker(1));
@@ -247,10 +253,15 @@ TEST(Soak, HoursOfWorkerKillsStayExactlyOnceWithFlatMemory) {
     killer.join();
     sampler.join();
 
-    ASSERT_TRUE(r.ok) << r.reject_message;
+    // Report everything the submitter knows BEFORE asserting: an ASSERT
+    // aborts the test body, so an error loop after it never runs on the
+    // path where it matters.
+    std::string submit_detail = "completed=" + std::string(r.completed ? "true" : "false") +
+                                " reject='" + r.reject_message + "'";
     for (const auto& e : r.errors) {
-        ADD_FAILURE() << "job completed with error: " << e;
+        submit_detail += "\n  job error: " + e;
     }
+    ASSERT_TRUE(r.ok) << submit_detail;
 
     // Vacuity: this was a soak with real kills, not an idle wait.
     EXPECT_GE(kills.load(), 2) << "fewer than two kills landed; the budget is too small "
