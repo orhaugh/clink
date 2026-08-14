@@ -129,6 +129,34 @@ if [ ! -f "/usr/local/lib/cmake/etcd-cpp-api/etcd-cpp-api-config.cmake" ]; then
     ldconfig
 fi
 
+# -- DuckDB CLI (test-time tool, not a connector dep) --
+# The reference implementation for the differential SQL oracle
+# (tests/test_sql_oracle.cpp): identical queries run through clink and
+# through this binary, and the answers must agree. Pinned in versions.env
+# because the oracle's meaning depends on WHICH DuckDB it argues with; a
+# floating version could start failing on an upstream behaviour change and
+# masquerade as a clink regression. Official release zips are per-arch and
+# sha256-pinned here (the asset arch names happen to match dpkg's exactly).
+if ! command -v duckdb >/dev/null 2>&1; then
+    echo "▶ Installing DuckDB CLI ${DUCKDB_CLI_VERSION} (SQL oracle)..."
+    _duck_arch="$(dpkg --print-architecture)"  # amd64 | arm64
+    case "${_duck_arch}" in
+        amd64) _duck_sha="08c0ca117111fcede14239d0093792352befdc174218c344d232c13279643d05" ;;
+        arm64) _duck_sha="02163197027a42149147364d31fa67cac82108517a4be43304a1cc226eaef07a" ;;
+        *) echo "no duckdb release asset for ${_duck_arch}; the oracle suite will skip" ;;
+    esac
+    if [ -n "${_duck_sha:-}" ]; then
+        _duck_tmp="$(mktemp -d)"
+        curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_CLI_VERSION}/duckdb_cli-linux-${_duck_arch}.zip"             -o "${_duck_tmp}/duckdb.zip"
+        echo "${_duck_sha}  ${_duck_tmp}/duckdb.zip" | sha256sum -c -
+        command -v unzip >/dev/null 2>&1 || apt-get install -y --no-install-recommends unzip
+        (cd "${_duck_tmp}" && unzip -o duckdb.zip duckdb >/dev/null)
+        install -m 0755 "${_duck_tmp}/duckdb" /usr/local/bin/duckdb
+        rm -rf "${_duck_tmp}"
+        duckdb --version
+    fi
+fi
+
 rm -rf /var/lib/apt/lists/*
 
 echo "▶ Connector deps ready."
