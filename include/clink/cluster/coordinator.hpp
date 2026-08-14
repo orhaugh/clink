@@ -1344,6 +1344,11 @@ private:
     std::uint16_t bound_port_{0};
     std::thread accept_thread_;
     std::thread watchdog_thread_;
+    // The watchdog's previous sweep time, for self-pause detection: a sweep
+    // late by more than watchdog_interval + heartbeat_timeout means the
+    // JUDGE was suspended, and last_seen staleness measured across that gap
+    // says nothing about the workers. See watchdog_loop_.
+    std::chrono::steady_clock::time_point last_watchdog_sweep_{std::chrono::steady_clock::now()};
     std::thread checkpoint_thread_;
     std::atomic<bool> stop_{false};
 

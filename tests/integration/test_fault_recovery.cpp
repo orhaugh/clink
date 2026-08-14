@@ -1239,3 +1239,154 @@ TEST_F(FaultRecoveryTest,
                return os.str();
            }();
 }
+
+// --- The hung-but-alive axis. Every kill above is SIGKILL: clean death,
+// the failure mode the engine handles best and reality serves least. These
+// two pause a process with SIGSTOP - alive, holding its sockets, its locks
+// and its staged output - and resume it AFTER the cluster has moved on.
+
+// A worker declared lost while merely paused RESUMES, with subtasks live,
+// staged 2PC output on disk, and half-open sockets. The re-registration
+// contract's own comment names the premise this violates: "the previous
+// PROCESS is gone, so anything it had in flight can never report" - here it
+// is not gone, and everything it had in flight can still report.
+//
+// What keeps the output exactly-once is structural, and this test exists to
+// pin exactly that structure: commits happen only on coordinator triggers
+// (a dead-ended control plane mints no new ones), the committed filename is
+// derived from (subtask, checkpoint) with no attempt component (a zombie
+// finishing an in-flight commit renames onto the path recovery already
+// wrote - idempotent, not duplicating), and loss-declaration shutdown_read()s
+// the zombie's socket so its resumed heartbeats go nowhere. Weaken any of
+// those - attempt-unique filenames, say - and the zombie duplicates output,
+// which is precisely what the final assertion is watching for.
+TEST_F(FaultRecoveryTest, AWorkerResumedAfterBeingDeclaredLostCannotBreakExactlyOnce) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+
+    auto sub = submit(c, /*max_restarts=*/3);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
+                                    std::chrono::seconds(45)))
+        << "no checkpoint completed before the pause";
+
+    c.worker(0).signal(SIGSTOP);
+
+    // Vacuity: the watchdog must genuinely declare the loss (default
+    // heartbeat_timeout is 2s), or everything below is a plain clean run.
+    ASSERT_TRUE(clink::itest::await([&] { return c.coordinator().log_contains("worker lost"); },
+                                    std::chrono::seconds(30)))
+        << "the coordinator never declared the paused worker lost";
+
+    // The job must recover onto worker 1 and complete WHILE worker 0 is
+    // still frozen - proven, not assumed, by its process state.
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value()) << "submitter never exited after the pause";
+    ASSERT_EQ(*code, 0) << "the job did not recover from a paused worker";
+    {
+        std::string state_cmd = "ps -o state= -p " + std::to_string(c.worker(0).pid());
+        FILE* p = ::popen(state_cmd.c_str(), "r");
+        ASSERT_NE(p, nullptr);
+        char buf[16] = {};
+        (void)::fgets(buf, sizeof(buf), p);
+        ::pclose(p);
+        ASSERT_NE(std::string_view{buf}.find('T'), std::string_view::npos)
+            << "worker 0 was not in the stopped state when the job completed (state: " << buf
+            << "), so this tested an ordinary worker loss, not a zombie";
+    }
+
+    // Wake the zombie. Everything it does from here is the scenario: its
+    // subtasks resume mid-record, its channels point at cancelled peers,
+    // any in-flight commit dispatch completes against files recovery
+    // already committed.
+    c.worker(0).signal(SIGCONT);
+
+    // Give it a damage window. The zombie is EXPECTED to notice its
+    // dead-ended control plane and exit, but that is not the contract this
+    // test gates - the discarded result makes this a bounded wait, not an
+    // assertion, and the window exists so that if the zombie CAN corrupt
+    // the output, it has had every chance to before we look.
+    (void)clink::itest::await([&] { return !c.worker(0).running(); }, std::chrono::seconds(8));
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "the resumed zombie re-published output recovery had already committed: " << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << "records were LOST across the zombie window: " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty())
+        << "output contains records the source never emitted: " << describe(v);
+    EXPECT_TRUE(c.coordinator().running())
+        << "the coordinator did not survive the zombie's resumed traffic";
+
+    c.worker(0).kill_and_reap();
+}
+
+// The coordinator itself pauses past its own heartbeat timeout and resumes.
+// Nothing dies: worker heartbeats and completion reports pile into socket
+// buffers the paused process is not reading. On resume the coordinator
+// drains a backlog in which every worker's last_seen is stale by the whole
+// pause - and the watchdog's next sweep judges that staleness.
+//
+// Contract: the job completes exactly-once AND no healthy worker is
+// declared lost by the resumed watchdog. The second half is load-bearing
+// and was not free - see the self-pause detection block in
+// watchdog_loop_, which this test forced into existence on its first run.
+TEST_F(FaultRecoveryTest, ACoordinatorPausedPastItsHeartbeatTimeoutStillDeliversExactlyOnce) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+
+    auto sub = submit(c, /*max_restarts=*/3);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
+                                    std::chrono::seconds(45)))
+        << "no checkpoint completed before the pause";
+
+    c.coordinator().signal(SIGSTOP);
+    // Hold the pause for 3x the 2s default heartbeat timeout, using the
+    // workers' continued liveness as the condition (they must NOT die just
+    // because the coordinator went quiet - their sockets are merely
+    // buffering). A fixed sleep would hide a worker that exits early.
+    const auto pause_until = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            if (!c.worker(0).running() || !c.worker(1).running()) {
+                return true;  // fail fast below - a worker died during the pause
+            }
+            return std::chrono::steady_clock::now() >= pause_until;
+        },
+        std::chrono::seconds(20)));
+    ASSERT_TRUE(c.worker(0).running() && c.worker(1).running())
+        << "a worker exited during the coordinator pause - workers must tolerate a "
+           "quiet coordinator at least as long as the pause the cluster is expected "
+           "to absorb";
+    c.coordinator().signal(SIGCONT);
+
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value()) << "submitter never exited after the coordinator resumed";
+    ASSERT_EQ(*code, 0) << "the job did not complete after the coordinator resumed";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "a post-resume false loss triggered a recovery that re-published output: "
+        << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << "records were LOST across the pause: " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty())
+        << "output contains records the source never emitted: " << describe(v);
+
+    // Asserted, because it is now an engine property rather than timing:
+    // the watchdog detects its own suspension (a sweep late by more than
+    // watchdog_interval + heartbeat_timeout) and grants every live worker
+    // one fresh timeout instead of judging staleness across its own
+    // absence. The first run of this test, written before that guard
+    // existed, watched the resumed watchdog declare BOTH healthy workers
+    // lost in the same millisecond, sever their connections, and fail the
+    // job "no slot available" - a paused coordinator destroying its own
+    // healthy cluster.
+    EXPECT_TRUE(c.coordinator().log_contains("watchdog resumed after a suspension"))
+        << "the pause never tripped the self-pause detector, so this run did not "
+           "exercise the resume path it exists to gate";
+    EXPECT_FALSE(c.coordinator().log_contains("worker lost"))
+        << "the resumed watchdog declared a healthy worker lost - self-pause "
+           "detection has regressed";
+}

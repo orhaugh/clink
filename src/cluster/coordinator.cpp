@@ -3932,6 +3932,34 @@ void Coordinator::watchdog_loop_() {
         std::vector<PendingDeploy> deferred_restart_deploys;
         {
             std::lock_guard lock(mu_);
+            // Self-pause detection. A sweep that is itself late by more than
+            // the staleness bound was suspended (SIGSTOP, VM migration, a
+            // long GC-like stall) or starved - and during that gap NO
+            // worker's heartbeat could be read, so every last_seen is stale
+            // by the coordinator's own pause, not the workers'. Judging
+            // staleness on this sweep declares every worker lost at once;
+            // mark_worker_lost_locked_ then shutdown_read()s their healthy
+            // connections, they exit on the severed control plane, and the
+            // restart finds no capacity anywhere: a paused-then-resumed
+            // coordinator destroys its own healthy cluster. Found by the
+            // hung-but-alive test the moment it first ran.
+            //
+            // The remedy is one full timeout of grace: refresh every live
+            // worker's last_seen to now, so a worker that genuinely died
+            // DURING the pause is still declared lost - one heartbeat_timeout
+            // later than it would have been, which is the honest price of
+            // the coordinator having been absent for the evidence window.
+            if (now - last_watchdog_sweep_ > cfg_.watchdog_interval + cfg_.heartbeat_timeout) {
+                log::warn("coordinator.watchdog",
+                          "watchdog resumed after a suspension; deferring staleness "
+                          "judgement one interval");
+                for (auto& [_, worker] : registered_) {
+                    if (!worker->lost) {
+                        worker->last_seen = now;
+                    }
+                }
+            }
+            last_watchdog_sweep_ = now;
             for (auto& [_, worker] : registered_) {
                 if (worker->lost) {
                     continue;
