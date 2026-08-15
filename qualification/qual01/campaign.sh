@@ -479,10 +479,20 @@ PY
 done
 
 echo "campaign: duration reached; stopping generator and collecting evidence"
-on_host "$OPS_PUB" "pkill -INT -f generator.py || true"
+# Bracketed, for the reason given at the top of the run: an unbracketed
+# pattern also matches the remote shell carrying the pkill, so the command
+# signals itself and dies before reaching its target. `|| true` then hides
+# it completely. That is not theoretical - it is why run 3's generator and
+# verifier were still running nearly two hours after the campaign reported
+# that it had stopped them and collected its evidence.
+on_host "$OPS_PUB" "pkill -INT -f '[g]enerator.py' || true"
 sleep 120   # let the pipeline drain the tail and the verifier judge it
-on_host "$OPS_PUB" "pkill -INT -f verifier.py || true"
+on_host "$OPS_PUB" "pkill -INT -f '[v]erifier.py' || true"
 sleep 20
+# Say so if either is somehow still alive, rather than collecting evidence
+# from underneath a still-running producer and calling the verdict final.
+STILL=$(on_host "$OPS_PUB" "pgrep -f '[g]enerator.py|[v]erifier.py' | wc -l" | tr -d ' \r')
+[ "${STILL:-0}" = "0" ] || echo "campaign: WARNING - $STILL generator/verifier process(es) survived the drain" >&2
 for f in verdict.json chaos.jsonl progress.json progress.json.spec generator.log verifier.log chaos.log; do
     scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
 done
