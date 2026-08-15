@@ -479,9 +479,13 @@ TEST(CheckpointCompletion, ACompletedCheckpointRecordsAnOtlpLifecycleSpan) {
 
     const auto spans = buf.drain();
     buf.set_enabled(false);
-    ASSERT_FALSE(spans.empty()) << "no span recorded for a completed checkpoint";
-    const auto& s = spans.front();
-    EXPECT_EQ(s.name, "clink.checkpoint");
+    // Select by name: the submit that brought the job up records its own
+    // clink.submit span into the same buffer, and the order is the
+    // lifecycle's, not this assertion's concern.
+    const auto ckpt_span = std::find_if(
+        spans.begin(), spans.end(), [](const auto& sp) { return sp.name == "clink.checkpoint"; });
+    ASSERT_NE(ckpt_span, spans.end()) << "no span recorded for a completed checkpoint";
+    const auto& s = *ckpt_span;
     EXPECT_LE(s.start_unix_nano, s.end_unix_nano);
     EXPECT_GT(s.end_unix_nano, 0U);
     const auto attr = [&](const std::string& key) -> std::string {

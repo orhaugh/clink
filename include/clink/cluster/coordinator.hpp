@@ -886,6 +886,11 @@ private:
         // index for each new subtask. Populated alongside
         // rescale_overrides; cleared together.
         std::unordered_map<std::string, std::uint32_t> pre_rescale_parallelism;
+        // Wall-clock start for the clink.rescale lifecycle span recorded
+        // when restart_job_locked_ emits the rescaled deploys (both the
+        // whole-job drain and the per-operator replan set it). 0 = the
+        // span buffer was disabled when the rescale was staged.
+        std::uint64_t rescale_span_start_unix_nano{0};
         // Set by rescale_operator_parallelism: operator id -> requested
         // parallelism, with the parallelism each of those operators had when
         // the request was accepted. When non-empty, the next
@@ -993,6 +998,10 @@ private:
             };
             Phase phase{Phase::Arming};
             std::chrono::steady_clock::time_point phase_deadline{};
+            // Wall-clock start for the clink.rescale lifecycle span
+            // recorded at completion (mode=hot_cutover). 0 = span
+            // disabled when the cutover began.
+            std::uint64_t span_start_unix_nano{0};
             // The validated post-cutover plan, held from request time so
             // the deploy uses exactly what eligibility checked.
             std::vector<PlannedTask> planned_tasks;

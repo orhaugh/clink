@@ -292,8 +292,7 @@
     }
   ],
   "remaining_limitations": [
-    "EXPLAIN does not yet render the guarantee/determinism report inline (it renders at submission and in clink lint)",
-    "OTLP spans cover the checkpoint lifecycle only; submit/recovery/rescale spans and TLS transport are follow-ons",
-    "LIMIT/OFFSET without ORDER BY is global but arrival-order dependent across a fan-in; not yet marked in the determinism report"
+    "CLOSED since audit: EXPLAIN renders the determinism verdict and bare LIMIT is marked arrival-order dependent (27da01f); HA recovery no longer drops capacity-refused jobs (PR-13).",
+    "CLOSED since audit: OTLP spans now cover submit, recovery (with parked/failed outcomes) and rescale (drain/replan/hot_cutover) alongside the checkpoint lifecycle; the submit site is behaviourally gated (OtlpExport.ASubmittedJobRecordsALifecycleSpan, mutation-checked). OTLP TLS transport stays out BY DESIGN - the exporter documents plain HTTP with a collector sidecar as the deployment shape."
   ]
 }

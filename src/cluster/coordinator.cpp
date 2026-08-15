@@ -642,6 +642,13 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                       "recovery skipped for job_id=" + std::to_string(job_id) + ": " + reject);
             return;
         }
+        // Start of the clink.recovery lifecycle span (recorded below with
+        // the outcome; parked is a deliberate wait, not a failure).
+        const std::uint64_t recovery_span_start = clink::metrics::SpanBuffer::global().enabled()
+                                                      ? clink::metrics::otlp_now_unix_nano()
+                                                      : 0;
+        std::string recovery_outcome = "recovered";
+        bool recovery_ok = true;
         try {
             const auto graph = JobGraphSpec::from_json(graph_json);
             // Use submit_job (creates a fresh JobState). Keep the
@@ -663,6 +670,7 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                       "recovered job_id=" + std::to_string(job_id) +
                           " restore_from_ckpt=" + std::to_string(ckpt.restore_from_checkpoint_id));
         } catch (const InsufficientSlotsError& e) {
+            recovery_outcome = "parked";
             // No worker had registered yet - the takeover raced the
             // supervisor restarting them. The job is intact on disk, so
             // PARK it and retry from the manifest when capacity appears;
@@ -684,8 +692,22 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                       "recovery of job_id=" + std::to_string(job_id) + " parked for capacity (" +
                           e.what() + "); it retries when a worker registers");
         } catch (const std::exception& e) {
+            recovery_outcome = "failed";
+            recovery_ok = false;
             log::warn("coordinator.ha",
                       "recovery failed for job_id=" + std::to_string(job_id) + ": " + e.what());
+        }
+        if (recovery_span_start != 0 && clink::metrics::SpanBuffer::global().enabled()) {
+            clink::metrics::OtlpSpan span;
+            span.name = "clink.recovery";
+            span.start_unix_nano = recovery_span_start;
+            span.end_unix_nano = clink::metrics::otlp_now_unix_nano();
+            span.ok = recovery_ok;
+            span.attributes = {
+                {"clink.job_id", std::to_string(job_id)},
+                {"clink.outcome", recovery_outcome},
+                {"clink.restore_from_checkpoint", std::to_string(ckpt.restore_from_checkpoint_id)}};
+            clink::metrics::SpanBuffer::global().record(std::move(span));
         }
     }
 }
@@ -1843,6 +1865,11 @@ RescaleJobAckMsg Coordinator::rescale_job(
             job.rescale_overrides[role] = new_p;
         }
         job.pre_rescale_parallelism = std::move(current_p);
+        // Start of the clink.rescale lifecycle span (recorded when
+        // restart_job_locked_ emits the rescaled deploys).
+        if (clink::metrics::SpanBuffer::global().enabled()) {
+            job.rescale_span_start_unix_nano = clink::metrics::otlp_now_unix_nano();
+        }
         job.awaiting_restart = true;
         // Bound the rescale drain the same way the worker-loss path does: a
         // survivor that hangs while still heartbeating would otherwise wedge
@@ -2097,6 +2124,11 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
             // last one lands.
             job.pending_op_parallelism[op_id] = new_parallelism;
             job.pre_rescale_op_parallelism[op_id] = old_parallelism;
+            // Start of the clink.rescale lifecycle span (mode=replan),
+            // recorded when restart_job_locked_ emits the replanned deploys.
+            if (clink::metrics::SpanBuffer::global().enabled()) {
+                job.rescale_span_start_unix_nano = clink::metrics::otlp_now_unix_nano();
+            }
             job.awaiting_restart = true;
             job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
             for (const auto& [worker_id, pending] : job.pending_per_worker) {
@@ -2309,6 +2341,9 @@ bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
     hot.arm_workers_pending = arm_workers;
     hot.phase = JobState::HotCutover::Phase::Arming;
     hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
+    if (clink::metrics::SpanBuffer::global().enabled()) {
+        hot.span_start_unix_nano = clink::metrics::otlp_now_unix_nano();
+    }
 
     BeginRescaleMsg arm;
     arm.job_id = job.id;
@@ -2704,6 +2739,22 @@ void Coordinator::hot_cutover_complete_locked_(JobState& job,
                   " " + std::to_string(hot.old_parallelism) + "->" +
                   std::to_string(hot.target_parallelism) + " cutover_checkpoint=" +
                   std::to_string(hot.cutover_checkpoint) + "; the checkpoint clock resumes");
+    // Lifecycle span for OTLP export: arm to completion of the in-place
+    // cutover (mode=hot_cutover; the drain-based flavours record theirs in
+    // restart_job_locked_).
+    if (hot.span_start_unix_nano != 0 && clink::metrics::SpanBuffer::global().enabled()) {
+        clink::metrics::OtlpSpan span;
+        span.name = "clink.rescale";
+        span.start_unix_nano = hot.span_start_unix_nano;
+        span.end_unix_nano = clink::metrics::otlp_now_unix_nano();
+        span.attributes = {
+            {"clink.job_id", std::to_string(job.id)},
+            {"clink.mode", "hot_cutover"},
+            {"clink.op_id", hot.op_id},
+            {"clink.parallelism",
+             std::to_string(hot.old_parallelism) + "->" + std::to_string(hot.target_parallelism)}};
+        clink::metrics::SpanBuffer::global().record(std::move(span));
+    }
     job.hot_cutover.reset();
     cv_.notify_all();
 }
@@ -3193,6 +3244,10 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
                               CheckpointConfig checkpoint,
                               std::unique_ptr<JobBundle> bundle,
                               network::Connection* notify_client_conn) {
+    // Start of the clink.submit lifecycle span, recorded at the success
+    // return. Zero when no exporter has enabled the buffer.
+    const std::uint64_t submit_span_start =
+        clink::metrics::SpanBuffer::global().enabled() ? clink::metrics::otlp_now_unix_nano() : 0;
     // Cluster-level default: when the submitter chose no state backend, apply
     // the configured default here - before the HA manifest snapshot (line
     // ~1408) and the deploy below - so the resolved URI is what gets persisted
@@ -3435,6 +3490,24 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
                                 js_quote(graph.name) + ",\"lineage\":" + lg.to_json() + "}");
         }
     } catch (...) {
+    }
+
+    // Lifecycle span for OTLP export: gate-to-deployed for this submit.
+    // Success only - a rejected submit throws before reaching here and is
+    // visible through its own error, not a span.
+    if (submit_span_start != 0 && clink::metrics::SpanBuffer::global().enabled()) {
+        clink::metrics::OtlpSpan span;
+        span.name = "clink.submit";
+        span.start_unix_nano = submit_span_start;
+        span.end_unix_nano = clink::metrics::otlp_now_unix_nano();
+        span.attributes = {{"clink.job_id", std::to_string(job_id)},
+                           {"clink.tasks", std::to_string(plan.tasks.size())}};
+        if (checkpoint_copy.restore_from_checkpoint_id != 0) {
+            span.attributes.emplace_back(
+                "clink.restore_from_checkpoint",
+                std::to_string(checkpoint_copy.restore_from_checkpoint_id));
+        }
+        clink::metrics::SpanBuffer::global().record(std::move(span));
     }
 
     return job_id;
@@ -4939,6 +5012,25 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                   " attempt=" + std::to_string(job.restart_attempts) +
                   " survivors=" + std::to_string(survivors.size()) +
                   " tasks=" + std::to_string(tasks_to_redeploy.size()));
+    // Lifecycle span for OTLP export: rescale request to rescaled-deploys-
+    // emitted, for both drain-based flavours (the hot cutover records its
+    // own at completion). Recorded before the overrides are cleared so the
+    // role count is still known.
+    if ((is_rescale || is_replan_rescale) && job.rescale_span_start_unix_nano != 0 &&
+        clink::metrics::SpanBuffer::global().enabled()) {
+        clink::metrics::OtlpSpan span;
+        span.name = "clink.rescale";
+        span.start_unix_nano = job.rescale_span_start_unix_nano;
+        span.end_unix_nano = clink::metrics::otlp_now_unix_nano();
+        span.attributes = {{"clink.job_id", std::to_string(job.id)},
+                           {"clink.mode", is_rescale ? "drain" : "replan"},
+                           {"clink.roles",
+                            std::to_string(is_rescale ? job.rescale_overrides.size()
+                                                      : job.pending_op_parallelism.size())},
+                           {"clink.tasks", std::to_string(tasks_to_redeploy.size())}};
+        clink::metrics::SpanBuffer::global().record(std::move(span));
+    }
+    job.rescale_span_start_unix_nano = 0;
     if (is_rescale) {
         job.rescale_overrides.clear();
         job.pre_rescale_parallelism.clear();

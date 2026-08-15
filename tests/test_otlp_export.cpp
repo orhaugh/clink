@@ -14,6 +14,7 @@
 #include "clink/config/json.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/otlp_export.hpp"
+#include "clink/test/test_cluster.hpp"
 
 #ifdef CLINK_HAS_HTTP
 #include <condition_variable>
@@ -227,5 +228,61 @@ TEST(OtlpExport, AnUnreachableCollectorCountsAFailureAndTakesNothingDown) {
 }
 
 #endif  // CLINK_HAS_HTTP
+
+// The clink.submit span site, behaviourally: a real in-process cluster runs
+// a job to completion with the buffer enabled, and the drained spans carry
+// exactly one clink.submit with the job id and task count. This is the site
+// the tracker's "spans cover the checkpoint lifecycle only" gap named; the
+// recovery and rescale sites follow the same guarded pattern at their
+// (integration-tested) transitions.
+TEST(OtlpExport, ASubmittedJobRecordsALifecycleSpan) {
+    auto& buf = SpanBuffer::global();
+    buf.set_enabled(true);
+    (void)buf.drain();  // clear anything an earlier test left behind
+
+    clink::test::TestCluster mini({.workers = 1, .slots_per_worker = 4});
+    clink::cluster::JobGraphSpec g;
+    clink::cluster::OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{clink::cluster::kChannelInt64};
+    src.params = {{"count", "5"}};
+    g.ops.push_back(src);
+    clink::cluster::OperatorSpec snk;
+    snk.type = "collecting_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"src"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{clink::cluster::kChannelInt64};
+    g.ops.push_back(snk);
+    const auto job_id = mini.execute(g);
+
+    const auto spans = buf.drain();
+    buf.set_enabled(false);
+    std::size_t submits = 0;
+    for (const auto& s : spans) {
+        if (s.name != "clink.submit") {
+            continue;
+        }
+        ++submits;
+        EXPECT_GE(s.end_unix_nano, s.start_unix_nano);
+        bool saw_job_id = false;
+        bool saw_tasks = false;
+        for (const auto& [k, v] : s.attributes) {
+            if (k == "clink.job_id") {
+                saw_job_id = true;
+                EXPECT_EQ(v, std::to_string(job_id));
+            }
+            if (k == "clink.tasks") {
+                saw_tasks = true;
+                EXPECT_EQ(v, "2");
+            }
+        }
+        EXPECT_TRUE(saw_job_id) << "the submit span carries no job id";
+        EXPECT_TRUE(saw_tasks) << "the submit span carries no task count";
+    }
+    EXPECT_EQ(submits, 1u) << "exactly one clink.submit span per submit";
+}
 
 }  // namespace
