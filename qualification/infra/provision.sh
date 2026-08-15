@@ -40,10 +40,13 @@ SUBNET="10.20.1.0/24"
 SSH_KEY_NAME="qual-key"
 SSH_KEY_FILE="${SSH_KEY_FILE:-$HOME/.ssh/clink-qual-ed25519}"
 
-OPS_TYPE="${OPS_TYPE:-cpx31}"
-COORD_TYPE="${COORD_TYPE:-cpx21}"
-WORKER_TYPE="${WORKER_TYPE:-cpx31}"
-BROKER_TYPE="${BROKER_TYPE:-cpx21}"
+# The cpx*2 generation: the older cpx11/21/31/41 still list prices in
+# fsn1 but the API refuses to create them there, so anything defaulting
+# to those fails partway through, after the network already exists.
+OPS_TYPE="${OPS_TYPE:-cpx32}"
+COORD_TYPE="${COORD_TYPE:-cpx22}"
+WORKER_TYPE="${WORKER_TYPE:-cpx32}"
+BROKER_TYPE="${BROKER_TYPE:-cpx22}"
 WORKERS="${WORKERS:-3}"
 BROKERS="${BROKERS:-3}"
 
