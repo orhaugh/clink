@@ -232,7 +232,7 @@
         "KafkaExactlyOnceTest.AnOrphanedBrokerTransactionIsCommittedAcrossACoordinatorFailover (whole-chain HA e2e, real processes + real broker: held commit loads the orphan by construction, worker dies pre-commit, leader dies, standby's recovery resolves the orphan on the broker, CONFIRMED advances, output totally clean; mutation-checked with a false-confirm resolver linked into the job plugin - caught as 3 MISSING records)"
       ],
       "dependencies": [],
-      "limitations": "resolution runs on HA/lock-free recovery paths only (in-incarnation restarts keep the bounded contract until a lock-free restart phase exists); non-flexible protocol versions only (FindCoordinator v1/v2, EndTxn v1) and no SASL - both fall back, never guess. Revisit against librdkafka KIP-939 support when it ships. e2e round findings: producer identity is now captured with a bounded wait in KafkaSink::open() (stats tick at 100ms), closing the pre-first-tick window where staged handles were unresumable; the HA-recovery-drops-job-on-no-capacity finding is closed by PR-13."
+      "limitations": "in-incarnation restarts now resolve too (PR-14); non-flexible protocol versions only (FindCoordinator v1/v2, EndTxn v1) and no SASL - both fall back, never guess. Revisit against librdkafka KIP-939 support when it ships. e2e round findings: producer identity is now captured with a bounded wait in KafkaSink::open() (stats tick at 100ms), closing the pre-first-tick window where staged handles were unresumable; the HA-recovery-drops-job-on-no-capacity finding is closed by PR-13."
     },
     {
       "id": "PR-13",
@@ -255,6 +255,28 @@
         "PR-12"
       ],
       "limitations": "the retry keeps trying for as long as the coordinator leads (no give-up bound - a parked job with no workers is the operator's capacity problem, surfaced by the park warning); typed InsufficientSlotsError distinguishes capacity from every other submit rejection."
+    },
+    {
+      "id": "PR-14",
+      "priority": "P1",
+      "title": "In-incarnation restarts hold the redeploy behind in-doubt resolution, so the prepared-transaction resume covers ordinary worker loss, not just HA takeover",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "The common failure (worker dies pre-commit, coordinator survives) fell back to the bounded replay contract. The restart is now staged behind an off-thread resolution when a tracked job's drain completes with a completed-but-unconfirmed gap: nothing deploys while the broker is being asked, so nothing can fence the orphan - resolution and restore-point selection stay one decision. A refused/failed resolution releases the restart unchanged; a wedged resolver hits a 90s watchdog backstop that fails the job loudly naming the resolution.",
+      "files": [
+        "include/clink/cluster/coordinator.hpp",
+        "src/cluster/coordinator.cpp",
+        "tests/integration/test_connector_exactly_once.cpp",
+        "docs/connectors/kafka.md",
+        "docs/internals/checkpointing.md"
+      ],
+      "tests": [
+        "KafkaExactlyOnceTest.AnOrphanedBrokerTransactionIsCommittedOnAnInIncarnationRestart (real coordinator survives, loaded orphan, restart held, resolver commits on the broker, restore advances, submitter exits 0, output totally clean; mutation-checked by never holding the restart - caught on the held-restart vacuity line with clink_node rebuild verified by mtime)"
+      ],
+      "dependencies": [
+        "PR-12"
+      ],
+      "limitations": "all four restart_job_locked_ trigger sites are gated; the resolution thread mirrors the drain-complete readiness check (drained covers expected). Non-tracked jobs and jobs with no confirmed<completed gap stage nothing and restart exactly as before."
     }
   ],
   "verified_already_done": [

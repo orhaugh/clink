@@ -746,6 +746,110 @@ void Coordinator::recovery_retry_loop_() {
     }
 }
 
+bool Coordinator::stage_in_doubt_resolution_locked_(JobState& job) {
+    if (job.resolving_in_doubt) {
+        return true;  // in flight; the resolution thread fires the restart
+    }
+    // Only tracked jobs (a non-recoverable-commit sink in the plan), only
+    // when a completed-but-unconfirmed gap actually exists, and only with a
+    // checkpoint dir to read the staged handles from. Everything else
+    // restarts immediately, exactly as before.
+    if (job.confirm_task_keys.empty() || job.checkpoint.checkpoint_dir.empty() ||
+        job.latest_completed_checkpoint_id == 0 ||
+        job.latest_confirmed_checkpoint_id >= job.latest_completed_checkpoint_id) {
+        return false;
+    }
+    job.resolving_in_doubt = true;
+    // The drain is complete; the deadline now guards the RESOLUTION, which
+    // is hard-bounded by the resolver's wire timeouts. 90s is far above
+    // any of them - hitting it means the resolver wedged, and the watchdog
+    // fails the job loudly (naming the resolution, not a phantom drain).
+    job.restart_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{90};
+    pending_in_doubt_resolutions_.push_back(job.id);
+    if (!in_doubt_resolution_thread_.joinable()) {
+        in_doubt_resolution_thread_ = std::thread([this] { in_doubt_resolution_loop_(); });
+    }
+    log::info("coordinator.restart",
+              "job_id=" + std::to_string(job.id) +
+                  " restart held for in-doubt resolution (latest_completed=" +
+                  std::to_string(job.latest_completed_checkpoint_id) +
+                  " latest_confirmed=" + std::to_string(job.latest_confirmed_checkpoint_id) +
+                  "); nothing deploys until the broker answers");
+    cv_.notify_all();
+    return true;
+}
+
+void Coordinator::in_doubt_resolution_loop_() {
+    std::unique_lock lock(mu_);
+    while (!stop_.load(std::memory_order_acquire)) {
+        if (pending_in_doubt_resolutions_.empty()) {
+            cv_.wait_for(lock, std::chrono::seconds{2});
+            continue;
+        }
+        auto ids = std::move(pending_in_doubt_resolutions_);
+        pending_in_doubt_resolutions_.clear();
+        for (const auto id : ids) {
+            std::string dir;
+            std::uint64_t confirmed = 0;
+            std::uint64_t completed = 0;
+            {
+                auto it = jobs_.find(id);
+                if (it == jobs_.end() || !it->second->resolving_in_doubt) {
+                    continue;  // failed, cancelled, or gone while queued
+                }
+                dir = it->second->checkpoint.checkpoint_dir;
+                confirmed = it->second->latest_confirmed_checkpoint_id;
+                completed = it->second->latest_completed_checkpoint_id;
+            }
+            lock.unlock();
+            // The broker round-trips, off mu_. No task of this job is
+            // deployed while it runs, so nothing can fence the orphan
+            // between this answer and the restore point that consumes it.
+            const auto resolved = resolve_in_doubt_commits(dir, id, confirmed, completed);
+            lock.lock();
+            auto it = jobs_.find(id);
+            if (it == jobs_.end()) {
+                continue;
+            }
+            auto& job = *it->second;
+            if (!job.resolving_in_doubt) {
+                continue;  // the watchdog backstop failed the job meanwhile
+            }
+            job.resolving_in_doubt = false;
+            if (resolved > job.latest_confirmed_checkpoint_id) {
+                log::info("coordinator.restart",
+                          "job_id=" + std::to_string(id) +
+                              " restore point advanced by in-doubt resolution: checkpoint " +
+                              std::to_string(job.latest_confirmed_checkpoint_id) + " -> " +
+                              std::to_string(resolved));
+                job.latest_confirmed_checkpoint_id = resolved;
+            }
+            std::vector<PendingDeploy> deploys;
+            // Same readiness the drain-complete path uses: every expected
+            // key drained (an empty expected set is trivially ready). The
+            // expected set is NOT emptied by draining - it is covered.
+            bool drain_ready = true;
+            for (const auto& expected : job.restart_drain_expected) {
+                if (job.restart_drained_keys.count(expected) == 0) {
+                    drain_ready = false;
+                    break;
+                }
+            }
+            if (job.awaiting_restart && !job.completion_signalled && !job.cancel_requested &&
+                drain_ready) {
+                deploys = restart_job_locked_(job);
+            }
+            lock.unlock();
+            for (auto& d : deploys) {
+                if (d.conn) {
+                    send_frame(*d.conn, d.frame);
+                }
+            }
+            lock.lock();
+        }
+    }
+}
+
 void Coordinator::reload_history_from_disk_() {
     if (ha_dir_.empty())
         return;
@@ -4166,8 +4270,11 @@ void Coordinator::watchdog_loop_() {
                     }
                     // If the job is awaiting_restart and no surviving
                     // subtasks need to drain (they finished before the
-                    // watchdog tick), kick off the redeploy here.
-                    if (job->awaiting_restart && job->restart_drain_expected.empty()) {
+                    // watchdog tick), kick off the redeploy here - unless
+                    // an in-doubt resolution must answer first, in which
+                    // case the resolution thread fires the restart.
+                    if (job->awaiting_restart && job->restart_drain_expected.empty() &&
+                        !stage_in_doubt_resolution_locked_(*job)) {
                         auto deploys = restart_job_locked_(*job);
                         for (auto& d : deploys)
                             deferred_restart_deploys.push_back(std::move(d));
@@ -4213,7 +4320,8 @@ void Coordinator::watchdog_loop_() {
             // events.
             for (auto& [_, job] : jobs_) {
                 if (job->awaiting_restart && !job->completion_signalled && !job->cancel_requested &&
-                    job->restart_drain_expected.empty()) {
+                    job->restart_drain_expected.empty() &&
+                    !stage_in_doubt_resolution_locked_(*job)) {
                     auto deploys = restart_job_locked_(*job);
                     for (auto& d : deploys) {
                         deferred_restart_deploys.push_back(std::move(d));
@@ -4224,6 +4332,30 @@ void Coordinator::watchdog_loop_() {
                 if (job->awaiting_restart && !job->completion_signalled &&
                     job->restart_deadline != std::chrono::steady_clock::time_point{} &&
                     now > job->restart_deadline) {
+                    // Backstop for a wedged in-doubt resolution (its wire
+                    // timeouts bound it far below the 90s the stage set, so
+                    // reaching here means the resolver hung): fail the job
+                    // naming the resolution, not a phantom drain. Clearing
+                    // the flag makes a late-returning resolver skip its
+                    // deferred restart - the job is already failed.
+                    if (job->resolving_in_doubt) {
+                        job->resolving_in_doubt = false;
+                        log::warn("coordinator.watchdog",
+                                  "job_id=" + std::to_string(job->id) +
+                                      " in-doubt resolution timed out; failing job");
+                        job->errors.push_back(
+                            "in-doubt resolution timed out (the resolver exceeded its "
+                            "wire-level bounds); the restart was held to keep resolution "
+                            "and restore-point selection one decision");
+                        job->awaiting_restart = false;
+                        job->restart_deadline = {};
+                        job->restart_pending.clear();
+                        job->restart_drained_keys.clear();
+                        job->restart_drain_expected.clear();
+                        job->completed_count = job->expected_completion;
+                        signal_job_completion_locked_(*job);
+                        continue;
+                    }
                     // Name the keys still owed and the workers that own them:
                     // a drain timeout with an anonymous survivor is
                     // undiagnosable from a transcript, and this line is what
@@ -5529,7 +5661,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                     break;
                 }
             }
-            if (ready_for_restart) {
+            if (ready_for_restart && !stage_in_doubt_resolution_locked_(job)) {
                 restart_deploys = restart_job_locked_(job);
             }
         } else if (!retry && msg.had_error && !msg.fatal && !job.completion_signalled &&
@@ -5607,8 +5739,12 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                 // No in-flight subtasks (all finished, e.g. a bounded job whose
                 // sink exited before the source timed out): redeploy now. Do NOT
                 // broadcast CancelJob - there is nothing to drain, and a cancel
-                // would race the just-redeployed subtasks.
-                restart_deploys = restart_job_locked_(job);
+                // would race the just-redeployed subtasks. In-doubt resolution
+                // first, though: the resolution thread fires the deferred
+                // restart when the broker has answered.
+                if (!stage_in_doubt_resolution_locked_(job)) {
+                    restart_deploys = restart_job_locked_(job);
+                }
             } else {
                 // Cancel the in-flight subtasks so they drain; when all have
                 // reported (the awaiting_restart branch above), restart_job_locked_
@@ -5929,6 +6065,9 @@ void Coordinator::stop() {
     cv_.notify_all();
     if (recovery_retry_thread_.joinable()) {
         recovery_retry_thread_.join();
+    }
+    if (in_doubt_resolution_thread_.joinable()) {
+        in_doubt_resolution_thread_.join();
     }
     // Tear down per-job autoscalers before everything else.
     // Their polling threads might be sitting on mu_ trying to call

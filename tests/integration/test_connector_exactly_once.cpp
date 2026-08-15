@@ -810,6 +810,92 @@ TEST_F(KafkaExactlyOnceTest, AnOrphanedBrokerTransactionIsCommittedAcrossACoordi
     sub->kill_and_reap();
 }
 
+// The in-incarnation half: the COORDINATOR SURVIVES the worker kill, and the
+// ordinary restart machinery - not an HA takeover - is what must resolve the
+// orphan. The restart is HELD while the resolver commits the loaded
+// transaction on the broker (nothing deploys in that window, so nothing can
+// fence the orphan - resolution and restore-point selection stay one
+// decision), then fires with latest_confirmed advanced past the interval.
+//
+// The verdict is TOTAL cleanliness, which is the elevation over
+// ACommitThatDiesWithTheWorkerIsReplayedNotLost above: that scenario used to
+// replay the interval into a fresh transaction (clean, but re-produced);
+// with the held restart the orphan's own records are the committed ones and
+// nothing is replayed. The output alone cannot distinguish the two paths, so
+// vacuity is pinned by the hold and advance log lines only this path writes.
+TEST_F(KafkaExactlyOnceTest, AnOrphanedBrokerTransactionIsCommittedOnAnInIncarnationRestart) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+    // The orphan must survive kill -> loss detection -> resolution; the
+    // suite-default 5s broker expiry races that.
+    ::setenv("CLINK_2PC_KAFKA_TXN_TIMEOUT_MS", "60000", 1);
+
+    ClusterSpec one;
+    one.node_binary = node_binary();
+    one.workers = 1;
+    one.slots_per_worker = 4;
+    Cluster c(one);
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    // Same orphan-loading recipe as the failover e2e: commit 1 held 800ms
+    // (its records pile into transaction 2 by construction), then the
+    // worker dies BEFORE checkpoint 2's broker commit executes.
+    ASSERT_TRUE(
+        c.start_worker(0, {.fault = "sink.before_commit=delay:800@1,sink.before_commit=exit:1@2"}));
+    ASSERT_TRUE(c.await_workers_registered(1));
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(c.await_process_gone(0))
+        << "the die-before-commit fault never fired; the orphan window never happened";
+
+    // The scenario's shape: a confirmed base and above it a checkpoint that
+    // COMPLETED but whose commit never executed.
+    ASSERT_TRUE(clink::itest::await([&] { return latest_confirmed(c.checkpoint_dir()) >= 1; }, 15s))
+        << "checkpoint 1's executed commit was never confirmed";
+    const auto completed_before = latest_completed(c.checkpoint_dir());
+    ASSERT_GT(completed_before, latest_confirmed(c.checkpoint_dir()))
+        << "no completed-but-unconfirmed checkpoint exists; nothing is in doubt";
+
+    // The supervisor's move. The re-registration retires the dead session,
+    // the fold empties the drain, and the watchdog's kick must now HOLD the
+    // restart behind the resolution instead of redeploying immediately.
+    ASSERT_TRUE(c.restart_worker(0));  // fresh process, no fault armed
+
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return c.count_in_coordinator_log("restart held for in-doubt resolution") > 0; },
+        30s))
+        << "the restart was never held; the in-incarnation resolution never staged";
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return c.count_in_coordinator_log("restore point advanced by in-doubt resolution") > 0;
+        },
+        30s))
+        << "the resolution never advanced the restore point; the resolver refused or "
+           "the staged handle was unusable";
+
+    // The advance is durable before anything redeploys.
+    EXPECT_GE(latest_confirmed(c.checkpoint_dir()), completed_before)
+        << "the restore point advanced without the CONFIRMED marker";
+
+    // The coordinator survived, so the submitter's exit code IS the job's
+    // verdict here - unlike the failover test above.
+    const auto code = sub->await_exit(120s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover through the held restart";
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.missing.empty())
+        << "the orphaned interval was LOST: " << clink::itest::describe(v);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "the interval was BOTH committed by the resolution and replayed - resolution and "
+           "restore-point selection came apart: "
+        << clink::itest::describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << clink::itest::describe(v);
+}
+
 // The longer-horizon arm, mirroring the Postgres one: thirty times the
 // records, two separated worker losses, same exact verdict.
 // RE-ENABLED with its sibling above (the item-51 fix). One caveat stands,

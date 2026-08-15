@@ -886,6 +886,13 @@ private:
         // index for each new subtask. Populated alongside
         // rescale_overrides; cleared together.
         std::unordered_map<std::string, std::uint32_t> pre_rescale_parallelism;
+        // An in-incarnation restart is HELD while the in-doubt resolver is
+        // finalising this job's completed-but-unconfirmed broker
+        // transactions (see stage_in_doubt_resolution_locked_). Resolution
+        // and restore-point selection are ONE decision: nothing may deploy
+        // - and so nothing may fence the orphan - until the broker has
+        // answered and latest_confirmed reflects it.
+        bool resolving_in_doubt{false};
         // Wall-clock start for the clink.rescale lifecycle span recorded
         // when restart_job_locked_ emits the rescaled deploys (both the
         // whole-job drain and the per-operator replan set it). 0 = the
@@ -1389,6 +1396,21 @@ private:
     // One job dir's recovery, callable repeatedly (skips ids already in
     // jobs_). Parks the id on InsufficientSlotsError.
     void recover_one_persisted_job_(JobId job_id);
+
+    // In-incarnation in-doubt resolution: jobs whose drain has completed
+    // but whose restart is HELD while the resolver finalises their
+    // completed-but-unconfirmed broker transactions off-thread (broker
+    // round-trips must not run under mu_ or on the watchdog). The thread
+    // is spawned on first stage and joined in stop(); when a resolution
+    // returns it applies the advanced confirmed watermark and fires the
+    // deferred restart itself.
+    std::vector<JobId> pending_in_doubt_resolutions_;
+    std::thread in_doubt_resolution_thread_;
+    void in_doubt_resolution_loop_();
+    // True = the restart is deferred (either just staged, or a resolution
+    // is already in flight); the caller must NOT run restart_job_locked_.
+    // False = nothing to resolve; restart immediately.
+    [[nodiscard]] bool stage_in_doubt_resolution_locked_(JobState& job);
 
     mutable std::mutex mu_;
     std::condition_variable cv_;
