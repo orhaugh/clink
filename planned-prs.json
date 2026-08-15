@@ -354,6 +354,23 @@
         "PR-16"
       ],
       "limitations": "SHA-256 only (what brokers enable); no channel binding (matching every Kafka client - transport pairing is the TLS dialer); RFC 5802 username escaping but no full SASLprep (non-ASCII usernames are the broker's refusal, not a silent mis-encode). consume_all gained an extra_conf param for authenticated drains. KIP-939 revisit unchanged."
+    },
+    {
+      "id": "PR-18",
+      "priority": "P1",
+      "title": "HttpServer::stop() waits for the listen loop before stopping it - the lost-stop wedge behind watch item 64",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "httplib's Server::stop() is a no-op until the listen thread sets is_running_, so a stop() outrunning a slow-starting listen thread was silently lost: listen_after_bind() blocked in accept() on the never-closed socket and the join hung until an external timeout. Every HttpServer teardown in the tree - queryable state, dashboards, OTLP test collectors - carried the race; it surfaced in CI as a 0.05s queryable-state test wedging for its full 180s bound under runner load. stop() now calls wait_until_ready() first, making the stop landable in every interleaving.",
+      "files": [
+        "src/http/http_server.cpp",
+        "tests/test_http_auth.cpp"
+      ],
+      "tests": [
+        "HttpLifecycle.ImmediateStopAfterStartNeverWedges (200 start/stop cycles with stop as close to start as the code can express; 280ms with the fix. Mutation-checked: removing the wait_until_ready wedged the hammer within 45 seconds on this machine - the race reproduces on demand, it was never load-exclusive)"
+      ],
+      "dependencies": [],
+      "limitations": "root-caused analytically from one CI sighting (client waits provably bounded at ~24s eliminated every other suspect); the hammer makes the pre-fix wedge reproducible locally, so the pin does not depend on CI load."
     }
   ],
   "verified_already_done": [

@@ -309,6 +309,15 @@ void HttpServer::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+    // httplib's Server::stop() is a NO-OP until the listen thread has set
+    // its internal is_running_ flag - a stop() racing a slow-starting
+    // listen thread is silently lost, listen_after_bind() then blocks in
+    // accept() on the never-closed socket, and the join below hangs until
+    // whatever timeout kills the process. Observed in CI as a 0.05s test
+    // wedging for its full 180s ctest bound under runner load (watch item
+    // 64). wait_until_ready() blocks until the listen loop is actually
+    // running (or already done), which makes the stop landable.
+    impl_->server.wait_until_ready();
     impl_->server.stop();
     if (impl_->listen_thread.joinable()) {
         impl_->listen_thread.join();

@@ -71,3 +71,23 @@ TEST(HttpAuth, NoTokenConfiguredLeavesAuthOff) {
 
     server.stop();
 }
+
+// The start/stop race that wedged a 0.05s test for its full 180s ctest
+// bound in CI (watch item 64): httplib's Server::stop() is a NO-OP until
+// the listen thread has set is_running_, so a stop() outrunning a
+// slow-starting listen thread was silently lost and the join hung on an
+// accept() nobody would ever wake. stop() now waits for the listen loop
+// to be ready before stopping it, which makes this hammer deterministic:
+// every cycle must complete, including the ones where stop() wins the
+// old race (the first iterations, before the thread scheduler warms up,
+// are exactly the hostile interleaving). Pre-fix this wedges within a
+// handful of cycles on a loaded machine; the ctest timeout is the
+// failure detector.
+TEST(HttpLifecycle, ImmediateStopAfterStartNeverWedges) {
+    for (int i = 0; i < 200; ++i) {
+        HttpServer server;
+        server.get("/ping", pong);
+        (void)server.start("127.0.0.1", 0);
+        server.stop();  // as close to start() as the code can express
+    }
+}
