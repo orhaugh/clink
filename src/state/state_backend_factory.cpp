@@ -431,6 +431,23 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
         // and union operator rows from topologies this restore has nothing to do
         // with.
         {
+            // This subtask's own operator keys, so a peer can fill in one it
+            // does not have and never overwrite one it does.
+            //
+            // Not all operator state is partition-scoped. A Kafka source keys
+            // its offsets per partition, and those must cross subtasks because
+            // the broker decides who owns a partition. The file, directory,
+            // polling and vector sources each keep their position under one
+            // FIXED key, so at parallelism 4 all four subtasks write the same
+            // key with four different values - and the merge keeps the greater
+            // i64 on collision, which is the safe direction for a partition
+            // offset and silent data loss for these, handing every subtask the
+            // furthest position any of them reached.
+            std::set<std::pair<std::uint64_t, std::string>> own_keys;
+            for (const auto& own : parts) {
+                auto k = InMemoryStateBackend::operator_state_keys(own);
+                own_keys.insert(k.begin(), k.end());
+            }
             const auto participants =
                 completed_participants(restore_path, spec.restore_checkpoint_id);
             std::error_code dec;
@@ -485,7 +502,8 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                 }
                 auto b = read_file(entry.path() / ckpt_name);
                 if (!b.empty()) {
-                    parts.push_back(InMemoryStateBackend::extract_operator_state_bytes(b));
+                    parts.push_back(
+                        InMemoryStateBackend::extract_operator_state_bytes(b, &own_keys));
                 }
             }
         }

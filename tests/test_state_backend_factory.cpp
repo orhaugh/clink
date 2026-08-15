@@ -1120,3 +1120,76 @@ TEST(StateBackendFactory, APlainRestartSeesEveryPartitionsSourceOffsetNotJustIts
     const std::string got(reinterpret_cast<const char*>(peer->data()), peer->size());
     EXPECT_EQ(got, "OFFSET_FOR_PARTITION_1");
 }
+
+// A subtask's OWN operator row wins over a peer's row for the same key.
+//
+// The companion to the test above, and the constraint that makes it safe.
+// Unioning peers' operator rows into every restoring subtask is required for
+// a source whose partitions are assigned externally, because that subtask may
+// come back owning a partition it never checkpointed. But operator state is
+// not all partition-scoped: the file, directory, polling and vector sources
+// each store their position under one FIXED key, so at parallelism 4 all four
+// subtasks write the same key with four different values.
+//
+// The merge keeps the greater i64 on collision, which is right for a Kafka
+// partition offset (it can only move forward, and never rewinding is the safe
+// direction) and catastrophic for these: every subtask would restore the
+// furthest subtask's position and skip everything between its own and that.
+// Silent data loss, in the same operation the union exists to make correct.
+//
+// So the rule is: peers fill in keys this subtask does not have, and never
+// overwrite one it does.
+TEST(StateBackendFactory, APeersOperatorRowNeverOverwritesThisSubtasksOwn) {
+    const auto base = make_temp_dir("own_row_wins");
+    const std::uint64_t ckpt_id = 12;
+    const clink::OperatorId op{1};
+
+    // A fixed-key source position, as an 8-byte little-endian i64 - the shape
+    // the merge's max-wins rule acts on. A different width would sidestep the
+    // rule entirely and the test would prove nothing.
+    const auto i64le = [](std::uint64_t v) {
+        std::string s(8, '\0');
+        for (int i = 0; i < 8; ++i) {
+            s[static_cast<std::size_t>(i)] = static_cast<char>((v >> (i * 8)) & 0xFF);
+        }
+        return s;
+    };
+    const auto publish_pos_at = [&](std::uint32_t idx, const std::string& val) {
+        clink::InMemoryStateBackend backend;
+        backend.put_operator_state(
+            op, clink::StateBackend::KeyView{"srcpos"}, clink::StateBackend::ValueView{val});
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(base, idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
+    };
+    publish_pos_at(0, i64le(100));  // this subtask, deliberately behind
+    publish_pos_at(1, i64le(500));  // a peer, further along
+
+    const auto jobs_dir = base / "_jobs" / "1";
+    std::filesystem::create_directories(jobs_dir);
+    {
+        std::ofstream m(jobs_dir / ("COMPLETED-" + std::to_string(ckpt_id)));
+        m << "job=1\ncheckpoint=" << ckpt_id << "\ngeneration=1\nsubtasks=0,1\n";
+    }
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 0;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    ASSERT_NE(built.backend, nullptr);
+    ASSERT_TRUE(built.restore_from.has_value());
+    built.backend->restore(*built.restore_from);
+
+    const auto got = built.backend->get_operator_state(op, clink::StateBackend::KeyView{"srcpos"});
+    ASSERT_TRUE(got.has_value()) << "the subtask lost its own operator row entirely";
+    const std::string bytes(reinterpret_cast<const char*>(got->data()), got->size());
+    EXPECT_EQ(bytes, i64le(100))
+        << "subtask 0 checkpointed position 100 and restored its peer's 500. Sources that "
+           "store their position under one fixed key have one row per subtask under the same "
+           "name, so unioning peers' rows hands every subtask the furthest position any of "
+           "them reached and silently skips everything in between.";
+}

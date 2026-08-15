@@ -433,8 +433,46 @@ std::vector<std::byte> InMemoryStateBackend::merge_snapshot_bytes(
     return bytes;
 }
 
-std::vector<std::byte> InMemoryStateBackend::extract_operator_state_bytes(
+std::set<std::pair<std::uint64_t, std::string>> InMemoryStateBackend::operator_state_keys(
     std::span<const std::byte> snapshot_bytes) {
+    std::set<std::pair<std::uint64_t, std::string>> out;
+    if (snapshot_bytes.empty()) {
+        return out;
+    }
+    auto buffer =
+        std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(snapshot_bytes.data()),
+                                        static_cast<int64_t>(snapshot_bytes.size()));
+    auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+    auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+    if (!reader_result.ok())
+        throw_arrow("operator_state_keys (open reader)", reader_result.status());
+    auto reader = *reader_result;
+    verify_snapshot_format_version(reader->schema()->metadata(),
+                                   "InMemoryStateBackend operator_state_keys");
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+        if (auto s = reader->ReadNext(&batch); !s.ok())
+            throw_arrow("operator_state_keys (read batch)", s);
+        if (!batch)
+            break;
+        const auto* op_arr = static_cast<const arrow::UInt64Array*>(batch->column(0).get());
+        const auto* key_arr = static_cast<const arrow::BinaryArray*>(batch->column(1).get());
+        for (int64_t i = 0; i < batch->num_rows(); ++i) {
+            int32_t klen = 0;
+            const uint8_t* kptr = key_arr->GetValue(i, &klen);
+            if (klen == 0 || static_cast<KeyGroup>(kptr[0]) < kNumKeyGroups)
+                continue;  // keyed row, not operator state
+            out.emplace(
+                op_arr->Value(i),
+                std::string(reinterpret_cast<const char*>(kptr), static_cast<std::size_t>(klen)));
+        }
+    }
+    return out;
+}
+
+std::vector<std::byte> InMemoryStateBackend::extract_operator_state_bytes(
+    std::span<const std::byte> snapshot_bytes,
+    const std::set<std::pair<std::uint64_t, std::string>>* exclude) {
     const auto schema = snapshot_schema();
 
     SnapshotArrowWriter writer;
@@ -470,6 +508,14 @@ std::vector<std::byte> InMemoryStateBackend::extract_operator_state_bytes(
                 // (the reserved kOperatorStateKeyPrefix). Keyed rows are dropped.
                 if (klen == 0 || static_cast<KeyGroup>(kptr[0]) < kNumKeyGroups)
                     continue;
+                // A key the caller already holds is its own, and its own is
+                // authoritative: peers fill gaps, they do not overwrite.
+                if (exclude != nullptr &&
+                    exclude->count({op_arr->Value(i),
+                                    std::string(reinterpret_cast<const char*>(kptr),
+                                                static_cast<std::size_t>(klen))}) != 0) {
+                    continue;
+                }
                 int32_t vlen = 0;
                 const uint8_t* vptr = val_arr->GetValue(i, &vlen);
                 writer.append(op_arr->Value(i),

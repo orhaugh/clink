@@ -6,10 +6,12 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "clink/core/hash_map.hpp"
@@ -205,6 +207,20 @@ public:
     // new subtask while keyed rows stay assigned + key-group-filtered. The
     // output is a valid Arrow IPC stream restore()/merge() can consume.
     static std::vector<std::byte> extract_operator_state_bytes(
+        std::span<const std::byte> snapshot_bytes,
+        const std::set<std::pair<std::uint64_t, std::string>>* exclude = nullptr);
+
+    // The (operator, key) pairs of the OPERATOR-state rows in a snapshot.
+    //
+    // A restoring subtask passes its OWN keys as the exclusion above when
+    // pulling in its peers' rows, so peers fill in keys it does not have and
+    // never overwrite one it does. That distinction is load-bearing: source
+    // offsets keyed per partition (Kafka) must cross subtasks, because the
+    // broker decides who owns a partition, while sources that keep their
+    // position under one fixed key have one row per subtask under the same
+    // name - and the merge's keep-the-greater rule would otherwise hand every
+    // subtask the furthest position any of them reached.
+    static std::set<std::pair<std::uint64_t, std::string>> operator_state_keys(
         std::span<const std::byte> snapshot_bytes);
 
 private:

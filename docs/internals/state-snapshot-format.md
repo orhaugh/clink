@@ -55,7 +55,7 @@ Value bytes belong to the operator's value codec; the format deliberately does n
 
 - **TTL slots** prefix every value with `[ 8-byte expire-at-ms, little-endian ]` before the codec bytes.
 - **Collection state** (`ListState`, `MapState`, ...) serialises the whole collection as one value per key.
-- **Source offsets** (operator-state rows) are typically bare 8-byte little-endian int64s; the restore merge relies on this to keep the greater offset when subtask snapshots collide on the same key.
+- **Source offsets** (operator-state rows) are typically bare 8-byte little-endian int64s; the restore merge relies on this to keep the greater offset when subtask snapshots collide on the same key. That rule only applies between *peers*: a restoring subtask's own row is authoritative for any key it holds, and peers contribute only keys it does not have. Keep-the-greater is the safe direction for a partition offset, which can only move forward, and would be silent data loss for a source that keeps its position under a single fixed key shared by every subtask.
 
 ## The changelog variant
 
