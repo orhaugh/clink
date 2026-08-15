@@ -1969,8 +1969,15 @@ int run_coordinator(int argc, char** argv) {
         // resubmit persisted jobs as soon as it wins leadership, but
         // the supervisor needs a beat to restart the worker whose
         // connection died with the old leader. Wait up to 15s for
-        // slots before failing the recovery.
+        // slots before parking the recovery for the capacity retry.
         cfg.submit_wait_for_slots = 15s;
+    }
+    // Explicit override for either mode (tests shrink it so the parked-
+    // recovery path is reachable in seconds rather than after the 15s
+    // default).
+    if (const auto submit_wait_str = get_arg(argc, argv, "submit-wait-for-slots-ms", "");
+        !submit_wait_str.empty()) {
+        cfg.submit_wait_for_slots = std::chrono::milliseconds{std::stoll(submit_wait_str)};
     }
 
     // Lint the liveness settings before the coordinator starts listening.

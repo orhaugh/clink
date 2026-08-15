@@ -171,6 +171,10 @@ struct ProcOptions {
     // kills a process at an exact point in a protocol.
     std::string fault;
     std::vector<std::pair<std::string, std::string>> env;
+    // Extra clink_node flags appended after the harness-built argv (e.g.
+    // "--submit-wait-for-slots-ms=1500" to make a capacity-timeout path
+    // reachable within a test's budget).
+    std::vector<std::string> extra_args;
 };
 
 // One spawned process, with its output captured to a file so a failure can
@@ -507,6 +511,7 @@ public:
                                           "--advertise-host=127.0.0.1",
                                           "--port=" + std::to_string(coordinator_port_),
                                           "--ha-dir=" + ha_dir().string()};
+            argv.insert(argv.end(), opts.extra_args.begin(), opts.extra_args.end());
             ha_coordinators_.push_back(std::make_unique<Process>());
             if (!ha_coordinators_.back()->spawn("coordinator-" + std::to_string(i),
                                                 spec_.node_binary,

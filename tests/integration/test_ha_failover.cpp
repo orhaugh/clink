@@ -414,4 +414,69 @@ TEST_F(HaFailoverTest, ExactlyOnceSurvivesACoordinatorFailover) {
     sub->kill_and_reap();
 }
 
+// A recovered job must WAIT for capacity, not die of it. The takeover races
+// the supervisor restarting the workers whose connections died with the old
+// leader; before the parked-recovery retry existed, a worker that returned
+// after the submit slot-wait meant the recovery was logged-and-dropped and a
+// RUNNING job silently ceased to exist until the next failover - observed
+// live as "recovery failed: submit_job: insufficient free slots (need 2,
+// have 0)" while the job's checkpoints sat intact on disk. Here the worker
+// deliberately returns only AFTER the recovery has parked, and the job must
+// still finish exactly once.
+TEST_F(HaFailoverTest, ARecoveredJobParkedForCapacityRunsWhenAWorkerReturns) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    // Shrink the submit slot-wait so the parked path is REACHED inside the
+    // test budget instead of absorbed by the 15s default.
+    ASSERT_TRUE(c.start_ha_coordinators(2, {.extra_args = {"--submit-wait-for-slots-ms=1500"}}));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.await_workers_registered(1));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+
+    // Published work exists before anything dies, so a recovery that never
+    // runs is observable as loss rather than as an empty no-op.
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return verify_exactly_once(out_dir_, kTotalRecords).total_lines > 0; },
+        std::chrono::seconds(45)))
+        << "nothing was committed before the failover; the run would prove nothing";
+
+    // The worker dies FIRST, so the new leader recovers into a cluster with
+    // zero slots; then the leader.
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    ASSERT_TRUE(c.kill_leader_and_await_failover().has_value())
+        << "no standby took over after the leader was killed";
+    ASSERT_TRUE(c.await_coordinator_ready());
+
+    // Vacuity pin: the recovery genuinely hit the capacity wall and parked.
+    // Without this line the test can pass through the plain recovery path
+    // (worker back within the wait) and prove nothing about parking.
+    ASSERT_TRUE(
+        clink::itest::await([&] { return c.count_in_coordinator_log("parked for capacity") > 0; },
+                            std::chrono::seconds(30)))
+        << "the recovery never parked; the scenario under test never happened ["
+        << c.describe_coordinator_exits() << "]";
+
+    // The supervisor's move, deliberately AFTER the park.
+    ASSERT_TRUE(c.restart_worker_ha(0)) << "the worker did not come back";
+    ASSERT_TRUE(c.await_workers_registered(2))
+        << "the restarted worker never registered with the new leader";
+
+    const bool finished = clink::itest::await(
+        [&] { return verify_exactly_once(out_dir_, kTotalRecords).missing.empty(); },
+        std::chrono::seconds(90));
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(finished) << "the parked recovery never ran once capacity registered: "
+                          << describe(v) << " [" << c.describe_coordinator_exits()
+                          << ", worker-0=" << (c.worker(0).running() ? "running" : "gone") << "]";
+    EXPECT_TRUE(v.duplicated.empty()) << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << describe(v);
+
+    sub->kill_and_reap();
+}
+
 }  // namespace

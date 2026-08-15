@@ -522,21 +522,31 @@ void Coordinator::recover_persisted_jobs() {
     }
     std::sort(ids.begin(), ids.end());
     for (auto job_id : ids) {
-        // Skip if already in jobs_ (idempotent on repeated takeover).
-        {
-            std::lock_guard lock(mu_);
-            if (jobs_.count(job_id) != 0)
-                continue;
-        }
+        recover_one_persisted_job_(job_id);
+    }
+}
+
+void Coordinator::recover_one_persisted_job_(JobId job_id) {
+    const auto jobs_root = std::filesystem::path{ha_dir_} / "jobs";
+    // Skip if already in jobs_ (idempotent on repeated takeover, and the
+    // guard that makes the capacity RETRY safe to run any number of
+    // times: a recovery that succeeded between park and retry is a no-op
+    // here, never a duplicate submission).
+    {
+        std::lock_guard lock(mu_);
+        if (jobs_.count(job_id) != 0)
+            return;
+    }
+    {
         const auto job_dir = jobs_root / std::to_string(job_id);
         const auto manifest_path = job_dir / "manifest.json";
         std::ifstream in(manifest_path);
         if (!in)
-            continue;
+            return;
         std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         const auto graph_json = read_string_field(body, "graph_json");
         if (graph_json.empty())
-            continue;
+            return;
         CheckpointConfig ckpt;
         ckpt.checkpoint_dir = read_string_field(body, "checkpoint_dir");
         ckpt.state_backend_uri = read_string_field(body, "state_backend_uri");
@@ -595,7 +605,7 @@ void Coordinator::recover_persisted_jobs() {
             plugin_so_paths.push_back(path);
         }
         if (!plugins_ok)
-            continue;
+            return;
         // In-doubt commit resolution, AFTER plugin load (the resolvers
         // register at connector install, which the plugin loads carry) and
         // BEFORE the restore point is used: a completed-but-unconfirmed
@@ -630,7 +640,7 @@ void Coordinator::recover_persisted_jobs() {
             !reject.empty()) {
             log::warn("coordinator.ha",
                       "recovery skipped for job_id=" + std::to_string(job_id) + ": " + reject);
-            continue;
+            return;
         }
         try {
             const auto graph = JobGraphSpec::from_json(graph_json);
@@ -652,10 +662,65 @@ void Coordinator::recover_persisted_jobs() {
             log::info("coordinator.ha",
                       "recovered job_id=" + std::to_string(job_id) +
                           " restore_from_ckpt=" + std::to_string(ckpt.restore_from_checkpoint_id));
+        } catch (const InsufficientSlotsError& e) {
+            // No worker had registered yet - the takeover raced the
+            // supervisor restarting them. The job is intact on disk, so
+            // PARK it and retry from the manifest when capacity appears;
+            // dropping it here silently lost a running job until the next
+            // failover. The failed submit consumed this attempt's plugins
+            // and bundle, which is why the retry re-runs the whole
+            // manifest recovery rather than reusing them.
+            {
+                std::lock_guard lock(mu_);
+                if (std::find(pending_recovery_ids_.begin(), pending_recovery_ids_.end(), job_id) ==
+                    pending_recovery_ids_.end()) {
+                    pending_recovery_ids_.push_back(job_id);
+                }
+                if (!recovery_retry_thread_.joinable()) {
+                    recovery_retry_thread_ = std::thread([this] { recovery_retry_loop_(); });
+                }
+            }
+            log::warn("coordinator.ha",
+                      "recovery of job_id=" + std::to_string(job_id) + " parked for capacity (" +
+                          e.what() + "); it retries when a worker registers");
         } catch (const std::exception& e) {
             log::warn("coordinator.ha",
                       "recovery failed for job_id=" + std::to_string(job_id) + ": " + e.what());
         }
+    }
+}
+
+void Coordinator::recovery_retry_loop_() {
+    std::unique_lock lock(mu_);
+    while (!stop_.load(std::memory_order_acquire)) {
+        // Paced by notify (worker registration, stop) with a periodic
+        // re-check; no predicate, because "parked but zero slots" must
+        // WAIT here rather than spin through an always-true predicate.
+        cv_.wait_for(lock, std::chrono::seconds{2});
+        if (stop_.load(std::memory_order_acquire)) {
+            break;
+        }
+        if (pending_recovery_ids_.empty()) {
+            continue;
+        }
+        std::size_t free = 0;
+        for (const auto& [_, w] : registered_) {
+            if (!w->lost) {
+                free += (w->slot_capacity - w->slots_in_use);
+            }
+        }
+        if (free == 0) {
+            continue;  // a retry is a guaranteed refusal; wait for a register
+        }
+        auto ids = std::move(pending_recovery_ids_);
+        pending_recovery_ids_.clear();
+        lock.unlock();
+        for (const auto id : ids) {
+            // Re-parks itself on a fresh capacity refusal; the submit's own
+            // bounded slot wait paces repeated attempts.
+            recover_one_persisted_job_(id);
+        }
+        lock.lock();
     }
 }
 
@@ -3205,6 +3270,12 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
         std::unique_lock lock(mu_);
         const auto deadline = std::chrono::steady_clock::now() + cfg_.submit_wait_for_slots;
         cv_.wait_until(lock, deadline, [&] {
+            // stop_ in the predicate so a coordinator shutting down never
+            // holds a submitter (or the HA recovery retry thread) hostage
+            // for the full slot wait.
+            if (stop_.load(std::memory_order_acquire)) {
+                return true;
+            }
             std::size_t free = 0;
             for (const auto& [_, worker] : registered_) {
                 if (!worker->lost) {
@@ -3223,9 +3294,9 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
             }
         }
         if (free < required) {
-            throw std::runtime_error("submit_job: insufficient free slots (need " +
-                                     std::to_string(required) + ", have " + std::to_string(free) +
-                                     ")");
+            throw InsufficientSlotsError("submit_job: insufficient free slots (need " +
+                                         std::to_string(required) + ", have " +
+                                         std::to_string(free) + ")");
         }
     }
 
@@ -5761,6 +5832,12 @@ std::vector<std::string> Coordinator::lost_workers() const {
 
 void Coordinator::stop() {
     stop_.store(true, std::memory_order_release);
+    // Wake every cv_ waiter whose predicate checks stop_: the recovery
+    // retry loop, and any submit blocked in its slot wait.
+    cv_.notify_all();
+    if (recovery_retry_thread_.joinable()) {
+        recovery_retry_thread_.join();
+    }
     // Tear down per-job autoscalers before everything else.
     // Their polling threads might be sitting on mu_ trying to call
     // request_operator_rescale; joining them now (under the move-out +

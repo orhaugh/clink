@@ -637,7 +637,22 @@ public:
     // back into this coordinator, with restore_from set per job. Called by
     // clink_node when its HaCoordinator fires the become-leader
     // callback. Idempotent - already-running job_ids are skipped.
+    //
+    // A job whose recovery fails ONLY for capacity (no worker registered
+    // yet - takeover races the supervisor restarting the workers whose
+    // connections died with the old leader) is PARKED, not dropped: a
+    // retry thread re-runs its recovery from the manifest whenever
+    // capacity registers. Dropping it silently lost a running job until
+    // the next failover.
     void recover_persisted_jobs();
+
+    // Thrown by submit_job when the cluster lacks the slots the plan
+    // needs after the configured wait. A distinct type so the HA
+    // recovery path can tell "no workers yet" (parkable, retried) apart
+    // from every non-retriable rejection (bad graph, failed gate).
+    struct InsufficientSlotsError : std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
 
 private:
     struct WorkerConnection {
@@ -1351,6 +1366,20 @@ private:
     std::chrono::steady_clock::time_point last_watchdog_sweep_{std::chrono::steady_clock::now()};
     std::thread checkpoint_thread_;
     std::atomic<bool> stop_{false};
+
+    // HA recoveries parked for capacity (job ids whose manifest is intact
+    // but no worker had registered yet), and the thread that re-runs them
+    // when slots appear. Guarded by mu_; the thread is spawned on first
+    // park and joined in stop(). Recovery is re-run from the MANIFEST
+    // (recover_one_persisted_job_), not from parked in-memory state: a
+    // failed submit_job consumes its plugin/bundle arguments, so the disk
+    // copy is the only ingredient list that survives a refusal.
+    std::vector<JobId> pending_recovery_ids_;
+    std::thread recovery_retry_thread_;
+    void recovery_retry_loop_();
+    // One job dir's recovery, callable repeatedly (skips ids already in
+    // jobs_). Parks the id on InsufficientSlotsError.
+    void recover_one_persisted_job_(JobId job_id);
 
     mutable std::mutex mu_;
     std::condition_variable cv_;

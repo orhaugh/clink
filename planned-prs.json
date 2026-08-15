@@ -232,7 +232,29 @@
         "KafkaExactlyOnceTest.AnOrphanedBrokerTransactionIsCommittedAcrossACoordinatorFailover (whole-chain HA e2e, real processes + real broker: held commit loads the orphan by construction, worker dies pre-commit, leader dies, standby's recovery resolves the orphan on the broker, CONFIRMED advances, output totally clean; mutation-checked with a false-confirm resolver linked into the job plugin - caught as 3 MISSING records)"
       ],
       "dependencies": [],
-      "limitations": "resolution runs on HA/lock-free recovery paths only (in-incarnation restarts keep the bounded contract until a lock-free restart phase exists); non-flexible protocol versions only (FindCoordinator v1/v2, EndTxn v1) and no SASL - both fall back, never guess. Revisit against librdkafka KIP-939 support when it ships. e2e round findings: producer identity is now captured with a bounded wait in KafkaSink::open() (stats tick at 100ms), closing the pre-first-tick window where staged handles were unresumable; HA recovery DROPS a recovered job when no worker capacity registers within the submit wait (~15s, 'insufficient free slots') instead of queueing - named follow-up."
+      "limitations": "resolution runs on HA/lock-free recovery paths only (in-incarnation restarts keep the bounded contract until a lock-free restart phase exists); non-flexible protocol versions only (FindCoordinator v1/v2, EndTxn v1) and no SASL - both fall back, never guess. Revisit against librdkafka KIP-939 support when it ships. e2e round findings: producer identity is now captured with a bounded wait in KafkaSink::open() (stats tick at 100ms), closing the pre-first-tick window where staged handles were unresumable; the HA-recovery-drops-job-on-no-capacity finding is closed by PR-13."
+    },
+    {
+      "id": "PR-13",
+      "priority": "P1",
+      "title": "HA recovery parks a capacity-refused job and retries from the manifest when a worker registers, instead of dropping it",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "A takeover that outpaced the worker supervisor logged 'recovery failed: insufficient free slots' and a RUNNING job silently ceased to exist until the next failover, its checkpoints intact on disk. Parking + manifest-replay makes recovery converge whenever capacity returns; the already-running guard makes the retry idempotent, and every non-capacity failure still drops loudly.",
+      "files": [
+        "include/clink/cluster/coordinator.hpp",
+        "src/cluster/coordinator.cpp",
+        "tools/clink_node.cpp",
+        "tests/integration/cluster_harness.hpp",
+        "tests/integration/test_ha_failover.cpp"
+      ],
+      "tests": [
+        "HaFailoverTest.ARecoveredJobParkedForCapacityRunsWhenAWorkerReturns (integration: worker killed BEFORE the leader, submit slot-wait shrunk to 1.5s via the new --submit-wait-for-slots-ms flag so the park is reached, park pinned from the coordinator log, worker restarted only AFTER the park, output exactly-once; mutation-checked by disabling the park - caught as 38 MISSING records after 96s)"
+      ],
+      "dependencies": [
+        "PR-12"
+      ],
+      "limitations": "the retry keeps trying for as long as the coordinator leads (no give-up bound - a parked job with no workers is the operator's capacity problem, surfaced by the park warning); typed InsufficientSlotsError distinguishes capacity from every other submit rejection."
     }
   ],
   "verified_already_done": [
