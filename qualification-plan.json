@@ -61,17 +61,27 @@
       "category": "code",
       "priority": "P1",
       "title": "Release qualification tooling: scripts/qualification/run.sh --ref <git-ref> with full provenance recording",
-      "status": "planned",
-      "evidence": []
+      "status": "completed",
+      "evidence": [
+        "scripts/qualification/run.sh --ref <git-ref>: detached-worktree build + suite + provenance (SHA, 87 build flags, compiler, 10 dependency pins, capability manifest, host, timestamps) into a retained per-run evidence dir; destroy.sh deletes a run's cloud resources by label",
+        "Demonstrated: PASS at 0199248a5f6b, 2180/2180 in 20 minutes, provenance.json + results.json retained",
+        "Its first invocation found a real defect: cmake/GitHooks.cmake aborted configure in any git worktree (.git is a file there), so every worktree build of clink was broken"
+      ]
     },
     {
       "id": "QUAL-01",
       "category": "qualification",
       "priority": "P0",
       "title": "Multi-day Kafka exactly-once failure campaign with independent oracle",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
+      "status": "in_progress",
+      "infrastructure": [
+        "Hetzner fsn1, run qual01-20260816: 1 ops (cpx42, also image builder + NFS export) + 1 coordinator + 3 workers (cpx32) + 3 Redpanda brokers (cpx22), EUR 0.315/h",
+        "Shared checkpoint state over NFS from the ops host - proven required: state is per-subtask under one dir resolved on each node's own filesystem, so a redeployed subtask on another host finds nothing",
+        "Qualification image built ON the rig at the commit under test, with CLINK_ENABLE_FAULT_INJECTION=ON"
+      ],
+      "results": {
+        "local_dry_run": "harness proven end to end before any spend: 46,800 deterministic events, 1,137 committed output records, every judged window correct; mutation-tested by injecting a foreign record (caught, foreign=1) which exposed and fixed a verifier defect that reported 317 phantom missing results"
+      }
     },
     {
       "id": "QUAL-02",
@@ -171,6 +181,40 @@
       "status": "planned",
       "infrastructure": [],
       "results": {}
+    },
+    {
+      "id": "HARDEN-05",
+      "category": "code",
+      "priority": "P0",
+      "title": "SQL cluster submissions can configure checkpointing (found by the QUAL-01 feasibility check)",
+      "status": "completed",
+      "evidence": [
+        "Both submit endpoints + clink_submit_sql now carry checkpoint_dir, checkpoint_interval_ms, restore_from_*, max_restarts_on_worker_loss and alignment through one shared parser; malformed values refused, not defaulted",
+        "Verified on a real coordinator: the QUAL-01 pipeline submits at parallelism 4 and is classified END_TO_END_EXACTLY_ONCE - previously unreachable for any SQL cluster job",
+        "in-doubt resolution now counts resolved vs unresolved so a campaign can tell clink's two recovery guarantees apart"
+      ]
+    },
+    {
+      "id": "HARDEN-06",
+      "category": "code",
+      "priority": "P0",
+      "title": "No silent transport downgrade (Postgres TLS assertion, Kafka SASL coherence)",
+      "status": "completed",
+      "evidence": [
+        "Postgres: zero sslmode handling existed anywhere; libpq's default silently falls back to plaintext. Every connect site now asserts the established transport (PQsslInUse) - refuses when encryption was demanded, warns when unstated and unencrypted, records when encrypted",
+        "Kafka: SASL credentials with no security_protocol, and TLS material with a plaintext protocol, are refused before a byte reaches a broker; the passthrough cannot weaken a transport under configured credentials. 10/10 security tests"
+      ]
+    },
+    {
+      "id": "HARDEN-07",
+      "category": "code",
+      "priority": "P1",
+      "title": "Worker task-thread handle leak; job status on the HTTP API",
+      "status": "completed",
+      "evidence": [
+        "Finished subtasks were never joined until worker shutdown, holding an 8MB stack mapping each - invisible to a thread count. Reaped now; regression test asserts on the retained handle count (mutation: 2 handles after one job vs 14 after seven)",
+        "GET /api/v1/jobs/:id and /jobs gained an explicit status; the ops API previously exposed none, and the chaos controller's gate silently never fired"
+      ]
     }
   ]
 }

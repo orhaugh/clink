@@ -34,10 +34,19 @@ services:
       - --overprovisioned
       - --default-log-level=info
     volumes:
-      - /qual/redpanda:/var/lib/redpanda/data
+      # A named volume, not a host bind mount: redpanda runs as uid 101
+      # inside the container and cannot write a root-owned host
+      # directory, which fails as an opaque 'Permission denied' at
+      # startup and a container that restart-loops. The volume also
+      # survives the chaos controller's `docker restart redpanda`, which
+      # is the point of restarting rather than recreating it.
+      - redpanda-data:/var/lib/redpanda/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
       interval: 10s
       timeout: 5s
       retries: 30
+
+volumes:
+  redpanda-data:

@@ -96,6 +96,11 @@ COORD_PRIV=$(read_inv coordinator private_ip)
 WORKER_PUBS=$(read_inv worker public_ip)
 BROKER_PRIVS=$(read_inv broker private_ip)
 BROKER_LIST=$(for ip in $BROKER_PRIVS; do printf "%s:9092," "$ip"; done | sed 's/,$//')
+# Redpanda's --seeds takes RPC addresses (33145), not Kafka ones. Seeding
+# a cluster with the Kafka port leaves each node forming its own
+# single-node cluster, which looks healthy per-node and silently gives
+# the campaign no replication to lose when a broker is restarted.
+SEED_LIST=$(for ip in $BROKER_PRIVS; do printf "%s:33145," "$ip"; done | sed 's/,$//')
 echo "campaign: brokers=$BROKER_LIST coordinator=$COORD_PRIV ops=$OPS_PUB"
 
 for h in $OPS_PUB $COORD_PUB $WORKER_PUBS; do
@@ -135,7 +140,7 @@ for bp in $(read_inv broker public_ip); do
     priv=$(echo "$BROKER_PRIVS" | cut -d' ' -f$i)
     on_host "$bp" "mkdir -p /qual"
     to_host "$bp" "$HERE/../infra/broker.yml" /qual/broker.yml
-    on_host "$bp" "cd /qual && NODE_ID=$i PRIVATE_IP=$priv SEEDS='$BROKER_LIST' docker compose -f broker.yml up -d"
+    on_host "$bp" "cd /qual && NODE_ID=$i PRIVATE_IP=$priv SEEDS='$SEED_LIST' docker compose -f broker.yml up -d"
 done
 
 on_host "$COORD_PUB" "mkdir -p /qual"
