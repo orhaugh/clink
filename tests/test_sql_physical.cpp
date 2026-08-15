@@ -267,6 +267,34 @@ TEST(SqlPhysical, WebSocketConnectorMapsToTheStringSourceAndColumnarBridge) {
     }
 }
 
+// A source-only connector requested as a sink is refused at compile time
+// with the role named - never planned into a factory that does not exist.
+TEST(SqlPhysical, ASourceOnlyConnectorRequestedAsASinkIsRefused) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE f_in (symbol TEXT, px DOUBLE) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE ws_out (symbol TEXT, px DOUBLE) "
+        "WITH (connector='websocket', format='json', url='ws://feed.example.test/ws');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+
+    PhysicalPlanner pp;
+    auto plan = bind_insert(cat, "INSERT INTO ws_out SELECT symbol, px FROM f_in");
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+        FAIL() << "a websocket sink was planned; websocket is source-only";
+    } catch (const TranslationError& e) {
+        // The diagnostic names the role and the offending connector, and
+        // lists the connectors that CAN sink this format.
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("sink"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("'websocket'"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("requires connector="), std::string::npos)
+            << "the diagnostic offers no alternatives: " << msg;
+    }
+}
+
 // connector='rabbitmq' lowers to rabbitmq_source_string / rabbitmq_sink_string (string channel)
 // via the json_string_to_row + row_to_json_string bridges, carrying queue/routing_key/host.
 TEST(SqlPhysical, RabbitMqConnectorMapsToAmqpFactories) {

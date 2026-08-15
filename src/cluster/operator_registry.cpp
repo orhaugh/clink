@@ -106,6 +106,28 @@ const SinkFactory* OperatorRegistry::find_sink(const std::string& type, ChannelT
     return parent_ != nullptr ? parent_->find_sink(type, in) : nullptr;
 }
 
+bool OperatorRegistry::knows_type(const std::string& type) const {
+    {
+        std::lock_guard lock(mu_);
+        for (const auto& [k, _v] : sources_) {
+            if (k.type == type) {
+                return true;
+            }
+        }
+        for (const auto& [k, _v] : operators_) {
+            if (k.type == type) {
+                return true;
+            }
+        }
+        for (const auto& [k, _v] : sinks_) {
+            if (k.type == type) {
+                return true;
+            }
+        }
+    }
+    return parent_ != nullptr && parent_->knows_type(type);
+}
+
 namespace {
 
 // File-line sink: writes string records one per line to a path supplied

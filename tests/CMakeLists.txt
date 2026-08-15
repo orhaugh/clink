@@ -174,6 +174,7 @@ add_executable(clink_core_tests
     test_exactly_once_windows.cpp
     test_guarantee_gate.cpp
     test_connector_capability.cpp
+    test_connector_availability.cpp
     test_columnar_filter.cpp
     test_columnar_string_filter.cpp
     test_columnar_sql_filter.cpp

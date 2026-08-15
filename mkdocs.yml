@@ -55,6 +55,7 @@ exclude_docs: |
   !/connectors/
   !/design/
   !/consumer-examples/
+  !/qualification/
   !/assets/
   consumer-examples/build/
 
@@ -86,6 +87,8 @@ nav:
   - Capabilities: capabilities.md
   - SQL: sql.md
   - Benchmarks: benchmarks.md
+  - Qualification:
+      - qualification/README.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md

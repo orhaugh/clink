@@ -15,6 +15,7 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/config_lint.hpp"
+#include "clink/cluster/connector_availability.hpp"
 #include "clink/cluster/fenced_metadata.hpp"
 #include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
@@ -3381,6 +3382,24 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
             }
         }
         if (!reject.empty()) {
+            throw std::runtime_error(reject);
+        }
+    }
+    // Connector-availability gate: a job naming a connector this binary
+    // was not built with is refused HERE, before planning or allocation,
+    // with the connector, the available set and the rebuild flag - not on
+    // a worker mid-deploy with a factory string. Runs against the
+    // registries the job would deploy with (the bundle's when present, so
+    // plugin registrations count). For a distributed submission this
+    // process IS the target cluster's coordinator, which is what makes
+    // the cluster - not the submitting CLI - authoritative.
+    {
+        const OperatorRegistry& effective_ops =
+            bundle != nullptr ? bundle->operator_registry() : registry;
+        const RunnerRegistry& effective_runners =
+            bundle != nullptr ? bundle->runner_registry() : RunnerRegistry::default_instance();
+        if (auto reject = check_connector_availability(graph, effective_ops, effective_runners);
+            !reject.empty()) {
             throw std::runtime_error(reject);
         }
     }

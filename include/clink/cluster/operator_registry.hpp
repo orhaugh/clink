@@ -112,6 +112,13 @@ public:
                                          ChannelType out) const;
     const SinkFactory* find_sink(const std::string& type, ChannelType in) const;
 
+    // Whether ANY factory (source, operator or sink, any channel
+    // pairing) is registered under this op-type name, here or in a
+    // parent. The submission-time connector-availability gate asks
+    // this: "does this binary know the name at all", ahead of the
+    // channel-resolved lookups deploy will perform.
+    [[nodiscard]] bool knows_type(const std::string& type) const;
+
     // Singleton with built-in registrations (vector source, collecting
     // sink, etc.). Process-wide; safe to access from multiple threads
     // for reads after the static initialisers finish.

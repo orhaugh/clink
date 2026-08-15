@@ -90,6 +90,7 @@ benchmarks/prod_compare/*/rocksdb:/
 !/docs/connectors/
 !/docs/internals/
 !/docs/design/
+!/docs/qualification/
 !/docs/index.md
 !/docs/capabilities.md
 !/docs/benchmarks.md

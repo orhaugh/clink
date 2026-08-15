@@ -423,6 +423,13 @@ public:
     [[nodiscard]] bool has_join_for_type(const std::string& op_type) const;
     [[nodiscard]] bool has_co_operator_for_type(const std::string& op_type) const;
 
+    // Whether ANY runner (source, operator, sink, join or co-operator,
+    // any channel pairing) is registered under this op-type name, here
+    // or in a parent. The submission-time connector-availability gate
+    // asks this: "does this binary know the name at all", ahead of the
+    // channel-resolved lookups deploy will perform.
+    [[nodiscard]] bool knows_type(const std::string& op_type) const;
+
     static RunnerRegistry& default_instance();
 
 private:

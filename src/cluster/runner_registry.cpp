@@ -144,6 +144,38 @@ bool RunnerRegistry::has_join_for_type(const std::string& op_type) const {
     return parent_ != nullptr && parent_->has_join_for_type(op_type);
 }
 
+bool RunnerRegistry::knows_type(const std::string& op_type) const {
+    {
+        std::lock_guard lock(mu_);
+        for (const auto& [k, _v] : sources_) {
+            if (k.type == op_type) {
+                return true;
+            }
+        }
+        for (const auto& [k, _v] : operators_) {
+            if (k.type == op_type) {
+                return true;
+            }
+        }
+        for (const auto& [k, _v] : sinks_) {
+            if (k.type == op_type) {
+                return true;
+            }
+        }
+        for (const auto& [k, _v] : joins_) {
+            if (k.type == op_type) {
+                return true;
+            }
+        }
+        for (const auto& [k, _v] : co_operators_) {
+            if (k.type == op_type) {
+                return true;
+            }
+        }
+    }
+    return parent_ != nullptr && parent_->knows_type(op_type);
+}
+
 bool RunnerRegistry::has_co_operator_for_type(const std::string& op_type) const {
     {
         std::lock_guard lock(mu_);

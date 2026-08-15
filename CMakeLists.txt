@@ -527,6 +527,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/cluster/dag_builder_registry.cpp
     src/cluster/built_in_factories.cpp
     src/cluster/guarantee_gate.cpp
+    src/cluster/connector_availability.cpp
     src/cluster/config_lint.cpp
     src/cluster/plugin_loader.cpp
     src/cluster/plugin_cache.cpp
