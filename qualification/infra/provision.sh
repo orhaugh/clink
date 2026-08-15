@@ -155,6 +155,40 @@ for i in $(seq 1 "$WORKERS"); do create "qual-${RUN_ID}-worker${i}" "$WORKER_TYP
 for i in $(seq 1 "$BROKERS"); do create "qual-${RUN_ID}-broker${i}" "$BROKER_TYPE"; done
 rm -f "$CLOUD_INIT" "$OPS_CLOUD_INIT"
 
+# Firewall. The coordinator's HTTP API accepts job submissions, and a
+# submitted job is code, so an unauthenticated control plane on a public
+# IP is a remote-execution surface - short-lived test rig or not. SSH and
+# every clink port are restricted to the operator's address; the rig
+# talks to itself over the private network.
+OPERATOR_IP="${OPERATOR_IP:-$(curl -fsS https://ifconfig.me 2>/dev/null || curl -fsS https://api.ipify.org)}"
+if [ -z "$OPERATOR_IP" ]; then
+    echo "provision: could not determine the operator's public IP; refusing to leave the" >&2
+    echo "  control plane open. Set OPERATOR_IP=<addr> and re-run." >&2
+    exit 2
+fi
+FW="qual-${RUN_ID}-fw"
+if ! hcloud firewall describe "$FW" >/dev/null 2>&1; then
+    echo "==> creating firewall ${FW} (operator ${OPERATOR_IP})"
+    hcloud firewall create --name "$FW" --label "qual=1" --label "qual-run=${RUN_ID}" >/dev/null
+fi
+RULES=$(mktemp)
+cat > "$RULES" <<JSON
+[
+  {"direction":"in","protocol":"tcp","port":"22","source_ips":["${OPERATOR_IP}/32"],"description":"ssh, operator only"},
+  {"direction":"in","protocol":"tcp","port":"any","source_ips":["${NET_RANGE}"],"description":"rig-internal"},
+  {"direction":"in","protocol":"udp","port":"any","source_ips":["${NET_RANGE}"],"description":"rig-internal"},
+  {"direction":"in","protocol":"tcp","port":"8095","source_ips":["${OPERATOR_IP}/32"],"description":"coordinator HTTP, operator only"},
+  {"direction":"in","protocol":"tcp","port":"6123","source_ips":["${OPERATOR_IP}/32"],"description":"coordinator control plane, operator only"},
+  {"direction":"in","protocol":"tcp","port":"9092","source_ips":["${OPERATOR_IP}/32"],"description":"kafka, operator only"}
+]
+JSON
+hcloud firewall replace-rules "$FW" --rules-file "$RULES" >/dev/null
+rm -f "$RULES"
+for s in $(hcloud server list -l "qual-run=${RUN_ID}" -o noheader -o columns=name); do
+    hcloud firewall apply-to-resource "$FW" --type server --server "$s" >/dev/null 2>&1 || true
+done
+echo "==> firewall applied to every host"
+
 echo
 echo "Inventory:"
 hcloud server list -l "qual-run=${RUN_ID}" -o columns=name,status,ipv4,private_net
