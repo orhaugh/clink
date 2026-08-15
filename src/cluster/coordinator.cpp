@@ -4080,12 +4080,32 @@ void Coordinator::watchdog_loop_() {
                 if (job->awaiting_restart && !job->completion_signalled &&
                     job->restart_deadline != std::chrono::steady_clock::time_point{} &&
                     now > job->restart_deadline) {
+                    // Name the keys still owed and the workers that own them:
+                    // a drain timeout with an anonymous survivor is
+                    // undiagnosable from a transcript, and this line is what
+                    // splits "which subtask" from "which worker" in a
+                    // post-mortem (watch item 63).
+                    std::string undrained;
+                    for (const auto& key : job->restart_drain_expected) {
+                        std::string owner = "?";
+                        for (const auto& [worker_id, pending] : job->pending_per_worker) {
+                            for (const auto& [role, sub] : pending) {
+                                if (role + ":" + std::to_string(sub) == key) {
+                                    owner = worker_id;
+                                }
+                            }
+                        }
+                        if (!undrained.empty()) {
+                            undrained += ", ";
+                        }
+                        undrained += key + " on " + owner;
+                    }
                     log::warn("coordinator.watchdog",
                               "job_id=" + std::to_string(job->id) +
-                                  " restart drain timed out; failing job");
+                                  " restart drain timed out; failing job. undrained: " + undrained);
                     job->errors.push_back("restart drain timed out after " +
                                           std::to_string(cfg_.restart_drain_timeout.count()) +
-                                          "ms (survivors did not drain)");
+                                          "ms (survivors did not drain: " + undrained + ")");
                     job->awaiting_restart = false;
                     job->restart_deadline = {};
                     job->restart_pending.clear();

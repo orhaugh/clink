@@ -656,14 +656,22 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
                 // observes the flip and winds the runner down; run_task_
                 // sends SubtaskFinished with had_error=true, error
                 // message "cancelled" once the runner exits.
+                std::size_t flipped = 0;
                 auto it = per_job_cancel_tokens_.find(cj.job_id);
                 if (it != per_job_cancel_tokens_.end()) {
                     for (auto& [subtask_idx, token] : it->second) {
                         if (token) {
                             token->store(true, std::memory_order_release);
+                            ++flipped;
                         }
                     }
                 }
+                // Paired with the subtask-exit log in run_task_: a cancel
+                // that flipped N tokens must be followed by N exits, and
+                // the gap names the runner a drain timeout is stuck on.
+                log::info("worker.cancel",
+                          "job_id=" + std::to_string(cj.job_id) + " cancel received; flipped " +
+                              std::to_string(flipped) + " cancel token(s)");
                 // Rebind pump relays block in pop() with no view of any
                 // cancel token; wake them so their jthreads can join.
                 cancel_rebind_pumps_locked_(cj.job_id);
@@ -1430,6 +1438,7 @@ void Worker::run_task_(JobId job_id,
                        const std::string& expected_state_versions_packed,
                        const std::string& udfs_packed) {
     metrics::worker::subtask_started();
+    const auto task_start = std::chrono::steady_clock::now();
     bool had_error = false;
     bool fatal = false;
     std::string err_msg;
@@ -1497,6 +1506,18 @@ void Worker::run_task_(JobId job_id,
     } else {
         metrics::worker::subtask_completed_ok();
     }
+
+    // The exit line the cancel log pairs with: every flipped token must be
+    // followed by one of these, and a missing one names the wedged runner
+    // when a restart drain times out (watch item 63).
+    log::info("worker.task",
+              "job_id=" + std::to_string(job_id) + " " + task.role + "[" +
+                  std::to_string(task.subtask_idx) + "] exited after " +
+                  std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::steady_clock::now() - task_start)
+                                     .count()) +
+                  "s had_error=" + (had_error ? "true" : "false") +
+                  (err_msg.empty() ? "" : " error=" + err_msg));
 
     SubtaskFinishedMsg done;
     done.job_id = job_id;

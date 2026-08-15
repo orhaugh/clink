@@ -197,7 +197,7 @@ jobs:
         # benchmark is excluded entirely: throughput/timing asserts are
         # meaningless on a shared runner in a Debug (-O0) build and belong to
         # the perf harness on real hardware.
-        run: ctest --test-dir build --output-on-failure -j "$(nproc)" --timeout 180 -LE '^(integration|benchmark|sql)$'
+        run: ctest --test-dir build --output-on-failure -j "$(nproc)" --timeout 180 -LE '^(integration|benchmark|sql|soak)$'
       - name: Test (SQL, low parallelism) [blocking gate]
         # The SQL surface, incl. runtime ITs that stand up in-process
         # coordinator/worker clusters and HTTP servers, at -j2 to avoid the
@@ -242,6 +242,21 @@ jobs:
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
           -L integration
+      - name: Test (soak, serial) [blocking gate]
+        # The wall-time kill/recover soak, alone on the runner. It used to
+        # run inside the parallel unit sweep above, where it shared 4 cores
+        # and one disk with the rest of the suite - and its restart-drain
+        # deadline (30s, a correctness bound - never raise it) sits within
+        # reach of a contention-stretched FileBacked snapshot persist
+        # (watch item 63; the drain-timeout failures showed a survivor that
+        # was alive and scheduled the whole time). Serial gives that
+        # deadline an honest premise. The assertions are unchanged; if this
+        # still fails serially, the SNAPSHOT_WORKER_JOIN_STUCK /
+        # SNAPSHOT_PERSIST_SLOW and worker.cancel/worker.task log lines in
+        # the dumped cluster logs name the wedged runner directly.
+        run: >-
+          ctest --test-dir build --output-on-failure --parallel 1
+          -L '^soak$'
       - name: Upload integration artifacts on failure
         # A multi-process failure with no child logs cannot be diagnosed
         # from a CI transcript. The harness keeps its scratch tree (with
