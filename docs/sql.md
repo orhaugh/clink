@@ -67,9 +67,15 @@ WITH ( <key>='<value>' [, ...] )
 ```
 
 Every `WITH` value is a single-quoted string literal, including numeric ones
-(`watermark_lag_ms='200'`, not `200`). Columns are `name TYPE` pairs; table-level
-constraints (`PRIMARY KEY (...)`, `CHECK`, `UNIQUE`) are rejected, and inline
-`NOT NULL` / `PRIMARY KEY` parse but are ignored. Every column is nullable.
+(`watermark_lag_ms='200'`, not `200`). Columns are `name TYPE` pairs. An inline
+`PRIMARY KEY` on a single column is honoured: it populates exactly the same
+catalogue metadata as `WITH (primary_key='col')`, and if both forms are given
+they must agree or the statement is rejected. A composite key is declared with
+`WITH (primary_key='a,b')`; several inline `PRIMARY KEY` markers are rejected
+with that form named. Every other column constraint clink cannot enforce -
+`NOT NULL`, `CHECK`, `UNIQUE`, `DEFAULT`, `REFERENCES` - is rejected with a
+diagnostic rather than parsed and ignored, as are table-level constraints.
+Every column is nullable.
 
 ### Choosing the channel
 
@@ -587,8 +593,9 @@ Being explicit so you are not surprised at compile time:
 - **No state TTL** on unbounded joins, `DISTINCT`, or unbounded `GROUP BY` in this
   version.
 - **Silently accepted, then ignored:** `WITH CHECK OPTION` on a view; the options
-  to `EXPLAIN ANALYZE` / `EXPLAIN VERBOSE` (no execution or timing); inline
-  `NOT NULL` / `PRIMARY KEY` column constraints; `HAVING` without `GROUP BY`.
+  to `EXPLAIN ANALYZE` / `EXPLAIN VERBOSE` (no execution or timing); `HAVING`
+  without `GROUP BY`. (Inline `PRIMARY KEY` is honoured; every other column
+  constraint is rejected, never ignored.)
 
 ## See also
 

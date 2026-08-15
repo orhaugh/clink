@@ -1427,6 +1427,26 @@ TEST(SqlBinder, UpsertSinkWithoutPrimaryKeyRejected) {
         TranslationError);
 }
 
+TEST(SqlBinder, UpsertSinkAcceptsAnInlinePrimaryKey) {
+    // The inline PRIMARY KEY must reach exactly the same catalogue
+    // metadata as WITH (primary_key='user_id') - upsert planning binds
+    // against it with no WITH-option in sight.
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (user_id BIGINT, amount BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE sink_up (user_id BIGINT PRIMARY KEY, amount BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/out.ndjson', "
+        "      mode='upsert')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    Binder b(cat);
+    auto plan =
+        b.bind_insert(as_insert(parse("INSERT INTO sink_up SELECT user_id, amount FROM src_t")));
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(plan->kind(), "Sink");
+}
+
 TEST(SqlBinder, UpsertSinkPrimaryKeyMustExistInSelect) {
     Catalog cat;
     auto s = parse(

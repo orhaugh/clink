@@ -1464,8 +1464,20 @@ ast::CreateTableStmt translate_create_stmt(const JsonValue& body) {
     if (body.contains("tableElts") && body.at("tableElts").is_array()) {
         for (const auto& wrapper : body.at("tableElts").as_array()) {
             auto [kind, inner] = node_wrapper(wrapper);
+            if (kind == "Constraint") {
+                // Table-level constraints (PRIMARY KEY (a, b), UNIQUE,
+                // CHECK, FOREIGN KEY ...) are refused loudly rather than
+                // dropped: a constraint that parses and does nothing lets
+                // a user believe their data is validated. The one clink
+                // honours - the primary key - has a supported spelling.
+                unsupported(
+                    "table-level constraints are not supported; for a primary key "
+                    "(including composite keys) use WITH (primary_key='col1,col2'), and "
+                    "enforce other constraints in the source system or in the pipeline",
+                    stmt.loc.pos);
+            }
             if (kind != "ColumnDef") {
-                // Constraints / indexes etc. are not yet supported.
+                // Indexes etc. are not yet supported.
                 unsupported("table element kind " + kind, stmt.loc.pos);
             }
             stmt.columns.push_back(translate_column_def(*inner));

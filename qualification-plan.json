@@ -1,0 +1,164 @@
+{
+  "baseline_revision": "8fa61d76692446b9a3a96ea6e8b32be3c99104f6",
+  "audited_revision": "d6e8fbae2199fb505d81b6aefe27dce7e9a10623",
+  "qualification_version": 1,
+  "notes": "Phase A closes the residual code gaps from the 2026-08-15 external audit; Phase B qualifies the result against real infrastructure (Hetzner Cloud, project 'clink', cost-capped). Every experiment must leave retained machine-readable evidence under qualification-results/ (gitignored; summaries land in docs/production-qualification-report.md).",
+  "items": [
+    {
+      "id": "HARDEN-00",
+      "category": "code",
+      "priority": "P0",
+      "title": "HttpServer::stop() waits for the listen loop before stopping it (watch item 64)",
+      "status": "completed",
+      "result_revision": "7bf9187",
+      "evidence": [
+        "tests/test_http_auth.cpp HttpLifecycle.ImmediateStopAfterStartNeverWedges: ~550ms with the fix across 3 runs; mutant (wait_until_ready removed) wedges within 90s, verified by disassembly of both binaries",
+        "core label green post-fix: 2157 passed / 0 failed / 5 platform skips"
+      ]
+    },
+    {
+      "id": "HARDEN-01",
+      "category": "code",
+      "priority": "P0",
+      "title": "SQL inline constraint semantics: honour PRIMARY KEY fully, refuse the rest loudly",
+      "status": "in_progress",
+      "evidence": [
+        "Pre-existing since audit: inline PK reaches catalogue; NOT NULL/CHECK/UNIQUE/DEFAULT/REFERENCES refused with actionable diagnostic (Option B)",
+        "New: conflicting inline vs WITH primary_key is refused (was: WITH silently won); multiple inline PRIMARY KEY columns refused with composite WITH form in the diagnostic; table-level constraints refused with the supported form named; inline PK canonicalised into the properties bag so it survives the catalog JSON round trip (was silently dropped on reload - real defect found during this work); upsert planning binds against an inline-only key",
+        "Mutation-checked: reverting catalog.cpp+ast_builder.cpp to pre-change semantics fails exactly the 4 new gate tests"
+      ]
+    },
+    {
+      "id": "HARDEN-02",
+      "category": "code",
+      "priority": "P0",
+      "title": "Reject unavailable connectors before deployment (local plan-time + cluster-authoritative submission)",
+      "status": "planned",
+      "evidence": []
+    },
+    {
+      "id": "HARDEN-03",
+      "category": "code",
+      "priority": "P1",
+      "title": "Adaptive unaligned-checkpoint wiring: measured backpressure drives the existing resolver in clink's own runtimes",
+      "status": "planned",
+      "evidence": []
+    },
+    {
+      "id": "HARDEN-04",
+      "category": "code",
+      "priority": "P1",
+      "title": "Release qualification tooling: scripts/qualification/run.sh --ref <git-ref> with full provenance recording",
+      "status": "planned",
+      "evidence": []
+    },
+    {
+      "id": "QUAL-01",
+      "category": "qualification",
+      "priority": "P0",
+      "title": "Multi-day Kafka exactly-once failure campaign with independent oracle",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-02",
+      "category": "qualification",
+      "priority": "P0",
+      "title": "PostgreSQL PREPARE TRANSACTION campaign with pg_prepared_xacts monitoring",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-03",
+      "category": "qualification",
+      "priority": "P0",
+      "title": "Object-store checkpoint + transactional sink fault campaign",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-04",
+      "category": "qualification",
+      "priority": "P1",
+      "title": "Large-state campaign (100GB+, progressive), per backend",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-05",
+      "category": "qualification",
+      "priority": "P1",
+      "title": "TTL steady-state campaign across GROUP BY / DISTINCT / join / CEP / typed state",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-06",
+      "category": "qualification",
+      "priority": "P1",
+      "title": "Large DAG / high-parallelism scaling limits (thread-per-subtask knee)",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-07",
+      "category": "qualification",
+      "priority": "P1",
+      "title": "Reference-engine semantic comparison on deterministic workloads",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-08",
+      "category": "qualification",
+      "priority": "P0",
+      "title": "Rolling upgrade qualification (previous release -> candidate, candidate -> candidate)",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-09",
+      "category": "qualification",
+      "priority": "P0",
+      "title": "Reusable chaos controller + infrastructure failure matrix",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-10",
+      "category": "qualification",
+      "priority": "P1",
+      "title": "Long-running leak and resource campaign (24h/72h/7d) with trend detection",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-11",
+      "category": "qualification",
+      "priority": "P1",
+      "title": "Schema evolution campaign over long-running jobs",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    },
+    {
+      "id": "QUAL-12",
+      "category": "qualification",
+      "priority": "P1",
+      "title": "Security configuration failure tests (no silent downgrade invariant)",
+      "status": "planned",
+      "infrastructure": [],
+      "results": {}
+    }
+  ]
+}

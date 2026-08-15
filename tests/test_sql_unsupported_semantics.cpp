@@ -122,31 +122,37 @@ TEST(SqlUnsupportedSemantics, InColumnPrimaryKeyReachesTheCatalog) {
     EXPECT_EQ(t->primary_key[0], "k");
 }
 
-TEST(SqlUnsupportedSemantics, AMultiColumnInlinePrimaryKeyIsCollected) {
+TEST(SqlUnsupportedSemantics, MultipleInlinePrimaryKeyColumnsAreRefused) {
+    // PostgreSQL refuses two inline PRIMARY KEY markers, and so does clink:
+    // the composite intent has an unambiguous spelling that also carries
+    // column order. Silently collecting the markers into a composite key
+    // guessed at an intent the user never stated.
     ensure_installed();
-    Catalog cat;
-    for (const auto& st :
-         parse(
-             std::string("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT PRIMARY KEY, c BIGINT) ") +
-             kBase + ";")
-             .statements) {
-        if (const auto* ct = std::get_if<ast::CreateTableStmt>(&st)) {
-            cat.register_table(*ct);
-        }
-    }
-    const auto* t = cat.get_table("t");
-    ASSERT_NE(t, nullptr);
-    EXPECT_EQ(t->primary_key, (std::vector<std::string>{"a", "b"}));
+    const auto err = register_ddl(
+        std::string("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT PRIMARY KEY, c BIGINT) ") +
+        kBase + ";");
+    ASSERT_FALSE(err.empty()) << "two inline PRIMARY KEYs were accepted";
+    EXPECT_NE(err.find("primary_key='a,b'"), std::string::npos)
+        << "the diagnostic does not offer the supported composite form: " << err;
 }
 
-TEST(SqlUnsupportedSemantics, TheWithOptionWinsOverAnInlinePrimaryKey) {
-    // The explicit list is the more specific statement, and the form that
-    // survives a catalog JSON round trip.
+TEST(SqlUnsupportedSemantics, ConflictingInlineAndWithPrimaryKeysAreRefused) {
+    // When both forms are supplied they must agree. Silently preferring
+    // either one leaves the other a lie in the user's own DDL.
+    ensure_installed();
+    const auto err = register_ddl(
+        "CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT) WITH "
+        "(connector='file', format='json', path='/tmp/x', primary_key='v');");
+    ASSERT_FALSE(err.empty()) << "conflicting primary keys were accepted";
+    EXPECT_NE(err.find("conflicting"), std::string::npos) << err;
+}
+
+TEST(SqlUnsupportedSemantics, AgreeingInlineAndWithPrimaryKeysAreAccepted) {
     ensure_installed();
     Catalog cat;
     for (const auto& st : parse("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT) WITH "
                                 "(connector='file', format='json', path='/tmp/x', "
-                                "primary_key='v');")
+                                "primary_key='k');")
                               .statements) {
         if (const auto* ct = std::get_if<ast::CreateTableStmt>(&st)) {
             cat.register_table(*ct);
@@ -154,7 +160,39 @@ TEST(SqlUnsupportedSemantics, TheWithOptionWinsOverAnInlinePrimaryKey) {
     }
     const auto* t = cat.get_table("t");
     ASSERT_NE(t, nullptr);
-    EXPECT_EQ(t->primary_key, (std::vector<std::string>{"v"}));
+    EXPECT_EQ(t->primary_key, (std::vector<std::string>{"k"}));
+}
+
+TEST(SqlUnsupportedSemantics, AnInlinePrimaryKeySurvivesACatalogRoundTrip) {
+    // The typed primary_key field is derived state: to_json persists the
+    // properties bag and from_json re-derives from it. An inline PRIMARY
+    // KEY that only set the typed field vanished on the first catalog
+    // reload - an upsert table came back keyless after an engine restart.
+    ensure_installed();
+    Catalog cat;
+    for (const auto& st :
+         parse(std::string("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT) ") + kBase + ";")
+             .statements) {
+        if (const auto* ct = std::get_if<ast::CreateTableStmt>(&st)) {
+            cat.register_table(*ct);
+        }
+    }
+    const auto* t = cat.get_table("t");
+    ASSERT_NE(t, nullptr);
+    ASSERT_EQ(t->primary_key, (std::vector<std::string>{"k"}));
+    const auto reloaded = Catalog::from_json(Catalog::to_json(*t));
+    EXPECT_EQ(reloaded.primary_key, (std::vector<std::string>{"k"}))
+        << "the inline PRIMARY KEY did not survive the JSON round trip";
+}
+
+TEST(SqlUnsupportedSemantics, TableLevelConstraintsAreRefusedNotDropped) {
+    // A table-level PRIMARY KEY (a, b) must not parse into nothing.
+    ensure_installed();
+    const auto err = register_ddl(
+        std::string("CREATE TABLE t (a BIGINT, b BIGINT, PRIMARY KEY (a, b)) ") + kBase + ";");
+    ASSERT_FALSE(err.empty()) << "a table-level constraint was accepted and dropped";
+    EXPECT_NE(err.find("primary_key="), std::string::npos)
+        << "the diagnostic does not offer the supported form: " << err;
 }
 
 // --- WITH-option checking ------------------------------------------------

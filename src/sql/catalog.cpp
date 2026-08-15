@@ -185,18 +185,56 @@ void Catalog::register_table(const ast::CreateTableStmt& stmt) {
         }
         def.columns.push_back(ColumnSpec{col.name, sql_type_to_arrow(col.type)});
     }
+    // A composite key spelt as several inline PRIMARY KEY markers is
+    // refused, matching PostgreSQL ("multiple primary keys ... are not
+    // allowed"). Two markers more often mean two misunderstandings than
+    // one composite key, and the composite intent has an unambiguous
+    // spelling that also carries column order.
+    if (inline_primary_key.size() > 1) {
+        throw TranslationError(
+            "table '" + stmt.table_name +
+                "' declares PRIMARY KEY on more than one column; for a composite key use "
+                "WITH (primary_key='" +
+                [&] {
+                    std::string csv;
+                    for (const auto& k : inline_primary_key) {
+                        if (!csv.empty()) {
+                            csv += ',';
+                        }
+                        csv += k;
+                    }
+                    return csv;
+                }() +
+                "')",
+            stmt.loc.pos);
+    }
     for (const auto& opt : stmt.options) {
         // Duplicate keys: last-write-wins matches PG's WITH-clause
         // semantics (the last DefElem for a given defname survives).
         def.properties[opt.key] = opt.value;
     }
     lift_typed_fields(def);
-    // Inline PRIMARY KEY applies only when the WITH-option did not set one:
-    // the explicit list is the more specific statement, and it is the form
-    // that survives a catalog JSON round trip. Applied AFTER
-    // lift_typed_fields because that clears unconditionally for ALTER.
-    if (def.primary_key.empty() && !inline_primary_key.empty()) {
-        def.primary_key = std::move(inline_primary_key);
+    // Inline PRIMARY KEY canonicalises into the properties bag rather than
+    // the typed field: properties are what to_json persists and what
+    // lift_typed_fields re-derives from on every load and ALTER, so
+    // writing the typed field alone means the key silently vanishes on
+    // the first catalog reload. When both forms are supplied they must
+    // agree - never silently prefer one declaration over the other.
+    if (!inline_primary_key.empty()) {
+        if (!def.primary_key.empty()) {
+            if (def.primary_key != inline_primary_key) {
+                throw TranslationError(
+                    "table '" + stmt.table_name +
+                        "' declares conflicting primary keys: inline PRIMARY KEY names '" +
+                        inline_primary_key.front() + "' but WITH (primary_key='" +
+                        def.properties.at("primary_key") +
+                        "') names a different key. Keep one declaration, or make them agree.",
+                    stmt.loc.pos);
+            }
+        } else {
+            def.properties["primary_key"] = inline_primary_key.front();
+            lift_typed_fields(def);
+        }
     }
     // Near-miss and value checks on the options clink itself interprets.
     // A misspelt `delivery_guarantee` or an out-of-domain `mode` is
