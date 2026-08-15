@@ -198,33 +198,52 @@ on_host "$OPS_PUB" "chmod 600 /root/.ssh/id_ed25519 && pip3 install --break-syst
 BASE_MS=$(( $(date +%s) * 1000 ))
 echo "$BASE_MS" > "$OUT_DIR/base_ms"
 
-on_host "$OPS_PUB" "cd /qual && nohup python3 generator.py --brokers '$BROKER_LIST' \
+on_host "$OPS_PUB" "cd /qual && setsid nohup python3 generator.py --brokers '$BROKER_LIST' \
     --topic qual01-in --rate $RATE --partitions $PARTITIONS --keys $KEYS \
     --seed $SEED --base-ms $BASE_MS --max-jitter-ms $MAX_JITTER_MS \
     --window-ms $WINDOW_MS --progress /qual/progress.json \
-    > /qual/generator.log 2>&1 &"
+    </dev/null > /qual/generator.log 2>&1 &"
 echo "campaign: generator started"
 
 # --- pipeline -----------------------------------------------------------
 sed -e "s|__BROKERS__|$BROKER_LIST|g" -e "s|__WM_LAG_MS__|$WM_LAG_MS|g" \
     -e "s|__TXN_ID__|qual01-${RUN_ID}|g" "$HERE/pipeline.sql.tmpl" > "$OUT_DIR/pipeline.sql"
 
-"$REPO_ROOT/build/tools/clink_submit_sql" \
+# clink_submit_sql POSTs to the coordinator's HTTP API, so the port here
+# is the HTTP one (8095), not the binary control plane (6123).
+"$REPO_ROOT/build/clink_submit_sql" \
     --file "$OUT_DIR/pipeline.sql" \
-    --coordinator-host "$COORD_PUB" --coordinator-port 6123 \
+    --coordinator-host "$COORD_PUB" --coordinator-port 8095 \
     --parallelism "$PARTITIONS" \
     --checkpoint-dir /qual/state \
     --checkpoint-interval-ms "$CHECKPOINT_INTERVAL_MS" \
     --max-restarts-on-worker-loss "$MAX_RESTARTS" \
     | tee "$OUT_DIR/submit.log"
-JOB_ID=$(python3 "$REPO_ROOT/benchmarks/nexmark_compare/cloud/job_id.py" < "$OUT_DIR/submit.log" 2>/dev/null \
-         || grep -oE 'job[ _]?id[ =:]+[0-9]+' "$OUT_DIR/submit.log" | grep -oE '[0-9]+$' | head -1)
+# The submit response is one JSON object per compiled statement:
+# {"ok":true,"job_id":N,"name":"..."}. Parsed directly rather than
+# scraped, so a changed message cannot silently yield an empty id.
+JOB_ID=$(python3 - "$OUT_DIR/submit.log" <<'PYEOF'
+import json, re, sys
+ids = []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        doc = json.loads(line)
+    except ValueError:
+        continue
+    if doc.get("ok") and doc.get("job_id"):
+        ids.append(int(doc["job_id"]))
+print(ids[-1] if ids else "")
+PYEOF
+)
 [ -n "$JOB_ID" ] || { echo "campaign: could not determine job id - see $OUT_DIR/submit.log" >&2; exit 1; }
 echo "campaign: job $JOB_ID submitted"
 
-on_host "$OPS_PUB" "cd /qual && nohup python3 verifier.py --brokers '$BROKER_LIST' \
+on_host "$OPS_PUB" "cd /qual && setsid nohup python3 verifier.py --brokers '$BROKER_LIST' \
     --topic qual01-out --spec /qual/progress.json.spec --progress /qual/progress.json \
-    --verdict /qual/verdict.json > /qual/verifier.log 2>&1 &"
+    --verdict /qual/verdict.json </dev/null > /qual/verifier.log 2>&1 &"
 echo "campaign: verifier started"
 
 # --- functional verification --------------------------------------------
@@ -281,10 +300,10 @@ echo "campaign: verifier judging windows ($JUDGED evaluated)"
 
 # --- chaos --------------------------------------------------------------
 DURATION_S=$(( DURATION_H * 3600 ))
-on_host "$OPS_PUB" "cd /qual && nohup python3 chaos.py --inventory /qual/inventory.json \
+on_host "$OPS_PUB" "cd /qual && setsid nohup python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
-    --duration-s $DURATION_S > /qual/chaos.log 2>&1 &"
+    --duration-s $DURATION_S </dev/null > /qual/chaos.log 2>&1 &"
 echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE)"
 
 # 5. Chaos must actually land a fault. A controller that applies none is
