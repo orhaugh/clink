@@ -95,19 +95,47 @@ if ! hcloud network describe "$NET_NAME" >/dev/null 2>&1; then
         --ip-range "$SUBNET" >/dev/null
 fi
 
-CLOUD_INIT=$(mktemp)
-cat > "$CLOUD_INIT" <<'YAML'
+# Two cloud-inits. The ops host EXPORTS /qual/state over NFS; the
+# coordinator and workers MOUNT it.
+#
+# Shared state is not a convenience here, it is a correctness
+# requirement. Checkpoint state is laid out as
+# <checkpoint_dir>/v1/<subtask_idx>/, resolved on each node's own
+# filesystem, so when a killed worker's subtask is redeployed onto a
+# different host it finds no state and the restore refuses. A campaign
+# whose whole point is killing workers cannot run on per-host local
+# disks. (An object-store state backend is the other answer, and is
+# QUAL-03's subject rather than a dependency of this one.)
+OPS_CLOUD_INIT=$(mktemp)
+cat > "$OPS_CLOUD_INIT" <<'YAML'
 #cloud-config
 package_update: true
-packages: [docker.io, docker-compose-v2, python3-pip, iproute2, iptables]
+packages: [docker.io, docker-compose-v2, python3-pip, iproute2, iptables, nfs-kernel-server]
 runcmd:
   - systemctl enable --now docker
   - usermod -aG docker root
   - sysctl -w vm.max_map_count=262144
+  - mkdir -p /qual/state
+  - chmod 777 /qual/state
+  - echo "/qual/state 10.20.1.0/24(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
+  - exportfs -ra
+  - systemctl enable --now nfs-kernel-server
 YAML
 
-create() {  # name type
-    local name=$1 type=$2
+CLOUD_INIT=$(mktemp)
+cat > "$CLOUD_INIT" <<'YAML'
+#cloud-config
+package_update: true
+packages: [docker.io, docker-compose-v2, python3-pip, iproute2, iptables, nfs-common]
+runcmd:
+  - systemctl enable --now docker
+  - usermod -aG docker root
+  - sysctl -w vm.max_map_count=262144
+  - mkdir -p /qual/state
+YAML
+
+create() {  # name type [cloud-init]
+    local name=$1 type=$2 init=${3:-$CLOUD_INIT}
     if hcloud server describe "$name" >/dev/null 2>&1; then
         echo "==> ${name} exists, skipping"
         return 0
@@ -115,14 +143,14 @@ create() {  # name type
     echo "==> creating ${name} (${type})"
     hcloud server create --name "$name" --type "$type" --image "$IMAGE" \
         --location "$LOCATION" --ssh-key "$SSH_KEY_NAME" --network "$NET_NAME" \
-        --user-data-from-file "$CLOUD_INIT" --label "$LABELS" >/dev/null
+        --user-data-from-file "$init" --label "$LABELS" >/dev/null
 }
 
-create "qual-${RUN_ID}-ops" "$OPS_TYPE"
+create "qual-${RUN_ID}-ops" "$OPS_TYPE" "$OPS_CLOUD_INIT"
 create "qual-${RUN_ID}-coordinator" "$COORD_TYPE"
 for i in $(seq 1 "$WORKERS"); do create "qual-${RUN_ID}-worker${i}" "$WORKER_TYPE"; done
 for i in $(seq 1 "$BROKERS"); do create "qual-${RUN_ID}-broker${i}" "$BROKER_TYPE"; done
-rm -f "$CLOUD_INIT"
+rm -f "$CLOUD_INIT" "$OPS_CLOUD_INIT"
 
 echo
 echo "Inventory:"

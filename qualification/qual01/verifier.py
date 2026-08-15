@@ -60,9 +60,20 @@ def main() -> int:
         time.sleep(1)
     spec = load_spec(args.spec)
 
+    # A UNIQUE group per run, and an explicit close at the end.
+    #
+    # A fixed group id cost a false FAIL the first time this harness was
+    # dry-run: the previous run's member had not yet aged out, the new
+    # one was assigned a subset of partitions, and 317 records it never
+    # read were reported as MISSING output. A verifier that manufactures
+    # the very defect it is hunting is worse than no verifier. This
+    # oracle recomputes everything from the spec and holds its own
+    # observations in memory, so re-reading the whole topic from the
+    # beginning is always the correct behaviour.
+    group = f"qual01-verifier-{os.getpid()}-{int(time.time())}"
     consumer = Consumer({
         "bootstrap.servers": args.brokers,
-        "group.id": "qual01-verifier",
+        "group.id": group,
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
         "isolation.level": "read_committed",
@@ -98,7 +109,44 @@ def main() -> int:
             json.dump(verdict, f, indent=2)
         os.replace(tmp, args.verdict)
 
+    def caught_up() -> bool:
+        """Whether this consumer has read to the end of every partition it
+        is assigned, and is assigned every partition of the topic.
+
+        Absence of output is only evidence of MISSING output once both
+        hold. Without this check a lagging or partially-assigned consumer
+        reports records it simply has not reached yet as lost - which is
+        exactly the false failure that a fixed consumer group produced on
+        this harness's first dry run."""
+        try:
+            meta = consumer.list_topics(args.topic, timeout=10)
+            total_partitions = len(meta.topics[args.topic].partitions)
+        except Exception:
+            return False
+        assignment = consumer.assignment()
+        if not assignment or len(assignment) < total_partitions:
+            return False
+        for tp in assignment:
+            try:
+                low, high = consumer.get_watermark_offsets(tp, timeout=10,
+                                                           cached=False)
+                pos = consumer.position([tp])[0].offset
+            except Exception:
+                return False
+            if pos is None or pos < 0:
+                # No position yet on a non-empty partition: not caught up.
+                if high > low:
+                    return False
+                continue
+            if pos < high:
+                return False
+        return True
+
     def evaluate():
+        if not caught_up():
+            print("verifier: not caught up to the end of every partition yet; "
+                  "deferring judgement", flush=True)
+            return
         try:
             with open(args.progress) as f:
                 produced_high = {int(k): v for k, v in
@@ -181,6 +229,7 @@ def main() -> int:
         pass
     evaluate()
     write_verdict(final=True)
+    consumer.close()  # leave the group cleanly; see the group-id note above
     print("verifier: final verdict written", flush=True)
     return 0
 
