@@ -89,6 +89,9 @@ class Chaos:
         self.run_id = run_id
         self.rng = rng
         self._fault_surface = None
+        # (host, container) -> the image it was first seen running, so a
+        # restart that brings it back on a different build is caught.
+        self.container_images: dict = {}
 
     # --- observation -----------------------------------------------------
 
@@ -154,14 +157,42 @@ class Chaos:
     # --- faults ----------------------------------------------------------
 
     def assert_container_running(self, host: dict, name: str):
-        """Prove a killed process came back. A rig left one worker short
-        makes every measurement after it a different experiment."""
+        """Prove a killed process came back, AS THE BUILD UNDER TEST.
+
+        A rig left one worker short makes every measurement after it a
+        different experiment - and a rig where the worker came back on a
+        different image is worse, because it still looks whole. That is not
+        hypothetical: a restart that lost its environment brought a worker
+        back on the published :main image instead of the campaign's, and
+        only the fact that it also lost its coordinator address, and so
+        exited, stopped the campaign from measuring a cluster running two
+        versions of clink at once.
+
+        So the image is recorded on the first sighting of each container
+        and every later restart is checked against it.
+        """
+        image = None
         for _ in range(20):
-            res = self.rig.ssh(host, f"docker ps --filter name={name} --format '{{{{.Names}}}}'")
-            if name in (res.stdout or ""):
-                return
+            res = self.rig.ssh(
+                host, f"docker ps --filter name={name} --format '{{{{.Names}}}} {{{{.Image}}}}'")
+            out = (res.stdout or "").strip()
+            if name in out:
+                parts = out.split()
+                image = parts[1] if len(parts) > 1 else "unknown"
+                break
             time.sleep(3)
-        raise ChaosCommandFailed(f"{host['name']}: {name} did not come back after a restart")
+        if image is None:
+            raise ChaosCommandFailed(f"{host['name']}: {name} did not come back after a restart")
+
+        key = (host["name"], name)
+        expected = self.container_images.get(key)
+        if expected is None:
+            self.container_images[key] = image
+        elif image != expected:
+            raise ChaosCommandFailed(
+                f"{host['name']}: {name} came back as {image}, not {expected}. The rig is now "
+                "running more than one build of clink and every measurement after this point "
+                "would be of a cluster that does not exist anywhere else.")
 
     def assert_container_gone(self, host: dict, name: str):
         """Prove the container is actually down. `docker kill` on an
@@ -359,6 +390,7 @@ def main() -> int:
     started = time.time()
     last_ckpt = 0
     faults = 0
+    consecutive_failures = 0
     while True:
         if args.duration_s and time.time() - started >= args.duration_s:
             break
@@ -375,8 +407,31 @@ def main() -> int:
         last_ckpt = ckpt
         status, _ = chaos.job_state()
         fault = rng.choice(weighted)
-        getattr(chaos, fault)(status, ckpt)
-        faults += 1
+        # One fault that cannot be applied must not end the campaign's
+        # fault generation. It did exactly that on QUAL-01: the first
+        # worker kill was applied, its restart came back misconfigured and
+        # exited, the assertion raised, and the controller died - leaving
+        # an hour of "soak" with nothing touching the cluster and a
+        # campaign that looked like it had been under fault the whole
+        # time. Record the failure as evidence, keep going, and let the
+        # consecutive-failure ceiling below decide when the rig itself is
+        # too broken to be worth continuing against.
+        try:
+            getattr(chaos, fault)(status, ckpt)
+            faults += 1
+            consecutive_failures = 0
+        except ChaosCommandFailed as exc:
+            consecutive_failures += 1
+            chaos.record("controller", "fault_failed", status, ckpt,
+                         {"attempted": fault, "error": str(exc),
+                          "consecutive_failures": consecutive_failures})
+            print(f"chaos: {fault} could not be applied ({exc}); "
+                  f"{consecutive_failures} in a row", flush=True)
+            if consecutive_failures >= 5:
+                print("chaos: FIVE FAULTS IN A ROW COULD NOT BE APPLIED - stopping. The rig "
+                      "is not in a state this controller can act on, and continuing would "
+                      "produce a soak with no faults in it.", flush=True)
+                return 2
         time.sleep(args.min_gap_s + rng.uniform(0, args.min_gap_s))
     print(f"chaos: {faults} faults applied", flush=True)
     if faults == 0:

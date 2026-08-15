@@ -168,9 +168,28 @@ for bp in $(read_inv broker public_ip); do
     on_host "$bp" "cd /qual && NODE_ID=$i PRIVATE_IP=$priv SEEDS='$SEED_LIST' docker compose -f broker.yml up -d"
 done
 
+# Every host gets a /qual/.env, which docker compose reads automatically
+# from its project directory. The deploy below then passes nothing on the
+# command line that is not also in that file.
+#
+# The reason is the chaos controller. It restarts a killed container with
+# `cd /qual && docker compose -f worker.yml up -d` and no environment,
+# because it cannot know what the campaign deployed. With the settings
+# passed only as inline environment on the original command, that restart
+# silently fell back to the compose defaults: the worker came back as
+# ghcr.io/orhaugh/clink-runtime:main - a different build entirely from the
+# image under test - with an empty --coordinator-host, and exited 1. The
+# controller's own assertion then failed, which killed it, and QUAL-01
+# soaked for an hour with one fault applied and no fault generator alive.
+# Had that container merely STARTED, the campaign would have gone on
+# measuring a cluster running two versions of clink at once.
+#
+# So the configuration lives on the host, and anything that restarts a
+# container reproduces the deployment rather than guessing at it.
 on_host "$COORD_PUB" "mkdir -p /qual"
 to_host "$COORD_PUB" "$HERE/../infra/coordinator.yml" /qual/coordinator.yml
-on_host "$COORD_PUB" "cd /qual && CLINK_IMAGE=$CLINK_IMAGE CONTROL_IP=$COORD_PRIV docker compose -f coordinator.yml up -d"
+on_host "$COORD_PUB" "printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\n' '$CLINK_IMAGE' '$COORD_PRIV' > /qual/.env"
+on_host "$COORD_PUB" "cd /qual && docker compose -f coordinator.yml up -d"
 
 wid=0
 for wp in $WORKER_PUBS; do
@@ -178,7 +197,9 @@ for wp in $WORKER_PUBS; do
     wpriv=$(read_inv worker private_ip | cut -d' ' -f$wid)
     on_host "$wp" "mkdir -p /qual /qual/state"
     to_host "$wp" "$HERE/../infra/worker.yml" /qual/worker.yml
-    on_host "$wp" "cd /qual && CLINK_IMAGE=$CLINK_IMAGE CONTROL_IP=$COORD_PRIV WORKER_ID=w$wid WORKER_IP=$wpriv docker compose -f worker.yml up -d"
+    on_host "$wp" "printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nWORKER_ID=w%s\nWORKER_IP=%s\n' \
+        '$CLINK_IMAGE' '$COORD_PRIV' '$wid' '$wpriv' > /qual/.env"
+    on_host "$wp" "cd /qual && docker compose -f worker.yml up -d"
 done
 
 # The deployed build's own capability manifest, captured as evidence
@@ -379,11 +400,18 @@ echo "campaign: chaos landing faults ($FAULTS recorded)"
 # missed a checkpoint, and the campaign was minutes from publishing a
 # fault-tolerance result for a cluster nothing had touched. So the gate
 # now reads the coordinator's own counter of workers it has lost.
-LOST=$(curl -fsS "http://${COORD_PUB}:8095/metrics" 2>/dev/null \
-       | awk '/^clink_coordinator_workers_lost_total /{print $2}')
-if [ "${LOST:-0}" -lt 1 ]; then
+#
+# "The metric says zero" and "the metric could not be read" are different
+# facts, and defaulting an unreachable coordinator to zero would be the same
+# silent assumption in a different coat.
+METRICS=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/metrics" 2>/dev/null) \
+    || verify_fail "cannot read the coordinator's metrics, so a fault cannot be confirmed"
+LOST=$(echo "$METRICS" | awk '/^clink_coordinator_workers_lost_total /{print $2}')
+[ -n "$LOST" ] || verify_fail "the coordinator exports no clink_coordinator_workers_lost_total,
+  so there is no way to confirm a fault reached the engine"
+if [ "${LOST%%.*}" -lt 1 ]; then
     verify_fail "the chaos controller recorded faults but the coordinator has lost no worker
-  (clink_coordinator_workers_lost_total=${LOST:-0}). A fault that leaves no trace in the
+  (clink_coordinator_workers_lost_total=${LOST}). A fault that leaves no trace in the
   engine did not happen, whatever the chaos log says."
 fi
 echo "campaign: fault confirmed by the engine (workers lost: $LOST)"
@@ -407,11 +435,35 @@ echo "campaign: verification summary" > "$OUT_DIR/verification.txt"
 # Poll evidence back to the laptop every 10 minutes, so a campaign that
 # dies at hour 90 still has 89 hours of evidence locally.
 END=$(( $(date +%s) + DURATION_S ))
+CHAOS_DIED_AT=""
 while [ "$(date +%s)" -lt "$END" ]; do
     sleep 600
     for f in verdict.json chaos.jsonl progress.json generator.log verifier.log chaos.log; do
         scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
     done
+
+    # Is anything still applying faults?
+    #
+    # On the run that found the source-offset defect, the chaos controller
+    # raised on its first worker restart and died four minutes in. The
+    # campaign then soaked for a full hour, reported healthy every ten
+    # minutes, and finished - having applied exactly one fault, with no
+    # fault generator alive for 93% of the run. Nothing in the harness
+    # noticed, because a soak with no faults looks exactly like a soak that
+    # survived them. The gate proves faults land at the START; this proves
+    # they are still landing, and says so the moment they stop.
+    if [ -z "$CHAOS_DIED_AT" ] \
+       && ! on_host "$OPS_PUB" "pgrep -f '[c]haos.py' >/dev/null"; then
+        CHAOS_DIED_AT=$(date -u +%H:%M)
+        NFAULTS=$(on_host "$OPS_PUB" "wc -l < /qual/chaos.jsonl 2>/dev/null || echo 0" | tr -d '\r')
+        echo "campaign: WARNING - the chaos controller is no longer running (noticed ${CHAOS_DIED_AT}," \
+             "${NFAULTS} fault record(s) written). Everything after this point is an" \
+             "undisturbed soak, not a fault campaign, and must be reported as such." >&2
+        { echo "chaos_controller_died=yes"; echo "noticed_at_utc=$CHAOS_DIED_AT";
+          echo "fault_records_at_death=$NFAULTS";
+          echo "tail:"; on_host "$OPS_PUB" "tail -20 /qual/chaos.log" 2>/dev/null || true;
+        } > "$OUT_DIR/chaos-died.txt"
+    fi
     curl -fsS "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" \
         > "$OUT_DIR/job-status.json" 2>/dev/null || true
     python3 - "$OUT_DIR/verdict.json" <<'PY' || true

@@ -90,6 +90,7 @@ nav:
   - Qualification:
       - qualification/README.md
       - qualification/feasibility.md
+      - qualification/qual-01-kafka-exactly-once.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md

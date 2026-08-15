@@ -71,7 +71,7 @@ verdict, defects found and regression tests created.
 
 | Campaign | Subject | Status |
 |----------|---------|--------|
-| QUAL-01 | Kafka exactly-once under a multi-day fault campaign | feasible, not yet run |
+| [QUAL-01](qual-01-kafka-exactly-once.md) | Kafka exactly-once under a fault campaign | **completed - two engine defects found and fixed** |
 | QUAL-02 | PostgreSQL two-phase-commit sink under targeted crash windows | feasible, not yet run |
 | QUAL-09 | Infrastructure failure matrix (reusable chaos controller) | feasible, not yet run |
 | QUAL-03 | Object-store checkpointing and transactional sinks under storage faults | rescoped; see feasibility |
@@ -84,11 +84,15 @@ verdict, defects found and regression tests created.
 | QUAL-11 | Schema evolution over long-running jobs | rescoped; see feasibility |
 | QUAL-12 | Security configuration failure behaviour (no silent downgrade) | two defects already found and fixed |
 
-No campaign has completed yet, and the table above says which ones could even
-produce evidence today. The programme is in its code-hardening phase, closing
-the residual findings of the adversarial external audit of 15 August 2026 and
-the blockers the feasibility assessment found, before infrastructure spend
-begins. Until a campaign's page exists, its subject sits in the *unknown* or
+QUAL-01 has completed and found two genuine defects in clink, both now fixed
+and pinned by regression tests: source offsets that could be silently replayed
+or skipped on a plain restart, breaking exactly-once, and a configured
+checkpoint interval that was ignored entirely. Its page is the model for the
+rest: the defects are the headline, and the limits of what was actually
+exercised are stated in the same breath as the results.
+
+The remaining table entries say which campaigns could even produce evidence
+today. Until a campaign's page exists, its subject sits in the *unknown* or
 *architecturally supported but not qualified* category, and this table is the
 honest statement of that.
 
