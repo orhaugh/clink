@@ -397,20 +397,40 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                 "CLINK_ALLOW_MISSING_RESTORE_STATE=1.");
         }
 
-        // On rescale, OPERATOR state (source offsets, broadcast slots) is
-        // broadcast, not partitioned: every new subtask must see all parents'
-        // operator rows, then narrow at the source (Kafka's apply-once
-        // rebalance cb). So union the operator-only rows from every OTHER
-        // parent. The old parallelism is discovered by listing the numeric
-        // subdirs of the restore GENERATION - no wire change. Same-parallelism
-        // restore skips this (each subtask's own dir already has its state),
-        // so a large keyed job pays nothing on a plain resubmit.
+        // OPERATOR state (source offsets, broadcast slots) is broadcast, not
+        // partitioned: every restoring subtask must see all parents' operator
+        // rows, then narrow at the source (Kafka's apply-once rebalance cb).
+        // So union the operator-only rows from every OTHER parent. The old
+        // parallelism is discovered by listing the numeric subdirs of the
+        // restore GENERATION - no wire change.
+        //
+        // This used to be gated on is_rescale, on the reasoning that at the
+        // same parallelism each subtask's own dir already has its state. That
+        // holds for KEYED state, whose key groups are pinned to a subtask
+        // index, and fails for operator state whose ownership something
+        // outside clink decides. A Kafka source subscribes to a consumer
+        // group, so which subtask owns which partition is chosen by the group
+        // coordinator and is not stable across a restart: a subtask that came
+        // back holding a partition it had not owned before found no restored
+        // offset for it and silently resumed from the broker's committed group
+        // offset instead of the checkpoint, replaying or skipping records.
+        // QUAL-01 caught it as 938 wrong keys in the single window in flight
+        // across a worker kill - counted twice for the rewound partitions,
+        // lost for the ones that jumped forward.
+        //
+        // The cost is that a plain restart now reads its peers' snapshot files
+        // to extract their operator rows, where before it read only its own.
+        // Only the operator rows are kept (extract_operator_state_bytes), but
+        // the read is of the whole file, so a large keyed job pays I/O on
+        // restore that it did not pay before. That is the right trade: a
+        // restore is rare, and the alternative is a silent correctness hole in
+        // the one operation whose entire purpose is to be correct.
         //
         // Scoped to the generation that produced the checkpoint, not to the base:
         // scanning the base would now walk every generation the job has ever had
         // and union operator rows from topologies this restore has nothing to do
         // with.
-        if (is_rescale) {
+        {
             const auto participants =
                 completed_participants(restore_path, spec.restore_checkpoint_id);
             std::error_code dec;

@@ -1043,3 +1043,80 @@ TEST(StateBackendFactory, ARestoreFallsBackToListingWhenNoMarkerIdentifiesPartic
     const std::string got(reinterpret_cast<const char*>(v->data()), v->size());
     EXPECT_EQ(got, "LEGITIMATE");
 }
+
+// A plain restart must see every partition's source offset, not just its own.
+//
+// Found by QUAL-01 on 2026-08-16, not by any unit test: a worker was killed,
+// the job restarted from checkpoint 343 at UNCHANGED parallelism, and the one
+// window in flight came back with 938 of 16,500 keys wrong - some keys counted
+// twice, others missing entirely. An independent recount from the input topic
+// exonerated both the oracle and the generator, which left the engine.
+//
+// The chain: a Kafka source subscribes to a consumer group, so which subtask
+// owns which partition is decided by the group coordinator and is NOT stable
+// across a restart. Source offsets are checkpointed per subtask, one row per
+// partition that subtask owned. The union of other subtasks' OPERATOR rows was
+// gated on is_rescale, on the reasoning that at the same parallelism "each
+// subtask's own dir already has its state" - true of KEYED state, false of
+// operator state whose ownership the broker reassigns. So a subtask that came
+// back owning a partition it had not owned before found no restored offset for
+// it and resumed from the broker's committed group offset instead of the
+// checkpoint: some partitions rewound and re-delivered records already folded
+// into the window, others jumped forward and skipped records entirely.
+//
+// Hence a same-parallelism restore, with the offsets deliberately split across
+// two subtasks the way a running job splits them.
+TEST(StateBackendFactory, APlainRestartSeesEveryPartitionsSourceOffsetNotJustItsOwn) {
+    const auto base = make_temp_dir("plain_restart_offset_union");
+    const std::uint64_t ckpt_id = 343;
+    const clink::OperatorId op{1};
+
+    const auto publish_offset_at = [&](std::uint32_t idx,
+                                       const std::string& key,
+                                       const std::string& val) {
+        clink::InMemoryStateBackend backend;
+        // Operator state, which is what source offsets are. A keyed put would
+        // not exercise the union path at all.
+        backend.put_operator_state(
+            op, clink::StateBackend::KeyView{key}, clink::StateBackend::ValueView{val});
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(base, idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
+    };
+    publish_offset_at(0, "koffp0", "OFFSET_FOR_PARTITION_0");
+    publish_offset_at(1, "koffp1", "OFFSET_FOR_PARTITION_1");
+
+    const auto jobs_dir = base / "_jobs" / "1";
+    std::filesystem::create_directories(jobs_dir);
+    {
+        std::ofstream m(jobs_dir / ("COMPLETED-" + std::to_string(ckpt_id)));
+        m << "job=1\ncheckpoint=" << ckpt_id << "\ngeneration=1\nsubtasks=0,1\n";
+    }
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 0;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    // No restore_from_subtask_idx: a plain restart at unchanged parallelism,
+    // which is exactly the path the campaign exercised.
+
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    ASSERT_NE(built.backend, nullptr);
+    ASSERT_TRUE(built.restore_from.has_value()) << "the restore produced nothing at all";
+    built.backend->restore(*built.restore_from);
+
+    const auto own = built.backend->get_operator_state(op, clink::StateBackend::KeyView{"koffp0"});
+    ASSERT_TRUE(own.has_value()) << "the subtask lost even its own partition's offset";
+
+    const auto peer = built.backend->get_operator_state(op, clink::StateBackend::KeyView{"koffp1"});
+    ASSERT_TRUE(peer.has_value())
+        << "subtask 0 restored without the offset subtask 1 had checkpointed for its "
+           "partition. Partition ownership is assigned by the consumer group and is not "
+           "stable across a restart, so when this subtask is handed that partition it has "
+           "no checkpointed position for it and resumes from the broker's committed group "
+           "offset - replaying or skipping records, and breaking exactly-once.";
+    const std::string got(reinterpret_cast<const char*>(peer->data()), peer->size());
+    EXPECT_EQ(got, "OFFSET_FOR_PARTITION_1");
+}
