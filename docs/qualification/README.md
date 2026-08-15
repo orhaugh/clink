@@ -96,6 +96,9 @@ today. Until a campaign's page exists, its subject sits in the *unknown* or
 *architecturally supported but not qualified* category, and this table is the
 honest statement of that.
 
-The full production-qualification report, aggregating every campaign into a
-single assessment against an immutable release candidate, will be published
-here alongside the campaign pages.
+The [production qualification report](production-qualification-report.md)
+aggregates every campaign into a single assessment, and is the page to read
+first when evaluating clink. It records six defects found by this programme -
+three in clink, three in the harness that was meant to test it - and states
+plainly which claims are demonstrated, which are bounded, and which are
+unknown.
