@@ -247,6 +247,114 @@ protected:
 
 std::unique_ptr<clink::test::DockerKafka> TxnResumeSaslLive::sasl_broker_;
 
+// The crown arm: the WHOLE resume circle on an authenticated broker. A
+// genuine orphan is produced with SCRAM credentials (fork + _exit, no
+// destructors, exactly as the unauthenticated suite does), the resume
+// authenticates via SCRAM-SHA-256 - both connections, server signature
+// verified - and commits it; an authenticated read_committed drain then
+// sees exactly the orphaned records. This is what "SCRAM ships" means.
+TEST_F(TxnResumeSaslLive, AScramAuthenticatedResumeCommitsAGenuineOrphan) {
+    const std::string topic = "clink_scram_resume";
+    sasl_broker_->create_topic(topic);
+    const std::vector<std::pair<std::string, std::string>> client_sasl = {
+        {"security.protocol", "sasl_plaintext"},
+        {"sasl.mechanism", "SCRAM-SHA-256"},
+        {"sasl.username", "admin"},
+        {"sasl.password", "secret"}};
+
+    // Produce the orphan in a forked child, with the sink authenticating
+    // via librdkafka's own SCRAM - independent of the resume's
+    // implementation, so the two sides cross-check each other.
+    const std::vector<std::string> values = {"s1", "s2", "s3"};
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(::pipe(fds), 0);
+    const pid_t child = ::fork();
+    if (child == 0) {
+        ::close(fds[0]);
+        KafkaSink::Options o;
+        o.brokers = sasl_broker_->brokers();
+        o.topic = topic;
+        o.transactional_id = "scram-resume-live";
+        for (const auto& [k, v] : client_sasl) {
+            o.conf[k] = v;
+        }
+        KafkaSink sink(o);
+        sink.open();
+        Batch<KafkaMessage> b;
+        for (const auto& v : values) {
+            b.emplace(KafkaMessage{v});
+        }
+        sink.on_data(b);
+        sink.flush();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!sink.producer_identity().has_value() &&
+               std::chrono::steady_clock::now() < deadline) {
+            sink.flush();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::int64_t pid = -1;
+        std::int16_t epoch = -1;
+        if (const auto ident = sink.producer_identity(); ident.has_value()) {
+            pid = ident->producer_id;
+            epoch = ident->producer_epoch;
+        }
+        (void)!::write(fds[1], &pid, sizeof(pid));
+        (void)!::write(fds[1], &epoch, sizeof(epoch));
+        ::close(fds[1]);
+        ::_exit(0);  // the crash: no destructors, no abort, no goodbye
+    }
+    ::close(fds[1]);
+    TxnIdentity txn;
+    txn.transactional_id = "scram-resume-live";
+    std::int64_t pid = -1;
+    std::int16_t epoch = -1;
+    if (::read(fds[0], &pid, sizeof(pid)) == sizeof(pid) &&
+        ::read(fds[0], &epoch, sizeof(epoch)) == sizeof(epoch)) {
+        txn.producer_id = pid;
+        txn.producer_epoch = epoch;
+    }
+    ::close(fds[0]);
+    int status = 0;
+    (void)::waitpid(child, &status, 0);
+    ASSERT_TRUE(txn.complete()) << "the child never captured its producer identity";
+
+    clink::kafka::ResumeAuth auth;
+    auth.mechanism = "SCRAM-SHA-256";
+    auth.username = "admin";
+    auth.password = "secret";
+    const auto [host, port] = broker_addr();
+    const auto outcome = clink::kafka::resume_commit(
+        host,
+        port,
+        txn,
+        [](const std::string& h, std::uint16_t p) { return clink::network::connect_plain(h, p); },
+        auth);
+    ASSERT_TRUE(outcome.committed()) << outcome.detail;
+
+    EXPECT_EQ(clink::kafka::consume_all_committed(
+                  sasl_broker_->brokers(), topic, std::chrono::seconds{20}, client_sasl),
+              values)
+        << "after the SCRAM-authenticated resume, a downstream read_committed consumer sees "
+           "exactly the orphaned records";
+}
+
+// Wrong SCRAM credentials must be refused by the REAL broker with its own
+// message - and nothing may be committed.
+TEST_F(TxnResumeSaslLive, WrongScramCredentialsAreRefusedByTheRealBroker) {
+    clink::kafka::ResumeAuth auth;
+    auth.mechanism = "SCRAM-SHA-256";
+    auth.username = "admin";
+    auth.password = "not-the-password";
+    const auto [host, port] = broker_addr();
+    const auto outcome = clink::kafka::resume_commit(
+        host,
+        port,
+        some_identity(),
+        [](const std::string& h, std::uint16_t p) { return clink::network::connect_plain(h, p); },
+        auth);
+    EXPECT_EQ(outcome.status, ResumeOutcome::Status::Refused) << outcome.detail;
+}
+
 TEST_F(TxnResumeSaslLive, APlainHandshakeIsRefusedByAScramOnlyBrokerNamingScram) {
     clink::kafka::ResumeAuth auth;
     auth.mechanism = "PLAIN";

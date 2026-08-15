@@ -11,16 +11,20 @@
 
 namespace clink::kafka {
 
-std::vector<std::string> consume_all_committed(const std::string& brokers,
-                                               const std::string& topic,
-                                               std::chrono::milliseconds timeout) {
-    return consume_all(brokers, topic, "read_committed", timeout);
+std::vector<std::string> consume_all_committed(
+    const std::string& brokers,
+    const std::string& topic,
+    std::chrono::milliseconds timeout,
+    const std::vector<std::pair<std::string, std::string>>& extra_conf) {
+    return consume_all(brokers, topic, "read_committed", timeout, extra_conf);
 }
 
-std::vector<std::string> consume_all(const std::string& brokers,
-                                     const std::string& topic,
-                                     const std::string& isolation,
-                                     std::chrono::milliseconds timeout) {
+std::vector<std::string> consume_all(
+    const std::string& brokers,
+    const std::string& topic,
+    const std::string& isolation,
+    std::chrono::milliseconds timeout,
+    const std::vector<std::pair<std::string, std::string>>& extra_conf) {
     std::string err;
     auto cfg = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
     auto set_or_throw = [&](const std::string& k, const std::string& v) {
@@ -37,6 +41,9 @@ std::vector<std::string> consume_all(const std::string& brokers,
     // stable offset, so an open transaction holds EOF back and the drain
     // times out - which is the leak signal the callers assert on.
     set_or_throw("enable.partition.eof", "true");
+    for (const auto& [k, v] : extra_conf) {
+        set_or_throw(k, v);
+    }
 
     std::unique_ptr<RdKafka::KafkaConsumer> consumer(
         RdKafka::KafkaConsumer::create(cfg.get(), err));

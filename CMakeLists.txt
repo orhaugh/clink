@@ -1278,6 +1278,10 @@ endif()
 if(TARGET clink::tls AND TARGET clink_kafka)
     target_link_libraries(clink_kafka PRIVATE clink::tls)
     target_compile_definitions(clink_kafka PRIVATE CLINK_KAFKA_RESUME_TLS=1)
+    # SCRAM-SHA-256 for the resume rides the same gate: clink::tls is what
+    # brings OpenSSL, whose HMAC/PBKDF2/SHA-256 are the mechanism's whole
+    # crypto surface. OpenSSL itself comes via the tls target's link line.
+    target_sources(clink_kafka PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/impls/kafka/src/scram.cpp)
     if(TARGET clink_kafka_tests)
         target_link_libraries(clink_kafka_tests PRIVATE clink::tls)
         target_compile_definitions(clink_kafka_tests PRIVATE CLINK_KAFKA_RESUME_TLS=1)

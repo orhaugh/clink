@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace clink::kafka {
@@ -23,10 +24,13 @@ namespace clink::kafka {
 // offset order. Throws std::runtime_error on connection/consume errors or if
 // the drain does not reach EOF on every partition within `timeout` (an open
 // transaction pinning the last stable offset looks like exactly that).
+// `extra_conf`: librdkafka properties applied verbatim on top of the
+// drain's own settings (SASL/TLS credentials for authenticated brokers).
 std::vector<std::string> consume_all_committed(
     const std::string& brokers,
     const std::string& topic,
-    std::chrono::milliseconds timeout = std::chrono::seconds{30});
+    std::chrono::milliseconds timeout = std::chrono::seconds{30},
+    const std::vector<std::pair<std::string, std::string>>& extra_conf = {});
 
 // Same drain with an explicit isolation level ("read_committed" or
 // "read_uncommitted"). The uncommitted view includes records of open and
@@ -34,9 +38,11 @@ std::vector<std::string> consume_all_committed(
 // diagnostic when committed output goes missing: records absent from BOTH
 // were never produced; records visible only uncommitted sit in a
 // transaction that never committed.
-std::vector<std::string> consume_all(const std::string& brokers,
-                                     const std::string& topic,
-                                     const std::string& isolation,
-                                     std::chrono::milliseconds timeout = std::chrono::seconds{30});
+std::vector<std::string> consume_all(
+    const std::string& brokers,
+    const std::string& topic,
+    const std::string& isolation,
+    std::chrono::milliseconds timeout = std::chrono::seconds{30},
+    const std::vector<std::pair<std::string, std::string>>& extra_conf = {});
 
 }  // namespace clink::kafka

@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 
+#include "clink/kafka/scram.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 #include "clink/runtime/network/tls_connection.hpp"
 #include "clink/runtime/network/tls_socket.hpp"
@@ -230,7 +231,9 @@ std::vector<std::uint8_t> sasl_handshake_body(std::int16_t error,
     return b;
 }
 
-std::vector<std::uint8_t> sasl_authenticate_body(std::int16_t error, const std::string& message) {
+std::vector<std::uint8_t> sasl_authenticate_body(std::int16_t error,
+                                                 const std::string& message,
+                                                 const std::string& auth_payload = "") {
     std::vector<std::uint8_t> b;
     const auto put16 = [&](std::int16_t v) {
         b.push_back(static_cast<std::uint8_t>((static_cast<std::uint16_t>(v) >> 8) & 0xFF));
@@ -245,8 +248,15 @@ std::vector<std::uint8_t> sasl_authenticate_body(std::int16_t error, const std::
             b.push_back(static_cast<std::uint8_t>(c));
         }
     }
-    // auth_bytes (empty) + session_lifetime_ms (v1 tail the parser ignores).
-    b.insert(b.end(), {0, 0, 0, 0});
+    // auth_bytes (SCRAM's server messages ride here) + session_lifetime_ms.
+    const auto n = static_cast<std::uint32_t>(auth_payload.size());
+    b.push_back(static_cast<std::uint8_t>((n >> 24) & 0xFF));
+    b.push_back(static_cast<std::uint8_t>((n >> 16) & 0xFF));
+    b.push_back(static_cast<std::uint8_t>((n >> 8) & 0xFF));
+    b.push_back(static_cast<std::uint8_t>(n & 0xFF));
+    for (const char c : auth_payload) {
+        b.push_back(static_cast<std::uint8_t>(c));
+    }
     b.insert(b.end(), {0, 0, 0, 0, 0, 0, 0, 0});
     return b;
 }
@@ -262,6 +272,11 @@ struct FakeSasl {
     std::int16_t auth_error{0};
     std::string auth_error_message;
     std::vector<std::string> mechanisms{"PLAIN"};
+    // SCRAM scripting: answer round 1 with a server-first extending the
+    // client's nonce, round 2 with this v= payload (garbage by default -
+    // the forged-server arm's whole point).
+    bool scram{false};
+    std::string scram_server_final{"v=Zm9yZ2Vkc2lnbmF0dXJlZm9yZ2Vk"};
 };
 
 // A broker whose behaviour is the script: for each accepted connection it
@@ -354,13 +369,36 @@ private:
                     std::lock_guard lock(mu_);
                     auth_bytes_seen_.push_back(req.body);
                 }
-                send_response(fd,
-                              req.correlation,
-                              sasl_authenticate_body(sasl_.auth_error, sasl_.auth_error_message));
-                if (sasl_.auth_error != 0) {
-                    return;
+                if (sasl_.scram) {
+                    // The request body is BYTES: 4-byte length then the SCRAM
+                    // message. Round 1 carries "n,,n=...,r=<nonce>"; extract
+                    // the nonce and answer with a server-first that extends
+                    // it. Round 2 gets the scripted server-final. A fake
+                    // needs no real crypto to script the FORGED-server arm -
+                    // a wrong signature is just a wrong string, and the
+                    // client must refuse it.
+                    const std::string payload(req.body.begin() + 4, req.body.end());
+                    std::string reply;
+                    if (payload.rfind("n,,", 0) == 0) {
+                        const auto r_pos = payload.rfind(",r=");
+                        const std::string client_nonce =
+                            r_pos == std::string::npos ? "" : payload.substr(r_pos + 3);
+                        reply = "r=" + client_nonce + "srvext,s=c2FsdHNhbHRzYWx0c2FsdA==,i=4096";
+                    } else {
+                        reply = sasl_.scram_server_final;
+                        authenticated = true;
+                    }
+                    send_response(fd, req.correlation, sasl_authenticate_body(0, "", reply));
+                } else {
+                    send_response(
+                        fd,
+                        req.correlation,
+                        sasl_authenticate_body(sasl_.auth_error, sasl_.auth_error_message));
+                    if (sasl_.auth_error != 0) {
+                        return;
+                    }
+                    authenticated = true;
                 }
-                authenticated = true;
             } else if (sasl_.required && !authenticated) {
                 // A SASL-only listener drops unauthenticated traffic; the
                 // client observes a closed connection, not a Kafka error.
@@ -608,13 +646,14 @@ TEST(TxnResume, AnUnknownMechanismIsRefusedBeforeAnyByteIsSent) {
         return nullptr;
     };
     clink::kafka::ResumeAuth auth;
-    auth.mechanism = "SCRAM-SHA-256";
+    auth.mechanism = "GSSAPI";
     auth.username = "alice";
     auth.password = "secret";
     const auto outcome =
         clink::kafka::resume_commit("127.0.0.1", 9092, identity(), refuse_dial, auth);
     EXPECT_EQ(outcome.status, ResumeOutcome::Status::Refused);
-    EXPECT_NE(outcome.detail.find("PLAIN only"), std::string::npos) << outcome.detail;
+    EXPECT_NE(outcome.detail.find("PLAIN and SCRAM-SHA-256 only"), std::string::npos)
+        << outcome.detail;
     EXPECT_FALSE(dialed) << "an unspoken mechanism must refuse locally, not probe the network";
 }
 
@@ -670,6 +709,86 @@ TEST(TxnResume, BadCredentialsAreRefusedWithTheBrokersMessage) {
 }
 
 #ifdef CLINK_KAFKA_RESUME_TLS
+
+// --- SCRAM-SHA-256 ---------------------------------------------------------------
+//
+// The whole exchange against RFC 7677's published test vector (user /
+// pencil), so the crypto is pinned by the RFC rather than by this
+// implementation's own output - the only non-circular gate a from-scratch
+// SCRAM client can have.
+
+TEST(TxnResumeScram, TheRfc7677VectorIsReproducedExactly) {
+    namespace scram = clink::kafka::scram;
+    const auto first = scram::client_first("user", "rOprNGfwEbeRWgbNEkqO");
+    EXPECT_EQ(first.full, "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+    EXPECT_EQ(first.bare, "n=user,r=rOprNGfwEbeRWgbNEkqO");
+
+    const std::string server_first_msg =
+        "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
+        "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    const auto server_first = scram::parse_server_first(server_first_msg);
+    ASSERT_TRUE(server_first.has_value());
+    EXPECT_EQ(server_first->iterations, 4096U);
+    EXPECT_EQ(server_first->nonce, "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0");
+
+    const auto final = scram::client_final("pencil", first, *server_first);
+    ASSERT_TRUE(final.has_value());
+    EXPECT_EQ(final->message,
+              "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
+              "p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+
+    // The v= the RFC's server sends must equal OUR computed ServerSignature:
+    // the mutual-authentication half of the vector.
+    const auto server_sig =
+        scram::parse_server_final_signature("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+    ASSERT_TRUE(server_sig.has_value());
+    EXPECT_EQ(*server_sig, final->expected_server_signature);
+}
+
+TEST(TxnResumeScram, AForgedServerSignatureIsRefusedNeverTrusted) {
+    // The fake completes both SCRAM rounds happily but signs the final
+    // message with garbage - a broker (or an interceptor) that never knew
+    // the credentials. Trusting it and proceeding would hand EndTxn to an
+    // unauthenticated peer.
+    FakeBroker broker(/*end_txn_error=*/0,
+                      /*fc_min=*/0,
+                      /*fc_max=*/4,
+                      /*et_min=*/0,
+                      /*et_max=*/4,
+                      FakeSasl{.required = true,
+                               .handshake_error = 0,
+                               .auth_error = 0,
+                               .auth_error_message = {},
+                               .mechanisms = {"SCRAM-SHA-256"},
+                               .scram = true});
+    clink::kafka::ResumeAuth auth;
+    auth.mechanism = "SCRAM-SHA-256";
+    auth.username = "alice";
+    auth.password = "secret";
+    const auto outcome =
+        clink::kafka::resume_commit("127.0.0.1", broker.port(), identity(), plain_connect(), auth);
+    EXPECT_EQ(outcome.status, ResumeOutcome::Status::Refused) << outcome.detail;
+    EXPECT_NE(outcome.detail.find("server signature mismatch"), std::string::npos)
+        << outcome.detail;
+    EXPECT_TRUE(broker.end_txn_bodies().empty())
+        << "EndTxn went to a server that never proved knowledge of the credentials";
+}
+
+TEST(TxnResumeScram, AttackShapesAreRefusedAtParseAndComputeTime) {
+    namespace scram = clink::kafka::scram;
+    const auto first = scram::client_first("user", "clientnonce");
+
+    // A server nonce that does not EXTEND the client's is a reflection.
+    const auto foreign = scram::parse_server_first("r=somebodyelse,s=c2FsdA==,i=4096");
+    ASSERT_TRUE(foreign.has_value());
+    EXPECT_FALSE(scram::client_final("pw", first, *foreign).has_value());
+
+    // An iteration count below RFC 7677's 4096 floor is a KDF downgrade.
+    EXPECT_FALSE(scram::parse_server_first("r=clientnonceX,s=c2FsdA==,i=1").has_value());
+
+    // e= is an explicit server error, never a signature.
+    EXPECT_FALSE(scram::parse_server_final_signature("e=other-error").has_value());
+}
 
 // --- TLS ------------------------------------------------------------------------
 //

@@ -1,5 +1,9 @@
 #include "clink/kafka/txn_resume.hpp"
 
+#ifdef CLINK_KAFKA_RESUME_TLS
+#include "clink/kafka/scram.hpp"
+#endif
+
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -78,6 +82,15 @@ public:
         }
         pos_ += 4;
         return static_cast<std::int32_t>(v);
+    }
+    std::optional<std::vector<std::byte>> bytes(std::size_t n) {
+        if (pos_ + n > b_.size()) {
+            return std::nullopt;
+        }
+        std::vector<std::byte> out(b_.begin() + static_cast<std::ptrdiff_t>(pos_),
+                                   b_.begin() + static_cast<std::ptrdiff_t>(pos_ + n));
+        pos_ += n;
+        return out;
     }
     // Nullable string: length -1 = null (returned as empty).
     std::optional<std::string> string() {
@@ -284,6 +297,12 @@ std::optional<SaslAuthenticateResponse> parse_sasl_authenticate_response_v1(
         return std::nullopt;
     }
     out.error_message = *msg;
+    // auth_bytes: BYTES (i32 length, -1 = null). Absent entirely (a terse
+    // fake's truncated tail) parses as empty rather than failing - PLAIN
+    // needs nothing from it, and SCRAM's brokers always send it.
+    if (const auto len = r.i32(); len.has_value() && *len > 0) {
+        out.auth_bytes = r.bytes(static_cast<std::size_t>(*len)).value_or(std::vector<std::byte>{});
+    }
     return out;
 }
 
@@ -398,28 +417,104 @@ std::optional<SaslStepFailure> authenticate(Connection& conn,
                             (enabled.empty() ? "<none listed>" : enabled) + ")"},
             .detail = {}};
     }
-    ++corr;
-    const auto au_body = roundtrip(conn,
-                                   wire::sasl_authenticate_request_v1(
-                                       corr, wire::plain_auth_bytes(auth.username, auth.password)));
-    if (!au_body.has_value()) {
-        return SaslStepFailure{
-            .transport = true, .outcome = {}, .detail = "SaslAuthenticate transport failure"};
+    // One SaslAuthenticate round: send payload, surface transport/refusal,
+    // return the server's auth_bytes on success.
+    const auto sasl_round = [&](const std::vector<std::byte>& payload)
+        -> std::pair<std::optional<SaslStepFailure>, std::vector<std::byte>> {
+        ++corr;
+        const auto au_body = roundtrip(conn, wire::sasl_authenticate_request_v1(corr, payload));
+        if (!au_body.has_value()) {
+            return {SaslStepFailure{.transport = true,
+                                    .outcome = {},
+                                    .detail = "SaslAuthenticate transport failure"},
+                    {}};
+        }
+        const auto au = wire::parse_sasl_authenticate_response_v1(*au_body, corr);
+        if (!au.has_value()) {
+            return {SaslStepFailure{.transport = true,
+                                    .outcome = {},
+                                    .detail = "SaslAuthenticate response did not parse"},
+                    {}};
+        }
+        if (au->error_code != 0) {
+            return {
+                SaslStepFailure{
+                    .transport = false,
+                    .outcome = {Status::Refused,
+                                "SaslAuthenticate: " + wire::error_name(au->error_code) +
+                                    (au->error_message.empty() ? ""
+                                                               : " (" + au->error_message + ")")},
+                    .detail = {}},
+                {}};
+        }
+        return {std::nullopt, au->auth_bytes};
+    };
+
+    if (auth.mechanism == "PLAIN") {
+        auto [failure, ignored] = sasl_round(wire::plain_auth_bytes(auth.username, auth.password));
+        (void)ignored;
+        return failure;
     }
-    const auto au = wire::parse_sasl_authenticate_response_v1(*au_body, corr);
-    if (!au.has_value()) {
-        return SaslStepFailure{
-            .transport = true, .outcome = {}, .detail = "SaslAuthenticate response did not parse"};
+
+#ifdef CLINK_KAFKA_RESUME_TLS
+    // SCRAM-SHA-256 (RFC 5802/7677): two rounds, and the SERVER is verified
+    // too - a broker that cannot prove knowledge of the credentials via the
+    // ServerSignature is refused, not trusted.
+    const auto as_bytes = [](const std::string& s) {
+        return std::vector<std::byte>(reinterpret_cast<const std::byte*>(s.data()),
+                                      reinterpret_cast<const std::byte*>(s.data()) + s.size());
+    };
+    const auto first = scram::client_first(auth.username, scram::random_nonce());
+    auto [f1, server_first_bytes] = sasl_round(as_bytes(first.full));
+    if (f1.has_value()) {
+        return f1;
     }
-    if (au->error_code != 0) {
+    const std::string server_first_msg(reinterpret_cast<const char*>(server_first_bytes.data()),
+                                       server_first_bytes.size());
+    const auto server_first = scram::parse_server_first(server_first_msg);
+    if (!server_first.has_value()) {
         return SaslStepFailure{
             .transport = false,
             .outcome = {Status::Refused,
-                        "SaslAuthenticate: " + wire::error_name(au->error_code) +
-                            (au->error_message.empty() ? "" : " (" + au->error_message + ")")},
+                        "SCRAM server-first message was malformed or demanded a KDF below the "
+                        "RFC 7677 floor: " +
+                            server_first_msg},
+            .detail = {}};
+    }
+    const auto final_msg = scram::client_final(auth.password, first, *server_first);
+    if (!final_msg.has_value()) {
+        return SaslStepFailure{
+            .transport = false,
+            .outcome = {Status::Refused,
+                        "SCRAM server nonce did not extend the client's (reflected or foreign "
+                        "nonce); refusing"},
+            .detail = {}};
+    }
+    auto [f2, server_final_bytes] = sasl_round(as_bytes(final_msg->message));
+    if (f2.has_value()) {
+        return f2;
+    }
+    const std::string server_final_msg(reinterpret_cast<const char*>(server_final_bytes.data()),
+                                       server_final_bytes.size());
+    const auto server_sig = scram::parse_server_final_signature(server_final_msg);
+    if (!server_sig.has_value() || *server_sig != final_msg->expected_server_signature) {
+        return SaslStepFailure{
+            .transport = false,
+            .outcome = {Status::Refused,
+                        "SCRAM server signature mismatch: the broker did not prove knowledge "
+                        "of the credentials; refusing rather than trusting it"},
             .detail = {}};
     }
     return std::nullopt;
+#else
+    return SaslStepFailure{
+        .transport = false,
+        .outcome = {Status::Refused,
+                    "SASL mechanism '" + auth.mechanism +
+                        "' needs the crypto that ships with clink::tls, which this build "
+                        "lacks; refusing rather than downgrading"},
+        .detail = {}};
+#endif
 }
 
 }  // namespace
@@ -437,11 +532,11 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
     }
     // A mechanism this module does not speak is refused HERE, before a byte
     // goes out: silently proceeding unauthenticated would be a downgrade.
-    if (auth.enabled() && auth.mechanism != "PLAIN") {
+    if (auth.enabled() && auth.mechanism != "PLAIN" && auth.mechanism != "SCRAM-SHA-256") {
         return {Status::Refused,
                 "SASL mechanism '" + auth.mechanism +
-                    "' is not spoken by the resume path (PLAIN only); refusing rather than "
-                    "downgrading to unauthenticated"};
+                    "' is not spoken by the resume path (PLAIN and SCRAM-SHA-256 only); "
+                    "refusing rather than downgrading to unauthenticated"};
     }
 
     // Bounded retry around the coordinator dance: leadership can be mid-move

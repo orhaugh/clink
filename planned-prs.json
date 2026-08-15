@@ -325,6 +325,35 @@
       ],
       "limitations": "complete: SASL/PLAIN wire half, live refusal arms against a real SASL broker, and the env-gated TLS dialer (wired at the TOP-LEVEL CMakeLists - impls/tls is processed after impls/kafka, so an if(TARGET) inside the kafka lists is false forever; export-safe since clink_tls shares the export set and libclink already links it). SCRAM deferred (crypto surface); the PLAIN happy path live requires a broker pin with PLAIN support; KIP-939 revisit unchanged.",
       "result_revision": "HEAD"
+    },
+    {
+      "id": "PR-17",
+      "priority": "P2",
+      "title": "SCRAM-SHA-256 for the prepared-transaction resume, closing the authenticated-broker happy path live",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "SCRAM is what Kafka clusters (and the pinned Redpanda, which rejects PLAIN outright) actually enable, so the resume's SASL support was refusal-only in practice. A from-scratch RFC 5802/7677 client (clink/kafka/scram.hpp, OpenSSL HMAC/PBKDF2/SHA-256 via the clink::tls gate) now runs the two-round exchange on both resume connections and VERIFIES THE SERVER: signature mismatch, non-extending nonce, and sub-4096 iteration counts are refused - a broker that cannot prove knowledge of the credentials never receives EndTxn.",
+      "files": [
+        "impls/kafka/include/clink/kafka/scram.hpp",
+        "impls/kafka/src/scram.cpp",
+        "impls/kafka/include/clink/kafka/txn_resume.hpp",
+        "impls/kafka/src/txn_resume.cpp",
+        "impls/kafka/include/clink/kafka/consume_all.hpp",
+        "impls/kafka/src/consume_all.cpp",
+        "impls/kafka/tests/test_txn_resume.cpp",
+        "impls/kafka/tests/test_txn_resume_live.cpp",
+        "CMakeLists.txt",
+        "docs/connectors/kafka.md"
+      ],
+      "tests": [
+        "TxnResumeScram.TheRfc7677VectorIsReproducedExactly (the whole exchange against the RFC's published user/pencil vector - the only non-circular gate a from-scratch SCRAM client can have)",
+        "TxnResumeScram attack arms: reflected/foreign nonce, KDF-downgrade iteration count, e= error replies, and a forged server signature scripted by a crypto-free fake broker (mutation-checked: skipping the signature verification is caught)",
+        "TxnResumeSaslLive.AScramAuthenticatedResumeCommitsAGenuineOrphan (the crown arm: an orphan produced with librdkafka's own SCRAM - an independent implementation - resumed by this client against real Redpanda, server signature verified, records committed exactly; wrong credentials refused by the real broker)"
+      ],
+      "dependencies": [
+        "PR-16"
+      ],
+      "limitations": "SHA-256 only (what brokers enable); no channel binding (matching every Kafka client - transport pairing is the TLS dialer); RFC 5802 username escaping but no full SASLprep (non-ASCII usernames are the broker's refusal, not a silent mis-encode). consume_all gained an extra_conf param for authenticated drains. KIP-939 revisit unchanged."
     }
   ],
   "verified_already_done": [

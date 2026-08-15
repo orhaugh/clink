@@ -34,15 +34,19 @@
 //   * Transport is the engine's own Connection seam, so a fake broker tests
 //     the full path byte-for-byte and TLS can slot in via the factory.
 //
-// SASL: PLAIN is spoken (SaslHandshake v1 + SaslAuthenticate v1 on each
-// connection, before anything else) when the caller supplies credentials.
-// They come from the RESOLVING process's environment at resolution time -
-// never from the staged handle, because durable checkpoint state must not
-// carry secrets. Any other mechanism, and any authentication refusal, is a
-// loud Refused and recovery falls back to the bounded contract. PLAIN over
-// a plaintext connection sends the password in the clear; pair it with a
-// TLS ConnectFn (the seam accepts one) exactly as you would configure the
-// sink with sasl_ssl.
+// SASL: PLAIN and SCRAM-SHA-256 are spoken (SaslHandshake v1 +
+// SaslAuthenticate v1 rounds on each connection, before anything else)
+// when the caller supplies credentials. SCRAM (clink/kafka/scram.hpp,
+// pinned against RFC 7677's test vector) verifies the SERVER too: a
+// server-final whose signature does not match, a nonce that does not
+// extend the client's, or an iteration count below the RFC floor is a
+// loud Refused. Credentials come from the RESOLVING process's environment
+// at resolution time - never from the staged handle, because durable
+// checkpoint state must not carry secrets. Any other mechanism, and any
+// authentication refusal, is a loud Refused and recovery falls back to
+// the bounded contract. PLAIN over a plaintext connection sends the
+// password in the clear; pair it with the TLS ConnectFn exactly as you
+// would configure the sink with sasl_ssl.
 
 #include <cstdint>
 #include <functional>
@@ -89,7 +93,10 @@ using ConnectFn = std::function<std::unique_ptr<network::Connection>(const std::
 // supported; any other mechanism value is refused locally before a byte is
 // sent, so a typo cannot silently downgrade to unauthenticated.
 struct ResumeAuth {
-    std::string mechanism;  // "" = none; "PLAIN" is the only spoken value
+    // "" = none. "PLAIN" is always spoken; "SCRAM-SHA-256" is spoken when
+    // the build carries clink::tls (OpenSSL provides its crypto) and is
+    // refused loudly otherwise. Any other value is refused locally.
+    std::string mechanism;
     std::string username;
     std::string password;
 
@@ -172,13 +179,15 @@ struct SaslHandshakeResponse {
 [[nodiscard]] std::optional<SaslHandshakeResponse> parse_sasl_handshake_response_v1(
     const std::vector<std::byte>& body, std::int32_t expected_correlation_id);
 
-// SaslAuthenticate v1 response: error_code + nullable error_message. The
-// trailing auth_bytes and session_lifetime_ms are not consumed - nothing
-// downstream needs them and a parser that stops early cannot be broken by
-// a broker extending the tail.
+// SaslAuthenticate v1 response: error_code, nullable error_message, and
+// auth_bytes (the server's SASL payload - SCRAM's server-first and
+// server-final ride here; PLAIN's is empty). session_lifetime_ms is not
+// consumed. auth_bytes missing entirely (a truncated tail) parses as
+// empty, so PLAIN exchanges against terse fakes keep working.
 struct SaslAuthenticateResponse {
     std::int16_t error_code{0};
     std::string error_message;
+    std::vector<std::byte> auth_bytes;
 };
 [[nodiscard]] std::optional<SaslAuthenticateResponse> parse_sasl_authenticate_response_v1(
     const std::vector<std::byte>& body, std::int32_t expected_correlation_id);
