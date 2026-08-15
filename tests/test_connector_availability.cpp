@@ -164,6 +164,30 @@ TEST(ConnectorAvailability, EveryDeclaredCapabilityResolvesThroughTheVocabulary)
     }
 }
 
+TEST(ConnectorAvailability, DeclaredAvailabilityFollowsTheCapabilityRegistry) {
+    ensure_built_ins_registered();
+    // Always-built, in-tree connectors report available regardless of
+    // capability records - no build flag can remove them.
+    EXPECT_TRUE(connector_declared_available("file"));
+    EXPECT_TRUE(connector_declared_available("filesystem"));
+    EXPECT_TRUE(connector_declared_available("parquet"));
+    EXPECT_TRUE(connector_declared_available("blackhole"));
+    // A connector with no record in THIS test binary and no always-built
+    // status reports unavailable - the endpoint must never assert
+    // availability it cannot see. (If a future change links the mqtt
+    // impl into clink_core_tests, this pin moves with it: the point is
+    // registry-driven truth, not mqtt's absence.)
+    if (clink::connectors::CapabilityRegistry::instance().find("mqtt") == nullptr) {
+        EXPECT_FALSE(connector_declared_available("mqtt"));
+    }
+    // Family prefixes count in both directions: a declared kafka_2pc
+    // implies kafka, and a declared s3 implies s3_parquet.
+    clink::connectors::declare_connector({.name = "qualtest_2pc", .is_sink = true});
+    EXPECT_TRUE(connector_declared_available("qualtest"));
+    clink::connectors::declare_connector({.name = "qbase", .is_source = true});
+    EXPECT_TRUE(connector_declared_available("qbase_parquet"));
+}
+
 TEST(ConnectorAvailability, SubmissionIsRefusedAtTheCoordinatorBeforeAnyDeploy) {
     // The gate as wired: Coordinator::submit_job throws before planning,
     // capacity waits or worker deploys - no worker even exists here. The

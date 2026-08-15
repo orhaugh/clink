@@ -53,6 +53,7 @@
 #include "clink/etcd/etcd_ha_coordinator.hpp"
 #endif
 #include "clink/cluster/config_lint.hpp"
+#include "clink/cluster/connector_availability.hpp"
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_graph.hpp"
@@ -1156,8 +1157,11 @@ clink::http::HttpResponse handle_catalog(const clink::http::HttpRequest&) {
 
 // GET /api/v1/connectors - the SQL connector vocabulary (the values accepted in
 // WITH (connector='...')). Names are authoritative (mirror the planner); the
-// source/sink flags are best-effort and a connector only works at submit time if
-// its impl is linked into this build. Drives autocomplete + the connectors page.
+// source/sink flags are best-effort. Each entry also carries `available`,
+// read from the capability registry, so a submitter can tell the connectors
+// this cluster's binary was actually built with from the ones that merely
+// exist in the vocabulary. Drives autocomplete + the connectors page, and
+// the CLI's pre-submit check against a remote cluster.
 clink::http::HttpResponse handle_connectors(const clink::http::HttpRequest&) {
     struct ConnectorInfo {
         const char* name;
@@ -1213,6 +1217,13 @@ clink::http::HttpResponse handle_connectors(const clink::http::HttpRequest&) {
         w.kv("source", c.source);
         w.kv("sink", c.sink);
         w.kv("category", c.category);
+        // Whether THIS binary was built with the connector, read from
+        // the capability registry rather than asserted. The vocabulary
+        // above is static (it drives autocomplete for every connector
+        // clink knows); availability is not, and a submitter checking
+        // this endpoint before a deploy must see the truth of the
+        // running cluster.
+        w.kv("available", clink::cluster::connector_declared_available(c.name));
         w.end_object();
     }
     w.end_array();

@@ -97,6 +97,46 @@ std::optional<ConnectorVocabularyEntry> connector_vocabulary_lookup(std::string_
     return std::nullopt;
 }
 
+bool connector_declared_available(std::string_view connector) {
+    // In-tree connectors compiled into every SQL-linked build: no
+    // capability toggle can remove them, so a registry miss for one of
+    // these would be a false "unavailable".
+    static constexpr std::array<std::string_view, 9> kAlwaysBuilt{
+        "file",
+        "filesystem",
+        "parquet",
+        "blackhole",
+        "generator",
+        "changelog",
+        "nexmark",
+        "delta",
+        "print",
+    };
+    for (const auto a : kAlwaysBuilt) {
+        if (connector == a) {
+            return true;
+        }
+    }
+    const std::string with_sep = std::string(connector) + "_";
+    for (const auto& cap : connectors::CapabilityRegistry::instance().all()) {
+        if (cap.name == connector) {
+            return true;
+        }
+        // kafka -> kafka_2pc: the family's variant records imply the base.
+        if (cap.name.size() > with_sep.size() &&
+            cap.name.compare(0, with_sep.size(), with_sep) == 0) {
+            return true;
+        }
+        // s3_parquet -> s3: the providing impl's base record implies the
+        // longer SQL-vocabulary name it also registers factories for.
+        if (connector.size() > cap.name.size() + 1 &&
+            connector.substr(0, cap.name.size()) == cap.name && connector[cap.name.size()] == '_') {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string check_connector_availability(const JobGraphSpec& graph,
                                          const OperatorRegistry& ops,
                                          const RunnerRegistry& runners) {

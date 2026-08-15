@@ -61,4 +61,13 @@ struct ConnectorVocabularyEntry {
                                                        const OperatorRegistry& ops,
                                                        const RunnerRegistry& runners);
 
+// Whether a user-facing connector name is available in THIS binary, for
+// vocabulary surfaces like GET /api/v1/connectors. In-tree connectors
+// that every SQL-linked build carries report true directly; everything
+// else is matched against the capability registry (a record is declared
+// only when the impl is compiled in), tolerating the prefix families in
+// both directions: "kafka" is available when "kafka_2pc" is declared,
+// and "s3_parquet" is available when its providing impl declared "s3".
+[[nodiscard]] bool connector_declared_available(std::string_view connector);
+
 }  // namespace clink::cluster
