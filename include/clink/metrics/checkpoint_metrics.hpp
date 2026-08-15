@@ -68,6 +68,17 @@ inline constexpr const char* kCheckpointFailed = "clink_ckpt_failed_total";
 // This changes exactly when the event happens.
 inline constexpr const char* kCheckpointLastCompletedUnixSeconds =
     "clink_ckpt_last_completed_unix_seconds";
+// Barrier mode actually stamped per triggered checkpoint, and how often
+// the adaptive policy changed its answer. The mode counters carry the
+// mode as an inlined tag (the registry is a flat name -> series map);
+// the switch counter is the oscillation alarm - a healthy adaptive job
+// switches rarely, and a counter climbing every few checkpoints means
+// the thresholds sit on top of the workload's noise.
+inline constexpr const char* kCheckpointModeAlignedTotal =
+    "clink_ckpt_mode_total{mode=\"aligned\"}";
+inline constexpr const char* kCheckpointModeUnalignedTotal =
+    "clink_ckpt_mode_total{mode=\"unaligned\"}";
+inline constexpr const char* kCheckpointAdaptiveSwitchTotal = "clink_ckpt_adaptive_switch_total";
 // Checkpoint duration as a histogram rather than a counter pair.
 //
 // The exposition is unchanged where it already existed: a histogram named
@@ -114,6 +125,18 @@ namespace ckpt {
 
 inline void triggered() {
     MetricsRegistry::global().counter(kCheckpointTriggered).increment();
+}
+// One increment per triggered checkpoint, under the mode its barriers
+// were stamped with. Emitted by whoever makes the stamping decision
+// (the cluster coordinator's trigger sweep; the in-process
+// CheckpointCoordinator's trigger()).
+inline void mode_stamped(bool unaligned) {
+    MetricsRegistry::global()
+        .counter(unaligned ? kCheckpointModeUnalignedTotal : kCheckpointModeAlignedTotal)
+        .increment();
+}
+inline void adaptive_switch() {
+    MetricsRegistry::global().counter(kCheckpointAdaptiveSwitchTotal).increment();
 }
 inline void completed(std::uint64_t duration_ms) {
     MetricsRegistry::global().counter(kCheckpointCompleted).increment();

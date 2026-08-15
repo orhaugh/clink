@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "clink/checkpoint/adaptive_mode_policy.hpp"
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/core/types.hpp"
 #include "clink/state/state_backend.hpp"
@@ -113,6 +114,24 @@ public:
         std::function<CheckpointBarrier::Mode(CheckpointId, CheckpointBarrier::Mode default_mode)>;
     void set_mode_resolver(ModeResolver resolver) { mode_resolver_ = std::move(resolver); }
 
+    // Convenience over set_mode_resolver: drive the mode from an
+    // AdaptiveModePolicy fed by `pressure`, sampled once per trigger.
+    // The pressure function defines what backpressure means for the
+    // hosting runtime and must return a value in [0, 1] - e.g. the
+    // maximum channel occupancy across a Dag's runner input channels.
+    // The policy supplies the discipline (thresholds, hysteresis,
+    // bounded history); trigger() emits the stamped-mode and
+    // adaptive-switch metrics. Replaces any resolver set earlier.
+    using PressureFn = std::function<double()>;
+    void enable_adaptive_mode(PressureFn pressure,
+                              checkpoint::AdaptiveModePolicyConfig policy_cfg = {});
+
+    // The adaptive policy, when enable_adaptive_mode has been called;
+    // nullptr otherwise. Exposed for tests and diagnostics.
+    [[nodiscard]] const checkpoint::AdaptiveModePolicy* adaptive_policy() const noexcept {
+        return adaptive_policy_.get();
+    }
+
     StateBackend& backend() noexcept { return *backend_; }
 
     Config config() const noexcept { return cfg_; }
@@ -155,6 +174,8 @@ private:
     OnComplete on_complete_{};
     OnAbort on_abort_{};
     ModeResolver mode_resolver_{};
+    std::unique_ptr<checkpoint::AdaptiveModePolicy> adaptive_policy_;
+    PressureFn pressure_fn_{};
 
     // Periodic-trigger machinery
     std::vector<BarrierInjector> source_injectors_{};

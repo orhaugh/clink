@@ -103,6 +103,9 @@ struct JobDetail {
     std::uint64_t restore_from_checkpoint_id{0};
     std::uint32_t max_restarts_on_worker_loss{0};
     bool unaligned_checkpoints{false};
+    // CheckpointAlignment::Adaptive: the coordinator stamps the mode per
+    // trigger from measured pressure instead of a static flag.
+    bool adaptive_barrier_mode{false};
 };
 
 // --- Job DAG (GET /api/v1/jobs/:id/graph) ----------------------------------

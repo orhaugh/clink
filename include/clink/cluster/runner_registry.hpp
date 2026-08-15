@@ -174,6 +174,10 @@ struct RunnerContext {
     // and copied to JobConfig.unaligned_checkpoints by the plugin
     // runner.
     bool unaligned_checkpoints{false};
+    // Adaptive checkpoint mode: the injected barrier's stamp (carried on
+    // the coordinator's trigger) wins over the static flag above.
+    // Copied to JobConfig.adaptive_barrier_mode alongside it.
+    bool adaptive_barrier_mode{false};
     // Packed expected state-version map (schema evolution) carried from
     // DeployMsg. Empty means "no declared versions" - the subtask
     // restores state verbatim. When non-empty, make_subtask_job_config

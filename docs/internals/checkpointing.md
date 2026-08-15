@@ -115,6 +115,14 @@ A union operator carries no state, so under unaligned mode it just lets the barr
 
 Per-checkpoint mode is decided by the first delivery and pinned for that id, so aligned and unaligned semantics never mix mid-flight for one checkpoint even if a later same-id delivery carried a different stamp. `apply_barrier_mode_override` lets a per-operator `JobConfig` override re-stamp a barrier (for example to force a stateful operator that does not implement in-flight capture to stay aligned while the rest of the job runs unaligned). Async multi-input operators force-align the popped/in-flight tail via `drain_for_barrier` while keeping the unaligned fast path for the unpopped other-channel records; an operator that cannot capture in-flight records is gated by `can_unalign` so an unaligned barrier degrades to aligned rather than losing data.
 
+#### Adaptive mode (measured pressure decides per checkpoint)
+
+`CheckpointAlignment::Adaptive` puts the aligned-versus-unaligned decision on measured pressure instead of a static flag, one checkpoint at a time. The decision discipline lives in `checkpoint::AdaptiveModePolicy` (`include/clink/checkpoint/adaptive_mode_policy.hpp`): an observation window is one checkpoint interval, a window is pressured when its normalised signal crosses `pressure_threshold`, switching to unaligned takes `windows_to_unaligned` consecutive pressured windows and switching back takes `windows_to_aligned` consecutive calm ones - so a one-window spike never flips the mode and the policy cannot oscillate faster than the configured runs. The recent observations are kept in a bounded history for diagnostics only.
+
+The two runtimes feed the policy different signals through the same seam. In process, `CheckpointCoordinator::enable_adaptive_mode(pressure_fn, cfg)` installs the policy behind the existing `set_mode_resolver` hook; `Dag::channel_pressure_fn()` supplies the signal (maximum depth/capacity occupancy across the runner input channels, the same probes the LocalExecutor's metrics loop polls). In the cluster, the coordinator's trigger sweep observes the LAST completed checkpoint's duration relative to the configured interval - alignment stalls under backpressure are exactly what stretches it - and stamps the decision on the `TriggerCheckpointMsg` (`barrier_mode_plus1`, a trailing wire field; 0 from an older coordinator means "not stamped" and the worker keeps its deploy-static behaviour). An adaptive deploy sets `DeployMsg::adaptive_barrier_mode`, and sources then forward the injected barrier's stamp untouched instead of re-stamping the static mode; per-operator overrides still win. The EOS final checkpoint of a bounded source carries the static default - no trigger rides it to carry a stamp.
+
+Every stamped decision increments `clink_ckpt_mode_total{mode="aligned"|"unaligned"}`, and each policy flip increments `clink_ckpt_adaptive_switch_total` - a healthy adaptive job switches rarely, and a counter climbing every few checkpoints means the thresholds sit on top of the workload's noise. Checkpoint correctness is mode-independent (each checkpoint runs entirely under the mode pinned by its first barrier delivery), so the adaptive policy chooses between two individually-proven protocols rather than creating a third.
+
 ### Exactly-once: two-phase-commit sinks
 
 Snapshot-on-barrier makes operator state recoverable; getting end-to-end exactly-once also requires that output is only published when the checkpoint that produced it is globally durable. That is the two-phase-commit (2PC) sink protocol. `FileSink2PC<T>` (`file_2pc_sink.hpp`) is the canonical implementation:
@@ -159,6 +167,9 @@ The source side of exactly-once is `snapshot_offset` / `restore_offset` on `Sour
 | `CheckpointCoordinator::register_operator` / `acknowledge` / `abort` | Participant registration and ack/abort lifecycle |
 | `CheckpointCoordinator::start_periodic_trigger` / `set_source_injectors` | Periodic in-process trigger (local path) |
 | `CheckpointCoordinator::set_mode_resolver` | Per-checkpoint adaptive mode seam (e.g. backpressure-driven) |
+| `CheckpointCoordinator::enable_adaptive_mode` | Installs an `AdaptiveModePolicy` over a caller-supplied pressure function, sampled once per trigger |
+| `checkpoint::AdaptiveModePolicy` | The decision discipline: threshold, consecutive-window hysteresis (up and down), bounded history, switch counter |
+| `Dag::channel_pressure_fn` | Normalised max channel occupancy across the DAG's runner input channels - the in-process pressure signal |
 | `MultiInputAlignment::on_barrier` | Chandy-Lamport alignment; returns `forward` / `unaligned_first` |
 | `MultiInputAlignment::pending_inputs_for` | Inputs not yet delivering a barrier (which channels to drain on unaligned capture) |
 | `SnapshotWorker` | Off-thread `persist` + ack; FIFO capacity-1 queue with backpressure |
@@ -178,7 +189,9 @@ The source side of exactly-once is `snapshot_offset` / `restore_offset` on `Sour
 | `CheckpointCoordinatorConfig::timeout` | `checkpoint_coordinator.hpp` | `60000` ms | Checkpoint timeout field |
 | `CheckpointCoordinatorConfig::default_mode` | `checkpoint_coordinator.hpp` | `Aligned` | Mode stamped on issued barriers absent an override |
 | `JobConfig::unaligned_checkpoints` | `job_config.hpp` | `false` | Job-global alignment policy; sources stamp barriers from it |
+| `JobConfig::adaptive_barrier_mode` | `job_config.hpp` | `false` | Sources forward the injected barrier's per-trigger stamp instead of re-stamping the static mode |
 | `JobConfig::barrier_mode_overrides_by_operator` | `job_config.hpp` | empty | Per-operator mode override re-stamped on passing barriers |
+| `CheckpointAlignment` (cluster job submit) | `protocol.hpp` | `Aligned` | `Aligned` / `Unaligned` / `Adaptive`; adaptive puts the mode decision on the coordinator's trigger sweep |
 | `interval_ms` (cluster job submit) | `protocol.hpp` / `coordinator.cpp` | `0` (disabled) | Cluster periodic-checkpoint cadence; `> 0` with a checkpoint dir enables it |
 | `CLINK_STATE_FSYNC` (env) | `durable_file_write.hpp` | on (unset) | Set to `0`/`false` to fall back to flush+rename |
 

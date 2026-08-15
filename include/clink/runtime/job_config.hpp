@@ -158,6 +158,11 @@ struct JobConfig {
     // runner separately captures + replays the per-channel in-flight
     // buffer via the state backend).
     bool unaligned_checkpoints{false};
+    // Adaptive checkpoint mode: source runners keep the mode already
+    // stamped on an injected barrier (the coordinator's per-trigger
+    // decision) instead of re-stamping the static mode above.
+    // Per-operator overrides still win.
+    bool adaptive_barrier_mode{false};
 
     // Shared drain-target signal. The cluster's worker wires
     // BeginRescale dispatch to set this atomic to the rescale's

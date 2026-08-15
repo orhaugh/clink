@@ -87,6 +87,7 @@ void LocalExecutor::start() {
             contexts_.back()->set_wait_final_committed(config_.wait_final_committed);
         }
         contexts_.back()->set_unaligned_checkpoints(config_.unaligned_checkpoints);
+        contexts_.back()->set_adaptive_barrier_mode(config_.adaptive_barrier_mode);
         // Give operators the restore key-group range so timer restore can
         // route each timer to the subtask owning its key group on a rescale
         // (full range = same-parallelism, keep all). See Operator::restore_timers.

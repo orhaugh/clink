@@ -186,6 +186,7 @@ private:
                    std::uint32_t generation,
                    std::uint32_t restore_from_generation,
                    bool unaligned_checkpoints,
+                   bool adaptive_barrier_mode,
                    const std::string& expected_state_versions_packed,
                    const std::string& udfs_packed = {});
     void run_generic_subtask_(JobId job_id,
@@ -196,6 +197,7 @@ private:
                               std::uint32_t generation,
                               std::uint32_t restore_from_generation,
                               bool unaligned_checkpoints,
+                              bool adaptive_barrier_mode,
                               const std::string& expected_state_versions_packed);
     void handle_trigger_checkpoint_(MessageReader& r);
     void handle_commit_checkpoint_(MessageReader& r);

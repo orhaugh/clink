@@ -439,10 +439,21 @@ public:
             // Downstream operators read the stamp off the barrier
             // (not off RuntimeContext) when deciding aligned vs
             // unaligned semantics for that checkpoint.
+            // Adaptive mode: the injected barrier already carries the
+            // coordinator's per-trigger decision, so the emitter's
+            // default stamp stays unset and the stamp flows through
+            // untouched. A per-operator override still wins - it exists
+            // precisely to pin an operator regardless of the policy.
+            // (source_barrier_mode itself stays defined either way; the
+            // EOS final-checkpoint injection below uses it, and under
+            // adaptive that final barrier is deliberately the static
+            // default - no trigger rides it to carry a stamp.)
             const auto source_barrier_mode = ctx.barrier_mode_override().value_or(
                 ctx.unaligned_checkpoints() ? CheckpointBarrier::Mode::Unaligned
                                             : CheckpointBarrier::Mode::Aligned);
-            emitter.set_default_barrier_mode(source_barrier_mode);
+            if (ctx.barrier_mode_override().has_value() || !ctx.adaptive_barrier_mode()) {
+                emitter.set_default_barrier_mode(source_barrier_mode);
+            }
             // Drain any barriers that arrived while produce() wasn't
             // running. Each barrier triggers a snapshot of the source's
             // current offset, then the barrier emits to downstream, then
@@ -3747,10 +3758,14 @@ public:
                 Emitter<T> typed_emitter(emitter.get());
                 // Same source-side stamping as the
                 // single-subtask path. Sources emit mode-agnostic
-                // barriers; the runner stamps from JobConfig.
-                typed_emitter.set_default_barrier_mode(ctx.barrier_mode_override().value_or(
-                    ctx.unaligned_checkpoints() ? CheckpointBarrier::Mode::Unaligned
-                                                : CheckpointBarrier::Mode::Aligned));
+                // barriers; the runner stamps from JobConfig. Adaptive
+                // mode leaves the default unset so the injected
+                // barrier's per-trigger stamp flows through.
+                if (ctx.barrier_mode_override().has_value() || !ctx.adaptive_barrier_mode()) {
+                    typed_emitter.set_default_barrier_mode(ctx.barrier_mode_override().value_or(
+                        ctx.unaligned_checkpoints() ? CheckpointBarrier::Mode::Unaligned
+                                                    : CheckpointBarrier::Mode::Aligned));
+                }
                 const auto& ack_cb = ctx.checkpoint_ack();
                 bool armed_drained = false;
                 auto drain_pending_barriers = [&]() {
@@ -4505,6 +4520,37 @@ public:
     const std::vector<detail::OperatorRunner>& runners() const noexcept { return runners_; }
 
     std::size_t operator_count() const noexcept { return runners_.size(); }
+
+    // Normalised backpressure across this DAG's operator input channels:
+    // the maximum depth/capacity over every runner that exposes both
+    // probes, so 0 means idle and 1 means some channel is full. This is
+    // the PressureFn the CheckpointCoordinator's adaptive checkpoint
+    // mode samples once per trigger - the same probes the
+    // LocalExecutor's metrics loop polls, read at the moment the mode
+    // decision is made. Call after the topology is fully built; the
+    // returned closure captures the probe set by value.
+    [[nodiscard]] std::function<double()> channel_pressure_fn() const {
+        std::vector<std::pair<std::function<std::size_t()>, std::function<std::size_t()>>> probes;
+        for (const auto& r : runners_) {
+            if (r.input_depth && r.input_capacity) {
+                probes.emplace_back(r.input_depth, r.input_capacity);
+            }
+        }
+        return [probes = std::move(probes)]() -> double {
+            double max_occupancy = 0.0;
+            for (const auto& [depth, capacity] : probes) {
+                const auto cap = capacity();
+                if (cap == 0) {
+                    continue;
+                }
+                const double occupancy = static_cast<double>(depth()) / static_cast<double>(cap);
+                if (occupancy > max_occupancy) {
+                    max_occupancy = occupancy;
+                }
+            }
+            return max_occupancy > 1.0 ? 1.0 : max_occupancy;
+        };
+    }
 
     // Type-erased per-source barrier injectors. Used by
     // CheckpointCoordinator::start_periodic_trigger to push barriers into

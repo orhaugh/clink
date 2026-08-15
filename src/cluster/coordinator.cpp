@@ -1488,6 +1488,7 @@ std::optional<JobDetail> Coordinator::snapshot_job(JobId job_id) const {
     d.restore_from_checkpoint_id = job.checkpoint.restore_from_checkpoint_id;
     d.max_restarts_on_worker_loss = job.checkpoint.max_restarts_on_worker_loss;
     d.unaligned_checkpoints = job.checkpoint.alignment == CheckpointAlignment::Unaligned;
+    d.adaptive_barrier_mode = job.checkpoint.alignment == CheckpointAlignment::Adaptive;
     return d;
 }
 
@@ -2697,6 +2698,7 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         dm.generation = job.state_generation;
         dm.restore_generation = job.state_generation;
         dm.unaligned_checkpoints = job.checkpoint.alignment == CheckpointAlignment::Unaligned;
+        dm.adaptive_barrier_mode = job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         dm.expected_state_versions_packed = job.expected_state_versions_packed;
         dm.udfs_packed = job.udfs_packed;
         out_frames.push_back({it->second->conn.get(), fenced_frame_(MessageKind::Deploy, dm)});
@@ -3934,6 +3936,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                                             ? job->state_generation
                                             : highest_generation_in(checkpoint.restore_from_dir);
         deploy_msg.unaligned_checkpoints = checkpoint.alignment == CheckpointAlignment::Unaligned;
+        deploy_msg.adaptive_barrier_mode = checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job->expected_state_versions_packed;
         deploy_msg.udfs_packed = job->udfs_packed;
         const auto frame = fenced_frame_(MessageKind::Deploy, deploy_msg);
@@ -5308,6 +5311,8 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                        : job.state_generation);
         deploy_msg.unaligned_checkpoints =
             job.checkpoint.alignment == CheckpointAlignment::Unaligned;
+        deploy_msg.adaptive_barrier_mode =
+            job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
         out.push_back(
@@ -5540,6 +5545,8 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.restore_from_checkpoint_id = status->cutover_checkpoint;
         deploy_msg.unaligned_checkpoints =
             job.checkpoint.alignment == CheckpointAlignment::Unaligned;
+        deploy_msg.adaptive_barrier_mode =
+            job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
         out.push_back(
@@ -6486,6 +6493,10 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 const auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                         std::chrono::steady_clock::now() - sit->second)
                                         .count();
+                // The adaptive checkpoint-mode policy observes this at the
+                // next trigger: duration relative to interval is its
+                // pressure signal.
+                job.last_checkpoint_duration_ms = static_cast<std::uint64_t>(dur_ms);
                 clink::metrics::ckpt::completed(static_cast<std::uint64_t>(dur_ms));
                 clink::metrics::ckpt::last_completed_now();
                 job.pending_checkpoint_start_times.erase(sit);
@@ -6744,7 +6755,8 @@ void Coordinator::checkpoint_trigger_loop_() {
         // wakes at its own interval - we use the minimum live interval
         // as the loop's sleep so we don't oversleep any job.
         std::chrono::milliseconds sleep_for{500};
-        std::vector<std::tuple<JobId, std::uint64_t, std::uint64_t, std::vector<std::string>>>
+        std::vector<
+            std::tuple<JobId, std::uint64_t, std::uint64_t, std::uint8_t, std::vector<std::string>>>
             to_trigger;
         {
             std::lock_guard lock(mu_);
@@ -6836,18 +6848,54 @@ void Coordinator::checkpoint_trigger_loop_() {
                 }
                 job.pending_checkpoint_start_times[next_id] = std::chrono::steady_clock::now();
                 clink::metrics::ckpt::triggered();
+                // Adaptive alignment: decide this trigger's barrier mode
+                // from the last completed checkpoint's duration relative
+                // to the interval (1.0 = the checkpoint took the whole
+                // interval; alignment stalls under backpressure are
+                // exactly what stretches it). Hysteresis lives in the
+                // policy, so one slow checkpoint never flips the mode
+                // and the decision cannot oscillate. Statically-aligned
+                // jobs leave the byte 0 = not stamped.
+                std::uint8_t barrier_mode_plus1 = 0;
+                if (job.checkpoint.alignment == CheckpointAlignment::Adaptive) {
+                    if (!job.adaptive_ckpt_policy) {
+                        job.adaptive_ckpt_policy =
+                            std::make_unique<clink::checkpoint::AdaptiveModePolicy>();
+                    }
+                    const double pressure = static_cast<double>(job.last_checkpoint_duration_ms) /
+                                            static_cast<double>(job.checkpoint.interval_ms);
+                    const auto before = job.adaptive_ckpt_policy->mode();
+                    const auto decided = job.adaptive_ckpt_policy->observe(pressure);
+                    if (decided != before) {
+                        clink::metrics::ckpt::adaptive_switch();
+                        log::info("coordinator.checkpoint",
+                                  "job " + std::to_string(jid) +
+                                      ": adaptive checkpoint mode switched to " +
+                                      (decided == CheckpointBarrier::Mode::Unaligned ? "unaligned"
+                                                                                     : "aligned") +
+                                      " (pressure " + std::to_string(pressure) + ")");
+                    }
+                    barrier_mode_plus1 = decided == CheckpointBarrier::Mode::Unaligned ? 2 : 1;
+                    clink::metrics::ckpt::mode_stamped(decided ==
+                                                       CheckpointBarrier::Mode::Unaligned);
+                } else {
+                    clink::metrics::ckpt::mode_stamped(job.checkpoint.alignment ==
+                                                       CheckpointAlignment::Unaligned);
+                }
                 std::vector<std::string> worker_ids;
                 for (const auto& [worker_id, _] : job.tasks_by_worker) {
                     worker_ids.push_back(worker_id);
                 }
-                to_trigger.emplace_back(jid, next_id, job.state_generation, std::move(worker_ids));
+                to_trigger.emplace_back(
+                    jid, next_id, job.state_generation, barrier_mode_plus1, std::move(worker_ids));
             }
         }
-        for (const auto& [jid, ckpt_id, gen, worker_ids] : to_trigger) {
+        for (const auto& [jid, ckpt_id, gen, mode_plus1, worker_ids] : to_trigger) {
             TriggerCheckpointMsg m;
             m.job_id = jid;
             m.checkpoint_id = ckpt_id;
             m.generation = gen;
+            m.barrier_mode_plus1 = mode_plus1;
             const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, m);
             for (const auto& worker_id : worker_ids) {
                 network::Connection* c = nullptr;

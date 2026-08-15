@@ -114,6 +114,11 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // of 1/1, which is the correct answer for a job that has never rescaled.
     b.put_u32_be(m.generation);
     b.put_u32_be(m.restore_generation);
+    // Adaptive checkpoint mode: sources keep the barrier stamp the
+    // coordinator's trigger carries instead of re-stamping the
+    // deploy-static mode. A peer that stops reading earlier keeps the
+    // default false = static stamping, the historical behaviour.
+    b.put_u8(m.adaptive_barrier_mode ? 1 : 0);
     // Fencing epoch, appended last so an older peer that stops reading here still
     // decodes the rest correctly. Anything new goes BEFORE this, not after.
     b.put_u64_be(m.coordinator_epoch);
@@ -253,6 +258,11 @@ inline void encode_body(MessageBuilder& b, const TriggerCheckpointMsg& m) {
     // own eof and never sees it; an older writer's frame ends early and the
     // eof-guarded decode below reads 0 = unfenced.
     b.put_u64_be(m.generation);
+    // Trailing per-trigger barrier mode (adaptive checkpoints). 0 = not
+    // stamped (older coordinator, or a job whose alignment is static);
+    // 1 = aligned; 2 = unaligned. Older workers see EOF first and keep
+    // their deploy-static behaviour.
+    b.put_u8(m.barrier_mode_plus1);
 }
 
 inline void encode_body(MessageBuilder& b, const CommitCheckpointMsg& m) {
@@ -562,6 +572,11 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     if (!r.eof()) {
         m.restore_generation = r.read_u32_be();
     }
+    // Adaptive checkpoint mode. Absent from older coordinator peers ->
+    // false = deploy-static barrier stamping.
+    if (!r.eof()) {
+        m.adaptive_barrier_mode = r.read_u8() != 0;
+    }
     // Fencing epoch LAST, matching the encoder. It is deliberately the final field
     // so a peer that stops reading earlier still decodes everything before it.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
@@ -720,9 +735,15 @@ inline SubmitJobMsg decode_submit_job(MessageReader& r) {
     }
     if (!r.eof()) {
         const auto raw = r.read_u8();
-        m.checkpoint.alignment = (raw == static_cast<std::uint8_t>(CheckpointAlignment::Unaligned))
-                                     ? CheckpointAlignment::Unaligned
-                                     : CheckpointAlignment::Aligned;
+        // Unknown values map to Aligned - the safe default - which is
+        // also what a pre-adaptive coordinator does with Adaptive (2).
+        if (raw == static_cast<std::uint8_t>(CheckpointAlignment::Unaligned)) {
+            m.checkpoint.alignment = CheckpointAlignment::Unaligned;
+        } else if (raw == static_cast<std::uint8_t>(CheckpointAlignment::Adaptive)) {
+            m.checkpoint.alignment = CheckpointAlignment::Adaptive;
+        } else {
+            m.checkpoint.alignment = CheckpointAlignment::Aligned;
+        }
     }
     if (!r.eof()) {
         // Trailing state-backend URI. Absent from older clients -> stays
@@ -771,6 +792,9 @@ inline TriggerCheckpointMsg decode_trigger_checkpoint(MessageReader& r) {
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     // Generation (F84). 0 from an older coordinator = accept-all.
     m.generation = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    // Per-trigger barrier mode. 0 from an older coordinator = not
+    // stamped, and the worker keeps its deploy-static behaviour.
+    m.barrier_mode_plus1 = r.eof() ? std::uint8_t{0} : r.read_u8();
     return m;
 }
 

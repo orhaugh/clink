@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include "clink/metrics/checkpoint_metrics.hpp"
+
 namespace clink {
 
 CheckpointCoordinator::CheckpointCoordinator(std::shared_ptr<StateBackend> backend, Config cfg)
@@ -87,6 +89,7 @@ CheckpointBarrier CheckpointCoordinator::trigger() {
     if (mode_resolver_) {
         mode = mode_resolver_(id, cfg_.default_mode);
     }
+    metrics::ckpt::mode_stamped(mode == CheckpointBarrier::Mode::Unaligned);
     return CheckpointBarrier{id, /*terminal=*/false, mode};
 }
 
@@ -101,7 +104,27 @@ CheckpointBarrier CheckpointCoordinator::trigger(CheckpointBarrier::Mode mode_ov
     inf.started_at = Clock::now();
     inf.pending = registered_ops_;
     in_flight_.emplace(id, std::move(inf));
+    metrics::ckpt::mode_stamped(mode_override == CheckpointBarrier::Mode::Unaligned);
     return CheckpointBarrier{id, /*terminal=*/false, mode_override};
+}
+
+void CheckpointCoordinator::enable_adaptive_mode(PressureFn pressure,
+                                                 checkpoint::AdaptiveModePolicyConfig policy_cfg) {
+    adaptive_policy_ = std::make_unique<checkpoint::AdaptiveModePolicy>(policy_cfg);
+    pressure_fn_ = std::move(pressure);
+    // The resolver samples pressure once per trigger, so an observation
+    // window is one checkpoint interval - which is what makes the
+    // policy's hysteresis mean "N consecutive checkpoints under
+    // pressure", not N scheduler ticks.
+    mode_resolver_ = [this](CheckpointId /*id*/, CheckpointBarrier::Mode /*default_mode*/) {
+        const double p = pressure_fn_ ? pressure_fn_() : 0.0;
+        const auto before = adaptive_policy_->mode();
+        const auto decided = adaptive_policy_->observe(p);
+        if (decided != before) {
+            metrics::ckpt::adaptive_switch();
+        }
+        return decided;
+    };
 }
 
 bool CheckpointCoordinator::acknowledge(CheckpointId id, OperatorId op) {

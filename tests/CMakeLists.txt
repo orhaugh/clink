@@ -154,6 +154,7 @@ add_executable(clink_core_tests
     test_dead_letter.cpp
     test_operator_lifecycle.cpp
     test_checkpoint_barrier.cpp
+    test_adaptive_checkpoint_mode.cpp
     test_in_memory_state.cpp
     test_async_state_get.cpp
     test_async_execution_controller.cpp

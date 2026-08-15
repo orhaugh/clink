@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/checkpoint/adaptive_mode_policy.hpp"
 #include "clink/cluster/autoscaler.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/cluster/rescale_coordinator.hpp"
@@ -1089,6 +1090,17 @@ private:
             pending_checkpoint_start_times;
         std::uint64_t latest_completed_checkpoint_id{0};
         std::uint64_t next_checkpoint_id{1};
+
+        // Adaptive checkpoint mode (CheckpointAlignment::Adaptive). The
+        // policy decides the mode stamped on each trigger; its pressure
+        // observation is the LAST completed checkpoint's duration
+        // relative to the configured interval - a checkpoint that takes
+        // as long as its interval is the direct symptom (barrier
+        // alignment stalls under backpressure) unaligned mode exists to
+        // relieve. Created lazily on the first adaptive trigger; null
+        // for statically-aligned jobs.
+        std::unique_ptr<clink::checkpoint::AdaptiveModePolicy> adaptive_ckpt_policy;
+        std::uint64_t last_checkpoint_duration_ms{0};
 
         // Bounded-source end-of-stream FINAL checkpoint coordination. When the
         // first bounded source reaches clean EOS and sends RequestFinalCheckpoint,

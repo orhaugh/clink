@@ -251,6 +251,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     // reference to it. nullptr in legacy/in-process paths.
     cfg.external_cancel_token = rctx.cancel_token;
     cfg.unaligned_checkpoints = rctx.unaligned_checkpoints;
+    cfg.adaptive_barrier_mode = rctx.adaptive_barrier_mode;
     // Schema evolution: unpack the declared expected state-version map so
     // the LocalExecutor auto-migrates restored state to it at start. Empty
     // packed string -> no declared versions -> restore verbatim.

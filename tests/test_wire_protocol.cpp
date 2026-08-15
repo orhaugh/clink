@@ -479,6 +479,16 @@ TEST(WireProtocol, SubmitJobCarriesAlignmentMode) {
     auto out = round_trip(MessageKind::SubmitJob, in, decode_submit_job);
     EXPECT_EQ(out.checkpoint.alignment, CheckpointAlignment::Unaligned);
 
+    // Adaptive round-trips too; an OLDER decoder maps the unknown value
+    // to Aligned, the safe default, which is the degradation this enum
+    // was extended under.
+    SubmitJobMsg in_adaptive;
+    in_adaptive.graph_json = "{}";
+    in_adaptive.checkpoint.checkpoint_dir = "/var/clink/state";
+    in_adaptive.checkpoint.alignment = CheckpointAlignment::Adaptive;
+    auto out_adaptive = round_trip(MessageKind::SubmitJob, in_adaptive, decode_submit_job);
+    EXPECT_EQ(out_adaptive.checkpoint.alignment, CheckpointAlignment::Adaptive);
+
     // Default-init message round-trips as Aligned.
     SubmitJobMsg in_default;
     in_default.graph_json = "{}";
@@ -500,6 +510,23 @@ TEST(WireProtocol, DeployCarriesUnalignedCheckpointsFlag) {
     in_default.tasks.push_back(DeploymentTask{.role = "r", .subtask_idx = 0});
     auto out_default = round_trip(MessageKind::Deploy, in_default, decode_deploy);
     EXPECT_FALSE(out_default.unaligned_checkpoints);
+    EXPECT_FALSE(out_default.adaptive_barrier_mode);
+}
+
+TEST(WireProtocol, DeployCarriesAdaptiveBarrierModeFlag) {
+    DeployMsg in;
+    in.job_id = 5;
+    in.tasks.push_back(DeploymentTask{.role = "r", .subtask_idx = 0});
+    in.adaptive_barrier_mode = true;
+    in.coordinator_epoch = 4;
+    auto out = round_trip(MessageKind::Deploy, in, decode_deploy);
+    EXPECT_TRUE(out.adaptive_barrier_mode);
+    // The flag sits before the epoch on the wire (the epoch stays the
+    // final field by contract); both must survive together.
+    EXPECT_EQ(out.coordinator_epoch, 4U);
+    EXPECT_FALSE(out.unaligned_checkpoints)
+        << "adaptive deploys leave the static flag false - aligned is the default the "
+           "per-trigger stamp overrides";
 }
 
 TEST(WireProtocol, DeployCarriesExpectedStateVersions) {
@@ -836,11 +863,15 @@ TEST(WireProtocolFencing, EveryControlFrameCarriesTheCoordinatorEpoch) {
         EXPECT_EQ(round_trip(MessageKind::CancelJob, in, decode_cancel_job).coordinator_epoch, 9U);
     }
     {
-        TriggerCheckpointMsg in{
-            .job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9, .generation = 7};
+        TriggerCheckpointMsg in{.job_id = 1,
+                                .checkpoint_id = 2,
+                                .coordinator_epoch = 9,
+                                .generation = 7,
+                                .barrier_mode_plus1 = 2};
         const auto out = round_trip(MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint);
         EXPECT_EQ(out.coordinator_epoch, 9U);
         EXPECT_EQ(out.generation, 7U);
+        EXPECT_EQ(out.barrier_mode_plus1, 2U);
     }
     {
         CommitCheckpointMsg in{
@@ -960,28 +991,54 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
         EXPECT_EQ(out.retain_floor, 0U);
     }
     {
-        // TriggerCheckpoint's tail has grown: the fencing epoch (8 bytes) plus
-        // the F84 generation (8 bytes). A peer that predates BOTH sends
-        // neither, so 16 bytes come off, not 8.
-        TriggerCheckpointMsg in{
-            .job_id = 1, .checkpoint_id = 33, .coordinator_epoch = 9, .generation = 7};
+        // TriggerCheckpoint's tail has grown: the fencing epoch (8 bytes),
+        // the F84 generation (8 bytes) and the adaptive barrier mode
+        // (1 byte). A peer that predates ALL THREE sends none of them,
+        // so 17 bytes come off, not 8.
+        TriggerCheckpointMsg in{.job_id = 1,
+                                .checkpoint_id = 33,
+                                .coordinator_epoch = 9,
+                                .generation = 7,
+                                .barrier_mode_plus1 = 2};
         auto out = round_trip_without_epoch_field(
-            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint, /*tail_bytes=*/16);
+            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint, /*tail_bytes=*/17);
         EXPECT_EQ(out.checkpoint_id, 33U);
         EXPECT_EQ(out.coordinator_epoch, 0U);
         EXPECT_EQ(out.generation, 0U);
+        EXPECT_EQ(out.barrier_mode_plus1, 0U);
     }
     {
-        // The intermediate peer: has fencing, predates the F84 generation.
-        // Chops only the generation; the epoch must survive and the
-        // generation must read 0 = accept-all at the worker's fence.
-        TriggerCheckpointMsg in{
-            .job_id = 1, .checkpoint_id = 34, .coordinator_epoch = 9, .generation = 7};
+        // The intermediate peer: has fencing, predates the F84 generation
+        // (and therefore the adaptive mode byte). Chops the generation and
+        // the mode; the epoch must survive, the generation must read 0 =
+        // accept-all at the worker's fence, and the mode 0 = not stamped.
+        TriggerCheckpointMsg in{.job_id = 1,
+                                .checkpoint_id = 34,
+                                .coordinator_epoch = 9,
+                                .generation = 7,
+                                .barrier_mode_plus1 = 2};
         auto out = round_trip_without_epoch_field(
-            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint, /*tail_bytes=*/8);
+            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint, /*tail_bytes=*/9);
         EXPECT_EQ(out.checkpoint_id, 34U);
         EXPECT_EQ(out.coordinator_epoch, 9U);
         EXPECT_EQ(out.generation, 0U);
+        EXPECT_EQ(out.barrier_mode_plus1, 0U);
+    }
+    {
+        // The peer that has fencing and the generation but predates the
+        // adaptive mode byte: only that byte comes off, and it reads 0 =
+        // not stamped (deploy-static behaviour).
+        TriggerCheckpointMsg in{.job_id = 1,
+                                .checkpoint_id = 35,
+                                .coordinator_epoch = 9,
+                                .generation = 7,
+                                .barrier_mode_plus1 = 2};
+        auto out = round_trip_without_epoch_field(
+            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint, /*tail_bytes=*/1);
+        EXPECT_EQ(out.checkpoint_id, 35U);
+        EXPECT_EQ(out.coordinator_epoch, 9U);
+        EXPECT_EQ(out.generation, 7U);
+        EXPECT_EQ(out.barrier_mode_plus1, 0U);
     }
     {
         BeginRescaleMsg in;

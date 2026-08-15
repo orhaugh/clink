@@ -47,8 +47,14 @@
       "category": "code",
       "priority": "P1",
       "title": "Adaptive unaligned-checkpoint wiring: measured backpressure drives the existing resolver in clink's own runtimes",
-      "status": "planned",
-      "evidence": []
+      "status": "completed",
+      "evidence": [
+        "checkpoint::AdaptiveModePolicy (header-only): threshold + consecutive-window hysteresis both directions + bounded history + switch counter; deterministic, driven by synthetic pressure in tests",
+        "In-process wiring: CheckpointCoordinator::enable_adaptive_mode(pressure_fn) behind the existing set_mode_resolver seam; Dag::channel_pressure_fn() = max depth/capacity across runner input channels; trigger() emits clink_ckpt_mode_total{mode} and clink_ckpt_adaptive_switch_total",
+        "Cluster wiring: CheckpointAlignment::Adaptive; coordinator trigger sweep observes last completed checkpoint duration / interval and stamps TriggerCheckpointMsg.barrier_mode_plus1 (trailing wire field, 0 = legacy/static); DeployMsg.adaptive_barrier_mode (trailing, before the epoch per contract) makes sources forward the injected stamp instead of re-stamping; per-op overrides still win; lint covers Adaptive-without-periodic",
+        "Tests: 8 AdaptiveModePolicy behaviours incl. spike-no-switch and hysteresis both ways; wire round-trips + 3 tail-truncation compat shapes; mode-flip correctness rests on the aligner's per-barrier pinning proven in test_co_operator_unaligned",
+        "Mutation-checked: hysteresis mutant (switch on first pressured window) compiles and fails the policy suite; core label 2179/2179 green"
+      ]
     },
     {
       "id": "HARDEN-04",

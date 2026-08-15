@@ -437,6 +437,7 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
     w.kv("restore_from_checkpoint_id", static_cast<std::int64_t>(j.restore_from_checkpoint_id));
     w.kv("max_restarts_on_worker_loss", static_cast<std::int64_t>(j.max_restarts_on_worker_loss));
     w.kv("unaligned_checkpoints", j.unaligned_checkpoints);
+    w.kv("adaptive_barrier_mode", j.adaptive_barrier_mode);
     w.key("pending_checkpoint_ids").begin_array();
     for (auto id : j.pending_checkpoint_ids) {
         w.uint_value(id);

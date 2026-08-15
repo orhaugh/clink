@@ -1205,7 +1205,14 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
             }
         }
     }
-    CheckpointBarrier barrier(CheckpointId{msg.checkpoint_id});
+    // Per-trigger barrier mode (adaptive checkpoints). When the
+    // coordinator stamped a mode on this trigger, the injected barrier
+    // carries it and adaptive-deployed sources forward it untouched; a
+    // legacy trigger (0) leaves the barrier at its Aligned default and
+    // the deploy-static stamping applies as before.
+    const auto barrier_mode = msg.barrier_mode_plus1 == 2 ? CheckpointBarrier::Mode::Unaligned
+                                                          : CheckpointBarrier::Mode::Aligned;
+    CheckpointBarrier barrier(CheckpointId{msg.checkpoint_id}, barrier_mode);
     for (auto& fn : to_invoke) {
         try {
             fn(barrier);
@@ -1337,6 +1344,7 @@ void Worker::handle_deploy_(MessageReader& r) {
         }
         const std::uint32_t restore_generation = msg.restore_generation;
         const bool unaligned = msg.unaligned_checkpoints;
+        const bool adaptive = msg.adaptive_barrier_mode;
         const std::string expected_versions = msg.expected_state_versions_packed;
         const std::string udfs = msg.udfs_packed;
         task_threads_.emplace_back([this,
@@ -1348,6 +1356,7 @@ void Worker::handle_deploy_(MessageReader& r) {
                                     generation,
                                     restore_generation,
                                     unaligned,
+                                    adaptive,
                                     expected_versions,
                                     udfs] {
             run_task_(jid,
@@ -1358,6 +1367,7 @@ void Worker::handle_deploy_(MessageReader& r) {
                       generation,
                       restore_generation,
                       unaligned,
+                      adaptive,
                       expected_versions,
                       udfs);
         });
@@ -1435,6 +1445,7 @@ void Worker::run_task_(JobId job_id,
                        std::uint32_t generation,
                        std::uint32_t restore_from_generation,
                        bool unaligned_checkpoints,
+                       bool adaptive_barrier_mode,
                        const std::string& expected_state_versions_packed,
                        const std::string& udfs_packed) {
     metrics::worker::subtask_started();
@@ -1460,6 +1471,7 @@ void Worker::run_task_(JobId job_id,
                                  generation,
                                  restore_from_generation,
                                  unaligned_checkpoints,
+                                 adaptive_barrier_mode,
                                  expected_state_versions_packed);
         } else {
             auto it = roles_.find(task.role);
@@ -1545,6 +1557,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                                   std::uint32_t generation,
                                   std::uint32_t restore_from_generation,
                                   bool unaligned_ckpt,
+                                  bool adaptive_barrier_mode,
                                   const std::string& expected_state_versions_packed) {
     // Built-in channels and op-runners must be present before we look
     // up TypeRegistry entries for bridge construction. Idempotent.
@@ -2096,6 +2109,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 // (F39: Linux-only, since macOS resolved both to one).
                 .side_output_attachers = job_soar,
                 .unaligned_checkpoints = unaligned_ckpt,
+                .adaptive_barrier_mode = adaptive_barrier_mode,
                 .expected_state_versions_packed = expected_state_versions_packed,
                 .restore_from_subtask_idx = rescale_parent_idx,
                 .restore_from_parent_count = rescale_parent_count,
@@ -2458,6 +2472,7 @@ void Worker::run_generic_subtask_(JobId job_id,
             // its built-ins under RTLD_LOCAL (F39).
             .side_output_attachers = job_soar,
             .unaligned_checkpoints = unaligned_ckpt,
+            .adaptive_barrier_mode = adaptive_barrier_mode,
             .expected_state_versions_packed = expected_state_versions_packed,
             .restore_from_subtask_idx = task.restore_from_subtask_idx == kRestoreFromSelf
                                             ? std::numeric_limits<std::uint32_t>::max()

@@ -93,11 +93,14 @@ std::vector<ConfigProblem> lint_checkpoint_config(const CheckpointConfig& c) {
     // Unaligned barrier handling is a property of checkpointing. Asking for
     // it without checkpointing is not harmful, but it means the setting was
     // misunderstood.
-    if (c.alignment == CheckpointAlignment::Unaligned && !periodic_checkpointing_will_run(c)) {
+    if (c.alignment != CheckpointAlignment::Aligned && !periodic_checkpointing_will_run(c)) {
         out.push_back({LintSeverity::Warning,
                        "unaligned_checkpoints",
-                       "unaligned checkpoints were requested but this job takes no periodic "
-                       "checkpoints, so the setting has nothing to apply to."});
+                       std::string{c.alignment == CheckpointAlignment::Adaptive
+                                       ? "adaptive checkpoint alignment was requested"
+                                       : "unaligned checkpoints were requested"} +
+                           " but this job takes no periodic checkpoints, so the setting has "
+                           "nothing to apply to."});
     }
 
     // --- combinations that contradict each other -------------------------

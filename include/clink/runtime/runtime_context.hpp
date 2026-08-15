@@ -236,6 +236,13 @@ public:
     void set_unaligned_checkpoints(bool v) noexcept { unaligned_checkpoints_ = v; }
     bool unaligned_checkpoints() const noexcept { return unaligned_checkpoints_; }
 
+    // Adaptive checkpoint mode: source runners leave the mode already
+    // stamped on an injected barrier untouched (the coordinator's
+    // per-trigger decision) instead of re-stamping the static default.
+    // Per-operator overrides still win.
+    void set_adaptive_barrier_mode(bool v) noexcept { adaptive_barrier_mode_ = v; }
+    bool adaptive_barrier_mode() const noexcept { return adaptive_barrier_mode_; }
+
     // The key-group range this run's state restore loaded: the full range
     // {0, kNumKeyGroups} for a plain same-parallelism restore, or a narrowed
     // slice for a rescale. Set by the executor from the restore key-group
@@ -551,6 +558,7 @@ private:
     RequestFinalCheckpointFn request_final_ckpt_;
     WaitFinalCommittedFn wait_final_committed_;
     bool unaligned_checkpoints_{false};
+    bool adaptive_barrier_mode_{false};
     KeyGroupRange restore_kg_range_{};  // default {0, kNumKeyGroups} = covers all
     std::optional<CheckpointBarrier::Mode> barrier_mode_override_;
     std::shared_ptr<std::atomic<std::uint32_t>> drain_target_;

@@ -375,6 +375,11 @@ struct DeployMsg {
     // their alignment state machine. v1 trailing field - old workers
     // see EOF and default to aligned.
     bool unaligned_checkpoints{false};
+    // Adaptive checkpoint mode (CheckpointAlignment::Adaptive): sources
+    // forward the barrier stamp the coordinator's trigger carried
+    // instead of re-stamping the deploy-static mode above. Trailing
+    // field - old workers see EOF and keep static stamping.
+    bool adaptive_barrier_mode{false};
     // State schema evolution: the versions the job expects per
     // (op, state_type), packed as "op|type|ver" lines (StateVersionMap::pack).
     // The worker unpacks it into JobConfig.expected_state_versions so each
@@ -579,6 +584,13 @@ struct HelloClientMsg {
 enum class CheckpointAlignment : std::uint8_t {
     Aligned = 0,
     Unaligned = 1,
+    // The coordinator decides per checkpoint from measured pressure
+    // (the adaptive-mode policy over recent checkpoint durations) and
+    // stamps the decision on each trigger; workers stamp injected
+    // barriers with it. An older coordinator receiving this submits the
+    // job as Aligned - the safe default - because its decode maps
+    // unknown values there.
+    Adaptive = 2,
 };
 
 // Sentinel for max_restarts_on_worker_loss meaning "not set - use the recovery
@@ -789,6 +801,13 @@ struct TriggerCheckpointMsg {
     // deployed. Zero means a pre-F84 coordinator; accepted, preserving the
     // old behaviour on mixed versions.
     std::uint64_t generation{0};
+    // Per-trigger barrier mode for adaptive checkpoints, offset by one
+    // so zero survives the trailing-field decode as "not stamped":
+    // 0 = absent (older coordinator or static alignment - the worker
+    // keeps its deploy-static behaviour), 1 = aligned, 2 = unaligned.
+    // Stamped by the coordinator's trigger sweep when the job's
+    // alignment is CheckpointAlignment::Adaptive.
+    std::uint8_t barrier_mode_plus1{0};
 };
 
 // coordinator → worker. The commit phase of the 2PC sink protocol. Broadcast to every worker
