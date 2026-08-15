@@ -471,6 +471,70 @@ TEST(WireProtocol, DeployRoundTripsRescaleDirectivesPerTask) {
     EXPECT_EQ(out.tasks[2].key_group_last, 64);
 }
 
+// Two MessageKinds deliberately share the value 117, and this pins that
+// as a decision rather than an accident.
+//
+// CommitConfirmed travels worker -> coordinator and StopSubtasks travels
+// coordinator -> worker, so each dispatch loop sees only one of them and
+// the value is unambiguous in context. That is sound, but it is the kind
+// of soundness that survives only while someone remembers it: the file's
+// own history records a duplicate that "aborted the coordinator on every
+// savepoint" when Savepoint collided with RescaleOperator in the SAME
+// direction. This test states the rule - a value may be shared ONLY
+// across directions - so a third kind added at 117, or a future move of
+// either of these onto the other's side, fails here instead of routing a
+// frame into the wrong handler at runtime.
+TEST(WireProtocol, MessageKindsMayShareAValueOnlyAcrossDirections) {
+    // The pair that shares 117 today.
+    EXPECT_EQ(static_cast<int>(MessageKind::CommitConfirmed), 117);
+    EXPECT_EQ(static_cast<int>(MessageKind::StopSubtasks), 117);
+
+    // Every kind the COORDINATOR dispatches (arriving from a worker or a
+    // client) must be unique among itself.
+    const std::vector<std::pair<MessageKind, const char*>> to_coordinator = {
+        {MessageKind::Register, "Register"},
+        {MessageKind::Heartbeat, "Heartbeat"},
+        {MessageKind::SubtaskFinished, "SubtaskFinished"},
+        {MessageKind::SubtaskListening, "SubtaskListening"},
+        {MessageKind::SubtaskCheckpointed, "SubtaskCheckpointed"},
+        {MessageKind::CommitConfirmed, "CommitConfirmed"},
+        {MessageKind::RequestFinalCheckpoint, "RequestFinalCheckpoint"},
+        {MessageKind::SubmitJob, "SubmitJob"},
+        {MessageKind::CancelJob, "CancelJob"},
+        {MessageKind::ListJobs, "ListJobs"},
+        {MessageKind::Savepoint, "Savepoint"},
+        {MessageKind::StopJob, "StopJob"},
+        {MessageKind::BeginRescaleAck, "BeginRescaleAck"},
+    };
+    // Every kind the WORKER dispatches (arriving from the coordinator).
+    const std::vector<std::pair<MessageKind, const char*>> to_worker = {
+        {MessageKind::RegisterAck, "RegisterAck"},
+        {MessageKind::Deploy, "Deploy"},
+        {MessageKind::PeerUpdate, "PeerUpdate"},
+        {MessageKind::TriggerCheckpoint, "TriggerCheckpoint"},
+        {MessageKind::CommitCheckpoint, "CommitCheckpoint"},
+        {MessageKind::AbortCheckpoint, "AbortCheckpoint"},
+        {MessageKind::FinalCheckpointAssigned, "FinalCheckpointAssigned"},
+        {MessageKind::BeginRescale, "BeginRescale"},
+        {MessageKind::StopSubtasks, "StopSubtasks"},
+        {MessageKind::CutoverPeerUpdate, "CutoverPeerUpdate"},
+        {MessageKind::CutoverRebind, "CutoverRebind"},
+    };
+    const auto assert_unique = [](const auto& kinds, const char* direction) {
+        std::map<int, std::string> seen;
+        for (const auto& [kind, name] : kinds) {
+            const int value = static_cast<int>(kind);
+            auto it = seen.find(value);
+            ASSERT_EQ(it, seen.end())
+                << direction << ": " << name << " and " << it->second << " both use " << value
+                << ", so one of them will be routed to the other's handler";
+            seen.emplace(value, name);
+        }
+    };
+    assert_unique(to_coordinator, "coordinator-bound");
+    assert_unique(to_worker, "worker-bound");
+}
+
 TEST(WireProtocol, SubmitJobCarriesAlignmentMode) {
     SubmitJobMsg in;
     in.graph_json = "{}";

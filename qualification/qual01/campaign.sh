@@ -70,7 +70,12 @@ start_on_host() {  # host, log-name, command
     # Prove it actually started, rather than trusting a backgrounded
     # command that may have died on its first line.
     sleep 3
-    on_host "$host" "pgrep -f '$(echo "$cmd" | awk '{print $2}')' >/dev/null" \
+    local script; script=$(echo "$cmd" | awk '{print $2}')
+    # Bracketed for the same reason as above: an unbracketed pattern also
+    # matches the ssh command carrying it, so the check would pass even
+    # for a process that never started.
+    local pattern="[${script:0:1}]${script:1}"
+    on_host "$host" "pgrep -f '$pattern' >/dev/null" \
         || { echo "campaign: $log did not start - see /qual/$log on $host" >&2
              on_host "$host" "tail -20 /qual/$log" >&2 || true; exit 3; }
 }
@@ -230,7 +235,12 @@ on_host "$OPS_PUB" "chmod 600 /root/.ssh/id_ed25519 && pip3 install --break-syst
 # No survivors from an earlier run. A leftover verifier keeps writing the
 # verdict file this campaign reads, and its stale in-memory state once
 # produced 161,111 phantom missing results that were read as this run's.
-on_host "$OPS_PUB" "pkill -f generator.py; pkill -f verifier.py; pkill -f chaos.py; \
+# The bracket trick, and it is not cosmetic: `pkill -f generator.py`
+# matches ANY command line containing that text - including the remote
+# shell running this very command - so it killed its own parent, the ssh
+# died with 255, and the campaign aborted here. '[g]enerator.py' cannot
+# match itself.
+on_host "$OPS_PUB" "pkill -f '[g]enerator.py'; pkill -f '[v]erifier.py'; pkill -f '[c]haos.py'; \
     rm -f /qual/progress.json* /qual/verdict.json /qual/chaos.jsonl; true"
 
 # A fixed event-time base makes the whole campaign reproducible: the
