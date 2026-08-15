@@ -15,6 +15,12 @@ struct KnownUnbounded {
     const char* kind;
     const char* what_it_retains;
     const char* remedy;
+    // Whether a declared `state_ttl` actually BOUNDS this operator's
+    // state. False means the planner does not stamp a TTL onto it and
+    // the operator reads none, so accepting state_ttl as the fix would
+    // let the query pass the gate while its state still grows without
+    // limit - the gate reporting safety it did not verify.
+    bool state_ttl_bounds_it;
 };
 
 // The node kinds that retain per-key state for the life of the job.
@@ -26,28 +32,44 @@ struct KnownUnbounded {
 constexpr KnownUnbounded kUnboundedKinds[] = {
     {"Aggregate",
      "one accumulator per group, kept for the life of the job",
-     "add a window (TUMBLE / HOP / SESSION), set 'state_ttl', or write ALLOW UNBOUNDED STATE"},
+     "add a window (TUMBLE / HOP / SESSION), set 'state_ttl', or write ALLOW UNBOUNDED STATE",
+     true},
     {"Distinct",
      "every distinct row seen so far",
-     "add a window, set 'state_ttl', or write ALLOW UNBOUNDED STATE"},
+     "add a window, set 'state_ttl', or write ALLOW UNBOUNDED STATE",
+     true},
     {"EquiJoin",
      "every row from both inputs, so either side can match a future row from the other",
      "use an interval join (a time-bounded ON condition), set 'state_ttl', or write ALLOW "
-     "UNBOUNDED STATE"},
+     "UNBOUNDED STATE",
+     true},
     {"SemiJoin",
      "every row from the probed side",
-     "use an interval join, set 'state_ttl', or write ALLOW UNBOUNDED STATE"},
+     "use an interval join, set 'state_ttl', or write ALLOW UNBOUNDED STATE",
+     true},
     {"SetOp",
      "every row seen on both sides, to evaluate the set semantics",
-     "set 'state_ttl' or write ALLOW UNBOUNDED STATE"},
+     "set 'state_ttl' or write ALLOW UNBOUNDED STATE",
+     true},
+    // ROW_NUMBER / TopN honours NO retention: the physical planner never
+    // stamps state_ttl onto top_n_row and the operator reads none. Until
+    // it does, offering state_ttl as the remedy - and letting a declared
+    // one satisfy the gate - told users their state was bounded when
+    // nothing bounded it.
     {"RowNumber",
      "the running row count per partition",
-     "bound the query with a window, set 'state_ttl', or write ALLOW UNBOUNDED STATE"},
+     "bound the query with a window, or write ALLOW UNBOUNDED STATE. Note that 'state_ttl' "
+     "does NOT bound this operator: it is not applied to ROW_NUMBER / TopN state",
+     false},
 };
 
-void walk(const LogicalPlan& node, std::vector<UnboundedStateFinding>& out) {
+// `ttl_declared` suppresses only the findings a TTL genuinely bounds.
+void walk(const LogicalPlan& node, std::vector<UnboundedStateFinding>& out, bool ttl_declared) {
     const auto kind = node.kind();
     for (const auto& k : kUnboundedKinds) {
+        if (ttl_declared && k.state_ttl_bounds_it) {
+            continue;
+        }
         if (kind == k.kind) {
             out.push_back(UnboundedStateFinding{
                 .node_kind = kind, .description = k.what_it_retains, .remedy = k.remedy});
@@ -56,7 +78,7 @@ void walk(const LogicalPlan& node, std::vector<UnboundedStateFinding>& out) {
     }
     for (const auto* in : node.inputs()) {
         if (in != nullptr) {
-            walk(*in, out);
+            walk(*in, out, ttl_declared);
         }
     }
 }
@@ -243,17 +265,17 @@ BoundedStateReport check_bounded_state(const LogicalPlan& plan,
     if (sources_bounded) {
         return report;
     }
-    // A chosen retention or an explicit override satisfies the gate. The
-    // override is recorded so the caller can shout about it.
-    if (retention.ttl_ms > 0) {
-        return report;
-    }
+    // An explicit override satisfies the gate outright, and is recorded
+    // so the caller can shout about it.
     if (retention.allow_unbounded) {
         report.used_unsafe_override = true;
         return report;
     }
-
-    walk(plan, report.findings);
+    // A declared retention satisfies the gate only for the operators it
+    // actually bounds. It used to clear every finding, which quietly
+    // passed a ROW_NUMBER query whose state no TTL is ever applied to -
+    // the gate certifying a bound it had not checked.
+    walk(plan, report.findings, /*ttl_declared=*/retention.ttl_ms > 0);
     return report;
 }
 

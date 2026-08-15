@@ -434,6 +434,70 @@ TEST(SqlBoundedState, SetOperationReceivesTheRetention) {
     EXPECT_EQ(params.at("state_ttl_ms"), "3600000");
 }
 
+// A declared retention must satisfy the gate only for the operators it
+// actually bounds.
+//
+// ROW_NUMBER / TopN is the one gated kind the planner never stamps a TTL
+// onto, and top_n_row reads none - yet a declared state_ttl used to
+// clear EVERY finding, so a ranking query over an unbounded source
+// compiled with the gate reporting it bounded and its state growing for
+// the life of the job. The gate certifying a bound it had not checked is
+// worse than no gate: it is the reason the author stopped worrying.
+TEST(SqlBoundedState, ADeclaredTtlDoesNotSatisfyTheGateForRowNumber) {
+    clink::cluster::ensure_built_ins_registered();
+    ensure_sql_installed_for_bounded_state_tests();
+    Catalog cat;
+    const auto ddl = kafka_table("src", "t") + kFileDst;
+    for (const auto& st : parse(ddl).statements) {
+        if (const auto* ct = std::get_if<ast::CreateTableStmt>(&st)) {
+            cat.register_table(*ct);
+        }
+    }
+    // A BARE ROW_NUMBER: the running count per partition, retained for
+    // the life of the job. (A `WHERE rn <= N` filter would bind to
+    // TopNPerKey instead, which the gate deliberately does not flag
+    // because it keeps at most N rows per key.) The source declares
+    // state_ttl='1h' - see kafka_table.
+    const auto script = parse(
+        "INSERT INTO dst SELECT k, rn FROM "
+        "(SELECT *, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM src) s");
+    const Binder binder(cat);
+    auto plan = binder.bind_insert(std::get<ast::InsertStmt>(script.statements.front()));
+
+    const auto report = check_plan_bounded_state(*plan, /*allow_unbounded=*/false);
+    ASSERT_FALSE(report.findings.empty())
+        << "a declared state_ttl satisfied the gate for ROW_NUMBER, whose state no TTL reaches";
+    bool found_row_number = false;
+    for (const auto& f : report.findings) {
+        if (f.node_kind == "RowNumber") {
+            found_row_number = true;
+            EXPECT_NE(f.remedy.find("does NOT bound this operator"), std::string::npos)
+                << "the remedy still offers state_ttl: " << f.remedy;
+        }
+    }
+    EXPECT_TRUE(found_row_number) << "the RowNumber finding was suppressed";
+}
+
+// The same declared TTL must still satisfy the gate for the operators it
+// genuinely bounds, or the fix above would simply have broken them.
+TEST(SqlBoundedState, ADeclaredTtlStillSatisfiesTheGateForAnAggregate) {
+    clink::cluster::ensure_built_ins_registered();
+    ensure_sql_installed_for_bounded_state_tests();
+    Catalog cat;
+    const auto ddl = kafka_table("src", "t") + kFileDst;
+    for (const auto& st : parse(ddl).statements) {
+        if (const auto* ct = std::get_if<ast::CreateTableStmt>(&st)) {
+            cat.register_table(*ct);
+        }
+    }
+    const auto script = parse("INSERT INTO dst SELECT k, SUM(v) FROM src GROUP BY k");
+    const Binder binder(cat);
+    auto plan = binder.bind_insert(std::get<ast::InsertStmt>(script.statements.front()));
+    const auto report = check_plan_bounded_state(*plan, /*allow_unbounded=*/false);
+    EXPECT_TRUE(report.findings.empty())
+        << "a declared state_ttl no longer satisfies the gate for an aggregate, which it bounds";
+}
+
 TEST(SqlBoundedState, RetentionIsSatisfiedByAnyOfTheFourRoutes) {
     EXPECT_TRUE(StateRetention{.ttl_ms = 1000}.bounded());
     EXPECT_TRUE(StateRetention{.allow_unbounded = true}.bounded());
