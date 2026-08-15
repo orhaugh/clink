@@ -70,6 +70,7 @@ on_host "$OPS_PUB" "cd /qual/src && docker build \
     --build-arg BASE_IMAGE=clink-build:qual \
     --build-arg BUILD_PARALLEL=${BUILD_PARALLEL} \
     --build-arg CLINK_ENABLE_FAULT_INJECTION=$FAULT_INJECTION \
+    --build-arg CLINK_GIT_SHA=$SHA \
     -t $IMAGE_TAG -f docker/Dockerfile.runtime . 2>&1 | tail -5"
 
 # The image's own account of itself, kept as evidence: this is what the

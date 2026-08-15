@@ -249,9 +249,19 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ---------------------------------------------------------------------------
 set(CLINK_ABI_VERSION 1)
 find_package(Git QUIET)
+# An explicitly supplied hash wins over discovery. A source archive carries
+# no .git, so a build from one could not name its own commit and reported
+# "unknown" - which for a qualification image is the whole provenance chain,
+# since results are only attributable to a revision if the binary can say
+# which one it is. The builder passes -DCLINK_ABI_HASH=<sha> and takes
+# responsibility for it matching the source it shipped.
+set(CLINK_ABI_HASH_SUPPLIED "${CLINK_ABI_HASH}")
 set(CLINK_ABI_HASH "unknown")
 set(CLINK_ABI_HASH_CLEAN "false")
-if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+if(CLINK_ABI_HASH_SUPPLIED)
+    set(CLINK_ABI_HASH "${CLINK_ABI_HASH_SUPPLIED}")
+    set(CLINK_ABI_HASH_CLEAN "true")
+elseif(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     execute_process(
         COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"

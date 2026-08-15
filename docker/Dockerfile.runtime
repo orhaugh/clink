@@ -67,6 +67,15 @@ ARG CLINK_ISA_BASELINE=
 # `clink --capabilities` reports the resulting state, and the
 # qualification campaign asserts it before using the profile.
 ARG CLINK_ENABLE_FAULT_INJECTION=OFF
+
+# The commit this image was built from.
+#
+# The build normally derives it from .git, which a source archive does
+# not carry - so an archive build reported git_sha=unknown and the image
+# could not state which revision it was. For a qualification campaign
+# that is the whole provenance chain: the results are only attributable
+# to a commit if the binary under test can name it.
+ARG CLINK_GIT_SHA=
 # CLINK_BUILD_SQL=ON so clink_node registers the SQL operator factories
 # (json_string_to_row, window_row, equi_join_row, ...) - required to run SQL
 # jobs (e.g. the Nexmark queries) against a containerized cluster; without it the
@@ -84,6 +93,7 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
         -DCLINK_WITH_JEMALLOC=${CLINK_WITH_JEMALLOC} \
         -DCLINK_ISA_BASELINE=${CLINK_ISA_BASELINE} \
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+        -DCLINK_ABI_HASH=${CLINK_GIT_SHA} \
     # Build EVERYTHING (tests off): `cmake --install` below installs every
     # tool the install rules cover, and a selective build leaves some of
     # them missing (clink_submit_sql was the one that failed). The extra
