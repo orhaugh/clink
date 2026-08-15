@@ -64,8 +64,11 @@ echo "build-image: building the toolchain base (public Debian + public prebuilt 
 on_host "$OPS_PUB" "cd /qual/src && docker build -t clink-build:qual -f docker/Dockerfile . 2>&1 | tail -5"
 
 echo "build-image: building the runtime image (fault injection: $FAULT_INJECTION)"
+BUILD_PARALLEL=$(on_host "$OPS_PUB" "nproc" | tr -d '\r')
+echo "build-image: building with parallelism ${BUILD_PARALLEL}"
 on_host "$OPS_PUB" "cd /qual/src && docker build \
     --build-arg BASE_IMAGE=clink-build:qual \
+    --build-arg BUILD_PARALLEL=${BUILD_PARALLEL} \
     --build-arg CLINK_ENABLE_FAULT_INJECTION=$FAULT_INJECTION \
     -t $IMAGE_TAG -f docker/Dockerfile.runtime . 2>&1 | tail -5"
 

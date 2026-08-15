@@ -30,7 +30,11 @@ COPY . /src
 # spawn one compile per host core. Docker Desktop on Mac caps the
 # container's nproc anyway, but being explicit here keeps the build
 # polite on hosts that haven't tuned Docker's resource allocation.
-ENV CMAKE_BUILD_PARALLEL_LEVEL=4
+# An ARG rather than a fixed 4 so a dedicated build host can use the
+# cores it has: the default left an 8-core qualification builder running
+# at a load of 1.4.
+ARG BUILD_PARALLEL=4
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_PARALLEL}
 # Opt-in: bake the ForSt state backend into the runtime (forst:// and the
 # forst_s3 schemes). Default OFF keeps the image build identical; ON adds
 # the ForSt engine's ExternalProject fetch + build (~5-8 min, needs
