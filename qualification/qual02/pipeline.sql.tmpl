@@ -1,0 +1,22 @@
+-- QUAL-02 pipeline: Kafka -> Postgres two-phase-commit sink.
+--
+-- Deliberately a pass-through, not an aggregation. QUAL-01 already
+-- qualifies windowed exactly-once; what is under test here is the 2PC
+-- sink protocol itself, and a one-row-in-one-row-out pipeline makes the
+-- three failure modes directly countable in the sink table: a duplicate
+-- is a repeated event_id, a loss is a gap in a partition's sequence, and
+-- a fabrication is an event_id outside the generated range.
+--
+-- __BROKERS__ and __CONNINFO__ are substituted by the campaign driver.
+CREATE TABLE q2_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
+  WITH (connector='kafka', format='json', brokers='__BROKERS__',
+        topic='qual02-in', group_id='qual02',
+        auto_offset_reset='earliest');
+
+CREATE TABLE q2_out (event_id TEXT, k BIGINT, amount BIGINT)
+  WITH (connector='postgres', format='json',
+        conninfo='__CONNINFO__',
+        "table"='public.q2_out',
+        delivery_guarantee='exactly_once');
+
+INSERT INTO q2_out SELECT event_id, k, amount FROM q2_in;

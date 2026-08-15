@@ -1,0 +1,33 @@
+# QUAL-02 sink database.
+#
+# Runs on the ops host, outside the clink failure domain, so a fault
+# aimed at clink never takes the oracle's evidence store with it.
+#
+# max_prepared_transactions is the whole point: it defaults to 0, which
+# disables PREPARE TRANSACTION entirely and makes the two-phase-commit
+# sink fail its first checkpoint. The campaign asserts the effective
+# value from the server rather than trusting this file.
+services:
+  postgres:
+    image: postgres:16
+    container_name: qual02-postgres
+    restart: "no"
+    environment:
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+      POSTGRES_DB: qual02
+    command:
+      - postgres
+      - -c
+      - max_prepared_transactions=200
+      - -c
+      - max_connections=200
+      # The campaign reads pg_prepared_xacts constantly; keep the log
+      # quiet enough that it is the evidence, not the noise.
+      - -c
+      - log_min_messages=warning
+    ports:
+      - "5432:5432"
+    volumes:
+      - qual02-pgdata:/var/lib/postgresql/data
+volumes:
+  qual02-pgdata:
