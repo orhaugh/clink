@@ -200,6 +200,86 @@ TEST_F(TxnResumeLive, AFencedIdentityIsRefusedAndTheOrphanStaysAborted) {
         << "the fenced orphan's records must stay invisible";
 }
 
+// --- SASL against a real authenticated broker ---------------------------------
+//
+// The pinned Redpanda speaks SCRAM ONLY (its config validation rejects
+// PLAIN outright - verified empirically against v24.2.7), so the live SASL
+// truths this suite CAN pin are the refusal shapes: a PLAIN handshake must
+// be refused by a real broker naming the mechanisms it does enable, and an
+// unauthenticated resume against a SASL-required listener must surface as
+// the transport fallback (the broker drops the connection) - never as a
+// guess. The PLAIN happy path is pinned hermetically in test_txn_resume.cpp
+// and stays that way until SCRAM ships or the broker pin gains PLAIN.
+class TxnResumeSaslLive : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        if (clink::test::DockerKafka::docker_available()) {
+            clink::test::DockerKafkaOptions opts;
+            opts.sasl = true;
+            sasl_broker_ = std::make_unique<clink::test::DockerKafka>(opts);
+        }
+    }
+    static void TearDownTestSuite() { sasl_broker_.reset(); }
+
+    void SetUp() override {
+        if (sasl_broker_ == nullptr) {
+            GTEST_SKIP() << "Docker not available";
+        }
+    }
+
+    static std::pair<std::string, std::uint16_t> broker_addr() {
+        const auto brokers = sasl_broker_->brokers();
+        const auto colon = brokers.rfind(':');
+        return {brokers.substr(0, colon),
+                static_cast<std::uint16_t>(std::stoi(brokers.substr(colon + 1)))};
+    }
+
+    static TxnIdentity some_identity() {
+        TxnIdentity txn;
+        txn.transactional_id = "sasl-live";
+        txn.producer_id = 7;
+        txn.producer_epoch = 0;
+        return txn;
+    }
+
+    static std::unique_ptr<clink::test::DockerKafka> sasl_broker_;
+};
+
+std::unique_ptr<clink::test::DockerKafka> TxnResumeSaslLive::sasl_broker_;
+
+TEST_F(TxnResumeSaslLive, APlainHandshakeIsRefusedByAScramOnlyBrokerNamingScram) {
+    clink::kafka::ResumeAuth auth;
+    auth.mechanism = "PLAIN";
+    auth.username = "admin";
+    auth.password = "secret";
+    const auto [host, port] = broker_addr();
+    const auto outcome = clink::kafka::resume_commit(
+        host,
+        port,
+        some_identity(),
+        [](const std::string& h, std::uint16_t p) { return clink::network::connect_plain(h, p); },
+        auth);
+    EXPECT_EQ(outcome.status, ResumeOutcome::Status::Refused)
+        << "a real broker's mechanism refusal must be FINAL, never retried into a guess: "
+        << outcome.detail;
+    EXPECT_NE(outcome.detail.find("UNSUPPORTED_SASL_MECHANISM"), std::string::npos)
+        << outcome.detail;
+    EXPECT_NE(outcome.detail.find("SCRAM"), std::string::npos)
+        << "the refusal must carry what the broker WOULD accept: " << outcome.detail;
+}
+
+TEST_F(TxnResumeSaslLive, NoCredentialsAgainstASaslBrokerFallsBackAsTransportError) {
+    const auto [host, port] = broker_addr();
+    const auto outcome = clink::kafka::resume_commit(
+        host, port, some_identity(), [](const std::string& h, std::uint16_t p) {
+            return clink::network::connect_plain(h, p);
+        });
+    EXPECT_EQ(outcome.status, ResumeOutcome::Status::TransportError)
+        << "a SASL-required listener drops unauthenticated traffic; the resume must fall "
+           "back to the bounded contract, never claim a verdict: "
+        << outcome.detail;
+}
+
 TEST_F(TxnResumeLive, TheWrapperStagesAResolvableHandleAndErasesItOnCommit) {
     // The full sink-side half through the real factory: the 2PC wrapper
     // stages a handle whose identity the registered resolver could use,

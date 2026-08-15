@@ -21,24 +21,59 @@ namespace clink::test {
 //   if (!DockerKafka::docker_available()) GTEST_SKIP();
 //   DockerKafka kafka;
 //   ... use kafka.brokers() ...
+// SASL mode for DockerKafka. The pinned Redpanda (v24.2.7) supports SCRAM
+// ONLY - `sasl_mechanisms` validation rejects PLAIN outright (verified
+// empirically 2026-08-15) - so a SASL broker here authenticates rpk and
+// librdkafka clients via SCRAM-SHA-256, while a PLAIN-speaking client is
+// refused with UNSUPPORTED_SASL_MECHANISM. That refusal shape is itself
+// what the resume's live SASL arms pin.
+struct DockerKafkaOptions {
+    bool sasl{false};
+    std::string username{"admin"};
+    std::string password{"secret"};
+};
+
 class DockerKafka {
 public:
-    DockerKafka() {
+    DockerKafka() : DockerKafka(DockerKafkaOptions{}) {}
+
+    explicit DockerKafka(DockerKafkaOptions options) : options_(std::move(options)) {
         port_ = pick_port();
         container_name_ = "clink_test_rp_" + std::to_string(port_);
         // Two listeners: `internal` keeps in-container rpk working (rpk dials
         // the ADVERTISED address, which for a single mapped listener would be
         // the host port - unreachable from inside the container), `external`
         // is what the host-side test clients bootstrap through.
+        const std::string sasl_flags =
+            options_.sasl ? " --set redpanda.enable_sasl=true --set 'redpanda.superusers=[\"" +
+                                options_.username + "\"]'"
+                          : "";
         const std::string cmd =
             "docker run -d --rm -p " + std::to_string(port_) + ":19092 --name " + container_name_ +
             " redpandadata/redpanda:v24.2.7 redpanda start"
             " --mode dev-container --smp 1"
             " --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092"
             " --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:" +
-            std::to_string(port_) + " > /dev/null 2>&1";
+            std::to_string(port_) + sasl_flags + " > /dev/null 2>&1";
         if (std::system(cmd.c_str()) != 0) {
             throw std::runtime_error("DockerKafka: docker run failed");
+        }
+        if (options_.sasl) {
+            // The superuser must exist before the Kafka-API readiness probes
+            // below can authenticate. User creation rides the admin API,
+            // which is up well before the Kafka API and needs no auth in
+            // this dev setup; retry while the container boots.
+            const auto user_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            const std::string mkuser = "docker exec " + container_name_ + " rpk acl user create " +
+                                       options_.username + " -p " + options_.password +
+                                       " > /dev/null 2>&1";
+            while (std::system(mkuser.c_str()) != 0) {
+                if (std::chrono::steady_clock::now() >= user_deadline) {
+                    stop();
+                    throw std::runtime_error("DockerKafka: SASL user creation never succeeded");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
         }
         // Readiness is a broker-side condition, not a duration: rpk ships in
         // the image and exits 0 only once the cluster answers. `cluster
@@ -50,8 +85,8 @@ public:
         // and leadership to settle, which is the precondition the
         // transactional path actually needs.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
-        const std::string probe =
-            "docker exec " + container_name_ + " rpk cluster info > /dev/null 2>&1";
+        const std::string probe = "docker exec " + container_name_ + " rpk cluster info" +
+                                  rpk_auth_() + " > /dev/null 2>&1";
         while (std::system(probe.c_str()) != 0) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 stop();
@@ -80,7 +115,8 @@ public:
     // test does not depend on auto-creation racing the first produce.
     void create_topic(const std::string& name, int partitions = 1) const {
         const std::string cmd = "docker exec " + container_name_ + " rpk topic create " + name +
-                                " -p " + std::to_string(partitions) + " > /dev/null 2>&1";
+                                " -p " + std::to_string(partitions) + rpk_auth_() +
+                                " > /dev/null 2>&1";
         if (std::system(cmd.c_str()) != 0) {
             throw std::runtime_error("DockerKafka: rpk topic create " + name + " failed");
         }
@@ -89,6 +125,15 @@ public:
     static bool docker_available() { return std::system("docker info > /dev/null 2>&1") == 0; }
 
 private:
+    // rpk credentials for a SASL broker; empty when unauthenticated. The
+    // broker speaks SCRAM only (see DockerKafkaOptions).
+    [[nodiscard]] std::string rpk_auth_() const {
+        if (!options_.sasl) {
+            return "";
+        }
+        return " -X user=" + options_.username + " -X pass=" + options_.password +
+               " -X sasl.mechanism=SCRAM-SHA-256";
+    }
     void stop() noexcept {
         if (!container_name_.empty()) {
             const std::string cmd = "docker stop " + container_name_ + " > /dev/null 2>&1";
@@ -106,6 +151,7 @@ private:
 
     int port_{0};
     std::string container_name_;
+    DockerKafkaOptions options_;
 };
 
 }  // namespace clink::test
