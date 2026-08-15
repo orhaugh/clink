@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/connectors/postgres_tls.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 
 #ifdef CLINK_HAS_POSTGRES
@@ -52,6 +53,8 @@ void PostgresSink::open() {
         impl_->conn = nullptr;
         throw std::runtime_error("PostgresSink::open: " + err);
     }
+    clink::connectors::pg::assert_no_silent_downgrade(
+        impl_->conn, impl_->opts.conninfo, "postgres_sink");
     impl_->last_flush = std::chrono::steady_clock::now();
 }
 

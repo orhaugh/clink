@@ -68,16 +68,32 @@ class Chaos:
     # --- observation -----------------------------------------------------
 
     def job_state(self):
-        """(status, latest_completed_checkpoint_id) or (None, None)."""
+        """(status, latest_completed_checkpoint_id) or (None, None).
+
+        GET /api/v1/jobs/:id returns a FLAT object - there is no "job"
+        wrapper - and it gained an explicit `status` only alongside this
+        controller. Both facts were learned the expensive way: the first
+        version of this method unwrapped a "job" key that does not exist
+        and read a "status" field that did not either, so the liveness
+        gate below could never be true, no fault was ever applied, and a
+        campaign would have burned its whole rig budget logging nothing.
+        Liveness is therefore ALSO derived from fields that have always
+        existed, so this works against a coordinator of either vintage.
+        """
         try:
             with urllib.request.urlopen(
                     f"{self.coordinator_url}/api/v1/jobs/{self.job_id}", timeout=10) as r:
-                doc = json.load(r)
+                job = json.load(r)
         except (urllib.error.URLError, OSError, ValueError):
             return None, None
-        job = doc.get("job", doc)
-        return (job.get("status") or job.get("state"),
-                job.get("latest_completed_checkpoint_id", 0))
+        status = job.get("status")
+        if not status:
+            running = (bool(job.get("tasks"))
+                       and not job.get("completion_signalled")
+                       and not job.get("cancel_requested")
+                       and not job.get("errors"))
+            status = "RUNNING" if running else "NOT_RUNNING"
+        return status, job.get("latest_completed_checkpoint_id", 0)
 
     def await_healthy_checkpoint(self, since_ckpt: int, timeout_s: int = 600):
         """Block until the job is running AND has completed a checkpoint
@@ -86,8 +102,7 @@ class Chaos:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             status, ckpt = self.job_state()
-            if status and str(status).upper() in ("RUNNING", "DEPLOYED") \
-                    and ckpt and ckpt > since_ckpt:
+            if status == "RUNNING" and ckpt and ckpt > since_ckpt:
                 return ckpt
             time.sleep(5)
         return None
@@ -312,6 +327,14 @@ def main() -> int:
         faults += 1
         time.sleep(args.min_gap_s + rng.uniform(0, args.min_gap_s))
     print(f"chaos: {faults} faults applied", flush=True)
+    if faults == 0:
+        # The failure mode this controller has already had once: a gate
+        # that never fires looks exactly like a quiet campaign. Never
+        # again silently.
+        print("chaos: NO FAULTS WERE APPLIED - the campaign proved nothing. "
+              "Check that the job is running and that the coordinator URL is "
+              "reachable from the ops host.", flush=True)
+        return 1
     return 0
 
 

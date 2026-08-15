@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "clink/connectors/postgres_sql.hpp"
+#include "clink/connectors/postgres_tls.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
@@ -96,6 +97,9 @@ public:
             PQfinish(c);
             throw std::runtime_error(opts_.name + ": connect failed: " + err);
         }
+        // Transport assertion: never continue on a silently-downgraded
+        // connection (see postgres_tls.hpp).
+        clink::connectors::pg::assert_no_silent_downgrade(c, opts_.conninfo, "postgres_json_sink");
         conn_.reset(c);
     }
 

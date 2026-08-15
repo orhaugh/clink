@@ -111,6 +111,10 @@ SubmitFn make_http_submit(std::string coordinator_host,
             add_param("restore_from_checkpoint_id",
                       std::to_string(checkpoint.restore_from_checkpoint_id));
         }
+        if (checkpoint.max_restarts_on_worker_loss > 0) {
+            add_param("max_restarts_on_worker_loss",
+                      std::to_string(checkpoint.max_restarts_on_worker_loss));
+        }
         add_param("alignment", checkpoint.alignment);
         auto resp = client.post(path, spec.to_json());
         if (resp.status == 0) {

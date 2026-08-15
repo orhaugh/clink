@@ -392,6 +392,7 @@ void write_job_summary(clink::http::JsonWriter& w, const clink::cluster::JobSumm
     w.kv("completion_signalled", j.completion_signalled);
     w.kv("cancel_requested", j.cancel_requested);
     w.kv("error_count", j.error_count);
+    w.kv("status", j.status);
     w.end_object();
 }
 
@@ -440,6 +441,7 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
     w.kv("max_restarts_on_worker_loss", static_cast<std::int64_t>(j.max_restarts_on_worker_loss));
     w.kv("unaligned_checkpoints", j.unaligned_checkpoints);
     w.kv("adaptive_barrier_mode", j.adaptive_barrier_mode);
+    w.kv("status", j.status);
     w.key("pending_checkpoint_ids").begin_array();
     for (auto id : j.pending_checkpoint_ids) {
         w.uint_value(id);

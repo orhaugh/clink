@@ -82,6 +82,30 @@ Additional options exist on the `PostgresCdcSource::Options` struct but are not 
 
 Note: `columns` is required at the `PostgresJsonSink` level; on the SQL Row path it is filled from the table DDL via `schema_columns`, so it need not be repeated in the WITH clause.
 
+## Transport security
+
+Every factory takes a raw libpq `conninfo`, so TLS is configured the way
+libpq documents it: `sslmode=require` to demand encryption,
+`sslmode=verify-full` with `sslrootcert=/path/ca.pem` to demand it and
+verify the server, `sslmode=disable` to state plaintext deliberately.
+
+What clink adds is the assertion. libpq's default is `sslmode=prefer`,
+which tries TLS and **silently falls back to an unencrypted connection**
+when the server offers none - so a conninfo that names a certificate, or
+an operator who assumed a managed database meant an encrypted link, got
+plaintext with nothing said. On every connection clink now reads the
+transport that was actually established (`PQsslInUse`) and:
+
+- refuses, rather than continuing, if `sslmode=require` / `verify-ca` /
+  `verify-full` was asked for and the link is not encrypted;
+- logs a warning naming `sslmode` when no mode was stated and the link
+  came up unencrypted - the silent-downgrade case, now stated;
+- records at info that the link is encrypted when it is, so the transport
+  is provable from the log rather than assumed.
+
+Plaintext to a database on a trusted private network remains a supported
+deployment. Only the silence is removed.
+
 ## SQL usage
 
 The connector is mapped in `src/sql/physical_plan.cpp` under `connector='postgres'`. A `mode='cdc'` table property selects the CDC source (`postgres_cdc_source`); otherwise the SELECT source (`postgres_source`) is used. The sink maps to `postgres_sink`.

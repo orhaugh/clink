@@ -52,6 +52,16 @@ result is ever promoted beyond the scope actually tested:
   test in clink's CI, fixed, and the campaign that found it is rerun. The
   defect log on each campaign page links the fixes.
 
+## Feasibility first
+
+Every campaign was audited against the code before any infrastructure was
+provisioned, to establish whether running it would produce evidence at all.
+That audit found three campaign-fatal blockers, two live security defects and
+a resource leak - none of which needed a cloud rig to find - and established
+that several campaigns could not be run as written. See
+[Campaign feasibility assessment](feasibility.md). The negative results there
+are part of the qualification record, not a preamble to it.
+
 ## Campaigns
 
 Results are published here as campaigns complete, each on its own page with
@@ -61,25 +71,26 @@ verdict, defects found and regression tests created.
 
 | Campaign | Subject | Status |
 |----------|---------|--------|
-| QUAL-01 | Kafka exactly-once under a multi-day fault campaign | planned |
-| QUAL-02 | PostgreSQL two-phase-commit sink under targeted crash windows | planned |
-| QUAL-03 | Object-store checkpointing and transactional sinks under storage faults | planned |
-| QUAL-04 | Large state (100 GB and beyond, progressive) across state backends | planned |
-| QUAL-05 | State TTL steady-state under sustained high key cardinality | planned |
-| QUAL-06 | Large DAG / high-parallelism scaling limits | planned |
-| QUAL-07 | Cross-engine semantic comparison on deterministic workloads | planned |
-| QUAL-08 | Rolling upgrade with live state | planned |
-| QUAL-09 | Infrastructure failure matrix (reusable chaos controller) | planned |
-| QUAL-10 | Long-running leak and resource trend campaign | planned |
-| QUAL-11 | Schema evolution over long-running jobs | planned |
-| QUAL-12 | Security configuration failure behaviour (no silent downgrade) | planned |
+| QUAL-01 | Kafka exactly-once under a multi-day fault campaign | feasible, not yet run |
+| QUAL-02 | PostgreSQL two-phase-commit sink under targeted crash windows | feasible, not yet run |
+| QUAL-09 | Infrastructure failure matrix (reusable chaos controller) | feasible, not yet run |
+| QUAL-03 | Object-store checkpointing and transactional sinks under storage faults | rescoped; see feasibility |
+| QUAL-04 | Large state (100 GB and beyond, progressive) across state backends | blocked; see feasibility |
+| QUAL-05 | State TTL steady-state under sustained high key cardinality | blocked; see feasibility |
+| QUAL-06 | Large DAG / high-parallelism scaling limits | blocked; see feasibility |
+| QUAL-07 | Cross-engine semantic comparison on deterministic workloads | not yet assessed |
+| QUAL-08 | Rolling upgrade with live state | rescoped; see feasibility |
+| QUAL-10 | Long-running leak and resource trend campaign | blocked; see feasibility |
+| QUAL-11 | Schema evolution over long-running jobs | rescoped; see feasibility |
+| QUAL-12 | Security configuration failure behaviour (no silent downgrade) | two defects already found and fixed |
 
-No campaign has completed yet: the programme is in its code-hardening phase,
-which closes the residual findings of the adversarial external audit of
-15 August 2026 before infrastructure spend begins. This page and the campaign
-pages update as evidence lands; until a campaign's page exists, its subject
-sits in the *unknown* or *architecturally supported but not qualified*
-category, and this table is the honest statement of that.
+No campaign has completed yet, and the table above says which ones could even
+produce evidence today. The programme is in its code-hardening phase, closing
+the residual findings of the adversarial external audit of 15 August 2026 and
+the blockers the feasibility assessment found, before infrastructure spend
+begins. Until a campaign's page exists, its subject sits in the *unknown* or
+*architecturally supported but not qualified* category, and this table is the
+honest statement of that.
 
 The full production-qualification report, aggregating every campaign into a
 single assessment against an immutable release candidate, will be published

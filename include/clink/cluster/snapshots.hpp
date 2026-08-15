@@ -47,6 +47,15 @@ struct JobSummary {
     bool completion_signalled{false};
     bool cancel_requested{false};
     std::size_t error_count{0};
+    // RUNNING / COMPLETED_OK / FAILED / CANCELLED, on exactly the
+    // precedence signal_job_completion_locked_ uses for its log line and
+    // ListJobs uses on the binary control plane. Until this existed the
+    // HTTP API exposed no job status at all: a caller had to reconstruct
+    // it from completion_signalled + cancel_requested + errors, and the
+    // qualification chaos controller's liveness gate - written against
+    // the obvious field name - silently never fired, so it applied zero
+    // faults for a whole campaign.
+    std::string status;
 };
 
 struct JobTaskRecord {
@@ -106,6 +115,8 @@ struct JobDetail {
     // CheckpointAlignment::Adaptive: the coordinator stamps the mode per
     // trigger from measured pressure instead of a static flag.
     bool adaptive_barrier_mode{false};
+    // Same value and precedence as JobSummary::status.
+    std::string status;
 };
 
 // --- Job DAG (GET /api/v1/jobs/:id/graph) ----------------------------------

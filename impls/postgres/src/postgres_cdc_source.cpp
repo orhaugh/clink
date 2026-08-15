@@ -16,6 +16,7 @@
 
 #include "clink/connectors/pg_cdc_test_seam.hpp"
 #include "clink/connectors/postgres_decoder.hpp"
+#include "clink/connectors/postgres_tls.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 
 #ifdef CLINK_HAS_POSTGRES
@@ -583,6 +584,8 @@ void PostgresCdcSource::open() {
         impl_->conn = nullptr;
         throw std::runtime_error("PostgresCdcSource::open: connect failed: " + err);
     }
+    clink::connectors::pg::assert_no_silent_downgrade(
+        impl_->conn, conninfo_repl, "postgres_cdc_source");
 
     bool slot_was_created = false;
     if (impl_->opts.create_slot) {

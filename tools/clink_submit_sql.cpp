@@ -43,6 +43,7 @@ struct Args {
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id = 0;
     std::string alignment;
+    std::uint32_t max_restarts = 0;
     bool explain = false;
     std::uint32_t parallelism = 1;  // uniform op parallelism (>1 fans the plan out)
 };
@@ -78,6 +79,10 @@ void print_usage() {
            "--checkpoint-dir).\n"
         << "  --restore-from-dir <dir>      Restore this job from a checkpoint/savepoint dir.\n"
         << "  --restore-from-checkpoint-id <n>  Which checkpoint id in that dir to restore.\n"
+        << "  --max-restarts-on-worker-loss <n>  Worker-loss restart budget. The default\n"
+        << "                      resolves to a LIFETIME cap of 10 when checkpointing is on;\n"
+        << "                      the count is never reset, so a job under repeated faults\n"
+        << "                      stops once it is spent.\n"
         << "  --alignment <mode>  aligned | unaligned | adaptive (default aligned). Adaptive\n"
         << "                      lets the coordinator pick per checkpoint from measured\n"
         << "                      backpressure.\n"
@@ -158,6 +163,12 @@ Args parse_args(int argc, char** argv) {
                 std::exit(2);
             }
             a.restore_from_checkpoint_id = std::stoull(argv[i]);
+        } else if (arg == "--max-restarts-on-worker-loss") {
+            if (++i >= argc) {
+                std::cerr << "error: --max-restarts-on-worker-loss requires a number\n";
+                std::exit(2);
+            }
+            a.max_restarts = static_cast<std::uint32_t>(std::stoul(argv[i]));
         } else if (arg == "--alignment") {
             if (++i >= argc) {
                 std::cerr << "error: --alignment requires aligned|unaligned|adaptive\n";
@@ -254,6 +265,7 @@ int main(int argc, char** argv) {
                                 .restore_from_dir = args.restore_from_dir,
                                 .restore_from_checkpoint_id = args.restore_from_checkpoint_id,
                                 .alignment = args.alignment,
+                                .max_restarts_on_worker_loss = args.max_restarts,
                             },
                             std::cout,
                             std::cerr)

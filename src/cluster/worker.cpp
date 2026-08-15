@@ -1347,18 +1347,31 @@ void Worker::handle_deploy_(MessageReader& r) {
         const bool adaptive = msg.adaptive_barrier_mode;
         const std::string expected_versions = msg.expected_state_versions_packed;
         const std::string udfs = msg.udfs_packed;
-        task_threads_.emplace_back([this,
-                                    jid,
-                                    task = std::move(task),
-                                    ckpt_dir,
-                                    restore_dir,
-                                    restore_id,
-                                    generation,
-                                    restore_generation,
-                                    unaligned,
-                                    adaptive,
-                                    expected_versions,
-                                    udfs] {
+        // Reap before spawning: the vector is the only thing holding
+        // finished subtasks' thread handles, and an unjoined exited
+        // pthread keeps its stack mapping.
+        reap_finished_task_threads_locked_();
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        std::thread t([this,
+                       jid,
+                       task = std::move(task),
+                       ckpt_dir,
+                       restore_dir,
+                       restore_id,
+                       generation,
+                       restore_generation,
+                       unaligned,
+                       adaptive,
+                       expected_versions,
+                       udfs,
+                       done] {
+            // Set on EVERY exit path, including an exception escaping
+            // run_task_: a thread that died is exactly the one whose
+            // handle must be reclaimed.
+            struct MarkDone {
+                std::shared_ptr<std::atomic<bool>> flag;
+                ~MarkDone() { flag->store(true, std::memory_order_release); }
+            } mark{done};
             run_task_(jid,
                       task,
                       ckpt_dir,
@@ -1371,6 +1384,7 @@ void Worker::handle_deploy_(MessageReader& r) {
                       expected_versions,
                       udfs);
         });
+        task_threads_.push_back(TaskThread{std::move(t), std::move(done)});
     }
 }
 
@@ -2750,12 +2764,31 @@ void Worker::stop() {
     // interrupt an arbitrary callback. That path is the in-process test
     // API, not how clink_node runs work.
     for (auto& t : task_threads_) {
-        if (t.joinable()) {
-            t.join();
+        if (t.thread.joinable()) {
+            t.thread.join();
         }
     }
     task_threads_.clear();
     conn_.reset();
+}
+
+std::size_t Worker::retained_task_thread_count() const {
+    std::lock_guard lock(mu_);
+    return task_threads_.size();
+}
+
+void Worker::reap_finished_task_threads_locked_() {
+    auto it = task_threads_.begin();
+    while (it != task_threads_.end()) {
+        if (it->done->load(std::memory_order_acquire)) {
+            if (it->thread.joinable()) {
+                it->thread.join();  // already exited: returns immediately
+            }
+            it = task_threads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 std::optional<Worker::JobStateExport> Worker::export_job_state_arrow(JobId job_id) const {

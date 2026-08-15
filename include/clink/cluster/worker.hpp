@@ -141,6 +141,15 @@ public:
         const std::string& host, std::uint16_t port)>;
     void set_connect_factory(ConnectFactory f) { connect_factory_ = std::move(f); }
 
+    // Task-thread handles this worker is still holding. Finished
+    // subtasks are joined and erased on the next deploy, so under job
+    // churn this stays bounded by concurrent subtasks rather than
+    // growing with the worker's lifetime total. Exposed because the leak
+    // it guards is INVISIBLE to a live-thread count: an exited but
+    // unjoined pthread is reaped by the kernel while its 8MB stack
+    // mapping survives, so only the handle count shows it.
+    [[nodiscard]] std::size_t retained_task_thread_count() const;
+
     // ----- Snapshot API for the HTTP read endpoints -----
     //
     // Same shape as the coordinator side: take mu_ briefly, copy state into a
@@ -246,7 +255,28 @@ private:
     ConnectFactory connect_factory_;
     std::thread reader_;
     std::thread heartbeat_;
-    std::vector<std::thread> task_threads_;
+    // One entry per deployed subtask. `done` is set by the task thread
+    // itself as it returns, so finished entries can be joined and erased
+    // on the next deploy (reap_finished_task_threads_locked_).
+    //
+    // Without that reaping this vector only ever grew: every completed
+    // subtask left an exited-but-unjoined std::thread behind for the
+    // worker's whole lifetime, and on glibc an unjoined exited pthread
+    // keeps its 8MB stack mapping until join. The symptom is virtual
+    // memory climbing ~8MB per completed subtask while the live thread
+    // count stays flat - which is exactly why a live-thread assertion
+    // cannot see it, and why a long-running worker under job churn
+    // (restarts, rescales, short jobs) drifts upward for days.
+    struct TaskThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::vector<TaskThread> task_threads_;
+    // Join + erase every task thread that has signalled completion.
+    // Called with mu_ held. Joining an already-exited thread returns
+    // immediately, and only self-reported-done entries are touched, so
+    // this never blocks on running work.
+    void reap_finished_task_threads_locked_();
     std::unordered_map<std::string, RoleHandler> roles_;
     bool deployed_{false};
 

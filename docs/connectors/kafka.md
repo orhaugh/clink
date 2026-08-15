@@ -137,6 +137,18 @@ All the factories above (sources, sinks, the transactional and upsert sinks) acc
 | `ssl_endpoint_identification_algorithm` | `ssl.endpoint.identification.algorithm` | `https` to verify the broker hostname, `none` to disable. |
 | `enable_ssl_certificate_verification` | `enable.ssl.certificate.verification` | `false` to skip broker-cert verification (testing only). |
 
+A security configuration that would be silently weaker than it looks is
+refused at build time, before a byte reaches a broker. librdkafka accepts
+`sasl_username` / `sasl_password` with no `security_protocol` without
+comment - the default is plaintext, so the credentials are configured,
+never presented, and the connection is unauthenticated and unencrypted -
+and it likewise accepts a named CA or client certificate that a plaintext
+transport will never use. Both now throw, naming the option that fixes
+them. Deliberate plaintext stays available; it just has to be named
+(`security_protocol='plaintext'`). The check runs on the final property
+map, so the `kafka.<property>` passthrough below cannot weaken a
+transport under configured credentials either.
+
 For any librdkafka property the aliases do not cover, an escape hatch passes it through verbatim: a WITH-option (or programmatic `Options.conf` entry) keyed `kafka.<property>` sets librdkafka `<property>` directly, e.g. `kafka.client.rack`. librdkafka validates each key/value when the client opens and throws on an unknown or unsupported one (for example an SSL setting on a build without SSL support). Credentials are passed through but never logged by the connector.
 
 ## SQL usage

@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "clink/connectors/postgres_tls.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 
 #ifdef CLINK_HAS_POSTGRES
@@ -54,6 +55,8 @@ void PostgresSource::open() {
         impl_->conn = nullptr;
         throw std::runtime_error("PostgresSource::open failed: " + err);
     }
+    clink::connectors::pg::assert_no_silent_downgrade(
+        impl_->conn, impl_->opts.conninfo, "postgres_source");
 
     impl_->result = PQexec(impl_->conn, impl_->opts.query.c_str());
     if (PQresultStatus(impl_->result) != PGRES_TUPLES_OK) {

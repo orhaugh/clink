@@ -1433,6 +1433,23 @@ std::vector<WorkerSummary> Coordinator::snapshot_workers() const {
     return out;
 }
 
+// The job's terminal status, on exactly the precedence
+// signal_job_completion_locked_ uses for its log line and ListJobs uses
+// on the binary control plane - one function, so the HTTP API and the
+// control plane cannot disagree about how a job ended.
+std::string job_status_string(bool completion_signalled, bool cancel_requested, bool has_errors) {
+    if (!completion_signalled) {
+        return std::string{to_string(JobTerminalStatus::Running)};
+    }
+    if (cancel_requested) {
+        return std::string{to_string(JobTerminalStatus::Cancelled)};
+    }
+    if (has_errors) {
+        return std::string{to_string(JobTerminalStatus::Failed)};
+    }
+    return std::string{to_string(JobTerminalStatus::CompletedOk)};
+}
+
 std::vector<JobSummary> Coordinator::snapshot_jobs() const {
     std::vector<JobSummary> out;
     std::lock_guard lock(mu_);
@@ -1445,6 +1462,8 @@ std::vector<JobSummary> Coordinator::snapshot_jobs() const {
         s.completion_signalled = job->completion_signalled;
         s.cancel_requested = job->cancel_requested;
         s.error_count = job->errors.size();
+        s.status = job_status_string(
+            job->completion_signalled, job->cancel_requested, !job->errors.empty());
         out.push_back(std::move(s));
     }
     return out;
@@ -1489,6 +1508,8 @@ std::optional<JobDetail> Coordinator::snapshot_job(JobId job_id) const {
     d.max_restarts_on_worker_loss = job.checkpoint.max_restarts_on_worker_loss;
     d.unaligned_checkpoints = job.checkpoint.alignment == CheckpointAlignment::Unaligned;
     d.adaptive_barrier_mode = job.checkpoint.alignment == CheckpointAlignment::Adaptive;
+    d.status =
+        job_status_string(job.completion_signalled, job.cancel_requested, !job.errors.empty());
     return d;
 }
 

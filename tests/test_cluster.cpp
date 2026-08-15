@@ -1868,6 +1868,74 @@ clink::cluster::JobGraphSpec clink_cancel_test_graph() {
 // The first job doubles as the warm-up that spins any lazily-created
 // engine singletons (metrics, logging, data-plane helpers), so the
 // baseline reflects steady state and the assertion isolates job number two.
+// Finished subtasks must not accumulate thread HANDLES on the worker.
+//
+// The leak this pins is invisible to the live-thread assertion in the
+// test below it: an exited pthread is reaped by the kernel - so the
+// thread count returns to baseline - while its 8MB stack mapping is
+// held until someone joins the handle. A worker that only ever pushed
+// onto task_threads_ and joined at shutdown therefore drifted upward by
+// ~8MB of address space per completed subtask, flat thread count
+// throughout, for as long as the process lived. Under the job churn a
+// multi-day campaign generates that is a slow, silent climb.
+//
+// The assertion is on the retained handle count, because that is the
+// only place the defect is observable.
+TEST(Cluster, FinishedSubtaskThreadHandlesAreReapedNotAccumulated) {
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-reap"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-reap", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto run_one = [&]() -> bool {
+        const auto job_id =
+            coordinator.submit_job(clink_cancel_test_graph(), OperatorRegistry::default_instance());
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        bool running = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto d = coordinator.snapshot_job(job_id);
+            if (d.has_value() && d->completed_count == 0 && !d->tasks.empty()) {
+                running = true;
+                break;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+        if (!running) {
+            return false;
+        }
+        (void)coordinator.cancel_job(job_id);
+        return coordinator.await_job_completion(job_id, 5s);
+    };
+
+    ASSERT_TRUE(run_one()) << "warm-up job did not reach a terminal state";
+    // After the warm-up, one job's worth of handles may still be held -
+    // they are reaped on the NEXT deploy, not at completion.
+    const auto after_first = worker.retained_task_thread_count();
+
+    constexpr int kMoreJobs = 6;
+    for (int i = 0; i < kMoreJobs; ++i) {
+        ASSERT_TRUE(run_one()) << "job " << i << " did not reach a terminal state";
+    }
+
+    // The count must reflect concurrent subtasks, not the lifetime total.
+    // Pre-fix this grew by one graph's worth of subtasks per job, so the
+    // bound below fails on the accumulation rather than on any timing.
+    const auto after_many = worker.retained_task_thread_count();
+    EXPECT_LE(after_many, after_first * 2)
+        << "task-thread handles accumulate with job count: " << after_first << " after one job, "
+        << after_many << " after " << (kMoreJobs + 1)
+        << " - finished subtasks are not being reaped";
+
+    worker.stop();
+    coordinator.stop();
+}
+
 TEST(Cluster, ACancelledJobsThreadsAreJoinedNotLeaked) {
     Coordinator::Config cfg;
     cfg.max_restarts = 0;

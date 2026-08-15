@@ -43,6 +43,7 @@
 #include "clink/connectors/committing_sink.hpp"
 #include "clink/connectors/postgres_json_sink.hpp"  // PgconnDeleter
 #include "clink/connectors/postgres_sql.hpp"
+#include "clink/connectors/postgres_tls.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 
 namespace clink {
@@ -164,6 +165,10 @@ private:
             PQfinish(c);
             throw std::runtime_error(opts_.name + ": connect failed: " + err);
         }
+        // Transport assertion: never continue on a silently-downgraded
+        // connection (see postgres_tls.hpp).
+        clink::connectors::pg::assert_no_silent_downgrade(
+            c, opts_.conninfo, "postgres_json_sink_2pc");
         conn_.reset(c);
     }
 

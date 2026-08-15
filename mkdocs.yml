@@ -89,6 +89,7 @@ nav:
   - Benchmarks: benchmarks.md
   - Qualification:
       - qualification/README.md
+      - qualification/feasibility.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md
