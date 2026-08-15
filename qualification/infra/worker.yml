@@ -1,0 +1,30 @@
+# One clink worker of the qualification rig's three.
+#
+# restart: no, for the same reason as the coordinator: the chaos
+# controller kills workers to measure recovery, and an automatic restart
+# would hide the very interval being measured. The controller restarts
+# it explicitly and records that as an action.
+#
+# WORKER_IP is this node's private address - the address PEERS dial for
+# data. A container hostname is meaningless to a worker on another host,
+# and localhost would silently make every cross-node edge fail.
+services:
+  clink-worker:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}
+    container_name: clink-worker
+    network_mode: host
+    command:
+      - --role=worker
+      - --id=${WORKER_ID}
+      - --coordinator-host=${CONTROL_IP}
+      - --coordinator-port=6123
+      - --data-host=${WORKER_IP}
+      - --slots=${CLINK_SLOTS:-16}
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+      CLINK_FAULT_INJECT: ${CLINK_FAULT_INJECT:-}
+    volumes:
+      - /qual/state:/qual/state
+    restart: "no"

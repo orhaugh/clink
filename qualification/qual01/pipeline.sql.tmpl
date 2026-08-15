@@ -1,0 +1,24 @@
+-- QUAL-01 pipeline: Kafka -> event-time parse -> keyed tumbling-window
+-- aggregation -> transactional Kafka sink (exactly-once, 2PC).
+--
+-- __BROKERS__, __WM_LAG_MS__ and __TXN_ID__ are substituted by the
+-- campaign driver. The watermark lag must strictly exceed the
+-- generator's max_jitter_ms (asserted in campaign.sh): with per-partition
+-- watermarks and source parallelism equal to the partition count, no
+-- in-window record is falsely late and the expected output is exact.
+CREATE TABLE q1_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
+  WITH (connector='kafka', format='json', brokers='__BROKERS__',
+        topic='qual01-in', group_id='qual01',
+        auto_offset_reset='earliest',
+        event_time_column='ts', watermark_lag_ms='__WM_LAG_MS__');
+
+CREATE TABLE q1_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT)
+  WITH (connector='kafka', format='json', brokers='__BROKERS__',
+        topic='qual01-out',
+        delivery_guarantee='exactly_once',
+        transactional_id='__TXN_ID__');
+
+INSERT INTO q1_out
+SELECT k, window_start AS ws, COUNT(*) AS cnt, SUM(amount) AS total
+FROM q1_in
+GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;

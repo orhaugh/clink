@@ -62,6 +62,7 @@
 #include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/plugin_loader.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/cluster/submit_query_config.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/lineage/lineage_listener.hpp"
 #ifdef CLINK_HAS_HTTP
@@ -668,9 +669,12 @@ clink::http::HttpResponse handle_submit_job(clink::cluster::Coordinator& coordin
 // built-in operator factories already registered on every worker.
 //
 // Optional ?name=<job_name> picks the display name (defaults to
-// "sql_job"). Optional ?state_backend=<uri> picks the per-job state
-// backend (else the cluster default). Returns 200 with
-// {ok:true,job_id,name} on success, 400 on bad JSON, 500 on submit failure.
+// "sql_job"). Durability rides as query parameters - ?state_backend,
+// ?checkpoint_dir, ?checkpoint_interval_ms, ?restore_from_dir,
+// ?restore_from_checkpoint_id, ?max_restarts_on_worker_loss, ?alignment
+// - see checkpoint_config_from_query. Returns 200 with
+// {ok:true,job_id,name} on success, 400 on bad JSON or a bad parameter,
+// 500 on submit failure.
 clink::http::HttpResponse handle_submit_spec(clink::cluster::Coordinator& coordinator,
                                              const clink::http::HttpRequest& req) {
     clink::http::HttpResponse resp;
@@ -699,14 +703,10 @@ clink::http::HttpResponse handle_submit_spec(clink::cluster::Coordinator& coordi
     }
     const std::string& job_name = graph.name;
 
-    // Optional ?state_backend=<uri> picks the per-job state backend (e.g. a
-    // disaggregated remote-read:// tier that activates the async KeyedState
-    // path). Left empty, submit_job applies the cluster default. cpp-httplib
-    // has already percent-decoded the value, so a URI carrying its own query
-    // (remote-read://...?hot_max_bytes=N) round-trips intact.
-    clink::cluster::CheckpointConfig ckpt;
-    if (auto it = req.query.find("state_backend"); it != req.query.end() && !it->second.empty()) {
-        ckpt.state_backend_uri = it->second;
+    std::string ckpt_error;
+    const auto ckpt = clink::cluster::checkpoint_config_from_query(req.query, &ckpt_error);
+    if (!ckpt_error.empty()) {
+        return fail(400, ckpt_error);
     }
 
     std::uint64_t job_id = 0;
@@ -875,6 +875,14 @@ clink::http::HttpResponse handle_sql(clink::cluster::Coordinator& coordinator,
     if (auto it = req.query.find("name"); it != req.query.end() && !it->second.empty()) {
         base_name = it->second;
     }
+    // Durability, on the same terms as /jobs/spec: without it a SQL job
+    // submitted here could never checkpoint, so its exactly-once sinks
+    // could never commit and a worker loss could never be recovered.
+    std::string ckpt_error;
+    const auto submit_ckpt = clink::cluster::checkpoint_config_from_query(req.query, &ckpt_error);
+    if (!ckpt_error.empty()) {
+        return fail(400, ckpt_error);
+    }
 
     auto apply_parallelism = [&](clink::cluster::JobGraphSpec& spec) {
         clink::cluster::apply_job_parallelism(spec, parallelism);
@@ -922,7 +930,7 @@ clink::http::HttpResponse handle_sql(clink::cluster::Coordinator& coordinator,
                 coordinator.submit_job(spec,
                                        clink::cluster::OperatorRegistry::default_instance(),
                                        /*plugins=*/{},
-                                       clink::cluster::CheckpointConfig{},
+                                       submit_ckpt,
                                        /*bundle=*/nullptr,
                                        /*notify_client_conn=*/nullptr);
             jobs.push_back({nm, job_id});

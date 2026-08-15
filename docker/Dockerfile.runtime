@@ -53,6 +53,16 @@ ARG CLINK_WITH_JEMALLOC=OFF
 # chosen level, which is why it is empty by default for a published image.
 #   docker build --build-arg CLINK_ISA_BASELINE=x86-64-v3 ...
 ARG CLINK_ISA_BASELINE=
+# Runtime fault-injection points. OFF for a shipped image: no fault
+# surface at all. ON builds a QUALIFICATION image, where the chaos
+# controller can crash a process inside a named 2PC window
+# (CLINK_FAULT_INJECT) - windows an external kill cannot hit reliably.
+# It must be an explicit opt-in rather than following CLINK_BUILD_TESTS,
+# because arming CLINK_FAULT_INJECT against a build without the surface
+# is a SILENT no-op: the campaign would report faults it never injected.
+# `clink --capabilities` reports the resulting state, and the
+# qualification campaign asserts it before using the profile.
+ARG CLINK_ENABLE_FAULT_INJECTION=OFF
 # CLINK_BUILD_SQL=ON so clink_node registers the SQL operator factories
 # (json_string_to_row, window_row, equi_join_row, ...) - required to run SQL
 # jobs (e.g. the Nexmark queries) against a containerized cluster; without it the
@@ -65,6 +75,7 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
     fi \
  && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
         -DCLINK_BUILD_TESTS=OFF \
+        -DCLINK_ENABLE_FAULT_INJECTION=${CLINK_ENABLE_FAULT_INJECTION} \
         -DCLINK_WITH_FORST=${CLINK_WITH_FORST} \
         -DCLINK_WITH_JEMALLOC=${CLINK_WITH_JEMALLOC} \
         -DCLINK_ISA_BASELINE=${CLINK_ISA_BASELINE} \

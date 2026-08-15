@@ -99,6 +99,23 @@ inline constexpr const char* kMalformedFrames = "clink_malformed_frames_total";
 inline constexpr const char* kClientConnectionsRefused = "clink_client_connections_refused_total";
 inline constexpr const char* kWorkerConnectionsRefused =
     "clink_coordinator_worker_connections_refused_total";
+// In-doubt transaction resolution at recovery: the two OUTCOMES a
+// restore can have when a checkpoint completed but its external commit
+// may not have executed.
+//
+// Resolved means every staged handle of that checkpoint was PROVEN
+// committed by its connector's resolver, so the restore point advances
+// and the run stays exactly-once. Unresolved means the walk stopped -
+// no resolver, a refusal, an unreachable broker - and the job falls
+// back to the commit-confirmed contract, which trades a bounded replay
+// (duplicates for one interval) for never losing data.
+//
+// These are counted separately because the difference is the difference
+// between two DIFFERENT guarantees, and an operator - or a
+// qualification campaign judging duplicate output - cannot tell them
+// apart from logs alone.
+inline constexpr const char* kInDoubtResolved = "clink_recovery_in_doubt_resolved_total";
+inline constexpr const char* kInDoubtUnresolved = "clink_recovery_in_doubt_unresolved_total";
 
 namespace orch {
 
@@ -122,6 +139,12 @@ inline void autoscaler_tick() {
 }
 inline void autoscaler_decision(const char* outcome) {
     MetricsRegistry::global().counter(autoscaler_decision_name(outcome)).increment();
+}
+inline void in_doubt_resolved() {
+    MetricsRegistry::global().counter(kInDoubtResolved).increment();
+}
+inline void in_doubt_unresolved() {
+    MetricsRegistry::global().counter(kInDoubtUnresolved).increment();
 }
 inline void ha_leader_takeover() {
     MetricsRegistry::global().counter(kHaLeaderTakeovers).increment();

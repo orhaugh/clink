@@ -67,12 +67,29 @@ int run_script(const std::string& sql,
                const ScriptIO& io,
                const SubmitFn& submit);
 
+// Per-job durability settings a cluster submission carries. Before this
+// existed, a SQL job submitted to a cluster could set only the state
+// backend, so it could not enable periodic checkpointing at all - which
+// silently made exactly-once sinks and worker-loss recovery unreachable
+// for every SQL cluster job, while the identical compiled-job path had
+// them. An empty / zero field is omitted from the request and leaves the
+// cluster default in place.
+struct SubmitCheckpointOptions {
+    std::string state_backend_uri;
+    std::string checkpoint_dir;
+    std::int64_t checkpoint_interval_ms{0};
+    std::string restore_from_dir;
+    std::uint64_t restore_from_checkpoint_id{0};
+    // "", "aligned", "unaligned" or "adaptive". Empty leaves the default.
+    std::string alignment;
+};
+
 // SubmitFn that POSTs the spec JSON to a Coordinator's HTTP submit
 // endpoint (/api/v1/jobs/spec), forwarding the coordinator's response body to
-// `out`. `state_backend_uri` (optional) rides as a query param.
+// `out`. The checkpoint options ride as query params.
 SubmitFn make_http_submit(std::string coordinator_host,
                           std::uint16_t coordinator_port,
-                          std::string state_backend_uri,
+                          SubmitCheckpointOptions checkpoint,
                           std::ostream& out,
                           std::ostream& err);
 

@@ -232,11 +232,20 @@ int clink_cmd_run_sql(int argc, char** argv) {
         opts.job_name = args.job_name;
         clink::sql::ScriptIO io{&std::cout, &std::cerr};
         auto submit = !args.coordinator_host.empty()
-                          ? clink::sql::make_http_submit(args.coordinator_host,
-                                                         args.coordinator_port,
-                                                         args.state_backend,
-                                                         std::cout,
-                                                         std::cerr)
+                          ? clink::sql::make_http_submit(
+                                args.coordinator_host,
+                                args.coordinator_port,
+                                // The same durability the embedded path
+                                // below applies: a job handed to a cluster
+                                // must not silently lose the checkpointing
+                                // its flags asked for.
+                                clink::sql::SubmitCheckpointOptions{
+                                    .state_backend_uri = args.state_backend,
+                                    .checkpoint_dir = args.checkpoint_dir,
+                                    .checkpoint_interval_ms = args.checkpoint_interval_ms,
+                                },
+                                std::cout,
+                                std::cerr)
                           : clink::sql::make_print_submit(std::cout);
         return clink::sql::run_script(sql, catalog, opts, io, submit);
     }

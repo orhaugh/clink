@@ -1,0 +1,43 @@
+# One Redpanda broker of the qualification cluster's three.
+#
+# Redpanda rather than Kafka+Zookeeper: same Kafka API (including
+# transactions, which QUAL-01 exists to exercise), one process per node
+# instead of three, and a container that survives SIGKILL-and-restart
+# cleanly - which the chaos controller does to it repeatedly.
+#
+# Host networking, and PRIVATE addresses advertised. A Kafka client
+# follows the advertised address after bootstrap, so advertising a
+# container name or localhost would send clink's workers back to their
+# own loopback with no obvious clue why. Replication factor 3 across
+# these three brokers is what makes a broker restart survivable, so the
+# campaign is measuring clink's behaviour rather than a single broker's
+# absence.
+#
+# NODE_ID, PRIVATE_IP and SEEDS are set per host by the campaign driver.
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: redpanda
+    network_mode: host
+    command:
+      - redpanda
+      - start
+      - --node-id=${NODE_ID}
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://${PRIVATE_IP}:9092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=${PRIVATE_IP}:33145
+      - --seeds=${SEEDS}
+      - --smp=2
+      - --memory=2G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --default-log-level=info
+    volumes:
+      - /qual/redpanda:/var/lib/redpanda/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30

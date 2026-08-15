@@ -7,6 +7,7 @@
 
 #include "clink/config/json.hpp"
 #include "clink/connectors/txn_resume_registry.hpp"
+#include "clink/metrics/orchestration_metrics.hpp"
 #include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/state/durable_file_write.hpp"
@@ -146,6 +147,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                              "in-doubt resolution: COMPLETED-" + std::to_string(id) +
                                  " carries no participant set; stopping at confirmed=" +
                                  std::to_string(confirmed));
+            clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
         }
         const auto handles = read_resume_handles(checkpoint_dir, *info, id);
@@ -159,6 +161,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                      " staged no resume handles; stopping at confirmed=" +
                                      std::to_string(confirmed));
             }
+            clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
         }
         bool all_committed = true;
@@ -194,6 +197,11 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
             }
         }
         if (!all_committed) {
+            // The job now falls back to the commit-confirmed contract: a
+            // bounded replay rather than data loss. Counted, because that
+            // is a DIFFERENT guarantee from the resolved path and nothing
+            // else distinguishes them at the metrics layer.
+            clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
         }
         // Every handle of this checkpoint provably committed: publish the
@@ -212,6 +220,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                   "); stopping so the restore point never outruns its record");
             return confirmed;
         }
+        clink::metrics::orch::in_doubt_resolved();
         clink::log::info("coordinator.recovery",
                          "job_id=" + std::to_string(job_id) + " checkpoint " + std::to_string(id) +
                              " commit-CONFIRMED by in-doubt resolution");

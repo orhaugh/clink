@@ -76,12 +76,12 @@ bool plan_is_row_channel(const LogicalPlan& node) {
 
 SubmitFn make_http_submit(std::string coordinator_host,
                           std::uint16_t coordinator_port,
-                          std::string state_backend_uri,
+                          SubmitCheckpointOptions checkpoint,
                           std::ostream& out,
                           std::ostream& err) {
     return [coordinator_host = std::move(coordinator_host),
             coordinator_port,
-            state_backend_uri = std::move(state_backend_uri),
+            checkpoint = std::move(checkpoint),
             &out,
             &err](const cluster::JobGraphSpec& spec, const std::string& name) -> int {
         clink::http::HttpClient client(coordinator_host, coordinator_port);
@@ -101,7 +101,17 @@ SubmitFn make_http_submit(std::string coordinator_host,
             sep = '&';
         };
         add_param("name", name);
-        add_param("state_backend", state_backend_uri);
+        add_param("state_backend", checkpoint.state_backend_uri);
+        add_param("checkpoint_dir", checkpoint.checkpoint_dir);
+        if (checkpoint.checkpoint_interval_ms > 0) {
+            add_param("checkpoint_interval_ms", std::to_string(checkpoint.checkpoint_interval_ms));
+        }
+        add_param("restore_from_dir", checkpoint.restore_from_dir);
+        if (checkpoint.restore_from_checkpoint_id > 0) {
+            add_param("restore_from_checkpoint_id",
+                      std::to_string(checkpoint.restore_from_checkpoint_id));
+        }
+        add_param("alignment", checkpoint.alignment);
         auto resp = client.post(path, spec.to_json());
         if (resp.status == 0) {
             err << "error: HTTP transport failure: " << resp.error << "\n";

@@ -34,6 +34,15 @@ struct Args {
     std::uint16_t coordinator_port = 0;
     std::string job_name;
     std::string state_backend;  // per-job state backend URI (empty = cluster default)
+    // Per-job durability. Without these a SQL job submitted to a cluster
+    // could not checkpoint at all, so its exactly-once sinks could never
+    // commit and a worker loss could never be recovered - the compiled-job
+    // path had them all along.
+    std::string checkpoint_dir;
+    std::int64_t checkpoint_interval_ms = 0;
+    std::string restore_from_dir;
+    std::uint64_t restore_from_checkpoint_id = 0;
+    std::string alignment;
     bool explain = false;
     std::uint32_t parallelism = 1;  // uniform op parallelism (>1 fans the plan out)
 };
@@ -61,6 +70,17 @@ void print_usage() {
         << "  --state-backend <uri>  Per-job state backend URI, overriding the cluster default.\n"
         << "                      A disaggregated tier (e.g. remote-read://...) activates the\n"
         << "                      async KeyedState path. Only used with --coordinator-host.\n"
+        << "  --checkpoint-dir <dir>  Enable periodic checkpointing into this directory.\n"
+        << "                      REQUIRED for exactly-once sinks and worker-loss recovery:\n"
+        << "                      without it the job runs but never checkpoints, so a 2PC\n"
+        << "                      sink never commits and a lost worker cannot be restored.\n"
+        << "  --checkpoint-interval-ms <n>  Periodic checkpoint cadence (needs "
+           "--checkpoint-dir).\n"
+        << "  --restore-from-dir <dir>      Restore this job from a checkpoint/savepoint dir.\n"
+        << "  --restore-from-checkpoint-id <n>  Which checkpoint id in that dir to restore.\n"
+        << "  --alignment <mode>  aligned | unaligned | adaptive (default aligned). Adaptive\n"
+        << "                      lets the coordinator pick per checkpoint from measured\n"
+        << "                      backpressure.\n"
         << "  --parallelism <n>   Uniform op parallelism (default 1). >1 fans every op out to\n"
         << "  -p <n>              n subtasks; keyed ops hash-partition by key, sources split\n"
         << "                      partitions across subtasks (Kafka needs >= n partitions).\n"
@@ -114,6 +134,41 @@ Args parse_args(int argc, char** argv) {
                 std::exit(2);
             }
             a.state_backend = argv[i];
+        } else if (arg == "--checkpoint-dir") {
+            if (++i >= argc) {
+                std::cerr << "error: --checkpoint-dir requires a path\n";
+                std::exit(2);
+            }
+            a.checkpoint_dir = argv[i];
+        } else if (arg == "--checkpoint-interval-ms") {
+            if (++i >= argc) {
+                std::cerr << "error: --checkpoint-interval-ms requires a number\n";
+                std::exit(2);
+            }
+            a.checkpoint_interval_ms = std::stoll(argv[i]);
+        } else if (arg == "--restore-from-dir") {
+            if (++i >= argc) {
+                std::cerr << "error: --restore-from-dir requires a path\n";
+                std::exit(2);
+            }
+            a.restore_from_dir = argv[i];
+        } else if (arg == "--restore-from-checkpoint-id") {
+            if (++i >= argc) {
+                std::cerr << "error: --restore-from-checkpoint-id requires a number\n";
+                std::exit(2);
+            }
+            a.restore_from_checkpoint_id = std::stoull(argv[i]);
+        } else if (arg == "--alignment") {
+            if (++i >= argc) {
+                std::cerr << "error: --alignment requires aligned|unaligned|adaptive\n";
+                std::exit(2);
+            }
+            a.alignment = argv[i];
+            if (a.alignment != "aligned" && a.alignment != "unaligned" &&
+                a.alignment != "adaptive") {
+                std::cerr << "error: --alignment must be aligned, unaligned or adaptive\n";
+                std::exit(2);
+            }
         } else if (arg == "--parallelism" || arg == "-p") {
             if (++i >= argc) {
                 std::cerr << "error: --parallelism requires a number\n";
@@ -189,11 +244,19 @@ int main(int argc, char** argv) {
 
     clink::sql::ScriptIO io{&std::cout, &std::cerr};
     auto submit = (!args.coordinator_host.empty() && args.coordinator_port != 0)
-                      ? clink::sql::make_http_submit(args.coordinator_host,
-                                                     args.coordinator_port,
-                                                     args.state_backend,
-                                                     std::cout,
-                                                     std::cerr)
+                      ? clink::sql::make_http_submit(
+                            args.coordinator_host,
+                            args.coordinator_port,
+                            clink::sql::SubmitCheckpointOptions{
+                                .state_backend_uri = args.state_backend,
+                                .checkpoint_dir = args.checkpoint_dir,
+                                .checkpoint_interval_ms = args.checkpoint_interval_ms,
+                                .restore_from_dir = args.restore_from_dir,
+                                .restore_from_checkpoint_id = args.restore_from_checkpoint_id,
+                                .alignment = args.alignment,
+                            },
+                            std::cout,
+                            std::cerr)
                       : clink::sql::make_print_submit(std::cout);
     return clink::sql::run_script(sql, catalog, opts, io, submit);
 }

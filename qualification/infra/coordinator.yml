@@ -1,0 +1,33 @@
+# The qualification rig's clink coordinator.
+#
+# restart: no - deliberately. The chaos controller SIGKILLs this process
+# and measures what the cluster does next; a docker auto-restart would
+# resurrect it before the failure had any observable consequence and the
+# campaign would prove nothing about HA recovery. The controller brings
+# it back explicitly, and that restart is a recorded chaos action.
+#
+# CONTROL_IP is this node's private address, advertised to workers.
+services:
+  clink-coordinator:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}
+    container_name: clink-coordinator
+    network_mode: host
+    command:
+      - --role=coordinator
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=${CONTROL_IP}
+      - --http-port=8095
+      - --http-bind=0.0.0.0
+    environment:
+      # Armed per-restart by the chaos controller for targeted 2PC-window
+      # faults; empty in normal operation.
+      CLINK_FAULT_INJECT: ${CLINK_FAULT_INJECT:-}
+    volumes:
+      - /qual/state:/qual/state
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8095/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 40

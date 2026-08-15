@@ -111,9 +111,23 @@ else
 fi
 
 # Connector capability manifest from the binary just built - what THIS
-# build can genuinely do, not what the project supports somewhere.
-if [[ -x "$BUILD_DIR/tools/clink" ]]; then
-    "$BUILD_DIR/tools/clink" --capabilities-json >"$OUT_DIR/capabilities.json" 2>/dev/null || true
+# build can genuinely do, not what the project supports somewhere. The
+# manifest is part of the evidence a verdict is scoped to, so its absence
+# is reported rather than passed over: the first run wrote no manifest at
+# all because the CLI is at build/clink, and nothing said so.
+CAPABILITIES_OK=false
+if [[ "$BUILD_OK" -eq 1 ]]; then
+    for candidate in "$BUILD_DIR/clink" "$BUILD_DIR/tools/clink"; do
+        if [[ -x "$candidate" ]] && "$candidate" --capabilities-json \
+                >"$OUT_DIR/capabilities.json" 2>/dev/null; then
+            CAPABILITIES_OK=true
+            break
+        fi
+    done
+    if [[ "$CAPABILITIES_OK" != "true" ]]; then
+        rm -f "$OUT_DIR/capabilities.json"
+        echo "run.sh: WARNING - no capability manifest captured (clink CLI not found or failed)" >&2
+    fi
 fi
 
 FINISHED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -182,6 +196,7 @@ results = {
     "build_ok": "$BUILD_OK" == "1",
     "ctest_ok": "$CTEST_OK" == "true",
     "ctest_summary": """$CTEST_SUMMARY""",
+    "capability_manifest_captured": "$CAPABILITIES_OK" == "true",
 }
 json.dump(results, open(os.path.join(out_dir, "results.json"), "w"), indent=2)
 PYEOF
