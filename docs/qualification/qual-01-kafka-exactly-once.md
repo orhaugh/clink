@@ -18,7 +18,7 @@ test passed.
 | | |
 |---|---|
 | Run id | `qual01-20260816` |
-| clink revision | `8fa61d7` (image built from the commit under test, fault injection compiled in) |
+| clink revision | `440043f` (image built by `git archive` of that commit, fault injection compiled in) |
 | Infrastructure | Hetzner Cloud, 8 hosts: 1 coordinator, 3 workers, 3 Redpanda brokers, 1 ops host |
 | Pipeline | Kafka source (4 partitions) → event-time tumbling 10s window → `GROUP BY` key → transactional Kafka sink |
 | Delivery guarantee | End-to-end exactly-once, as classified by the coordinator |
@@ -192,7 +192,7 @@ the component being judged.**
 
 ## What this campaign demonstrates
 
-**Demonstrated** - at revision `8fa61d7`, on the topology and scale above:
+**Demonstrated** - at revision `440043f`, on the topology and scale above:
 
 - Steady-state exactly-once through a transactional Kafka sink: 395 of 396
   windows exact over 6.7 million committed records, with zero duplicate,
