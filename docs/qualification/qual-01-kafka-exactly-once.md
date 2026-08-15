@@ -230,11 +230,25 @@ nothing about what the tenth would do.
 ## Evidence retained
 
 Machine-readable evidence for this run is retained under
-`qualification-results/qual01-20260816/`: the host inventory, the image's own
-capability manifest, the generated pipeline SQL, the submission response, the
-verification gate summary, the verifier's verdict with defect samples, the
-chaos controller's fault log, the independent recount report, and the
-coordinator's final metrics.
+`qualification-results/qual01-20260816/`: the host inventory, the build
+provenance record, the deployed build's capability manifest, the generated
+pipeline SQL, the submission response, the verification gate summary, the
+verifier's verdict with defect samples, the chaos controller's fault log, the
+independent recount report, and the campaign summary.
+
+Two gaps in that record, stated rather than quietly left:
+
+- The campaign did not retain the coordinator's final metrics, so the restart
+  and worker-loss counters quoted above were read from the live cluster while
+  it was still up rather than from a retained file. Later campaigns retain
+  them.
+- The capability manifest is captured from the `clink` CLI, which does not
+  link the connector implementations: it lists six connectors where the
+  running coordinator lists thirty-three, including the Kafka connector this
+  campaign is about. The manifest is therefore accurate about build flags
+  (SQL, TLS, fault injection) and understates connectors. Later campaigns also
+  retain the coordinator's own registry, which is the authoritative answer and
+  the same one the deployment gate consults.
 
 ## Honest summary
 
