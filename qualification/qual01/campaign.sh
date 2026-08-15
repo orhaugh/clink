@@ -201,9 +201,24 @@ fi
 # Topics: partition count is load-bearing. Source parallelism equals it
 # (the configuration the per-partition watermark work proved exact), and
 # the oracle's per-partition sequences assume exactly these partitions.
+# DELETED and recreated, not created-if-absent.
+#
+# The oracle recomputes expectations from ONE generator spec, so a topic
+# still holding a previous run's events is a stream the oracle does not
+# know about: on the first cloud run the input topic carried two
+# generations with different event-time bases and the verifier reported
+# 161,111 missing results for output that was never its run's to produce.
+# A campaign must own its topics outright.
 BROKER1_PUB=$(read_inv broker public_ip | cut -d' ' -f1)
-on_host "$BROKER1_PUB" "docker exec redpanda rpk topic create qual01-in -p $PARTITIONS -r 3 || true"
-on_host "$BROKER1_PUB" "docker exec redpanda rpk topic create qual01-out -p $PARTITIONS -r 3 || true"
+for t in qual01-in qual01-out; do
+    on_host "$BROKER1_PUB" "docker exec redpanda rpk topic delete $t >/dev/null 2>&1 || true"
+done
+sleep 5
+for t in qual01-in qual01-out; do
+    on_host "$BROKER1_PUB" "docker exec redpanda rpk topic create $t -p $PARTITIONS -r 3" \
+        || { echo "campaign: could not create topic $t" >&2; exit 2; }
+done
+echo "campaign: topics recreated ($PARTITIONS partitions, replication 3)"
 
 # --- ops host: generator + verifier + chaos -----------------------------
 on_host "$OPS_PUB" "mkdir -p /qual"

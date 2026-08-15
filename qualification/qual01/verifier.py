@@ -95,6 +95,7 @@ def main() -> int:
               "output_records": 0}
     defects = []              # bounded sample of concrete defects
     window_ready_at = {}      # ws -> wallclock when fully produced was seen
+    window_ready_offsets = {}  # ws -> {partition: high-water offset at that moment}
     last_eval = time.time()
 
     def write_verdict(final=False):
@@ -109,44 +110,55 @@ def main() -> int:
             json.dump(verdict, f, indent=2)
         os.replace(tmp, args.verdict)
 
-    def caught_up() -> bool:
-        """Whether this consumer has read to the end of every partition it
-        is assigned, and is assigned every partition of the topic.
-
-        Absence of output is only evidence of MISSING output once both
-        hold. Without this check a lagging or partially-assigned consumer
-        reports records it simply has not reached yet as lost - which is
-        exactly the false failure that a fixed consumer group produced on
-        this harness's first dry run."""
+    def topic_end_offsets():
+        """High-water offset per partition, or None if the topic cannot be
+        read. Also requires that this consumer is assigned EVERY partition,
+        since a partial assignment would make absence meaningless."""
         try:
             meta = consumer.list_topics(args.topic, timeout=10)
             total_partitions = len(meta.topics[args.topic].partitions)
         except Exception:
-            return False
+            return None
         assignment = consumer.assignment()
         if not assignment or len(assignment) < total_partitions:
-            return False
+            return None
+        ends = {}
         for tp in assignment:
             try:
-                low, high = consumer.get_watermark_offsets(tp, timeout=10,
-                                                           cached=False)
-                pos = consumer.position([tp])[0].offset
+                _low, high = consumer.get_watermark_offsets(tp, timeout=10,
+                                                            cached=False)
             except Exception:
-                return False
-            if pos is None or pos < 0:
-                # No position yet on a non-empty partition: not caught up.
-                if high > low:
-                    return False
-                continue
-            if pos < high:
+                return None
+            ends[tp.partition] = high
+        return ends
+
+    def read_past(snapshot) -> bool:
+        """Whether this consumer has read past every offset that existed
+        when `snapshot` was taken.
+
+        This is the sound form of "caught up" for a LIVE stream. Requiring
+        the consumer to sit exactly at the high-water mark never succeeds
+        while the pipeline is still producing - the first cloud run of this
+        harness deferred judgement forever and would have soaked overnight
+        for a vacuous verdict. What actually matters is weaker and
+        achievable: everything that existed when the window's grace timer
+        started has since been read, so an absence now is a real absence."""
+        if not snapshot:
+            return False
+        assignment = consumer.assignment()
+        if not assignment:
+            return False
+        try:
+            positions = {tp.partition: tp.offset for tp in consumer.position(list(assignment))}
+        except Exception:
+            return False
+        for partition, end in snapshot.items():
+            pos = positions.get(partition)
+            if pos is None or pos < 0 or pos < end:
                 return False
         return True
 
     def evaluate():
-        if not caught_up():
-            print("verifier: not caught up to the end of every partition yet; "
-                  "deferring judgement", flush=True)
-            return
         try:
             with open(args.progress) as f:
                 produced_high = {int(k): v for k, v in
@@ -158,11 +170,24 @@ def main() -> int:
         # input is produced AND whose grace has elapsed since we first saw
         # that - independent of whether any output arrived for it.
         nonlocal window_cursor
+        # ONE offset snapshot per pass, shared by every window that becomes
+        # ready in it: they all become ready at this same instant, and a
+        # per-window snapshot cost a broker round trip per partition per
+        # window, which stalled the verifier outright once a few hundred
+        # windows came ready together.
+        pass_ends = None
         while spec.window_fully_produced(window_cursor, produced_high):
-            window_ready_at.setdefault(window_cursor, now)
+            if window_cursor not in window_ready_at:
+                if pass_ends is None:
+                    pass_ends = topic_end_offsets()
+                window_ready_at[window_cursor] = now
+                # The offsets that existed the moment this window's grace
+                # began. Judging waits until they have all been read.
+                window_ready_offsets[window_cursor] = pass_ends
             window_cursor += spec.window_ms
         ready = [ws for ws, t in window_ready_at.items()
-                 if now - t >= args.grace_s and ws not in fully_evaluated]
+                 if now - t >= args.grace_s and ws not in fully_evaluated
+                 and read_past(window_ready_offsets.get(ws))]
         for ws in sorted(ready):
             expected = spec.expected_for_window(ws, produced_high)
             ok = True
@@ -203,6 +228,7 @@ def main() -> int:
                 totals["correct_windows"] += 1
             fully_evaluated.add(ws)
             window_ready_at.pop(ws, None)
+            window_ready_offsets.pop(ws, None)
         write_verdict()
         print(f"verifier: {totals}", flush=True)
 
