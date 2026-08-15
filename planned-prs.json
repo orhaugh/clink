@@ -10,8 +10,18 @@
       "status": "completed",
       "result_revision": "11ff9cc",
       "risk": "A query is accepted and returns numbers that do not mean what the SQL says.",
-      "files": ["src/sql/ast_builder.cpp", "src/sql/physical_plan.cpp", "tests/test_sql_unsupported_semantics.cpp", "tests/test_sql_runtime.cpp"],
-      "tests": ["SqlUnsupportedSemantics.QueryClausesAreImplementedOrRefusedNeverDecorative", "SqlUnsupportedSemantics.SelectIntoIsRefusedNotSilentlyDropped", "SqlRuntime.LimitAndTopNArePlannedAsForcedSingletons", "SqlRuntime.LimitIsGlobalUnderFanOut"],
+      "files": [
+        "src/sql/ast_builder.cpp",
+        "src/sql/physical_plan.cpp",
+        "tests/test_sql_unsupported_semantics.cpp",
+        "tests/test_sql_runtime.cpp"
+      ],
+      "tests": [
+        "SqlUnsupportedSemantics.QueryClausesAreImplementedOrRefusedNeverDecorative",
+        "SqlUnsupportedSemantics.SelectIntoIsRefusedNotSilentlyDropped",
+        "SqlRuntime.LimitAndTopNArePlannedAsForcedSingletons",
+        "SqlRuntime.LimitIsGlobalUnderFanOut"
+      ],
       "dependencies": []
     },
     {
@@ -21,8 +31,13 @@
       "status": "completed",
       "result_revision": "2ac8ed1",
       "risk": "Tooling consuming the manifest cannot detect a schema change or map a manifest to a build.",
-      "files": ["include/clink/connectors/capability.hpp", "src/connectors/capability.cpp"],
-      "tests": ["ConnectorCapabilityTest.ManifestJsonDeclaresItsSchemaVersionAndOrigin"],
+      "files": [
+        "include/clink/connectors/capability.hpp",
+        "src/connectors/capability.cpp"
+      ],
+      "tests": [
+        "ConnectorCapabilityTest.ManifestJsonDeclaresItsSchemaVersionAndOrigin"
+      ],
       "dependencies": []
     },
     {
@@ -32,8 +47,13 @@
       "status": "completed",
       "result_revision": "bfbd1a4",
       "risk": "An operator reads split-brain safety into a backend that cannot provide it across hosts.",
-      "files": ["tools/clink_node.cpp"],
-      "tests": ["EtcdHaCoordinator.OnlyOneOfTwoCoordinatorsWinsTheElection (live)", "CoordinatorFencing.TwoWritersCannotStraddleTheCasWindow (pre-existing)"],
+      "files": [
+        "tools/clink_node.cpp"
+      ],
+      "tests": [
+        "EtcdHaCoordinator.OnlyOneOfTwoCoordinatorsWinsTheElection (live)",
+        "CoordinatorFencing.TwoWritersCannotStraddleTheCasWindow (pre-existing)"
+      ],
       "dependencies": []
     },
     {
@@ -43,8 +63,14 @@
       "status": "completed",
       "result_revision": "b3515c8",
       "risk": "An incompatible persistent format is consumed silently, or an encode/decode pair co-evolves past its own shipped artefacts.",
-      "files": ["docs/internals/protocol-compatibility.md", "tests/test_format_fixtures.cpp", "tests/fixtures/"],
-      "tests": ["FormatFixtures.*"],
+      "files": [
+        "docs/internals/protocol-compatibility.md",
+        "tests/test_format_fixtures.cpp",
+        "tests/fixtures/"
+      ],
+      "tests": [
+        "FormatFixtures.*"
+      ],
       "dependencies": []
     },
     {
@@ -54,8 +80,16 @@
       "status": "completed",
       "result_revision": "a50ac4e",
       "risk": "A delivery-exactly-once pipeline that replays to different values is reported as if replay-stable.",
-      "files": ["src/cluster/guarantee_gate.cpp", "src/connectors/delivery_guarantee.cpp", "src/sql/physical_plan.cpp", "include/clink/cluster/job_graph.hpp"],
-      "tests": ["GuaranteeGateTest (determinism section)", "SqlRuntime.CompiledSpecsClaimSqlPlannerDeterminismCoverage"],
+      "files": [
+        "src/cluster/guarantee_gate.cpp",
+        "src/connectors/delivery_guarantee.cpp",
+        "src/sql/physical_plan.cpp",
+        "include/clink/cluster/job_graph.hpp"
+      ],
+      "tests": [
+        "GuaranteeGateTest (determinism section)",
+        "SqlRuntime.CompiledSpecsClaimSqlPlannerDeterminismCoverage"
+      ],
       "dependencies": []
     },
     {
@@ -65,8 +99,16 @@
       "status": "completed",
       "result_revision": "068db32",
       "risk": "No production trace/metrics export path; the OTel boundary was a stub.",
-      "files": ["include/clink/metrics/otlp_export.hpp", "src/metrics/otlp_export.cpp", "src/cluster/coordinator.cpp", "tools/clink_node.cpp"],
-      "tests": ["OtlpExport.*", "CheckpointCompletion.ACompletedCheckpointRecordsAnOtlpLifecycleSpan"],
+      "files": [
+        "include/clink/metrics/otlp_export.hpp",
+        "src/metrics/otlp_export.cpp",
+        "src/cluster/coordinator.cpp",
+        "tools/clink_node.cpp"
+      ],
+      "tests": [
+        "OtlpExport.*",
+        "CheckpointCompletion.ACompletedCheckpointRecordsAnOtlpLifecycleSpan"
+      ],
       "dependencies": []
     },
     {
@@ -76,7 +118,10 @@
       "status": "completed",
       "result_revision": "036d73d",
       "risk": "The plan doc misreports what CI proves - the exact staleness class the doc exists to catch.",
-      "files": ["docs/production-hardening-plan.md", "planned-prs.json"],
+      "files": [
+        "docs/production-hardening-plan.md",
+        "planned-prs.json"
+      ],
       "tests": [],
       "dependencies": []
     },
@@ -87,8 +132,14 @@
       "status": "completed",
       "result_revision": "HEAD",
       "risk": "A connector's declared semantics drift from its implementation with nothing tying claim to behaviour; the guarantee analyser then reasons from fiction in either direction.",
-      "files": ["include/clink/test/source_contract.hpp", "tests/test_source_contract.cpp", "src/connectors/builtin_capabilities.cpp"],
-      "tests": ["SourceContractSuite (FileSource, DirectoryFileSource, ParquetSource instantiations)"],
+      "files": [
+        "include/clink/test/source_contract.hpp",
+        "tests/test_source_contract.cpp",
+        "src/connectors/builtin_capabilities.cpp"
+      ],
+      "tests": [
+        "SourceContractSuite (FileSource, DirectoryFileSource, ParquetSource instantiations)"
+      ],
       "dependencies": [],
       "follow_up": "per-impl rollout to the container-backed connectors under the live label"
     },
@@ -99,9 +150,16 @@
       "status": "completed",
       "result_revision": "HEAD",
       "risk": "A sink's exactly-once claim rests on crash windows nothing exercises uniformly: visible-before-commit, non-idempotent recommit, lost prepared transactions.",
-      "files": ["include/clink/test/sink_contract.hpp", "tests/test_sink_contract.cpp"],
-      "tests": ["SinkContractSuite (FileSink2PC, ParquetSink2PC instantiations; 8 cases each)"],
-      "dependencies": ["PR-08"]
+      "files": [
+        "include/clink/test/sink_contract.hpp",
+        "tests/test_sink_contract.cpp"
+      ],
+      "tests": [
+        "SinkContractSuite (FileSink2PC, ParquetSink2PC instantiations; 8 cases each)"
+      ],
+      "dependencies": [
+        "PR-08"
+      ]
     },
     {
       "id": "PR-10",
@@ -110,9 +168,20 @@
       "status": "completed",
       "result_revision": "HEAD",
       "risk": "The 2PC crash windows were held hermetically but not against real PREPARE TRANSACTION / multipart-upload state; the effectively-once family had no executable collapse obligation at all.",
-      "files": ["include/clink/test/upsert_contract.hpp", "impls/postgres/tests/test_postgres_contract_suites.cpp", "impls/s3/tests/test_s3_contract_suite.cpp", "scripts/run-all-live.sh"],
-      "tests": ["PostgresSink2PC/SinkContractSuite (8, live)", "PostgresUpsert/UpsertContractSuite (5, live)", "S3Sink2PC/SinkContractSuite (8, live)"],
-      "dependencies": ["PR-09"]
+      "files": [
+        "include/clink/test/upsert_contract.hpp",
+        "impls/postgres/tests/test_postgres_contract_suites.cpp",
+        "impls/s3/tests/test_s3_contract_suite.cpp",
+        "scripts/run-all-live.sh"
+      ],
+      "tests": [
+        "PostgresSink2PC/SinkContractSuite (8, live)",
+        "PostgresUpsert/UpsertContractSuite (5, live)",
+        "S3Sink2PC/SinkContractSuite (8, live)"
+      ],
+      "dependencies": [
+        "PR-09"
+      ]
     },
     {
       "id": "PR-11",
@@ -121,9 +190,20 @@
       "status": "completed",
       "result_revision": "HEAD",
       "risk": "Three connectors carried EffectivelyOnceIdempotent records with nothing holding the collapse behaviour behind the claim.",
-      "files": ["impls/redis/tests/test_redis_upsert_contract.cpp", "impls/mysql/tests/test_mysql_upsert_contract.cpp", "impls/cassandra/tests/test_cassandra_upsert_contract.cpp", "scripts/run-all-live.sh"],
-      "tests": ["RedisUpsert/UpsertContractSuite (5, live)", "MysqlUpsert/UpsertContractSuite (5, live)", "CassandraUpsert/UpsertContractSuite (5, live)"],
-      "dependencies": ["PR-10"],
+      "files": [
+        "impls/redis/tests/test_redis_upsert_contract.cpp",
+        "impls/mysql/tests/test_mysql_upsert_contract.cpp",
+        "impls/cassandra/tests/test_cassandra_upsert_contract.cpp",
+        "scripts/run-all-live.sh"
+      ],
+      "tests": [
+        "RedisUpsert/UpsertContractSuite (5, live)",
+        "MysqlUpsert/UpsertContractSuite (5, live)",
+        "CassandraUpsert/UpsertContractSuite (5, live)"
+      ],
+      "dependencies": [
+        "PR-10"
+      ],
       "follow_up": "changelog-delete semantics as an optional upsert-contract case; a mongo_upsert factory/op-type if the replace mode should be analyser-visible"
     },
     {
@@ -133,21 +213,61 @@
       "status": "completed",
       "result_revision": "HEAD",
       "risk": "A checkpoint completing whose broker commit had not executed when the worker died was the one window neither the sink nor the client could close; resolution commits the genuine orphan and advances the restore point past the interval, with the commit-confirmed bounded contract as the floor on every failure.",
-      "files": ["impls/kafka/include/clink/kafka/txn_resume.hpp", "impls/kafka/src/txn_resume.cpp", "impls/kafka/src/kafka_sink.cpp", "impls/kafka/src/register_factories.cpp", "include/clink/connectors/txn_resume_registry.hpp", "include/clink/cluster/in_doubt_resolution.hpp", "src/cluster/in_doubt_resolution.cpp", "src/cluster/coordinator.cpp"],
-      "tests": ["TxnResumeWire/TxnResume (10, hermetic: byte-for-byte golden frame, parsers vs truncation/foreign correlation, fake broker: happy/fenced/unsupported/no-identity/unreachable, resolver through the registry)", "ResolutionFixture (9: walk order, all-handles-must-commit, every conservative stop)", "TxnResumeLive (3, real Redpanda: fork-crashed orphan committed exactly-once end to end, fenced identity refused, wrapper stages resolvable handle and erases on commit)"],
+      "files": [
+        "examples/kafka_2pc_job.cpp",
+        "impls/kafka/include/clink/kafka/txn_resume.hpp",
+        "impls/kafka/src/kafka_sink.cpp",
+        "impls/kafka/src/register_factories.cpp",
+        "impls/kafka/src/txn_resume.cpp",
+        "include/clink/cluster/in_doubt_resolution.hpp",
+        "include/clink/connectors/txn_resume_registry.hpp",
+        "src/cluster/coordinator.cpp",
+        "src/cluster/in_doubt_resolution.cpp",
+        "tests/integration/test_connector_exactly_once.cpp"
+      ],
+      "tests": [
+        "TxnResumeWire/TxnResume (10, hermetic: byte-for-byte golden frame, parsers vs truncation/foreign correlation, fake broker: happy/fenced/unsupported/no-identity/unreachable, resolver through the registry)",
+        "ResolutionFixture (9: walk order, all-handles-must-commit, every conservative stop)",
+        "TxnResumeLive (3, real Redpanda: fork-crashed orphan committed exactly-once end to end, fenced identity refused, wrapper stages resolvable handle and erases on commit)",
+        "KafkaExactlyOnceTest.AnOrphanedBrokerTransactionIsCommittedAcrossACoordinatorFailover (whole-chain HA e2e, real processes + real broker: held commit loads the orphan by construction, worker dies pre-commit, leader dies, standby's recovery resolves the orphan on the broker, CONFIRMED advances, output totally clean; mutation-checked with a false-confirm resolver linked into the job plugin - caught as 3 MISSING records)"
+      ],
       "dependencies": [],
-      "limitations": "resolution runs on HA/lock-free recovery paths only (in-incarnation restarts keep the bounded contract until a lock-free restart phase exists); non-flexible protocol versions only (FindCoordinator v1/v2, EndTxn v1) and no SASL - both fall back, never guess; no single-run whole-chain HA e2e yet (each link is tested; the chain e2e is the named follow-up for the integration label). Revisit against librdkafka KIP-939 support when it ships."
+      "limitations": "resolution runs on HA/lock-free recovery paths only (in-incarnation restarts keep the bounded contract until a lock-free restart phase exists); non-flexible protocol versions only (FindCoordinator v1/v2, EndTxn v1) and no SASL - both fall back, never guess. Revisit against librdkafka KIP-939 support when it ships. e2e round findings: producer identity is now captured with a bounded wait in KafkaSink::open() (stats tick at 100ms), closing the pre-first-tick window where staged handles were unresumable; HA recovery DROPS a recovered job when no worker capacity registers within the submit wait (~15s, 'insufficient free slots') instead of queueing - named follow-up."
     }
   ],
   "verified_already_done": [
-    {"area": "Exactly-once crash windows", "evidence": "followups items 19/20/51/52/58/61/62: 90-pair fault grid clean, durability-window points armed, output-equality verifier, real-container Kafka/Postgres/S3 arms"},
-    {"area": "Connector capability parity gate", "evidence": "tests/test_connector_manifest_gate.cpp over build-generated enabled-impls list; 21 records / 16 impls; mutation-checked three ways (item 54)"},
-    {"area": "Bounded-state SQL + TTL", "evidence": "items 53/55; test_sql_bounded_state.cpp, test_sql_state_ttl_runtime.cpp, twelve-clause refusal battery"},
-    {"area": "HA CAS on the file backend", "evidence": "fenced_metadata_cas_write under flock, CoordinatorFencing.TwoWritersCannotStraddleTheCasWindow, mutation-checked (item 4); etcd backend atomic create + live two-contender election"},
-    {"area": "Resource/overload limits", "evidence": "frame max/max+1 tests both planes, connection caps tested, first-read deadline, plugin-cache path validation, decode reserve bound, ValidateFull on data plane (items 8/9/10/32/56)"},
-    {"area": "Protocol version negotiation", "evidence": "three enforcement sites driven end to end, protocol_mismatch metric asserted (item 11)"},
-    {"area": "Cancellation/shutdown", "evidence": "items 6/12: operator-level audit + stop-with-savepoint"},
-    {"area": "Fuzz campaign + properties", "evidence": "six targets incl sql_parse, ValidateFull + round-trip properties, committed reproducers replayed in gtest (items 21/56)"}
+    {
+      "area": "Exactly-once crash windows",
+      "evidence": "followups items 19/20/51/52/58/61/62: 90-pair fault grid clean, durability-window points armed, output-equality verifier, real-container Kafka/Postgres/S3 arms"
+    },
+    {
+      "area": "Connector capability parity gate",
+      "evidence": "tests/test_connector_manifest_gate.cpp over build-generated enabled-impls list; 21 records / 16 impls; mutation-checked three ways (item 54)"
+    },
+    {
+      "area": "Bounded-state SQL + TTL",
+      "evidence": "items 53/55; test_sql_bounded_state.cpp, test_sql_state_ttl_runtime.cpp, twelve-clause refusal battery"
+    },
+    {
+      "area": "HA CAS on the file backend",
+      "evidence": "fenced_metadata_cas_write under flock, CoordinatorFencing.TwoWritersCannotStraddleTheCasWindow, mutation-checked (item 4); etcd backend atomic create + live two-contender election"
+    },
+    {
+      "area": "Resource/overload limits",
+      "evidence": "frame max/max+1 tests both planes, connection caps tested, first-read deadline, plugin-cache path validation, decode reserve bound, ValidateFull on data plane (items 8/9/10/32/56)"
+    },
+    {
+      "area": "Protocol version negotiation",
+      "evidence": "three enforcement sites driven end to end, protocol_mismatch metric asserted (item 11)"
+    },
+    {
+      "area": "Cancellation/shutdown",
+      "evidence": "items 6/12: operator-level audit + stop-with-savepoint"
+    },
+    {
+      "area": "Fuzz campaign + properties",
+      "evidence": "six targets incl sql_parse, ValidateFull + round-trip properties, committed reproducers replayed in gtest (items 21/56)"
+    }
   ],
   "remaining_limitations": [
     "EXPLAIN does not yet render the guarantee/determinism report inline (it renders at submission and in clink lint)",

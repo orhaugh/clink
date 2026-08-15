@@ -64,10 +64,16 @@ void define_job(clink::api::Pipeline& pipeline) {
     // expiry is 60 seconds - far longer than these bounded test runs - so
     // shorten it. Commits land every checkpoint interval (~150ms), two
     // orders of magnitude inside this bound.
-    sink.params["kafka.transaction.timeout.ms"] = "5000";
+    //
+    // Env-overridable because the prepared-transaction-resume e2e needs the
+    // OPPOSITE: its orphaned transaction must survive a coordinator
+    // failover long enough for the recovery's resolution to commit it, and
+    // a 5s broker expiry races that whole choreography.
+    const auto txn_timeout = env_or("CLINK_2PC_KAFKA_TXN_TIMEOUT_MS", "5000");
+    sink.params["kafka.transaction.timeout.ms"] = txn_timeout;
     // librdkafka refuses a producer whose delivery timeout exceeds the
     // transaction timeout, so shorten it in step.
-    sink.params["kafka.message.timeout.ms"] = "5000";
+    sink.params["kafka.message.timeout.ms"] = txn_timeout;
 
     pipeline.source<std::string>(src).sink(sink);
 }

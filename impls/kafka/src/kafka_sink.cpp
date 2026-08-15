@@ -213,10 +213,10 @@ void KafkaSink::open() {
         set_or_throw("enable.idempotence", "true");
         set_or_throw("acks", "all");
         // Stats are how the producer identity (pid/epoch) becomes
-        // observable - see ProducerIdentityStats. 500ms keeps the window
-        // between init_transactions and the first capture short without
-        // being noisy; opts.conf below can still override the interval.
-        set_or_throw("statistics.interval.ms", "500");
+        // observable - see ProducerIdentityStats. 100ms keeps the
+        // bounded capture wait at the end of open() short; opts.conf
+        // below can still override the interval.
+        set_or_throw("statistics.interval.ms", "100");
     }
     // Tighten message timeout so we don't leak memory waiting forever for
     // a downed broker. Capped at the user's produce_timeout (we'll fail
@@ -297,6 +297,26 @@ void KafkaSink::open() {
         auto err_begin = impl_->producer->begin_transaction();
         if (err_begin) {
             throw std::runtime_error("KafkaSink: begin_transaction failed: " + err_begin->str());
+        }
+        // Capture the producer identity (pid/epoch) BEFORE the first record:
+        // it only surfaces through the stats callback, which fires on poll()
+        // at statistics.interval.ms. Left to chance, a checkpoint barrier
+        // arriving before the first tick staged a resume handle with no
+        // identity - unresumable by design, observed end to end as the HA
+        // recovery refusing to finalise an orphaned transaction it should
+        // have committed. open() runs once per deploy, so a bounded wait
+        // here buys every subsequent barrier a resumable handle. Not
+        // captured by the deadline = proceed: produce/commit need no
+        // identity, and a staged handle without one still refuses loudly.
+        const auto ident_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!producer_identity().has_value() &&
+               std::chrono::steady_clock::now() < ident_deadline) {
+            impl_->producer->poll(50);
+        }
+        if (!producer_identity().has_value()) {
+            clink::log::warn("kafka.sink",
+                             "producer identity not observed within the open() bound; resume "
+                             "handles staged before the first stats tick will refuse resolution");
         }
     }
 }

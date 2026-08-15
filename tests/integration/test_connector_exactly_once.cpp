@@ -139,6 +139,33 @@ std::uint64_t latest_completed(const std::filesystem::path& ckpt_root) {
     return latest;
 }
 
+// The highest CONFIRMED-N under the checkpoint tree, or 0: the newest
+// checkpoint whose external commits provably EXECUTED. The gap between this
+// and latest_completed is the set of in-doubt intervals the resolution walk
+// has to answer for.
+std::uint64_t latest_confirmed(const std::filesystem::path& ckpt_root) {
+    std::uint64_t latest = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(ckpt_root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!e.is_regular_file()) {
+            continue;
+        }
+        const auto name = e.path().filename().string();
+        if (name.rfind("CONFIRMED-", 0) != 0) {
+            continue;
+        }
+        try {
+            const auto id = static_cast<std::uint64_t>(std::stoull(name.substr(10)));
+            latest = std::max(latest, id);
+        } catch (const std::exception&) {
+        }
+    }
+    return latest;
+}
+
 class PostgresExactlyOnceTest : public ::testing::Test {
 protected:
     // One container for the whole suite (startup is seconds); one TABLE per
@@ -442,6 +469,9 @@ protected:
         kafka_->create_topic(topic_);
         ::setenv("CLINK_KAFKA_BROKERS", kafka_->brokers().c_str(), 1);
         ::setenv("CLINK_KAFKA_TOPIC", topic_.c_str(), 1);
+        // Re-pin the job's default per test: setenv leaks across tests in
+        // one process, and the failover e2e below raises this deliberately.
+        ::setenv("CLINK_2PC_KAFKA_TXN_TIMEOUT_MS", "5000", 1);
     }
 
     std::vector<std::string> committed() const {
@@ -623,6 +653,161 @@ TEST_F(KafkaExactlyOnceTest, ACommitThatDiesWithTheWorkerIsReplayedNotLost) {
            "select the confirmed checkpoint: "
         << clink::itest::describe(v);
     EXPECT_TRUE(v.unexpected.empty()) << clink::itest::describe(v);
+}
+
+// The whole prepared-transaction-resume chain in one run, on real processes
+// and a real broker. The sink stages a resume handle inside every checkpoint;
+// the worker dies between checkpoint 2 completing and its broker commit
+// executing (the residual window the resume closes); the LEADER coordinator
+// dies too. The standby's HA recovery loads the job plugin - which registers
+// the kafka_2pc resolver - resolves the orphaned transaction ON THE BROKER
+// with the dead producer's identity, writes CONFIRMED for the interval, and
+// advances the restore point past it instead of replaying it.
+//
+// The verdict is total: every record exactly once with NO duplicates. That
+// alone cannot prove the resume ran (the commit-confirmed protocol without it
+// also ends clean here, by fencing the orphan and replaying from CONFIRMED-1),
+// so vacuity is pinned twice over: the marker state before the failover shows
+// a completed-but-unconfirmed checkpoint existed, and the new leader's log
+// carries the restore-point advance only the resolution writes.
+TEST_F(KafkaExactlyOnceTest, AnOrphanedBrokerTransactionIsCommittedAcrossACoordinatorFailover) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+    // The orphan must SURVIVE kill -> failover -> recovery -> resolution:
+    // at the suite default (5s) the broker's own transaction expiry races
+    // that whole choreography and self-aborts the orphan under load. The
+    // resolution unpins the topic itself by committing, so nothing here
+    // waits on this bound.
+    ::setenv("CLINK_2PC_KAFKA_TXN_TIMEOUT_MS", "60000", 1);
+
+    ClusterSpec one;
+    one.node_binary = node_binary();
+    one.workers = 1;
+    one.slots_per_worker = 4;
+    one.ha = true;
+    Cluster c(one);
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_ha_coordinators(2)) << "no coordinator won the election";
+    // Checkpoint 1's commit is HELD 800ms then executes normally
+    // (CONFIRMED-1 gives the resolution a base to advance from). The hold
+    // is what makes the orphan non-empty by construction: every record the
+    // source produces during it lands in the NEXT transaction, so the
+    // transaction checkpoint 2 prepares carries a dozen-plus records
+    // rather than whatever a race left in it. (An EMPTY prepared
+    // transaction makes this whole scenario vacuous - falsely confirming
+    // one loses nothing, which a mutation check demonstrated.) The worker
+    // then dies BEFORE checkpoint 2's broker commit executes, leaving that
+    // loaded transaction open broker-side with its handle staged in
+    // snapshot 2.
+    ASSERT_TRUE(c.start_ha_worker(
+        0, {.fault = "sink.before_commit=delay:800@1,sink.before_commit=exit:1@2"}));
+    ASSERT_TRUE(c.await_workers_registered(1));
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(c.await_process_gone(0))
+        << "the die-before-commit fault never fired; the orphan window never happened";
+
+    // The orphan is real AND non-empty, proven from the broker: records
+    // exist that no committed reader can see. Either the committed drain
+    // cannot reach EOF at all (the open transaction pins the last stable
+    // offset) or it returns strictly fewer records than the uncommitted
+    // view holds.
+    {
+        const auto uncommitted_at_kill = clink::kafka::consume_all(
+            kafka_->brokers(), topic_, "read_uncommitted", std::chrono::seconds{20});
+        bool in_doubt_records_exist = false;
+        try {
+            in_doubt_records_exist = uncommitted_at_kill.size() >
+                                     clink::kafka::consume_all_committed(
+                                         kafka_->brokers(), topic_, std::chrono::seconds{10})
+                                         .size();
+        } catch (const std::exception&) {
+            in_doubt_records_exist = true;  // pinned short of EOF = open transaction with records
+        }
+        ASSERT_TRUE(in_doubt_records_exist)
+            << "no in-doubt records exist broker-side (uncommitted view holds "
+            << uncommitted_at_kill.size()
+            << " records, all visible committed); the orphaned transaction is empty and "
+               "the scenario is vacuous";
+    }
+
+    // The scenario's shape, proven from the markers: a confirmed base, and
+    // above it a checkpoint that COMPLETED but whose commit never executed.
+    // Without that gap there is no in-doubt transaction and the run proves
+    // nothing about the resolution.
+    ASSERT_TRUE(clink::itest::await([&] { return latest_confirmed(c.checkpoint_dir()) >= 1; }, 15s))
+        << "checkpoint 1's executed commit was never confirmed";
+    const auto completed_before = latest_completed(c.checkpoint_dir());
+    const auto confirmed_before = latest_confirmed(c.checkpoint_dir());
+    ASSERT_GT(completed_before, confirmed_before)
+        << "no completed-but-unconfirmed checkpoint exists; there is no in-doubt "
+           "transaction for the recovery to resolve";
+
+    // Kill the leader. The standby recovers the job from the HA store; its
+    // plugin load registers the resolver, and the recovery hook commits the
+    // orphan on the broker before the restore point is used.
+    ASSERT_TRUE(c.kill_leader_and_await_failover().has_value())
+        << "no standby took over after the leader was killed";
+    ASSERT_TRUE(c.await_coordinator_ready()) << "the new leader never opened the control port";
+
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return c.count_in_coordinator_log("restore point advanced by in-doubt resolution") > 0;
+        },
+        30s))
+        << "the new leader never resolved the in-doubt transaction; the recovery either "
+           "skipped the resolution walk or the resolver refused (completed="
+        << completed_before << " confirmed=" << confirmed_before << ")";
+    // The advance is durable: the orphaned interval's checkpoint is now
+    // CONFIRMED on disk, so even ANOTHER failover would not re-litigate it.
+    EXPECT_GE(latest_confirmed(c.checkpoint_dir()), completed_before)
+        << "the resolution advanced the restore point without writing the CONFIRMED marker";
+
+    // The worker exits with its coordinator by design; the harness plays
+    // the supervisor. Fresh process, no fault armed.
+    ASSERT_TRUE(c.restart_worker_ha(0)) << "the worker did not come back";
+    ASSERT_TRUE(c.await_workers_registered(2))
+        << "the restarted worker never registered with the new leader";
+
+    // The job finishes under the new leader, judged by the data (the
+    // submitter's connection died with the old leader, so its exit code
+    // reports the client's fate rather than the job's). Each poll drains
+    // the committed view to EOF; an open successor transaction pins the
+    // drain and throws, which simply means "not yet".
+    const bool finished = clink::itest::await(
+        [&] {
+            try {
+                return clink::itest::verify_exactly_once_records(
+                           clink::kafka::consume_all_committed(
+                               kafka_->brokers(), topic_, std::chrono::seconds{10}),
+                           kTotal)
+                    .clean();
+            } catch (const std::exception&) {
+                return false;
+            }
+        },
+        120s);
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(finished) << "the job did not finish clean under the new leader: "
+                          << clink::itest::describe(v)
+                          << " [processes: " << c.describe_coordinator_exits()
+                          << ", worker-0=" << (c.worker(0).running() ? "running" : "gone") << "]";
+    EXPECT_TRUE(v.missing.empty())
+        << "the orphaned interval was LOST - the resume committed nothing and the restore "
+           "still advanced: "
+        << clink::itest::describe(v);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records were committed MORE than once - the restore point advanced past the "
+           "interval yet its records were replayed, or the resume committed a transaction "
+           "that also carried post-barrier records: "
+        << clink::itest::describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << clink::itest::describe(v);
+
+    sub->kill_and_reap();
 }
 
 // The longer-horizon arm, mirroring the Postgres one: thirty times the
