@@ -96,20 +96,30 @@ def read_output_window(brokers, topic, w_start):
     })
     md = consumer.list_topics(topic, timeout=15)
     parts = list(md.topics[topic].partitions.keys())
+
+    # Bounded by the high-water mark AS IT IS NOW, not by going quiet.
+    # The pipeline is still running while this diagnostic reads, so a
+    # consumer that stops when the topic goes idle never stops at all -
+    # it just keeps pace with the producer forever. The window under
+    # examination is long closed, so everything relevant is already
+    # below these offsets.
+    ends = {}
+    for p in parts:
+        _, hi = consumer.get_watermark_offsets(TopicPartition(topic, p), timeout=15)
+        ends[p] = hi
     consumer.assign([TopicPartition(topic, p, 0) for p in parts])
+    remaining = {p for p in parts if ends[p] > 0}
 
     out = {}
     occurrences = {}
-    idle = 0
-    while idle < 3:
-        msg = consumer.poll(5)
+    while remaining:
+        msg = consumer.poll(10)
         if msg is None:
-            idle += 1
-            continue
+            break
         if msg.error():
-            idle += 1
-            continue
-        idle = 0
+            break
+        if msg.offset() >= ends[msg.partition()] - 1:
+            remaining.discard(msg.partition())
         rec = json.loads(msg.value())
         if int(rec["ws"]) != w_start:
             continue
