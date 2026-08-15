@@ -277,6 +277,39 @@
         "PR-12"
       ],
       "limitations": "all four restart_job_locked_ trigger sites are gated; the resolution thread mirrors the drain-complete readiness check (drained covers expected). Non-tracked jobs and jobs with no confirmed<completed gap stage nothing and restart exactly as before."
+    },
+    {
+      "id": "PR-15",
+      "priority": "P0",
+      "title": "Restart-drain readiness is coverage, not emptiness: the watchdog kick fires a restart whose expected set a fold shrank to already-drained keys",
+      "status": "completed",
+      "result_revision": "HEAD",
+      "risk": "The soak's three-CI-sighting wedge (watch item 63). Draining credits restart_drained_keys and COVERS restart_drain_expected; a second-worker fold erases the dead worker's keys from both sets. When the survivor's drain ack lands before the fold, the expected set becomes covered-but-nonempty and readiness - re-evaluated only on a new SubtaskFinished - is never observed again: the ready restart sits until the 30s drain deadline fails the job with a phantom 'survivors did not drain'. restart_drain_covered_() is now THE readiness predicate at every restart trigger site.",
+      "files": [
+        "include/clink/cluster/coordinator.hpp",
+        "src/cluster/coordinator.cpp",
+        "tests/test_restart_drain_readiness.cpp",
+        ".github/workflows/ci.yml",
+        "docs/internals/fault-tolerance-and-rescale.md"
+      ],
+      "tests": [
+        "RestartDrainReadiness.AFoldAfterTheLastDrainAckStillFiresTheRestart (deterministic: DrainFakeWorker pair scripts the exact frame order - victim dies silently, survivor errors, survivor's other subtask drains, replacement registers - against a real coordinator over real sockets; asserts the redeploy arrives well inside the drain deadline. Pre-fix mutant (emptiness kicks) wedges 16s and fails; fix passes in 0.5s.)"
+      ],
+      "dependencies": [],
+      "limitations": "diagnosed entirely from the serial soak run's dumped logs (the d8faf3c instrumentation); the soak itself remains the probabilistic end-to-end witness and stays serial - its 30s deadline is a correctness bound and is unchanged."
+    },
+    {
+      "id": "PR-16",
+      "priority": "P2",
+      "title": "SASL (and wired TLS) for the prepared-transaction resume, so the resolver reaches brokers the sink can already talk to",
+      "status": "planned",
+      "risk": "The sink declares sasl_plaintext/sasl_ssl/ssl (librdkafka passthrough) but the resume wire path speaks plaintext-no-auth only, so on an authenticated cluster every in-doubt resolution refuses and the bounded contract carries it. Scope: (1) SaslHandshake v1 + SaslAuthenticate v1 (PLAIN) on both resume connections, golden-frame UTs + FakeBroker refusal arms; (2) credentials read from the coordinator's environment at RESOLVE time - never staged in the checkpoint handle; (3) TLS via the existing ConnectFn seam (impls/tls), with the doc stating PLAIN-over-plaintext leaks credentials and recommending sasl_ssl; (4) DockerKafka gains a SASL mode (Redpanda enable_sasl + superuser) and a live arm proving resolve-with-creds commits and resolve-without refuses loudly.",
+      "files": [],
+      "tests": [],
+      "dependencies": [
+        "PR-12"
+      ],
+      "limitations": "SCRAM deferred (crypto surface); KIP-939 revisit unchanged."
     }
   ],
   "verified_already_done": [

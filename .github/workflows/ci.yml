@@ -243,17 +243,18 @@ jobs:
           ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
           -L integration
       - name: Test (soak, serial) [blocking gate]
-        # The wall-time kill/recover soak, alone on the runner. It used to
-        # run inside the parallel unit sweep above, where it shared 4 cores
-        # and one disk with the rest of the suite - and its restart-drain
-        # deadline (30s, a correctness bound - never raise it) sits within
-        # reach of a contention-stretched FileBacked snapshot persist
-        # (watch item 63; the drain-timeout failures showed a survivor that
-        # was alive and scheduled the whole time). Serial gives that
-        # deadline an honest premise. The assertions are unchanged; if this
-        # still fails serially, the SNAPSHOT_WORKER_JOIN_STUCK /
-        # SNAPSHOT_PERSIST_SLOW and worker.cancel/worker.task log lines in
-        # the dumped cluster logs name the wedged runner directly.
+        # The wall-time kill/recover soak, alone on the runner. Its first
+        # serial run is what finally cracked watch item 63: with capacity
+        # ruled out by construction, the dumped logs showed the survivor's
+        # drain ack landing BEFORE the dead worker's fold, leaving the
+        # expected-drain set covered-but-nonempty - a ready restart that an
+        # emptiness-keyed kick could never fire (fixed: the kick now tests
+        # coverage, pinned by RestartDrainReadiness). Kept serial: the 30s
+        # drain deadline is a correctness bound (never raise it) and
+        # deserves an uncontended premise, and the diagnostics
+        # (SNAPSHOT_WORKER_JOIN_STUCK / SNAPSHOT_PERSIST_SLOW,
+        # worker.cancel/worker.task, the timeout naming undrained keys)
+        # name any future wedge directly.
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1
           -L '^soak$'

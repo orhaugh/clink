@@ -1412,6 +1412,16 @@ private:
     // False = nothing to resolve; restart immediately.
     [[nodiscard]] bool stage_in_doubt_resolution_locked_(JobState& job);
 
+    // THE definition of a restart drain being complete: every expected key
+    // has drained (an empty expected set is trivially ready). Draining
+    // COVERS the expected set rather than emptying it, and a fold can
+    // shrink the expected set to keys that already drained - so any site
+    // that tests expected.empty() instead of this misses a ready restart
+    // and wedges the job into its drain deadline (watch item 63's actual
+    // mechanism: the survivor's drain ack arrived BEFORE the dead worker's
+    // fold, and nothing re-evaluated readiness after the fold).
+    [[nodiscard]] static bool restart_drain_covered_(const JobState& job);
+
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::vector<std::string> expected_workers_;

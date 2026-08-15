@@ -106,6 +106,7 @@ add_executable(clink_core_tests
     test_plugin_cache.cpp
     test_cancel_teardown.cpp
     test_checkpoint_completion.cpp
+    test_restart_drain_readiness.cpp
     test_fuzz_corpus.cpp
     test_config_lint.cpp
     test_ha_coordinator.cpp
