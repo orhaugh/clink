@@ -80,7 +80,27 @@
         "Qualification image built ON the rig at the commit under test, with CLINK_ENABLE_FAULT_INJECTION=ON"
       ],
       "results": {
-        "local_dry_run": "harness proven end to end before any spend: 46,800 deterministic events, 1,137 committed output records, every judged window correct; mutation-tested by injecting a foreign record (caught, foreign=1) which exposed and fixed a verifier defect that reported 317 phantom missing results"
+        "local_dry_run": "harness proven end to end before any spend: 46,800 deterministic events, 1,137 committed output records, every judged window correct; mutation-tested by injecting a foreign record (caught, foreign=1) which exposed and fixed a verifier defect that reported 317 phantom missing results",
+        "functional_verification": {
+          "passed": true,
+          "at": "2026-08-15T21:31Z",
+          "input_events_observed": 140200,
+          "committed_output_records": 104340,
+          "windows_judged": 4,
+          "windows_correct": 4,
+          "faults_landed": 2,
+          "first_fault": "worker SIGKILL at checkpoint 341 while RUNNING, restarted 26s later",
+          "recovered_after_first_fault": true,
+          "note": "the campaign refuses to enter its soak until every one of these is observed; each was a step that had previously failed silently in some form"
+        },
+        "harness_defects_found_and_fixed": [
+          "chaos controller polled a job status field that did not exist - would have applied zero faults",
+          "backgrounding over ssh hung the driver twice while the remote process ran happily",
+          "verifier reused a fixed consumer group - a re-run got a partial assignment and reported 317 phantom missing results",
+          "verifier required exact high-water position, unreachable on a live stream - deferred judgement forever",
+          "verifier stored a null offset snapshot when the group was still assigning - those windows could never be judged",
+          "campaign did not own its topics - a previous run's events made the oracle report 161,111 missing that were never its to produce"
+        ]
       }
     },
     {
