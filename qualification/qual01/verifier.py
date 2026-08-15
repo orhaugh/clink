@@ -180,6 +180,15 @@ def main() -> int:
             if window_cursor not in window_ready_at:
                 if pass_ends is None:
                     pass_ends = topic_end_offsets()
+                if pass_ends is None:
+                    # The consumer group has not finished assigning yet.
+                    # Recording readiness now would store a null snapshot
+                    # that read_past can never satisfy, leaving those
+                    # windows permanently unjudgeable - which is how the
+                    # first clean cloud run sat at zero judged windows
+                    # while output streamed past it. Leave the cursor
+                    # where it is and retry on the next pass.
+                    break
                 window_ready_at[window_cursor] = now
                 # The offsets that existed the moment this window's grace
                 # began. Judging waits until they have all been read.
