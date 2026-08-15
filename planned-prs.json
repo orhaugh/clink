@@ -302,26 +302,28 @@
       "id": "PR-16",
       "priority": "P2",
       "title": "SASL (and wired TLS) for the prepared-transaction resume, so the resolver reaches brokers the sink can already talk to",
-      "status": "in_progress",
+      "status": "completed",
       "risk": "The sink declares sasl_plaintext/sasl_ssl/ssl (librdkafka passthrough) but the resume wire path speaks plaintext-no-auth only, so on an authenticated cluster every in-doubt resolution refuses and the bounded contract carries it. DELIVERED: SASL/PLAIN on both resume connections with env-sourced credentials (CLINK_KAFKA_RESUME_SASL_*), local refusal of unspoken mechanisms, honest fallback shapes. REMAINING scope: (1) SaslHandshake v1 + SaslAuthenticate v1 (PLAIN) on both resume connections, golden-frame UTs + FakeBroker refusal arms; (2) credentials read from the coordinator's environment at RESOLVE time - never staged in the checkpoint handle; (3) TLS via the existing ConnectFn seam (impls/tls), with the doc stating PLAIN-over-plaintext leaks credentials and recommending sasl_ssl; (4) DockerKafka gains a SASL mode (Redpanda enable_sasl + superuser) and a live arm proving resolve-with-creds commits and resolve-without refuses loudly.",
       "files": [
-        "impls/kafka/include/clink/kafka/txn_resume.hpp",
-        "impls/kafka/src/txn_resume.cpp",
-        "impls/kafka/src/register_factories.cpp",
-        "impls/kafka/tests/test_txn_resume.cpp",
+        "CMakeLists.txt",
         "docs/connectors/kafka.md",
-        "tests/integration/docker_kafka.hpp",
-        "impls/kafka/tests/test_txn_resume_live.cpp"
+        "impls/kafka/include/clink/kafka/txn_resume.hpp",
+        "impls/kafka/src/register_factories.cpp",
+        "impls/kafka/src/txn_resume.cpp",
+        "impls/kafka/tests/test_txn_resume.cpp",
+        "impls/kafka/tests/test_txn_resume_live.cpp",
+        "tests/integration/docker_kafka.hpp"
       ],
       "tests": [
         "TxnResumeWire.SaslFramesArePinnedByteForByte + SaslParsersRefuseTruncationAndForeignCorrelation (goldens)",
         "TxnResume SASL arms vs the fake broker: authenticated resume commits and presents the RFC 4616 payload on BOTH connections; unknown mechanism refused locally before any dial; handshake refusal surfaces the broker's enabled mechanisms; bad credentials refused with the broker's message and no EndTxn attempted; no-credentials against a SASL-only listener falls back as TransportError. Mutation-checked twice: auth-failure-treated-as-success caught by the bad-credentials arm; mechanism-gate-removed caught by the unknown-mechanism arm.",
-        "TxnResumeSaslLive (live, real SASL-required Redpanda via DockerKafkaOptions{sasl}): a PLAIN handshake is refused by the SCRAM-only broker naming SCRAM; no credentials falls back as TransportError on the connection drop. The pinned Redpanda v24.2.7 rejects PLAIN in sasl_mechanisms validation (verified empirically), so the PLAIN happy path stays hermetic by necessity."
+        "TxnResumeSaslLive (live, real SASL-required Redpanda via DockerKafkaOptions{sasl}): a PLAIN handshake is refused by the SCRAM-only broker naming SCRAM; no credentials falls back as TransportError on the connection drop. The pinned Redpanda v24.2.7 rejects PLAIN in sasl_mechanisms validation (verified empirically), so the PLAIN happy path stays hermetic by necessity.",
+        "TxnResumeTls (hermetic, real TLS sessions via a self-signed cert and accept_tls_connection): the resume commits over a verified TLS session; the resolver dials TLS end to end when CLINK_KAFKA_RESUME_TLS_CA is set; an unusable CA refuses loudly with a plaintext broker standing ready to catch a downgrade. Mutation-checked: the resolver ignoring the CA env was caught by BOTH the dial-through assertion and the no-downgrade arm."
       ],
       "dependencies": [
         "PR-12"
       ],
-      "limitations": "delivered: the PLAIN wire half (hermetic, mutation-checked twice) and the live refusal arms against a real SASL broker (DockerKafka gained a SASL mode: enable_sasl + superuser + SCRAM-authenticated probes). Remaining: the resolver's env-gated TLS dialer - deliberately its own round, because kafka->tls linkage enters the install/export set and the wheel's OpenSSL closure and needs packaging verification. SCRAM deferred (crypto surface); KIP-939 revisit unchanged.",
+      "limitations": "complete: SASL/PLAIN wire half, live refusal arms against a real SASL broker, and the env-gated TLS dialer (wired at the TOP-LEVEL CMakeLists - impls/tls is processed after impls/kafka, so an if(TARGET) inside the kafka lists is false forever; export-safe since clink_tls shares the export set and libclink already links it). SCRAM deferred (crypto surface); the PLAIN happy path live requires a broker pin with PLAIN support; KIP-939 revisit unchanged.",
       "result_revision": "HEAD"
     }
   ],

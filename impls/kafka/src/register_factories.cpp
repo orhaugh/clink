@@ -41,6 +41,11 @@
 #include "clink/runtime/network/connection.hpp"
 #include "clink/state/state_backend.hpp"
 
+#ifdef CLINK_KAFKA_RESUME_TLS
+#include "clink/runtime/network/tls_connection.hpp"
+#include "clink/runtime/network/tls_socket.hpp"
+#endif
+
 namespace clink::kafka {
 
 namespace {
@@ -581,9 +586,50 @@ clink::connectors::InDoubtResolution resolve_kafka_2pc_handle(const std::string&
                     "' carries no producer identity (the stats capture had not fired before "
                     "the barrier); nothing can be resumed"};
     }
-    const auto connect = [](const std::string& host, std::uint16_t port) {
+    // The dialer: plaintext by default, TLS when the resolving process's
+    // environment names a CA bundle (CLINK_KAFKA_RESUME_TLS_CA, plus
+    // optional CLINK_KAFKA_RESUME_TLS_CERT/_KEY for mTLS). Same boundary
+    // as the SASL credentials below: transport security is the resolving
+    // process's configuration, never the staged handle's. TLS requested
+    // in a build without clink::tls - or with an unusable CA - is refused
+    // LOUDLY; silently dialing plaintext would leak the SASL password the
+    // operator configured TLS to protect.
+    clink::kafka::ConnectFn connect = [](const std::string& host, std::uint16_t port) {
         return clink::network::connect_plain(host, port);
     };
+    if (const char* tls_ca = std::getenv("CLINK_KAFKA_RESUME_TLS_CA");
+        tls_ca != nullptr && *tls_ca != '\0') {
+#ifdef CLINK_KAFKA_RESUME_TLS
+        try {
+            auto ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
+            const char* cert = std::getenv("CLINK_KAFKA_RESUME_TLS_CERT");
+            const char* key = std::getenv("CLINK_KAFKA_RESUME_TLS_KEY");
+            if (cert != nullptr && *cert != '\0' && key != nullptr && *key != '\0') {
+                ctx->set_client_cert(cert, key);
+            }
+            connect = [ctx](const std::string& host,
+                            std::uint16_t port) -> std::unique_ptr<clink::network::Connection> {
+                try {
+                    return clink::network::connect_tls_connection(host, port, ctx);
+                } catch (const std::exception&) {
+                    // A failed handshake is a transport failure: bounded
+                    // retries and the honest TransportError fallback, the
+                    // same as an unreachable broker.
+                    return nullptr;
+                }
+            };
+        } catch (const std::exception& e) {
+            return {false,
+                    std::string{"TLS requested (CLINK_KAFKA_RESUME_TLS_CA) but the client "
+                                "context could not be built: "} +
+                        e.what()};
+        }
+#else
+        return {false,
+                "TLS requested (CLINK_KAFKA_RESUME_TLS_CA) but this build carries no "
+                "clink::tls; refusing rather than downgrading to plaintext"};
+#endif
+    }
     // SASL credentials come from the RESOLVING process's environment at
     // resolution time - never from the staged handle, because durable
     // checkpoint state must not carry secrets. Unset = unauthenticated,

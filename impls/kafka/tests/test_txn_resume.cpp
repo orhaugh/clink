@@ -21,6 +21,17 @@
 #include "clink/kafka/txn_resume.hpp"
 #include "clink/runtime/network/connection.hpp"
 
+#ifdef CLINK_KAFKA_RESUME_TLS
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+
+#include "clink/runtime/network/network_socket.hpp"
+#include "clink/runtime/network/tls_connection.hpp"
+#include "clink/runtime/network/tls_socket.hpp"
+#endif
+
 namespace {
 
 using clink::kafka::ResumeOutcome;
@@ -657,6 +668,224 @@ TEST(TxnResume, BadCredentialsAreRefusedWithTheBrokersMessage) {
     EXPECT_TRUE(broker.end_txn_bodies().empty())
         << "no EndTxn may be attempted on an unauthenticated connection";
 }
+
+#ifdef CLINK_KAFKA_RESUME_TLS
+
+// --- TLS ------------------------------------------------------------------------
+//
+// The resume over a REAL TLS session: a fake broker behind
+// accept_tls_connection, a self-signed certificate generated with the
+// openssl CLI (the tls impl's own fixture pattern), and the client
+// verifying against that certificate as its CA. Gated on the build
+// carrying clink::tls, exactly like the resolver branch under test.
+
+std::filesystem::path resume_tls_cert_dir() {
+    const auto dir =
+        std::filesystem::temp_directory_path() / ("clink_resume_tls_" + std::to_string(::getpid()));
+    std::filesystem::create_directories(dir);
+    const auto cert = dir / "cert.pem";
+    const auto key = dir / "key.pem";
+    const std::string cmd = "openssl req -x509 -newkey rsa:2048 -nodes -keyout " + key.string() +
+                            " -out " + cert.string() +
+                            " -days 1 -subj /CN=127.0.0.1"
+                            " -addext subjectAltName=IP:127.0.0.1 > /dev/null 2>&1";
+    if (std::system(cmd.c_str()) != 0) {
+        return {};
+    }
+    return dir;
+}
+
+// One-connection-at-a-time TLS broker scripting the happy resume dialogue.
+// Serial accept is enough here: the resume releases its bootstrap
+// connection before dialing the coordinator.
+class TlsResumeBroker {
+public:
+    explicit TlsResumeBroker(const std::filesystem::path& cert_dir)
+        : ctx_(std::make_shared<clink::network::TlsServerContext>(
+              (cert_dir / "cert.pem").string(), (cert_dir / "key.pem").string())) {
+        std::uint16_t bound = 0;
+        listen_fd_ = clink::network::NetworkSocket::listen_on(bound, "127.0.0.1");
+        port_ = bound;
+        accept_thread_ = std::thread([this] { accept_loop_(); });
+    }
+
+    ~TlsResumeBroker() {
+        // Order matters: the flag first, so the accept loop can tell the
+        // listener teardown (accept_tls_connection THROWS on a dead
+        // listener, same as on a failed client handshake) from a client
+        // it should keep serving past.
+        stopping_.store(true, std::memory_order_release);
+        clink::network::NetworkSocket::shutdown_read(listen_fd_);
+        clink::network::NetworkSocket::close(listen_fd_);
+        if (accept_thread_.joinable()) {
+            accept_thread_.join();
+        }
+    }
+
+    TlsResumeBroker(const TlsResumeBroker&) = delete;
+    TlsResumeBroker& operator=(const TlsResumeBroker&) = delete;
+    TlsResumeBroker(TlsResumeBroker&&) = delete;
+    TlsResumeBroker& operator=(TlsResumeBroker&&) = delete;
+
+    [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+    [[nodiscard]] std::size_t end_txn_count() const {
+        std::lock_guard lock(mu_);
+        return end_txn_count_;
+    }
+
+private:
+    void accept_loop_() {
+        while (!stopping_.load(std::memory_order_acquire)) {
+            std::unique_ptr<clink::network::Connection> conn;
+            try {
+                conn = clink::network::accept_tls_connection(listen_fd_, ctx_);
+            } catch (const std::exception&) {
+                continue;  // a failed handshake ends that client, not the broker
+            }
+            if (conn == nullptr) {
+                return;
+            }
+            serve_(*conn);
+        }
+    }
+
+    void serve_(clink::network::Connection& conn) {
+        while (true) {
+            std::byte hdr[4];
+            if (!conn.recv_all(hdr, 4)) {
+                return;
+            }
+            std::uint32_t size = 0;
+            for (int i = 0; i < 4; ++i) {
+                size = (size << 8) | static_cast<std::uint8_t>(hdr[i]);
+            }
+            if (size == 0 || size > (1U << 20)) {
+                return;
+            }
+            std::vector<std::byte> payload(size);
+            if (!conn.recv_all(payload.data(), payload.size())) {
+                return;
+            }
+            const auto api_key =
+                static_cast<std::int16_t>((static_cast<std::uint8_t>(payload[0]) << 8) |
+                                          static_cast<std::uint8_t>(payload[1]));
+            const auto correlation = static_cast<std::int32_t>(
+                (std::uint32_t(static_cast<std::uint8_t>(payload[4])) << 24) |
+                (std::uint32_t(static_cast<std::uint8_t>(payload[5])) << 16) |
+                (std::uint32_t(static_cast<std::uint8_t>(payload[6])) << 8) |
+                std::uint32_t(static_cast<std::uint8_t>(payload[7])));
+
+            std::vector<std::uint8_t> body;
+            if (api_key == wire::kApiVersionsKey) {
+                body = api_versions_body(0, 4, 0, 4);
+            } else if (api_key == wire::kFindCoordinatorKey) {
+                body = find_coordinator_body(0, "127.0.0.1", port_);
+            } else if (api_key == wire::kEndTxnKey) {
+                {
+                    std::lock_guard lock(mu_);
+                    ++end_txn_count_;
+                }
+                body = end_txn_body(0);
+            } else {
+                return;
+            }
+            std::vector<std::byte> out;
+            const std::uint32_t total = static_cast<std::uint32_t>(body.size() + 4);
+            for (int i = 3; i >= 0; --i) {
+                out.push_back(static_cast<std::byte>((total >> (i * 8)) & 0xFF));
+            }
+            for (int i = 3; i >= 0; --i) {
+                out.push_back(static_cast<std::byte>(
+                    (static_cast<std::uint32_t>(correlation) >> (i * 8)) & 0xFF));
+            }
+            for (const auto b : body) {
+                out.push_back(static_cast<std::byte>(b));
+            }
+            if (!conn.send_all(out.data(), out.size())) {
+                return;
+            }
+        }
+    }
+
+    std::shared_ptr<clink::network::TlsServerContext> ctx_;
+    int listen_fd_{-1};
+    std::uint16_t port_{0};
+    std::thread accept_thread_;
+    std::atomic<bool> stopping_{false};
+    mutable std::mutex mu_;
+    std::size_t end_txn_count_{0};
+};
+
+TEST(TxnResumeTls, TheResumeCommitsOverAVerifiedTlsSession) {
+    if (std::system("openssl version > /dev/null 2>&1") != 0) {
+        GTEST_SKIP() << "openssl CLI not available for the cert fixture";
+    }
+    const auto cert_dir = resume_tls_cert_dir();
+    ASSERT_FALSE(cert_dir.empty()) << "self-signed cert generation failed";
+    TlsResumeBroker broker(cert_dir);
+
+    auto ctx = std::make_shared<clink::network::TlsClientContext>((cert_dir / "cert.pem").string());
+    const clink::kafka::ConnectFn tls_connect =
+        [ctx](const std::string& host,
+              std::uint16_t port) -> std::unique_ptr<clink::network::Connection> {
+        try {
+            return clink::network::connect_tls_connection(host, port, ctx);
+        } catch (const std::exception&) {
+            return nullptr;
+        }
+    };
+    const auto outcome =
+        clink::kafka::resume_commit("127.0.0.1", broker.port(), identity(), tls_connect);
+    EXPECT_TRUE(outcome.committed()) << outcome.detail;
+    EXPECT_EQ(broker.end_txn_count(), 1U);
+    std::error_code ec;
+    std::filesystem::remove_all(cert_dir, ec);
+}
+
+TEST(TxnResumeTls, TheResolverDialsTlsWhenTheEnvironmentNamesACa) {
+    if (std::system("openssl version > /dev/null 2>&1") != 0) {
+        GTEST_SKIP() << "openssl CLI not available for the cert fixture";
+    }
+    const auto cert_dir = resume_tls_cert_dir();
+    ASSERT_FALSE(cert_dir.empty());
+    TlsResumeBroker broker(cert_dir);
+    ::setenv("CLINK_KAFKA_RESUME_TLS_CA", (cert_dir / "cert.pem").c_str(), 1);
+
+    const auto resolver = clink::connectors::TxnResumeRegistry::instance().find("kafka_2pc");
+    ASSERT_TRUE(resolver.has_value());
+    const std::string handle = "{\"v\":1,\"resolver\":\"kafka_2pc\",\"bootstrap\":\"127.0.0.1:" +
+                               std::to_string(broker.port()) +
+                               "\",\"transactional_id\":\"resume-me\",\"producer_id\":\"42\","
+                               "\"producer_epoch\":\"3\",\"ckpt\":\"2\"}";
+    const auto result = (*resolver)(handle);
+    ::unsetenv("CLINK_KAFKA_RESUME_TLS_CA");
+    EXPECT_TRUE(result.committed) << result.detail;
+    EXPECT_EQ(broker.end_txn_count(), 1U)
+        << "the resolver must have dialed THROUGH the TLS session, not around it";
+    std::error_code ec;
+    std::filesystem::remove_all(cert_dir, ec);
+}
+
+TEST(TxnResumeTls, AnUnusableCaRefusesLoudlyInsteadOfDowngradingToPlaintext) {
+    // A plaintext fake broker stands ready: a silent downgrade WOULD
+    // succeed against it, which is exactly what must not happen.
+    FakeBroker broker(/*end_txn_error=*/0);
+    ::setenv("CLINK_KAFKA_RESUME_TLS_CA", "/nonexistent/resume-ca.pem", 1);
+    const auto resolver = clink::connectors::TxnResumeRegistry::instance().find("kafka_2pc");
+    ASSERT_TRUE(resolver.has_value());
+    const std::string handle = "{\"v\":1,\"resolver\":\"kafka_2pc\",\"bootstrap\":\"127.0.0.1:" +
+                               std::to_string(broker.port()) +
+                               "\",\"transactional_id\":\"resume-me\",\"producer_id\":\"42\","
+                               "\"producer_epoch\":\"3\",\"ckpt\":\"2\"}";
+    const auto result = (*resolver)(handle);
+    ::unsetenv("CLINK_KAFKA_RESUME_TLS_CA");
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.detail.find("could not be built"), std::string::npos) << result.detail;
+    EXPECT_TRUE(broker.end_txn_bodies().empty())
+        << "the resolver dialed PLAINTEXT after TLS was requested - the downgrade defect";
+}
+
+#endif  // CLINK_KAFKA_RESUME_TLS
 
 TEST(TxnResume, NoCredentialsAgainstASaslOnlyBrokerFallsBackAsTransportError) {
     FakeBroker broker(/*end_txn_error=*/0,

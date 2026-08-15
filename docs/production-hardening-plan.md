@@ -21,6 +21,24 @@ exactly-once under real brokers and stores (Kafka, Postgres, S3, with six
 engine defects found and fixed by those suites), and a source-runner
 ack-before-durability defect in the checkpoint completion path.
 
+Update 2026-08-15: the rounds after the 2026-08-14 external re-audit closed
+the Kafka prepared-transaction resume end to end (wire-level EndTxn(commit)
+with the dead producer's identity; staged handles inside checkpoints;
+in-doubt resolution at BOTH the HA-recovery and in-incarnation restart
+paths, with the restart HELD so resolution and restore-point selection stay
+one decision; SASL/PLAIN with env-sourced credentials and no-downgrade
+refusals, proven hermetically and against a real SASL broker), parked
+HA recovery for capacity-refused jobs, OTLP lifecycle spans for
+submit/recovery/rescale, and - the deepest one - the soak's recurring
+30-second drain-timeout wedge: restart-drain readiness was tested as
+"expected set empty" at the watchdog kicks while draining COVERS the set
+rather than emptying it, so a second-worker fold arriving after the
+survivor's drain ack left a ready restart nothing ever fired. The fix
+(restart_drain_covered_ as the single readiness predicate) is pinned
+deterministically by tests/test_restart_drain_readiness.cpp and the soak
+runs green serially in CI. The live tracker for these rounds is
+planned-prs.json (PR-01..PR-16).
+
 **Status date:** 2026-08-04 (round CLOSED - see section 8; preface above
 updated 2026-08-10)
 **Follow-up queue:** 24 prioritised items, kept out of the repository

@@ -1268,6 +1268,21 @@ endforeach()
 if(TARGET clink::tls)
     target_link_libraries(clink_node PRIVATE clink::tls)
 endif()
+# TLS dialer for the Kafka prepared-transaction resume. Wired HERE, after
+# every impl exists, because impls/tls is processed after impls/kafka and
+# an if(TARGET clink_tls) inside the kafka lists is false forever.
+# Export-safe: clink_tls sits in the same export set and libclink already
+# carries the OpenSSL closure. The define gates the resolver's env-driven
+# TLS branch; without it a TLS request is refused loudly rather than
+# silently downgraded to plaintext.
+if(TARGET clink::tls AND TARGET clink_kafka)
+    target_link_libraries(clink_kafka PRIVATE clink::tls)
+    target_compile_definitions(clink_kafka PRIVATE CLINK_KAFKA_RESUME_TLS=1)
+    if(TARGET clink_kafka_tests)
+        target_link_libraries(clink_kafka_tests PRIVATE clink::tls)
+        target_compile_definitions(clink_kafka_tests PRIVATE CLINK_KAFKA_RESUME_TLS=1)
+    endif()
+endif()
 # Same for clink_etcd: when the etcd impl is built, clink_node
 # links it so --etcd-endpoints actually drives multi-machine HA.
 if(TARGET clink::etcd)
