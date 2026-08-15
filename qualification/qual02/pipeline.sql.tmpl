@@ -13,8 +13,11 @@ CREATE TABLE q2_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
         topic='qual02-in', group_id='qual02',
         auto_offset_reset='earliest');
 
+-- delivery_guarantee='exactly_once' is what selects postgres_2pc_sink
+-- (PREPARE TRANSACTION / COMMIT PREPARED). No format: the planner binds
+-- row_to_json_string for this sink itself.
 CREATE TABLE q2_out (event_id TEXT, k BIGINT, amount BIGINT)
-  WITH (connector='postgres', format='json',
+  WITH (connector='postgres',
         conninfo='__CONNINFO__',
         "table"='public.q2_out',
         delivery_guarantee='exactly_once');
