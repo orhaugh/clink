@@ -71,6 +71,52 @@ as slowly climbing address space under job churn. Finished handles are now
 reaped, pinned by a regression test that asserts on the handle count, since
 that is the only place the defect is observable.
 
+## What the first cloud run taught
+
+The rig itself found more harness defects than the code audit did, and every
+one of them was silent.
+
+The campaign driver hung twice on the same thing: ssh holds its channel open
+until the remote command's descriptors are released, so a backgrounded process
+left the driver waiting on a step it believed finished - once while the
+generator it had started was already producing ninety thousand events.
+
+The verifier had to be corrected three times before it could judge anything
+honestly. A fixed consumer group meant a re-run got a partial partition
+assignment and reported three hundred phantom missing results. Requiring the
+consumer to sit exactly at the topic's high-water mark can never be satisfied
+while a pipeline is still producing, so it deferred judgement indefinitely. And
+when the consumer group had not finished assigning on the first pass, it stored
+an empty offset snapshot that no later read could ever satisfy, leaving those
+windows permanently unjudgeable while a quarter of a million records streamed
+past.
+
+The campaign did not own its topics, so a previous run's events - carrying a
+different event-time base the oracle knew nothing about - produced 161,111
+"missing" results that were never that run's to produce. Read as an engine
+defect, that would have been completely wrong.
+
+**And the faults were not landing at all.** Every chaos command was addressed
+to its target's public IP. The firewall added that same night, to stop an
+unauthenticated control plane facing the internet, admits ssh from the operator
+and the private network only - so each command timed out and was silently
+ignored while the controller wrote the fault into the evidence log and
+continued. The cluster completed 1,771 checkpoints, failed none, and lost no
+worker. The campaign was minutes from publishing a fault-tolerance result for a
+cluster that nothing had touched.
+
+That is the failure this programme exists to prevent, and it was caught only
+because the campaign is required to prove each link before it soaks. The
+controller now addresses hosts privately, refuses to continue when a fault
+command fails, and confirms a kill by observing the process gone rather than
+assuming it. The gate no longer accepts a recorded fault as evidence either: it
+reads the engine's own count of workers lost, so a fault must be visible to
+clink before anything is allowed to run unattended.
+
+The lesson generalises beyond this harness. A qualification result is only
+worth the weakest unverified assumption in the path that produced it, and every
+one of these would have produced a confident, green, meaningless page.
+
 ## Campaigns rescoped
 
 **Rolling upgrade** cannot be run as specified for compiled plugin jobs: the
