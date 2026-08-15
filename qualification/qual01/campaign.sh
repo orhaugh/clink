@@ -82,13 +82,25 @@ start_on_host() {  # host, log-name, command
 
 echo "campaign: QUAL-01 run $RUN_ID, ${DURATION_H}h, profile=$PROFILE"
 
+# Which rig to run against. Defaults to this run's own, which is what a
+# fresh campaign wants. RIG_RUN_ID points a second campaign at hosts that
+# already exist - a re-run proving a fix, or a different campaign reusing
+# the rig - so the evidence still lands in its own directory while the
+# infrastructure is paid for once. The inventory stays API-derived either
+# way; this changes which label is queried, not where the answer comes from.
+RIG_RUN_ID="${RIG_RUN_ID:-$RUN_ID}"
+if [ "$RIG_RUN_ID" != "$RUN_ID" ]; then
+    echo "campaign: running against the existing rig labelled qual-run=$RIG_RUN_ID"
+    SKIP_PROVISION=1
+fi
+
 if [ "${SKIP_PROVISION:-0}" != "1" ]; then
     RUN_ID="$RUN_ID" "$REPO_ROOT/qualification/infra/provision.sh"
     echo "campaign: waiting for cloud-init on every host"
 fi
 
 # Inventory, read from the API by label - never hand-maintained.
-hcloud server list -l "qual-run=${RUN_ID}" -o json | python3 -c "
+hcloud server list -l "qual-run=${RIG_RUN_ID}" -o json | python3 -c "
 import json, sys
 servers = json.load(sys.stdin)
 hosts = []
