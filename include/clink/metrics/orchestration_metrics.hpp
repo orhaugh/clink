@@ -116,6 +116,15 @@ inline constexpr const char* kWorkerConnectionsRefused =
 // apart from logs alone.
 inline constexpr const char* kInDoubtResolved = "clink_recovery_in_doubt_resolved_total";
 inline constexpr const char* kInDoubtUnresolved = "clink_recovery_in_doubt_unresolved_total";
+// Control frames whose MessageKind this build does not handle.
+//
+// Both dispatch loops used to drop an unknown kind with a bare
+// `default: break;`, so a peer speaking a newer protocol got SILENCE:
+// the sender waits for an effect that never happens while the version
+// handshake reports the pair compatible. During a rolling upgrade that
+// is the difference between "the roll crossed a version boundary" and
+// "a graceful stop hung for no visible reason".
+inline constexpr const char* kUnknownControlFrames = "clink_unknown_control_frames_total";
 
 namespace orch {
 
@@ -139,6 +148,9 @@ inline void autoscaler_tick() {
 }
 inline void autoscaler_decision(const char* outcome) {
     MetricsRegistry::global().counter(autoscaler_decision_name(outcome)).increment();
+}
+inline void unknown_control_frame() {
+    MetricsRegistry::global().counter(kUnknownControlFrames).increment();
 }
 inline void in_doubt_resolved() {
     MetricsRegistry::global().counter(kInDoubtResolved).increment();

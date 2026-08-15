@@ -4045,6 +4045,14 @@ void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>
             }
             break;
         default:
+            // See the worker's dispatch: an unhandled kind is a version
+            // boundary, not a no-op, and it must be visible.
+            clink::metrics::orch::unknown_control_frame();
+            clink::log::warn("coordinator.protocol",
+                             "dropping an unrecognised control frame (kind " +
+                                 std::to_string(static_cast<int>(kind)) +
+                                 "): this build cannot handle it, so whatever the peer "
+                                 "expected of it will not happen");
             break;
     }
 }

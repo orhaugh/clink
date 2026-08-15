@@ -716,6 +716,17 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
                 handle_cutover_rebind_(r);
                 break;
             default:
+                // Not silence: a kind this build does not know means the
+                // peer is speaking a protocol this one cannot honour, and
+                // the sender is waiting for an effect that will never
+                // happen. Counted and logged so a rolling upgrade shows
+                // the boundary it crossed.
+                clink::metrics::orch::unknown_control_frame();
+                clink::log::warn("worker.protocol",
+                                 "dropping an unrecognised control frame (kind " +
+                                     std::to_string(static_cast<int>(kind)) +
+                                     "): this build cannot handle it, so whatever the "
+                                     "coordinator expected of it will not happen");
                 break;
         }
     }
