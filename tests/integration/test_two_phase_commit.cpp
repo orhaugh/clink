@@ -448,12 +448,22 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
         // had never measured and losing every time; a generous bound costs
         // nothing when the condition holds early and still fails outright if
         // no checkpoint ever completes.
+        // Wait for COMMITTED BYTES, not just the marker. The marker means
+        // the coordinator completed the checkpoint; the sink's commit
+        // happens later, when the worker processes the CommitCheckpoint
+        // broadcast - and killing on the marker made this premise
+        // timing-dependent (0 committed under CI load, the exact race the
+        // HA failover test documents and drives out the same way).
         const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline &&
-               latest_completed_checkpoint(ckpt_dir) == 0) {
+               (latest_completed_checkpoint(ckpt_dir) == 0 ||
+                read_all_committed_lines(out_dir).empty())) {
             std::this_thread::sleep_for(50ms);
         }
         ASSERT_GT(latest_completed_checkpoint(ckpt_dir), 0u) << "no checkpoint completed in run 1";
+        ASSERT_FALSE(read_all_committed_lines(out_dir).empty())
+            << "no commit landed in run 1 within the bound; killing now would leave the "
+               "recovery nothing to prove";
 
         // Hard kill coordinator + worker. Submitter will fail; that's expected.
         kill_quietly(c->coordinator_pid);
