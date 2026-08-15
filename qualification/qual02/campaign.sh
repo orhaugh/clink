@@ -203,6 +203,19 @@ PYEOF
 [ -n "$JOB_ID" ] || { echo "campaign: could not determine job id - see $OUT_DIR/submit.log" >&2; exit 1; }
 echo "campaign: job $JOB_ID submitted"
 
+# The connector manifest that actually describes what is under test.
+#
+# `clink --capabilities-json` reports the CLI binary's registry, and the CLI
+# does not link the impl libraries: it lists six connectors where the running
+# coordinator lists thirty-three, including the ones the campaign depends on.
+# Retaining only that would mean the provenance record omits the connector
+# being qualified. The coordinator's own registry is the authoritative answer,
+# and it is the same rule the deployment gate follows - the target cluster
+# decides what is available, not whatever submitted the job.
+curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/connectors" \
+    > "$OUT_DIR/cluster-connectors.json" 2>/dev/null \
+    || echo "campaign: WARNING - could not retain the cluster's connector manifest" >&2
+
 start_on_host "$OPS_PUB" q2-verifier.log "python3 verifier.py --dsn '$DSN' \
     --progress /qual/q2-progress.json --out /qual/q2-verdict.json --interval-s 20"
 echo "campaign: verifier started"
