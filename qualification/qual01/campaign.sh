@@ -227,6 +227,11 @@ to_host "$OPS_PUB" "$HERE/../chaos/chaos.py" /qual/chaos.py
 to_host "$OPS_PUB" "$OUT_DIR/inventory.json" /qual/inventory.json
 to_host "$OPS_PUB" "$KEY_FILE" /root/.ssh/id_ed25519
 on_host "$OPS_PUB" "chmod 600 /root/.ssh/id_ed25519 && pip3 install --break-system-packages -q confluent-kafka || pip3 install -q confluent-kafka"
+# No survivors from an earlier run. A leftover verifier keeps writing the
+# verdict file this campaign reads, and its stale in-memory state once
+# produced 161,111 phantom missing results that were read as this run's.
+on_host "$OPS_PUB" "pkill -f generator.py; pkill -f verifier.py; pkill -f chaos.py; \
+    rm -f /qual/progress.json* /qual/verdict.json /qual/chaos.jsonl; true"
 
 # A fixed event-time base makes the whole campaign reproducible: the
 # oracle's window boundaries do not depend on when it was started.
@@ -356,6 +361,23 @@ if [ "${FAULTS:-0}" -eq 0 ]; then
 fi
 echo "campaign: chaos landing faults ($FAULTS recorded)"
 
+# 5b. The fault must have had an OBSERVABLE EFFECT on the cluster.
+#
+# A recorded fault is an intention, not an event. On the first cloud run
+# every chaos command timed out against an address the rig's own
+# firewall blocked; the controller logged two faults, the job never
+# missed a checkpoint, and the campaign was minutes from publishing a
+# fault-tolerance result for a cluster nothing had touched. So the gate
+# now reads the coordinator's own counter of workers it has lost.
+LOST=$(curl -fsS "http://${COORD_PUB}:8095/metrics" 2>/dev/null \
+       | awk '/^clink_coordinator_workers_lost_total /{print $2}')
+if [ "${LOST:-0}" -lt 1 ]; then
+    verify_fail "the chaos controller recorded faults but the coordinator has lost no worker
+  (clink_coordinator_workers_lost_total=${LOST:-0}). A fault that leaves no trace in the
+  engine did not happen, whatever the chaos log says."
+fi
+echo "campaign: fault confirmed by the engine (workers lost: $LOST)"
+
 # 6. And the job must SURVIVE that fault - recover and keep checkpointing.
 sleep 90
 POST=$(curl -fsS "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}") || verify_fail "coordinator unreachable after the first fault"
@@ -367,7 +389,8 @@ print('yes' if j.get('status') == 'RUNNING' else 'no')" "$POST")
 echo "campaign: job recovered from the first fault - VERIFICATION PASSED, entering soak"
 echo "campaign: verification summary" > "$OUT_DIR/verification.txt"
 { echo "input_events_observed=$P2"; echo "output_records=$OUT_N";
-  echo "windows_judged=$JUDGED"; echo "faults_landed=$FAULTS";
+  echo "windows_judged=$JUDGED"; echo "faults_recorded=$FAULTS";
+  echo "workers_lost_observed_by_coordinator=$LOST";
   echo "recovered_after_first_fault=yes"; } >> "$OUT_DIR/verification.txt"
 
 # --- watch --------------------------------------------------------------

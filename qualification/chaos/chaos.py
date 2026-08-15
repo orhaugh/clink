@@ -35,8 +35,13 @@ import time
 import urllib.error
 import urllib.request
 
-SSH = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+SSH = ["ssh", "-n", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
        "-o", "BatchMode=yes"]
+
+
+class ChaosCommandFailed(RuntimeError):
+    """A fault could not be applied. Never swallowed: a controller that
+    keeps going after a failed command manufactures evidence."""
 
 
 class Rig:
@@ -48,10 +53,30 @@ class Rig:
     def hosts(self, role: str):
         return [h for h in self.inv["hosts"] if h["role"] == role]
 
-    def ssh(self, host: dict, command: str, check=False):
-        cmd = SSH + ["-i", self.key_file, f"root@{host['public_ip']}", command]
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=120, check=check)
+    def ssh(self, host: dict, command: str):
+        """Run a command on a rig host and REFUSE to continue if it fails.
+
+        Two things here were the difference between a campaign and a
+        fiction. The address is the PRIVATE one, because the rig's
+        firewall admits ssh from the operator's laptop and from the
+        private network only - the ops host reaching a worker's public
+        address times out, which is exactly what happened: every fault
+        command silently timed out for a whole run while the log
+        recorded them as applied, the job never missed a checkpoint, and
+        the campaign would have published a fault-tolerance result for a
+        cluster nothing had touched.
+
+        And a non-zero exit is now an exception rather than a shrug. A
+        chaos controller that cannot apply a fault must stop, not
+        continue writing evidence about faults that did not happen.
+        """
+        cmd = SSH + ["-i", self.key_file, f"root@{host['private_ip']}", command]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            raise ChaosCommandFailed(
+                f"{host['name']}: `{command}` exited {result.returncode}: "
+                f"{(result.stderr or result.stdout).strip()[:300]}")
+        return result
 
 
 class Chaos:
@@ -128,37 +153,64 @@ class Chaos:
 
     # --- faults ----------------------------------------------------------
 
+    def assert_container_running(self, host: dict, name: str):
+        """Prove a killed process came back. A rig left one worker short
+        makes every measurement after it a different experiment."""
+        for _ in range(20):
+            res = self.rig.ssh(host, f"docker ps --filter name={name} --format '{{{{.Names}}}}'")
+            if name in (res.stdout or ""):
+                return
+            time.sleep(3)
+        raise ChaosCommandFailed(f"{host['name']}: {name} did not come back after a restart")
+
+    def assert_container_gone(self, host: dict, name: str):
+        """Prove the container is actually down. `docker kill` on an
+        already-dead or misnamed container is a no-op, and a fault that
+        did not happen must never be recorded as one."""
+        res = self.rig.ssh(host, f"docker ps --filter name={name} --format '{{{{.Names}}}}'")
+        if name in (res.stdout or ""):
+            raise ChaosCommandFailed(
+                f"{host['name']}: {name} is still running after a kill - the fault did not land")
+
     def kill_worker(self, state, ckpt):
         host = self.rng.choice(self.rig.hosts("worker"))
-        self.rig.ssh(host, "docker kill -s SIGKILL clink-worker || true")
+        self.rig.ssh(host, "docker kill -s SIGKILL clink-worker")
+        self.assert_container_gone(host, "clink-worker")
         self.record(host["name"], "worker_sigkill", state, ckpt)
         # Restart after a beat so the cluster can actually recover; the
         # campaign is about recovery, not permanent capacity loss.
         time.sleep(self.rng.uniform(5, 20))
         self.rig.ssh(host, "cd /qual && docker compose -f worker.yml up -d")
+        self.assert_container_running(host, "clink-worker")
         self.record(host["name"], "worker_restart", "killed", ckpt)
 
     def kill_coordinator(self, state, ckpt):
         host = self.rig.hosts("coordinator")[0]
-        self.rig.ssh(host, "docker kill -s SIGKILL clink-coordinator || true")
+        self.rig.ssh(host, "docker kill -s SIGKILL clink-coordinator")
+        self.assert_container_gone(host, "clink-coordinator")
         self.record(host["name"], "coordinator_sigkill", state, ckpt)
         time.sleep(self.rng.uniform(5, 15))
         self.rig.ssh(host, "cd /qual && docker compose -f coordinator.yml up -d")
+        self.assert_container_running(host, "clink-coordinator")
         self.record(host["name"], "coordinator_restart", "killed", ckpt)
 
     def restart_broker(self, state, ckpt):
         host = self.rng.choice(self.rig.hosts("broker"))
-        self.rig.ssh(host, "docker restart redpanda || true")
+        self.rig.ssh(host, "docker restart redpanda")
         self.record(host["name"], "broker_restart", state, ckpt)
 
     def network_latency(self, state, ckpt):
         host = self.rng.choice(self.rig.hosts("worker"))
         delay = self.rng.choice([50, 150, 400])
         dur = self.rng.uniform(30, 120)
-        self.rig.ssh(host, f"tc qdisc add dev eth0 root netem delay {delay}ms 20ms || true")
+        self.rig.ssh(host, f"tc qdisc add dev eth0 root netem delay {delay}ms 20ms")
         self.record(host["name"], "network_latency", state, ckpt,
                     {"delay_ms": delay, "duration_s": round(dur, 1)})
         time.sleep(dur)
+        # `|| true` on the REMOVAL only: the qdisc may legitimately be
+        # absent if the add was rolled back. Everything that APPLIES a
+        # fault above is intolerant, so a fault can never be recorded
+        # without having been applied.
         self.rig.ssh(host, "tc qdisc del dev eth0 root || true")
         self.record(host["name"], "network_latency_cleared", "delayed", ckpt)
 
@@ -166,7 +218,7 @@ class Chaos:
         host = self.rng.choice(self.rig.hosts("worker"))
         loss = self.rng.choice([1, 5, 15])
         dur = self.rng.uniform(30, 120)
-        self.rig.ssh(host, f"tc qdisc add dev eth0 root netem loss {loss}% || true")
+        self.rig.ssh(host, f"tc qdisc add dev eth0 root netem loss {loss}%")
         self.record(host["name"], "packet_loss", state, ckpt,
                     {"loss_pct": loss, "duration_s": round(dur, 1)})
         time.sleep(dur)
@@ -190,12 +242,12 @@ class Chaos:
         and in-doubt paths exist for."""
         dur = self.rng.uniform(15, 60)
         for host in self.rig.hosts("broker"):
-            self.rig.ssh(host, "docker stop redpanda || true")
+            self.rig.ssh(host, "docker stop redpanda")
         self.record("all-brokers", "kafka_unavailable", state, ckpt,
                     {"duration_s": round(dur, 1)})
         time.sleep(dur)
         for host in self.rig.hosts("broker"):
-            self.rig.ssh(host, "docker start redpanda || true")
+            self.rig.ssh(host, "docker start redpanda")
         self.record("all-brokers", "kafka_restored", "down", ckpt)
 
     def fault_surface_present(self) -> bool:
@@ -247,7 +299,7 @@ class Chaos:
         compose = "coordinator.yml" if is_coordinator else "worker.yml"
         service = "clink-coordinator" if is_coordinator else "clink-worker"
         self.record(host["name"], f"twopc_arm:{point}", state, ckpt)
-        self.rig.ssh(host, f"docker kill -s SIGKILL {service} || true")
+        self.rig.ssh(host, f"docker kill -s SIGKILL {service}")
         self.rig.ssh(
             host,
             f"cd /qual && CLINK_FAULT_INJECT='{point}=exit:9@1' "
