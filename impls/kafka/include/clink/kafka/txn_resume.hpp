@@ -34,8 +34,15 @@
 //   * Transport is the engine's own Connection seam, so a fake broker tests
 //     the full path byte-for-byte and TLS can slot in via the factory.
 //
-// SASL is not spoken yet: on a SASL-required listener the requests fail and
-// recovery falls back. Recorded as the module's standing limitation.
+// SASL: PLAIN is spoken (SaslHandshake v1 + SaslAuthenticate v1 on each
+// connection, before anything else) when the caller supplies credentials.
+// They come from the RESOLVING process's environment at resolution time -
+// never from the staged handle, because durable checkpoint state must not
+// carry secrets. Any other mechanism, and any authentication refusal, is a
+// loud Refused and recovery falls back to the bounded contract. PLAIN over
+// a plaintext connection sends the password in the clear; pair it with a
+// TLS ConnectFn (the seam accepts one) exactly as you would configure the
+// sink with sasl_ssl.
 
 #include <cstdint>
 #include <functional>
@@ -77,15 +84,30 @@ struct ResumeOutcome {
 using ConnectFn = std::function<std::unique_ptr<network::Connection>(const std::string& host,
                                                                      std::uint16_t port)>;
 
+// SASL credentials for the resume dialogue. Default-constructed = no
+// authentication (the pre-SASL behaviour, byte-for-byte). Only "PLAIN" is
+// supported; any other mechanism value is refused locally before a byte is
+// sent, so a typo cannot silently downgrade to unauthenticated.
+struct ResumeAuth {
+    std::string mechanism;  // "" = none; "PLAIN" is the only spoken value
+    std::string username;
+    std::string password;
+
+    [[nodiscard]] bool enabled() const noexcept { return !mechanism.empty(); }
+};
+
 // The whole recovery step against one bootstrap address:
-// ApiVersions -> FindCoordinator(transactional.id) -> connect to the
-// coordinator -> EndTxn(commit). Retries the retriable coordinator codes
-// (NOT_COORDINATOR, COORDINATOR_NOT_AVAILABLE, COORDINATOR_LOAD_IN_PROGRESS)
-// a bounded number of times; everything else is a final verdict.
+// [SASL] -> ApiVersions -> FindCoordinator(transactional.id) -> connect to
+// the coordinator -> [SASL] -> EndTxn(commit). Retries the retriable
+// coordinator codes (NOT_COORDINATOR, COORDINATOR_NOT_AVAILABLE,
+// COORDINATOR_LOAD_IN_PROGRESS) a bounded number of times; everything else
+// is a final verdict. Authentication failures are final: credentials do
+// not improve on retry.
 [[nodiscard]] ResumeOutcome resume_commit(const std::string& bootstrap_host,
                                           std::uint16_t bootstrap_port,
                                           const TxnIdentity& txn,
-                                          const ConnectFn& connect);
+                                          const ConnectFn& connect,
+                                          const ResumeAuth& auth = {});
 
 // --- wire encoding, exposed for the frame tests -----------------------------
 
@@ -94,6 +116,8 @@ namespace wire {
 inline constexpr std::int16_t kApiVersionsKey = 18;
 inline constexpr std::int16_t kFindCoordinatorKey = 10;
 inline constexpr std::int16_t kEndTxnKey = 26;
+inline constexpr std::int16_t kSaslHandshakeKey = 17;
+inline constexpr std::int16_t kSaslAuthenticateKey = 36;
 
 // Complete request frames (size prefix included), non-flexible encoding.
 [[nodiscard]] std::vector<std::byte> api_versions_request_v0(std::int32_t correlation_id);
@@ -103,6 +127,14 @@ inline constexpr std::int16_t kEndTxnKey = 26;
 [[nodiscard]] std::vector<std::byte> end_txn_request_v1(std::int32_t correlation_id,
                                                         const TxnIdentity& txn,
                                                         bool commit);
+[[nodiscard]] std::vector<std::byte> sasl_handshake_request_v1(std::int32_t correlation_id,
+                                                               const std::string& mechanism);
+// auth_bytes for PLAIN is '\0' + username + '\0' + password (empty authzid);
+// plain_auth_bytes builds it, sasl_authenticate_request_v1 wraps any bytes.
+[[nodiscard]] std::vector<std::byte> plain_auth_bytes(const std::string& username,
+                                                      const std::string& password);
+[[nodiscard]] std::vector<std::byte> sasl_authenticate_request_v1(
+    std::int32_t correlation_id, const std::vector<std::byte>& auth_bytes);
 
 struct ApiRange {
     std::int16_t min{0};
@@ -129,6 +161,26 @@ struct FindCoordinatorResponse {
 
 // EndTxn v0/v1 response: throttle + error_code.
 [[nodiscard]] std::optional<std::int16_t> parse_end_txn_response(
+    const std::vector<std::byte>& body, std::int32_t expected_correlation_id);
+
+// SaslHandshake v1 response: error_code + the broker's enabled mechanisms
+// (surfaced in the refusal detail so an operator sees what WOULD work).
+struct SaslHandshakeResponse {
+    std::int16_t error_code{0};
+    std::vector<std::string> mechanisms;
+};
+[[nodiscard]] std::optional<SaslHandshakeResponse> parse_sasl_handshake_response_v1(
+    const std::vector<std::byte>& body, std::int32_t expected_correlation_id);
+
+// SaslAuthenticate v1 response: error_code + nullable error_message. The
+// trailing auth_bytes and session_lifetime_ms are not consumed - nothing
+// downstream needs them and a parser that stops early cannot be broken by
+// a broker extending the tail.
+struct SaslAuthenticateResponse {
+    std::int16_t error_code{0};
+    std::string error_message;
+};
+[[nodiscard]] std::optional<SaslAuthenticateResponse> parse_sasl_authenticate_response_v1(
     const std::vector<std::byte>& body, std::int32_t expected_correlation_id);
 
 // Kafka protocol error-code names for the codes this path can meet;

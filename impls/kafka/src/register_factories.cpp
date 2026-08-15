@@ -584,6 +584,21 @@ clink::connectors::InDoubtResolution resolve_kafka_2pc_handle(const std::string&
     const auto connect = [](const std::string& host, std::uint16_t port) {
         return clink::network::connect_plain(host, port);
     };
+    // SASL credentials come from the RESOLVING process's environment at
+    // resolution time - never from the staged handle, because durable
+    // checkpoint state must not carry secrets. Unset = unauthenticated,
+    // the pre-SASL behaviour; a mechanism the resume path does not speak
+    // is refused loudly inside resume_commit rather than downgraded.
+    clink::kafka::ResumeAuth auth;
+    if (const char* m = std::getenv("CLINK_KAFKA_RESUME_SASL_MECHANISM"); m != nullptr) {
+        auth.mechanism = m;
+    }
+    if (const char* u = std::getenv("CLINK_KAFKA_RESUME_SASL_USERNAME"); u != nullptr) {
+        auth.username = u;
+    }
+    if (const char* p = std::getenv("CLINK_KAFKA_RESUME_SASL_PASSWORD"); p != nullptr) {
+        auth.password = p;
+    }
     std::string last;
     std::size_t pos = 0;
     while (pos <= bootstrap.size()) {
@@ -600,7 +615,7 @@ clink::connectors::InDoubtResolution resolve_kafka_2pc_handle(const std::string&
             colon == std::string::npos
                 ? std::uint16_t{9092}
                 : static_cast<std::uint16_t>(std::stoi(entry.substr(colon + 1)));
-        const auto outcome = clink::kafka::resume_commit(host, port, txn, connect);
+        const auto outcome = clink::kafka::resume_commit(host, port, txn, connect, auth);
         if (outcome.status != clink::kafka::ResumeOutcome::Status::TransportError) {
             return {outcome.committed(), outcome.detail};
         }

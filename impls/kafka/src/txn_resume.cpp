@@ -128,6 +128,35 @@ std::vector<std::byte> end_txn_request_v1(std::int32_t correlation_id,
     return frame(kEndTxnKey, 1, correlation_id, body);
 }
 
+std::vector<std::byte> sasl_handshake_request_v1(std::int32_t correlation_id,
+                                                 const std::string& mechanism) {
+    std::vector<std::byte> body;
+    put_string(body, mechanism);
+    return frame(kSaslHandshakeKey, 1, correlation_id, body);
+}
+
+std::vector<std::byte> plain_auth_bytes(const std::string& username, const std::string& password) {
+    // SASL/PLAIN (RFC 4616): [authzid] NUL authcid NUL passwd; empty authzid.
+    std::vector<std::byte> out;
+    out.push_back(std::byte{0});
+    for (const char c : username) {
+        out.push_back(static_cast<std::byte>(c));
+    }
+    out.push_back(std::byte{0});
+    for (const char c : password) {
+        out.push_back(static_cast<std::byte>(c));
+    }
+    return out;
+}
+
+std::vector<std::byte> sasl_authenticate_request_v1(std::int32_t correlation_id,
+                                                    const std::vector<std::byte>& auth_bytes) {
+    std::vector<std::byte> body;
+    put_i32(body, static_cast<std::int32_t>(auth_bytes.size()));
+    body.insert(body.end(), auth_bytes.begin(), auth_bytes.end());
+    return frame(kSaslAuthenticateKey, 1, correlation_id, body);
+}
+
 std::optional<ApiVersionsResponse> parse_api_versions_response_v0(
     const std::vector<std::byte>& body, std::int32_t expected_correlation_id) {
     Reader r(body);
@@ -207,6 +236,57 @@ std::optional<std::int16_t> parse_end_txn_response(const std::vector<std::byte>&
     return r.i16();
 }
 
+std::optional<SaslHandshakeResponse> parse_sasl_handshake_response_v1(
+    const std::vector<std::byte>& body, std::int32_t expected_correlation_id) {
+    Reader r(body);
+    const auto corr = r.i32();
+    if (!corr.has_value() || *corr != expected_correlation_id) {
+        return std::nullopt;
+    }
+    // v1: error_code, mechanisms ARRAY<STRING>. No throttle field.
+    SaslHandshakeResponse out;
+    const auto err = r.i16();
+    if (!err.has_value()) {
+        return std::nullopt;
+    }
+    out.error_code = *err;
+    const auto count = r.i32();
+    if (!count.has_value() || *count < 0) {
+        return std::nullopt;
+    }
+    for (std::int32_t i = 0; i < *count; ++i) {
+        const auto m = r.string();
+        if (!m.has_value()) {
+            return std::nullopt;
+        }
+        out.mechanisms.push_back(*m);
+    }
+    return out;
+}
+
+std::optional<SaslAuthenticateResponse> parse_sasl_authenticate_response_v1(
+    const std::vector<std::byte>& body, std::int32_t expected_correlation_id) {
+    Reader r(body);
+    const auto corr = r.i32();
+    if (!corr.has_value() || *corr != expected_correlation_id) {
+        return std::nullopt;
+    }
+    // v1: error_code, error_message (nullable), auth_bytes, session_lifetime_ms.
+    // The tail past error_message is deliberately not consumed.
+    SaslAuthenticateResponse out;
+    const auto err = r.i16();
+    if (!err.has_value()) {
+        return std::nullopt;
+    }
+    out.error_code = *err;
+    const auto msg = r.string();
+    if (!msg.has_value()) {
+        return std::nullopt;
+    }
+    out.error_message = *msg;
+    return out;
+}
+
 std::string error_name(std::int16_t code) {
     switch (code) {
         case 0:
@@ -217,6 +297,10 @@ std::string error_name(std::int16_t code) {
             return "COORDINATOR_NOT_AVAILABLE";
         case 16:
             return "NOT_COORDINATOR";
+        case 33:
+            return "UNSUPPORTED_SASL_MECHANISM";
+        case 34:
+            return "ILLEGAL_SASL_STATE";
         case 35:
             return "UNSUPPORTED_VERSION";
         case 47:
@@ -225,6 +309,8 @@ std::string error_name(std::int16_t code) {
             return "INVALID_TXN_STATE";
         case 53:
             return "TRANSACTIONAL_ID_AUTHORIZATION_FAILED";
+        case 58:
+            return "SASL_AUTHENTICATION_FAILED";
         case 90:
             return "PRODUCER_FENCED";
         default:
@@ -272,17 +358,90 @@ bool retriable(std::int16_t code) {
     return code == 14 || code == 15 || code == 16;
 }
 
+// The SASL step, run once per connection before any other request. Three
+// outcomes: authenticated (nullopt), a FINAL refusal (credentials do not
+// improve on retry - carries the outcome to return), or a transport
+// failure (carries a detail; the caller's retry loop decides).
+struct SaslStepFailure {
+    bool transport{false};
+    ResumeOutcome outcome;  // meaningful when !transport
+    std::string detail;     // meaningful when transport
+};
+std::optional<SaslStepFailure> authenticate(Connection& conn,
+                                            const ResumeAuth& auth,
+                                            std::int32_t& corr) {
+    using Status = ResumeOutcome::Status;
+    if (!auth.enabled()) {
+        return std::nullopt;
+    }
+    ++corr;
+    const auto hs_body = roundtrip(conn, wire::sasl_handshake_request_v1(corr, auth.mechanism));
+    if (!hs_body.has_value()) {
+        return SaslStepFailure{
+            .transport = true, .outcome = {}, .detail = "SaslHandshake transport failure"};
+    }
+    const auto hs = wire::parse_sasl_handshake_response_v1(*hs_body, corr);
+    if (!hs.has_value()) {
+        return SaslStepFailure{
+            .transport = true, .outcome = {}, .detail = "SaslHandshake response did not parse"};
+    }
+    if (hs->error_code != 0) {
+        std::string enabled;
+        for (const auto& m : hs->mechanisms) {
+            enabled += (enabled.empty() ? "" : ", ") + m;
+        }
+        return SaslStepFailure{
+            .transport = false,
+            .outcome = {Status::Refused,
+                        "SaslHandshake: " + wire::error_name(hs->error_code) + " (mechanism '" +
+                            auth.mechanism + "'; broker enables: " +
+                            (enabled.empty() ? "<none listed>" : enabled) + ")"},
+            .detail = {}};
+    }
+    ++corr;
+    const auto au_body = roundtrip(conn,
+                                   wire::sasl_authenticate_request_v1(
+                                       corr, wire::plain_auth_bytes(auth.username, auth.password)));
+    if (!au_body.has_value()) {
+        return SaslStepFailure{
+            .transport = true, .outcome = {}, .detail = "SaslAuthenticate transport failure"};
+    }
+    const auto au = wire::parse_sasl_authenticate_response_v1(*au_body, corr);
+    if (!au.has_value()) {
+        return SaslStepFailure{
+            .transport = true, .outcome = {}, .detail = "SaslAuthenticate response did not parse"};
+    }
+    if (au->error_code != 0) {
+        return SaslStepFailure{
+            .transport = false,
+            .outcome = {Status::Refused,
+                        "SaslAuthenticate: " + wire::error_name(au->error_code) +
+                            (au->error_message.empty() ? "" : " (" + au->error_message + ")")},
+            .detail = {}};
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 ResumeOutcome resume_commit(const std::string& bootstrap_host,
                             std::uint16_t bootstrap_port,
                             const TxnIdentity& txn,
-                            const ConnectFn& connect) {
+                            const ConnectFn& connect,
+                            const ResumeAuth& auth) {
     using Status = ResumeOutcome::Status;
     if (!txn.complete()) {
         return {Status::Refused,
                 "handle carries no producer identity (pid/epoch were never captured); "
                 "nothing can be resumed"};
+    }
+    // A mechanism this module does not speak is refused HERE, before a byte
+    // goes out: silently proceeding unauthenticated would be a downgrade.
+    if (auth.enabled() && auth.mechanism != "PLAIN") {
+        return {Status::Refused,
+                "SASL mechanism '" + auth.mechanism +
+                    "' is not spoken by the resume path (PLAIN only); refusing rather than "
+                    "downgrading to unauthenticated"};
     }
 
     // Bounded retry around the coordinator dance: leadership can be mid-move
@@ -302,8 +461,18 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
         }
         (void)bootstrap->set_recv_timeout(std::chrono::milliseconds(5000));
 
+        // 0. Authenticate this connection, when the caller has credentials.
+        std::int32_t corr = 0;
+        if (const auto sasl = authenticate(*bootstrap, auth, corr); sasl.has_value()) {
+            if (!sasl->transport) {
+                return sasl->outcome;  // refusals are final
+            }
+            last_detail = sasl->detail + " against bootstrap";
+            continue;
+        }
+
         // 1. What does this broker still speak?
-        std::int32_t corr = 1;
+        ++corr;
         const auto av_body = roundtrip(*bootstrap, wire::api_versions_request_v0(corr));
         if (!av_body.has_value()) {
             last_detail = "ApiVersions transport failure against bootstrap";
@@ -371,6 +540,14 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
             continue;
         }
         (void)coord->set_recv_timeout(std::chrono::milliseconds(5000));
+        // The coordinator connection is a fresh session: authenticate it too.
+        if (const auto sasl = authenticate(*coord, auth, corr); sasl.has_value()) {
+            if (!sasl->transport) {
+                return sasl->outcome;
+            }
+            last_detail = sasl->detail + " against coordinator";
+            continue;
+        }
         ++corr;
         const auto et_body =
             roundtrip(*coord, wire::end_txn_request_v1(corr, txn, /*commit=*/true));

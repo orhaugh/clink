@@ -302,14 +302,24 @@
       "id": "PR-16",
       "priority": "P2",
       "title": "SASL (and wired TLS) for the prepared-transaction resume, so the resolver reaches brokers the sink can already talk to",
-      "status": "planned",
-      "risk": "The sink declares sasl_plaintext/sasl_ssl/ssl (librdkafka passthrough) but the resume wire path speaks plaintext-no-auth only, so on an authenticated cluster every in-doubt resolution refuses and the bounded contract carries it. Scope: (1) SaslHandshake v1 + SaslAuthenticate v1 (PLAIN) on both resume connections, golden-frame UTs + FakeBroker refusal arms; (2) credentials read from the coordinator's environment at RESOLVE time - never staged in the checkpoint handle; (3) TLS via the existing ConnectFn seam (impls/tls), with the doc stating PLAIN-over-plaintext leaks credentials and recommending sasl_ssl; (4) DockerKafka gains a SASL mode (Redpanda enable_sasl + superuser) and a live arm proving resolve-with-creds commits and resolve-without refuses loudly.",
-      "files": [],
-      "tests": [],
+      "status": "in_progress",
+      "risk": "The sink declares sasl_plaintext/sasl_ssl/ssl (librdkafka passthrough) but the resume wire path speaks plaintext-no-auth only, so on an authenticated cluster every in-doubt resolution refuses and the bounded contract carries it. DELIVERED: SASL/PLAIN on both resume connections with env-sourced credentials (CLINK_KAFKA_RESUME_SASL_*), local refusal of unspoken mechanisms, honest fallback shapes. REMAINING scope: (1) SaslHandshake v1 + SaslAuthenticate v1 (PLAIN) on both resume connections, golden-frame UTs + FakeBroker refusal arms; (2) credentials read from the coordinator's environment at RESOLVE time - never staged in the checkpoint handle; (3) TLS via the existing ConnectFn seam (impls/tls), with the doc stating PLAIN-over-plaintext leaks credentials and recommending sasl_ssl; (4) DockerKafka gains a SASL mode (Redpanda enable_sasl + superuser) and a live arm proving resolve-with-creds commits and resolve-without refuses loudly.",
+      "files": [
+        "impls/kafka/include/clink/kafka/txn_resume.hpp",
+        "impls/kafka/src/txn_resume.cpp",
+        "impls/kafka/src/register_factories.cpp",
+        "impls/kafka/tests/test_txn_resume.cpp",
+        "docs/connectors/kafka.md"
+      ],
+      "tests": [
+        "TxnResumeWire.SaslFramesArePinnedByteForByte + SaslParsersRefuseTruncationAndForeignCorrelation (goldens)",
+        "TxnResume SASL arms vs the fake broker: authenticated resume commits and presents the RFC 4616 payload on BOTH connections; unknown mechanism refused locally before any dial; handshake refusal surfaces the broker's enabled mechanisms; bad credentials refused with the broker's message and no EndTxn attempted; no-credentials against a SASL-only listener falls back as TransportError. Mutation-checked twice: auth-failure-treated-as-success caught by the bad-credentials arm; mechanism-gate-removed caught by the unknown-mechanism arm."
+      ],
       "dependencies": [
         "PR-12"
       ],
-      "limitations": "SCRAM deferred (crypto surface); KIP-939 revisit unchanged."
+      "limitations": "delivered: the PLAIN wire half, hermetically tested. Remaining: DockerKafka SASL mode + live arm (resolve-with-creds commits, without refuses), and the env-gated TLS dialer wiring for the resolver. SCRAM deferred (crypto surface); KIP-939 revisit unchanged.",
+      "result_revision": "HEAD"
     }
   ],
   "verified_already_done": [
