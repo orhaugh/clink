@@ -99,7 +99,12 @@ DSN="postgresql://postgres:$PGPASSWORD@localhost:5432/qual02"
 echo "campaign: starting the sink database"
 on_host "$OPS_PUB" "mkdir -p /qual"
 to_host "$OPS_PUB" "$HERE/postgres.yml" /qual/postgres.yml
-on_host "$OPS_PUB" "cd /qual && PGPASSWORD='$PGPASSWORD' docker compose -f postgres.yml up -d"
+# Written to the host, not passed inline, so anything that later restarts
+# this container reproduces its configuration. See qual01/campaign.sh: a
+# restart that lost its environment brought a worker back on the wrong
+# image with an empty coordinator address.
+on_host "$OPS_PUB" "printf 'PGPASSWORD=%s\\n' '$PGPASSWORD' >> /qual/.env"
+on_host "$OPS_PUB" "cd /qual && docker compose -f postgres.yml up -d"
 
 for _ in $(seq 1 30); do
     if on_host "$OPS_PUB" "docker exec qual02-postgres pg_isready -U postgres -q" 2>/dev/null; then
@@ -316,11 +321,30 @@ echo "campaign: recovered and still committing ($BEFORE -> $AFTER rows) - VERIFI
 
 # --- soak ---------------------------------------------------------------
 END=$(( $(date +%s) + DURATION_S ))
+CHAOS_DIED_AT=""
 while [ "$(date +%s)" -lt "$END" ]; do
     sleep 600
     for f in q2-verdict.json q2-chaos.jsonl q2-progress.json q2-generator.log q2-verifier.log q2-chaos.log; do
         scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
     done
+
+    # The gate proves faults land at the start of the run; this proves they
+    # are still landing. QUAL-01's controller died four minutes into an hour
+    # and the campaign reported healthy for the remaining fifty-six, because
+    # a soak with no faults in it looks exactly like a soak that survived
+    # them.
+    if [ -z "$CHAOS_DIED_AT" ] \
+       && ! on_host "$OPS_PUB" "pgrep -f '[c]haos.py' >/dev/null"; then
+        CHAOS_DIED_AT=$(date -u +%H:%M)
+        NFAULTS=$(on_host "$OPS_PUB" "wc -l < /qual/q2-chaos.jsonl 2>/dev/null || echo 0" | tr -d '\r')
+        echo "campaign: WARNING - the chaos controller is no longer running (noticed ${CHAOS_DIED_AT}," \
+             "${NFAULTS} fault record(s) written). Everything after this point is an" \
+             "undisturbed soak, not a fault campaign, and must be reported as such." >&2
+        { echo "chaos_controller_died=yes"; echo "noticed_at_utc=$CHAOS_DIED_AT";
+          echo "fault_records_at_death=$NFAULTS";
+          echo "tail:"; on_host "$OPS_PUB" "tail -20 /qual/q2-chaos.log" 2>/dev/null || true;
+        } > "$OUT_DIR/chaos-died.txt"
+    fi
     psql_q "SELECT count(*), count(DISTINCT event_id) FROM public.q2_out" > "$OUT_DIR/pg-counts.txt" 2>/dev/null || true
     echo "campaign: $(date -u +%H:%M) soak, $(tail -1 "$OUT_DIR/pg-counts.txt" 2>/dev/null || echo '?') rows/distinct"
 done
