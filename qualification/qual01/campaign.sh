@@ -52,8 +52,28 @@ OUT_DIR="$REPO_ROOT/qualification-results/$RUN_ID"
 mkdir -p "$OUT_DIR"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
-on_host() { ssh "${SSH_OPTS[@]}" "root@$1" "$2"; }
+on_host() { ssh -n "${SSH_OPTS[@]}" "root@$1" "$2"; }
 to_host()  { scp "${SSH_OPTS[@]}" -q "$2" "root@$1:$3"; }
+
+# Start a long-running process on a host and RETURN.
+#
+# ssh holds its channel open until every process holding the remote
+# command's stdout and stderr has exited, so a plain `cmd &` leaves the
+# driver blocked on a step it believes it finished - which is exactly
+# how this campaign hung twice, once with the generator already happily
+# producing 90,000 events while the driver waited. Detaching needs all
+# three: a new session (setsid), every descriptor redirected, and the
+# remote shell exiting explicitly.
+start_on_host() {  # host, log-name, command
+    local host=$1 log=$2 cmd=$3
+    on_host "$host" "cd /qual && (setsid nohup $cmd </dev/null >/qual/$log 2>&1 &) ; exit 0"
+    # Prove it actually started, rather than trusting a backgrounded
+    # command that may have died on its first line.
+    sleep 3
+    on_host "$host" "pgrep -f '$(echo "$cmd" | awk '{print $2}')' >/dev/null" \
+        || { echo "campaign: $log did not start - see /qual/$log on $host" >&2
+             on_host "$host" "tail -20 /qual/$log" >&2 || true; exit 3; }
+}
 
 echo "campaign: QUAL-01 run $RUN_ID, ${DURATION_H}h, profile=$PROFILE"
 
@@ -198,11 +218,10 @@ on_host "$OPS_PUB" "chmod 600 /root/.ssh/id_ed25519 && pip3 install --break-syst
 BASE_MS=$(( $(date +%s) * 1000 ))
 echo "$BASE_MS" > "$OUT_DIR/base_ms"
 
-on_host "$OPS_PUB" "cd /qual && setsid nohup python3 generator.py --brokers '$BROKER_LIST' \
+start_on_host "$OPS_PUB" generator.log "python3 generator.py --brokers '$BROKER_LIST' \
     --topic qual01-in --rate $RATE --partitions $PARTITIONS --keys $KEYS \
     --seed $SEED --base-ms $BASE_MS --max-jitter-ms $MAX_JITTER_MS \
-    --window-ms $WINDOW_MS --progress /qual/progress.json \
-    </dev/null > /qual/generator.log 2>&1 &"
+    --window-ms $WINDOW_MS --progress /qual/progress.json"
 echo "campaign: generator started"
 
 # --- pipeline -----------------------------------------------------------
@@ -241,9 +260,9 @@ PYEOF
 [ -n "$JOB_ID" ] || { echo "campaign: could not determine job id - see $OUT_DIR/submit.log" >&2; exit 1; }
 echo "campaign: job $JOB_ID submitted"
 
-on_host "$OPS_PUB" "cd /qual && setsid nohup python3 verifier.py --brokers '$BROKER_LIST' \
+start_on_host "$OPS_PUB" verifier.log "python3 verifier.py --brokers '$BROKER_LIST' \
     --topic qual01-out --spec /qual/progress.json.spec --progress /qual/progress.json \
-    --verdict /qual/verdict.json </dev/null > /qual/verifier.log 2>&1 &"
+    --verdict /qual/verdict.json"
 echo "campaign: verifier started"
 
 # --- functional verification --------------------------------------------
@@ -300,10 +319,10 @@ echo "campaign: verifier judging windows ($JUDGED evaluated)"
 
 # --- chaos --------------------------------------------------------------
 DURATION_S=$(( DURATION_H * 3600 ))
-on_host "$OPS_PUB" "cd /qual && setsid nohup python3 chaos.py --inventory /qual/inventory.json \
+start_on_host "$OPS_PUB" chaos.log "python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
-    --duration-s $DURATION_S </dev/null > /qual/chaos.log 2>&1 &"
+    --duration-s $DURATION_S"
 echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE)"
 
 # 5. Chaos must actually land a fault. A controller that applies none is
