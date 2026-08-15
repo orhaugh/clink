@@ -2602,3 +2602,85 @@ TEST(Cluster, ARestartBeforeTheFirstCheckpointKeepsTheSubmittedRestorePoint) {
     worker.stop();
     coordinator.stop();
 }
+
+// The configured checkpoint interval must gate the trigger, not just the sleep.
+//
+// Found by QUAL-01 on 2026-08-16: a job submitted with a 10s interval was
+// completing 61 checkpoints every 30 seconds - one about every 490ms, twenty
+// times what it asked for, with the corresponding multiple of state writes,
+// barrier injections and transactional sink commits. One worker logged 5,947
+// refused commit dispatches in fifty minutes purely because so many
+// checkpoints were being taken.
+//
+// The trigger loop took the minimum configured interval as its own sleep, so
+// it never OVERSLEPT a job, and then triggered every eligible job on every
+// pass - so it never waited for one either. interval_ms only ever shortened
+// the loop tick below its 500ms default; a value above it did nothing at all.
+//
+// Four seconds against a sixty-second interval: correct behaviour is the one
+// checkpoint fired immediately at startup, and the pre-fix behaviour is about
+// eight. The margin is wide on purpose - this asserts a cadence, and a tight
+// bound would just be a flake on a loaded machine.
+TEST(CoordinatorCheckpointing, TheConfiguredIntervalGatesTheTriggerNotJustTheSleep) {
+    using namespace std::chrono_literals;
+    ensure_built_ins_registered();
+
+    Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-ckpt-cadence"});
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;
+    Worker worker("worker-ckpt-cadence", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto out_path = std::filesystem::temp_directory_path() /
+                          ("clink_ckpt_cadence_" + std::to_string(::getpid()) + ".txt");
+    const auto ckpt_dir = std::filesystem::temp_directory_path() /
+                          ("clink_ckpt_cadence_ckpt_" + std::to_string(::getpid()));
+    std::filesystem::remove(out_path);
+    std::filesystem::remove_all(ckpt_dir);
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{kChannelInt64};
+    // Paced, not drained. An unpaced range source finishes in well under a
+    // second, the job completes, periodic triggering stops with it, and the
+    // window measures a finished job - which is how the first version of this
+    // test passed against the unfixed code. 200 records at 50ms is ten
+    // seconds of running, comfortably past the measurement window.
+    src.params = {{"count", "200"}, {"delay_ms", "50"}};
+    g.ops.push_back(src);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"src"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = ckpt_dir.string();
+    ckpt.interval_ms = 60'000;
+    const auto job_id = coordinator.submit_job(
+        g, OperatorRegistry::default_instance(), std::vector<PluginBinary>{}, ckpt, nullptr);
+
+    std::this_thread::sleep_for(4s);
+    const auto completed = coordinator.latest_completed_checkpoint(job_id);
+
+    EXPECT_LE(completed, 2U)
+        << "the job asked for a checkpoint every 60s and got " << completed
+        << " of them in four seconds. The interval is being used only to shorten the "
+           "trigger loop's own sleep, so every job is checkpointed at the loop tick "
+           "whatever cadence it configured - paying that multiple in state writes, "
+           "barrier injections and transactional sink commits.";
+
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove(out_path);
+    std::filesystem::remove_all(ckpt_dir);
+}

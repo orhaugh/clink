@@ -6849,6 +6849,28 @@ void Coordinator::checkpoint_trigger_loop_() {
                 if (interval < sleep_for) {
                     sleep_for = interval;
                 }
+                // Is this job actually DUE? Shortening the loop's sleep to the
+                // smallest configured interval only guarantees we never oversleep
+                // a job; on its own it triggered every eligible job on every pass,
+                // so a job asking for a 10s interval got one every 500ms - the
+                // loop tick - along with twenty times the intended state writes
+                // and transactional sink commits. The interval has to gate the
+                // trigger, not just the sleep.
+                const auto now = std::chrono::steady_clock::now();
+                if (job.last_checkpoint_trigger_at != std::chrono::steady_clock::time_point{}) {
+                    const auto since = now - job.last_checkpoint_trigger_at;
+                    if (since < interval) {
+                        // Not due. Wake when it is, so a long interval does not
+                        // get rounded up to the next 500ms tick either.
+                        const auto remaining =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(interval - since);
+                        if (remaining < sleep_for) {
+                            sleep_for = remaining;
+                        }
+                        continue;
+                    }
+                }
+                job.last_checkpoint_trigger_at = now;
                 const auto next_id = job.next_checkpoint_id++;
                 std::unordered_set<std::string> pending;
                 for (const auto& [key, _] : job.task_records) {

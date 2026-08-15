@@ -1091,6 +1091,20 @@ private:
         std::uint64_t latest_completed_checkpoint_id{0};
         std::uint64_t next_checkpoint_id{1};
 
+        // When this job last had a periodic checkpoint TRIGGERED, so the
+        // trigger loop can tell whether its interval has elapsed.
+        //
+        // Without it the loop computed a sleep from the configured
+        // intervals and then triggered every eligible job on every pass,
+        // so interval_ms only ever shortened the loop's sleep and never
+        // gated a job. Every job checkpointed at the loop's 500ms tick
+        // whatever it had asked for - QUAL-01 measured 61 checkpoints in
+        // 30 seconds against a configured 10s interval, twenty times the
+        // intended rate, with the corresponding multiple of state writes
+        // and transactional sink commits. Default-constructed means
+        // "never triggered", which fires the first one immediately.
+        std::chrono::steady_clock::time_point last_checkpoint_trigger_at{};
+
         // Adaptive checkpoint mode (CheckpointAlignment::Adaptive). The
         // policy decides the mode stamped on each trigger; its pressure
         // observation is the LAST completed checkpoint's duration
