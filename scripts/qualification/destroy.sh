@@ -8,12 +8,22 @@
 #
 # Usage:
 #   scripts/qualification/destroy.sh <run-id> [--yes] [--local-evidence]
+#   scripts/qualification/destroy.sh --all [--yes]
+#
+# --all sweeps every resource labelled qual=1, whatever run it belongs to.
+# It exists because some resources are deliberately SHARED between runs and
+# so carry no qual-run label - the ssh key is one - which meant the
+# documented teardown path could never reach the state its own --check
+# demands: destroy by run id, then assert nothing labelled qual=1 survives.
+# The shared key survived every per-run destroy and failed the check for a
+# reason no per-run teardown could fix. Use --all at the end of a session,
+# when no other campaign is running against this project.
 #
 # Without --yes the script only LISTS what it would delete.
 set -euo pipefail
 
 RUN_ID="${1:-}"
-[[ -n "$RUN_ID" ]] || { echo "destroy.sh: usage: destroy.sh <run-id> [--yes] [--local-evidence]" >&2; exit 2; }
+[[ -n "$RUN_ID" ]] || { echo "destroy.sh: usage: destroy.sh <run-id>|--all [--yes] [--local-evidence]" >&2; exit 2; }
 shift
 YES=0
 LOCAL_EVIDENCE=0
@@ -25,7 +35,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-SELECTOR="qual-run=$RUN_ID"
+if [[ "$RUN_ID" == "--all" ]]; then
+    SELECTOR="qual=1"
+    echo "destroy.sh: sweeping EVERY resource labelled qual=1, across all runs"
+else
+    SELECTOR="qual-run=$RUN_ID"
+fi
 
 if command -v hcloud >/dev/null 2>&1; then
     # Deletion order matters: servers first (they hold volume
@@ -46,6 +61,12 @@ if command -v hcloud >/dev/null 2>&1; then
     done
 else
     echo "destroy.sh: hcloud CLI not found; no cloud resources to sweep on this machine" >&2
+fi
+
+if [[ "$LOCAL_EVIDENCE" -eq 1 && "$RUN_ID" == "--all" ]]; then
+    echo "destroy.sh: refusing --local-evidence with --all: that would delete every" >&2
+    echo "  campaign's retained evidence at once, and evidence outlives the rig." >&2
+    exit 2
 fi
 
 if [[ "$LOCAL_EVIDENCE" -eq 1 ]]; then
