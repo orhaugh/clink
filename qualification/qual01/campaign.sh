@@ -80,6 +80,29 @@ start_on_host() {  # host, log-name, command
              on_host "$host" "tail -20 /qual/$log" >&2 || true; exit 3; }
 }
 
+
+# Kill the previous run's processes and PROVE they are gone.
+#
+# SIGINT alone does not do it. Run b's drain sent one, the campaign warned
+# that two processes had survived, and thirty minutes later its generator
+# was still producing - into a topic the next run had just deleted, which
+# it promptly recreated with default settings and thereby aborted that run
+# before it started. So the signal escalates and the result is verified,
+# because "asked it to stop" and "it stopped" are different facts.
+kill_campaign_processes() {  # host
+    local host=$1 sig
+    for sig in INT TERM KILL; do
+        on_host "$host" "pkill -$sig -f '[g]enerator.py'; pkill -$sig -f '[v]erifier.py'; \
+            pkill -$sig -f '[c]haos.py'; true"
+        sleep 5
+        local left
+        left=$(on_host "$host" "pgrep -f '[g]enerator.py|[v]erifier.py|[c]haos.py' | wc -l" | tr -d ' \r')
+        [ "${left:-0}" = "0" ] && return 0
+    done
+    echo "campaign: could not stop the previous run's processes on $host" >&2
+    return 1
+}
+
 echo "campaign: QUAL-01 run $RUN_ID, ${DURATION_H}h, profile=$PROFILE"
 
 # Which rig to run against. Defaults to this run's own, which is what a
@@ -247,11 +270,38 @@ fi
 # generations with different event-time bases and the verifier reported
 # 161,111 missing results for output that was never its run's to produce.
 # A campaign must own its topics outright.
+# Stop the previous run's processes BEFORE recreating topics, not after.
+# A leftover generator auto-creates the topic the moment this campaign
+# deletes it - with the broker's default one partition, no replication -
+# and the campaign then refuses to run against a topic it does not own.
+# That is the right refusal, arriving after the avoidable cause.
+kill_campaign_processes "$OPS_PUB" || exit 2
+on_host "$OPS_PUB" "rm -f /qual/progress.json* /qual/verdict.json /qual/chaos.jsonl; true"
+
 BROKER1_PUB=$(read_inv broker public_ip | cut -d' ' -f1)
 for t in qual01-in qual01-out; do
     on_host "$BROKER1_PUB" "docker exec redpanda rpk topic delete $t >/dev/null 2>&1 || true"
 done
-sleep 5
+# Deletion is asynchronous, so wait for the broker to actually forget the
+# topic instead of sleeping and hoping. A fixed sleep raced it and the
+# create came back TOPIC_ALREADY_EXISTS, which the campaign correctly
+# refused to continue past - a topic it does not own carries a previous
+# run's events, and reading those as this run's once produced 161,111
+# phantom missing results.
+for t in qual01-in qual01-out; do
+    gone=0
+    for _ in $(seq 1 30); do
+        if ! on_host "$BROKER1_PUB" \
+                "docker exec redpanda rpk topic list 2>/dev/null | awk '{print \$1}' | grep -qx $t"; then
+            gone=1; break
+        fi
+        on_host "$BROKER1_PUB" "docker exec redpanda rpk topic delete $t >/dev/null 2>&1 || true"
+        sleep 2
+    done
+    [ "$gone" = "1" ] || { echo "campaign: topic $t still exists after 30 delete attempts;" >&2
+                           echo "  refusing to run against a topic this campaign does not own" >&2
+                           exit 2; }
+done
 for t in qual01-in qual01-out; do
     on_host "$BROKER1_PUB" "docker exec redpanda rpk topic create $t -p $PARTITIONS -r 3" \
         || { echo "campaign: could not create topic $t" >&2; exit 2; }
@@ -265,17 +315,6 @@ to_host "$OPS_PUB" "$HERE/../chaos/chaos.py" /qual/chaos.py
 to_host "$OPS_PUB" "$OUT_DIR/inventory.json" /qual/inventory.json
 to_host "$OPS_PUB" "$KEY_FILE" /root/.ssh/id_ed25519
 on_host "$OPS_PUB" "chmod 600 /root/.ssh/id_ed25519 && pip3 install --break-system-packages -q confluent-kafka || pip3 install -q confluent-kafka"
-# No survivors from an earlier run. A leftover verifier keeps writing the
-# verdict file this campaign reads, and its stale in-memory state once
-# produced 161,111 phantom missing results that were read as this run's.
-# The bracket trick, and it is not cosmetic: `pkill -f generator.py`
-# matches ANY command line containing that text - including the remote
-# shell running this very command - so it killed its own parent, the ssh
-# died with 255, and the campaign aborted here. '[g]enerator.py' cannot
-# match itself.
-on_host "$OPS_PUB" "pkill -f '[g]enerator.py'; pkill -f '[v]erifier.py'; pkill -f '[c]haos.py'; \
-    rm -f /qual/progress.json* /qual/verdict.json /qual/chaos.jsonl; true"
-
 # A fixed event-time base makes the whole campaign reproducible: the
 # oracle's window boundaries do not depend on when it was started.
 BASE_MS=$(( $(date +%s) * 1000 ))
@@ -543,6 +582,8 @@ on_host "$OPS_PUB" "pkill -INT -f '[g]enerator.py' || true"
 sleep 120   # let the pipeline drain the tail and the verifier judge it
 on_host "$OPS_PUB" "pkill -INT -f '[v]erifier.py' || true"
 sleep 20
+# SIGINT is the polite request; this makes sure it happened.
+kill_campaign_processes "$OPS_PUB" || true
 # Say so if either is somehow still alive, rather than collecting evidence
 # from underneath a still-running producer and calling the verdict final.
 STILL=$(on_host "$OPS_PUB" "pgrep -f '[g]enerator.py|[v]erifier.py' | wc -l" | tr -d ' \r')
