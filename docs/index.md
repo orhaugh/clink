@@ -1,4 +1,9 @@
-# clink
+---
+title: Clink — C++23 Stream Processing Engine
+description: Clink is an embedded-first, Arrow-native C++23 stream processing engine with streaming SQL, event time, exactly-once checkpoints, stateful operators, distributed execution, and production connectors.
+---
+
+# Clink — C++23 Stream Processing Engine
 
 `clink` is an embedded-first, Arrow-native stream processing engine in modern
 C++ (C++23): stateful stream processing with engine-grade semantics - SQL,
@@ -11,6 +16,13 @@ daemons; `libclink` embeds the engine in any service behind a pure-C ABI, and
 `pyclink` returns results as pyarrow tables. At scale, the same SQL file,
 unchanged, submits to a distributed Coordinator/Worker cluster with
 parallelism, failover, and rescale.
+
+If you are evaluating stream processing in C++, start with the focused guides:
+
+- [C++ stream processing engine](guides/cpp-stream-processing.md)
+- [Streaming SQL in C++](guides/cpp-streaming-sql.md)
+- [Clink vs Apache Flink](guides/clink-vs-flink.md)
+- [Arrow-native stream processing](guides/arrow-stream-processing.md)
 
 This site is the deep reference for the engine, organised in three layers:
 
