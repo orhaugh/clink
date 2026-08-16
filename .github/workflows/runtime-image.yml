@@ -18,7 +18,12 @@
 #   both               :sha-<short sha>, so any deployment can be traced back
 #                      to the commit that produced it
 # With the ForSt engine opted in, every tag above gains a `-forst` suffix so an
-# opt-in build can never silently overwrite the canonical image.
+# opt-in build can never silently overwrite the canonical image. The same
+# applies to a fault-injection build (`-faultinj`), which exists so a
+# qualification campaign can pull a ready-made image instead of compiling one
+# on paid rig hardware - the rig then only has to exist for the campaign
+# itself, and every host pulls the same digest rather than being fed a tarball
+# over ssh.
 #
 # Visibility: the first run's package came out publicly pullable (verified by
 # fetching the manifest with an anonymous ghcr token: HTTP 200), so no manual
@@ -44,6 +49,10 @@ on:
         default: ""
       with_forst:
         description: "Bake in the ForSt state backend (forst:// and the forst_s3 schemes). Adds ~5-8 min and publishes -forst suffixed tags."
+        type: boolean
+        default: false
+      fault_injection:
+        description: "Compile in the named fault points (2PC crash windows) for a qualification campaign. Publishes -faultinj suffixed tags: a shipped image must never gain a fault surface silently."
         type: boolean
         default: false
 
@@ -104,6 +113,11 @@ jobs:
           # The suffix keeps it addressable for an A/B while leaving those alone.
           isa="${{ inputs.isa_baseline }}"
           if [ -n "$isa" ]; then suffix="${suffix}-isa$(echo "$isa" | tr -cd 'a-zA-Z0-9')"; fi
+          # A fault-injection build is for campaigns only. Arming
+          # CLINK_FAULT_INJECT against an image that lacks the points is a
+          # SILENT no-op, so the surface has to be visible in the tag - and
+          # the tag must never be one a deployment pulls blindly.
+          if [ "${{ inputs.fault_injection }}" = "true" ]; then suffix="${suffix}-faultinj"; fi
           short="$(echo "${GITHUB_SHA}" | cut -c1-12)"
           tags="${IMAGE}:sha-${short}${suffix}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
@@ -126,6 +140,8 @@ jobs:
             BASE_IMAGE=${{ env.TOOLCHAIN }}:${{ inputs.toolchain_tag || 'main' }}
             CLINK_WITH_FORST=${{ inputs.with_forst == true && 'ON' || 'OFF' }}
             CLINK_ISA_BASELINE=${{ inputs.isa_baseline }}
+            CLINK_ENABLE_FAULT_INJECTION=${{ inputs.fault_injection == true && 'ON' || 'OFF' }}
+            CLINK_GIT_SHA=${{ github.sha }}
           tags: ${{ steps.tags.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

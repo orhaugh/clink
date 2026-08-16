@@ -2,6 +2,18 @@
 # Build the qualification runtime image ON the rig, at the exact commit
 # under test, and load it onto every clink host.
 #
+# PREFER qualification/infra/pull-image.sh. GitHub Actions builds the same
+# image for nothing, on a runner warm from the registry build cache, and every
+# rig host then pulls the same digest:
+#
+#   gh workflow run runtime-image.yml -f fault_injection=true --ref <branch>
+#   RUN_ID=<id> IMAGE=ghcr.io/orhaugh/clink-runtime:sha-<short>-faultinj ./pull-image.sh
+#
+# This script compiles the engine in Release with LTO on paid rig hardware -
+# about forty minutes of an eight-host rig - and exists for the cases the
+# registry cannot serve: an uncommitted tree, or a commit that has not been
+# pushed anywhere a runner can reach.
+#
 # Why not the published image: the campaigns qualify a specific revision,
 # and the published :main tag is whatever was last released - for this
 # programme that predates the fixes the campaigns depend on (a coordinator
