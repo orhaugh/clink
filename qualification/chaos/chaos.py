@@ -225,6 +225,29 @@ class Chaos:
         self.assert_container_running(host, "clink-coordinator")
         self.record(host["name"], "coordinator_restart", "killed", ckpt)
 
+        # Bring the workers back too, because killing the coordinator killed
+        # them.
+        #
+        # A clink worker exits on coordinator disconnect - "exiting for
+        # restart" - by design, expecting whatever supervises it to start it
+        # again. The rig deliberately runs workers with restart: "no" so that
+        # a chaos WORKER kill has an observable consequence the controller
+        # times, and the two together mean a coordinator kill decapitates the
+        # cluster permanently: every worker exits, nothing restarts them, and
+        # the recovered coordinator parks the job for capacity it will never
+        # get. QUAL-01 measured that as a job that simply vanished mid-run.
+        #
+        # So the fault owns its whole blast radius. Without this, a
+        # coordinator kill is not a recovery test - it is the end of the run.
+        for w in self.rig.hosts("worker"):
+            res = self.rig.ssh(
+                w, "docker ps -a --filter name=clink-worker --format '{{.Status}}'")
+            if "Up" in (res.stdout or ""):
+                continue
+            self.rig.ssh(w, "cd /qual && docker compose -f worker.yml up -d")
+            self.assert_container_running(w, "clink-worker")
+            self.record(w["name"], "worker_restart_after_coordinator_kill", "killed", ckpt)
+
     def restart_broker(self, state, ckpt):
         host = self.rng.choice(self.rig.hosts("broker"))
         self.rig.ssh(host, "docker restart redpanda")
