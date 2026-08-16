@@ -190,6 +190,59 @@ enough to be worth naming: **every link between "the campaign ran" and "the
 property holds" has to be proven, continuously, and by something other than
 the component being judged.**
 
+## The re-run
+
+A second run (`qual01-20260816b`) at revision `5a767f5`, with both fixes in the
+image and the harness repairs above in place, was used to test the fix in the
+field. With the fault generator no longer dying, it delivered the campaign the
+first run was supposed to have:
+
+| Fault | Count |
+|---|---|
+| Worker SIGKILL (and its restart) | 3 |
+| Coordinator-to-worker partition (and heal) | 2 |
+| Two-phase-commit window faults (`sink.before_prepare`, `sink.before_commit`, `coordinator.after_completed_marker`) | 3 |
+| Broker restart | 1 |
+| Network latency injection (and clear) | 1 |
+
+Correctness across all of it, over 8.27 million input events:
+
+| Counter | Value |
+|---|---|
+| Windows fully correct | 223 |
+| Incorrect aggregates | **0** |
+| Duplicate results | **0** |
+| Conflicting results | **0** |
+| Foreign results | **0** |
+
+Three worker kills and three two-phase-commit window faults produced no
+corruption of any kind, where a single worker kill on the unfixed build
+corrupted the window in flight. That is the evidence the fix was after.
+
+**But the run is not a clean pass, and its own harness says so.** It is
+recorded as FAIL and void, for a reason worth publishing in full.
+
+The last two-phase-commit fault was injected at the coordinator's
+`after_completed_marker` point, which crashed the coordinator by design. It
+restarted clean - and came back with *no jobs at all*, because the rig
+deployed it without `--ha-dir` and it had therefore never persisted a job
+manifest to recover from. The pipeline stopped for good. The oracle carried on
+doing exactly its job, reporting every subsequent expected result as missing,
+and by the end of the hour that was 2.9 million of them.
+
+Read cold, 2.9 million missing results is catastrophic data loss. It is
+nothing of the kind: every counter that means corruption stayed at zero, and
+the job had simply ceased to exist. Killing a control plane that was never
+configured to survive it measures the deployment, not the engine.
+
+Two fixes followed. The rig's coordinator now runs with `--ha-dir` on local
+disk, so a coordinator kill becomes a genuine test of job recovery instead of
+a guaranteed ending. And the campaign now checks that the *subject* of the
+test is still running, not only that its fault generator is - it says the
+moment the job stops being `RUNNING`, so a summary can distinguish "the engine
+lost data" from "there was no engine". A third run with that configuration is
+under way; its result will be added here.
+
 ## What this campaign demonstrates
 
 **Demonstrated** - at revision `440043f`, on the topology and scale above:
@@ -213,10 +266,13 @@ than the campaign intended:
   broker restart, network partition, packet loss, latency injection and the
   two-phase-commit window faults were all in the configured profile and none
   of them ran. This campaign is not evidence about any of them.
-- The correctness fix is proven by a deterministic regression test; **it has
-  not yet been re-proven in the field by a repeat campaign at the fixed
-  revision.** Until that re-run is published here, the field evidence for
-  exactly-once across a restart is the defect above, not its absence.
+- The correctness fix is proven by a deterministic regression test, and
+  supported in the field by the re-run above: three worker kills and three
+  two-phase-commit window faults produced zero corruption of any kind, where
+  one kill on the unfixed build corrupted the window in flight. That re-run is
+  **not** a completed clean campaign - it is recorded FAIL and void because
+  its coordinator was killed by a fault it was not configured to survive, so
+  it covers 223 windows rather than a full hour.
 
 **Architecturally supported but not qualified** - exercised incidentally or
 not at all: rescale during faults, savepoints, schema evolution, multi-sink
