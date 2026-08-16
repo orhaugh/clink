@@ -748,12 +748,20 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
     // coordinator ignores confirmations from tasks it is not tracking, so
     // sending for every committer subtask is correct for unflagged jobs
     // too (one small frame per subtask per checkpoint).
-    std::vector<std::pair<std::uint32_t, std::vector<RunnerContext::CommitCheckpointFn>>> to_invoke;
+    std::vector<std::pair<std::uint32_t, std::vector<CommitCallback>>> to_invoke;
     {
         std::lock_guard lock(mu_);
         auto job_it = per_job_committers_.find(msg.job_id);
         if (job_it != per_job_committers_.end()) {
             for (auto& [sub_idx, entry] : job_it->second) {
+                // Drop callbacks whose runner has retired. A gate never
+                // un-retires, so these can only refuse - and one refusal
+                // blocks confirmation for the whole subtask, including a live
+                // callback registered beside it by the runner that replaced
+                // them. A subtask whose teardown hangs never reaches the code
+                // that removes its own registrations, so without this the job
+                // stops confirming anything, permanently.
+                std::erase_if(entry, [](const CommitCallback& c) { return c.dead(); });
                 to_invoke.emplace_back(sub_idx, entry);
             }
         }
@@ -1154,6 +1162,12 @@ void Worker::handle_abort_checkpoint_(MessageReader& r) {
         auto job_it = per_job_aborters_.find(msg.job_id);
         if (job_it != per_job_aborters_.end()) {
             for (auto& [sub_idx, entry] : job_it->second) {
+                // Same pruning as the commit path: a retired runner's abort
+                // callback can only refuse. Nothing is confirmed on the abort
+                // path, so this is tidiness rather than correctness - but a
+                // dead entry that stays registered forever is how the commit
+                // path's defect looked too.
+                std::erase_if(entry, [](const AbortCallback& c) { return c.dead(); });
                 for (auto& fn : entry) {
                     to_invoke.push_back(fn);
                 }
@@ -1776,8 +1790,11 @@ void Worker::run_generic_subtask_(JobId job_id,
         // ran - so a refused checkpoint was confirmed, the coordinator
         // advanced the restore point past it, and the transaction it named
         // was neither committed nor ever replayed.
-        return RunnerContext::CommitCheckpointFn{
-            clink::cluster::gated_dispatch(dispatch_gate, std::move(fn))};
+        //
+        // The gate rides along so the dispatch can drop this entry once the
+        // runner behind it retires, rather than refusing on it forever.
+        return GatedCallback{dispatch_gate,
+                             clink::cluster::gated_dispatch(dispatch_gate, std::move(fn))};
     };
     // Skip the legacy single-op runner path when fusion is in play:
     // even a chain of one operator with fused source/sink needs the

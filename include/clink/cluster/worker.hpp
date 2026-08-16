@@ -16,6 +16,7 @@
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/cluster/checkpoint_retention.hpp"
+#include "clink/cluster/commit_dispatch_gate.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/snapshots.hpp"
@@ -370,7 +371,12 @@ private:
     // 2PC protocol register a callback at startup; CommitCheckpoint
     // dispatches it with the just-completed checkpoint_id. Late-bind
     // analog to per_job_injectors_ above.
-    using CommitCallback = std::function<void(std::uint64_t checkpoint_id)>;
+    // The callback plus the gate that owns it, so a dispatch can drop
+    // entries whose runner has retired. A retired entry can never run again;
+    // keeping it means every later dispatch refuses, and a refusal blocks
+    // confirmation for the whole subtask - so one subtask whose teardown hung
+    // would stop the job confirming anything, for good.
+    using CommitCallback = GatedCallback;
     std::unordered_map<JobId, std::unordered_map<std::uint32_t, std::vector<CommitCallback>>>
         per_job_committers_;
 
@@ -389,7 +395,7 @@ private:
     // startup; the worker dispatches it on AbortCheckpoint. Same
     // signature shape as CommitCallback so callers can use the same
     // type alias and registration plumbing.
-    using AbortCallback = std::function<void(std::uint64_t checkpoint_id)>;
+    using AbortCallback = GatedCallback;
     std::unordered_map<JobId, std::unordered_map<std::uint32_t, std::vector<AbortCallback>>>
         per_job_aborters_;
 

@@ -2811,3 +2811,47 @@ TEST(CommitDispatchGate, ARefusedDispatchThrowsRatherThanLookingLikeACommit) {
     EXPECT_EQ(refused_ckpt, 42U) << "the refusal must name the checkpoint it refused";
     EXPECT_EQ(ran, 1) << "the callback must not have run after retirement";
 }
+
+// A retired callback must be pruned, not left to block the live one beside it.
+//
+// The other half of the QUAL-01 output stall. A subtask whose teardown hangs
+// never reaches the code that removes its own registrations, so its retired
+// callbacks stay in the dispatch bucket - run 3 logged 5,947 refusals from
+// exactly that, and run c's drain timeout shows the hang that causes it.
+//
+// Once a refusal correctly blocks confirmation, a single stale entry would
+// stop the subtask confirming anything ever again, even though the runner
+// that replaced it is committing perfectly well. A gate never un-retires, so
+// the entry can be dropped the moment it is seen to be dead.
+TEST(CommitDispatchGate, ARetiredCallbackIsPrunedRatherThanBlockingTheLiveOneBesideIt) {
+    auto dead_gate = std::make_shared<clink::cluster::CommitDispatchGate>();
+    auto live_gate = std::make_shared<clink::cluster::CommitDispatchGate>();
+
+    int dead_ran = 0;
+    int live_ran = 0;
+    std::vector<clink::cluster::GatedCallback> bucket{
+        {dead_gate, [&dead_ran](std::uint64_t) { ++dead_ran; }},
+        {live_gate, [&live_ran](std::uint64_t) { ++live_ran; }},
+    };
+
+    // The old runner retires; the replacement's registration sits beside it.
+    dead_gate->retire_and_drain();
+
+    std::erase_if(bucket, [](const clink::cluster::GatedCallback& c) { return c.dead(); });
+    ASSERT_EQ(bucket.size(), 1U)
+        << "a retired runner's callback stayed in the dispatch bucket. It can only ever "
+           "refuse, and a refusal blocks confirmation for the whole subtask - so the job "
+           "would never confirm another checkpoint, however well its live sink commits.";
+
+    bool threw = false;
+    for (const auto& cb : bucket) {
+        try {
+            cb(7);
+        } catch (const clink::cluster::CommitDispatchRefused&) {
+            threw = true;
+        }
+    }
+    EXPECT_FALSE(threw) << "the surviving callback must dispatch cleanly";
+    EXPECT_EQ(live_ran, 1) << "the live callback must have run";
+    EXPECT_EQ(dead_ran, 0) << "the retired callback must not have run";
+}

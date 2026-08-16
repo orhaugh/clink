@@ -40,6 +40,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -87,6 +88,15 @@ public:
         cv_.notify_all();
     }
 
+    // Whether this gate has been retired. A gate never un-retires, so a
+    // callback behind a retired gate can never run again and dispatching to
+    // it can only ever produce a refusal - which blocks confirmation for the
+    // whole subtask, including any live callback registered alongside it.
+    [[nodiscard]] bool retired() {
+        std::lock_guard lk(mu_);
+        return retired_;
+    }
+
     // Marks the gate retired and blocks until every in-flight dispatch has
     // left. After this returns, no callback is executing and none can start,
     // so the executor behind them is safe to destroy.
@@ -123,6 +133,21 @@ public:
 
 private:
     std::shared_ptr<CommitDispatchGate> gate_;
+};
+
+// A commit/abort callback together with the gate that owns it.
+//
+// The pairing is what lets a dispatch DROP entries whose runner has retired.
+// A gate never un-retires, so such an entry can only ever refuse - and one
+// refusal blocks confirmation for its whole subtask, including a live
+// callback the replacement runner registered beside it. A subtask whose
+// teardown hangs never reaches the code that removes its own registrations,
+// so without pruning it stops the job confirming anything, permanently.
+struct GatedCallback {
+    std::shared_ptr<CommitDispatchGate> gate;  // null on in-process paths
+    std::function<void(std::uint64_t /*checkpoint_id*/)> fn;
+    void operator()(std::uint64_t ckpt) const { fn(ckpt); }
+    [[nodiscard]] bool dead() const { return gate && gate->retired(); }
 };
 
 // Wrap a commit/abort callback so it runs under the gate.
