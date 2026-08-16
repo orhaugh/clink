@@ -198,7 +198,7 @@ done
 #
 # So the configuration lives on the host, and anything that restarts a
 # container reproduces the deployment rather than guessing at it.
-on_host "$COORD_PUB" "mkdir -p /qual"
+on_host "$COORD_PUB" "mkdir -p /qual /qual/ha"
 to_host "$COORD_PUB" "$HERE/../infra/coordinator.yml" /qual/coordinator.yml
 on_host "$COORD_PUB" "printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\n' '$CLINK_IMAGE' '$COORD_PRIV' > /qual/.env"
 on_host "$COORD_PUB" "cd /qual && docker compose -f coordinator.yml up -d"
@@ -322,6 +322,16 @@ PYEOF
 )
 [ -n "$JOB_ID" ] || { echo "campaign: could not determine job id - see $OUT_DIR/submit.log" >&2; exit 1; }
 echo "campaign: job $JOB_ID submitted"
+
+# The connector manifest the CLUSTER actually has. `clink --capabilities-json`
+# above reports the CLI binary's registry, and the CLI does not link the
+# connector implementations - it lists six where the coordinator lists
+# thirty-three, including the Kafka connector this campaign is about. The
+# build flags it reports are right; its connector list is not the evidence it
+# looks like.
+curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/connectors" \
+    > "$OUT_DIR/cluster-connectors.json" 2>/dev/null \
+    || echo "campaign: WARNING - could not retain the cluster's connector manifest" >&2
 
 start_on_host "$OPS_PUB" verifier.log "python3 verifier.py --brokers '$BROKER_LIST' \
     --topic qual01-out --spec /qual/progress.json.spec --progress /qual/progress.json \
@@ -448,6 +458,7 @@ echo "campaign: verification summary" > "$OUT_DIR/verification.txt"
 # dies at hour 90 still has 89 hours of evidence locally.
 END=$(( $(date +%s) + DURATION_S ))
 CHAOS_DIED_AT=""
+JOB_GONE_AT=""
 while [ "$(date +%s)" -lt "$END" ]; do
     sleep 600
     for f in verdict.json chaos.jsonl progress.json generator.log verifier.log chaos.log; do
@@ -475,6 +486,37 @@ while [ "$(date +%s)" -lt "$END" ]; do
           echo "fault_records_at_death=$NFAULTS";
           echo "tail:"; on_host "$OPS_PUB" "tail -20 /qual/chaos.log" 2>/dev/null || true;
         } > "$OUT_DIR/chaos-died.txt"
+    fi
+
+    # And is the SUBJECT of the test still alive?
+    #
+    # The check above watches the apparatus. This one watches the thing being
+    # measured, which is a different failure and produces a far more
+    # misleading number. On the re-run a 2PC fault crashed the coordinator,
+    # which came back with no jobs because it had no manifest to recover
+    # from, and the pipeline stopped for good. The oracle kept doing its job
+    # perfectly: it reported every subsequent expected result as missing, and
+    # by the end that was 2.9 million of them. Read cold, that looks like
+    # catastrophic data loss. It was a job that had ceased to exist.
+    #
+    # So the campaign says the moment it happens, and the summary can
+    # separate "the engine lost data" from "there was no engine".
+    if [ -z "$JOB_GONE_AT" ]; then
+        ALIVE=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" 2>/dev/null \
+                | python3 -c "
+import json,sys
+try:
+    print(json.load(sys.stdin).get('status') or 'UNKNOWN')
+except Exception:
+    print('GONE')" 2>/dev/null || echo GONE)
+        if [ "$ALIVE" != "RUNNING" ]; then
+            JOB_GONE_AT=$(date -u +%H:%M)
+            echo "campaign: WARNING - job ${JOB_ID} is no longer RUNNING (status=${ALIVE}," \
+                 "noticed ${JOB_GONE_AT}). Every result expected after this point will be" \
+                 "counted missing because nothing is producing, which is NOT data loss." >&2
+            { echo "job_gone=yes"; echo "status=$ALIVE"; echo "noticed_at_utc=$JOB_GONE_AT";
+            } > "$OUT_DIR/job-gone.txt"
+        fi
     fi
     curl -fsS "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" \
         > "$OUT_DIR/job-status.json" 2>/dev/null || true
@@ -508,6 +550,13 @@ STILL=$(on_host "$OPS_PUB" "pgrep -f '[g]enerator.py|[v]erifier.py' | wc -l" | t
 for f in verdict.json chaos.jsonl progress.json progress.json.spec generator.log verifier.log chaos.log; do
     scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
 done
+
+# The coordinator's final counters, retained rather than read from a live
+# cluster that is about to be destroyed. Run 3's restart and worker-loss
+# figures had to be quoted from a terminal session because nothing kept them.
+curl -fsS --max-time 20 "http://${COORD_PUB}:8095/metrics" \
+    > "$OUT_DIR/coordinator-metrics-final.txt" 2>/dev/null \
+    || echo "campaign: WARNING - could not retain the coordinator's final metrics" >&2
 
 python3 "$HERE/summarise.py" --out-dir "$OUT_DIR" --run-id "$RUN_ID" \
     --duration-h "$DURATION_H" --profile "$PROFILE" > "$OUT_DIR/QUAL-01-summary.md"
