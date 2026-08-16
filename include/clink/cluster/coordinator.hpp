@@ -607,6 +607,16 @@ public:
     // has not completed a checkpoint.
     [[nodiscard]] std::uint64_t latest_completed_checkpoint(JobId job_id) const;
 
+    // The latest checkpoint whose external commits are PROVEN executed.
+    //
+    // For a job with commit-confirming sinks this - not the completed id
+    // above - is what a restart picks as its restore point, so it decides
+    // where an exactly-once job resumes from. It was invisible until
+    // QUAL-01 needed it: a job had inherited a previous job's confirmed
+    // id from markers left in a reused checkpoint directory, and the only
+    // way to see it was a log line printed during a restart.
+    [[nodiscard]] std::uint64_t latest_confirmed_checkpoint(JobId job_id) const;
+
     // Client sessions currently held, live or awaiting reaping.
     //
     // Exposed because "the coordinator does not leak a thread per

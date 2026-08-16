@@ -1207,6 +1207,12 @@ std::uint64_t Coordinator::latest_completed_checkpoint(JobId job_id) const {
     return it == jobs_.end() ? 0 : it->second->latest_completed_checkpoint_id;
 }
 
+std::uint64_t Coordinator::latest_confirmed_checkpoint(JobId job_id) const {
+    std::lock_guard lock(mu_);
+    const auto it = jobs_.find(job_id);
+    return it == jobs_.end() ? 0 : it->second->latest_confirmed_checkpoint_id;
+}
+
 std::size_t Coordinator::reap_finished_clients_() {
     std::vector<std::thread> to_join;
     std::size_t live = 0;
@@ -3776,14 +3782,46 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             job->confirm_task_keys.insert(t.role + ":" + std::to_string(t.subtask_idx));
         }
     }
-    if (!job->confirm_task_keys.empty() && !checkpoint.checkpoint_dir.empty()) {
-        // A recovered or restarted coordinator starts with in-memory
-        // latest_confirmed at zero while CONFIRMED-N markers sit on disk;
-        // without this seed a later worker-loss restart would restore from
-        // scratch past genuinely confirmed checkpoints.
-        job->latest_confirmed_checkpoint_id =
-            std::max(job->latest_confirmed_checkpoint_id,
-                     latest_confirmed_id_on_disk(checkpoint.checkpoint_dir, job_id));
+    // Seed latest_confirmed from the CONFIRMED-N markers on disk - but ONLY
+    // for a job that is actually resuming.
+    //
+    // The seed exists because a recovered or restarted coordinator starts
+    // with in-memory latest_confirmed at zero while the markers of the run it
+    // is resuming sit on disk; without it, a later worker-loss restart would
+    // restore from scratch past genuinely confirmed checkpoints.
+    //
+    // Applying it to a FRESH submission is a different thing entirely, and it
+    // is a correctness hole. The markers live under
+    // <checkpoint_dir>/_jobs/<job_id>/, and job ids restart at 1 with every
+    // coordinator, so a new job submitted into a checkpoint directory a
+    // previous job used inherits that job's confirmed id. QUAL-01 hit exactly
+    // this: a new job with zero completed checkpoints came up believing
+    // checkpoint 224 was confirmed, and its first worker-loss restart chose
+    // 224 as the restore point - another run's checkpoint. It replayed that
+    // run's offsets and re-emitted windows it had already committed, which
+    // the oracle counted as 181,071 duplicate results. Every value was
+    // correct; each one simply arrived twice.
+    //
+    // A job that is not resuming has, by definition, confirmed nothing.
+    const bool resuming =
+        checkpoint.restore_from_checkpoint_id != 0 || !checkpoint.restore_from_dir.empty();
+    if (resuming && !job->confirm_task_keys.empty() && !checkpoint.checkpoint_dir.empty()) {
+        auto seed = latest_confirmed_id_on_disk(checkpoint.checkpoint_dir, job_id);
+        // And never past the point being resumed from. A marker beyond the
+        // restore point belongs to progress this job is deliberately not
+        // taking - a savepoint restore to an earlier checkpoint is the plain
+        // case - and treating it as confirmed would put the restore point
+        // ahead of the state actually being restored.
+        if (checkpoint.restore_from_checkpoint_id != 0 &&
+            seed > checkpoint.restore_from_checkpoint_id) {
+            log::warn("coordinator.restart",
+                      "job_id=" + std::to_string(job_id) + " ignoring CONFIRMED-" +
+                          std::to_string(seed) + " on disk: it is ahead of the checkpoint " +
+                          std::to_string(checkpoint.restore_from_checkpoint_id) +
+                          " this job is resuming from");
+            seed = checkpoint.restore_from_checkpoint_id;
+        }
+        job->latest_confirmed_checkpoint_id = std::max(job->latest_confirmed_checkpoint_id, seed);
     }
     for (const auto& t : resolved_plan.tasks) {
         DeploymentTask d;

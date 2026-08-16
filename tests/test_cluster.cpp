@@ -2684,3 +2684,86 @@ TEST(CoordinatorCheckpointing, TheConfiguredIntervalGatesTheTriggerNotJustTheSle
     std::filesystem::remove(out_path);
     std::filesystem::remove_all(ckpt_dir);
 }
+
+// A fresh job must not inherit a previous job's CONFIRMED marker.
+//
+// Found by QUAL-01 on 2026-08-16, as 181,071 duplicate committed results.
+//
+// For a job with commit-confirming sinks the restore point is the latest
+// CONFIRMED checkpoint, not the latest completed one - a completed-but-
+// unconfirmed checkpoint may hold an external transaction that died with the
+// worker. To survive a coordinator restart, that id is seeded on submission
+// from the CONFIRMED-N markers on disk.
+//
+// Those markers live under <checkpoint_dir>/_jobs/<job_id>/, and job ids
+// restart at 1 with every coordinator. So a NEW job submitted into a
+// checkpoint directory some earlier job used inherited that job's confirmed
+// id. On the rig a job with zero completed checkpoints came up believing
+// checkpoint 224 was confirmed; its first worker-loss restart duly chose 224
+// as the restore point - a checkpoint belonging to a different run - replayed
+// that run's source offsets, and re-emitted windows it had already committed.
+// Every value was correct. Each simply arrived twice, which is an
+// exactly-once violation a downstream consumer would double-count.
+//
+// A job that is not resuming has confirmed nothing, whatever is on disk.
+TEST(Cluster, AFreshJobDoesNotInheritAPreviousJobsConfirmedCheckpoint) {
+    using namespace std::chrono_literals;
+    clink::cluster::ensure_built_ins_registered();
+    // The record override puts the job on the commit-confirmation protocol,
+    // which is the only case that reads the marker at all.
+    const auto* file_2pc = clink::connectors::CapabilityRegistry::instance().find("file_2pc");
+    ASSERT_NE(file_2pc, nullptr) << "built-in capability records not declared";
+    auto flagged = *file_2pc;
+    flagged.commit_recoverable = false;
+    ClinkScopedRecordOverride guard(std::move(flagged));
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto ckpt_dir = tmp / ("clink_stale_confirm_ckpt_" + std::to_string(::getpid()));
+    const auto out_dir = tmp / ("clink_stale_confirm_out_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::remove_all(out_dir);
+
+    // A previous job's leavings: job id 1 confirmed checkpoint 224 here.
+    const auto marker_dir = ckpt_dir / "_jobs" / "1";
+    std::filesystem::create_directories(marker_dir);
+    {
+        std::ofstream m(marker_dir / "CONFIRMED-224");
+        m << "job=1\ncheckpoint=224\n";
+    }
+    {
+        std::ofstream m(marker_dir / "COMPLETED-224");
+        m << "job=1\ncheckpoint=224\n";
+    }
+
+    Coordinator coordinator;
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-stale-confirm"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-stale-confirm", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = ckpt_dir.string();
+    ckpt.interval_ms = 100;
+    // Deliberately NO restore_from: this is a fresh submission, not a resume.
+    const auto job_id = coordinator.submit_job(clink_confirm_test_graph(out_dir),
+                                               OperatorRegistry::default_instance(),
+                                               std::vector<PluginBinary>{},
+                                               ckpt);
+
+    const auto seeded = coordinator.latest_confirmed_checkpoint(job_id);
+    EXPECT_EQ(seeded, 0u)
+        << "a fresh job came up with latest_confirmed=" << seeded
+        << ", inherited from a CONFIRMED marker an earlier job left in this checkpoint "
+           "directory. Its first restart would restore from that checkpoint - another "
+           "job's - replaying source offsets it never wrote and re-emitting output it had "
+           "already committed.";
+
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, clink::test_support::scale_slack(30s)));
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::remove_all(out_dir);
+}

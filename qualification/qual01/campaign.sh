@@ -185,6 +185,17 @@ for h in $COORD_PUB $WORKER_PUBS; do
              echo "  construction and the result would be meaningless." >&2; exit 2; }
 done
 # Prove it is genuinely shared, not just mounted.
+# Each run gets its OWN checkpoint directory under the shared mount.
+#
+# Runs used to share /qual/state, and CONFIRMED-N markers live under
+# <checkpoint_dir>/_jobs/<job_id>/ while job ids restart at 1 with every
+# coordinator. A new run's job id 1 therefore inherited the previous run's
+# job id 1 confirmed checkpoint, and its first restart restored from a
+# checkpoint belonging to a different run - re-emitting output it had
+# already committed. clink no longer seeds a fresh job that way, but a
+# campaign should not depend on that to keep its runs apart: two runs
+# sharing a checkpoint directory are not independent experiments.
+on_host "$OPS_PUB" "mkdir -p /qual/state/$RUN_ID"
 on_host "$OPS_PUB" "echo shared-$$ > /qual/state/.probe"
 for h in $COORD_PUB $WORKER_PUBS; do
     on_host "$h" "grep -q shared-$$ /qual/state/.probe" \
@@ -336,7 +347,7 @@ sed -e "s|__BROKERS__|$BROKER_LIST|g" -e "s|__WM_LAG_MS__|$WM_LAG_MS|g" \
     --file "$OUT_DIR/pipeline.sql" \
     --coordinator-host "$COORD_PUB" --coordinator-port 8095 \
     --parallelism "$PARTITIONS" \
-    --checkpoint-dir /qual/state \
+    --checkpoint-dir "/qual/state/$RUN_ID" \
     --checkpoint-interval-ms "$CHECKPOINT_INTERVAL_MS" \
     --max-restarts-on-worker-loss "$MAX_RESTARTS" \
     | tee "$OUT_DIR/submit.log"
