@@ -2,7 +2,7 @@
   "baseline_revision": "8fa61d76692446b9a3a96ea6e8b32be3c99104f6",
   "audited_revision": "d6e8fbae2199fb505d81b6aefe27dce7e9a10623",
   "qualification_version": 1,
-  "notes": "Phase A closes the residual code gaps from the 2026-08-15 external audit; Phase B qualifies the result against real infrastructure (Hetzner Cloud, project 'clink', cost-capped). Every experiment must leave retained machine-readable evidence under qualification-results/ (gitignored; summaries land in docs/production-qualification-report.md). PUBLICATION CONTRACT: every campaign outcome is published on the docs site under docs/qualification/ (tracked + allowlisted + in nav), with the four-category honesty labels; the index table in docs/qualification/README.md tracks status. A campaign is not done until its page is on the site.",
+  "notes": "Phase A closes the residual code gaps from the 2026-08-15 external audit; Phase B qualifies the result against real infrastructure (Hetzner Cloud, project 'clink', cost-capped). Every experiment must leave retained machine-readable evidence under qualification-results/ (gitignored). PUBLICATION CONTRACT (owner directive, 2026-08-16): docs/qualification/ carries a campaign page ONLY once that campaign is fully fixed and empirically verified green with useful results. Test failures, void runs, harness defects and the reasons behind them are NOT published there - they live in the fixes, their regression tests, the commit messages, and the gitignored internal record (docs/qualification-internal-record.md). A campaign is done when it is green; only then does it get a page.",
   "items": [
     {
       "id": "HARDEN-00",
