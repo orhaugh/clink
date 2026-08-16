@@ -12,17 +12,24 @@ failure is never treated as proof.
 
 ## The short version
 
-The programme found **three correctness defects in clink** and **three defects
+The programme found **four correctness defects in clink** and **four defects
 in its own test harness**, all on a codebase that passes its full unit suite
-and a green CI matrix.
+and a green CI matrix. Three of the four engine defects are fixed and pinned
+by regression tests. **One is open and published unfixed.**
 
 The most serious was an exactly-once violation: after a single ordinary worker
 failure, a windowed aggregation silently produced wrong results for the window
 in flight - some keys counted twice, others lost. One worker kill on real
-infrastructure was enough to surface it on the first attempt. It is fixed and
-pinned by a regression test that fails in 6 milliseconds without the fix. A
-field re-run at the fixed revision is under way; until its result is published
-here, the field evidence is the defect, not its absence.
+infrastructure was enough to surface it on the first attempt. It is fixed,
+pinned by a regression test that fails in 6 milliseconds without the fix, and
+supported in the field by a re-run in which three worker kills and three
+two-phase-commit window faults produced no corruption at all.
+
+The open one, D4, is a different exactly-once violation and was found by the
+third run: when a restart *fails* - a second worker lost while the first
+restart was still draining, ending in a drain timeout - the job committed
+181,071 duplicate window results. Every value was correct; the same result
+simply reached the topic twice.
 
 The harness defects matter as much, because each one would have produced a
 confident, green, meaningless result page. They are recorded on the campaign
@@ -32,12 +39,14 @@ pages in the same voice as the engine defects.
 
 | # | Defect | Severity | Status |
 |---|---|---|---|
-| D1 | Source offsets could be silently replayed or skipped on a plain restart, breaking exactly-once | **Correctness** | Fixed, regression test; field re-run in progress |
+| D1 | Source offsets could be silently replayed or skipped on a plain restart, breaking exactly-once | **Correctness** | Fixed, regression test, supported by a field re-run |
 | D2 | The configured checkpoint interval was ignored; every job checkpointed at the 500ms loop tick | Resource / operability | Fixed, regression test |
 | D3 | A peer's operator row could overwrite a subtask's own, which would have made D1's fix lose data for fixed-key sources | **Correctness** | Fixed before shipping, regression test |
+| D4 | A restart that fails - a second worker lost mid-drain, ending in a drain timeout - committed 181,071 duplicate window results | **Correctness** | **OPEN** |
 | H1 | Chaos faults addressed to a firewalled interface: every fault silently timed out and was logged as applied | Harness | Fixed |
 | H2 | The oracle could not judge: wrong consumer group, an unsatisfiable high-water requirement, and a null offset snapshot that made windows permanently unjudgeable | Harness | Fixed |
 | H3 | The fault generator died four minutes into an hour and nothing noticed; the campaign reported healthy throughout | Harness | Fixed |
+| H4 | A leftover generator from a finished run survived its drain and recreated the topic the next run had just deleted, aborting it | Harness | Fixed |
 
 Two further live defects were found by the pre-campaign code audit, before any
 infrastructure was provisioned: Postgres connections could silently downgrade
@@ -67,7 +76,7 @@ that keep their position under a single fixed key.
 
 | Campaign | Subject | Verdict |
 |---|---|---|
-| [QUAL-01](qual-01-kafka-exactly-once.md) | Kafka exactly-once under fault | Completed. Two engine defects found and fixed; field re-run under way |
+| [QUAL-01](qual-01-kafka-exactly-once.md) | Kafka exactly-once under fault | Completed over three runs. Three engine defects found; two fixed, D4 open |
 | QUAL-02 | Postgres two-phase-commit sink | Prepared; oracle proven against injected defects |
 | Others | See the index | Blocked, rescoped, or not yet run - stated per campaign |
 
@@ -81,11 +90,15 @@ named revision:
   specification rather than from anything clink produced.
 - Automatic recovery from worker loss: whole-job restart from a selected
   restore point, without operator intervention, continuing to commit
-  afterwards.
-Note the scope carefully: the completed campaign applied **one** fault before
-its fault generator died, so what it demonstrates about recovery is what one
-worker loss did. A multi-fault re-run at the fixed revision is running as this
-is written, and its result will be added here rather than assumed.
+  afterwards - **when the restart succeeds.** When it does not, see D4.
+
+Note the scope carefully. The first run applied **one** fault before its fault
+generator died. The re-run applied three worker kills, two partitions, a broker
+restart and three two-phase-commit window faults, and produced zero corruption
+of any kind - the evidence D1's fix was after - but is recorded void because a
+fault killed a coordinator the rig had not configured to survive. The third run
+found D4 and failed. No single run is a clean pass, and the page says which is
+which.
 
 ## What is not
 
