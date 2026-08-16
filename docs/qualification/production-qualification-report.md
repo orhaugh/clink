@@ -19,9 +19,10 @@ and a green CI matrix.
 The most serious was an exactly-once violation: after a single ordinary worker
 failure, a windowed aggregation silently produced wrong results for the window
 in flight - some keys counted twice, others lost. One worker kill on real
-infrastructure was enough to surface it on the first attempt. It is fixed,
-pinned by a regression test that fails in 6 milliseconds without the fix, and
-the fix has been re-proven in the field.
+infrastructure was enough to surface it on the first attempt. It is fixed and
+pinned by a regression test that fails in 6 milliseconds without the fix. A
+field re-run at the fixed revision is under way; until its result is published
+here, the field evidence is the defect, not its absence.
 
 The harness defects matter as much, because each one would have produced a
 confident, green, meaningless result page. They are recorded on the campaign
@@ -31,7 +32,7 @@ pages in the same voice as the engine defects.
 
 | # | Defect | Severity | Status |
 |---|---|---|---|
-| D1 | Source offsets could be silently replayed or skipped on a plain restart, breaking exactly-once | **Correctness** | Fixed, regression test, re-proven in the field |
+| D1 | Source offsets could be silently replayed or skipped on a plain restart, breaking exactly-once | **Correctness** | Fixed, regression test; field re-run in progress |
 | D2 | The configured checkpoint interval was ignored; every job checkpointed at the 500ms loop tick | Resource / operability | Fixed, regression test |
 | D3 | A peer's operator row could overwrite a subtask's own, which would have made D1's fix lose data for fixed-key sources | **Correctness** | Fixed before shipping, regression test |
 | H1 | Chaos faults addressed to a firewalled interface: every fault silently timed out and was logged as applied | Harness | Fixed |
@@ -66,7 +67,7 @@ that keep their position under a single fixed key.
 
 | Campaign | Subject | Verdict |
 |---|---|---|
-| [QUAL-01](qual-01-kafka-exactly-once.md) | Kafka exactly-once under fault | Completed. Two engine defects found; fix re-proven under a multi-fault re-run |
+| [QUAL-01](qual-01-kafka-exactly-once.md) | Kafka exactly-once under fault | Completed. Two engine defects found and fixed; field re-run under way |
 | QUAL-02 | Postgres two-phase-commit sink | Prepared; oracle proven against injected defects |
 | Others | See the index | Blocked, rescoped, or not yet run - stated per campaign |
 
@@ -81,8 +82,10 @@ named revision:
 - Automatic recovery from worker loss: whole-job restart from a selected
   restore point, without operator intervention, continuing to commit
   afterwards.
-- Correct output across repeated worker kills, coordinator partitions and
-  injected network latency, at the fixed revision, over the campaign duration.
+Note the scope carefully: the completed campaign applied **one** fault before
+its fault generator died, so what it demonstrates about recovery is what one
+worker loss did. A multi-fault re-run at the fixed revision is running as this
+is written, and its result will be added here rather than assumed.
 
 ## What is not
 
