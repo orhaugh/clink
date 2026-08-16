@@ -1,7 +1,7 @@
 # QUAL-01: Kafka exactly-once under a fault campaign
 
-**Status: completed. The campaign found a genuine exactly-once defect in
-clink, which is fixed and pinned by a regression test.**
+**Status: completed over three runs. Two exactly-once defects were found;
+one is fixed and pinned by a regression test, and one (QUAL-01-D4) is open.**
 
 This is the flagship correctness campaign: a keyed, event-time windowed
 aggregation reading from Kafka and writing to Kafka through a transactional
@@ -243,6 +243,60 @@ moment the job stops being `RUNNING`, so a summary can distinguish "the engine
 lost data" from "there was no engine". A third run with that configuration is
 under way; its result will be added here.
 
+## The third run, and an open defect
+
+A third run (`qual01-20260816c`) used the same image as the re-run, with the
+coordinator now given `--ha-dir` so a coordinator kill would exercise job
+recovery rather than end the campaign. It did not get that far, and what it
+found instead is more important.
+
+The sequence, from the coordinator's own log:
+
+1. A worker subtask failed and the coordinator began a whole-job restart,
+   expecting seven subtasks to drain.
+2. Four seconds later a **second** worker was lost while that drain was in
+   progress. Six more subtasks were folded into the pending restart.
+3. The restart selected checkpoint 224 as its restore point, logging
+   `latest_completed=18 latest_confirmed=224`.
+4. Three minutes later a second restart attempt began, and thirty seconds
+   after that the drain deadline expired with eight subtasks still undrained -
+   several on workers the coordinator could no longer name. It failed the job.
+
+The oracle's verdict over what the job did produce:
+
+| Counter | Value |
+|---|---|
+| Windows fully correct | 27 |
+| **Duplicate results** (same key and window committed twice, same value) | **181,071** |
+| Incorrect aggregates | 0 |
+| Conflicting results | 0 |
+| Foreign results | 0 |
+
+**QUAL-01-D4: a restart that fails can commit duplicate output. OPEN.**
+
+Duplicates are an exactly-once violation even though every value is correct -
+the same window result reached the output topic twice, in two committed
+transactions. A downstream consumer counting these would double-count.
+
+What is established: it happened at revision `5a767f5`, on the same binary
+that produced **zero** duplicates in the re-run, so it is not a regression
+from the fixes above but a behaviour of this particular failure sequence -
+a second worker lost while a restart was already draining, ending in a drain
+timeout and a failed job.
+
+What is not yet established, and is deliberately not guessed at here: whether
+the duplicates were emitted during the restart sequence itself or by the
+second attempt restoring from a point whose output had already been committed.
+The `latest_completed=18` against `latest_confirmed=224` in the restore-point
+selection is unexplained and is the first thing to look at - a confirmed id
+surviving from before a restart while the completed id reflects the run since
+it is at least an odd pairing to be choosing a restore point from.
+
+This defect is **open**. It is published unfixed because a qualification page
+that reported only the defects convenient to have fixed would be worth
+nothing, and because the failure sequence that produces it - two workers lost
+in quick succession - is not exotic.
+
 ## What this campaign demonstrates
 
 **Demonstrated** - at revision `440043f`, on the topology and scale above:
@@ -279,9 +333,10 @@ not at all: rescale during faults, savepoints, schema evolution, multi-sink
 commit groups.
 
 **Unknown** - multi-day behaviour, memory and file-descriptor trends over
-days, behaviour under simultaneous broker and worker failure, and behaviour
-under repeated back-to-back restarts. The single fault this run applied says
-nothing about what the tenth would do.
+days, behaviour under simultaneous broker and worker failure, and whether
+QUAL-01-D4's duplicates can occur without a failed restart. Coordinator kill
+and job recovery were configured for the third run but never reached, so HA
+recovery remains unqualified.
 
 ## Evidence retained
 
