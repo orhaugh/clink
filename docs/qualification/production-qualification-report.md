@@ -139,10 +139,16 @@ unverified assumption in the path that produced it.*
 
 Campaigns run on Hetzner Cloud under a unique `qualification_run_id`, with
 every resource labelled with it, and are destroyed by label
-(`scripts/qualification/destroy.sh <run-id>`) followed by a verification sweep
-that fails if anything survives. Orphaned infrastructure is treated as a
-failed test. The rig for the campaigns above is eight small instances; total
-spend for the work on this page is a few euros.
+(`scripts/qualification/destroy.sh <run-id>`, or `--all` for the shared
+resources no per-run label reaches) followed by a verification sweep that
+fails if anything survives. Orphaned infrastructure is treated as a failed
+test.
+
+The rig for the campaigns above was eight small instances, reused across all
+three runs rather than rebuilt for each, and **has been destroyed**: the
+verification sweep reports clean, and an independent enumeration of servers,
+volumes, firewalls, networks, load balancers and ssh keys returns zero of
+each. Total spend for every campaign on this page is a few euros.
 
 No credentials are stored in clink checkpoint state or in this repository.
 Campaign databases and brokers are dedicated to the run and destroyed with it.

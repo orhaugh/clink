@@ -282,7 +282,9 @@ What is established: it happened at revision `5a767f5`, on the same binary
 that produced **zero** duplicates in the re-run, so it is not a regression
 from the fixes above but a behaviour of this particular failure sequence -
 a second worker lost while a restart was already draining, ending in a drain
-timeout and a failed job.
+timeout and a failed job. The coordinator's retained final metrics corroborate
+the log exactly: `workers_lost_total 2`, `job_restarts_total 1`,
+`jobs_failed_total 1`.
 
 What is not yet established, and is deliberately not guessed at here: whether
 the duplicates were emitted during the restart sequence itself or by the
