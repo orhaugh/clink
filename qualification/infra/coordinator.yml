@@ -19,12 +19,31 @@ services:
       - --advertise-host=${CONTROL_IP}
       - --http-port=8095
       - --http-bind=0.0.0.0
+      # Without this the coordinator persists no job manifests, so a
+      # coordinator that dies takes every running job with it and comes
+      # back empty. QUAL-01's re-run demonstrated exactly that: a 2PC
+      # fault point crashed the coordinator, it restarted clean, and the
+      # pipeline never resumed - which the oracle then reported as 1.6
+      # million missing results. Nothing was lost or corrupted; the job
+      # had simply ceased to exist. Killing a control plane that was
+      # never configured to survive it measures the configuration, not
+      # the engine.
+      #
+      # Deliberately a LOCAL path, not the NFS-shared /qual/state: the
+      # ha-dir doubles as the leader-election lock, and the coordinator
+      # refuses leadership when it cannot verify the filesystem honours
+      # locks (NFS being the case it has in mind) unless told to accept
+      # that risk. The container restarts on its own host, so a local
+      # directory survives exactly the failure being injected without
+      # asking for an unsafe lock.
+      - --ha-dir=/qual/ha
     environment:
       # Armed per-restart by the chaos controller for targeted 2PC-window
       # faults; empty in normal operation.
       CLINK_FAULT_INJECT: ${CLINK_FAULT_INJECT:-}
     volumes:
       - /qual/state:/qual/state
+      - /qual/ha:/qual/ha
     restart: "no"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8095/api/v1/health"]
