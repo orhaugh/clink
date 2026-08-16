@@ -5,10 +5,11 @@
 # exclude_docs is an allowlist mirroring .gitignore: only the tracked,
 # published content can reach a build, even one run locally.
 
-site_name: clink
+site_name: Clink — C++23 Stream Processing Engine
 site_description: >-
-  Embedded-first, Arrow-native stream processing engine in modern C++:
-  how it works, why it is designed this way, and what it can do.
+  Clink is an embedded-first, Arrow-native C++23 stream processing engine with
+  streaming SQL, event time, exactly-once checkpoints, stateful operators,
+  distributed execution, and production connectors.
 site_url: https://orhaugh.github.io/clink/
 repo_url: https://github.com/orhaugh/clink
 repo_name: orhaugh/clink
@@ -39,10 +40,6 @@ theme:
     - content.code.copy
     - content.action.edit
 
-# NOTE: these patterns are also matched against the THEME's static files
-# (MkDocs adds them to the same file collection), so a blanket /* would strip
-# Material's assets/ tree and ship an unstyled site. Exclude narrowly and
-# re-include /assets/ for the theme.
 exclude_docs: |
   /*.md
   !/index.md
@@ -51,6 +48,7 @@ exclude_docs: |
   !/efficiency.md
   !/sql.md
   /*/
+  !/guides/
   !/internals/
   !/connectors/
   !/design/
@@ -61,8 +59,6 @@ exclude_docs: |
 
 validation:
   links:
-    # Internals pages cite engine sources by relative path (include/, src/);
-    # those are repository links, not site pages, so do not fail on them.
     unrecognized_links: info
     absolute_links: info
 
@@ -84,6 +80,11 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Guides:
+      - C++ stream processing engine: guides/cpp-stream-processing.md
+      - Streaming SQL in C++: guides/cpp-streaming-sql.md
+      - Clink vs Apache Flink: guides/clink-vs-flink.md
+      - Arrow-native stream processing: guides/arrow-stream-processing.md
   - Capabilities: capabilities.md
   - SQL: sql.md
   - Benchmarks: benchmarks.md
