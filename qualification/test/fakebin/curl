@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Fake curl for the coordinator API and metrics.
+set -uo pipefail
+. "$FAKERIG/../rigsim.sh"
+url=""; for a in "$@"; do case "$a" in http*) url="$a";; esac; done
+case "$url" in
+  */metrics)
+      [ "$(rig_scenario metrics_unreachable 0)" = "1" ] && exit 7
+      echo "clink_coordinator_workers_lost_total $(rig_scenario workers_lost 1)"
+      echo "clink_coordinator_job_restarts_total 1"
+      ;;
+  */api/v1/jobs/*/cancel) echo '{"ok":true}';;
+  */api/v1/jobs/*)
+      st=$(rig_scenario job_status RUNNING)
+      dies=$(rig_scenario job_dies_after 0)
+      if [ "$dies" != "0" ]; then
+        n=$(rig_bump jobpoll); [ "$n" -gt "$dies" ] && st=FAILED
+      fi
+      [ "$st" = "GONE" ] && exit 22
+      echo "{\"id\":1,\"status\":\"$st\",\"latest_completed_checkpoint_id\":42,\"checkpoints_completed\":42,\"tasks\":[1],\"errors\":[]}"
+      ;;
+  */api/v1/connectors) echo '{"connectors":[{"name":"kafka","available":true}]}';;
+  *) echo '{}';;
+esac
+exit 0

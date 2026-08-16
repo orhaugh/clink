@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake hcloud: the campaign only reads the server list to build an inventory.
+[ "${1:-}" = "server" ] && [ "${2:-}" = "list" ] && cat "$FAKERIG/servers.json" && exit 0
+echo "[]"

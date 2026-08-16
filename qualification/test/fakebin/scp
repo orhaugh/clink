@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fake scp: copies to/from the simulated host trees.
+set -uo pipefail
+args=(); while [ $# -gt 0 ]; do case "$1" in -o|-i) shift 2;; -q|-r) shift;; *) args+=("$1"); shift;; esac; done
+src="${args[0]:-}"; dst="${args[1]:-}"
+resolve() { case "$1" in root@*:*) h="${1#root@}"; h="${h%%:*}"; p="${1#*:}"; echo "$FAKERIG/$h$p";; *) echo "$1";; esac; }
+s=$(resolve "$src"); d=$(resolve "$dst")
+mkdir -p "$(dirname "$d")" 2>/dev/null
+[ -e "$s" ] && cp -r "$s" "$d" 2>/dev/null
+exit 0

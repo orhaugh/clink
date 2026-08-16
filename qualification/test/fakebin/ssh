@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Fake ssh for the campaign self-test. Interprets the remote command against
+# a simulated rig rooted at $FAKERIG (one directory per host).
+set -uo pipefail
+host=""; cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|-q) shift;;
+    -o|-i) shift 2;;
+    root@*) host="${1#root@}"; shift; cmd="$*"; break;;
+    *) shift;;
+  esac
+done
+H="$FAKERIG/$host"; mkdir -p "$H/qual"
+. "$FAKERIG/../rigsim.sh"
+rig_exec "$host" "$cmd"

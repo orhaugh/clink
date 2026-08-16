@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo '{"ok":true,"job_id":1,"name":"sql_job"}'

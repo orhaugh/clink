@@ -49,6 +49,10 @@ MAX_RESTARTS="${MAX_RESTARTS:-100000}"
 CLINK_IMAGE="${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}"
 KEY_FILE="${SSH_KEY_FILE:-$HOME/.ssh/clink-qual-ed25519}"
 OUT_DIR="$REPO_ROOT/qualification-results/$RUN_ID"
+# The submit CLI. Overridable so the driver can be exercised against a
+# stub - see qualification/test/test_campaign.sh - and so a build in a
+# non-default directory does not need the script edited.
+SUBMIT_BIN="${SUBMIT_BIN:-$REPO_ROOT/build/clink_submit_sql}"
 mkdir -p "$OUT_DIR"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
@@ -343,7 +347,7 @@ sed -e "s|__BROKERS__|$BROKER_LIST|g" -e "s|__WM_LAG_MS__|$WM_LAG_MS|g" \
 
 # clink_submit_sql POSTs to the coordinator's HTTP API, so the port here
 # is the HTTP one (8095), not the binary control plane (6123).
-"$REPO_ROOT/build/clink_submit_sql" \
+"$SUBMIT_BIN" \
     --file "$OUT_DIR/pipeline.sql" \
     --coordinator-host "$COORD_PUB" --coordinator-port 8095 \
     --parallelism "$PARTITIONS" \

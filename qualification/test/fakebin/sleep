@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The self-test runs the real driver, including its polling loops. Their
+# pacing is not what is under test - the logic is - so time passes for free.
+exit 0
