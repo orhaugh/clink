@@ -2767,3 +2767,47 @@ TEST(Cluster, AFreshJobDoesNotInheritAPreviousJobsConfirmedCheckpoint) {
     std::filesystem::remove_all(ckpt_dir);
     std::filesystem::remove_all(out_dir);
 }
+
+// A refused dispatch must be distinguishable from a commit that ran.
+//
+// Found by QUAL-01 on 2026-08-16 as an output topic frozen at 955,647 records
+// while the generator produced 1,997 events a second, the job reported
+// RUNNING and checkpoints advanced past 331.
+//
+// The gate refuses a commit whose runner has retired, and that is safe by
+// design only because the prepared handle is still persisted, so a later
+// restore re-commits it. The refusal used to log and RETURN, which the
+// worker's dispatch loop could not tell apart from a callback that had run:
+// it counted the subtask as committed and sent CommitConfirmed. The
+// coordinator then wrote CONFIRMED-N and advanced the restore point past the
+// very transaction that never committed - so it was never committed and never
+// replayed, and the sink's output simply stopped becoming visible.
+//
+// The only way to observe "it ran" must therefore be the absence of an
+// exception.
+TEST(CommitDispatchGate, ARefusedDispatchThrowsRatherThanLookingLikeACommit) {
+    auto gate = std::make_shared<clink::cluster::CommitDispatchGate>();
+    int ran = 0;
+    auto cb = clink::cluster::gated_dispatch(gate, [&ran](std::uint64_t) { ++ran; });
+
+    cb(41);
+    EXPECT_EQ(ran, 1) << "a live gate must let the callback through";
+
+    gate->retire_and_drain();
+
+    bool refused = false;
+    std::uint64_t refused_ckpt = 0;
+    try {
+        cb(42);
+    } catch (const clink::cluster::CommitDispatchRefused& e) {
+        refused = true;
+        refused_ckpt = e.checkpoint_id();
+    }
+    EXPECT_TRUE(refused)
+        << "a dispatch after retirement returned normally. The dispatch loop cannot "
+           "distinguish that from a commit that executed, so it confirms the checkpoint - "
+           "and the restore point advances past a transaction that was never committed and "
+           "will never be replayed.";
+    EXPECT_EQ(refused_ckpt, 42U) << "the refusal must name the checkpoint it refused";
+    EXPECT_EQ(ran, 1) << "the callback must not have run after retirement";
+}

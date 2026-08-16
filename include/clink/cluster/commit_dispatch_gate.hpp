@@ -16,17 +16,55 @@
 // enters the gate for the duration of the dispatch, and the runner retires the
 // gate - blocking until in-flight dispatch drains - strictly BEFORE its
 // executor is destroyed (CommitDispatchRetirer, constructed after the
-// executor, does this on every exit path including exceptions). A dispatch
-// arriving after retirement is refused, which is safe by design: the prepared
-// handle is still persisted in operator state, so the next restore re-commits
-// it idempotently via the sink's recovery scan. Refusing an abort is likewise
-// equivalent to a crash before the abort, which the same recovery reconciles.
+// executor, does this on every exit path including exceptions).
+//
+// A dispatch arriving after retirement is REFUSED, and a refusal must be
+// reported as a failure to commit - never as a commit. The refusal is safe
+// only because the prepared handle is still persisted, so a later restore
+// re-commits it idempotently; that argument collapses the moment the refused
+// checkpoint is CONFIRMED, because the restore point then advances past the
+// very transaction that never committed and nothing will ever replay it.
+//
+// It collapsed exactly that way. The worker's dispatch loop treated a
+// silently-refused callback as success and sent CommitConfirmed for it, the
+// coordinator wrote CONFIRMED-N and moved the restore point on, and the
+// transactional sink's output stopped becoming visible while the job went on
+// reporting RUNNING with advancing checkpoints. QUAL-01 measured that as an
+// output topic frozen at 955,647 records with a generator still producing at
+// 1,997 events a second.
+//
+// So refusal throws. A caller that dispatches through gated_dispatch cannot
+// mistake it for a commit, because the only way to observe "it ran" is the
+// absence of an exception. Refusing an abort is likewise equivalent to a
+// crash before the abort, which the same recovery reconciles.
 
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
 namespace clink::cluster {
+
+// A commit/abort dispatch that arrived after its runner retired.
+//
+// A distinct type, not a bare runtime_error, so the dispatch loop can say
+// which of the two things happened: the sink tried to commit and failed, or
+// the sink was never asked. Both must prevent confirmation; only one is a
+// sink problem.
+class CommitDispatchRefused : public std::runtime_error {
+public:
+    explicit CommitDispatchRefused(std::uint64_t checkpoint_id)
+        : std::runtime_error("commit/abort dispatch for checkpoint " +
+                             std::to_string(checkpoint_id) + " arrived after runner retirement"),
+          checkpoint_id_(checkpoint_id) {}
+    [[nodiscard]] std::uint64_t checkpoint_id() const { return checkpoint_id_; }
+
+private:
+    std::uint64_t checkpoint_id_;
+};
 
 class CommitDispatchGate {
 public:
@@ -86,5 +124,25 @@ public:
 private:
     std::shared_ptr<CommitDispatchGate> gate_;
 };
+
+// Wrap a commit/abort callback so it runs under the gate.
+//
+// The one place the enter/leave protocol is implemented, so a caller cannot
+// get it subtly wrong - and so refusal always throws rather than returning
+// quietly, which is the difference between "this checkpoint did not commit"
+// and "this checkpoint committed".
+template <class Fn>
+auto gated_dispatch(std::shared_ptr<CommitDispatchGate> gate, Fn fn) {
+    return [gate = std::move(gate), fn = std::move(fn)](std::uint64_t ckpt) {
+        if (!gate->try_enter()) {
+            throw CommitDispatchRefused(ckpt);
+        }
+        struct Leave {
+            CommitDispatchGate* g;
+            ~Leave() { g->leave(); }
+        } leave{gate.get()};
+        fn(ckpt);
+    };
+}
 
 }  // namespace clink::cluster

@@ -763,6 +763,22 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
         for (auto& fn : fns) {
             try {
                 fn(msg.checkpoint_id);
+            } catch (const CommitDispatchRefused& refused) {
+                // The runner behind this callback retired before the dispatch
+                // reached it, so the external commit did NOT execute. That is
+                // safe only while the checkpoint stays unconfirmed: the
+                // prepared handle is still persisted and a later restore
+                // re-commits it. Confirming it instead advances the restore
+                // point past a transaction nothing will ever replay, which is
+                // how a healthy-looking job stopped producing visible output
+                // altogether.
+                all_ok = false;
+                clink::log::info("worker.commit",
+                                 std::string{"not confirming checkpoint "} +
+                                     std::to_string(msg.checkpoint_id) + " for subtask " +
+                                     std::to_string(sub_idx) + ": " + refused.what() +
+                                     "; the prepared handle stays persisted for restore-time "
+                                     "recovery");
             } catch (const std::exception& e) {
                 // Best-effort: a single sink failing to commit must not stall
                 // the reader; a recoverable sink's persisted handle is retried
@@ -1755,21 +1771,13 @@ void Worker::run_generic_subtask_(JobId job_id,
     // restore re-commits it idempotently.
     auto dispatch_gate = std::make_shared<CommitDispatchGate>();
     auto gated = [dispatch_gate](RunnerContext::CommitCheckpointFn fn) {
-        return [gate = dispatch_gate, fn = std::move(fn)](std::uint64_t ckpt) {
-            if (!gate->try_enter()) {
-                clink::log::info("worker.commit",
-                                 "refused a commit/abort dispatch for checkpoint " +
-                                     std::to_string(ckpt) +
-                                     " arriving after runner retirement; the prepared handle "
-                                     "stays persisted for restore-time recovery");
-                return;
-            }
-            struct Leave {
-                CommitDispatchGate* g;
-                ~Leave() { g->leave(); }
-            } leave{gate.get()};
-            fn(ckpt);
-        };
+        // gated_dispatch THROWS on refusal. It used to log and return, which
+        // the dispatch loop below could not tell apart from a commit that
+        // ran - so a refused checkpoint was confirmed, the coordinator
+        // advanced the restore point past it, and the transaction it named
+        // was neither committed nor ever replayed.
+        return RunnerContext::CommitCheckpointFn{
+            clink::cluster::gated_dispatch(dispatch_gate, std::move(fn))};
     };
     // Skip the legacy single-op runner path when fusion is in play:
     // even a chain of one operator with fused source/sink needs the
