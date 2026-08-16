@@ -64,6 +64,7 @@
 #include "clink/cluster/protocol.hpp"
 #include "clink/cluster/submit_query_config.hpp"
 #include "clink/cluster/worker.hpp"
+#include "clink/cluster/worker_supervisor.hpp"
 #include "clink/lineage/lineage_listener.hpp"
 #ifdef CLINK_HAS_HTTP
 #include "clink/cluster/snapshots.hpp"
@@ -534,11 +535,34 @@ void write_coordinator_config(clink::http::JsonWriter& w,
     w.end_object();
 }
 
-void write_worker_config(clink::http::JsonWriter& w, const clink::cluster::Worker::Config& c) {
+void write_worker_config(clink::http::JsonWriter& w,
+                         const clink::cluster::WorkerSupervisor::Config& supervisor) {
+    const auto& c = supervisor.worker;
     w.begin_object();
     w.kv("slot_count", c.slot_count);
     w.kv("heartbeat_interval_ms",
          std::chrono::duration_cast<std::chrono::milliseconds>(c.heartbeat_interval).count());
+    w.kv("coordinator_heartbeat_timeout_ms",
+         std::chrono::duration_cast<std::chrono::milliseconds>(c.coordinator_heartbeat_timeout)
+             .count());
+    w.kv("reconnect_discovery_timeout_ms", supervisor.discovery_timeout.count());
+    w.kv("reconnect_initial_backoff_ms", supervisor.initial_backoff.count());
+    w.kv("reconnect_max_backoff_ms", supervisor.max_backoff.count());
+    w.end_object();
+}
+
+void write_worker_recovery_snapshot(clink::http::JsonWriter& w,
+                                    const clink::cluster::WorkerSupervisor::Snapshot& recovery) {
+    w.begin_object();
+    w.kv("state", recovery.state);
+    w.kv("connected", recovery.connected);
+    w.kv("session_number", static_cast<std::int64_t>(recovery.session_number));
+    w.kv("connection_attempts", static_cast<std::int64_t>(recovery.connection_attempts));
+    w.kv("successful_reconnections", static_cast<std::int64_t>(recovery.successful_reconnections));
+    w.kv("coordinator_host", recovery.coordinator_host);
+    w.kv("coordinator_port", recovery.coordinator_port);
+    w.kv("coordinator_epoch", static_cast<std::int64_t>(recovery.coordinator_epoch));
+    w.kv("last_error", recovery.last_error);
     w.end_object();
 }
 
@@ -612,10 +636,12 @@ clink::http::HttpResponse handle_submit_job(clink::cluster::Coordinator& coordin
     if (!load_result.ok) {
         return fail(500, "dlopen/register failed: " + load_result.error);
     }
+    void* plugin_handle = load_result.plugin.dl_handle;
+    bundle->retain_plugin(std::move(load_result.plugin));
 
     using JobBuildFn = int (*)(const char**, std::size_t*);
     JobBuildFn job_build = nullptr;
-    auto sym = ::dlsym(load_result.plugin.dl_handle, "clink_job_build");
+    auto sym = ::dlsym(plugin_handle, "clink_job_build");
     if (sym == nullptr) {
         return fail(400, ".so does not export clink_job_build (built with CLINK_REGISTER_JOB?)");
     }
@@ -2753,8 +2779,9 @@ int run_coordinator(int argc, char** argv) {
     return 0;
 }
 
-// worker mode. Connect to coordinator, idle, run whatever subtasks the coordinator deploys
-// via the generic role. No job-specific roles registered here.
+// worker mode. Keep one process alive across coordinator failures and replace
+// its fenced Worker session after every disconnect. No job-specific roles are
+// registered here.
 int run_worker(int argc, char** argv) {
 #ifdef CLINK_HAS_HTTP
     clink::metrics::init_worker_metrics();
@@ -2786,12 +2813,8 @@ int run_worker(int argc, char** argv) {
     const auto tls_ca = get_arg(argc, argv, "tls-ca", "");
     const auto tls_client_cert = get_arg(argc, argv, "tls-client-cert", "");
     const auto tls_client_key = get_arg(argc, argv, "tls-client-key", "");
-    // HA: when set, look up the current leader endpoint from
-    // <ha-dir>/active-leader.json instead of using --coordinator-host/--coordinator-port
-    // directly. On coordinator disconnect (reader_loop_ exits), this worker exits
-    // non-zero so an external supervisor (systemd/k8s/test harness)
-    // can restart it; the restart re-reads active-leader.json to find
-    // the new (possibly-just-elected) leader.
+    // HA: when set, every control-session attempt looks up the current leader
+    // endpoint. Static mode reconnects to the configured address instead.
     const auto ha_dir = get_arg(argc, argv, "ha-dir", "");
     const auto etcd_endpoints = get_arg(argc, argv, "etcd-endpoints", "");
     const auto etcd_cluster = get_arg(argc, argv, "etcd-cluster", "default");
@@ -2801,59 +2824,65 @@ int run_worker(int argc, char** argv) {
     }
     // Initialise logging now that the id is known (root logger %n = worker@<id>).
     clink::logging::init(make_logging_config(argc, argv, "worker@" + worker_id));
-    std::string discovered_coordinator_host = coordinator_host;
-    std::uint16_t discovered_coordinator_port =
-        static_cast<std::uint16_t>(std::stoi(coordinator_port));
+    std::unique_ptr<clink::cluster::HaCoordinator> ha_discovery;
     if (!etcd_endpoints.empty() || !ha_dir.empty()) {
-        std::unique_ptr<clink::cluster::HaCoordinator> coord;
         if (!etcd_endpoints.empty()) {
 #ifdef CLINK_LINKED_ETCD
             clink::cluster::EtcdHaConfig ecfg;
             ecfg.endpoints = etcd_endpoints;
             ecfg.cluster_name = etcd_cluster;
-            coord = clink::cluster::make_etcd_ha_coordinator(ecfg, {});
+            ha_discovery = clink::cluster::make_etcd_ha_coordinator(ecfg, {});
 #else
             std::cerr << "worker: --etcd-endpoints given but clink_etcd not linked\n";
             return 1;
 #endif
         } else {
-            coord = clink::cluster::make_file_ha_coordinator(ha_dir, {});
+            ha_discovery = clink::cluster::make_file_ha_coordinator(ha_dir, {});
         }
-        // Poll the active-leader file for up to 10s - covers the gap
-        // between worker startup and the first coordinator acquiring leadership.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
-        std::optional<clink::cluster::LeaderEndpoint> ep;
-        while (std::chrono::steady_clock::now() < deadline) {
-            ep = coord->current_leader_endpoint();
-            if (ep.has_value())
-                break;
-            std::this_thread::sleep_for(100ms);
-        }
-        if (!ep.has_value()) {
-            std::cerr << "worker: no leader visible (etcd=\"" << etcd_endpoints << "\" file=\""
-                      << ha_dir << "\") after 10s\n";
-            return 2;
-        }
-        discovered_coordinator_host = ep->host;
-        discovered_coordinator_port = ep->port;
-        std::cout << "worker HA: discovered leader " << discovered_coordinator_host << ":"
-                  << discovered_coordinator_port << " (epoch=" << ep->epoch << ")\n";
     }
 
-    Worker::Config cfg;
-    cfg.heartbeat_interval = 500ms;
-    cfg.slot_count = static_cast<std::uint32_t>(std::stoi(slot_str));
-    // cfg.http_port is set later via set_advertised_http_port AFTER
-    // the HttpServer binds - so when --http-port=0 lets the OS pick,
-    // the Register frame carries the actually-bound port.
-    Worker worker(worker_id, data_host, cfg);
+    WorkerSupervisor::Config supervisor_cfg;
+    supervisor_cfg.worker.heartbeat_interval = 500ms;
+    supervisor_cfg.worker.coordinator_heartbeat_timeout = std::chrono::milliseconds{
+        std::stoll(get_arg(argc, argv, "coordinator-heartbeat-timeout-ms", "3000"))};
+    supervisor_cfg.worker.slot_count = static_cast<std::uint32_t>(std::stoi(slot_str));
+    supervisor_cfg.discovery_timeout = std::chrono::milliseconds{
+        std::stoll(get_arg(argc, argv, "reconnect-discovery-timeout-ms", "1000"))};
+    supervisor_cfg.initial_backoff = std::chrono::milliseconds{
+        std::stoll(get_arg(argc, argv, "reconnect-initial-backoff-ms", "100"))};
+    supervisor_cfg.max_backoff = std::chrono::milliseconds{
+        std::stoll(get_arg(argc, argv, "reconnect-max-backoff-ms", "5000"))};
+
+    WorkerSupervisor::DiscoverFn discover;
+    if (ha_discovery) {
+        discover = [&ha_discovery](std::chrono::milliseconds timeout)
+            -> std::optional<clink::cluster::LeaderEndpoint> {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            do {
+                if (auto ep = ha_discovery->current_leader_endpoint(); ep.has_value()) {
+                    return ep;
+                }
+                std::this_thread::sleep_for(100ms);
+            } while (std::chrono::steady_clock::now() < deadline);
+            return std::nullopt;
+        };
+    } else {
+        const auto static_port = static_cast<std::uint16_t>(std::stoi(coordinator_port));
+        discover = [coordinator_host, static_port](
+                       std::chrono::milliseconds) -> std::optional<clink::cluster::LeaderEndpoint> {
+            return clink::cluster::LeaderEndpoint{
+                .host = coordinator_host, .port = static_port, .epoch = 0};
+        };
+    }
+
+    WorkerSupervisor supervisor(worker_id, data_host, supervisor_cfg, std::move(discover));
 #ifdef CLINK_LINKED_TLS
     if (!tls_ca.empty()) {
         auto client_ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
         if (!tls_client_cert.empty() && !tls_client_key.empty()) {
             client_ctx->set_client_cert(tls_client_cert, tls_client_key);
         }
-        worker.set_connect_factory([client_ctx](const std::string& host, std::uint16_t port) {
+        supervisor.set_connect_factory([client_ctx](const std::string& host, std::uint16_t port) {
             return clink::network::connect_tls_connection(host, port, client_ctx);
         });
         std::cout << "worker TLS enabled (ca=" << tls_ca
@@ -2865,9 +2894,22 @@ int run_worker(int argc, char** argv) {
     }
 #endif
 
-    // No register_role() calls: the Worker constructor wired up the
-    // generic subtask role, which is everything a worker needs to execute
-    // any submitted graph that uses operators in the OperatorRegistry.
+    supervisor.set_on_connected([worker_id, using_ha = static_cast<bool>(ha_discovery)](
+                                    const Worker& worker,
+                                    const clink::cluster::LeaderEndpoint& endpoint,
+                                    std::uint64_t session_number) {
+        if (using_ha) {
+            std::cout << "worker HA: discovered leader " << endpoint.host << ":" << endpoint.port
+                      << " (epoch=" << worker.bound_epoch() << ")\n";
+        }
+        // Load-bearing readiness banner on STDOUT: integration and cold-start
+        // harnesses use it as an observable registration condition.
+        clink::log::info("node.allocator", "allocator: " + clink::allocator_name());
+        std::cout << "worker " << worker_id << " registered with " << endpoint.host << ":"
+                  << endpoint.port << " (session=" << session_number
+                  << ", epoch=" << worker.bound_epoch() << ")\n";
+        std::cout.flush();
+    });
 
     const auto start_time = std::chrono::steady_clock::now();
 
@@ -2899,7 +2941,6 @@ int run_worker(int argc, char** argv) {
             }
             clink::metrics::configure_disk_volumes(std::move(vols));
         }
-        auto* worker_ptr = &worker;
         // Queryable state: serve the process-wide registry. Operators that
         // expose state (SQL aggregates do so automatically) bind their
         // slots into Registry::global(); these routes make them readable.
@@ -2909,36 +2950,63 @@ int run_worker(int argc, char** argv) {
             *http_srv, clink::queryable_state::Registry::global());
         // Live whole-job state export: this worker's share of a job's keyed
         // state as one canonical Arrow snapshot stream.
-        clink::queryable_state::register_worker_state_export_route(*http_srv, worker);
-        http_srv->get("/api/v1/health", [start_time, &http_bound](const clink::http::HttpRequest&) {
-            clink::http::HttpResponse resp;
-            resp.body = make_health_body("worker", start_time, http_bound);
-            return resp;
-        });
-        http_srv->get("/api/v1/worker", [worker_ptr](const clink::http::HttpRequest&) {
+        clink::queryable_state::register_worker_state_export_route(
+            *http_srv, [&supervisor] { return supervisor.active_worker(); });
+        http_srv->get(
+            "/api/v1/health",
+            [start_time, &http_bound, &supervisor](const clink::http::HttpRequest&) {
+                clink::http::HttpResponse resp;
+                const auto recovery = supervisor.snapshot();
+                const auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                          std::chrono::steady_clock::now() - start_time)
+                                          .count();
+                clink::http::JsonWriter w;
+                w.begin_object();
+                w.kv("role", "worker");
+                w.kv("ok", recovery.connected);
+                w.kv("uptime_s", uptime_s);
+                w.kv("bound_port", http_bound);
+                w.kv("state", recovery.state);
+                w.kv("session_number", static_cast<std::int64_t>(recovery.session_number));
+                w.kv("coordinator_epoch", static_cast<std::int64_t>(recovery.coordinator_epoch));
+                w.end_object();
+                resp.status = recovery.connected ? 200 : 503;
+                resp.body = w.str();
+                return resp;
+            });
+        http_srv->get("/api/v1/worker", [&supervisor](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
-            write_worker_snapshot(w, worker_ptr->snapshot_worker());
+            if (auto worker = supervisor.active_worker()) {
+                write_worker_snapshot(w, worker->snapshot_worker());
+            } else {
+                resp.status = 503;
+                write_worker_recovery_snapshot(w, supervisor.snapshot());
+            }
             resp.body = w.str();
             return resp;
         });
-        http_srv->get("/api/v1/worker/subtasks", [worker_ptr](const clink::http::HttpRequest&) {
+        http_srv->get("/api/v1/worker/subtasks", [&supervisor](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
             w.begin_object();
             w.key("subtasks").begin_array();
-            for (const auto& s : worker_ptr->snapshot_subtasks()) {
-                write_subtask_record(w, s);
+            if (auto worker = supervisor.active_worker()) {
+                for (const auto& s : worker->snapshot_subtasks()) {
+                    write_subtask_record(w, s);
+                }
+            } else {
+                resp.status = 503;
             }
             w.end_array();
             w.end_object();
             resp.body = w.str();
             return resp;
         });
-        http_srv->get("/api/v1/config", [worker_ptr](const clink::http::HttpRequest&) {
+        http_srv->get("/api/v1/config", [&supervisor](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
-            write_worker_config(w, worker_ptr->config_snapshot());
+            write_worker_config(w, supervisor.config());
             resp.body = w.str();
             return resp;
         });
@@ -2959,48 +3027,26 @@ int run_worker(int argc, char** argv) {
         http_bound = http_srv->start(http_bind, http_port_req);
         std::cout << "worker HTTP on " << http_bind << ":" << http_bound << "\n";
         std::cout.flush();
-        // Tell the Worker which port to advertise to the coordinator at
-        // register time. Must happen BEFORE connect_to_coordinator.
-        worker.set_advertised_http_port(http_bound);
+        // Every replacement session advertises the same long-lived HTTP port.
+        supervisor.set_advertised_http_port(http_bound);
     }
 #else
     (void)http_port_str;
     (void)http_bind;
 #endif
 
-    worker.connect_to_coordinator(discovered_coordinator_host, discovered_coordinator_port);
-    // Load-bearing readiness banner on STDOUT: bench_failover_coldstart greps the
-    // child's captured stdout for "registered" at several sites. Keep it on
-    // std::cout (NOT the logger) so it survives --log-no-console and is not
-    // reordered by async logging.
-    clink::log::info("node.allocator", "allocator: " + clink::allocator_name());
-    std::cout << "worker " << worker_id << " registered with " << discovered_coordinator_host << ":"
-              << discovered_coordinator_port << "\n";
-    std::cout.flush();
-
-    // Idle until SIGTERM/SIGINT - or until the coordinator disconnects, in EVERY
-    // mode, not just HA. A disconnected worker is useless (there is no worker-side
-    // re-register path), so staying up just zombies the process; under a
-    // supervisor (k8s restartPolicy, compose restart, the HA wrapper)
-    // exiting is what triggers the restart + re-registration that heals the
-    // cluster. In HA the next process reads active-leader.json and follows
-    // whatever coordinator holds leadership; in non-HA it reconnects to the same
-    // address. Exit code 2 marks a restart-me exit, not a clean shutdown.
-    while (!g_shutdown_requested.load(std::memory_order_acquire)) {
-        if (worker.disconnected()) {
-            std::cerr << "worker " << worker_id
-                      << ": coordinator disconnected; exiting for restart\n";
-            break;
-        }
-        std::this_thread::sleep_for(200ms);
-    }
+    const auto run_result =
+        supervisor.run([] { return g_shutdown_requested.load(std::memory_order_acquire); });
 #ifdef CLINK_HAS_HTTP
     if (http_srv) {
         http_srv->stop();
     }
 #endif
-    worker.stop();
-    return (worker.disconnected() && !g_shutdown_requested.load()) ? 2 : 0;
+    if (run_result.fatal) {
+        std::cerr << "worker " << worker_id << ": recovery stopped: " << run_result.error << "\n";
+        return 2;
+    }
+    return 0;
 }
 
 }  // namespace
@@ -3159,6 +3205,14 @@ int main(int argc, char** argv) {
                    "                               Without it such a coordinator refuses, because "
                    "the\n"
                    "                               lock cannot fence and two would both lead.\n"
+                << "\n"
+                << "Worker recovery flags:\n"
+                << "  --coordinator-heartbeat-timeout-ms=<n> control-session lease (default "
+                   "3000).\n"
+                << "  --reconnect-discovery-timeout-ms=<n>  one discovery pass (default "
+                   "1000).\n"
+                << "  --reconnect-initial-backoff-ms=<n>     first retry cap (default 100).\n"
+                << "  --reconnect-max-backoff-ms=<n>         retry cap (default 5000).\n"
                 << "\n"
                 << "Logging flags:\n"
                 << "  --log-level=<lvl>            trace|debug|info|warn|error|off "

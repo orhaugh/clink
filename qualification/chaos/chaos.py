@@ -203,6 +203,18 @@ class Chaos:
             raise ChaosCommandFailed(
                 f"{host['name']}: {name} is still running after a kill - the fault did not land")
 
+    def container_pid(self, host: dict, name: str):
+        """Return a running container's host PID, refusing an absent/invalid value."""
+        res = self.rig.ssh(host, f"docker inspect --format '{{{{.State.Pid}}}}' {name}")
+        try:
+            pid = int((res.stdout or "").strip())
+        except ValueError as exc:
+            raise ChaosCommandFailed(
+                f"{host['name']}: {name} returned an invalid container PID") from exc
+        if pid <= 0:
+            raise ChaosCommandFailed(f"{host['name']}: {name} is not running")
+        return pid
+
     def kill_worker(self, state, ckpt):
         host = self.rng.choice(self.rig.hosts("worker"))
         self.rig.ssh(host, "docker kill -s SIGKILL clink-worker")
@@ -217,36 +229,33 @@ class Chaos:
 
     def kill_coordinator(self, state, ckpt):
         host = self.rig.hosts("coordinator")[0]
+        workers = self.rig.hosts("worker")
+        worker_pids_before = {
+            w["name"]: self.container_pid(w, "clink-worker") for w in workers
+        }
         self.rig.ssh(host, "docker kill -s SIGKILL clink-coordinator")
         self.assert_container_gone(host, "clink-coordinator")
         self.record(host["name"], "coordinator_sigkill", state, ckpt)
         time.sleep(self.rng.uniform(5, 15))
         self.rig.ssh(host, "cd /qual && docker compose -f coordinator.yml up -d")
         self.assert_container_running(host, "clink-coordinator")
-        self.record(host["name"], "coordinator_restart", "killed", ckpt)
 
-        # Bring the workers back too, because killing the coordinator killed
-        # them.
-        #
-        # A clink worker exits on coordinator disconnect - "exiting for
-        # restart" - by design, expecting whatever supervises it to start it
-        # again. The rig deliberately runs workers with restart: "no" so that
-        # a chaos WORKER kill has an observable consequence the controller
-        # times, and the two together mean a coordinator kill decapitates the
-        # cluster permanently: every worker exits, nothing restarts them, and
-        # the recovered coordinator parks the job for capacity it will never
-        # get. QUAL-01 measured that as a job that simply vanished mid-run.
-        #
-        # So the fault owns its whole blast radius. Without this, a
-        # coordinator kill is not a recovery test - it is the end of the run.
-        for w in self.rig.hosts("worker"):
-            res = self.rig.ssh(
-                w, "docker ps -a --filter name=clink-worker --format '{{.Status}}'")
-            if "Up" in (res.stdout or ""):
-                continue
-            self.rig.ssh(w, "cd /qual && docker compose -f worker.yml up -d")
+        # Workers remain running. Each one fences and drains the dead control
+        # session, then reconnects to this coordinator under its new epoch.
+        # Restarting them here would conceal a regression in that contract.
+        worker_pids_after = {}
+        for w in workers:
             self.assert_container_running(w, "clink-worker")
-            self.record(w["name"], "worker_restart_after_coordinator_kill", "killed", ckpt)
+            pid = self.container_pid(w, "clink-worker")
+            worker_pids_after[w["name"]] = pid
+            if pid != worker_pids_before[w["name"]]:
+                raise ChaosCommandFailed(
+                    f"{w['name']}: clink-worker PID changed across coordinator restart "
+                    f"({worker_pids_before[w['name']]} -> {pid}); the campaign did not "
+                    "exercise in-process control-session recovery")
+        self.record(host["name"], "coordinator_restart", "killed", ckpt,
+                    {"worker_pids_before": worker_pids_before,
+                     "worker_pids_after": worker_pids_after})
 
     def restart_broker(self, state, ckpt):
         host = self.rng.choice(self.rig.hosts("broker"))

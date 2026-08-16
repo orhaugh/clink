@@ -31,6 +31,7 @@ inline void encode_body(MessageBuilder& b, const RegisterAckMsg& m) {
     // reading here is pre-versioning and decodes 0, which reads as v1.
     b.put_u32_be(m.protocol_version);
     b.put_u32_be(m.min_compatible_protocol_version);
+    b.put_u8(m.retryable ? 1 : 0);
 }
 
 // Append a PluginBinary's wire encoding. The bytes blob can be large
@@ -194,6 +195,13 @@ inline void encode_body(MessageBuilder& b, const SubtaskFinishedMsg& m) {
 
 inline void encode_body(MessageBuilder& b, const HeartbeatMsg& m) {
     b.put_string(m.worker_id);
+    b.put_u64_be(m.sequence);
+}
+
+inline void encode_body(MessageBuilder& b, const HeartbeatAckMsg& m) {
+    b.put_string(m.worker_id);
+    b.put_u64_be(m.sequence);
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 inline void encode_body(MessageBuilder& b, const HelloClientMsg& m) {
@@ -480,6 +488,7 @@ inline RegisterAckMsg decode_register_ack(MessageReader& r) {
     // which decodes 0 and is read as v1 by check_protocol_compatibility.
     m.protocol_version = r.eof() ? std::uint32_t{0} : r.read_u32_be();
     m.min_compatible_protocol_version = r.eof() ? std::uint32_t{0} : r.read_u32_be();
+    m.retryable = r.eof() ? false : r.read_u8() != 0;
     return m;
 }
 
@@ -680,7 +689,22 @@ inline SubtaskFinishedMsg decode_subtask_finished(MessageReader& r) {
 }
 
 inline HeartbeatMsg decode_heartbeat(MessageReader& r) {
-    return HeartbeatMsg{r.read_string()};
+    HeartbeatMsg m;
+    m.worker_id = r.read_string();
+    if (!r.eof()) {
+        m.sequence = r.read_u64_be();
+    }
+    return m;
+}
+
+inline HeartbeatAckMsg decode_heartbeat_ack(MessageReader& r) {
+    HeartbeatAckMsg m;
+    m.worker_id = r.read_string();
+    m.sequence = r.read_u64_be();
+    if (!r.eof()) {
+        m.coordinator_epoch = r.read_u64_be();
+    }
+    return m;
 }
 
 inline RequestFinalCheckpointMsg decode_request_final_checkpoint(MessageReader& r) {

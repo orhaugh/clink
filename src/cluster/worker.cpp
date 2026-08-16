@@ -51,6 +51,12 @@ namespace clink::cluster {
 
 namespace {
 
+std::int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 // Register the job's shipped UDF declarations (DeployMsg.udfs_packed) into
 // the process-wide registries via each declaration's LANGUAGE loader. The
 // module payload travels base64 in the spec; the local path in
@@ -403,6 +409,12 @@ Worker::Worker(std::string worker_id, std::string data_host)
 
 Worker::Worker(std::string worker_id, std::string data_host, Config cfg)
     : cfg_(cfg), worker_id_(std::move(worker_id)), data_host_(std::move(data_host)) {
+    if (cfg_.heartbeat_interval.count() < 0) {
+        throw std::invalid_argument("Worker: heartbeat_interval must not be negative");
+    }
+    if (cfg_.coordinator_heartbeat_timeout.count() < 0) {
+        throw std::invalid_argument("Worker: coordinator_heartbeat_timeout must not be negative");
+    }
     // Auto-register the generic subtask role so any submission can run
     // on this worker without job-specific C++ glue.
     roles_[kGenericSubtaskRole] = [](const DeploymentTask& /*task*/) {
@@ -435,32 +447,64 @@ void Worker::connect_to_coordinator(const std::string& coordinator_host,
     coordinator_host_ = coordinator_host;
     coordinator_port_ = coordinator_port;
     metrics::worker::slot_capacity_set(cfg_.slot_count);
-    conn_ = connect_factory_(coordinator_host, coordinator_port);
+    try {
+        conn_ = connect_factory_(coordinator_host, coordinator_port);
+    } catch (const std::exception& e) {
+        throw WorkerConnectionError(WorkerConnectionError::Kind::Transient,
+                                    "Worker::connect_to_coordinator: connect failed for " +
+                                        coordinator_host + ":" + std::to_string(coordinator_port) +
+                                        ": " + e.what());
+    }
     if (!conn_) {
-        throw std::runtime_error("Worker::connect_to_coordinator: connect failed for " +
-                                 coordinator_host + ":" + std::to_string(coordinator_port));
+        throw WorkerConnectionError(WorkerConnectionError::Kind::Transient,
+                                    "Worker::connect_to_coordinator: connect failed for " +
+                                        coordinator_host + ":" + std::to_string(coordinator_port));
     }
 
     const auto reg_frame =
         encode_frame(MessageKind::Register,
                      RegisterMsg{worker_id_, data_host_, cfg_.slot_count, cfg_.http_port});
     if (!send_frame_(reg_frame)) {
-        throw std::runtime_error("Worker::connect_to_coordinator: Register send failed");
+        throw WorkerConnectionError(WorkerConnectionError::Kind::Transient,
+                                    "Worker::connect_to_coordinator: Register send failed");
     }
 
+    // Bound the registration handshake as well as the established session.
+    // A TCP peer can accept and then send nothing; without this deadline the
+    // supervisor cannot retry discovery or honour shutdown. Plain TCP and any
+    // transport that implements set_recv_timeout enforce the bound.
+    if (cfg_.coordinator_heartbeat_timeout.count() > 0) {
+        (void)conn_->set_recv_timeout(cfg_.coordinator_heartbeat_timeout);
+    }
     auto frame = read_frame(*conn_);
+    (void)conn_->set_recv_timeout(std::chrono::milliseconds{0});
     if (!frame.has_value()) {
-        throw std::runtime_error("Worker::connect_to_coordinator: connection closed before ack");
+        throw WorkerConnectionError(WorkerConnectionError::Kind::Transient,
+                                    "Worker::connect_to_coordinator: connection closed before ack");
     }
-    MessageReader r(std::move(*frame));
-    const auto kind = static_cast<MessageKind>(r.read_u8());
-    if (kind != MessageKind::RegisterAck) {
-        throw std::runtime_error("Worker::connect_to_coordinator: unexpected first message");
+    RegisterAckMsg ack;
+    try {
+        MessageReader r(std::move(*frame));
+        const auto kind = static_cast<MessageKind>(r.read_u8());
+        if (kind != MessageKind::RegisterAck) {
+            throw WorkerConnectionError(
+                WorkerConnectionError::Kind::FatalHandshake,
+                "Worker::connect_to_coordinator: unexpected first message kind " +
+                    std::to_string(static_cast<int>(kind)));
+        }
+        ack = decode_register_ack(r);
+    } catch (const WorkerConnectionError&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw WorkerConnectionError(
+            WorkerConnectionError::Kind::FatalHandshake,
+            "Worker::connect_to_coordinator: malformed RegisterAck: " + std::string{e.what()});
     }
-    const auto ack = decode_register_ack(r);
     if (!ack.ok) {
-        throw std::runtime_error("Worker::connect_to_coordinator: register rejected: " +
-                                 ack.message);
+        throw WorkerConnectionError(
+            ack.retryable ? WorkerConnectionError::Kind::Transient
+                          : WorkerConnectionError::Kind::FatalHandshake,
+            "Worker::connect_to_coordinator: register rejected: " + ack.message);
     }
     // The worker's half of the negotiation. The coordinator has already
     // checked the worker; this checks the coordinator. Both directions are
@@ -471,13 +515,18 @@ void Worker::connect_to_coordinator(const std::string& coordinator_host,
             ack.protocol_version, ack.min_compatible_protocol_version, "coordinator");
         !compat.compatible) {
         metrics::orch::protocol_mismatch();
-        throw std::runtime_error("Worker::connect_to_coordinator: " + compat.reason);
+        throw WorkerConnectionError(WorkerConnectionError::Kind::FatalHandshake,
+                                    "Worker::connect_to_coordinator: " + compat.reason);
     }
     // Bind to the epoch of the coordinator that admitted us. Every later
     // control frame is measured against this. Reconnecting - which is how
     // a worker follows a failover - re-registers and so re-binds, which is
     // why binding unconditionally here is right rather than max()-ing.
     bound_epoch_.store(ack.coordinator_epoch, std::memory_order_release);
+    coordinator_protocol_version_.store(ack.protocol_version, std::memory_order_release);
+    heartbeat_sequence_.store(0, std::memory_order_release);
+    heartbeat_ack_sequence_.store(0, std::memory_order_release);
+    last_coordinator_contact_ms_.store(steady_now_ms(), std::memory_order_release);
 
     reader_ = std::thread([this] { reader_loop_(); });
     if (cfg_.heartbeat_interval.count() > 0) {
@@ -545,10 +594,67 @@ void Worker::heartbeat_loop_() {
         // cadence a heartbeat runs at is already the right one for a gauge, and
         // a state size that updates only at checkpoints does not need finer.
         publish_job_state_sizes_();
-        const auto frame = encode_frame(MessageKind::Heartbeat, HeartbeatMsg{worker_id_});
+        const auto sequence = heartbeat_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const auto frame = encode_frame(MessageKind::Heartbeat, HeartbeatMsg{worker_id_, sequence});
         if (!send_frame_(frame)) {
+            signal_disconnect_("heartbeat send failed");
             return;
         }
+        // Only v2+ coordinators promise HeartbeatAck. Retaining the EOF-only
+        // behaviour with a v1 peer is what keeps rolling upgrades compatible.
+        if (coordinator_protocol_version_.load(std::memory_order_acquire) >= 2 &&
+            cfg_.coordinator_heartbeat_timeout.count() > 0) {
+            const auto silent_ms =
+                steady_now_ms() - last_coordinator_contact_ms_.load(std::memory_order_acquire);
+            if (silent_ms > cfg_.coordinator_heartbeat_timeout.count()) {
+                signal_disconnect_("coordinator heartbeat lease expired after " +
+                                   std::to_string(silent_ms) + "ms");
+                return;
+            }
+        }
+    }
+}
+
+void Worker::signal_disconnect_(const std::string& reason) {
+    bool expected = false;
+    if (!disconnected_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    log::warn("worker.connection", "control session ended: " + reason);
+    {
+        std::lock_guard lock(mu_);
+        for (auto& [_, pt] : pending_) {
+            pt->cancelled = true;
+            pt->cv.notify_all();
+        }
+        // Fence all work from the dead session immediately. Waiting for the
+        // process supervisor to notice the disconnect leaves a window where a
+        // partitioned worker can keep publishing while the coordinator has
+        // already restored the same job elsewhere.
+        for (auto& [_job_id, per_subtask] : per_job_cancel_tokens_) {
+            for (auto& [_subtask, token] : per_subtask) {
+                if (token) {
+                    token->store(true, std::memory_order_release);
+                }
+            }
+        }
+        std::vector<JobId> pump_jobs;
+        pump_jobs.reserve(per_job_rebind_pumps_.size());
+        for (const auto& [job_id, _] : per_job_rebind_pumps_) {
+            pump_jobs.push_back(job_id);
+        }
+        for (const auto job_id : pump_jobs) {
+            cancel_rebind_pumps_locked_(job_id);
+        }
+        cv_.notify_all();
+    }
+    {
+        std::lock_guard<std::mutex> wake(final_ckpt_mu_);
+    }
+    final_ckpt_cv_.notify_all();
+    if (conn_) {
+        conn_->close();
     }
 }
 
@@ -579,32 +685,24 @@ bool Worker::accept_epoch_(std::uint64_t frame_epoch, const char* what) {
 void Worker::reader_loop_() {
     while (!stop_.load(std::memory_order_acquire)) {
         if (!conn_) {
-            disconnected_.store(true, std::memory_order_release);
+            signal_disconnect_("connection object is absent");
             return;
         }
         auto frame = read_frame(*conn_);
         if (!frame.has_value()) {
-            // Connection closed; wake any pending awaiters so they can
-            // exit instead of hanging forever. Flip disconnected_ so
-            // an --ha-dir worker in clink_node can detect the coordinator
-            // disconnect and exit (supervisor restarts it; the new
-            // process re-reads active-leader.json).
-            disconnected_.store(true, std::memory_order_release);
-            std::lock_guard lock(mu_);
-            for (auto& [_, pt] : pending_) {
-                pt->cancelled = true;
-                pt->cv.notify_all();
-            }
+            signal_disconnect_("coordinator closed the connection");
             return;
         }
+        last_coordinator_contact_ms_.store(steady_now_ms(), std::memory_order_release);
         MessageReader r(std::move(*frame));
-        // A malformed control frame must not terminate the worker.
+        // A malformed control frame must not terminate the process.
         //
         // The decoders throw by design on a truncated or nonsensical
         // payload, and nothing here caught it: the throw left this thread
         // function, which is std::terminate. A coordinator with a version
         // skew, or anything else able to write to this socket, could kill
-        // every task the worker was running.
+        // every task the worker was running. Bound it to this control session
+        // instead, then let the supervisor drain and recover cleanly.
         try {
             dispatch_control_frame_(r);
         } catch (const std::exception& e) {
@@ -613,12 +711,7 @@ void Worker::reader_loop_() {
                                    "connection: "} +
                            e.what());
             metrics::orch::malformed_frame();
-            disconnected_.store(true, std::memory_order_release);
-            std::lock_guard lock(mu_);
-            for (auto& [_, pt] : pending_) {
-                pt->cancelled = true;
-                pt->cv.notify_all();
-            }
+            signal_disconnect_(std::string{"malformed control frame: "} + e.what());
             return;
         }
     }
@@ -636,6 +729,28 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
             case MessageKind::PeerUpdate:
                 handle_peer_update_(r);
                 break;
+            case MessageKind::HeartbeatAck: {
+                const auto ack = decode_heartbeat_ack(r);
+                if (!accept_epoch_(ack.coordinator_epoch, "HeartbeatAck")) {
+                    break;
+                }
+                if (ack.worker_id != worker_id_) {
+                    throw std::runtime_error("HeartbeatAck names worker '" + ack.worker_id +
+                                             "', expected '" + worker_id_ + "'");
+                }
+                const auto sent = heartbeat_sequence_.load(std::memory_order_acquire);
+                if (ack.sequence > sent) {
+                    throw std::runtime_error(
+                        "HeartbeatAck sequence " + std::to_string(ack.sequence) +
+                        " is ahead of the last sent heartbeat " + std::to_string(sent));
+                }
+                auto observed = heartbeat_ack_sequence_.load(std::memory_order_acquire);
+                while (ack.sequence > observed &&
+                       !heartbeat_ack_sequence_.compare_exchange_weak(
+                           observed, ack.sequence, std::memory_order_acq_rel)) {
+                }
+                break;
+            }
             case MessageKind::CancelJob: {
                 auto cj = decode_cancel_job(r);
                 if (!accept_epoch_(cj.coordinator_epoch, "CancelJob")) {
@@ -1319,6 +1434,7 @@ void Worker::handle_deploy_(MessageReader& r) {
                 plugin_err = "plugin '" + plug.name + "': " + res.error;
                 break;
             }
+            job_bundle->retain_plugin(std::move(res.plugin));
         } catch (const std::exception& e) {
             plugin_err = "plugin '" + plug.name + "': " + e.what();
             break;

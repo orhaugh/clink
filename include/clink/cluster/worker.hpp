@@ -9,9 +9,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
@@ -27,6 +29,25 @@ namespace clink::cluster {
 
 class OperatorRegistry;
 class JobBundle;
+
+// A connect failure carries enough policy for a long-lived worker process to
+// distinguish an unavailable leader from a permanent protocol/configuration
+// refusal. Transport failures are retryable. A malformed handshake, a
+// registration rejection, or incompatible protocol is fatal until the binary
+// or configuration changes, so retrying it forever would only hammer the
+// coordinator and hide the real fault.
+class WorkerConnectionError : public std::runtime_error {
+public:
+    enum class Kind { Transient, FatalHandshake };
+
+    WorkerConnectionError(Kind kind, std::string message)
+        : std::runtime_error(std::move(message)), kind_(kind) {}
+
+    [[nodiscard]] bool retryable() const noexcept { return kind_ == Kind::Transient; }
+
+private:
+    Kind kind_;
+};
 
 // A RoleHandler runs one task end-to-end. It receives the deployment task
 // (which contains peer addresses, the bind port, and any role-specific
@@ -51,6 +72,11 @@ class Worker {
 public:
     struct Config {
         std::chrono::milliseconds heartbeat_interval{500};
+        // Maximum time without any coordinator frame after registration.
+        // Protocol-v2 coordinators acknowledge every heartbeat, making this a
+        // bidirectional control-plane lease rather than an EOF detector. Set
+        // to 0 to disable the lease (used only for compatibility tests).
+        std::chrono::milliseconds coordinator_heartbeat_timeout{3000};
         std::uint32_t slot_count{1};
         // Maximum time to wait for a PeerUpdate after sending
         // SubtaskListening. Beyond this the generic role aborts the
@@ -106,12 +132,10 @@ public:
     // long-running work cooperatively.
     bool was_cancelled() const noexcept { return cancelled_.load(std::memory_order_acquire); }
 
-    // True once the reader_loop_ has observed the coordinator connection
-    // dropping (peer closed, transport error). Stays true until
-    // stop(). clink_node's --ha-dir worker mode polls this so it can
-    // exit on disconnect; an external supervisor (or the integration
-    // test) restarts the worker, which then reads active-leader.json to
-    // find the new leader.
+    // True once the control session has ended through EOF, transport/protocol
+    // failure, or expiry of the coordinator heartbeat lease. The long-lived
+    // worker supervisor replaces this Worker object with a fresh session; the
+    // process and container stay alive.
     bool disconnected() const noexcept { return disconnected_.load(std::memory_order_acquire); }
 
     // Fencing epoch this worker is bound to: the epoch carried by the
@@ -174,6 +198,10 @@ public:
 
 private:
     void reader_loop_();
+    // Fence and cancel the whole session exactly once. The old coordinator
+    // session must stop touching external systems before a replacement
+    // registers under the same worker id.
+    void signal_disconnect_(const std::string& reason);
     // Fencing check, run on every control frame that changes what this
     // worker is doing. Returns false - meaning DROP the frame - when it
     // carries a lower epoch than the one bound at registration, so a
@@ -286,6 +314,10 @@ private:
     std::atomic<std::uint64_t> fenced_frames_{0};
     std::atomic<bool> cancelled_{false};
     std::atomic<bool> disconnected_{false};
+    std::atomic<std::uint32_t> coordinator_protocol_version_{0};
+    std::atomic<std::uint64_t> heartbeat_sequence_{0};
+    std::atomic<std::uint64_t> heartbeat_ack_sequence_{0};
+    std::atomic<std::int64_t> last_coordinator_contact_ms_{0};
     mutable std::mutex mu_;
     std::mutex send_mu_;
     std::condition_variable cv_;

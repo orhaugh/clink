@@ -13,16 +13,12 @@ class PluginRegistry;
 
 namespace clink::cluster {
 
-// Result of loading one plugin shared library. The handle owns the
-// dlopen()'d module; destroying the handle dlclose()'s it. While a
-// handle is alive, the plugin's registered factories remain in the
-// process-wide TypeRegistry / RunnerRegistry / SelectorRegistry.
-//
-// v1: handles are tracked but never explicitly released - we keep
-// plugins loaded for the worker's lifetime. dlclose() with registered
-// std::function closures pointing back into plugin code is risky
-// without quiescing all in-flight subtasks first; that
-// machinery is deferred.
+// Result of loading one plugin shared library. `module` shares ownership of
+// the dlopen handle and dlclose()s it when the last copy is destroyed.
+// Per-job JobBundle objects retain this handle and declare it before their
+// registries, so registry closures are destroyed before module code is
+// unmapped. The default process-wide loader retains successful handles in
+// `loaded_` for the process lifetime.
 struct LoadedPlugin {
     std::string source_path;  // Original .so path on disk.
     std::string name;         // From clink_plugin_metadata().
@@ -31,7 +27,8 @@ struct LoadedPlugin {
     int abi_version{0};           // From clink_plugin_abi_version() (diagnostic; 0 = legacy).
     std::string abi_hash;         // From clink_plugin_abi_hash() (informational / strict gate).
     std::string target_triple;    // From clink_plugin_target_triple().
-    void* dl_handle{nullptr};     // dlopen handle - opaque.
+    std::shared_ptr<void> module;
+    void* dl_handle{nullptr};  // Non-owning alias of module.get(), for dlsym callers.
 };
 
 // Outcome of a load attempt. Holds the parsed LoadedPlugin on success
@@ -76,6 +73,8 @@ public:
     // to scope a job's registrations to its JobBundle. Idempotency
     // applies per (path, registry-identity) pair - see notes on the
     // implementation.
+    // The returned LoadedPlugin must outlive every closure registered into
+    // `registry`. Per-job callers normally move it into JobBundle::retain_plugin.
     PluginLoadResult load_into(const std::string& so_path, plugin::PluginRegistry& registry);
 
     // Returns the LoadedPlugin matching this path, if loaded. nullptr

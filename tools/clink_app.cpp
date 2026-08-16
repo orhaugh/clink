@@ -161,13 +161,15 @@ int clink_cmd_run_application(int argc, char** argv) {
                   << load_result.error << "\n";
         return 3;
     }
+    void* plugin_handle = load_result.plugin.dl_handle;
+    bundle->retain_plugin(std::move(load_result.plugin));
 
     // Retrieve the JobGraphSpec JSON via clink_job_build. The .so has
     // already run build_fn under call_once (during load_into); job_build
     // just exposes the captured JSON pointer.
     using JobBuildFn = int (*)(const char**, std::size_t*);
     JobBuildFn job_build = nullptr;
-    auto sym = ::dlsym(load_result.plugin.dl_handle, "clink_job_build");
+    auto sym = ::dlsym(plugin_handle, "clink_job_build");
     if (sym == nullptr) {
         std::cerr << "clink_app: .so does not export clink_job_build (was it built with "
                      "CLINK_REGISTER_JOB?)\n";

@@ -143,10 +143,11 @@ TEST(WireProtocol, RegisterAckRoundTrips) {
     EXPECT_EQ(ok_out.ok, true);
     EXPECT_EQ(ok_out.message, "welcome");
 
-    RegisterAckMsg bad_msg{.ok = false, .message = "duplicate worker_id"};
+    RegisterAckMsg bad_msg{.ok = false, .message = "connection limit", .retryable = true};
     auto bad_out = round_trip(MessageKind::RegisterAck, bad_msg, decode_register_ack);
     EXPECT_EQ(bad_out.ok, false);
-    EXPECT_EQ(bad_out.message, "duplicate worker_id");
+    EXPECT_EQ(bad_out.message, "connection limit");
+    EXPECT_TRUE(bad_out.retryable);
 }
 
 TEST(WireProtocol, DeployRoundTripsSimpleTask) {
@@ -246,9 +247,27 @@ TEST(WireProtocol, SubtaskFinishedRoundTrips) {
 }
 
 TEST(WireProtocol, HeartbeatRoundTrips) {
-    HeartbeatMsg in{.worker_id = "worker-z"};
+    HeartbeatMsg in{.worker_id = "worker-z", .sequence = 42};
     auto out = round_trip(MessageKind::Heartbeat, in, decode_heartbeat);
     EXPECT_EQ(out.worker_id, "worker-z");
+    EXPECT_EQ(out.sequence, 42U);
+
+    HeartbeatAckMsg ack{.worker_id = "worker-z", .sequence = 42, .coordinator_epoch = 7};
+    auto ack_out = round_trip(MessageKind::HeartbeatAck, ack, decode_heartbeat_ack);
+    EXPECT_EQ(ack_out.worker_id, "worker-z");
+    EXPECT_EQ(ack_out.sequence, 42U);
+    EXPECT_EQ(ack_out.coordinator_epoch, 7U);
+}
+
+TEST(WireProtocol, VersionOneHeartbeatDefaultsSequenceToZero) {
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::Heartbeat));
+    b.put_string("old-worker");
+    MessageReader r(body_of(b.finalize()));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::Heartbeat);
+    const auto heartbeat = decode_heartbeat(r);
+    EXPECT_EQ(heartbeat.worker_id, "old-worker");
+    EXPECT_EQ(heartbeat.sequence, 0U);
 }
 
 // ----- Backwards-compat: Register without slot_count must still parse -----
@@ -420,6 +439,7 @@ TEST(WireProtocol, MessageKindValuesArePinnedForCompatibility) {
     EXPECT_EQ(static_cast<int>(MessageKind::SubmitJobAck), 105);
     EXPECT_EQ(static_cast<int>(MessageKind::JobCompleted), 106);
     EXPECT_EQ(static_cast<int>(MessageKind::RescaleJobAck), 111);
+    EXPECT_EQ(static_cast<int>(MessageKind::HeartbeatAck), 122);
 }
 
 TEST(WireProtocol, DeployRoundTripsRescaleDirectivesPerTask) {
@@ -518,6 +538,7 @@ TEST(WireProtocol, MessageKindsMayShareAValueOnlyAcrossDirections) {
         {MessageKind::BeginRescale, "BeginRescale"},
         {MessageKind::StopSubtasks, "StopSubtasks"},
         {MessageKind::CutoverPeerUpdate, "CutoverPeerUpdate"},
+        {MessageKind::HeartbeatAck, "HeartbeatAck"},
         {MessageKind::CutoverRebind, "CutoverRebind"},
     };
     const auto assert_unique = [](const auto& kinds, const char* direction) {
@@ -1008,12 +1029,13 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
                                                   decode_register_ack,
                                                   // RegisterAck's tail has grown: the fencing epoch
                                                   // (8 bytes) plus the protocol version declaration
-                                                  // (two u32s). A peer that predates BOTH sends
-                                                  // neither, so 16 bytes come off, not 8. The
+                                                  // (two u32s) and retryable (one byte). A peer
+                                                  // that predates all three sends none, so 17
+                                                  // bytes come off, not 8. The
                                                   // 8-byte case - a peer that has fencing but not
                                                   // versioning - is covered in
                                                   // test_protocol_versioning.cpp.
-                                                  /*tail_bytes=*/16);
+                                                  /*tail_bytes=*/17);
         EXPECT_TRUE(out.ok);
         EXPECT_EQ(out.message, "welcome");
         EXPECT_EQ(out.coordinator_epoch, 0U);

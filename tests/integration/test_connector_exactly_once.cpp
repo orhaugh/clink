@@ -766,11 +766,13 @@ TEST_F(KafkaExactlyOnceTest, AnOrphanedBrokerTransactionIsCommittedAcrossACoordi
     EXPECT_GE(latest_confirmed(c.checkpoint_dir()), completed_before)
         << "the resolution advanced the restore point without writing the CONFIRMED marker";
 
-    // The worker exits with its coordinator by design; the harness plays
-    // the supervisor. Fresh process, no fault armed.
-    ASSERT_TRUE(c.restart_worker_ha(0)) << "the worker did not come back";
+    // This worker was deliberately killed by the sink fault above, rather
+    // than merely disconnected by coordinator failover. An external process
+    // supervisor must therefore restart it. The replacement discovers the
+    // new leader and starts with no fault armed.
+    ASSERT_TRUE(c.restart_worker_ha(0)) << "the killed worker did not come back";
     ASSERT_TRUE(c.await_workers_registered(2))
-        << "the restarted worker never registered with the new leader";
+        << "the replacement worker never registered with the new leader";
 
     // The job finishes under the new leader, judged by the data (the
     // submitter's connection died with the old leader, so its exit code

@@ -28,7 +28,7 @@ co-evolve past its own history.
 
 | Domain | Current | Minimum compatible | Where enforced |
 |---|---|---|---|
-| Cluster control protocol | 1 | 1 | `include/clink/cluster/protocol.hpp` (`kClusterProtocolVersion`), three handshake sites |
+| Cluster control protocol | 2 | 1 | `include/clink/cluster/protocol.hpp` (`kClusterProtocolVersion`), three handshake sites |
 | Data plane (operator wire frames) | unversioned by design | n/a | `include/clink/runtime/network/wire.hpp` |
 | Checkpoint metadata sidecar | 1 | 1 | `include/clink/state/checkpoint_integrity.hpp` (`kCheckpointMetaVersion`) |
 | State snapshots and savepoints | 1 (`clink.format_version`) | 1 (absence reads as 1) | `docs/internals/state-snapshot-format.md` |
@@ -41,7 +41,7 @@ co-evolve past its own history.
 
 ## Cluster control protocol
 
-`kClusterProtocolVersion = 1`, `kMinCompatibleClusterProtocolVersion = 1`
+`kClusterProtocolVersion = 2`, `kMinCompatibleClusterProtocolVersion = 1`
 (`include/clink/cluster/protocol.hpp`). Peers exchange both numbers in the
 handshake messages and are compatible when the ranges overlap, so versions
 may differ as long as each side can speak something the other accepts.
@@ -56,6 +56,12 @@ may differ as long as each side can speak something the other accepts.
   absent tail as the field's v1 default, and a peer that declares nothing
   reads as version 1 (pre-versioning peers still decode). Bump
   `kClusterProtocolVersion` only for a change old peers would misread.
+- **Version 2 capability:** worker heartbeats carry a tail sequence and a v2
+  coordinator returns `HeartbeatAck`. The worker uses acknowledgements as a
+  bidirectional control-session lease, detecting one-way partitions that do
+  not produce TCP EOF. The new frame is sent only when the registered worker
+  declares v2; a v2 worker paired with a v1 coordinator falls back to EOF, so
+  the minimum remains v1 for rolling upgrades.
 - **Known limitation:** client enforcement is one-directional. The
   coordinator sends no hello ack on success, so a CLI never learns the
   coordinator's version.

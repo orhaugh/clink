@@ -603,6 +603,7 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                 plugins_ok = false;
                 break;
             }
+            bundle->retain_plugin(std::move(load_result.plugin));
             plugin_so_paths.push_back(path);
         }
         if (!plugins_ok)
@@ -1099,7 +1100,7 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
                 "genuinely is this large.";
             log::warn("coordinator.register", reason);
             metrics::orch::worker_connection_refused();
-            RegisterAckMsg nack{.ok = false, .message = reason};
+            RegisterAckMsg nack{.ok = false, .message = reason, .retryable = true};
             const auto frame = fenced_frame_(MessageKind::RegisterAck, nack);
             (void)send_frame(*conn, frame);
             return;  // conn destructor closes
@@ -1127,8 +1128,8 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     // concurrent deploy cannot slip a Deploy frame ahead of it (the worker's
     // connect handshake requires RegisterAck as the first message).
     //
-    // A re-registration under an existing id (a restarted worker with a stable
-    // name, e.g. a StatefulSet pod) replaces the old WorkerConnection. Its reader
+    // A re-registration under an existing id (a fresh in-process session or a
+    // restarted process with a stable name) replaces the old WorkerConnection. Its reader
     // thread must be joined before the object can be destroyed - destroying a
     // joinable std::thread is std::terminate - and the join must happen off
     // this lock AND off the reader thread (the reader takes mu_ in its loop,
@@ -1136,10 +1137,12 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     // map drop the last reference hands destruction to the exiting reader
     // itself: self-join, terminate).
     std::shared_ptr<WorkerConnection> replaced;
+    bool replaced_was_lost = false;
     {
         std::lock_guard lock(mu_);
         if (auto it = registered_.find(reg.worker_id); it != registered_.end()) {
             replaced = it->second;
+            replaced_was_lost = replaced->lost;
         }
         registered_[reg.worker_id] = worker;
         // Binds the worker to this leader's epoch.
@@ -1166,16 +1169,17 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
         }
         log::info("coordinator.register",
                   "worker=" + reg.worker_id + " re-registered; previous session retired");
-        // Retiring the session is not enough: whatever the OLD process had
+        // Retiring the session is not enough: whatever the OLD session had
         // in flight for a job can never report now, and any restart drain
         // waiting on those subtasks would wait until its deadline and then
         // fail the job.
         //
-        // This is how a restarted worker deadlocked recovery. A worker dies,
-        // the coordinator starts a restart drain, an external supervisor
-        // brings the worker back under the SAME id (which is correct - the id
-        // must be stable for the coordinator to recognise it), and the drain
-        // is now waiting on a subtask whose owning PROCESS no longer exists.
+        // This is how a replacement session deadlocked recovery. A session ends,
+        // the coordinator starts a restart drain, and the worker registers a
+        // fresh session under the SAME id (which is
+        // correct - the id must be stable for the coordinator to recognise
+        // it), and the drain is now waiting on a subtask whose owning session
+        // can no longer report.
         // The re-registered worker is alive and heartbeating, so the watchdog
         // never declares it lost and never folds it in.
         //
@@ -1187,7 +1191,17 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     }
     cv_.notify_all();
 
-    metrics::coordinator::worker_registered(worker->slot_capacity);
+    // Replacing a still-live session keeps the registered-worker and slot
+    // capacity gauges unchanged. A previously-lost session was already
+    // subtracted by worker_lost(), so its replacement must add them back.
+    // Counting every re-registration inflated both gauges on each transient
+    // control-plane reconnect.
+    if (!replaced || replaced_was_lost) {
+        metrics::coordinator::worker_registered(worker->slot_capacity);
+    } else {
+        metrics::coordinator::worker_session_replaced(
+            replaced->slot_capacity, replaced->slots_in_use, worker->slot_capacity);
+    }
     log::info("coordinator.register",
               "worker=" + worker->worker_id + " host=" + worker->data_host +
                   " slots=" + std::to_string(worker->slot_capacity) +
@@ -3313,6 +3327,7 @@ void Coordinator::handle_submit_(network::Connection& conn, MessageReader& r) {
                 throw std::runtime_error("plugin '" + plug.name +
                                          "' failed to load on coordinator: " + load_result.error);
             }
+            bundle->retain_plugin(std::move(load_result.plugin));
             plugin_so_paths.push_back(path);
         }
         // Schema-evolution D: fail fast if the restore savepoint cannot be
@@ -4068,9 +4083,25 @@ void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>
         case MessageKind::SubtaskListening:
             handle_subtask_listening_(r);
             break;
-        case MessageKind::Heartbeat:
-            (void)decode_heartbeat(r);
+        case MessageKind::Heartbeat: {
+            const auto heartbeat = decode_heartbeat(r);
+            if (heartbeat.worker_id != worker->worker_id) {
+                throw std::runtime_error("Heartbeat names worker '" + heartbeat.worker_id +
+                                         "', but this session belongs to '" + worker->worker_id +
+                                         "'");
+            }
+            // HeartbeatAck is a v2 capability. Sending an unknown frame to a
+            // v1 worker would turn a compatible rolling upgrade into a forced
+            // disconnect, so the registration version gates it explicitly.
+            if (worker->protocol_version >= 2 && worker->conn) {
+                HeartbeatAckMsg ack{.worker_id = worker->worker_id, .sequence = heartbeat.sequence};
+                const auto frame = fenced_frame_(MessageKind::HeartbeatAck, ack);
+                if (!send_frame(*worker->conn, frame)) {
+                    worker->conn->close();
+                }
+            }
             break;
+        }
         case MessageKind::SubtaskCheckpointed:
             handle_subtask_checkpointed_(r);
             break;
@@ -4504,7 +4535,7 @@ void Coordinator::watchdog_loop_() {
 
 // The per-job half of losing a worker's in-flight subtasks, shared by the two ways
 // that can happen: the watchdog declaring a worker lost, and a worker RE-REGISTERING
-// under the same id (its previous PROCESS is gone, so whatever that session had in
+// under the same id (its previous SESSION is gone, so whatever that session had in
 // flight can never report). Both must reach the same outcome - fold into an
 // in-progress restart, or start one - and they did not: the re-registration path
 // only handled the fold, so a worker that died and came back before the coordinator
@@ -4666,7 +4697,7 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
 }
 
 // A worker re-registered under an id that already had a live session. The previous
-// PROCESS is gone, so anything it had in flight can never report.
+// SESSION has been fenced and drained, so anything it had in flight can never report.
 //
 // This now takes exactly the same path as a watchdog-declared loss. It used to
 // handle only the case where a restart drain was ALREADY in progress and skip the

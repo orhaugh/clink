@@ -43,6 +43,17 @@ inline constexpr const char* kWorkerFencedFramesTotal = "clink_worker_fenced_fra
 inline constexpr const char* kWorkerSubtasksRunning = "clink_worker_subtasks_running";
 inline constexpr const char* kWorkerSlotsCapacity = "clink_worker_slots_capacity";
 inline constexpr const char* kWorkerSlotsInUse = "clink_worker_slots_in_use";
+// Long-lived worker-process control session. Attempts include the initial
+// registration and every recovery attempt; reconnects count successful
+// sessions after the first. The connected gauge is the health signal for a
+// worker process that remains alive while leader discovery/backoff is active.
+inline constexpr const char* kWorkerControlConnectionAttemptsTotal =
+    "clink_worker_control_connection_attempts_total";
+inline constexpr const char* kWorkerControlDisconnectsTotal =
+    "clink_worker_control_disconnects_total";
+inline constexpr const char* kWorkerControlReconnectsTotal =
+    "clink_worker_control_reconnects_total";
+inline constexpr const char* kWorkerControlConnected = "clink_worker_control_connected";
 
 // Columnar-execution observability. The engine carries an Arrow sidecar alongside
 // a batch and only decodes it into rows when a row accessor is touched, so
@@ -104,11 +115,15 @@ inline void init_worker_metrics() {
     (void)r.counter(kWorkerSubtasksCompletedTotal);
     (void)r.counter(kWorkerSubtasksFailedTotal);
     (void)r.counter(kWorkerFencedFramesTotal);
+    (void)r.counter(kWorkerControlConnectionAttemptsTotal);
+    (void)r.counter(kWorkerControlDisconnectsTotal);
+    (void)r.counter(kWorkerControlReconnectsTotal);
     (void)r.counter(kHttpRequestsTotal);
     (void)r.counter(kHttpErrorsTotal);
     (void)r.gauge(kWorkerSubtasksRunning);
     (void)r.gauge(kWorkerSlotsCapacity);
     (void)r.gauge(kWorkerSlotsInUse);
+    (void)r.gauge(kWorkerControlConnected);
 }
 
 namespace coordinator {
@@ -149,6 +164,21 @@ inline void worker_lost(std::uint32_t slot_capacity, std::uint32_t slots_in_use)
     MetricsRegistry::global()
         .gauge(kCoordinatorSlotsInUse)
         .sub(static_cast<std::int64_t>(slots_in_use));
+}
+
+// A stable worker id opened a fresh control session before the watchdog
+// declared the old one lost. The worker count is unchanged, but old in-flight
+// slots are retired and a configuration change may alter advertised capacity.
+inline void worker_session_replaced(std::uint32_t old_slot_capacity,
+                                    std::uint32_t old_slots_in_use,
+                                    std::uint32_t new_slot_capacity) {
+    MetricsRegistry::global()
+        .gauge(kCoordinatorSlotsCapacity)
+        .add(static_cast<std::int64_t>(new_slot_capacity) -
+             static_cast<std::int64_t>(old_slot_capacity));
+    MetricsRegistry::global()
+        .gauge(kCoordinatorSlotsInUse)
+        .sub(static_cast<std::int64_t>(old_slots_in_use));
 }
 
 inline void slots_in_use_delta(std::int64_t delta) {
@@ -196,6 +226,26 @@ inline void subtask_completed_ok() {
 // A control frame arrived from a superseded coordinator and was dropped.
 inline void frame_fenced() {
     MetricsRegistry::global().counter(kWorkerFencedFramesTotal).increment();
+}
+
+inline void control_connection_attempted() {
+    MetricsRegistry::global().counter(kWorkerControlConnectionAttemptsTotal).increment();
+}
+
+inline void control_connected(bool reconnect) {
+    MetricsRegistry::global().gauge(kWorkerControlConnected).set(1);
+    if (reconnect) {
+        MetricsRegistry::global().counter(kWorkerControlReconnectsTotal).increment();
+    }
+}
+
+inline void control_disconnected() {
+    MetricsRegistry::global().gauge(kWorkerControlConnected).set(0);
+    MetricsRegistry::global().counter(kWorkerControlDisconnectsTotal).increment();
+}
+
+inline void control_stopped() {
+    MetricsRegistry::global().gauge(kWorkerControlConnected).set(0);
 }
 
 inline void subtask_failed() {

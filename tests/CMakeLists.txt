@@ -112,6 +112,7 @@ add_executable(clink_core_tests
     test_ha_coordinator.cpp
     test_key_groups.cpp
     test_service_discovery.cpp
+    test_worker_supervisor.cpp
     test_codec.cpp
     test_stream_element.cpp
     test_wire_protocol.cpp

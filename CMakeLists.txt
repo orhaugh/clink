@@ -524,6 +524,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/cluster/coordinator.cpp
     src/cluster/in_doubt_resolution.cpp
     src/cluster/worker.cpp
+    src/cluster/worker_supervisor.cpp
     src/cluster/service_discovery.cpp
     src/cluster/job_graph.cpp
     src/cluster/job_planner.cpp

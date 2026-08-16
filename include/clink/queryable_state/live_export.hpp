@@ -23,6 +23,8 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -40,40 +42,62 @@ inline std::string body_from_bytes(const std::vector<std::byte>& bytes) {
     return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
+inline http::HttpResponse worker_export(const http::HttpRequest& req, cluster::Worker& worker) {
+    http::HttpResponse resp;
+    auto job_it = req.path_params.find("job_id");
+    if (job_it == req.path_params.end()) {
+        resp.status = 400;
+        resp.body = "{\"error\":\"missing job_id\"}";
+        return resp;
+    }
+    cluster::JobId job{};
+    try {
+        job = static_cast<cluster::JobId>(std::stoull(job_it->second));
+    } catch (...) {
+        resp.status = 400;
+        resp.body = "{\"error\":\"malformed job_id\"}";
+        return resp;
+    }
+    auto exported = worker.export_job_state_arrow(job);
+    if (!exported.has_value()) {
+        resp.status = 404;
+        resp.body = "{\"error\":\"no state backends hosted for this job\"}";
+        return resp;
+    }
+    resp.body = body_from_bytes(exported->bytes);
+    resp.content_type = "application/vnd.apache.arrow.stream";
+    if (exported->skipped_subtasks > 0) {
+        resp.headers["X-Clink-Skipped-Subtasks"] = std::to_string(exported->skipped_subtasks);
+    }
+    return resp;
+}
+
 }  // namespace live_export_detail
 
 // worker-side route: this worker's share of the job's live state as one stream.
 inline void register_worker_state_export_route(http::HttpServer& server, cluster::Worker& worker) {
+    server.get("/api/v1/state/export/job/:job_id", [&worker](const http::HttpRequest& req) {
+        return live_export_detail::worker_export(req, worker);
+    });
+}
+
+// Recovering worker variant. The provider returns a shared ownership token so
+// replacing the active control session cannot invalidate an HTTP request that
+// already began. During discovery/drain there is deliberately no active
+// session and the route reports 503 rather than dereferencing stale state.
+using WorkerProvider = std::function<std::shared_ptr<cluster::Worker>()>;
+
+inline void register_worker_state_export_route(http::HttpServer& server, WorkerProvider provider) {
     server.get("/api/v1/state/export/job/:job_id",
-               [&worker](const http::HttpRequest& req) -> http::HttpResponse {
-                   http::HttpResponse resp;
-                   auto job_it = req.path_params.find("job_id");
-                   if (job_it == req.path_params.end()) {
-                       resp.status = 400;
-                       resp.body = "{\"error\":\"missing job_id\"}";
+               [provider = std::move(provider)](const http::HttpRequest& req) {
+                   auto worker = provider();
+                   if (!worker) {
+                       http::HttpResponse resp;
+                       resp.status = 503;
+                       resp.body = "{\"error\":\"worker control session is recovering\"}";
                        return resp;
                    }
-                   cluster::JobId job{};
-                   try {
-                       job = static_cast<cluster::JobId>(std::stoull(job_it->second));
-                   } catch (...) {
-                       resp.status = 400;
-                       resp.body = "{\"error\":\"malformed job_id\"}";
-                       return resp;
-                   }
-                   auto exported = worker.export_job_state_arrow(job);
-                   if (!exported.has_value()) {
-                       resp.status = 404;
-                       resp.body = "{\"error\":\"no state backends hosted for this job\"}";
-                       return resp;
-                   }
-                   resp.body = live_export_detail::body_from_bytes(exported->bytes);
-                   resp.content_type = "application/vnd.apache.arrow.stream";
-                   if (exported->skipped_subtasks > 0) {
-                       resp.headers["X-Clink-Skipped-Subtasks"] =
-                           std::to_string(exported->skipped_subtasks);
-                   }
-                   return resp;
+                   return live_export_detail::worker_export(req, *worker);
                });
 }
 

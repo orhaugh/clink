@@ -376,6 +376,7 @@ TEST_F(HaFailoverTest, ExactlyOnceSurvivesACoordinatorFailover) {
 
     const auto committed_before = verify_exactly_once(out_dir_, kTotalRecords).total_lines;
     ASSERT_GT(committed_before, 0U);
+    const auto worker_pid_before = c.worker(0).pid();
 
     // Kill the leader. The standby takes over and calls
     // recover_persisted_jobs(), which resolves a restore point from the
@@ -383,12 +384,13 @@ TEST_F(HaFailoverTest, ExactlyOnceSurvivesACoordinatorFailover) {
     ASSERT_TRUE(c.kill_leader_and_await_failover().has_value())
         << "no standby took over after the leader was killed";
 
-    // The worker exits on coordinator disconnect by design - there is no
-    // worker-side re-register path, so a supervisor restarts it. The harness
-    // plays the supervisor.
-    ASSERT_TRUE(c.restart_worker_ha(0)) << "the worker did not come back";
+    // The worker process stays alive, fences and drains its old task session,
+    // discovers the new leader, then re-registers a fresh session in-process.
     ASSERT_TRUE(c.await_workers_registered(2))
-        << "the restarted worker never registered with the new leader";
+        << "the worker never re-registered with the new leader";
+    ASSERT_TRUE(c.worker(0).running()) << "worker process exited during coordinator failover";
+    EXPECT_EQ(c.worker(0).pid(), worker_pid_before)
+        << "coordinator failover restarted the worker process instead of its control session";
 
     // Wait for the job to finish under the new leader, judged by the output
     // rather than by any process: every record committed, or a deadline.
@@ -415,8 +417,8 @@ TEST_F(HaFailoverTest, ExactlyOnceSurvivesACoordinatorFailover) {
 }
 
 // A recovered job must WAIT for capacity, not die of it. The takeover races
-// the supervisor restarting the workers whose connections died with the old
-// leader; before the parked-recovery retry existed, a worker that returned
+// an external process supervisor restarting a worker that genuinely died;
+// before the parked-recovery retry existed, a worker that returned
 // after the submit slot-wait meant the recovery was logged-and-dropped and a
 // RUNNING job silently ceased to exist until the next failover - observed
 // live as "recovery failed: submit_job: insufficient free slots (need 2,
@@ -459,7 +461,7 @@ TEST_F(HaFailoverTest, ARecoveredJobParkedForCapacityRunsWhenAWorkerReturns) {
         << "the recovery never parked; the scenario under test never happened ["
         << c.describe_coordinator_exits() << "]";
 
-    // The supervisor's move, deliberately AFTER the park.
+    // The external process supervisor's move, deliberately AFTER the park.
     ASSERT_TRUE(c.restart_worker_ha(0)) << "the worker did not come back";
     ASSERT_TRUE(c.await_workers_registered(2))
         << "the restarted worker never registered with the new leader";

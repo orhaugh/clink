@@ -635,13 +635,9 @@ public:
             "worker-" + std::to_string(idx), spec_.node_binary, std::move(argv), log_dir(), opts);
     }
 
-    // Restart an HA worker at the same index, rediscovering the leader.
-    //
-    // A worker exits on coordinator disconnect by design - there is no
-    // worker-side re-register path, so a supervisor is what heals the
-    // cluster. This is the harness playing that supervisor, and it is
-    // needed for any failover test: without it the surviving coordinator
-    // has no worker to redeploy onto and the job never resumes.
+    // Restart an HA worker that was itself killed. Coordinator failover no
+    // longer needs this: a live worker process replaces its control session
+    // in-process. Genuine worker-process fault tests still use this helper.
     [[nodiscard]] bool restart_worker_ha(std::size_t idx, const ProcOptions& opts = {}) {
         if (idx < workers_.size() && workers_[idx]) {
             workers_[idx]->kill_and_reap();

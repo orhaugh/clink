@@ -148,6 +148,8 @@ TEST(PluginLoader, LoadIntoGivesEachBundleAFreshInstance) {
     auto preg_a = bundle_a.as_plugin_registry();
     auto a = loader.load_into(path.string(), preg_a);
     ASSERT_TRUE(a.ok) << a.error;
+    const auto handle_a = a.plugin.dl_handle;
+    bundle_a.retain_plugin(std::move(a.plugin));
     EXPECT_NE(bundle_a.runner_registry().find_source("hello.GreetingSource", "hello.Greeting"),
               nullptr);
 
@@ -155,11 +157,12 @@ TEST(PluginLoader, LoadIntoGivesEachBundleAFreshInstance) {
     auto preg_b = bundle_b.as_plugin_registry();
     auto b = loader.load_into(path.string(), preg_b);
     ASSERT_TRUE(b.ok) << b.error;
+    const auto handle_b = b.plugin.dl_handle;
+    bundle_b.retain_plugin(std::move(b.plugin));
     EXPECT_NE(bundle_b.runner_registry().find_source("hello.GreetingSource", "hello.Greeting"),
               nullptr)
         << "reload must re-register into the second bundle, not reuse the first";
-    EXPECT_NE(a.plugin.dl_handle, b.plugin.dl_handle)
-        << "each load_into must dlopen a distinct module instance";
+    EXPECT_NE(handle_a, handle_b) << "each load_into must dlopen a distinct module instance";
 }
 
 TEST(PluginLoader, MissingFileFailsCleanly) {

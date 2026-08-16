@@ -2,9 +2,12 @@
 
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/cluster/plugin_loader.hpp"
 #include "clink/cluster/runner_helpers.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
@@ -46,7 +49,10 @@ public:
               std::make_unique<DagBuilderRegistry>(&DagBuilderRegistry::default_instance())) {}
 
     JobBundle(JobBundle&&) noexcept = default;
-    JobBundle& operator=(JobBundle&&) noexcept = default;
+    // Moving a live bundle by assignment would release its old module handles
+    // before replacing the old registries, briefly unmapping code still owned
+    // by registry closures. Bundles are heap-owned and never need assignment.
+    JobBundle& operator=(JobBundle&&) noexcept = delete;
     JobBundle(const JobBundle&) = delete;
     JobBundle& operator=(const JobBundle&) = delete;
 
@@ -80,7 +86,13 @@ public:
                                       *dag_builder_registry_};
     }
 
+    // Keep a loaded module mapped until after every registry closure and task
+    // using it has gone away. Member declaration order below makes registries
+    // destruct first and these handles last.
+    void retain_plugin(LoadedPlugin plugin) { loaded_plugins_.push_back(std::move(plugin)); }
+
 private:
+    std::vector<LoadedPlugin> loaded_plugins_;
     std::unique_ptr<TypeRegistry> type_registry_;
     std::unique_ptr<RunnerRegistry> runner_registry_;
     std::unique_ptr<SelectorRegistry> selector_registry_;

@@ -150,9 +150,10 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
     // instance with fresh static state - a fresh once_flag AND a fresh
     // inline-name counter, so build_fn re-mints the same deterministic op
     // names the submitter's graph_json references. The copy is unlinked
-    // immediately after dlopen (the mapping stays valid); handles live for
-    // the process lifetime (see LoadedPlugin), so the on-disk file is not
-    // needed past the open.
+    // immediately after dlopen (the mapping stays valid). The default loader
+    // retains its handle for the process lifetime; a per-job bundle retains
+    // it until all registry closures and task objects are destroyed, so the
+    // on-disk file is not needed past the open.
     std::string instance_path;
     {
         static std::atomic<std::uint64_t> load_counter{0};
@@ -261,7 +262,12 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
     lp.abi_version = abi_version_fn != nullptr ? abi_version_fn() : 0;
     lp.abi_hash = plugin_abi;
     lp.target_triple = plugin_triple;
-    lp.dl_handle = handle;
+    lp.module = std::shared_ptr<void>(handle, [](void* p) {
+        if (p != nullptr) {
+            ::dlclose(p);
+        }
+    });
+    lp.dl_handle = lp.module.get();
     result.ok = true;
     result.plugin = std::move(lp);
     return result;

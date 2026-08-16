@@ -1,9 +1,9 @@
 # One clink worker of the qualification rig's three.
 #
-# restart: no, for the same reason as the coordinator: the chaos
-# controller kills workers to measure recovery, and an automatic restart
-# would hide the very interval being measured. The controller restarts
-# it explicitly and records that as an action.
+# restart: no. A deliberate worker SIGKILL must remain observable until the
+# chaos controller records and restarts it. Coordinator failure is different:
+# the worker container stays up and its in-process supervisor replaces only the
+# fenced control session.
 #
 # WORKER_IP is this node's private address - the address PEERS dial for
 # data. A container hostname is meaningless to a worker on another host,

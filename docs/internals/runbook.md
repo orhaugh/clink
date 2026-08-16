@@ -213,6 +213,33 @@ today.
 
 ---
 
+## ClinkWorkerControlDisconnected
+
+`clink_worker_control_connected == 0`
+
+The worker process is alive but has no admitted coordinator session. Its health
+endpoint returns 503 while it drains the old session, discovers a leader, or waits
+in reconnect backoff. It must not run or expose subtasks in this state.
+
+**Look at:** the worker's `/api/v1/worker` recovery snapshot and
+`worker.recovery` log lines. `state`, `last_error`, `coordinator_epoch`,
+`connection_attempts` and `successful_reconnections` distinguish normal failover
+from a persistent refusal. Correlate with
+`clink_worker_control_disconnects_total` and
+`clink_worker_control_connection_attempts_total`.
+
+**A short dip during coordinator failover is expected.** The worker has fenced and
+cancelled its old subtasks, then will register a fresh session without changing
+PID. A rising `clink_worker_control_reconnects_total` confirms recovery.
+
+**A sustained zero is actionable.** Check leader discovery, reachability, TLS and
+the last registration refusal. Temporary coordinator connection-cap pressure is
+retried with jitter. Protocol or configuration refusals are fatal and the worker
+process exits with code 2 so the external process supervisor and operator can see
+that retrying the same binary/configuration is not progress.
+
+---
+
 ## ClinkRestoreDiscardedKeyedState
 
 `increase(clink_state_restore_keys_dropped_total[15m]) > 0`

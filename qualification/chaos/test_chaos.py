@@ -47,14 +47,15 @@ class FakeRig:
             {"name": "b1", "role": "broker", "public_ip": "10.0.0.5", "private_ip": "10.0.0.5"},
         ]}
         self.key_file = key_file
-        # host name -> {container: {"up": bool, "image": str}}
+        # host name -> {container: {"up": bool, "image": str, "pid": int}}
         self.state = {
-            "coord": {"clink-coordinator": {"up": True, "image": "clink:qual"}},
-            "w1": {"clink-worker": {"up": True, "image": "clink:qual"}},
-            "w2": {"clink-worker": {"up": True, "image": "clink:qual"}},
-            "b1": {"redpanda": {"up": True, "image": "redpanda:v24"}},
+            "coord": {"clink-coordinator": {"up": True, "image": "clink:qual", "pid": 101}},
+            "w1": {"clink-worker": {"up": True, "image": "clink:qual", "pid": 201}},
+            "w2": {"clink-worker": {"up": True, "image": "clink:qual", "pid": 202}},
+            "b1": {"redpanda": {"up": True, "image": "redpanda:v24", "pid": 301}},
             "ops": {},
         }
+        self.next_pid = 1000
         self.commands = []
         # Command substrings that should fail, to drive the error paths.
         self.fail_on = []
@@ -63,6 +64,9 @@ class FakeRig:
         self.restart_image = None
         # If set, `compose up` does not bring the container back at all.
         self.restart_broken = False
+        # Simulate a runtime policy that wrongly replaces every worker when
+        # the coordinator is restarted.
+        self.restart_workers_with_coordinator = False
 
     def hosts(self, role):
         return [h for h in self.inv["hosts"] if h["role"] == role]
@@ -73,6 +77,12 @@ class FakeRig:
             if pat in command:
                 raise C.ChaosCommandFailed(f"{host['name']}: `{command}` exited 1: simulated")
         conts = self.state.setdefault(host["name"], {})
+
+        if "docker inspect" in command and ".State.Pid" in command:
+            for n, details in conts.items():
+                if n in command:
+                    return FakeResult(str(details["pid"] if details["up"] else 0))
+            return FakeResult("0")
 
         if "docker ps" in command:
             name = None
@@ -92,22 +102,31 @@ class FakeRig:
             for n in conts:
                 if n in command:
                     conts[n]["up"] = False
+                    conts[n]["pid"] = 0
             return FakeResult("")
 
         if "docker compose" in command and "up -d" in command:
             target = ("clink-coordinator" if "coordinator.yml" in command
                       else "clink-worker" if "worker.yml" in command else None)
             if target and not self.restart_broken:
-                conts.setdefault(target, {"up": False, "image": "clink:qual"})
+                conts.setdefault(target, {"up": False, "image": "clink:qual", "pid": 0})
                 conts[target]["up"] = True
+                self.next_pid += 1
+                conts[target]["pid"] = self.next_pid
                 if self.restart_image:
                     conts[target]["image"] = self.restart_image
+                if target == "clink-coordinator" and self.restart_workers_with_coordinator:
+                    for worker_host in ("w1", "w2"):
+                        self.next_pid += 1
+                        self.state[worker_host]["clink-worker"]["pid"] = self.next_pid
             return FakeResult("")
 
         if "docker restart" in command:
             for n in conts:
                 if n in command:
                     conts[n]["up"] = True
+                    self.next_pid += 1
+                    conts[n]["pid"] = self.next_pid
             return FakeResult("")
 
         return FakeResult("")
@@ -187,21 +206,32 @@ def test_a_worker_back_on_a_different_image_raises(tmp):
               or "came back as" in str(exc), str(exc)[:80])
 
 
-def test_coordinator_kill_restarts_the_workers_it_killed(tmp):
-    """A clink worker exits on coordinator disconnect by design, and the rig
-    runs workers with restart: no. Without this the coordinator kill ends the
-    run: no worker ever returns and the recovered job parks for capacity."""
+def test_coordinator_kill_leaves_workers_running(tmp):
+    """A coordinator fault must exercise in-process worker recovery. Restarting
+    workers here would hide a regression behind container-level recovery."""
     rig = FakeRig()
     ch = make_chaos(rig, os.path.join(tmp, "e.jsonl"))
-    # The coordinator kill takes the workers with it, as it does on the rig.
-    for h in ("w1", "w2"):
-        rig.state[h]["clink-worker"]["up"] = False
     ch.kill_coordinator("RUNNING", 9)
     up = [rig.state[h]["clink-worker"]["up"] for h in ("w1", "w2")]
-    check("coordinator kill brings its workers back", all(up), str(up))
+    check("coordinator kill leaves workers running", all(up), str(up))
     kinds = [e["fault"] for e in read_log(os.path.join(tmp, "e.jsonl"))]
-    check("coordinator kill records the worker restarts",
-          "worker_restart_after_coordinator_kill" in kinds, str(kinds))
+    check("coordinator kill does not record worker restarts",
+          not any("worker_restart" in kind for kind in kinds), str(kinds))
+    restart = next(e for e in read_log(os.path.join(tmp, "e.jsonl"))
+                   if e["fault"] == "coordinator_restart")
+    check("coordinator kill records stable worker PIDs",
+          restart["worker_pids_before"] == restart["worker_pids_after"], str(restart))
+
+
+def test_coordinator_kill_rejects_worker_pid_churn(tmp):
+    rig = FakeRig()
+    rig.restart_workers_with_coordinator = True
+    ch = make_chaos(rig, os.path.join(tmp, "e2.jsonl"))
+    try:
+        ch.kill_coordinator("RUNNING", 9)
+        check("coordinator kill rejects worker PID churn", False, "no exception")
+    except C.ChaosCommandFailed as exc:
+        check("coordinator kill rejects worker PID churn", "PID changed" in str(exc), str(exc))
 
 
 def test_loop_survives_a_failed_fault_and_reports_zero(tmp):
@@ -257,7 +287,8 @@ def main():
         test_a_kill_that_does_not_land_raises(tmp)
         test_a_worker_that_does_not_come_back_raises(tmp)
         test_a_worker_back_on_a_different_image_raises(tmp)
-        test_coordinator_kill_restarts_the_workers_it_killed(tmp)
+        test_coordinator_kill_leaves_workers_running(tmp)
+        test_coordinator_kill_rejects_worker_pid_churn(tmp)
         test_loop_survives_a_failed_fault_and_reports_zero(tmp)
     bad = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} passed")

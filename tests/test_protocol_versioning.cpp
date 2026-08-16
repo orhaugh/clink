@@ -236,13 +236,13 @@ TEST(ProtocolVersioning, AHandshakeFromAPreVersioningPeerStillDecodes) {
         EXPECT_EQ(out.min_compatible_protocol_version, 0U);
     }
     {
-        // The RegisterAck case matters most: it now carries THREE tail
-        // fields (epoch, version, min). A peer that knows only the epoch
+        // The RegisterAck case matters most: it now carries FOUR tail
+        // fields (epoch, version, min, retryable). A peer that knows only the epoch
         // truncates after it, and the epoch must still arrive intact.
         RegisterAckMsg in{.ok = true, .message = "welcome"};
         in.coordinator_epoch = 12;
         MessageReader r(
-            proto_body_of(truncate_tail(encode_frame(MessageKind::RegisterAck, in), 8)));
+            proto_body_of(truncate_tail(encode_frame(MessageKind::RegisterAck, in), 9)));
         EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::RegisterAck);
         const auto out = decode_register_ack(r);
         EXPECT_TRUE(out.ok);

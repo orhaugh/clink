@@ -31,19 +31,26 @@ namespace clink::cluster {
 //
 //   * THIS VERSION handles everything additive tails cannot: a field
 //     changing meaning or width, a message kind being repurposed, a
-//     semantic contract changing under an unchanged encoding. Those are
-//     invisible on the wire, so the only defence is for both ends to say
-//     what they speak and refuse a pairing neither can honour.
+//     semantic contract changing under an unchanged encoding, or an
+//     optional capability whose new frame kind must be sent only to peers
+//     known to understand it. Those are invisible on the wire, so both
+//     ends declare what they speak and refuse or capability-gate as needed.
 //
-// Bump kClusterProtocolVersion for the second kind and NEVER for the
-// first: bumping on an additive change would refuse a rolling upgrade the
-// protocol was explicitly designed to survive.
+// Bump kClusterProtocolVersion for the second kind and NEVER merely for an
+// additive tail: bumping on an additive change would refuse a rolling upgrade
+// the protocol was explicitly designed to survive.
 //
 // kMinCompatibleClusterProtocolVersion is the oldest peer this build will
 // talk to. Raise it only when carrying the compatibility shim for an old
 // version stops being worth it - that is a deliberate end-of-support
 // decision, and it strands any peer below it, loudly.
-inline constexpr std::uint32_t kClusterProtocolVersion = 1;
+// v2 adds a coordinator -> worker HeartbeatAck. A v2 worker uses the
+// acknowledgement as a control-plane lease and tears down its task session
+// when the coordinator is unreachable, including a one-way network partition
+// where TCP has not reported EOF. v1 peers remain wire-compatible: a v2
+// coordinator sends the new frame only to a worker that registered as v2, and
+// a v2 worker connected to a v1 coordinator falls back to EOF detection.
+inline constexpr std::uint32_t kClusterProtocolVersion = 2;
 inline constexpr std::uint32_t kMinCompatibleClusterProtocolVersion = 1;
 
 // What a peer that predates versioning looks like on the wire: the field
@@ -228,6 +235,12 @@ enum class MessageKind : std::uint8_t {
     // worker → coordinator. Reply to an arming BeginRescale: what this
     // worker armed for the named operator. See BeginRescaleAckMsg.
     BeginRescaleAck = 121,
+    // coordinator -> worker. Reply to Heartbeat, echoed only to v2+
+    // workers. Besides proving that the connection can still carry bytes in
+    // both directions, the epoch fences a delayed response from a superseded
+    // coordinator and the sequence makes the exchange observable in tests and
+    // diagnostics.
+    HeartbeatAck = 122,
 };
 
 // Sentinel marking "no rescale-specific restore override" on a
@@ -343,6 +356,11 @@ struct RegisterAckMsg {
     // control frame far from the cause.
     std::uint32_t protocol_version{kClusterProtocolVersion};
     std::uint32_t min_compatible_protocol_version{kMinCompatibleClusterProtocolVersion};
+    // A refusal caused by temporary admission pressure may be retried with
+    // backoff. Protocol, identity and configuration refusals remain fatal.
+    // Appended at the tail so old peers read false and retain fail-fast
+    // behaviour.
+    bool retryable{false};
 };
 
 struct DeployMsg {
@@ -535,6 +553,14 @@ struct SubtaskFinishedMsg {
 
 struct HeartbeatMsg {
     std::string worker_id;
+    // v2 tail. Zero is the value sent by v1 workers.
+    std::uint64_t sequence{0};
+};
+
+struct HeartbeatAckMsg {
+    std::string worker_id;
+    std::uint64_t sequence{0};
+    std::uint64_t coordinator_epoch{0};
 };
 
 // worker → coordinator. A bounded source subtask reached clean end-of-stream and asks the

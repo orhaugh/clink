@@ -332,18 +332,20 @@ TEST(CoordinatorHaFailover, StandbyTakesOverAndRecoversJob) {
         << "active-leader.json didn't flip to coordinator-B (still " << leader_port << ", expected "
         << port_b << ")";
 
-    // The worker should have exited (it watches the coordinator connection). Reap
-    // and respawn - a supervisor would do this automatically. The new
-    // worker reads active-leader.json and connects to coordinator-B.
-    EXPECT_TRUE(wait_for_exit(worker, 4s)) << "worker didn't exit after coordinator-A crash";
-    worker = spawn_worker();
-    ASSERT_GT(worker, 0);
-    // The replacement worker registered with coordinator-B, the NEW leader. Checked
+    // The same worker process rediscovers coordinator-B and opens a fresh
+    // control session. Container/process churn here would mask the contract
+    // this test is meant to prove.
+    const auto worker_pid_before = worker;
+    EXPECT_FALSE(wait_for_exit(worker, 500ms))
+        << "worker process exited instead of recovering its control session";
+    ASSERT_EQ(::kill(worker, 0), 0) << "worker process is not alive during leader failover";
+    // The recovered session registered with coordinator-B, the NEW leader. Checked
     // against B's log rather than a duration: this is the point of the test, so
     // proceeding before it happened would test nothing and fail further down for an
     // unrelated-looking reason.
     ASSERT_TRUE(clink::itest::await_log_matches(log_b, " slots=", 1))
-        << "coordinator-B never registered the replacement worker after failover";
+        << "coordinator-B never registered the surviving worker after failover";
+    EXPECT_EQ(worker, worker_pid_before) << "worker PID changed across coordinator failover";
 
     // The recovered job should make further checkpoint progress under
     // coordinator-B. Wait a few seconds and confirm ckpt_after > ckpt_before.
@@ -487,17 +489,18 @@ TEST(CoordinatorHaFailover, StandbyRecoversTheJobExactlyOnceWhenCoordinatorAndWo
     EXPECT_TRUE(active_leader_endpoint(ha_dir, &leader_port));
     EXPECT_EQ(leader_port, port_b) << "active-leader.json didn't flip to coordinator-B";
 
-    // The surviving worker exits on its own when its coordinator connection
-    // drops; reap it, then respawn both (the supervisor's job in production).
-    EXPECT_TRUE(wait_for_exit(worker1, 4s)) << "worker-1 didn't exit after coordinator-A crash";
-    kill_quietly(worker1);
-    worker1 = -1;
+    // Worker-0 genuinely died and must be restarted by the external process
+    // supervisor. Worker-1 must remain the same OS process and reconnect on
+    // its own, so coordinator failover does not amplify into a fleet restart.
+    const auto worker1_pid_before = worker1;
+    EXPECT_FALSE(wait_for_exit(worker1, 500ms))
+        << "surviving worker exited instead of recovering its control session";
+    ASSERT_EQ(::kill(worker1, 0), 0) << "surviving worker process is not alive";
     worker0 = spawn_worker("worker-hac-0");
-    worker1 = spawn_worker("worker-hac-1");
     ASSERT_GT(worker0, 0);
-    ASSERT_GT(worker1, 0);
     ASSERT_TRUE(clink::itest::await_log_matches(log_b, " slots=", 2))
-        << "coordinator-B never registered the replacement workers";
+        << "coordinator-B never registered the restarted and surviving workers";
+    EXPECT_EQ(worker1, worker1_pid_before) << "surviving worker PID changed across failover";
 
     // The standby must have RESTORED the job, not re-run it from scratch.
     // The output check below cannot see the difference on its own: the sink

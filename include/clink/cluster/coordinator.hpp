@@ -650,7 +650,7 @@ public:
     // callback. Idempotent - already-running job_ids are skipped.
     //
     // A job whose recovery fails ONLY for capacity (no worker registered
-    // yet - takeover races the supervisor restarting the workers whose
+    // yet - takeover races workers reconnecting after their old control
     // connections died with the old leader) is PARKED, not dropped: a
     // retry thread re-runs its recovery from the manifest whenever
     // capacity registers. Dropping it silently lost a running job until
@@ -671,9 +671,10 @@ private:
         std::string data_host;
         // Content hashes of plugin modules already shipped over THIS
         // connection (item 30). Deploys send hash-only references for
-        // these; a re-register builds a fresh WorkerConnection, so a
-        // restarted worker (whose pid-keyed cache is gone) starts empty
-        // and receives full bytes again. Recorded at Deploy build under
+        // these; a re-register builds a fresh WorkerConnection, so the new
+        // session starts empty and receives full bytes again. The worker's
+        // process-level content cache still deduplicates the bytes on disk.
+        // Recorded at Deploy build under
         // mu_ - if the send then fails, the worker is on its way to lost
         // or re-registered, both of which reset this.
         std::unordered_set<std::string> shipped_plugin_hashes;
@@ -1291,7 +1292,7 @@ private:
                                                  const std::string& cause);
 
     // Fold a re-registered worker's PREVIOUS session's in-flight subtasks
-    // into any restart drain that is waiting on them. The old process is
+    // into any restart drain that is waiting on them. The old session is
     // gone, so those subtasks can never report; without this the drain
     // waits out its deadline and fails a job that was recovering.
     // Takes the lock itself (called from the register path, outside it).

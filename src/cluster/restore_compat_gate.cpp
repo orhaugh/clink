@@ -110,9 +110,9 @@ std::string check_restore_compatibility_via_plugins(const std::vector<std::strin
         // and the closures kept working.
         //
         // NODELETE rather than dropping the dlclose: the refcount is still
-        // managed, the module simply is never unmapped. Matches the "keep
-        // plugins loaded for the process lifetime" policy the loader already
-        // documents.
+        // managed, the module simply is never unmapped. This path exports a
+        // raw function pointer without a JobBundle to retain its module, so it
+        // deliberately uses the process-lifetime exception.
         void* handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
         if (handle == nullptr) {
             continue;  // a connector .so we can't load; the job .so is what matters
