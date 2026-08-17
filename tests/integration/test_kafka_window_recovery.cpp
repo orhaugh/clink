@@ -35,6 +35,7 @@ using namespace std::chrono_literals;
 using clink::itest::Cluster;
 using clink::itest::ClusterSpec;
 using clink::itest::Process;
+using clink::itest::ProcOptions;
 using clink::itest::ScopedDiagnostics;
 
 std::filesystem::path node_binary() {
@@ -223,6 +224,56 @@ void produce_json_sustained(const std::string& brokers,
         std::this_thread::sleep_for(2ms);
     }
     sink.close();
+}
+
+// Continuous producer for one open window: emits batches of records for
+// every key until told to stop, and returns the exact per-key aggregate it
+// sent so the oracle's expectation is built from what actually went in.
+struct SustainedFeed {
+    std::map<std::int64_t, Aggregate> per_key;
+    std::size_t records{0};
+};
+
+SustainedFeed produce_json_until(const std::string& brokers,
+                                 const std::string& topic,
+                                 std::int64_t window_start,
+                                 int keys,
+                                 std::atomic<bool>& stop,
+                                 std::atomic<std::size_t>& produced) {
+    clink::KafkaSink::Options opts;
+    opts.brokers = brokers;
+    opts.topic = topic;
+    opts.metric_prefix.clear();
+    clink::KafkaSink sink(std::move(opts));
+    sink.open();
+    SustainedFeed feed;
+    for (std::size_t copy = 0; !stop.load(std::memory_order_acquire); ++copy) {
+        clink::Batch<clink::KafkaMessage> batch;
+        for (int key = 0; key < keys; ++key) {
+            const auto ts = window_start + 100 +
+                            static_cast<std::int64_t>((copy * static_cast<std::size_t>(keys) +
+                                                       static_cast<std::size_t>(key)) %
+                                                      9'000);
+            const auto amount =
+                static_cast<std::int64_t>(key) + static_cast<std::int64_t>(copy % 7) + 1;
+            clink::KafkaMessage message{"{\"event_id\":\"until-" + std::to_string(copy) + "-" +
+                                        std::to_string(key) + "\",\"k\":" + std::to_string(key) +
+                                        ",\"amount\":" + std::to_string(amount) +
+                                        ",\"ts\":" + std::to_string(ts) + "}"};
+            message.partition = key % 4;
+            batch.emplace(std::move(message));
+            auto& agg = feed.per_key[key];
+            agg.first += 1;
+            agg.second += amount;
+            ++feed.records;
+        }
+        sink.on_data(batch);
+        sink.flush();
+        produced.store(feed.records, std::memory_order_release);
+        std::this_thread::sleep_for(5ms);
+    }
+    sink.close();
+    return feed;
 }
 
 class KafkaWindowRecoveryTest : public ::testing::Test {
@@ -422,5 +473,388 @@ TEST_F(KafkaWindowRecoveryTest, WorkerAndHaCoordinatorFailoverKeepSourceWindowAn
         << "HA recovery restored Kafka offsets, keyed window state and the 2PC sink from "
            "different logical cuts";
 }
+
+// QUAL-01 run C, deterministically: the coordinator dies at
+// coordinator.after_completed_marker - AFTER the COMPLETED marker is durable,
+// BEFORE the commit broadcast - while records are continuously entering an
+// open keyed window. Its replacement inherits the still-armed fault (on the
+// rig the auto-restarted coordinator re-reads the same arming), so the
+// replacement recovers, redeploys, completes exactly one checkpoint and dies
+// at ITS first marker: a one-second ghost incarnation whose consumed input
+// and prepared transaction are both thrown away. Only the third coordinator
+// runs clean. Worker processes must survive all of it with stable pids, the
+// recovered job must number new checkpoints above the ghost's marker instead
+// of overwriting it, and the committed output must match the exact external
+// oracle. Run C failed this shape with 107,884 inflated aggregates: each
+// recovery handed every source subtask the union of all restored offsets,
+// and consumer-group churn after the redeploy seeked moved partitions back
+// to stale restored offsets, absorbing replayed spans into open windows a
+// second time.
+TEST_F(KafkaWindowRecoveryTest, RepeatedCompletedMarkerCoordinatorCrashesKeepOneCut) {
+    constexpr int kKeys = 10;
+    constexpr std::int64_t kBase = 2'000'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    spec.slots_per_worker = 8;
+    spec.ha = true;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    // Ordinal 12: the job's first eleven completed checkpoints go through
+    // cleanly (a confirmed restore base plus committed pre-crash windows),
+    // then the twelfth marker write kills the leader inside the
+    // marker-durable-but-commit-unsent window, about a second into the
+    // sustained feed.
+    ASSERT_TRUE(cluster.start_ha_coordinators(
+        1, ProcOptions{.fault = "coordinator.after_completed_marker=exit:72@12"}));
+    ASSERT_TRUE(cluster.start_ha_worker(0));
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + input_topic_ +
+        "', group_id='marker-crash', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + output_topic_ +
+        "', delivery_guarantee='exactly_once', transactional_id='marker-crash'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql-marker",
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "kafka-marker-crash",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "100",
+                              "--max-restarts-on-worker-loss",
+                              "8",
+                              "--parallelism",
+                              "4"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+
+    std::map<WindowKey, Aggregate> expected;
+    // Three windows that close and commit before the first crash: replay
+    // across the recoveries must not re-emit or inflate them.
+    for (int window = 0; window < 3; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
+    // The open window that stays live across both coordinator deaths, fed
+    // continuously the whole way.
+    const auto open_start = kBase + 50'000;
+    std::atomic<bool> stop_feed{false};
+    std::atomic<std::size_t> produced{0};
+    SustainedFeed feed;
+    std::thread feeder([&] {
+        feed = produce_json_until(
+            kafka_->brokers(), input_topic_, open_start, kKeys, stop_feed, produced);
+    });
+    ASSERT_TRUE(
+        clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s))
+        << "the sustained feed did not start before the armed marker crash";
+
+    // First death: at the fault point, by its distinctive exit code, with the
+    // interrupted checkpoint's COMPLETED marker on disk.
+    ASSERT_TRUE(clink::itest::await([&] { return !cluster.ha_coordinator(0).running(); }, 60s))
+        << "the coordinator never reached coordinator.after_completed_marker";
+    const auto first_exit = cluster.ha_coordinator(0).poll_exit();
+    ASSERT_TRUE(first_exit.has_value());
+    ASSERT_EQ(*first_exit, 72) << "the first coordinator died for another reason";
+    const auto markers_after_first = latest_marker(cluster.checkpoint_dir(), "COMPLETED-");
+    ASSERT_GT(markers_after_first, 0u)
+        << "no COMPLETED marker survived the first crash; the fault fired on the wrong side";
+
+    const auto worker_0_pid = cluster.worker(0).pid();
+    const auto worker_1_pid = cluster.worker(1).pid();
+
+    // The ghost: the replacement inherits the still-armed fault and dies at
+    // its OWN first completed marker, having recovered, redeployed and run
+    // the job for about a second.
+    ASSERT_TRUE(cluster.start_ha_coordinators(
+        1, ProcOptions{.fault = "coordinator.after_completed_marker=exit:72@1"}));
+    ASSERT_TRUE(clink::itest::await([&] { return !cluster.ha_coordinator(1).running(); }, 60s))
+        << "the ghost coordinator never completed a checkpoint, so the double-kill "
+           "shape was not reproduced";
+    const auto ghost_exit = cluster.ha_coordinator(1).poll_exit();
+    ASSERT_TRUE(ghost_exit.has_value());
+    ASSERT_EQ(*ghost_exit, 72) << "the ghost coordinator died for another reason";
+    const auto markers_after_ghost = latest_marker(cluster.checkpoint_dir(), "COMPLETED-");
+    ASSERT_GT(markers_after_ghost, markers_after_first)
+        << "the ghost incarnation completed no checkpoint of its own - it must, or this "
+           "test is not exercising the id-reuse and stale-offset window";
+    ASSERT_TRUE(cluster.worker(0).running() && cluster.worker(1).running())
+        << "a worker process died across the ghost incarnation";
+    EXPECT_EQ(cluster.worker(0).pid(), worker_0_pid);
+    EXPECT_EQ(cluster.worker(1).pid(), worker_1_pid);
+
+    // The clean successor.
+    ASSERT_TRUE(cluster.start_ha_coordinators(1));
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return cluster.count_in_coordinator_log("recovered job_id=1") >= 2; }, 60s))
+        << "the third coordinator never recovered the job";
+    ASSERT_TRUE(cluster.worker(0).running() && cluster.worker(1).running());
+    EXPECT_EQ(cluster.worker(0).pid(), worker_0_pid);
+    EXPECT_EQ(cluster.worker(1).pid(), worker_1_pid);
+    // The ghost left a COMPLETED marker above the restore point; the
+    // recovered job must have numbered its checkpoints above it rather than
+    // rewriting the ghost's records.
+    EXPECT_GE(cluster.count_in_coordinator_log("numbers new checkpoints from"), 1u)
+        << "recovery reused a checkpoint id that already has a durable record";
+
+    // Let the recovered job absorb a post-recovery stretch of the feed, then
+    // close the open window and judge everything against the exact oracle.
+    const auto produced_at_recovery = produced.load(std::memory_order_acquire);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return produced.load(std::memory_order_acquire) >= produced_at_recovery + 2'000; },
+        30s));
+    stop_feed.store(true, std::memory_order_release);
+    feeder.join();
+    for (int key = 0; key < kKeys; ++key) {
+        const auto sent = feed.per_key[key];
+        expected[{key, open_start}] = sent;
+    }
+
+    produce_json(kafka_->brokers(), input_topic_, window_records(kBase + 90'000, kKeys));
+
+    const auto after = consume_committed(kafka_->brokers(), output_topic_, expected.size(), 90s);
+    const auto actual = parse_output(after);
+    EXPECT_EQ(actual, expected)
+        << "repeated coordinator.after_completed_marker recoveries mixed checkpoint cuts: "
+           "inflated aggregates mean a replayed span was absorbed twice, missing rows mean "
+           "a committed interval was lost";
+}
+
+// ---------------------------------------------------------------------------
+// The QUAL-01 2PC fault matrix, local and deterministic: every named fault
+// point of the exactly-once protocol kills its process at exactly that point
+// while records are continuously entering an open keyed window, the process
+// is restarted clean, and the committed output must match the exact oracle.
+// The campaign's weighted-random chaos cannot prove this coverage; this
+// matrix is what a PASS verdict's required-fault gate points back to.
+// ---------------------------------------------------------------------------
+
+struct TwopcFaultCase {
+    const char* point;
+    bool on_coordinator;
+    // Which occurrence kills the process: late enough that a confirmed
+    // restore base exists below the interrupted checkpoint.
+    int ordinal;
+};
+
+std::ostream& operator<<(std::ostream& os, const TwopcFaultCase& c) {
+    return os << c.point << "@" << c.ordinal;
+}
+
+class KafkaTwopcFaultMatrixTest : public ::testing::TestWithParam<TwopcFaultCase> {
+protected:
+    static void SetUpTestSuite() {
+        if (clink::test::DockerKafka::docker_available()) {
+            kafka_ = std::make_unique<clink::test::DockerKafka>();
+        }
+    }
+    static void TearDownTestSuite() { kafka_.reset(); }
+
+    void SetUp() override {
+        if (kafka_ == nullptr) {
+            GTEST_SKIP() << "Docker not available; skipping 2PC fault matrix";
+        }
+        if (!std::filesystem::exists(node_binary()) || !std::filesystem::exists(sql_binary())) {
+            GTEST_SKIP() << "cluster node or SQL submit binary is not built";
+        }
+        const auto suffix =
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        input_topic_ = "clink_twopc_matrix_in_" + suffix;
+        output_topic_ = "clink_twopc_matrix_out_" + suffix;
+        run_tag_ = "m" + suffix;
+        kafka_->create_topic(input_topic_, 4);
+        kafka_->create_topic(output_topic_, 4);
+    }
+
+    static std::unique_ptr<clink::test::DockerKafka> kafka_;
+    std::string input_topic_;
+    std::string output_topic_;
+    std::string run_tag_;
+};
+
+std::unique_ptr<clink::test::DockerKafka> KafkaTwopcFaultMatrixTest::kafka_;
+
+TEST_P(KafkaTwopcFaultMatrixTest, DiesAtThePointRecoversAndMatchesTheOracle) {
+    const auto& fault_case = GetParam();
+    constexpr int kKeys = 10;
+    constexpr std::int64_t kBase = 3'000'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    spec.slots_per_worker = 8;
+    spec.ha = true;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    const std::string arm =
+        std::string{fault_case.point} + "=exit:72@" + std::to_string(fault_case.ordinal);
+    ASSERT_TRUE(cluster.start_ha_coordinators(
+        1, fault_case.on_coordinator ? ProcOptions{.fault = arm} : ProcOptions{}));
+    ASSERT_TRUE(cluster.start_ha_worker(
+        0, fault_case.on_coordinator ? ProcOptions{} : ProcOptions{.fault = arm}));
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + input_topic_ + "', group_id='" + run_tag_ +
+        "', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + output_topic_ +
+        "', delivery_guarantee='exactly_once', transactional_id='" + run_tag_ +
+        "'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql-" + run_tag_,
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "kafka-twopc-matrix",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "100",
+                              "--max-restarts-on-worker-loss",
+                              "8",
+                              "--parallelism",
+                              "4"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 2; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
+    const auto open_start = kBase + 50'000;
+    std::atomic<bool> stop_feed{false};
+    std::atomic<std::size_t> produced{0};
+    SustainedFeed feed;
+    std::thread feeder([&] {
+        feed = produce_json_until(
+            kafka_->brokers(), input_topic_, open_start, kKeys, stop_feed, produced);
+    });
+    ASSERT_TRUE(
+        clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 200; }, 15s));
+
+    // The armed process must die AT the point, proven by the injected exit
+    // code. Without this the matrix would pass vacuously on a renamed or
+    // unreachable fault point - precisely the gap that let a campaign
+    // record sink.before_prepare coverage while the kafka sink never fired
+    // it.
+    auto& armed = fault_case.on_coordinator ? cluster.ha_coordinator(0) : cluster.worker(0);
+    ASSERT_TRUE(clink::itest::await([&] { return !armed.running(); }, 60s))
+        << fault_case.point << " never fired: the armed process outlived the deadline, so "
+        << "this fault point is not reachable in the kafka exactly-once pipeline";
+    const auto armed_exit = armed.poll_exit();
+    ASSERT_TRUE(armed_exit.has_value());
+    ASSERT_EQ(*armed_exit, 72) << "the armed process died for a reason other than "
+                               << fault_case.point;
+
+    const auto confirmed_at_death = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+    if (fault_case.on_coordinator) {
+        const auto worker_0_pid = cluster.worker(0).pid();
+        const auto worker_1_pid = cluster.worker(1).pid();
+        ASSERT_TRUE(cluster.start_ha_coordinators(1));
+        ASSERT_TRUE(clink::itest::await(
+            [&] { return cluster.count_in_coordinator_log("recovered job_id=1") >= 1; }, 60s));
+        ASSERT_TRUE(cluster.worker(0).running() && cluster.worker(1).running());
+        EXPECT_EQ(cluster.worker(0).pid(), worker_0_pid);
+        EXPECT_EQ(cluster.worker(1).pid(), worker_1_pid);
+    } else {
+        ASSERT_TRUE(cluster.restart_worker_ha(0));
+    }
+    // Progress proves recovery: commits confirmed beyond anything from
+    // before the death.
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") >= confirmed_at_death + 3;
+        },
+        60s))
+        << "the job never resumed confirmed commits after the " << fault_case.point << " recovery";
+
+    const auto produced_at_recovery = produced.load(std::memory_order_acquire);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return produced.load(std::memory_order_acquire) >= produced_at_recovery + 1'000; },
+        30s));
+    stop_feed.store(true, std::memory_order_release);
+    feeder.join();
+    for (int key = 0; key < kKeys; ++key) {
+        expected[{key, open_start}] = feed.per_key[key];
+    }
+
+    produce_json(kafka_->brokers(), input_topic_, window_records(kBase + 90'000, kKeys));
+
+    const auto after = consume_committed(kafka_->brokers(), output_topic_, expected.size(), 90s);
+    const auto actual = parse_output(after);
+    EXPECT_EQ(actual, expected)
+        << fault_case.point
+        << ": recovery broke exactly-once (inflated = double-absorbed replay, missing = lost "
+           "interval, extra = replayed an externally committed transaction)";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Qual01FaultPoints,
+    KafkaTwopcFaultMatrixTest,
+    ::testing::Values(TwopcFaultCase{"sink.before_prepare", false, 3},
+                      TwopcFaultCase{"sink.after_prepare", false, 3},
+                      TwopcFaultCase{"coordinator.before_completed_marker", true, 6},
+                      TwopcFaultCase{"coordinator.after_completed_marker", true, 6},
+                      TwopcFaultCase{"sink.before_commit", false, 3},
+                      TwopcFaultCase{"sink.after_external_commit", false, 3}),
+    [](const ::testing::TestParamInfo<TwopcFaultCase>& info) {
+        std::string name{info.param.point};
+        for (auto& ch : name) {
+            if (ch == '.') {
+                ch = '_';
+            }
+        }
+        return name;
+    });
 
 }  // namespace

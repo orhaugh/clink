@@ -362,6 +362,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_postgres_cdc_pgoutput.cpp
         integration/test_connector_exactly_once.cpp
         integration/test_kafka_window_recovery.cpp
+        integration/test_kafka_source_ownership.cpp
         integration/test_multiprocess_cluster.cpp
         integration/test_plugin_submission.cpp
         integration/test_application_mode.cpp

@@ -291,7 +291,14 @@ public:
         }
         // The live interval's records (tail_ drained by the last commit, or
         // forwarded directly) are in the open transaction; flush and mark it
-        // as awaiting this checkpoint's commit.
+        // as awaiting this checkpoint's commit. This IS the kafka 2PC
+        // prepare: the named fault points bracket it so a qualification
+        // campaign arming sink.before_prepare / sink.after_prepare on this
+        // sink family genuinely dies inside the prepare window. They used to
+        // exist only in the CommittingSink family, so arming them against a
+        // kafka exactly-once pipeline tested nothing but an ordinary worker
+        // restart while the evidence said otherwise.
+        CLINK_FAULT_POINT(clink::fault::points::kSinkBeforePrepare);
         inner_.flush();
         inner_.on_barrier(b);
         open_txn_ckpt_ = b.id().value();
@@ -304,6 +311,7 @@ public:
         // then refuses with a message naming the missing capture, which
         // beats a silently absent handle.
         stage_resume_handle_(b.id().value());
+        CLINK_FAULT_POINT(clink::fault::points::kSinkAfterPrepare);
     }
 
     void on_commit(std::uint64_t checkpoint_id) override {
