@@ -335,15 +335,22 @@ TEST(TwoPhaseCommit, HappyPathExactlyOnceCommittedFiles) {
     if (!std::filesystem::exists(submit) || !std::filesystem::exists(job_so)) {
         GTEST_SKIP() << "submitter or two_phase_commit_job.so not built";
     }
-    auto c = start_cluster();
-    if (!c.has_value()) {
-        GTEST_SKIP() << "cluster startup failed";
-    }
+    // Env BEFORE the cluster: the worker processes inherit their environment
+    // at spawn, and the job's source reads CLINK_2PC_TOTAL there. With the
+    // cluster started first, a whole-binary run inherited whatever a
+    // preceding test had exported (test_connector_exactly_once leaves 1200)
+    // and this test read 1200 committed records where it produced 30. ctest
+    // runs each test in its own process, which is why the leak never showed
+    // there.
     const auto out_dir = mktmpdir("happy_out");
     const auto ckpt_dir = mktmpdir("happy_ckpt");
     ::setenv("CLINK_2PC_OUT_DIR", out_dir.c_str(), 1);
     ::setenv("CLINK_2PC_TOTAL", "30", 1);
     ::setenv("CLINK_2PC_TICK_MS", "20", 1);
+    auto c = start_cluster();
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
 
     // Checkpoint every 150ms; over the ~600ms the source takes, several
     // checkpoints fire. Each barrier pre-commits the in-flight pending
