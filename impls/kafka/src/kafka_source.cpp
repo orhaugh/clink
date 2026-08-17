@@ -1,17 +1,21 @@
 #include "clink/connectors/kafka_source.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/metrics/metrics_registry.hpp"
+#include "clink/runtime/logging.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
 #ifdef CLINK_HAS_KAFKA
@@ -25,18 +29,18 @@
 
 namespace clink {
 
-std::string KafkaSource::stable_group_instance_id(std::string_view topic,
-                                                  std::uint32_t subtask_idx) {
-    // Kafka group.instance.id is scoped by group.id. Include the topic so
-    // distinct topic subscriptions using that group do not fence each other
-    // merely because both have subtask zero. FNV-1a keeps the identity stable
-    // across processes and standard-library implementations.
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (const auto ch : topic) {
-        hash ^= static_cast<unsigned char>(ch);
-        hash *= 1099511628211ULL;
+bool KafkaSource::owns_partition(std::int32_t partition,
+                                 std::uint32_t source_parallelism,
+                                 std::uint32_t subtask_index) noexcept {
+    // Deterministic, restart-stable, rescale-stable: partition p belongs to
+    // subtask p % parallelism. Ownership decided inside the engine is what
+    // lets the checkpointed offset rows and the consumed positions describe
+    // one cut; anything decided by a consumer-group coordinator is not
+    // stable across restores and cannot be.
+    if (partition < 0 || source_parallelism == 0) {
+        return false;
     }
-    return "clink-" + std::to_string(hash) + "-" + std::to_string(subtask_idx);
+    return static_cast<std::uint32_t>(partition) % source_parallelism == subtask_index;
 }
 
 // Offset-map (partition -> next offset) serialization. Pure and
@@ -162,62 +166,32 @@ constexpr const char* kOffsetKey = "__kafka_source_offsets__";
 // of colliding on a single whole-map key.
 constexpr const char* kOffsetPartPrefix = "__kafka_off__:";
 
-// Rebalance callback that makes the clink checkpoint the source of truth on
-// restore. On partition assignment it seeks each partition to the restored
-// offset (if any), then assigns; restored entries are applied at most once
-// (erased as consumed) so a later mid-run rebalance never rewinds. With no
-// restored offsets it behaves exactly like the default (assign / unassign),
-// so first-run behaviour and auto_offset_reset are unchanged.
-class SeekRebalanceCb final : public RdKafka::RebalanceCb {
-public:
-    SeekRebalanceCb(std::map<std::int32_t, std::int64_t>* restored,
-                    std::map<std::int32_t, std::int64_t>* next_offsets,
-                    bool* assigned_seen)
-        : restored_(restored), next_offsets_(next_offsets), assigned_seen_(assigned_seen) {}
-
-    void rebalance_cb(RdKafka::KafkaConsumer* consumer,
-                      RdKafka::ErrorCode err,
-                      std::vector<RdKafka::TopicPartition*>& partitions) override {
-        if (err == RdKafka::ERR__ASSIGN_PARTITIONS) {
-            for (auto* tp : partitions) {
-                if (restored_ == nullptr) {
-                    break;
-                }
-                auto it = restored_->find(tp->partition());
-                if (it != restored_->end()) {
-                    tp->set_offset(it->second);
-                    // Seed next_offsets for this OWNED partition so a snapshot
-                    // re-persists its restored position and the snapshot prune
-                    // keeps it (rather than treating it as non-owned).
-                    if (next_offsets_ != nullptr) {
-                        (*next_offsets_)[tp->partition()] = it->second;
-                    }
-                    restored_->erase(it);  // apply once; never rewind later
-                }
-            }
-            // Assignment has happened: the source now knows which partitions
-            // it owns, so snapshot may prune non-owned operator-state rows.
-            if (assigned_seen_ != nullptr) {
-                *assigned_seen_ = true;
-            }
-            consumer->assign(partitions);
-        } else {
-            // Revoked: stop persisting partitions this subtask no longer owns
-            // so they don't linger as stale offset rows in future checkpoints.
-            if (next_offsets_ != nullptr && err == RdKafka::ERR__REVOKE_PARTITIONS) {
-                for (auto* tp : partitions) {
-                    next_offsets_->erase(tp->partition());
-                }
-            }
-            consumer->unassign();
+// The partition count of one topic, or 0 when the topic is not (yet) known
+// to the cluster. Manual-assignment sources derive their owned set from
+// this rather than from a consumer-group assignment.
+std::int32_t partition_count_for(RdKafka::KafkaConsumer& consumer,
+                                 const std::string& topic,
+                                 std::chrono::milliseconds timeout) {
+    std::string err;
+    const std::unique_ptr<RdKafka::Topic> handle(
+        RdKafka::Topic::create(&consumer, topic, nullptr, err));
+    if (handle == nullptr) {
+        throw std::runtime_error("KafkaSource: topic handle for metadata failed: " + err);
+    }
+    RdKafka::Metadata* md_raw = nullptr;
+    const auto rc =
+        consumer.metadata(false, handle.get(), &md_raw, static_cast<int>(timeout.count()));
+    if (rc != RdKafka::ERR_NO_ERROR) {
+        return 0;  // transient (broker starting, metadata propagating): caller retries
+    }
+    const std::unique_ptr<RdKafka::Metadata> md(md_raw);
+    for (const auto* tmd : *md->topics()) {
+        if (tmd->topic() == topic && tmd->err() == RdKafka::ERR_NO_ERROR) {
+            return static_cast<std::int32_t>(tmd->partitions()->size());
         }
     }
-
-private:
-    std::map<std::int32_t, std::int64_t>* restored_;
-    std::map<std::int32_t, std::int64_t>* next_offsets_;
-    bool* assigned_seen_;
-};
+    return 0;
+}
 
 }  // namespace
 
@@ -247,15 +221,17 @@ struct KafkaSource::Impl {
     // next_offsets[partition] did on EVERY record.
     std::vector<std::pair<std::int32_t, std::int64_t>> offset_scratch;
     // partition -> next offset to read; advanced as records are emitted,
-    // persisted at each checkpoint.
+    // persisted at each checkpoint. Seeded at restore with the OWNED
+    // partitions' restored positions, so a checkpoint taken before the
+    // first record still re-persists them.
     std::map<std::int32_t, std::int64_t> next_offsets;
-    // partition -> offset to seek to on assignment after a restore; drained
-    // by the rebalance callback as it applies each.
+    // partition -> start offset for open()'s manual assignment, already
+    // narrowed to owned partitions by restore_offset. Drained as applied.
     std::map<std::int32_t, std::int64_t> restored_offsets;
-    // Set true once the rebalance callback has seen an assignment, so the
-    // source knows which partitions it owns and snapshot may prune the rest.
-    bool assigned_seen{false};
-    std::unique_ptr<SeekRebalanceCb> rebalance_cb;
+    // The owned partitions currently assigned; grows when discovery sees a
+    // repartitioned topic.
+    std::vector<std::int32_t> owned_partitions;
+    std::chrono::steady_clock::time_point last_discovery{};
 };
 
 bool KafkaSource::is_real_implementation() {
@@ -309,36 +285,51 @@ void KafkaSource::open() {
         set_or_throw(k, v);
     }
 
-    // Seek-on-assignment rebalance callback: applies any restored offsets so
-    // the consumer resumes from the clink checkpoint rather than Kafka's
-    // committed offset. The callback points at restored_offsets (a stable
-    // Impl member, populated by restore_offset before open()); with none set
-    // it assigns/unassigns exactly like the default.
-    impl_->rebalance_cb = std::make_unique<SeekRebalanceCb>(
-        &impl_->restored_offsets, &impl_->next_offsets, &impl_->assigned_seen);
-    if (cfg->set("rebalance_cb", impl_->rebalance_cb.get(), err) != RdKafka::Conf::CONF_OK) {
-        throw std::runtime_error("KafkaSource: config 'rebalance_cb': " + err);
-    }
-
     auto* consumer = RdKafka::KafkaConsumer::create(cfg.get(), err);
     if (consumer == nullptr) {
         throw std::runtime_error("KafkaSource: create consumer failed: " + err);
     }
     impl_->consumer.reset(consumer);
 
-    auto rc = impl_->consumer->subscribe({impl_->opts.topic});
-    if (rc != RdKafka::ERR_NO_ERROR) {
-        throw std::runtime_error("KafkaSource: subscribe failed: " + RdKafka::err2str(rc));
+    // Manual, deterministic partition assignment: this subtask owns exactly
+    // the partitions p with p % source_parallelism == subtask_index, and
+    // consumes them via assign() - no consumer-group rebalancing, no group
+    // join, no membership races. Group-decided ownership is external state
+    // and cannot be held to one checkpoint cut: after a restore, a partition
+    // handed to a different subtask either has no restored offset there or a
+    // stale one, and both silently break exactly-once (QUAL-01 run C
+    // measured the stale form as 107,884 inflated window aggregates while
+    // every subtask held the restored union of all offset rows). Ownership
+    // decided here, from the same subtask index the offset rows are scoped
+    // to, keeps source position and downstream state on one cut through any
+    // sequence of restores.
+    //
+    // The topic may not be visible yet (broker start, metadata propagation),
+    // so poll metadata briefly rather than failing the first attempt.
+    std::int32_t partitions = 0;
+    const auto metadata_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while ((partitions = partition_count_for(
+                *impl_->consumer, impl_->opts.topic, std::chrono::milliseconds{2'000})) == 0 &&
+           std::chrono::steady_clock::now() < metadata_deadline &&
+           !impl_->cancelled.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{250});
     }
+    if (partitions == 0) {
+        impl_->consumer->close();
+        impl_->consumer.reset();
+        throw std::runtime_error("KafkaSource: topic '" + impl_->opts.topic +
+                                 "' has no visible partitions after 30s; cannot assign");
+    }
+    assign_owned_(partitions);
+    impl_->last_discovery = std::chrono::steady_clock::now();
 
     // Hold the consumer queue for the batched fetch path. Polling this queue
-    // counts as a consumer poll (it is the queue rd_kafka_consumer_poll serves),
-    // so max.poll.interval.ms keeps being reset and group membership is
-    // maintained exactly as before; rebalance and error ops travel on the same
-    // queue, so the seek-on-assignment callback still fires. The suite's
-    // SourceReplayResumesFromCheckpoint case is the canary for that: without a
-    // firing rebalance callback the restored source resumes at payload-0 rather
-    // than payload-6 and the test fails.
+    // counts as a consumer poll (it is the queue rd_kafka_consumer_poll
+    // serves), and with manual assignment it carries fetch data and error ops
+    // only - there is no group membership to maintain and no rebalance events
+    // to dispatch. The suite's SourceReplaysFromSnapshottedOffset case is the
+    // canary for restore: a restored source must resume at payload-6 rather
+    // than payload-0.
     impl_->cqueue = rd_kafka_queue_get_consumer(impl_->consumer->c_ptr());
     if (impl_->cqueue == nullptr) {
         throw std::runtime_error("KafkaSource: rd_kafka_queue_get_consumer returned null");
@@ -354,9 +345,132 @@ void KafkaSource::open() {
     }
 }
 
+void KafkaSource::assign_owned_(std::int32_t partition_count) {
+    const auto& opts = impl_->opts;
+    std::vector<std::int32_t> owned;
+    for (std::int32_t p = 0; p < partition_count; ++p) {
+        if (owns_partition(p, opts.source_parallelism, opts.subtask_index)) {
+            owned.push_back(p);
+        }
+    }
+    // The owned set only ever GROWS. Kafka partitions cannot be removed, so
+    // a metadata response listing fewer than currently owned is a degraded
+    // snapshot (a broker mid-restart), not a repartition; acting on it would
+    // drop in-flight partitions and their tracked offsets, and the eventual
+    // re-add would fall back to auto.offset.reset - a silent rewind to the
+    // start of the partition under exactly the broker chaos a qualification
+    // campaign applies.
+    for (const auto p : impl_->owned_partitions) {
+        if (std::find(owned.begin(), owned.end(), p) == owned.end()) {
+            owned.push_back(p);
+        }
+    }
+    std::sort(owned.begin(), owned.end());
+    if (owned == impl_->owned_partitions) {
+        return;  // discovery found nothing new for this subtask
+    }
+
+    // Current fetch positions of the partitions already assigned, so a
+    // repartition-driven reassign never moves an in-flight partition.
+    std::map<std::int32_t, std::int64_t> current;
+    if (!impl_->owned_partitions.empty()) {
+        std::vector<RdKafka::TopicPartition*> held;
+        held.reserve(impl_->owned_partitions.size());
+        for (const auto p : impl_->owned_partitions) {
+            held.push_back(RdKafka::TopicPartition::create(opts.topic, p));
+        }
+        if (impl_->consumer->position(held) == RdKafka::ERR_NO_ERROR) {
+            for (const auto* tp : held) {
+                if (tp->offset() >= 0) {
+                    current[tp->partition()] = tp->offset();
+                }
+            }
+        }
+        RdKafka::TopicPartition::destroy(held);
+    }
+
+    std::vector<RdKafka::TopicPartition*> assignment;
+    assignment.reserve(owned.size());
+    std::string described;
+    for (const auto p : owned) {
+        std::int64_t offset = 0;
+        std::string origin;
+        if (const auto held = current.find(p); held != current.end()) {
+            offset = held->second;
+            origin = "held";
+        } else if (const auto next = impl_->next_offsets.find(p);
+                   next != impl_->next_offsets.end()) {
+            // Consumed (or restored) position tracked but not yet queryable
+            // from the consumer - the authoritative resume point.
+            offset = next->second;
+            origin = "tracked";
+        } else if (const auto restored = impl_->restored_offsets.find(p);
+                   restored != impl_->restored_offsets.end()) {
+            offset = restored->second;
+            origin = "restored";
+        } else {
+            // No clink-side position: resolve the group's committed offset,
+            // falling back to auto.offset.reset - the same semantics
+            // subscription-based consumption had for a partition without
+            // engine state.
+            offset = RdKafka::Topic::OFFSET_STORED;
+            origin = "stored/" + opts.auto_offset_reset;
+        }
+        impl_->restored_offsets.erase(p);  // applied; a reassign resumes, never rewinds
+        assignment.push_back(RdKafka::TopicPartition::create(opts.topic, p, offset));
+        described += (described.empty() ? "" : ",") + std::to_string(p) + ":" + origin +
+                     (offset >= 0 ? "@" + std::to_string(offset) : "");
+    }
+
+    const auto rc = impl_->consumer->assign(assignment);
+    RdKafka::TopicPartition::destroy(assignment);
+    if (rc != RdKafka::ERR_NO_ERROR) {
+        throw std::runtime_error("KafkaSource: assign failed: " + RdKafka::err2str(rc));
+    }
+    impl_->owned_partitions = std::move(owned);
+    // Drop tracked positions for partitions outside the owned set - restored
+    // rows naming partitions the topic does not (or no longer) has. Left in
+    // place they would re-persist forever as garbage offset rows.
+    for (auto it = impl_->next_offsets.begin(); it != impl_->next_offsets.end();) {
+        const bool still_owned =
+            std::find(impl_->owned_partitions.begin(), impl_->owned_partitions.end(), it->first) !=
+            impl_->owned_partitions.end();
+        it = still_owned ? std::next(it) : impl_->next_offsets.erase(it);
+    }
+    // The forensic record QUAL-01 lacked: which subtask owns which partitions
+    // from which offsets. One line per (re)assignment, not per record.
+    clink::log::info("kafka.source",
+                     "topic '" + opts.topic + "' subtask " + std::to_string(opts.subtask_index) +
+                         "/" + std::to_string(opts.source_parallelism) + " assigned " +
+                         std::to_string(impl_->owned_partitions.size()) + " of " +
+                         std::to_string(partition_count) + " partitions [" + described + "]");
+}
+
 bool KafkaSource::produce(Emitter<KafkaMessage>& out) {
     if (this->cancelled() || impl_->cancelled.load(std::memory_order_acquire)) {
         return false;
+    }
+    // Partition discovery: a repartitioned topic grows new partitions whose
+    // owner (by the deterministic rule) is this subtask. Metadata is polled
+    // on an interval rather than learned from rebalance callbacks, because
+    // there is no group protocol here. Failures are transient by nature and
+    // retried on the next tick.
+    if (impl_->opts.partition_discovery_interval > std::chrono::milliseconds::zero()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - impl_->last_discovery >= impl_->opts.partition_discovery_interval) {
+            impl_->last_discovery = now;
+            try {
+                const auto partitions = partition_count_for(
+                    *impl_->consumer, impl_->opts.topic, std::chrono::milliseconds{1'000});
+                if (partitions > 0) {
+                    assign_owned_(partitions);
+                }
+            } catch (const std::exception& e) {
+                clink::log::warn("kafka.source",
+                                 "partition discovery for topic '" + impl_->opts.topic +
+                                     "' failed (" + e.what() + "); retrying on the next tick");
+            }
+        }
     }
     Batch<KafkaMessage> batch;
     // The batch never exceeds max_batch_size, and its size is known here, so one
@@ -501,8 +615,8 @@ void KafkaSource::snapshot_offset(StateBackend& backend,
     // operator-state path exempts these from the rescale key-group filter,
     // and the distinct per-partition keys let a multi-parent rescale merge
     // UNION the partitions rather than collide on a single whole-map key.
-    // The apply-once rebalance callback then keeps only the partitions the
-    // broker assigns this subtask.
+    // restore_offset then narrows the union to the partitions the
+    // deterministic ownership rule gives the restoring subtask.
     for (const auto& [partition, offset] : impl_->next_offsets) {
         std::array<std::byte, 8> bytes{};
         const auto u = static_cast<std::uint64_t>(offset);
@@ -516,14 +630,17 @@ void KafkaSource::snapshot_offset(StateBackend& backend,
             StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
     }
 
-    // Once assignment is known, this subtask owns exactly next_offsets's
-    // partitions, so drop any per-partition row it does NOT own - the
-    // restored union it inherited on a rescale, or a partition revoked
-    // mid-run. This converges each subtask's checkpoint to owned-only
-    // (no bloat, no stale rows). Before assignment we keep everything so a
-    // checkpoint in the restore->assignment window loses no offset; max-wins
-    // on restore is the order-independent backstop for any row that lingers.
-    if (impl_->assigned_seen) {
+    // This subtask owns exactly the partitions the deterministic rule gives
+    // it, so drop any per-partition row it does NOT track - the restored
+    // union it inherited (which a rescale legitimately hands it), or a row
+    // for a partition that no longer exists. Ownership is static, so this
+    // needs no assignment to have happened: restore_offset seeds
+    // next_offsets with the owned partitions' restored positions, meaning a
+    // checkpoint taken in the restore->consumption window persists owned
+    // rows and nothing else. QUAL-01 run C's checkpoint 246 kept all four
+    // subtasks' rows in every subtask, which is how stale foreign offsets
+    // survived to be seeked after the partitions moved.
+    {
         const std::string_view part_prefix{kOffsetPartPrefix};
         std::vector<std::string> stale;
         backend.scan_operator_state(op_id, [&](StateBackend::KeyView key, StateBackend::ValueView) {
@@ -590,14 +707,29 @@ bool KafkaSource::restore_offset(StateBackend& backend, OperatorId op_id) {
     if (restored.empty()) {
         return false;
     }
+    // Narrow the union to OWNED partitions here, before any consumption. A
+    // restore hands every subtask all subtasks' rows (that is what a rescale
+    // needs); a foreign partition's restored offset is stale the moment its
+    // real owner consumes past it, so holding it as a seek target is the
+    // QUAL-01 run C corruption waiting to fire. Ownership is deterministic,
+    // so the narrowing needs no broker and no assignment.
+    for (auto it = restored.begin(); it != restored.end();) {
+        if (owns_partition(it->first, impl_->opts.source_parallelism, impl_->opts.subtask_index)) {
+            ++it;
+        } else {
+            it = restored.erase(it);
+        }
+    }
+    if (restored.empty()) {
+        return false;  // nothing this subtask owns; fresh partitions use auto_offset_reset
+    }
+    // Seed next_offsets with the owned restored positions so a checkpoint
+    // taken before the first record re-persists them and the snapshot prune
+    // (owned-only) keeps them.
+    for (const auto& [partition, offset] : restored) {
+        impl_->next_offsets[partition] = offset;
+    }
     impl_->restored_offsets = std::move(restored);
-    // Do NOT seed next_offsets with the full restored union: that would make
-    // this subtask re-persist every partition (bloat) and freeze offsets for
-    // partitions it does not own. The rebalance callback seeds next_offsets
-    // for the partitions it is actually assigned (so an immediate post-
-    // assignment checkpoint still re-persists them); until assignment, the
-    // backend's restored rows are preserved (snapshot does not prune yet), so
-    // no offset is lost in the restore->assignment window.
     return true;
 }
 

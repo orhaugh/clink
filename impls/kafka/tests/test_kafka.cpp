@@ -686,12 +686,89 @@ TEST(Kafka, OffsetMapEncodeDecodeRoundTrip) {
     EXPECT_TRUE(KafkaSource::encode_offsets({}).size() >= 4u);  // count prefix only
 }
 
-TEST(Kafka, ParallelSourceGroupIdentityIsStableAndSubtaskScoped) {
-    const auto first = KafkaSource::stable_group_instance_id("events", 1);
-    EXPECT_EQ(first, KafkaSource::stable_group_instance_id("events", 1));
-    EXPECT_NE(first, KafkaSource::stable_group_instance_id("events", 2));
-    EXPECT_NE(first, KafkaSource::stable_group_instance_id("other-events", 1));
-    EXPECT_EQ(first.rfind("-1"), first.size() - 2);
+// Partition ownership is a pure function of (partition, parallelism,
+// subtask): p % parallelism == subtask. Deterministic and restart-stable,
+// so the subtask that checkpointed a partition's offset is always the
+// subtask that resumes it - no consumer-group coordinator in the loop.
+TEST(Kafka, OwnershipRuleIsDeterministicAndPartitionScoped) {
+    // Parallelism 4: partition p belongs to subtask p % 4, and nobody else.
+    for (std::int32_t p = 0; p < 8; ++p) {
+        for (std::uint32_t sub = 0; sub < 4; ++sub) {
+            EXPECT_EQ(KafkaSource::owns_partition(p, 4, sub),
+                      static_cast<std::uint32_t>(p) % 4 == sub)
+                << "partition " << p << " subtask " << sub;
+        }
+    }
+    // Parallelism 1 (standalone source) owns everything.
+    EXPECT_TRUE(KafkaSource::owns_partition(0, 1, 0));
+    EXPECT_TRUE(KafkaSource::owns_partition(7, 1, 0));
+    // More subtasks than partitions: the excess subtasks own nothing.
+    EXPECT_TRUE(KafkaSource::owns_partition(1, 8, 1));
+    EXPECT_FALSE(KafkaSource::owns_partition(1, 8, 5));
+    // Degenerate inputs own nothing rather than crash.
+    EXPECT_FALSE(KafkaSource::owns_partition(-1, 4, 0));
+    EXPECT_FALSE(KafkaSource::owns_partition(0, 0, 0));
+}
+
+// QUAL-01 run C: a restore hands every subtask the UNION of all subtasks'
+// per-partition offset rows (that is what a rescale needs). The union must
+// be narrowed to OWNED partitions at restore, before any record is read:
+// a foreign partition's restored offset is stale by construction the moment
+// another subtask consumes past it, and seeking there re-absorbs the span
+// into downstream state. Run C measured that as 107,884 inflated window
+// aggregates. This is broker-free: restore and snapshot are pure state-
+// backend operations, and the narrowing must not depend on any assignment
+// having happened.
+TEST(Kafka, RestoreNarrowsUnionOffsetsToOwnedPartitionsBeforeAssignment) {
+    InMemoryStateBackend backend;
+    const OperatorId op_id{31};
+    auto le8 = [](std::int64_t v) {
+        std::string s(8, '\0');
+        const auto u = static_cast<std::uint64_t>(v);
+        for (int i = 0; i < 8; ++i) {
+            s[static_cast<std::size_t>(i)] = static_cast<char>((u >> (i * 8)) & 0xFF);
+        }
+        return s;
+    };
+    // The restored union: four partitions, four distinct offsets.
+    for (std::int32_t p = 0; p < 4; ++p) {
+        const std::string key = "__kafka_off__:" + std::to_string(p);
+        backend.put_operator_state(op_id,
+                                   StateBackend::KeyView{key.data(), key.size()},
+                                   StateBackend::ValueView{le8(1000 + p)});
+    }
+
+    KafkaSource::Options opts;
+    opts.brokers = "localhost:1";  // never contacted: open() is not called
+    opts.topic = "narrow";
+    opts.subtask_index = 1;
+    opts.source_parallelism = 4;
+    KafkaSource src(opts);
+    ASSERT_TRUE(src.restore_offset(backend, op_id));
+
+    // A checkpoint taken in the restore->consumption window must already be
+    // owned-only: partition 1's restored position re-persisted, the three
+    // foreign rows pruned. Run C's checkpoint 246 snapshots showed all four
+    // rows in every subtask, which is how the stale offsets survived to be
+    // seeked.
+    src.snapshot_offset(backend, op_id, CheckpointId{1});
+    const auto own =
+        backend.get_operator_state(op_id, StateBackend::KeyView{"__kafka_off__:1", 15});
+    ASSERT_TRUE(own.has_value()) << "owned partition's restored offset must be re-persisted";
+    std::uint64_t off = 0;
+    for (int i = 0; i < 8; ++i) {
+        off |= static_cast<std::uint64_t>(
+                   static_cast<std::uint8_t>((*own)[static_cast<std::size_t>(i)]))
+               << (i * 8);
+    }
+    EXPECT_EQ(off, 1001u);
+    for (const std::int32_t p : {0, 2, 3}) {
+        const std::string key = "__kafka_off__:" + std::to_string(p);
+        EXPECT_FALSE(
+            backend.get_operator_state(op_id, StateBackend::KeyView{key.data(), key.size()})
+                .has_value())
+            << "foreign partition " << p << " must be narrowed away at restore";
+    }
 }
 
 // Source replay: a source that consumed part of a partition snapshots its

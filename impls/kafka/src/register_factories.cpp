@@ -101,12 +101,15 @@ void apply_batch_shape(const plugin::BuildContext& ctx, KafkaSource::Options& op
     }
 }
 
-void apply_stable_group_membership(const plugin::BuildContext& ctx, KafkaSource::Options& opts) {
-    if (ctx.parallelism <= 1) {
-        return;
-    }
-    opts.conf.try_emplace("group.instance.id",
-                          KafkaSource::stable_group_instance_id(opts.topic, ctx.subtask_idx));
+void apply_deterministic_ownership(const plugin::BuildContext& ctx, KafkaSource::Options& opts) {
+    // Partition ownership is decided by the engine, not by consumer-group
+    // rebalancing: this subtask consumes exactly the partitions p with
+    // p % parallelism == subtask_idx, assigned manually inside
+    // KafkaSource::open(). Ownership therefore survives restores, worker
+    // moves and coordinator failovers on the same cut as the checkpointed
+    // per-partition offset rows.
+    opts.subtask_index = ctx.subtask_idx;
+    opts.source_parallelism = std::max<std::uint32_t>(1, ctx.parallelism);
 }
 
 // Forwarding emitter: convert KafkaMessage batches to string batches;
@@ -786,7 +789,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             apply_batch_max_wait(ctx, opts);
             apply_batch_shape(ctx, opts);
             populate_kafka_security_conf(ctx, opts.conf);
-            apply_stable_group_membership(ctx, opts);
+            apply_deterministic_ownership(ctx, opts);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_message_source: 'brokers' is required");
             }
@@ -837,7 +840,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         apply_batch_max_wait(ctx, opts);
         apply_batch_shape(ctx, opts);
         populate_kafka_security_conf(ctx, opts.conf);
-        apply_stable_group_membership(ctx, opts);
+        apply_deterministic_ownership(ctx, opts);
         if (opts.brokers.empty()) {
             throw std::runtime_error("kafka source: 'brokers' is required");
         }

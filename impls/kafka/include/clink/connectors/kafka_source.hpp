@@ -91,6 +91,26 @@ public:
         //   kafka_source.<metric_prefix>.consume_errors
         // Empty disables the metric registration.
         std::string metric_prefix = "default";
+        // Deterministic partition ownership. This source instance owns and
+        // consumes exactly the partitions p of `topic` with
+        // p % source_parallelism == subtask_index, assigned manually via
+        // assign() rather than through consumer-group rebalancing. Group
+        // rebalancing decides ownership OUTSIDE the engine, so it cannot be
+        // held to one checkpoint cut: a partition handed to a different
+        // subtask after a restore either has no restored offset there
+        // (silent auto_offset_reset) or a stale one (silent replay into
+        // downstream state). QUAL-01 run C measured the stale form as
+        // 107,884 inflated window aggregates. Deterministic ownership keys
+        // consumption to the same subtask index that the checkpointed
+        // offset rows are scoped to, so source position and downstream
+        // state always describe one cut. The defaults make a standalone
+        // (non-cluster) source own every partition.
+        std::uint32_t subtask_index = 0;
+        std::uint32_t source_parallelism = 1;
+        // How often produce() re-checks topic metadata for NEW partitions
+        // (a repartitioned topic). Newly appeared owned partitions join the
+        // assignment at auto_offset_reset. Zero disables discovery.
+        std::chrono::milliseconds partition_discovery_interval = std::chrono::seconds{30};
         // Extra librdkafka config properties applied verbatim after the fields
         // above, e.g. {"security.protocol":"sasl_ssl", "sasl.mechanism":"PLAIN",
         // "sasl.username":"u", "sasl.password":"p", "ssl.ca.location":"/ca.pem"}.
@@ -121,11 +141,14 @@ public:
     bool commit_current();
 
     // Source replay: bind the consumer position to clink checkpoints rather
-    // than Kafka's own committed offset. snapshot_offset persists the
-    // per-partition next-offset map captured so far; restore_offset loads it
-    // and the consumer seeks each partition there on assignment (via a
-    // rebalance callback), making the clink checkpoint the source of truth on
-    // recovery. Runs on the source-runner thread between produce() calls.
+    // than Kafka's own committed offset. snapshot_offset persists one
+    // operator-state row per OWNED partition; restore_offset loads the rows,
+    // narrowed to the partitions this subtask owns (a restore hands every
+    // subtask the union of all subtasks' operator rows, which is what a
+    // rescale needs and what deterministic ownership makes safe), and open()
+    // assigns each owned partition at its restored offset. The clink
+    // checkpoint is the source of truth on recovery. Runs on the
+    // source-runner thread between produce() calls.
     void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt_id) override;
     bool restore_offset(StateBackend& backend, OperatorId op_id) override;
 
@@ -135,18 +158,24 @@ public:
     static std::string encode_offsets(const std::map<std::int32_t, std::int64_t>& offsets);
     static std::map<std::int32_t, std::int64_t> decode_offsets(std::string_view bytes);
 
-    // Stable Kafka group identity for one parallel source subtask. Kafka's
-    // static-membership protocol maps this identity back to the same member
-    // across a process or coordinator recovery, preserving partition
-    // ownership so a subtask's checkpointed offset map remains authoritative.
-    // Pure and broker-independent for unit testing.
-    static std::string stable_group_instance_id(std::string_view topic, std::uint32_t subtask_idx);
+    // Deterministic partition ownership rule shared by open(), restore_offset
+    // and the snapshot prune. Pure and broker-independent for unit testing.
+    static bool owns_partition(std::int32_t partition,
+                               std::uint32_t source_parallelism,
+                               std::uint32_t subtask_index) noexcept;
 
     std::string name() const override { return "kafka_source"; }
 
     static bool is_real_implementation();
 
 private:
+    // (Re)assign the owned subset of a topic with `partition_count`
+    // partitions: previously-assigned partitions keep their current
+    // position, newly-owned ones start at their restored offset (drained on
+    // use) or the auto_offset_reset policy. Called by open() and by the
+    // periodic partition discovery in produce().
+    void assign_owned_(std::int32_t partition_count);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
