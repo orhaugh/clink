@@ -434,6 +434,21 @@ print('yes' if j.get('status') == 'RUNNING' and j.get('latest_completed_checkpoi
 [ "$JOB_OK" = "yes" ] || verify_fail "the job is not running with completed checkpoints: $JOB_JSON"
 echo "campaign: job RUNNING with completed checkpoints"
 
+# 2b. EXACTLY ONE job. The campaign submitted one pipeline; a second
+# active job means something else is producing into this run's topics -
+# run e's coordinator resurrected the previous run's job from a stale HA
+# store and every window was committed twice by two individually-correct
+# jobs. The HA wipe above prevents that path, and this gate refuses any
+# other source of a second job before the soak can spend on it.
+JOBS_JSON=$(curl -fsS "http://${COORD_PUB}:8095/api/v1/jobs") || verify_fail "cannot list jobs"
+ACTIVE_JOBS=$(python3 -c "
+import json,sys
+doc = json.loads(sys.argv[1])
+jobs = doc.get('jobs', doc) if isinstance(doc, dict) else doc
+print(len(jobs))" "$JOBS_JSON")
+[ "$ACTIVE_JOBS" = "1" ] || verify_fail "expected exactly one job on the coordinator, found ${ACTIVE_JOBS}: $JOBS_JSON"
+echo "campaign: exactly one job on the coordinator"
+
 # 3. Output is reaching the sink topic, committed.
 OUT_N=$(on_host "$OPS_PUB" "python3 -c \"import json;print(json.load(open('/qual/verdict.json'))['output_records'])\"" 2>/dev/null || echo 0)
 [ "${OUT_N:-0}" -gt 0 ] || verify_fail "the verifier has seen no committed output records"
