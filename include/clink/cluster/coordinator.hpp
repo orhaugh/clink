@@ -292,6 +292,19 @@ public:
         // underload. Default (nullopt) disables autoscaling - manual
         // rescale via clink rescale-op still works.
         std::optional<AutoscalerConfig> autoscaler;
+        // HA recovery placement: how long recover_persisted_jobs waits for
+        // worker registrations to stop arriving before redeploying, and the
+        // hard bound on that wait. Workers reconnect within moments of a new
+        // leader binding, but not simultaneously; a redeploy fired at the
+        // first registration schedules the whole job onto that one worker
+        // (QUAL-01 run C ran its final minutes with all sixteen tasks on one
+        // worker for exactly this reason). The settle wait ends as soon as
+        // the registered set has been stable for recovery_worker_settle,
+        // and unconditionally at recovery_worker_settle_deadline, so a
+        // genuinely single-worker cluster still recovers promptly. Zero
+        // settle disables the wait.
+        std::chrono::milliseconds recovery_worker_settle{1000};
+        std::chrono::milliseconds recovery_worker_settle_deadline{5000};
     };
 
     Coordinator();

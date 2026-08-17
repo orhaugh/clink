@@ -522,6 +522,48 @@ void Coordinator::recover_persisted_jobs() {
         }
     }
     std::sort(ids.begin(), ids.end());
+    if (ids.empty()) {
+        return;
+    }
+    // Let worker registrations settle before redeploying. The supervisors of
+    // a running cluster reconnect within moments of a new leader binding, but
+    // not simultaneously; recovering at the first registration schedules
+    // every task onto that one worker and the cluster never rebalances back.
+    // Stop waiting once the registered set has been stable for
+    // recovery_worker_settle (and at least one worker exists), and
+    // unconditionally at recovery_worker_settle_deadline. A cluster with no
+    // workers at the deadline still proceeds: the submit parks the job for
+    // capacity and the retry loop finishes the recovery.
+    if (cfg_.recovery_worker_settle > std::chrono::milliseconds::zero()) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + cfg_.recovery_worker_settle_deadline;
+        auto count_workers = [this] {
+            std::lock_guard lock(mu_);
+            std::size_t live = 0;
+            for (const auto& [_, w] : registered_) {
+                if (w && !w->lost) {
+                    ++live;
+                }
+            }
+            return live;
+        };
+        std::size_t stable_count = count_workers();
+        auto stable_since = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto now_count = count_workers();
+            if (now_count != stable_count) {
+                stable_count = now_count;
+                stable_since = std::chrono::steady_clock::now();
+            } else if (stable_count > 0 && std::chrono::steady_clock::now() - stable_since >=
+                                               cfg_.recovery_worker_settle) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+        log::info("coordinator.ha",
+                  "recovering " + std::to_string(ids.size()) + " persisted job(s) with " +
+                      std::to_string(stable_count) + " worker(s) registered");
+    }
     for (auto job_id : ids) {
         recover_one_persisted_job_(job_id);
     }
@@ -3764,8 +3806,38 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     // Not specific to HA. Any resume does it, including an explicit
     // --restore-from-checkpoint-id=N, which is the documented way to rewind
     // a job.
+    //
+    // Above the restore point is NOT enough: number above every checkpoint
+    // id recorded on disk. The restore point can sit BELOW the newest
+    // COMPLETED marker - the exact shape of a coordinator that died between
+    // the marker write and the commit broadcast, where in-doubt resolution
+    // reports the newest completed checkpoint as not externally committed
+    // and the job restores from the older confirmed one. Numbering from
+    // restore_from+1 then reuses the dead incarnation's id: QUAL-01 run C's
+    // recovery restored from 245 while COMPLETED-246 sat on disk, and its
+    // first checkpoint overwrote 246's marker and snapshot files. The
+    // marker then vouches for participant files a DIFFERENT incarnation
+    // wrote, and a further crash inside that window would recover from a
+    // checkpoint whose marker and snapshots disagree. Ids are cheap;
+    // never reuse one that has a durable record.
     if (checkpoint.restore_from_checkpoint_id > 0) {
-        job->next_checkpoint_id = checkpoint.restore_from_checkpoint_id + 1;
+        std::uint64_t id_floor = checkpoint.restore_from_checkpoint_id;
+        if (!checkpoint.checkpoint_dir.empty()) {
+            id_floor =
+                std::max(id_floor, latest_completed_id_on_disk(checkpoint.checkpoint_dir, job_id));
+            id_floor =
+                std::max(id_floor, latest_confirmed_id_on_disk(checkpoint.checkpoint_dir, job_id));
+        }
+        job->next_checkpoint_id = id_floor + 1;
+        if (id_floor > checkpoint.restore_from_checkpoint_id) {
+            log::info("coordinator.restart",
+                      "job_id=" + std::to_string(job_id) + " resumes from checkpoint " +
+                          std::to_string(checkpoint.restore_from_checkpoint_id) +
+                          " but numbers new checkpoints from " +
+                          std::to_string(job->next_checkpoint_id) + ": ids up to " +
+                          std::to_string(id_floor) +
+                          " already have durable records in this directory");
+        }
     }
     job->notify_client_conn = notify_client_conn;
     job->expected_completion = resolved_plan.tasks.size();
