@@ -63,7 +63,8 @@ std::uint64_t latest_marker(const std::filesystem::path& root, std::string_view 
             continue;
         }
         try {
-            latest = std::max(latest, std::stoull(name.substr(prefix.size())));
+            latest = std::max(latest,
+                              static_cast<std::uint64_t>(std::stoull(name.substr(prefix.size()))));
         } catch (const std::exception&) {
         }
     }
