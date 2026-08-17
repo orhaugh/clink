@@ -215,6 +215,62 @@ class Chaos:
             raise ChaosCommandFailed(f"{host['name']}: {name} is not running")
         return pid
 
+    def worker_pids(self):
+        """Current worker container PIDs by host name. Captured before any
+        coordinator disturbance so the stability gate has evidence to
+        compare against, whatever code path caused the restart."""
+        return {w["name"]: self.container_pid(w, "clink-worker")
+                for w in self.rig.hosts("worker")}
+
+    def assert_worker_pids_stable(self, before: dict, context: str):
+        """Prove every worker survived `context` in process. This is THE
+        stable-PID gate; every path that disturbs the coordinator must go
+        through it. Run C's targeted coordinator faults bypassed it, so the
+        campaign had no stable-PID evidence for exactly the events that
+        went wrong."""
+        after = {}
+        for w in self.rig.hosts("worker"):
+            self.assert_container_running(w, "clink-worker")
+            pid = self.container_pid(w, "clink-worker")
+            after[w["name"]] = pid
+            if pid != before.get(w["name"]):
+                raise ChaosCommandFailed(
+                    f"{w['name']}: clink-worker PID changed across {context} "
+                    f"({before.get(w['name'])} -> {pid}); the campaign did not "
+                    "exercise in-process control-session recovery")
+        return after
+
+    def await_container_exit(self, host: dict, name: str, expect_code: int,
+                             attempts: int = 60):
+        """Block until `name` exits, and prove it exited with the ARMED
+        fault's code. This is what makes a targeted fault real evidence: an
+        armed point that is unreachable in the deployed pipeline leaves the
+        process running forever, and before this check existed the campaign
+        recorded such arms as coverage. sink.before_prepare was exactly
+        that: armed four times against a kafka pipeline whose sink never
+        fired it."""
+        for _ in range(attempts):
+            res = self.rig.ssh(
+                host,
+                f"docker inspect --format '{{{{.State.Status}}}} {{{{.State.ExitCode}}}}' "
+                f"{name} || echo absent 0")
+            out = (res.stdout or "").strip()
+            if out.startswith("exited"):
+                try:
+                    code = int(out.split()[1])
+                except (IndexError, ValueError):
+                    code = -1
+                if code != expect_code:
+                    raise ChaosCommandFailed(
+                        f"{host['name']}: {name} exited {code}, not the armed fault's "
+                        f"{expect_code}; the process died for a different reason and the "
+                        "targeted window was not exercised")
+                return
+            time.sleep(3)
+        raise ChaosCommandFailed(
+            f"{host['name']}: {name} never exited - the armed fault point did not fire "
+            "and this fault has produced no coverage")
+
     def kill_worker(self, state, ckpt):
         host = self.rng.choice(self.rig.hosts("worker"))
         self.rig.ssh(host, "docker kill -s SIGKILL clink-worker")
@@ -229,10 +285,7 @@ class Chaos:
 
     def kill_coordinator(self, state, ckpt):
         host = self.rig.hosts("coordinator")[0]
-        workers = self.rig.hosts("worker")
-        worker_pids_before = {
-            w["name"]: self.container_pid(w, "clink-worker") for w in workers
-        }
+        worker_pids_before = self.worker_pids()
         self.rig.ssh(host, "docker kill -s SIGKILL clink-coordinator")
         self.assert_container_gone(host, "clink-coordinator")
         self.record(host["name"], "coordinator_sigkill", state, ckpt)
@@ -243,16 +296,8 @@ class Chaos:
         # Workers remain running. Each one fences and drains the dead control
         # session, then reconnects to this coordinator under its new epoch.
         # Restarting them here would conceal a regression in that contract.
-        worker_pids_after = {}
-        for w in workers:
-            self.assert_container_running(w, "clink-worker")
-            pid = self.container_pid(w, "clink-worker")
-            worker_pids_after[w["name"]] = pid
-            if pid != worker_pids_before[w["name"]]:
-                raise ChaosCommandFailed(
-                    f"{w['name']}: clink-worker PID changed across coordinator restart "
-                    f"({worker_pids_before[w['name']]} -> {pid}); the campaign did not "
-                    "exercise in-process control-session recovery")
+        worker_pids_after = self.assert_worker_pids_stable(
+            worker_pids_before, "coordinator restart")
         self.record(host["name"], "coordinator_restart", "killed", ckpt,
                     {"worker_pids_before": worker_pids_before,
                      "worker_pids_after": worker_pids_after})
@@ -331,12 +376,39 @@ class Chaos:
                 self._fault_surface = False
         return self._fault_surface
 
-    def twopc_window_fault(self, state, ckpt):
-        """Crash a worker INSIDE a named 2PC window, using the engine's
+    TWOPC_POINTS = (
+        "sink.before_prepare",
+        "sink.after_prepare",
+        "coordinator.before_completed_marker",
+        "coordinator.after_completed_marker",
+        "sink.before_commit",
+        "sink.after_external_commit",
+    )
+
+    def twopc_window_fault(self, state, ckpt, point=None):
+        """Crash a process INSIDE a named 2PC window, using the engine's
         own deterministic fault points - the windows an external kill
-        cannot hit reliably. The worker is restarted with the armed
-        variable, takes the fault on the next checkpoint, and comes back
-        clean so the next fault is independent."""
+        cannot hit reliably.
+
+        Arming requires a restart (CLINK_FAULT_INJECT is read at process
+        start), so the sequence is inherently a double death: the running
+        process is killed, its ARMED replacement recovers the job, runs
+        until it reaches the point, and dies there; only then is the clean
+        process started. The armed incarnation is therefore a short-lived
+        ghost that redeploys, consumes input and leaves durable artefacts
+        (checkpoints, markers, prepared transactions) behind - run C's
+        corruption came out of exactly that window, so it is kept as a
+        FEATURE of this fault, verified rather than accidental:
+
+          * the armed process must EXIT WITH THE FAULT'S CODE, proving the
+            named point actually fired (an unreachable point previously
+            recorded coverage it never had);
+          * a coordinator-side fault must leave every worker PID stable
+            across all three coordinator incarnations, the same gate
+            kill_coordinator enforces;
+          * every phase is recorded, so the evidence distinguishes the
+            kill, the ghost's death at the point, and the clean recovery.
+        """
         if not self.fault_surface_present():
             # Recorded, not skipped silently: a campaign whose evidence
             # omits this cannot tell "the 2PC windows survived" from "the
@@ -348,30 +420,43 @@ class Chaos:
             # Fall back to a real external kill so the tick is not wasted.
             self.kill_worker(state, ckpt)
             return
-        point = self.rng.choice([
-            "sink.before_prepare",
-            "sink.after_prepare",
-            "coordinator.before_completed_marker",
-            "coordinator.after_completed_marker",
-            "sink.before_commit",
-            "sink.after_external_commit",
-        ])
+        if point is None:
+            point = self.rng.choice(list(self.TWOPC_POINTS))
         is_coordinator = point.startswith("coordinator.")
         host = (self.rig.hosts("coordinator")[0] if is_coordinator
                 else self.rng.choice(self.rig.hosts("worker")))
         compose = "coordinator.yml" if is_coordinator else "worker.yml"
         service = "clink-coordinator" if is_coordinator else "clink-worker"
+        worker_pids_before = self.worker_pids() if is_coordinator else None
         self.record(host["name"], f"twopc_arm:{point}", state, ckpt)
         self.rig.ssh(host, f"docker kill -s SIGKILL {service}")
+        self.assert_container_gone(host, service)
         self.rig.ssh(
             host,
             f"cd /qual && CLINK_FAULT_INJECT='{point}=exit:9@1' "
             f"docker compose -f {compose} up -d")
-        # Let it take the fault, then bring it back WITHOUT the arm so the
-        # next window is reached in a clean process.
-        time.sleep(self.rng.uniform(30, 90))
+        # The armed incarnation recovers and must DIE AT THE POINT. exit:9
+        # observed is the proof; anything else (still running, another exit
+        # code) means the window was not exercised and the campaign must
+        # know.
+        self.await_container_exit(host, service, expect_code=9)
+        self.record(host["name"], f"twopc_fired:{point}", "armed", ckpt,
+                    {"exit_code": 9})
+        if worker_pids_before is not None:
+            self.assert_worker_pids_stable(
+                worker_pids_before, f"the armed {point} incarnation")
+        # A short deliberate outage, then the clean process. Bounded and
+        # small: run C's arming left 30-90s of unattended dead air in which
+        # nothing was measured.
+        time.sleep(self.rng.uniform(5, 15))
         self.rig.ssh(host, f"cd /qual && docker compose -f {compose} up -d")
-        self.record(host["name"], f"twopc_recovered:{point}", "armed", ckpt)
+        self.assert_container_running(host, service)
+        extra = {}
+        if worker_pids_before is not None:
+            extra = {"worker_pids_before": worker_pids_before,
+                     "worker_pids_after": self.assert_worker_pids_stable(
+                         worker_pids_before, f"the {point} recovery")}
+        self.record(host["name"], f"twopc_recovered:{point}", "armed", ckpt, extra)
 
 
 PROFILES = {
@@ -393,6 +478,33 @@ PROFILES = {
 }
 
 
+def oracle_error_total(verdict_path: str):
+    """The verifier's combined error count, or None when no verdict is
+    readable yet. Any non-zero value means the campaign is ALREADY dirty:
+    every further fault changes state that the diagnosis will need frozen,
+    which is how run C spent ten more minutes mutating a broken cluster
+    before anyone looked."""
+    try:
+        with open(verdict_path) as f:
+            v = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return sum(int(v.get(k) or 0)
+               for k in ("missing", "duplicate", "conflicting", "incorrect", "foreign"))
+
+
+# Every fault a PASS verdict requires. The summariser refuses PASS unless
+# each of these left evidence of having actually happened (for the 2PC
+# points: twopc_fired, not merely twopc_arm).
+MANDATORY_FAULTS = (
+    "kill_worker",
+    "kill_coordinator",
+    "restart_broker",
+    "network_latency",
+    "partition_worker_from_coordinator",
+) + tuple(f"twopc:{p}" for p in Chaos.TWOPC_POINTS)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--inventory", required=True)
@@ -408,6 +520,15 @@ def main() -> int:
                          "have a chance to complete or the campaign measures "
                          "cascading failure rather than recovery")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--verdict", default="",
+                    help="path to the verifier's verdict.json; when set, the "
+                         "controller stops injecting the moment any oracle "
+                         "error counter is non-zero (exit 3), freezing the "
+                         "cluster for diagnosis")
+    ap.add_argument("--ensure-coverage", action="store_true",
+                    help="before the weighted-random loop, apply every "
+                         "mandatory fault once in a fixed order, so a PASS "
+                         "never depends on the dice having rolled them")
     args = ap.parse_args()
 
     rig = Rig(args.inventory, args.key_file)
@@ -419,6 +540,14 @@ def main() -> int:
     for name, weight in PROFILES[args.profile]:
         weighted.extend([name] * weight)
 
+    # The deterministic coverage pre-pass, then the weighted-random soak.
+    # Run C became dirty before random selection ever reached the ordinary
+    # kill_coordinator action; a verdict must never depend on that luck.
+    schedule = []
+    if args.ensure_coverage:
+        for name in MANDATORY_FAULTS:
+            schedule.append(name)
+
     started = time.time()
     last_ckpt = 0
     faults = 0
@@ -426,6 +555,17 @@ def main() -> int:
     while True:
         if args.duration_s and time.time() - started >= args.duration_s:
             break
+        if args.verdict:
+            dirty = oracle_error_total(args.verdict)
+            if dirty:
+                chaos.record("oracle", "oracle_dirty_stop", "dirty", last_ckpt,
+                             {"error_total": dirty,
+                              "note": "the verifier reports oracle errors; no further "
+                                      "faults will be injected so the cluster state "
+                                      "stays diagnosable"})
+                print(f"chaos: ORACLE DIRTY ({dirty} errors) - stopping fault "
+                      "injection to freeze the evidence", flush=True)
+                return 3
         # Trigger against observable state: wait for a checkpoint newer
         # than the last fault's, so every fault lands in steady state and
         # the recovery it causes is attributable.
@@ -438,7 +578,8 @@ def main() -> int:
             continue
         last_ckpt = ckpt
         status, _ = chaos.job_state()
-        fault = rng.choice(weighted)
+        scheduled = schedule.pop(0) if schedule else None
+        fault = scheduled if scheduled is not None else rng.choice(weighted)
         # One fault that cannot be applied must not end the campaign's
         # fault generation. It did exactly that on QUAL-01: the first
         # worker kill was applied, its restart came back misconfigured and
@@ -449,11 +590,20 @@ def main() -> int:
         # consecutive-failure ceiling below decide when the rig itself is
         # too broken to be worth continuing against.
         try:
-            getattr(chaos, fault)(status, ckpt)
+            if fault.startswith("twopc:"):
+                chaos.twopc_window_fault(status, ckpt, point=fault.split(":", 1)[1])
+            else:
+                getattr(chaos, fault)(status, ckpt)
             faults += 1
             consecutive_failures = 0
         except ChaosCommandFailed as exc:
             consecutive_failures += 1
+            if scheduled is not None:
+                # A mandatory fault that could not be applied is retried at
+                # the end of the pre-pass; a PASS without it is impossible
+                # (the summariser's coverage gate), so giving up silently
+                # here would only defer the failure to the verdict.
+                schedule.append(scheduled)
             chaos.record("controller", "fault_failed", status, ckpt,
                          {"attempted": fault, "error": str(exc),
                           "consecutive_failures": consecutive_failures})

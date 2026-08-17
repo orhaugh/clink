@@ -14,7 +14,10 @@
 #   qual-<id>-worker{1..3}  CPX31  clink workers
 #   qual-<id>-broker{1..3}  CPX21  Redpanda cluster (Kafka API)
 #
-# ~EUR 0.19/hour all in; the 7-day QUAL-01 campaign is ~EUR 32.
+# Measured on the 2026-08-17 rig (this exact topology): EUR 0.433/hour,
+# so a 2-hour shakedown is ~EUR 0.87 and the 7-day QUAL-01 campaign
+# ~EUR 73. Earlier comments quoting EUR 0.19/hour predate the cpx*2
+# generation and the 8-host topology; do not budget from them.
 set -euo pipefail
 
 # Same guard as the benchmark rig, for the same reason: the active hcloud
@@ -192,6 +195,11 @@ echo "==> firewall applied to every host"
 echo
 echo "Inventory:"
 hcloud server list -l "qual-run=${RUN_ID}" -o columns=name,status,ipv4,private_net
+# The machine-readable inventory every other tool keys on (pull-image.sh
+# refuses to run without it, chaos.py and campaign.sh read it). Written
+# HERE so the rig never exists without its inventory - the prior run had
+# to reconstruct it by hand before the image pull could proceed.
+"$(dirname "$0")/inventory.sh"
 echo
 echo "REMINDER: these bill until destroyed."
 echo "  scripts/qualification/destroy.sh ${RUN_ID} --yes   # then:"

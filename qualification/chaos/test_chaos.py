@@ -67,6 +67,10 @@ class FakeRig:
         # Simulate a runtime policy that wrongly replaces every worker when
         # the coordinator is restarted.
         self.restart_workers_with_coordinator = False
+        # If set, an ARMED container never reaches its fault point: it keeps
+        # running instead of exiting - the inert-arm defect (a point that is
+        # unreachable in the deployed pipeline).
+        self.fault_never_fires = False
 
     def hosts(self, role):
         return [h for h in self.inv["hosts"] if h["role"] == role]
@@ -83,6 +87,22 @@ class FakeRig:
                 if n in command:
                     return FakeResult(str(details["pid"] if details["up"] else 0))
             return FakeResult("0")
+
+        if "docker inspect" in command and ".State.Status" in command:
+            for n, details in conts.items():
+                if n in command:
+                    armed = details.get("armed_exit")
+                    if details["up"] and armed is not None and not self.fault_never_fires:
+                        # The armed incarnation recovers, reaches the point,
+                        # and dies with the armed code.
+                        details["up"] = False
+                        details["exit_code"] = armed
+                        details["pid"] = 0
+                        return FakeResult(f"exited {armed}")
+                    if details["up"]:
+                        return FakeResult("running 0")
+                    return FakeResult(f"exited {details.get('exit_code', 137)}")
+            return FakeResult("absent 0")
 
         if "docker ps" in command:
             name = None
@@ -103,6 +123,7 @@ class FakeRig:
                 if n in command:
                     conts[n]["up"] = False
                     conts[n]["pid"] = 0
+                    conts[n]["exit_code"] = 137
             return FakeResult("")
 
         if "docker compose" in command and "up -d" in command:
@@ -113,6 +134,12 @@ class FakeRig:
                 conts[target]["up"] = True
                 self.next_pid += 1
                 conts[target]["pid"] = self.next_pid
+                # An armed start records the exit code the fault will use;
+                # an unarmed start clears any previous arm.
+                if "CLINK_FAULT_INJECT=" in command:
+                    conts[target]["armed_exit"] = 9
+                else:
+                    conts[target].pop("armed_exit", None)
                 if self.restart_image:
                     conts[target]["image"] = self.restart_image
                 if target == "clink-coordinator" and self.restart_workers_with_coordinator:
@@ -280,6 +307,151 @@ def test_loop_survives_a_failed_fault_and_reports_zero(tmp):
           f"rc={rc} streak={streak[-8:]}")
 
 
+def _no_sleep():
+    orig = C.time.sleep
+    C.time.sleep = lambda s: None  # type: ignore[assignment]
+    return orig
+
+
+def test_twopc_fault_verifies_it_fired(tmp):
+    """The inert-arm defect: run C armed sink.before_prepare four times
+    against a pipeline whose sink never fired it, and the evidence read as
+    coverage. The controller must now observe the armed process EXIT WITH
+    THE FAULT'S CODE before recording the fault as having happened."""
+    rig = FakeRig()
+    log = os.path.join(tmp, "g.jsonl")
+    ch = make_chaos(rig, log)
+    ch._fault_surface = True
+    orig = _no_sleep()
+    try:
+        ch.twopc_window_fault("RUNNING", 12, point="coordinator.after_completed_marker")
+    finally:
+        C.time.sleep = orig
+    kinds = [e["fault"] for e in read_log(log)]
+    check("a twopc fault records arm, fired and recovered",
+          kinds == ["twopc_arm:coordinator.after_completed_marker",
+                    "twopc_fired:coordinator.after_completed_marker",
+                    "twopc_recovered:coordinator.after_completed_marker"], str(kinds))
+    recovered = read_log(log)[-1]
+    check("a coordinator twopc fault carries stable worker PID evidence",
+          recovered.get("worker_pids_before") == recovered.get("worker_pids_after")
+          and recovered.get("worker_pids_before"), str(recovered))
+
+
+def test_twopc_point_that_never_fires_raises(tmp):
+    rig = FakeRig()
+    rig.fault_never_fires = True
+    ch = make_chaos(rig, os.path.join(tmp, "h.jsonl"))
+    ch._fault_surface = True
+    orig = _no_sleep()
+    try:
+        try:
+            ch.twopc_window_fault("RUNNING", 12, point="sink.before_prepare")
+            check("an armed point that never fires raises", False, "no exception")
+        except C.ChaosCommandFailed as exc:
+            check("an armed point that never fires raises",
+                  "did not fire" in str(exc) or "never exited" in str(exc), str(exc)[:100])
+    finally:
+        C.time.sleep = orig
+    kinds = [e["fault"] for e in read_log(os.path.join(tmp, "h.jsonl"))]
+    check("an unfired point records no twopc_fired evidence",
+          not any(k.startswith("twopc_fired") for k in kinds), str(kinds))
+
+
+def test_twopc_coordinator_fault_rejects_worker_pid_churn(tmp):
+    rig = FakeRig()
+    rig.restart_workers_with_coordinator = True
+    ch = make_chaos(rig, os.path.join(tmp, "i.jsonl"))
+    ch._fault_surface = True
+    orig = _no_sleep()
+    try:
+        try:
+            ch.twopc_window_fault("RUNNING", 12, point="coordinator.before_completed_marker")
+            check("a twopc coordinator fault rejects worker PID churn", False, "no exception")
+        except C.ChaosCommandFailed as exc:
+            check("a twopc coordinator fault rejects worker PID churn",
+                  "PID changed" in str(exc), str(exc)[:100])
+    finally:
+        C.time.sleep = orig
+
+
+def test_oracle_dirty_stops_injection(tmp):
+    """Fail-fast: the moment the verifier counts any error, injecting more
+    faults only destroys the evidence. Run C's ten-minute polling let the
+    cluster mutate for most of an hour after the first bad window."""
+    rig = FakeRig()
+    log = os.path.join(tmp, "j.jsonl")
+    inv = os.path.join(tmp, "inv.json")
+    json.dump(rig.inv, open(inv, "w"))
+    verdict = os.path.join(tmp, "verdict.json")
+    json.dump({"missing": 0, "duplicate": 0, "conflicting": 0,
+               "incorrect": 12, "foreign": 0}, open(verdict, "w"))
+
+    orig_rig, orig_sleep = C.Rig, C.time.sleep
+    C.Rig = lambda *a, **k: rig          # type: ignore[assignment]
+    C.time.sleep = lambda s: None        # type: ignore[assignment]
+    orig_state = C.Chaos.job_state
+    orig_await = C.Chaos.await_healthy_checkpoint
+    C.Chaos.job_state = lambda self: ("RUNNING", 10)      # type: ignore[assignment]
+    C.Chaos.await_healthy_checkpoint = lambda self, since, timeout_s=600: since + 1  # type: ignore
+    argv = sys.argv
+    sys.argv = ["chaos.py", "--inventory", inv, "--log", log,
+                "--coordinator-url", "http://stub:8095", "--job-id", "1",
+                "--run-id", "t", "--duration-s", "600", "--verdict", verdict]
+    try:
+        rc = C.main()
+    finally:
+        C.Rig, C.time.sleep, sys.argv = orig_rig, orig_sleep, argv
+        C.Chaos.job_state = orig_state
+        C.Chaos.await_healthy_checkpoint = orig_await
+    check("a dirty oracle stops injection with a distinct exit code", rc == 3, f"rc={rc}")
+    kinds = [e["fault"] for e in read_log(log)]
+    check("the stop is recorded as evidence", "oracle_dirty_stop" in kinds, str(kinds))
+
+
+def test_ensure_coverage_applies_every_mandatory_fault(tmp):
+    """A PASS must never depend on the dice: with --ensure-coverage the
+    controller applies every mandatory fault once before the random soak,
+    and each 2PC point leaves twopc_fired evidence."""
+    rig = FakeRig()
+    log = os.path.join(tmp, "k.jsonl")
+    inv = os.path.join(tmp, "inv.json")
+    json.dump(rig.inv, open(inv, "w"))
+
+    orig_rig, orig_sleep = C.Rig, C.time.sleep
+    C.Rig = lambda *a, **k: rig          # type: ignore[assignment]
+    C.time.sleep = lambda s: None        # type: ignore[assignment]
+    orig_state = C.Chaos.job_state
+    orig_await = C.Chaos.await_healthy_checkpoint
+    orig_surface = C.Chaos.fault_surface_present
+    C.Chaos.job_state = lambda self: ("RUNNING", 10)      # type: ignore[assignment]
+    C.Chaos.await_healthy_checkpoint = lambda self, since, timeout_s=600: since + 1  # type: ignore
+    C.Chaos.fault_surface_present = lambda self: True     # type: ignore[assignment]
+    argv = sys.argv
+    sys.argv = ["chaos.py", "--inventory", inv, "--log", log,
+                "--coordinator-url", "http://stub:8095", "--job-id", "1",
+                "--run-id", "t", "--duration-s", "1", "--seed", "5",
+                "--ensure-coverage"]
+    try:
+        rc = C.main()
+    finally:
+        C.Rig, C.time.sleep, sys.argv = orig_rig, orig_sleep, argv
+        C.Chaos.job_state = orig_state
+        C.Chaos.await_healthy_checkpoint = orig_await
+        C.Chaos.fault_surface_present = orig_surface
+    kinds = [e["fault"] for e in read_log(log)]
+    missing = []
+    for point in C.Chaos.TWOPC_POINTS:
+        if f"twopc_fired:{point}" not in kinds:
+            missing.append(point)
+    for marker in ("worker_sigkill", "coordinator_restart", "broker_restart",
+                   "network_latency", "partition_from_coordinator"):
+        if marker not in kinds:
+            missing.append(marker)
+    check("ensure-coverage leaves fired evidence for every mandatory fault",
+          rc == 0 and not missing, f"rc={rc} missing={missing}")
+
+
 def main():
     print("chaos controller functional tests (no rig)")
     with tempfile.TemporaryDirectory() as tmp:
@@ -290,6 +462,11 @@ def main():
         test_coordinator_kill_leaves_workers_running(tmp)
         test_coordinator_kill_rejects_worker_pid_churn(tmp)
         test_loop_survives_a_failed_fault_and_reports_zero(tmp)
+        test_twopc_fault_verifies_it_fired(tmp)
+        test_twopc_point_that_never_fires_raises(tmp)
+        test_twopc_coordinator_fault_rejects_worker_pid_churn(tmp)
+        test_oracle_dirty_stops_injection(tmp)
+        test_ensure_coverage_applies_every_mandatory_fault(tmp)
     bad = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} passed")
     return 1 if bad else 0

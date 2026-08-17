@@ -127,26 +127,9 @@ if [ "${SKIP_PROVISION:-0}" != "1" ]; then
 fi
 
 # Inventory, read from the API by label - never hand-maintained.
-hcloud server list -l "qual-run=${RIG_RUN_ID}" -o json | python3 -c "
-import json, sys
-servers = json.load(sys.stdin)
-hosts = []
-for s in servers:
-    name = s['name']
-    role = ('ops' if name.endswith('-ops') else
-            'coordinator' if name.endswith('-coordinator') else
-            'worker' if '-worker' in name else
-            'broker' if '-broker' in name else 'unknown')
-    hosts.append({
-        'name': name,
-        'role': role,
-        'public_ip': s['public_net']['ipv4']['ip'],
-        'private_ip': (s.get('private_net') or [{}])[0].get('ip', ''),
-    })
-json.dump({'run_id': '${RUN_ID}', 'hosts': sorted(hosts, key=lambda h: h['name'])},
-          open('${OUT_DIR}/inventory.json', 'w'), indent=2)
-print('campaign: inventory ->', '${OUT_DIR}/inventory.json')
-"
+# One inventory implementation for every tool (provision.sh writes it at
+# rig creation; this refresh covers a rig reused under a new run id).
+RUN_ID="$RUN_ID" "$HERE/../infra/inventory.sh" "$RIG_RUN_ID" "$OUT_DIR"
 
 read_inv() { python3 -c "
 import json
@@ -167,7 +150,10 @@ BROKER_LIST=$(for ip in $BROKER_PRIVS; do printf "%s:9092," "$ip"; done | sed 's
 SEED_LIST=$(for ip in $BROKER_PRIVS; do printf "%s:33145," "$ip"; done | sed 's/,$//')
 echo "campaign: brokers=$BROKER_LIST coordinator=$COORD_PRIV ops=$OPS_PUB"
 
-for h in $OPS_PUB $COORD_PUB $WORKER_PUBS; do
+# Brokers included: run C's deploy raced broker docker readiness because
+# only ops/coordinator/workers were gated here, and the broker compose
+# below then failed on the slowest host.
+for h in $OPS_PUB $COORD_PUB $WORKER_PUBS $(read_inv broker public_ip); do
     until on_host "$h" "docker info >/dev/null 2>&1"; do
         echo "campaign: waiting for docker on $h"; sleep 15
     done
@@ -446,11 +432,16 @@ echo "campaign: verifier judging windows ($JUDGED evaluated)"
 
 # --- chaos --------------------------------------------------------------
 DURATION_S=$(( DURATION_H * 3600 ))
+# --verdict: the controller stops injecting the moment the oracle counts
+# any error, freezing the cluster for diagnosis instead of mutating it
+# for the rest of the soak. --ensure-coverage: every mandatory fault -
+# including each named 2PC point, verified to have FIRED - lands once
+# before the weighted-random phase, so a PASS never depends on the dice.
 start_on_host "$OPS_PUB" chaos.log "python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
-    --duration-s $DURATION_S"
-echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE)"
+    --duration-s $DURATION_S --verdict /qual/verdict.json --ensure-coverage"
+echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE, coverage-first, oracle fail-fast)"
 
 # 5. Chaos must actually land a fault. A controller that applies none is
 #    the failure this harness has already had once, and it looks exactly
@@ -508,16 +499,46 @@ echo "campaign: verification summary" > "$OUT_DIR/verification.txt"
   echo "recovered_after_first_fault=yes"; } >> "$OUT_DIR/verification.txt"
 
 # --- watch --------------------------------------------------------------
-# Poll evidence back to the laptop every 10 minutes, so a campaign that
-# dies at hour 90 still has 89 hours of evidence locally.
+# Poll evidence back to the laptop every 2 minutes - both so a campaign
+# that dies at hour 90 still has its evidence locally, and so a dirty
+# oracle is acted on within minutes. Run C's 10-minute cadence let the
+# cluster keep mutating for most of an hour after the first bad window.
 END=$(( $(date +%s) + DURATION_S ))
 CHAOS_DIED_AT=""
 JOB_GONE_AT=""
+ORACLE_DIRTY=""
 while [ "$(date +%s)" -lt "$END" ]; do
-    sleep 600
+    sleep 120
     for f in verdict.json chaos.jsonl progress.json generator.log verifier.log chaos.log; do
         scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
     done
+
+    # FAIL FAST on the oracle. One non-zero error counter means the
+    # campaign has already failed; the only useful thing left is to freeze
+    # and collect the evidence while the state that produced the defect
+    # still exists. The chaos controller watches the same file and stops
+    # injecting on its own; this stops the SOAK.
+    ORACLE_DIRTY=$(python3 - "$OUT_DIR/verdict.json" <<'PY' || echo ""
+import json, sys
+try:
+    v = json.load(open(sys.argv[1]))
+except Exception:
+    print("")
+    sys.exit(0)
+bad = sum(int(v.get(k) or 0)
+          for k in ("missing", "duplicate", "conflicting", "incorrect", "foreign"))
+print(bad if bad else "")
+PY
+)
+    if [ -n "$ORACLE_DIRTY" ]; then
+        echo "campaign: ORACLE DIRTY ($ORACLE_DIRTY errors) - stopping the soak now and" >&2
+        echo "  collecting evidence; every further minute of faults would mutate the" >&2
+        echo "  state a diagnosis needs frozen." >&2
+        { echo "oracle_dirty=yes"; echo "error_total=$ORACLE_DIRTY";
+          echo "noticed_at_utc=$(date -u +%H:%M)"; } > "$OUT_DIR/oracle-dirty.txt"
+        on_host "$OPS_PUB" "pkill -INT -f '[c]haos.py' || true"
+        break
+    fi
 
     # Is anything still applying faults?
     #
@@ -622,3 +643,9 @@ echo
 echo "campaign: evidence in $OUT_DIR"
 echo "campaign: rig STILL RUNNING and billing. Tear down with:"
 echo "  scripts/qualification/destroy.sh $RUN_ID --yes && qualification/infra/teardown.sh --check"
+if [ -n "${ORACLE_DIRTY:-}" ]; then
+    echo "campaign: RESULT: FAILED FAST on a dirty oracle ($ORACLE_DIRTY errors); the" >&2
+    echo "  configured duration was NOT completed and this run is a FAILURE, not a" >&2
+    echo "  short pass. Evidence above; do not publish." >&2
+    exit 4
+fi

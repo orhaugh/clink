@@ -11,6 +11,9 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "chaos"))
+from chaos import Chaos  # noqa: E402  (single source of truth for the fault points)
+
 
 def load_json(path, default=None):
     try:
@@ -18,6 +21,51 @@ def load_json(path, default=None):
             return json.load(f)
     except (OSError, ValueError):
         return default
+
+
+# What a PASS must be able to point at in chaos.jsonl. For the 2PC points
+# the required record is twopc_fired - an arm alone proves nothing (run C
+# armed sink.before_prepare against a sink that never fired it, and the
+# evidence read as coverage).
+MANDATORY_EVENTS = (
+    "worker_sigkill",
+    "coordinator_restart",
+    "broker_restart",
+    "network_latency",
+    "partition_from_coordinator",
+) + tuple(f"twopc_fired:{p}" for p in Chaos.TWOPC_POINTS)
+
+
+def coverage_and_pid_gates(chaos_path):
+    """(missing_events, pid_violations, coordinator_restarts_with_evidence).
+
+    Scans the retained chaos log and answers the two questions a PASS
+    depends on: did every mandatory fault provably happen, and does every
+    coordinator restart carry stable worker-PID evidence."""
+    seen = collections.Counter()
+    pid_violations = []
+    coord_restarts = 0
+    if os.path.exists(chaos_path):
+        with open(chaos_path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                fault = entry.get("fault", "")
+                seen[fault] += 1
+                is_coord_restart = (fault == "coordinator_restart"
+                                    or fault.startswith("twopc_recovered:coordinator."))
+                if is_coord_restart:
+                    coord_restarts += 1
+                    before = entry.get("worker_pids_before")
+                    after = entry.get("worker_pids_after")
+                    if not before or not after:
+                        pid_violations.append(f"{fault}: no worker PID evidence recorded")
+                    elif before != after:
+                        pid_violations.append(f"{fault}: worker PIDs changed {before} -> {after}")
+    missing = [ev for ev in MANDATORY_EVENTS if seen[ev] == 0]
+    return missing, pid_violations, coord_restarts
 
 
 def main() -> int:
@@ -58,9 +106,28 @@ def main() -> int:
     foreign = verdict.get("foreign")
     counted = [missing, duplicate, conflicting, incorrect, foreign]
     have_verdict = verdict.get("final") and all(c is not None for c in counted)
-    result = ("PASS" if have_verdict and not any(counted) and not recovery_timeouts
-              else "FAIL" if have_verdict or recovery_timeouts
-              else "INCONCLUSIVE (no final verdict written)")
+    uncovered, pid_violations, coord_restarts = coverage_and_pid_gates(chaos_path)
+    dirty_stop = os.path.exists(os.path.join(d, "oracle-dirty.txt"))
+    # Any observed oracle error is a FAILURE even without a final verdict:
+    # an interrupted run may be INCONCLUSIVE, but an interrupted run that
+    # already counted errors is not.
+    observed_errors = sum(int(c) for c in counted if c is not None)
+    clean = have_verdict and not observed_errors and not recovery_timeouts and not dirty_stop
+    if clean and not uncovered and not pid_violations:
+        result = "PASS"
+    elif clean:
+        # Correct output, but the campaign cannot prove it was under the
+        # required faults - a clean verdict without coverage is not a pass,
+        # it is an experiment that did not happen.
+        gaps = uncovered + pid_violations
+        result = ("INCONCLUSIVE (correctness clean but required-fault coverage "
+                  f"incomplete: {'; '.join(gaps)})")
+    elif observed_errors or recovery_timeouts or dirty_stop:
+        result = "FAIL"
+    elif have_verdict:
+        result = "FAIL"
+    else:
+        result = "INCONCLUSIVE (no final verdict written)"
 
     def num(x):
         return "no evidence" if x is None else str(x)
@@ -91,6 +158,16 @@ def main() -> int:
             print(f"- {name}: {count}")
     else:
         print("- none recorded")
+    print()
+
+    print("## Required-fault coverage\n")
+    for event in MANDATORY_EVENTS:
+        status = "MISSING" if event in uncovered else "covered"
+        print(f"- {event}: {status}")
+    print(f"- coordinator restarts with stable-PID evidence: {coord_restarts}"
+          + (f" ({len(pid_violations)} VIOLATION(S))" if pid_violations else ""))
+    for violation in pid_violations:
+        print(f"  - {violation}")
     print()
 
     print("## Correctness (independent oracle, read_committed)\n")
