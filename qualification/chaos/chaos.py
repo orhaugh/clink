@@ -423,40 +423,76 @@ class Chaos:
         if point is None:
             point = self.rng.choice(list(self.TWOPC_POINTS))
         is_coordinator = point.startswith("coordinator.")
-        host = (self.rig.hosts("coordinator")[0] if is_coordinator
-                else self.rng.choice(self.rig.hosts("worker")))
         compose = "coordinator.yml" if is_coordinator else "worker.yml"
         service = "clink-coordinator" if is_coordinator else "clink-worker"
+        # Sink points only fire in a process that actually hosts a sink
+        # subtask, and placement decides that - so a single randomly chosen
+        # worker can be an inert arm (run d armed the same sinkless worker
+        # twice). Walk the candidates until the point fires; a coordinator
+        # point has exactly one candidate.
+        if is_coordinator:
+            candidates = [self.rig.hosts("coordinator")[0]]
+        else:
+            candidates = list(self.rig.hosts("worker"))
+            self.rng.shuffle(candidates)
         worker_pids_before = self.worker_pids() if is_coordinator else None
-        self.record(host["name"], f"twopc_arm:{point}", state, ckpt)
-        self.rig.ssh(host, f"docker kill -s SIGKILL {service}")
-        self.assert_container_gone(host, service)
-        self.rig.ssh(
-            host,
-            f"cd /qual && CLINK_FAULT_INJECT='{point}=exit:9@1' "
-            f"docker compose -f {compose} up -d")
-        # The armed incarnation recovers and must DIE AT THE POINT. exit:9
-        # observed is the proof; anything else (still running, another exit
-        # code) means the window was not exercised and the campaign must
-        # know.
-        self.await_container_exit(host, service, expect_code=9)
-        self.record(host["name"], f"twopc_fired:{point}", "armed", ckpt,
-                    {"exit_code": 9})
-        if worker_pids_before is not None:
-            self.assert_worker_pids_stable(
-                worker_pids_before, f"the armed {point} incarnation")
-        # A short deliberate outage, then the clean process. Bounded and
-        # small: run C's arming left 30-90s of unattended dead air in which
-        # nothing was measured.
-        time.sleep(self.rng.uniform(5, 15))
-        self.rig.ssh(host, f"cd /qual && docker compose -f {compose} up -d")
-        self.assert_container_running(host, service)
+        fired_host = None
+        for host in candidates:
+            self.record(host["name"], f"twopc_arm:{point}", state, ckpt)
+            self.rig.ssh(host, f"docker kill -s SIGKILL {service}")
+            self.assert_container_gone(host, service)
+            self.rig.ssh(
+                host,
+                f"cd /qual && CLINK_FAULT_INJECT='{point}=exit:9@1' "
+                f"docker compose -f {compose} up -d")
+            fired = False
+            try:
+                # The armed incarnation recovers and must DIE AT THE POINT.
+                # exit:9 observed is the proof; anything else (still
+                # running, another exit code) means this process did not
+                # exercise the window.
+                self.await_container_exit(host, service, expect_code=9)
+                fired = True
+                self.record(host["name"], f"twopc_fired:{point}", "armed", ckpt,
+                            {"exit_code": 9})
+            except ChaosCommandFailed:
+                # An inert candidate, not a failure of the fault: the point
+                # lives in a process this host does not run (a sink subtask
+                # placed elsewhere). Recorded below; the walk continues.
+                pass
+            finally:
+                # THE ARM IS REMOVED ON EVERY PATH, fired or not, before
+                # anything else can raise. Run d left a never-fired arm
+                # running on a worker; a later redeploy placed a sink there,
+                # the stale arm detonated mid-recovery of a DIFFERENT fault,
+                # and the abort that followed also skipped the coordinator's
+                # own unarmed restart - a decapitated cluster from one
+                # missing cleanup. A short deliberate outage applies only
+                # after a genuine fire; an inert candidate is restored
+                # immediately.
+                if fired:
+                    time.sleep(self.rng.uniform(5, 15))
+                self.rig.ssh(host, f"cd /qual && docker compose -f {compose} up -d")
+                self.assert_container_running(host, service)
+            if fired:
+                fired_host = host
+                break
+            self.record(host["name"], f"twopc_arm_inert:{point}", "armed", ckpt,
+                        {"note": "the point did not fire in this process "
+                                 "(no hosting subtask); disarmed and restored"})
+        if fired_host is None:
+            raise ChaosCommandFailed(
+                f"{point} did not fire on any candidate host - the armed fault point is "
+                "unreachable in this deployment and has produced no coverage")
         extra = {}
         if worker_pids_before is not None:
+            # The gate runs AFTER the unarmed restore above, so a violation
+            # can no longer strand a dead coordinator; it still fails the
+            # fault loudly.
             extra = {"worker_pids_before": worker_pids_before,
                      "worker_pids_after": self.assert_worker_pids_stable(
-                         worker_pids_before, f"the {point} recovery")}
-        self.record(host["name"], f"twopc_recovered:{point}", "armed", ckpt, extra)
+                         worker_pids_before, f"the {point} fault")}
+        self.record(fired_host["name"], f"twopc_recovered:{point}", "armed", ckpt, extra)
 
 
 PROFILES = {

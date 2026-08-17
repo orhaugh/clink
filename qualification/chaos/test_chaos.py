@@ -71,6 +71,10 @@ class FakeRig:
         # running instead of exiting - the inert-arm defect (a point that is
         # unreachable in the deployed pipeline).
         self.fault_never_fires = False
+        # If set to a host name, an armed fault fires ONLY there - modelling
+        # a point (a sink barrier) that only exists in the process actually
+        # hosting that operator. Arms on other hosts stay inert.
+        self.fault_fires_only_on = None
 
     def hosts(self, role):
         return [h for h in self.inv["hosts"] if h["role"] == role]
@@ -92,7 +96,10 @@ class FakeRig:
             for n, details in conts.items():
                 if n in command:
                     armed = details.get("armed_exit")
-                    if details["up"] and armed is not None and not self.fault_never_fires:
+                    inert = self.fault_never_fires or (
+                        self.fault_fires_only_on is not None
+                        and host["name"] != self.fault_fires_only_on)
+                    if details["up"] and armed is not None and not inert:
                         # The armed incarnation recovers, reaches the point,
                         # and dies with the armed code.
                         details["up"] = False
@@ -375,6 +382,80 @@ def test_twopc_coordinator_fault_rejects_worker_pid_churn(tmp):
         C.time.sleep = orig
 
 
+def test_an_unfired_arm_is_always_disarmed(tmp):
+    """Run d's first defect: a point that never fired raised its error and
+    left the process RUNNING WITH THE ARM STILL SET. The stale arm detonated
+    minutes later when a redeploy finally placed a sink on that worker. An
+    arm must be removed on EVERY exit path, fired or not."""
+    rig = FakeRig()
+    rig.fault_never_fires = True
+    ch = make_chaos(rig, os.path.join(tmp, "l.jsonl"))
+    ch._fault_surface = True
+    orig = _no_sleep()
+    try:
+        try:
+            ch.twopc_window_fault("RUNNING", 12, point="sink.before_prepare")
+        except C.ChaosCommandFailed:
+            pass
+    finally:
+        C.time.sleep = orig
+    stale = [(h, n) for h, conts in rig.state.items()
+             for n, d in conts.items() if d.get("armed_exit") is not None]
+    running = all(d["up"] for h in ("w1", "w2")
+                  for d in [rig.state[h]["clink-worker"]])
+    check("an unfired arm is removed before the fault action returns",
+          not stale and running, f"stale={stale} all_running={running}")
+
+
+def test_coordinator_is_restored_even_when_a_gate_raises(tmp):
+    """Run d's second defect: the fired coordinator fault aborted inside the
+    worker-PID gate and never ran the unarmed restart, leaving the cluster
+    decapitated. The unarmed restore must precede any gate that can raise."""
+    rig = FakeRig()
+    rig.restart_workers_with_coordinator = True   # makes the PID gate raise
+    ch = make_chaos(rig, os.path.join(tmp, "m.jsonl"))
+    ch._fault_surface = True
+    orig = _no_sleep()
+    try:
+        try:
+            ch.twopc_window_fault("RUNNING", 12,
+                                  point="coordinator.before_completed_marker")
+            check("a coordinator gate failure still raises", False, "no exception")
+        except C.ChaosCommandFailed:
+            check("a coordinator gate failure still raises", True)
+    finally:
+        C.time.sleep = orig
+    coord = rig.state["coord"]["clink-coordinator"]
+    check("the coordinator is back up and unarmed after the gate failure",
+          coord["up"] and coord.get("armed_exit") is None,
+          f"up={coord['up']} armed={coord.get('armed_exit')}")
+
+
+def test_sink_faults_try_each_worker_until_the_point_fires(tmp):
+    """Placement decides which worker hosts a sink subtask, so arming one
+    random worker can be inert (run d armed worker1 twice for nothing). The
+    fault walks the workers until the point fires, disarming each inert
+    candidate on the way."""
+    rig = FakeRig()
+    rig.fault_fires_only_on = "w2"
+    log = os.path.join(tmp, "n.jsonl")
+    ch = make_chaos(rig, log)
+    ch._fault_surface = True
+    orig = _no_sleep()
+    try:
+        ch.twopc_window_fault("RUNNING", 12, point="sink.before_prepare")
+    finally:
+        C.time.sleep = orig
+    kinds = [e["fault"] for e in read_log(log)]
+    check("the point eventually fires on the hosting worker",
+          "twopc_fired:sink.before_prepare" in kinds, str(kinds))
+    stale = [(h, n) for h, conts in rig.state.items()
+             for n, d in conts.items() if d.get("armed_exit") is not None]
+    up = [rig.state[h]["clink-worker"]["up"] for h in ("w1", "w2")]
+    check("every candidate ends unarmed and running", not stale and all(up),
+          f"stale={stale} up={up}")
+
+
 def test_oracle_dirty_stops_injection(tmp):
     """Fail-fast: the moment the verifier counts any error, injecting more
     faults only destroys the evidence. Run C's ten-minute polling let the
@@ -465,6 +546,9 @@ def main():
         test_twopc_fault_verifies_it_fired(tmp)
         test_twopc_point_that_never_fires_raises(tmp)
         test_twopc_coordinator_fault_rejects_worker_pid_churn(tmp)
+        test_an_unfired_arm_is_always_disarmed(tmp)
+        test_coordinator_is_restored_even_when_a_gate_raises(tmp)
+        test_sink_faults_try_each_worker_until_the_point_fires(tmp)
         test_oracle_dirty_stops_injection(tmp)
         test_ensure_coverage_applies_every_mandatory_fault(tmp)
     bad = [r for r in RESULTS if not r[1]]
