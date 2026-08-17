@@ -15576,6 +15576,59 @@ TEST(WindowStateLifecycle, EveryKindSurvivesSnapshotAndRestore) {
     }
 }
 
+// A checkpoint taken after a window fires must replace the earlier checkpoint's
+// open-window state with its empty post-fire state. This is the other half of
+// restore correctness: preserving open windows without persisting their removal
+// resurrects already-emitted results after a later recovery.
+TEST(WindowStateLifecycle, FiredWindowsStayPurgedAcrossTheNextSnapshotAndRestore) {
+    ensure_sql_installed_once();
+    MetricsRegistry metrics;
+    const auto input = rescale_input();
+    const OperatorId op_id{9924};
+
+    for (const auto& kind : all_window_kinds()) {
+        auto op = build_window_op(kind);
+        ASSERT_NE(op, nullptr) << kind.label;
+        auto backend = std::make_shared<InMemoryStateBackend>();
+        RuntimeContext ctx{op_id, "win", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+
+        Batch<Row> batch;
+        for (const auto& [ts, key] : input) {
+            Row row;
+            row.values["auction"] = clink::config::JsonValue{key};
+            row.values["datetime"] = clink::config::JsonValue{ts};
+            batch.emplace(std::move(row), EventTime{ts});
+        }
+        std::size_t emitted = 0;
+        Emitter<Row> em([&](StreamElement<Row> element) {
+            if (element.is_data()) {
+                emitted += element.as_data().size();
+            }
+            return true;
+        });
+        op->process(StreamElement<Row>::data(std::move(batch)), em);
+
+        // Materialise the open-window state in checkpoint 1, then fire it and
+        // take checkpoint 2. A backend update bug can otherwise leave checkpoint
+        // 2 carrying the old buckets even though the live operator purged them.
+        op->snapshot_timers(*backend, op_id);
+        (void)backend->snapshot(CheckpointId{1});
+        op->process(StreamElement<Row>::watermark(Watermark{EventTime{kRescaleTerminalWm}}), em);
+        ASSERT_GT(emitted, 0u) << kind.label << ": the precondition did not fire any windows";
+        op->snapshot_timers(*backend, op_id);
+        auto post_fire = backend->snapshot(CheckpointId{2});
+        op->close();
+
+        const auto replayed =
+            restore_subtask_and_drain(kind, {std::move(post_fire)}, 0, 1, op_id, metrics);
+        EXPECT_TRUE(replayed.empty())
+            << kind.label << ": a fired window was resurrected by checkpoint 2; first row: "
+            << (replayed.empty() ? std::string{} : *replayed.begin());
+    }
+}
+
 // Scale UP: one subtask's open windows must redistribute across the new subtasks
 // with nothing lost and nothing restored into two of them.
 TEST(WindowRescale, ScaleUpSplitsOpenWindowsWithoutLossOrDuplication) {

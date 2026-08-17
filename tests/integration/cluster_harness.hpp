@@ -495,15 +495,21 @@ public:
     // Bring up `n` coordinator processes under leader election and wait for
     // one to win. Requires ClusterSpec::ha.
     [[nodiscard]] bool start_ha_coordinators(std::size_t n, const ProcOptions& opts = {}) {
-        if (!spec_.ha || n == 0) {
+        // The node starts its HTTP listener before it wins leadership, so
+        // standbys cannot share one HTTP port. A test that needs HTTP uses a
+        // single HA coordinator and starts its replacement after the kill.
+        if (!spec_.ha || n == 0 || (spec_.http && n != 1)) {
             return false;
         }
         ReservedPort rpc;
+        ReservedPort http;
         if (!rpc.valid()) {
             return false;
         }
         coordinator_port_ = rpc.port();
+        http_port_ = spec_.http ? http.port() : 0;
         rpc.release();
+        http.release();
         for (std::size_t i = 0; i < n; ++i) {
             std::vector<std::string> argv{spec_.node_binary.string(),
                                           "--role=coordinator",
@@ -511,6 +517,9 @@ public:
                                           "--advertise-host=127.0.0.1",
                                           "--port=" + std::to_string(coordinator_port_),
                                           "--ha-dir=" + ha_dir().string()};
+            if (spec_.http) {
+                argv.push_back("--http-port=" + std::to_string(http_port_));
+            }
             argv.insert(argv.end(), opts.extra_args.begin(), opts.extra_args.end());
             ha_coordinators_.push_back(std::make_unique<Process>());
             if (!ha_coordinators_.back()->spawn("coordinator-" + std::to_string(i),
@@ -521,7 +530,8 @@ public:
                 return false;
             }
         }
-        return await_leader_elected() && await_coordinator_ready();
+        return await_leader_elected() && await_coordinator_ready() &&
+               (!spec_.http || await([this] { return port_accepting(http_port_); }));
     }
 
     // Index of the process currently holding leadership, by its own log.

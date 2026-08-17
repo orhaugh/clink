@@ -8,6 +8,23 @@
 
 Link the `clink::test_support` CMake target from test executables only; production binaries must not depend on it. Everything lives in `namespace clink::test` under `include/clink/test/`.
 
+## Engine correctness gates
+
+The qualification rig is an environment and endurance check, not the first place an engine invariant should be exercised. A change to a correctness-sensitive path is complete only when the cheapest applicable layers below cover it. CI runs the unit, SQL, integration and soak labels as blocking gates.
+
+| Logical boundary | Deterministic unit or component gate | Production-shaped integration gate |
+| --- | --- | --- |
+| Records, control elements, watermarks, barriers and network framing | `test_stream_element.cpp`, `test_multi_input_alignment.cpp`, `test_network_channel.cpp`, `test_checkpoint_alignment.cpp` | `test_multiprocess_cluster.cpp`, `test_cluster_tls.cpp` |
+| Source cursor snapshot and replay | `test_source_contract.cpp` plus each connector's source-contract instantiation | `test_connector_exactly_once.cpp` |
+| Keyed state, timers, windows and post-fire state removal | state and timer suites, window suites, `test_sql_runtime.cpp` | `test_kafka_window_recovery.cpp` |
+| Checkpoint completion, durability and sink commit/abort | `test_checkpoint_*.cpp`, `test_two_phase_commit.cpp` | `test_connector_exactly_once.cpp`, `test_commit_group_atomicity.cpp`, `test_kafka_window_recovery.cpp` |
+| Worker loss, stable-id replacement and coordinator leadership change | `test_cluster.cpp`, `test_restart_drain_readiness.cpp` | `test_fault_recovery.cpp`, `test_ha_failover.cpp`, `test_coordinator_ha_failover.cpp`, `test_kafka_window_recovery.cpp` |
+| Rescale, key-group ownership and schema evolution | rescale and schema suites in `tests/` | `test_rescale_exactly_once.cpp`, `test_coordinator_rescale.cpp`, `test_schema_evo_check.cpp` |
+| SQL parse, bind, planning and stateful runtime | the `clink_sql_tests` target | `test_kafka_window_recovery.cpp` exercises SQL submission through a real distributed job |
+| Plugin ABI, loading, isolation and lifecycle | plugin and registry suites in `tests/` | `test_plugin_submission.cpp`, `test_job_plugin_e2e.cpp`, `test_job_bundle_isolation.cpp` |
+
+For an exactly-once qualification graph, component coverage alone is insufficient. The integration analogue must use the real source and transactional sink, keep state open across each injected fault, consume only externally committed output, and compare an exact oracle for missing, duplicate, conflicting and incorrect results. It must also prove the intended recovery mode, such as stable worker process ids across coordinator replacement. `KafkaWindowRecoveryTest.WorkerAndHaCoordinatorFailoverKeepSourceWindowAndSinkOnOneCut` is the reference gate: four Kafka partitions and parallelism four, a real worker process loss with same-id replacement, then HA coordinator replacement while worker process ids remain stable, with keyed window aggregates checked after each recovery.
+
 ## Where it lives
 
 | Path | What |

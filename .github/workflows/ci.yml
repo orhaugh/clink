@@ -12,13 +12,9 @@
 # Jobs and what gates the pipeline:
 #   toolchain-image - build + push the pinned image (cached). Push events
 #                     only; pull_request runs reuse the :main image.     [gate]
-#   build           - build with SQL + WASM + integration on. The unit + SQL
-#                     ctest runs are hard gates, and so is the multi-process
-#                     FAULT-TOLERANCE subset (tests/integration/
-#                     test_fault_recovery.cpp on the deterministic harness).
-#                     The remaining integration tests stay advisory until
-#                     they are converted off the sleep/bind-close-race
-#                     patterns onto that harness.        [gates + advisory step]
+#   build           - build with SQL + WASM + integration on. Unit, SQL, the
+#                     complete deterministic integration label and the soak
+#                     label are blocking gates.                           [gate]
 #   install-smoke   - install + consume from an out-of-tree find_package. [gate]
 #   release-sql-runtime - the two live queryable-state HTTP tests, built in
 #                     Release (they need optimized throughput; the Debug gate
@@ -28,10 +24,8 @@
 #                     dependency bump there merges unverified.           [gate]
 #
 # So a green pipeline requires: the pinned image builds, the full tree builds,
-# the unit + SQL suite passes, the multi-process fault-tolerance scenarios
-# pass, install-smoke consumes clink, and the Release queryable-state HTTP
-# tests pass. The remaining integration tests run advisory with a named
-# reason (see the step comment) and a shrinking scope.
+# the unit, SQL, complete integration and soak suites pass, install-smoke
+# consumes clink, and the Release queryable-state HTTP tests pass.
 #
 # Sanitizers are their own workflow (sanitizers.yml) and are no longer
 # manual-only: a fast ASan+UBSan subset gates every pull request and the

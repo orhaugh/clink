@@ -4709,9 +4709,10 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
 // default. F64 / follow-up 46.
 void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id) {
     bool touched = false;
+    std::vector<std::pair<std::shared_ptr<WorkerConnection>, JobId>> survivor_cancels;
     {
         std::lock_guard lock(mu_);
-        for (auto& [_, job] : jobs_) {
+        for (auto& [job_id, job] : jobs_) {
             if (job->pending_per_worker.find(worker_id) == job->pending_per_worker.end() ||
                 job->pending_per_worker[worker_id].empty()) {
                 continue;
@@ -4722,7 +4723,31 @@ void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id
                 "coordinator.register",
                 "worker re-registered; the process holding this subtask is gone");
             touched = true;
+
+            // Starting a whole-job restart is only half of the worker-loss
+            // choreography. Every still-running peer must also receive
+            // CancelJob so that it reports SubtaskFinished and covers the
+            // restart drain. The watchdog path already broadcasts this, but
+            // a fast same-id replacement bypasses watchdog loss detection:
+            // the replacement is healthy and heartbeating by the time the
+            // next sweep runs. Without this register-path broadcast, an
+            // unbounded survivor runs forever and the restart expires at its
+            // drain deadline.
+            for (const auto& [other_worker_id, _] : job->tasks_by_worker) {
+                if (other_worker_id == worker_id) {
+                    continue;
+                }
+                auto it = registered_.find(other_worker_id);
+                if (it != registered_.end() && !it->second->lost && it->second->conn) {
+                    survivor_cancels.emplace_back(it->second, job_id);
+                }
+            }
         }
+    }
+    for (const auto& [survivor, job_id] : survivor_cancels) {
+        CancelJobMsg cancel;
+        cancel.job_id = job_id;
+        (void)send_frame(*survivor->conn, fenced_frame_(MessageKind::CancelJob, cancel));
     }
     // A fold may have emptied the drain, which is the condition that fires the
     // redeploy, and a fresh restart needs the watchdog to act on it. Either way,

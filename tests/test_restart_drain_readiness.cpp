@@ -339,4 +339,78 @@ TEST(RestartDrainReadiness, AFoldAfterTheLastDrainAckStillFiresTheRestart) {
     std::filesystem::remove_all(dir, ec);
 }
 
+// A fast same-id replacement reaches the register path before the watchdog
+// declares the old session lost. That path must perform the complete loss
+// choreography: fold the vanished session's tasks AND cancel every survivor.
+// Folding alone leaves an unbounded survivor running forever, so its drain ack
+// never arrives and the job fails only when the 30-second deadline expires.
+TEST(RestartDrainReadiness, AReplacementSessionCancelsSurvivorsBeforeRedeploy) {
+    ensure_built_ins_registered();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_register_drain_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator coordinator;
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"dw-a", "dw-b"});
+
+    auto wa = std::make_unique<DrainFakeWorker>(port, "dw-a");
+    auto wb = std::make_unique<DrainFakeWorker>(port, "dw-b");
+    ASSERT_TRUE(wa->valid() && wb->valid());
+    ASSERT_TRUE(wa->register_and_ack());
+    ASSERT_TRUE(wb->register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    ckpt.max_restarts_on_worker_loss = 3;
+    const auto job_id = coordinator.submit_job(
+        three_task_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+
+    struct Deployed {
+        DrainFakeWorker* worker{nullptr};
+        std::vector<std::pair<std::string, std::uint32_t>> tasks;
+    };
+    Deployed a{wa.get(), {}};
+    Deployed b{wb.get(), {}};
+    std::uint16_t fake_port = 42000;
+    for (auto* d : {&a, &b}) {
+        auto deploy = d->worker->await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value()) << "a worker never received its initial Deploy";
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            d->tasks.emplace_back(t.role, t.subtask_idx);
+            ASSERT_TRUE(d->worker->report_listening(job_id, t.role, t.subtask_idx, fake_port++));
+        }
+    }
+    Deployed& survivor = a.tasks.size() == 2 ? a : b;
+    Deployed& victim = a.tasks.size() == 2 ? b : a;
+    ASSERT_EQ(survivor.tasks.size(), 2U);
+    ASSERT_EQ(victim.tasks.size(), 1U);
+
+    const std::string replacement_id = victim.worker == wb.get() ? "dw-b" : "dw-a";
+    victim.worker->die_silently();
+    auto replacement = std::make_unique<DrainFakeWorker>(port, replacement_id);
+    ASSERT_TRUE(replacement->valid());
+    ASSERT_TRUE(replacement->register_and_ack());
+
+    ASSERT_TRUE(survivor.worker->await_frame(MessageKind::CancelJob, 5s).has_value())
+        << "same-id replacement started a restart but never cancelled the surviving worker";
+    for (const auto& [role, subtask] : survivor.tasks) {
+        ASSERT_TRUE(survivor.worker->send_finished(job_id, role, subtask, /*had_error=*/false));
+    }
+
+    const bool redeployed = survivor.worker->await_frame(MessageKind::Deploy, 10s).has_value() ||
+                            replacement->await_frame(MessageKind::Deploy, 1s).has_value();
+    EXPECT_TRUE(redeployed)
+        << "the survivor drained after cancellation, but the whole job was not redeployed";
+
+    replacement->close();
+    survivor.worker->close();
+    coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 }  // namespace

@@ -1292,9 +1292,10 @@ private:
                                                  const std::string& cause);
 
     // Fold a re-registered worker's PREVIOUS session's in-flight subtasks
-    // into any restart drain that is waiting on them. The old session is
-    // gone, so those subtasks can never report; without this the drain
-    // waits out its deadline and fails a job that was recovering.
+    // into a restart and cancel the surviving sessions so they drain. The old
+    // session is gone, so its subtasks can never report; without the fold or
+    // survivor broadcast the drain waits out its deadline and fails a job
+    // that was recovering.
     // Takes the lock itself (called from the register path, outside it).
     void retire_previous_session_subtasks_(const std::string& worker_id);
     void send_peer_updates_locked_(JobState& job);

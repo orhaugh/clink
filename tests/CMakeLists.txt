@@ -361,6 +361,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_postgres_cdc.cpp
         integration/test_postgres_cdc_pgoutput.cpp
         integration/test_connector_exactly_once.cpp
+        integration/test_kafka_window_recovery.cpp
         integration/test_multiprocess_cluster.cpp
         integration/test_plugin_submission.cpp
         integration/test_application_mode.cpp
@@ -452,6 +453,7 @@ if(CLINK_INTEGRATION_TESTS)
     target_compile_definitions(clink_integration_tests PRIVATE
         CLINK_NODE_BINARY=\"$<TARGET_FILE:clink_node>\"
         CLINK_SUBMIT_BINARY=\"$<TARGET_FILE:clink_submit_job>\"
+        CLINK_SUBMIT_SQL_BINARY=\"$<TARGET_FILE:clink_submit_sql>\"
         CLINK_APP_BINARY=\"$<TARGET_FILE:clink_app>\"
         CLINK_RESCALE_BINARY=\"$<TARGET_FILE:clink_rescale_job>\"
         CLINK_RESCALE_TEST_JOB_PATH=\"$<TARGET_FILE:clink_rescale_test_job>\"
@@ -477,6 +479,7 @@ if(CLINK_INTEGRATION_TESTS)
         clink_two_sink_commit_group_job
         clink_node
         clink_submit_job
+        clink_submit_sql
         clink_app
         clink_cancel_job
         clink_rescale_job
