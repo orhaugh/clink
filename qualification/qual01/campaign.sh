@@ -222,6 +222,19 @@ done
 #
 # So the configuration lives on the host, and anything that restarts a
 # container reproduces the deployment rather than guessing at it.
+# The coordinator's HA directory is wiped before every campaign. It
+# persists on the host, and recover_persisted_jobs() resurrects whatever
+# job manifests it finds - which is exactly right WITHIN a run (that is
+# the recovery under test) and exactly wrong ACROSS runs: reusing the rig
+# for qual01-20260817e restarted the coordinator over run d's HA dir, run
+# d's job came back as a zombie twin consuming the recreated input topic
+# (its restored offsets were past the fresh topic's end, so earliest
+# rewound it to zero), and every window landed on the output topic twice
+# under two different transactional ids. The verifier counted 177k
+# identical duplicates against an engine that was doing precisely what
+# its HA contract says. A campaign never wants another campaign's jobs.
+on_host "$COORD_PUB" "docker rm -f clink-coordinator >/dev/null 2>&1 || true; \
+    rm -rf /qual/ha/jobs /qual/ha/history"
 on_host "$COORD_PUB" "mkdir -p /qual /qual/ha"
 to_host "$COORD_PUB" "$HERE/../infra/coordinator.yml" /qual/coordinator.yml
 on_host "$COORD_PUB" "printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\n' '$CLINK_IMAGE' '$COORD_PRIV' > /qual/.env"
@@ -231,6 +244,11 @@ wid=0
 for wp in $WORKER_PUBS; do
     wid=$((wid+1))
     wpriv=$(read_inv worker private_ip | cut -d' ' -f$wid)
+    # Same reuse rule as the coordinator: a surviving worker container from
+    # a previous run still hosts that run's task processes, and `up -d`
+    # with an unchanged environment would leave it untouched. Every
+    # campaign starts its workers fresh.
+    on_host "$wp" "docker rm -f clink-worker >/dev/null 2>&1 || true"
     on_host "$wp" "mkdir -p /qual /qual/state"
     to_host "$wp" "$HERE/../infra/worker.yml" /qual/worker.yml
     on_host "$wp" "printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nWORKER_ID=w%s\nWORKER_IP=%s\n' \
