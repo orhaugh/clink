@@ -49,9 +49,9 @@ public:
               std::make_unique<DagBuilderRegistry>(&DagBuilderRegistry::default_instance())) {}
 
     JobBundle(JobBundle&&) noexcept = default;
-    // Moving a live bundle by assignment would release its old module handles
-    // before replacing the old registries, briefly unmapping code still owned
-    // by registry closures. Bundles are heap-owned and never need assignment.
+    // Bundles are heap-owned and never need move assignment. Keeping that
+    // operation unavailable also prevents accidental replacement of a live
+    // registry set while tasks still refer to it.
     JobBundle& operator=(JobBundle&&) noexcept = delete;
     JobBundle(const JobBundle&) = delete;
     JobBundle& operator=(const JobBundle&) = delete;
@@ -86,9 +86,9 @@ public:
                                       *dag_builder_registry_};
     }
 
-    // Keep a loaded module mapped until after every registry closure and task
-    // using it has gone away. Member declaration order below makes registries
-    // destruct first and these handles last.
+    // Retain the module identity and provenance with the job. PluginLoader also
+    // keeps the actual mapping for the process lifetime because unloading C++
+    // plugin code cannot be made safe merely from registry ownership.
     void retain_plugin(LoadedPlugin plugin) { loaded_plugins_.push_back(std::move(plugin)); }
 
 private:

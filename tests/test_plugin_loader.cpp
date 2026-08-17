@@ -5,6 +5,8 @@
 // closures captured T correctly across the dlopen boundary.
 
 #include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -13,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/job_bundle.hpp"
+#include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/plugin_loader.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
@@ -22,6 +25,14 @@ namespace {
 std::filesystem::path hello_plugin_path() {
 #ifdef CLINK_HELLO_PLUGIN_PATH
     return std::filesystem::path{CLINK_HELLO_PLUGIN_PATH};
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path schema_evo_job_path() {
+#ifdef CLINK_SCHEMA_EVO_JOB_PATH
+    return std::filesystem::path{CLINK_SCHEMA_EVO_JOB_PATH};
 #else
     return {};
 #endif
@@ -129,15 +140,10 @@ TEST(PluginLoader, LoadIsIdempotent) {
     EXPECT_EQ(a.plugin.dl_handle, b.plugin.dl_handle);
 }
 
-// load_into must give each call a FRESH module instance so a .so's
-// per-instance, call_once-gated registration (CLINK_REGISTER_JOB build_fn)
-// re-runs into THIS caller's bundle. A long-lived Coordinator loads the same
-// .so once per submitted job into a different per-job bundle; if the second
-// load reused the first's dlopen handle, the once-gate would have already
-// fired and the second bundle would resolve no factories (plan_job then
-// rejects "no source factory registered"). Two load_into calls for the same
-// path must therefore yield distinct handles and each populate its own bundle.
-TEST(PluginLoader, LoadIntoGivesEachBundleAFreshInstance) {
+// load_into reuses one safely retained mapping, but the registration hook must
+// run against every supplied JobBundle. This keeps mapping growth bounded
+// across worker reconnects while preserving strict registry isolation.
+TEST(PluginLoader, LoadIntoReusesMappingAndPopulatesEveryBundle) {
     const auto path = hello_plugin_path();
     if (!std::filesystem::exists(path)) {
         GTEST_SKIP() << "hello_plugin not built";
@@ -162,7 +168,45 @@ TEST(PluginLoader, LoadIntoGivesEachBundleAFreshInstance) {
     EXPECT_NE(bundle_b.runner_registry().find_source("hello.GreetingSource", "hello.Greeting"),
               nullptr)
         << "reload must re-register into the second bundle, not reuse the first";
-    EXPECT_NE(handle_a, handle_b) << "each load_into must dlopen a distinct module instance";
+    EXPECT_EQ(handle_a, handle_b) << "one source path must keep one process-lifetime mapping";
+}
+
+TEST(PluginLoader, JobPluginReregistersInlineFactoriesIntoEveryBundle) {
+    const auto path = schema_evo_job_path();
+    if (!std::filesystem::exists(path)) {
+        GTEST_SKIP() << "schema evolution job plugin not built";
+    }
+    auto& loader = clink::cluster::PluginLoader::default_instance();
+
+    clink::cluster::JobBundle bundle_a;
+    auto preg_a = bundle_a.as_plugin_registry();
+    auto a = loader.load_into(path.string(), preg_a);
+    ASSERT_TRUE(a.ok) << a.error;
+    void* handle = a.plugin.dl_handle;
+    bundle_a.retain_plugin(std::move(a.plugin));
+
+    using JobBuildFn = int (*)(const char**, std::size_t*);
+    JobBuildFn job_build = nullptr;
+    void* symbol = ::dlsym(handle, "clink_job_build");
+    ASSERT_NE(symbol, nullptr);
+    std::memcpy(&job_build, &symbol, sizeof(job_build));
+    const char* graph_data = nullptr;
+    std::size_t graph_size = 0;
+    ASSERT_EQ(job_build(&graph_data, &graph_size), 0);
+    ASSERT_NE(graph_data, nullptr);
+    const auto graph = clink::cluster::JobGraphSpec::from_json({graph_data, graph_size});
+    ASSERT_FALSE(graph.ops.empty());
+    const auto& source = graph.ops.front();
+    ASSERT_NE(bundle_a.runner_registry().find_source(source.type, source.out_channel), nullptr);
+
+    clink::cluster::JobBundle bundle_b;
+    auto preg_b = bundle_b.as_plugin_registry();
+    auto b = loader.load_into(path.string(), preg_b);
+    ASSERT_TRUE(b.ok) << b.error;
+    EXPECT_EQ(b.plugin.dl_handle, handle);
+    bundle_b.retain_plugin(std::move(b.plugin));
+    EXPECT_NE(bundle_b.runner_registry().find_source(source.type, source.out_channel), nullptr)
+        << "CLINK_REGISTER_JOB must rebuild inline factories into each isolated bundle";
 }
 
 TEST(PluginLoader, MissingFileFailsCleanly) {

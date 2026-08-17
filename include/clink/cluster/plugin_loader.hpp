@@ -13,12 +13,13 @@ class PluginRegistry;
 
 namespace clink::cluster {
 
-// Result of loading one plugin shared library. `module` shares ownership of
-// the dlopen handle and dlclose()s it when the last copy is destroyed.
-// Per-job JobBundle objects retain this handle and declare it before their
-// registries, so registry closures are destroyed before module code is
-// unmapped. The default process-wide loader retains successful handles in
-// `loaded_` for the process lifetime.
+// Result of loading one plugin shared library. `module` aliases the loader's
+// process-lifetime mapping. Successful C++ plugins are deliberately not
+// dlclose()d: factories, type-erased closures, TLS and module statics can all
+// outlive the registry call that created them, and POSIX provides no reliable
+// proof that every such reference has gone away. PluginLoader keeps one
+// mapping per source path, so this safety rule is bounded rather than one
+// mapping per job or worker control session.
 struct LoadedPlugin {
     std::string source_path;  // Original .so path on disk.
     std::string name;         // From clink_plugin_metadata().
@@ -73,8 +74,10 @@ public:
     // to scope a job's registrations to its JobBundle. Idempotency
     // applies per (path, registry-identity) pair - see notes on the
     // implementation.
-    // The returned LoadedPlugin must outlive every closure registered into
-    // `registry`. Per-job callers normally move it into JobBundle::retain_plugin.
+    // The module is mapped once per path, but its register hook runs on every
+    // call so each job bundle receives an independent set of registrations.
+    // Per-job callers normally retain the result for provenance even though
+    // the loader itself owns the process-lifetime mapping.
     PluginLoadResult load_into(const std::string& so_path, plugin::PluginRegistry& registry);
 
     // Returns the LoadedPlugin matching this path, if loaded. nullptr
@@ -87,6 +90,11 @@ public:
 
 private:
     mutable std::mutex mu_;
+    // All successfully admitted module mappings. Their shared_ptr deleter is
+    // intentionally a no-op; the operating system reclaims them at process
+    // exit. This avoids unsafe C++ plugin unloading while bounding mappings to
+    // one per cache path/content hash.
+    std::unordered_map<std::string, LoadedPlugin> modules_;
     std::unordered_map<std::string, LoadedPlugin> loaded_;
 };
 

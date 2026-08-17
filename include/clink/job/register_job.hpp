@@ -17,9 +17,9 @@
 //   3. clink_plugin_abi_hash()       -- ditto (informational / strict-mode gate)
 //   4. clink_plugin_target_triple()  -- ditto
 //   5. clink_plugin_metadata()       -- ditto
-//   6. clink_plugin_register(...)    -- runs the user's build_fn under
-//                                         std::call_once; registers all
-//                                         inline ops as a side effect.
+//   6. clink_plugin_register(...)    -- runs the user's build_fn against the
+//                                         supplied per-job registry on every
+//                                         call, registering all inline ops.
 //                                         Returns 0 on success, non-zero
 //                                         with err_buf filled on failure.
 //   5. clink_job_build(out_json, out_size)
@@ -51,13 +51,12 @@
 // pick one authoring style per shared library.
 //
 // Lifecycle:
-//   * Submitter process: dlopen(.so) -> clink_plugin_register fires
-//     build_fn once (call_once gate); clink_job_build returns the
-//     captured JSON; submitter uploads .so + JSON to the coordinator.
-//   * worker process:        dlopen(.so) -> clink_plugin_register fires
-//     build_fn once (in this process; call_once is per-process); the
-//     side-effect registrations populate THIS process's
-//     RunnerRegistry. worker ignores clink_job_build.
+//   * Submitter process: dlopen(.so) -> clink_plugin_register builds into the
+//     supplied job registry; clink_job_build returns the separately cached,
+//     deterministic graph JSON; submitter uploads .so + JSON to the coordinator.
+//   * worker process: the same mapped .so may serve many jobs. Every
+//     clink_plugin_register call rebuilds into that job's registry, so inline
+//     registrations never bleed between jobs and no module reload is needed.
 //
 // Determinism caveat: build_fn must register operators in a stable
 // order across processes. The inline-op counter
@@ -90,15 +89,6 @@ struct JobBuilderState {
     std::once_flag flag;
     std::string graph_json;
     std::string build_error;  // populated if build_fn threw
-    // Host-supplied PluginRegistry passed to clink_plugin_register.
-    // Captured before call_once fires so the wrapped build_fn can route
-    // its inline-lambda registrations into the host's singletons rather
-    // than the .so's private copies (clink_core is statically linked
-    // into both, so the singletons are *distinct* across the dlopen
-    // boundary). nullptr is valid: the submit-tool path passes nullptr
-    // because it only needs the captured graph JSON, not runtime
-    // registrations.
-    ::clink::plugin::PluginRegistry* host_registry{nullptr};
     // Holds the most recent packed compatibility result so the C-ABI
     // export can hand back a stable pointer. Recomputed (overwritten) on
     // every clink_job_check_restore_compatibility call, so the returned
@@ -114,9 +104,7 @@ template <typename BuildFn>
 inline void ensure_built(JobBuilderState& state, BuildFn&& build_fn) {
     std::call_once(state.flag, [&state, build_fn = std::forward<BuildFn>(build_fn)]() mutable {
         try {
-            auto env = state.host_registry != nullptr
-                           ? ::clink::api::Pipeline::create_with_registry(state.host_registry)
-                           : ::clink::api::Pipeline::create();
+            auto env = ::clink::api::Pipeline::create();
             build_fn(env);
             state.graph_json = env.graph().to_json();
         } catch (const std::exception& e) {
@@ -125,6 +113,22 @@ inline void ensure_built(JobBuilderState& state, BuildFn&& build_fn) {
             state.build_error = "build_fn threw an unknown exception";
         }
     });
+}
+
+// Run build_fn into one host-owned registry. Unlike the graph cache above,
+// this is deliberately repeatable: a long-lived worker or coordinator uses
+// one safely retained module mapping for many isolated JobBundles.
+template <typename BuildFn>
+inline std::string register_into(::clink::plugin::PluginRegistry& registry, BuildFn&& build_fn) {
+    try {
+        auto env = ::clink::api::Pipeline::create_with_registry(&registry);
+        build_fn(env);
+        return {};
+    } catch (const std::exception& e) {
+        return std::string{"build_fn threw: "} + e.what();
+    } catch (...) {
+        return "build_fn threw an unknown exception";
+    }
 }
 
 }  // namespace clink::job
@@ -156,20 +160,18 @@ inline void ensure_built(JobBuilderState& state, BuildFn&& build_fn) {
     extern "C" int clink_plugin_register(                                                        \
         void* registry_ptr, char* err_buf, ::std::size_t err_buf_size) {                         \
         auto& s = clink_job_state_();                                                            \
-        /* Stash the host registry BEFORE call_once fires; ensure_built()  */                    \
-        /* reads it from state to wire the env at construction time. Safe  */                    \
-        /* to assign on every call: call_once only invokes build_fn once   */                    \
-        /* per process, and the first non-null registry wins (subsequent   */                    \
-        /* loads from the same process re-dlopen the same .so and pass the */                    \
-        /* same singletons). */                                                                  \
-        if (registry_ptr != nullptr) {                                                           \
-            s.host_registry = static_cast<::clink::plugin::PluginRegistry*>(registry_ptr);       \
-        }                                                                                        \
+        /* Cache the deterministic graph and populate module-local state   */                    \
+        /* once, independently of any host registry lifetime. */                                 \
         ::clink::job::ensure_built(s, (build_fn));                                               \
-        if (!s.build_error.empty()) {                                                            \
+        auto error = s.build_error;                                                              \
+        if (error.empty() && registry_ptr != nullptr) {                                          \
+            auto* registry = static_cast<::clink::plugin::PluginRegistry*>(registry_ptr);        \
+            error = ::clink::job::register_into(*registry, (build_fn));                          \
+        }                                                                                        \
+        if (!error.empty()) {                                                                    \
             if (err_buf != nullptr && err_buf_size > 0) {                                        \
-                const auto n = ::std::min(s.build_error.size(), err_buf_size - 1);               \
-                ::std::memcpy(err_buf, s.build_error.data(), n);                                 \
+                const auto n = ::std::min(error.size(), err_buf_size - 1);                       \
+                ::std::memcpy(err_buf, error.data(), n);                                         \
                 err_buf[n] = '\0';                                                               \
             }                                                                                    \
             return 1;                                                                            \
