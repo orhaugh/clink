@@ -686,6 +686,14 @@ TEST(Kafka, OffsetMapEncodeDecodeRoundTrip) {
     EXPECT_TRUE(KafkaSource::encode_offsets({}).size() >= 4u);  // count prefix only
 }
 
+TEST(Kafka, ParallelSourceGroupIdentityIsStableAndSubtaskScoped) {
+    const auto first = KafkaSource::stable_group_instance_id("events", 1);
+    EXPECT_EQ(first, KafkaSource::stable_group_instance_id("events", 1));
+    EXPECT_NE(first, KafkaSource::stable_group_instance_id("events", 2));
+    EXPECT_NE(first, KafkaSource::stable_group_instance_id("other-events", 1));
+    EXPECT_EQ(first.rfind("-1"), first.size() - 2);
+}
+
 // Source replay: a source that consumed part of a partition snapshots its
 // offset; a fresh source restored from that snapshot seeks past the consumed
 // records on assignment, so it resumes at the next offset rather than

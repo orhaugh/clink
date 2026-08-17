@@ -6,6 +6,7 @@
 // here can.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -176,6 +178,53 @@ std::vector<SeedRecord> window_records(std::int64_t window_start, int keys) {
     return records;
 }
 
+std::vector<SeedRecord> sustained_window_records(std::int64_t window_start,
+                                                 int keys,
+                                                 int copies_per_key) {
+    std::vector<SeedRecord> records;
+    records.reserve(static_cast<std::size_t>(keys * copies_per_key));
+    for (int copy = 0; copy < copies_per_key; ++copy) {
+        for (int key = 0; key < keys; ++key) {
+            const auto ts = window_start + 100 + ((copy * keys + key) % 9'000);
+            const auto amount = key + (copy % 7) + 1;
+            records.push_back(SeedRecord{
+                .payload = "{\"event_id\":\"live-" + std::to_string(window_start) + "-" +
+                           std::to_string(key) + "-" + std::to_string(copy) + "\",\"k\":" +
+                           std::to_string(key) + ",\"amount\":" + std::to_string(amount) +
+                           ",\"ts\":" + std::to_string(ts) + "}",
+                .partition = key % 4});
+        }
+    }
+    return records;
+}
+
+void produce_json_sustained(const std::string& brokers,
+                            const std::string& topic,
+                            const std::vector<SeedRecord>& records,
+                            std::atomic<std::size_t>& produced) {
+    clink::KafkaSink::Options opts;
+    opts.brokers = brokers;
+    opts.topic = topic;
+    opts.metric_prefix.clear();
+    clink::KafkaSink sink(std::move(opts));
+    sink.open();
+    constexpr std::size_t kBatchSize = 40;
+    for (std::size_t begin = 0; begin < records.size(); begin += kBatchSize) {
+        clink::Batch<clink::KafkaMessage> batch;
+        const auto end = std::min(begin + kBatchSize, records.size());
+        for (auto i = begin; i < end; ++i) {
+            clink::KafkaMessage message{records[i].payload};
+            message.partition = records[i].partition;
+            batch.emplace(std::move(message));
+        }
+        sink.on_data(batch);
+        sink.flush();
+        produced.store(end, std::memory_order_release);
+        std::this_thread::sleep_for(2ms);
+    }
+    sink.close();
+}
+
 class KafkaWindowRecoveryTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
@@ -320,6 +369,21 @@ TEST_F(KafkaWindowRecoveryTest, WorkerAndHaCoordinatorFailoverKeepSourceWindowAn
         },
         30s));
 
+    // Keep records arriving in the open window while the coordinator dies.
+    // A quiescent source can make independently restored offsets and window
+    // state look consistent because both happen to sit exactly on a completed
+    // checkpoint. QUAL-01 is continuous, so its HA gate must cover records on
+    // both sides of the selected checkpoint as well.
+    constexpr int kLiveCopiesPerKey = 1'000;
+    const auto live_records = sustained_window_records(kBase + 70'000, kKeys, kLiveCopiesPerKey);
+    std::atomic<std::size_t> live_produced{0};
+    std::jthread live_producer([&] {
+        produce_json_sustained(kafka_->brokers(), input_topic_, live_records, live_produced);
+    });
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return live_produced.load(std::memory_order_acquire) >= 400; }, 15s))
+        << "the sustained producer did not overlap the coordinator failure";
+
     const auto worker_0_pid = cluster.worker(0).pid();
     const auto worker_1_pid = cluster.worker(1).pid();
     cluster.ha_coordinator(0).kill_and_reap();
@@ -331,12 +395,25 @@ TEST_F(KafkaWindowRecoveryTest, WorkerAndHaCoordinatorFailoverKeepSourceWindowAn
     ASSERT_TRUE(cluster.worker(0).running() && cluster.worker(1).running());
     EXPECT_EQ(cluster.worker(0).pid(), worker_0_pid);
     EXPECT_EQ(cluster.worker(1).pid(), worker_1_pid);
+    live_producer.join();
+
+    const auto confirmed_after_ha = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") >= confirmed_after_ha + 3;
+        },
+        30s));
 
     // A later event advances the watermark and closes the window that crossed
     // the restore. Any source/state cut mismatch changes its ten aggregates.
     produce_json(kafka_->brokers(), input_topic_, window_records(kBase + 90'000, kKeys));
     for (int key = 0; key < kKeys; ++key) {
-        expected[{key, kBase + 70'000}] = {2, (2 * key) + 3};
+        const auto whole_cycles = kLiveCopiesPerKey / 7;
+        const auto remainder = kLiveCopiesPerKey % 7;
+        const auto live_total = static_cast<std::int64_t>(kLiveCopiesPerKey) * (key + 1) +
+                                static_cast<std::int64_t>(whole_cycles) * 21 +
+                                (static_cast<std::int64_t>(remainder) * (remainder - 1)) / 2;
+        expected[{key, kBase + 70'000}] = {2 + kLiveCopiesPerKey, (2 * key) + 3 + live_total};
     }
 
     const auto after = consume_committed(kafka_->brokers(), output_topic_, expected.size(), 45s);

@@ -135,6 +135,13 @@ public:
     static std::string encode_offsets(const std::map<std::int32_t, std::int64_t>& offsets);
     static std::map<std::int32_t, std::int64_t> decode_offsets(std::string_view bytes);
 
+    // Stable Kafka group identity for one parallel source subtask. Kafka's
+    // static-membership protocol maps this identity back to the same member
+    // across a process or coordinator recovery, preserving partition
+    // ownership so a subtask's checkpointed offset map remains authoritative.
+    // Pure and broker-independent for unit testing.
+    static std::string stable_group_instance_id(std::string_view topic, std::uint32_t subtask_idx);
+
     std::string name() const override { return "kafka_source"; }
 
     static bool is_real_implementation();

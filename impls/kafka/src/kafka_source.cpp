@@ -25,6 +25,20 @@
 
 namespace clink {
 
+std::string KafkaSource::stable_group_instance_id(std::string_view topic,
+                                                  std::uint32_t subtask_idx) {
+    // Kafka group.instance.id is scoped by group.id. Include the topic so
+    // distinct topic subscriptions using that group do not fence each other
+    // merely because both have subtask zero. FNV-1a keeps the identity stable
+    // across processes and standard-library implementations.
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const auto ch : topic) {
+        hash ^= static_cast<unsigned char>(ch);
+        hash *= 1099511628211ULL;
+    }
+    return "clink-" + std::to_string(hash) + "-" + std::to_string(subtask_idx);
+}
+
 // Offset-map (partition -> next offset) serialization. Pure and
 // broker-independent (defined in both the real and stub builds) so it can be
 // unit-tested without a Kafka client: count(u32 LE) then repeated

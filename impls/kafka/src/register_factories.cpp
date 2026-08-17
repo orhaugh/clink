@@ -101,6 +101,14 @@ void apply_batch_shape(const plugin::BuildContext& ctx, KafkaSource::Options& op
     }
 }
 
+void apply_stable_group_membership(const plugin::BuildContext& ctx, KafkaSource::Options& opts) {
+    if (ctx.parallelism <= 1) {
+        return;
+    }
+    opts.conf.try_emplace("group.instance.id",
+                          KafkaSource::stable_group_instance_id(opts.topic, ctx.subtask_idx));
+}
+
 // Forwarding emitter: convert KafkaMessage batches to string batches;
 // pass watermarks/barriers through.
 class StringKafkaSource final : public Source<std::string> {
@@ -778,6 +786,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             apply_batch_max_wait(ctx, opts);
             apply_batch_shape(ctx, opts);
             populate_kafka_security_conf(ctx, opts.conf);
+            apply_stable_group_membership(ctx, opts);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_message_source: 'brokers' is required");
             }
@@ -828,6 +837,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         apply_batch_max_wait(ctx, opts);
         apply_batch_shape(ctx, opts);
         populate_kafka_security_conf(ctx, opts.conf);
+        apply_stable_group_membership(ctx, opts);
         if (opts.brokers.empty()) {
             throw std::runtime_error("kafka source: 'brokers' is required");
         }
