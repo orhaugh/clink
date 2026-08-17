@@ -136,7 +136,8 @@ protected:
     // silently never fire.
     static std::unique_ptr<Process> submit(Cluster& c,
                                            int max_restarts,
-                                           const std::string& state_backend = {}) {
+                                           const std::string& state_backend = {},
+                                           std::int64_t checkpoint_interval_ms = 150) {
         auto p = std::make_unique<Process>();
         std::vector<std::string> argv{
             submit_binary().string(),
@@ -145,7 +146,7 @@ protected:
             "--coordinator-port=" + std::to_string(c.coordinator_port()),
             "--wait-timeout-s=90",
             "--checkpoint-dir=" + c.checkpoint_dir().string(),
-            "--checkpoint-interval-ms=150",
+            "--checkpoint-interval-ms=" + std::to_string(checkpoint_interval_ms),
             "--max-restarts-on-worker-loss=" + std::to_string(max_restarts)};
         if (!state_backend.empty()) {
             argv.push_back("--state-backend=" + state_backend);
@@ -201,7 +202,14 @@ TEST_F(FaultRecoveryTest, WorkerDeathBeforeAnyCheckpointStillCompletes) {
     ScopedDiagnostics diag(c);
     bring_up(c);
 
-    auto sub = submit(c, /*max_restarts=*/2);
+    // Keep the first periodic trigger well beyond this bounded job's normal
+    // lifetime. The end-of-stream checkpoint still proves that checkpointing
+    // works after recovery, while the pre-kill state is deterministically
+    // checkpoint-free even on a heavily loaded runner.
+    auto sub = submit(c,
+                      /*max_restarts=*/2,
+                      /*state_backend=*/{},
+                      /*checkpoint_interval_ms=*/60'000);
     ASSERT_NE(sub, nullptr);
 
     // Wait until the job is DEPLOYED before killing.
@@ -1322,15 +1330,13 @@ TEST_F(FaultRecoveryTest, AWorkerResumedAfterBeingDeclaredLostCannotBreakExactly
 }
 
 // The coordinator itself pauses past its own heartbeat timeout and resumes.
-// Nothing dies: worker heartbeats and completion reports pile into socket
-// buffers the paused process is not reading. On resume the coordinator
-// drains a backlog in which every worker's last_seen is stale by the whole
-// pause - and the watchdog's next sweep judges that staleness.
+// A pause longer than the worker heartbeat lease makes each worker retire its
+// stale control session, drain its tasks and reconnect after the coordinator
+// resumes. The worker processes themselves must stay alive throughout.
 //
-// Contract: the job completes exactly-once AND no healthy worker is
-// declared lost by the resumed watchdog. The second half is load-bearing
-// and was not free - see the self-pause detection block in
-// watchdog_loop_, which this test forced into existence on its first run.
+// Contract: the job completes exactly-once, both original worker PIDs survive,
+// and the resumed coordinator does not independently declare either worker
+// stale before accepting their replacement sessions.
 TEST_F(FaultRecoveryTest, ACoordinatorPausedPastItsHeartbeatTimeoutStillDeliversExactlyOnce) {
     Cluster c(spec());
     ScopedDiagnostics diag(c);
@@ -1341,6 +1347,9 @@ TEST_F(FaultRecoveryTest, ACoordinatorPausedPastItsHeartbeatTimeoutStillDelivers
     ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
                                     std::chrono::seconds(45)))
         << "no checkpoint completed before the pause";
+
+    const auto worker_0_pid = c.worker(0).pid();
+    const auto worker_1_pid = c.worker(1).pid();
 
     c.coordinator().signal(SIGSTOP);
     // Hold the pause for 3x the 2s default heartbeat timeout, using the
@@ -1357,14 +1366,18 @@ TEST_F(FaultRecoveryTest, ACoordinatorPausedPastItsHeartbeatTimeoutStillDelivers
         },
         std::chrono::seconds(20)));
     ASSERT_TRUE(c.worker(0).running() && c.worker(1).running())
-        << "a worker exited during the coordinator pause - workers must tolerate a "
-           "quiet coordinator at least as long as the pause the cluster is expected "
-           "to absorb";
+        << "a worker process exited during the coordinator pause";
+    ASSERT_EQ(c.worker(0).pid(), worker_0_pid);
+    ASSERT_EQ(c.worker(1).pid(), worker_1_pid);
     c.coordinator().signal(SIGCONT);
 
     const auto code = sub->await_exit(std::chrono::seconds(120));
     ASSERT_TRUE(code.has_value()) << "submitter never exited after the coordinator resumed";
     ASSERT_EQ(*code, 0) << "the job did not complete after the coordinator resumed";
+    EXPECT_EQ(c.worker(0).pid(), worker_0_pid)
+        << "worker-0 was replaced instead of recovering its control session in-process";
+    EXPECT_EQ(c.worker(1).pid(), worker_1_pid)
+        << "worker-1 was replaced instead of recovering its control session in-process";
 
     const auto v = verify_exactly_once(out_dir_, kTotalRecords);
     EXPECT_TRUE(v.duplicated.empty())
@@ -1374,19 +1387,16 @@ TEST_F(FaultRecoveryTest, ACoordinatorPausedPastItsHeartbeatTimeoutStillDelivers
     EXPECT_TRUE(v.unexpected.empty())
         << "output contains records the source never emitted: " << describe(v);
 
-    // Asserted, because it is now an engine property rather than timing:
-    // the watchdog detects its own suspension (a sweep late by more than
-    // watchdog_interval + heartbeat_timeout) and grants every live worker
-    // one fresh timeout instead of judging staleness across its own
-    // absence. The first run of this test, written before that guard
-    // existed, watched the resumed watchdog declare BOTH healthy workers
-    // lost in the same millisecond, sever their connections, and fail the
-    // job "no slot available" - a paused coordinator destroying its own
-    // healthy cluster.
+    // The watchdog must recognise its own pause before the reconnecting
+    // sessions arrive. Session replacement can legitimately fold the old
+    // tasks into one restart, but the watchdog must not independently evict
+    // workers based on timestamps accumulated while it was stopped.
     EXPECT_TRUE(c.coordinator().log_contains("watchdog resumed after a suspension"))
         << "the pause never tripped the self-pause detector, so this run did not "
            "exercise the resume path it exists to gate";
-    EXPECT_FALSE(c.coordinator().log_contains("worker lost"))
+    EXPECT_FALSE(c.coordinator().log_contains("[coordinator.watchdog] [warning] worker lost"))
         << "the resumed watchdog declared a healthy worker lost - self-pause "
            "detection has regressed";
+    EXPECT_TRUE(c.coordinator().log_contains("re-registered; previous session retired"))
+        << "the workers never replaced their expired control sessions";
 }

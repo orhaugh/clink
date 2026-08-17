@@ -208,7 +208,7 @@ TEST(ClusterTls, WorkerRegistersOverTlsControlPlane) {
     kill_quietly(coordinator);
 }
 
-TEST(ClusterTls, PlainWorkerCannotJoinTlsCoordinator) {
+TEST(ClusterTls, PlainWorkerStaysAliveButCannotJoinTlsCoordinator) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
@@ -233,8 +233,9 @@ TEST(ClusterTls, PlainWorkerCannotJoinTlsCoordinator) {
     ASSERT_GT(coordinator, 0);
     ASSERT_TRUE(await_http_ready(http_port, 3s));
 
-    // Spawn a worker WITHOUT --tls-ca: it should try plain TCP, fail the
-    // handshake, and exit non-zero. We give it 2s to die.
+    // Spawn a worker WITHOUT --tls-ca. The supervisor cannot distinguish a
+    // persistent TLS mismatch from a temporarily unavailable coordinator, so
+    // it must stay alive and retry without ever registering.
     const auto worker_http = probe_free_port();
     const pid_t worker = spawn_proc({"clink_node",
                                      "--role=worker",
@@ -245,8 +246,8 @@ TEST(ClusterTls, PlainWorkerCannotJoinTlsCoordinator) {
                                      "--http-bind=127.0.0.1"},
                                     node);
     ASSERT_GT(worker, 0);
-    EXPECT_TRUE(wait_for_exit(worker, 3s))
-        << "plain-TCP worker should have exited fast when coordinator only speaks TLS";
+    EXPECT_FALSE(wait_for_exit(worker, 3s))
+        << "a recoverable control-plane connection failure killed the worker process";
 
     // coordinator /api/v1/workers should remain empty.
     const auto r = http_get("127.0.0.1", http_port, "/api/v1/workers");
