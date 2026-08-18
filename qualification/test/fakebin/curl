@@ -10,6 +10,15 @@ case "$url" in
       echo "clink_coordinator_job_restarts_total 1"
       ;;
   */api/v1/jobs/*/cancel) echo '{"ok":true}';;
+  */api/v1/jobs)
+      # The exactly-one-job gate: the sim's healthy rig has one job; a
+      # scenario can inject a zombie twin to drive the gate's refusal.
+      if [ "$(rig_scenario extra_job 0)" = "1" ]; then
+        echo '{"jobs":[{"id":1,"status":"RUNNING"},{"id":2,"status":"RUNNING"}]}'
+      else
+        echo '{"jobs":[{"id":1,"status":"RUNNING"}]}'
+      fi
+      ;;
   */api/v1/jobs/*)
       st=$(rig_scenario job_status RUNNING)
       dies=$(rig_scenario job_dies_after 0)

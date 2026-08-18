@@ -103,6 +103,13 @@ scenario "no faults at all fails the gate" quiet 3 \
     "applied no fault" \
     "job_status=RUNNING" "workers_lost=1" "no_faults=1"
 
+# 4b. A second active job means something else is feeding this run's topics
+#     (run e: the previous run's job resurrected from a stale HA store, every
+#     window committed twice). The gate must refuse before the soak spends.
+scenario "a second job on the coordinator fails the gate" zombiejob 3 \
+    "expected exactly one job" \
+    "job_status=RUNNING" "workers_lost=1" "extra_job=1"
+
 # 5. A job that never comes back after the first fault must fail the gate.
 # The job must be RUNNING when the gate first looks and gone only after the
 # fault - a job already dead at step 2 fails a different check, which is what
