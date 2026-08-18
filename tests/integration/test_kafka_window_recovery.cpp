@@ -234,6 +234,109 @@ struct SustainedFeed {
     std::size_t records{0};
 };
 
+// Continuous producer with ADVANCING event time: each batch moves the
+// stream's event time forward ~1s, so 10s tumbling windows close every few
+// dozen wall-milliseconds and every checkpoint interval carries fired
+// panes. A gate about replaying committed output needs committed output in
+// the stalled interval - a single open window emits nothing mid-episode
+// and turns the oracle vacuous. Returns the exact per-(key, window_start)
+// aggregate sent, closed and tail windows alike.
+std::map<WindowKey, Aggregate> produce_json_advancing(const std::string& brokers,
+                                                      const std::string& topic,
+                                                      std::int64_t base,
+                                                      int keys,
+                                                      std::atomic<bool>& stop,
+                                                      std::atomic<std::size_t>& produced) {
+    clink::KafkaSink::Options opts;
+    opts.brokers = brokers;
+    opts.topic = topic;
+    opts.metric_prefix.clear();
+    clink::KafkaSink sink(std::move(opts));
+    sink.open();
+    std::map<WindowKey, Aggregate> sent;
+    std::size_t records = 0;
+    for (std::size_t copy = 0; !stop.load(std::memory_order_acquire); ++copy) {
+        clink::Batch<clink::KafkaMessage> batch;
+        // ~200ms of event time per ~5ms wall batch: a 10s window closes
+        // every ~250ms wall, comfortably above the 300ms checkpoint
+        // cadence, without racing so far ahead that the oracle's read
+        // cannot drain the produced windows within its timeout (the first
+        // 1s-per-batch version expected ~8000 windows and timed out).
+        const auto ts = base + 100 + static_cast<std::int64_t>(copy) * 200;
+        const auto ws = ts - (ts % 10'000);
+        for (int key = 0; key < keys; ++key) {
+            const auto amount =
+                static_cast<std::int64_t>(key) + static_cast<std::int64_t>(copy % 7) + 1;
+            clink::KafkaMessage message{"{\"event_id\":\"adv-" + std::to_string(copy) + "-" +
+                                        std::to_string(key) + "\",\"k\":" + std::to_string(key) +
+                                        ",\"amount\":" + std::to_string(amount) +
+                                        ",\"ts\":" + std::to_string(ts) + "}"};
+            message.partition = key % 4;
+            batch.emplace(std::move(message));
+            auto& agg = sent[{key, ws}];
+            agg.first += 1;
+            agg.second += amount;
+            ++records;
+        }
+        sink.on_data(batch);
+        sink.flush();
+        produced.store(records, std::memory_order_release);
+        std::this_thread::sleep_for(5ms);
+    }
+    sink.close();
+    return sent;
+}
+
+// Initialise a transactional producer with `txn_id` and close it again:
+// the init bumps the id's producer epoch broker-side, FENCING any prepared
+// transaction a previous holder left open. This is the test's stand-in for
+// the incarnation churn that fenced a stranded handle on the rig.
+void fence_transactional_id(const std::string& brokers,
+                            const std::string& topic,
+                            const std::string& txn_id) {
+    clink::KafkaSink::Options opts;
+    opts.brokers = brokers;
+    opts.topic = topic;
+    opts.transactional_id = txn_id;
+    opts.metric_prefix.clear();
+    clink::KafkaSink sink(std::move(opts));
+    sink.open();
+    sink.close();
+}
+
+// Commit receipts under <checkpoint_dir>/_jobs/<job>/receipts with a
+// checkpoint id above `floor`, across every job in the tree. Iterated with
+// the error_code API throughout: this poller races the workers' retention
+// sweep, which unlinks snapshots and receipts while we walk, and the
+// throwing iterator overloads turn a vanished entry into std::terminate
+// inside the await lambda.
+std::size_t receipts_above(const std::filesystem::path& checkpoint_root, std::uint64_t floor) {
+    std::size_t count = 0;
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it{
+        checkpoint_root, std::filesystem::directory_options::skip_permission_denied, ec};
+    const std::filesystem::recursive_directory_iterator end;
+    while (!ec && it != end) {
+        std::error_code entry_ec;
+        const auto path = it->path();
+        if (it->is_regular_file(entry_ec) && !entry_ec &&
+            path.parent_path().filename() == "receipts") {
+            const auto name = path.filename().string();
+            const auto dash = name.rfind('-');
+            if (name.rfind("sub", 0) == 0 && dash != std::string::npos) {
+                try {
+                    if (std::stoull(name.substr(dash + 1)) > floor) {
+                        ++count;
+                    }
+                } catch (const std::exception&) {
+                }
+            }
+        }
+        it.increment(ec);
+    }
+    return count;
+}
+
 SustainedFeed produce_json_until(const std::string& brokers,
                                  const std::string& topic,
                                  std::int64_t window_start,
@@ -787,6 +890,192 @@ TEST_F(KafkaWindowRecoveryTest, CascadingWorkerLossAcrossACommitWindowStaysExact
     EXPECT_EQ(actual, expected)
         << "the cascade produced duplicates (a completed checkpoint's committed slices were "
            "replayed) or losses (a prepared slice was discarded)";
+}
+
+// The partial-commit fallback closed end to end. One subtask's commit
+// callback throws, stranding its PREPARED transaction inside a COMPLETED
+// checkpoint while its siblings' commits execute (receipts on disk); the
+// stranded transaction is then FENCED before resolution can finalise it.
+// qual01-20260818b reached this through incarnation churn; the test reaches
+// it deterministically by initialising the same transactional.id from
+// outside during the sink's commit-wait window. The held restart's
+// resolution takes the receipted handles as COMMITTED with no wire call,
+// gets a fenced VERDICT for the stranded one, and falls back to the last
+// confirmed restore point. The replayed interval must reach the output
+// exactly once: the receipted sinks arm replay suppression and swallow
+// their already-published re-emissions, the fenced subtask re-emits its
+// aborted slice, and no process dies at any point - both worker pids hold
+// end to end, pinning that this failure class is purely logical.
+TEST_F(KafkaWindowRecoveryTest, AFencedPartialCommitFallsBackWithoutDuplicates) {
+    constexpr int kKeys = 10;
+    constexpr std::int64_t kBase = 6'000'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    spec.slots_per_worker = 8;
+    spec.ha = true;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    ASSERT_TRUE(cluster.start_ha_coordinators(1));
+    ASSERT_TRUE(cluster.start_ha_worker(0, ProcOptions{.fault = "sink.before_commit=throw@3"}));
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + input_topic_ +
+        "', group_id='fenced', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + output_topic_ +
+        "', delivery_guarantee='exactly_once', transactional_id='fenced'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql-fenced",
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "kafka-fenced",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "300",
+                              "--max-restarts-on-worker-loss",
+                              "8",
+                              "--parallelism",
+                              "4"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 2; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
+    const auto advance_base = kBase + 50'000;
+    std::atomic<bool> stop_feed{false};
+    std::atomic<std::size_t> produced{0};
+    std::map<WindowKey, Aggregate> feed_windows;
+    std::thread feeder([&] {
+        feed_windows = produce_json_advancing(
+            kafka_->brokers(), input_topic_, advance_base, kKeys, stop_feed, produced);
+    });
+    ASSERT_TRUE(
+        clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s));
+
+    const auto w0_pid = cluster.worker(0).pid();
+    const auto w1_pid = cluster.worker(1).pid();
+
+    // The stall: the armed callback refused a commit (loudly), the same
+    // checkpoint's sibling commits executed (their receipts are on disk),
+    // and its CONFIRMED can now never arrive from inside the job.
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return cluster.worker(0).log_contains("commit callback for checkpoint") &&
+                   receipts_above(cluster.checkpoint_dir(),
+                                  latest_marker(cluster.checkpoint_dir(), "CONFIRMED-")) > 0;
+        },
+        60s))
+        << "the partial-commit stall never formed: fault fired="
+        << cluster.worker(0).log_contains("commit callback for checkpoint");
+    const auto completed_at_stall = latest_marker(cluster.checkpoint_dir(), "COMPLETED-");
+
+    // Fence every sink transactional.id from outside while the stuck sink
+    // waits inside its commit-wait window: resolution must now get a
+    // VERDICT (fenced), not a resumable orphan. Fencing the healthy ids too
+    // costs only their next transactional operation (a logical subtask
+    // error, part of the same restart); their commits already executed.
+    for (int sub = 0; sub < 4; ++sub) {
+        fence_transactional_id(kafka_->brokers(), output_topic_, "fenced-" + std::to_string(sub));
+    }
+
+    // Recovery: the fallback restores below the stalled checkpoint, the
+    // replay re-runs it, and new checkpoints (numbered above every durable
+    // marker) confirm past it.
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > completed_at_stall; },
+        120s))
+        << "the job never confirmed past the fenced fallback";
+
+    // Purely logical episode: no process was lost at any point.
+    EXPECT_EQ(cluster.worker(0).pid(), w0_pid) << "worker 0 must survive the whole episode";
+    EXPECT_EQ(cluster.worker(1).pid(), w1_pid) << "worker 1 must survive the whole episode";
+
+    // Pin the branch this gate exists for: resolution really did fall back
+    // with executed commits on the books (not resolve everything), and the
+    // redeployed sinks really did arm suppression from their receipts.
+    EXPECT_TRUE(
+        cluster.ha_coordinator(0).log_contains("handles committed before resolution failed"))
+        << "resolution did not take the fenced-fallback branch; the gate tested nothing";
+    EXPECT_TRUE(cluster.worker(0).log_contains("replay suppression armed from receipt") ||
+                cluster.worker(1).log_contains("replay suppression armed from receipt"))
+        << "no sink armed replay suppression; the replay ran unguarded";
+
+    const auto produced_at_recovery = produced.load(std::memory_order_acquire);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return produced.load(std::memory_order_acquire) >= produced_at_recovery + 1'500; },
+        30s));
+    stop_feed.store(true, std::memory_order_release);
+    feeder.join();
+    expected.insert(feed_windows.begin(), feed_windows.end());
+
+    // Close the feed's tail window: seed one window comfortably above the
+    // highest event time the feed reached, so its watermark fires everything.
+    std::int64_t max_ws = advance_base;
+    for (const auto& [key, agg] : feed_windows) {
+        (void)agg;
+        max_ws = std::max(max_ws, key.second);
+    }
+    // The closer is a pure watermark pusher: its own window has nothing
+    // beyond it to advance the watermark past its end, so it never fires
+    // and is deliberately NOT expected.
+    const auto closer_start = max_ws + 20'000;
+    produce_json(kafka_->brokers(), input_topic_, window_records(closer_start, kKeys));
+
+    const auto after = consume_committed(kafka_->brokers(), output_topic_, expected.size(), 180s);
+    const auto actual = parse_output(after);
+    if (actual != expected) {
+        // gtest elides large map dumps; print the symmetric difference so a
+        // failure names the exact windows lost, invented, or mis-aggregated.
+        for (const auto& [key, agg] : expected) {
+            const auto it = actual.find(key);
+            if (it == actual.end()) {
+                ADD_FAILURE() << "MISSING k=" << key.first << " ws=" << key.second
+                              << " expected cnt=" << agg.first << " total=" << agg.second;
+            } else if (it->second != agg) {
+                ADD_FAILURE() << "WRONG k=" << key.first << " ws=" << key.second
+                              << " got cnt=" << it->second.first << " total=" << it->second.second
+                              << " expected cnt=" << agg.first << " total=" << agg.second;
+            }
+        }
+        for (const auto& [key, agg] : actual) {
+            if (expected.count(key) == 0) {
+                ADD_FAILURE() << "EXTRA k=" << key.first << " ws=" << key.second
+                              << " cnt=" << agg.first << " total=" << agg.second;
+            }
+        }
+    }
+    EXPECT_EQ(actual, expected)
+        << "the fenced fallback produced duplicates (already-published re-emissions were not "
+           "suppressed) or losses (a record above the receipt horizon was swallowed)";
 }
 
 // A FAILED checkpoint must rewind, not sail on. The abort broadcast that
