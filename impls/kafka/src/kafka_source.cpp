@@ -428,6 +428,38 @@ void KafkaSource::assign_owned_(std::int32_t partition_count) {
         throw std::runtime_error("KafkaSource: assign failed: " + RdKafka::err2str(rc));
     }
     impl_->owned_partitions = std::move(owned);
+    // Every owned partition gets a CONCRETE numeric position in
+    // next_offsets from the moment it is assigned, so the very first
+    // checkpoint already carries a resume row for it. A partition whose
+    // row is absent at restore falls back to group offsets or the reset
+    // policy - external state the engine's cut knows nothing about - and
+    // the window between assignment and the first consumed record is
+    // exactly where a fresh job's early checkpoints used to have no rows.
+    // Logical starts resolve here: BEGINNING/END via the broker's
+    // watermarks, STORED via the group's committed offset when one exists
+    // (falling back to the reset policy's watermark). Best-effort per
+    // partition: an unresolved one just stays unseeded until its first
+    // record, which is no worse than before.
+    for (const auto p : impl_->owned_partitions) {
+        if (impl_->next_offsets.find(p) != impl_->next_offsets.end()) {
+            continue;
+        }
+        std::int64_t low = 0;
+        std::int64_t high = 0;
+        if (impl_->consumer->query_watermark_offsets(opts.topic, p, &low, &high, 2'000) !=
+            RdKafka::ERR_NO_ERROR) {
+            continue;
+        }
+        std::int64_t start = opts.auto_offset_reset == "latest" ? high : low;
+        std::vector<RdKafka::TopicPartition*> committed;
+        committed.push_back(RdKafka::TopicPartition::create(opts.topic, p));
+        if (impl_->consumer->committed(committed, 2'000) == RdKafka::ERR_NO_ERROR &&
+            committed[0]->offset() >= 0) {
+            start = committed[0]->offset();
+        }
+        RdKafka::TopicPartition::destroy(committed);
+        impl_->next_offsets[p] = start;
+    }
     // Drop tracked positions for partitions outside the owned set - restored
     // rows naming partitions the topic does not (or no longer) has. Left in
     // place they would re-persist forever as garbage offset rows.

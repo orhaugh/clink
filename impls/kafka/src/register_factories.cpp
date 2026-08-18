@@ -110,6 +110,16 @@ void apply_deterministic_ownership(const plugin::BuildContext& ctx, KafkaSource:
     // per-partition offset rows.
     opts.subtask_index = ctx.subtask_idx;
     opts.source_parallelism = std::max<std::uint32_t>(1, ctx.parallelism);
+    // The engine's checkpoints are the only resume authority, so the
+    // engine-managed source must not WRITE group offsets: librdkafka's
+    // auto-commit records consumed positions the checkpoint never
+    // completed, and a restore whose partition lacks an offset row then
+    // resumes from that group offset via OFFSET_STORED - past records
+    // whose effects died with the rewound attempt. Measured as silent
+    // loss of the whole pre-restart span when a job's first checkpoint
+    // failed. Manual mode writes nothing unless commit_current() is
+    // called, which the engine never does.
+    opts.commit_mode = KafkaSource::CommitMode::Manual;
 }
 
 // Forwarding emitter: convert KafkaMessage batches to string batches;
