@@ -52,6 +52,8 @@ PY
     cp "$HERE/fakebin/clink_submit_sql" "$work/build/clink_submit_sql"
     PATH="$HERE/fakebin:$PATH" \
     RUN_ID="camptest" SKIP_PROVISION=1 DURATION_H=0 \
+    DURATION_S="${SIM_DURATION_S:-0}" WATCH_MAX_LOOPS="${SIM_WATCH_LOOPS:-0}" \
+    JOB_PROBE_INTERVAL_S=0 \
     CLINK_IMAGE="clink:test" SSH_KEY_FILE="$work/key" \
     SUBMIT_BIN="$work/build/clink_submit_sql" \
     CHECKPOINT_INTERVAL_MS=10000 \
@@ -117,6 +119,31 @@ scenario "a second job on the coordinator fails the gate" zombiejob 3 \
 scenario "a job that does not recover from the fault fails the gate" norecover 3 \
     "did not recover" \
     "job_status=RUNNING" "workers_lost=1" "job_dies_after=1"
+
+# 6. The job-gone latch needs SIX consecutive non-RUNNING probes. A probe
+#    landing in a legitimate coordinator-fault window - three status polls
+#    fail, then recovery answers - must NOT latch: a single-shot probe used
+#    to, and the latch poisons the summary's read of every later window.
+#    (Polls 1 and 2 are the verification gate's own status reads; the watch
+#    probe starts at poll 3.)
+SIM_DURATION_S=3600 SIM_WATCH_LOOPS=1 \
+scenario "a transient status outage does not latch job-gone" flapgone "" \
+    "VERIFICATION PASSED" \
+    "job_status=RUNNING" "workers_lost=1" \
+    "job_gone_from_poll=3" "job_gone_until_poll=5"
+if grep -q "no longer RUNNING" "$LAST_WORK/out.log"; then
+    report "a transient outage leaves the latch alone" 0 "latched on a 3-poll outage"
+else
+    report "a transient outage leaves the latch alone" 1 ""
+fi
+
+# 7. A job that STAYS gone must still latch - the latch exists so the
+#    summary can separate "no engine" from "the engine lost data".
+SIM_DURATION_S=3600 SIM_WATCH_LOOPS=1 \
+scenario "a persistently gone job latches job-gone" staygone "" \
+    "no longer RUNNING" \
+    "job_status=RUNNING" "workers_lost=1" \
+    "job_gone_from_poll=3" "job_gone_until_poll=999"
 
 echo
 echo "$PASS passed, $FAIL failed"

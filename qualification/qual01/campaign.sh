@@ -54,6 +54,15 @@ OUT_DIR="$REPO_ROOT/qualification-results/$RUN_ID"
 # non-default directory does not need the script edited.
 SUBMIT_BIN="${SUBMIT_BIN:-$REPO_ROOT/build/clink_submit_sql}"
 mkdir -p "$OUT_DIR"
+# A relaunch reusing a RUN_ID must not inherit the previous attempt's
+# evidence: the watch loop reads $OUT_DIR/verdict.json BEFORE the first
+# scp is guaranteed to have replaced it, so a stale dirty verdict would
+# abort a healthy run, and a stale job-gone.txt or failure.txt poisons
+# the summary. Scoped to the files this campaign writes; archives from
+# prior runs under other RUN_IDs are untouched.
+rm -f "$OUT_DIR/verdict.json" "$OUT_DIR/job-gone.txt" "$OUT_DIR/chaos-died.txt" \
+      "$OUT_DIR/failure.txt" "$OUT_DIR/job-status.json" "$OUT_DIR/verification.txt" \
+      "$OUT_DIR/chaos.jsonl" "$OUT_DIR/progress.json"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
 on_host() { ssh -n "${SSH_OPTS[@]}" "root@$1" "$2"; }
@@ -464,7 +473,13 @@ done
 echo "campaign: verifier judging windows ($JUDGED evaluated)"
 
 # --- chaos --------------------------------------------------------------
-DURATION_S=$(( DURATION_H * 3600 ))
+# Overridable so the simulator can drive the watch loop directly
+# (DURATION_H=0 skips it entirely, which is how the job-gone probe's
+# false positive escaped simulation). WATCH_MAX_LOOPS bounds the loop by
+# iteration count for the same reason; 0 = unbounded (production).
+DURATION_S="${DURATION_S:-$(( DURATION_H * 3600 ))}"
+WATCH_MAX_LOOPS="${WATCH_MAX_LOOPS:-0}"
+JOB_PROBE_INTERVAL_S="${JOB_PROBE_INTERVAL_S:-10}"
 # --verdict: the controller stops injecting the moment the oracle counts
 # any error, freezing the cluster for diagnosis instead of mutating it
 # for the rest of the soak. --ensure-coverage: every mandatory fault -
@@ -540,7 +555,12 @@ END=$(( $(date +%s) + DURATION_S ))
 CHAOS_DIED_AT=""
 JOB_GONE_AT=""
 ORACLE_DIRTY=""
+WATCH_LOOPS=0
 while [ "$(date +%s)" -lt "$END" ]; do
+    if [ "$WATCH_MAX_LOOPS" != "0" ] && [ "$WATCH_LOOPS" -ge "$WATCH_MAX_LOOPS" ]; then
+        break
+    fi
+    WATCH_LOOPS=$(( WATCH_LOOPS + 1 ))
     sleep 120
     for f in verdict.json chaos.jsonl progress.json generator.log verifier.log chaos.log; do
         scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
@@ -610,19 +630,40 @@ PY
     # So the campaign says the moment it happens, and the summary can
     # separate "the engine lost data" from "there was no engine".
     if [ -z "$JOB_GONE_AT" ]; then
-        ALIVE=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" 2>/dev/null \
-                | python3 -c "
+        # A coordinator mid-armed-fault answers nothing, and a job
+        # mid-recovery is briefly not RUNNING: both are healthy chaos, not
+        # a dead pipeline. A single probe here used to latch job_gone
+        # permanently, and the latch poisons the summary's read of every
+        # later window in BOTH directions (a false latch discounts real
+        # loss; a real latch mislabelled as loss reads as catastrophe). So
+        # the latch needs six consecutive non-RUNNING observations across
+        # a full minute - longer than any recovery window this campaign
+        # arms - and any single RUNNING answer clears the streak.
+        NOT_RUNNING=0
+        PROBES=""
+        for _probe in 1 2 3 4 5 6; do
+            ALIVE=$(curl -fsS --max-time 20 \
+                    "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" 2>/dev/null \
+                    | python3 -c "
 import json,sys
 try:
     print(json.load(sys.stdin).get('status') or 'UNKNOWN')
 except Exception:
     print('GONE')" 2>/dev/null || echo GONE)
-        if [ "$ALIVE" != "RUNNING" ]; then
+            PROBES="${PROBES}${ALIVE} "
+            if [ "$ALIVE" = "RUNNING" ]; then
+                NOT_RUNNING=0
+                break
+            fi
+            NOT_RUNNING=$(( NOT_RUNNING + 1 ))
+            [ "$_probe" -lt 6 ] && sleep "$JOB_PROBE_INTERVAL_S"
+        done
+        if [ "$NOT_RUNNING" -ge 6 ]; then
             JOB_GONE_AT=$(date -u +%H:%M)
-            echo "campaign: WARNING - job ${JOB_ID} is no longer RUNNING (status=${ALIVE}," \
+            echo "campaign: WARNING - job ${JOB_ID} is no longer RUNNING (probes: ${PROBES}," \
                  "noticed ${JOB_GONE_AT}). Every result expected after this point will be" \
                  "counted missing because nothing is producing, which is NOT data loss." >&2
-            { echo "job_gone=yes"; echo "status=$ALIVE"; echo "noticed_at_utc=$JOB_GONE_AT";
+            { echo "job_gone=yes"; echo "probes=$PROBES"; echo "noticed_at_utc=$JOB_GONE_AT";
             } > "$OUT_DIR/job-gone.txt"
         fi
     fi

@@ -108,11 +108,16 @@ def main() -> int:
     have_verdict = verdict.get("final") and all(c is not None for c in counted)
     uncovered, pid_violations, coord_restarts = coverage_and_pid_gates(chaos_path)
     dirty_stop = os.path.exists(os.path.join(d, "oracle-dirty.txt"))
+    # A latched job-gone (six consecutive non-RUNNING probes) means the
+    # pipeline died mid-soak. The oracle's missing counts would catch it
+    # anyway, but a dead job must veto PASS on its own evidence too.
+    job_gone = os.path.exists(os.path.join(d, "job-gone.txt"))
     # Any observed oracle error is a FAILURE even without a final verdict:
     # an interrupted run may be INCONCLUSIVE, but an interrupted run that
     # already counted errors is not.
     observed_errors = sum(int(c) for c in counted if c is not None)
-    clean = have_verdict and not observed_errors and not recovery_timeouts and not dirty_stop
+    clean = (have_verdict and not observed_errors and not recovery_timeouts and not dirty_stop
+             and not job_gone)
     if clean and not uncovered and not pid_violations:
         result = "PASS"
     elif clean:
