@@ -145,6 +145,17 @@ scenario "a persistently gone job latches job-gone" staygone "" \
     "job_status=RUNNING" "workers_lost=1" \
     "job_gone_from_poll=3" "job_gone_until_poll=999"
 
+# 8. The finish phase must WAIT for the verifier's final verdict before its
+#    kill sweep. The real verifier's SIGINT path evaluates every pending
+#    window before writing final=true - minutes at multi-hour scale - and
+#    sweeping after a fixed 20s killed it mid-finalise on qual01-20260818c,
+#    turning a 751/751-clean campaign INCONCLUSIVE. The fake verifier here
+#    refuses to finalise for three polls; the campaign must keep waiting.
+scenario "the finish waits for the verifier's final verdict" finalwait "" \
+    "verifier finalised after 30s" \
+    "job_status=RUNNING" "workers_lost=1" \
+    "verifier_final_after_polls=3"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

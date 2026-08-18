@@ -691,7 +691,26 @@ echo "campaign: duration reached; stopping generator and collecting evidence"
 on_host "$OPS_PUB" "pkill -INT -f '[g]enerator.py' || true"
 sleep 120   # let the pipeline drain the tail and the verifier judge it
 on_host "$OPS_PUB" "pkill -INT -f '[v]erifier.py' || true"
-sleep 20
+# The verifier's SIGINT path runs ONE FULL evaluation over every pending
+# window before writing final=true - minutes, not seconds, at multi-hour
+# scale. qual01-20260818c was killed mid-finalise at 199,441 pending
+# pairs by the sweep below, and a campaign with 751/751 clean windows and
+# full fault coverage summarised INCONCLUSIVE for want of the flag. Wait
+# for the final verdict, bounded, and only then sweep; a timeout is said
+# loudly and the summary correctly refuses to call the run complete.
+FINAL_WAIT_S="${FINAL_WAIT_S:-600}"
+waited=0
+while [ "$waited" -lt "$FINAL_WAIT_S" ]; do
+    if on_host "$OPS_PUB" "python3 -c \"import json,sys; sys.exit(0 if json.load(open('/qual/verdict.json')).get('final') else 1)\"" \
+        2>/dev/null; then
+        echo "campaign: verifier finalised after ${waited}s"
+        break
+    fi
+    sleep 10
+    waited=$(( waited + 10 ))
+done
+[ "$waited" -lt "$FINAL_WAIT_S" ] \
+    || echo "campaign: WARNING - the verifier did not finalise within ${FINAL_WAIT_S}s; the summary will read this run as incomplete" >&2
 # SIGINT is the polite request; this makes sure it happened.
 kill_campaign_processes "$OPS_PUB" || true
 # Say so if either is somehow still alive, rather than collecting evidence

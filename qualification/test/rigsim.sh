@@ -135,6 +135,31 @@ rig_exec() {
         *"wc -l < /qual/chaos.jsonl"*)
             wc -l < "$FAKERIG/chaos.jsonl" 2>/dev/null || echo 0; return 0;;
 
+        *"verdict.json"*"final"*)
+            # The finish phase polls for the verifier's final verdict before
+            # its kill sweep (the real verifier runs one full evaluation over
+            # every pending window first - minutes at multi-hour scale, and
+            # sweeping early killed it mid-finalise on qual01-20260818c).
+            # The fake verifier finalises after verifier_final_after_polls
+            # probes; default 0 = already final.
+            local need cur
+            need=$(rig_scenario verifier_final_after_polls 0)
+            cur=$(rig_bump finalpoll)
+            if [ "$cur" -gt "$need" ]; then
+                python3 - "$FAKERIG/verdict.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    v = json.load(open(p))
+except Exception:
+    v = {}
+v["final"] = True
+json.dump(v, open(p, "w"))
+PY
+                return 0
+            fi
+            return 1;;
+
         *"python3 -c"*)
             # The campaign reads the generator's progress this way. Each read
             # returns a larger number so "input flowing" is satisfied.
