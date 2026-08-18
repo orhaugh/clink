@@ -3068,7 +3068,8 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_S3
     clink::s3::install(reg);
-    clink::s3::install_state_backend();  // remote-read:// disaggregated state backend
+    clink::s3::install_state_backend();       // remote-read:// disaggregated state backend
+    clink::s3::install_coordination_store();  // s3:// coordination records
 #endif
 #ifdef CLINK_LINKED_AWS
     clink::aws::install(reg);  // kinesis / firehose / dynamodb connectors

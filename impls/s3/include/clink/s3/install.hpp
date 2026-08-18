@@ -14,4 +14,9 @@ void install(clink::plugin::PluginRegistry& reg);
 // Idempotent; called once at startup (clink_node) when clink::s3 is linked.
 void install_state_backend();
 
+// Register the "s3" coordination-store scheme (checkpoint markers, commit
+// receipts and HA manifests on a bucket) on the coordination-store registry.
+// Idempotent; called once at startup (clink_node) when clink::s3 is linked.
+void install_coordination_store();
+
 }  // namespace clink::s3

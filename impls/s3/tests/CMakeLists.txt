@@ -17,6 +17,7 @@ add_executable(clink_s3_tests
     test_s3_cas_snapshot_store.cpp
     test_s3_remote_pool.cpp
     test_state_parquet_export_s3.cpp
+    test_s3_coordination_store.cpp
     # Custom gtest main that finalises Arrow S3 before static destruction (the AWS CRT
     # background threads must be joined off the static-destruction path); see the file.
     ${CMAKE_SOURCE_DIR}/tests/test_helpers/s3_finalizing_gtest_main.cpp
@@ -26,6 +27,8 @@ target_link_libraries(clink_s3_tests PRIVATE
     clink::s3
     GTest::gtest
 )
+# The coordination-store contract suite is shared with the core tests.
+target_include_directories(clink_s3_tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_compile_definitions(clink_s3_tests PRIVATE CLINK_HAS_AWS_S3)
 clink_set_warnings(clink_s3_tests)
 gtest_discover_tests(clink_s3_tests
