@@ -115,6 +115,15 @@ struct ResolutionFixture : ::testing::Test {
         return "{\"resolver\":\"test_resume\",\"tag\":\"" + tag + "\"}";
     }
 
+    // Drop the durable commit receipt a 2PC sink writes right after its
+    // external commit for checkpoint `id` executed.
+    void write_receipt(std::uint64_t id, std::uint32_t sub) const {
+        const auto rdir = clink::cluster::commit_receipt_dir_for(dir, kJob);
+        std::filesystem::create_directories(rdir);
+        std::ofstream out(rdir / clink::connectors::commit_receipt_file_name(sub, id));
+        out << "wm=12345\n";
+    }
+
     [[nodiscard]] bool confirmed_marker_exists(std::uint64_t id) const {
         return std::filesystem::exists(completed_marker_dir_for(dir, kJob) /
                                        ("CONFIRMED-" + std::to_string(id)));
@@ -207,6 +216,50 @@ TEST_F(ResolutionFixture, ExhaustedTransportRetriesFallBackWithoutConfirming) {
     EXPECT_FALSE(confirmed_marker_exists(4));
     // The retries genuinely happened before the conservative fallback.
     EXPECT_GE(transport_calls, 3);
+}
+
+// A commit receipt on disk is the sink's own durable record that the broker
+// acknowledged this subtask's commit. It outlives everything that makes the
+// wire path ambiguous - producer fencing under incarnation churn, broker
+// restarts, transaction timeouts - so the walk takes it as COMMITTED without
+// a wire call. qual01-20260818b: a handle whose commit HAD executed was
+// fenced by the successor's init before resolution ran, the wire verdict
+// came back not-committed, and the fallback replayed the committed interval.
+TEST_F(ResolutionFixture, ACommitReceiptShortCircuitsAnUnreachableResolver) {
+    write_completed_marker(4);
+    write_snapshot_with_handle(4, 0, handle("transport-always"));
+    write_receipt(4, 0);
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::milliseconds{0}), 4u);
+    EXPECT_TRUE(confirmed_marker_exists(4));
+    EXPECT_EQ(transport_calls, 0) << "a receipted handle must never be re-resolved over the wire "
+                                     "- the wire can only disagree with a commit that happened";
+}
+
+TEST_F(ResolutionFixture, AReceiptForAnotherSubtaskVouchesForNothing) {
+    // sub0's handle is unreachable and only sub1 holds a receipt: the walk
+    // must fall back. Receipts are per-subtask facts, not per-checkpoint.
+    write_completed_marker(4);
+    write_snapshot_with_handle(4, 0, handle("transport-always"));
+    write_receipt(4, 1);
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::milliseconds{0}), 3u);
+    EXPECT_FALSE(confirmed_marker_exists(4));
+}
+
+TEST_F(ResolutionFixture, AMixedWalkConfirmsFromReceiptAndWireTogether) {
+    // The partial-commit shape: sub0 committed (receipt written, and its
+    // fenced handle would refuse over the wire); sub1 never committed but
+    // resolves cleanly. Both proofs together advance CONFIRMED.
+    write_completed_marker(4, "0,1");
+    write_snapshot_with_handle(4, 0, handle("refuse"));
+    write_receipt(4, 0);
+    write_snapshot_with_handle(4, 1, handle("commit"));
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::milliseconds{0}), 4u);
+    EXPECT_TRUE(confirmed_marker_exists(4));
+    ASSERT_EQ(seen.size(), 1u) << "only the unreceipted handle goes to the wire";
+    EXPECT_NE(seen[0].find("\"tag\":\"commit\""), std::string::npos);
 }
 
 TEST_F(ResolutionFixture, ACheckpointWithNoHandlesStopsConservatively) {

@@ -51,6 +51,19 @@ namespace clink::connectors {
 // subtask index so parallel sinks stage distinct keys.
 inline constexpr std::string_view kTxnResumeStateKeyPrefix = "_clink_txn_resume_";
 
+// Commit-receipt file name inside the job's receipts directory
+// (commit_receipt_dir_for in clink/cluster/in_doubt_resolution.hpp): the
+// sink's durable record that ITS external commit for checkpoint `ckpt`
+// executed. Written by the sink right after the broker acknowledged the
+// commit, read by the resolution walk (a receipted handle is COMMITTED with
+// no wire call) and by the sink's own restore path (receipts newer than the
+// restore point mean the replayed interval is already published, so its
+// re-emissions are suppressed). One 2PC sink per subtask - the same
+// constraint the staged-handle key above already imposes.
+inline std::string commit_receipt_file_name(std::uint32_t subtask_idx, std::uint64_t ckpt) {
+    return "sub" + std::to_string(subtask_idx) + "-" + std::to_string(ckpt);
+}
+
 struct InDoubtResolution {
     bool committed{false};
     std::string detail;

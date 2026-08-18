@@ -23,6 +23,10 @@ std::filesystem::path completed_marker_dir_for(const std::string& checkpoint_dir
     return std::filesystem::path{checkpoint_dir} / "_jobs" / std::to_string(job_id);
 }
 
+std::filesystem::path commit_receipt_dir_for(const std::string& checkpoint_dir, JobId job_id) {
+    return completed_marker_dir_for(checkpoint_dir, job_id) / "receipts";
+}
+
 namespace {
 //
 // A checkpoint that COMPLETED but was never CONFIRMED may hold external
@@ -79,14 +83,24 @@ std::optional<CompletedMarkerInfo> read_completed_marker(const std::filesystem::
     return out;
 }
 
+// One staged resume handle plus the sink subtask that staged it. The
+// subtask index comes from the stored key's suffix (the sink stages under
+// kTxnResumeStateKeyPrefix + "sub<K>"), and is what pairs the handle with
+// its on-disk commit receipt.
+struct StagedHandle {
+    std::uint32_t subtask{0};
+    std::string handle;
+};
+
 // The staged resume handles inside one checkpoint's snapshots: operator-state
 // rows (0xFF-prefixed stored keys) whose logical key starts with
-// kTxnResumeStateKeyPrefix. nullopt = a snapshot could not be read, which is
-// different from "no handles" and must stop resolution.
-std::optional<std::vector<std::string>> read_resume_handles(const std::string& checkpoint_dir,
-                                                            const CompletedMarkerInfo& info,
-                                                            std::uint64_t ckpt_id) {
-    std::vector<std::string> handles;
+// kTxnResumeStateKeyPrefix. nullopt = a snapshot could not be read (or a
+// staged key did not parse), which is different from "no handles" and must
+// stop resolution.
+std::optional<std::vector<StagedHandle>> read_resume_handles(const std::string& checkpoint_dir,
+                                                             const CompletedMarkerInfo& info,
+                                                             std::uint64_t ckpt_id) {
+    std::vector<StagedHandle> handles;
     for (const auto sub : info.subtasks) {
         const auto snap =
             std::filesystem::path(clink::state_dir_for(checkpoint_dir, info.generation, sub)) /
@@ -109,7 +123,21 @@ std::optional<std::vector<std::string>> read_resume_handles(const std::string& c
                             key.compare(1,
                                         clink::connectors::kTxnResumeStateKeyPrefix.size(),
                                         clink::connectors::kTxnResumeStateKeyPrefix) == 0) {
-                            handles.push_back(entry.value);
+                            // Suffix after the prefix is "sub<K>". An
+                            // unparsable suffix is corrupt state: stop, as
+                            // an unreadable snapshot would.
+                            const auto suffix =
+                                key.substr(1 + clink::connectors::kTxnResumeStateKeyPrefix.size());
+                            if (suffix.size() < 4 || suffix.compare(0, 3, "sub") != 0) {
+                                clink::log::warn("coordinator.recovery",
+                                                 "in-doubt resolution: staged handle key '" +
+                                                     suffix + "' in " + snap.string() +
+                                                     " names no subtask; stopping resolution");
+                                return std::nullopt;
+                            }
+                            handles.push_back({static_cast<std::uint32_t>(
+                                                   std::strtoul(suffix.c_str() + 3, nullptr, 10)),
+                                               entry.value});
                         }
                     }
                 }
@@ -177,6 +205,26 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         // ANSWERS "not committed" (fenced, timed out, refused) is final.
         constexpr int kTransportAttempts = 5;
         std::vector<bool> handle_committed(handles->size(), false);
+        // A commit receipt on disk is the sink's own durable record that the
+        // broker acknowledged this subtask's commit for this checkpoint. It
+        // is taken over the wire outright: the wire path can be fenced by a
+        // successor producer, time out, or answer for a transaction that no
+        // longer exists - none of which can retract a commit that already
+        // happened (qual01-20260818b hit exactly that inversion, replaying
+        // a committed interval on a fenced verdict).
+        const auto receipt_dir = commit_receipt_dir_for(checkpoint_dir, job_id);
+        for (std::size_t i = 0; i < handles->size(); ++i) {
+            std::error_code rec_ec;
+            if (std::filesystem::exists(receipt_dir / clink::connectors::commit_receipt_file_name(
+                                                          (*handles)[i].subtask, id),
+                                        rec_ec)) {
+                handle_committed[i] = true;
+                clink::log::info("coordinator.recovery",
+                                 "in-doubt resolution: checkpoint " + std::to_string(id) +
+                                     " subtask " + std::to_string((*handles)[i].subtask) +
+                                     ": commit receipt on disk; COMMITTED without a wire call");
+            }
+        }
         bool all_committed = false;
         bool verdict_failure = false;
         for (int attempt = 0; attempt < kTransportAttempts && !verdict_failure; ++attempt) {
@@ -186,7 +234,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                 if (handle_committed[i]) {
                     continue;  // already executed; never re-resolve
                 }
-                const auto& handle = (*handles)[i];
+                const auto& handle = (*handles)[i].handle;
                 std::string resolver_name;
                 try {
                     resolver_name = clink::config::parse(handle).at("resolver").as_string();

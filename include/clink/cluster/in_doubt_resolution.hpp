@@ -35,6 +35,18 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 [[nodiscard]] std::filesystem::path completed_marker_dir_for(const std::string& checkpoint_dir,
                                                              JobId job_id);
 
+// <checkpoint_dir>/_jobs/<job_id>/receipts: per-subtask commit receipts.
+// A 2PC sink writes `sub<K>-<N>` here immediately after its external commit
+// for checkpoint N provably executed (see kCommitReceiptFileName in
+// txn_resume_registry.hpp for the file-name convention). The resolution walk
+// treats a receipted handle as COMMITTED without a wire call - the receipt
+// is this process's own durable record of the broker's acknowledgement, so
+// it outlives producer fencing, broker restarts, and transaction timeouts,
+// none of which can retract a commit that already happened. Workers prune
+// receipts alongside the checkpoints their retention sweep purges.
+[[nodiscard]] std::filesystem::path commit_receipt_dir_for(const std::string& checkpoint_dir,
+                                                           JobId job_id);
+
 // Walk (confirmed, completed], resolving each completed checkpoint's staged
 // handles via TxnResumeRegistry and durably writing CONFIRMED-<id> on full
 // success. Returns the new confirmed id (== `confirmed` when nothing
