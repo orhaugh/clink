@@ -699,7 +699,13 @@ clink::connectors::InDoubtResolution resolve_kafka_2pc_handle(const std::string&
         }
         last = outcome.detail;
     }
-    return {false, "no bootstrap broker reachable: " + last};
+    // Transport-only failure: no broker gave a verdict. Marked so the
+    // resolution walk retries in place instead of treating unreachability
+    // as "not committed" - which, after earlier handles of the same
+    // checkpoint already committed, would replay their intervals.
+    return {.committed = false,
+            .detail = "no bootstrap broker reachable: " + last,
+            .transport_inconclusive = true};
 }
 
 void install(clink::plugin::PluginRegistry& reg) {

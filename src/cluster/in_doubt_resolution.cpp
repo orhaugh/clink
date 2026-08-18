@@ -1,8 +1,10 @@
 #include "clink/cluster/in_doubt_resolution.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include "clink/config/json.hpp"
@@ -130,7 +132,8 @@ std::optional<std::vector<std::string>> read_resume_handles(const std::string& c
 std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                        JobId job_id,
                                        std::uint64_t confirmed,
-                                       std::uint64_t completed) {
+                                       std::uint64_t completed,
+                                       std::chrono::milliseconds transport_retry_backoff) {
     if (checkpoint_dir.empty() || completed <= confirmed) {
         return confirmed;
     }
@@ -164,36 +167,78 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
             clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
         }
-        bool all_committed = true;
-        for (const auto& handle : *handles) {
-            std::string resolver_name;
-            try {
-                resolver_name = clink::config::parse(handle).at("resolver").as_string();
-            } catch (const std::exception& e) {
-                clink::log::warn(
-                    "coordinator.recovery",
-                    std::string("in-doubt resolution: handle did not parse: ") + e.what());
-                all_committed = false;
-                break;
-            }
-            const auto resolver =
-                clink::connectors::TxnResumeRegistry::instance().find(resolver_name);
-            if (!resolver.has_value()) {
+        // EndTxn IS the resolution - each success EXECUTES a commit - so a
+        // checkpoint's handles are walked with per-handle memory and
+        // bounded retries on transport failure. A broker that is merely
+        // unreachable gives no verdict, and falling back after SOME handles
+        // committed would restore below intervals this walk just published
+        // and replay them as duplicates; broker chaos overlapping a
+        // recovery reaches exactly that interleaving. A broker that
+        // ANSWERS "not committed" (fenced, timed out, refused) is final.
+        constexpr int kTransportAttempts = 5;
+        std::vector<bool> handle_committed(handles->size(), false);
+        bool all_committed = false;
+        bool verdict_failure = false;
+        for (int attempt = 0; attempt < kTransportAttempts && !verdict_failure; ++attempt) {
+            bool transport_hit = false;
+            bool everything_done = true;
+            for (std::size_t i = 0; i < handles->size(); ++i) {
+                if (handle_committed[i]) {
+                    continue;  // already executed; never re-resolve
+                }
+                const auto& handle = (*handles)[i];
+                std::string resolver_name;
+                try {
+                    resolver_name = clink::config::parse(handle).at("resolver").as_string();
+                } catch (const std::exception& e) {
+                    clink::log::warn(
+                        "coordinator.recovery",
+                        std::string("in-doubt resolution: handle did not parse: ") + e.what());
+                    verdict_failure = true;
+                    everything_done = false;
+                    break;
+                }
+                const auto resolver =
+                    clink::connectors::TxnResumeRegistry::instance().find(resolver_name);
+                if (!resolver.has_value()) {
+                    clink::log::info("coordinator.recovery",
+                                     "in-doubt resolution: no resolver registered for '" +
+                                         resolver_name + "' (plugin not loaded in this process?)");
+                    verdict_failure = true;
+                    everything_done = false;
+                    break;
+                }
+                const auto result = (*resolver)(handle);
                 clink::log::info("coordinator.recovery",
-                                 "in-doubt resolution: no resolver registered for '" +
-                                     resolver_name + "' (plugin not loaded in this process?)");
-                all_committed = false;
+                                 "in-doubt resolution: checkpoint " + std::to_string(id) +
+                                     " via '" + resolver_name + "': " +
+                                     (result.committed                ? "COMMITTED"
+                                      : result.transport_inconclusive ? "transport-inconclusive"
+                                                                      : "not committed") +
+                                     " (" + result.detail + ")");
+                if (result.committed) {
+                    handle_committed[i] = true;
+                    continue;
+                }
+                everything_done = false;
+                if (result.transport_inconclusive) {
+                    transport_hit = true;
+                    continue;  // other handles may reach different brokers
+                }
+                verdict_failure = true;
                 break;
             }
-            const auto result = (*resolver)(handle);
-            clink::log::info("coordinator.recovery",
-                             "in-doubt resolution: checkpoint " + std::to_string(id) + " via '" +
-                                 resolver_name +
-                                 "': " + (result.committed ? "COMMITTED" : "not committed") + " (" +
-                                 result.detail + ")");
-            if (!result.committed) {
-                all_committed = false;
+            if (everything_done) {
+                all_committed = true;
                 break;
+            }
+            if (!verdict_failure && transport_hit && attempt + 1 < kTransportAttempts) {
+                clink::log::info("coordinator.recovery",
+                                 "in-doubt resolution: checkpoint " + std::to_string(id) +
+                                     " has unreachable broker(s); retrying (attempt " +
+                                     std::to_string(attempt + 2) + " of " +
+                                     std::to_string(kTransportAttempts) + ")");
+                std::this_thread::sleep_for(transport_retry_backoff);
             }
         }
         if (!all_committed) {
@@ -201,6 +246,23 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
             // bounded replay rather than data loss. Counted, because that
             // is a DIFFERENT guarantee from the resolved path and nothing
             // else distinguishes them at the metrics layer.
+            const auto committed_count = static_cast<std::size_t>(
+                std::count(handle_committed.begin(), handle_committed.end(), true));
+            if (committed_count > 0) {
+                // The bad corner, made loud: some of this checkpoint's
+                // transactions are now committed and the restore below will
+                // replay their intervals as duplicates. Reaching this needs
+                // a genuine mixed verdict or retries exhausted mid-outage -
+                // both narrowed hard by the transport retries and by
+                // teardown preserving prepared transactions.
+                clink::log::error(
+                    "coordinator.recovery",
+                    "in-doubt resolution: checkpoint " + std::to_string(id) + ": " +
+                        std::to_string(committed_count) + " of " + std::to_string(handles->size()) +
+                        " handles committed before resolution failed; the restore below WILL "
+                        "replay the committed intervals as duplicates (bounded by this one "
+                        "checkpoint)");
+            }
             clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
         }

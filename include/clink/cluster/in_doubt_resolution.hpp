@@ -20,6 +20,7 @@
 // missing resolver, or any resolver failure stops the walk and leaves the
 // bounded-replay contract in force.
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -38,9 +39,20 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 // handles via TxnResumeRegistry and durably writing CONFIRMED-<id> on full
 // success. Returns the new confirmed id (== `confirmed` when nothing
 // advanced).
-[[nodiscard]] std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
-                                                     JobId job_id,
-                                                     std::uint64_t confirmed,
-                                                     std::uint64_t completed);
+//
+// Resolution EXECUTES commits handle by handle - EndTxn is the resolution,
+// there is no read-only probe - so a handle whose broker is merely
+// UNREACHABLE (transport_inconclusive) is retried in place rather than
+// treated as a verdict: a fallback taken after some handles committed
+// would restore below intervals this walk just published and replay them
+// as duplicates. Broker chaos overlapping a recovery reaches exactly that
+// interleaving. `transport_retry_backoff` spaces the bounded retries; the
+// held restart the callers run under is already waiting on this answer.
+[[nodiscard]] std::uint64_t resolve_in_doubt_commits(
+    const std::string& checkpoint_dir,
+    JobId job_id,
+    std::uint64_t confirmed,
+    std::uint64_t completed,
+    std::chrono::milliseconds transport_retry_backoff = std::chrono::seconds{2});
 
 }  // namespace clink::cluster

@@ -54,6 +54,14 @@ inline constexpr std::string_view kTxnResumeStateKeyPrefix = "_clink_txn_resume_
 struct InDoubtResolution {
     bool committed{false};
     std::string detail;
+    // True when the resolver could not reach a broker AT ALL: no verdict
+    // exists, as opposed to a broker answering "no" (fenced, timed out,
+    // refused). The distinction matters because resolution EXECUTES commits
+    // handle by handle - a transport failure part-way through a checkpoint,
+    // treated as a verdict, would restore below intervals the walk just
+    // committed and replay them as duplicates. Transport failures are
+    // retried in place; verdicts are final.
+    bool transport_inconclusive{false};
 };
 
 // handle_json is the staged handle verbatim.
