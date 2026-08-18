@@ -15388,6 +15388,116 @@ TEST(WindowStateLifecycle, AnOpenWindowSurvivesSnapshotAndRestore) {
         << "both records folded before the snapshot must still be counted: " << rows[0];
 }
 
+// The late-drop horizon is part of the cut. A window that fired and whose
+// row was committed is removed from state, so state alone cannot resurrect
+// it - but a REPLAYED late record can, if the restored operator has
+// forgotten how far the watermark had advanced: before the first
+// post-restore watermark the drop horizon is wide open, the late record
+// builds a fresh bucket for the already-emitted window, and the next
+// watermark fires a second, partial row for a (key, window) the downstream
+// already holds. Duplicate at best, a silent partial overwrite through an
+// upsert sink at worst. OverAggregateRowOp has persisted its watermark for
+// exactly this reason since it was fixed; the tumbling and session window
+// operators are its siblings and must hold the same line. A late record is
+// one whose event time trails the watermark by more than the configured
+// lag - QUAL-01's generator premise (jitter strictly under lag) never
+// produces one, which is why the campaign could not catch this.
+TEST(WindowStateLifecycle, AFiredWindowIsNotResurrectedByAReplayedLateRecord) {
+    ensure_sql_installed_once();
+    Catalog cat;
+    auto ddl = parse(window_probe_ddl());
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    const auto spec = compile(cat,
+                              "INSERT INTO out_t SELECT COUNT(*) AS num FROM bid "
+                              "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction");
+    std::map<std::string, std::string> win_params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "tumbling_window_row") {
+            win_params = op.params;
+        }
+    }
+    ASSERT_FALSE(win_params.empty());
+
+    const OperatorId op_id{9913};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    auto build = [&] {
+        const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+            "tumbling_window_row", std::string{kChannelRow}, std::string{kChannelRow});
+        EXPECT_NE(f, nullptr);
+        cluster::OperatorBuildContext octx;
+        octx.params = win_params;
+        octx.parallelism = 1;
+        return std::static_pointer_cast<Operator<Row, Row>>(f->build(octx));
+    };
+    auto feed = [](Operator<Row, Row>& op, std::int64_t ts, std::int64_t key) {
+        Row r;
+        r.values["auction"] = clink::config::JsonValue{key};
+        r.values["datetime"] = clink::config::JsonValue{ts};
+        Batch<Row> b;
+        b.emplace(r, EventTime{ts});
+        BoundedChannel<StreamElement<Row>> ch(64);
+        Emitter<Row> em(&ch);
+        op.process(StreamElement<Row>::data(std::move(b)), em);
+        std::size_t n = 0;
+        while (auto el = ch.try_pop()) {
+            if (el->is_data()) {
+                n += el->as_data().size();
+            }
+        }
+        return n;
+    };
+    auto advance = [](Operator<Row, Row>& op, std::int64_t wm) {
+        BoundedChannel<StreamElement<Row>> ch(64);
+        Emitter<Row> em(&ch);
+        op.process(StreamElement<Row>::watermark(Watermark{EventTime{wm}}), em);
+        std::size_t n = 0;
+        while (auto el = ch.try_pop()) {
+            if (el->is_data()) {
+                n += el->as_data().size();
+            }
+        }
+        return n;
+    };
+
+    Snapshot snap;
+    {
+        auto op = build();
+        RuntimeContext ctx{op_id, "win", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        EXPECT_EQ(feed(*op, 1'000, 7), 0u);
+        EXPECT_EQ(feed(*op, 2'000, 7), 0u);
+        // Watermark 15000 fires and RETIRES window [0,10000): its row is
+        // downstream (committed, in the full pipeline).
+        EXPECT_EQ(advance(*op, 15'000), 1u) << "the window must fire once before the crash";
+        // A genuinely late straggler is correctly dropped pre-crash.
+        EXPECT_EQ(feed(*op, 3'000, 7), 0u);
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    auto restored_backend = std::make_shared<InMemoryStateBackend>();
+    restored_backend->restore(snap);
+    auto op2 = build();
+    RuntimeContext ctx2{op_id, "win", restored_backend.get(), &metrics};
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*restored_backend, op_id);
+    op2->open();
+
+    // The replay delivers the same late straggler BEFORE any post-restore
+    // watermark reaches this operator (multi-input alignment holds the
+    // watermark at min until every input has spoken). The restored horizon
+    // must drop it exactly as the pre-crash operator did.
+    EXPECT_EQ(feed(*op2, 3'000, 7), 0u);
+    EXPECT_EQ(advance(*op2, 20'000), 0u)
+        << "a replayed late record resurrected a fired window: its second, partial row "
+           "would land downstream beside the committed complete one";
+}
+
 // ---------------------------------------------------------------------------
 // RESCALE: a windowed query changing parallelism across a restore.
 //

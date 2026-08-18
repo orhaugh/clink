@@ -1767,12 +1767,47 @@ public:
                          OperatorId op_id,
                          const std::string& slot = "") override {
         Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        // The late-drop horizon is part of the cut. A fired window is
+        // erased from state and its row is downstream; only the restored
+        // watermark keeps a REPLAYED late record from rebuilding it and
+        // firing a second, partial row beside the committed one. Written on
+        // both sync and async paths - KeyedState holds the windows for
+        // async, never the watermark. Same 9-byte blob OverAggregateRowOp
+        // has persisted since its identical fix: wm (8, LE) + have flag.
+        std::array<std::byte, 9> wm_bytes{};
+        const auto wv = static_cast<std::uint64_t>(current_wm_);
+        for (int i = 0; i < 8; ++i) {
+            wm_bytes[static_cast<std::size_t>(i)] = static_cast<std::byte>((wv >> (i * 8)) & 0xFF);
+        }
+        wm_bytes[8] = static_cast<std::byte>(have_wm_ ? 1 : 0);
+        const std::string wm_key = std::string("winrow.wm") + slot;
+        backend.put_operator_state(
+            op_id,
+            StateBackend::KeyView{wm_key.data(), wm_key.size()},
+            StateBackend::ValueView{reinterpret_cast<const char*>(wm_bytes.data()),
+                                    wm_bytes.size()});
         if (!persist_inmem_) {
             return;  // the async path already holds its windows in KeyedState
         }
         auto kv = keyed_state_();
         for (const auto& [key, by_window] : state_) {
             kv.put(key, by_window);
+        }
+    }
+    void restore_timers(StateBackend& backend,
+                        OperatorId op_id,
+                        const std::string& slot = "") override {
+        Operator<Row, Row>::restore_timers(backend, op_id, slot);
+        const std::string wm_key = std::string("winrow.wm") + slot;
+        const auto v =
+            backend.get_operator_state(op_id, StateBackend::KeyView{wm_key.data(), wm_key.size()});
+        if (v.has_value() && v->size() >= 9) {
+            std::uint64_t raw = 0;
+            for (int i = 0; i < 8; ++i) {
+                raw |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
+            }
+            current_wm_ = static_cast<std::int64_t>(raw);
+            have_wm_ = static_cast<std::uint8_t>((*v)[8]) != 0;
         }
     }
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
@@ -2517,12 +2552,43 @@ public:
                          OperatorId op_id,
                          const std::string& slot = "") override {
         Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        // Same cut rule as the tumbling operator above: a replayed late
+        // record must meet the restored horizon, or it opens a spurious
+        // second session beside one whose row already committed.
+        std::array<std::byte, 9> wm_bytes{};
+        const auto wv = static_cast<std::uint64_t>(current_wm_);
+        for (int i = 0; i < 8; ++i) {
+            wm_bytes[static_cast<std::size_t>(i)] = static_cast<std::byte>((wv >> (i * 8)) & 0xFF);
+        }
+        wm_bytes[8] = static_cast<std::byte>(have_wm_ ? 1 : 0);
+        const std::string wm_key = std::string("sesswin.wm") + slot;
+        backend.put_operator_state(
+            op_id,
+            StateBackend::KeyView{wm_key.data(), wm_key.size()},
+            StateBackend::ValueView{reinterpret_cast<const char*>(wm_bytes.data()),
+                                    wm_bytes.size()});
         if (!persist_inmem_) {
             return;  // the async path already holds its sessions in KeyedState
         }
         auto kv = keyed_state_();
         for (const auto& [key, by_session] : state_) {
             kv.put(key, by_session);
+        }
+    }
+    void restore_timers(StateBackend& backend,
+                        OperatorId op_id,
+                        const std::string& slot = "") override {
+        Operator<Row, Row>::restore_timers(backend, op_id, slot);
+        const std::string wm_key = std::string("sesswin.wm") + slot;
+        const auto v =
+            backend.get_operator_state(op_id, StateBackend::KeyView{wm_key.data(), wm_key.size()});
+        if (v.has_value() && v->size() >= 9) {
+            std::uint64_t raw = 0;
+            for (int i = 0; i < 8; ++i) {
+                raw |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
+            }
+            current_wm_ = static_cast<std::int64_t>(raw);
+            have_wm_ = static_cast<std::uint8_t>((*v)[8]) != 0;
         }
     }
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
