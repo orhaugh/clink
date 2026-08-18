@@ -1915,7 +1915,12 @@ public:
             return;  // already fired / never existed
         }
         Batch<Row> batch;
-        batch.push(Record<Row>{finalize_window_(wit->second, win_end)});
+        // Fired panes carry the window's max event time (end - 1): downstream
+        // event-time consumers - cascading windows, the 2PC sink's replay
+        // suppression - order emissions on it.
+        Record<Row> fired{finalize_window_(wit->second, win_end)};
+        fired.set_event_time(EventTime{clink::sat_sub(win_end, 1)});
+        batch.push(std::move(fired));
         by_window.erase(wit);
         out.emit_data(std::move(batch));
         kv.put(key, by_window);  // empty map is harmless; next get rebuilds
@@ -1946,7 +1951,12 @@ public:
             if (wit == by_window.end()) {
                 continue;  // already fired / never existed
             }
-            batch.push(Record<Row>{finalize_window_(wit->second, win_end)});
+            // Fired panes carry the window's max event time (end - 1): downstream
+            // event-time consumers - cascading windows, the 2PC sink's replay
+            // suppression - order emissions on it.
+            Record<Row> fired{finalize_window_(wit->second, win_end)};
+            fired.set_event_time(EventTime{clink::sat_sub(win_end, 1)});
+            batch.push(std::move(fired));
             by_window.erase(wit);
             changed = true;
         }
@@ -2334,7 +2344,10 @@ private:
                     }
                     bail();
                 }
-                emit_batch.push(Record<Row>{finalize_window_(it->second, it->first)});
+                // Same event-time stamp as the timer fires above: end - 1.
+                Record<Row> fired{finalize_window_(it->second, it->first)};
+                fired.set_event_time(EventTime{clink::sat_sub(it->first, 1)});
+                emit_batch.push(std::move(fired));
                 it = by_window.erase(it);
             }
         }
@@ -3117,7 +3130,13 @@ private:
                 ++it;
                 continue;
             }
-            batch.push(Record<Row>{finalize_session_(it->second)});
+            // Fired sessions carry the session window's max event time
+            // (end + gap - 1), mirroring the fixed-window fires: downstream
+            // event-time consumers order emissions on it.
+            Record<Row> fired{finalize_session_(it->second)};
+            fired.set_event_time(
+                EventTime{clink::sat_sub(clink::sat_add(it->second.end, gap_ms_), 1)});
+            batch.push(std::move(fired));
             it = by_session.erase(it);
             changed = true;
         }
@@ -3138,7 +3157,11 @@ private:
                     ++it;
                     continue;
                 }
-                emit_batch.push(Record<Row>{finalize_session_(it->second)});
+                // Same event-time stamp as fire_due_sessions_: end + gap - 1.
+                Record<Row> fired{finalize_session_(it->second)};
+                fired.set_event_time(
+                    EventTime{clink::sat_sub(clink::sat_add(it->second.end, gap_ms_), 1)});
+                emit_batch.push(std::move(fired));
                 it = by_session.erase(it);
             }
         }
