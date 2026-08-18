@@ -382,6 +382,10 @@ class Chaos:
         "coordinator.before_completed_marker",
         "coordinator.after_completed_marker",
         "sink.before_commit",
+        # The ack window: broker committed, nothing durable recorded yet.
+        # qual01-20260818d's duplicates rode exactly this gap; recovery must
+        # prove the commit over the wire (idempotent re-EndTxn).
+        "sink.between_commit_and_receipt",
         "sink.after_external_commit",
     )
 

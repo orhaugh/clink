@@ -721,11 +721,21 @@ TEST_F(KafkaWindowRecoveryTest, RepeatedCompletedMarkerCoordinatorCrashesKeepOne
     ASSERT_TRUE(cluster.worker(0).running() && cluster.worker(1).running());
     EXPECT_EQ(cluster.worker(0).pid(), worker_0_pid);
     EXPECT_EQ(cluster.worker(1).pid(), worker_1_pid);
-    // The ghost left a COMPLETED marker above the restore point; the
-    // recovered job must have numbered its checkpoints above it rather than
-    // rewriting the ghost's records.
-    EXPECT_GE(cluster.count_in_coordinator_log("numbers new checkpoints from"), 1u)
-        << "recovery reused a checkpoint id that already has a durable record";
+    // The ghost left a COMPLETED marker above the last confirmed
+    // checkpoint. Two sound recoveries exist: resolution proves the
+    // ghost's commits (receipts, or the wire with DescribeTransactions
+    // disambiguation) and the restore point reaches the marker - no
+    // numbering gap opens - or resolution cannot prove them, the restore
+    // stays below, and the recovered job must announce the gap it numbers
+    // across rather than rewriting the ghost's records. Before the
+    // receipts era only the second path existed and this assertion pinned
+    // its announcement alone; the id-reuse mutant is still caught because
+    // reusing an id under EITHER path corrupts the ghost's snapshots and
+    // fails the exact oracle below.
+    EXPECT_GE(cluster.count_in_coordinator_log("numbers new checkpoints from") +
+                  cluster.count_in_coordinator_log("commit-CONFIRMED by in-doubt resolution"),
+              1u)
+        << "recovery neither resolved the ghost's checkpoint nor announced the numbering gap";
 
     // Let the recovered job absorb a post-recovery stretch of the feed, then
     // close the open window and judge everything against the exact oracle.
@@ -1078,6 +1088,200 @@ TEST_F(KafkaWindowRecoveryTest, AFencedPartialCommitFallsBackWithoutDuplicates) 
            "suppressed) or losses (a record above the receipt horizon was swallowed)";
 }
 
+// qual01-20260818d, reproduced deterministically end to end. Two
+// ingredients, both required: FIRST a plain worker-loss restore, whose
+// union operator-state semantics replicate every sink's staged resume
+// handle into every subtask's state (later snapshots re-persist the stale
+// copies - the walk once saw 64 handles for 4 sinks and aborted on a
+// fenced stale copy); THEN a kill inside the ack window - after the broker
+// committed, before the receipt landed. Recovery must read each sink's
+// handle only from its own subtask's snapshot, prove the unrecorded
+// commit over the wire (re-EndTxn answers idempotently, pinned live), and
+// advance CONFIRMED - restoring AT the checkpoint instead of replaying
+// the committed slice as 4,560 duplicates.
+TEST_F(KafkaWindowRecoveryTest, AKillInTheAckWindowAfterARestoreStaysExactlyOnce) {
+    constexpr int kKeys = 10;
+    constexpr std::int64_t kBase = 7'000'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    spec.slots_per_worker = 8;
+    spec.ha = true;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    ASSERT_TRUE(cluster.start_ha_coordinators(1));
+    // Worker 0 starts UNARMED: the fault must fire only after the
+    // pollution-bake restore, and a hit ordinal cannot guarantee that -
+    // sink placement varies, so a fixed ordinal raced the bake and fired
+    // early. Phase 2 restarts worker 0 with the fault armed at its fresh
+    // process's FIRST commit dispatch, which is post-restore by
+    // construction.
+    ASSERT_TRUE(cluster.start_ha_worker(0));
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + input_topic_ +
+        "', group_id='ackwin', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + output_topic_ +
+        "', delivery_guarantee='exactly_once', transactional_id='ackwin'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql-ackwin",
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "kafka-ackwin",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "300",
+                              "--max-restarts-on-worker-loss",
+                              "8",
+                              "--parallelism",
+                              "4"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 2; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
+    const auto advance_base = kBase + 50'000;
+    std::atomic<bool> stop_feed{false};
+    std::atomic<std::size_t> produced{0};
+    std::map<WindowKey, Aggregate> feed_windows;
+    std::thread feeder([&] {
+        feed_windows = produce_json_advancing(
+            kafka_->brokers(), input_topic_, advance_base, kKeys, stop_feed, produced);
+    });
+    // A fatal assertion returns from the test body early; an unjoined
+    // feeder thread then terminates the whole binary and eats the actual
+    // failure message.
+    struct FeedGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~FeedGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } feed_guard{stop_feed, feeder};
+    ASSERT_TRUE(
+        clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s));
+
+    // Phase 1 - bake the union pollution: an ordinary worker loss and
+    // restore. Every snapshot taken afterwards carries every sink's staged
+    // handle rows.
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > 0; }, 60s))
+        << "no confirmed checkpoint before the pollution bake";
+    const auto confirmed_before_bake = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+    cluster.worker(1).kill_and_reap();
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") >=
+                   confirmed_before_bake + 3;
+        },
+        90s))
+        << "the job never resumed confirmed commits after the pollution-bake restore";
+    const auto w1_pid_after_bake = cluster.worker(1).pid();
+
+    // Phase 2 - the ack-window kill. Worker 0 is restarted WITH the fault
+    // armed at its first commit dispatch: another restore (more pollution
+    // baked), then the fresh process's first broker-acknowledged commit
+    // dies before its receipt lands.
+    cluster.worker(0).kill_and_reap();
+    ASSERT_TRUE(cluster.start_ha_worker(
+        0, ProcOptions{.fault = "sink.between_commit_and_receipt=exit:72@1"}));
+    ASSERT_TRUE(clink::itest::await([&] { return !cluster.worker(0).running(); }, 120s))
+        << "sink.between_commit_and_receipt never fired on the restarted worker 0";
+    const auto w0_exit = cluster.worker(0).poll_exit();
+    ASSERT_TRUE(w0_exit.has_value());
+    ASSERT_EQ(*w0_exit, 72);
+    const auto completed_at_kill = latest_marker(cluster.checkpoint_dir(), "COMPLETED-");
+    ASSERT_TRUE(cluster.restart_worker_ha(0));
+
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > completed_at_kill; },
+        90s))
+        << "the job never confirmed past the ack-window kill";
+
+    // The branch this gate exists for: resolution PROVED the unrecorded
+    // commit rather than falling back, and no stale union copy poisoned it.
+    // Worker 1 must ride the whole ack-window episode in one process: the
+    // failure under test is worker 0's alone.
+    EXPECT_EQ(cluster.worker(1).pid(), w1_pid_after_bake)
+        << "worker 1 must survive the ack-window episode";
+    EXPECT_TRUE(cluster.ha_coordinator(0).log_contains("commit-CONFIRMED by in-doubt resolution"))
+        << "recovery never proved the ack-window commit over the wire";
+    EXPECT_FALSE(
+        cluster.ha_coordinator(0).log_contains("handles committed before resolution failed"))
+        << "the walk fell back - a stale union handle copy poisoned it again";
+
+    const auto produced_at_recovery = produced.load(std::memory_order_acquire);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return produced.load(std::memory_order_acquire) >= produced_at_recovery + 1'500; },
+        30s));
+    stop_feed.store(true, std::memory_order_release);
+    feeder.join();
+    expected.insert(feed_windows.begin(), feed_windows.end());
+
+    std::int64_t max_ws = advance_base;
+    for (const auto& [key, agg] : feed_windows) {
+        (void)agg;
+        max_ws = std::max(max_ws, key.second);
+    }
+    const auto closer_start = max_ws + 20'000;
+    produce_json(kafka_->brokers(), input_topic_, window_records(closer_start, kKeys));
+
+    const auto after = consume_committed(kafka_->brokers(), output_topic_, expected.size(), 180s);
+    const auto actual = parse_output(after);
+    if (actual != expected) {
+        for (const auto& [key, agg] : expected) {
+            const auto it = actual.find(key);
+            if (it == actual.end()) {
+                ADD_FAILURE() << "MISSING k=" << key.first << " ws=" << key.second;
+            } else if (it->second != agg) {
+                ADD_FAILURE() << "WRONG k=" << key.first << " ws=" << key.second;
+            }
+        }
+        for (const auto& [key, agg] : actual) {
+            if (expected.count(key) == 0) {
+                ADD_FAILURE() << "EXTRA k=" << key.first << " ws=" << key.second
+                              << " cnt=" << agg.first << " total=" << agg.second;
+            }
+        }
+    }
+    EXPECT_EQ(actual, expected)
+        << "the ack-window kill produced duplicates (the committed slice was replayed) or "
+           "losses";
+}
+
 // A FAILED checkpoint must rewind, not sail on. The abort broadcast that
 // follows a failed checkpoint discards every sink's barrier-sealed staged
 // transaction - the records of one whole checkpoint interval - and the
@@ -1411,6 +1615,7 @@ INSTANTIATE_TEST_SUITE_P(
                       TwopcFaultCase{"coordinator.before_completed_marker", true, 6},
                       TwopcFaultCase{"coordinator.after_completed_marker", true, 6},
                       TwopcFaultCase{"sink.before_commit", false, 3},
+                      TwopcFaultCase{"sink.between_commit_and_receipt", false, 3},
                       TwopcFaultCase{"sink.after_external_commit", false, 3}),
     [](const ::testing::TestParamInfo<TwopcFaultCase>& info) {
         std::string name{info.param.point};

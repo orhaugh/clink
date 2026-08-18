@@ -698,7 +698,7 @@ on_host "$OPS_PUB" "pkill -INT -f '[v]erifier.py' || true"
 # full fault coverage summarised INCONCLUSIVE for want of the flag. Wait
 # for the final verdict, bounded, and only then sweep; a timeout is said
 # loudly and the summary correctly refuses to call the run complete.
-FINAL_WAIT_S="${FINAL_WAIT_S:-600}"
+FINAL_WAIT_S="${FINAL_WAIT_S:-1200}"
 waited=0
 while [ "$waited" -lt "$FINAL_WAIT_S" ]; do
     if on_host "$OPS_PUB" "python3 -c \"import json,sys; sys.exit(0 if json.load(open('/qual/verdict.json')).get('final') else 1)\"" \
