@@ -194,6 +194,12 @@ void pin_recovered_state_backend(CheckpointConfig& checkpoint);
 // when the file is absent, unreadable, or predates fencing.
 [[nodiscard]] std::uint64_t metadata_stored_epoch(const std::string& path);
 
+// The body-shaped form of the same extractor: the coordinator_epoch stamped
+// inside a manifest/history record. This is what the coordination store's
+// fenced_put takes - an object store fences on the record it read back, not
+// on a filesystem path.
+[[nodiscard]] std::uint64_t metadata_epoch_in_body(const std::string& body);
+
 // The metadata fencing rule: a coordinator may overwrite a record only if
 // the record was not written by a LATER epoch than its own. Exposed
 // (alongside the two policies above) so the rule can be tested without

@@ -518,6 +518,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/state/state_backend_factory.cpp
     src/state/schema_version.cpp
     src/state/state_migration_on_restore.cpp
+    src/cluster/coordination_store.cpp
     src/cluster/fenced_metadata.cpp
     src/cluster/ha_coordinator.cpp
     src/cluster/restore_compat_gate.cpp

@@ -16,6 +16,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/config_lint.hpp"
 #include "clink/cluster/connector_availability.hpp"
+#include "clink/cluster/coordination_store.hpp"
 #include "clink/cluster/fenced_metadata.hpp"
 #include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
@@ -204,37 +205,16 @@ void Coordinator::set_ha_dir(std::string dir) {
     }
 }
 
-namespace {
-
-// Durable atomic file write for control-plane metadata. Avoids a reader (or
-// standby coordinator) seeing a partial JSON / .so file mid-write, AND makes
-// the bytes survive an OS/power loss rather than only a process crash.
-//
-// This used to be an ofstream to a fixed "<path>.tmp" followed by a rename.
-// Write control-plane metadata only if this coordinator has not been
-// superseded, judged by the epoch already recorded in the file. The rule is
-// metadata_write_allowed and the mechanism is fenced_metadata_cas_write: the
-// check and the durable rename run inside one per-target critical section,
-// so two racing writers can no longer both pass the check (item 4 - the old
-// read-then-rename form let the staler writer land second and win).
-bool fenced_write_file(const std::filesystem::path& path,
-                       const std::string& body,
-                       std::uint64_t writer_epoch) {
-    return fenced_metadata_cas_write(path, body, writer_epoch, metadata_stored_epoch);
-}
-
-}  // namespace
+// HA metadata now goes through the coordination store's fenced_put with
+// metadata_stored_epoch as the extractor - the same fenced_metadata_cas_write
+// mechanism (check and durable rename inside one per-target critical
+// section), behind the seam an object-store implementation can also satisfy.
 
 // Deliberately the same hand-rolled scan the manifest readers use rather
 // than a JSON parser: the field is written by this file and read by this
 // file, and pulling in a parser for one integer would be the tail wagging
 // the dog.
-std::uint64_t metadata_stored_epoch(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) {
-        return 0;
-    }
-    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+std::uint64_t metadata_epoch_in_body(const std::string& body) {
     const auto key = std::string("\"coordinator_epoch\":");
     const auto pos = body.find(key);
     if (pos == std::string::npos) {
@@ -247,6 +227,15 @@ std::uint64_t metadata_stored_epoch(const std::string& path) {
     }
 }
 
+std::uint64_t metadata_stored_epoch(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        return 0;
+    }
+    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return metadata_epoch_in_body(body);
+}
+
 // Serialize a terminal-state record to <ha_dir>/history/<job_id>.json.
 // One file per job mirrors HistoryServer archive layout and
 // avoids needing a DB. Atomic-rename so a partially-written file is
@@ -256,7 +245,6 @@ void persist_history_record_(const std::string& ha_dir,
                              std::uint64_t writer_epoch) {
     if (ha_dir.empty())
         return;
-    const auto history_dir = std::filesystem::path{ha_dir} / "history";
     auto q = [](const std::string& s) { return js_quote(s); };
     std::string body;
     body += "{\"job_id\":" + std::to_string(rec.job_id);
@@ -278,7 +266,12 @@ void persist_history_record_(const std::string& ha_dir,
     // false operational record, even though it changes no running work.
     body += ",\"coordinator_epoch\":" + std::to_string(writer_epoch);
     body += "}";
-    fenced_write_file(history_dir / (std::to_string(rec.job_id) + ".json"), body, writer_epoch);
+    (void)make_coordination_store(ha_dir)->fenced_put(
+        "history/" + std::to_string(rec.job_id) + ".json",
+        body,
+        writer_epoch,
+        metadata_epoch_in_body,
+        {});
 }
 
 void apply_default_state_backend(CheckpointConfig& checkpoint, const std::string& default_uri) {
@@ -313,21 +306,17 @@ void persist_job_manifest_(const std::string& ha_dir,
                            bool requires_commit_confirmation) {
     if (ha_dir.empty())
         return;
-    const auto job_dir = std::filesystem::path{ha_dir} / "jobs" / std::to_string(job_id);
-    std::error_code ec;
-    std::filesystem::create_directories(job_dir, ec);
+    const auto store = make_coordination_store(ha_dir);
+    const auto job_prefix = "jobs/" + std::to_string(job_id);
     // Plugin bytes: idempotent by content-hash. Same hash = same
     // bytes, so re-writes are no-ops; cheaper to skip than to re-
     // verify content.
     for (const auto& p : plugins) {
-        const auto path = job_dir / ("plugin-" + p.content_hash + ".so");
-        if (std::filesystem::exists(path))
+        const auto key = job_prefix + "/plugin-" + p.content_hash + ".so";
+        if (store->exists(key))
             continue;
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (out) {
-            out.write(reinterpret_cast<const char*>(p.bytes.data()),
-                      static_cast<std::streamsize>(p.bytes.size()));
-        }
+        store->put(key,
+                   std::string_view(reinterpret_cast<const char*>(p.bytes.data()), p.bytes.size()));
     }
     // Manifest. Hand-crafted JSON; the readers (recover_persisted_jobs
     // below + the test fixture) parse only what they wrote.
@@ -355,7 +344,10 @@ void persist_job_manifest_(const std::string& ha_dir,
     // Stamped so a later writer can tell whether it has been superseded.
     manifest += ",\"coordinator_epoch\":" + std::to_string(writer_epoch);
     manifest += "}";
-    fenced_write_file(job_dir / "manifest.json", manifest, writer_epoch);
+    // Refusal is logged inside the CAS (same line the direct fenced write
+    // produced); the write is fire-and-forget for the same reason it was.
+    (void)store->fenced_put(
+        job_prefix + "/manifest.json", manifest, writer_epoch, metadata_epoch_in_body, {});
 }
 
 namespace {
@@ -380,14 +372,10 @@ std::uint64_t latest_marker_id_on_disk(const std::string& checkpoint_dir,
                                        const std::string& prefix) {
     if (checkpoint_dir.empty())
         return 0;
-    const auto job_dir = completed_marker_dir_for(checkpoint_dir, job_id);
-    if (!std::filesystem::exists(job_dir))
-        return 0;
     std::uint64_t latest = 0;
-    for (const auto& e : std::filesystem::directory_iterator(job_dir)) {
-        if (!e.is_regular_file())
-            continue;
-        const auto name = e.path().filename().string();
+    for (const auto& key :
+         make_coordination_store(checkpoint_dir)->list("_jobs/" + std::to_string(job_id))) {
+        const auto name = std::filesystem::path(key).filename().string();
         if (name.rfind(prefix, 0) != 0)
             continue;
         try {
@@ -509,15 +497,17 @@ std::vector<std::string> read_string_array_field(const std::string& body, const 
 void Coordinator::recover_persisted_jobs() {
     if (ha_dir_.empty())
         return;
-    const auto jobs_root = std::filesystem::path{ha_dir_} / "jobs";
-    if (!std::filesystem::exists(jobs_root))
-        return;
+    // A persisted job is identified by its manifest key: jobs/<id>/manifest.json.
+    // Key-shaped rather than directory-shaped so the coordination store's
+    // object-store implementations (which have no directories) recover the
+    // same set.
     std::vector<JobId> ids;
-    for (const auto& e : std::filesystem::directory_iterator(jobs_root)) {
-        if (!e.is_directory())
+    for (const auto& key : make_coordination_store(ha_dir_)->list("jobs")) {
+        const std::filesystem::path p(key);
+        if (p.filename() != "manifest.json")
             continue;
         try {
-            ids.push_back(static_cast<JobId>(std::stoull(e.path().filename().string())));
+            ids.push_back(static_cast<JobId>(std::stoull(p.parent_path().filename().string())));
         } catch (...) {
         }
     }
@@ -570,7 +560,6 @@ void Coordinator::recover_persisted_jobs() {
 }
 
 void Coordinator::recover_one_persisted_job_(JobId job_id) {
-    const auto jobs_root = std::filesystem::path{ha_dir_} / "jobs";
     // Skip if already in jobs_ (idempotent on repeated takeover, and the
     // guard that makes the capacity RETRY safe to run any number of
     // times: a recovery that succeeded between park and retry is a no-op
@@ -581,12 +570,12 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
             return;
     }
     {
-        const auto job_dir = jobs_root / std::to_string(job_id);
-        const auto manifest_path = job_dir / "manifest.json";
-        std::ifstream in(manifest_path);
-        if (!in)
+        const auto store = make_coordination_store(ha_dir_);
+        const auto job_prefix = "jobs/" + std::to_string(job_id);
+        const auto manifest = store->get(job_prefix + "/manifest.json");
+        if (!manifest.has_value())
             return;
-        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::string& body = *manifest;
         const auto graph_json = read_string_field(body, "graph_json");
         if (graph_json.empty())
             return;
@@ -620,16 +609,23 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
             ckpt.restore_from_dir = ckpt.checkpoint_dir;
             ckpt.restore_from_checkpoint_id = latest;
         }
-        // Plugins: scan plugin-*.so files in this job dir, load each
+        // Plugins: scan plugin-*.so keys in this job's prefix, load each
         // into a fresh JobBundle.
         std::vector<PluginBinary> plugins;
-        for (const auto& f : std::filesystem::directory_iterator(job_dir)) {
-            if (!f.is_regular_file())
-                continue;
-            const auto name = f.path().filename().string();
+        for (const auto& key : store->list(job_prefix)) {
+            const auto name = std::filesystem::path(key).filename().string();
             if (name.rfind("plugin-", 0) != 0 || name.size() < 11)
                 continue;
-            plugins.push_back(make_plugin_binary_from_file(f.path().string(), name));
+            const auto bytes = store->get(key);
+            if (!bytes.has_value()) {
+                continue;  // pruned between list and read; recovery stays conservative
+            }
+            PluginBinary blob;
+            blob.bytes.assign(reinterpret_cast<const std::byte*>(bytes->data()),
+                              reinterpret_cast<const std::byte*>(bytes->data()) + bytes->size());
+            blob.content_hash = fnv1a_64_hex(blob.bytes);
+            blob.name = name;
+            plugins.push_back(std::move(blob));
         }
         auto bundle = std::make_unique<JobBundle>();
         auto bundle_preg = bundle->as_plugin_registry();
@@ -896,19 +892,15 @@ void Coordinator::in_doubt_resolution_loop_() {
 void Coordinator::reload_history_from_disk_() {
     if (ha_dir_.empty())
         return;
-    const auto history_dir = std::filesystem::path{ha_dir_} / "history";
-    if (!std::filesystem::exists(history_dir))
-        return;
+    const auto store = make_coordination_store(ha_dir_);
     std::vector<CompletedJobRecord> records;
-    for (const auto& e : std::filesystem::directory_iterator(history_dir)) {
-        if (!e.is_regular_file())
+    for (const auto& key : store->list("history")) {
+        if (std::filesystem::path(key).extension() != ".json")
             continue;
-        if (e.path().extension() != ".json")
+        const auto body_opt = store->get(key);
+        if (!body_opt.has_value())
             continue;
-        std::ifstream in(e.path());
-        if (!in)
-            continue;
-        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::string& body = *body_opt;
         CompletedJobRecord rec;
         rec.job_id = static_cast<JobId>(read_uint_field(body, "job_id"));
         if (rec.job_id == 0)
@@ -6378,7 +6370,7 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
 void Coordinator::handle_commit_confirmed_(MessageReader& r) {
     const auto msg = decode_commit_confirmed(r);
     const std::string key = msg.role + ":" + std::to_string(msg.subtask_idx);
-    std::filesystem::path marker;
+    std::string marker_root;  // checkpoint_dir; empty = nothing to publish
     std::uint64_t confirmed_id = 0;
     JobId jid{};
     {
@@ -6406,21 +6398,16 @@ void Coordinator::handle_commit_confirmed_(MessageReader& r) {
         if (msg.checkpoint_id > job.latest_confirmed_checkpoint_id) {
             job.latest_confirmed_checkpoint_id = msg.checkpoint_id;
         }
-        if (!job.checkpoint.checkpoint_dir.empty()) {
-            marker = completed_marker_dir_for(job.checkpoint.checkpoint_dir, msg.job_id) /
-                     ("CONFIRMED-" + std::to_string(msg.checkpoint_id));
-        }
+        marker_root = job.checkpoint.checkpoint_dir;
         confirmed_id = msg.checkpoint_id;
         jid = msg.job_id;
     }
-    if (!marker.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(marker.parent_path(), ec);
+    if (!marker_root.empty()) {
         try {
-            clink::state::detail::write_string_fsync_rename(
-                marker,
-                "job=" + std::to_string(jid) + "\ncheckpoint=" + std::to_string(confirmed_id) +
-                    "\n");
+            make_coordination_store(marker_root)
+                ->put("_jobs/" + std::to_string(jid) + "/CONFIRMED-" + std::to_string(confirmed_id),
+                      "job=" + std::to_string(jid) +
+                          "\ncheckpoint=" + std::to_string(confirmed_id) + "\n");
         } catch (const std::exception& e) {
             clink::log::error("coordinator.checkpoint",
                               "could not durably record commit confirmation of checkpoint " +
@@ -6913,11 +6900,8 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             // Markers written by an older build sit at the flat or bare
             // job-id path and are not migrated. Nothing reads them, so
             // nothing is lost by leaving them.
-            const std::filesystem::path marker =
-                completed_marker_dir_for(completed_marker_dir, jid) /
-                ("COMPLETED-" + std::to_string(ckpt_id));
-            std::error_code ec;
-            std::filesystem::create_directories(marker.parent_path(), ec);
+            const std::string marker_key =
+                "_jobs/" + std::to_string(jid) + "/COMPLETED-" + std::to_string(ckpt_id);
             CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCompletedMarker);
             try {
                 // The marker records what the checkpoint CONSISTS OF, not only
@@ -6934,11 +6918,11 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 for (const auto idx : subtasks) {
                     subtask_list += (subtask_list.empty() ? "" : ",") + std::to_string(idx);
                 }
-                clink::state::detail::write_string_fsync_rename(
-                    marker,
-                    "job=" + std::to_string(jid) + "\ncheckpoint=" + std::to_string(ckpt_id) +
-                        "\ngeneration=" + std::to_string(gen) + "\nsubtasks=" + subtask_list +
-                        "\n");
+                make_coordination_store(completed_marker_dir)
+                    ->put(marker_key,
+                          "job=" + std::to_string(jid) + "\ncheckpoint=" + std::to_string(ckpt_id) +
+                              "\ngeneration=" + std::to_string(gen) + "\nsubtasks=" + subtask_list +
+                              "\n");
             } catch (const std::exception& e) {
                 clink::log::error(
                     "coordinator.checkpoint",

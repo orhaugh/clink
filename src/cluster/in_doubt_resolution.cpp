@@ -2,11 +2,12 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <fstream>
 #include <optional>
+#include <sstream>
 #include <thread>
 #include <vector>
 
+#include "clink/cluster/coordination_store.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/txn_resume_registry.hpp"
 #include "clink/metrics/orchestration_metrics.hpp"
@@ -50,12 +51,9 @@ struct CompletedMarkerInfo {
     std::vector<std::uint32_t> subtasks;
 };
 
-std::optional<CompletedMarkerInfo> read_completed_marker(const std::filesystem::path& marker) {
-    std::ifstream in(marker);
-    if (!in.is_open()) {
-        return std::nullopt;
-    }
+std::optional<CompletedMarkerInfo> read_completed_marker(const std::string& body) {
     CompletedMarkerInfo out;
+    std::istringstream in(body);
     std::string line;
     bool saw_subtasks = false;
     while (std::getline(in, line)) {
@@ -92,6 +90,9 @@ struct StagedHandle {
     std::string handle;
 };
 
+// W3 (coordination-store plan): these snapshot loads are the one read the
+// store does not yet cover - they go through the state layout directly and
+// only exist under a filesystem/legacy backend rooted at checkpoint_dir.
 // The staged resume handles inside one checkpoint's snapshots: operator-state
 // rows (0xFF-prefixed stored keys) whose logical key starts with
 // kTxnResumeStateKeyPrefix. nullopt = a snapshot could not be read (or a
@@ -165,14 +166,14 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
     if (checkpoint_dir.empty() || completed <= confirmed) {
         return confirmed;
     }
-    const auto job_dir = completed_marker_dir_for(checkpoint_dir, job_id);
+    const auto store = make_coordination_store(checkpoint_dir);
+    const auto job_prefix = "_jobs/" + std::to_string(job_id) + "/";
     for (std::uint64_t id = confirmed + 1; id <= completed; ++id) {
-        const auto marker = job_dir / ("COMPLETED-" + std::to_string(id));
-        std::error_code ec;
-        if (!std::filesystem::exists(marker, ec)) {
+        const auto marker_body = store->get(job_prefix + "COMPLETED-" + std::to_string(id));
+        if (!marker_body.has_value()) {
             continue;  // this id never completed; its transaction was aborted
         }
-        const auto info = read_completed_marker(marker);
+        const auto info = read_completed_marker(*marker_body);
         if (!info.has_value()) {
             clink::log::info("coordinator.recovery",
                              "in-doubt resolution: COMPLETED-" + std::to_string(id) +
@@ -212,12 +213,10 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         // longer exists - none of which can retract a commit that already
         // happened (qual01-20260818b hit exactly that inversion, replaying
         // a committed interval on a fenced verdict).
-        const auto receipt_dir = commit_receipt_dir_for(checkpoint_dir, job_id);
         for (std::size_t i = 0; i < handles->size(); ++i) {
-            std::error_code rec_ec;
-            if (std::filesystem::exists(receipt_dir / clink::connectors::commit_receipt_file_name(
-                                                          (*handles)[i].subtask, id),
-                                        rec_ec)) {
+            if (store->exists(
+                    job_prefix + "receipts/" +
+                    clink::connectors::commit_receipt_file_name((*handles)[i].subtask, id))) {
                 handle_committed[i] = true;
                 clink::log::info("coordinator.recovery",
                                  "in-doubt resolution: checkpoint " + std::to_string(id) +
@@ -318,10 +317,9 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         // confirmation durably, exactly as handle_commit_confirmed_ does,
         // so THIS and every later recovery selects it.
         try {
-            clink::state::detail::write_string_fsync_rename(
-                job_dir / ("CONFIRMED-" + std::to_string(id)),
-                "job=" + std::to_string(job_id) + "\ncheckpoint=" + std::to_string(id) +
-                    "\nresolved=in-doubt\n");
+            store->put(job_prefix + "CONFIRMED-" + std::to_string(id),
+                       "job=" + std::to_string(job_id) + "\ncheckpoint=" + std::to_string(id) +
+                           "\nresolved=in-doubt\n");
         } catch (const std::exception& e) {
             clink::log::error("coordinator.recovery",
                               "in-doubt resolution: checkpoint " + std::to_string(id) +
