@@ -6504,6 +6504,18 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         std::uint64_t checkpoint_id{};
         std::uint32_t generation{1};
         std::set<std::uint32_t> subtasks;
+        // A checkpoint completing while the job is draining for a restart
+        // gets its COMPLETED marker (durability is unconditional) but NOT
+        // the commit broadcast: half the sinks are being torn down, so a
+        // broadcast lands on some and not others, and a completed
+        // checkpoint with PARTIAL external commits is unrepairable at
+        // restore granularity - qual01-20260818a replayed the committed
+        // slices as 13,519 duplicates. Left completed-but-unconfirmed, the
+        // restart's held in-doubt resolution finalises every prepared
+        // transaction atomically (teardown now preserves them), or the
+        // job restores below it with nothing committed. One decision, one
+        // decider.
+        bool suppress_commit{false};
     };
     std::vector<CompletedCheckpoint> just_completed;
     std::string completed_marker_dir;
@@ -6679,6 +6691,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                     done.subtasks = pit->second.subtasks;
                     job.checkpoint_participants.erase(pit);
                 }
+                done.suppress_commit = job.awaiting_restart;
                 just_completed.push_back(std::move(done));
             }
             completed_marker_dir = job.checkpoint.checkpoint_dir;
@@ -6807,7 +6820,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     }
     // Write the COMPLETED marker outside the lock so a slow filesystem
     // doesn't block reader threads.
-    for (const auto& [jid, ckpt_id, gen, subtasks] : just_completed) {
+    for (const auto& [jid, ckpt_id, gen, subtasks, suppress_commit] : just_completed) {
         // The COMPLETED-N marker is the authoritative record that a
         // checkpoint reached global completion, and the 2PC sinks key their
         // commit-on-restore on finding it. It therefore has to be durable
@@ -6887,6 +6900,20 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 continue;
             }
             CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAfterCompletedMarker);
+        }
+        // A checkpoint that completed while the job was draining for a
+        // restart keeps its durable marker but is NOT committed from here:
+        // a broadcast into a half-torn-down job commits some sinks and not
+        // others, and a completed checkpoint with partial external commits
+        // forces the restore to either replay committed slices (duplicates)
+        // or skip uncommitted ones (loss). The restart's held in-doubt
+        // resolution finalises it as one decision instead.
+        if (suppress_commit) {
+            log::info("coordinator.checkpoint",
+                      "job_id=" + std::to_string(jid) + " checkpoint " + std::to_string(ckpt_id) +
+                          " completed during a restart drain; commit broadcast withheld for "
+                          "the restart's in-doubt resolution");
+            continue;
         }
         // The commit phase of the 2PC sink protocol: broadcast CommitCheckpoint
         // to every worker hosting tasks for this job. The marker write

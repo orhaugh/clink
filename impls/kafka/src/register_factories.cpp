@@ -322,17 +322,15 @@ public:
         CLINK_FAULT_POINT(clink::fault::points::kSinkBeforeCommit);
         std::lock_guard lk(mu_);
         if (closed_) {
-            // The prepared transaction died with close()'s abort. Executing
-            // "successfully" here would confirm a checkpoint whose records
-            // the broker has already discarded - the restore would then
-            // select it and replay PAST them. Refusing keeps the worker
-            // from sending CommitConfirmed, so the restore falls back to
-            // the last checkpoint whose commit genuinely executed and the
-            // replay re-produces these records.
+            // The producer was destroyed at close(), so this process can no
+            // longer execute the commit. The PREPARED transaction survives
+            // teardown (close leaves it for the checkpoint protocol), and
+            // the in-doubt resolver finalises it at the held restart.
+            // Confirming here would claim an execution that did not happen.
             throw std::runtime_error(
                 "kafka_2pc_sink_string: commit for checkpoint " + std::to_string(checkpoint_id) +
-                " arrived after the sink closed; its transaction was aborted at teardown and "
-                "must not be confirmed");
+                " arrived after the sink closed; the prepared transaction is left for "
+                "in-doubt resolution and must not be confirmed by this process");
         }
         if (!open_txn_ckpt_.has_value() || *open_txn_ckpt_ != checkpoint_id) {
             if (checkpoint_id <= last_committed_ckpt_) {
@@ -384,16 +382,31 @@ public:
 
     void close() override {
         std::lock_guard lk(mu_);
-        // If a transaction is still open at shutdown - meaning the last
-        // barrier wasn't followed by an on_commit - abort it so the broker
-        // doesn't leave records lingering in PREPARED. Buffered records die
-        // with it; the checkpoint they follow was never committed, so the
-        // restore replays them. closed_ makes any LATER on_commit refuse
-        // loudly: teardown can race the coordinator's commit broadcast, and
-        // a commit dispatched after this abort must not read as executed.
         closed_ = true;
         tail_.clear();
-        inner_.abort_transaction();
+        if (!open_txn_ckpt_.has_value()) {
+            // Only the OPEN TAIL transaction is teardown's to abort: no
+            // barrier sealed it, no checkpoint covers its records, and the
+            // restore replays them.
+            inner_.abort_transaction();
+        }
+        // A barrier-sealed PREPARED transaction is the checkpoint
+        // protocol's to finalise - commit broadcast, abort broadcast, or
+        // the in-doubt resolver - never teardown's. This used to abort it
+        // on the reasoning that "the checkpoint was never committed", but a
+        // checkpoint CAN be completed with its commit broadcast racing a
+        // restart drain: some subtasks commit, the torn-down ones aborted
+        // here, and resolution then found fenced handles and fell back to
+        // a replay that re-emitted the committed slices
+        // (qual01-20260818a: 13,519 identical-value duplicates in one
+        // window). Left pending, the transaction is finalised by the held
+        // restart's resolution, or expires at transaction.timeout.ms if
+        // its checkpoint genuinely never completed - a bounded
+        // read_committed latency cost on teardown, never a correctness
+        // cost. closed_ still makes any LATER on_commit refuse loudly: the
+        // producer below is destroyed, so this process can no longer
+        // execute the commit, and confirming it would be a lie the
+        // resolver exists to avoid.
         inner_.close();
         pending_cv_.notify_all();
     }

@@ -68,13 +68,13 @@ protected:
 
     // Produce `values` inside a transaction and CRASH: the work happens in
     // a forked child that reports its producer identity through a pipe and
-    // then _exit()s without running a single destructor. That is the only
-    // honest simulation - a graceful KafkaSink teardown politely ABORTS
-    // the open transaction (librdkafka's producer shutdown does), so an
-    // in-process "orphan" would quietly stop being one. The child's death
+    // then _exit()s without running a single destructor. The child's death
     // drops its sockets with no protocol goodbye, and the transaction
     // stays open broker-side, pinning the last stable offset - exactly the
-    // state a killed worker leaves behind.
+    // state a killed worker leaves behind. (An in-process simulation would
+    // be dishonest for the OPEN TAIL case, which the 2PC wrapper's close()
+    // does abort; the prepared case is pinned separately by
+    // CloseLeavesAPreparedTransactionForTheResolver below.)
     TxnIdentity produce_orphan(const std::string& txn_id, const std::vector<std::string>& values) {
         int fds[2] = {-1, -1};
         EXPECT_EQ(::pipe(fds), 0);
@@ -386,6 +386,80 @@ TEST_F(TxnResumeSaslLive, NoCredentialsAgainstASaslBrokerFallsBackAsTransportErr
         << "a SASL-required listener drops unauthenticated traffic; the resume must fall "
            "back to the bounded contract, never claim a verdict: "
         << outcome.detail;
+}
+
+// qual01-20260818a: a checkpoint COMPLETED, its commit broadcast reached
+// some sinks and not others (a restart drain was tearing the job down),
+// and the torn-down sinks' close() ABORTED their prepared transactions.
+// In-doubt resolution then found the handles fenced, fell back to the
+// bounded replay, and the slices that HAD committed were re-emitted:
+// 13,519 identical-value duplicates in one window. The sink-level
+// invariant this pins: close() may abort the OPEN TAIL transaction
+// (records after the last barrier - the restore replays them), but a
+// barrier-sealed PREPARED transaction belongs to the checkpoint protocol,
+// and only a commit, an abort broadcast, or the resolver may finalise it.
+// A prepared transaction left pending costs read_committed consumers
+// latency up to transaction.timeout.ms if nothing resolves it; an aborted
+// one costs correctness whenever its checkpoint completed.
+TEST_F(TxnResumeLive, CloseLeavesAPreparedTransactionForTheResolver) {
+    auto& registry = clink::cluster::OperatorRegistry::default_instance();
+    const auto* factory =
+        registry.find_sink("kafka_2pc_sink_string", clink::cluster::ChannelType{"string"});
+    ASSERT_NE(factory, nullptr);
+
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"brokers", broker_->brokers()},
+                  {"topic", topic_},
+                  {"transactional_id", "resume-live-close-prepared"}};
+    auto boxed = factory->build(ctx);
+    auto sink = std::static_pointer_cast<clink::Sink<std::string>>(boxed);
+    ASSERT_NE(sink, nullptr);
+
+    clink::InMemoryStateBackend state;
+    clink::RuntimeContext rctx(clink::OperatorId{43}, "resume_close", &state, nullptr);
+    sink->set_id(clink::OperatorId{43});
+    sink->attach_runtime(&rctx);
+
+    sink->open();
+    Batch<std::string> committed_interval;
+    committed_interval.emplace(std::string{"c1"});
+    committed_interval.emplace(std::string{"c2"});
+    sink->on_data(committed_interval);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));  // identity capture
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});          // T_1 PREPARED
+
+    // Records after the barrier: the open tail. close() aborting THESE is
+    // correct - no checkpoint covers them and the restore replays them.
+    Batch<std::string> tail;
+    tail.emplace(std::string{"tail-must-abort"});
+    sink->on_data(tail);
+
+    const std::string key = std::string(clink::connectors::kTxnResumeStateKeyPrefix) + "sub0";
+    const auto staged = state.get_operator_state(
+        clink::OperatorId{43}, clink::StateBackend::KeyView{key.data(), key.size()});
+    ASSERT_TRUE(staged.has_value()) << "the barrier must stage a resume handle";
+    const std::string handle(reinterpret_cast<const char*>(staged->data()), staged->size());
+
+    // The teardown that races a commit broadcast: no on_commit arrives.
+    sink->close();
+
+    // The resolver must still be able to finalise T_1 with the staged
+    // handle, exactly as it would after a process death.
+    const auto resolver = clink::connectors::TxnResumeRegistry::instance().find("kafka_2pc");
+    ASSERT_TRUE(resolver.has_value());
+    const auto resolution = (*resolver)(handle);
+    EXPECT_TRUE(resolution.committed)
+        << "close() must leave the PREPARED transaction for the resolver; it was finalised "
+           "some other way: "
+        << resolution.detail;
+
+    // The committed view holds exactly the prepared interval: the tail's
+    // transaction died with close (correct), the prepared one committed
+    // via the resolver (the fix), nothing twice.
+    EXPECT_EQ(
+        clink::kafka::consume_all_committed(broker_->brokers(), topic_, std::chrono::seconds(20)),
+        (std::vector<std::string>{"c1", "c2"}))
+        << "prepared interval must be exactly-once after close + resolve";
 }
 
 TEST_F(TxnResumeLive, TheWrapperStagesAResolvableHandleAndErasesItOnCommit) {

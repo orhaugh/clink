@@ -647,6 +647,148 @@ TEST_F(KafkaWindowRecoveryTest, RepeatedCompletedMarkerCoordinatorCrashesKeepOne
            "a committed interval was lost";
 }
 
+// qual01-20260818a: a sink.before_commit death is survivable alone (the
+// matrix covers it), but CASCADED - a second worker lost while the first
+// recovery is still settling - it left a completed checkpoint with partial
+// external commits: the commit broadcast raced the restart drain, torn-down
+// sinks aborted their prepared transactions at close, in-doubt resolution
+// found fenced handles, and the fallback replay re-emitted the slices that
+// HAD committed - 13,519 identical-value duplicates in one window. Two
+// fixes close it: teardown preserves barrier-sealed prepared transactions
+// for the resolver, and a checkpoint completing during a restart drain
+// keeps its marker but not its broadcast, so the held resolution finalises
+// it as one decision. This gate drives the full cascade against the exact
+// oracle; the sink-level invariant is pinned deterministically by
+// TxnResumeLive.CloseLeavesAPreparedTransactionForTheResolver.
+TEST_F(KafkaWindowRecoveryTest, CascadingWorkerLossAcrossACommitWindowStaysExactlyOnce) {
+    constexpr int kKeys = 10;
+    constexpr std::int64_t kBase = 4'000'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    spec.slots_per_worker = 8;
+    spec.ha = true;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    ASSERT_TRUE(cluster.start_ha_coordinators(1));
+    ASSERT_TRUE(cluster.start_ha_worker(0, ProcOptions{.fault = "sink.before_commit=exit:72@3"}));
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + input_topic_ +
+        "', group_id='cascade', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + output_topic_ +
+        "', delivery_guarantee='exactly_once', transactional_id='cascade'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql-cascade",
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "kafka-cascade",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "300",
+                              "--max-restarts-on-worker-loss",
+                              "8",
+                              "--parallelism",
+                              "4"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 2; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
+    const auto open_start = kBase + 50'000;
+    std::atomic<bool> stop_feed{false};
+    std::atomic<std::size_t> produced{0};
+    SustainedFeed feed;
+    std::thread feeder([&] {
+        feed = produce_json_until(
+            kafka_->brokers(), input_topic_, open_start, kKeys, stop_feed, produced);
+    });
+    ASSERT_TRUE(
+        clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s));
+
+    // First loss: worker 0 dies at the fault point, mid-commit-broadcast,
+    // leaving its slice of a completed checkpoint prepared while worker 1's
+    // slice committed - the partial-commit state.
+    ASSERT_TRUE(clink::itest::await([&] { return !cluster.worker(0).running(); }, 60s))
+        << "sink.before_commit never fired on worker 0";
+    const auto w0_exit = cluster.worker(0).poll_exit();
+    ASSERT_TRUE(w0_exit.has_value());
+    ASSERT_EQ(*w0_exit, 72);
+    ASSERT_TRUE(cluster.restart_worker_ha(0));
+
+    // Let the first recovery deploy and settle just far enough to have
+    // fresh sinks and an in-flight checkpoint...
+    const auto confirmed_after_first = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") >=
+                   confirmed_after_first + 2;
+        },
+        60s))
+        << "the first recovery never resumed confirmed commits";
+
+    // ...then the cascade: the second worker dies while the recovered job
+    // is live, with commits in flight at a 300ms cadence.
+    cluster.worker(1).kill_and_reap();
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+
+    const auto confirmed_after_cascade = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") >=
+                   confirmed_after_cascade + 3;
+        },
+        60s))
+        << "the job never resumed confirmed commits after the cascade";
+
+    const auto produced_at_recovery = produced.load(std::memory_order_acquire);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return produced.load(std::memory_order_acquire) >= produced_at_recovery + 1'500; },
+        30s));
+    stop_feed.store(true, std::memory_order_release);
+    feeder.join();
+    for (int key = 0; key < kKeys; ++key) {
+        expected[{key, open_start}] = feed.per_key[key];
+    }
+
+    produce_json(kafka_->brokers(), input_topic_, window_records(kBase + 90'000, kKeys));
+
+    const auto after = consume_committed(kafka_->brokers(), output_topic_, expected.size(), 90s);
+    const auto actual = parse_output(after);
+    EXPECT_EQ(actual, expected)
+        << "the cascade produced duplicates (a completed checkpoint's committed slices were "
+           "replayed) or losses (a prepared slice was discarded)";
+}
+
 // ---------------------------------------------------------------------------
 // The QUAL-01 2PC fault matrix, local and deterministic: every named fault
 // point of the exactly-once protocol kills its process at exactly that point
