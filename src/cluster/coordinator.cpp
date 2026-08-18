@@ -5913,69 +5913,8 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                 --worker_it->second->slots_in_use;
                 metrics::coordinator::slots_in_use_delta(-1);
             }
-            job.awaiting_restart = true;
-            job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
-            // Drain the still-IN-FLIGHT subtasks (pending_per_worker, after removing
-            // the just-failed one above), and redeploy EVERY subtask of the job
-            // (tasks_by_worker) - including the failed one and any that ALREADY
-            // FINISHED. A bounded job re-runs its whole topology from the last
-            // checkpoint, so finished subtasks (e.g. a sink that exited at EOS
-            // before the source's final-checkpoint timed out) must redeploy too;
-            // redeploying only the in-flight + failed ones would orphan them.
-            // Contrast mark_worker_lost_locked_, whose redeploy set draws only from
-            // pending_per_worker. This path MUST include finished peers because its
-            // trigger is a bounded subtask erroring AFTER a peer finished
-            // cleanly, so it builds restart_pending from tasks_by_worker minus
-            // in_flight, re-adding the cleanly-finished subtasks the worker-loss
-            // path omits.
-            std::unordered_set<std::string> in_flight;
-            for (const auto& [other_worker, pending] : job.pending_per_worker) {
-                for (const auto& [role, sub] : pending) {
-                    in_flight.insert(role + ":" + std::to_string(sub));
-                }
-            }
-            job.restart_drain_expected = in_flight;
-            for (const auto& [other_worker, dts] : job.tasks_by_worker) {
-                for (const auto& dt : dts) {
-                    const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
-                    if (in_flight.count(k) == 0) {
-                        job.restart_pending.emplace_back(dt.role, dt.subtask_idx);
-                    }
-                }
-            }
-            job.completed_count = 0;  // belongs to the failed attempt
-            job.errors.clear();
-            // Counted here rather than at the redeploy below, because both
-            // branches of that redeploy are the same restart and counting in
-            // one would undercount.
-            metrics::orch::job_restarted();
-            log::warn("coordinator.restart",
-                      "job_id=" + std::to_string(job.id) + " subtask error -> whole-job restart" +
-                          " (attempt " + std::to_string(job.restart_attempts + 1) + "/" +
-                          std::to_string(effective_max_restarts(job.checkpoint)) +
-                          ") drain_expected=" + std::to_string(job.restart_drain_expected.size()) +
-                          " cause=" + msg.error_message);
-            if (job.restart_drain_expected.empty()) {
-                // No in-flight subtasks (all finished, e.g. a bounded job whose
-                // sink exited before the source timed out): redeploy now. Do NOT
-                // broadcast CancelJob - there is nothing to drain, and a cancel
-                // would race the just-redeployed subtasks. In-doubt resolution
-                // first, though: the resolution thread fires the deferred
-                // restart when the broker has answered.
-                if (!stage_in_doubt_resolution_locked_(job)) {
-                    restart_deploys = restart_job_locked_(job);
-                }
-            } else {
-                // Cancel the in-flight subtasks so they drain; when all have
-                // reported (the awaiting_restart branch above), restart_job_locked_
-                // redeploys the whole job from the last checkpoint.
-                for (const auto& [worker_id2, _] : job.tasks_by_worker) {
-                    auto cit = registered_.find(worker_id2);
-                    if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
-                        error_restart_cancels.emplace_back(cit->second->conn.get(), job_id);
-                    }
-                }
-            }
+            restart_deploys = initiate_job_restart_locked_(
+                job, "subtask error", msg.error_message, error_restart_cancels);
         } else if (!retry) {
             ++job.completed_count;
             if (msg.had_error) {
@@ -6493,6 +6432,70 @@ void Coordinator::handle_commit_confirmed_(MessageReader& r) {
     }
 }
 
+std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked_(
+    JobState& job,
+    const std::string& reason,
+    const std::string& cause,
+    std::vector<std::pair<network::Connection*, JobId>>& cancels) {
+    job.awaiting_restart = true;
+    job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+    // Drain the still-IN-FLIGHT subtasks (pending_per_worker, minus anything
+    // the caller already removed), and redeploy EVERY subtask of the job
+    // (tasks_by_worker) - including any that ALREADY FINISHED. A bounded job
+    // re-runs its whole topology from the last checkpoint, so finished
+    // subtasks (e.g. a sink that exited at EOS before the source's
+    // final-checkpoint timed out) must redeploy too; redeploying only the
+    // in-flight ones would orphan them. Contrast mark_worker_lost_locked_,
+    // whose redeploy set draws only from pending_per_worker.
+    std::unordered_set<std::string> in_flight;
+    for (const auto& [other_worker, pending] : job.pending_per_worker) {
+        for (const auto& [role, sub] : pending) {
+            in_flight.insert(role + ":" + std::to_string(sub));
+        }
+    }
+    job.restart_drain_expected = in_flight;
+    job.restart_pending.clear();
+    for (const auto& [other_worker, dts] : job.tasks_by_worker) {
+        for (const auto& dt : dts) {
+            const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
+            if (in_flight.count(k) == 0) {
+                job.restart_pending.emplace_back(dt.role, dt.subtask_idx);
+            }
+        }
+    }
+    job.completed_count = 0;  // belongs to the failed attempt
+    job.errors.clear();
+    // Counted here rather than at the redeploy below, because both branches
+    // of that redeploy are the same restart and counting in one would
+    // undercount.
+    metrics::orch::job_restarted();
+    log::warn("coordinator.restart",
+              "job_id=" + std::to_string(job.id) + " " + reason + " -> whole-job restart" +
+                  " (attempt " + std::to_string(job.restart_attempts + 1) + "/" +
+                  std::to_string(effective_max_restarts(job.checkpoint)) + ") drain_expected=" +
+                  std::to_string(job.restart_drain_expected.size()) + " cause=" + cause);
+    if (job.restart_drain_expected.empty()) {
+        // No in-flight subtasks: redeploy now. Do NOT broadcast CancelJob -
+        // there is nothing to drain, and a cancel would race the
+        // just-redeployed subtasks. In-doubt resolution first, though: the
+        // resolution thread fires the deferred restart when the broker has
+        // answered.
+        if (!stage_in_doubt_resolution_locked_(job)) {
+            return restart_job_locked_(job);
+        }
+        return {};
+    }
+    // Cancel the in-flight subtasks so they drain; when all have reported,
+    // restart_job_locked_ redeploys the whole job from the last checkpoint.
+    for (const auto& [worker_id, _] : job.tasks_by_worker) {
+        auto cit = registered_.find(worker_id);
+        if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
+            cancels.emplace_back(cit->second->conn.get(), job.id);
+        }
+    }
+    return {};
+}
+
 void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     auto msg = decode_subtask_checkpointed(r);
     // What a completed checkpoint CONSISTS OF, not just that it happened: the
@@ -6523,6 +6526,11 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     // broadcast to every worker hosting any of its members. Collected
     // under the lock; sent outside it.
     std::vector<std::pair<JobId, std::uint64_t>> groups_to_abort;
+    // A FAILED checkpoint initiates a whole-job restart (the abort above
+    // discards a staged interval only a rewind re-emits). Collected under
+    // the lock; dispatched outside it, after the abort broadcast.
+    std::vector<PendingDeploy> failed_ckpt_deploys;
+    std::vector<std::pair<network::Connection*, JobId>> failed_ckpt_cancels;
     // BeginRescale frames queued by the checkpoint-completed
     // path. When the cutover checkpoint ack closes, any operator still
     // in Preparing advances to Draining and we send BeginRescale to
@@ -6662,6 +6670,30 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 job.commit_group_progress.erase(msg.checkpoint_id);
                 job.pending_checkpoint_acks.erase(msg.checkpoint_id);
                 checkpoint_failed = true;
+                // The abort above discards every sink's staged interval for
+                // this checkpoint - a barrier-sealed transaction holds the
+                // records of (K-1, K], and once aborted nothing re-emits
+                // them unless the job REWINDS. This used to abort and sail
+                // on: the runner survives its own capture failure (it acks
+                // ok=false and keeps processing), so a transient snapshot
+                // error silently cost one checkpoint interval of output.
+                // A failed checkpoint therefore initiates the same
+                // whole-job restart a subtask error does; the replay from
+                // the last completed checkpoint re-produces the aborted
+                // interval. Guarded exactly like the subtask-error path -
+                // a job already restarting, completing, cancelling, or out
+                // of budget keeps today's behaviour.
+                if (!job.awaiting_restart && !job.completion_signalled && !job.cancel_requested &&
+                    !job.checkpoint.checkpoint_dir.empty() &&
+                    job.restart_attempts < effective_max_restarts(job.checkpoint)) {
+                    failed_ckpt_deploys = initiate_job_restart_locked_(
+                        job,
+                        "checkpoint failure",
+                        "checkpoint " + std::to_string(msg.checkpoint_id) +
+                            " failed; its aborted sink transactions carried one interval of "
+                            "output that only a rewind re-emits",
+                        failed_ckpt_cancels);
+                }
             }
         }
         if (all_subtasks_answered && !checkpoint_failed) {
@@ -6818,6 +6850,23 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         for (auto* c : worker_conns)
             send_frame(*c, frame);
     }
+    // The failed-checkpoint restart: cancels drain the in-flight subtasks
+    // (their SubtaskFinished arrivals complete the drain and fire the
+    // redeploy); deploys are the immediate-redeploy branch when nothing was
+    // in flight. After the aborts above so the sinks process the abort
+    // before any teardown reaches them.
+    for (const auto& [conn, jid] : failed_ckpt_cancels) {
+        if (conn) {
+            CancelJobMsg cj;
+            cj.job_id = jid;
+            send_frame(*conn, fenced_frame_(MessageKind::CancelJob, cj));
+        }
+    }
+    for (auto& d : failed_ckpt_deploys) {
+        if (d.conn) {
+            send_frame(*d.conn, d.frame);
+        }
+    }
     // Write the COMPLETED marker outside the lock so a slow filesystem
     // doesn't block reader threads.
     for (const auto& [jid, ckpt_id, gen, subtasks, suppress_commit] : just_completed) {
@@ -6926,6 +6975,24 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             std::lock_guard lock(mu_);
             auto job_it = jobs_.find(jid);
             if (job_it != jobs_.end()) {
+                // The suppress decision is RE-TAKEN here, not merely carried
+                // from the ack that completed the checkpoint: the marker
+                // fsync above runs outside the lock (deliberately), and a
+                // restart or cancel beginning inside that window would
+                // otherwise receive the broadcast into a half-torn-down job
+                // - the partial-commit state the captured flag was added to
+                // prevent, re-opened one durable write later. Cancel gets
+                // the same treatment as restart because a cancelled job has
+                // no held resolution behind it: a partial commit there is
+                // permanent.
+                if (job_it->second->awaiting_restart || job_it->second->cancel_requested) {
+                    log::info("coordinator.checkpoint",
+                              "job_id=" + std::to_string(jid) + " checkpoint " +
+                                  std::to_string(ckpt_id) +
+                                  " completed but a restart or cancel began before its commit "
+                                  "broadcast; withheld for in-doubt resolution");
+                    continue;
+                }
                 for (const auto& [worker_id, _] : job_it->second->tasks_by_worker) {
                     auto worker_it = registered_.find(worker_id);
                     if (worker_it != registered_.end() && !worker_it->second->lost &&

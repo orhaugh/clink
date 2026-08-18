@@ -1325,6 +1325,19 @@ private:
     // restore_from set to the coordinator's latest_completed_checkpoint_id.
     // Returns the new Deploy frames to send outside the lock.
     std::vector<PendingDeploy> restart_job_locked_(JobState& job);
+    // Begin a whole-job restart under mu_: drain bookkeeping, budget count,
+    // the restart log line, and either an immediate redeploy (nothing in
+    // flight, no in-doubt hold - the returned deploys) or CancelJob sends
+    // the caller dispatches outside the lock (`cancels`). Shared by the
+    // subtask-error path and the failed-checkpoint path: a failed
+    // checkpoint aborts the sinks' staged transactions, and without the
+    // rewind this initiates, the aborted interval was simply GONE - the
+    // job sailed on and one checkpoint's records never reached the output.
+    std::vector<PendingDeploy> initiate_job_restart_locked_(
+        JobState& job,
+        const std::string& reason,
+        const std::string& cause,
+        std::vector<std::pair<network::Connection*, JobId>>& cancels);
 
     // Replan a job at a changed per-operator parallelism.
     //
