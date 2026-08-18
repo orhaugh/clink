@@ -538,6 +538,56 @@ std::shared_ptr<clink::Sink<std::string>> build_receipt_sink(const std::string& 
     return sink;
 }
 
+// The ack-window question, pinned against the real broker: a worker can be
+// killed AFTER its EndTxn(commit) took effect broker-side but BEFORE the
+// process recorded anything (the receipt fsync, or even the client ack
+// arriving). Recovery's wire path then re-sends EndTxn(commit) with the
+// SAME identity. Whatever the broker answers here defines whether the
+// resume path alone rescues that window - qual01-20260818d's 4,560
+// duplicates rode exactly this gap. This test pins the observed behaviour
+// so a broker upgrade that changes it fails loudly instead of silently
+// changing the recovery contract.
+TEST_F(TxnResumeLive, ResumingAnAlreadyCommittedTransactionIsIdempotentlyCommitted) {
+    KafkaSink::Options o;
+    o.brokers = broker_->brokers();
+    o.topic = topic_;
+    o.transactional_id = "resume-live-recommit";
+    o.metric_prefix.clear();
+    KafkaSink sink(o);
+    sink.open();
+    Batch<KafkaMessage> b;
+    b.emplace(KafkaMessage{"r1"});
+    b.emplace(KafkaMessage{"r2"});
+    sink.on_data(b);
+    sink.flush();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!sink.producer_identity().has_value() && std::chrono::steady_clock::now() < deadline) {
+        sink.flush();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const auto ident = sink.producer_identity();
+    ASSERT_TRUE(ident.has_value());
+    sink.commit_transaction();  // the commit that a kill would leave unrecorded
+    sink.close();
+
+    TxnIdentity txn;
+    txn.transactional_id = "resume-live-recommit";
+    txn.producer_id = ident->producer_id;
+    txn.producer_epoch = ident->producer_epoch;
+    const auto [host, port] = broker_addr();
+    const auto outcome = clink::kafka::resume_commit(host, port, txn, connect_plain_fn());
+    EXPECT_TRUE(outcome.committed())
+        << "re-EndTxn(commit) for an already-committed transaction with the same identity "
+           "answered '"
+        << outcome.detail
+        << "' - the wire path no longer rescues the kill-between-commit-and-receipt window "
+           "and recovery needs a different proof for it";
+    EXPECT_EQ(
+        clink::kafka::consume_all_committed(broker_->brokers(), topic_, std::chrono::seconds(20)),
+        (std::vector<std::string>{"r1", "r2"}))
+        << "the re-commit must be idempotent: nothing lost, nothing twice";
+}
+
 TEST_F(TxnResumeLive, ACommitWritesAReceiptAndFreshStartsNeverSuppress) {
     const auto receipt_dir = std::filesystem::temp_directory_path() /
                              ("clink_receipts_" + std::to_string(::getpid()) + "_" +

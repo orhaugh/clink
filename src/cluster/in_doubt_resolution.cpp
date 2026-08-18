@@ -136,9 +136,30 @@ std::optional<std::vector<StagedHandle>> read_resume_handles(const std::string& 
                                                      " names no subtask; stopping resolution");
                                 return std::nullopt;
                             }
-                            handles.push_back({static_cast<std::uint32_t>(
-                                                   std::strtoul(suffix.c_str() + 3, nullptr, 10)),
-                                               entry.value});
+                            const auto owner = static_cast<std::uint32_t>(
+                                std::strtoul(suffix.c_str() + 3, nullptr, 10));
+                            // A handle is authoritative for THIS walk id
+                            // only if it was staged AT this checkpoint -
+                            // the handle records its own "ckpt". Union
+                            // operator-state restore replicates every
+                            // sink's row into every subtask and later
+                            // snapshots re-persist the copies verbatim, so
+                            // stale copies carry an OLDER ckpt by
+                            // construction (only the owning sink ever
+                            // re-stages its key). qual01-20260818d's walk
+                            // saw 64 handles for 4 sinks and aborted on a
+                            // fenced stale copy without trying the live
+                            // ones. The ckpt field discriminates without
+                            // assuming anything about subtask numbering -
+                            // the key's index is the SINK-LOCAL one and the
+                            // marker's subtasks are job-global, which a
+                            // first cut of this filter conflated, dropping
+                            // every live handle instead.
+                            const auto ckpt_tag = "\"ckpt\":\"" + std::to_string(ckpt_id) + "\"";
+                            if (entry.value.find(ckpt_tag) == std::string::npos) {
+                                continue;
+                            }
+                            handles.push_back({owner, entry.value});
                         }
                     }
                 }

@@ -89,13 +89,25 @@ struct ResolutionFixture : ::testing::Test {
     void write_snapshot_with_handle(std::uint64_t id,
                                     std::uint32_t sub,
                                     const std::string& handle) const {
+        write_snapshot_with_handles(id, sub, {{sub, handle}});
+    }
+
+    // A snapshot carrying handle rows for arbitrary sink subtasks - the
+    // union-restore pollution shape, where a subtask's snapshot re-persists
+    // copies of OTHER sinks' staged handles.
+    void write_snapshot_with_handles(
+        std::uint64_t id,
+        std::uint32_t sub,
+        const std::vector<std::pair<std::uint32_t, std::string>>& rows) const {
         auto sp = clink::state_processor::Savepoint::create();
-        const std::string key =
-            std::string(clink::connectors::kTxnResumeStateKeyPrefix) + "sub" + std::to_string(sub);
-        sp.backend().put_operator_state(
-            clink::OperatorId{42},
-            clink::StateBackend::KeyView{key.data(), key.size()},
-            clink::StateBackend::ValueView{handle.data(), handle.size()});
+        for (const auto& [row_sub, handle] : rows) {
+            const std::string key = std::string(clink::connectors::kTxnResumeStateKeyPrefix) +
+                                    "sub" + std::to_string(row_sub);
+            sp.backend().put_operator_state(
+                clink::OperatorId{42},
+                clink::StateBackend::KeyView{key.data(), key.size()},
+                clink::StateBackend::ValueView{handle.data(), handle.size()});
+        }
         const auto sub_dir = std::filesystem::path(clink::state_dir_for(dir, 1, sub));
         std::filesystem::create_directories(sub_dir);
         sp.write_to_file(sub_dir / ("checkpoint-" + std::to_string(id) + ".snap"));
@@ -111,8 +123,9 @@ struct ResolutionFixture : ::testing::Test {
         sp.write_to_file(sub_dir / ("checkpoint-" + std::to_string(id) + ".snap"));
     }
 
-    static std::string handle(const std::string& tag) {
-        return "{\"resolver\":\"test_resume\",\"tag\":\"" + tag + "\"}";
+    static std::string handle(const std::string& tag, std::uint64_t ckpt = 4) {
+        return "{\"resolver\":\"test_resume\",\"tag\":\"" + tag + "\",\"ckpt\":\"" +
+               std::to_string(ckpt) + "\"}";
     }
 
     // Drop the durable commit receipt a 2PC sink writes right after its
@@ -152,7 +165,7 @@ TEST_F(ResolutionFixture, TheWalkCoversEveryUnconfirmedCheckpointInOrder) {
     write_completed_marker(4);
     write_snapshot_with_handle(4, 0, handle("commit"));
     write_completed_marker(5);
-    write_snapshot_with_handle(5, 0, handle("commit"));
+    write_snapshot_with_handle(5, 0, handle("commit", 5));
 
     EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 5), 5u);
     EXPECT_TRUE(confirmed_marker_exists(4));
@@ -164,7 +177,7 @@ TEST_F(ResolutionFixture, ARefusedHandleStopsTheWalkAtTheLastSuccess) {
     write_completed_marker(4);
     write_snapshot_with_handle(4, 0, handle("commit"));
     write_completed_marker(5);
-    write_snapshot_with_handle(5, 0, handle("refuse"));
+    write_snapshot_with_handle(5, 0, handle("refuse", 5));
 
     EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 5), 4u);
     EXPECT_TRUE(confirmed_marker_exists(4));
@@ -247,6 +260,29 @@ TEST_F(ResolutionFixture, AReceiptForAnotherSubtaskVouchesForNothing) {
     EXPECT_FALSE(confirmed_marker_exists(4));
 }
 
+// Union operator-state restore replicates every sink's staged handle into
+// every subtask's live state, and later snapshots re-persist the copies -
+// so a subtask's snapshot can carry OTHER sinks' handles from long-dead
+// incarnations. qual01-20260818d: the walk saw 64 handles for 4 sinks and
+// aborted on a fenced OLD-incarnation copy without ever trying the live
+// ones. A handle is authoritative only in its OWN subtask's snapshot.
+TEST_F(ResolutionFixture, AStaleUnionCopyFromAnOlderCheckpointIsIgnored) {
+    write_completed_marker(4, "0,1");
+    // Subtask 0's snapshot: its own live handle (staged AT checkpoint 4)
+    // PLUS a stale union-restored copy of subtask 1's handle from an older
+    // checkpoint, which the broker would refuse. The stale copy must never
+    // reach the wire: only handles staged at the walked checkpoint are
+    // authoritative.
+    write_snapshot_with_handles(4, 0, {{0, handle("commit")}, {1, handle("refuse", 2)}});
+    // Subtask 1's own snapshot carries its live, committable handle.
+    write_snapshot_with_handles(4, 1, {{1, handle("commit")}});
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::milliseconds{0}), 4u)
+        << "the stale union copy poisoned the walk";
+    EXPECT_TRUE(confirmed_marker_exists(4));
+    EXPECT_EQ(seen.size(), 2u) << "exactly one handle per sink subtask goes to the wire";
+}
+
 TEST_F(ResolutionFixture, AMixedWalkConfirmsFromReceiptAndWireTogether) {
     // The partial-commit shape: sub0 committed (receipt written, and its
     // fenced handle would refuse over the wire); sub1 never committed but
@@ -297,7 +333,7 @@ TEST_F(ResolutionFixture, IdsThatNeverCompletedAreSkippedNotFatal) {
     // 4 never completed (no marker - its transaction was aborted with the
     // failed checkpoint); 5 did and commits. The walk reaches 5.
     write_completed_marker(5);
-    write_snapshot_with_handle(5, 0, handle("commit"));
+    write_snapshot_with_handle(5, 0, handle("commit", 5));
 
     EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 5), 5u);
     EXPECT_TRUE(confirmed_marker_exists(5));

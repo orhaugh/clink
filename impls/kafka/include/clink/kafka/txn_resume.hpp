@@ -28,9 +28,13 @@
 //     failure - reports itself and the caller falls back to the
 //     commit-confirmed contract (bounded replay). A false "committed" here
 //     recreates the false-confirm defect item 52 fixed.
-//   * Only non-flexible protocol versions are spoken (the flexible tagged
-//     encoding is a later increment); a broker that has dropped them gets
-//     Unsupported, not a guess.
+//   * Non-flexible protocol versions are spoken except where none exists:
+//     DescribeTransactions v0 (KIP-664, flexible-only) is the one compact
+//     exchange, used to disambiguate a fenced EndTxn - the staged epoch
+//     comes from librdkafka's periodic statistics while the broker bumps
+//     the epoch on every commit, so a mid-run handle is chronically one
+//     commit stale and a COMMITTED transaction reads as fenced. A broker
+//     that has dropped the spoken versions gets Unsupported, not a guess.
 //   * Transport is the engine's own Connection seam, so a fake broker tests
 //     the full path byte-for-byte and TLS can slot in via the factory.
 //
@@ -123,6 +127,7 @@ namespace wire {
 inline constexpr std::int16_t kApiVersionsKey = 18;
 inline constexpr std::int16_t kFindCoordinatorKey = 10;
 inline constexpr std::int16_t kEndTxnKey = 26;
+inline constexpr std::int16_t kDescribeTransactionsKey = 65;
 inline constexpr std::int16_t kSaslHandshakeKey = 17;
 inline constexpr std::int16_t kSaslAuthenticateKey = 36;
 
@@ -154,8 +159,29 @@ struct ApiVersionsResponse {
     std::int16_t error_code{0};
     std::optional<ApiRange> find_coordinator;
     std::optional<ApiRange> end_txn;
+    std::optional<ApiRange> describe_transactions;
 };
 [[nodiscard]] std::optional<ApiVersionsResponse> parse_api_versions_response_v0(
+    const std::vector<std::byte>& body, std::int32_t expected_correlation_id);
+
+// DescribeTransactions v0 (KIP-664; flexible/compact encoding - the one
+// place this module speaks it). The QUERY the resume path needs when
+// EndTxn answers INVALID_PRODUCER_EPOCH: the staged handle's epoch comes
+// from librdkafka's PERIODIC statistics callback while the broker bumps
+// the producer epoch on every commit, so a handle staged mid-run is
+// chronically one commit stale and a legitimately committed transaction
+// reads as fenced. The transaction's actual state answers what the fenced
+// EndTxn cannot: CompleteCommit with our producer id = the commit landed.
+[[nodiscard]] std::vector<std::byte> describe_transactions_request_v0(std::int32_t correlation_id,
+                                                                      const std::string& txn_id);
+
+struct DescribeTransactionsState {
+    std::int16_t error_code{0};
+    std::string state;  // "Empty", "Ongoing", "PrepareCommit", "CompleteCommit", ...
+    std::int64_t producer_id{-1};
+    std::int16_t producer_epoch{-1};
+};
+[[nodiscard]] std::optional<DescribeTransactionsState> parse_describe_transactions_response_v0(
     const std::vector<std::byte>& body, std::int32_t expected_correlation_id);
 
 struct FindCoordinatorResponse {

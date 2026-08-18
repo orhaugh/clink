@@ -110,10 +110,92 @@ public:
         return s;
     }
 
+    // --- flexible (compact) protocol pieces, for KIP-664 admin replies ---
+
+    std::optional<std::int64_t> i64() {
+        if (pos_ + 8 > b_.size()) {
+            return std::nullopt;
+        }
+        std::uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) {
+            v = (v << 8) | static_cast<std::uint8_t>(b_[pos_ + static_cast<std::size_t>(i)]);
+        }
+        pos_ += 8;
+        return static_cast<std::int64_t>(v);
+    }
+
+    std::optional<std::uint64_t> uvarint() {
+        std::uint64_t v = 0;
+        int shift = 0;
+        while (pos_ < b_.size() && shift <= 63) {
+            const auto byte = static_cast<std::uint8_t>(b_[pos_++]);
+            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+            if ((byte & 0x80) == 0) {
+                return v;
+            }
+            shift += 7;
+        }
+        return std::nullopt;
+    }
+
+    // COMPACT_STRING: uvarint length+1 (0 = null, returned as empty).
+    std::optional<std::string> compact_string() {
+        const auto len_plus_one = uvarint();
+        if (!len_plus_one.has_value()) {
+            return std::nullopt;
+        }
+        if (*len_plus_one == 0) {
+            return std::string{};
+        }
+        const auto n = static_cast<std::size_t>(*len_plus_one - 1);
+        if (pos_ + n > b_.size()) {
+            return std::nullopt;
+        }
+        std::string s(reinterpret_cast<const char*>(b_.data() + pos_), n);
+        pos_ += n;
+        return s;
+    }
+
+    // Tagged-field buffer: uvarint count, then per field uvarint tag +
+    // uvarint size + size bytes. Everything here is skipped - this module
+    // consumes no tagged fields.
+    bool skip_tags() {
+        const auto count = uvarint();
+        if (!count.has_value()) {
+            return false;
+        }
+        for (std::uint64_t i = 0; i < *count; ++i) {
+            if (!uvarint().has_value()) {
+                return false;
+            }
+            const auto size = uvarint();
+            if (!size.has_value() || pos_ + *size > b_.size()) {
+                return false;
+            }
+            pos_ += static_cast<std::size_t>(*size);
+        }
+        return true;
+    }
+
 private:
     const std::vector<std::byte>& b_;
     std::size_t pos_{0};
 };
+
+void put_uvarint(std::vector<std::byte>& out, std::uint64_t v) {
+    while (v >= 0x80) {
+        out.push_back(static_cast<std::byte>((v & 0x7F) | 0x80));
+        v >>= 7;
+    }
+    out.push_back(static_cast<std::byte>(v));
+}
+
+void put_compact_string(std::vector<std::byte>& out, const std::string& s) {
+    put_uvarint(out, s.size() + 1);
+    for (const char c : s) {
+        out.push_back(static_cast<std::byte>(c));
+    }
+}
 
 }  // namespace
 
@@ -146,6 +228,29 @@ std::vector<std::byte> sasl_handshake_request_v1(std::int32_t correlation_id,
     std::vector<std::byte> body;
     put_string(body, mechanism);
     return frame(kSaslHandshakeKey, 1, correlation_id, body);
+}
+
+std::vector<std::byte> describe_transactions_request_v0(std::int32_t correlation_id,
+                                                        const std::string& txn_id) {
+    // Flexible protocol: request header v2 (classic nullable client_id
+    // string PLUS a tagged-field buffer), compact body. The one flexible
+    // request this module speaks - KIP-664's admin keys have no
+    // non-flexible versions.
+    std::vector<std::byte> payload;
+    put_i16(payload, kDescribeTransactionsKey);
+    put_i16(payload, 0);
+    put_i32(payload, correlation_id);
+    put_string(payload, "clink-txn-resume");
+    put_uvarint(payload, 0);  // header tag buffer
+    // Body: transactional_ids COMPACT_ARRAY<COMPACT_STRING> + tag buffer.
+    put_uvarint(payload, 2);  // array length + 1
+    put_compact_string(payload, txn_id);
+    put_uvarint(payload, 0);  // body tag buffer
+
+    std::vector<std::byte> out;
+    put_i32(out, static_cast<std::int32_t>(payload.size()));
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
 }
 
 std::vector<std::byte> plain_auth_bytes(const std::string& username, const std::string& password) {
@@ -198,8 +303,63 @@ std::optional<ApiVersionsResponse> parse_api_versions_response_v0(
             out.find_coordinator = ApiRange{*min, *max};
         } else if (*key == kEndTxnKey) {
             out.end_txn = ApiRange{*min, *max};
+        } else if (*key == kDescribeTransactionsKey) {
+            out.describe_transactions = ApiRange{*min, *max};
         }
     }
+    return out;
+}
+
+std::optional<DescribeTransactionsState> parse_describe_transactions_response_v0(
+    const std::vector<std::byte>& body, std::int32_t expected_correlation_id) {
+    Reader r(body);
+    const auto corr = r.i32();
+    if (!corr.has_value() || *corr != expected_correlation_id) {
+        return std::nullopt;
+    }
+    // Flexible response header v1: a tag buffer follows the correlation id.
+    if (!r.skip_tags()) {
+        return std::nullopt;
+    }
+    // Body v0: throttle_time_ms, transaction_states COMPACT_ARRAY of
+    // [error_code, transactional_id, state, timeout_ms, start_time_ms,
+    // producer_id, producer_epoch, topics COMPACT_ARRAY, TAG_BUFFER],
+    // TAG_BUFFER. One id was asked about; the first entry answers, and the
+    // remainder (topics onward) is not consumed.
+    if (!r.i32().has_value()) {  // throttle
+        return std::nullopt;
+    }
+    const auto states_plus_one = r.uvarint();
+    if (!states_plus_one.has_value() || *states_plus_one < 2) {
+        return std::nullopt;  // null or empty array: no answer
+    }
+    DescribeTransactionsState out;
+    const auto err = r.i16();
+    if (!err.has_value()) {
+        return std::nullopt;
+    }
+    out.error_code = *err;
+    if (!r.compact_string().has_value()) {  // transactional_id (echoed)
+        return std::nullopt;
+    }
+    const auto state = r.compact_string();
+    if (!state.has_value()) {
+        return std::nullopt;
+    }
+    out.state = *state;
+    if (!r.i32().has_value()) {  // timeout_ms
+        return std::nullopt;
+    }
+    if (!r.i64().has_value()) {  // start_time_ms
+        return std::nullopt;
+    }
+    const auto pid = r.i64();
+    const auto epoch = r.i16();
+    if (!pid.has_value() || !epoch.has_value()) {
+        return std::nullopt;
+    }
+    out.producer_id = *pid;
+    out.producer_epoch = *epoch;
     return out;
 }
 
@@ -664,6 +824,43 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
         last_detail = "EndTxn: " + wire::error_name(*code);
         if (retriable(*code)) {
             continue;
+        }
+        // A fenced EndTxn is ambiguous BY CONSTRUCTION: the staged epoch
+        // comes from librdkafka's periodic statistics callback while the
+        // broker bumps the producer epoch on every commit, so a handle
+        // staged mid-run is chronically one commit stale and a COMMITTED
+        // transaction reads as fenced (qual01-20260818d: 4,560 duplicates
+        // from exactly this misreading). The transaction's actual state
+        // disambiguates. CompleteCommit under our producer id with an
+        // epoch at or above the staged one is the commit landing; this is
+        // sound because every resolution walk runs before anything
+        // redeploys, so no successor can have produced that state.
+        if ((*code == 47 /*INVALID_PRODUCER_EPOCH*/ || *code == 90 /*PRODUCER_FENCED*/) &&
+            av->describe_transactions.has_value() && av->describe_transactions->min <= 0) {
+            ++corr;
+            const auto dt_body = roundtrip(
+                *coord, wire::describe_transactions_request_v0(corr, txn.transactional_id));
+            if (dt_body.has_value()) {
+                const auto dt = wire::parse_describe_transactions_response_v0(*dt_body, corr);
+                if (dt.has_value() && dt->error_code == 0 && dt->state == "CompleteCommit" &&
+                    dt->producer_id == txn.producer_id &&
+                    dt->producer_epoch >= txn.producer_epoch) {
+                    return {Status::Committed,
+                            "DescribeTransactions proves CompleteCommit for '" +
+                                txn.transactional_id + "' pid " + std::to_string(txn.producer_id) +
+                                " (staged epoch " + std::to_string(txn.producer_epoch) +
+                                " was stale, broker epoch " + std::to_string(dt->producer_epoch) +
+                                "); the fenced EndTxn was a stale-epoch artefact, not a verdict"};
+                }
+                if (dt.has_value()) {
+                    last_detail +=
+                        "; DescribeTransactions: " +
+                        (dt->error_code != 0
+                             ? wire::error_name(dt->error_code)
+                             : ("state=" + dt->state + " pid=" + std::to_string(dt->producer_id) +
+                                " epoch=" + std::to_string(dt->producer_epoch)));
+                }
+            }
         }
         return {Status::Refused, last_detail};
     }

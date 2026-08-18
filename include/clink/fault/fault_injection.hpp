@@ -289,6 +289,12 @@ inline constexpr char kCoordinatorBeforeCommitBroadcast[] = "coordinator.before_
 inline constexpr char kSinkBeforePrepare[] = "sink.before_prepare";
 inline constexpr char kSinkAfterPrepare[] = "sink.after_prepare";
 inline constexpr char kSinkBeforeCommit[] = "sink.before_commit";
+// Between the broker acknowledging the commit and the durable receipt
+// landing: the ack window. A kill here leaves a committed transaction with
+// no receipt, and recovery must prove the commit over the wire
+// (idempotent re-EndTxn, pinned by TxnResumeLive) rather than replay it.
+// qual01-20260818d's duplicates rode exactly this window.
+inline constexpr char kSinkBetweenCommitAndReceipt[] = "sink.between_commit_and_receipt";
 inline constexpr char kSinkAfterExternalCommit[] = "sink.after_external_commit";
 
 // State backend + restore.

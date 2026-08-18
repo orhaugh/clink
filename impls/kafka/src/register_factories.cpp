@@ -409,12 +409,18 @@ public:
         }
         inner_.commit_transaction();  // commits, then begins the next txn
         last_committed_ckpt_ = checkpoint_id;
+        // The ack window: the broker has committed, nothing durable records
+        // it yet. A kill here is recovered over the wire - the resolution
+        // walk re-sends EndTxn(commit) with this producer's identity and
+        // the broker answers idempotently (pinned live by TxnResumeLive) -
+        // so the receipt below is an optimisation and a suppression
+        // horizon, not the only proof.
+        CLINK_FAULT_POINT(clink::fault::points::kSinkBetweenCommitAndReceipt);
         // Durable receipt as close to the broker's acknowledgement as
         // possible: recovery takes it over any wire verdict (fencing,
         // timeouts and broker restarts cannot retract a commit that
         // happened), and a restored instance arms replay suppression from
-        // it. The residual window is a crash between the EndTxn response
-        // and this fsync - documented in the connector page.
+        // it.
         write_commit_receipt_(checkpoint_id, open_txn_wm_);
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
         // The commit provably executed: the staged handle must not outlive
