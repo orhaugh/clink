@@ -31,6 +31,18 @@ run "chaos controller (fault application, blast radius, failure handling)" \
 run "campaign driver (the verification gate, end to end, no cloud)" \
     bash "$HERE/test_campaign.sh"
 
+# Interface drift between a campaign and the shared chaos controller dies
+# at argparse ~25 paid minutes into a rig (QUAL-02 carried two renamed
+# flags). Checked statically for every campaign at once.
+run "chaos interface (every campaign's invocation parses)" \
+    python3 "$HERE/test_chaos_interface.py"
+
+run "QUAL-02 driver parses" \
+    bash -n "$HERE/../qual02/campaign.sh"
+
+run "QUAL-02 summariser result logic (PASS is earned, never assumed)" \
+    python3 "$HERE/test_summarise2.py"
+
 if [ "${1:-}" = "--with-docker" ]; then
     # The QUAL-02 oracle is the one component that was tested offline from the
     # start, and it found a real defect in itself on the first attempt - a
