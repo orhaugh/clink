@@ -315,6 +315,12 @@ TEST_F(ConnectorCapabilityTest, NonReplayableSourceIsAtMostOnceRegardlessOfSink)
         .checkpoint_integrated = false,
         .delivery = DeliveryGuarantee::AtMostOnce,
     });
+    // The registry is process-global: leaked, this synthetic capability
+    // fails the availability sweep's every-capability-has-a-vocabulary-
+    // entry invariant in whatever suite runs after this one.
+    struct Undeclare {
+        ~Undeclare() { CapabilityRegistry::instance().undeclare("test_amnesiac"); }
+    } cleanup;
     PipelineFacts f;
     f.connectors = {src("test_amnesiac"), snk("file_2pc", {"dir"})};
     f.checkpointing_enabled = true;

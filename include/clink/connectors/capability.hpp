@@ -183,6 +183,14 @@ public:
     // behaviour of factory registration.
     void declare(ConnectorCapabilities caps);
 
+    // Remove a declaration. Production registrations are permanent; this
+    // exists so a test that declares a synthetic capability into the
+    // process-global registry can clean up after itself instead of leaking
+    // it into every later suite (the availability sweep requires a
+    // vocabulary entry for EVERY declared capability, so a leaked
+    // synthetic name fails an unrelated test order-dependently).
+    void undeclare(std::string_view name);
+
     [[nodiscard]] const ConnectorCapabilities* find(std::string_view name) const;
 
     // All declarations, ordered by name so output is stable and diffable.

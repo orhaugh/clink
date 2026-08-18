@@ -161,6 +161,13 @@ void CapabilityRegistry::declare(ConnectorCapabilities caps) {
     by_name_[caps.name] = std::move(caps);
 }
 
+void CapabilityRegistry::undeclare(std::string_view name) {
+    std::lock_guard lock(mu_);
+    if (const auto it = by_name_.find(name); it != by_name_.end()) {
+        by_name_.erase(it);
+    }
+}
+
 const ConnectorCapabilities* CapabilityRegistry::find(std::string_view name) const {
     std::lock_guard lock(mu_);
     const auto it = by_name_.find(name);
