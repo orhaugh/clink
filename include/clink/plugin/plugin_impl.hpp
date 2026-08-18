@@ -192,6 +192,11 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     cfg.capture_dir = rctx.capture_dir;
     cfg.capture_records = static_cast<std::size_t>(rctx.capture_records);
     cfg.capture_subtask_idx = rctx.chain.subtask_idx;
+    // Commit receipts: where this job's 2PC sinks record executed commits,
+    // and the restore point receipts are judged against (a receipt newer
+    // than the restore point marks an interval that is already published).
+    cfg.commit_receipt_dir = rctx.commit_receipt_dir;
+    cfg.restore_from_checkpoint_id = rctx.restore_from_checkpoint_id;
     // Queryable-state identity: the deployment role + global subtask index
     // external clients address lookups by.
     cfg.runner_role = rctx.runner_role;

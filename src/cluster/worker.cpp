@@ -17,6 +17,7 @@
 #include "clink/cluster/commit_dispatch_gate.hpp"
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/frame_io.hpp"
+#include "clink/cluster/in_doubt_resolution.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_planner.hpp"
 #include "clink/cluster/messages.hpp"
@@ -952,6 +953,8 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
     // bounded. Collect the (backend, id) work under the lock, run the
     // purges (filesystem remove_all / unlink) outside it.
     std::vector<std::pair<std::shared_ptr<StateBackend>, CheckpointId>> to_purge;
+    std::string receipt_dir;
+    std::vector<CheckpointId> receipt_purge_ids;
     {
         std::lock_guard lock(mu_);
         auto ret_it = per_job_retention_.find(msg.job_id);
@@ -982,6 +985,17 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
                     }
                 }
             }
+            // Commit receipts ride the same retention window: a purged
+            // checkpoint's receipts (sub<K>-<id>, any subtask) go with it.
+            // The retain_floor filter above already keeps every receipt at
+            // or above the newest CONFIRMED checkpoint - the ones recovery
+            // and replay suppression still read.
+            if (auto cp_it = per_job_checkpoint_.find(msg.job_id);
+                cp_it != per_job_checkpoint_.end() && !cp_it->second.checkpoint_dir.empty()) {
+                receipt_dir =
+                    commit_receipt_dir_for(cp_it->second.checkpoint_dir, msg.job_id).string();
+                receipt_purge_ids.assign(purge_ids.begin(), purge_ids.end());
+            }
         }
     }
     for (auto& [backend, id] : to_purge) {
@@ -989,6 +1003,27 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
             backend->purge_checkpoint(id);
         } catch (...) {
             // Best-effort: a failed purge only leaves disk un-reclaimed.
+        }
+    }
+    if (!receipt_dir.empty() && !receipt_purge_ids.empty()) {
+        std::error_code ec;
+        std::filesystem::directory_iterator it{receipt_dir, ec};
+        if (!ec) {
+            for (const auto& ent : it) {
+                const auto name = ent.path().filename().string();
+                const auto dash = name.rfind('-');
+                if (name.rfind("sub", 0) != 0 || dash == std::string::npos) {
+                    continue;
+                }
+                const auto id = std::strtoull(name.c_str() + dash + 1, nullptr, 10);
+                for (const auto purge_id : receipt_purge_ids) {
+                    if (id == purge_id.value()) {
+                        std::error_code rm_ec;
+                        std::filesystem::remove(ent.path(), rm_ec);
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -2252,6 +2287,11 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .checkpoint_dir = checkpoint_dir,
                 .restore_from_dir = restore_from_dir,
                 .restore_from_checkpoint_id = restore_from_checkpoint_id,
+                // 2PC sinks record executed commits here; the resolution
+                // walk and the sink's own restore path read them back.
+                .commit_receipt_dir = checkpoint_dir.empty()
+                                          ? std::string{}
+                                          : commit_receipt_dir_for(checkpoint_dir, job_id).string(),
                 .generation = generation,
                 .restore_from_generation = restore_from_generation,
                 .capture_dir = capture_dir,
@@ -2625,6 +2665,12 @@ void Worker::run_generic_subtask_(JobId job_id,
             .checkpoint_dir = checkpoint_dir,
             .restore_from_dir = restore_from_dir,
             .restore_from_checkpoint_id = restore_from_checkpoint_id,
+            // 2PC sinks record executed commits here (see the deploy-path
+            // RunnerContext above for the contract).
+            .commit_receipt_dir =
+                checkpoint_dir.empty()
+                    ? std::string{}
+                    : clink::cluster::commit_receipt_dir_for(checkpoint_dir, job_id).string(),
             .generation = generation,
             .restore_from_generation = restore_from_generation,
             .capture_dir = capture_dir,

@@ -124,6 +124,13 @@ void LocalExecutor::start() {
         if (!config_.runner_role.empty()) {
             contexts_.back()->set_runner_identity(config_.runner_role, config_.runner_subtask_idx);
         }
+        // Commit receipts (2PC sinks): where executed commits are recorded
+        // and the restore point receipts are judged against. Empty dir in
+        // in-process / legacy paths keeps the feature off.
+        if (!config_.commit_receipt_dir.empty()) {
+            contexts_.back()->set_commit_receipts(config_.commit_receipt_dir,
+                                                  config_.restore_from_checkpoint_id);
+        }
         auto* ctx_ptr = contexts_.back().get();
         auto run_fn = runner.run;
         auto cancel_fn = runner.cancel;

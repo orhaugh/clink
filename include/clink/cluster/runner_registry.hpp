@@ -109,6 +109,12 @@ struct RunnerContext {
     std::string checkpoint_dir;
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
+    // Where 2PC sinks drop per-subtask commit receipts
+    // (<checkpoint_dir>/_jobs/<job_id>/receipts - the worker resolves the
+    // job id, which the chain spec does not carry). Empty = receipts off
+    // (in-process / legacy paths). See commit_receipt_dir_for in
+    // clink/cluster/in_doubt_resolution.hpp for who reads them.
+    std::string commit_receipt_dir;
     // Topology generation. State is rooted at
     // `<checkpoint_dir>/v<generation>/<subtask_idx>` rather than
     // `<checkpoint_dir>/<subtask_idx>`, because a job-global subtask index is

@@ -154,6 +154,22 @@ public:
     std::size_t capture_records() const noexcept { return capture_records_; }
     std::size_t capture_subtask_idx() const noexcept { return capture_subtask_idx_; }
 
+    // Commit receipts (2PC sinks). commit_receipt_dir is where this job's
+    // sinks durably record executed external commits (one `sub<K>-<N>` file
+    // per subtask and checkpoint); restore_from_checkpoint_id is the
+    // checkpoint this run restored from (0 = fresh start). A sink arms
+    // replay suppression from receipts NEWER than the restore point: their
+    // intervals are already published, so re-emitting them on replay would
+    // duplicate. Empty dir = receipts off (in-process / legacy paths).
+    void set_commit_receipts(std::string dir, std::uint64_t restore_from_ckpt) noexcept {
+        commit_receipt_dir_ = std::move(dir);
+        restore_from_checkpoint_id_ = restore_from_ckpt;
+    }
+    const std::string& commit_receipt_dir() const noexcept { return commit_receipt_dir_; }
+    std::uint64_t restore_from_checkpoint_id() const noexcept {
+        return restore_from_checkpoint_id_;
+    }
+
     // Queryable-state identity: the DeploymentTask role and global subtask
     // index this operator runs as. An operator that exposes a state slot
     // for external lookup binds it under exactly this (role, subtask) pair
@@ -549,6 +565,8 @@ private:
     std::string capture_dir_;
     std::size_t capture_records_{0};
     std::size_t capture_subtask_idx_{0};
+    std::string commit_receipt_dir_;
+    std::uint64_t restore_from_checkpoint_id_{0};
     std::string runner_role_;
     std::size_t runner_subtask_idx_{0};
     TimerService timer_service_{};

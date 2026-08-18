@@ -67,6 +67,16 @@ struct JobConfig {
     // use the embedded path verbatim (same-location restart).
     std::string restore_base;
 
+    // Commit receipts (2PC sinks): the job's receipts directory and the
+    // checkpoint id this run restored from. A 2PC sink writes
+    // <commit_receipt_dir>/sub<K>-<N> after its external commit for
+    // checkpoint N executed, and on restore arms replay suppression from
+    // receipts newer than restore_from_checkpoint_id (its output for that
+    // span is already published). Empty dir = receipts off (in-process /
+    // legacy paths). restore_from_checkpoint_id is 0 on a fresh start.
+    std::string commit_receipt_dir;
+    std::uint64_t restore_from_checkpoint_id{0};
+
     // Record-capture flight recorder (time-travel debugging). When non-empty,
     // operator runners whose registration supplied an input codec tee every
     // input record into per-checkpoint-epoch .cap files under
