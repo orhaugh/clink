@@ -9,6 +9,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -26,6 +28,8 @@
 #include "clink/runtime/network/connection.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/time/event_time.hpp"
+#include "clink/time/watermark.hpp"
 
 #include "tests/integration/docker_kafka.hpp"
 
@@ -512,6 +516,126 @@ TEST_F(TxnResumeLive, TheWrapperStagesAResolvableHandleAndErasesItOnCommit) {
                      .has_value())
         << "an executed commit must erase its handle";
     sink->close();
+}
+
+// Builds the 2PC sink through the factory with a RuntimeContext carrying a
+// commit-receipt directory, so the receipt + replay-suppression surface runs
+// exactly as deployed. Returns the sink; `rctx` and `state` must outlive it.
+std::shared_ptr<clink::Sink<std::string>> build_receipt_sink(const std::string& topic,
+                                                             const std::string& txn_id,
+                                                             clink::RuntimeContext& rctx) {
+    auto& registry = clink::cluster::OperatorRegistry::default_instance();
+    const auto* factory =
+        registry.find_sink("kafka_2pc_sink_string", clink::cluster::ChannelType{"string"});
+    if (factory == nullptr) {
+        return nullptr;
+    }
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"brokers", broker_->brokers()}, {"topic", topic}, {"transactional_id", txn_id}};
+    auto sink = std::static_pointer_cast<clink::Sink<std::string>>(factory->build(ctx));
+    sink->set_id(clink::OperatorId{44});
+    sink->attach_runtime(&rctx);
+    return sink;
+}
+
+TEST_F(TxnResumeLive, ACommitWritesAReceiptAndFreshStartsNeverSuppress) {
+    const auto receipt_dir = std::filesystem::temp_directory_path() /
+                             ("clink_receipts_" + std::to_string(::getpid()) + "_" +
+                              ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    std::filesystem::remove_all(receipt_dir);
+    std::filesystem::create_directories(receipt_dir);
+    // A lingering receipt from some earlier run. A FRESH start (restore id
+    // 0) reprocesses from scratch and owes the user its full output, so it
+    // must not arm suppression from this.
+    {
+        std::ofstream stale(receipt_dir / clink::connectors::commit_receipt_file_name(0, 9));
+        stale << "wm=99999\n";
+    }
+
+    clink::InMemoryStateBackend state;
+    clink::RuntimeContext rctx(clink::OperatorId{44}, "receipt_fresh", &state, nullptr);
+    rctx.set_commit_receipts(receipt_dir.string(), /*restore_from_ckpt=*/0);
+    auto sink = build_receipt_sink(topic_, "receipt-live-fresh", rctx);
+    ASSERT_NE(sink, nullptr);
+
+    sink->open();
+    Batch<std::string> b;
+    b.emplace(std::string{"v1"}, clink::EventTime{100});  // far below the stale horizon
+    sink->on_data(b);
+    sink->on_watermark(clink::Watermark{clink::EventTime{200}});
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    sink->on_commit(1);
+    sink->close();
+
+    EXPECT_EQ(
+        clink::kafka::consume_all_committed(broker_->brokers(), topic_, std::chrono::seconds(20)),
+        (std::vector<std::string>{"v1"}))
+        << "a fresh start must publish everything - stale receipts arm nothing";
+    // The commit dropped a durable receipt carrying the sealing barrier's
+    // watermark horizon.
+    std::ifstream in(receipt_dir / clink::connectors::commit_receipt_file_name(0, 1));
+    std::string line;
+    ASSERT_TRUE(in.is_open() && std::getline(in, line))
+        << "an executed commit must write its receipt";
+    EXPECT_EQ(line, "wm=200");
+    std::filesystem::remove_all(receipt_dir);
+}
+
+TEST_F(TxnResumeLive, AnArmedRestoreSuppressesAlreadyPublishedReemissions) {
+    // The partial-commit fallback: this subtask's commit for checkpoint 3
+    // executed (receipt on disk, horizon wm=10000) but recovery restored
+    // from checkpoint 1 because a SIBLING subtask's transaction was lost.
+    // The replay re-produces this subtask's already-published interval; the
+    // armed sink must swallow exactly the re-emissions at or below the
+    // horizon and pass everything else - including a record it cannot
+    // judge (no event time), which degrades loudly to bounded replay
+    // rather than silently dropping data.
+    const auto receipt_dir = std::filesystem::temp_directory_path() /
+                             ("clink_receipts_" + std::to_string(::getpid()) + "_" +
+                              ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    std::filesystem::remove_all(receipt_dir);
+    std::filesystem::create_directories(receipt_dir);
+    {
+        std::ofstream receipt(receipt_dir / clink::connectors::commit_receipt_file_name(0, 3));
+        receipt << "wm=10000\n";
+    }
+
+    clink::InMemoryStateBackend state;
+    clink::RuntimeContext rctx(clink::OperatorId{44}, "receipt_armed", &state, nullptr);
+    rctx.set_commit_receipts(receipt_dir.string(), /*restore_from_ckpt=*/1);
+    auto sink = build_receipt_sink(topic_, "receipt-live-armed", rctx);
+    ASSERT_NE(sink, nullptr);
+
+    sink->open();  // arms from the receipt: horizon 10000
+    Batch<std::string> replayed;
+    replayed.emplace(std::string{"old-a"}, clink::EventTime{9000});
+    replayed.emplace(std::string{"old-b"}, clink::EventTime{10000});  // == horizon: covered
+    sink->on_data(replayed);
+
+    Batch<std::string> unjudgeable;
+    unjudgeable.emplace(std::string{"no-ts"});  // no event time: pass, loudly
+    sink->on_data(unjudgeable);
+
+    Batch<std::string> past_horizon;
+    past_horizon.emplace(std::string{"edge-d"}, clink::EventTime{10001});  // first new pane
+    sink->on_data(past_horizon);
+
+    sink->on_watermark(clink::Watermark{clink::EventTime{10500}});  // retires suppression
+
+    Batch<std::string> fresh;
+    fresh.emplace(std::string{"new-c"}, clink::EventTime{10200});
+    sink->on_data(fresh);
+
+    sink->on_barrier(CheckpointBarrier{CheckpointId{10}});
+    sink->on_commit(10);
+    sink->close();
+
+    EXPECT_EQ(
+        clink::kafka::consume_all_committed(broker_->brokers(), topic_, std::chrono::seconds(20)),
+        (std::vector<std::string>{"no-ts", "edge-d", "new-c"}))
+        << "exactly the receipted horizon is swallowed: nothing below it twice, nothing "
+           "above it lost";
+    std::filesystem::remove_all(receipt_dir);
 }
 
 }  // namespace

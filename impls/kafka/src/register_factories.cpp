@@ -15,6 +15,9 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -39,7 +42,9 @@
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/network/connection.hpp"
+#include "clink/state/durable_file_write.hpp"
 #include "clink/state/state_backend.hpp"
+#include "clink/time/event_time.hpp"
 
 #ifdef CLINK_KAFKA_RESUME_TLS
 #include "clink/runtime/network/tls_connection.hpp"
@@ -260,13 +265,20 @@ private:
 // connector doc's exactly-once caveat.
 class TwoPhaseCommitStringKafkaSink final : public Sink<std::string> {
 public:
-    explicit TwoPhaseCommitStringKafkaSink(KafkaSink::Options opts, std::uint32_t subtask_idx = 0)
+    explicit TwoPhaseCommitStringKafkaSink(KafkaSink::Options opts,
+                                           std::uint32_t subtask_idx = 0,
+                                           bool replay_suppression = true)
         : brokers_(opts.brokers),
           transactional_id_(opts.transactional_id),
           subtask_idx_(subtask_idx),
+          replay_suppression_(replay_suppression),
           inner_(std::move(opts)) {}
 
-    void open() override { inner_.open(); }
+    void open() override {
+        inner_.open();
+        std::lock_guard lk(mu_);
+        arm_replay_suppression_();
+    }
 
     // The resume handle staged in on_barrier is state the checkpoint must
     // capture - same contract as CommittingSink's prepared handles.
@@ -274,6 +286,32 @@ public:
 
     void on_data(const Batch<std::string>& b) override {
         std::lock_guard lk(mu_);
+        if (suppress_armed_) {
+            // Replay suppression: the receipts this instance armed from
+            // prove its commits up to suppress_source_ckpt_ executed, so the
+            // restored run's re-emissions of that span are already published.
+            // A fired pane is committed iff its event time (window end - 1)
+            // is at or below the watermark the sealing barrier saw - exact
+            // for watermark-monotone feeds (windowed/aggregated emissions),
+            // which is the premise this option documents.
+            Batch<std::string> kept;
+            for (const auto& r : b) {
+                if (!suppress_record_(r)) {
+                    kept.push(r);
+                }
+            }
+            if (kept.empty()) {
+                return;
+            }
+            if (open_txn_ckpt_.has_value()) {
+                for (const auto& r : kept) {
+                    tail_.push_back(r.value());
+                }
+                return;
+            }
+            forward_(kept);
+            return;
+        }
         if (open_txn_ckpt_.has_value()) {
             // A commit is outstanding: these records belong to the next
             // interval and must not enter the prepared transaction.
@@ -287,6 +325,15 @@ public:
 
     void on_watermark(Watermark wm) override {
         std::lock_guard lk(mu_);
+        // Track the highest non-idle watermark: it stamps each prepared
+        // transaction's receipt (the horizon its records are covered by) and
+        // retires replay suppression once the replay has passed the horizon.
+        if (!wm.is_idle() && wm.timestamp().millis() > cur_wm_) {
+            cur_wm_ = wm.timestamp().millis();
+            if (suppress_armed_ && cur_wm_ > suppress_horizon_) {
+                disarm_suppression_();
+            }
+        }
         inner_.on_watermark(wm);
     }
 
@@ -312,6 +359,10 @@ public:
         inner_.flush();
         inner_.on_barrier(b);
         open_txn_ckpt_ = b.id().value();
+        // The watermark horizon this transaction's records are covered by:
+        // stamped into the commit receipt so a later restore knows how far
+        // its replayed re-emissions are already published.
+        open_txn_wm_ = cur_wm_;
         // Stage the resume handle INSIDE this checkpoint: if the worker
         // dies after this checkpoint completes but before the commit
         // executes, recovery reads the handle out of the snapshot and can
@@ -358,6 +409,13 @@ public:
         }
         inner_.commit_transaction();  // commits, then begins the next txn
         last_committed_ckpt_ = checkpoint_id;
+        // Durable receipt as close to the broker's acknowledgement as
+        // possible: recovery takes it over any wire verdict (fencing,
+        // timeouts and broker restarts cannot retract a commit that
+        // happened), and a restored instance arms replay suppression from
+        // it. The residual window is a crash between the EndTxn response
+        // and this fsync - documented in the connector page.
+        write_commit_receipt_(checkpoint_id, open_txn_wm_);
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
         // The commit provably executed: the staged handle must not outlive
         // it, or a later recovery could try to finalise a transaction that
@@ -496,14 +554,156 @@ private:
                                     clink::StateBackend::KeyView{key.data(), key.size()});
     }
 
+    // --- commit receipts + replay suppression -----------------------------
+    //
+    // The receipt (sub<K>-<N>, body "wm=<horizon>") is this subtask's
+    // durable record that its external commit for checkpoint N executed.
+    // Two readers: the coordinator's in-doubt resolution (a receipted
+    // handle is COMMITTED with no wire call), and this class's own restore
+    // path. When the restore point could NOT advance to a receipted
+    // checkpoint (a sibling subtask's transaction was lost), the replay
+    // re-produces intervals this subtask already published; suppression
+    // swallows exactly those. The cut is the receipt's watermark horizon:
+    // a fired pane is inside a committed transaction iff its event time is
+    // at or below the watermark the sealing barrier saw - exact when the
+    // feed's event times are watermark-monotone (windowed / aggregated
+    // emissions), which is the premise the connector page documents for
+    // the replay_suppression option.
+
+    void write_commit_receipt_(std::uint64_t ckpt, std::int64_t wm_horizon) {
+        const auto* rt = this->runtime();
+        if (!replay_suppression_ || rt == nullptr || rt->commit_receipt_dir().empty()) {
+            return;
+        }
+        try {
+            const std::filesystem::path dir{rt->commit_receipt_dir()};
+            std::filesystem::create_directories(dir);
+            clink::state::detail::write_string_fsync_rename(
+                dir / clink::connectors::commit_receipt_file_name(subtask_idx_, ckpt),
+                "wm=" + std::to_string(wm_horizon) + "\n");
+        } catch (const std::exception& e) {
+            // Best-effort by design: the commit DID execute, and confirming
+            // it stays truthful. Losing the receipt only widens this
+            // recovery's fallback to the bounded-replay contract - but
+            // never silently.
+            if (this->runtime() != nullptr) {
+                this->runtime()->log_error(
+                    std::string{"kafka_2pc_sink_string: commit receipt for checkpoint "} +
+                    std::to_string(ckpt) + " could not be written (" + e.what() +
+                    "); a recovery crossing this checkpoint falls back to bounded replay");
+            }
+        }
+    }
+
+    // Called from open() (under mu_): arm suppression from receipts newer
+    // than the checkpoint this run restored from. Fresh starts (restore id
+    // 0) never arm - a deliberate resubmit that reprocesses from scratch
+    // owes the user its full output.
+    void arm_replay_suppression_() {
+        const auto* rt = this->runtime();
+        if (!replay_suppression_ || rt == nullptr || rt->commit_receipt_dir().empty() ||
+            rt->restore_from_checkpoint_id() == 0) {
+            return;
+        }
+        const auto restore_from = rt->restore_from_checkpoint_id();
+        const std::string prefix = "sub" + std::to_string(subtask_idx_) + "-";
+        std::uint64_t best_ckpt = 0;
+        std::error_code ec;
+        std::filesystem::directory_iterator it{rt->commit_receipt_dir(), ec};
+        if (ec) {
+            return;  // no receipts directory: nothing was ever committed here
+        }
+        for (const auto& ent : it) {
+            const auto name = ent.path().filename().string();
+            if (name.rfind(prefix, 0) != 0) {
+                continue;
+            }
+            const auto id = std::strtoull(name.c_str() + prefix.size(), nullptr, 10);
+            if (id > restore_from && id > best_ckpt) {
+                best_ckpt = id;
+            }
+        }
+        if (best_ckpt == 0) {
+            return;
+        }
+        std::ifstream in{std::filesystem::path{rt->commit_receipt_dir()} /
+                         clink::connectors::commit_receipt_file_name(subtask_idx_, best_ckpt)};
+        std::string line;
+        if (!in.is_open() || !std::getline(in, line) || line.rfind("wm=", 0) != 0) {
+            this->runtime()->log_warn(
+                std::string{"kafka_2pc_sink_string: unreadable commit receipt for checkpoint "} +
+                std::to_string(best_ckpt) + "; replay suppression stays off (bounded replay)");
+            return;
+        }
+        const auto horizon = std::strtoll(line.c_str() + 3, nullptr, 10);
+        if (horizon == EventTime::min().millis()) {
+            return;  // no watermark had been seen by that barrier: nothing to cut on
+        }
+        suppress_armed_ = true;
+        suppress_horizon_ = horizon;
+        suppress_source_ckpt_ = best_ckpt;
+        this->runtime()->log_info(
+            std::string{"kafka_2pc_sink_string: replay suppression armed from receipt for "
+                        "checkpoint "} +
+            std::to_string(best_ckpt) + " (restored from " + std::to_string(restore_from) +
+            "): re-emissions with event time <= " + std::to_string(horizon) +
+            " are already published and will be swallowed");
+    }
+
+    // True = swallow. Only called while armed, under mu_.
+    bool suppress_record_(const Record<std::string>& r) {
+        if (!r.event_time().has_value()) {
+            if (!warned_ts_less_) {
+                warned_ts_less_ = true;
+                if (this->runtime() != nullptr) {
+                    this->runtime()->log_error(
+                        "kafka_2pc_sink_string: replay suppression is armed but a record "
+                        "carries no event time, so it cannot be matched against the committed "
+                        "horizon; passing it through (bounded-replay contract). Feed this sink "
+                        "watermark-monotone, event-timed records - windowed or aggregated "
+                        "emissions - or set replay_suppression='false'.");
+                }
+            }
+            return false;
+        }
+        if (r.event_time()->millis() <= suppress_horizon_) {
+            ++suppressed_records_;
+            return true;
+        }
+        return false;
+    }
+
+    void disarm_suppression_() {
+        suppress_armed_ = false;
+        if (this->runtime() != nullptr) {
+            this->runtime()->log_info(
+                std::string{"kafka_2pc_sink_string: replay suppression retired at watermark "} +
+                std::to_string(cur_wm_) + ": swallowed " + std::to_string(suppressed_records_) +
+                " already-published record(s) from the replay of checkpoints <= " +
+                std::to_string(suppress_source_ckpt_));
+        }
+    }
+
     std::string brokers_;
     std::string transactional_id_;
     std::uint32_t subtask_idx_{0};
+    bool replay_suppression_{true};
     KafkaSink inner_;
     std::mutex mu_;
     std::condition_variable pending_cv_;
     std::optional<std::uint64_t> open_txn_ckpt_;
     std::vector<std::string> tail_;
+    // Highest non-idle watermark seen, and its value when the open
+    // transaction's barrier sealed it (the receipt's horizon).
+    std::int64_t cur_wm_{EventTime::min().millis()};
+    std::int64_t open_txn_wm_{EventTime::min().millis()};
+    // Replay suppression (armed at open() from receipts newer than the
+    // restore point; retired once the replay's watermark passes the horizon).
+    bool suppress_armed_{false};
+    std::int64_t suppress_horizon_{EventTime::min().millis()};
+    std::uint64_t suppress_source_ckpt_{0};
+    std::uint64_t suppressed_records_{0};
+    bool warned_ts_less_{false};
     // Highest checkpoint whose commit this instance EXECUTED. A re-delivered
     // commit at or below it is idempotent; anything else that misses the
     // open transaction is a commit that did not happen and must throw.
@@ -941,8 +1141,15 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (ctx.parallelism > 1) {
                 opts.transactional_id += "-" + std::to_string(ctx.subtask_idx);
             }
-            auto sink =
-                std::make_shared<TwoPhaseCommitStringKafkaSink>(std::move(opts), ctx.subtask_idx);
+            // replay_suppression (default on): swallow re-emissions of
+            // intervals this subtask's receipts prove are already published
+            // when a recovery could not advance the restore point past them.
+            // Exact for watermark-monotone feeds (windowed / aggregated
+            // emissions); a feed that delivers records at or below the
+            // current watermark should set 'false' (see the connector page).
+            const bool replay_suppression = ctx.param_or("replay_suppression", "true") != "false";
+            auto sink = std::make_shared<TwoPhaseCommitStringKafkaSink>(
+                std::move(opts), ctx.subtask_idx, replay_suppression);
             // Declare commit-group membership so the coordinator can
             // gate this sink's CommitCheckpoint on its group peers.
             if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
