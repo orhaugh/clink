@@ -64,6 +64,15 @@ struct ResolutionFixture : ::testing::Test {
                                              .detail = "scripted transport failure",
                                              .transport_inconclusive = true};
                 }
+                if (handle.find("\"tag\":\"commit-and-cancel\"") != std::string::npos) {
+                    // The deadline trips WHILE this probe is in flight: the
+                    // resolver answers committed, but the walk must discard
+                    // the answer - acting on it is a store effect.
+                    if (cancel_to_set != nullptr) {
+                        cancel_to_set->store(true, std::memory_order_release);
+                    }
+                    return InDoubtResolution{true, "scripted commit, cancelled mid-flight"};
+                }
                 return InDoubtResolution{false, "scripted refusal"};
             });
     }
@@ -150,9 +159,37 @@ struct ResolutionFixture : ::testing::Test {
                                        ("CONFIRMED-" + std::to_string(id)));
     }
 
+    // The .unresolved marker a failed or cancelled walk leaves next to the
+    // receipts: body = the staged handle, consumed by the owning sink's
+    // pre-fence describe.
+    [[nodiscard]] std::filesystem::path unresolved_marker_path(std::uint32_t sub,
+                                                               std::uint64_t id) const {
+        return clink::cluster::commit_receipt_dir_for(dir, kJob) /
+               (clink::connectors::commit_receipt_file_name(sub, id) + ".unresolved");
+    }
+
+    [[nodiscard]] bool marker_exists(std::uint32_t sub, std::uint64_t id) const {
+        return std::filesystem::exists(unresolved_marker_path(sub, id));
+    }
+
+    [[nodiscard]] std::string read_marker(std::uint32_t sub, std::uint64_t id) const {
+        std::ifstream in{unresolved_marker_path(sub, id)};
+        std::stringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    }
+
+    void write_marker(std::uint32_t sub, std::uint64_t id, const std::string& body) const {
+        const auto rdir = clink::cluster::commit_receipt_dir_for(dir, kJob);
+        std::filesystem::create_directories(rdir);
+        std::ofstream out(unresolved_marker_path(sub, id));
+        out << body;
+    }
+
     std::string dir;
     std::vector<std::string> seen;
     int transport_calls{0};
+    std::atomic<bool>* cancel_to_set{nullptr};
 };
 
 TEST_F(ResolutionFixture, ACommittedHandleAdvancesConfirmedDurably) {
@@ -388,6 +425,114 @@ TEST_F(ResolutionFixture, AMixedVerdictStillMaterialisesLaterCommits) {
                          clink::connectors::commit_receipt_file_name(1, 4);
     EXPECT_TRUE(std::filesystem::exists(receipt))
         << "the refusal stopped the walk from proving (and receipting) the later commit";
+}
+
+// -- the id floor over unmarked snapshot files (qual01-20260819g) ----------
+//
+// A seconds-lived incarnation dies holding snapshot files for checkpoints
+// no marker names. A successor numbering above markers alone reuses those
+// ids and its files interleave with the dead incarnation's - the
+// mixed-vintage restore. The floor must count every snapshot file.
+TEST_F(ResolutionFixture, TheIdFloorCountsUnmarkedSnapshotFiles) {
+    write_completed_marker(5);
+    write_snapshot_without_handles(9, 0);
+    write_snapshot_without_handles(7, 2);
+    EXPECT_EQ(clink::cluster::latest_snapshot_id_on_disk(dir), 9u);
+
+    // Non-conforming names and directories are not checkpoints.
+    std::filesystem::create_directories(std::filesystem::path(dir) / "vX" / "0");
+    std::ofstream(std::filesystem::path(dir) / "v1" / "0" / "checkpoint-.snap").put('x');
+    std::ofstream(std::filesystem::path(dir) / "v1" / "0" / "other-12.snap").put('x');
+    EXPECT_EQ(clink::cluster::latest_snapshot_id_on_disk(dir), 9u);
+    EXPECT_EQ(clink::cluster::latest_snapshot_id_on_disk(""), 0u);
+}
+
+// -- cancellation (the rig-night composite's zombie walk) ------------------
+//
+// The coordinator's watchdog cancels a walk that outruns its deadline. A
+// cancelled walk must stop MUTATING - its probes execute commits, its
+// store writes steer every later recovery - not merely stop restarting:
+// the composite caught a timed-out walk committing transactions and
+// writing CONFIRMED for a job the coordinator had already failed.
+
+TEST_F(ResolutionFixture, ACancelledWalkProbesNothingButMarksTheOrphans) {
+    write_completed_marker(4);
+    const auto h = handle_with_wm("commit", 4, 99);
+    write_snapshot_with_handle(4, 0, h);
+    std::atomic<bool> cancel{true};
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::seconds{2}, &cancel), 3u);
+    EXPECT_TRUE(seen.empty()) << "a cancelled walk fired a wire probe";
+    EXPECT_FALSE(confirmed_marker_exists(4));
+    EXPECT_FALSE(std::filesystem::exists(clink::cluster::commit_receipt_dir_for(dir, kJob) /
+                                         clink::connectors::commit_receipt_file_name(0, 4)));
+    // The mandated final act: the handle the walk never settled is left as
+    // an .unresolved marker so the owning sink can describe the orphan
+    // BEFORE its init fences it - a cancelled walk that writes nothing is
+    // what turns a bounded walk into a blind fence.
+    EXPECT_EQ(read_marker(0, 4), h);
+}
+
+TEST_F(ResolutionFixture, ACancelTrippedMidProbeDiscardsTheInFlightAnswer) {
+    write_completed_marker(4);
+    const auto h = handle_with_wm("commit-and-cancel", 4, 99);
+    write_snapshot_with_handle(4, 0, h);
+    std::atomic<bool> cancel{false};
+    cancel_to_set = &cancel;
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::seconds{2}, &cancel), 3u)
+        << "an answer that arrived after the cancel advanced the restore point";
+    EXPECT_EQ(seen.size(), 1u);
+    EXPECT_FALSE(confirmed_marker_exists(4))
+        << "a cancelled walk published CONFIRMED from an in-flight answer";
+    EXPECT_FALSE(std::filesystem::exists(clink::cluster::commit_receipt_dir_for(dir, kJob) /
+                                         clink::connectors::commit_receipt_file_name(0, 4)))
+        << "a cancelled walk materialised a receipt from an in-flight answer";
+    // The discarded answer leaves the handle unresolved - and unresolved
+    // means marked: the sink's pre-fence describe recovers the truth the
+    // discard threw away.
+    EXPECT_EQ(read_marker(0, 4), h);
+}
+
+TEST_F(ResolutionFixture, AnExhaustedTransportWalkLeavesMarkersForTheSinks) {
+    write_completed_marker(4, "0,1");
+    write_snapshot_with_handle(4, 0, handle_with_wm("commit", 4, 777));
+    const auto h1 = handle_with_wm("transport-always", 4, 888);
+    write_snapshot_with_handle(4, 1, h1);
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::milliseconds{0}), 3u);
+    // The wire-proven commit got its receipt and needs no marker; the
+    // handle the outage kept unknowable is marked for its sink.
+    EXPECT_TRUE(std::filesystem::exists(clink::cluster::commit_receipt_dir_for(dir, kJob) /
+                                        clink::connectors::commit_receipt_file_name(0, 4)));
+    EXPECT_FALSE(marker_exists(0, 4)) << "a committed handle must not be marked unresolved";
+    EXPECT_EQ(read_marker(1, 4), h1);
+}
+
+TEST_F(ResolutionFixture, AResolvedHandleRetiresItsStaleMarker) {
+    // An earlier failed episode marked sub0's handle; this episode proves
+    // the commit over the wire. The stale marker must go with it - a
+    // marker outliving its verdict would be re-judged by a later open
+    // against broker state that generations have moved past.
+    write_completed_marker(4);
+    write_snapshot_with_handle(4, 0, handle_with_wm("commit", 4, 99));
+    write_marker(0, 4, "stale-handle-body");
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::milliseconds{0}), 4u);
+    EXPECT_TRUE(confirmed_marker_exists(4));
+    EXPECT_FALSE(marker_exists(0, 4));
+}
+
+TEST_F(ResolutionFixture, AFinalRefusalRetiresTheMarker) {
+    // A broker that ANSWERS "not committed" is final; the marker from an
+    // earlier inconclusive episode must not survive to be re-described.
+    write_completed_marker(4);
+    write_snapshot_with_handle(4, 0, handle("refuse", 4));
+    write_marker(0, 4, "stale-handle-body");
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4, std::chrono::milliseconds{0}), 3u);
+    EXPECT_FALSE(confirmed_marker_exists(4));
+    EXPECT_FALSE(marker_exists(0, 4));
 }
 
 TEST_F(ResolutionFixture, AHandleWithoutAHorizonMaterialisesNothing) {

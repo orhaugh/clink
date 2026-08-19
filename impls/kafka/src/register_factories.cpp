@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -215,6 +216,93 @@ private:
     KafkaSink inner_;
 };
 
+// The dialer + credentials for the resume-protocol clients (EndTxn probes
+// and read-only DescribeTransactions): plaintext by default, TLS when the
+// process's environment names a CA bundle, SASL from the environment. Shared
+// by the coordinator-side resolver (resolve_kafka_2pc_handle) and the sink's
+// pre-fence orphan resolution - transport security is always the CALLING
+// process's configuration, never the staged handle's.
+struct ResumeDialer {
+    clink::kafka::ConnectFn connect;
+    clink::kafka::ResumeAuth auth;
+    std::string error;  // non-empty: refused (TLS misconfiguration)
+};
+
+ResumeDialer build_resume_dialer() {
+    ResumeDialer d;
+    d.connect = [](const std::string& host, std::uint16_t port) {
+        return clink::network::connect_plain(host, port);
+    };
+    if (const char* tls_ca = std::getenv("CLINK_KAFKA_RESUME_TLS_CA");
+        tls_ca != nullptr && *tls_ca != '\0') {
+#ifdef CLINK_KAFKA_RESUME_TLS
+        try {
+            auto ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
+            const char* cert = std::getenv("CLINK_KAFKA_RESUME_TLS_CERT");
+            const char* key = std::getenv("CLINK_KAFKA_RESUME_TLS_KEY");
+            if (cert != nullptr && *cert != '\0' && key != nullptr && *key != '\0') {
+                ctx->set_client_cert(cert, key);
+            }
+            d.connect = [ctx](const std::string& host,
+                              std::uint16_t port) -> std::unique_ptr<clink::network::Connection> {
+                try {
+                    return clink::network::connect_tls_connection(host, port, ctx);
+                } catch (const std::exception&) {
+                    // A failed handshake is a transport failure: bounded
+                    // retries and the honest transport fallback, the same
+                    // as an unreachable broker.
+                    return nullptr;
+                }
+            };
+        } catch (const std::exception& e) {
+            d.error =
+                std::string{
+                    "TLS requested (CLINK_KAFKA_RESUME_TLS_CA) but the client "
+                    "context could not be built: "} +
+                e.what();
+            return d;
+        }
+#else
+        d.error =
+            "TLS requested (CLINK_KAFKA_RESUME_TLS_CA) but this build carries no "
+            "clink::tls; refusing rather than downgrading to plaintext";
+        return d;
+#endif
+    }
+    if (const char* m = std::getenv("CLINK_KAFKA_RESUME_SASL_MECHANISM"); m != nullptr) {
+        d.auth.mechanism = m;
+    }
+    if (const char* u = std::getenv("CLINK_KAFKA_RESUME_SASL_USERNAME"); u != nullptr) {
+        d.auth.username = u;
+    }
+    if (const char* p = std::getenv("CLINK_KAFKA_RESUME_SASL_PASSWORD"); p != nullptr) {
+        d.auth.password = p;
+    }
+    return d;
+}
+
+std::vector<std::pair<std::string, std::uint16_t>> parse_bootstrap_entries(
+    const std::string& bootstrap) {
+    std::vector<std::pair<std::string, std::uint16_t>> entries;
+    std::size_t pos = 0;
+    while (pos <= bootstrap.size()) {
+        const auto comma = bootstrap.find(',', pos);
+        const auto entry =
+            bootstrap.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos = comma == std::string::npos ? bootstrap.size() + 1 : comma + 1;
+        if (entry.empty()) {
+            continue;
+        }
+        const auto colon = entry.rfind(':');
+        const std::string host = colon == std::string::npos ? entry : entry.substr(0, colon);
+        const auto port = colon == std::string::npos
+                              ? std::uint16_t{9092}
+                              : static_cast<std::uint16_t>(std::stoi(entry.substr(colon + 1)));
+        entries.emplace_back(host, port);
+    }
+    return entries;
+}
+
 // 2PC-aware Kafka sink. Holds a transactional KafkaSink internally. The open
 // broker transaction always carries EXACTLY ONE checkpoint interval's
 // records, and - the load-bearing rule - a checkpoint can only be ACKED once
@@ -275,6 +363,12 @@ public:
           inner_(std::move(opts)) {}
 
     void open() override {
+        // BEFORE inner_.open(): opening the transactional producer fences
+        // the previous incarnation, which aborts an undecided orphan and
+        // erases the broker state that could have named a committed one.
+        // Anything this subtask must still learn about its predecessor has
+        // to be learned first.
+        resolve_unresolved_orphan_();
         inner_.open();
         std::lock_guard lk(mu_);
         arm_replay_suppression_();
@@ -407,21 +501,21 @@ public:
                                                                  : std::string{"none"}) +
                                      "); refusing to confirm a commit that did not execute");
         }
-        inner_.commit_transaction();  // commits, then begins the next txn
+        // The receipt is written BETWEEN the broker's commit and the next
+        // begin_transaction. Order is the contract: while no successor
+        // transaction is Ongoing, the transaction coordinator still reads
+        // CompleteCommit for this commit, so a death in the ack window
+        // leaves either the receipt or a coordinator state that names the
+        // commit - which the pre-fence resolution in open() maps back to
+        // "committed". With begin first (the old order), a death here left
+        // Ongoing, indistinguishable from an undecided prepared
+        // transaction, and a restore below this checkpoint replayed panes
+        // the broker had already published (the rig-night duplicate).
+        inner_.commit_transaction([&] {
+            CLINK_FAULT_POINT(clink::fault::points::kSinkBetweenCommitAndReceipt);
+            write_commit_receipt_(checkpoint_id, open_txn_wm_);
+        });
         last_committed_ckpt_ = checkpoint_id;
-        // The ack window: the broker has committed, nothing durable records
-        // it yet. A kill here is recovered over the wire - the resolution
-        // walk re-sends EndTxn(commit) with this producer's identity and
-        // the broker answers idempotently (pinned live by TxnResumeLive) -
-        // so the receipt below is an optimisation and a suppression
-        // horizon, not the only proof.
-        CLINK_FAULT_POINT(clink::fault::points::kSinkBetweenCommitAndReceipt);
-        // Durable receipt as close to the broker's acknowledgement as
-        // possible: recovery takes it over any wire verdict (fencing,
-        // timeouts and broker restarts cannot retract a commit that
-        // happened), and a restored instance arms replay suppression from
-        // it.
-        write_commit_receipt_(checkpoint_id, open_txn_wm_);
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
         // The commit provably executed: the staged handle must not outlive
         // it, or a later recovery could try to finalise a transaction that
@@ -608,6 +702,178 @@ private:
                     "); a recovery crossing this checkpoint falls back to bounded replay");
             }
         }
+    }
+
+    // Called from open() BEFORE the transactional producer opens. When the
+    // coordinator's in-doubt resolution could not settle this subtask's
+    // prepared transaction (broker outage mid-walk, walk cancelled), it
+    // leaves a sub<K>-<N>.unresolved marker next to the receipts, carrying
+    // the staged handle. This is the LAST moment the orphan's fate is
+    // knowable: nothing has re-initialised the producer yet, so the
+    // broker's transaction coordinator still names it (CompleteCommit for a
+    // commit that executed in the ack window; Ongoing for one that never
+    // did). init_transactions would abort the undecided case and bump the
+    // epoch - after which no probe can tell the two apart. So ask FIRST,
+    // with the read-only DescribeTransactions: committed => write the
+    // receipt here (replay suppression arms from it right after),
+    // undecided or aborted => delete the marker and let the restore's
+    // replay re-produce the interval. An unreachable broker is a refusal
+    // to fence blind: throw, let the restart cycle retry, converge when
+    // the broker returns. Skipping this is what published one subtask's
+    // committed windows twice on the qual01 rig-night composite.
+    void resolve_unresolved_orphan_() {
+        const auto* rt = this->runtime();
+        if (!replay_suppression_ || rt == nullptr || rt->commit_receipt_dir().empty() ||
+            rt->restore_from_checkpoint_id() == 0) {
+            return;
+        }
+        const auto restore_from = rt->restore_from_checkpoint_id();
+        const std::string prefix = "sub" + std::to_string(subtask_idx_) + "-";
+        const std::string suffix = ".unresolved";
+        std::uint64_t marker_ckpt = 0;
+        std::error_code ec;
+        std::filesystem::directory_iterator it{rt->commit_receipt_dir(), ec};
+        if (ec) {
+            return;
+        }
+        for (const auto& ent : it) {
+            const auto name = ent.path().filename().string();
+            if (name.rfind(prefix, 0) != 0 || name.size() <= suffix.size() ||
+                name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                continue;
+            }
+            const auto id = std::strtoull(name.c_str() + prefix.size(), nullptr, 10);
+            if (id > restore_from && id > marker_ckpt) {
+                marker_ckpt = id;
+            }
+        }
+        if (marker_ckpt == 0) {
+            return;
+        }
+        const auto marker_path =
+            std::filesystem::path{rt->commit_receipt_dir()} /
+            (clink::connectors::commit_receipt_file_name(subtask_idx_, marker_ckpt) + suffix);
+        const auto retire = [&] {
+            std::error_code rec;
+            std::filesystem::remove(marker_path, rec);
+        };
+        // A receipt for the marker's checkpoint outranks it (the walk or a
+        // prior incarnation resolved it after the marker was written).
+        if (std::filesystem::exists(
+                std::filesystem::path{rt->commit_receipt_dir()} /
+                    clink::connectors::commit_receipt_file_name(subtask_idx_, marker_ckpt),
+                ec)) {
+            retire();
+            return;
+        }
+        std::string handle;
+        {
+            std::ifstream in{marker_path};
+            std::stringstream ss;
+            ss << in.rdbuf();
+            handle = ss.str();
+        }
+        std::int64_t handle_pid = -1;
+        std::int16_t handle_epoch = -1;
+        std::string wm;
+        std::string handle_txn_id;
+        try {
+            const auto j = clink::config::parse(handle);
+            handle_txn_id = j.at("transactional_id").as_string();
+            handle_pid = std::stoll(j.at("producer_id").as_string());
+            handle_epoch = static_cast<std::int16_t>(std::stoi(j.at("producer_epoch").as_string()));
+            if (j.contains("wm")) {
+                wm = j.at("wm").as_string();
+            }
+        } catch (const std::exception& e) {
+            this->runtime()->log_error(
+                std::string{"kafka_2pc_sink_string: unresolved orphan marker for checkpoint "} +
+                std::to_string(marker_ckpt) + " did not parse (" + e.what() +
+                "); proceeding under the bounded-replay contract");
+            retire();
+            return;
+        }
+        if (handle_txn_id != transactional_id_ || handle_pid < 0 || handle_epoch < 0) {
+            this->runtime()->log_error(
+                std::string{"kafka_2pc_sink_string: unresolved orphan marker for checkpoint "} +
+                std::to_string(marker_ckpt) + " names '" + handle_txn_id + "' pid=" +
+                std::to_string(handle_pid) + " which is not this sink's transaction lineage ('" +
+                transactional_id_ + "'); ignoring it under the bounded-replay contract");
+            retire();
+            return;
+        }
+        const auto dialer = build_resume_dialer();
+        if (!dialer.error.empty()) {
+            // Cannot ask AND must not fence blind: fail the open loudly.
+            throw std::runtime_error("kafka_2pc_sink_string: unresolved orphan for checkpoint " +
+                                     std::to_string(marker_ckpt) +
+                                     " cannot be described: " + dialer.error);
+        }
+        // Bounded both ways: by attempts (a fast-refusing dead port must not
+        // spin) and by wall clock (a raw blocking connect against a black
+        // hole can eat the OS connect timeout per attempt). Either bound
+        // expiring means throw below - the restart cycle is the outer retry.
+        // The 90s must stay BELOW the coordinator's restart drain deadline
+        // (120s): a restart cancel arriving mid-describe is only observed
+        // when this loop exits, and a drain deadline that undercuts it
+        // reads the sink as a wedged survivor and fails the whole job
+        // (exactly how the orphaned-commit gate first died).
+        constexpr int kDescribeAttempts = 6;
+        const auto describe_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{90};
+        std::optional<clink::kafka::DescribeState> verdict;
+        for (int attempt = 0; attempt < kDescribeAttempts && !verdict.has_value() &&
+                              std::chrono::steady_clock::now() < describe_deadline;
+             ++attempt) {
+            for (const auto& [host, port] : parse_bootstrap_entries(brokers_)) {
+                verdict = clink::kafka::describe_transaction_state(
+                    host, port, transactional_id_, dialer.connect, dialer.auth);
+                if (verdict.has_value()) {
+                    break;
+                }
+            }
+        }
+        if (!verdict.has_value()) {
+            // Fencing now would abort an undecided transaction OR erase the
+            // evidence of a committed one - and pick which blindly. The
+            // restart cycle retries this open; it converges when the broker
+            // answers.
+            throw std::runtime_error(
+                "kafka_2pc_sink_string: checkpoint " + std::to_string(marker_ckpt) +
+                " left an unresolved prepared transaction and no broker is reachable to "
+                "describe it; refusing to fence blind (a blind fence turns \"committed in "
+                "the ack window\" into replayed duplicates)");
+        }
+        const bool ours =
+            verdict->producer_id == handle_pid && verdict->producer_epoch == handle_epoch;
+        const bool committed_state =
+            verdict->state == "CompleteCommit" || verdict->state == "PrepareCommit";
+        if (ours && committed_state) {
+            if (wm.empty()) {
+                this->runtime()->log_error(
+                    std::string{"kafka_2pc_sink_string: orphaned transaction for checkpoint "} +
+                    std::to_string(marker_ckpt) + " proved committed (" + verdict->state +
+                    ") but its handle carries no watermark horizon (older binary); no receipt "
+                    "can be written and the replay of its interval will NOT be suppressed");
+            } else {
+                write_commit_receipt_(marker_ckpt, std::strtoll(wm.c_str(), nullptr, 10));
+                this->runtime()->log_info(
+                    std::string{"kafka_2pc_sink_string: orphaned transaction for checkpoint "} +
+                    std::to_string(marker_ckpt) + " resolved COMMITTED before fencing (" +
+                    verdict->state + " pid=" + std::to_string(verdict->producer_id) +
+                    " epoch=" + std::to_string(verdict->producer_epoch) +
+                    "); receipt written, replay suppression arms from it");
+            }
+            retire();
+            return;
+        }
+        this->runtime()->log_info(
+            std::string{"kafka_2pc_sink_string: orphaned transaction for checkpoint "} +
+            std::to_string(marker_ckpt) + " resolved not-committed before fencing (state=" +
+            verdict->state + " pid=" + std::to_string(verdict->producer_id) +
+            " epoch=" + std::to_string(verdict->producer_epoch) + (ours ? "" : ", not ours") +
+            "); the init below aborts any undecided remains and the replay re-produces the "
+            "interval");
+        retire();
     }
 
     // Called from open() (under mu_): arm suppression from receipts newer
@@ -843,82 +1109,19 @@ clink::connectors::InDoubtResolution resolve_kafka_2pc_handle(const std::string&
                     "' carries no producer identity (the stats capture had not fired before "
                     "the barrier); nothing can be resumed"};
     }
-    // The dialer: plaintext by default, TLS when the resolving process's
-    // environment names a CA bundle (CLINK_KAFKA_RESUME_TLS_CA, plus
-    // optional CLINK_KAFKA_RESUME_TLS_CERT/_KEY for mTLS). Same boundary
-    // as the SASL credentials below: transport security is the resolving
-    // process's configuration, never the staged handle's. TLS requested
-    // in a build without clink::tls - or with an unusable CA - is refused
+    // Dialer + SASL from the resolving process's environment (see
+    // build_resume_dialer): transport security and credentials are never the
+    // staged handle's to carry. TLS requested but unusable is refused
     // LOUDLY; silently dialing plaintext would leak the SASL password the
     // operator configured TLS to protect.
-    clink::kafka::ConnectFn connect = [](const std::string& host, std::uint16_t port) {
-        return clink::network::connect_plain(host, port);
-    };
-    if (const char* tls_ca = std::getenv("CLINK_KAFKA_RESUME_TLS_CA");
-        tls_ca != nullptr && *tls_ca != '\0') {
-#ifdef CLINK_KAFKA_RESUME_TLS
-        try {
-            auto ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
-            const char* cert = std::getenv("CLINK_KAFKA_RESUME_TLS_CERT");
-            const char* key = std::getenv("CLINK_KAFKA_RESUME_TLS_KEY");
-            if (cert != nullptr && *cert != '\0' && key != nullptr && *key != '\0') {
-                ctx->set_client_cert(cert, key);
-            }
-            connect = [ctx](const std::string& host,
-                            std::uint16_t port) -> std::unique_ptr<clink::network::Connection> {
-                try {
-                    return clink::network::connect_tls_connection(host, port, ctx);
-                } catch (const std::exception&) {
-                    // A failed handshake is a transport failure: bounded
-                    // retries and the honest TransportError fallback, the
-                    // same as an unreachable broker.
-                    return nullptr;
-                }
-            };
-        } catch (const std::exception& e) {
-            return {false,
-                    std::string{"TLS requested (CLINK_KAFKA_RESUME_TLS_CA) but the client "
-                                "context could not be built: "} +
-                        e.what()};
-        }
-#else
-        return {false,
-                "TLS requested (CLINK_KAFKA_RESUME_TLS_CA) but this build carries no "
-                "clink::tls; refusing rather than downgrading to plaintext"};
-#endif
-    }
-    // SASL credentials come from the RESOLVING process's environment at
-    // resolution time - never from the staged handle, because durable
-    // checkpoint state must not carry secrets. Unset = unauthenticated,
-    // the pre-SASL behaviour; a mechanism the resume path does not speak
-    // is refused loudly inside resume_commit rather than downgraded.
-    clink::kafka::ResumeAuth auth;
-    if (const char* m = std::getenv("CLINK_KAFKA_RESUME_SASL_MECHANISM"); m != nullptr) {
-        auth.mechanism = m;
-    }
-    if (const char* u = std::getenv("CLINK_KAFKA_RESUME_SASL_USERNAME"); u != nullptr) {
-        auth.username = u;
-    }
-    if (const char* p = std::getenv("CLINK_KAFKA_RESUME_SASL_PASSWORD"); p != nullptr) {
-        auth.password = p;
+    const auto dialer = build_resume_dialer();
+    if (!dialer.error.empty()) {
+        return {false, dialer.error};
     }
     std::string last;
-    std::size_t pos = 0;
-    while (pos <= bootstrap.size()) {
-        const auto comma = bootstrap.find(',', pos);
-        const auto entry =
-            bootstrap.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-        pos = comma == std::string::npos ? bootstrap.size() + 1 : comma + 1;
-        if (entry.empty()) {
-            continue;
-        }
-        const auto colon = entry.rfind(':');
-        const std::string host = colon == std::string::npos ? entry : entry.substr(0, colon);
-        const std::uint16_t port =
-            colon == std::string::npos
-                ? std::uint16_t{9092}
-                : static_cast<std::uint16_t>(std::stoi(entry.substr(colon + 1)));
-        const auto outcome = clink::kafka::resume_commit(host, port, txn, connect, auth);
+    for (const auto& [host, port] : parse_bootstrap_entries(bootstrap)) {
+        const auto outcome =
+            clink::kafka::resume_commit(host, port, txn, dialer.connect, dialer.auth);
         if (outcome.status != clink::kafka::ResumeOutcome::Status::TransportError) {
             return {outcome.committed(), outcome.detail};
         }

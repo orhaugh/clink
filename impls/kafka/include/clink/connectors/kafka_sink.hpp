@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -127,7 +128,16 @@ public:
     // for the next checkpoint - without it the post-abort on_data()
     // would have no open transaction to produce into. Both are no-ops
     // when transactions weren't enabled.
+    //
+    // between_commit_and_begin, when supplied, runs after the broker
+    // accepted the commit and BEFORE the next transaction begins. The
+    // 2PC wrapper writes its durable commit receipt there: while no new
+    // transaction is Ongoing, the transaction coordinator's state
+    // (CompleteCommit) still names this commit, so a death inside the
+    // window stays externally distinguishable from an undecided
+    // prepared transaction. Once begin runs, that evidence is gone.
     void commit_transaction();
+    void commit_transaction(const std::function<void()>& between_commit_and_begin);
     void abort_transaction();
 
     static bool is_real_implementation();

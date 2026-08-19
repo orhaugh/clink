@@ -809,10 +809,24 @@ bool Coordinator::stage_in_doubt_resolution_locked_(JobState& job) {
         return false;
     }
     job.resolving_in_doubt = true;
-    // The drain is complete; the deadline now guards the RESOLUTION, which
-    // is hard-bounded by the resolver's wire timeouts. 90s is far above
-    // any of them - hitting it means the resolver wedged, and the watchdog
-    // fails the job loudly (naming the resolution, not a phantom drain).
+    job.in_doubt_cancel = std::make_shared<std::atomic<bool>>(false);
+    job.in_doubt_cancel_requested = false;
+    // A fresh hold is a fresh episode for the capacity clock: the deadline
+    // measures CONSECUTIVE capacity starvation, and time spent resolving
+    // in-doubt commits is work, not starvation. Left ticking across holds,
+    // it expired mid-resolution and failed a job whose workers were back
+    // and whose restart machinery was mid-flight ("capacity never
+    // returned" with capacity long since returned).
+    job.restart_capacity_deadline = {};
+    // The drain is complete; the deadline now guards the RESOLUTION. It is
+    // a SOFT deadline: the walk's own wire budget is NOT "far below 90s" -
+    // five retry rounds over several handles at three 5s-timeout connect
+    // attempts each legitimately runs past two minutes when the broker is
+    // slow or out (the rig-night composite measured 117s against a healthy
+    // but stalling broker). Hitting the deadline therefore CANCELS the walk
+    // (it stops mutating and returns; the restart proceeds on the bounded
+    // contract) rather than failing the job; only the hard grace after the
+    // cancel treats a walk that never returned as hung.
     job.restart_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{90};
     pending_in_doubt_resolutions_.push_back(job.id);
     if (!in_doubt_resolution_thread_.joinable()) {
@@ -841,6 +855,7 @@ void Coordinator::in_doubt_resolution_loop_() {
             std::string dir;
             std::uint64_t confirmed = 0;
             std::uint64_t completed = 0;
+            std::shared_ptr<std::atomic<bool>> cancel;
             {
                 auto it = jobs_.find(id);
                 if (it == jobs_.end() || !it->second->resolving_in_doubt) {
@@ -849,12 +864,14 @@ void Coordinator::in_doubt_resolution_loop_() {
                 dir = it->second->checkpoint.checkpoint_dir;
                 confirmed = it->second->latest_confirmed_checkpoint_id;
                 completed = it->second->latest_completed_checkpoint_id;
+                cancel = it->second->in_doubt_cancel;
             }
             lock.unlock();
             // The broker round-trips, off mu_. No task of this job is
             // deployed while it runs, so nothing can fence the orphan
             // between this answer and the restore point that consumes it.
-            const auto resolved = resolve_in_doubt_commits(dir, id, confirmed, completed);
+            const auto resolved = resolve_in_doubt_commits(
+                dir, id, confirmed, completed, std::chrono::seconds{2}, cancel.get());
             lock.lock();
             auto it = jobs_.find(id);
             if (it == jobs_.end()) {
@@ -865,6 +882,10 @@ void Coordinator::in_doubt_resolution_loop_() {
                 continue;  // the watchdog backstop failed the job meanwhile
             }
             job.resolving_in_doubt = false;
+            // The resolution deadline is spent (soft-cancelled or not); the
+            // deferred restart below may enter a capacity wait, which runs
+            // on its own deadline.
+            job.restart_deadline = {};
             if (resolved > job.latest_confirmed_checkpoint_id) {
                 log::info("coordinator.restart",
                           "job_id=" + std::to_string(id) +
@@ -1222,6 +1243,18 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
         // is consumed - this is still the same restart, now correctly aware
         // that one of the survivors it was waiting for has been replaced.
         retire_previous_session_subtasks_(reg.worker_id);
+    }
+    // A registration IS forward progress for any restart waiting on
+    // capacity: reset every waiting job's capacity clock so the deadline
+    // measures 180s with NO worker arriving - genuine starvation - rather
+    // than 180s of a kill/return cadence that keeps almost catching up.
+    // (The rig-night composite expired the clock across episodes whose
+    // workers returned within seconds, each time reading a live recovery
+    // as a dead cluster.)
+    for (auto& [_, jptr] : jobs_) {
+        if (jptr->awaiting_restart) {
+            jptr->restart_capacity_deadline = {};
+        }
     }
     cv_.notify_all();
 
@@ -3819,6 +3852,15 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                 std::max(id_floor, latest_completed_id_on_disk(checkpoint.checkpoint_dir, job_id));
             id_floor =
                 std::max(id_floor, latest_confirmed_id_on_disk(checkpoint.checkpoint_dir, job_id));
+            // Markers are not the only durable records: a seconds-lived
+            // incarnation (a restart storm's middle attempts) dies holding
+            // SNAPSHOT FILES for checkpoints that never completed - no
+            // marker names them, and numbering above markers alone reuses
+            // their ids. The successor's same-id files then interleave with
+            // the dead incarnation's, and a later restore can assemble one
+            // checkpoint from two vintages (qual01-20260819g re-published
+            // ten windows that way). Number above every snapshot file too.
+            id_floor = std::max(id_floor, latest_snapshot_id_on_disk(checkpoint.checkpoint_dir));
         }
         job->next_checkpoint_id = id_floor + 1;
         if (id_floor > checkpoint.restore_from_checkpoint_id) {
@@ -4528,15 +4570,37 @@ void Coordinator::watchdog_loop_() {
                     // naming the resolution, not a phantom drain. Clearing
                     // the flag makes a late-returning resolver skip its
                     // deferred restart - the job is already failed.
+                    if (job->resolving_in_doubt && !job->in_doubt_cancel_requested) {
+                        // Stage one: the walk is SLOW, not proven hung. Ask
+                        // it to stop mutating and give it a hard grace to
+                        // return; the resolution loop then fires the
+                        // deferred restart at the un-advanced restore point
+                        // - the bounded contract, not a dead job.
+                        job->in_doubt_cancel_requested = true;
+                        if (job->in_doubt_cancel) {
+                            job->in_doubt_cancel->store(true, std::memory_order_release);
+                        }
+                        job->restart_deadline =
+                            std::chrono::steady_clock::now() + std::chrono::seconds{60};
+                        log::warn("coordinator.watchdog",
+                                  "job_id=" + std::to_string(job->id) +
+                                      " in-doubt resolution outran its deadline; cancelling "
+                                      "the walk - the restart proceeds on the bounded "
+                                      "contract once it returns");
+                        continue;
+                    }
                     if (job->resolving_in_doubt) {
+                        // Stage two: the walk ignored the cancel through the
+                        // hard grace - genuinely hung. Failing is the safe
+                        // escalation, exactly as before.
                         job->resolving_in_doubt = false;
                         log::warn("coordinator.watchdog",
                                   "job_id=" + std::to_string(job->id) +
                                       " in-doubt resolution timed out; failing job");
                         job->errors.push_back(
-                            "in-doubt resolution timed out (the resolver exceeded its "
-                            "wire-level bounds); the restart was held to keep resolution "
-                            "and restore-point selection one decision");
+                            "in-doubt resolution hung past its cancel grace; the restart "
+                            "was held to keep resolution and restore-point selection one "
+                            "decision");
                         job->awaiting_restart = false;
                         job->restart_deadline = {};
                         job->restart_pending.clear();
@@ -5068,8 +5132,38 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         }
     }
     if (survivors.empty() || total_free < tasks_to_redeploy.size()) {
-        // No room to restart. Fall back: synthesise errors and signal
-        // completion so the client sees the failure.
+        // No room to restart RIGHT NOW. That is a transient condition, not
+        // a verdict: the worker whose loss triggered this restart is
+        // typically seconds from re-registering (a container restart, a
+        // supervisor respawn), and the register path re-fires a pending
+        // restart the moment capacity returns. The first cut synthesised
+        // per-subtask errors and signalled completion here - permanent job
+        // failure - which the broker-outage composite caught live: an
+        // in-doubt walk finishing before the killed worker returned killed
+        // the whole job. Rig topologies masked it only by slot headroom.
+        // Wait under a deadline; fail with the original diagnosis only if
+        // capacity genuinely never comes back.
+        const auto now_tp = std::chrono::steady_clock::now();
+        if (job.restart_capacity_deadline == std::chrono::steady_clock::time_point{}) {
+            job.restart_capacity_deadline = now_tp + std::chrono::seconds{180};
+            log::warn("coordinator.restart",
+                      "job_id=" + std::to_string(job.id) + " restart waiting for capacity: " +
+                          std::to_string(tasks_to_redeploy.size()) + " task(s) need slots, " +
+                          std::to_string(total_free) +
+                          " free; a worker re-registration re-fires this restart");
+        }
+        if (now_tp < job.restart_capacity_deadline) {
+            // The drain/resolution deadline has served its purpose (the
+            // drain is provably covered - this function only runs after
+            // coverage); left set, the watchdog would fail the wait as a
+            // phantom "survivors did not drain".
+            job.restart_deadline = {};
+            return {};  // awaiting_restart stays set; the next kick retries
+        }
+        log::warn("coordinator.restart",
+                  "job_id=" + std::to_string(job.id) +
+                      " capacity never returned within the restart's capacity deadline; "
+                      "failing the job");
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
@@ -5087,6 +5181,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         }
         job.awaiting_restart = false;
         job.restart_deadline = {};
+        job.restart_capacity_deadline = {};
         job.restart_pending.clear();
         job.restart_drained_keys.clear();
         job.restart_drain_expected.clear();
@@ -5095,6 +5190,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         }
         return {};
     }
+    job.restart_capacity_deadline = {};
 
     // 3. Build new worker_id assignments round-robin across survivors.
     //    Reuse the existing DeploymentTask shape from task_records so

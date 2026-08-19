@@ -854,10 +854,50 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
     if (!accept_epoch_(msg.coordinator_epoch, "CommitCheckpoint")) {
         return;
     }
+    // Hand the dispatch to its own thread and return to reading frames.
+    // Running commit callbacks on the reader was "outside mu_" but still ON
+    // the reader: a Kafka commit_transaction against an unreachable broker
+    // blocks for the transaction timeout, during which no frame is read and
+    // the coordinator-contact clock the lease check consults is frozen -
+    // the worker then self-disconnects mid-outage with a healthy process
+    // (qual01-20260819g severed two live workers exactly this way). One
+    // FIFO consumer preserves per-worker commit order across checkpoints,
+    // which the 2PC sinks' open-transaction sequencing relies on.
+    {
+        std::lock_guard lock(commit_dispatch_mu_);
+        if (!commit_dispatch_.joinable()) {
+            commit_dispatch_ = std::thread([this] { commit_dispatch_loop_(); });
+        }
+        commit_dispatch_queue_.push_back(std::move(msg));
+    }
+    commit_dispatch_cv_.notify_one();
+}
+
+void Worker::commit_dispatch_loop_() {
+    std::unique_lock lock(commit_dispatch_mu_);
+    while (true) {
+        commit_dispatch_cv_.wait(
+            lock, [this] { return commit_dispatch_stop_ || !commit_dispatch_queue_.empty(); });
+        if (commit_dispatch_stop_) {
+            // Abandon the backlog: a commit not dispatched leaves its
+            // PREPARED transaction and staged handle for restore-time
+            // recovery, exactly like a dispatch refused after retirement.
+            return;
+        }
+        auto msg = std::move(commit_dispatch_queue_.front());
+        commit_dispatch_queue_.pop_front();
+        lock.unlock();
+        dispatch_commit_checkpoint_(msg);
+        lock.lock();
+    }
+}
+
+void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
     // Snapshot per-job commit callbacks under the lock, then dispatch
     // without it. The sink's commit work (atomic rename, Kafka commitTx,
     // SQL COMMIT PREPARED) may block on the external system; doing it
-    // outside mu_ keeps reader-loop dispatch responsive.
+    // outside mu_ keeps this dispatch thread's queue draining without
+    // stalling anything the reader owes the coordinator.
     // Grouped by subtask so success is ATTRIBUTABLE: a subtask whose
     // callbacks all executed without throwing has provably run its external
     // commit, and the CommitConfirmed it sends below is what the
@@ -2946,6 +2986,17 @@ void Worker::stop() {
     }
     if (heartbeat_.joinable()) {
         heartbeat_.join();
+    }
+    {
+        std::lock_guard lock(commit_dispatch_mu_);
+        commit_dispatch_stop_ = true;
+    }
+    commit_dispatch_cv_.notify_all();
+    if (commit_dispatch_.joinable()) {
+        // Unbounded for the same reason as the joins above: an in-flight
+        // commit callback is touching this Worker's members (gates,
+        // backends); detaching it trades a loud hang for a use-after-free.
+        commit_dispatch_.join();
     }
     // These joins are unbounded on purpose: once cancellation has been
     // signalled, a subtask that still will not exit is a bug in that

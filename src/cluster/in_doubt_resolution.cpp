@@ -28,6 +28,65 @@ std::filesystem::path commit_receipt_dir_for(const std::string& checkpoint_dir, 
     return completed_marker_dir_for(checkpoint_dir, job_id) / "receipts";
 }
 
+std::uint64_t latest_snapshot_id_on_disk(const std::string& checkpoint_dir) {
+    if (checkpoint_dir.empty()) {
+        return 0;
+    }
+    // Layout: <checkpoint_dir>/v<generation>/<subtask>/checkpoint-<id>.snap.
+    // error_code iteration throughout: this scans a directory the live job
+    // writes and retention prunes.
+    std::uint64_t latest = 0;
+    std::error_code ec;
+    for (const auto& gen : std::filesystem::directory_iterator(checkpoint_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code tec;
+        if (!gen.is_directory(tec) || tec) {
+            continue;
+        }
+        const auto gname = gen.path().filename().string();
+        if (gname.size() < 2 || gname.front() != 'v' ||
+            gname.find_first_not_of("0123456789", 1) != std::string::npos) {
+            continue;
+        }
+        std::error_code sec;
+        for (const auto& sub : std::filesystem::directory_iterator(gen.path(), sec)) {
+            if (sec) {
+                break;
+            }
+            std::error_code stec;
+            if (!sub.is_directory(stec) || stec) {
+                continue;
+            }
+            std::error_code fec;
+            for (const auto& file : std::filesystem::directory_iterator(sub.path(), fec)) {
+                if (fec) {
+                    break;
+                }
+                const auto name = file.path().filename().string();
+                constexpr std::string_view kPrefix = "checkpoint-";
+                constexpr std::string_view kSuffix = ".snap";
+                if (name.rfind(kPrefix, 0) != 0 || name.size() <= kPrefix.size() + kSuffix.size() ||
+                    name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+                    continue;
+                }
+                const auto digits =
+                    name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
+                if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+                    continue;
+                }
+                try {
+                    latest = std::max(latest, std::stoull(digits));
+                } catch (const std::exception&) {
+                    // an overlong digit run; not an id this engine wrote
+                }
+            }
+        }
+    }
+    return latest;
+}
+
 namespace {
 //
 // A checkpoint that COMPLETED but was never CONFIRMED may hold external
@@ -183,13 +242,39 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                        JobId job_id,
                                        std::uint64_t confirmed,
                                        std::uint64_t completed,
-                                       std::chrono::milliseconds transport_retry_backoff) {
+                                       std::chrono::milliseconds transport_retry_backoff,
+                                       const std::atomic<bool>* cancel) {
     if (checkpoint_dir.empty() || completed <= confirmed) {
         return confirmed;
     }
+    // Cooperative cancellation: consulted before every wire probe and every
+    // store effect, and between a probe's answer and acting on it. A probe
+    // is an EndTxn - it EXECUTES commits - and the store writes steer every
+    // later recovery, so a walk that outran its deadline must stop
+    // mutating, not merely stop restarting (the rig-night composite caught
+    // a timed-out walk committing transactions and writing CONFIRMED for a
+    // job the coordinator had already failed). One mandated exception: a
+    // cancelled walk still persists .unresolved markers for the handles it
+    // never settled (a local store write, no wire side) - see
+    // persist_unresolved_markers below.
+    const auto cancelled = [cancel, job_id, &confirmed]() {
+        if (cancel != nullptr && cancel->load(std::memory_order_acquire)) {
+            clink::log::info("coordinator.recovery",
+                             "in-doubt resolution: cancelled for job " + std::to_string(job_id) +
+                                 "; stopping before further wire or store effects, the restart "
+                                 "proceeds on the bounded contract at confirmed=" +
+                                 std::to_string(confirmed));
+            return true;
+        }
+        return false;
+    };
     const auto store = make_coordination_store(checkpoint_dir);
     const auto job_prefix = "_jobs/" + std::to_string(job_id) + "/";
     for (std::uint64_t id = confirmed + 1; id <= completed; ++id) {
+        // No cancel return here: even a walk cancelled between checkpoints
+        // must first read this id's handles and leave unresolved markers
+        // (below) - returning with nothing written is what lets the next
+        // deploy fence blind.
         const auto marker_body = store->get(job_prefix + "COMPLETED-" + std::to_string(id));
         if (!marker_body.has_value()) {
             continue;  // this id never completed; its transaction was aborted
@@ -227,6 +312,12 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         // ANSWERS "not committed" (fenced, timed out, refused) is final.
         constexpr int kTransportAttempts = 5;
         std::vector<bool> handle_committed(handles->size(), false);
+        // A handle the broker finally REFUSED (fenced, wrong state) is
+        // settled - not committed - and must not be re-marked unresolved:
+        // the sink's pre-fence describe cannot out-know a broker verdict,
+        // and re-judging it against later transaction generations could
+        // invent a commit that never covered this checkpoint.
+        std::vector<bool> handle_refused(handles->size(), false);
         // A commit receipt on disk is the sink's own durable record that the
         // broker acknowledged this subtask's commit for this checkpoint. It
         // is taken over the wire outright: the wire path can be fenced by a
@@ -234,16 +325,76 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         // longer exists - none of which can retract a commit that already
         // happened (qual01-20260818b hit exactly that inversion, replaying
         // a committed interval on a fenced verdict).
+        const auto marker_key = [&](std::size_t i) {
+            return job_prefix + "receipts/" +
+                   clink::connectors::commit_receipt_file_name((*handles)[i].subtask, id) +
+                   ".unresolved";
+        };
+        const auto retire_marker = [&](std::size_t i) {
+            // A resolved handle's unresolved marker (left by an earlier
+            // failed episode of this walk) is stale the moment a verdict
+            // lands; a lingering marker would make a LATER sink open
+            // describe a transaction generations past the one it names.
+            try {
+                store->remove(marker_key(i));
+            } catch (const std::exception&) {
+                // Best-effort: the sink also deletes its marker after
+                // acting on it, and a receipt outranks a marker.
+            }
+        };
         for (std::size_t i = 0; i < handles->size(); ++i) {
             if (store->exists(
                     job_prefix + "receipts/" +
                     clink::connectors::commit_receipt_file_name((*handles)[i].subtask, id))) {
                 handle_committed[i] = true;
+                retire_marker(i);
                 clink::log::info("coordinator.recovery",
                                  "in-doubt resolution: checkpoint " + std::to_string(id) +
                                      " subtask " + std::to_string((*handles)[i].subtask) +
                                      ": commit receipt on disk; COMMITTED without a wire call");
             }
+        }
+        // Every handle still unresolved is persisted as an .unresolved
+        // marker (body = the staged handle) next to the receipts. The
+        // owning sink consumes it at its next open, BEFORE it fences:
+        // fencing re-initialises the producer, which aborts an undecided
+        // transaction and erases the coordinator state that could have
+        // named a committed one - after that, nobody can ever know. The
+        // marker is what lets the sink ask first (a read-only
+        // DescribeTransactions) and turn "committed in the ack window"
+        // into a receipt instead of a duplicate. Written even when the
+        // walk was CANCELLED: it is the walk's mandated final act, a
+        // local store write with no wire side, and skipping it is what
+        // converts a bounded walk into an exactly-once hole
+        // (qual01 rig-night composite: 3 keys' windows published twice).
+        const auto persist_unresolved_markers = [&] {
+            for (std::size_t i = 0; i < handles->size(); ++i) {
+                if (handle_committed[i] || handle_refused[i]) {
+                    continue;
+                }
+                try {
+                    store->put(marker_key(i), (*handles)[i].handle);
+                    clink::log::info(
+                        "coordinator.recovery",
+                        "in-doubt resolution: checkpoint " + std::to_string(id) + " subtask " +
+                            std::to_string((*handles)[i].subtask) +
+                            ": unresolved orphan marker written; the owning sink resolves it "
+                            "before fencing");
+                } catch (const std::exception& e) {
+                    clink::log::error("coordinator.recovery",
+                                      "in-doubt resolution: checkpoint " + std::to_string(id) +
+                                          " subtask " + std::to_string((*handles)[i].subtask) +
+                                          ": unresolved orphan marker could not be written (" +
+                                          std::string(e.what()) +
+                                          "); a restore below this checkpoint may replay an "
+                                          "interval whose commit executed");
+                }
+            }
+        };
+        if (cancelled()) {
+            persist_unresolved_markers();
+            clink::metrics::orch::in_doubt_unresolved();
+            return confirmed;
         }
         bool all_committed = false;
         bool verdict_failure = false;
@@ -262,6 +413,11 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
             for (std::size_t i = 0; i < handles->size(); ++i) {
                 if (handle_committed[i]) {
                     continue;  // already executed; never re-resolve
+                }
+                if (cancelled()) {
+                    verdict_failure = true;
+                    everything_done = false;
+                    break;  // no further probes; a probe EXECUTES a commit
                 }
                 const auto& handle = (*handles)[i].handle;
                 std::string resolver_name;
@@ -286,6 +442,14 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                     continue;
                 }
                 const auto result = (*resolver)(handle);
+                if (cancelled()) {
+                    // The probe was in flight when the deadline tripped; its
+                    // answer must not be ACTED on - marking it committed or
+                    // materialising its receipt is a store effect.
+                    verdict_failure = true;
+                    everything_done = false;
+                    break;
+                }
                 clink::log::info("coordinator.recovery",
                                  "in-doubt resolution: checkpoint " + std::to_string(id) +
                                      " via '" + resolver_name + "': " +
@@ -348,7 +512,17 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                     "of this interval will NOT be suppressed");
                         }
                     }
+                    retire_marker(i);
                     continue;
+                }
+                if (!result.transport_inconclusive) {
+                    // A FINAL wire refusal supersedes any stale marker: the
+                    // sink's pre-fence describe could not out-know the
+                    // broker's own verdict, and a marker surviving past it
+                    // would be re-judged against a transaction coordinator
+                    // state that later generations have moved on.
+                    handle_refused[i] = true;
+                    retire_marker(i);
                 }
                 everything_done = false;
                 if (result.transport_inconclusive) {
@@ -360,6 +534,9 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
             }
             if (everything_done) {
                 all_committed = true;
+                break;
+            }
+            if (cancelled()) {
                 break;
             }
             if (!verdict_failure && transport_hit && attempt + 1 < kTransportAttempts) {
@@ -399,12 +576,17 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                         "the committed intervals, suppressed downstream by their (written or "
                         "materialised) receipts");
             }
+            persist_unresolved_markers();
             clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
         }
         // Every handle of this checkpoint provably committed: publish the
         // confirmation durably, exactly as handle_commit_confirmed_ does,
         // so THIS and every later recovery selects it.
+        if (cancelled()) {
+            clink::metrics::orch::in_doubt_unresolved();
+            return confirmed;
+        }
         try {
             store->put(job_prefix + "CONFIRMED-" + std::to_string(id),
                        "job=" + std::to_string(job_id) + "\ncheckpoint=" + std::to_string(id) +

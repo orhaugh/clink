@@ -261,8 +261,16 @@ public:
         // cancel nor dying) would otherwise wedge the job forever. On expiry
         // the watchdog FAILS the job (it does not force a restart, because a
         // still-alive-but-slow survivor must not be redeployed concurrently).
-        // Generous by default to avoid false positives under load.
-        std::chrono::milliseconds restart_drain_timeout{30000};
+        // The bound must dominate the worst LEGITIMATE drain, not the
+        // typical one: a 2PC sink cancelled mid-call against an unreachable
+        // broker sits in a bounded librdkafka operation (produce, flush,
+        // commit - up to ~30s each, and they stack) before it can observe
+        // the cancel. That sink is slow, not hung - it exits the moment its
+        // own timeout fires - and the old 30s default read exactly that as
+        // a wedged survivor and failed the job mid-broker-outage (soak
+        // watch item 63; reproduced locally by the orphaned-commit gate:
+        // two sinks blocked on a paused broker, drain expired, job dead).
+        std::chrono::milliseconds restart_drain_timeout{120000};
         // How long the SubmitJob handler waits for spare slots before
         // returning a rejection ack to the client. 0 means "never wait,
         // reject immediately". Useful when clusters auto-scale.
@@ -924,6 +932,17 @@ private:
         // - and so nothing may fence the orphan - until the broker has
         // answered and latest_confirmed reflects it.
         bool resolving_in_doubt{false};
+        // Cooperative cancellation for the in-doubt walk, created at stage
+        // time and handed to resolve_in_doubt_commits. The watchdog's SOFT
+        // deadline sets it (a slow walk - an outage stretching the wire
+        // probes - must stop mutating and let the restart proceed on the
+        // bounded contract); only the HARD deadline that follows treats a
+        // walk that STILL has not returned as hung and fails the job. The
+        // rig-night composite caught the one-stage alternative live: a
+        // timed-out walk kept executing commits and wrote CONFIRMED for a
+        // job the coordinator had already failed.
+        std::shared_ptr<std::atomic<bool>> in_doubt_cancel;
+        bool in_doubt_cancel_requested{false};
         // Wall-clock start for the clink.rescale lifecycle span recorded
         // when restart_job_locked_ emits the rescaled deploys (both the
         // whole-job drain and the per-operator replan set it). 0 = the
@@ -1001,6 +1020,12 @@ private:
         // drain is still outstanding past it. Default-constructed (epoch)
         // means "no drain in progress".
         std::chrono::steady_clock::time_point restart_deadline{};
+        // Set when a covered restart found insufficient capacity: the wait
+        // window for a lost worker to re-register before the restart is
+        // failed with the no-slot diagnosis. Zero = not waiting. Distinct
+        // from restart_deadline (drain/resolution progress), whose expiry
+        // semantics do not fit a capacity wait.
+        std::chrono::steady_clock::time_point restart_capacity_deadline{};
 
         // Plugin binaries this job depends on. Held so deploy_internal_
         // can attach them to every DeployMsg. The coordinator caches the bytes

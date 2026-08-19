@@ -370,9 +370,15 @@ public:
                 safe += (std::isalnum(static_cast<unsigned char>(c)) != 0) ? c : '_';
             }
             // pid + test name: ctest -j gives each test its own process, so
-            // a fixed path would collide across concurrent tests.
+            // a fixed path would collide across concurrent tests. The run
+            // counter keeps --gtest_repeat iterations apart as well: a
+            // repeat re-enters with the same pid and test name, and its
+            // setup remove_all below used to destroy the artifacts a
+            // failed earlier iteration had deliberately kept.
+            static std::atomic<int> harness_run_counter{0};
             spec_.root = std::filesystem::temp_directory_path() /
-                         ("clink_it_" + std::to_string(::getpid()) + "_" + safe);
+                         ("clink_it_" + std::to_string(::getpid()) + "_r" +
+                          std::to_string(harness_run_counter.fetch_add(1)) + "_" + safe);
         }
         std::filesystem::remove_all(spec_.root);
         std::filesystem::create_directories(spec_.root);

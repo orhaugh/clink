@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -239,6 +240,11 @@ private:
                               const std::string& expected_state_versions_packed);
     void handle_trigger_checkpoint_(MessageReader& r);
     void handle_commit_checkpoint_(MessageReader& r);
+    // The dispatch body handle_commit_checkpoint_ enqueues: sink commit
+    // callbacks, CommitConfirmed sends, the committed high-water record,
+    // retention and receipt pruning. Runs on commit_dispatch_ only.
+    void dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg);
+    void commit_dispatch_loop_();
     // Reply to a source's RequestFinalCheckpoint: records the coordinator-assigned id and
     // wakes the blocked source runner (see request_final_checkpoint hook wiring).
     void handle_final_checkpoint_assigned_(MessageReader& r);
@@ -284,6 +290,21 @@ private:
     ConnectFactory connect_factory_;
     std::thread reader_;
     std::thread heartbeat_;
+    // Commit dispatch runs on its OWN thread, fed FIFO by the reader. A
+    // sink's commit work blocks on the external system - a Kafka
+    // commit_transaction against an unreachable broker holds for the full
+    // transaction timeout - and on the reader thread that stall freezes
+    // frame processing AND the coordinator-contact clock the lease check
+    // reads, so the worker self-disconnects mid-outage with its process
+    // perfectly healthy (qual01-20260819g severed two live workers this
+    // way, feeding the restart storm). Single consumer, so per-worker
+    // commit order across checkpoints is preserved - the 2PC sinks'
+    // open-transaction sequencing depends on it.
+    std::thread commit_dispatch_;
+    std::mutex commit_dispatch_mu_;
+    std::condition_variable commit_dispatch_cv_;
+    std::deque<CommitCheckpointMsg> commit_dispatch_queue_;
+    bool commit_dispatch_stop_{false};
     // One entry per deployed subtask. `done` is set by the task thread
     // itself as it returns, so finished entries can be joined and erased
     // on the next deploy (reap_finished_task_threads_locked_).

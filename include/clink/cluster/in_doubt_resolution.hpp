@@ -20,6 +20,7 @@
 // missing resolver, or any resolver failure stops the walk and leaves the
 // bounded-replay contract in force.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -60,11 +61,35 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 // as duplicates. Broker chaos overlapping a recovery reaches exactly that
 // interleaving. `transport_retry_backoff` spaces the bounded retries; the
 // held restart the callers run under is already waiting on this answer.
+// The highest checkpoint id named by ANY snapshot file under this
+// checkpoint directory - every generation, every subtask, INCLUDING files
+// no marker vouches for. Recovered jobs number their new checkpoints above
+// this as well as above the durable markers: a seconds-lived incarnation
+// dies holding snapshot files whose checkpoints never completed, no marker
+// records them, and a successor numbering above markers alone REUSES those
+// ids - its files then interleave with the dead incarnation's, and a later
+// restore can assemble one checkpoint from two vintages (qual01-20260819g:
+// window state of one vintage, source offsets of another, one nominal id;
+// ten windows re-published identically). Ids are cheap; never reuse one
+// that ANY durable artefact names.
+[[nodiscard]] std::uint64_t latest_snapshot_id_on_disk(const std::string& checkpoint_dir);
+
+// `cancel` (optional): cooperative cancellation, checked before every wire
+// probe and before every store effect (receipt materialisation, CONFIRMED
+// markers) - and between reading a probe's answer and ACTING on it. The
+// coordinator's watchdog sets it when the walk outruns its deadline; the
+// walk must then stop MUTATING, because its EndTxn probes execute commits
+// and its store writes steer every later recovery. The rig-night composite
+// caught the alternative live: a timed-out walk kept committing
+// transactions and wrote CONFIRMED for a job the coordinator had already
+// failed. A cancelled walk returns its progress so far, exactly like a
+// refusal.
 [[nodiscard]] std::uint64_t resolve_in_doubt_commits(
     const std::string& checkpoint_dir,
     JobId job_id,
     std::uint64_t confirmed,
     std::uint64_t completed,
-    std::chrono::milliseconds transport_retry_backoff = std::chrono::seconds{2});
+    std::chrono::milliseconds transport_retry_backoff = std::chrono::seconds{2},
+    const std::atomic<bool>* cancel = nullptr);
 
 }  // namespace clink::cluster

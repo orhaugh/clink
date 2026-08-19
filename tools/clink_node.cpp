@@ -1965,8 +1965,13 @@ int run_coordinator(int argc, char** argv) {
     const auto etcd_ttl_str = get_arg(argc, argv, "etcd-lease-ttl-s", "10");
     // Upper bound on how long a job may sit draining survivors before a
     // worker-loss restart fires; on expiry the coordinator fails the job rather than
-    // wedge on a hung survivor. Tunable per deployment.
-    const auto restart_drain_timeout_str = get_arg(argc, argv, "restart-drain-timeout-ms", "30000");
+    // wedge on a hung survivor. Tunable per deployment. The default must
+    // dominate the worst legitimate drain: a 2PC sink cancelled mid-call
+    // against an unreachable broker holds for its own bounded operation
+    // timeouts (~30s each, stackable) before it can observe the cancel -
+    // slow, not hung (see Coordinator::Config::restart_drain_timeout).
+    const auto restart_drain_timeout_str =
+        get_arg(argc, argv, "restart-drain-timeout-ms", "120000");
     // How long the coordinator waits without hearing from a worker before declaring it
     // lost (and, if checkpointing + restart are configured, restarting the
     // job from the latest checkpoint). The default is conservative; lower

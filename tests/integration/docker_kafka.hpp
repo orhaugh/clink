@@ -124,6 +124,34 @@ public:
 
     static bool docker_available() { return std::system("docker info > /dev/null 2>&1") == 0; }
 
+    // Freeze / thaw the broker - the local model of the qualification
+    // campaign's kafka_unavailable fault, composed by the storm gates with
+    // worker loss and recovery (the composition qual01-20260819g failed
+    // under). pause is the ONLY viable outage here: it is near-instant
+    // (docker stop takes seconds and loses the race with the recovery
+    // window a gate just opened), and this fixture runs the container with
+    // --rm, so a STOPPED broker is a DELETED broker (the first cut's
+    // stop/start pair failed exactly there). Connections hang rather than
+    // refuse; wire probes hit their timeouts and reach the same
+    // transport-inconclusive branch the rig's refused connections did, and
+    // the broker's own timers (transaction expiry) fire only after the
+    // thaw.
+    void pause_broker() {
+        if (container_name_.empty()) {
+            return;
+        }
+        const std::string cmd = "docker pause " + container_name_ + " > /dev/null 2>&1";
+        (void)std::system(cmd.c_str());
+    }
+
+    void unpause_broker() {
+        if (container_name_.empty()) {
+            return;
+        }
+        const std::string cmd = "docker unpause " + container_name_ + " > /dev/null 2>&1";
+        (void)std::system(cmd.c_str());
+    }
+
 private:
     // rpk credentials for a SASL broker; empty when unauthenticated. The
     // broker speaks SCRAM only (see DockerKafkaOptions).
@@ -136,6 +164,13 @@ private:
     }
     void stop() noexcept {
         if (!container_name_.empty()) {
+            // Unpause first: a test that dies between pause_broker() and
+            // unpause_broker() (an assert mid-outage) leaves the container
+            // paused, and docker's stop/kill refuse paused containers on
+            // some engine versions - the container then outlives the test
+            // holding its port. Harmless when not paused.
+            const std::string unpause = "docker unpause " + container_name_ + " > /dev/null 2>&1";
+            std::system(unpause.c_str());
             const std::string cmd = "docker stop " + container_name_ + " > /dev/null 2>&1";
             std::system(cmd.c_str());
             container_name_.clear();

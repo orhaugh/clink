@@ -530,7 +530,7 @@ if(CLINK_INTEGRATION_TESTS)
     # moving to POST_BUILD discovery, which is a larger change than this is worth.
     gtest_discover_tests(clink_integration_tests
         DISCOVERY_MODE PRE_TEST
-        PROPERTIES TIMEOUT 120 LABELS integration
+        PROPERTIES TIMEOUT 600 LABELS integration
                    RESOURCE_LOCK clink_multiprocess_cluster)
 
     # Soak: wall-clock endurance under a kill cadence (hardening item 22).

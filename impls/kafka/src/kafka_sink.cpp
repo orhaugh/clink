@@ -322,6 +322,10 @@ void KafkaSink::open() {
 }
 
 void KafkaSink::commit_transaction() {
+    commit_transaction({});
+}
+
+void KafkaSink::commit_transaction(const std::function<void()>& between_commit_and_begin) {
     if (impl_->opts.transactional_id.empty()) {
         return;
     }
@@ -350,6 +354,13 @@ void KafkaSink::commit_transaction() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count();
     clink::metrics::connector::commit_latency_observe("kafka", static_cast<std::uint64_t>(dt));
+    if (between_commit_and_begin) {
+        // Runs while the transaction coordinator still reads CompleteCommit
+        // for THIS commit - see the header contract. The 2PC wrapper's
+        // receipt write lives here so a death in the ack window leaves
+        // either the receipt or a coordinator state that names the commit.
+        between_commit_and_begin();
+    }
     auto err_begin = impl_->producer->begin_transaction();
     if (err_begin) {
         throw std::runtime_error("KafkaSink: begin_transaction (post-commit) failed: " +
@@ -523,6 +534,7 @@ void KafkaSink::on_data(const Batch<KafkaMessage>& /*batch*/) {}
 void KafkaSink::flush() {}
 void KafkaSink::close() {}
 void KafkaSink::commit_transaction() {}
+void KafkaSink::commit_transaction(const std::function<void()>& /*between_commit_and_begin*/) {}
 void KafkaSink::abort_transaction() {}
 std::optional<KafkaSink::ProducerIdentity> KafkaSink::producer_identity() const noexcept {
     return std::nullopt;
