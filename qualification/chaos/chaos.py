@@ -537,13 +537,20 @@ def oracle_error_total(verdict_path: str):
 # Every fault a PASS verdict requires. The summariser refuses PASS unless
 # each of these left evidence of having actually happened (for the 2PC
 # points: twopc_fired, not merely twopc_arm).
-MANDATORY_FAULTS = (
+# The 2PC points go FIRST: each needs an arm, a commit actually passing
+# the point, a process death and a full recovery - the slowest and most
+# placement-sensitive coverage in the set. qual01-smoke-a scheduled them
+# last and its 15-minute soak expired with the three commit-side points
+# unfired: correctness clean, verdict INCONCLUSIVE on coverage. The infra
+# faults are quick kill/restarts and follow. Order is scheduling, not
+# contract - the summariser's coverage gate is the contract.
+MANDATORY_FAULTS = tuple(f"twopc:{p}" for p in Chaos.TWOPC_POINTS) + (
     "kill_worker",
     "kill_coordinator",
     "restart_broker",
     "network_latency",
     "partition_worker_from_coordinator",
-) + tuple(f"twopc:{p}" for p in Chaos.TWOPC_POINTS)
+)
 
 
 def main() -> int:
