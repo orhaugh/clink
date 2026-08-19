@@ -28,6 +28,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import random
 import subprocess
 import sys
@@ -565,6 +566,13 @@ def main() -> int:
                          "controller stops injecting the moment any oracle "
                          "error counter is non-zero (exit 3), freezing the "
                          "cluster for diagnosis")
+    ap.add_argument("--stop-file", default="",
+                    help="finish cleanly when this file appears (default: "
+                         "<log>.stop). Checked between faults, never mid-"
+                         "fault, so tc rules and armed points are always "
+                         "cleared before exit. A file because the spawn "
+                         "discipline starts this process with SIGINT "
+                         "ignored; see qual01/verifier.py's docstring.")
     ap.add_argument("--ensure-coverage", action="store_true",
                     help="before the weighted-random loop, apply every "
                          "mandatory fault once in a fixed order, so a PASS "
@@ -592,7 +600,11 @@ def main() -> int:
     last_ckpt = 0
     faults = 0
     consecutive_failures = 0
+    stop_file = args.stop_file or (args.log + ".stop")
     while True:
+        if os.path.exists(stop_file):
+            print("chaos: stop requested; finishing cleanly", flush=True)
+            break
         if args.duration_s and time.time() - started >= args.duration_s:
             break
         if args.verdict:

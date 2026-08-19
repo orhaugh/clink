@@ -282,6 +282,11 @@ on_host "$OPS_PUB" "docker run --rm docker.redpanda.com/redpandadata/redpanda:v2
 echo "campaign: topic recreated ($PARTITIONS partitions, replication 3)"
 
 # --- ops host: generator + verifier + chaos -----------------------------
+# Stop requests are FILES (see qual01/verifier.py: the spawn discipline
+# starts these processes with SIGINT ignored, so a polite pkill -INT never
+# reaches them). Stale stop files on a reused rig would make fresh
+# processes exit on their first loop iteration.
+on_host "$OPS_PUB" "rm -f /qual/q2-progress.json.stop /qual/q2-chaos.jsonl.stop"
 for f in ../qual01/detspec.py ../qual01/generator.py verifier.py; do
     to_host "$OPS_PUB" "$HERE/$f" "/qual/$(basename "$f")"
 done
@@ -426,10 +431,12 @@ echo "$GID_SAMPLE" > "$OUT_DIR/gid-sample.txt"
 #    controller. No --verdict here: chaos.py's oracle fail-fast parses
 #    QUAL-01's counter-shaped verdict, and this campaign's verdict is
 #    finding-shaped; the watch loop below owns fail-fast instead.
+# Padded past the soak deadline (the controller's clock starts before the
+# soak's does); the drain stops it via its stop file, orderly.
 start_on_host "$OPS_PUB" q2-chaos.log "python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/q2-chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
-    --duration-s $DURATION_S --ensure-coverage"
+    --duration-s $(( DURATION_S + 1800 )) --ensure-coverage"
 echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE, coverage-first)"
 
 FAULTS=0
@@ -509,6 +516,7 @@ PY
     if [ "$DIRTY" = "DIRTY" ]; then
         echo "campaign: ORACLE DIRTY - freezing faults and collecting evidence" >&2
         { echo "oracle_dirty=yes"; echo "noticed_at_utc=$(date -u +%H:%M)"; } > "$OUT_DIR/oracle-dirty.txt"
+        on_host "$OPS_PUB" "touch /qual/q2-chaos.jsonl.stop"
         on_host "$OPS_PUB" "pkill -INT -f '[c]haos.py' || true"
         break
     fi
@@ -565,7 +573,29 @@ done
 
 # --- drain and final judgement ------------------------------------------
 echo "campaign: soak complete, draining"
+# Stop requests are FILES; the pkill -INT is a courtesy for interactive
+# runs only (the spawn discipline starts these with SIGINT ignored - see
+# qual01/verifier.py). Chaos first and ORDERLY: mid-fault it holds tc
+# rules and armed points, so it exits between faults, clearing them.
+on_host "$OPS_PUB" "touch /qual/q2-chaos.jsonl.stop"
+cwaited=0
+while [ "$cwaited" -lt 120 ]; do
+    on_host "$OPS_PUB" "pgrep -f '[c]haos.py' >/dev/null" || break
+    sleep 5
+    cwaited=$(( cwaited + 5 ))
+done
+[ "$cwaited" -lt 120 ] \
+    || echo "campaign: WARNING - the chaos controller is still running 120s after its stop request; a fault may straddle the drain" >&2
+on_host "$OPS_PUB" "touch /qual/q2-progress.json.stop"
 on_host "$OPS_PUB" "pkill -INT -f '[c]haos.py'; pkill -INT -f '[g]enerator.py'; true"
+gwaited=0
+while [ "$gwaited" -lt 60 ]; do
+    on_host "$OPS_PUB" "pgrep -f '[g]enerator.py' >/dev/null" || break
+    sleep 5
+    gwaited=$(( gwaited + 5 ))
+done
+[ "$gwaited" -lt 60 ] \
+    || echo "campaign: WARNING - the generator is still producing 60s after its stop request" >&2
 sleep 120   # let the pipeline commit what it has already read
 
 # The verdict is final only over a SETTLED table. The verifier re-judges

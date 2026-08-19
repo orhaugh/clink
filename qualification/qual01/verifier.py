@@ -17,14 +17,27 @@ Counted per closed window, per key:
 Verdict JSON is rewritten every evaluation pass; the final write on
 shutdown is the campaign's correctness record.
 
+Shutdown protocol: the campaign requests the final verdict by creating
+the stop file (--stop-file, default <verdict>.stop). A file is the only
+delivery the spawn discipline guarantees: start_on_host backgrounds this
+process with `&` under a non-interactive shell, which POSIX starts with
+SIGINT IGNORED - and Python does not install its KeyboardInterrupt
+handler over an inherited SIG_IGN, so a polite pkill -INT never reached
+the loop. qual01-20260818e ran 2h with a perfect oracle and summarised
+INCONCLUSIVE because of exactly that: 235,668 tail pairs, final=false,
+the campaign's 1200s grace spent waiting for a signal that was being
+ignored. SIGINT is re-armed explicitly below as a courtesy for
+interactive use, but the stop file is the contract.
+
 Usage:
   verifier.py --brokers HOST:9092 --topic qual01-out \
               --spec /qual/progress.json.spec --progress /qual/progress.json \
-              --verdict /qual/verdict.json [--grace-s 60]
+              --verdict /qual/verdict.json [--grace-s 60] [--stop-file P]
 """
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 
@@ -54,7 +67,14 @@ def main() -> int:
                          "an absent result counts as missing (must cover "
                          "watermark lag + checkpoint interval + recovery)")
     ap.add_argument("--eval-every-s", type=int, default=30)
+    ap.add_argument("--stop-file", default="",
+                    help="finalise and exit when this file appears "
+                         "(default: <verdict>.stop)")
     args = ap.parse_args()
+    stop_file = args.stop_file or (args.verdict + ".stop")
+    # Re-arm SIGINT even if it was inherited ignored (see module docstring);
+    # the stop file remains the delivery the campaign relies on.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
 
     while not os.path.exists(args.spec):
         time.sleep(1)
@@ -242,7 +262,7 @@ def main() -> int:
         print(f"verifier: {totals}", flush=True)
 
     try:
-        while True:
+        while not os.path.exists(stop_file):
             msg = consumer.poll(1.0)
             if msg is not None and not msg.error():
                 try:
@@ -262,6 +282,7 @@ def main() -> int:
                 last_eval = time.time()
     except KeyboardInterrupt:
         pass
+    print("verifier: stop requested; finalising", flush=True)
     evaluate()
     write_verdict(final=True)
     consumer.close()  # leave the group cleanly; see the group-id note above

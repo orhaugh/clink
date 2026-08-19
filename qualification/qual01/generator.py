@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 
@@ -66,6 +67,12 @@ def main() -> int:
     ap.add_argument("--window-ms", type=int, default=10000)
     ap.add_argument("--progress", required=True)
     ap.add_argument("--duration-s", type=int, default=0, help="0 = run until stopped")
+    ap.add_argument("--stop-file", default="",
+                    help="stop producing, flush and write final progress when "
+                         "this file appears (default: <progress>.stop). The "
+                         "spawn discipline starts this process with SIGINT "
+                         "ignored, so a file is the stop delivery the campaign "
+                         "relies on; see verifier.py's docstring.")
     args = ap.parse_args()
 
     per_part_rate = max(1, args.rate // args.partitions)
@@ -91,11 +98,13 @@ def main() -> int:
     with open(args.progress + ".spec", "w") as f:
         json.dump(spec_record, f, indent=2)
 
+    stop_file = args.stop_file or (args.progress + ".stop")
+    signal.signal(signal.SIGINT, signal.default_int_handler)  # re-arm over inherited SIG_IGN
     started = time.time()
     last_flush = started
     produced_since_report = 0
     try:
-        while True:
+        while not os.path.exists(stop_file):
             tick_started = time.time()
             if args.duration_s and tick_started - started >= args.duration_s:
                 break

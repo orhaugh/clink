@@ -146,15 +146,35 @@ scenario "a persistently gone job latches job-gone" staygone "" \
     "job_gone_from_poll=3" "job_gone_until_poll=999"
 
 # 8. The finish phase must WAIT for the verifier's final verdict before its
-#    kill sweep. The real verifier's SIGINT path evaluates every pending
+#    kill sweep. The real verifier's stop path evaluates every pending
 #    window before writing final=true - minutes at multi-hour scale - and
 #    sweeping after a fixed 20s killed it mid-finalise on qual01-20260818c,
 #    turning a 751/751-clean campaign INCONCLUSIVE. The fake verifier here
 #    refuses to finalise for three polls; the campaign must keep waiting.
+#    Since qual01-20260818e this scenario also pins the DELIVERY: the sim's
+#    pkill -INT is inert (matching the real spawn discipline, which starts
+#    both processes with SIGINT ignored), so the fake verifier finalises
+#    only if the campaign touched /qual/verdict.json.stop. A campaign that
+#    still relies on the signal fails here.
 scenario "the finish waits for the verifier's final verdict" finalwait "" \
     "verifier finalised after 30s" \
     "job_status=RUNNING" "workers_lost=1" \
     "verifier_final_after_polls=3"
+
+# 9. A verifier whose finalisation genuinely wedges must not hold the
+#    finish phase for the full hard cap: the progress-aware wait gives up
+#    after FINAL_STALL_S without movement, says so, and the summary reads
+#    the run as incomplete - loudly INCONCLUSIVE, never a silent hang.
+FINAL_WAIT_S=90 FINAL_STALL_S=30 \
+scenario "a wedged finalisation is a loud stall, not a hang" finalstall "" \
+    "made no finalisation progress" \
+    "job_status=RUNNING" "workers_lost=1" \
+    "verifier_never_finalises=1"
+if grep -q "did not finalise" "$LAST_WORK/out.log"; then
+    report "the stalled run is still declared incomplete" 1 ""
+else
+    report "the stalled run is still declared incomplete" 0 "missing the incomplete warning"
+fi
 
 echo
 echo "$PASS passed, $FAIL failed"

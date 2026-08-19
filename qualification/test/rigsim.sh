@@ -78,11 +78,44 @@ rig_exec() {
 
         *"pip3 install"*|*"chmod 600"*) return 0;;
 
+        *"touch /qual/progress.json.stop"*)
+            # The generator's stop file: the real generator polls for it and
+            # exits promptly (the file is the delivery; see below for why the
+            # signal is not).
+            touch "$FAKERIG/progress.json.stop"
+            rm -f "$FAKERIG/proc.generator"
+            return 0;;
+        *"touch /qual/verdict.json.stop"*)
+            # The verifier's stop file: finalisation becomes possible only
+            # once this exists (modelled in the verdict-poll case below).
+            touch "$FAKERIG/verdict.json.stop"
+            return 0;;
+        *"touch /qual/chaos.jsonl.stop"*)
+            # The chaos controller's stop file: it exits cleanly between
+            # faults (clearing anything it applied), promptly in the sim.
+            touch "$FAKERIG/chaos.jsonl.stop"
+            rm -f "$FAKERIG/proc.chaos"
+            return 0;;
+        *"rm -f /qual/progress.json.stop"*)
+            rm -f "$FAKERIG/progress.json.stop" "$FAKERIG/verdict.json.stop" \
+                  "$FAKERIG/chaos.jsonl.stop"
+            return 0;;
+
+        *"pkill -INT"*)
+            # Deliberately INERT for the generator and verifier: the spawn
+            # discipline (`&` under a non-interactive shell) starts them with
+            # SIGINT ignored, and Python keeps an inherited SIG_IGN, so on
+            # the real rig a polite INT never reaches either loop. The sim
+            # modelling INT as effective is exactly how qual01-20260818e's
+            # INCONCLUSIVE got past the self-test: the stop FILES above are
+            # the delivery the campaign must rely on.
+            return 0;;
         *"pkill"*)
-            # Match the BRACKET-SAFE substring. The campaign writes its
-            # patterns as '[g]enerator.py' precisely so they cannot match the
-            # shell carrying them, which also means they do not contain the
-            # string "generator" - a fake that greps for that sees nothing.
+            # Non-INT pkill (the kill sweep). Match the BRACKET-SAFE
+            # substring. The campaign writes its patterns as '[g]enerator.py'
+            # precisely so they cannot match the shell carrying them, which
+            # also means they do not contain the string "generator" - a fake
+            # that greps for that sees nothing.
             echo "$cmd" | grep -q "enerator.py" && rm -f "$FAKERIG/proc.generator"
             echo "$cmd" | grep -q "erifier.py"  && rm -f "$FAKERIG/proc.verifier"
             echo "$cmd" | grep -q "haos.py"     && rm -f "$FAKERIG/proc.chaos"
@@ -136,16 +169,23 @@ rig_exec() {
             wc -l < "$FAKERIG/chaos.jsonl" 2>/dev/null || echo 0; return 0;;
 
         *"verdict.json"*"final"*)
-            # The finish phase polls for the verifier's final verdict before
-            # its kill sweep (the real verifier runs one full evaluation over
-            # every pending window first - minutes at multi-hour scale, and
-            # sweeping early killed it mid-finalise on qual01-20260818c).
-            # The fake verifier finalises after verifier_final_after_polls
-            # probes; default 0 = already final.
+            # The finish phase polls the verifier's state line
+            # ("<final> <pending> <evaluated>") before its kill sweep (the
+            # real verifier runs one full evaluation over every pending
+            # window first - minutes at multi-hour scale, and sweeping early
+            # killed it mid-finalise on qual01-20260818c). The fake verifier
+            # finalises ONLY once its stop FILE exists - the campaign's
+            # signals are inert (see the pkill -INT case) - and then only
+            # after verifier_final_after_polls probes; default 0 = on the
+            # first post-stop probe. verifier_never_finalises=1 models a
+            # wedged finalisation for the stall path.
             local need cur
             need=$(rig_scenario verifier_final_after_polls 0)
             cur=$(rig_bump finalpoll)
-            if [ "$cur" -gt "$need" ]; then
+            if [ "$(rig_scenario verifier_never_finalises 0)" = "1" ]; then
+                echo "0 235668 4"; return 0
+            fi
+            if [ -e "$FAKERIG/verdict.json.stop" ] && [ "$cur" -gt "$need" ]; then
                 python3 - "$FAKERIG/verdict.json" <<'PY'
 import json, sys
 p = sys.argv[1]
@@ -156,9 +196,12 @@ except Exception:
 v["final"] = True
 json.dump(v, open(p, "w"))
 PY
-                return 0
+                echo "1 0 4"; return 0
             fi
-            return 1;;
+            # Not final yet: report a shrinking backlog so the campaign's
+            # progress-aware wait keeps waiting rather than reading an
+            # in-progress finalisation as a stall.
+            echo "0 $(( 100000 - cur * 1000 )) 4"; return 0;;
 
         *"python3 -c"*)
             # The campaign reads the generator's progress this way. Each read

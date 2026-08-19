@@ -61,6 +61,7 @@ mkdir -p "$OUT_DIR"
 # the summary. Scoped to the files this campaign writes; archives from
 # prior runs under other RUN_IDs are untouched.
 rm -f "$OUT_DIR/verdict.json" "$OUT_DIR/job-gone.txt" "$OUT_DIR/chaos-died.txt" \
+      "$OUT_DIR/chaos-completed.txt" \
       "$OUT_DIR/failure.txt" "$OUT_DIR/job-status.json" "$OUT_DIR/verification.txt" \
       "$OUT_DIR/chaos.jsonl" "$OUT_DIR/progress.json"
 
@@ -338,6 +339,11 @@ echo "campaign: topics recreated ($PARTITIONS partitions, replication 3)"
 
 # --- ops host: generator + verifier + chaos -----------------------------
 on_host "$OPS_PUB" "mkdir -p /qual"
+# A stale stop file from a previous run on a reused rig would make the
+# fresh generator and verifier exit on their first loop iteration - the
+# stop protocol is files (see the drain phase), so the files must start
+# absent.
+on_host "$OPS_PUB" "rm -f /qual/progress.json.stop /qual/verdict.json.stop /qual/chaos.jsonl.stop"
 for f in detspec.py generator.py verifier.py; do to_host "$OPS_PUB" "$HERE/$f" "/qual/$f"; done
 to_host "$OPS_PUB" "$HERE/../chaos/chaos.py" /qual/chaos.py
 to_host "$OPS_PUB" "$OUT_DIR/inventory.json" /qual/inventory.json
@@ -485,10 +491,16 @@ JOB_PROBE_INTERVAL_S="${JOB_PROBE_INTERVAL_S:-10}"
 # for the rest of the soak. --ensure-coverage: every mandatory fault -
 # including each named 2PC point, verified to have FIRED - lands once
 # before the weighted-random phase, so a PASS never depends on the dice.
+# The controller's clock starts now, but the soak deadline starts only
+# after the first fault is confirmed recovered - so an unpadded duration
+# has the controller retiring minutes BEFORE the soak ends (run e: orderly
+# "32 faults applied" exit ~13 minutes early, recorded as a death). Pad it
+# past any plausible verification time; the drain's kill sweep is what
+# actually ends it.
 start_on_host "$OPS_PUB" chaos.log "python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
-    --duration-s $DURATION_S --verdict /qual/verdict.json --ensure-coverage"
+    --duration-s $(( DURATION_S + 1800 )) --verdict /qual/verdict.json --ensure-coverage"
 echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE, coverage-first, oracle fail-fast)"
 
 # 5. Chaos must actually land a fault. A controller that applies none is
@@ -607,13 +619,27 @@ PY
        && ! on_host "$OPS_PUB" "pgrep -f '[c]haos.py' >/dev/null"; then
         CHAOS_DIED_AT=$(date -u +%H:%M)
         NFAULTS=$(on_host "$OPS_PUB" "wc -l < /qual/chaos.jsonl 2>/dev/null || echo 0" | tr -d '\r')
-        echo "campaign: WARNING - the chaos controller is no longer running (noticed ${CHAOS_DIED_AT}," \
-             "${NFAULTS} fault record(s) written). Everything after this point is an" \
-             "undisturbed soak, not a fault campaign, and must be reported as such." >&2
-        { echo "chaos_controller_died=yes"; echo "noticed_at_utc=$CHAOS_DIED_AT";
-          echo "fault_records_at_death=$NFAULTS";
-          echo "tail:"; on_host "$OPS_PUB" "tail -20 /qual/chaos.log" 2>/dev/null || true;
-        } > "$OUT_DIR/chaos-died.txt"
+        # An orderly duration-elapsed exit prints its fault count as its
+        # last act; anything else is a death. The distinction matters:
+        # with the padded duration above, a completion mid-soak should be
+        # impossible, and a real death must never be softened into one.
+        if on_host "$OPS_PUB" "tail -1 /qual/chaos.log 2>/dev/null" | grep -q "faults applied"; then
+            echo "campaign: NOTE - the chaos controller completed its padded duration early" \
+                 "(noticed ${CHAOS_DIED_AT}, ${NFAULTS} fault record(s)); the remaining soak is" \
+                 "undisturbed. This should not happen with the +1800s pad - investigate." >&2
+            { echo "chaos_controller_completed=yes"; echo "noticed_at_utc=$CHAOS_DIED_AT";
+              echo "fault_records_at_completion=$NFAULTS";
+              echo "tail:"; on_host "$OPS_PUB" "tail -20 /qual/chaos.log" 2>/dev/null || true;
+            } > "$OUT_DIR/chaos-completed.txt"
+        else
+            echo "campaign: WARNING - the chaos controller is no longer running (noticed ${CHAOS_DIED_AT}," \
+                 "${NFAULTS} fault record(s) written). Everything after this point is an" \
+                 "undisturbed soak, not a fault campaign, and must be reported as such." >&2
+            { echo "chaos_controller_died=yes"; echo "noticed_at_utc=$CHAOS_DIED_AT";
+              echo "fault_records_at_death=$NFAULTS";
+              echo "tail:"; on_host "$OPS_PUB" "tail -20 /qual/chaos.log" 2>/dev/null || true;
+            } > "$OUT_DIR/chaos-died.txt"
+        fi
     fi
 
     # And is the SUBJECT of the test still alive?
@@ -688,37 +714,91 @@ echo "campaign: duration reached; stopping generator and collecting evidence"
 # it completely. That is not theoretical - it is why run 3's generator and
 # verifier were still running nearly two hours after the campaign reported
 # that it had stopped them and collected its evidence.
+# Stop requests are FILES, not signals. start_on_host backgrounds these
+# processes with `&` under a non-interactive shell, which POSIX starts
+# with SIGINT set to SIG_IGN - and Python does not install its
+# KeyboardInterrupt handler over an inherited ignore, so every polite
+# pkill -INT this drain ever sent was silently dropped. qual01-20260818e
+# spent its full finalisation grace waiting on a verifier that never saw
+# the request: perfect oracle, 235,668 tail pairs, final=false,
+# INCONCLUSIVE. Both scripts now poll for their stop file; the pkill -INT
+# stays as a courtesy for interactively-run instances only.
+# Chaos first, and ORDERLY: with the padded duration it is still injecting
+# when the soak ends, and faults during the drain would delay tail commits
+# past the oracle's grace. A hard kill is no answer - mid-fault it leaves
+# tc rules installed or points armed - so the controller checks its stop
+# file BETWEEN faults and always clears what it applied before exiting.
+on_host "$OPS_PUB" "touch /qual/chaos.jsonl.stop"
+cwaited=0
+while [ "$cwaited" -lt 120 ]; do
+    on_host "$OPS_PUB" "pgrep -f '[c]haos.py' >/dev/null" || break
+    sleep 5
+    cwaited=$(( cwaited + 5 ))
+done
+[ "$cwaited" -lt 120 ] \
+    || echo "campaign: WARNING - the chaos controller is still running 120s after its stop request; a fault may straddle the drain" >&2
+on_host "$OPS_PUB" "touch /qual/progress.json.stop"
 on_host "$OPS_PUB" "pkill -INT -f '[g]enerator.py' || true"
+# The generator must actually stop before the drain sleep means anything:
+# a producer still writing during the "drain" manufactures tail windows
+# faster than the pipeline can retire them.
+gwaited=0
+while [ "$gwaited" -lt 60 ]; do
+    on_host "$OPS_PUB" "pgrep -f '[g]enerator.py' >/dev/null" || break
+    sleep 5
+    gwaited=$(( gwaited + 5 ))
+done
+[ "$gwaited" -lt 60 ] \
+    || echo "campaign: WARNING - the generator is still producing 60s after its stop request" >&2
 sleep 120   # let the pipeline drain the tail and the verifier judge it
+on_host "$OPS_PUB" "touch /qual/verdict.json.stop"
 on_host "$OPS_PUB" "pkill -INT -f '[v]erifier.py' || true"
-# The verifier's SIGINT path runs ONE FULL evaluation over every pending
+# The verifier's stop path runs ONE FULL evaluation over every pending
 # window before writing final=true - minutes, not seconds, at multi-hour
-# scale. qual01-20260818c was killed mid-finalise at 199,441 pending
-# pairs by the sweep below, and a campaign with 751/751 clean windows and
-# full fault coverage summarised INCONCLUSIVE for want of the flag. Wait
-# for the final verdict, bounded, and only then sweep; a timeout is said
-# loudly and the summary correctly refuses to call the run complete.
+# scale. Wait for the final verdict with a PROGRESS-AWARE bound: keep
+# waiting while pending pairs fall or judged windows rise, give up only
+# on a genuine stall or the hard cap, and say so loudly - the summary
+# then correctly refuses to call the run complete.
 FINAL_WAIT_S="${FINAL_WAIT_S:-1200}"
+FINAL_STALL_S="${FINAL_STALL_S:-180}"
 waited=0
+stalled=0
+last_state=""
+finalised=0
 while [ "$waited" -lt "$FINAL_WAIT_S" ]; do
-    if on_host "$OPS_PUB" "python3 -c \"import json,sys; sys.exit(0 if json.load(open('/qual/verdict.json')).get('final') else 1)\"" \
-        2>/dev/null; then
-        echo "campaign: verifier finalised after ${waited}s"
-        break
+    state=$(on_host "$OPS_PUB" "python3 -c \"import json;d=json.load(open('/qual/verdict.json'));print(int(bool(d.get('final'))), d.get('pending_pairs',-1), d.get('evaluated_windows',-1))\"" 2>/dev/null \
+        || echo "unreadable")
+    case "$state" in
+        1\ *) echo "campaign: verifier finalised after ${waited}s"; finalised=1; break ;;
+    esac
+    if [ "$state" = "$last_state" ]; then
+        stalled=$(( stalled + 10 ))
+        if [ "$stalled" -ge "$FINAL_STALL_S" ]; then
+            echo "campaign: WARNING - the verifier made no finalisation progress for ${FINAL_STALL_S}s" \
+                 "(state: '$state'); giving up on the final verdict" >&2
+            break
+        fi
+    else
+        stalled=0
+        last_state="$state"
     fi
     sleep 10
     waited=$(( waited + 10 ))
 done
-[ "$waited" -lt "$FINAL_WAIT_S" ] \
-    || echo "campaign: WARNING - the verifier did not finalise within ${FINAL_WAIT_S}s; the summary will read this run as incomplete" >&2
+[ "$finalised" = "1" ] \
+    || echo "campaign: WARNING - the verifier did not finalise (waited ${waited}s of ${FINAL_WAIT_S}s); the summary will read this run as incomplete" >&2
 # SIGINT is the polite request; this makes sure it happened.
 kill_campaign_processes "$OPS_PUB" || true
 # Say so if either is somehow still alive, rather than collecting evidence
 # from underneath a still-running producer and calling the verdict final.
 STILL=$(on_host "$OPS_PUB" "pgrep -f '[g]enerator.py|[v]erifier.py' | wc -l" | tr -d ' \r')
 [ "${STILL:-0}" = "0" ] || echo "campaign: WARNING - $STILL generator/verifier process(es) survived the drain" >&2
+# Loud per-file: run e's verifier.log silently failed to collect under
+# the old `|| true`, and the one file that could explain a finalisation
+# failure was the one file missing from the evidence.
 for f in verdict.json chaos.jsonl progress.json progress.json.spec generator.log verifier.log chaos.log; do
-    scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
+    scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null \
+        || echo "campaign: WARNING - could not retain /qual/$f in the evidence" >&2
 done
 
 # The coordinator's final counters, retained rather than read from a live
