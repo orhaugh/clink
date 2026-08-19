@@ -537,15 +537,19 @@ def oracle_error_total(verdict_path: str):
 # Every fault a PASS verdict requires. The summariser refuses PASS unless
 # each of these left evidence of having actually happened (for the 2PC
 # points: twopc_fired, not merely twopc_arm).
-# The 2PC points go FIRST: each needs an arm, a commit actually passing
-# the point, a process death and a full recovery - the slowest and most
-# placement-sensitive coverage in the set. qual01-smoke-a scheduled them
-# last and its 15-minute soak expired with the three commit-side points
-# unfired: correctness clean, verdict INCONCLUSIVE on coverage. The infra
-# faults are quick kill/restarts and follow. Order is scheduling, not
-# contract - the summariser's coverage gate is the contract.
-MANDATORY_FAULTS = tuple(f"twopc:{p}" for p in Chaos.TWOPC_POINTS) + (
-    "kill_worker",
+# kill_worker MUST lead: the campaign's pre-soak verification gate
+# confirms the first fault through the coordinator's worker-loss counter,
+# and a worker kill's record and its engine-visible loss land together.
+# qual01-smoke-b led with a 2PC point instead, whose arm RECORD precedes
+# the fire (and the loss) by many seconds - the gate read that gap as the
+# fabricated-fault defect and refused to soak. The 2PC points come second:
+# each needs an arm, a commit actually passing the point, a process death
+# and a full recovery - the slowest, most placement-sensitive coverage in
+# the set - and qual01-smoke-a proved that scheduling them LAST runs a
+# short soak out of clock with the commit-side points unfired. The quick
+# infra kill/restarts close. Order is scheduling, not contract - the
+# summariser's coverage gate is the contract.
+MANDATORY_FAULTS = ("kill_worker",) + tuple(f"twopc:{p}" for p in Chaos.TWOPC_POINTS) + (
     "kill_coordinator",
     "restart_broker",
     "network_latency",
