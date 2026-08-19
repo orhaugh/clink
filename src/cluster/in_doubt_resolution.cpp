@@ -77,7 +77,11 @@ std::uint64_t latest_snapshot_id_on_disk(const std::string& checkpoint_dir) {
                     continue;
                 }
                 try {
-                    latest = std::max(latest, std::stoull(digits));
+                    // Explicit width: stoull returns unsigned long long,
+                    // which is NOT std::uint64_t on Linux/LP64 (that is
+                    // unsigned long), and the mismatched std::max fails to
+                    // compile there while building clean on macOS.
+                    latest = std::max(latest, static_cast<std::uint64_t>(std::stoull(digits)));
                 } catch (const std::exception&) {
                     // an overlong digit run; not an id this engine wrote
                 }
