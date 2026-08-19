@@ -521,9 +521,13 @@ JOB_PROBE_INTERVAL_S="${JOB_PROBE_INTERVAL_S:-10}"
 # MIN_GAP_S: the floor between injected faults. The default paces a long
 # soak; a SMOKE run (short DURATION_S validating the whole lifecycle on a
 # real rig before a paid multi-hour campaign) sets ~30. Size the smoke
-# soak generously: the coverage pre-pass is gap + recovery per fault, and
-# qual01-smoke-a's 900s expired with three 2PC points unfired - 1500s is
-# the working floor at MIN_GAP_S=30.
+# soak from the MEASURED pre-pass cost, not hope: a 2PC point costs
+# 90-150s end to end (arm, a commit passing the point, a process death, a
+# full recovery) and recovery dominates, so the gap barely matters. The
+# 13-fault mandatory set needs ~40 minutes: qual01-smoke-a (900s) and
+# qual01-smoke-c (1500s) both expired with coverage incomplete while
+# their correctness was spotless. DURATION_S=2700 is the working smoke
+# floor.
 start_on_host "$OPS_PUB" chaos.log "python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
