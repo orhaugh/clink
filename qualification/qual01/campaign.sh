@@ -69,6 +69,27 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "
 on_host() { ssh -n "${SSH_OPTS[@]}" "root@$1" "$2"; }
 to_host()  { scp "${SSH_OPTS[@]}" -q "$2" "root@$1:$3"; }
 
+# Retain the coordinator's and every worker's CONTAINER logs in the
+# evidence. qual01-20260819f failed with a real engine finding and its
+# cluster logs were destroyed with the rig - nothing here captured them,
+# and the teardown-always discipline (correct for cost) means nobody gets
+# a second chance. Called on the oracle-dirty fail-fast AND in the final
+# collection; last call wins, bounded via --tail. Best-effort per host,
+# loud per miss.
+collect_container_logs() {
+    mkdir -p "$OUT_DIR/logs"
+    on_host "$COORD_PUB" "docker logs --tail 200000 clink-coordinator 2>&1" \
+        > "$OUT_DIR/logs/coordinator.log" 2>/dev/null \
+        || echo "campaign: WARNING - could not retain the coordinator container log" >&2
+    local wi=0
+    for wp in $WORKER_PUBS; do
+        on_host "$wp" "docker logs --tail 200000 clink-worker 2>&1" \
+            > "$OUT_DIR/logs/worker-$wi.log" 2>/dev/null \
+            || echo "campaign: WARNING - could not retain worker $wi's container log" >&2
+        wi=$(( wi + 1 ))
+    done
+}
+
 # Start a long-running process on a host and RETURN.
 #
 # ssh holds its channel open until every process holding the remote
@@ -497,9 +518,14 @@ JOB_PROBE_INTERVAL_S="${JOB_PROBE_INTERVAL_S:-10}"
 # "32 faults applied" exit ~13 minutes early, recorded as a death). Pad it
 # past any plausible verification time; the drain's kill sweep is what
 # actually ends it.
+# MIN_GAP_S: the floor between injected faults. The default paces a long
+# soak; a SMOKE run (short DURATION_S validating the whole lifecycle on a
+# real rig before a paid multi-hour campaign) sets ~30 so the mandatory
+# coverage pre-pass fits inside a 15-minute soak instead of taking 28.
 start_on_host "$OPS_PUB" chaos.log "python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
+    --min-gap-s ${MIN_GAP_S:-120} \
     --duration-s $(( DURATION_S + 1800 )) --verdict /qual/verdict.json --ensure-coverage"
 echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE, coverage-first, oracle fail-fast)"
 
@@ -601,7 +627,11 @@ PY
         echo "  state a diagnosis needs frozen." >&2
         { echo "oracle_dirty=yes"; echo "error_total=$ORACLE_DIRTY";
           echo "noticed_at_utc=$(date -u +%H:%M)"; } > "$OUT_DIR/oracle-dirty.txt"
+        on_host "$OPS_PUB" "touch /qual/chaos.jsonl.stop"
         on_host "$OPS_PUB" "pkill -INT -f '[c]haos.py' || true"
+        # The state a diagnosis needs, captured NOW while it is freshest;
+        # the final collection refreshes it after the drain.
+        collect_container_logs
         break
     fi
 
@@ -800,6 +830,7 @@ for f in verdict.json chaos.jsonl progress.json progress.json.spec generator.log
     scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null \
         || echo "campaign: WARNING - could not retain /qual/$f in the evidence" >&2
 done
+collect_container_logs
 
 # The coordinator's final counters, retained rather than read from a live
 # cluster that is about to be destroyed. Run 3's restart and worker-loss

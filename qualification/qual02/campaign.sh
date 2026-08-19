@@ -74,6 +74,22 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "
 on_host() { ssh -n "${SSH_OPTS[@]}" "root@$1" "$2"; }
 to_host()  { scp "${SSH_OPTS[@]}" -q "$2" "root@$1:$3"; }
 
+# Container logs into the evidence before any teardown - the qual01 run f
+# lesson: a real engine finding whose cluster logs died with the rig.
+collect_container_logs() {
+    mkdir -p "$OUT_DIR/logs"
+    on_host "$COORD_PUB" "docker logs --tail 200000 clink-coordinator 2>&1" \
+        > "$OUT_DIR/logs/coordinator.log" 2>/dev/null \
+        || echo "campaign: WARNING - could not retain the coordinator container log" >&2
+    local wi=0
+    for wp in $WORKER_PUBS; do
+        on_host "$wp" "docker logs --tail 200000 clink-worker 2>&1" \
+            > "$OUT_DIR/logs/worker-$wi.log" 2>/dev/null \
+            || echo "campaign: WARNING - could not retain worker $wi's container log" >&2
+        wi=$(( wi + 1 ))
+    done
+}
+
 # See qual01/campaign.sh: ssh holds its channel open until the remote
 # command's descriptors are released, so detaching needs setsid, every
 # descriptor redirected, and an explicit exit - and the start must then
@@ -436,6 +452,7 @@ echo "$GID_SAMPLE" > "$OUT_DIR/gid-sample.txt"
 start_on_host "$OPS_PUB" q2-chaos.log "python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/q2-chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
+    --min-gap-s ${MIN_GAP_S:-120} \
     --duration-s $(( DURATION_S + 1800 )) --ensure-coverage"
 echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE, coverage-first)"
 
@@ -518,6 +535,7 @@ PY
         { echo "oracle_dirty=yes"; echo "noticed_at_utc=$(date -u +%H:%M)"; } > "$OUT_DIR/oracle-dirty.txt"
         on_host "$OPS_PUB" "touch /qual/q2-chaos.jsonl.stop"
         on_host "$OPS_PUB" "pkill -INT -f '[c]haos.py' || true"
+        collect_container_logs
         break
     fi
 
@@ -656,8 +674,10 @@ STILL=$(on_host "$OPS_PUB" "pgrep -f '[g]enerator.py|[v]erifier.py|[c]haos.py' |
 [ "${STILL:-0}" = "0" ] || echo "campaign: WARNING - $STILL campaign process(es) survived the drain" >&2
 
 for f in q2-verdict.json q2-chaos.jsonl q2-progress.json q2-generator.log q2-verifier.log q2-chaos.log; do
-    scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
+    scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null \
+        || echo "campaign: WARNING - could not retain /qual/$f in the evidence" >&2
 done
+collect_container_logs
 psql_q "SELECT count(*) FROM public.q2_out" > "$OUT_DIR/pg-rows-final.txt" || true
 psql_q "SELECT count(DISTINCT event_id) FROM public.q2_out" > "$OUT_DIR/pg-distinct-final.txt" || true
 curl -fsS "http://${COORD_PUB}:8095/metrics" > "$OUT_DIR/coordinator-metrics-final.txt" 2>/dev/null || true
