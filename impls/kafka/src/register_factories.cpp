@@ -543,7 +543,16 @@ private:
              "\"";
         j += ",\"producer_epoch\":\"" +
              std::to_string(ident.has_value() ? ident->producer_epoch : -1) + "\"";
-        j += ",\"ckpt\":\"" + std::to_string(ckpt) + "\"}";
+        j += ",\"ckpt\":\"" + std::to_string(ckpt) + "\"";
+        // The watermark horizon this transaction's records are covered by -
+        // the exact value the commit receipt would carry. When a kill lands
+        // in the ack window (committed, no receipt) and resolution proves
+        // the commit over the wire, the walk materialises the missing
+        // receipt FROM THIS FIELD, so a restore below this checkpoint still
+        // arms replay suppression for the interval. Without it, a mixed
+        // verdict replayed the committed slice as duplicates
+        // (qual01-20260819f: one subtask's whole pane, twice).
+        j += ",\"wm\":\"" + std::to_string(open_txn_wm_) + "\"}";
         const auto key = resume_state_key_();
         state->put_operator_state(this->id(),
                                   clink::StateBackend::KeyView{key.data(), key.size()},
@@ -1134,6 +1143,19 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.transactional_id = ctx.param_or("transactional_id", "");
             apply_linger_ms(ctx, opts);
             populate_kafka_security_conf(ctx, opts.conf);
+            // transaction_timeout_ms -> librdkafka transaction.timeout.ms:
+            // how long the broker keeps an abandoned prepared transaction
+            // before aborting it. Declared in this connector's capability
+            // metadata since the committer wave but consumed only now; the
+            // mixed-verdict recovery gate needs a short expiry to model an
+            // orphaned sibling transaction without waiting the 60s default.
+            // message.timeout.ms rides along: librdkafka requires it <= the
+            // transaction timeout, and in a transactional producer a
+            // message cannot meaningfully outlive its transaction anyway.
+            if (const auto t = ctx.param_or("transaction_timeout_ms", ""); !t.empty()) {
+                opts.conf["transaction.timeout.ms"] = t;
+                opts.conf["message.timeout.ms"] = t;
+            }
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_2pc_sink_string: 'brokers' is required");
             }

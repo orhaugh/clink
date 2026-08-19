@@ -128,6 +128,14 @@ struct ResolutionFixture : ::testing::Test {
                std::to_string(ckpt) + "\"}";
     }
 
+    // As the 2PC sink stages it since the receipt-materialisation fix: the
+    // transaction's watermark horizon rides in the handle so the walk can
+    // mint the receipt an ack-window kill prevented.
+    static std::string handle_with_wm(const std::string& tag, std::uint64_t ckpt, std::int64_t wm) {
+        return "{\"resolver\":\"test_resume\",\"tag\":\"" + tag + "\",\"ckpt\":\"" +
+               std::to_string(ckpt) + "\",\"wm\":\"" + std::to_string(wm) + "\"}";
+    }
+
     // Drop the durable commit receipt a 2PC sink writes right after its
     // external commit for checkpoint `id` executed.
     void write_receipt(std::uint64_t id, std::uint32_t sub) const {
@@ -337,6 +345,61 @@ TEST_F(ResolutionFixture, IdsThatNeverCompletedAreSkippedNotFatal) {
 
     EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 5), 5u);
     EXPECT_TRUE(confirmed_marker_exists(5));
+}
+
+// -- receipt materialisation (qual01-20260819f) ---------------------------
+//
+// A commit proven over the wire has, by construction, no receipt on disk:
+// the ack window killed the sink between the broker's acknowledgement and
+// the receipt write, or the walk itself just executed the commit. The walk
+// must write that receipt from the handle's watermark horizon, because if
+// resolution later stops on a sibling (the mixed verdict), the restore
+// replays this subtask's interval and replay suppression arms ONLY from
+// receipts - without one, the committed slice re-publishes as duplicates.
+
+TEST_F(ResolutionFixture, AWireCommittedHandleGetsItsReceiptMaterialised) {
+    write_completed_marker(4);
+    write_snapshot_with_handle(4, 0, handle_with_wm("commit", 4, 777));
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4), 4u);
+    const auto receipt = clink::cluster::commit_receipt_dir_for(dir, kJob) /
+                         clink::connectors::commit_receipt_file_name(0, 4);
+    ASSERT_TRUE(std::filesystem::exists(receipt))
+        << "the wire-proven commit's receipt was not materialised";
+    std::ifstream in(receipt);
+    std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(body, "wm=777\n") << "the materialised receipt must carry the handle's horizon";
+}
+
+// The deterministic pin for the probe-all rule: the REFUSED handle sorts
+// FIRST (subtask 0), the provable commit second (subtask 1). A walk that
+// stops probing at the first refusal never proves the second handle and
+// never materialises its receipt - the order-dependent corner run f hit.
+// The checkpoint must still refuse to confirm.
+TEST_F(ResolutionFixture, AMixedVerdictStillMaterialisesLaterCommits) {
+    write_completed_marker(4, "0,1");
+    write_snapshot_with_handle(4, 0, handle("refuse", 4));
+    write_snapshot_with_handle(4, 1, handle_with_wm("commit", 4, 4242));
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4), 3u)
+        << "a mixed verdict must not confirm the checkpoint";
+    EXPECT_FALSE(confirmed_marker_exists(4));
+    const auto receipt = clink::cluster::commit_receipt_dir_for(dir, kJob) /
+                         clink::connectors::commit_receipt_file_name(1, 4);
+    EXPECT_TRUE(std::filesystem::exists(receipt))
+        << "the refusal stopped the walk from proving (and receipting) the later commit";
+}
+
+TEST_F(ResolutionFixture, AHandleWithoutAHorizonMaterialisesNothing) {
+    // Staged by a pre-horizon binary: the commit still confirms, but no
+    // receipt can be invented for it - that recovery keeps the documented
+    // bounded-replay contract rather than a receipt with a made-up cut.
+    write_completed_marker(4);
+    write_snapshot_with_handle(4, 0, handle("commit", 4));
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 4), 4u);
+    EXPECT_FALSE(std::filesystem::exists(clink::cluster::commit_receipt_dir_for(dir, kJob) /
+                                         clink::connectors::commit_receipt_file_name(0, 4)));
 }
 
 }  // namespace

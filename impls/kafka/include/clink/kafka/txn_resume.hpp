@@ -120,6 +120,27 @@ struct ResumeAuth {
                                           const ConnectFn& connect,
                                           const ResumeAuth& auth = {});
 
+// READ-ONLY probe of a transactional.id's coordinator-side state record
+// ("Empty", "Ongoing", "CompleteCommit", ...), via FindCoordinator +
+// DescribeTransactions on fresh connections. nullopt = transport failure,
+// a broker without DescribeTransactions, or an unparseable response.
+// Unlike resume_commit - whose EndTxn probe EXECUTES a commit on a
+// prepared transaction - this never mutates broker state, which is what
+// makes it usable as a wait condition: the mixed-verdict recovery gate
+// polls it until an orphaned prepared transaction expires broker-side,
+// where a bare sleep would be a guess at the broker's expiry sweep.
+struct DescribeState {
+    std::string state;
+    std::int64_t producer_id{-1};
+    std::int16_t producer_epoch{-1};
+};
+[[nodiscard]] std::optional<DescribeState> describe_transaction_state(
+    const std::string& bootstrap_host,
+    std::uint16_t bootstrap_port,
+    const std::string& transactional_id,
+    const ConnectFn& connect,
+    const ResumeAuth& auth = {});
+
 // --- wire encoding, exposed for the frame tests -----------------------------
 
 namespace wire {

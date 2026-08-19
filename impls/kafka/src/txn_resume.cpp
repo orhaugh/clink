@@ -867,4 +867,73 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
     return {Status::TransportError, last_detail + " (after " + std::to_string(3) + " attempts)"};
 }
 
+std::optional<DescribeState> describe_transaction_state(const std::string& bootstrap_host,
+                                                        std::uint16_t bootstrap_port,
+                                                        const std::string& transactional_id,
+                                                        const ConnectFn& connect,
+                                                        const ResumeAuth& auth) {
+    // The read-only half of resume_commit's dance: [SASL] -> ApiVersions ->
+    // FindCoordinator -> coordinator -> DescribeTransactions. Single
+    // attempt; the caller polls (it exists to BE a wait condition).
+    auto bootstrap = connect(bootstrap_host, bootstrap_port);
+    if (bootstrap == nullptr) {
+        return std::nullopt;
+    }
+    (void)bootstrap->set_recv_timeout(std::chrono::milliseconds(5000));
+    std::int32_t corr = 0;
+    if (const auto sasl = authenticate(*bootstrap, auth, corr); sasl.has_value()) {
+        return std::nullopt;
+    }
+    ++corr;
+    const auto av_body = roundtrip(*bootstrap, wire::api_versions_request_v0(corr));
+    if (!av_body.has_value()) {
+        return std::nullopt;
+    }
+    const auto av = wire::parse_api_versions_response_v0(*av_body, corr);
+    if (!av.has_value() || av->error_code != 0 || !av->find_coordinator.has_value() ||
+        !av->describe_transactions.has_value() || av->describe_transactions->min > 0) {
+        return std::nullopt;
+    }
+    std::int16_t fc_version = 0;
+    if (av->find_coordinator->min <= 1 && av->find_coordinator->max >= 1) {
+        fc_version = 1;
+    } else if (av->find_coordinator->min <= 2 && av->find_coordinator->max >= 2) {
+        fc_version = 2;
+    } else {
+        return std::nullopt;
+    }
+    ++corr;
+    const auto fc_body =
+        roundtrip(*bootstrap, wire::find_coordinator_request(fc_version, corr, transactional_id));
+    if (!fc_body.has_value()) {
+        return std::nullopt;
+    }
+    const auto fc = wire::parse_find_coordinator_response(*fc_body, corr);
+    if (!fc.has_value() || fc->error_code != 0) {
+        return std::nullopt;
+    }
+    bootstrap.reset();
+    auto coord = connect(fc->host, static_cast<std::uint16_t>(fc->port));
+    if (coord == nullptr) {
+        return std::nullopt;
+    }
+    (void)coord->set_recv_timeout(std::chrono::milliseconds(5000));
+    corr = 0;
+    if (const auto sasl = authenticate(*coord, auth, corr); sasl.has_value()) {
+        return std::nullopt;
+    }
+    ++corr;
+    const auto dt_body =
+        roundtrip(*coord, wire::describe_transactions_request_v0(corr, transactional_id));
+    if (!dt_body.has_value()) {
+        return std::nullopt;
+    }
+    const auto dt = wire::parse_describe_transactions_response_v0(*dt_body, corr);
+    if (!dt.has_value() || dt->error_code != 0) {
+        return std::nullopt;
+    }
+    return DescribeState{
+        .state = dt->state, .producer_id = dt->producer_id, .producer_epoch = dt->producer_epoch};
+}
+
 }  // namespace clink::kafka

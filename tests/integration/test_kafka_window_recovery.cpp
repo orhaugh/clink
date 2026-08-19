@@ -25,6 +25,8 @@
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/connectors/kafka_source.hpp"
+#include "clink/kafka/txn_resume.hpp"
+#include "clink/runtime/network/connection.hpp"
 
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_kafka.hpp"
@@ -1280,6 +1282,238 @@ TEST_F(KafkaWindowRecoveryTest, AKillInTheAckWindowAfterARestoreStaysExactlyOnce
     EXPECT_EQ(actual, expected)
         << "the ack-window kill produced duplicates (the committed slice was replayed) or "
            "losses";
+}
+
+// qual01-20260819f, reproduced deterministically: the MIXED-verdict corner
+// of in-doubt resolution with an UNRECEIPTED committed transaction inside
+// it. One sink subtask's commit executes and its process dies before the
+// receipt lands (the ack window); a sibling subtask in the same process
+// never reached its commit, and its abandoned prepared transaction
+// EXPIRES broker-side (transaction_timeout_ms, shortened here) before
+// recovery runs - the walk then gets a FINAL not-committed verdict for
+// the sibling, exactly as a rig accumulating restarts does. Resolution
+// stops below the checkpoint ("handles committed before resolution
+// failed"), the restore replays the committed subtask's interval - and
+// with no receipt on disk, nothing arms replay suppression for it. On the
+// rig this surfaced as 4,583 identical duplicates in exactly one window:
+// one subtask's whole pane, committed twice. Two walk properties close
+// it, both asserted below: every handle proved committed over the wire
+// gets its receipt MATERIALISED from the handle's watermark horizon, and
+// a refusal must not stop the remaining handles from being proven (the
+// first cut broke out of the loop, leaving later commits unproven in
+// handle-listing order).
+//
+// Determinism: the parallelism-4 job occupies 16 task slots, so with 8
+// slots per worker a lone survivor can never host it - recovery always
+// waits for worker 0's return, and the fences below are durably in place
+// before the walk first runs. The mixed-branch assert guards the
+// placement-dependent part (worker 0 must have hosted a second,
+// uncommitted sink when the fault killed it).
+TEST_F(KafkaWindowRecoveryTest, AnUnreceiptedCommitInAMixedVerdictIsNotReplayedAsDuplicates) {
+    constexpr int kKeys = 10;
+    constexpr std::int64_t kBase = 9'000'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    spec.slots_per_worker = 8;
+    spec.ha = true;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    ASSERT_TRUE(cluster.start_ha_coordinators(1));
+    // Armed at the 7th commit through worker 0's sinks. The ordinal is
+    // ODD by design: worker 0 hosts two sinks, so each checkpoint's commit
+    // wave is two hits, and only a fault on the FIRST hit of a wave leaves
+    // the second sink's transaction PREPARED-but-uncommitted - the sibling
+    // whose expiry later turns the verdict mixed. An even ordinal kills
+    // after both committed and the corner never forms. The advancing feed
+    // closes a 10s window every ~250ms wall; at this gate's 1s checkpoint
+    // cadence every transaction carries fired panes, so the faulted one
+    // always has committed output to replay.
+    ASSERT_TRUE(cluster.start_ha_worker(
+        0, ProcOptions{.fault = "sink.between_commit_and_receipt=exit:72@7"}));
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + input_topic_ +
+        "', group_id='mixed', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + output_topic_ +
+        "', delivery_guarantee='exactly_once', transactional_id='mixed', "
+        "transaction_timeout_ms='15000'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql-mixed",
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "kafka-mixed",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "1000",
+                              "--max-restarts-on-worker-loss",
+                              "8",
+                              "--parallelism",
+                              "4"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 2; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
+    const auto advance_base = kBase + 50'000;
+    std::atomic<bool> stop_feed{false};
+    std::atomic<std::size_t> produced{0};
+    std::map<WindowKey, Aggregate> feed_windows;
+    std::thread feeder([&] {
+        feed_windows = produce_json_advancing(
+            kafka_->brokers(), input_topic_, advance_base, kKeys, stop_feed, produced);
+    });
+    struct FeedGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~FeedGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } feed_guard{stop_feed, feeder};
+
+    // The ack-window kill: the 8th commit through worker 0's first sink
+    // executes on the broker, then the process dies before its receipt.
+    // The sibling sink in the same process never commits this checkpoint.
+    ASSERT_TRUE(clink::itest::await([&] { return !cluster.worker(0).running(); }, 120s))
+        << "sink.between_commit_and_receipt never fired on worker 0";
+    const auto w0_exit = cluster.worker(0).poll_exit();
+    ASSERT_TRUE(w0_exit.has_value());
+    ASSERT_EQ(*w0_exit, 72);
+    const auto completed_at_kill = latest_marker(cluster.checkpoint_dir(), "COMPLETED-");
+    const auto w1_pid = cluster.worker(1).pid();
+
+    // Hold resolution back. The walk runs the moment the coordinator
+    // initiates the restart - seconds after the kill - and an EndTxn probe
+    // on the sibling's still-live PREPARED transaction would EXECUTE it,
+    // resolving the whole checkpoint cleanly (that path is the ack-window
+    // gate above). The corner needs the sibling EXPIRED first, and on a
+    // rig that ordering arrives by itself across repeated restarts and
+    // coordinator loss. Deterministically: kill the coordinator in the
+    // same breath as the worker - a composite every long fault campaign
+    // produces - so no walk can run until the sibling's shortened
+    // transaction timeout has expired it broker-side. The expiry is
+    // AWAITED, not guessed at: describe_transaction_state is a read-only
+    // DescribeTransactions probe (an EndTxn probe would execute the
+    // commit), and the condition is that no sink id still reports an
+    // in-flight state. The executed commit stays provable throughout:
+    // expiry aborts only the ONGOING transaction, leaving the committed
+    // one's CompleteCommit for the walk's disambiguation to find.
+    cluster.ha_coordinator(0).kill_and_reap();
+    const auto broker_hp = kafka_->brokers();
+    const auto colon = broker_hp.rfind(':');
+    ASSERT_NE(colon, std::string::npos);
+    const std::string broker_host = broker_hp.substr(0, colon);
+    const auto broker_port = static_cast<std::uint16_t>(std::stoi(broker_hp.substr(colon + 1)));
+    const auto plain_connect = [](const std::string& h, std::uint16_t p) {
+        return clink::network::connect_plain(h, p);
+    };
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            for (int sub = 0; sub < 4; ++sub) {
+                const auto st = clink::kafka::describe_transaction_state(
+                    broker_host, broker_port, "mixed-" + std::to_string(sub), plain_connect);
+                if (!st.has_value() || st->state == "Ongoing" || st->state == "PrepareCommit" ||
+                    st->state == "PrepareAbort") {
+                    return false;  // still pending (or unknowable): keep waiting
+                }
+            }
+            return true;
+        },
+        60s))
+        << "the orphaned prepared transaction never expired broker-side";
+    ASSERT_TRUE(cluster.start_ha_coordinators(1))
+        << "a replacement coordinator did not acquire leadership";
+    ASSERT_TRUE(cluster.restart_worker_ha(0));
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > completed_at_kill; },
+        120s))
+        << "the job never confirmed past the mixed-verdict recovery";
+
+    // The branch this gate exists for: a genuine mixed verdict - at least
+    // one handle proved committed, at least one refused - so the restore
+    // stayed below the checkpoint and replayed the committed interval.
+    // Without this line the fault landed somewhere harmless and the oracle
+    // check below proves nothing about the corner.
+    EXPECT_TRUE(cluster.count_in_coordinator_log("handles committed before resolution failed") > 0)
+        << "resolution never took the mixed-verdict branch; the gate tested nothing";
+    // The mechanism that closes the corner: the walk wrote the receipt the
+    // ack-window commit never got to, and the restored sink armed replay
+    // suppression from it.
+    EXPECT_TRUE(cluster.count_in_coordinator_log("receipt materialised by in-doubt resolution") > 0)
+        << "the walk never materialised the unreceipted commit's receipt";
+    EXPECT_TRUE(cluster.worker(0).log_contains("replay suppression armed from receipt"))
+        << "the restarted worker's sink never armed suppression from the materialised receipt";
+    EXPECT_EQ(cluster.worker(1).pid(), w1_pid) << "worker 1 must survive the whole episode";
+
+    const auto produced_at_recovery = produced.load(std::memory_order_acquire);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return produced.load(std::memory_order_acquire) >= produced_at_recovery + 1'500; },
+        30s));
+    stop_feed.store(true, std::memory_order_release);
+    feeder.join();
+    expected.insert(feed_windows.begin(), feed_windows.end());
+
+    std::int64_t max_ws = advance_base;
+    for (const auto& [key, agg] : feed_windows) {
+        (void)agg;
+        max_ws = std::max(max_ws, key.second);
+    }
+    const auto closer_start = max_ws + 20'000;
+    produce_json(kafka_->brokers(), input_topic_, window_records(closer_start, kKeys));
+
+    const auto after = consume_committed(kafka_->brokers(), output_topic_, expected.size(), 180s);
+    const auto actual = parse_output(after);
+    if (actual != expected) {
+        for (const auto& [key, agg] : expected) {
+            const auto it = actual.find(key);
+            if (it == actual.end()) {
+                ADD_FAILURE() << "MISSING k=" << key.first << " ws=" << key.second;
+            } else if (it->second != agg) {
+                ADD_FAILURE() << "WRONG k=" << key.first << " ws=" << key.second;
+            }
+        }
+        for (const auto& [key, agg] : actual) {
+            if (expected.count(key) == 0) {
+                ADD_FAILURE() << "EXTRA k=" << key.first << " ws=" << key.second
+                              << " cnt=" << agg.first << " total=" << agg.second;
+            }
+        }
+    }
+    EXPECT_EQ(actual, expected)
+        << "the mixed-verdict recovery replayed an unreceipted committed interval as "
+           "duplicates (or lost records above a receipt horizon)";
 }
 
 // A FAILED checkpoint must rewind, not sail on. The abort broadcast that

@@ -250,6 +250,15 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         for (int attempt = 0; attempt < kTransportAttempts && !verdict_failure; ++attempt) {
             bool transport_hit = false;
             bool everything_done = true;
+            // Probe EVERY handle, even after a final not-committed verdict.
+            // The first cut broke out of this loop on the first refusal,
+            // which left every handle after it unproven - and an unproven
+            // commit gets no materialised receipt, so whether its interval
+            // replayed as duplicates depended on the ORDER the handles came
+            // back from the snapshot listing (qual01-20260819f's corner, at
+            // one remove). A refusal still stops the checkpoint from
+            // confirming; it must not stop the remaining commits from being
+            // proven and receipted.
             for (std::size_t i = 0; i < handles->size(); ++i) {
                 if (handle_committed[i]) {
                     continue;  // already executed; never re-resolve
@@ -264,7 +273,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                         std::string("in-doubt resolution: handle did not parse: ") + e.what());
                     verdict_failure = true;
                     everything_done = false;
-                    break;
+                    continue;
                 }
                 const auto resolver =
                     clink::connectors::TxnResumeRegistry::instance().find(resolver_name);
@@ -274,7 +283,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                          resolver_name + "' (plugin not loaded in this process?)");
                     verdict_failure = true;
                     everything_done = false;
-                    break;
+                    continue;
                 }
                 const auto result = (*resolver)(handle);
                 clink::log::info("coordinator.recovery",
@@ -286,6 +295,59 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                      " (" + result.detail + ")");
                 if (result.committed) {
                     handle_committed[i] = true;
+                    // Materialise the receipt this commit never got to write.
+                    // A commit proven over the wire has, by construction, no
+                    // receipt on disk (the receipted case short-circuited
+                    // above) - the ack window, or a commit this walk itself
+                    // just executed. If resolution later stops on a SIBLING
+                    // handle (the mixed verdict), the restore replays this
+                    // subtask's interval, and replay suppression arms ONLY
+                    // from receipts - so without this write the committed
+                    // slice re-publishes as duplicates (qual01-20260819f:
+                    // one subtask's whole window pane, twice). The horizon
+                    // comes from the handle, staged at the sealing barrier
+                    // with the exact value the sink's own receipt carries.
+                    std::string wm;
+                    try {
+                        const auto j = clink::config::parse(handle);
+                        if (j.contains("wm")) {
+                            wm = j.at("wm").as_string();
+                        }
+                    } catch (const std::exception&) {
+                        // fall through to the no-horizon path below
+                    }
+                    if (wm.empty()) {
+                        clink::log::warn(
+                            "coordinator.recovery",
+                            "in-doubt resolution: checkpoint " + std::to_string(id) + " subtask " +
+                                std::to_string((*handles)[i].subtask) +
+                                ": handle carries no watermark horizon (staged by an older "
+                                "binary); no receipt can be materialised, and a restore below "
+                                "this checkpoint replays its interval under the bounded-replay "
+                                "contract");
+                    } else {
+                        try {
+                            store->put(job_prefix + "receipts/" +
+                                           clink::connectors::commit_receipt_file_name(
+                                               (*handles)[i].subtask, id),
+                                       "wm=" + wm + "\n");
+                            clink::log::info(
+                                "coordinator.recovery",
+                                "in-doubt resolution: checkpoint " + std::to_string(id) +
+                                    " subtask " + std::to_string((*handles)[i].subtask) +
+                                    ": receipt materialised by in-doubt resolution (wm=" + wm +
+                                    ")");
+                        } catch (const std::exception& e) {
+                            clink::log::error(
+                                "coordinator.recovery",
+                                "in-doubt resolution: checkpoint " + std::to_string(id) +
+                                    " subtask " + std::to_string((*handles)[i].subtask) +
+                                    ": receipt could not be materialised (" +
+                                    std::string(e.what()) +
+                                    "); if resolution stops below this checkpoint, the replay "
+                                    "of this interval will NOT be suppressed");
+                        }
+                    }
                     continue;
                 }
                 everything_done = false;
@@ -294,7 +356,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                     continue;  // other handles may reach different brokers
                 }
                 verdict_failure = true;
-                break;
+                continue;  // final refusal: keep proving the remaining handles
             }
             if (everything_done) {
                 all_committed = true;
@@ -317,19 +379,25 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
             const auto committed_count = static_cast<std::size_t>(
                 std::count(handle_committed.begin(), handle_committed.end(), true));
             if (committed_count > 0) {
-                // The bad corner, made loud: some of this checkpoint's
-                // transactions are now committed and the restore below will
-                // replay their intervals as duplicates. Reaching this needs
-                // a genuine mixed verdict or retries exhausted mid-outage -
+                // The mixed-verdict corner, made loud: some of this
+                // checkpoint's transactions are committed and the restore
+                // below replays their intervals. Every commit resolved above
+                // carries a receipt - written by the sink, or materialised
+                // from the handle's watermark horizon at the moment it was
+                // proven - so the replayed re-emissions are swallowed by the
+                // restored sinks' replay suppression. Only a handle staged by
+                // a pre-horizon binary (warned above) still reaches the
+                // bounded-replay contract. Reaching this branch needs a
+                // genuine mixed verdict or retries exhausted mid-outage -
                 // both narrowed hard by the transport retries and by
                 // teardown preserving prepared transactions.
                 clink::log::error(
                     "coordinator.recovery",
                     "in-doubt resolution: checkpoint " + std::to_string(id) + ": " +
                         std::to_string(committed_count) + " of " + std::to_string(handles->size()) +
-                        " handles committed before resolution failed; the restore below WILL "
-                        "replay the committed intervals as duplicates (bounded by this one "
-                        "checkpoint)");
+                        " handles committed before resolution failed; the restore below replays "
+                        "the committed intervals, suppressed downstream by their (written or "
+                        "materialised) receipts");
             }
             clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
