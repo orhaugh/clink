@@ -339,6 +339,16 @@ private:
     std::atomic<std::uint64_t> heartbeat_sequence_{0};
     std::atomic<std::uint64_t> heartbeat_ack_sequence_{0};
     std::atomic<std::int64_t> last_coordinator_contact_ms_{0};
+    // True while the reader thread is inside dispatch_control_frame_. The
+    // lease check treats an in-flight dispatch as contact: the reader
+    // being busy processing the coordinator's OWN frame is evidence of
+    // life, not silence, and a dispatch the OS stalls (Deploy writing +
+    // dlopen'ing plugin bytes while first-execution scanning holds them -
+    // the nine-worker gateway-pipeline flake) must not read as a dead
+    // coordinator. Dead-coordinator detection is delayed by at most one
+    // dispatch duration: the contact clock is restamped when dispatch
+    // returns, and the next lease window runs from there.
+    std::atomic<bool> dispatching_frame_{false};
     mutable std::mutex mu_;
     std::mutex send_mu_;
     std::condition_variable cv_;

@@ -232,6 +232,67 @@ TEST(Cluster, RestartDrainDeadlineDefaultDominatesBoundedSinkCalls) {
     EXPECT_GE(Coordinator::Config{}.restart_drain_timeout, std::chrono::milliseconds{120000});
 }
 
+// A control frame whose DISPATCH is slow must never read as a dead
+// coordinator. Deploy handling runs on the worker's reader thread and
+// includes writing the plugin bytes to cache and dlopen'ing them - work
+// the OS can stall for seconds (macOS scans a freshly written .so on
+// first execution; nine workers deploying the same plugin stalled every
+// reader past the 3s coordinator lease in the gateway-pipeline test).
+// The reader being busy processing the coordinator's OWN frame is
+// evidence of contact, not of silence: pre-fix, the worker's heartbeat
+// thread read the stale contact clock, dropped the session mid-deploy
+// ("coordinator heartbeat lease expired"), re-registered, and the job
+// never made progress. Here the armed Delay holds Deploy dispatch for
+// three times the lease, and the job must still complete on the FIRST
+// deployment - a re-registration means the lease misfired.
+TEST(Cluster, ASlowDeployDispatchDoesNotExpireTheCoordinatorLease) {
+    Coordinator coordinator;
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-slow"});
+
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    Worker::Config cfg;
+    cfg.heartbeat_interval = 100ms;
+    cfg.coordinator_heartbeat_timeout = 600ms;
+    Worker worker("worker-slow", "127.0.0.1", cfg);
+    worker.register_role("solo", [sink](const DeploymentTask&) {
+        std::vector<Record<std::int64_t>> records;
+        records.emplace_back(Record<std::int64_t>{7});
+        auto src = std::make_shared<VectorSource<std::int64_t>>(std::move(records));
+        Dag dag;
+        auto h0 = dag.add_source<std::int64_t>(src);
+        dag.add_sink<std::int64_t>(h0, sink);
+        LocalExecutor exec(std::move(dag));
+        exec.run();
+    });
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const clink::fault::ScopedFault guard(clink::fault::Rule{
+        .point = clink::fault::points::kWorkerDeployDispatch,
+        .ordinal = 0,
+        .action = clink::fault::Action::Delay,
+        .arg = 1800,
+    });
+
+    JobPlan plan;
+    plan.tasks.push_back(PlannedTask{
+        .worker_id = "worker-slow",
+        .role = "solo",
+        .subtask_idx = 0,
+        .data_port = 0,
+        .peer_refs = {},
+        .extra_config = "",
+    });
+    coordinator.deploy(plan);
+    ASSERT_TRUE(coordinator.await_completion(10s))
+        << "the deploy never completed - a lease expiry mid-dispatch drops the session";
+    EXPECT_TRUE(coordinator.errors().empty());
+    EXPECT_EQ(sink->collected(), (std::vector<std::int64_t>{7}));
+    worker.stop();
+    coordinator.stop();
+}
+
 // Heartbeat watchdog detects a worker that registers but stops sending
 // heartbeats. The coordinator marks it lost, synthesises errors for any pending
 // tasks, and unblocks await_completion.

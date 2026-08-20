@@ -300,6 +300,14 @@ inline constexpr char kSinkAfterExternalCommit[] = "sink.after_external_commit";
 // State backend + restore.
 inline constexpr char kStateBeforeRestore[] = "state.before_restore";
 
+// Worker control-plane dispatch. Fires at the top of Deploy handling, on
+// the reader thread - where the plugin bytes are written to cache and
+// dlopen'd. A Delay here models the OS stalling that work (first-execution
+// scanning of a freshly written .so held nine workers' readers past the 3s
+// coordinator lease in the gateway-pipeline flake), which must read as a
+// busy reader, never as a dead coordinator.
+inline constexpr char kWorkerDeployDispatch[] = "worker.deploy_dispatch";
+
 // ----- Rescale lifecycle -----
 //
 // A rescale is not one moment, it is a sequence: accept, drain the old subtasks,

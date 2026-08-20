@@ -608,7 +608,16 @@ void Worker::heartbeat_loop_() {
             cfg_.coordinator_heartbeat_timeout.count() > 0) {
             const auto silent_ms =
                 steady_now_ms() - last_coordinator_contact_ms_.load(std::memory_order_acquire);
-            if (silent_ms > cfg_.coordinator_heartbeat_timeout.count()) {
+            // An in-flight dispatch is contact, not silence: the clock goes
+            // stale while the reader processes the coordinator's own frame,
+            // and a Deploy the OS stalls (first-execution scanning of the
+            // freshly written plugin .so held nine readers past this lease
+            // at once) must not make the worker sever its own session
+            // mid-deploy. The reader restamps the clock when dispatch
+            // returns, so a coordinator that genuinely died during a long
+            // dispatch is detected one lease window later.
+            if (silent_ms > cfg_.coordinator_heartbeat_timeout.count() &&
+                !dispatching_frame_.load(std::memory_order_acquire)) {
                 signal_disconnect_("coordinator heartbeat lease expired after " +
                                    std::to_string(silent_ms) + "ms");
                 return;
@@ -705,9 +714,11 @@ void Worker::reader_loop_() {
         // skew, or anything else able to write to this socket, could kill
         // every task the worker was running. Bound it to this control session
         // instead, then let the supervisor drain and recover cleanly.
+        dispatching_frame_.store(true, std::memory_order_release);
         try {
             dispatch_control_frame_(r);
         } catch (const std::exception& e) {
+            dispatching_frame_.store(false, std::memory_order_release);
             log::error("worker.protocol",
                        std::string{"control frame did not decode; dropping the coordinator "
                                    "connection: "} +
@@ -716,6 +727,13 @@ void Worker::reader_loop_() {
             signal_disconnect_(std::string{"malformed control frame: "} + e.what());
             return;
         }
+        // Restamp BEFORE clearing the flag: the heartbeat thread must never
+        // observe not-dispatching with a clock still dated to the frame's
+        // arrival - a dispatch that legitimately ran longer than the lease
+        // (a Deploy stalled in first-execution scanning of its plugin .so)
+        // would be read as coordinator silence in that gap.
+        last_coordinator_contact_ms_.store(steady_now_ms(), std::memory_order_release);
+        dispatching_frame_.store(false, std::memory_order_release);
     }
 }
 
@@ -1456,6 +1474,11 @@ void Worker::handle_deploy_(MessageReader& r) {
     if (!accept_epoch_(msg.coordinator_epoch, "Deploy")) {
         return;
     }
+    // Deploy dispatch runs on the reader thread and includes writing the
+    // plugin bytes to cache and dlopen'ing them - work the OS can stall
+    // for seconds (first-execution scanning of a fresh .so). The armed
+    // Delay makes that stall reproducible for the lease test below it.
+    CLINK_FAULT_POINT(clink::fault::points::kWorkerDeployDispatch);
 
     // Allocate (or reuse) the per-job bundle. Plugin .so bytes that
     // come with this Deploy will register their op factories INTO this
