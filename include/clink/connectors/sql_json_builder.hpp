@@ -61,6 +61,29 @@ inline std::string quote_ident(std::string_view name, const Dialect& d) {
     return out;
 }
 
+// Quote a TABLE identifier, which - unlike a column - may be
+// schema-qualified: "schema.table" quotes as "schema"."table", each part
+// validated by quote_ident so the dot is a separator and never part of a
+// name. At most one dot: catalog-qualified three-part names are not a
+// thing either dialect's sink supports, and rejecting them here beats a
+// server error mid-checkpoint. The connector docs have always shown
+// 'public.users' for the Postgres sinks; the plain quote_ident rejected
+// the dot and the documented form failed at open() - caught by QUAL-02's
+// local rig on its first deployed pipeline.
+inline std::string quote_table_ident(std::string_view name, const Dialect& d) {
+    const auto dot = name.find('.');
+    if (dot == std::string_view::npos) {
+        return quote_ident(name, d);
+    }
+    const auto schema = name.substr(0, dot);
+    const auto table = name.substr(dot + 1);
+    if (table.find('.') != std::string_view::npos) {
+        throw std::runtime_error(std::string(d.name) + ": invalid table identifier '" +
+                                 std::string(name) + "' (at most one '.', schema.table)");
+    }
+    return quote_ident(schema, d) + "." + quote_ident(table, d);
+}
+
 // Extract column names from a serialize_row_schema string
 // ("name:typecode;name:typecode") - the schema the SQL Row path injects as the
 // schema_columns param. Dialect-independent.
@@ -127,7 +150,7 @@ inline std::string build_insert_head_values(const std::string& table,
     if (columns.empty()) {
         throw std::runtime_error(std::string(d.name) + ": 'columns' is required for the sink");
     }
-    std::string sql = "INSERT INTO " + quote_ident(table, d) + " (";
+    std::string sql = "INSERT INTO " + quote_table_ident(table, d) + " (";
     for (std::size_t i = 0; i < columns.size(); ++i) {
         sql += quote_ident(columns[i], d);
         if (i + 1 < columns.size()) {
@@ -173,7 +196,7 @@ inline std::string build_delete_by_keys_sql(const std::string& table,
         throw std::runtime_error(std::string(d.name) + ": delete requires key_columns");
     }
     const bool composite = key_columns.size() > 1;
-    std::string sql = "DELETE FROM " + quote_ident(table, d) + " WHERE ";
+    std::string sql = "DELETE FROM " + quote_table_ident(table, d) + " WHERE ";
     if (composite) {
         sql += "(";
         for (std::size_t i = 0; i < key_columns.size(); ++i) {

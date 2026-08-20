@@ -669,8 +669,20 @@ def main() -> int:
     # kill_coordinator action; a verdict must never depend on that luck.
     schedule = []
     if args.ensure_coverage:
+        # Extras go straight after the 2PC points, BEFORE the generic
+        # infra faults. The order encodes priority: whatever sits at the
+        # end is what a short or curtailed soak fails to cover, and a
+        # campaign's decisive composition must not be the casualty.
+        # QUAL-02's is pg_unavailable - the external transaction manager
+        # down while a recovery needs it - which a 10-minute local soak
+        # never reached while network_latency and a partition did.
         extra = tuple(f for f in args.extra_faults.split(",") if f)
-        for name in mandatory_faults(chaos.twopc_points) + extra:
+        base = mandatory_faults(chaos.twopc_points)
+        infra = ("kill_coordinator", "restart_broker", "network_latency",
+                 "partition_worker_from_coordinator")
+        head = tuple(f for f in base if f not in infra)
+        tail = tuple(f for f in base if f in infra)
+        for name in head + extra + tail:
             schedule.append(name)
 
     started = time.time()

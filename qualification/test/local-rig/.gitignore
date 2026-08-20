@@ -1,0 +1,8 @@
+# Generated per machine by local-rig.sh: a throwaway keypair for the
+# local containers and the inventory of their ephemeral IPs. Neither is
+# reproducible or meaningful on another machine, and a committed private
+# key is a committed private key whatever its blast radius.
+id_ed25519
+id_ed25519.pub
+inventory.json
+hostimg/authorized_keys

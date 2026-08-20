@@ -71,7 +71,7 @@ public:
         if (opts_.batch_records == 0) {
             opts_.batch_records = 1;
         }
-        (void)pgsql::quote_ident(opts_.table);
+        (void)pgsql::quote_table_ident(opts_.table);
         for (const auto& c : opts_.columns) {
             (void)pgsql::quote_ident(c);
         }

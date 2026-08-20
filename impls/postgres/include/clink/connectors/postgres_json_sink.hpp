@@ -71,7 +71,7 @@ public:
         }
         // Fail fast on bad identifiers / on_conflict config (build_insert_sql also
         // validates, but at first flush).
-        (void)pgsql::quote_ident(opts_.table);
+        (void)pgsql::quote_table_ident(opts_.table);
         for (const auto& c : opts_.columns) {
             (void)pgsql::quote_ident(c);
         }

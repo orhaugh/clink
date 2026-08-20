@@ -132,6 +132,24 @@ TEST(PostgresJsonSinkLogic, QuoteIdentDoubleQuotesAndRejectsInjection) {
     EXPECT_THROW(quote_ident("a\"b"), std::runtime_error);
     EXPECT_THROW(quote_ident("a;b"), std::runtime_error);
     EXPECT_THROW(quote_ident(""), std::runtime_error);
+    // A COLUMN never carries a schema qualifier: the dot stays rejected
+    // here so quote_table_ident below is the one deliberate seam.
+    EXPECT_THROW(quote_ident("public.t"), std::runtime_error);
+}
+
+// The table position accepts the documented schema-qualified form -
+// 'public.users' quotes part-by-part so the dot is a separator, never a
+// name - and stays exactly as injection-hostile as quote_ident about
+// everything else. QUAL-02's first locally deployed pipeline failed at
+// open() on the documented form before this seam existed.
+TEST(PostgresJsonSinkLogic, QuoteTableIdentAllowsOneSchemaQualifier) {
+    EXPECT_EQ(clink::pgsql::quote_table_ident("q2_out"), "\"q2_out\"");
+    EXPECT_EQ(clink::pgsql::quote_table_ident("public.q2_out"), "\"public\".\"q2_out\"");
+    EXPECT_THROW(clink::pgsql::quote_table_ident("a.b.c"), std::runtime_error);
+    EXPECT_THROW(clink::pgsql::quote_table_ident(".t"), std::runtime_error);
+    EXPECT_THROW(clink::pgsql::quote_table_ident("s."), std::runtime_error);
+    EXPECT_THROW(clink::pgsql::quote_table_ident("pub\"lic.t"), std::runtime_error);
+    EXPECT_THROW(clink::pgsql::quote_table_ident("public.t;drop"), std::runtime_error);
 }
 
 TEST(PostgresJsonSinkLogic, ColumnsFromSchema) {

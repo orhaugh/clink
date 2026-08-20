@@ -22,6 +22,11 @@ inline std::string quote_ident(std::string_view name) {
     return sqljson::quote_ident(name, sqljson::kMysql);
 }
 
+// Table position only: allows one schema qualifier (`db`.`table`).
+inline std::string quote_table_ident(std::string_view name) {
+    return sqljson::quote_table_ident(name, sqljson::kMysql);
+}
+
 // Column names from the SQL Row path's schema_columns param.
 inline std::vector<std::string> columns_from_schema(const std::string& schema) {
     return sqljson::columns_from_schema(schema);
@@ -76,7 +81,7 @@ inline std::string build_select_sql(const std::string& table,
                                     const std::string& cursor,
                                     int batch_size,
                                     const EscapeFn& esc) {
-    std::string sql = "SELECT * FROM " + quote_ident(table);
+    std::string sql = "SELECT * FROM " + quote_table_ident(table);
     const std::string qc = quote_ident(cursor_column);
     if (id_column.empty()) {
         if (!cursor.empty()) {

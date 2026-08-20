@@ -75,7 +75,7 @@ public:
             opts_.batch_records = 1;
         }
         // Fail fast on bad identifiers.
-        (void)pgsql::quote_ident(opts_.table);
+        (void)pgsql::quote_table_ident(opts_.table);
         for (const auto& c : opts_.columns) {
             (void)pgsql::quote_ident(c);
         }

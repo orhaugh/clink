@@ -52,7 +52,7 @@ public:
             opts_.batch_records = 1;
         }
         // Validate identifiers up front (fail fast at build, not at first flush).
-        (void)quote_ident(opts_.table);
+        (void)quote_table_ident(opts_.table);
         for (const auto& c : opts_.columns) {
             (void)quote_ident(c);
         }

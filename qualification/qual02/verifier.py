@@ -136,11 +136,20 @@ def sample(cur, produced_high: dict):
                              "expected_distinct": max_seq + 1,
                              "actual_distinct": rows_distinct,
                              "missing": (max_seq + 1) - rows_distinct})
-        # Committed output can never run ahead of what was produced.
+        # NOT a finding mid-flight. produced_high comes from the
+        # generator's periodic progress SNAPSHOT, which is a LOWER bound
+        # on what it has actually produced - an engine keeping up with
+        # the generator legitimately commits sequences the snapshot has
+        # not recorded yet, and treating a lower bound as an upper bound
+        # made the oracle manufacture the defect it hunts (the local rig
+        # produced 32 such "foreign" findings on a run whose end state
+        # was exactly complete: 411,000 produced, 411,000 committed,
+        # zero duplicates). The verifier never learns when the generator
+        # has stopped, so it cannot make this call at all; the campaign
+        # driver's post-drain completeness step owns it, where the final
+        # progress file IS authoritative.
         if max_seq >= high:
-            findings.append({"kind": "foreign", "partition": p, "max_seq": max_seq,
-                             "produced_high": high,
-                             "detail": "committed output is ahead of the generator"})
+            stats["ahead_of_snapshot"] = stats.get("ahead_of_snapshot", 0) + 1
 
     cur.execute("SELECT count(*), coalesce(min(prepared), now()) FROM pg_prepared_xacts")
     prepared_n, prepared_oldest = cur.fetchone()

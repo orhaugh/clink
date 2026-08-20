@@ -454,6 +454,11 @@ echo "campaign: verifier started"
 # inspect.
 echo "campaign: functional verification (nothing soaks until this passes)"
 verify_fail() { echo "campaign: VERIFICATION FAILED - $1" >&2
+                # The cluster logs ARE the evidence for a verification
+                # failure (QUAL-02's first local run failed here and left
+                # nothing to diagnose with until the still-live rig was
+                # dug through by hand).
+                collect_container_logs || true
                 echo "  rig is still up for inspection; tear down with:" >&2
                 echo "  scripts/qualification/destroy.sh $RUN_ID --yes" >&2
                 exit 3; }
@@ -572,12 +577,27 @@ echo "campaign: chaos landing faults ($FAULTS recorded)"
 # "The metric says zero" and "the metric could not be read" are different
 # facts, and defaulting an unreachable coordinator to zero would be the same
 # silent assumption in a different coat.
-METRICS=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/metrics" 2>/dev/null) \
-    || verify_fail "cannot read the coordinator's metrics, so a fault cannot be confirmed"
-LOST=$(echo "$METRICS" | awk '/^clink_coordinator_workers_lost_total /{print $2}')
+# Polled, not read once: the chaos log records the kill the moment it is
+# issued, while the coordinator only declares the loss when its heartbeat
+# lease expires seconds later. A one-shot read raced that window and
+# failed a campaign whose engine was behaving perfectly (QUAL-02 hit it
+# on the local rig, which is FASTER than the cloud rig whose ssh
+# round-trips had been masking the race here). Still a real gate: no
+# worker loss inside the window means the fault left no trace.
+LOST=0
+LOST_SEEN=0
+for _ in $(seq 1 30); do
+    METRICS=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/metrics" 2>/dev/null) || METRICS=""
+    if [ -n "$METRICS" ]; then
+        LOST=$(echo "$METRICS" | awk '/^clink_coordinator_workers_lost_total /{print $2}')
+        if [ -n "$LOST" ] && [ "${LOST%%.*}" -ge 1 ]; then LOST_SEEN=1; break; fi
+    fi
+    sleep 5
+done
+[ -n "$METRICS" ] || verify_fail "cannot read the coordinator's metrics, so a fault cannot be confirmed"
 [ -n "$LOST" ] || verify_fail "the coordinator exports no clink_coordinator_workers_lost_total,
   so there is no way to confirm a fault reached the engine"
-if [ "${LOST%%.*}" -lt 1 ]; then
+if [ "$LOST_SEEN" != "1" ]; then
     verify_fail "the chaos controller recorded faults but the coordinator has lost no worker
   (clink_coordinator_workers_lost_total=${LOST}). A fault that leaves no trace in the
   engine did not happen, whatever the chaos log says."

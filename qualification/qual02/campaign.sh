@@ -132,6 +132,10 @@ kill_campaign_processes() {  # host
 
 verify_fail() {
     echo "campaign: FUNCTIONAL VERIFICATION FAILED - $1" >&2
+    # The cluster logs ARE the evidence for a verification failure - the
+    # first local QUAL-02 run failed here and left nothing to diagnose
+    # with until the still-live rig was dug through by hand.
+    collect_container_logs || true
     echo "campaign: not entering soak. Evidence in $OUT_DIR" >&2
     exit 4
 }
@@ -198,6 +202,16 @@ to_host "$OPS_PUB" "$HERE/postgres.yml" /qual/postgres.yml
 # Written to the host, not passed inline, so anything that later restarts
 # this container reproduces its configuration.
 on_host "$OPS_PUB" "printf 'PGPASSWORD=%s\\n' '$PGPASSWORD' >> /qual/.env"
+# down -v FIRST: POSTGRES_PASSWORD only takes effect when the data
+# directory is initialised, and this campaign derives its password from
+# RUN_ID - so a second campaign on a REUSED rig (the INVENTORY= path
+# this driver advertises) inherits a volume whose role still carries the
+# previous run's password, and every oracle connection fails "password
+# authentication failed for user postgres". A fresh volume is also the
+# right default on its own terms: the sink table's counts are this
+# campaign's evidence, and inheriting another run's rows corrupts them
+# (the same reasoning that wipes the HA job store between runs).
+on_host "$OPS_PUB" "cd /qual && docker compose -f postgres.yml down -v" >/dev/null 2>&1 || true
 on_host "$OPS_PUB" "cd /qual && docker compose -f postgres.yml up -d"
 
 for _ in $(seq 1 30); do
@@ -300,11 +314,45 @@ echo "campaign: fault-injection surface confirmed"
 
 # --- topics -------------------------------------------------------------
 BROKER_ONE=$(echo "$BROKER_PRIVS" | awk '{print $1}')
-on_host "$OPS_PUB" "docker run --rm docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
-    rpk topic delete qual02-in --brokers $BROKER_ONE:9092" >/dev/null 2>&1 || true
-on_host "$OPS_PUB" "docker run --rm docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
-    rpk topic create qual02-in -p $PARTITIONS -r 3 --brokers $BROKER_ONE:9092"
-echo "campaign: topic recreated ($PARTITIONS partitions, replication 3)"
+# --entrypoint rpk, not a leading rpk arg: the image's entrypoint already
+# invokes rpk on some arches, and the doubled token made rpk parse its own
+# name as a subcommand (the local rig caught it; the flag error printed
+# rpk's help and killed the campaign at topic creation). Replication
+# follows the rig's actual broker count, capped at the cloud shape's 3 -
+# a hardcoded 3 cannot be satisfied by a smaller rig and says nothing
+# more on a bigger one.
+BROKER_COUNT=$(read_inv broker private_ip | wc -w | tr -d ' ')
+REPLICATION=$(( BROKER_COUNT < 3 ? BROKER_COUNT : 3 ))
+# Silence the PREVIOUS attempt's ops processes BEFORE touching topics: a
+# stale generator keeps producing, and with broker auto-creation on, the
+# topic delete below "succeeds" and the topic reincarnates on the very
+# next produce - with the broker-default single partition (round 5 spun
+# on exactly that for 30 delete attempts). The full ops reset later
+# still runs; this early sweep only guarantees a quiet broker here.
+on_host "$OPS_PUB" "pkill -f '[g]enerator.py'; pkill -f '[v]erifier.py'; pkill -f '[c]haos.py'; true"
+
+rpk_ops() {  # rpk against the broker, from the ops host
+    on_host "$OPS_PUB" "docker run --rm --entrypoint rpk \
+        docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
+        $1 --brokers $BROKER_ONE:9092"
+}
+rpk_ops "topic delete qual02-in" >/dev/null 2>&1 || true
+# Deletion is asynchronous: wait for the broker to actually forget the
+# topic, re-issuing the delete, instead of racing the create into
+# TOPIC_ALREADY_EXISTS - qual01's identical lesson (a topic this run does
+# not own carries a previous run's events, and reading those as this
+# run's once produced 161,111 phantom missing results there).
+gone=0
+for _ in $(seq 1 30); do
+    if ! rpk_ops "topic list" 2>/dev/null | awk '{print $1}' | grep -qx qual02-in; then
+        gone=1; break
+    fi
+    rpk_ops "topic delete qual02-in" >/dev/null 2>&1 || true
+    sleep 2
+done
+[ "$gone" = "1" ] || { echo "campaign: topic qual02-in still exists after 30 delete attempts" >&2; exit 2; }
+rpk_ops "topic create qual02-in -p $PARTITIONS -r $REPLICATION"
+echo "campaign: topic recreated ($PARTITIONS partitions, replication $REPLICATION)"
 
 # --- ops host: generator + verifier + chaos -----------------------------
 # Stop requests are FILES (see qual01/verifier.py: the spawn discipline
@@ -437,18 +485,33 @@ echo "campaign: rows committed to the sink database ($COMMITTED)"
 #    would look the same in the table. So require evidence that prepared
 #    transactions are really being created under clink's global-id scheme
 #    - otherwise the campaign would qualify a protocol it never exercised.
-PREPARED_SEEN=0
-for _ in $(seq 1 40); do
-    N=$(psql_q "SELECT count(*) FROM pg_prepared_xacts WHERE gid LIKE 'clink!_%' ESCAPE '!'" | tr -d '\r')
-    if [ "${N:-0}" -gt 0 ]; then PREPARED_SEEN=$N; break; fi
-    sleep 3
+#    Sampling pg_prepared_xacts for a live prepared transaction is a
+#    race against the prepare-to-commit window, which is MILLISECONDS
+#    on a healthy cluster - the local rig polled 120s and never caught
+#    one while 2PC ran perfectly underneath. Deterministic evidence
+#    instead: a worker hosting the sink logs the 2PC family name at
+#    open(), and a plain-insert or upsert deployment logs a different
+#    family. The prepared-xacts sample stays as recorded corroboration
+#    (the slower cloud rig can catch one), never as the verdict; the
+#    SOAK's armed 2PC faults - fired-proofed and recovery-proofed - are
+#    what genuinely exercise the windows this campaign qualifies.
+SINK_FAMILY_SEEN=0
+for wp in $WORKER_PUBS; do
+    if on_host "$wp" "docker logs clink-worker 2>&1 | grep -q postgres_json_sink_2pc"; then
+        SINK_FAMILY_SEEN=1
+    fi
 done
-[ "${PREPARED_SEEN:-0}" -gt 0 ] || verify_fail "no clink-prefixed prepared transaction was ever observed.
-  Rows are committing, but not through PREPARE TRANSACTION - the two-phase-commit
-  protocol this campaign exists to qualify is not being exercised."
-GID_SAMPLE=$(psql_q "SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'clink!_%' ESCAPE '!' LIMIT 1" | tr -d '\r')
-echo "campaign: two-phase commit confirmed in the database (gid example: $GID_SAMPLE)"
-echo "$GID_SAMPLE" > "$OUT_DIR/gid-sample.txt"
+[ "$SINK_FAMILY_SEEN" = "1" ] || verify_fail "no worker's sink opened as postgres_json_sink_2pc.
+  Rows are committing, but not through the two-phase-commit family this
+  campaign exists to qualify."
+echo "campaign: 2PC sink family confirmed deployed (postgres_json_sink_2pc on a worker)"
+N=$(psql_q "SELECT count(*) FROM pg_prepared_xacts WHERE gid LIKE 'clink!_%' ESCAPE '!'" | tr -d '\r')
+echo "prepared_xacts_sampled=${N:-0}" > "$OUT_DIR/gid-sample.txt"
+if [ "${N:-0}" -gt 0 ]; then
+    GID_SAMPLE=$(psql_q "SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'clink!_%' ESCAPE '!' LIMIT 1" | tr -d '\r')
+    echo "campaign: prepared transaction observed in flight (gid example: $GID_SAMPLE)"
+    echo "$GID_SAMPLE" >> "$OUT_DIR/gid-sample.txt"
+fi
 
 # 5. Faults land, and land where clink can see them. Coverage-first: the
 #    mandatory faults (including every 2PC crash window) are scheduled
@@ -485,11 +548,27 @@ echo "campaign: chaos landing faults ($FAULTS recorded)"
 # A recorded fault is not a landed fault. Read the engine's own count,
 # and distinguish "the metric says zero" from "the metric could not be
 # read".
-METRICS=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/metrics" 2>/dev/null) \
-    || verify_fail "cannot read the coordinator's metrics, so a fault cannot be confirmed"
-LOST=$(echo "$METRICS" | awk '/^clink_coordinator_workers_lost_total /{print $2}')
+# The counter is read on a POLL, not once: the chaos log records the kill
+# the moment it is issued, while the coordinator only declares the loss
+# when its heartbeat lease expires seconds later. A one-shot read raced
+# that window and failed a campaign whose engine was behaving perfectly
+# (the local rig hit it on the first fault - being FASTER than the cloud
+# rig, whose ssh round-trips had been masking the race). Still a real
+# gate: if no worker loss is recorded within the window, the fault left
+# no trace in the engine and did not happen.
+LOST=0
+LOST_SEEN=0
+for _ in $(seq 1 30); do
+    METRICS=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/metrics" 2>/dev/null) || METRICS=""
+    if [ -n "$METRICS" ]; then
+        LOST=$(echo "$METRICS" | awk '/^clink_coordinator_workers_lost_total /{print $2}')
+        if [ -n "$LOST" ] && [ "${LOST%%.*}" -ge 1 ]; then LOST_SEEN=1; break; fi
+    fi
+    sleep 5
+done
+[ -n "$METRICS" ] || verify_fail "cannot read the coordinator's metrics, so a fault cannot be confirmed"
 [ -n "$LOST" ] || verify_fail "the coordinator exports no clink_coordinator_workers_lost_total"
-if [ "${LOST%%.*}" -lt 1 ]; then
+if [ "$LOST_SEEN" != "1" ]; then
     verify_fail "the chaos controller recorded $FAULTS fault(s) but the coordinator has lost
   no worker (clink_coordinator_workers_lost_total=$LOST). A fault that leaves no trace
   in the engine did not happen, whatever the chaos log says."
@@ -513,7 +592,7 @@ echo "campaign: recovered and still committing ($BEFORE -> $AFTER rows) - VERIFI
 
 { echo "campaign=QUAL-02"; echo "run_id=$RUN_ID"; echo "job_id=$JOB_ID";
   echo "input_events_observed=$P2"; echo "rows_committed_at_gate=$AFTER";
-  echo "max_prepared_transactions=$MAXPREP"; echo "gid_sample=$GID_SAMPLE";
+  echo "max_prepared_transactions=$MAXPREP"; echo "gid_sample=${GID_SAMPLE:-none-caught-in-flight}";
   echo "faults_recorded=$FAULTS"; echo "workers_lost_observed_by_coordinator=$LOST";
   echo "recovered_after_first_fault=yes";
 } > "$OUT_DIR/verification.txt"
@@ -677,6 +756,28 @@ COMMITTED_DISTINCT=$(psql_q "SELECT count(DISTINCT event_id) FROM public.q2_out"
 { echo "produced_total=$PRODUCED_TOTAL"; echo "committed_distinct=${COMMITTED_DISTINCT:--1}";
 } > "$OUT_DIR/completeness.txt"
 echo "campaign: completeness produced=$PRODUCED_TOTAL committed_distinct=$COMMITTED_DISTINCT"
+
+# The AUTHORITATIVE foreign check. The generator has stopped and its final
+# progress file is now an upper bound, so a committed sequence at or above
+# it is a record this campaign never produced. Mid-flight the verifier
+# deliberately cannot make this call (its snapshot is only a lower bound,
+# and treating it as an upper one made the oracle invent 32 findings on a
+# provably complete run); here it can, and it is cheap.
+AHEAD_PAIRS=$(on_host "$OPS_PUB" "python3 -c \"
+import json;d=json.load(open('/qual/q2-progress.json'));print(' '.join('%s:%s' % (k,v) for k,v in d['produced_high'].items()))\"" 2>/dev/null || echo "")
+FOREIGN_AHEAD=0
+for pair in $AHEAD_PAIRS; do
+    part=${pair%%:*}
+    high=${pair##*:}
+    MAXSEQ=$(psql_q "SELECT coalesce(max(split_part(event_id,'-',2)::bigint),-1) FROM public.q2_out WHERE event_id LIKE 'p${part}-%'" | tr -d '\r')
+    if [ "${MAXSEQ:--1}" -ge "${high:-0}" ]; then
+        echo "campaign: FOREIGN - partition $part committed up to seq $MAXSEQ but the generator" >&2
+        echo "  finished at $high; the sink holds records that were never produced" >&2
+        FOREIGN_AHEAD=$(( FOREIGN_AHEAD + 1 ))
+    fi
+done
+echo "foreign_ahead_partitions=$FOREIGN_AHEAD" >> "$OUT_DIR/completeness.txt"
+echo "campaign: post-drain foreign check: $FOREIGN_AHEAD partition(s) ahead of the generator"
 
 # An orphaned prepared transaction holds locks and blocks vacuum forever.
 # Sampled BEFORE the job is cancelled: at most one in flight per subtask
