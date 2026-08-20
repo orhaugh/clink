@@ -170,8 +170,20 @@ def main() -> int:
     }
     consecutive_errors = 0
 
-    conn = psycopg2.connect(args.dsn)
-    conn.autocommit = True
+    # Bounded everywhere: a PAUSED server (the pg_unavailable fault) hangs
+    # connections and statements rather than refusing them, and an oracle
+    # that can hang is an oracle whose silence reads as judging. The
+    # timeouts turn the outage into counted sample errors, which the
+    # stuck detector below bounds - and the fault's dwell is capped under
+    # that bound, so injected outages can never fail the oracle by
+    # themselves.
+    def connect():
+        c = psycopg2.connect(args.dsn, connect_timeout=5,
+                             options="-c statement_timeout=10000")
+        c.autocommit = True
+        return c
+
+    conn = connect()
 
     while True:
         produced_high = read_progress(args.progress)
@@ -213,8 +225,7 @@ def main() -> int:
                 pass
             time.sleep(5)
             try:
-                conn = psycopg2.connect(args.dsn)
-                conn.autocommit = True
+                conn = connect()
             except psycopg2.Error:
                 pass
             continue

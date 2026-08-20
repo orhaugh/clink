@@ -87,6 +87,27 @@ public:
     int port() const noexcept { return port_; }
     const std::string& container_name() const noexcept { return container_name_; }
 
+    // Freeze / thaw the server - the local model of a Postgres outage
+    // composing with recovery, mirroring DockerKafka's pause contract:
+    // pause is near-instant (a stop loses the race with the recovery
+    // window a gate just opened), connections HANG rather than refuse,
+    // and libpq calls run their own timeouts against the frozen socket.
+    void pause() {
+        if (container_name_.empty()) {
+            return;
+        }
+        const std::string cmd = "docker pause " + container_name_ + " > /dev/null 2>&1";
+        (void)std::system(cmd.c_str());
+    }
+
+    void unpause() {
+        if (container_name_.empty()) {
+            return;
+        }
+        const std::string cmd = "docker unpause " + container_name_ + " > /dev/null 2>&1";
+        (void)std::system(cmd.c_str());
+    }
+
     std::string conninfo() const {
         return "host=127.0.0.1 port=" + std::to_string(port_) +
                " user=postgres password=test dbname=postgres";
@@ -159,6 +180,13 @@ public:
 private:
     void stop() noexcept {
         if (!container_name_.empty()) {
+            // Unpause first: a test that dies mid-outage leaves the
+            // container paused, and docker stop/kill refuse paused
+            // containers on some engine versions - the stray then holds
+            // its port past the test (the DockerKafka teardown lesson).
+            const std::string unpause_cmd =
+                "docker unpause " + container_name_ + " > /dev/null 2>&1";
+            std::system(unpause_cmd.c_str());
             const std::string cmd = "docker stop " + container_name_ + " > /dev/null 2>&1";
             std::system(cmd.c_str());
             container_name_.clear();

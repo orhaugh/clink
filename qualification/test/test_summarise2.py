@@ -15,14 +15,14 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 SUMMARISE = HERE.parent / "qual02" / "summarise.py"
 
-MANDATORY = None  # filled from chaos.py so the fixture stays in lockstep
-sys.path.insert(0, str(HERE.parent / "chaos"))
-from chaos import Chaos  # noqa: E402
+# Filled from the summariser ITSELF so the fixture stays in lockstep by
+# construction: QUAL-02's mandatory set diverged from the shared chaos
+# list once (the Kafka-only ack-window point made PASS unreachable), and
+# a fixture pinned to the wrong source would have hidden exactly that.
+sys.path.insert(0, str(HERE.parent / "qual02"))
+import summarise as q2_summarise  # noqa: E402
 
-MANDATORY = [
-    "worker_sigkill", "coordinator_restart", "broker_restart",
-    "network_latency", "partition_from_coordinator",
-] + [f"twopc_fired:{p}" for p in Chaos.TWOPC_POINTS]
+MANDATORY = list(q2_summarise.MANDATORY_EVENTS)
 
 
 def write_evidence(d, *, findings, stuck, quiesced, produced, committed,

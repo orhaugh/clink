@@ -23,8 +23,22 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "chaos"))
-from chaos import Chaos  # noqa: E402  (single source of truth for the fault points)
+# The 2PC points THIS campaign's sink family can fire. The Postgres sink
+# rides the CommittingSink prepare/commit path plus the coordinator's
+# completion markers; it has NO commit receipt, so the Kafka-only
+# sink.between_commit_and_receipt is deliberately absent - requiring it
+# made PASS structurally unreachable (the point never fires outside the
+# Kafka sink, and --ensure-coverage chased it forever). campaign.sh reads
+# this tuple as its --twopc-points, so the schedule and this gate cannot
+# drift apart.
+TWOPC_POINTS = (
+    "sink.before_prepare",
+    "sink.after_prepare",
+    "coordinator.before_completed_marker",
+    "coordinator.after_completed_marker",
+    "sink.before_commit",
+    "sink.after_external_commit",
+)
 
 MANDATORY_EVENTS = (
     "worker_sigkill",
@@ -32,7 +46,12 @@ MANDATORY_EVENTS = (
     "broker_restart",
     "network_latency",
     "partition_from_coordinator",
-) + tuple(f"twopc_fired:{p}" for p in Chaos.TWOPC_POINTS)
+    # QUAL-02's decisive composition: the external server down while
+    # recovery needs it. Both halves are required - an injected outage
+    # that never healed judged nothing.
+    "pg_unavailable",
+    "pg_restored",
+) + tuple(f"twopc_fired:{p}" for p in TWOPC_POINTS)
 
 
 def load_json(path, default=None):

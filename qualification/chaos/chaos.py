@@ -82,13 +82,21 @@ class Rig:
 
 class Chaos:
     def __init__(self, rig: Rig, coordinator_url: str, job_id: str,
-                 log_path: str, run_id: str, rng: random.Random):
+                 log_path: str, run_id: str, rng: random.Random,
+                 twopc_points=None):
         self.rig = rig
         self.coordinator_url = coordinator_url.rstrip("/")
         self.job_id = job_id
         self.log_path = log_path
         self.run_id = run_id
         self.rng = rng
+        # The 2PC points this CAMPAIGN can actually fire. The full class
+        # list is the Kafka set; a campaign whose sink family lacks a point
+        # (QUAL-02: the CommittingSink path has no commit receipt, so
+        # sink.between_commit_and_receipt exists only in the Kafka sink)
+        # must exclude it, or --ensure-coverage chases an unfireable point
+        # and the summariser's required-coverage gate can never PASS.
+        self.twopc_points = tuple(twopc_points) if twopc_points else self.TWOPC_POINTS
         self._fault_surface = None
         # (host, container) -> the image it was first seen running, so a
         # restart that brings it back on a different build is caught.
@@ -359,6 +367,39 @@ class Chaos:
             self.rig.ssh(host, "docker start redpanda")
         self.record("all-brokers", "kafka_restored", "down", ckpt)
 
+    def pg_unavailable(self, state, ckpt):
+        """The Postgres server frozen briefly - QUAL-02's decisive
+        composition. A prepared transaction outlives its session, so a
+        worker-loss recovery mid-outage meets a server that cannot answer
+        COMMIT PREPARED or the open()-time reconcile; the sink must retry
+        through the restart cycle and never resolve a gid blind. Pause,
+        not stop: instant, and connections hang the way the local gate
+        (APostgresOutageDuringRecoveryStaysExactlyOnce) models."""
+        # Postgres rides the OPS host on the QUAL-02 rig (outside the clink
+        # failure domain, next to the oracle). The fault targets the
+        # container by name, so the host role is wherever compose put it.
+        hosts = self.rig.hosts("postgres") or self.rig.hosts("ops")
+        if not hosts:
+            self.record("cluster", "pg_unavailable_no_host", state, ckpt,
+                        {"note": "no postgres or ops host in this rig's "
+                                 "inventory; fault skipped"})
+            return
+        # Capped at 40s: the verifier declares itself STUCK - a failed
+        # campaign - after 10 consecutive failed samples (~50s with its 5s
+        # retry cadence plus a 10s statement timeout). The fault must
+        # never be able to fail the oracle on its own; the composition it
+        # exists for (recovery meeting a dead server) forms well inside
+        # 40 seconds, as the local gate proves in an 8s dwell.
+        dur = self.rng.uniform(20, 40)
+        for host in hosts:
+            self.rig.ssh(host, "docker pause qual02-postgres")
+        self.record("postgres", "pg_unavailable", state, ckpt,
+                    {"duration_s": round(dur, 1)})
+        time.sleep(dur)
+        for host in hosts:
+            self.rig.ssh(host, "docker unpause qual02-postgres")
+        self.record("postgres", "pg_restored", "down", ckpt)
+
     def fault_surface_present(self) -> bool:
         """Whether the deployed build has fault-injection points compiled
         in. A shipped runtime image does NOT: every CLINK_FAULT_POINT
@@ -426,7 +467,7 @@ class Chaos:
             self.kill_worker(state, ckpt)
             return
         if point is None:
-            point = self.rng.choice(list(self.TWOPC_POINTS))
+            point = self.rng.choice(list(self.twopc_points))
         is_coordinator = point.startswith("coordinator.")
         compose = "coordinator.yml" if is_coordinator else "worker.yml"
         service = "clink-coordinator" if is_coordinator else "clink-worker"
@@ -549,12 +590,16 @@ def oracle_error_total(verdict_path: str):
 # short soak out of clock with the commit-side points unfired. The quick
 # infra kill/restarts close. Order is scheduling, not contract - the
 # summariser's coverage gate is the contract.
-MANDATORY_FAULTS = ("kill_worker",) + tuple(f"twopc:{p}" for p in Chaos.TWOPC_POINTS) + (
-    "kill_coordinator",
-    "restart_broker",
-    "network_latency",
-    "partition_worker_from_coordinator",
-)
+def mandatory_faults(twopc_points):
+    # kill_worker leads (the verification gate reads the worker-loss
+    # counter), then the campaign's fireable 2PC points, then the infra
+    # faults - the QUAL-01 smoke-b/c ordering lessons, kept per campaign.
+    return ("kill_worker",) + tuple(f"twopc:{p}" for p in twopc_points) + (
+        "kill_coordinator",
+        "restart_broker",
+        "network_latency",
+        "partition_worker_from_coordinator",
+    )
 
 
 def main() -> int:
@@ -566,6 +611,18 @@ def main() -> int:
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--key-file", default="/root/.ssh/id_ed25519")
     ap.add_argument("--profile", default="steady", choices=sorted(PROFILES))
+    ap.add_argument("--extra-faults", default="",
+                    help="comma-separated extra fault actions this campaign "
+                         "schedules (weight 2 each) and REQUIRES for "
+                         "coverage - e.g. pg_unavailable for QUAL-02, whose "
+                         "decisive composition is the external server down "
+                         "during a recovery")
+    ap.add_argument("--twopc-points", default="",
+                    help="comma-separated 2PC points this campaign's sink "
+                         "family can actually fire (default: the full Kafka "
+                         "set). Coverage and the mandatory schedule follow "
+                         "this list - naming an unfireable point makes PASS "
+                         "unreachable, omitting a fireable one untests it.")
     ap.add_argument("--duration-s", type=int, default=0)
     ap.add_argument("--min-gap-s", type=int, default=120,
                     help="minimum settle time between faults; recovery must "
@@ -592,19 +649,28 @@ def main() -> int:
 
     rig = Rig(args.inventory, args.key_file)
     rng = random.Random(args.seed)
+    twopc_points = (tuple(p for p in args.twopc_points.split(",") if p)
+                    if args.twopc_points else None)
     chaos = Chaos(rig, args.coordinator_url, args.job_id, args.log,
-                  args.run_id, rng)
+                  args.run_id, rng, twopc_points=twopc_points)
 
     weighted = []
     for name, weight in PROFILES[args.profile]:
         weighted.extend([name] * weight)
+    # Campaign-specific extras recur through the soak, not only in the
+    # coverage pre-pass: QUAL-02's pg_unavailable must keep composing with
+    # whatever the dice put next to it, exactly as QUAL-01's broker faults
+    # did when they found the fencing defect.
+    for name in (f for f in args.extra_faults.split(",") if f):
+        weighted.extend([name] * 2)
 
     # The deterministic coverage pre-pass, then the weighted-random soak.
     # Run C became dirty before random selection ever reached the ordinary
     # kill_coordinator action; a verdict must never depend on that luck.
     schedule = []
     if args.ensure_coverage:
-        for name in MANDATORY_FAULTS:
+        extra = tuple(f for f in args.extra_faults.split(",") if f)
+        for name in mandatory_faults(chaos.twopc_points) + extra:
             schedule.append(name)
 
     started = time.time()

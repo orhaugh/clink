@@ -458,10 +458,18 @@ echo "$GID_SAMPLE" > "$OUT_DIR/gid-sample.txt"
 #    finding-shaped; the watch loop below owns fail-fast instead.
 # Padded past the soak deadline (the controller's clock starts before the
 # soak's does); the drain stops it via its stop file, orderly.
+# The fireable 2PC point set comes from summarise.py's TWOPC_POINTS -
+# one source of truth, so the chaos schedule can never require a point
+# the summariser does not, nor the reverse (QUAL-02's original wiring
+# imported the full Kafka list and PASS was structurally unreachable:
+# sink.between_commit_and_receipt exists only in the Kafka sink).
+Q2_POINTS=$(cd "$(dirname "$0")" && python3 -c "import summarise; print(','.join(summarise.TWOPC_POINTS))")
+[ -n "$Q2_POINTS" ] || { echo "campaign: could not derive the 2PC point set from summarise.py" >&2; exit 78; }
 start_on_host "$OPS_PUB" q2-chaos.log "python3 chaos.py --inventory /qual/inventory.json \
     --log /qual/q2-chaos.jsonl --coordinator-url http://${COORD_PRIV}:8095 \
     --job-id $JOB_ID --run-id $RUN_ID --profile $PROFILE --seed $SEED \
-    --min-gap-s ${MIN_GAP_S:-120} \
+    --min-gap-s ${MIN_GAP_S:-120} --twopc-points $Q2_POINTS \
+    --extra-faults pg_unavailable \
     --duration-s $(( DURATION_S + 1800 )) --ensure-coverage"
 echo "campaign: chaos started (${DURATION_H}h, profile=$PROFILE, coverage-first)"
 

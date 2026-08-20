@@ -335,6 +335,86 @@ TEST_F(PostgresExactlyOnceTest, AWorkerKilledInsideTheCommitWindowStaysExactlyOn
            "reconcile did not resolve every gid";
 }
 
+// QUAL-01's decisive composition, transposed to the recoverable-commit
+// model: the EXTERNAL system goes down while a worker-loss recovery needs
+// it. A worker dies inside a held commit window (a prepared transaction is
+// durably on the server, its commit outstanding), Postgres is then PAUSED,
+// and the restarted sink's open()-time reconcile - COMMIT PREPARED for
+// gids in restored state, ROLLBACK PREPARED for its own orphans - meets a
+// frozen server. The contract under test: the reconcile must fail the
+// subtask loudly and retry through the restart cycle (bounded libpq
+// waits, tolerated by the 120s drain deadline), never decide a gid's fate
+// blind, and converge on the heal with every row exactly once and no
+// prepared transaction left behind. On the Kafka side this composition is
+// where the campaign found blind fencing; here the deterministic gids and
+// server-held prepared state carry the evidence across the outage, and
+// this gate pins that they actually do.
+TEST_F(PostgresExactlyOnceTest, APostgresOutageDuringRecoveryStaysExactlyOnce) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.start_worker(1, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/6);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+    // Vacuity guard, as in the commit-window gate: the kill must land on a
+    // provably open commit window.
+    ASSERT_TRUE(clink::itest::await([&] { return prepared_count() > 0; }, 30s))
+        << "no prepared transaction appeared; the commit window never opened";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    // Freeze the server BEFORE the recovery's reconcile can reach it. The
+    // kill was inside the window, so at least one prepared transaction is
+    // stranded server-side and the redeploying sink MUST talk to Postgres
+    // to resolve it - against a paused container that conversation hangs
+    // on its own bounded timeouts, the subtask fails loudly, and the
+    // restart cycle carries the retries.
+    pg_->pause();
+    // Return the worker (the campaign's supervisor would); the job churns
+    // against the frozen server - the composition the rig's fault schedule
+    // creates - and MUST NOT resolve anything blind.
+    ASSERT_TRUE(c.start_worker(0, {}));
+    // Non-vacuity, two halves. The recovery engaged:
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return c.count_in_coordinator_log("whole-job restart") > 0 ||
+                   c.count_in_coordinator_log("restart waiting for capacity") > 0;
+        },
+        60s))
+        << "the recovery never engaged while the server was frozen";
+    // ...and the freeze genuinely bit it: the sink cannot PREPARE against a
+    // paused server, so no checkpoint may complete while it is frozen. A
+    // broken pause() sails through this window completing checkpoints and
+    // reds here rather than passing the gate vacuously. The eight seconds
+    // double as guaranteed composition dwell.
+    const auto stalled_at = latest_completed(c.checkpoint_dir());
+    EXPECT_FALSE(
+        clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > stalled_at; }, 8s))
+        << "a checkpoint completed against a frozen server; the outage never composed";
+
+    pg_->unpause();
+
+    const auto code = sub->await_exit(180s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover once the server returned";
+
+    const auto v = clink::itest::verify_exactly_once_records(rows(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a Postgres outage during recovery broke exactly-once: "
+                           << clink::itest::describe(v);
+    EXPECT_EQ(prepared_count(), 0)
+        << "the run completed but a prepared transaction is still pending; the reconcile "
+           "did not resolve every gid across the outage";
+}
+
 // The longer-horizon arm: thirty times the records of the file suite, two
 // separated worker losses, and the same exact verdict. Long enough for many
 // checkpoint cycles (and their prepared-transaction churn) to expose drift a
