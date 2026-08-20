@@ -30,7 +30,7 @@ IMAGE="${IMAGE:?set IMAGE to the published tag, e.g. ghcr.io/orhaugh/clink-runti
 OUT_DIR="$REPO_ROOT/qualification-results/$RUN_ID"
 KEY_FILE="${SSH_KEY_FILE:-$HOME/.ssh/clink-qual-ed25519}"
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
 on_host() { ssh -n "${SSH_OPTS[@]}" "root@$1" "$2"; }
 
 [ -f "$OUT_DIR/inventory.json" ] || { echo "pull-image: no inventory at $OUT_DIR/inventory.json" >&2; exit 2; }

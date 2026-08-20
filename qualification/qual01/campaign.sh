@@ -53,6 +53,15 @@ OUT_DIR="$REPO_ROOT/qualification-results/$RUN_ID"
 # stub - see qualification/test/test_campaign.sh - and so a build in a
 # non-default directory does not need the script edited.
 SUBMIT_BIN="${SUBMIT_BIN:-$REPO_ROOT/build/clink_submit_sql}"
+# Host-side prerequisites are validated BEFORE any server is provisioned:
+# a missing submit binary discovered at submit time has already paid for
+# a full provision + image pull (qual01-smoke-d died exactly there, seven
+# minutes and four servers in).
+if [ ! -x "$SUBMIT_BIN" ]; then
+    echo "campaign: SUBMIT_BIN missing or not executable: $SUBMIT_BIN" >&2
+    echo "campaign: build clink_submit_sql in $REPO_ROOT/build or set SUBMIT_BIN" >&2
+    exit 78
+fi
 mkdir -p "$OUT_DIR"
 # A relaunch reusing a RUN_ID must not inherit the previous attempt's
 # evidence: the watch loop reads $OUT_DIR/verdict.json BEFORE the first
@@ -65,7 +74,7 @@ rm -f "$OUT_DIR/verdict.json" "$OUT_DIR/job-gone.txt" "$OUT_DIR/chaos-died.txt" 
       "$OUT_DIR/failure.txt" "$OUT_DIR/job-status.json" "$OUT_DIR/verification.txt" \
       "$OUT_DIR/chaos.jsonl" "$OUT_DIR/progress.json"
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
 on_host() { ssh -n "${SSH_OPTS[@]}" "root@$1" "$2"; }
 to_host()  { scp "${SSH_OPTS[@]}" -q "$2" "root@$1:$3"; }
 

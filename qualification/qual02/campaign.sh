@@ -60,6 +60,15 @@ WATCH_MAX_LOOPS="${WATCH_MAX_LOOPS:-0}"
 JOB_PROBE_INTERVAL_S="${JOB_PROBE_INTERVAL_S:-10}"
 FINAL_WAIT_S="${FINAL_WAIT_S:-600}"
 
+# Host-side prerequisites before any provisioning spend (same guard as
+# qual01: a missing submit binary must fail at second zero, not at submit
+# time on a live rig).
+SUBMIT_BIN="${SUBMIT_BIN:-$REPO_ROOT/build/clink_submit_sql}"
+if [ ! -x "$SUBMIT_BIN" ]; then
+    echo "campaign: SUBMIT_BIN missing or not executable: $SUBMIT_BIN" >&2
+    exit 78
+fi
+
 mkdir -p "$OUT_DIR"
 # A relaunch reusing a RUN_ID must not inherit the previous attempt's
 # evidence: the watch loop reads the pulled verdict before the first scp
@@ -70,7 +79,7 @@ rm -f "$OUT_DIR/q2-verdict.json" "$OUT_DIR/q2-chaos.jsonl" "$OUT_DIR/q2-progress
       "$OUT_DIR/verification.txt" "$OUT_DIR/completeness.txt" "$OUT_DIR/job-status.json" \
       "$OUT_DIR/QUAL-02-summary.md"
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
 on_host() { ssh -n "${SSH_OPTS[@]}" "root@$1" "$2"; }
 to_host()  { scp "${SSH_OPTS[@]}" -q "$2" "root@$1:$3"; }
 

@@ -44,7 +44,7 @@ IMAGE_TAG="${IMAGE_TAG:-clink-runtime:qual}"
 FAULT_INJECTION=OFF
 [ "${1:-}" = "--fault-injection" ] && FAULT_INJECTION=ON
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
 on_host() { ssh "${SSH_OPTS[@]}" "root@$1" "$2"; }
 
 [ -f "$OUT_DIR/inventory.json" ] || { echo "build-image: no inventory at $OUT_DIR/inventory.json" >&2; exit 2; }
