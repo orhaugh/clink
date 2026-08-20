@@ -219,6 +219,19 @@ TEST(Cluster, CoordinatorWorkerDistributedProducerConsumer) {
     coordinator.stop();
 }
 
+// The restart drain deadline's DEFAULT must dominate the worst legitimate
+// drain, not the typical one: a 2PC sink cancelled mid-call against an
+// unreachable broker sits in bounded client operations (produce, flush,
+// commit at up to ~30s each, and the Kafka sink's pre-fence describe holds
+// open() for up to 90s) before it can observe the cancel. A default below
+// that read a slow-but-live survivor as wedged and FAILED the job
+// mid-broker-outage - the qualification campaign's soak watch item 63,
+// reproduced by the orphaned-commit gate. This pins the floor so a future
+// "tidy the timeouts" pass cannot silently reintroduce it.
+TEST(Cluster, RestartDrainDeadlineDefaultDominatesBoundedSinkCalls) {
+    EXPECT_GE(Coordinator::Config{}.restart_drain_timeout, std::chrono::milliseconds{120000});
+}
+
 // Heartbeat watchdog detects a worker that registers but stops sending
 // heartbeats. The coordinator marks it lost, synthesises errors for any pending
 // tasks, and unblocks await_completion.

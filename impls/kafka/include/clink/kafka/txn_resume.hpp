@@ -141,6 +141,27 @@ struct DescribeState {
     const ConnectFn& connect,
     const ResumeAuth& auth = {});
 
+// The pre-fence orphan verdict: does the observed coordinator state PROVE
+// that the staged producer's prepared transaction committed? True only for
+// a commit decision (CompleteCommit, or PrepareCommit - decided, being
+// completed) under EXACTLY the staged identity: a different producer id or
+// epoch means the state describes some other generation's transaction, and
+// treating it as this orphan's commit would arm replay suppression for
+// panes that were never published (data loss, the inverse failure of the
+// duplicate this verdict exists to prevent). Everything else - Ongoing,
+// the abort states, Empty, an unknown string - is "not proven": the
+// producer open that follows aborts an undecided transaction, and the
+// restore's replay legitimately re-produces the interval. Pure so the
+// mapping is unit-tested state by state; the 2PC sink's open() is the
+// caller.
+[[nodiscard]] inline bool orphan_commit_proven(const DescribeState& observed,
+                                               std::int64_t staged_producer_id,
+                                               std::int16_t staged_producer_epoch) noexcept {
+    const bool ours = observed.producer_id == staged_producer_id &&
+                      observed.producer_epoch == staged_producer_epoch;
+    return ours && (observed.state == "CompleteCommit" || observed.state == "PrepareCommit");
+}
+
 // --- wire encoding, exposed for the frame tests -----------------------------
 
 namespace wire {

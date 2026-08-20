@@ -845,9 +845,7 @@ private:
         }
         const bool ours =
             verdict->producer_id == handle_pid && verdict->producer_epoch == handle_epoch;
-        const bool committed_state =
-            verdict->state == "CompleteCommit" || verdict->state == "PrepareCommit";
-        if (ours && committed_state) {
+        if (clink::kafka::orphan_commit_proven(*verdict, handle_pid, handle_epoch)) {
             if (wm.empty()) {
                 this->runtime()->log_error(
                     std::string{"kafka_2pc_sink_string: orphaned transaction for checkpoint "} +

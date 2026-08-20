@@ -158,20 +158,65 @@ void send_response(int fd, std::int32_t correlation, const std::vector<std::uint
 std::vector<std::uint8_t> api_versions_body(std::int16_t fc_min,
                                             std::int16_t fc_max,
                                             std::int16_t et_min,
-                                            std::int16_t et_max) {
+                                            std::int16_t et_max,
+                                            std::int16_t dt_min = 0,
+                                            std::int16_t dt_max = 0) {
     std::vector<std::uint8_t> b;
     const auto put16 = [&](std::int16_t v) {
         b.push_back(static_cast<std::uint8_t>((static_cast<std::uint16_t>(v) >> 8) & 0xFF));
         b.push_back(static_cast<std::uint8_t>(static_cast<std::uint16_t>(v) & 0xFF));
     };
     put16(0);  // error_code
-    b.insert(b.end(), {0, 0, 0, 2});
+    b.insert(b.end(), {0, 0, 0, 3});
     put16(wire::kFindCoordinatorKey);
     put16(fc_min);
     put16(fc_max);
     put16(wire::kEndTxnKey);
     put16(et_min);
     put16(et_max);
+    put16(wire::kDescribeTransactionsKey);
+    put16(dt_min);
+    put16(dt_max);
+    return b;
+}
+
+// DescribeTransactions v0 response, exactly as far as the client's parser
+// consumes it: flexible header tag buffer, throttle, a one-entry states
+// array of [error, echoed id, state, timeout, start_time, pid, epoch].
+// The unconsumed remainder (topics array, tag buffers) is deliberately
+// absent - the parser must not require it.
+std::vector<std::uint8_t> describe_transactions_body(std::int16_t error,
+                                                     const std::string& txn_id,
+                                                     const std::string& state,
+                                                     std::int64_t pid,
+                                                     std::int16_t epoch) {
+    std::vector<std::uint8_t> b;
+    const auto put16 = [&](std::int16_t v) {
+        b.push_back(static_cast<std::uint8_t>((static_cast<std::uint16_t>(v) >> 8) & 0xFF));
+        b.push_back(static_cast<std::uint8_t>(static_cast<std::uint16_t>(v) & 0xFF));
+    };
+    const auto put64 = [&](std::int64_t v) {
+        for (int i = 7; i >= 0; --i) {
+            b.push_back(
+                static_cast<std::uint8_t>((static_cast<std::uint64_t>(v) >> (i * 8)) & 0xFF));
+        }
+    };
+    const auto put_compact = [&](const std::string& s) {
+        b.push_back(static_cast<std::uint8_t>(s.size() + 1));  // uvarint, short strings only
+        for (const char c : s) {
+            b.push_back(static_cast<std::uint8_t>(c));
+        }
+    };
+    b.push_back(0);                   // header tag buffer
+    b.insert(b.end(), {0, 0, 0, 0});  // throttle
+    b.push_back(2);                   // states: COMPACT_ARRAY length+1
+    put16(error);
+    put_compact(txn_id);
+    put_compact(state);
+    b.insert(b.end(), {0, 0, 0x3A, 0x98});  // timeout_ms 15000
+    put64(1);                               // start_time_ms
+    put64(pid);
+    put16(epoch);
     return b;
 }
 
@@ -291,12 +336,16 @@ public:
                         std::int16_t fc_max = 4,
                         std::int16_t et_min = 0,
                         std::int16_t et_max = 4,
-                        FakeSasl sasl = {})
+                        FakeSasl sasl = {},
+                        std::int16_t dt_min = 0,
+                        std::int16_t dt_max = 0)
         : end_txn_error_(end_txn_error),
           fc_min_(fc_min),
           fc_max_(fc_max),
           et_min_(et_min),
           et_max_(et_max),
+          dt_min_(dt_min),
+          dt_max_(dt_max),
           sasl_(std::move(sasl)) {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in addr{};
@@ -328,6 +377,14 @@ public:
     [[nodiscard]] std::vector<std::vector<std::uint8_t>> end_txn_bodies() const {
         std::lock_guard lock(mu_);
         return end_txn_bodies_;
+    }
+    // Script what DescribeTransactions answers (defaults: CompleteCommit
+    // under pid 42 epoch 3 - the identity() fixture).
+    void set_describe(std::string state, std::int64_t pid, std::int16_t epoch) {
+        std::lock_guard lock(mu_);
+        describe_state_ = std::move(state);
+        describe_pid_ = pid;
+        describe_epoch_ = epoch;
     }
     // The SaslAuthenticate auth_bytes each connection presented, in arrival
     // order - one entry per authenticated connection.
@@ -405,7 +462,22 @@ private:
                 return;
             } else if (req.api_key == wire::kApiVersionsKey) {
                 send_response(
-                    fd, req.correlation, api_versions_body(fc_min_, fc_max_, et_min_, et_max_));
+                    fd,
+                    req.correlation,
+                    api_versions_body(fc_min_, fc_max_, et_min_, et_max_, dt_min_, dt_max_));
+            } else if (req.api_key == wire::kDescribeTransactionsKey) {
+                std::string state;
+                std::int64_t pid = 0;
+                std::int16_t epoch = 0;
+                {
+                    std::lock_guard lock(mu_);
+                    state = describe_state_;
+                    pid = describe_pid_;
+                    epoch = describe_epoch_;
+                }
+                send_response(fd,
+                              req.correlation,
+                              describe_transactions_body(0, "resume-me", state, pid, epoch));
             } else if (req.api_key == wire::kFindCoordinatorKey) {
                 // The coordinator is this same fake broker.
                 send_response(fd, req.correlation, find_coordinator_body(0, "127.0.0.1", port_));
@@ -423,6 +495,10 @@ private:
 
     std::int16_t end_txn_error_;
     std::int16_t fc_min_, fc_max_, et_min_, et_max_;
+    std::int16_t dt_min_, dt_max_;
+    std::string describe_state_{"CompleteCommit"};
+    std::int64_t describe_pid_{42};
+    std::int16_t describe_epoch_{3};
     FakeSasl sasl_;
     int listen_fd_{-1};
     std::uint16_t port_{0};
@@ -468,10 +544,29 @@ TEST(TxnResume, HappyPathCommitsAndSendsTheExactIdentity) {
 
 TEST(TxnResume, AFencedProducerIsRefusedNeverClaimedCommitted) {
     FakeBroker broker(/*end_txn_error=*/90);  // PRODUCER_FENCED
+    // The fenced disambiguation asks DescribeTransactions; when the state
+    // record does not prove OUR commit (here: the id is Empty under a
+    // foreign identity), the refusal must stand.
+    broker.set_describe("Empty", -1, -1);
     const auto outcome =
         clink::kafka::resume_commit("127.0.0.1", broker.port(), identity(), plain_connect());
     EXPECT_EQ(outcome.status, ResumeOutcome::Status::Refused);
     EXPECT_NE(outcome.detail.find("PRODUCER_FENCED"), std::string::npos) << outcome.detail;
+}
+
+TEST(TxnResume, AFencedEndTxnIsDisambiguatedByDescribeWhenTheCommitLanded) {
+    // The staged epoch is chronically one commit stale (it rides the
+    // statistics callback while the broker bumps per commit), so a
+    // COMMITTED transaction can answer EndTxn with PRODUCER_FENCED. The
+    // resolver must then read CompleteCommit under our producer id - at
+    // or above the staged epoch - as the commit landing, not a refusal:
+    // the refusal path replays the committed interval as duplicates.
+    FakeBroker broker(/*end_txn_error=*/90);
+    broker.set_describe("CompleteCommit", 42, /*epoch=*/4);
+    const auto outcome =
+        clink::kafka::resume_commit("127.0.0.1", broker.port(), identity(), plain_connect());
+    EXPECT_TRUE(outcome.committed()) << outcome.detail;
+    EXPECT_NE(outcome.detail.find("stale-epoch artefact"), std::string::npos) << outcome.detail;
 }
 
 TEST(TxnResume, ABrokerWithoutTheSpokenVersionsIsUnsupported) {
@@ -503,6 +598,83 @@ TEST(TxnResume, AnUnreachableBrokerIsATransportErrorAfterBoundedAttempts) {
 }
 
 // --- the registered resolver end to end ---------------------------------------
+
+// --- the read-only describe probe + the pre-fence orphan verdict -------------
+//
+// describe_transaction_state is what the 2PC sink's open() asks BEFORE its
+// init_transactions fences a predecessor whose walk ended unresolved, and
+// what the recovery gates poll while awaiting broker-side expiry. It must
+// never mutate broker state, so its coverage here is the read path only:
+// the dialogue, the transport fallback, and the version guard.
+
+TEST(TxnResume, TheDescribeProbeReadsStateAndIdentity) {
+    FakeBroker broker;
+    const auto st = clink::kafka::describe_transaction_state(
+        "127.0.0.1", broker.port(), "resume-me", plain_connect());
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st->state, "CompleteCommit");
+    EXPECT_EQ(st->producer_id, 42);
+    EXPECT_EQ(st->producer_epoch, 3);
+    EXPECT_TRUE(broker.end_txn_bodies().empty())
+        << "the READ-ONLY probe must never send EndTxn - an EndTxn executes a commit";
+}
+
+TEST(TxnResume, TheDescribeProbeIsNulloptAgainstAnUnreachableBroker) {
+    const auto st =
+        clink::kafka::describe_transaction_state("127.0.0.1", 1, "resume-me", plain_connect());
+    EXPECT_FALSE(st.has_value());
+}
+
+TEST(TxnResume, TheDescribeProbeRefusesABrokerWithoutTheVersion) {
+    // DescribeTransactions advertised only from v1: this module speaks v0
+    // and must answer "no verdict" rather than guess at an encoding.
+    FakeBroker broker(/*end_txn_error=*/0,
+                      /*fc_min=*/0,
+                      /*fc_max=*/4,
+                      /*et_min=*/0,
+                      /*et_max=*/4,
+                      FakeSasl{},
+                      /*dt_min=*/1,
+                      /*dt_max=*/4);
+    const auto st = clink::kafka::describe_transaction_state(
+        "127.0.0.1", broker.port(), "resume-me", plain_connect());
+    EXPECT_FALSE(st.has_value());
+}
+
+// The verdict mapping the sink applies to what describe returns. Proving a
+// commit arms replay suppression for the orphan's panes; a false positive
+// here is DATA LOSS (suppressing panes never published), a false negative
+// is the rig-night duplicate. Every state the Kafka transaction
+// coordinator can report is pinned, under matching and foreign identities.
+TEST(TxnResume, TheOrphanVerdictProvesOnlyCommitDecisionsUnderTheStagedIdentity) {
+    using clink::kafka::DescribeState;
+    using clink::kafka::orphan_commit_proven;
+    const auto observed = [](std::string state, std::int64_t pid = 42, std::int16_t epoch = 3) {
+        DescribeState d;
+        d.state = std::move(state);
+        d.producer_id = pid;
+        d.producer_epoch = epoch;
+        return d;
+    };
+    // Commit decisions under the staged identity: proven.
+    EXPECT_TRUE(orphan_commit_proven(observed("CompleteCommit"), 42, 3));
+    EXPECT_TRUE(orphan_commit_proven(observed("PrepareCommit"), 42, 3));
+    // Undecided or abort-side states: never proven - the init's abort and
+    // the restore's replay are the legitimate outcome.
+    EXPECT_FALSE(orphan_commit_proven(observed("Ongoing"), 42, 3));
+    EXPECT_FALSE(orphan_commit_proven(observed("PrepareAbort"), 42, 3));
+    EXPECT_FALSE(orphan_commit_proven(observed("CompleteAbort"), 42, 3));
+    EXPECT_FALSE(orphan_commit_proven(observed("Empty"), 42, 3));
+    EXPECT_FALSE(orphan_commit_proven(observed("Dead"), 42, 3));
+    EXPECT_FALSE(orphan_commit_proven(observed("PrepareEpochFence"), 42, 3));
+    EXPECT_FALSE(orphan_commit_proven(observed(""), 42, 3));
+    // A commit decision under a FOREIGN identity describes some other
+    // generation's transaction: proving it would suppress panes this
+    // orphan never published.
+    EXPECT_FALSE(orphan_commit_proven(observed("CompleteCommit", 43, 3), 42, 3));
+    EXPECT_FALSE(orphan_commit_proven(observed("CompleteCommit", 42, 4), 42, 3));
+    EXPECT_FALSE(orphan_commit_proven(observed("CompleteCommit", -1, -1), 42, 3));
+}
 
 TEST(TxnResume, TheRegisteredResolverDrivesTheWholeChainFromAHandle) {
     const auto resolver = clink::connectors::TxnResumeRegistry::instance().find("kafka_2pc");
