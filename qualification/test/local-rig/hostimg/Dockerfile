@@ -12,6 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         docker.io docker-compose-v2 openssh-server python3-pip \
         iproute2 iptables curl ca-certificates \
+        nfs-kernel-server nfs-common \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /root/.ssh /qual /run/sshd \
     && chmod 700 /root/.ssh
