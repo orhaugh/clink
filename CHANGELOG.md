@@ -1,5 +1,89 @@
 # Changelog
 
+## v0.7.0 (August 2026)
+
+The qualification release. 318 commits whose centre of gravity is one
+question: do the guarantees hold when processes die at the worst possible
+instant? The answer is now published evidence rather than an architecture
+claim.
+
+**QUAL-01: Kafka exactly-once, qualified and published.** A windowed
+aggregation from Kafka through the transactional sink ran two hours on a
+multi-host rig under continuous fault injection - kills armed inside the
+two-phase-commit protocol's own windows, coordinator SIGKILLs, broker
+restarts and outages, network partitions - and an independent seeded oracle
+judged 755/755 windows byte-exact: zero missing, zero duplicates, zero
+foreign. The full report, method and honesty-bounded claims are on the docs
+site under Qualification. The campaign machinery (fault points compiled
+into the runtime, the chaos controller, the oracle) ships in-tree.
+
+**The exactly-once machinery the campaign forced into existence.**
+Commit-confirmed restores (a confirmed checkpoint now means its external
+commits executed); prepared-transaction resume over the Kafka wire protocol
+(orphaned commits finalised at restore-point selection, speaking SASL/PLAIN,
+SCRAM-SHA-256 with server verification, and TLS); durable commit receipts
+written inside the ack window, with replay suppression swallowing exactly
+the re-emissions a receipted commit covers; in-doubt resolution that probes
+every handle, materialises receipts for wire-proven commits, persists
+unresolved orphans as markers, and is cancellable at a deadline without
+abandoning safety; the sink's pre-fence describe, which refuses to open a
+producer while its predecessor's transaction is unknowable - because fencing
+first erases the only evidence of whether it committed. The single-interval
+transaction queue rebuild keeps one checkpoint interval per broker
+transaction under every restart shape.
+
+**Cluster robustness under sustained faults.** Worker commit dispatch and
+the coordinator-contact lease no longer conflate a busy reader with a dead
+peer (a broker-blocked commit or an OS-stalled plugin dlopen severed healthy
+workers' sessions); restarts held on missing capacity wait for workers to
+return instead of failing the job; checkpoint numbering rises above every
+snapshot file any incarnation left on disk, so restart storms cannot
+assemble one checkpoint id from two vintages; superseded coordinators are
+fenced by epoch with real compare-and-set metadata fencing; restart drains
+tolerate sinks legitimately blocked in bounded client calls. Every
+coordination record now sits behind one store seam, with filesystem and S3
+conditional-PUT implementations sharing a typed contract suite.
+
+**Hot rescale.** Changing an eligible operator's parallelism now runs as an
+in-place cutover at a checkpoint barrier - arm, cut, rebind, deploy, swap,
+complete - with only the rescaled operator's subtasks cycling; every
+ineligible or failed attempt falls back to the stop-the-world replan. Jobs
+can declare rescale bounds in the fluent API, and graceful stop-at-savepoint
+lands alongside.
+
+**Production-hardening round closed.** The full F1-F101 board from the
+adversarial audit: among them per-operator key-group slices, restores that
+refuse subtasks a checkpoint never named, real TTL on List/Map/Aggregating/
+Reducing and CEP partial-match state with backend expiry compaction, SQL
+that refuses clauses it used to silently drop, state_ttl genuinely bounding
+the streaming joins, protocol-corrupt receives failing the task instead of
+reading as end-of-input, and fatal signals leaving a stack.
+
+**Compatibility, made explicit.** The control-plane wire protocol is now
+version-negotiated (v2, with v1 peers retained for rolling upgrades); the
+snapshot format version that was only ever written is now enforced at read;
+a compatibility-domain inventory with frozen-bytes fixtures pins each
+encoding; the capabilities manifest declares its schema version and build
+origin. Plugin ABI unchanged (v1).
+
+**Observability and operations.** Real OTLP export - metrics plus lifecycle
+spans for submit, HA recovery and rescale - to any OpenTelemetry collector;
+checkpoint-staleness and restart-kind metrics; per-job state size; a shipped
+Grafana dashboard and a runbook for the shipped alerts; `clink lint
+--from-job` linting what is deployed, cross-checked against the
+delivery-guarantee analyser.
+
+**Testing surface.** Source and sink contract suites where a capability
+claim is a test obligation (the 2PC crash windows run as capability-gated
+obligations against real transaction state - and the source suite corrected
+parquet's record on its first run); libFuzzer targets whose findings become
+permanent regression tests; the SQL differential oracle against a pinned
+reference; content-addressed plugin shipping so bytes travel at most once
+per receiver.
+
+No REST API breaks. Wire protocol v2 negotiates down to v1. Snapshot format
+unchanged (now enforced). Plugin ABI v1 unchanged.
+
 ## v0.6.0 (July 2026)
 
 Two engine improvements, both surfaced by driving the SQL-native AI surface with a
