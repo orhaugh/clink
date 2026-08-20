@@ -88,6 +88,9 @@ nav:
   - Capabilities: capabilities.md
   - SQL: sql.md
   - Benchmarks: benchmarks.md
+  - Qualification:
+      - qualification/README.md
+      - qualification/qual-01-kafka-exactly-once.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md
