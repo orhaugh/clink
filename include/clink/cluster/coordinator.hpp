@@ -861,6 +861,20 @@ private:
         // the Connection; the watcher logic clears this pointer when
         // the client closes so signal_job_completion_locked_ can no-op.
         network::Connection* notify_client_conn{nullptr};
+        // Wire-order guarantee for the submitting client: JobCompleted must
+        // never overtake SubmitJobAck on the connection. The deploy starts
+        // the job BEFORE handle_submit_ writes the ack, and a tiny job can
+        // complete inside that window - its completion push then raced the
+        // ack onto the wire and the submitter read "unexpected reply kind
+        // 106" (ThreadSanitizer's scheduling hit it on every small-job
+        // cluster test from 2026-08-18). While false,
+        // signal_job_completion_locked_ DEFERS its push; handle_submit_
+        // flips it after the ack is sent and flushes the deferral. Defaults
+        // true because only the wire-submit path acks: an in-process or
+        // HTTP submission must never park its completion behind a flag
+        // nothing will flip.
+        bool submit_ack_sent{true};
+        bool completion_push_deferred{false};
         bool completion_signalled{false};
         // Set by handle_cancel_job_ (a client-initiated cancel) BEFORE
         // CancelJob is broadcast to the workers. signal_job_completion uses
@@ -1349,6 +1363,10 @@ private:
     std::vector<PluginBinary> plugins_for_worker_locked_(const JobState& job,
                                                          WorkerConnection& worker);
     void signal_job_completion_locked_(JobState& job);
+    // Build and send the JobCompleted frame to job.notify_client_conn.
+    // Callers hold mu_ and have checked the conn is non-null and the
+    // submit ack is already on the wire (JobState::submit_ack_sent).
+    void push_job_completed_locked_(JobState& job);
     // After every surviving-worker subtask of `job` has drained on
     // awaiting_restart=true, rebuild tasks_by_worker by round-robin
     // assigning the original task set onto survivor workers, reset

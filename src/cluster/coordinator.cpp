@@ -1250,10 +1250,15 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     // than 180s of a kill/return cadence that keeps almost catching up.
     // (The rig-night composite expired the clock across episodes whose
     // workers returned within seconds, each time reading a live recovery
-    // as a dead cluster.)
-    for (auto& [_, jptr] : jobs_) {
-        if (jptr->awaiting_restart) {
-            jptr->restart_capacity_deadline = {};
+    // as a dead cluster.) Under its own mu_ hold: the registration lock
+    // above was deliberately released before joining the replaced session's
+    // reader, and jobs_ is concurrently written by deploys.
+    {
+        std::lock_guard lock(mu_);
+        for (auto& [_, jptr] : jobs_) {
+            if (jptr->awaiting_restart) {
+                jptr->restart_capacity_deadline = {};
+            }
         }
     }
     cv_.notify_all();
@@ -3421,6 +3426,22 @@ void Coordinator::handle_submit_(network::Connection& conn, MessageReader& r) {
         ack.message = e.what();
     }
     send_frame(conn, encode_frame(MessageKind::SubmitJobAck, ack));
+    if (assigned != 0) {
+        // The ack is on the wire; release any completion push that fired
+        // inside the admit-to-ack window (JobState::submit_ack_sent). A tiny
+        // job can finish before this line runs, and its JobCompleted must
+        // never overtake the ack the client reads first.
+        std::lock_guard lock(mu_);
+        if (const auto it = jobs_.find(assigned); it != jobs_.end()) {
+            it->second->submit_ack_sent = true;
+            if (it->second->completion_push_deferred) {
+                it->second->completion_push_deferred = false;
+                if (it->second->notify_client_conn != nullptr) {
+                    push_job_completed_locked_(*it->second);
+                }
+            }
+        }
+    }
 }
 
 JobId Coordinator::allocate_job_id_() {
@@ -3874,6 +3895,9 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         }
     }
     job->notify_client_conn = notify_client_conn;
+    // A wire submission's completion push must wait behind the SubmitJobAck
+    // handle_submit_ has not sent yet (see JobState::submit_ack_sent).
+    job->submit_ack_sent = (notify_client_conn == nullptr);
     job->expected_completion = resolved_plan.tasks.size();
     job->submit_time = std::chrono::steady_clock::now();
     job->topology_version = 1;  // initial deploy is version 1
@@ -6194,27 +6218,40 @@ void Coordinator::signal_job_completion_locked_(JobState& job) {
         }
     }
     if (job.notify_client_conn != nullptr) {
-        JobCompletedMsg jc;
-        jc.job_id = job.id;
-        // A client-initiated cancel always reports !ok with a
-        // dedicated message so the submitter can distinguish "job
-        // failed" from "I asked it to stop". The per-subtask errors
-        // (typically "cancelled" from our run_task_ path, or
-        // truncated-channel diagnostics) are preserved as additional
-        // context in the errors list.
-        if (job.cancel_requested) {
-            jc.ok = false;
-            jc.errors = job.errors;
-            jc.errors.insert(jc.errors.begin(), "cancelled by client");
+        if (!job.submit_ack_sent) {
+            // The submitting client has not been ACKED yet: this job ran to
+            // completion inside handle_submit_'s admit-to-ack window (tiny
+            // jobs do). Pushing now would put JobCompleted on the wire
+            // ahead of SubmitJobAck and the submitter reads a protocol
+            // violation. handle_submit_ flushes this after the ack.
+            job.completion_push_deferred = true;
         } else {
-            jc.ok = job.errors.empty();
-            jc.errors = job.errors;
+            push_job_completed_locked_(job);
         }
-        // Best-effort send under the lock; client_fd is only ever
-        // touched here and at connection teardown.
-        send_frame(*job.notify_client_conn, encode_frame(MessageKind::JobCompleted, jc));
     }
     cv_.notify_all();
+}
+
+void Coordinator::push_job_completed_locked_(JobState& job) {
+    JobCompletedMsg jc;
+    jc.job_id = job.id;
+    // A client-initiated cancel always reports !ok with a
+    // dedicated message so the submitter can distinguish "job
+    // failed" from "I asked it to stop". The per-subtask errors
+    // (typically "cancelled" from our run_task_ path, or
+    // truncated-channel diagnostics) are preserved as additional
+    // context in the errors list.
+    if (job.cancel_requested) {
+        jc.ok = false;
+        jc.errors = job.errors;
+        jc.errors.insert(jc.errors.begin(), "cancelled by client");
+    } else {
+        jc.ok = job.errors.empty();
+        jc.errors = job.errors;
+    }
+    // Best-effort send under the lock; client_fd is only ever
+    // touched here and at connection teardown.
+    send_frame(*job.notify_client_conn, encode_frame(MessageKind::JobCompleted, jc));
 }
 
 void Coordinator::expect_workers(std::vector<std::string> worker_ids) {
