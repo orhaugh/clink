@@ -63,6 +63,7 @@
 #include "clink/core/types.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/state_backend.hpp"
 
@@ -138,6 +139,25 @@ public:
         const std::string blob = serialize(*committable);
         state->put_operator_state(
             this->id(), state_key_(ckpt), StateBackend::ValueView{blob.data(), blob.size()});
+    }
+
+    // The persisted-handle count, read by the sink runner's end-of-stream
+    // gate. The scan runs on the task thread while a commit dispatch may be
+    // finalising on the worker's dispatch thread - the same concurrency the
+    // barrier path already lives with (see the threading note above).
+    [[nodiscard]] std::size_t staged_commits_outstanding() const final {
+        std::size_t n = 0;
+        auto* state = state_backend_();
+        if (state == nullptr)
+            return 0;
+        const std::string prefix = key_prefix_();
+        state->scan_operator_state(this->id(),
+                                   [&](StateBackend::KeyView k, StateBackend::ValueView) {
+                                       const std::string key{k};
+                                       if (key.rfind(prefix, 0) == 0)
+                                           ++n;
+                                   });
+        return n;
     }
 
     void on_commit(std::uint64_t checkpoint_id) final {
@@ -268,7 +288,14 @@ private:
                                        keys.push_back(key);
                                        blobs.emplace_back(v);
                                    });
+        // The count is the forensic witness for restore-time recovery: a
+        // restore that should have re-committed a prepared handle but logs
+        // zero here lost the handle BEFORE this sink opened.
+        clink::log::info("sink.2pc",
+                         "recover_all sub" + std::to_string(subtask_idx_) + ": " +
+                             std::to_string(keys.size()) + " prepared handle(s) to finalise");
         for (std::size_t i = 0; i < keys.size(); ++i) {
+            clink::log::info("sink.2pc", "recovering prepared handle '" + keys[i] + "'");
             recover(deserialize(blobs[i]));
             state->erase_operator_state(this->id(), keys[i]);
         }

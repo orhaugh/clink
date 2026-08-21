@@ -28,6 +28,15 @@ std::vector<std::string> read_all_lines(const std::string& endpoint,
                                         const std::string& bucket,
                                         const std::string& prefix);
 
+// The visible objects under `prefix`, as "key (N bytes)" strings in key
+// order. The forensic companion to read_all_lines: when a verdict finds
+// records missing, this shows which per-(subtask, checkpoint) object is
+// absent or truncated.
+std::vector<std::string> list_objects(const std::string& endpoint,
+                                      const std::string& region,
+                                      const std::string& bucket,
+                                      const std::string& prefix);
+
 // The number of multipart uploads initiated under `prefix` and neither
 // completed nor aborted. Staged-but-uncommitted output sits here; so do
 // uploads orphaned by a crash before their checkpoint became durable

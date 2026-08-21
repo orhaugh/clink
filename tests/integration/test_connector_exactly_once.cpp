@@ -34,7 +34,7 @@
 
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_kafka.hpp"
-#include "tests/integration/docker_localstack.hpp"
+#include "tests/integration/docker_minio.hpp"
 #include "tests/integration/docker_postgres.hpp"
 #include "tests/integration/two_pc_output.hpp"
 
@@ -1064,10 +1064,10 @@ const auto* const kClinkS3Lifecycle =
 class S3ExactlyOnceTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
-        if (!clink::test::DockerLocalstack::docker_available()) {
+        if (!clink::test::DockerMinio::docker_available()) {
             return;  // per-test SetUp skips
         }
-        s3_ = new clink::test::DockerLocalstack();
+        s3_ = new clink::test::DockerMinio();
     }
 
     static void TearDownTestSuite() {
@@ -1076,7 +1076,7 @@ protected:
     }
 
     void SetUp() override {
-        if (!clink::test::DockerLocalstack::docker_available()) {
+        if (!clink::test::DockerMinio::docker_available()) {
             GTEST_SKIP() << "Docker or curl not available; skipping S3 exactly-once suite";
         }
         if (!std::filesystem::exists(node_binary()) || !std::filesystem::exists(submit_binary()) ||
@@ -1090,8 +1090,8 @@ protected:
         std::transform(bucket_.begin(), bucket_.end(), bucket_.begin(), [](unsigned char ch) {
             return static_cast<char>(std::tolower(ch));
         });
-        ::setenv("AWS_ACCESS_KEY_ID", "test", 1);
-        ::setenv("AWS_SECRET_ACCESS_KEY", "test", 1);
+        ::setenv("AWS_ACCESS_KEY_ID", clink::test::DockerMinio::access_key().c_str(), 1);
+        ::setenv("AWS_SECRET_ACCESS_KEY", clink::test::DockerMinio::secret_key().c_str(), 1);
         ::setenv("AWS_EC2_METADATA_DISABLED", "true", 1);
         clink::s3::ensure_bucket(s3_->endpoint(), "us-east-1", bucket_);
         ::setenv("CLINK_S3_BUCKET", bucket_.c_str(), 1);
@@ -1110,11 +1110,11 @@ protected:
         return submit_job(c, s3_2pc_job(), max_restarts);
     }
 
-    static clink::test::DockerLocalstack* s3_;
+    static clink::test::DockerMinio* s3_;
     std::string bucket_;
 };
 
-clink::test::DockerLocalstack* S3ExactlyOnceTest::s3_ = nullptr;
+clink::test::DockerMinio* S3ExactlyOnceTest::s3_ = nullptr;
 
 // The premise: a clean run commits each record exactly once, and no multipart
 // upload is left pending - a clean completion must leave nothing staged.
@@ -1207,6 +1207,112 @@ TEST_F(S3ExactlyOnceTest, AWorkerKilledInsideTheCommitWindowStaysExactlyOnce) {
     const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
     EXPECT_TRUE(v.clean()) << "a kill inside the commit window broke S3 exactly-once: "
                            << clink::itest::describe(v);
+}
+
+// The end-of-stream tail. The final pane's CommitCheckpoint arrives on the
+// worker's dispatch thread while the sink's runner - its input channel
+// closed by the completed source - is heading for close(). The source's
+// own EOS wait gates only on ITS worker's commit high-water, so a sink on
+// a DIFFERENT worker got no cover: the close won the race, the commit
+// failed against a torn-down client, and the job still exited 0 with the
+// final pane silently missing (this suite's outage gate caught it as a
+// 2-of-3 flake; the sink runner now refuses to close while
+// staged_commits_outstanding() is non-zero). A persistent 1s delay on
+// every commit dispatch makes the race deterministic instead of a die
+// roll: without the runner's wait this test loses the tail every run.
+TEST_F(S3ExactlyOnceTest, TheFinalPanesCommitIsWaitedForAtEndOfStream) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    // No ordinal: EVERY commit dispatch is held for a second, so the final
+    // one is guaranteed to still be in flight when the source completes.
+    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=delay:1000"}));
+    ASSERT_TRUE(c.start_worker(1, {.fault = "sink.before_commit=delay:1000"}));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/6);
+    ASSERT_NE(sub, nullptr);
+
+    const auto code = sub->await_exit(180s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not complete cleanly";
+
+    // The defect's signature was loss WITH success: exit 0 and a missing
+    // final pane. The verdict is therefore the whole test.
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    EXPECT_TRUE(v.clean()) << "the job completed successfully but the tail was not committed: "
+                           << clink::itest::describe(v);
+}
+
+// The decisive composition, transposed to object storage: the store goes
+// down while a worker-loss recovery needs it. A worker dies inside a held
+// commit window (parts uploaded, the multipart handle staged, its
+// CompleteMultipartUpload outstanding), the store is then PAUSED, and the
+// restarted framework must complete the restored handle against a frozen
+// endpoint - retrying through the restart cycle, resolving nothing blind,
+// and converging on the heal with every record exactly once. The
+// PostgreSQL twin of this gate (APostgresOutageDuringRecovery...) is what
+// QUAL-02's campaign leaned on; QUAL-03 gets the same floor before it
+// spends anything.
+TEST_F(S3ExactlyOnceTest, AnS3OutageDuringRecoveryStaysExactlyOnce) {
+    constexpr int kTotal = 40;
+    ::setenv("CLINK_2PC_TOTAL", "40", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "50", 1);
+
+    Cluster c(two_worker_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.start_worker(1, {.fault = "sink.before_commit=delay:4000@1"}));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/6);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
+    // Vacuity guard: the kill must land on a provably open commit window.
+    ASSERT_TRUE(clink::itest::await([&] { return pending_multiparts() > 0; }, 30s))
+        << "no multipart upload appeared; the commit window never opened";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    // Freeze the store BEFORE the recovery can complete the staged upload,
+    // and return the worker (the campaign's supervisor would).
+    s3_->pause();
+    ASSERT_TRUE(c.start_worker(0, {}));
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return c.count_in_coordinator_log("whole-job restart") > 0 ||
+                   c.count_in_coordinator_log("restart waiting for capacity") > 0;
+        },
+        60s))
+        << "the recovery never engaged while the store was frozen";
+    // Non-vacuity: a frozen store must stall the pipeline - the sink
+    // cannot upload parts at the barrier, so no checkpoint may complete.
+    // A broken pause() sails through this window and reds here rather
+    // than passing the gate vacuously. Doubles as composition dwell.
+    const auto stalled_at = latest_completed(c.checkpoint_dir());
+    EXPECT_FALSE(
+        clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > stalled_at; }, 8s))
+        << "a checkpoint completed against a frozen store; the outage never composed";
+
+    s3_->unpause();
+
+    const auto code = sub->await_exit(180s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover once the store returned";
+
+    const auto v = clink::itest::verify_exactly_once_records(committed(), kTotal);
+    std::string objects;
+    for (const auto& e : clink::s3::list_objects(s3_->endpoint(), "us-east-1", bucket_, "xo")) {
+        objects += "\n  " + e;
+    }
+    EXPECT_TRUE(v.clean()) << "an object-store outage during recovery broke S3 exactly-once: "
+                           << clink::itest::describe(v) << "\nvisible objects:" << objects;
 }
 
 // The longer-horizon arm: thirty times the records, two separated worker

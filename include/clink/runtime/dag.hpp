@@ -4501,6 +4501,32 @@ public:
             }
             if (!should_stop()) {
                 sink->flush();
+                // A committing sink must not close while a prepared handle is
+                // still awaiting its CommitCheckpoint: the dispatch arrives on
+                // the worker's dispatch thread and a closed sink fails the
+                // commit against a torn-down client. The source's own EOS wait
+                // gates on ITS worker's commit high-water, so it cannot cover
+                // a sink deployed on a different worker - the job completed
+                // with exit 0 while the final pane's commit had failed (found
+                // by the S3 exactly-once outage gate). Wait here, on the
+                // sink's own truth; on timeout, error the subtask so the
+                // whole-job restart's recover_all_() finalises the handle.
+                if (sink->stages_state_at_barrier()) {
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                    std::size_t outstanding = sink->staged_commits_outstanding();
+                    while (outstanding > 0 && !should_stop()) {
+                        if (std::chrono::steady_clock::now() >= deadline) {
+                            throw std::runtime_error(
+                                "[" + sink->name() + "] " + std::to_string(outstanding) +
+                                " staged commit(s) did not finalise within 30s of "
+                                "end-of-stream; failing the subtask so restore-time "
+                                "recovery re-commits them");
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                        outstanding = sink->staged_commits_outstanding();
+                    }
+                }
             }
             sink->close();
             sink->attach_runtime(nullptr);

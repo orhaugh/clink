@@ -1193,6 +1193,18 @@ public:
     // (see Dag::add_sink). A sink that only writes records and commits on
     // on_commit - the common case - leaves this false and is unaffected.
     [[nodiscard]] virtual bool stages_state_at_barrier() const noexcept { return false; }
+    // The number of prepared-but-unfinalised commits this sink is still
+    // holding - a CommittingSink's persisted handle count. The sink runner
+    // polls this at clean end-of-stream and refuses to close() while it is
+    // non-zero: the coordinator's CommitCheckpoint for the final checkpoint
+    // arrives on the worker's dispatch thread, and a sink closed before the
+    // dispatch lands fails the commit against a torn-down client. The
+    // source's own EOS wait cannot cover this - it gates on ITS worker's
+    // commit high-water, and this sink may be on a different worker (found
+    // by the S3 exactly-once outage gate: the job completed with exit 0
+    // while the final pane's commit had failed against a closed client).
+    // Non-staging sinks return 0 and close immediately, as before.
+    [[nodiscard]] virtual std::size_t staged_commits_outstanding() const { return 0; }
     // 2PC phase-2 hook. Called when the coordinator has confirmed checkpoint
     // `checkpoint_id` is globally durable (every subtask acked, the
     // COMPLETED-N marker is on disk, the coordinator broadcast CommitCheckpoint).

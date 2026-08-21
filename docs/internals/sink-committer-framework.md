@@ -73,6 +73,20 @@ Key points:
 - `pending_committables()` exposes the persisted-but-unfinalised handles so a
   connector can reconcile an external registry at `on_open()` (e.g. an XA sink
   rolling back prepared transactions that are not in the restored set).
+- At clean end-of-stream the sink runner refuses to `close()` while
+  `staged_commits_outstanding()` is non-zero (bounded at 30 seconds, then the
+  subtask errors so restore-time recovery finalises the handles). The final
+  checkpoint's `CommitCheckpoint` arrives on the worker's dispatch thread, and
+  the source's own EOS wait gates only on its OWN worker's commit high-water -
+  so a committing sink deployed on a different worker could be closed under an
+  in-flight final commit, failing it against a torn-down client while the job
+  still completed with exit 0. The S3 exactly-once outage gate caught the
+  resulting silent loss of the final pane; the runner-side wait closes it for
+  every `CommittingSink` connector at once.
+- `recover_all_()` logs the number of prepared handles it finalises at open
+  (`sink.2pc` channel). A restore that should have re-committed a handle but
+  logs zero recovered lost it before the sink opened - that line is the first
+  forensic split when a verdict finds records missing.
 
 ## Three delivery shapes
 

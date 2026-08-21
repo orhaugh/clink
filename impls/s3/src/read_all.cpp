@@ -106,22 +106,70 @@ std::vector<std::string> read_all_lines(const std::string& endpoint,
     return lines;
 }
 
+std::vector<std::string> list_objects(const std::string& endpoint,
+                                      const std::string& region,
+                                      const std::string& bucket,
+                                      const std::string& prefix) {
+    auto client = make_client(endpoint, region);
+    std::vector<std::string> entries;
+    Aws::S3::Model::ListObjectsV2Request list;
+    list.SetBucket(bucket);
+    if (!prefix.empty()) {
+        list.SetPrefix(prefix);
+    }
+    for (;;) {
+        auto out = client.ListObjectsV2(list);
+        if (!out.IsSuccess()) {
+            throw std::runtime_error("clink::s3::list_objects: ListObjectsV2 failed: " +
+                                     std::string{out.GetError().GetMessage()});
+        }
+        for (const auto& obj : out.GetResult().GetContents()) {
+            entries.emplace_back(std::string{obj.GetKey()} + " (" + std::to_string(obj.GetSize()) +
+                                 " bytes)");
+        }
+        if (!out.GetResult().GetIsTruncated()) {
+            break;
+        }
+        list.SetContinuationToken(out.GetResult().GetNextContinuationToken());
+    }
+    std::sort(entries.begin(), entries.end());
+    return entries;
+}
+
 std::size_t pending_multipart_count(const std::string& endpoint,
                                     const std::string& region,
                                     const std::string& bucket,
                                     const std::string& prefix) {
     auto client = make_client(endpoint, region);
+    // List WITHOUT a server-side prefix and filter here: MinIO's
+    // ListMultipartUploads only matches an empty prefix or the exact key
+    // (measured against RELEASE.2025-09-07; "xo" and "xo/" both return
+    // nothing for an upload keyed "xo/sub0-1.ndjson"), so a server-side
+    // prefix silently blinds the in-doubt witness on MinIO while working on
+    // real S3. Client-side filtering behaves identically on both.
     Aws::S3::Model::ListMultipartUploadsRequest req;
     req.SetBucket(bucket);
-    if (!prefix.empty()) {
-        req.SetPrefix(prefix);
+    std::size_t n = 0;
+    for (;;) {
+        auto out = client.ListMultipartUploads(req);
+        if (!out.IsSuccess()) {
+            throw std::runtime_error("clink::s3::pending_multipart_count: failed: " +
+                                     std::string{out.GetError().GetMessage()});
+        }
+        const auto& result = out.GetResult();
+        for (const auto& upload : result.GetUploads()) {
+            const std::string key{upload.GetKey()};
+            if (prefix.empty() || key.rfind(prefix, 0) == 0) {
+                ++n;
+            }
+        }
+        if (!result.GetIsTruncated()) {
+            break;
+        }
+        req.SetKeyMarker(result.GetNextKeyMarker());
+        req.SetUploadIdMarker(result.GetNextUploadIdMarker());
     }
-    auto out = client.ListMultipartUploads(req);
-    if (!out.IsSuccess()) {
-        throw std::runtime_error("clink::s3::pending_multipart_count: failed: " +
-                                 std::string{out.GetError().GetMessage()});
-    }
-    return static_cast<std::size_t>(out.GetResult().GetUploads().size());
+    return n;
 }
 
 }  // namespace clink::s3
