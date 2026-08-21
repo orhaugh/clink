@@ -24,7 +24,7 @@ fi
 
 mkdir -p .git/hooks
 
-for hook in pre-commit; do
+for hook in pre-commit commit-msg; do
     if [ ! -f "scripts/$hook" ]; then
         continue
     fi

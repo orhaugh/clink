@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Reject a commit subject that carries no conventional type prefix.
+#
+# 88% of this history is `type(scope): description` - feat(sql), fix(cluster),
+# perf(sql), docs(hardening), test(integration) - and nothing enforced it, so it
+# drifted: a long session read the last few subjects (its own, by then) instead
+# of the convention and put thirteen unprefixed commits in before anyone noticed.
+# A copy of the convention in CLAUDE.md is worth having; a check that runs is
+# worth more.
+#
+# This validates the PREFIX and nothing else, deliberately:
+#
+#   * Not the case of the description. 126 subjects in this history start it
+#     upper case, so a lower-case rule would reject established practice.
+#   * Not the subject length. The median is 73 characters and the longest is
+#     147; the bodies carry the reasoning and the subjects are allowed to say
+#     what happened.
+#
+# The type list is what the history actually uses, with the counts at the time
+# of writing. Adding a type is a one-word edit here - do that rather than
+# reaching for --no-verify, so the next person sees the vocabulary grow.
+set -euo pipefail
+
+msg_file="${1:?commit-msg: no message file}"
+subject=$(head -1 "$msg_file")
+
+# Git's own machinery, and rebase scaffolding: never this hook's business.
+case "$subject" in
+    Merge\ * | Revert\ * | fixup!\ * | squash!\ * | amend!\ *) exit 0 ;;
+    \#*) exit 0 ;;
+esac
+# Empty or whitespace-only: git aborts the commit itself, with a better message.
+[ -n "${subject//[[:space:]]/}" ] || exit 0
+
+# feat 321, fix 216, test 113, docs 91, perf 50, bench 48, ci 30, build 22,
+# chore 9, release 6, refactor 5.
+types='feat|fix|test|docs|perf|bench|ci|build|chore|release|refactor'
+
+if printf '%s' "$subject" | grep -qE "^(${types})(\([a-z0-9_./+,-]+\))?: .+"; then
+    exit 0
+fi
+
+cat >&2 <<MSG
+commit-msg: the subject line carries no conventional type prefix.
+
+  subject: ${subject}
+
+Use "type(scope): description", which 88% of this history follows and which
+makes the log greppable by area:
+
+  feat(cluster): change a running job's parallelism by replanning from its graph
+  fix(sql):      state_ttl now genuinely bounds the joins
+  perf(sql):     ...
+  test(integration): ...
+  docs(hardening):   ...
+  bench(nexmark):    ...
+
+Types: ${types//|/, }. A scope is optional but usual - plain "docs:" and
+"release: vX.Y.Z" are the accepted unscoped forms.
+
+Neither the case of the description nor the subject length is checked; only
+the prefix. If this commit genuinely needs a type that does not exist yet, add
+it to the list in scripts/commit-msg in the same commit.
+MSG
+exit 1
