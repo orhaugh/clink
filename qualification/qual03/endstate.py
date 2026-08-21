@@ -75,7 +75,11 @@ def main() -> int:
         for line in body.decode("utf-8", errors="replace").splitlines():
             if not line:
                 continue
-            token_, _, seq_s = line.partition("-")
+            try:
+                event_id = json.loads(line).get("event_id") or ""
+            except ValueError:
+                event_id = ""
+            token_, _, seq_s = event_id.partition("-")
             if not (token_.startswith("p") and token_[1:].isdigit() and seq_s.isdigit()):
                 foreign_lines += 1
                 continue

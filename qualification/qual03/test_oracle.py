@@ -67,8 +67,10 @@ class FakeS3:
 
 
 def fill(s3, sub, ckpt, partition, lo, hi):
+    # The pipeline commits the generator's whole JSON event per line.
     s3.put(f"q3/sub{sub}-{ckpt}.ndjson",
-           [f"p{partition}-{s}" for s in range(lo, hi)])
+           ['{"event_id":"p%d-%d","k":1,"amount":2,"ts":3}' % (partition, s)
+            for s in range(lo, hi)])
 
 
 def kinds(findings):
@@ -125,7 +127,11 @@ def main() -> int:
 
     print("foreign: tokens the generator never produced")
     s3, oracle = fresh()
-    s3.put("q3/sub0-1.ndjson", ["p0-0", "p9-5", "not-an-id", "p0-x"])
+    s3.put("q3/sub0-1.ndjson",
+           ['{"event_id":"p0-0","k":1,"amount":2,"ts":3}',
+            '{"event_id":"p9-5","k":1,"amount":2,"ts":3}',
+            "not even json",
+            '{"event_id":"p0-x","k":1,"amount":2,"ts":3}'])
     f, _ = oracle.sample(HIGH)
     check("foreign named", kinds(f) == ["foreign"], kinds(f))
     check("three foreign lines", len(f) == 3, len(f))

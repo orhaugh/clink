@@ -10,19 +10,23 @@
 -- a duplicate is a repeated event_id, a loss is a gap in a partition's
 -- sequence, and a fabrication is an event_id outside the generated range.
 --
--- The S3 sink is a string-channel sink (one STRING column); the line IS
--- the event_id, which is all the oracle judges.
+-- The S3 sink is a string-channel sink, and the planner refuses to
+-- bridge channels (a row-channel JSON source into a string sink does not
+-- compile), so the source is the raw single-TEXT-column Kafka channel
+-- and each committed line is the generator's whole JSON event. The
+-- oracle extracts event_id from the JSON; QUAL-01 and QUAL-02 already
+-- qualify the typed JSON decode path.
 --
 -- __BROKERS__, __BUCKET__ and __S3_ENDPOINT__ are substituted by the
 -- campaign driver.
-CREATE TABLE q3_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
-  WITH (connector='kafka', format='json', brokers='__BROKERS__',
+CREATE TABLE q3_in (line TEXT)
+  WITH (connector='kafka', brokers='__BROKERS__',
         topic='qual03-in', group_id='qual03',
         auto_offset_reset='earliest');
 
 -- delivery_guarantee='exactly_once' is what selects s3_2pc_string_sink
 -- (multipart-complete-on-commit).
-CREATE TABLE q3_out (line STRING)
+CREATE TABLE q3_out (line TEXT)
   WITH (connector='s3',
         bucket='__BUCKET__',
         key_prefix='q3',
@@ -30,4 +34,4 @@ CREATE TABLE q3_out (line STRING)
         endpoint_override='__S3_ENDPOINT__',
         delivery_guarantee='exactly_once');
 
-INSERT INTO q3_out SELECT event_id FROM q3_in;
+INSERT INTO q3_out SELECT line FROM q3_in;

@@ -152,11 +152,18 @@ class Oracle:
             kw["UploadIdMarker"] = resp.get("NextUploadIdMarker")
 
     def judge_line(self, line: str, produced_high: dict, findings: list, key: str):
-        token, _, seq_s = line.partition("-")
+        # Each committed line is the generator's whole JSON event (the
+        # pipeline is the raw string channel end to end); the id under
+        # judgement is its event_id field.
+        try:
+            event_id = json.loads(line).get("event_id") or ""
+        except ValueError:
+            event_id = ""
+        token, _, seq_s = event_id.partition("-")
         valid = token.startswith("p") and token[1:].isdigit() and seq_s.isdigit()
         if not valid:
             findings.append({"kind": "foreign", "object": key, "line": line[:120],
-                             "detail": "event_id does not parse as p<part>-<seq>"})
+                             "detail": "line carries no event_id of the form p<part>-<seq>"})
             return
         p, seq = int(token[1:]), int(seq_s)
         if p not in produced_high:
