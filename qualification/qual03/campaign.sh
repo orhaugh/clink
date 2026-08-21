@@ -505,22 +505,25 @@ echo "campaign: objects committed to the sink bucket ($COMMITTED)"
 #    would look the same in the listing. So require evidence the 2PC
 #    family is deployed. Sampling ListMultipartUploads for a staged
 #    upload is a race against the barrier-to-commit window; deterministic
-#    evidence instead: a worker hosting the sink logs the 2PC family name
-#    at open(), and a plain deployment logs a different family. The
+#    evidence instead: CommittingSink::open() logs the sink's name in its
+#    recover_all line at every open, so the 2PC family is provable from a
+#    worker log without racing anything (QUAL-02's original gate matched
+#    the Postgres sink's TLS warning - a config-dependent accident the S3
+#    sink does not reproduce; the recover_all line is deliberate). The
 #    pending-upload sample stays as recorded corroboration, never the
 #    verdict; the SOAK's armed 2PC faults - fired-proofed and
 #    recovery-proofed - are what genuinely exercise the windows this
 #    campaign qualifies.
 SINK_FAMILY_SEEN=0
 for wp in $WORKER_PUBS; do
-    if on_host "$wp" "docker logs clink-worker 2>&1 | grep -q s3_2pc_string_sink"; then
+    if on_host "$wp" "docker logs clink-worker 2>&1 | grep -q 'recover_all \[s3_2pc_sink\]'"; then
         SINK_FAMILY_SEEN=1
     fi
 done
-[ "$SINK_FAMILY_SEEN" = "1" ] || verify_fail "no worker's sink opened as s3_2pc_string_sink.
+[ "$SINK_FAMILY_SEEN" = "1" ] || verify_fail "no worker's sink opened as s3_2pc_sink.
   Objects are committing, but not through the staged-commit family this
   campaign exists to qualify."
-echo "campaign: 2PC sink family confirmed deployed (s3_2pc_string_sink on a worker)"
+echo "campaign: 2PC sink family confirmed deployed (s3_2pc_sink opened on a worker)"
 UPLOADS_SAMPLED=$(s3_uploads | tr -d '\r')
 echo "pending_uploads_sampled=${UPLOADS_SAMPLED:-0}" > "$OUT_DIR/upload-sample.txt"
 [ "${UPLOADS_SAMPLED:-0}" -gt 0 ] \
@@ -591,7 +594,7 @@ echo "campaign: recovered and still committing ($BEFORE -> $AFTER objects) - VER
 
 { echo "campaign=QUAL-03"; echo "run_id=$RUN_ID"; echo "job_id=$JOB_ID";
   echo "input_events_observed=$P2"; echo "objects_committed_at_gate=$AFTER";
-  echo "sink_family=s3_2pc_string_sink";
+  echo "sink_family=s3_2pc_sink";
   echo "pending_uploads_sampled=${UPLOADS_SAMPLED:-0}";
   echo "faults_recorded=$FAULTS"; echo "workers_lost_observed_by_coordinator=$LOST";
   echo "recovered_after_first_fault=yes";

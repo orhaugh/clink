@@ -290,10 +290,16 @@ private:
                                    });
         // The count is the forensic witness for restore-time recovery: a
         // restore that should have re-committed a prepared handle but logs
-        // zero here lost the handle BEFORE this sink opened.
+        // zero here lost the handle BEFORE this sink opened. The sink's
+        // name is deliberate evidence too: it fires at every open, so a
+        // qualification campaign can prove the 2PC family is actually
+        // deployed by grepping for it - QUAL-02's gate had been matching
+        // the Postgres sink's TLS warning, a config-dependent accident
+        // that the S3 sink does not reproduce.
         clink::log::info("sink.2pc",
-                         "recover_all sub" + std::to_string(subtask_idx_) + ": " +
-                             std::to_string(keys.size()) + " prepared handle(s) to finalise");
+                         "recover_all [" + this->name() + "] sub" + std::to_string(subtask_idx_) +
+                             ": " + std::to_string(keys.size()) +
+                             " prepared handle(s) to finalise");
         for (std::size_t i = 0; i < keys.size(); ++i) {
             clink::log::info("sink.2pc", "recovering prepared handle '" + keys[i] + "'");
             recover(deserialize(blobs[i]));

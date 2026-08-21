@@ -537,22 +537,23 @@ echo "campaign: rows committed to the sink database ($COMMITTED)"
 #    race against the prepare-to-commit window, which is MILLISECONDS
 #    on a healthy cluster - the local rig polled 120s and never caught
 #    one while 2PC ran perfectly underneath. Deterministic evidence
-#    instead: a worker hosting the sink logs the 2PC family name at
-#    open(), and a plain-insert or upsert deployment logs a different
-#    family. The prepared-xacts sample stays as recorded corroboration
+#    instead: CommittingSink::open() logs the sink's name in its
+#    recover_all line at every open (this gate originally matched the
+#    sink's TLS warning - real on this campaign's conninfo, but a
+#    config-dependent accident that adding sslmode would have broken). The prepared-xacts sample stays as recorded corroboration
 #    (the slower cloud rig can catch one), never as the verdict; the
 #    SOAK's armed 2PC faults - fired-proofed and recovery-proofed - are
 #    what genuinely exercise the windows this campaign qualifies.
 SINK_FAMILY_SEEN=0
 for wp in $WORKER_PUBS; do
-    if on_host "$wp" "docker logs clink-worker 2>&1 | grep -q postgres_json_sink_2pc"; then
+    if on_host "$wp" "docker logs clink-worker 2>&1 | grep -q 'recover_all \[postgres_2pc_sink\]'"; then
         SINK_FAMILY_SEEN=1
     fi
 done
-[ "$SINK_FAMILY_SEEN" = "1" ] || verify_fail "no worker's sink opened as postgres_json_sink_2pc.
+[ "$SINK_FAMILY_SEEN" = "1" ] || verify_fail "no worker's sink opened as postgres_2pc_sink.
   Rows are committing, but not through the two-phase-commit family this
   campaign exists to qualify."
-echo "campaign: 2PC sink family confirmed deployed (postgres_json_sink_2pc on a worker)"
+echo "campaign: 2PC sink family confirmed deployed (postgres_2pc_sink opened on a worker)"
 N=$(psql_q "SELECT count(*) FROM pg_prepared_xacts WHERE gid LIKE 'clink!_%' ESCAPE '!'" | tr -d '\r')
 echo "prepared_xacts_sampled=${N:-0}" > "$OUT_DIR/gid-sample.txt"
 if [ "${N:-0}" -gt 0 ]; then
