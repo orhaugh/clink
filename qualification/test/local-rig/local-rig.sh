@@ -186,6 +186,8 @@ seed() {  # host-container, image
 docker image inspect postgres:16 >/dev/null 2>&1 || docker pull -q postgres:16 >/dev/null
 docker image inspect docker.redpanda.com/redpandadata/redpanda:v24.2.7 >/dev/null 2>&1 || \
     docker pull -q docker.redpanda.com/redpandadata/redpanda:v24.2.7 >/dev/null
+MINIO_IMAGE="minio/minio:RELEASE.2025-09-07T16-13-09Z"   # qual03's store, pinned with minio.yml
+docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1 || docker pull -q "$MINIO_IMAGE" >/dev/null
 seed "$PREFIX-coordinator" "$RUNTIME_IMAGE" & p1=$!
 seed "$PREFIX-worker1" "$RUNTIME_IMAGE" & p2=$!
 seed "$PREFIX-worker2" "$RUNTIME_IMAGE" & p3=$!
@@ -198,6 +200,7 @@ for pid in $p1 $p2 $p3 $p4 $p5 $p6; do
     wait "$pid" || { echo "image seeding failed" >&2; exit 1; }
 done
 seed "$PREFIX-ops" postgres:16
+seed "$PREFIX-ops" "$MINIO_IMAGE"
 seed "$PREFIX-ops" docker.redpanda.com/redpandadata/redpanda:v24.2.7
 
 echo "==> writing inventory.json"

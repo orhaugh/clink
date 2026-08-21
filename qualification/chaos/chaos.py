@@ -400,6 +400,40 @@ class Chaos:
             self.rig.ssh(host, "docker unpause qual02-postgres")
         self.record("postgres", "pg_restored", "down", ckpt)
 
+    def s3_unavailable(self, state, ckpt):
+        """The object store frozen briefly - QUAL-03's decisive
+        composition. A staged multipart upload outlives its uploader, so
+        a worker-loss recovery mid-outage meets a store that cannot
+        answer CompleteMultipartUpload for the restored handle; the sink
+        must retry through the restart cycle and converge on the heal
+        with the pane committed exactly once. Pause, not stop: instant,
+        and connections hang the way the local gate
+        (AnS3OutageDuringRecoveryStaysExactlyOnce) models."""
+        # MinIO rides the OPS host on the QUAL-03 rig (outside the clink
+        # failure domain, next to the oracle). The fault targets the
+        # container by name, so the host role is wherever compose put it.
+        hosts = self.rig.hosts("minio") or self.rig.hosts("ops")
+        if not hosts:
+            self.record("cluster", "s3_unavailable_no_host", state, ckpt,
+                        {"note": "no minio or ops host in this rig's "
+                                 "inventory; fault skipped"})
+            return
+        # Capped at 40s for the same oracle-budget reason as
+        # pg_unavailable: the QUAL-03 verifier declares itself STUCK
+        # after 10 consecutive failed samples, and this fault must never
+        # be able to fail the oracle on its own. The composition it
+        # exists for forms well inside 40 seconds, as the local gate
+        # proves in an 8s dwell.
+        dur = self.rng.uniform(20, 40)
+        for host in hosts:
+            self.rig.ssh(host, "docker pause qual03-minio")
+        self.record("minio", "s3_unavailable", state, ckpt,
+                    {"duration_s": round(dur, 1)})
+        time.sleep(dur)
+        for host in hosts:
+            self.rig.ssh(host, "docker unpause qual03-minio")
+        self.record("minio", "s3_restored", "down", ckpt)
+
     def fault_surface_present(self) -> bool:
         """Whether the deployed build has fault-injection points compiled
         in. A shipped runtime image does NOT: every CLINK_FAULT_POINT

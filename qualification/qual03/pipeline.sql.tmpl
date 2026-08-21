@@ -1,0 +1,33 @@
+-- QUAL-03 pipeline: Kafka -> S3 staged-commit sink.
+--
+-- Deliberately a pass-through, not an aggregation. QUAL-01 already
+-- qualifies windowed exactly-once and QUAL-02 the external-transaction
+-- half; what is under test here is the staged object commit itself:
+-- records buffered per checkpoint interval, uploaded as multipart parts
+-- at the barrier, and made visible atomically at CompleteMultipartUpload
+-- only once the checkpoint is durable. One line in, one line out keeps
+-- the three failure modes directly countable across the visible objects:
+-- a duplicate is a repeated event_id, a loss is a gap in a partition's
+-- sequence, and a fabrication is an event_id outside the generated range.
+--
+-- The S3 sink is a string-channel sink (one STRING column); the line IS
+-- the event_id, which is all the oracle judges.
+--
+-- __BROKERS__, __BUCKET__ and __S3_ENDPOINT__ are substituted by the
+-- campaign driver.
+CREATE TABLE q3_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
+  WITH (connector='kafka', format='json', brokers='__BROKERS__',
+        topic='qual03-in', group_id='qual03',
+        auto_offset_reset='earliest');
+
+-- delivery_guarantee='exactly_once' is what selects s3_2pc_string_sink
+-- (multipart-complete-on-commit).
+CREATE TABLE q3_out (line STRING)
+  WITH (connector='s3',
+        bucket='__BUCKET__',
+        key_prefix='q3',
+        region='us-east-1',
+        endpoint_override='__S3_ENDPOINT__',
+        delivery_guarantee='exactly_once');
+
+INSERT INTO q3_out SELECT event_id FROM q3_in;

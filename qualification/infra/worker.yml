@@ -25,6 +25,13 @@ services:
     environment:
       CLINK_DATA_BIND_HOST: 0.0.0.0
       CLINK_FAULT_INJECT: ${CLINK_FAULT_INJECT:-}
+      # Object-store credentials for campaigns whose sink is S3-compatible
+      # (QUAL-03's MinIO). Empty for every other campaign; the metadata
+      # disable stops the SDK probing a cloud IMDS endpoint that either
+      # does not exist or answers for the wrong account.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
     volumes:
       - /qual/state:/qual/state
     restart: "no"

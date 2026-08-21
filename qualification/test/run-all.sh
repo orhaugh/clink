@@ -43,6 +43,19 @@ run "QUAL-02 driver parses" \
 run "QUAL-02 summariser result logic (PASS is earned, never assumed)" \
     python3 "$HERE/test_summarise2.py"
 
+run "QUAL-03 driver parses" \
+    bash -n "$HERE/../qual03/campaign.sh"
+
+run "QUAL-03 summariser result logic (PASS is earned, never assumed)" \
+    python3 "$HERE/test_summarise3.py"
+
+# QUAL-03's oracle test is container-free (the store is a duck-typed
+# fake), so unlike QUAL-02's it runs on every invocation - including the
+# paginated-listing race and MinIO's prefix-blind upload listing, which
+# no healthy live run would ever exercise on purpose.
+run "QUAL-03 oracle (must name every injected defect)" \
+    python3 "$HERE/../qual03/test_oracle.py"
+
 if [ "${1:-}" = "--with-docker" ]; then
     # The QUAL-02 oracle is the one component that was tested offline from the
     # start, and it found a real defect in itself on the first attempt - a
