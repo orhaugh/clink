@@ -285,6 +285,16 @@ fi
 # this campaign exists to detect. The oracle must be able to see a
 # duplicate land.
 psql_q "DROP TABLE IF EXISTS public.q2_out; CREATE TABLE public.q2_out (event_id text, k bigint, amount bigint)" >/dev/null
+# A PLAIN index, deliberately not UNIQUE: a unique index would make the
+# database reject the duplicates this campaign exists to catch, but a
+# non-unique one still lets every duplicate LAND while turning the
+# oracle's per-partition aggregates into index scans. Without it the
+# sample is a full-table scan whose cost grows with every committed row,
+# and at ~3M rows on the rig's shared-vCPU disks it crossed the
+# verifier's own 10s statement timeout - ten consecutive timeouts read
+# as a stuck oracle and failed a run whose correctness was spotless.
+# The local rig's NVMe never surfaced it.
+psql_q "CREATE INDEX q2_out_event_id ON public.q2_out (event_id)" >/dev/null
 echo "campaign: sink table created (no unique constraint - duplicates must be visible)"
 
 # The sink database is reached over the private network. Workers connect

@@ -187,8 +187,15 @@ def main() -> int:
     # that bound, so injected outages can never fail the oracle by
     # themselves.
     def connect():
+        # 60s, not 10s: the statement timeout exists to bound a PAUSED
+        # server's hang, where any finite value works - but it also bounds
+        # the sample query, whose cost grows with the table. At 10s the
+        # oracle cancelled its own samples once the sink passed ~3M rows on
+        # cloud disks and declared itself stuck against a spotless engine.
+        # The index the campaign now creates keeps the sample fast; this
+        # headroom keeps a slow plan from being read as a dead oracle.
         c = psycopg2.connect(args.dsn, connect_timeout=5,
-                             options="-c statement_timeout=10000")
+                             options="-c statement_timeout=60000")
         c.autocommit = True
         return c
 
