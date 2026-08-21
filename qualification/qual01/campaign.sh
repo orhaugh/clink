@@ -171,6 +171,14 @@ fi
 # rig creation; this refresh covers a rig reused under a new run id).
 RUN_ID="$RUN_ID" "$HERE/../infra/inventory.sh" "$RIG_RUN_ID" "$OUT_DIR"
 
+# The image under test goes on the hosts here, not in a launcher script.
+# pull-image.sh also proves every host resolved the same digest and writes
+# the provenance into the evidence; a campaign that leaves that to its
+# caller can be run without it and produce a result naming no build.
+if [ "${SKIP_IMAGE_PULL:-0}" != "1" ]; then
+    RUN_ID="$RUN_ID" IMAGE="$CLINK_IMAGE" "$HERE/../infra/pull-image.sh"
+fi
+
 read_inv() { python3 -c "
 import json
 inv = json.load(open('${OUT_DIR}/inventory.json'))

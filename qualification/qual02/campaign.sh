@@ -142,11 +142,37 @@ verify_fail() {
 
 echo "campaign: QUAL-02 run $RUN_ID, ${DURATION_H}h, profile=$PROFILE"
 
-# --- inventory ----------------------------------------------------------
-if [ ! -f "$OUT_DIR/inventory.json" ]; then
-    [ -n "${INVENTORY:-}" ] || { echo "campaign: no inventory. Provision a rig, or set INVENTORY=<path>" >&2; exit 2; }
+# --- rig ----------------------------------------------------------------
+# Every campaign is STANDALONE: it provisions the rig it needs, captures
+# the inventory, and puts the image under test on the hosts. This one
+# used to require an inventory from somewhere else and exit 2 without one
+# - a hangover from being written as "the campaign that reuses QUAL-01's
+# rig" - which made a QUAL-02-only run impossible without a launcher
+# script reproducing provisioning by hand, and made every future campaign
+# inherit the same gap.
+#
+# RIG_RUN_ID points at hosts that already exist (a re-run proving a fix,
+# or a second campaign sharing one paid rig): evidence still lands in this
+# run's own directory while the infrastructure is paid for once. INVENTORY
+# remains supported for a rig this tooling did not create - the local rig
+# under qualification/test/local-rig uses it.
+RIG_RUN_ID="${RIG_RUN_ID:-$RUN_ID}"
+if [ "$RIG_RUN_ID" != "$RUN_ID" ]; then
+    echo "campaign: running against the existing rig labelled qual-run=$RIG_RUN_ID"
+    SKIP_PROVISION=1
+fi
+
+if [ -n "${INVENTORY:-}" ]; then
     cp "$INVENTORY" "$OUT_DIR/inventory.json"
-    echo "campaign: reusing rig inventory from $INVENTORY"
+    echo "campaign: using the inventory supplied at $INVENTORY"
+else
+    if [ "${SKIP_PROVISION:-0}" != "1" ]; then
+        RUN_ID="$RUN_ID" "$REPO_ROOT/qualification/infra/provision.sh"
+        echo "campaign: waiting for cloud-init on every host"
+    fi
+    # API-derived, never hand-maintained. provision.sh writes it at rig
+    # creation; this refresh covers a rig reused under a new run id.
+    RUN_ID="$RUN_ID" "$HERE/../infra/inventory.sh" "$RIG_RUN_ID" "$OUT_DIR"
 fi
 read_inv() { python3 -c "
 import json
@@ -194,6 +220,18 @@ for h in $COORD_PUB $WORKER_PUBS; do
 done
 CHECKPOINT_DIR="/qual/state/$RUN_ID"
 echo "campaign: shared state verified; checkpoint dir $CHECKPOINT_DIR"
+
+# --- image under test ---------------------------------------------------
+# Part of being standalone, and not merely a convenience: pull-image.sh
+# verifies every host resolved the SAME digest for the tag (a moved tag
+# would otherwise have different hosts running different builds inside
+# one campaign) and writes the image's provenance and capability manifest
+# into the evidence, which is what lets a published result name the build
+# it actually tested. Skippable for a rig whose images are already loaded
+# - the local rig seeds them directly into each host's daemon.
+if [ "${SKIP_IMAGE_PULL:-0}" != "1" ]; then
+    RUN_ID="$RUN_ID" IMAGE="$CLINK_IMAGE" "$HERE/../infra/pull-image.sh"
+fi
 
 # --- sink database ------------------------------------------------------
 echo "campaign: starting the sink database"

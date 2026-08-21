@@ -51,7 +51,21 @@ rig_exec() {
         *"printf 'CLINK_IMAGE"*) return 0;;
         *"docker compose"*) return 0;;
 
-        *"clink --capabilities-json"*)
+        # pull-image.sh: the pull itself, and the digest every host must
+        # agree on. One fixed digest for every host, so the campaign's
+        # "all hosts resolved the same build" check passes here and a
+        # future change that breaks it fails here rather than on a rig.
+        *"docker pull"*) return 0;;
+        *"docker image inspect"*)
+            echo "ghcr.io/orhaugh/clink-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            return 0;;
+
+        # Both invocations: `docker exec clink-coordinator clink
+        # --capabilities-json` (the campaign's fault-surface gate) and
+        # `docker run --entrypoint clink <image> --capabilities-json`
+        # (pull-image.sh's provenance capture), which put the image name
+        # between the two tokens.
+        *"--capabilities-json"*)
             echo '{"build":{"git_sha":"deadbeef","git_clean":true,"sql":true,"fault_injection":true}}'
             return 0;;
 
