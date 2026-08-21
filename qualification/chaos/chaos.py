@@ -83,13 +83,14 @@ class Rig:
 class Chaos:
     def __init__(self, rig: Rig, coordinator_url: str, job_id: str,
                  log_path: str, run_id: str, rng: random.Random,
-                 twopc_points=None):
+                 twopc_points=None, recovery_timeout_s: int = 600):
         self.rig = rig
         self.coordinator_url = coordinator_url.rstrip("/")
         self.job_id = job_id
         self.log_path = log_path
         self.run_id = run_id
         self.rng = rng
+        self.recovery_timeout_s = recovery_timeout_s
         # The 2PC points this CAMPAIGN can actually fire. The full class
         # list is the Kafka set; a campaign whose sink family lacks a point
         # (QUAL-02: the CommittingSink path has no commit receipt, so
@@ -132,11 +133,20 @@ class Chaos:
             status = "RUNNING" if running else "NOT_RUNNING"
         return status, job.get("latest_completed_checkpoint_id", 0)
 
-    def await_healthy_checkpoint(self, since_ckpt: int, timeout_s: int = 600):
+    def await_healthy_checkpoint(self, since_ckpt: int, timeout_s: int = 0):
         """Block until the job is running AND has completed a checkpoint
         newer than `since_ckpt`. Returns the new checkpoint id, or None on
-        timeout - which is itself a finding, logged by the caller."""
-        deadline = time.time() + timeout_s
+        timeout - which is itself a finding, logged by the caller.
+
+        The deadline must scale with STATE SIZE. Restore time grows with
+        the state a worker has to read back, so a fixed ten minutes that
+        is generous for a delivery-semantics campaign is a false finding
+        waiting to happen on a large-state one: the run would record
+        'the job did not recover' about a job that was recovering
+        normally. Set --recovery-timeout-s from a calibration run's
+        measured restore duration (clink_ckpt_restore_ns), never by
+        guess."""
+        deadline = time.time() + (timeout_s or self.recovery_timeout_s)
         while time.time() < deadline:
             status, ckpt = self.job_state()
             if status == "RUNNING" and ckpt and ckpt > since_ckpt:
@@ -651,6 +661,13 @@ def main() -> int:
                          "coverage - e.g. pg_unavailable for QUAL-02, whose "
                          "decisive composition is the external server down "
                          "during a recovery")
+    ap.add_argument("--recovery-timeout-s", type=int, default=600,
+                    help="how long a post-fault recovery may take before the "
+                         "controller records a healthy_checkpoint_timeout. "
+                         "Scales with STATE SIZE - set it from a calibration "
+                         "run's measured restore duration, not by guess, or a "
+                         "large-state campaign will record false findings "
+                         "about a job that was recovering normally.")
     ap.add_argument("--twopc-points", default="",
                     help="comma-separated 2PC points this campaign's sink "
                          "family can actually fire (default: the full Kafka "
@@ -686,7 +703,8 @@ def main() -> int:
     twopc_points = (tuple(p for p in args.twopc_points.split(",") if p)
                     if args.twopc_points else None)
     chaos = Chaos(rig, args.coordinator_url, args.job_id, args.log,
-                  args.run_id, rng, twopc_points=twopc_points)
+                  args.run_id, rng, twopc_points=twopc_points,
+                  recovery_timeout_s=args.recovery_timeout_s)
 
     weighted = []
     for name, weight in PROFILES[args.profile]:
