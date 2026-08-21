@@ -102,9 +102,10 @@ Following the programme's honesty categories:
 - **Tested but bounded:** recovery liveness - every fault was followed by
   restored commit flow - bounded by this topology's restart pacing.
 - **Architecturally supported but not qualified:** the same guarantee at
-  larger state, higher parallelism, and multi-day durations; the other
-  recoverable-commit sinks (staged object-store commits) share the
-  framework but have their own campaign.
+  larger state, higher parallelism, and multi-day durations. The other
+  recoverable-commit shape, staged object-store commits, shares this
+  framework and now has its own campaign:
+  [QUAL-03](qual-03-s3-staged-commits.md).
 - **Unknown:** fault classes this campaign does not schedule (disk
   corruption, byzantine database behaviour, clock steps).
 

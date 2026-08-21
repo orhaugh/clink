@@ -91,8 +91,9 @@ Following the programme's honesty categories:
   the campaign's recovery deadline.
 - **Architecturally supported but not qualified:** the same guarantees at
   larger state, higher parallelism, and multi-day durations. Exactly-once
-  into PostgreSQL has its own campaign:
-  [QUAL-02](qual-02-postgres-two-phase-commit.md).
+  into PostgreSQL and into object storage have their own campaigns:
+  [QUAL-02](qual-02-postgres-two-phase-commit.md),
+  [QUAL-03](qual-03-s3-staged-commits.md).
 - **Unknown:** fault classes this campaign does not schedule (disk
   corruption, byzantine brokers, clock steps).
 
