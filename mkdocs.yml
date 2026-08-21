@@ -91,6 +91,7 @@ nav:
   - Qualification:
       - qualification/README.md
       - qualification/qual-01-kafka-exactly-once.md
+      - qualification/qual-02-postgres-two-phase-commit.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md
