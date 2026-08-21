@@ -9,6 +9,7 @@
 #include <stacktrace>
 #endif
 
+#include "clink/metrics/checkpoint_metrics.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/operator_metrics.hpp"
 #include "clink/runtime/cpu_affinity.hpp"
@@ -37,6 +38,17 @@ void LocalExecutor::start() {
         if (!config_.restore_base.empty()) {
             config_.state_backend->set_restore_base(config_.restore_base);
         }
+        // Timed: clink_ckpt_restore_ns is how long a job is dark after a
+        // fault, and it grows with state size - the number a large-state
+        // campaign has to calibrate its recovery deadlines from, rather
+        // than guess. The metric, its registration and a Grafana panel
+        // all existed already; nothing ever called restore_observe(), so
+        // the panel plotted an always-empty series.
+        //
+        // The window covers the migration too, deliberately: what matters
+        // to a recovery deadline is when the job can run again, not when
+        // the backend's own read finished.
+        const auto restore_started = std::chrono::steady_clock::now();
         config_.state_backend->restore(*config_.restore_from, config_.restore_key_group_filter);
         // State schema evolution: migrate the restored state up to the
         // versions the live job expects, before any operator reads it.
@@ -47,6 +59,10 @@ void LocalExecutor::start() {
         if (config_.expected_state_versions.has_value()) {
             migrate_restored_state(*config_.state_backend, *config_.expected_state_versions);
         }
+        clink::metrics::ckpt::restore_observe(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - restore_started)
+                                           .count()));
     } else if (config_.state_backend && config_.expected_state_versions.has_value()) {
         // Fresh start (no restore): stamp the expected versions so the
         // snapshots this job produces record them, enabling a future

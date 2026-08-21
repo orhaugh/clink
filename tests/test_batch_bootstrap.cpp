@@ -17,6 +17,8 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/metrics/checkpoint_metrics.hpp"
+#include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -166,4 +168,71 @@ TEST(BatchBootstrap, TakeSavepointRejectsMissingBackend) {
     LocalExecutor exec(std::move(dag), cfg);
     exec.run();
     EXPECT_THROW(exec.take_savepoint(), std::logic_error);
+}
+
+// clink_ckpt_restore_ns must actually be fed. The histogram, its
+// registration and a Grafana p99 panel all existed while nothing in the
+// engine ever called restore_observe(), so the panel plotted an empty
+// series and "how long is a job dark after a fault" had no answer at all.
+// That number is what a large-state campaign sets its recovery deadlines
+// from, so this pins the wiring rather than the value.
+TEST(BatchBootstrap, RestoringThroughTheExecutorRecordsItsDuration) {
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    Snapshot savepoint;
+    {
+        Dag dag;
+        auto src = dag.add_source<KV>(kv_source({{"a", 1}}));
+        auto sum = std::make_shared<KeyedSumOperator>();
+        sum->set_uid("keyed_sum_metric");
+        auto h = dag.add_operator<KV, KV>(src, sum);
+        dag.add_sink<KV>(h, std::make_shared<CollectingSink<KV>>());
+        JobConfig cfg;
+        cfg.state_backend = backend;
+        cfg.execution_mode = JobConfig::ExecutionMode::Batch;
+        LocalExecutor exec(std::move(dag), cfg);
+        exec.run_to_completion();
+        savepoint = exec.take_savepoint(CheckpointId{1});
+    }
+
+    const auto before =
+        MetricsRegistry::global().histogram(metrics::kRestoreFromSavepointNs).snapshot().count;
+    {
+        Dag dag;
+        auto src = dag.add_source<KV>(kv_source({{"a", 2}}));
+        auto sum = std::make_shared<KeyedSumOperator>();
+        sum->set_uid("keyed_sum_metric");
+        auto h = dag.add_operator<KV, KV>(src, sum);
+        dag.add_sink<KV>(h, std::make_shared<CollectingSink<KV>>());
+        JobConfig cfg;
+        cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+        cfg.restore_from = savepoint;
+        LocalExecutor exec(std::move(dag), cfg);
+        exec.run();
+        ASSERT_TRUE(exec.operator_errors().empty());
+    }
+    const auto after =
+        MetricsRegistry::global().histogram(metrics::kRestoreFromSavepointNs).snapshot().count;
+    EXPECT_EQ(after - before, 1u) << "a restore through LocalExecutor recorded no duration";
+}
+
+// A job that starts WITHOUT a restore must not record one - otherwise the
+// histogram fills with zero-length observations from every fresh start and
+// the p99 a campaign calibrates against is meaningless.
+TEST(BatchBootstrap, AFreshStartRecordsNoRestoreDuration) {
+    const auto before =
+        MetricsRegistry::global().histogram(metrics::kRestoreFromSavepointNs).snapshot().count;
+    Dag dag;
+    auto src = dag.add_source<KV>(kv_source({{"a", 1}}));
+    auto sum = std::make_shared<KeyedSumOperator>();
+    sum->set_uid("keyed_sum_fresh");
+    auto h = dag.add_operator<KV, KV>(src, sum);
+    dag.add_sink<KV>(h, std::make_shared<CollectingSink<KV>>());
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), cfg);
+    exec.run();
+    ASSERT_TRUE(exec.operator_errors().empty());
+    const auto after =
+        MetricsRegistry::global().histogram(metrics::kRestoreFromSavepointNs).snapshot().count;
+    EXPECT_EQ(after, before) << "a fresh start recorded a restore duration";
 }
