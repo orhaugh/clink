@@ -4,6 +4,12 @@
 #
 #   RUN_ID=<qualification run id> ./provision.sh          create + inventory
 #   RUN_ID=... ./provision.sh --dry                        print, touch nothing
+#   RUN_ID=... STATE_VOLUME_GB=300 ./provision.sh          + a volume for /qual/state
+#
+# STATE_VOLUME_GB attaches a Hetzner volume to the ops host and mounts it
+# at /qual/state before the NFS export, for campaigns whose shared state
+# outgrows the ops host's 160 GB root disk. destroy.sh and teardown.sh
+# --check already sweep volumes by label, so the orphan guard covers it.
 #
 # Topology (shared-vCPU deliberately: these campaigns measure correctness
 # under faults, not comparative performance, and CPX is 3-5x cheaper than
@@ -53,6 +59,20 @@ BROKER_TYPE="${BROKER_TYPE:-cpx22}"
 WORKERS="${WORKERS:-3}"
 BROKERS="${BROKERS:-3}"
 
+# Shared-state volume for the ops host, in GB. 0 (the default) keeps the
+# original behaviour: /qual/state lives on the ops host's own 160 GB root
+# disk, which is ample for the delivery-semantics campaigns (QUAL-01 to
+# QUAL-03 peaked at 6.7 GiB).
+#
+# A large-state campaign cannot use the root disk. Checkpoint retention
+# keeps one COMPLETED checkpoint plus the restore point, so the shared
+# directory holds roughly twice the live state size: a 100 GB campaign
+# needs ~200 GB against a 160 GB disk, and the campaign would die of
+# ENOSPC mid-soak with the failure looking like a checkpointing defect.
+# Set STATE_VOLUME_GB to at least 2.5x the target state size.
+STATE_VOLUME_GB="${STATE_VOLUME_GB:-0}"
+STATE_VOLUME_NAME="qual-${RUN_ID}-state"
+
 DRY=0
 [ "${1:-}" = "--dry" ] && DRY=1
 command -v hcloud >/dev/null 2>&1 || { echo "hcloud CLI not found"; exit 2; }
@@ -60,6 +80,9 @@ command -v hcloud >/dev/null 2>&1 || { echo "hcloud CLI not found"; exit 2; }
 echo "context : $(hcloud context active)"
 echo "run id  : ${RUN_ID}"
 echo "plan    : 1x ${OPS_TYPE} (ops) + 1x ${COORD_TYPE} (coordinator) + ${WORKERS}x ${WORKER_TYPE} (workers) + ${BROKERS}x ${BROKER_TYPE} (brokers)"
+if [ "${STATE_VOLUME_GB}" -gt 0 ]; then
+    echo "volume  : ${STATE_VOLUME_GB} GB attached to the ops host as /qual/state (NFS-exported)"
+fi
 
 hcloud server-type list -o json | python3 -c "
 import json, sys
@@ -78,6 +101,13 @@ for t in types:
         break
 print('cost    : EUR %.3f/hour (~EUR %.2f/day, ~EUR %.2f for 7 days)' % (total, total*24, total*24*7))
 "
+if [ "${STATE_VOLUME_GB}" -gt 0 ]; then
+    # Deliberately no euro figure: the API exposes no volume pricing to
+    # read it from, and a hardcoded rate in a cost line is how a stale
+    # number becomes a budget. Volumes bill per GB-month on top of the
+    # hourly figure above, and destroy.sh removes them with the rig.
+    echo "          plus a ${STATE_VOLUME_GB} GB volume, billed per GB-month until destroyed"
+fi
 
 if [ "$DRY" = "1" ]; then
     echo "--dry: nothing created."
@@ -113,20 +143,62 @@ fi
 # disks. (An object-store state backend is the other answer, and is
 # QUAL-03's subject rather than a dependency of this one.)
 OPS_CLOUD_INIT=$(mktemp)
-cat > "$OPS_CLOUD_INIT" <<'YAML'
-#cloud-config
-package_update: true
-packages: [docker.io, docker-compose-v2, python3-pip, iproute2, iptables, nfs-kernel-server]
-runcmd:
-  - systemctl enable --now docker
-  - usermod -aG docker root
-  - sysctl -w vm.max_map_count=262144
+{
+    echo '#cloud-config'
+    echo 'package_update: true'
+    echo 'packages: [docker.io, docker-compose-v2, python3-pip, iproute2, iptables, nfs-kernel-server]'
+    if [ "${STATE_VOLUME_GB}" -gt 0 ]; then
+        cat <<'YAML'
+write_files:
+  - path: /usr/local/bin/qual-mount-state.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Put the attached volume under /qual/state BEFORE the NFS export
+      # goes up. Written as a file rather than inline runcmd so the shell
+      # quoting is reviewable and a colon in a message cannot break the
+      # cloud-config parse.
+      set -euo pipefail
+      dev=""
+      # The attach and the first boot race, so poll rather than assume.
+      for _ in $(seq 1 90); do
+          dev=$(ls /dev/disk/by-id/scsi-0HC_Volume_* 2>/dev/null | head -1 || true)
+          [ -n "$dev" ] && break
+          sleep 2
+      done
+      if [ -z "$dev" ]; then
+          # Fail loudly. Exporting the root disk instead would look like a
+          # working rig right up to the point a large-state campaign
+          # filled 160 GB mid-soak, and the ENOSPC would read as a
+          # checkpointing defect.
+          echo "qual-mount-state found no Hetzner volume device" >&2
+          exit 1
+      fi
+      # Format only a blank device - a re-run must never wipe state.
+      if ! blkid "$dev" >/dev/null 2>&1; then
+          mkfs.ext4 -F -L qualstate "$dev"
+      fi
+      mkdir -p /qual/state
+      grep -q " /qual/state " /etc/fstab || \
+          echo "$dev /qual/state ext4 defaults,nofail 0 2" >> /etc/fstab
+      mountpoint -q /qual/state || mount /qual/state
+YAML
+    fi
+    echo 'runcmd:'
+    echo '  - systemctl enable --now docker'
+    echo '  - usermod -aG docker root'
+    echo '  - sysctl -w vm.max_map_count=262144'
+    if [ "${STATE_VOLUME_GB}" -gt 0 ]; then
+        echo '  - /usr/local/bin/qual-mount-state.sh'
+    fi
+    cat <<'YAML'
   - mkdir -p /qual/state
   - chmod 777 /qual/state
   - echo "/qual/state 10.20.1.0/24(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
   - exportfs -ra
   - systemctl enable --now nfs-kernel-server
 YAML
+} > "$OPS_CLOUD_INIT"
 
 CLOUD_INIT=$(mktemp)
 cat > "$CLOUD_INIT" <<'YAML'
@@ -140,8 +212,9 @@ runcmd:
   - mkdir -p /qual/state
 YAML
 
-create() {  # name type [cloud-init]
+create() {  # name type [cloud-init] [extra hcloud args...]
     local name=$1 type=$2 init=${3:-$CLOUD_INIT}
+    if [ "$#" -ge 3 ]; then shift 3; else shift "$#"; fi
     if hcloud server describe "$name" >/dev/null 2>&1; then
         echo "==> ${name} exists, skipping"
         return 0
@@ -149,10 +222,43 @@ create() {  # name type [cloud-init]
     echo "==> creating ${name} (${type})"
     hcloud server create --name "$name" --type "$type" --image "$IMAGE" \
         --location "$LOCATION" --ssh-key "$SSH_KEY_NAME" --network "$NET_NAME" \
-        --user-data-from-file "$init" --label "$LABELS" >/dev/null
+        --user-data-from-file "$init" --label "$LABELS" "$@" >/dev/null
 }
 
-create "qual-${RUN_ID}-ops" "$OPS_TYPE" "$OPS_CLOUD_INIT"
+# The shared-state volume, created BEFORE the ops host so it can be
+# attached at server-create time and be present when cloud-init looks for
+# it. Hetzner's minimum volume is 10 GB.
+OPS_EXTRA=()
+if [ "${STATE_VOLUME_GB}" -gt 0 ]; then
+    if [ "${STATE_VOLUME_GB}" -lt 10 ]; then
+        echo "provision: STATE_VOLUME_GB must be at least 10 (Hetzner's minimum)" >&2
+        exit 2
+    fi
+    if ! hcloud volume describe "$STATE_VOLUME_NAME" >/dev/null 2>&1; then
+        echo "==> creating ${STATE_VOLUME_GB} GB volume ${STATE_VOLUME_NAME}"
+        # Not --format: the device is formatted by cloud-init, which skips
+        # a device that already carries a filesystem, so re-running this
+        # script can never wipe a campaign's state.
+        hcloud volume create --name "$STATE_VOLUME_NAME" --size "$STATE_VOLUME_GB" \
+            --location "$LOCATION" --label "$LABELS" >/dev/null
+    fi
+    OPS_EXTRA=(--volume "$STATE_VOLUME_NAME")
+fi
+
+create "qual-${RUN_ID}-ops" "$OPS_TYPE" "$OPS_CLOUD_INIT" ${OPS_EXTRA[@]+"${OPS_EXTRA[@]}"}
+
+# Attach fallback for a rig whose ops host already existed when the volume
+# was added (create() skips an existing server, so the --volume above
+# would never be applied).
+if [ "${STATE_VOLUME_GB}" -gt 0 ]; then
+    attached_to=$(hcloud volume describe "$STATE_VOLUME_NAME" -o format='{{.Server.ID}}' 2>/dev/null || true)
+    if [ -z "$attached_to" ] || [ "$attached_to" = "<no value>" ] || [ "$attached_to" = "0" ]; then
+        echo "==> attaching ${STATE_VOLUME_NAME} to the ops host"
+        hcloud volume attach --server "qual-${RUN_ID}-ops" "$STATE_VOLUME_NAME" >/dev/null
+        echo "    NOTE: the volume was attached after first boot, so cloud-init did not"
+        echo "    mount it. On the ops host run: /usr/local/bin/qual-mount-state.sh"
+    fi
+fi
 create "qual-${RUN_ID}-coordinator" "$COORD_TYPE"
 for i in $(seq 1 "$WORKERS"); do create "qual-${RUN_ID}-worker${i}" "$WORKER_TYPE"; done
 for i in $(seq 1 "$BROKERS"); do create "qual-${RUN_ID}-broker${i}" "$BROKER_TYPE"; done
