@@ -622,7 +622,10 @@ echo "campaign: keyed state confirmed in the deferring backend ($STATE_SEEN live
 # on. A short blob here means the pipeline is not building the fat value
 # the state target is computed from, and every size number afterwards
 # would be measuring something else.
-BAD_LEN=$(psql_q "SELECT count(*) FROM public.q4_out WHERE blob_len <> $BLOB_BYTES" | tr -d '\r')
+# IS DISTINCT FROM, not <>: a NULL blob_len makes `blob_len <> 4096`
+# evaluate to NULL rather than true, so the count came back 0 and this
+# gate passed against a column that was NULL in every row.
+BAD_LEN=$(psql_q "SELECT count(*) FROM public.q4_out WHERE blob_len IS DISTINCT FROM $BLOB_BYTES" | tr -d '\r')
 [ "${BAD_LEN:-1}" = "0" ] || verify_fail "$BAD_LEN row(s) carry an accumulator that is
   not $BLOB_BYTES bytes. The fat value is not being built as configured, so the
   state target would be measuring a different workload."

@@ -44,8 +44,16 @@ CREATE TABLE q4_out (k BIGINT, blob_len BIGINT, n BIGINT)
         mode='upsert',
         primary_key='k');
 
+-- Every projected expression is ALIASED to its target column, and that is
+-- correctness rather than style here. The JSON-family SQL sinks resolve a
+-- row's columns BY NAME (sql_json_builder: "a column absent from a row
+-- becomes SQL NULL"), while the planner names an unaliased expression
+-- _col1 - so `SELECT k, length(m), n` into a (k, blob_len, n) table
+-- writes NULL into blob_len for every row, silently. Found here on local
+-- round C, where the accumulator-width gate had been passing vacuously
+-- against a column that was NULL throughout.
 INSERT INTO q4_out
-SELECT k, length(m), n
+SELECT k, length(m) AS blob_len, n
 FROM (SELECT k, MAX(rpad_blob) AS m, COUNT(*) AS n
       FROM (SELECT k, rpad(event_id, __BLOB_BYTES__, 'x') AS rpad_blob FROM q4_in) t
       GROUP BY k) g;

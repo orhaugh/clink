@@ -64,7 +64,7 @@ def sample(cur, blob_bytes: int, produced_lower: int, prev):
     cur.execute("""
         SELECT count(*),
                coalesce(sum(n), 0),
-               count(*) FILTER (WHERE blob_len <> %s),
+               count(*) FILTER (WHERE blob_len IS DISTINCT FROM %s),
                coalesce(min(blob_len), -1),
                coalesce(max(blob_len), -1)
         FROM public.q4_out
@@ -81,7 +81,8 @@ def sample(cur, blob_bytes: int, produced_lower: int, prev):
 
     if wrong_len:
         cur.execute(
-            "SELECT k, blob_len FROM public.q4_out WHERE blob_len <> %s LIMIT 5",
+            "SELECT k, blob_len FROM public.q4_out "
+            "WHERE blob_len IS DISTINCT FROM %s LIMIT 5",
             (blob_bytes,))
         findings.append({
             "kind": "short_blob", "rows": int(wrong_len),

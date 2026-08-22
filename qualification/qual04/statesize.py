@@ -45,6 +45,13 @@ import boto3
 from botocore.config import Config
 
 
+# Reporting only: how far behind the newest checkpoint a prefix must sit
+# before it is called stale. Stale prefixes are still COUNTED (dedup by
+# content hash makes that safe); the number is published because a rising
+# count means restarts are leaving state behind in abandoned prefixes.
+GENERATION_SLACK = 3
+
+
 def decode_manifest(blob: bytes):
     """(hash, size) for every entry. Mirrors S3RemotePool::encode_manifest_
     exactly; a short or malformed manifest raises rather than silently
@@ -134,14 +141,35 @@ def main() -> int:
 
     footprint = sum(sizes.values())
 
-    # Live state: the NEWEST manifest per subtask is this subtask's view of
-    # its state. Hashes are deduplicated across subtasks - the store is
-    # content addressed, so two subtasks holding an identical value share
-    # one object and it must not be counted twice.
+    # Live state: the newest manifest of every subtask prefix.
+    #
+    # One prefix per RUNNER, not per generation: a parallelism-4 job whose
+    # DAG has four operators writes state/v1/0 .. state/v1/15, and only the
+    # keyed operator's four hold anything - the rest carry a 4-byte empty
+    # manifest or a source offset. Prefixes also stop advancing when a
+    # restart moves an operator to different runner indices, leaving the
+    # old prefix behind at the checkpoint it died on, still holding a
+    # complete manifest.
+    #
+    # So this sums the newest manifest of EVERY prefix and deduplicates by
+    # content hash. Deduplication is what makes that correct rather than
+    # double-counting: a restart relocates the SAME values into the new
+    # prefix, and identical content is one object in a content-addressed
+    # store, so a value counts once however many prefixes reference it.
+    # (Scoping to a "current generation" by checkpoint id was tried and is
+    # wrong - it drops the keyed operator's prefixes whenever they sit
+    # behind a still-advancing source's, and reported 8 bytes for 600 MB
+    # of state.)
+    newest_per_prefix = {pref: max(slot) for pref, slot in manifests.items() if slot}
+    generation_cp = max(newest_per_prefix.values(), default=0)
+    stale_prefixes = sum(1 for cp in newest_per_prefix.values()
+                         if cp < generation_cp - GENERATION_SLACK)
+
     live_by_hash = {}
     live_entries = 0
     manifests_read = 0
-    for slot in manifests.values():
+    for pref in sorted(manifests):
+        slot = manifests[pref]
         if not slot:
             continue
         newest = slot[max(slot)]
@@ -165,6 +193,8 @@ def main() -> int:
         print(f"state_footprint_bytes={footprint}")
         print(f"state_objects={len(sizes)}")
         print(f"state_manifests_read={manifests_read}")
+        print(f"state_generation_checkpoint={generation_cp}")
+        print(f"state_stale_prefixes={stale_prefixes}")
         print(f"state_gib={live / (1024 ** 3):.3f}")
         print(f"state_footprint_gib={footprint / (1024 ** 3):.3f}")
         ratio = (footprint / live) if live else 0.0

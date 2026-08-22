@@ -77,7 +77,7 @@ def main() -> int:
     conn.autocommit = True
     with conn.cursor() as cur:
         cur.execute("SELECT count(*), coalesce(sum(n), 0), "
-                    "count(*) FILTER (WHERE blob_len <> %s) FROM public.q4_out",
+                    "count(*) FILTER (WHERE blob_len IS DISTINCT FROM %s) FROM public.q4_out",
                     (args.blob_bytes,))
         distinct_keys, sum_n, wrong_len = cur.fetchone()
 
