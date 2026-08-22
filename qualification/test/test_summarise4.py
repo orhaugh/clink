@@ -24,7 +24,7 @@ MANDATORY = list(q4_summarise.MANDATORY_EVENTS)
 
 def write_evidence(d, *, findings=(), stuck=False, quiesced=True,
                    produced=1000, sum_n=1000, wrong_len=0, checked=2000,
-                   missing=0, wrong_n=0, wrong_blob=0, state_gib=2.0,
+                   missing=0, wrong_n=0, wrong_blob=0, fabricated=0, state_gib=2.0,
                    caught_up=True, covered=True):
     (d / "q4-verdict.json").write_text(json.dumps({
         "samples": 12, "findings": list(findings), "stuck": stuck,
@@ -35,7 +35,8 @@ def write_evidence(d, *, findings=(), stuck=False, quiesced=True,
         f"produced_total={produced}\nsum_n={sum_n}\ndistinct_keys=500\n"
         f"wrong_blob_len_rows={wrong_len}\nsampled_keys_checked={checked}\n"
         f"sampled_keys_missing={missing}\nsampled_keys_wrong_count={wrong_n}\n"
-        f"sampled_keys_wrong_blob_len={wrong_blob}\n")
+        f"sampled_keys_wrong_blob_len={wrong_blob}\n"
+        f"sampled_keys_fabricated={fabricated}\n")
     (d / "state-size-final.txt").write_text(
         f"state_live_bytes={int(state_gib * 1024 ** 3)}\nstate_live_keys=500\n"
         f"state_footprint_bytes={int(state_gib * 3 * 1024 ** 3)}\n"
@@ -99,6 +100,18 @@ CASES = [
      {"caught_up": False, "sum_n": 800}, 1.0, "INCONCLUSIVE"),
     ("a shortfall while fully caught up is still a FAIL",
      {"caught_up": True, "sum_n": 800}, 1.0, "FAIL"),
+    # The classification that cost qual04-20260822c its verdict: the run
+    # was behind, so sampled keys were legitimately missing and short, and
+    # the sample check forced FAIL over the top of caught_up=no.
+    ("keys missing and short BECAUSE the pipeline is behind is INCONCLUSIVE",
+     {"caught_up": False, "sum_n": 800, "missing": 16, "wrong_n": 966},
+     1.0, "INCONCLUSIVE"),
+    # But a defect that incompleteness cannot explain still fails, behind
+    # or not: a truncated accumulator is wrong however little was read.
+    ("a truncated accumulator is a FAIL even when behind",
+     {"caught_up": False, "sum_n": 800, "wrong_blob": 3}, 1.0, "FAIL"),
+    ("a fabricated key is a FAIL even when behind",
+     {"caught_up": False, "sum_n": 800, "fabricated": 1}, 1.0, "FAIL"),
 ]
 
 for name, kwargs, target, want in CASES:

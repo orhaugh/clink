@@ -1006,7 +1006,11 @@ while [ "$cwait" -lt "${CATCHUP_TIMEOUT_S:-1800}" ]; do
         STALL_S=$(( STALL_S + 30 ))
         # Caught up as far as it is ever going to: stop waiting out a
         # deadline that will not change the answer.
-        [ "$STALL_S" -ge 300 ] && break
+        # A mid-recovery pipeline legitimately makes no progress for
+        # minutes: a restart drain plus a restore plus the replay back to
+        # where it died. 300s cut the wait short during exactly that, and
+        # the run was then judged on a partial read.
+        [ "$STALL_S" -ge "${CATCHUP_STALL_S:-900}" ] && break
     else
         STALL_S=0
     fi

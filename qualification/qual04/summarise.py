@@ -142,8 +142,19 @@ def main() -> int:
     have_accounting = produced >= 0 and sum_n >= 0 and caught_up
     exact = have_accounting and produced == sum_n and wrong_len == 0
     have_sample = checked >= 0
-    sample_clean = (have_sample and missing == 0 and wrong_n == 0
-                    and wrong_blob == 0 and fabricated <= 0)
+    # A pipeline that never finished reading explains a MISSING key and a
+    # LOW count without anything being wrong: those events were not lost,
+    # they were never consumed. Judging them as defects turned an
+    # unfinished run into a correctness FAIL, which is precisely the
+    # confusion the caught_up flag exists to prevent - and the sample
+    # check was overriding it.
+    #
+    # A wrong WIDTH or a FABRICATED key is a defect either way: neither is
+    # explained by having read less than everything, so both are enforced
+    # regardless.
+    sample_clean = have_sample and wrong_blob == 0 and fabricated <= 0
+    if caught_up:
+        sample_clean = sample_clean and missing == 0 and wrong_n == 0
     # A sample that checked nothing proves nothing.
     sample_meaningful = checked > 0
 
@@ -166,7 +177,8 @@ def main() -> int:
     if not sample_meaningful:
         gaps.append("no sampled key was checkable against the seed")
     if not caught_up:
-        gaps.append(f"the pipeline never caught up with the generator "
+        gaps.append(f"the pipeline never caught up with the generator, so neither exact "
+                    f"accounting nor per-key counts are judgeable "
                     f"({catchup.get('folded_at_catchup', '?')} of "
                     f"{catchup.get('produced_final', '?')} events read), so exact "
                     f"accounting cannot separate lost events from unread ones")
