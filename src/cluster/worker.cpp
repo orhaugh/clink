@@ -1583,6 +1583,10 @@ void Worker::handle_deploy_(MessageReader& r) {
     }
     for (auto& task : msg.tasks) {
         const JobId jid = msg.job_id;
+        // Copied before `task` is moved into the closure below; used only
+        // to name this subtask if the teardown join blocks on it.
+        const std::string task_role = task.role;
+        const std::uint32_t task_subtask_idx = task.subtask_idx;
         const std::string ckpt_dir = msg.checkpoint_dir;
         const std::string restore_dir = msg.restore_from_dir;
         const std::uint64_t restore_id = msg.restore_from_checkpoint_id;
@@ -1636,7 +1640,8 @@ void Worker::handle_deploy_(MessageReader& r) {
                       expected_versions,
                       udfs);
         });
-        task_threads_.push_back(TaskThread{std::move(t), std::move(done)});
+        task_threads_.push_back(
+            TaskThread{std::move(t), std::move(done), jid, task_role, task_subtask_idx});
     }
 }
 
@@ -3032,11 +3037,58 @@ void Worker::stop() {
     // register_role, which receives no cancel token - there is no way to
     // interrupt an arbitrary callback. That path is the in-process test
     // API, not how clink_node runs work.
-    for (auto& t : task_threads_) {
-        if (t.thread.joinable()) {
-            t.thread.join();
+    //
+    // The joins stay unbounded, for the reason above. They must not stay
+    // SILENT, though, and that is the part that bit: a worker wedged here
+    // never re-registers, so the coordinator recovers its job, finds no
+    // workers, parks it for capacity and waits for a registration that
+    // will never arrive. QUAL-04's rig reproduced it three times, and the
+    // last line any worker logged was "control session ended" - after
+    // which the cluster showed three healthy containers, no workers, and
+    // no job. A hang is only "a loud symptom with a stack to look at" if
+    // something says it is hanging.
+    drain_started_unix_.store(std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count(),
+                              std::memory_order_release);
+    std::size_t outstanding = 0;
+    for (const auto& t : task_threads_) {
+        if (t.thread.joinable() && !t.done->load(std::memory_order_acquire)) {
+            ++outstanding;
         }
     }
+    draining_subtasks_.store(outstanding, std::memory_order_release);
+    const auto drain_start = std::chrono::steady_clock::now();
+    for (auto& t : task_threads_) {
+        if (!t.thread.joinable()) {
+            continue;
+        }
+        // Wait in slices so a subtask that will not exit is reported
+        // repeatedly, with its identity, rather than swallowed. join()
+        // below then returns immediately.
+        while (!t.done->load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::seconds{5});
+            if (t.done->load(std::memory_order_acquire)) {
+                break;
+            }
+            const auto held = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::steady_clock::now() - drain_start)
+                                  .count();
+            log::warn("worker.drain",
+                      "still draining after " + std::to_string(held) +
+                          "s: job_id=" + std::to_string(t.job_id) + " " + t.role + "[" +
+                          std::to_string(t.subtask_idx) +
+                          "] has not exited. This worker will not re-register until it "
+                          "does, so its slots stay unavailable and any job needing them "
+                          "cannot be placed.");
+        }
+        t.thread.join();
+        if (draining_subtasks_.load(std::memory_order_acquire) > 0) {
+            draining_subtasks_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+    draining_subtasks_.store(0, std::memory_order_release);
+    drain_started_unix_.store(0, std::memory_order_release);
     task_threads_.clear();
     conn_.reset();
 }

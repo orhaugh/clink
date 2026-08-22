@@ -139,6 +139,18 @@ public:
     // process and container stay alive.
     bool disconnected() const noexcept { return disconnected_.load(std::memory_order_acquire); }
 
+    // Subtasks still winding down inside stop(). Non-zero means this
+    // worker is draining and will not re-register until it reaches zero.
+    [[nodiscard]] std::size_t draining_subtasks() const noexcept {
+        return draining_subtasks_.load(std::memory_order_acquire);
+    }
+    // Unix seconds when the current drain began, 0 when not draining. A
+    // value that stops advancing towards zero subtasks is the signature
+    // of a wedged teardown.
+    [[nodiscard]] std::int64_t drain_started_unix() const noexcept {
+        return drain_started_unix_.load(std::memory_order_acquire);
+    }
+
     // Fencing epoch this worker is bound to: the epoch carried by the
     // RegisterAck that admitted it, raised if a later frame carries a
     // higher one. Zero means the coordinator is unfenced (non-HA, or an
@@ -320,8 +332,21 @@ private:
     struct TaskThread {
         std::thread thread;
         std::shared_ptr<std::atomic<bool>> done;
+        // Identity, carried solely so a teardown that blocks can NAME what
+        // it is blocked on. The joins below are deliberately unbounded;
+        // that is only defensible if the wait is visible.
+        JobId job_id{0};
+        std::string role;
+        std::uint32_t subtask_idx{0};
     };
     std::vector<TaskThread> task_threads_;
+    // Subtasks that have not yet exited during a stop(), and when the
+    // drain began. Published so "up but wedged draining" is visible from
+    // outside the process: a worker stuck here never re-registers, and
+    // the cluster then shows healthy containers and a job parked for
+    // capacity that never comes back.
+    std::atomic<std::size_t> draining_subtasks_{0};
+    std::atomic<std::int64_t> drain_started_unix_{0};
     // Join + erase every task thread that has signalled completion.
     // Called with mu_ held. Joining an already-exited thread returns
     // immediately, and only self-reported-done entries are touched, so

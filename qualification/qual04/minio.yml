@@ -5,9 +5,23 @@
 # rides the store rather than an in-memory operator map, which is the
 # only way 100 GB of state is reachable on 8 GB workers.
 #
-# Data lands under /qual/state/minio, i.e. on the attached volume
-# (STATE_VOLUME_GB), because the ops host's 160 GB root disk cannot hold
-# a large-state campaign.
+# Data lands wherever MINIO_DATA_DIR points, defaulting to a docker
+# volume on the ops host's LOCAL disk.
+#
+# That default is a performance decision, measured rather than assumed. A
+# Hetzner volume is network block storage: `dd` on the mounted volume,
+# with MinIO out of the picture entirely, managed only ~300 small-file
+# creates per second, and since this workload writes one object per
+# distinct key touched per checkpoint, that ceiling - not MinIO, not
+# Docker - is what capped the pipeline at ~73 events/s and made persists
+# overrun their own interval. The root disk is local NVMe and does not
+# have that ceiling.
+#
+# It also fits: at a checkpoint interval comfortably above the persist
+# duration the store holds only ~1.1x the live state (measured), so a
+# 10 GiB campaign needs ~11 GiB, against ~150 GiB usable on the root
+# disk. Point MINIO_DATA_DIR at /qual/state/minio (the attached volume)
+# only for a campaign whose state genuinely outgrows that.
 services:
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
@@ -22,4 +36,6 @@ services:
     ports:
       - "9000:9000"
     volumes:
-      - /qual/state/minio:/data
+      - ${MINIO_DATA_DIR:-qual04-minio-data}:/data
+volumes:
+  qual04-minio-data:

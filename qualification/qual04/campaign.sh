@@ -280,11 +280,12 @@ fi
 # directory goes on the attached volume rather than the ops host's root
 # disk - that is what STATE_VOLUME_GB exists for.
 echo "campaign: starting the state store"
-on_host "$OPS_PUB" "mkdir -p /qual /qual/state/minio"
+on_host "$OPS_PUB" "mkdir -p /qual"
 to_host "$OPS_PUB" "$HERE/minio.yml" /qual/minio.yml
 # Written to the host, not passed inline, so anything that later restarts
 # this container reproduces its configuration.
-on_host "$OPS_PUB" "printf 'S3_ACCESS_KEY=%s\\nS3_SECRET_KEY=%s\\n' '$S3_ACCESS_KEY' '$S3_SECRET_KEY' >> /qual/.env"
+on_host "$OPS_PUB" "printf 'S3_ACCESS_KEY=%s\\nS3_SECRET_KEY=%s\\nMINIO_DATA_DIR=%s\\n' \
+    '$S3_ACCESS_KEY' '$S3_SECRET_KEY' '${MINIO_DATA_DIR:-qual04-minio-data}' >> /qual/.env"
 # down -v, then wipe the data dir: MinIO's root credentials only take
 # effect on an uninitialised data directory, and this campaign derives
 # its secret from RUN_ID, so a reused rig would otherwise serve a store
@@ -293,7 +294,9 @@ on_host "$OPS_PUB" "printf 'S3_ACCESS_KEY=%s\\nS3_SECRET_KEY=%s\\n' '$S3_ACCESS_
 # in that store is this campaign's subject, and inheriting another run's
 # is the same class of mistake as inheriting its job store.
 on_host "$OPS_PUB" "cd /qual && docker compose -f minio.yml down -v" >/dev/null 2>&1 || true
-on_host "$OPS_PUB" "rm -rf /qual/state/minio && mkdir -p /qual/state/minio"
+if [ -n "${MINIO_DATA_DIR:-}" ]; then
+    on_host "$OPS_PUB" "rm -rf $MINIO_DATA_DIR && mkdir -p $MINIO_DATA_DIR"
+fi
 on_host "$OPS_PUB" "cd /qual && docker compose -f minio.yml up -d"
 
 for _ in $(seq 1 45); do
@@ -308,21 +311,25 @@ on_host "$OPS_PUB" "curl -fsS $S3_ENDPOINT_OPS/minio/health/ready >/dev/null 2>&
 # The state store must have ROOM for the target. A campaign that fills
 # the volume mid-fill reports an engine failure that is really a sizing
 # mistake, so refuse up front rather than discover it at 80 GB.
-AVAIL_KB=$(on_host "$OPS_PUB" "df -Pk /qual/state | awk 'NR==2{print \$4}'" | tr -d ' \r')
+# Check the filesystem the STORE actually writes to, which is the root
+# disk unless MINIO_DATA_DIR was pointed at the attached volume.
+STORE_PATH="${MINIO_DATA_DIR:-/var/lib/docker}"
+AVAIL_KB=$(on_host "$OPS_PUB" "df -Pk $STORE_PATH | awk 'NR==2{print \$4}'" | tr -d ' \r')
 AVAIL_GIB=$(( ${AVAIL_KB:-0} / 1048576 ))
 NEED_GIB=$(python3 -c "print(int(${STATE_TARGET_GIB} * 1.4) + 1)")
-echo "campaign: /qual/state has ${AVAIL_GIB} GiB free, target needs ~${NEED_GIB} GiB"
+echo "campaign: the state store's filesystem ($STORE_PATH) has ${AVAIL_GIB} GiB free, target needs ~${NEED_GIB} GiB"
 [ "$AVAIL_GIB" -ge "$NEED_GIB" ] || {
-    echo "campaign: /qual/state has ${AVAIL_GIB} GiB free but this run targets" >&2
+    echo "campaign: $STORE_PATH has ${AVAIL_GIB} GiB free but this run targets" >&2
     echo "  ${STATE_TARGET_GIB} GiB of state (~${NEED_GIB} GiB with overhead)." >&2
-    echo "  Provision with STATE_VOLUME_GB=<n>; the ops root disk is not enough." >&2
+    echo "  Provision with STATE_VOLUME_GB=<n> and set MINIO_DATA_DIR=/qual/state/minio;" >&2
+    echo "  note the attached volume is far slower for small objects than the root disk." >&2
     exit 2
 }
 
 on_host "$OPS_PUB" "curl -fsS -X PUT --aws-sigv4 'aws:amz:us-east-1:s3' \
     --user '$S3_ACCESS_KEY:$S3_SECRET_KEY' $S3_ENDPOINT_OPS/$S3_BUCKET >/dev/null" \
     || { echo "campaign: could not create the state bucket" >&2; exit 2; }
-echo "campaign: state bucket created on the attached volume"
+echo "campaign: state bucket created (store data in $STORE_PATH)"
 
 # The verification database. NOT the subject: it is how an external
 # oracle reads the engine's per-key answers. mode='upsert' keyed by k
