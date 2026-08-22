@@ -25,7 +25,7 @@ MANDATORY = list(q4_summarise.MANDATORY_EVENTS)
 def write_evidence(d, *, findings=(), stuck=False, quiesced=True,
                    produced=1000, sum_n=1000, wrong_len=0, checked=2000,
                    missing=0, wrong_n=0, wrong_blob=0, state_gib=2.0,
-                   covered=True):
+                   caught_up=True, covered=True):
     (d / "q4-verdict.json").write_text(json.dumps({
         "samples": 12, "findings": list(findings), "stuck": stuck,
         "last_stats": {"sum_n": sum_n},
@@ -37,8 +37,14 @@ def write_evidence(d, *, findings=(), stuck=False, quiesced=True,
         f"sampled_keys_missing={missing}\nsampled_keys_wrong_count={wrong_n}\n"
         f"sampled_keys_wrong_blob_len={wrong_blob}\n")
     (d / "state-size-final.txt").write_text(
-        f"state_bytes={int(state_gib * 1024 ** 3)}\nstate_objects=100\n"
-        f"state_largest_object_bytes=20480\nstate_gib={state_gib:.3f}\n")
+        f"state_live_bytes={int(state_gib * 1024 ** 3)}\nstate_live_keys=500\n"
+        f"state_footprint_bytes={int(state_gib * 3 * 1024 ** 3)}\n"
+        f"state_objects=100\nstate_manifests_read=4\n"
+        f"state_gib={state_gib:.3f}\nstate_footprint_gib={state_gib * 3:.3f}\n"
+        f"state_footprint_ratio=3.0\n")
+    (d / "catchup.txt").write_text(
+        f"caught_up={'yes' if caught_up else 'no'}\nproduced_final={produced}\n"
+        f"folded_at_catchup={sum_n}\ncatchup_seconds=60\n")
     (d / "verification.txt").write_text(
         "blob_bytes=20480\nstate_backend=remote-read://b/state\n")
     lines = []
@@ -89,6 +95,10 @@ CASES = [
      {"state_gib": 0.4}, 10.0, "INCONCLUSIVE"),
     ("a run whose sample checked nothing is INCONCLUSIVE",
      {"checked": 0}, 1.0, "INCONCLUSIVE"),
+    ("a pipeline that never caught up is INCONCLUSIVE, not a correctness FAIL",
+     {"caught_up": False, "sum_n": 800}, 1.0, "INCONCLUSIVE"),
+    ("a shortfall while fully caught up is still a FAIL",
+     {"caught_up": True, "sum_n": 800}, 1.0, "FAIL"),
 ]
 
 for name, kwargs, target, want in CASES:

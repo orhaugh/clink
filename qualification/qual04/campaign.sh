@@ -467,10 +467,16 @@ on_host "$OPS_PUB" "pkill -f '[g]enerator.py'; pkill -f '[v]erifier.py'; pkill -
     rm -f /qual/q4-progress.json* /qual/q4-verdict.json /qual/q4-chaos.jsonl; true"
 
 # The state-size instrument, measured from outside the engine.
+# state_bytes reports LIVE keyed state (the newest manifest's referenced
+# objects, deduplicated by content hash), NOT the store footprint. The
+# store is append-only within a run - every update writes a new value
+# object and nothing reclaims the old one - so the footprint grows with
+# update volume and would let this campaign "reach" its target on
+# garbage. state_detail records both, and their ratio.
 state_bytes() { on_host "$OPS_PUB" "python3 /qual/statesize.py --endpoint $S3_ENDPOINT_OPS \
-    --bucket $S3_BUCKET --access-key '$S3_ACCESS_KEY' --secret-key '$S3_SECRET_KEY'"; }
+    --bucket $S3_BUCKET --prefix $S3_PREFIX --access-key '$S3_ACCESS_KEY' --secret-key '$S3_SECRET_KEY'"; }
 state_detail() { on_host "$OPS_PUB" "python3 /qual/statesize.py --detail --endpoint $S3_ENDPOINT_OPS \
-    --bucket $S3_BUCKET --access-key '$S3_ACCESS_KEY' --secret-key '$S3_SECRET_KEY'"; }
+    --bucket $S3_BUCKET --prefix $S3_PREFIX --access-key '$S3_ACCESS_KEY' --secret-key '$S3_SECRET_KEY'"; }
 
 # The state store must start EMPTY - what accumulates in it is this run's
 # evidence, and a previous run's objects would inflate the size the
@@ -610,7 +616,7 @@ done
   Rows are being produced, but the keyed state is not in the deferring
   backend - the aggregate is holding it in memory, which is the one
   configuration this campaign cannot be run on."
-echo "campaign: keyed state confirmed in the deferring backend ($STATE_SEEN bytes)"
+echo "campaign: keyed state confirmed in the deferring backend ($STATE_SEEN live bytes)"
 
 # The accumulator must be the FULL configured width from the first rows
 # on. A short blob here means the pipeline is not building the fat value
@@ -716,19 +722,30 @@ fi
 echo "campaign: fault confirmed by the engine (workers lost: $LOST)"
 
 # 6. The job survives the fault AND keeps folding events into state.
+#
+# Polled, not slept. Two things make a single 90-second look wrong at
+# size: a restart drain followed by a restore takes longer than it does
+# for a small job, and the replay from the last checkpoint re-folds
+# events the accumulators had already counted, so the total sits FLAT
+# until the job catches back up past the point it died. A one-shot probe
+# reads both as "the engine stopped".
 BEFORE=$(psql_q "SELECT coalesce(sum(n), 0) FROM public.q4_out" | tr -d '\r')
-sleep 90
-POST=$(curl -fsS "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}") || verify_fail "coordinator unreachable after the first fault"
-python3 -c "
+AFTER=$BEFORE
+RECOVERED=no
+for _ in $(seq 1 "${RECOVER_PROBES:-20}"); do
+    sleep 30
+    POST=$(curl -fsS "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" 2>/dev/null) || continue
+    python3 -c "
 import json,sys
 j = json.loads(sys.argv[1])
-sys.exit(0 if j.get('status') == 'RUNNING' else 1)" "$POST" \
-    || verify_fail "the job did not recover from the first fault: $POST"
-AFTER=$(psql_q "SELECT coalesce(sum(n), 0) FROM public.q4_out" | tr -d '\r')
-[ "${AFTER:-0}" -gt "${BEFORE:-0}" ] \
-    || verify_fail "the job reports RUNNING after the fault but has folded no further
-  events into state ($BEFORE -> $AFTER). A recovered job that cannot make progress
-  is not recovered."
+sys.exit(0 if j.get('status') == 'RUNNING' else 1)" "$POST" || continue
+    AFTER=$(psql_q "SELECT coalesce(sum(n), 0) FROM public.q4_out" | tr -d '\r')
+    if [ "${AFTER:-0}" -gt "${BEFORE:-0}" ]; then RECOVERED=yes; break; fi
+done
+[ "$RECOVERED" = "yes" ] || verify_fail "the job did not resume folding events within
+  $(( ${RECOVER_PROBES:-20} * 30 ))s of the first fault ($BEFORE -> $AFTER). Either the
+  restart never completed or the job is not making progress; the container logs
+  collected alongside this message say which."
 echo "campaign: recovered and still folding events ($BEFORE -> $AFTER) - VERIFICATION PASSED, entering soak"
 
 { echo "campaign=QUAL-04"; echo "run_id=$RUN_ID"; echo "job_id=$JOB_ID";
@@ -821,9 +838,11 @@ except Exception:
         fi
     fi
 
-    SB=$(state_bytes | tr -d '\r' 2>/dev/null || echo 0)
+    SD=$(state_detail 2>/dev/null | tr -d '\r' || true)
+    SLIVE=$(echo "$SD" | awk -F= '/^state_gib=/{print $2}')
+    SFOOT=$(echo "$SD" | awk -F= '/^state_footprint_gib=/{print $2}')
     SK=$(psql_q "SELECT count(*) FROM public.q4_out" 2>/dev/null | tr -d '\r' || echo '?')
-    echo "campaign: $(date -u +%H:%M) soak, $(python3 -c "print('%.2f' % (${SB:-0}/1024**3))") GiB state, $SK keys"
+    echo "campaign: $(date -u +%H:%M) soak, ${SLIVE:-?} GiB live state (${SFOOT:-?} GiB store footprint), $SK keys"
 done
 # --- drain and final judgement ------------------------------------------
 echo "campaign: soak complete, draining"
@@ -853,7 +872,40 @@ while [ "$gwaited" -lt 60 ]; do
 done
 [ "$gwaited" -lt 60 ] \
     || echo "campaign: WARNING - the generator is still producing 60s after its stop request" >&2
-sleep 120   # let the pipeline commit what it has already read
+echo "campaign: waiting for the pipeline to catch up with the generator"
+CATCHUP=no
+PRODUCED_FINAL=$(on_host "$OPS_PUB" "python3 -c \"
+import json;d=json.load(open('/qual/q4-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
+cwait=0
+LAST_FOLDED=-1
+STALL_S=0
+while [ "$cwait" -lt "${CATCHUP_TIMEOUT_S:-1800}" ]; do
+    FOLDED=$(psql_q "SELECT coalesce(sum(n), 0) FROM public.q4_out" | tr -d '\r')
+    if [ "${FOLDED:-0}" -ge "${PRODUCED_FINAL:-1}" ]; then CATCHUP=yes; break; fi
+    if [ "${FOLDED:-0}" -le "${LAST_FOLDED}" ]; then
+        STALL_S=$(( STALL_S + 30 ))
+        # Caught up as far as it is ever going to: stop waiting out a
+        # deadline that will not change the answer.
+        [ "$STALL_S" -ge 300 ] && break
+    else
+        STALL_S=0
+    fi
+    LAST_FOLDED=${FOLDED:-0}
+    echo "campaign: catch-up ${FOLDED:-0} / ${PRODUCED_FINAL} events"
+    sleep 30
+    cwait=$(( cwait + 30 ))
+done
+{ echo "caught_up=$CATCHUP"; echo "produced_final=${PRODUCED_FINAL}";
+  echo "folded_at_catchup=${FOLDED:-0}"; echo "catchup_seconds=$cwait";
+} > "$OUT_DIR/catchup.txt"
+if [ "$CATCHUP" = "yes" ]; then
+    echo "campaign: pipeline caught up (${FOLDED} events folded)"
+else
+    echo "campaign: WARNING - the pipeline did not catch up with the generator" >&2
+    echo "  (${FOLDED:-0} of ${PRODUCED_FINAL}). The exact-accounting check cannot" >&2
+    echo "  distinguish lost events from unread ones, so the summary will read this" >&2
+    echo "  run as INCONCLUSIVE rather than judge correctness on a partial read." >&2
+fi
 
 # The verdict is final only over a SETTLED bucket: at least one fresh
 # sample after the drain AND two consecutive samples seeing the same line

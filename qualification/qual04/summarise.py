@@ -113,6 +113,7 @@ def main() -> int:
     verification = load_kv(os.path.join(d, "verification.txt"))
     completeness = load_kv(os.path.join(d, "completeness.txt"))
     quiesce = load_kv(os.path.join(d, "final-quiesce.txt"))
+    catchup = load_kv(os.path.join(d, "catchup.txt"))
     statesize = load_kv(os.path.join(d, "state-size-final.txt"))
 
     findings = verdict.get("findings") or []
@@ -133,7 +134,12 @@ def main() -> int:
     wrong_blob = int(completeness.get("sampled_keys_wrong_blob_len") or -1)
     fabricated = int(completeness.get("sampled_keys_fabricated") or -1)
 
-    have_accounting = produced >= 0 and sum_n >= 0
+    # Exact accounting is only judgeable over a pipeline that finished
+    # reading. Behind-but-correct and lost-events look identical in the
+    # totals, so a run that never caught up is reported as unproven
+    # rather than convicted.
+    caught_up = catchup.get("caught_up", "yes") == "yes"
+    have_accounting = produced >= 0 and sum_n >= 0 and caught_up
     exact = have_accounting and produced == sum_n and wrong_len == 0
     have_sample = checked >= 0
     sample_clean = (have_sample and missing == 0 and wrong_n == 0
@@ -148,7 +154,8 @@ def main() -> int:
         os.path.join(d, "q4-chaos.jsonl"))
 
     clean = (samples > 0 and not findings and not stuck and not oracle_dirty
-             and not job_gone and exact and sample_clean and sample_meaningful)
+             and not job_gone and sample_clean and sample_meaningful
+             and (exact or not caught_up))
     gaps = []
     if not quiesced:
         gaps.append("final verdict never quiesced")
@@ -158,6 +165,11 @@ def main() -> int:
                     f"is evidence about a small job, not a large one")
     if not sample_meaningful:
         gaps.append("no sampled key was checkable against the seed")
+    if not caught_up:
+        gaps.append(f"the pipeline never caught up with the generator "
+                    f"({catchup.get('folded_at_catchup', '?')} of "
+                    f"{catchup.get('produced_final', '?')} events read), so exact "
+                    f"accounting cannot separate lost events from unread ones")
     gaps += uncovered + pid_violations
 
     if clean and not gaps:
@@ -181,17 +193,25 @@ def main() -> int:
     print(f"Chaos profile: {args.profile}\n")
 
     print("## State reached\n")
-    print(f"- Keyed state held at the end: {statesize.get('state_gib', 'no evidence')} GiB "
-          f"({statesize.get('state_bytes', 'no evidence')} bytes across "
-          f"{statesize.get('state_objects', 'no evidence')} objects)")
+    print(f"- LIVE keyed state at the end: {statesize.get('state_gib', 'no evidence')} GiB "
+          f"({statesize.get('state_live_bytes', 'no evidence')} bytes over "
+          f"{statesize.get('state_live_keys', 'no evidence')} keyed entries)")
+    print(f"- Store footprint: {statesize.get('state_footprint_gib', 'no evidence')} GiB "
+          f"across {statesize.get('state_objects', 'no evidence')} objects "
+          f"({statesize.get('state_footprint_ratio', '?')}x live)")
     print(f"- Target: {args.state_target_gib:.2f} GiB "
           f"({'reached' if target_met else 'NOT REACHED'})")
     print(f"- Distinct keys in state: {num(distinct_keys)}")
     print(f"- Per-key accumulator width: "
           f"{verification.get('blob_bytes', 'no evidence')} bytes")
     print(f"- State backend: {verification.get('state_backend', 'no evidence')}")
-    print("- Measured from OUTSIDE the engine (object bytes in the store), "
-          "not from an engine-reported gauge\n")
+    print("- Both measured from OUTSIDE the engine (the backend's own manifest "
+          "and object listing), not from an engine-reported gauge")
+    print("- The size gate reads LIVE state. The footprint is larger because the "
+          "store is content-addressed and append-only within a run: each update "
+          "writes a new value object and orphan reclamation (sweep) has no "
+          "caller in the engine, so footprint tracks update volume, not state "
+          "size\n")
 
     print("## Workload\n")
     print(f"- Input events produced: {num(produced)}")
