@@ -343,28 +343,39 @@ echo "campaign: the state store's filesystem ($STORE_PATH) has ${AVAIL_GIB} GiB 
 # Measured with dd, MinIO deliberately out of the picture, because the
 # ceiling belongs to the filesystem: a Hetzner network volume managed
 # ~300 creates/s where the local NVMe root disk is far faster.
-echo "campaign: measuring the state store's small-object write rate"
-STORE_FPS=$(on_host "$OPS_PUB" "
-    d=\$(mktemp -d ${STORE_PATH%/}/fpsXXXX 2>/dev/null || mktemp -d)
-    cd \$d
-    s=\$(date +%s%N)
-    for i in \$(seq 1 300); do dd if=/dev/zero of=f\$i bs=${BLOB_BYTES} count=1 2>/dev/null; done
-    e=\$(date +%s%N)
-    cd / && rm -rf \$d
-    echo \$(( 300000000000 / (e - s) ))" | tr -d ' \r')
-echo "store_files_per_sec=${STORE_FPS:-0}" > "$OUT_DIR/store-rate.txt"
-echo "campaign: the store's filesystem sustains ~${STORE_FPS:-?} objects/s of ${BLOB_BYTES} bytes"
+echo "campaign: measuring the state store's object write rate"
+# Measure what the STORE serves, at the concurrency the engine actually
+# drives - not what the disk underneath can do.
+#
+# A first version of this timed dd creating files on the store's
+# filesystem and reported ~435/s. That number was process-spawn cost: the
+# same disk does 14,337 files/s from a single process. It also led to the
+# wrong conclusion that a Hetzner volume was the bottleneck. The real
+# ceiling is MinIO's own per-request overhead - 171 PUT/s serially,
+# ~495 PUT/s from 8 concurrent writers on this host shape, CPU-bound
+# rather than disk-bound - so the probe must go through the S3 API, and
+# concurrently, or it measures the wrong layer twice over.
+to_host "$OPS_PUB" "$HERE/putprobe.py" /qual/putprobe.py
+STORE_PUTS=$(on_host "$OPS_PUB" "python3 /qual/putprobe.py --endpoint $S3_ENDPOINT_OPS \
+    --access-key '$S3_ACCESS_KEY' --secret-key '$S3_SECRET_KEY' \
+    --object-bytes $BLOB_BYTES --concurrency ${STORE_PROBE_CONCURRENCY:-8}" | tr -d ' \r')
+echo "campaign: the store serves ~${STORE_PUTS:-?} object writes/s at concurrency ${STORE_PROBE_CONCURRENCY:-8}"
 
-# Leave headroom: the measurement is a clean sequential best case, while
-# the real write mix includes MinIO's own metadata and concurrent reads.
-SUSTAINABLE=$(( ${STORE_FPS:-0} * 60 / 100 ))
-{ echo "store_files_per_sec=${STORE_FPS:-0}"; echo "sustainable_events_per_sec=$SUSTAINABLE";
-  echo "configured_rate=$RATE"; } > "$OUT_DIR/store-rate.txt"
+# Headroom, because the live mix also carries state READS and MinIO's own
+# metadata traffic, and the probe is a clean write-only best case.
+SUSTAINABLE=$(( ${STORE_PUTS:-0} * 60 / 100 ))
+{ echo "store_puts_per_sec=${STORE_PUTS:-0}"; echo "sustainable_events_per_sec=$SUSTAINABLE";
+  echo "configured_rate=$RATE"; echo "probe_concurrency=${STORE_PROBE_CONCURRENCY:-8}"; } \
+  > "$OUT_DIR/store-rate.txt"
+if [ "${SUSTAINABLE:-0}" -lt 1 ]; then
+    echo "campaign: could not measure the store's write rate; refusing to guess" >&2
+    exit 2
+fi
 if [ "$RATE" -gt "$SUSTAINABLE" ]; then
     echo "campaign: RATE=$RATE exceeds what this store can absorb (~$SUSTAINABLE events/s at" >&2
-    echo "  60% of a measured ${STORE_FPS} objects/s). Persists would outrun their interval and" >&2
-    echo "  the run would measure the storage, not the engine. Lower RATE, or put the store on" >&2
-    echo "  faster media (MINIO_DATA_DIR on local disk rather than the attached volume)." >&2
+    echo "  60% of a measured ${STORE_PUTS} object writes/s). Persists would outrun their" >&2
+    echo "  interval and the run would measure the store, not the engine. Lower RATE, raise" >&2
+    echo "  PARTITIONS so the engine drives more concurrent writes, or give the store more CPU." >&2
     exit 2
 fi
 echo "campaign: RATE=$RATE is within the store's sustainable ~$SUSTAINABLE events/s"
