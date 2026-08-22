@@ -1310,6 +1310,24 @@ private:
     // the hot path was engaged (arm frames staged into `out_frames`); false
     // means ineligible, with the reason, and the caller falls back to the
     // replan path. Called under mu_.
+    // Populate restart_drain_expected with the subtasks that can ACTUALLY
+    // drain - those on a worker still registered and not lost - and queue
+    // everything else for redeploy.
+    //
+    // The distinction is not cosmetic. The CancelJob broadcast that starts
+    // a drain skips workers that are unregistered or lost, so a subtask on
+    // a dead worker is never asked to drain and never will. Waiting for it
+    // burns the entire restart_drain_timeout and then fails the job.
+    // QUAL-04's rig run ended exactly there: 15 subtasks undrained at the
+    // deadline, 13 of them on a worker the coordinator had itself declared
+    // lost seconds earlier, with the job killed after ten minutes of
+    // waiting for the impossible.
+    //
+    // The worker-loss path always filtered this way; the subtask-error and
+    // rescale paths did not, and this exists so the three cannot drift
+    // apart again.
+    void populate_restart_drain_locked_(JobState& job);
+
     bool try_begin_hot_cutover_locked_(JobState& job,
                                        const std::string& op_id,
                                        std::uint32_t new_parallelism,

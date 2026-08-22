@@ -26,6 +26,7 @@ int clink_cmd_stop_job(int argc, char** argv);
 int clink_cmd_check_savepoint(int argc, char** argv);
 int clink_cmd_state_diff(int argc, char** argv);
 int clink_cmd_state_cat(int argc, char** argv);
+int clink_cmd_state_sweep(int argc, char** argv);
 int clink_cmd_state_export(int argc, char** argv);
 int clink_cmd_state_query(int argc, char** argv);
 int clink_cmd_capture_cat(int argc, char** argv);
@@ -59,6 +60,7 @@ void usage() {
         << "  check-savepoint   Inspect state-schema version stamps inside a savepoint file.\n"
         << "  state-diff        Compare the keyed state of two checkpoints/savepoints.\n"
         << "  state-cat         Dump a checkpoint/savepoint's keyed state.\n"
+        << "  state-sweep       Reclaim unreferenced objects from a disaggregated store.\n"
         << "  state-export      Write keyed state as one Arrow IPC stream file.\n"
         << "  state-query       Run SQL over a checkpoint/savepoint's keyed state.\n"
         << "  capture-cat       Inspect record-capture flight-recorder epochs.\n"
@@ -151,6 +153,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "state-diff") {
         return clink_cmd_state_diff(sub_argc, sub_argv);
+    }
+    if (cmd == "state-sweep") {
+        return clink_cmd_state_sweep(argc - 1, argv + 1);
     }
     if (cmd == "state-cat") {
         return clink_cmd_state_cat(sub_argc, sub_argv);

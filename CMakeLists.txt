@@ -1358,6 +1358,7 @@ add_library(clink_cli_cmds OBJECT
     tools/clink_stop_job.cpp
     tools/clink_check_savepoint.cpp
     tools/clink_state_diff.cpp
+    tools/clink_state_sweep.cpp
     tools/clink_capture_sync.cpp
     tools/clink_list.cpp
     tools/clink_checkpoint_verify.cpp
@@ -1407,6 +1408,14 @@ endif()
 if(TARGET clink::iceberg)
     target_link_libraries(clink_cli_cmds PUBLIC clink::iceberg)
     target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_ICEBERG)
+endif()
+# `clink state-sweep` reclaims unreferenced objects from a disaggregated
+# store. The reclaimer existed with no caller anywhere - no CLI, no
+# endpoint, no periodic task - so a remote-read:// store grew with update
+# volume for ever. This is the admin trigger its own comments describe.
+if(TARGET clink::s3)
+    target_link_libraries(clink_cli_cmds PUBLIC clink::s3)
+    target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_S3)
 endif()
 # The embedded runner (`clink run <file>.sql`, `clink flight-sql`) installs
 # every linked connector via install_defaults, so embedded SQL reaches the

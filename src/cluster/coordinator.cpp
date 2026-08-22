@@ -2095,11 +2095,7 @@ RescaleJobAckMsg Coordinator::rescale_job(
         // gated on a non-epoch restart_deadline). Set it whenever the job
         // enters awaiting_restart, per the field's contract.
         job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
-        for (const auto& [worker_id, pending] : job.pending_per_worker) {
-            for (const auto& [role, sub] : pending) {
-                job.restart_drain_expected.insert(role + ":" + std::to_string(sub));
-            }
-        }
+        populate_restart_drain_locked_(job);
         // Empty drain (no in-flight subtasks): fire restart immediately.
         // Typical case is mid-stream, so we just collect worker conns for
         // the cancel broadcast and let the existing drain do its work.
@@ -2349,11 +2345,7 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
             }
             job.awaiting_restart = true;
             job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
-            for (const auto& [worker_id, pending] : job.pending_per_worker) {
-                for (const auto& [role, sub] : pending) {
-                    job.restart_drain_expected.insert(role + ":" + std::to_string(sub));
-                }
-            }
+            populate_restart_drain_locked_(job);
             for (const auto& [worker_id, _] : job.tasks_by_worker) {
                 auto worker_it = registered_.find(worker_id);
                 if (worker_it != registered_.end() && !worker_it->second->lost &&
@@ -2410,6 +2402,42 @@ std::string producer_id_of_input_ref(const std::string& raw) {
     return raw.substr(0, dot);
 }
 }  // namespace
+
+void Coordinator::populate_restart_drain_locked_(JobState& job) {
+    // Only a subtask on a LIVE worker can drain: the CancelJob broadcast
+    // that starts the drain skips workers that are unregistered or lost,
+    // so nothing ever asks the others, and waiting for them burns the
+    // whole deadline before the watchdog fails the job.
+    std::unordered_set<std::string> in_flight;
+    for (const auto& [worker_id, pending] : job.pending_per_worker) {
+        auto it = registered_.find(worker_id);
+        if (it == registered_.end() || it->second->lost) {
+            continue;
+        }
+        for (const auto& [role, sub] : pending) {
+            in_flight.insert(role + ":" + std::to_string(sub));
+        }
+    }
+    job.restart_drain_expected = in_flight;
+    // Everything not draining has to be redeployed, or a subtask stranded
+    // on a dead worker is in neither set and simply never comes back:
+    // restart_job_locked_ builds its task set from the union of the two.
+    for (const auto& [worker_id, dts] : job.tasks_by_worker) {
+        for (const auto& dt : dts) {
+            const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
+            if (in_flight.count(k) != 0) {
+                continue;
+            }
+            const bool already = std::any_of(
+                job.restart_pending.begin(), job.restart_pending.end(), [&](const auto& p) {
+                    return p.first == dt.role && p.second == dt.subtask_idx;
+                });
+            if (!already) {
+                job.restart_pending.emplace_back(dt.role, dt.subtask_idx);
+            }
+        }
+    }
+}
 
 bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
                                                 const std::string& op_id,
@@ -3005,12 +3033,7 @@ void Coordinator::abort_hot_cutover_locked_(JobState& job,
     job.pre_rescale_op_parallelism[op_id] = old_p;
     job.awaiting_restart = true;
     job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
-    job.restart_drain_expected.clear();
-    for (const auto& [worker_id, pending] : job.pending_per_worker) {
-        for (const auto& [role, sub] : pending) {
-            job.restart_drain_expected.insert(role + ":" + std::to_string(sub));
-        }
-    }
+    populate_restart_drain_locked_(job);
     CancelJobMsg cj;
     cj.job_id = job.id;
     const auto frame = fenced_frame_(MessageKind::CancelJob, cj);

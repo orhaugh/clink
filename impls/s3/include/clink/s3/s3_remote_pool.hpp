@@ -304,12 +304,57 @@ public:
     // is unreferenced). Intended for an admin / periodic trigger, not the
     // checkpoint hot path; not thread-safe against a concurrent commit() to the
     // SAME object hash within min_age (which min_age also protects).
+    // What a sweep WOULD reclaim, deleting nothing. Shares scan_orphans_
+    // with sweep() so a dry run cannot drift from the real thing - an
+    // operator deciding whether to reclaim needs the number to be the
+    // number.
+    struct Reclaimable {
+        std::uint64_t objects{0};
+        std::uint64_t bytes{0};
+    };
+    [[nodiscard]] Reclaimable reclaimable_bytes(std::chrono::seconds min_age) {
+        Reclaimable out;
+        scan_orphans_(min_age, [&](const std::string&, std::int64_t size) {
+            ++out.objects;
+            out.bytes += static_cast<std::uint64_t>(size < 0 ? 0 : size);
+        });
+        return out;
+    }
+
     std::uint64_t sweep(std::chrono::seconds min_age) {
+        std::uint64_t reclaimed = 0;
+        auto fs_for_delete = [this]() -> std::shared_ptr<arrow::fs::S3FileSystem> {
+            try {
+                return fs_();
+            } catch (...) {
+                return nullptr;
+            }
+        }();
+        if (!fs_for_delete) {
+            return 0;
+        }
+        scan_orphans_(min_age, [&](const std::string& path, std::int64_t) {
+            if (fs_for_delete->DeleteFile(path).ok()) {
+                ++reclaimed;
+            }
+        });
+        objects_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
+        return reclaimed;
+    }
+
+private:
+    // Visit every object under this prefix that NO live manifest
+    // references and that is at least min_age old. Both the reclaimer and
+    // the dry-run report go through here; conservative by construction -
+    // an unreadable manifest aborts the scan entirely, because it cannot
+    // then be proven that an object is unreferenced.
+    template <typename Visit>
+    void scan_orphans_(std::chrono::seconds min_age, Visit&& visit) {
         std::shared_ptr<arrow::fs::S3FileSystem> fs;
         try {
             fs = fs_();
         } catch (...) {
-            return 0;
+            return;
         }
         // 1. Referenced object hashes across every live manifest.
         std::unordered_set<std::string> live;
@@ -318,23 +363,22 @@ public:
             try {
                 m = decode_manifest_(read_object_(*fs, mkey));
             } catch (...) {
-                return 0;  // unreadable manifest: cannot safely sweep
+                return;  // unreadable manifest: cannot safely sweep
             }
             for (const auto& [k, v] : m) {
                 live.insert(v.first);  // v.first == value-hash
             }
         }
-        // 2. Delete unreferenced objects older than min_age.
+        // 2. Visit unreferenced objects older than min_age.
         arrow::fs::FileSelector sel;
         sel.base_dir = base_prefix_() + "/objects";
         sel.recursive = false;
         sel.allow_not_found = true;
         auto infos = fs->GetFileInfo(sel);
         if (!infos.ok()) {
-            return 0;
+            return;
         }
         const auto now = std::chrono::system_clock::now();
-        std::uint64_t reclaimed = 0;
         for (const auto& info : *infos) {
             if (info.type() != arrow::fs::FileType::File) {
                 continue;
@@ -352,14 +396,11 @@ public:
                     continue;  // too young: may be an in-flight checkpoint's object
                 }
             }
-            if (fs->DeleteFile(path).ok()) {
-                ++reclaimed;
-            }
+            visit(path, info.size());
         }
-        objects_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
-        return reclaimed;
     }
 
+public:
     // Objects reclaimed by sweep() so far (for tests / metrics).
     [[nodiscard]] std::uint64_t objects_reclaimed() const noexcept {
         return objects_reclaimed_.load(std::memory_order_relaxed);

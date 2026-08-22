@@ -607,3 +607,58 @@ TEST(S3RemotePool, ScanCheckpointAndLiveExportOverS3) {
         op, [&](std::string_view k, std::string_view v) { live[std::string(k)] = std::string(v); });
     EXPECT_EQ(live, (std::map<std::string, std::string>{{"committed", "v1"}, {"fresh", "v2"}}));
 }
+
+// Orphan reclamation, and the dry run that must agree with it.
+//
+// Every update writes a NEW content-addressed object and purge() drops
+// only the manifest, so the store grows with UPDATE VOLUME rather than
+// with live state. sweep() is the only thing that reclaims the
+// difference - it had no caller anywhere in the engine until `clink
+// state-sweep`, which is why QUAL-04 finished a 30 GiB run holding 84 GiB
+// of objects with nothing able to reclaim them.
+TEST(S3RemotePool, SweepReclaimsOrphansAndTheDryRunAgrees) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const OperatorId op{5};
+    auto pool = std::make_shared<S3RemotePool>(pool_opts(unique_prefix() + "/sweep"));
+    RemoteReadBackend b(pool);
+
+    // Two checkpoints: the second rewrites the same key, so cp-1's object
+    // is unreferenced the moment cp-2's manifest lands.
+    b.put(op, "k", vv("first"));
+    b.snapshot(CheckpointId{1});
+    b.put(op, "k", vv("second"));
+    b.snapshot(CheckpointId{2});
+    pool->purge(CheckpointId{1});
+
+    // min_age 0: nothing is too young to reclaim, so this is the whole
+    // orphan set.
+    const auto planned = pool->reclaimable_bytes(std::chrono::seconds{0});
+    EXPECT_GT(planned.objects, 0u) << "cp-1's rewritten value should be reclaimable";
+    EXPECT_GT(planned.bytes, 0u);
+
+    const auto reclaimed = pool->sweep(std::chrono::seconds{0});
+    EXPECT_EQ(reclaimed, planned.objects)
+        << "a dry run must report exactly what the sweep then reclaims";
+
+    // The live checkpoint is untouched: reclamation must never cost data.
+    EXPECT_EQ(str(b.get(op, "k")), "second");
+    RemoteReadBackend fresh(pool);
+    Snapshot s2;
+    s2.checkpoint_id = CheckpointId{2};
+    fresh.restore(s2);
+    EXPECT_EQ(str(fresh.get(op, "k")), "second")
+        << "sweep deleted an object the live checkpoint still references";
+
+    // Idempotent: a second sweep finds nothing left.
+    EXPECT_EQ(pool->sweep(std::chrono::seconds{0}), 0u);
+
+    // A young orphan is protected, which is what keeps a sweep from
+    // racing an in-flight checkpoint whose manifest has not landed.
+    b.put(op, "k", vv("third"));
+    b.snapshot(CheckpointId{3});
+    pool->purge(CheckpointId{2});
+    EXPECT_EQ(pool->reclaimable_bytes(std::chrono::hours{24}).objects, 0u)
+        << "an object younger than min_age must never be considered reclaimable";
+}
