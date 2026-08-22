@@ -128,8 +128,48 @@ rm -f "$OUT_DIR/q4-verdict.json" "$OUT_DIR/q4-chaos.jsonl" "$OUT_DIR/q4-progress
       "$OUT_DIR/QUAL-04-summary.md"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY_FILE")
-on_host() { ssh -n "${SSH_OPTS[@]}" "root@$1" "$2"; }
-to_host()  { scp "${SSH_OPTS[@]}" -q "$2" "root@$1:$3"; }
+# ssh, retried on TRANSPORT failure only.
+#
+# ssh exits 255 for its own failures and passes the remote command's exit
+# code through otherwise, so retrying only on 255 leaves every legitimate
+# non-zero answer alone - `pgrep` finding nothing must still report
+# nothing, and the gates that branch on a remote command failing must
+# still see it fail.
+#
+# A multi-hour campaign makes hundreds of these calls against an ops host
+# that is simultaneously running the generator, the oracle, the chaos
+# controller and the state store. One "Connection reset by peer" killed a
+# QUAL-04 rig run at 6.3 GiB of a 10 GiB fill, twenty minutes in, with
+# `set -e` turning a transient blip into a total loss of the run and its
+# spend. The engine was fine; the driver simply could not survive a
+# dropped connection.
+on_host() {
+    local host=$1 cmd=$2 attempt=1 rc=0
+    while : ; do
+        # `cmd && rc=0 || rc=$?`, not a bare call: under set -e a bare
+        # failing command exits the script before rc can be captured, so
+        # the retry would only ever engage in a tested context.
+        ssh -n "${SSH_OPTS[@]}" "root@$host" "$cmd" && rc=0 || rc=$?
+        if [ "$rc" -ne 255 ] || [ "$attempt" -ge "${SSH_RETRIES:-4}" ]; then
+            return "$rc"
+        fi
+        echo "campaign: ssh to $host failed at the transport (attempt $attempt); retrying" >&2
+        sleep $(( attempt * 5 ))
+        attempt=$(( attempt + 1 ))
+    done
+}
+to_host() {
+    local host=$1 src=$2 dst=$3 attempt=1 rc=0
+    while : ; do
+        scp "${SSH_OPTS[@]}" -q "$src" "root@$host:$dst" && rc=0 || rc=$?
+        if [ "$rc" -eq 0 ] || [ "$attempt" -ge "${SSH_RETRIES:-4}" ]; then
+            return "$rc"
+        fi
+        echo "campaign: scp to $host failed (attempt $attempt); retrying" >&2
+        sleep $(( attempt * 5 ))
+        attempt=$(( attempt + 1 ))
+    done
+}
 
 # Container logs into the evidence before any teardown - the qual01 run f
 # lesson: a real engine finding whose cluster logs died with the rig.
