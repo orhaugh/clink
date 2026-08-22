@@ -326,6 +326,60 @@ echo "campaign: the state store's filesystem ($STORE_PATH) has ${AVAIL_GIB} GiB 
     exit 2
 }
 
+# --- store write-rate gate ------------------------------------------------
+# Measure what the store's filesystem can actually absorb, and refuse a
+# workload that exceeds it. This is the gate three earlier smokes needed
+# and did not have.
+#
+# The pipeline writes ONE object per distinct key touched per checkpoint
+# interval, so the store's small-file create rate is a hard ceiling on
+# sustainable events per second. Exceed it and persists take longer than
+# the interval they are supposed to fit in; the backlog grows without
+# bound, checkpoints stop completing, and a coordinator kill landing on
+# an overrunning persist wedges the worker's teardown. That chain is not
+# a subtle failure - it looks like an engine defect from every angle
+# except this measurement.
+#
+# Measured with dd, MinIO deliberately out of the picture, because the
+# ceiling belongs to the filesystem: a Hetzner network volume managed
+# ~300 creates/s where the local NVMe root disk is far faster.
+echo "campaign: measuring the state store's small-object write rate"
+STORE_FPS=$(on_host "$OPS_PUB" "
+    d=\$(mktemp -d ${STORE_PATH%/}/fpsXXXX 2>/dev/null || mktemp -d)
+    cd \$d
+    s=\$(date +%s%N)
+    for i in \$(seq 1 300); do dd if=/dev/zero of=f\$i bs=${BLOB_BYTES} count=1 2>/dev/null; done
+    e=\$(date +%s%N)
+    cd / && rm -rf \$d
+    echo \$(( 300000000000 / (e - s) ))" | tr -d ' \r')
+echo "store_files_per_sec=${STORE_FPS:-0}" > "$OUT_DIR/store-rate.txt"
+echo "campaign: the store's filesystem sustains ~${STORE_FPS:-?} objects/s of ${BLOB_BYTES} bytes"
+
+# Leave headroom: the measurement is a clean sequential best case, while
+# the real write mix includes MinIO's own metadata and concurrent reads.
+SUSTAINABLE=$(( ${STORE_FPS:-0} * 60 / 100 ))
+{ echo "store_files_per_sec=${STORE_FPS:-0}"; echo "sustainable_events_per_sec=$SUSTAINABLE";
+  echo "configured_rate=$RATE"; } > "$OUT_DIR/store-rate.txt"
+if [ "$RATE" -gt "$SUSTAINABLE" ]; then
+    echo "campaign: RATE=$RATE exceeds what this store can absorb (~$SUSTAINABLE events/s at" >&2
+    echo "  60% of a measured ${STORE_FPS} objects/s). Persists would outrun their interval and" >&2
+    echo "  the run would measure the storage, not the engine. Lower RATE, or put the store on" >&2
+    echo "  faster media (MINIO_DATA_DIR on local disk rather than the attached volume)." >&2
+    exit 2
+fi
+echo "campaign: RATE=$RATE is within the store's sustainable ~$SUSTAINABLE events/s"
+
+# The checkpoint interval must also exceed the time a persist takes, or
+# each persist overlaps the next. Persist writes one object per distinct
+# key touched since the last checkpoint, so at RATE events/s the interval
+# must satisfy: (RATE * interval) / STORE_FPS < interval, which is just
+# RATE < STORE_FPS - already gated above. What remains is the FIRST
+# checkpoint after a large fill, which writes everything at once; the
+# interval is reported here so the evidence records the margin.
+echo "campaign: checkpoint interval ${CHECKPOINT_INTERVAL_MS}ms; a full-state persist of" \
+     "$(python3 -c "print(int(${STATE_TARGET_GIB} * 1024**3 / ${BLOB_BYTES}))") objects would take" \
+     "~$(python3 -c "print(int(${STATE_TARGET_GIB} * 1024**3 / ${BLOB_BYTES} / max(${STORE_FPS:-1},1)))")s"
+
 on_host "$OPS_PUB" "curl -fsS -X PUT --aws-sigv4 'aws:amz:us-east-1:s3' \
     --user '$S3_ACCESS_KEY:$S3_SECRET_KEY' $S3_ENDPOINT_OPS/$S3_BUCKET >/dev/null" \
     || { echo "campaign: could not create the state bucket" >&2; exit 2; }
