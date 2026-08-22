@@ -10,6 +10,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -661,4 +662,76 @@ TEST(RemoteReadBackend, PoolScanCheckpointEnumeratesCommittedState) {
     pool.scan_checkpoint(CheckpointId{99},
                          [&](OperatorId, const std::string&, const auto&) { ++visited; });
     EXPECT_EQ(visited, 0u);
+}
+
+// A restore must ROLL BACK, not just refresh. RestoreClearsStaleHotTier
+// above moves a fresh backend forward (cp1 then cp2); this is the other
+// direction, and it is the one a recovery actually takes: a live backend
+// that has written PAST the checkpoint it is then restored to. Those
+// writes died with the failure - the source will replay the records that
+// produced them - so serving them after a restore double-counts every
+// replayed record into an accumulator that already saw it.
+TEST(RemoteReadBackend, RestoreRollsBackWritesMadeAfterTheCheckpoint) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{21};
+    RemoteReadBackend b(pool);
+    b.put(op, sv("k"), sv("at-cp1"));
+    b.snapshot(CheckpointId{1});
+
+    // Written after the checkpoint and never snapshotted: durably, these
+    // do not exist.
+    b.put(op, sv("k"), sv("after-cp1"));
+    b.put(op, sv("fresh"), sv("also-after-cp1"));
+
+    Snapshot s1;
+    s1.checkpoint_id = CheckpointId{1};
+    b.restore(s1);
+
+    EXPECT_EQ(to_string(*b.get(op, sv("k"))), "at-cp1")
+        << "restore served a write made after the checkpoint";
+    EXPECT_FALSE(b.get(op, sv("fresh")).has_value())
+        << "restore kept a key that only existed after the checkpoint";
+}
+
+// scan() must see the DURABLE tier, not just whatever happens to be hot.
+//
+// Restore here is lazy: a key arrives in the hot tier only when something
+// reads it. So immediately after a restore the hot tier is empty, and a
+// scan that consults only the hot tier reports that the operator has no
+// state at all - silently, and identically to an operator that genuinely
+// never had any.
+//
+// This is what put_operator_state/scan_operator_state are built on, and
+// scanning is how the restore paths that matter reassemble themselves: a
+// Kafka source rebuilding one offset row per partition, and
+// CommittingSink::recover_all_() looking for prepared-but-uncommitted
+// transactions. Both read "empty" and carry on: the source rewinds to
+// auto_offset_reset and replays the whole topic into keyed state that DID
+// restore (get() is manifest-backed), which double-counts every replayed
+// record; the sink never re-commits its prepared work.
+TEST(RemoteReadBackend, ScanSeesDurableStateAfterALazyRestore) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{31};
+    {
+        RemoteReadBackend w(pool);
+        // The shape a Kafka source persists: one operator-state row per
+        // partition, reassembled by scanning at restore.
+        w.put_operator_state(op, sv("offset_p0"), sv("1000"));
+        w.put_operator_state(op, sv("offset_p1"), sv("2000"));
+        w.snapshot(CheckpointId{1});
+    }
+
+    RemoteReadBackend b(pool);
+    Snapshot s1;
+    s1.checkpoint_id = CheckpointId{1};
+    b.restore(s1);
+
+    std::map<std::string, std::string> seen;
+    b.scan_operator_state(op, [&](StateBackend::KeyView k, StateBackend::ValueView v) {
+        seen[std::string(k)] = std::string(reinterpret_cast<const char*>(v.data()), v.size());
+    });
+    EXPECT_EQ(seen.size(), 2u) << "scan reported " << seen.size()
+                               << " operator-state rows after a restore that durably holds 2";
+    EXPECT_EQ(seen["offset_p0"], "1000");
+    EXPECT_EQ(seen["offset_p1"], "2000");
 }

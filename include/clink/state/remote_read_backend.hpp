@@ -259,9 +259,84 @@ public:
         }
         forget_hot_(op, key);  // drop from the hot-tier index + byte total
     }
+    // The COMPLETE live view for one operator, with get()'s precedence:
+    // the hot tier wins (it holds dirty writes), a logically erased key
+    // masks the pool, and the last durably-committed checkpoint fills the
+    // rest.
+    //
+    // Scanning only the hot tier was a silent state-loss bug, and the
+    // reason it was silent is that restore here is LAZY: a key arrives hot
+    // only when something reads it, so immediately after a restore the hot
+    // tier is empty and a hot-only scan reports an operator with no state -
+    // indistinguishable from one that never had any. Everything built on
+    // scan_operator_state() then rebuilt itself from nothing: a Kafka
+    // source rewound to auto_offset_reset and replayed its whole topic into
+    // keyed state that HAD restored (get() is manifest-backed), double
+    // counting every replayed record, and CommittingSink::recover_all_()
+    // found no prepared transactions to re-commit. Found by QUAL-04, which
+    // measured a keyed COUNT(*) reporting 502,887 events from a topic the
+    // broker proved held 312,312.
+    //
+    // Loader-only constructions (no pool) have no enumerable durable tier,
+    // so they keep the hot-only behaviour - there is nothing else to show.
     void scan(OperatorId op, const ScanVisitor& visit) const override {
-        std::lock_guard<std::mutex> lk(sync_mu_);
-        hot_.scan(op, visit);
+        struct Entry {
+            std::string key;
+            Value value;
+        };
+        std::vector<Entry> hot_entries;
+        std::set<std::string> hot_keys;
+        std::set<std::pair<std::uint64_t, std::string>> masked;
+        std::uint64_t ck = 0;
+        {
+            std::lock_guard<std::mutex> lk(sync_mu_);
+            hot_.scan(op, [&](std::string_view k, std::string_view v) {
+                hot_entries.push_back(
+                    Entry{std::string(k),
+                          Value{reinterpret_cast<const std::byte*>(v.data()),
+                                reinterpret_cast<const std::byte*>(v.data() + v.size())}});
+                hot_keys.emplace(k);
+            });
+            if (pool_ == nullptr) {
+                // Nothing durable to merge: emit the hot tier and stop,
+                // still outside the lock-free visitor contract below.
+                for (const auto& e : hot_entries) {
+                    visit(e.key,
+                          std::string_view(reinterpret_cast<const char*>(e.value.data()),
+                                           e.value.size()));
+                }
+                return;
+            }
+            masked = deleted_;
+            for (const auto& [k, pins] : persisting_deleted_) {
+                masked.insert(k);
+            }
+            ck = last_ckpt_.load(std::memory_order_relaxed);
+        }
+        // Pool reads happen OUTSIDE sync_mu_: a durable scan can be a
+        // network round trip per object, and the visitor may call back into
+        // the backend (the base's scan_operator_state contract already
+        // warns a visitor must not mutate, but reading is allowed).
+        if (ck != 0) {
+            pool_->scan_checkpoint(
+                CheckpointId{ck},
+                [&](OperatorId scanned_op, const std::string& key, const Value& value) {
+                    if (scanned_op.value() != op.value()) {
+                        return;
+                    }
+                    if (hot_keys.count(key) != 0 ||
+                        masked.count(std::make_pair(op.value(), key)) != 0) {
+                        return;  // hot value wins / logically erased
+                    }
+                    visit(key,
+                          std::string_view(reinterpret_cast<const char*>(value.data()),
+                                           value.size()));
+                });
+        }
+        for (const auto& e : hot_entries) {
+            visit(e.key,
+                  std::string_view(reinterpret_cast<const char*>(e.value.data()), e.value.size()));
+        }
     }
 
     // State-as-data: the COMPLETE live view as the canonical Arrow stream,
