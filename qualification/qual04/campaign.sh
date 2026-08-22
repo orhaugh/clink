@@ -373,7 +373,12 @@ on_host "$COORD_PUB" "docker rm -f clink-coordinator >/dev/null 2>&1 || true; \
     rm -rf /qual/ha/jobs /qual/ha/history"
 on_host "$COORD_PUB" "mkdir -p /qual /qual/ha"
 to_host "$COORD_PUB" "$HERE/../infra/coordinator.yml" /qual/coordinator.yml
-on_host "$COORD_PUB" "printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\n' '$CLINK_IMAGE' '$COORD_PRIV' > /qual/.env"
+# RESTART_DRAIN_TIMEOUT_MS scales the coordinator's restart-drain
+# deadline with the state backend: a subtask whose every key access is a
+# store round trip winds down far more slowly than one holding state in
+# memory, and the 120s default fails the job outright when it overruns.
+on_host "$COORD_PUB" "printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nRESTART_DRAIN_TIMEOUT_MS=%s\n' \
+    '$CLINK_IMAGE' '$COORD_PRIV' '${RESTART_DRAIN_TIMEOUT_MS:-600000}' > /qual/.env"
 on_host "$COORD_PUB" "cd /qual && docker compose -f coordinator.yml up -d"
 
 wid=0

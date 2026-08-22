@@ -37,6 +37,15 @@ services:
       # directory survives exactly the failure being injected without
       # asking for an unsafe lock.
       - --ha-dir=/qual/ha
+      # How long the coordinator waits for a restart's subtasks to wind
+      # down before it gives up and FAILS the job. The 120s default suits
+      # a job whose operators hold state in memory; it does not suit one
+      # whose every key access is a round trip to a state store, where a
+      # subtask takes correspondingly longer to drain. QUAL-04 measured
+      # exactly that: "restart drain timed out; failing job" with seven
+      # subtasks undrained, on a deferring backend running at its store's
+      # write ceiling. Scales with the backend, so the campaign sets it.
+      - --restart-drain-timeout-ms=${RESTART_DRAIN_TIMEOUT_MS:-120000}
     environment:
       # Armed per-restart by the chaos controller for targeted 2PC-window
       # faults; empty in normal operation.
