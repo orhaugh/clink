@@ -1,0 +1,25 @@
+# QUAL-04 state store.
+#
+# The job's keyed state lives HERE, not on the workers: the campaign runs
+# a deferring backend (remote-read://), so per-record state genuinely
+# rides the store rather than an in-memory operator map, which is the
+# only way 100 GB of state is reachable on 8 GB workers.
+#
+# Data lands under /qual/state/minio, i.e. on the attached volume
+# (STATE_VOLUME_GB), because the ops host's 160 GB root disk cannot hold
+# a large-state campaign.
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: qual04-minio
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    command:
+      - server
+      - /data
+    ports:
+      - "9000:9000"
+    volumes:
+      - /qual/state/minio:/data

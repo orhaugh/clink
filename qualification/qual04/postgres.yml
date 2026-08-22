@@ -1,0 +1,35 @@
+# QUAL-04 verification database.
+#
+# Runs on the ops host, outside the clink failure domain, so a fault
+# aimed at clink never takes the oracle's evidence store with it.
+#
+# This is the VERIFICATION channel, not the subject: QUAL-04's subject is
+# keyed state at size, and the upsert table is how an external oracle
+# reads the engine's per-key answers without asking the engine anything.
+# No prepared transactions are involved (mode='upsert' is
+# effectively-once by key, not 2PC - QUAL-02 owns the 2PC claim).
+#
+# max_connections is raised because the sink opens one connection per
+# subtask and the oracle samples alongside it.
+services:
+  postgres:
+    image: postgres:16
+    container_name: qual04-postgres
+    restart: "no"
+    environment:
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+      POSTGRES_DB: qual04
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      # The campaign reads pg_prepared_xacts constantly; keep the log
+      # quiet enough that it is the evidence, not the noise.
+      - -c
+      - log_min_messages=warning
+    ports:
+      - "5432:5432"
+    volumes:
+      - qual04-pgdata:/var/lib/postgresql/data
+volumes:
+  qual04-pgdata:

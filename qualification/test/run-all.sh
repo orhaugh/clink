@@ -56,6 +56,12 @@ run "QUAL-03 summariser result logic (PASS is earned, never assumed)" \
 run "QUAL-03 oracle (must name every injected defect)" \
     python3 "$HERE/../qual03/test_oracle.py"
 
+run "QUAL-04 driver parses" \
+    bash -n "$HERE/../qual04/campaign.sh"
+
+run "QUAL-04 summariser result logic (a small run must never pass as a large one)" \
+    python3 "$HERE/test_summarise4.py"
+
 if [ "${1:-}" = "--with-docker" ]; then
     # The QUAL-02 oracle is the one component that was tested offline from the
     # start, and it found a real defect in itself on the first attempt - a

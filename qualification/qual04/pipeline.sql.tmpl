@@ -1,0 +1,51 @@
+-- QUAL-04 pipeline: Kafka -> fat keyed state -> Postgres upsert table.
+--
+-- What is under test is KEYED STATE AT SIZE, not delivery semantics
+-- (QUAL-01 to QUAL-03 own those). The shape is therefore built to make
+-- state large and output small:
+--
+--   * The inner projection pads each event to __BLOB_BYTES__ bytes, so
+--     the aggregate's per-key accumulator is fat. State size is
+--     controlled by (distinct keys x blob size) rather than by event
+--     count, which is what makes 100 GB reachable in about an hour of
+--     fill instead of a day.
+--   * An unwindowed GROUP BY never closes, so state accumulates for the
+--     whole run - the campaign's subject.
+--   * The OUTER projection emits only length(m) and the count, so the
+--     blob never reaches the sink. An unwindowed GROUP BY emits an
+--     update per record; a 20 KB blob in the sink projection would make
+--     output volume, not state, the campaign's real cost.
+--
+-- length(MAX(x)) cannot be written directly: the binder rejects a scalar
+-- function wrapping an aggregate ("GROUP BY without aggregate functions
+-- in SELECT"), and over a derived table the same shape reaches an
+-- internal bad_variant_access. Recorded in docs/sql-parity-gaps.md; the
+-- aggregate-in-a-derived-table form below is the supported spelling.
+--
+-- The sink is mode='upsert' with a PRIMARY KEY, so the table holds one
+-- row per key and the changelog is netted by key within each flush -
+-- Postgres sees traffic proportional to KEYS, not to events. That is
+-- effectively-once on the sink table, not two-phase commit, which is the
+-- right guarantee to lean on here: the campaign asks whether large keyed
+-- state stays CORRECT across faults, and a converged upsert table is the
+-- evidence for that.
+--
+-- __BROKERS__, __CONNINFO__ and __BLOB_BYTES__ are substituted by the
+-- campaign driver.
+CREATE TABLE q4_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
+  WITH (connector='kafka', format='json', brokers='__BROKERS__',
+        topic='qual04-in', group_id='qual04',
+        auto_offset_reset='earliest');
+
+CREATE TABLE q4_out (k BIGINT, blob_len BIGINT, n BIGINT)
+  WITH (connector='postgres',
+        conninfo='__CONNINFO__',
+        "table"='public.q4_out',
+        mode='upsert',
+        primary_key='k');
+
+INSERT INTO q4_out
+SELECT k, length(m), n
+FROM (SELECT k, MAX(rpad_blob) AS m, COUNT(*) AS n
+      FROM (SELECT k, rpad(event_id, __BLOB_BYTES__, 'x') AS rpad_blob FROM q4_in) t
+      GROUP BY k) g;
