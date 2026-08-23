@@ -85,6 +85,14 @@ run "QUAL-05 state instrument (must refuse rather than report zero)" \
 run "QUAL-05 oracle (must name every injected defect)" \
     python3 "$HERE/../qual05/test_oracle.py"
 
+# The QUAL-06 width claim is by construction, so the construction gets the
+# gate: generated SQL must compile to exactly the operator count the
+# campaign quotes, with one consumer group per branch (the shared-group
+# trap loses most of the stream by construction). Needs the host build,
+# same as every campaign's SUBMIT_BIN prerequisite.
+run "QUAL-06 DAG generator (width against the real planner)" \
+    python3 "$HERE/test_dag_gen.py"
+
 if [ "${1:-}" = "--with-docker" ]; then
     # The QUAL-02 oracle is the one component that was tested offline from the
     # start, and it found a real defect in itself on the first attempt - a
