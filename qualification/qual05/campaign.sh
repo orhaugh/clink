@@ -185,6 +185,13 @@ kill_campaign_processes() {  # host
 verify_fail() {
     echo "campaign: FUNCTIONAL VERIFICATION FAILED - $1" >&2
     collect_container_logs || true
+    # Cancel what this run started. A campaign that exits at a gate and
+    # leaves its job behind hands the next run a crashlooping job holding
+    # its slots, and the next failure looks like a different defect.
+    for j in "${CONTROL_JOB:-}" "${JOB_ID:-}"; do
+        [ -n "$j" ] && curl -fsS -X POST \
+            "http://${COORD_PUB}:8095/api/v1/jobs/${j}/cancel" >/dev/null 2>&1 || true
+    done
     echo "campaign: not entering soak. Evidence in $OUT_DIR" >&2
     exit 4
 }
@@ -290,11 +297,19 @@ print([h['private_ip'] for h in inv['hosts'] if h['public_ip']=='$bp'][0])")
         docker compose -f broker.yml up -d"
     i=$(( i + 1 ))
 done
+# --force-recreate below, and the HA wipe beside it, are what make a run
+# independent of the last one. `up -d` leaves an already-running container
+# alone, so on a reused rig the previous run's coordinator survives with
+# its jobs still in memory: a campaign that exited at a gate leaves its job
+# crashlooping, and it holds the slots the next run needs. That is how the
+# third local run got "the control arm never completed a checkpoint" - 12
+# free slots against the 20 it needed, because a dead run's job still owned
+# the rest.
 to_host "$COORD_PUB" "$HERE/../infra/coordinator.yml" /qual/coordinator.yml
 on_host "$COORD_PUB" "rm -rf /qual/ha/jobs /qual/ha/history; mkdir -p /qual/ha"
 on_host "$COORD_PUB" "cd /qual && printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nRESTART_DRAIN_TIMEOUT_MS=%s\n' \
     '$CLINK_IMAGE' '$COORD_PRIV' '$RESTART_DRAIN_TIMEOUT_MS' > /qual/.env && \
-    docker compose -f coordinator.yml up -d"
+    docker compose -f coordinator.yml up -d --force-recreate"
 wi=0
 for wp in $WORKER_PUBS; do
     wpriv=$(python3 -c "
@@ -304,7 +319,7 @@ print([h['private_ip'] for h in inv['hosts'] if h['public_ip']=='$wp'][0])")
     to_host "$wp" "$HERE/../infra/worker.yml" /qual/worker.yml
     on_host "$wp" "cd /qual && printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nWORKER_ID=%s\nWORKER_IP=%s\n' \
         '$CLINK_IMAGE' '$COORD_PRIV' 'w$wi' '$wpriv' > /qual/.env && \
-        docker compose -f worker.yml up -d"
+        docker compose -f worker.yml up -d --force-recreate"
     wi=$(( wi + 1 ))
 done
 sleep 20
@@ -411,9 +426,17 @@ for line in open('$OUT_DIR/submit-$arm.log'):
 print(jid)"
 }
 
+# UNREACHABLE is deliberately distinct from GONE. Chaos restarts the
+# coordinator on purpose, and while it is down curl fails - which is not
+# evidence about the JOB at all. Conflating them latched "the job
+# disappeared" on a local run whose only crime was a coordinator kill
+# landing inside the probe window, and that latch is a FAIL.
 job_status() {  # job id
-    curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/$1" 2>/dev/null \
-        | python3 -c "
+    local body
+    body=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/$1" 2>/dev/null) || {
+        echo UNREACHABLE; return 0; }
+    [ -n "$body" ] || { echo UNREACHABLE; return 0; }
+    echo "$body" | python3 -c "
 import json,sys
 try:
     print(json.load(sys.stdin).get('status') or 'UNKNOWN')
@@ -468,10 +491,14 @@ echo "campaign: waiting for the control arm to complete a checkpoint"
 CONTROL_HEALTHY=no
 for _t in $(seq 1 30); do
     CJ=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/${CONTROL_JOB}" 2>/dev/null || echo "")
+    # latest_completed_checkpoint_id, NOT completed_count: the latter
+    # counts SUBTASKS that have finished, so on a streaming job it is zero
+    # for ever and this gate would fail a perfectly healthy run. It did,
+    # twice, on the local rig.
     CC=$(echo "$CJ" | python3 -c "
 import json,sys
 try:
-    print(int(json.load(sys.stdin).get('completed_count') or 0))
+    print(int(json.load(sys.stdin).get('latest_completed_checkpoint_id') or 0))
 except Exception:
     print(0)" 2>/dev/null || echo 0)
     [ "${CC:-0}" -ge 1 ] && { CONTROL_HEALTHY=yes; break; }
@@ -497,7 +524,17 @@ while [ "$celapsed" -lt "$CONTROL_S" ]; do
 done
 CSTATUS=$(job_status "$CONTROL_JOB")
 curl -fsS -X POST "http://${COORD_PUB}:8095/api/v1/jobs/${CONTROL_JOB}/cancel" >/dev/null 2>&1 || true
-sleep 20
+# Wait for it to actually stop, not just to have been asked. A cancelled
+# job still draining can still write into the sink the subject is about to
+# be judged on, and it still holds slots the subject needs.
+cstop=0
+while [ "$cstop" -lt 180 ]; do
+    CS=$(job_status "$CONTROL_JOB")
+    case "$CS" in RUNNING|RESTARTING|UNKNOWN) : ;; *) break ;; esac
+    sleep 5; cstop=$(( cstop + 5 ))
+done
+[ "$cstop" -lt 180 ] \
+    || echo "campaign: WARNING - the control arm was still live 180s after cancel" >&2
 { echo "control_first_bytes=${CONTROL_FIRST:-0}"
   echo "control_last_bytes=${CONTROL_LAST:-0}"
   echo "control_window_s=$celapsed"
@@ -536,9 +573,8 @@ import json;d=json.load(open('/qual/q5-progress.json'));print(sum(d['produced_hi
 [ "${P2:-0}" -gt "${P1:-0}" ] || verify_fail "no input is flowing (progress ${P1} -> ${P2})"
 
 # Polled, not single-shot: a job seconds away from its first checkpoint is
-# healthy, and the field is completed_count (completed_checkpoints does not
-# exist, so the old spelling read 0 for ever and would have failed every
-# run that got this far).
+# healthy. The field is latest_completed_checkpoint_id; completed_count is
+# finished SUBTASKS and stays zero for ever on a streaming job.
 JOB_HEALTHY=no
 for _t in $(seq 1 30); do
     curl -fsS --max-time 30 "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" \
@@ -549,15 +585,29 @@ try:
     d=json.load(open('$OUT_DIR/job-status.json'))
 except Exception:
     sys.exit(1)
-sys.exit(0 if int(d.get('completed_count') or 0) >= 1 and not d.get('errors') else 1)
+ok = (d.get('status') == 'RUNNING'
+      and int(d.get('latest_completed_checkpoint_id') or 0) >= 1
+      and not d.get('errors'))
+sys.exit(0 if ok else 1)
 "; then JOB_HEALTHY=yes; break; fi
     sleep 10
 done
-[ "$JOB_HEALTHY" = "yes" ] || verify_fail "the job never completed a checkpoint"
+[ "$JOB_HEALTHY" = "yes" ] \
+    || verify_fail "the job never reached RUNNING with a completed checkpoint"
 
+# Exactly one LIVE job. The zombie-twin check qual01 run e paid for, but
+# counting every job would count this campaign's own finished control arm,
+# which stays in the listing as CANCELLED. A terminal job writes nothing.
 NJOBS=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs" 2>/dev/null \
-    | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('jobs',[])))" 2>/dev/null || echo 0)
-[ "${NJOBS:-0}" = "1" ] || verify_fail "expected exactly one job on the cluster, found ${NJOBS}"
+    | python3 -c "
+import json,sys
+live = {'RUNNING', 'RESTARTING', 'DEPLOYING', 'PENDING'}
+try:
+    js = json.load(sys.stdin).get('jobs', [])
+except Exception:
+    print(-1); sys.exit(0)
+print(sum(1 for j in js if (j.get('status') or '').upper() in live))" 2>/dev/null || echo -1)
+[ "${NJOBS:-0}" = "1" ] || verify_fail "expected exactly one LIVE job on the cluster, found ${NJOBS}"
 
 SINK_OK=no
 for _t in $(seq 1 20); do
@@ -703,13 +753,31 @@ PY
           echo "fault_records_at_death=$NFAULTS"; } > "$OUT_DIR/chaos-died.txt"
     fi
 
+    # The state sample comes FIRST. It is the campaign's pass criterion, and
+    # putting it after the latches meant a loop that took a slow path
+    # contributed no sample at all: one run produced a single steady-state
+    # point across five minutes and could not be judged.
+    B=$(state_bytes "$SUBJECT_CKPT_DIR" || echo "")
+    case "$B" in
+        ''|*[!0-9]*) echo "campaign: state not measurable this tick" ;;
+        *)
+            T=$(( $(date +%s) - SOAK_START ))
+            echo "$T,$B" >> "$OUT_DIR/state-series-steady.csv"
+            echo "$(( T + WARMUP_S )),$B" >> "$OUT_DIR/state-series-all.csv"
+            K=$(psql_q "SELECT count(*) FROM public.q5_out" 2>/dev/null | tr -d '\r' || echo '?')
+            echo "campaign: $(date -u +%H:%M) steady ${T}s: $(( B / 1024 / 1024 )) MiB state, $K keys"
+            ;;
+    esac
+
     if [ -z "$JOB_GONE_AT" ]; then
         NOT_RUNNING=0; PROBES=""
         for _probe in 1 2 3 4 5 6; do
             ALIVE=$(job_status "$JOB_ID")
             PROBES="${PROBES}${ALIVE} "
             if [ "$ALIVE" = "RUNNING" ]; then NOT_RUNNING=0; break; fi
-            NOT_RUNNING=$(( NOT_RUNNING + 1 ))
+            # An unanswered probe says nothing about the job: the
+            # coordinator is being restarted by this campaign's own chaos.
+            [ "$ALIVE" = "UNREACHABLE" ] || NOT_RUNNING=$(( NOT_RUNNING + 1 ))
             [ "$_probe" -lt 6 ] && sleep "$JOB_PROBE_INTERVAL_S"
         done
         if [ "$NOT_RUNNING" -ge 6 ]; then
@@ -718,14 +786,6 @@ PY
             { echo "job_gone=yes"; echo "probes=$PROBES"; } > "$OUT_DIR/job-gone.txt"
         fi
     fi
-
-    B=$(state_bytes "$SUBJECT_CKPT_DIR" || echo "")
-    case "$B" in ''|*[!0-9]*) echo "campaign: state not measurable this tick"; continue ;; esac
-    T=$(( $(date +%s) - SOAK_START ))
-    echo "$T,$B" >> "$OUT_DIR/state-series-steady.csv"
-    echo "$(( T + WARMUP_S )),$B" >> "$OUT_DIR/state-series-all.csv"
-    K=$(psql_q "SELECT count(*) FROM public.q5_out" 2>/dev/null | tr -d '\r' || echo '?')
-    echo "campaign: $(date -u +%H:%M) steady ${T}s: $(( B / 1024 / 1024 )) MiB state, $K keys"
 done
 
 # --- drain and final judgement ------------------------------------------------

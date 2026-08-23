@@ -4,9 +4,16 @@
 Reads the sink table directly and repeatedly, and never asks clink anything.
 It judges the properties that are decidable while the job is still running:
 
-  * shrinking      - the number of keys or the total count went BACKWARDS
-                     between samples. An upsert table converges upward;
-                     going down means committed output was lost.
+  * shrinking      - the sink went BACKWARDS and STAYED there. The key
+                     count going down is flagged at once: this table never
+                     deletes a row, so a key vanishing is loss. The TOTAL
+                     is different, and the difference cost a local run its
+                     verdict: after a restart the job replays from its
+                     checkpoint and re-emits lower running totals, which a
+                     non-transactional upsert writes over the higher ones,
+                     so the total dips and then climbs back. That is
+                     convergence, not loss. Only a regression that persists
+                     for SHRINK_TOLERANCE_SAMPLES is a finding.
   * overcount      - the folded total has passed what the generator can
                      possibly have produced. Generous margin, because
                      progress is only a lower bound mid-flight.
@@ -27,6 +34,13 @@ import sys
 import time
 
 import psycopg2
+
+# How many consecutive samples the folded total may sit below its previous
+# high before it stops being a post-restart replay dip and starts being
+# lost output. At the default 20s interval this is about three minutes,
+# comfortably longer than a restore-and-catch-up on this workload and far
+# shorter than the soak.
+SHRINK_TOLERANCE_SAMPLES = 10
 
 
 def read_progress(path):
@@ -82,6 +96,7 @@ def main():
         "clean": True,
     }
     consecutive_errors = 0
+    below_max = 0
     stop_file = args.out + ".stop"
 
     while True:
@@ -112,17 +127,36 @@ def main():
         st["produced_lower_bound"] = produced_lower
         state["samples"] += 1
 
-        if st["distinct_keys"] < state["max_distinct_keys"] or st["sum_n"] < state["max_sum_n"]:
+        # A key that was in the table and is no longer: immediate. Nothing
+        # in this pipeline deletes a row.
+        if st["distinct_keys"] < state["max_distinct_keys"]:
             state["findings"].append(
                 {
                     "kind": "shrinking",
+                    "what": "distinct_keys",
                     "sample": state["samples"],
                     "keys": st["distinct_keys"],
                     "prev_max_keys": state["max_distinct_keys"],
-                    "sum_n": st["sum_n"],
-                    "prev_max_sum_n": state["max_sum_n"],
                 }
             )
+        # The total: only once it has failed to recover.
+        if st["sum_n"] < state["max_sum_n"]:
+            below_max += 1
+            state["max_below_max_streak"] = max(
+                state.get("max_below_max_streak", 0), below_max)
+            if below_max >= SHRINK_TOLERANCE_SAMPLES:
+                state["findings"].append(
+                    {
+                        "kind": "shrinking",
+                        "what": "sum_n",
+                        "sample": state["samples"],
+                        "consecutive_samples_below_max": below_max,
+                        "sum_n": st["sum_n"],
+                        "prev_max_sum_n": state["max_sum_n"],
+                    }
+                )
+        else:
+            below_max = 0
         if st["distinct_keys"] != st["keys_with_positive_n"]:
             state["findings"].append(
                 {
