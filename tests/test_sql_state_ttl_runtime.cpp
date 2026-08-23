@@ -106,6 +106,14 @@ public:
         op_->process(StreamElement<Row>::data(std::move(b)), emitter_);
     }
 
+    // Feed one row carrying an explicit record event time, as stamped by
+    // the assigner in a real chain.
+    void feed_record(Row row, std::int64_t ts_ms) {
+        Batch<Row> b;
+        b.emplace(std::move(row), EventTime::from_millis(ts_ms));
+        op_->process(StreamElement<Row>::data(std::move(b)), emitter_);
+    }
+
     void watermark(std::int64_t ms) {
         op_->process(StreamElement<Row>::watermark(Watermark{EventTime::from_millis(ms)}),
                      emitter_);
@@ -264,6 +272,15 @@ public:
         collected_.clear();
         Batch<Row> b;
         b.emplace(row_of(k, v));
+        op_->process(StreamElement<Row>::data(std::move(b)), emitter_);
+        return !collected_.empty();
+    }
+
+    // Same, with the record stamped at an explicit event time.
+    bool emits_at(std::int64_t k, std::int64_t v, std::int64_t ts_ms) {
+        collected_.clear();
+        Batch<Row> b;
+        b.emplace(row_of(k, v), EventTime::from_millis(ts_ms));
         op_->process(StreamElement<Row>::data(std::move(b)), emitter_);
         return !collected_.empty();
     }
@@ -903,4 +920,79 @@ TEST(SqlStateTtlRuntime, AJobWithoutRetentionPublishesNoRetentionGauges) {
     p.watermark(20'000);
     EXPECT_EQ(gauge_value("clink_state_ttl_tracked_keys{op_id=\"78\"}"), -1)
         << "a job with no state_ttl published a retention gauge";
+}
+
+// --- retention versus records ahead of the watermark --------------------------
+//
+// The QUAL-05 defect (followups item 70). Under partition skew - a
+// catch-up burst, a recovery replay, one lagging partition - a fast input
+// delivers records whose event time is far AHEAD of the aligned
+// min-watermark. Stamping their deadline watermark + ttl put the deadline
+// BEFORE the record's own timestamp, so the group evicted while the slow
+// input's exactly-on-time records were still approaching it; they then
+// re-opened it from zero and the upsert sink overwrote the correct row.
+// Measured: 13,868 of 53,550 events under-counted on a fault-free
+// two-partition backlog read.
+
+namespace {
+
+// Feed one row stamped with an explicit event time, the way records
+// arrive from a real source chain (the assigner stamps Record::event_time
+// and it rides the wire's event_time column).
+void feed_at(Probe& p, std::int64_t k, std::int64_t v, std::int64_t ts_ms) {
+    p.feed_record(row_of(k, v), ts_ms);
+}
+
+}  // namespace
+
+TEST(SqlStateTtlRuntime, AGroupAheadOfTheWatermarkOutlivesTheWatermarkPassingItsStamp) {
+    Probe p;
+    p.start({{"state_ttl_ms", "1000"}, {"state_ttl_domain", "event_time"}});
+    p.watermark(78'000);
+    // A fast input's record: event time 150s while the aligned watermark
+    // is 78s. The old stamp gave it deadline 79s - before its own ts.
+    feed_at(p, 1, 10, 150'000);
+    // The slow input's watermark advances to 130s on its way to 150s.
+    // The group must still be there: event time has not yet REACHED the
+    // record that created it, so no ttl can have elapsed since.
+    p.watermark(130'000);
+    EXPECT_EQ(p.running_total_after_feeding(1, 5), 15)
+        << "a group was evicted before the stream's event time reached the record that "
+           "created it (followups item 70)";
+
+    // And it still expires on schedule measured from its own time: 150s
+    // record + 1s ttl, so past 151s (the probe feed at 130s refreshed the
+    // deadline to 150s + 1s via the observed high event time).
+    p.watermark(152'000);
+    EXPECT_EQ(p.running_total_after_feeding(1, 5), 5)
+        << "the ahead-of-watermark group never expired";
+}
+
+TEST(SqlStateTtlRuntime, APreClockRecordWithItsOwnTimestampUsesItAsTheClock) {
+    // Before any watermark, a record's own event time is a valid clock
+    // base: deadline = ts + ttl. The pre-clock enrolment (first watermark
+    // + ttl) remains the fallback for records with no timestamp at all.
+    Probe p;
+    p.start({{"state_ttl_ms", "1000"}, {"state_ttl_domain", "event_time"}});
+    feed_at(p, 1, 10, 5'000);  // no watermark yet
+    // The first watermark lands far past ts + ttl: 95s of event time have
+    // genuinely passed since the data's own moment, so it expires.
+    p.watermark(100'000);
+    EXPECT_EQ(p.running_total_after_feeding(1, 5), 5)
+        << "a pre-clock record with its own timestamp was granted first-watermark + ttl "
+           "retention it had already outlived";
+}
+
+TEST(SqlStateTtlRuntime, DistinctAheadOfTheWatermarkIsNotForgottenEarly) {
+    // The same property at the DISTINCT: an entry created by a record
+    // ahead of the watermark must not be forgotten before the stream's
+    // event time reaches that record - or a replayed/slow-path duplicate
+    // would be re-emitted and folded twice.
+    OpProbe p("distinct_row",
+              {{"columns", "k"}, {"state_ttl_ms", "1000"}, {"state_ttl_domain", "event_time"}});
+    p.watermark(78'000);
+    EXPECT_TRUE(p.emits_at(1, 10, 150'000));
+    p.watermark(130'000);  // past old stamp (79s), before the record's own ts
+    EXPECT_FALSE(p.emits_at(1, 10, 150'000))
+        << "DISTINCT forgot a value before event time reached it; a duplicate would fold twice";
 }

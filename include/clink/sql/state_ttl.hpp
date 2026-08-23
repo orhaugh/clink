@@ -42,8 +42,10 @@
 //   at flush:      ttl_.flush(deadline_slot)
 //   at open:       ttl_.restore(deadline_slot)
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -85,12 +87,54 @@ public:
             return;
         }
         const auto now = now_ms();
+        // The deadline base is the LATER of the clock and the newest record
+        // event time this operator has observed - never the watermark alone.
+        //
+        // Under partition skew (a catch-up burst, a recovery replay, one
+        // lagging partition) a fast input delivers records whose event time
+        // is far ahead of the aligned min-watermark. Stamping those
+        // watermark + ttl gave a key a deadline that could precede its own
+        // record's timestamp: watermark 78s + 45s ttl = 123s for a record
+        // stamped 150s. The slow input's watermark then advanced past the
+        // deadline on its way TO 150s, the key evicted, and the slow
+        // input's exactly-on-time records re-opened it from zero - a
+        // silent, permanent under-count measured at 13,868 of 53,550
+        // events on a fault-free two-partition backlog read (QUAL-05).
+        //
+        // The observed high event time is a max over the operator's whole
+        // input rather than the touching record's own timestamp, so it can
+        // only lengthen retention relative to the per-record stamp - never
+        // shorten it - and the excess is bounded by the skew, converging
+        // to the watermark lag once caught up.
         if (!now.has_value()) {
+            if (event_time_ && high_event_ts_ != kNoEventTs) {
+                // No watermark yet, but the data itself carries a clock.
+                // ts + ttl is the faithful stamp, and nothing can expire
+                // against it until the first watermark arrives anyway.
+                deadlines_[key] = high_event_ts_ + ttl_ms_;
+                dirty_.insert(key);
+                return;
+            }
             pre_clock_.insert(key);
             return;
         }
-        deadlines_[key] = *now + ttl_ms_;
+        const auto base =
+            (event_time_ && high_event_ts_ != kNoEventTs) ? std::max(*now, high_event_ts_) : *now;
+        deadlines_[key] = base + ttl_ms_;
         dirty_.insert(key);
+    }
+
+    // Record that this operator has SEEN a record stamped `ts_ms`. Called
+    // once per data record by the TTL'd operators before folding, so the
+    // deadline base above can never lag the data. Event-time domain only;
+    // the processing-time clock is the wall clock and needs no help.
+    void observe_event_time(std::int64_t ts_ms) {
+        if (!enabled() || !event_time_) {
+            return;
+        }
+        if (high_event_ts_ == kNoEventTs || ts_ms > high_event_ts_) {
+            high_event_ts_ = ts_ms;
+        }
     }
 
     // Move the clock forward. Returns true when it actually moved, so a
@@ -220,10 +264,15 @@ public:
     }
 
 private:
+    static constexpr std::int64_t kNoEventTs = std::numeric_limits<std::int64_t>::min();
+
     std::int64_t ttl_ms_{0};
     bool event_time_{true};
     std::int64_t watermark_ms_{0};
     bool seen_watermark_{false};
+    // Newest record event time observed (kNoEventTs until the first). The
+    // second clock touch() stamps deadlines from; see observe_event_time.
+    std::int64_t high_event_ts_{kNoEventTs};
     std::unordered_map<std::string, std::int64_t> deadlines_;
     std::unordered_set<std::string> dirty_;
     // Keys touched before the first watermark, awaiting the clock. See

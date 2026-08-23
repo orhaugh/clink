@@ -4294,6 +4294,24 @@ private:
 // suspends a record instead of blocking the runner. The in-memory path is
 // the default and is byte-for-byte unchanged. The fold logic is shared by
 // both paths, so they produce identical results.
+// Feed every data record's event time into a retention tracker BEFORE the
+// operator folds the element, so deadline stamping can never lag the data
+// it is stamping for (StateTtlTracker::observe_event_time - the
+// skewed-catch-up under-count, followups item 70). Called at the head of
+// every data path of every TTL'd operator; a no-op when retention is off
+// or the element carries no data.
+inline void ttl_observe_element_(clink::sql::StateTtlTracker& ttl,
+                                 const StreamElement<Row>& element) {
+    if (!ttl.enabled() || !element.is_data()) {
+        return;
+    }
+    for (const auto& rec : element.as_data()) {
+        if (const auto ts = rec.event_time(); ts.has_value()) {
+            ttl.observe_event_time(ts->millis());
+        }
+    }
+}
+
 class AggregateRowOp final : public Operator<Row, Row> {
 public:
     AggregateRowOp(std::vector<std::string> group_keys,
@@ -4343,6 +4361,7 @@ public:
     }
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        ttl_observe_element_(ttl_, element);
         if (element.is_data()) {
             // Batch-granularity serving lock: external queryable-state
             // lookups read the live buckets from the worker's HTTP thread.
@@ -4396,6 +4415,19 @@ public:
         const auto& rb = element.as_data().arrow();
         if (!rb) {
             return false;
+        }
+        // The columnar twin of ttl_observe_element_: the record event times
+        // ride the batch's event_time column here rather than on Records.
+        if (ttl_.enabled()) {
+            if (const auto ti = rb->schema()->GetFieldIndex("event_time"); ti >= 0) {
+                if (const auto* a = dynamic_cast<const arrow::Int64Array*>(rb->column(ti).get())) {
+                    for (std::int64_t i = 0; i < a->length(); ++i) {
+                        if (!a->IsNull(i)) {
+                            ttl_.observe_event_time(a->Value(i));
+                        }
+                    }
+                }
+            }
         }
         // Same serving lock as process(): one acquisition per batch.
         std::lock_guard serving_lock(serving_mu_);
@@ -4724,6 +4756,7 @@ public:
     void process_async(const StreamElement<Row>& element,
                        Emitter<Row>& out,
                        AsyncExecutionController& aec) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data()) {
             return;  // the runner routes watermarks/barriers through the controller
         }
@@ -5121,6 +5154,7 @@ public:
     }
 
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         Batch<Row> batch;
@@ -5129,6 +5163,7 @@ public:
         emit_joined_(batch, out);
     }
     void process_element2(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         Batch<Row> batch;
@@ -5242,6 +5277,7 @@ public:
     void process_async1(const StreamElement<Row>& element,
                         Emitter<Row>& out,
                         AsyncExecutionController& aec) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         for (const auto& rec : element.as_data())
@@ -5250,6 +5286,7 @@ public:
     void process_async2(const StreamElement<Row>& element,
                         Emitter<Row>& out,
                         AsyncExecutionController& aec) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         for (const auto& rec : element.as_data())
@@ -5928,6 +5965,7 @@ public:
     }
 
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         Batch<Row> batch;
@@ -5944,6 +5982,7 @@ public:
             out.emit_data(std::move(batch));
     }
     void process_element2(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         Batch<Row> batch;
@@ -5969,6 +6008,7 @@ public:
     void process_async1(const StreamElement<Row>& element,
                         Emitter<Row>& out,
                         AsyncExecutionController& aec) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         auto kv_l = kv_left_();
@@ -6017,6 +6057,7 @@ public:
     void process_async2(const StreamElement<Row>& element,
                         Emitter<Row>& out,
                         AsyncExecutionController& aec) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         auto kv_l = kv_left_();
@@ -6593,6 +6634,7 @@ public:
     }
 
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         Batch<Row> batch;
@@ -6603,6 +6645,7 @@ public:
             out.emit_data(std::move(batch));
     }
     void process_element2(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         Batch<Row> batch;
@@ -6623,6 +6666,7 @@ public:
     void process_async1(const StreamElement<Row>& element,
                         Emitter<Row>& out,
                         AsyncExecutionController& aec) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         for (const auto& rec : element.as_data())
@@ -6631,6 +6675,7 @@ public:
     void process_async2(const StreamElement<Row>& element,
                         Emitter<Row>& out,
                         AsyncExecutionController& aec) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data())
             return;
         for (const auto& rec : element.as_data())
@@ -8140,6 +8185,7 @@ public:
     }
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        ttl_observe_element_(ttl_, element);
         if (element.is_data()) {
             Batch<Row> emit_batch;
             auto kv = keyed_state_();
@@ -8203,6 +8249,7 @@ public:
     void process_async(const StreamElement<Row>& element,
                        Emitter<Row>& out,
                        AsyncExecutionController& aec) override {
+        ttl_observe_element_(ttl_, element);
         if (!element.is_data()) {
             return;  // the runner routes watermarks/barriers through the controller
         }
