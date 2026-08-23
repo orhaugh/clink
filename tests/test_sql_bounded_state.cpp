@@ -13,6 +13,7 @@
 // a rejection a user cannot act on is only marginally better than silence.
 
 #include <map>
+#include <sstream>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -27,6 +28,7 @@
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
 #include "clink/sql/preparse.hpp"
+#include "clink/sql/script_runner.hpp"
 
 namespace {
 // The SQL runtime registrations must exist before a plan can compile.
@@ -505,3 +507,68 @@ TEST(SqlBoundedState, RetentionIsSatisfiedByAnyOfTheFourRoutes) {
 }
 
 }  // namespace
+
+// --- the override has to reach the planner, not just the parser ---------------
+//
+// compile_error() above wires script.allow_unbounded_state into the planner
+// itself, which is the right unit test of the GATE and is exactly why this
+// defect survived: the harness did the wiring the product had forgotten. In
+// production nothing called set_allow_unbounded_state at all, so the clause
+// was inert - the engine refused the query while its own diagnostic advised
+// writing the clause the user had just written. These two go through
+// run_script, the loop every real front door uses.
+
+namespace {
+
+// Compile a script the way a front door does. Returns the diagnostics text
+// (empty when every statement compiled) and reports how many specs reached
+// the SubmitFn.
+std::string run_script_error(const std::string& sql, int* submitted = nullptr) {
+    // Declares the kafka capability this binary links no impl for; without
+    // it the connector is UNKNOWN, unknown deliberately does not trip the
+    // gate, and both tests below would pass for the wrong reason.
+    ensure_sql_installed_for_bounded_state_tests();
+    Catalog cat;
+    std::ostringstream out;
+    std::ostringstream err;
+    int n = 0;
+    const ScriptRunOptions opts;
+    const ScriptIO io{.out = &out, .err = &err};
+    const int rc = run_script(
+        sql, cat, opts, io, [&](const clink::cluster::JobGraphSpec&, const std::string&) {
+            ++n;
+            return 0;
+        });
+    if (submitted != nullptr) {
+        *submitted = n;
+    }
+    return rc == 0 ? std::string{} : err.str();
+}
+
+const char* kUnboundedScript =
+    "CREATE TABLE src (k BIGINT, v BIGINT) WITH (connector='kafka', format='json', "
+    "topic='t', bootstrap_servers='localhost:9092');"
+    "CREATE TABLE dst (k BIGINT, s BIGINT) WITH (connector='file', format='json', "
+    "path='/tmp/o');"
+    "INSERT INTO dst SELECT k, SUM(v) AS s FROM src GROUP BY k";
+
+}  // namespace
+
+TEST(SqlBoundedState, TheOverrideReachesThePlannerThroughTheScriptRunner) {
+    int submitted = 0;
+    const std::string sql = std::string{kUnboundedScript} + " ALLOW UNBOUNDED STATE";
+    const auto err = run_script_error(sql, &submitted);
+    EXPECT_EQ(err, "") << "ALLOW UNBOUNDED STATE was inert: the gate refused a query that "
+                          "declared the very override its diagnostic recommends";
+    EXPECT_EQ(submitted, 1) << "the job did not reach the submit path";
+}
+
+TEST(SqlBoundedState, WithoutTheOverrideTheScriptRunnerStillRefuses) {
+    // The vacuity guard for the test above: if the gate were simply not
+    // running under run_script, that test would pass for the wrong reason.
+    int submitted = 0;
+    const auto err = run_script_error(kUnboundedScript, &submitted);
+    EXPECT_NE(err.find("ALLOW UNBOUNDED STATE"), std::string::npos)
+        << "the bounded-state gate did not fire under run_script at all";
+    EXPECT_EQ(submitted, 0) << "an unbounded job reached the submit path";
+}

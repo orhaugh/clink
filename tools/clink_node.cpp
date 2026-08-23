@@ -967,6 +967,11 @@ clink::http::HttpResponse handle_sql(clink::cluster::Coordinator& coordinator,
 
     try {
         auto script = clink::sql::parse(req.body);
+        // The pre-parser strips ALLOW UNBOUNDED STATE and records it here;
+        // the planner is the thing that has to be told, or the override is
+        // inert and the bounded-state gate refuses the query while advising
+        // the clause the user already wrote.
+        planner.set_allow_unbounded_state(script.allow_unbounded_state);
         for (auto& stmt : script.statements) {
             if (std::holds_alternative<std::unique_ptr<ast::ExplainStmt>>(stmt)) {
                 const auto& exp = *std::get<std::unique_ptr<ast::ExplainStmt>>(stmt);

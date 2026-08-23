@@ -149,6 +149,12 @@ int run_script(const std::string& sql,
 
     try {
         auto script = parse(sql);
+        // The pre-parser strips ALLOW UNBOUNDED STATE and records it on the
+        // script; the planner is the thing that has to be told. Without
+        // this the override is inert and the bounded-state gate refuses the
+        // query while its own diagnostic advises writing the clause the
+        // user has already written.
+        planner.set_allow_unbounded_state(script.allow_unbounded_state);
         bool produced_spec = false;
         int stdout_table_seq = 0;
         // Lazily register the SQL operator/source factories into the host
