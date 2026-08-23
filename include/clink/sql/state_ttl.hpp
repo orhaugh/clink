@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "clink/core/codec.hpp"
+#include "clink/metrics/state_metrics.hpp"
 #include "clink/state/keyed_state.hpp"
 
 namespace clink::sql {
@@ -187,6 +188,23 @@ public:
             return;
         }
         pre_clock_.insert(key);
+    }
+
+    // Publish this operator's retention position: the population currently
+    // under a deadline, and the number released over its life.
+    //
+    // Called from the eviction sweep rather than from touch(), so the cost
+    // is per advancing watermark rather than per record. A job whose
+    // watermark has stalled therefore stops updating these, which is the
+    // honest reading - retention has stalled with it.
+    void report_metrics(OperatorId op) const {
+        if (!enabled()) {
+            return;
+        }
+        clink::metrics::state::ttl_tracked_keys_set(op.value(),
+                                                    static_cast<std::int64_t>(deadlines_.size()));
+        clink::metrics::state::ttl_expired_total_set(op.value(),
+                                                     static_cast<std::int64_t>(expired_total_));
     }
 
     // The clock this tracker runs on. nullopt means event time has not

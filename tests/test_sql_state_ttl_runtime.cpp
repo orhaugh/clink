@@ -30,6 +30,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
+#include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
@@ -236,7 +237,12 @@ namespace {
 // A generic single-input driver for an operator built from the registry.
 class OpProbe {
 public:
-    OpProbe(const std::string& type, std::map<std::string, std::string> params)
+    // op_id is settable because the metrics registry is process-global and
+    // keys its retention gauges by operator: a test asserting that a gauge
+    // is ABSENT needs an id no earlier test has published under.
+    OpProbe(const std::string& type,
+            std::map<std::string, std::string> params,
+            std::uint64_t op_id = 77)
         : backend_(std::make_shared<InMemoryStateBackend>()) {
         ensure_installed();
         const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
@@ -245,9 +251,10 @@ public:
         cluster::OperatorBuildContext octx;
         octx.params = std::move(params);
         op_ = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
-        op_->set_id(OperatorId{77});
+        op_->set_id(OperatorId{op_id});
         rctx_ = std::make_unique<RuntimeContext>(
-            OperatorId{77}, type, backend_.get(), /*metrics=*/nullptr);
+            OperatorId{op_id}, type, backend_.get(), /*metrics=*/nullptr);
+        op_id_ = OperatorId{op_id};
         op_->attach_runtime(rctx_.get());
         op_->open();
     }
@@ -270,12 +277,13 @@ public:
     // distinction between hiding and releasing.
     std::size_t resident() const {
         std::size_t n = 0;
-        backend_->scan(OperatorId{77}, [&](std::string_view, std::string_view) { ++n; });
+        backend_->scan(op_id_, [&](std::string_view, std::string_view) { ++n; });
         return n;
     }
 
 private:
     std::shared_ptr<InMemoryStateBackend> backend_;
+    OperatorId op_id_{77};
     std::shared_ptr<Operator<Row, Row>> op_;
     std::unique_ptr<RuntimeContext> rctx_;
     std::vector<Row> collected_;
@@ -840,4 +848,59 @@ TEST(SqlStateTtlRuntime, SetOpStatePlateausAboveTheSweepBudget) {
         << "set-operation state reached " << with << " tuples over " << kRounds
         << " rounds against " << without
         << " without retention; a declared state_ttl did not bound it";
+}
+
+// --- retention is observable -------------------------------------------------
+
+namespace {
+
+std::int64_t gauge_value(const std::string& name) {
+    auto snap = MetricsRegistry::global().snapshot();
+    for (const auto& [n, v] : snap.gauges) {
+        if (n == name) {
+            return v;
+        }
+    }
+    return -1;  // absent, which is distinct from present-and-zero
+}
+
+}  // namespace
+
+// A job that declares a state_ttl has asked for a bound; these two gauges are
+// how its operator answers whether the bound is holding. They existed as
+// in-process counters with no reader at all - TtlStats' header said "read by
+// the operator's metrics reporting" and nothing read it, and
+// StateTtlTracker::tracked() had no caller anywhere - so an operator running a
+// TTL'd job had no way to tell retention that is keeping up from retention
+// that has silently stopped.
+TEST(SqlStateTtlRuntime, RetentionPublishesItsPopulationAndItsReleases) {
+    const std::string tracked = "clink_state_ttl_tracked_keys{op_id=\"77\"}";
+    const std::string expired = "clink_state_ttl_expired_total{op_id=\"77\"}";
+
+    OpProbe p("distinct_row",
+              {{"columns", "k"}, {"state_ttl_ms", "1000"}, {"state_ttl_domain", "event_time"}});
+    p.watermark(10'000);
+    for (int i = 0; i < 50; ++i) {
+        p.emits(i, i);
+    }
+    p.watermark(10'500);  // advances the clock, nothing due yet
+    EXPECT_EQ(gauge_value(tracked), 50)
+        << "the live retention population was not published (-1 means the gauge is absent)";
+    EXPECT_EQ(gauge_value(expired), 0) << "nothing was due, so nothing should have been released";
+
+    p.watermark(20'000);  // past every deadline
+    EXPECT_EQ(gauge_value(tracked), 0) << "the population did not fall as retention released";
+    EXPECT_EQ(gauge_value(expired), 50) << "released keys were not counted";
+}
+
+TEST(SqlStateTtlRuntime, AJobWithoutRetentionPublishesNoRetentionGauges) {
+    // Absence is the right answer for a job that declared no bound: a zero
+    // would read as "retention configured and releasing nothing", which is
+    // the alarm condition.
+    OpProbe p("distinct_row", {{"columns", "k"}}, /*op_id=*/78);
+    p.watermark(10'000);
+    p.emits(1, 10);
+    p.watermark(20'000);
+    EXPECT_EQ(gauge_value("clink_state_ttl_tracked_keys{op_id=\"78\"}"), -1)
+        << "a job with no state_ttl published a retention gauge";
 }

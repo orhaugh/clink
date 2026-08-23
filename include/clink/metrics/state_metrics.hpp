@@ -134,6 +134,44 @@ inline void job_state_reporting_backends_set(std::uint64_t job_id, std::int64_t 
     MetricsRegistry::global().gauge(name).set(n);
 }
 
+// --- retention (state_ttl) ---------------------------------------------------
+//
+// A job that declares a `state_ttl` has asked the engine for a bound. These
+// two say whether it is holding: how many keys are currently under
+// retention, and how many have been released so far. Without them an
+// operator cannot tell a TTL that is keeping up from one that has silently
+// stopped evicting - the state gauges above answer "how big", never "is
+// retention working", and on a disk-backed or disaggregated backend they do
+// not answer at all.
+//
+// Tagged by operator id, because retention is a per-operator policy and a
+// process-wide total cannot say which construct is the one still growing.
+// Reported from the eviction sweep, so a job whose watermark has stalled
+// stops updating them - which is itself the signal, and the reason
+// `tracked` is a gauge rather than something derived from the counter.
+inline std::string ttl_metric_name(const char* metric, std::uint64_t op_id) {
+    std::string out = kStateMetricPrefix;
+    out += "ttl_";
+    out += metric;
+    out += "{op_id=\"";
+    out += std::to_string(op_id);
+    out += "\"}";
+    return out;
+}
+
+// Keys currently carrying a deadline: the live population retention is
+// responsible for. Flat over time is the plateau a TTL exists to produce.
+inline void ttl_tracked_keys_set(std::uint64_t op_id, std::int64_t n) {
+    MetricsRegistry::global().gauge(ttl_metric_name("tracked_keys", op_id)).set(n);
+}
+
+// Keys released by retention over the operator's life. Zero on a job that
+// declared a TTL means nothing has ever expired, which is the difference
+// between a bound that holds and a bound that was only accepted.
+inline void ttl_expired_total_set(std::uint64_t op_id, std::int64_t n) {
+    MetricsRegistry::global().gauge(ttl_metric_name("expired_total", op_id)).set(n);
+}
+
 }  // namespace state
 
 }  // namespace clink::metrics

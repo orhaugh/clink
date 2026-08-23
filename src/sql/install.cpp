@@ -4337,6 +4337,7 @@ public:
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
         if (ttl_.advance_watermark(wm.timestamp().millis())) {
             ttl_evict_();
+            ttl_.report_metrics(this->id());
         }
         Operator<Row, Row>::on_watermark(wm, out);
     }
@@ -5114,6 +5115,7 @@ public:
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
         if (ttl_.advance_watermark(wm.timestamp().millis())) {
             ttl_evict_();
+            ttl_.report_metrics(this->id());
         }
         CoOperator<Row, Row, Row>::on_watermark(wm, out);
     }
@@ -5878,6 +5880,7 @@ public:
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
         if (ttl_.advance_watermark(wm.timestamp().millis())) {
             ttl_evict_();
+            ttl_.report_metrics(this->id());
         }
         CoOperator<Row, Row, Row>::on_watermark(wm, out);
     }
@@ -6547,6 +6550,7 @@ public:
         if (ttl_.enabled()) {
             if (ttl_.advance_watermark(wm.timestamp().millis())) {
                 ttl_evict_();
+                ttl_.report_metrics(this->id());
             }
         }
         CoOperator<Row, Row, Row>::on_watermark(wm, out);
@@ -8171,6 +8175,7 @@ public:
         if (ttl_.enabled()) {
             if (ttl_.advance_watermark(wm.timestamp().millis())) {
                 ttl_evict_();
+                ttl_.report_metrics(this->id());
             }
         }
         Operator<Row, Row>::on_watermark(wm, out);
