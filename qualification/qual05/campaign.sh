@@ -365,7 +365,13 @@ REPL=$(python3 -c "print(min(3, len('$BROKER_PRIVS'.split())))")
 rpk_ops "topic create qual05-in -p $PARTITIONS -r $REPL" >/dev/null
 
 # --- ops-host processes ------------------------------------------------------
-on_host "$OPS_PUB" "rm -f /qual/q5-*.stop /qual/q5-progress.json /qual/q5-verdict.json"
+# EVERYTHING this run will read as evidence, not just the stop files. The
+# chaos log in particular accumulates across runs on a reused rig, and a
+# fault-coverage gate satisfied by a PREVIOUS run's entries is a
+# false-PASS vector: run local-j's summary counted ~80 faults, most of
+# them from three earlier runs' leftovers.
+on_host "$OPS_PUB" "rm -f /qual/q5-*.stop /qual/q5-progress.json /qual/q5-verdict.json \
+    /qual/q5-chaos.jsonl /qual/q5-generator.log /qual/q5-verifier.log /qual/q5-chaos.log"
 for f in "$HERE/../qual01/detspec.py" "$HERE/../qual01/generator.py" \
          "$HERE/verifier.py" "$HERE/ckptsize.py" "$HERE/endstate.py" \
          "$HERE/../chaos/chaos.py"; do
