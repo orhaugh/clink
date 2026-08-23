@@ -382,7 +382,7 @@ submit_arm() {  # arm, checkpoint-dir -> echoes the job id
         --checkpoint-dir "$ckpt" \
         --checkpoint-interval-ms "$CHECKPOINT_INTERVAL_MS" \
         --max-restarts-on-worker-loss "$MAX_RESTARTS" \
-        > "$OUT_DIR/submit-$arm.log" 2>&1
+        > "$OUT_DIR/submit-$arm.log" 2>&1 || true
     python3 -c "
 import json,sys
 jid=''
@@ -420,28 +420,19 @@ state_detail() {  # checkpoint dir
 # answers that the size curve cannot is whether retention is the reason
 # the curve is flat.
 retention_totals() {
-    local ids
-    ids=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/workers" 2>/dev/null \
-        | python3 -c "
-import json,sys
-try:
-    d=json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-ws=d.get('workers') or d.get('items') or []
-for w in ws:
-    wid=w.get('id') or w.get('worker_id')
-    if wid: print(wid)" 2>/dev/null || true)
+    # Scraped from each worker's own /metrics over ssh rather than through
+    # the coordinator's proxy: the proxy needs a registered http_port and
+    # returns nothing for a worker mid-restart, and a retention gate that
+    # reads 0 because it could not reach anything is a gate that fails the
+    # engine for the harness's mistake.
     local expired=0 tracked=0
-    for wid in $ids; do
-        local body
-        body=$(curl -fsS --max-time 20 \
-            "http://${COORD_PUB}:8095/api/v1/workers/${wid}/metrics" 2>/dev/null || true)
-        local e t
-        e=$(echo "$body" | awk '/^clink_state_ttl_expired_total\{/{s+=$2} END{print s+0}')
-        t=$(echo "$body" | awk '/^clink_state_ttl_tracked_keys\{/{s+=$2} END{print s+0}')
-        expired=$(( expired + ${e%.*} ))
-        tracked=$(( tracked + ${t%.*} ))
+    for wp in $WORKER_PUBS; do
+        local body e t
+        body=$(on_host "$wp" "curl -fsS --max-time 10 http://127.0.0.1:8082/metrics" 2>/dev/null || true)
+        e=$(echo "$body" | awk '/^clink_state_ttl_expired_total\{/{s+=$2} END{printf "%d", s+0}')
+        t=$(echo "$body" | awk '/^clink_state_ttl_tracked_keys\{/{s+=$2} END{printf "%d", s+0}')
+        expired=$(( expired + ${e:-0} ))
+        tracked=$(( tracked + ${t:-0} ))
     done
     echo "$expired $tracked"
 }

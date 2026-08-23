@@ -296,6 +296,20 @@ def build(out_dir, run_id, duration_h, profile):
     a("")
     a(f"- keys released by retention: {expired_total}")
     a(f"- keys under retention at the end: {retention.get('retention_tracked_keys', '?')}")
+    # The workload's key space turns over at a known rate, so the live
+    # population is predictable in advance. Reported rather than gated:
+    # it is a sanity check on whether the plateau sits where the
+    # arithmetic says it should, and a wildly different level means the
+    # run measured something other than what was designed.
+    pred_entries = verif.get("predicted_live_distinct_entries")
+    pred_groups = verif.get("predicted_live_groups")
+    if pred_entries and pred_groups:
+        predicted = int(pred_entries) + int(pred_groups)
+        tracked = int(retention.get("retention_tracked_keys", 0) or 0)
+        a(f"- predicted live population: {predicted} "
+          f"({pred_entries} distinct entries + {pred_groups} groups)")
+        if tracked > 0:
+            a(f"- measured against prediction: {tracked / predicted:.2f}x")
     a("")
     a("## Correctness")
     a("")
