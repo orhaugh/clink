@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/api.h>
+
 #include "clink/operators/operator_base.hpp"
 #include "clink/time/alignment_group.hpp"
 #include "clink/time/watermark_strategy.hpp"
@@ -152,8 +154,10 @@ public:
     }
 
     // Columnar fast path: advance the watermark from the event-time column read
-    // straight from the Arrow sidecar, then forward the SAME batch downstream
-    // unchanged (sidecar preserved, zero row materialisation). Mirrors process()'s
+    // straight from the Arrow sidecar, stamp the extracted times into the
+    // forwarded batch's event_time column (standard Row-channel layout), and
+    // forward it still columnar (data columns shared, zero row
+    // materialisation). Mirrors process()'s
     // data-element side effects exactly (alignment wait, strategy feed,
     // last_record_time_/is_idle_, watermark emission); the idleness timer is
     // self-driving and untouched. Returns false BEFORE any emit on a surprise so
@@ -209,8 +213,59 @@ public:
             }
         }
         is_idle_ = false;
-        // Forward the SAME batch unchanged - the sidecar (a shared_ptr member)
-        // moves with it, so the stream stays columnar with zero row decode.
+        // Stamp the extracted event times into the sidecar's event_time column
+        // (column 0 of the standard Row-channel layout) before forwarding.
+        //
+        // This path used to forward the batch UNCHANGED, which advanced the
+        // watermark but left column 0 as the producer wrote it - null, since
+        // no assigner had run yet. Every record materialised downstream then
+        // carried NO Record::event_time on the columnar path, while the row
+        // path stamped it. That asymmetry made event-time retention blind to
+        // the data it was timing: deadlines fell back to the (lagging)
+        // watermark, and a catch-up burst expired state whose on-time records
+        // were still arriving - the QUAL-05 under-count, followups item 70.
+        // Stamping here is the assigner doing on the columnar path exactly
+        // what it does on the row path.
+        //
+        // Kept columnar: one column is replaced, the data columns are shared,
+        // and the batch's own materialise closure is reused (with_arrow), so
+        // there is still zero row decode.
+        {
+            const auto& schema = rb->schema();
+            if (schema->num_fields() > 0 && schema->field(0)->name() == "event_time" &&
+                schema->field(0)->type()->id() == arrow::Type::INT64 &&
+                static_cast<std::size_t>(rb->num_rows()) == times.size()) {
+                arrow::Int64Builder tb;
+                (void)tb.Reserve(rb->num_rows());
+                for (const auto& t : times) {
+                    if (t == EventTime::min()) {
+                        (void)tb.AppendNull();
+                    } else {
+                        tb.UnsafeAppend(t.millis());
+                    }
+                }
+                std::shared_ptr<arrow::Array> tcol;
+                if (tb.Finish(&tcol).ok()) {
+                    auto cols = rb->columns();
+                    cols[0] = std::move(tcol);
+                    auto stamped =
+                        arrow::RecordBatch::Make(schema, rb->num_rows(), std::move(cols));
+                    out.emit_data(batch.with_arrow(std::move(stamped),
+                                                   static_cast<std::size_t>(rb->num_rows())));
+                    if (auto wm = strategy_->current_watermark(); wm.has_value()) {
+                        last_emitted_wm_ = *wm;
+                        if (alignment_group_) {
+                            alignment_group_->update_watermark(alignment_member_id_, *wm);
+                        }
+                        out.emit_watermark(*wm);
+                    }
+                    return true;
+                }
+            }
+        }
+        // Non-standard layout (or a builder failure): forward unchanged, as
+        // before. Watermarks still advance; per-record event time stays the
+        // producer's business on such layouts.
         out.emit_data(std::move(const_cast<Batch<T>&>(batch)));
         if (auto wm = strategy_->current_watermark(); wm.has_value()) {
             last_emitted_wm_ = *wm;

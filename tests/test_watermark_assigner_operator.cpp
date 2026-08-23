@@ -347,3 +347,90 @@ TEST(WatermarkAssignerOperator, ColumnarWithoutPartitionReaderIsGlobalWatermark)
     ASSERT_TRUE(wm.has_value());
     EXPECT_EQ(*wm, 2000);  // global max - no per-partition tracking
 }
+
+// The columnar path must STAMP the extracted event times into the sidecar's
+// event_time column before forwarding - not merely advance the watermark.
+//
+// The real-world shape this pins: json_string_to_row_columnar emits column 0
+// (event_time) as NULLS because no assigner has run yet; the assigner's
+// columnar reader extracts times from a DATA column. Forwarding the batch
+// unchanged meant every record materialised downstream carried no
+// Record::event_time, while the row path stamped it - and event-time
+// retention, blind to the data it was timing, stamped deadlines from the
+// lagging watermark and expired state whose on-time records were still
+// arriving (followups item 70, the QUAL-05 under-count).
+TEST(WatermarkAssignerOperator, ColumnarPathStampsEventTimesIntoTheForwardedBatch) {
+    BoundedChannel<StreamElement<int>> ch(64);
+    Emitter<int> em(&ch);
+
+    // Column 0: event_time, ALL NULL (the pre-assigner state of the wire
+    // layout). Column 1: the data column carrying the actual times.
+    arrow::Int64Builder tb;
+    arrow::Int64Builder db;
+    const std::vector<std::int64_t> ts = {1000, 5000, 3000};
+    for (const auto t : ts) {
+        (void)tb.AppendNull();
+        (void)db.Append(t);
+    }
+    std::shared_ptr<arrow::Array> ta, da;
+    (void)tb.Finish(&ta);
+    (void)db.Finish(&da);
+    auto schema = arrow::schema(
+        {arrow::field("event_time", arrow::int64()), arrow::field("ts", arrow::int64())});
+    auto rb = arrow::RecordBatch::Make(schema, 3, {ta, da});
+    // Materialise closure mirroring rows_from_record_batch: event_time from
+    // column 0, null -> no event time on the record.
+    auto materialize = [](const arrow::RecordBatch& b) -> std::vector<Record<int>> {
+        const auto* t = static_cast<const arrow::Int64Array*>(b.column(0).get());
+        std::vector<Record<int>> recs;
+        for (std::int64_t i = 0; i < b.num_rows(); ++i) {
+            if (t->IsNull(i)) {
+                recs.emplace_back(0);
+            } else {
+                recs.emplace_back(0, EventTime{t->Value(i)});
+            }
+        }
+        return recs;
+    };
+    Batch<int> batch{rb, 3, materialize};
+
+    WatermarkAssignerOperator<int> op([](const int&) { return EventTime{0}; },
+                                      std::make_unique<BoundedOutOfOrdernessStrategy<int>>(0ms));
+    // Reader extracts from the DATA column, like the SQL assigner does.
+    op.with_columnar_event_times(
+        [](const arrow::RecordBatch& b, std::vector<EventTime>& out) -> bool {
+            const int idx = b.schema()->GetFieldIndex("ts");
+            if (idx < 0) {
+                return false;
+            }
+            const auto* a = static_cast<const arrow::Int64Array*>(b.column(idx).get());
+            out.resize(static_cast<std::size_t>(b.num_rows()));
+            for (std::int64_t i = 0; i < b.num_rows(); ++i) {
+                out[static_cast<std::size_t>(i)] = EventTime{a->Value(i)};
+            }
+            return true;
+        });
+
+    ASSERT_TRUE(op.process_columnar(StreamElement<int>::data(std::move(batch)), em));
+    ch.close();
+
+    std::optional<StreamElement<int>> fwd;
+    while (auto e = ch.try_pop()) {
+        if (e->is_data()) {
+            fwd = std::move(*e);
+        }
+    }
+    ASSERT_TRUE(fwd.has_value());
+    // Still columnar - the stamp must not cost a row materialisation.
+    EXPECT_TRUE(fwd->as_data().is_columnar());
+    // And a downstream row consumer now sees the times the assigner
+    // extracted, exactly as it would on the row path.
+    std::vector<std::int64_t> seen;
+    for (const auto& rec : fwd->as_data()) {
+        ASSERT_TRUE(rec.event_time().has_value())
+            << "a record materialised after the assigner carries no event time; retention "
+               "and every other event-time consumer downstream is blind again";
+        seen.push_back(rec.event_time()->millis());
+    }
+    EXPECT_EQ(seen, ts);
+}
