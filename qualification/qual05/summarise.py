@@ -316,6 +316,11 @@ def build(out_dir, run_id, duration_h, profile):
     a("")
     a(f"- keys released by retention: {expired_total}")
     a(f"- keys under retention at the end: {retention.get('retention_tracked_keys', '?')}")
+    reporting = retention.get("retention_workers_reporting")
+    total_w = retention.get("retention_workers_total")
+    if reporting is not None and total_w is not None:
+        a(f"- workers answering the scrape: {reporting} of {total_w}"
+          + ("" if reporting == total_w else " (totals are PARTIAL)"))
     # The workload's key space turns over at a known rate, so the live
     # population is predictable in advance. Reported rather than gated:
     # it is a sanity check on whether the plateau sits where the

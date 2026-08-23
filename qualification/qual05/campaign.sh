@@ -465,16 +465,23 @@ retention_totals() {
     # returns nothing for a worker mid-restart, and a retention gate that
     # reads 0 because it could not reach anything is a gate that fails the
     # engine for the harness's mistake.
-    local expired=0 tracked=0
+    # The third field is how many workers ANSWERED. A worker mid-restart
+    # scrapes as nothing and contributes zero, which is fine for the
+    # engaged gate (any positive total suffices) and misleading for the
+    # corroboration numbers - a half-covered scrape halved the tracked
+    # population on one local run. The summary reports coverage beside the
+    # totals so a partial scrape reads as partial.
+    local expired=0 tracked=0 answered=0
     for wp in $WORKER_PUBS; do
         local body e t
         body=$(on_host "$wp" "curl -fsS --max-time 10 http://127.0.0.1:8082/metrics" 2>/dev/null || true)
+        [ -n "$body" ] && answered=$(( answered + 1 ))
         e=$(echo "$body" | awk '/^clink_state_ttl_expired_total\{/{s+=$2} END{printf "%d", s+0}')
         t=$(echo "$body" | awk '/^clink_state_ttl_tracked_keys\{/{s+=$2} END{printf "%d", s+0}')
         expired=$(( expired + ${e:-0} ))
         tracked=$(( tracked + ${t:-0} ))
     done
-    echo "$expired $tracked"
+    echo "$expired $tracked $answered"
 }
 
 # =============================================================================
@@ -645,7 +652,7 @@ echo "campaign: waiting for retention to release its first keys"
 RET_OK=no
 rwait=0
 while [ "$rwait" -lt $(( STATE_TTL_MS / 1000 + KEY_EPOCH_MS / 1000 + 600 )) ]; do
-    read -r REXP RTRK <<<"$(retention_totals)"
+    read -r REXP RTRK RANS <<<"$(retention_totals)"
     if [ "${REXP:-0}" -gt 0 ]; then
         RET_OK=yes
         echo "campaign: retention engaged (${REXP} keys released, ${RTRK} tracked)"
@@ -708,7 +715,7 @@ for _p in $(seq 1 "$RECOVER_PROBES"); do
 done
 [ "$RECOVERED" = "yes" ] || verify_fail "the job did not resume making progress after the first fault"
 
-read -r REXP RTRK <<<"$(retention_totals)"
+read -r REXP RTRK RANS <<<"$(retention_totals)"
 { echo "campaign=QUAL-05"; echo "run_id=$RUN_ID"; echo "job_id=$JOB_ID";
   echo "state_ttl_ms=$STATE_TTL_MS"; echo "key_epoch_ms=$KEY_EPOCH_MS";
   echo "rate=$RATE"; echo "partitions=$PARTITIONS"; echo "keys_per_epoch=$KEYS";
@@ -809,8 +816,10 @@ done
     || echo "campaign: WARNING - the chaos controller is still running 120s after its stop request" >&2
 
 # Retention as the engine saw it, captured BEFORE the job is cancelled.
-read -r REXP RTRK <<<"$(retention_totals)"
+read -r REXP RTRK RANS <<<"$(retention_totals)"
+NWORKERS=$(echo "$WORKER_PUBS" | wc -w | tr -d ' ')
 { echo "retention_expired_total=${REXP:-0}"; echo "retention_tracked_keys=${RTRK:-0}";
+  echo "retention_workers_reporting=${RANS:-0}"; echo "retention_workers_total=${NWORKERS}";
 } > "$OUT_DIR/retention.txt"
 cat "$OUT_DIR/retention.txt"
 
