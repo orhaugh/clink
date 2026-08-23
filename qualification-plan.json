@@ -135,9 +135,21 @@
       "category": "qualification",
       "priority": "P1",
       "title": "TTL steady-state campaign across GROUP BY / DISTINCT / join / CEP / typed state",
-      "status": "planned",
+      "status": "completed",
       "infrastructure": [],
-      "results": {}
+      "results": {
+        "run": "qual05-20260823a",
+        "verdict": "PASS",
+        "produced": 8326400,
+        "folded": 8326400,
+        "keys_exact": "694996/694996",
+        "plateau_mib": 67.4,
+        "drift_pct": 1.9,
+        "control_growth_x": 12.9,
+        "engine_defects_found": "items 69 (open), 70, 71 + sweep starvation (all but 69 fixed)",
+        "evidence": "~/personal/clink-qual-evidence/qual05-20260823a"
+      },
+      "result_revision": "bed138c"
     },
     {
       "id": "QUAL-06",
