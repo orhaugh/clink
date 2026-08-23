@@ -2856,6 +2856,14 @@ int run_worker(int argc, char** argv) {
     supervisor_cfg.worker.coordinator_heartbeat_timeout = std::chrono::milliseconds{
         std::stoll(get_arg(argc, argv, "coordinator-heartbeat-timeout-ms", "3000"))};
     supervisor_cfg.worker.slot_count = static_cast<std::uint32_t>(std::stoi(slot_str));
+    // How many completed checkpoints each subtask keeps on disk. The
+    // default (1) keeps only the newest - which means an Incomplete or
+    // unreadable newest checkpoint leaves recovery NO floor to fall back
+    // to (followups item 75c: QUAL-06's restore refusal was fatal only
+    // because every older checkpoint had been purged). Rigs and
+    // durability-sensitive deployments should run >= 2.
+    supervisor_cfg.worker.checkpoint_num_retained =
+        static_cast<std::size_t>(std::stoull(get_arg(argc, argv, "checkpoint-num-retained", "1")));
     supervisor_cfg.discovery_timeout = std::chrono::milliseconds{
         std::stoll(get_arg(argc, argv, "reconnect-discovery-timeout-ms", "1000"))};
     supervisor_cfg.initial_backoff = std::chrono::milliseconds{

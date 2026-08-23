@@ -20,6 +20,11 @@ services:
       - --coordinator-port=6123
       - --data-host=${WORKER_IP}
       - --slots=${CLINK_SLOTS:-16}
+      # A fallback floor for recovery: with the default of 1 retained
+      # checkpoint, an Incomplete newest checkpoint (item 75c) strands the
+      # restore with nothing older to verify. Three keeps two rungs of
+      # history at negligible cost for campaign state sizes.
+      - --checkpoint-num-retained=${CLINK_CHECKPOINT_RETAINED:-3}
       - --http-port=8082
       - --http-bind=0.0.0.0
     environment:
