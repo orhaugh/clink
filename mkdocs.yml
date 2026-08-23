@@ -93,6 +93,7 @@ nav:
       - qualification/qual-01-kafka-exactly-once.md
       - qualification/qual-02-postgres-two-phase-commit.md
       - qualification/qual-03-s3-staged-commits.md
+      - qualification/qual-04-large-keyed-state.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md

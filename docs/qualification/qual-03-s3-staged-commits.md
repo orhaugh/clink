@@ -113,7 +113,8 @@ Following the programme's honesty categories:
   the campaign's recovery deadline.
 - **Architecturally supported but not qualified:** the same guarantees
   against AWS S3 and other managed S3-compatible services; the same
-  guarantees at larger state, higher parallelism and multi-day durations.
+  guarantees at higher parallelism and multi-day durations. Keyed state at
+  size has its own campaign: [QUAL-04](qual-04-large-keyed-state.md).
   Exactly-once into Kafka and into PostgreSQL have their own campaigns:
   [QUAL-01](qual-01-kafka-exactly-once.md),
   [QUAL-02](qual-02-postgres-two-phase-commit.md).
