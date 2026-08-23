@@ -93,6 +93,15 @@ run "QUAL-05 oracle (must name every injected defect)" \
 run "QUAL-06 DAG generator (width against the real planner)" \
     python3 "$HERE/test_dag_gen.py"
 
+run "QUAL-06 driver parses" \
+    bash -n "$HERE/../qual06/campaign.sh"
+
+# The scale-campaign essence: a rung that fails to deploy is a measured
+# boundary and must not fail the campaign; a deployed width disagreeing
+# with the generator's arithmetic must.
+run "QUAL-06 summariser result logic (a boundary is not a failure; a wrong width is)" \
+    python3 "$HERE/test_summarise6.py"
+
 if [ "${1:-}" = "--with-docker" ]; then
     # The QUAL-02 oracle is the one component that was tested offline from the
     # start, and it found a real defect in itself on the first attempt - a
