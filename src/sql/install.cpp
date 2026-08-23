@@ -6535,30 +6535,36 @@ public:
           right_columns_(std::move(right_columns)),
           is_except_(is_except),
           all_(all),
-          state_ttl_ms_(state_ttl_ms),
-          ttl_event_time_(ttl_event_time) {}
+          ttl_(state_ttl_ms, ttl_event_time) {}
 
-    // Retention. Like DISTINCT and unlike the aggregate and the joins, a
-    // set operation keeps ALL of its state in KeyedState - no in-memory hot
-    // map, so no checkpoint flush that would re-stamp deadlines, so
-    // KeyedState's own TtlConfig is exactly right and reusing it beats a
-    // second deadline mechanism.
+    // Retention, on the same deadline tracker the aggregate, both joins and
+    // DISTINCT use. Eviction is driven by the index, not by scanning the
+    // slot: the scan this replaced released at most its 256-entry budget
+    // per watermark while visiting every key, so any arrival rate above
+    // that outran it for ever. See DistinctRowOp::on_watermark, where the
+    // same defect was measured.
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
-        if (state_ttl_ms_ > 0) {
-            const auto ts = wm.timestamp().millis();
-            // Monotonic: a regression must not resurrect expired rows.
-            if (!seen_watermark_ || ts > last_watermark_ms_) {
-                last_watermark_ms_ = ts;
-                seen_watermark_ = true;
-            }
-            // Sweep, because lazy expiry hides an expired row from readers
-            // without releasing it - the set would still grow without bound.
-            if (this->runtime() != nullptr && this->runtime()->has_state_backend()) {
-                auto kv = keyed_state_();
-                kv.cleanup_batch();
+        if (ttl_.enabled()) {
+            if (ttl_.advance_watermark(wm.timestamp().millis())) {
+                ttl_evict_();
             }
         }
         CoOperator<Row, Row, Row>::on_watermark(wm, out);
+    }
+
+    // Absolute deadlines have to survive a restart, and this operator
+    // writes its buckets through on every arrival, so the barrier is the
+    // only place the deadline slot needs catching up.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot) override {
+        CoOperator<Row, Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (!ttl_.enabled() || this->runtime() == nullptr ||
+            !this->runtime()->has_state_backend()) {
+            return;
+        }
+        auto dl = deadline_state_();
+        ttl_.flush(dl);
     }
 
     // Ride the async/disaggregated KeyedState path whenever the bound backend
@@ -6569,6 +6575,17 @@ public:
     void open() override {
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        if (!ttl_.enabled() || this->runtime() == nullptr ||
+            !this->runtime()->has_state_backend()) {
+            return;
+        }
+        auto dl = deadline_state_();
+        ttl_.restore(dl);
+        // A bucket restored without a persisted deadline was pre-clock at
+        // snapshot time; re-enrol it so the first post-restore watermark
+        // starts its clock rather than leaving it immortal.
+        auto kv = keyed_state_();
+        kv.scan([&](const std::string& key, const Bucket&) { ttl_.enrol_restored_key(key); });
     }
 
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -6713,13 +6730,19 @@ private:
     // Persist the bucket, or erase it once the key is fully drained (both
     // sides empty and nothing emitted, so nothing is owed) - keeps keyed
     // state bounded. A future insert re-seeds its own representative.
-    static void store_(KeyedState<std::string, Bucket>& kv,
-                       const std::string& key,
-                       const Bucket& b) {
+    void store_(KeyedState<std::string, Bucket>& kv, const std::string& key, const Bucket& b) {
         if (b.left_count == 0 && b.right_count == 0 && b.emitted == 0) {
             kv.erase(key);
+            if (ttl_.enabled()) {
+                auto dl = deadline_state_();
+                StateTtlTracker::erase_persisted(dl, key);
+                ttl_.forget(key);
+            }
         } else {
             kv.put(key, b);
+            // Retention runs from the last arrival that touched the tuple,
+            // which is what the stamp-on-write it replaced also gave.
+            ttl_.touch(key);
         }
     }
 
@@ -6817,26 +6840,30 @@ private:
         };
     }
 
-    [[nodiscard]] TtlConfig ttl_config_() const {
-        if (state_ttl_ms_ <= 0) {
-            return {};
+    // Release every tuple whose deadline has passed, from the bucket slot
+    // and from the deadline slot. O(expired), not O(state).
+    void ttl_evict_() {
+        const auto doomed = ttl_.expired();
+        if (doomed.empty() || this->runtime() == nullptr || !this->runtime()->has_state_backend()) {
+            return;
         }
-        return TtlConfig{
-            .ttl = std::chrono::milliseconds{state_ttl_ms_},
-            .refresh_on_write = true,
-            .refresh_on_read = false,
-            .domain = ttl_event_time_ ? TtlTimeDomain::EventTime : TtlTimeDomain::ProcessingTime};
+        auto kv = keyed_state_();
+        auto dl = deadline_state_();
+        for (const auto& key : doomed) {
+            kv.erase(key);
+            StateTtlTracker::erase_persisted(dl, key);
+            ttl_.forget(key);
+        }
+    }
+
+    StateTtlTracker::DeadlineSlot deadline_state_() {
+        return this->runtime()->template keyed_state<std::string, std::int64_t>(
+            "setop_ttl", clink::string_codec(), clink::int64_codec());
     }
 
     KeyedState<std::string, Bucket> keyed_state_() {
-        auto ks = this->runtime()->template keyed_state<std::string, Bucket>(
-            "setop", clink::string_codec(), bucket_codec(), ttl_config_());
-        // KeyedState is constructed per call, so each instance is handed
-        // the operator's event-time clock.
-        if (state_ttl_ms_ > 0 && seen_watermark_) {
-            ks.advance_watermark(last_watermark_ms_);
-        }
-        return ks;
+        return this->runtime()->template keyed_state<std::string, Bucket>(
+            "setop", clink::string_codec(), bucket_codec());
     }
 
     std::vector<std::string> left_columns_;
@@ -6845,10 +6872,7 @@ private:
     bool all_;
     // Retention (0 = off) and the clock it runs on, from the table's
     // `state_ttl` / `state_ttl_domain` options via the physical planner.
-    std::int64_t state_ttl_ms_ = 0;
-    bool ttl_event_time_ = true;
-    std::int64_t last_watermark_ms_ = 0;
-    bool seen_watermark_ = false;
+    StateTtlTracker ttl_;
     // Finalised in open(): a deferring backend -> the async KeyedState path
     // (process_async{1,2}); otherwise the sync path above.
     bool effective_async_ = false;
@@ -8087,9 +8111,7 @@ public:
     explicit DistinctRowOp(std::vector<std::string> columns = {},
                            std::int64_t state_ttl_ms = 0,
                            bool ttl_event_time = true)
-        : columns_(std::move(columns)),
-          state_ttl_ms_(state_ttl_ms),
-          ttl_event_time_(ttl_event_time) {}
+        : columns_(std::move(columns)), ttl_(state_ttl_ms, ttl_event_time) {}
 
     // Ride the async/disaggregated KeyedState path whenever the bound
     // backend can genuinely defer reads (supports_async_get()); on a
@@ -8099,6 +8121,18 @@ public:
     void open() override {
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        if (!ttl_.enabled() || this->runtime() == nullptr ||
+            !this->runtime()->has_state_backend()) {
+            return;
+        }
+        auto dl = deadline_state_();
+        ttl_.restore(dl);
+        // A value restored with a presence marker but no persisted deadline
+        // was pre-clock at snapshot time; re-enrol it so the first
+        // post-restore watermark starts its clock instead of leaving it
+        // immortal. Same contract the joins keep.
+        auto kv = keyed_state_();
+        kv.scan([&](const std::string& key, const std::string&) { ttl_.enrol_restored_key(key); });
     }
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -8109,6 +8143,7 @@ public:
                 const std::string key = state_key_(rec.value());
                 if (!kv.get(key).has_value()) {
                     kv.put(key, kSeen);
+                    ttl_.touch(key);
                     emit_batch.push(rec);
                 }
             }
@@ -8121,25 +8156,36 @@ public:
         }
     }
 
-    // Retention needs the watermark for its clock, and needs to sweep:
-    // lazy expiry hides an expired value from readers but leaves it
-    // resident, so a DISTINCT over a high-cardinality stream would still
-    // grow without bound. The sweep is budgeted, so it costs a bounded
-    // amount per watermark rather than stalling proportionally to state.
+    // Retention needs the watermark for its clock, and needs to release:
+    // hiding an expired value from readers while leaving it resident is
+    // how a DISTINCT over a high-cardinality stream grows without bound.
+    //
+    // Eviction is driven by the deadline index, not by scanning the slot.
+    // The scan it replaced cost O(state) per watermark and released at
+    // most its 256-entry budget, so any arrival rate above that outran it
+    // for ever - measured at 4,880 entries resident of 10,000 emitted.
+    // (The budget never bounded the scan either: StateBackend::scan has no
+    // early exit, so every key was visited regardless, and on a deferring
+    // backend that means fetching the whole slot from the object store.)
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
-        if (state_ttl_ms_ > 0) {
-            const auto ts = wm.timestamp().millis();
-            // Monotonic: a regression must not resurrect expired values.
-            if (!seen_watermark_ || ts > last_watermark_ms_) {
-                last_watermark_ms_ = ts;
-                seen_watermark_ = true;
-            }
-            if (this->runtime() != nullptr && this->runtime()->has_state_backend()) {
-                auto kv = keyed_state_();
-                kv.cleanup_batch();
+        if (ttl_.enabled()) {
+            if (ttl_.advance_watermark(wm.timestamp().millis())) {
+                ttl_evict_();
             }
         }
         Operator<Row, Row>::on_watermark(wm, out);
+    }
+
+    // Deadlines are absolute and must survive a restart, so they are
+    // persisted alongside the presence markers they belong to. DISTINCT
+    // writes its data through on every insert, so the barrier is the only
+    // place the deadline slot needs catching up.
+    void on_barrier(CheckpointBarrier b, Emitter<Row>& out) override {
+        if (ttl_.enabled() && this->runtime() != nullptr && this->runtime()->has_state_backend()) {
+            auto dl = deadline_state_();
+            ttl_.flush(dl);
+        }
+        Operator<Row, Row>::on_barrier(b, out);
     }
 
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
@@ -8158,10 +8204,14 @@ public:
         auto kv = keyed_state_();
         for (const auto& rec : element.as_data()) {
             std::string key = state_key_(rec.value());
-            auto factory = [kv, rec, key, &out]() mutable -> async::Task<void> {
+            auto factory = [this, kv, rec, key, &out]() mutable -> async::Task<void> {
                 auto cur = co_await kv.get_async(key);
                 if (!cur.has_value()) {
                     kv.put(key, kSeen);
+                    // Same thread as the sync path: the controller resumes
+                    // completions on the runner thread, so the tracker needs
+                    // no lock of its own.
+                    ttl_.touch(key);
                     Batch<Row> b;
                     b.push(std::move(rec));
                     out.emit_data(std::move(b));
@@ -8204,39 +8254,67 @@ private:
         return key;
     }
 
-    // Unlike the aggregate, DISTINCT keeps ALL of its state in KeyedState -
-    // there is no in-memory hot map and therefore no checkpoint flush that
-    // would re-stamp deadlines. KeyedState's own TtlConfig is exactly right
-    // here, and reusing it is strictly better than a second deadline
-    // mechanism: the stamping, hiding, lazy purge and incremental cleanup
-    // are already tested (test_keyed_state_ttl_depth.cpp).
-    //
-    // refresh_on_read stays FALSE deliberately. Refreshing on read would
-    // mean a value that keeps arriving is retained for ever, so retention
-    // would depend on duplicate rate. False gives the predictable reading:
-    // a value is remembered for `state_ttl` after it was FIRST seen, and a
-    // sighting after that re-emits it.
-    [[nodiscard]] TtlConfig ttl_config_() const {
-        if (state_ttl_ms_ <= 0) {
-            return {};
+    // Release every value whose deadline has passed, from the seen-set and
+    // from the deadline slot. O(expired), not O(state).
+    void ttl_evict_() {
+        const auto doomed = ttl_.expired();
+        if (doomed.empty() || this->runtime() == nullptr || !this->runtime()->has_state_backend()) {
+            return;
         }
-        return TtlConfig{
-            .ttl = std::chrono::milliseconds{state_ttl_ms_},
-            .refresh_on_write = true,
-            .refresh_on_read = false,
-            .domain = ttl_event_time_ ? TtlTimeDomain::EventTime : TtlTimeDomain::ProcessingTime};
+        auto kv = keyed_state_();
+        auto dl = deadline_state_();
+        for (const auto& key : doomed) {
+            kv.erase(key);
+            StateTtlTracker::erase_persisted(dl, key);
+            ttl_.forget(key);
+        }
     }
 
+    // The deadline slot. Separate from the presence slot so the marker
+    // value stays a marker; additive, so a job that sets no state_ttl
+    // writes nothing extra.
+    StateTtlTracker::DeadlineSlot deadline_state_() {
+        return this->runtime()->template keyed_state<std::string, std::int64_t>(
+            "distinct_ttl", clink::string_codec(), clink::int64_codec());
+    }
+
+public:
+    // Values still under retention. The live-entry count for this operator,
+    // read by the TTL tests and by metrics reporting.
+    [[nodiscard]] std::size_t ttl_tracked_values() const noexcept { return ttl_.tracked(); }
+    [[nodiscard]] std::uint64_t ttl_expired_values() const noexcept { return ttl_.expired_total(); }
+
+private:
+    // Retention rides the same deadline tracker the aggregate and both
+    // joins use, rather than KeyedState's own TtlConfig.
+    //
+    // KeyedState's TTL was the natural fit on paper - DISTINCT keeps all
+    // its state in KeyedState, with no hot map whose flush would re-stamp
+    // a deadline - and it was wrong twice in practice. Its sweep could not
+    // keep up (see on_watermark), and its stamp for a value written before
+    // the first watermark is `0 + ttl`, so the first real watermark expired
+    // the entire pre-clock batch at once. The tracker holds such keys until
+    // the clock starts and then gives them the full retention from it,
+    // which is the same F97 contract the other three operators keep.
+    //
+    // A checkpoint written by the previous shape restores cleanly: its
+    // values carry an 8-byte expiry prefix that this operator never reads,
+    // and the marker only has to exist to answer "seen?".
+    //
+    // The historic note, kept because it is still the reason the two
+    // mechanisms differ elsewhere: unlike the aggregate, DISTINCT keeps ALL
+    // of its state in KeyedState - there is no in-memory hot map and
+    // therefore no checkpoint flush that would re-stamp deadlines. That is
+    // what made KeyedState's own TtlConfig look preferable to a second
+    // mechanism, and why the retention semantics below are what they are.
+    //
+    // A value is remembered for `state_ttl` after it was FIRST seen, and a
+    // sighting after that re-emits it. Retention deliberately does not
+    // depend on duplicate rate: a repeated sighting finds the marker
+    // present, writes nothing, and so does not touch the deadline.
     KeyedState<std::string, std::string> keyed_state_() {
-        auto ks = this->runtime()->template keyed_state<std::string, std::string>(
-            "distinct", clink::string_codec(), clink::string_codec(), ttl_config_());
-        // KeyedState is constructed per call, so the event-time clock has to
-        // be handed to each instance. Cheap, and it keeps the watermark in
-        // one place (this operator) rather than duplicated in state.
-        if (state_ttl_ms_ > 0 && seen_watermark_) {
-            ks.advance_watermark(last_watermark_ms_);
-        }
-        return ks;
+        return this->runtime()->template keyed_state<std::string, std::string>(
+            "distinct", clink::string_codec(), clink::string_codec());
     }
 
     // Value is a presence marker only; get().has_value() answers "seen?".
@@ -8245,10 +8323,7 @@ private:
     std::vector<std::string> columns_;
     // Retention (0 = off) and the clock it runs on, from the table's
     // `state_ttl` / `state_ttl_domain` options via the physical planner.
-    std::int64_t state_ttl_ms_ = 0;
-    bool ttl_event_time_ = true;
-    std::int64_t last_watermark_ms_ = 0;
-    bool seen_watermark_ = false;
+    StateTtlTracker ttl_;
     bool effective_async_ = false;
 };
 

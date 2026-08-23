@@ -339,6 +339,81 @@ TEST(SqlStateTtlRuntime, DistinctEvictsNothingBeforeTheFirstWatermark) {
         << "the value was expired against a watermark that had not arrived";
 }
 
+// The property a `state_ttl` declaration actually promises: over a stream
+// whose distinct values keep turning over, state reaches a plateau instead
+// of growing for as long as the job runs.
+//
+// Every other DISTINCT retention test here runs at a cardinality of 20 or
+// 1, which is inside the sweep's per-call budget, so all of them pass
+// whether or not the sweep can make progress across calls. This one runs
+// well above the budget with values arriving and expiring continuously,
+// which is the shape a real job has and the only shape that can tell a
+// bounded sweep from one that stalls.
+TEST(SqlStateTtlRuntime, DistinctStatePlateausAboveTheSweepBudget) {
+    OpProbe p("distinct_row",
+              {{"columns", "k"}, {"state_ttl_ms", "1000"}, {"state_ttl_domain", "event_time"}});
+
+    constexpr int kRounds = 20;
+    constexpr int kFreshPerRound = 500;  // well above the 256 sweep budget
+    std::int64_t wm = 10'000;
+    p.watermark(wm);
+
+    std::size_t resident_after_warmup = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        for (int i = 0; i < kFreshPerRound; ++i) {
+            p.emits(static_cast<std::int64_t>(round) * kFreshPerRound + i, i);
+        }
+        // Past every previous round's deadline, so only this round's
+        // values are live by the time the sweep runs. No watermark after
+        // the FINAL round, so it is still live when the loop ends: a bound
+        // satisfied by holding nothing is not a plateau.
+        if (round + 1 < kRounds) {
+            wm += 2'000;
+            p.watermark(wm);
+        }
+        if (round == 1) {
+            resident_after_warmup = p.resident();
+        }
+    }
+
+    // Steady state: one round's values are live, and the round before it
+    // has just expired. Anything beyond a couple of rounds' worth means
+    // expired entries are accumulating faster than retention releases
+    // them, which is unbounded growth with extra steps.
+    const std::size_t resident = p.resident();
+    EXPECT_LE(resident, static_cast<std::size_t>(3 * kFreshPerRound))
+        << "DISTINCT state grew to " << resident << " entries over " << kRounds
+        << " rounds (after two rounds it held " << resident_after_warmup
+        << "); a declared state_ttl did not bound it";
+    EXPECT_GE(resident, static_cast<std::size_t>(kFreshPerRound))
+        << "the final round's values were released early, so the bound above proves nothing";
+}
+
+// The F97 contract, for DISTINCT: a value written before event time
+// exists gets its full retention measured from the first watermark.
+//
+// The mechanism this replaced stamped such a value with `0 + ttl`, because
+// KeyedState has no clock to measure from before a watermark arrives. The
+// first real watermark is then years past that stamp, so the entire
+// pre-clock batch - in a real job, everything DISTINCT saw before the
+// source established event time - was forgotten in one go and re-emitted.
+// The aggregate's equivalent is APreClockGroupGetsTheFullTtlFromTheFirstWatermark.
+TEST(SqlStateTtlRuntime, APreClockDistinctValueGetsTheFullTtlFromTheFirstWatermark) {
+    OpProbe p("distinct_row",
+              {{"columns", "k"}, {"state_ttl_ms", "1000"}, {"state_ttl_domain", "event_time"}});
+    EXPECT_TRUE(p.emits(1, 10)) << "the first sighting of a value must emit";
+
+    // The clock starts here, well past `ttl` in absolute terms.
+    p.watermark(10'000);
+    EXPECT_FALSE(p.emits(1, 10))
+        << "a value written before the first watermark was expired against a clock that had "
+           "not started when it was written";
+
+    // ... and it still expires on schedule once the clock is running.
+    p.watermark(11'001);
+    EXPECT_TRUE(p.emits(1, 10)) << "the pre-clock value never expired";
+}
+
 TEST(SqlStateTtlRuntime, ProcessingTimeDomainIsHonoured) {
     // With processing time selected, watermarks are irrelevant and the
     // wall clock decides. A 1 ms TTL plus a real sleep must evict.
@@ -528,6 +603,13 @@ const std::map<std::string, std::string> kEquiParams = {
     {"right_columns", "id,rv"},
 };
 
+const std::map<std::string, std::string> kSetOpParams = {
+    {"mode", "intersect"},
+    {"all", "false"},
+    {"left_columns", "id"},
+    {"right_columns", "id"},
+};
+
 const std::map<std::string, std::string> kSemiParams = {
     {"left_key_column", "id"},
     {"right_key_column", "id"},
@@ -662,4 +744,100 @@ TEST(SqlStateTtlRuntime, APreClockGroupGetsTheFullTtlFromTheFirstWatermark) {
     p.watermark(10'500);  // inside the deadline
     EXPECT_EQ(p.running_total_after_feeding(1, 5), 15)
         << "a pre-clock group was expired against the watermark that established the clock";
+}
+
+// --- INTERSECT / EXCEPT ------------------------------------------------------
+//
+// The set operation had no runtime retention coverage at all: it was pinned
+// only at the planner level (SetOperationReceivesTheRetention), which proves
+// the option reaches the operator and nothing about what the operator then
+// does with it. It shares its retention mechanism with DISTINCT, so it
+// shared DISTINCT's defect.
+
+TEST(SqlStateTtlRuntime, SetOpWithoutRetentionKeepsItsPerTupleStateOnTheBackend) {
+    // Vacuity guard: without retention the tuple state must be visible to
+    // the probe after the run, or the release assertion below would pass
+    // against a probe that cannot see state at all.
+    const auto keys = co_op_state_keys_after_run("set_op_row",
+                                                 kSetOpParams,
+                                                 script_rows_only(join_row(1, "lv", 10)),
+                                                 script_rows_only(join_row(1, "rv", 100)));
+    EXPECT_TRUE(any_key_contains(keys, "setop")) << "tuple slot not visible to the probe";
+}
+
+TEST(SqlStateTtlRuntime, SetOpReleasesExpiredStateFromTheBackend) {
+    const auto keys = co_op_state_keys_after_run("set_op_row",
+                                                 with_ttl(kSetOpParams, 1000),
+                                                 script_expiring(join_row(1, "lv", 10)),
+                                                 script_expiring(join_row(1, "rv", 100)));
+    EXPECT_FALSE(any_key_contains(keys, "setop|"))
+        << "expired tuple state still persisted: hidden, not released";
+    EXPECT_FALSE(any_key_contains(keys, "setop_ttl"))
+        << "the deadline slot outlived the tuples it was tracking";
+}
+
+TEST(SqlStateTtlRuntime, SetOpStatePlateausAboveTheSweepBudget) {
+    // The same shape as DistinctStatePlateausAboveTheSweepBudget, over the
+    // other operator that shared the budgeted-scan sweep. Tuples arrive on
+    // the left only, so each one is stored (left_count > 0) and nothing is
+    // drained by matching; retention is the only thing that can release
+    // them.
+    //
+    // Watermarks AND barriers ride both inputs. A co-op's event time is the
+    // minimum of its two sides, and its barriers align across both: a
+    // barrier on one input only waits for a partner that never arrives, and
+    // the run deadlocks rather than failing.
+    constexpr int kRounds = 12;
+    constexpr int kFreshPerRound = 400;  // above the 256 budget the sweep used
+
+    std::vector<ClinkTtlScriptStep> left;
+    std::vector<ClinkTtlScriptStep> right;
+    std::int64_t wm = 10'000;
+    left.push_back(step_wm(wm));
+    right.push_back(step_wm(wm));
+    for (int round = 0; round < kRounds; ++round) {
+        for (int i = 0; i < kFreshPerRound; ++i) {
+            left.push_back(step_row(
+                join_row(static_cast<std::int64_t>(round) * kFreshPerRound + i, "lv", 10)));
+        }
+        left.push_back(step_barrier(round + 1));
+        right.push_back(step_barrier(round + 1));
+        // No watermark after the FINAL round, so its tuples are still live
+        // when the run ends. Advancing past every round including the last
+        // would leave the operator holding nothing, and an upper bound on
+        // nothing is not a plateau.
+        if (round + 1 < kRounds) {
+            wm += 2'000;  // past every previous round's deadline
+            left.push_back(step_wm(wm));
+            right.push_back(step_wm(wm));
+        }
+    }
+
+    const auto count_tuples = [](const std::vector<std::string>& keys) {
+        return static_cast<std::size_t>(
+            std::count_if(keys.begin(), keys.end(), [](const std::string& k) {
+                return k.find("setop|") != std::string::npos;
+            }));
+    };
+
+    // The control arm carries the non-vacuity, and it has to: a co-op's
+    // runner treats a CLOSED input as event time +infinity, so at the end
+    // of any run every TTL'd key is legitimately expired and the retention
+    // arm settles at zero whatever the sweep did. Asserting a surviving
+    // population post-run is therefore not available here (the same reason
+    // the join keeps-arms assert on output rather than on state). What the
+    // identical script without retention holds is the honest measure of
+    // what retention had to release.
+    const auto without =
+        count_tuples(co_op_state_keys_after_run("set_op_row", kSetOpParams, left, right));
+    ASSERT_GE(without, static_cast<std::size_t>(kRounds * kFreshPerRound) / 2)
+        << "the control arm held only " << without
+        << " tuples, so this script does not accumulate state and bounds it proves nothing";
+
+    const auto with = count_tuples(
+        co_op_state_keys_after_run("set_op_row", with_ttl(kSetOpParams, 1000), left, right));
+    EXPECT_LE(with, static_cast<std::size_t>(3 * kFreshPerRound))
+        << "set-operation state reached " << with << " tuples over " << kRounds
+        << " rounds against " << without
+        << " without retention; a declared state_ttl did not bound it";
 }
