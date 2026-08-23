@@ -80,6 +80,11 @@ run "QUAL-05 detspec key epochs (default path must be byte-identical)" \
 run "QUAL-05 state instrument (must refuse rather than report zero)" \
     python3 "$HERE/test_ckptsize.py"
 
+# Container-free: psycopg2 is stubbed, so the oracle is judged on every
+# invocation rather than only under --with-docker.
+run "QUAL-05 oracle (must name every injected defect)" \
+    python3 "$HERE/../qual05/test_oracle.py"
+
 if [ "${1:-}" = "--with-docker" ]; then
     # The QUAL-02 oracle is the one component that was tested offline from the
     # start, and it found a real defect in itself on the first attempt - a
