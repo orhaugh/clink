@@ -46,10 +46,21 @@ MANDATORY_EVENTS = (
 # breathes around its equilibrium; one that is still growing does not stay
 # inside a quarter of its own mean.
 #
-# PLATEAU_SPREAD_MAX: max/min over the window. Catches a run that ends flat
-# having spiked in the middle, which a slope alone would forgive.
+# The two spread statistics do different jobs and both are gated.
+#
+# PLATEAU_BAND_MAX is p90/p10 - how stable the LEVEL is. Max/min alone
+# cannot answer that: one restart transient decides it. A run measured on
+# the local rig sat at 1.4 MiB with p90/p10 of 1.29 and max/min of 1.90,
+# because a single sample landed mid-recovery. The level was flat; the
+# extremes were chaos. A genuinely climbing series has a large p90/p10
+# (the control arm's ramp is over 3), so this stays a real gate.
+#
+# PLATEAU_EXCURSION_MAX is max/min - how far the worst transient went. Kept
+# because a run that ends flat having tripled in the middle is not
+# something to certify quietly, and p90/p10 would forgive it.
 PLATEAU_DRIFT_MAX = 0.25
-PLATEAU_SPREAD_MAX = 1.75
+PLATEAU_BAND_MAX = 1.5
+PLATEAU_EXCURSION_MAX = 2.5
 # The control arm has to have grown by at least this multiple for its
 # comparison to be worth anything.
 CONTROL_MIN_RATIO = 3.0
@@ -118,14 +129,21 @@ def plateau(series):
     slope = 0.0 if denom == 0 else sum((ts[i] - mean_t) * (ys[i] - mean_y) for i in range(n)) / denom
     span = max(ts) - min(ts)
     drift = (slope * span) / mean_y
-    spread = max(ys) / min(ys) if min(ys) > 0 else float("inf")
+    ordered = sorted(ys)
+    pct = lambda q: ordered[min(n - 1, int(q * (n - 1)))]  # noqa: E731
+    p10, p90 = pct(0.10), pct(0.90)
+    band = (p90 / p10) if p10 > 0 else float("inf")
+    excursion = (max(ys) / min(ys)) if min(ys) > 0 else float("inf")
     return {
-        "ok": abs(drift) <= PLATEAU_DRIFT_MAX and spread <= PLATEAU_SPREAD_MAX,
+        "ok": (abs(drift) <= PLATEAU_DRIFT_MAX
+               and band <= PLATEAU_BAND_MAX
+               and excursion <= PLATEAU_EXCURSION_MAX),
         "samples": n,
         "mean_bytes": mean_y,
         "slope_bytes_per_hour": slope * 3600.0,
         "drift": drift,
-        "spread": spread,
+        "band": band,
+        "excursion": excursion,
         "window_s": span,
         "reason": "",
     }
@@ -279,7 +297,9 @@ def build(out_dir, run_id, duration_h, profile):
         a(f"- fitted trend: {pl.get('slope_bytes_per_hour', 0) / (1024 * 1024):.2f} MiB/hour")
         a(f"- drift across the window: {pl.get('drift', 0) * 100:.1f}% of mean "
           f"(band +/-{PLATEAU_DRIFT_MAX * 100:.0f}%)")
-        a(f"- spread (max/min): {pl.get('spread', 0):.2f} (band {PLATEAU_SPREAD_MAX})")
+        a(f"- level stability (p90/p10): {pl.get('band', 0):.2f} (band {PLATEAU_BAND_MAX})")
+        a(f"- worst excursion (max/min): {pl.get('excursion', 0):.2f} "
+          f"(band {PLATEAU_EXCURSION_MAX})")
     else:
         a(f"- NO steady-state samples: {pl.get('reason', 'unknown')}")
     a(f"- plateau: {'yes' if pl['ok'] else 'NO'}")

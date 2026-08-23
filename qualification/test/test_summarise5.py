@@ -27,6 +27,15 @@ MANDATORY = list(q5_summarise.MANDATORY_EVENTS)
 MIB = 1024 * 1024
 
 
+def shifted_series(n=20, mean_mib=200.0, shift_mult=1.8):
+    """Half the window at one level, half at a higher one, and it STAYS."""
+    rows = []
+    for i in range(n):
+        y = mean_mib * (shift_mult if i >= n // 2 else 1.0)
+        rows.append(f"{i * 120},{int(y * MIB)}")
+    return "\n".join(rows) + "\n"
+
+
 def flat_series(n=20, mean_mib=200.0, drift_frac=0.0, spike_at=None, spike_mult=1.0):
     """Steady-state samples: `drift_frac` of the mean across the window."""
     rows = []
@@ -123,6 +132,15 @@ CASES = [
      {"series": flat_series(drift_frac=0.10)}, "PASS"),
     ("state that ends flat but spiked mid-window is INCONCLUSIVE",
      {"series": flat_series(spike_at=10, spike_mult=3.0)}, "INCONCLUSIVE"),
+    # The shape the local rig actually produced: a flat level with one
+    # sample taken mid-recovery. max/min was 1.90 and p90/p10 was 1.29 -
+    # the level was stable and the extreme was chaos, so this must pass.
+    ("a flat level with one restart transient is a PASS",
+     {"series": flat_series(spike_at=7, spike_mult=1.9)}, "PASS"),
+    # But a level that MOVES and stays moved is not a plateau, even though
+    # each half of the window is individually flat.
+    ("a level that shifts up and stays there is INCONCLUSIVE",
+     {"series": shifted_series()}, "INCONCLUSIVE"),
     ("too few steady-state samples to fit a trend is INCONCLUSIVE",
      {"series": flat_series(n=4)}, "INCONCLUSIVE"),
     ("no steady-state samples at all is INCONCLUSIVE",

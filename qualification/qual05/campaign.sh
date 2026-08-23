@@ -805,6 +805,42 @@ read -r REXP RTRK <<<"$(retention_totals)"
 } > "$OUT_DIR/retention.txt"
 cat "$OUT_DIR/retention.txt"
 
+# Let the job finish recovering from the LAST fault before the catch-up
+# clock starts. Chaos stops between faults, but the job it just restarted
+# is still draining, restoring and replaying, and during that it makes no
+# progress at all - which the catch-up loop's stall detector reads as
+# "caught up as far as it ever will". A local run ended 612 events short
+# of 381,570 that way, and an unexplained shortfall is the difference
+# between a verdict and an INCONCLUSIVE.
+echo "campaign: waiting for the job to settle after the last fault"
+settle=0
+while [ "$settle" -lt 300 ]; do
+    if [ "$(job_status "$JOB_ID")" = "RUNNING" ]; then
+        CK1=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" 2>/dev/null \
+            | python3 -c "
+import json,sys
+try:
+    print(int(json.load(sys.stdin).get('latest_completed_checkpoint_id') or 0))
+except Exception:
+    print(0)" 2>/dev/null || echo 0)
+        sleep 20; settle=$(( settle + 20 ))
+        CK2=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" 2>/dev/null \
+            | python3 -c "
+import json,sys
+try:
+    print(int(json.load(sys.stdin).get('latest_completed_checkpoint_id') or 0))
+except Exception:
+    print(0)" 2>/dev/null || echo 0)
+        # A checkpoint completed AFTER the faults stopped: the job is
+        # running normally again, not merely reported as RUNNING.
+        [ "${CK2:-0}" -gt "${CK1:-0}" ] && break
+    else
+        sleep 20; settle=$(( settle + 20 ))
+    fi
+done
+[ "$settle" -lt 300 ] \
+    || echo "campaign: WARNING - the job had not completed a fresh checkpoint 300s after the last fault" >&2
+
 on_host "$OPS_PUB" "touch /qual/q5-progress.json.stop"
 on_host "$OPS_PUB" "pkill -INT -f '[g]enerator.py'; true"
 gwaited=0
