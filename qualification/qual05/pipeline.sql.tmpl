@@ -44,10 +44,17 @@ CREATE TABLE q5_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
         auto_offset_reset='earliest',
         event_time_column='ts', watermark_lag_ms='__WM_LAG_MS__'__RETENTION__);
 
+-- Each arm writes its OWN table. They are measured separately and must
+-- never be able to reach each other's evidence - and on this engine that
+-- is not hypothetical: a cancelled job is resurrected by a coordinator
+-- restart (followups item 69), so the control arm can come back in the
+-- middle of the subject's soak. Sharing one table let its counts overwrite
+-- the subject's, and two runs came up a few hundred events short of
+-- ~384,000 before the cause was found.
 CREATE TABLE q5_out (k BIGINT, n BIGINT)
   WITH (connector='postgres',
         conninfo='__CONNINFO__',
-        "table"='public.q5_out',
+        "table"='public.__SINK_TABLE__',
         mode='upsert',
         primary_key='k');
 

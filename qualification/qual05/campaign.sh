@@ -283,7 +283,10 @@ done
 CONNINFO="host=${OPS_PRIV} port=5432 dbname=qual user=qual password=${PGPASSWORD}"
 DSN="host=127.0.0.1 port=5432 dbname=qual user=qual password=${PGPASSWORD}"
 psql_q() { on_host "$OPS_PUB" "docker exec qual05-postgres psql -U qual -d qual -tAc \"$1\""; }
-psql_q "DROP TABLE IF EXISTS public.q5_out; CREATE TABLE public.q5_out (k BIGINT PRIMARY KEY, n BIGINT)" >/dev/null
+for arm in control subject; do
+    psql_q "DROP TABLE IF EXISTS public.q5_out_$arm; \
+            CREATE TABLE public.q5_out_$arm (k BIGINT PRIMARY KEY, n BIGINT)" >/dev/null
+done
 
 # --- stack ------------------------------------------------------------------
 i=0
@@ -396,6 +399,7 @@ render_pipeline() {  # arm, out-path
         -e "s|__CONNINFO__|$CONNINFO|g" \
         -e "s|__WM_LAG_MS__|$WM_LAG_MS|g" \
         -e "s|__GROUP__|qual05-$arm|g" \
+        -e "s|__SINK_TABLE__|q5_out_$arm|g" \
         -e "s|__RETENTION__|$retention|g" \
         -e "s|__UNBOUNDED__|$unbounded|g" \
         "$HERE/pipeline.sql.tmpl" > "$out"
@@ -546,8 +550,13 @@ if [ -z "$CONTROL_FIRST" ] || [ "${CONTROL_LAST:-0}" -le "${CONTROL_FIRST:-0}" ]
     echo "campaign: WARNING - the control arm did not grow; the subject's plateau will not" >&2
     echo "  be able to prove anything and the summary will read INCONCLUSIVE." >&2
 fi
-# The sink carries the control's rows; the subject must be judged on its own.
-psql_q "TRUNCATE public.q5_out" >/dev/null
+# Remove the control's HA manifest. Cancelling a job does not record the
+# cancellation in the HA store, so the next coordinator restart - and this
+# campaign's chaos restarts it repeatedly - recovers and re-runs it
+# (followups item 69). The separate sink tables mean a resurrected control
+# can no longer corrupt the subject's evidence; this stops it competing for
+# slots as well.
+on_host "$COORD_PUB" "rm -rf /qual/ha/jobs/${CONTROL_JOB} 2>/dev/null; true"
 
 # =============================================================================
 # SUBJECT ARM - the same workload with a declared state_ttl.
@@ -560,7 +569,7 @@ echo "campaign: subject job $JOB_ID"
 curl -fsS "http://${COORD_PUB}:8095/api/v1/connectors" > "$OUT_DIR/cluster-connectors.json" 2>/dev/null || true
 
 start_on_host "$OPS_PUB" q5-verifier.log \
-    "python3 /qual/verifier.py --dsn '$DSN' --table public.q5_out \
+    "python3 /qual/verifier.py --dsn '$DSN' --table public.q5_out_subject \
      --progress /qual/q5-progress.json --out /qual/q5-verdict.json --interval-s 20"
 
 # --- functional verification: nothing soaks until all of this is proven ------
@@ -611,7 +620,7 @@ print(sum(1 for j in js if (j.get('status') or '').upper() in live))" 2>/dev/nul
 
 SINK_OK=no
 for _t in $(seq 1 20); do
-    C=$(psql_q "SELECT count(*) FROM public.q5_out" | tr -d '\r')
+    C=$(psql_q "SELECT count(*) FROM public.q5_out_subject" | tr -d '\r')
     [ "${C:-0}" -gt 0 ] && { SINK_OK=yes; break; }
     sleep 15
 done
@@ -689,12 +698,12 @@ for _t in $(seq 1 30); do
 done
 [ "$LOST" = "yes" ] || verify_fail "a fault was recorded but the engine shows no worker loss"
 
-BEFORE=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q5_out" | tr -d '\r')
+BEFORE=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q5_out_subject" | tr -d '\r')
 RECOVERED=no
 for _p in $(seq 1 "$RECOVER_PROBES"); do
     sleep 30
     S=$(job_status "$JOB_ID")
-    AFTER=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q5_out" | tr -d '\r')
+    AFTER=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q5_out_subject" | tr -d '\r')
     if [ "$S" = "RUNNING" ] && [ "${AFTER:-0}" -gt "${BEFORE:-0}" ]; then RECOVERED=yes; break; fi
 done
 [ "$RECOVERED" = "yes" ] || verify_fail "the job did not resume making progress after the first fault"
@@ -764,7 +773,7 @@ PY
             T=$(( $(date +%s) - SOAK_START ))
             echo "$T,$B" >> "$OUT_DIR/state-series-steady.csv"
             echo "$(( T + WARMUP_S )),$B" >> "$OUT_DIR/state-series-all.csv"
-            K=$(psql_q "SELECT count(*) FROM public.q5_out" 2>/dev/null | tr -d '\r' || echo '?')
+            K=$(psql_q "SELECT count(*) FROM public.q5_out_subject" 2>/dev/null | tr -d '\r' || echo '?')
             echo "campaign: $(date -u +%H:%M) steady ${T}s: $(( B / 1024 / 1024 )) MiB state, $K keys"
             ;;
     esac
@@ -855,7 +864,7 @@ PRODUCED_FINAL=$(on_host "$OPS_PUB" "python3 -c \"
 import json;d=json.load(open('/qual/q5-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
 cwait=0; LAST_FOLDED=-1; STALL_S=0; FOLDED=0
 while [ "$cwait" -lt "$CATCHUP_TIMEOUT_S" ]; do
-    FOLDED=$(psql_q "SELECT coalesce(sum(n), 0) FROM public.q5_out" | tr -d '\r')
+    FOLDED=$(psql_q "SELECT coalesce(sum(n), 0) FROM public.q5_out_subject" | tr -d '\r')
     if [ "${FOLDED:-0}" -ge "${PRODUCED_FINAL:-1}" ]; then CATCHUP=yes; break; fi
     if [ "${FOLDED:-0}" -le "${LAST_FOLDED}" ]; then
         STALL_S=$(( STALL_S + 30 ))
@@ -898,7 +907,7 @@ cat "$OUT_DIR/state-size-final.txt" 2>/dev/null || true
 
 # The authoritative correctness pass, in a FRESH process against a settled
 # table: exact accounting plus every key recomputed from the seed.
-on_host "$OPS_PUB" "python3 /qual/endstate.py --dsn '$DSN' --table public.q5_out \
+on_host "$OPS_PUB" "python3 /qual/endstate.py --dsn '$DSN' --table public.q5_out_subject \
     --progress /qual/q5-progress.json --seed $SEED --partitions $PARTITIONS \
     --keys $KEYS --eps $EPS --base-ms $BASE_MS --key-epoch-ms $KEY_EPOCH_MS" \
     > "$OUT_DIR/completeness.txt" \
