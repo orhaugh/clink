@@ -308,6 +308,14 @@ inline constexpr char kStateBeforeRestore[] = "state.before_restore";
 // busy reader, never as a dead coordinator.
 inline constexpr char kWorkerDeployDispatch[] = "worker.deploy_dispatch";
 
+// Fires on the TASK thread just before run_task_ registers the subtask's
+// cancel token. A Delay here holds a task in construction across a
+// CancelJob arriving on the reader thread - the exact interleave that let
+// a task register a token the flip had already walked past and run on as
+// an orphan of a cancelled deployment (followups item 75b). The latch in
+// the registration block is what the armed window proves.
+inline constexpr char kWorkerTaskTokenRegister[] = "worker.task_token_register";
+
 // ----- Rescale lifecycle -----
 //
 // A rescale is not one moment, it is a sequence: accept, drain the old subtasks,

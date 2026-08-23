@@ -778,6 +778,12 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
                 }
                 cancelled_.store(true, std::memory_order_release);
                 std::lock_guard lock(mu_);
+                // Latch before the flip: a task still constructing on its
+                // task thread registers its token AFTER this handler ran,
+                // and without the latch it would start as an orphan of a
+                // cancelled deployment (followups item 75b). run_task_
+                // consults the latch at registration.
+                cancelled_jobs_.insert(cj.job_id);
                 // Wake any subtasks blocked in await_peer_update_ - for
                 // jobs cancelled before peer-update arrived.
                 for (auto& [key, pt] : pending_) {
@@ -1488,6 +1494,10 @@ void Worker::handle_deploy_(MessageReader& r) {
     JobBundle* job_bundle = nullptr;
     {
         std::lock_guard lock(mu_);
+        // A fresh deployment supersedes any earlier cancel of this job id:
+        // a whole-job restart redeploys under the SAME id, and its tasks
+        // must not inherit the previous attempt's cancel latch.
+        cancelled_jobs_.erase(msg.job_id);
         auto it = per_job_bundle_.find(msg.job_id);
         if (it == per_job_bundle_.end()) {
             it = per_job_bundle_.emplace(msg.job_id, std::make_unique<JobBundle>()).first;
@@ -2404,9 +2414,24 @@ void Worker::run_generic_subtask_(JobId job_id,
             // Register the cancel token (created above so the EOS waits could
             // capture it) under mu_ before the runner starts, so the CancelJob
             // handler sees it immediately; cleared in run_task_'s finally block.
+            // Holds this task in construction across a concurrently arriving
+            // CancelJob, which is the window the latch below closes.
+            CLINK_FAULT_POINT(clink::fault::points::kWorkerTaskTokenRegister);
             {
                 std::lock_guard lock(mu_);
                 per_job_cancel_tokens_[job_id][task.subtask_idx] = cancel_token;
+                // The job's CancelJob may have been processed while this
+                // task was still constructing - the flip walks only tokens
+                // registered at that moment. Start pre-cancelled rather
+                // than run as an orphan the coordinator counts against a
+                // completion that then never converges (item 75b).
+                if (cancelled_jobs_.count(job_id) != 0) {
+                    cancel_token->store(true, std::memory_order_release);
+                    log::info("worker.cancel",
+                              "job_id=" + std::to_string(job_id) + " subtask " +
+                                  std::to_string(task.subtask_idx) +
+                                  " registered after the job's cancel; starting pre-cancelled");
+                }
             }
             rctx.cancel_token = cancel_token;
             (*runner)(rctx);

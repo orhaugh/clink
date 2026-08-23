@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -577,6 +578,16 @@ private:
     // even after the run_task_ stack frame returns.
     std::unordered_map<JobId, std::unordered_map<std::uint32_t, std::shared_ptr<std::atomic<bool>>>>
         per_job_cancel_tokens_;
+    // Jobs whose CancelJob has been processed. The flip above only reaches
+    // tokens ALREADY registered, and task construction runs on task threads:
+    // a task that finishes constructing after the flip used to register a
+    // fresh token nobody would ever set and run on as an orphan of a
+    // cancelled deployment (followups item 75b - it parked a 292-task job's
+    // fail-by-counting completion at 291/292 forever). run_task_ checks this
+    // latch at registration and starts such a task pre-cancelled. A later
+    // Deploy for the same job id clears the latch: a whole-job restart
+    // redeploys under the same id and its tasks must run. Guarded by mu_.
+    std::unordered_set<JobId> cancelled_jobs_;
 };
 
 }  // namespace clink::cluster

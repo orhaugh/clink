@@ -892,6 +892,20 @@ private:
         // reported outcome, and a job that FAILED must report failed, not
         // cancelled. This one only stops the broadcast repeating.
         bool error_cancel_broadcast{false};
+        // Stamped whenever a broadcast CancelJob is expected to TERMINATE the
+        // job - by the fatal-error path (error_cancel_broadcast) and by a
+        // client cancel (cancel_requested) alike. Both complete the job by
+        // COUNTING: peer cancels drive completed_count to
+        // expected_completion - and a count has no timeout. A peer whose
+        // cancel never lands (its worker lost, or a task that finished
+        // constructing after its worker flipped the cancel tokens and so ran
+        // on as an orphan) parks the count short forever; QUAL-06 watched a
+        // 292-task job sit RUNNING for 75 minutes at 291/292 with its
+        // verdict already recorded (item 75a), and its run B saw a client
+        // cancel "ignored" for 40 minutes the same way (item 73). The
+        // watchdog force-completes the job - FAILED or CANCELLED per the
+        // usual outcome precedence - when this deadline expires.
+        std::chrono::steady_clock::time_point terminal_cancel_deadline{};
 
         // worker-crash recovery state.
         //

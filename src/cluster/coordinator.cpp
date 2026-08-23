@@ -1908,6 +1908,13 @@ CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
             ack.message = "cancel already in progress";
         } else {
             it->second->cancel_requested = true;
+            // The cancel completes by counting SubtaskFinished arrivals, and
+            // a peer that never reports would otherwise leave the job
+            // "cancelled but RUNNING" forever - QUAL-06 run B watched
+            // cancel_requested sit ignored for 40 minutes that way (item
+            // 73). Same convergence bound as the fatal-error broadcast.
+            it->second->terminal_cancel_deadline =
+                std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
             for (const auto& [worker_id, _] : it->second->tasks_by_worker) {
                 auto worker_it = registered_.find(worker_id);
                 if (worker_it != registered_.end() && !worker_it->second->lost &&
@@ -4692,6 +4699,55 @@ void Coordinator::watchdog_loop_() {
                     signal_job_completion_locked_(*job);
                 }
             }
+            // Bounded terminal-cancel convergence (followups items 75a and
+            // 73). Both the fatal-error broadcast and a client cancel
+            // terminate the job by cancelling every peer and waiting for
+            // completed_count to reach expected_completion - a COUNT, which
+            // used to have no deadline. A peer whose cancel never lands (its
+            // worker lost at broadcast time, or a task that finished
+            // constructing after its worker flipped the cancel tokens and
+            // ran on as an orphan) parks the count short forever: QUAL-06
+            // run C reported RUNNING for 75 silent minutes at 291/292 with
+            // its verdict already recorded, and run B watched a client
+            // cancel sit "ignored" for 40 minutes. The outcome is decided
+            // the moment the broadcast fires, so waiting past the deadline
+            // buys nothing - force the completion, naming what never
+            // reported; the FAILED/CANCELLED precedence is
+            // signal_job_completion's as ever. awaiting_restart excluded: a
+            // restart entered after an error broadcast owns the job and
+            // resets this state itself.
+            for (auto& [_, job] : jobs_) {
+                if ((job->error_cancel_broadcast || job->cancel_requested) &&
+                    !job->completion_signalled && !job->awaiting_restart &&
+                    job->terminal_cancel_deadline != std::chrono::steady_clock::time_point{} &&
+                    now > job->terminal_cancel_deadline) {
+                    std::string unreported;
+                    for (const auto& [worker_id, pending] : job->pending_per_worker) {
+                        for (const auto& [role, sub] : pending) {
+                            if (!unreported.empty()) {
+                                unreported += ", ";
+                            }
+                            unreported += role + ":" + std::to_string(sub) + " on " + worker_id;
+                        }
+                    }
+                    log::warn(
+                        "coordinator.watchdog",
+                        "job_id=" + std::to_string(job->id) +
+                            " terminal-cancel convergence timed out at " +
+                            std::to_string(job->completed_count) + "/" +
+                            std::to_string(job->expected_completion) +
+                            "; failing the job on its recorded verdict. unreported: " +
+                            (unreported.empty() ? "(none pending - counts diverged)" : unreported));
+                    job->errors.push_back(
+                        "terminal-cancel convergence timed out after " +
+                        std::to_string(cfg_.restart_drain_timeout.count()) +
+                        "ms; peers that never reported: " +
+                        (unreported.empty() ? "(none pending - counts diverged)" : unreported));
+                    job->terminal_cancel_deadline = {};
+                    job->completed_count = job->expected_completion;
+                    signal_job_completion_locked_(*job);
+                }
+            }
         }
         for (const auto& [conn, jid] : survivor_cancels) {
             CancelJobMsg cj;
@@ -5292,6 +5348,11 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     job.restart_drain_expected.clear();
     job.completed_count = 0;
     job.errors.clear();
+    // A restart supersedes any outstanding error-cancel convergence: the
+    // count it was waiting on restarts from zero with the new deployment,
+    // and a stale deadline would force-fail the fresh attempt.
+    job.error_cancel_broadcast = false;
+    job.terminal_cancel_deadline = {};
     job.peer_updates_sent = false;
     job.received_listenings = 0;
     job.ports.clear();
@@ -6098,12 +6159,29 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                 if (!job.error_cancel_broadcast && !job.cancel_requested &&
                     !job.completion_signalled) {
                     job.error_cancel_broadcast = true;
+                    // Bound the count-based completion this broadcast relies
+                    // on, and say the broadcast happened at all: the QUAL-06
+                    // wedge was invisible precisely because this path used
+                    // to cancel every peer without a log line and then wait
+                    // on a count with no deadline (followups item 75a).
+                    job.terminal_cancel_deadline =
+                        std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+                    std::size_t peers = 0;
                     for (const auto& [worker_id2, _] : job.tasks_by_worker) {
                         auto cit = registered_.find(worker_id2);
                         if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
                             error_restart_cancels.emplace_back(cit->second->conn.get(), job_id);
+                            ++peers;
                         }
                     }
+                    log::warn("coordinator.restart",
+                              "job_id=" + std::to_string(job_id) +
+                                  " unrecoverable subtask error from " + msg.worker_id + "/" +
+                                  msg.role + "[" + std::to_string(msg.subtask_idx) +
+                                  "]; cancelling peers on " + std::to_string(peers) +
+                                  " worker(s) to complete the job as FAILED (deadline " +
+                                  std::to_string(cfg_.restart_drain_timeout.count()) +
+                                  "ms): " + msg.error_message);
                 }
             }
             // Free this subtask's slot on the owning worker.
