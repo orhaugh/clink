@@ -221,6 +221,7 @@ WORKER_PUBS=$(read_inv worker public_ip)
 BROKER_PRIVS=$(read_inv broker private_ip)
 BROKER_LIST=$(for ip in $BROKER_PRIVS; do printf "%s:9092," "$ip"; done | sed 's/,$//')
 SEED_LIST=$(for ip in $BROKER_PRIVS; do printf "%s:33145," "$ip"; done | sed 's/,$//')
+BROKER_ONE=$(echo "$BROKER_PRIVS" | awk '{print $1}')
 echo "campaign: brokers=$BROKER_LIST coordinator=$COORD_PRIV ops=$OPS_PUB"
 
 for h in $OPS_PUB $COORD_PUB $WORKER_PUBS $(read_inv broker public_ip); do
@@ -259,6 +260,13 @@ fi
 # --- verification database -------------------------------------------------
 to_host "$OPS_PUB" "$HERE/postgres.yml" /qual/postgres.yml
 on_host "$OPS_PUB" "grep -q '^PGPASSWORD=' /qual/.env 2>/dev/null || echo 'PGPASSWORD=$PGPASSWORD' >> /qual/.env"
+# down -v FIRST, and it is not tidiness: POSTGRES_PASSWORD only applies to
+# an UNINITIALISED data directory, so a volume left by an earlier run keeps
+# that run's password and every sink connection fails authentication. The
+# job then crashloops with the coordinator restarting it for ever, the
+# state curve stays flat because nothing accumulates, and the campaign
+# reads it as "retention worked". Exactly the MinIO trap QUAL-04 hit.
+on_host "$OPS_PUB" "cd /qual && PGPASSWORD='$PGPASSWORD' docker compose -f postgres.yml down -v >/dev/null 2>&1; true"
 on_host "$OPS_PUB" "cd /qual && PGPASSWORD='$PGPASSWORD' docker compose -f postgres.yml up -d"
 pgready=0
 until on_host "$OPS_PUB" "docker exec qual05-postgres pg_isready -U qual >/dev/null 2>&1"; do
@@ -323,8 +331,13 @@ if not d.get('build',{}).get('fault_injection'):
 
 # --- topic ------------------------------------------------------------------
 kill_campaign_processes "$OPS_PUB" || true
-rpk_ops() { on_host "$OPS_PUB" "docker run --rm --network host docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
-    rpk --brokers '$BROKER_LIST' $1"; }
+# --brokers is a PER-COMMAND flag in rpk v24, not a global one: putting it
+# before the subcommand gets "unknown flag: --brokers" and a usage dump.
+rpk_ops() {  # rpk against the broker, from the ops host
+    on_host "$OPS_PUB" "docker run --rm --entrypoint rpk \
+        docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
+        $1 --brokers $BROKER_ONE:9092"
+}
 rpk_ops "topic delete qual05-in" >/dev/null 2>&1 || true
 for _t in $(seq 1 30); do
     rpk_ops "topic list" 2>/dev/null | grep -q "qual05-in" || break
@@ -446,6 +459,27 @@ CONTROL_JOB=$(submit_arm control "$CONTROL_CKPT_DIR")
                            tail -20 "$OUT_DIR/submit-control.log" >&2; exit 1; }
 echo "campaign: control job $CONTROL_JOB"
 
+# The control arm used to be measured blind. A job crashlooping on its sink
+# is reported RUNNING by the coordinator while restarting for ever, holds
+# no state, and produces a perfectly flat curve - which is indistinguishable
+# from a control that legitimately did not grow, and wastes the run either
+# way. Completed checkpoints, not status, is what says it is working.
+echo "campaign: waiting for the control arm to complete a checkpoint"
+CONTROL_HEALTHY=no
+for _t in $(seq 1 30); do
+    CJ=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/${CONTROL_JOB}" 2>/dev/null || echo "")
+    CC=$(echo "$CJ" | python3 -c "
+import json,sys
+try:
+    print(int(json.load(sys.stdin).get('completed_count') or 0))
+except Exception:
+    print(0)" 2>/dev/null || echo 0)
+    [ "${CC:-0}" -ge 1 ] && { CONTROL_HEALTHY=yes; break; }
+    sleep 10
+done
+[ "$CONTROL_HEALTHY" = "yes" ] \
+    || verify_fail "the control arm never completed a checkpoint; it is not processing"
+
 CONTROL_FIRST=""
 CONTROL_LAST=""
 cstart=$(date +%s)
@@ -501,13 +535,25 @@ P2=$(on_host "$OPS_PUB" "python3 -c \"
 import json;d=json.load(open('/qual/q5-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
 [ "${P2:-0}" -gt "${P1:-0}" ] || verify_fail "no input is flowing (progress ${P1} -> ${P2})"
 
-curl -fsS --max-time 30 "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" > "$OUT_DIR/job-status.json" 2>/dev/null || true
-python3 -c "
+# Polled, not single-shot: a job seconds away from its first checkpoint is
+# healthy, and the field is completed_count (completed_checkpoints does not
+# exist, so the old spelling read 0 for ever and would have failed every
+# run that got this far).
+JOB_HEALTHY=no
+for _t in $(seq 1 30); do
+    curl -fsS --max-time 30 "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}" \
+        > "$OUT_DIR/job-status.json" 2>/dev/null || true
+    if python3 -c "
 import json,sys
-d=json.load(open('$OUT_DIR/job-status.json'))
-if d.get('status') != 'RUNNING': sys.exit('status is %s' % d.get('status'))
-if int(d.get('completed_checkpoints') or 0) < 1: sys.exit('no checkpoint has completed')
-" || verify_fail "the job is not healthy"
+try:
+    d=json.load(open('$OUT_DIR/job-status.json'))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if int(d.get('completed_count') or 0) >= 1 and not d.get('errors') else 1)
+"; then JOB_HEALTHY=yes; break; fi
+    sleep 10
+done
+[ "$JOB_HEALTHY" = "yes" ] || verify_fail "the job never completed a checkpoint"
 
 NJOBS=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs" 2>/dev/null \
     | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('jobs',[])))" 2>/dev/null || echo 0)

@@ -10,12 +10,23 @@ state backend serialises each subtask's keyed state to
 shared mount, so the operations host can size a checkpoint without asking
 any clink process anything.
 
-What is reported is the size of ONE checkpoint, not of the directory. The
-directory also holds the checkpoints being retained for recovery, so its
-total grows with the retention count and would read as state growth on a
-job whose state was perfectly flat. The newest COMPLETE checkpoint - the
-newest id present for every subtask that any id has - is the honest
-snapshot of live state at a moment.
+What is reported is ONE checkpoint's worth of state, not the directory's
+total. The directory also holds the checkpoints being retained for
+recovery, so its total grows with the retention count and would read as
+state growth on a job whose state was perfectly flat.
+
+"One checkpoint's worth" is the NEWEST SNAPSHOT IN EACH SUBTASK
+DIRECTORY, summed - the same shape QUAL-04's instrument used against the
+object store's per-prefix manifests. The obvious alternative, "the newest
+id present in every subtask directory", is wrong in practice: retention
+purges old checkpoints per subtask at slightly different moments, so at
+any instant the id sets differ and the newest id they all share is a stale
+one. Measured on the first local run it reported 9.5 KB against a
+directory holding 494 KB.
+
+There is no partial-checkpoint hazard to work around: the file backend
+writes to a temp name and renames, so a .snap file that exists is
+complete.
 
 Refuses rather than reporting zero when it can find nothing: a size gate
 that silently reads 0 on a mis-typed path is a gate that cannot fail.
@@ -30,8 +41,8 @@ SNAP_RE = re.compile(r"^checkpoint-(\d+)\.snap$")
 
 
 def scan(root):
-    """{checkpoint_id: [file sizes]} across every subtask directory."""
-    by_id = defaultdict(list)
+    """({subtask dir: {checkpoint id: size}}, total bytes, total files)."""
+    by_dir = defaultdict(dict)
     total_bytes = 0
     total_files = 0
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -43,29 +54,29 @@ def scan(root):
             try:
                 size = os.path.getsize(path)
             except OSError:
-                continue  # a checkpoint being written or purged underneath us
-            by_id[int(m.group(1))].append(size)
+                continue  # purged underneath us between listing and stat
+            by_dir[dirpath][int(m.group(1))] = size
             total_bytes += size
             total_files += 1
-    return by_id, total_bytes, total_files
+    return by_dir, total_bytes, total_files
 
 
-def newest_complete(by_id):
-    """(id, files, bytes) for the newest id written by every subtask.
+def newest_per_subtask(by_dir):
+    """(newest id seen, subtask dirs counted, summed bytes).
 
-    A checkpoint mid-write has files for some subtasks and not others, and
-    sizing it would read as a dip. The subtask count is taken as the widest
-    any id reaches rather than configured, so the instrument does not have
-    to be told the parallelism and cannot disagree with it.
+    Each subtask contributes its own most recent snapshot, so a subtask
+    that has not yet written checkpoint N contributes N-1 rather than
+    dropping out of the measurement and halving it.
     """
-    if not by_id:
+    if not by_dir:
         return None
-    expected = max(len(v) for v in by_id.values())
-    complete = [i for i, v in by_id.items() if len(v) == expected]
-    if not complete:
-        return None
-    cid = max(complete)
-    return cid, expected, sum(by_id[cid])
+    total = 0
+    newest = 0
+    for _d, per_id in by_dir.items():
+        cid = max(per_id)
+        newest = max(newest, cid)
+        total += per_id[cid]
+    return newest, len(by_dir), total
 
 
 def main():
@@ -78,8 +89,8 @@ def main():
         print(f"ckptsize: {args.dir} is not a directory", file=sys.stderr)
         return 2
 
-    by_id, total_bytes, total_files = scan(args.dir)
-    newest = newest_complete(by_id)
+    by_dir, total_bytes, total_files = scan(args.dir)
+    newest = newest_per_subtask(by_dir)
     if newest is None:
         print(
             f"ckptsize: no checkpoint-<id>.snap files under {args.dir}; "
@@ -87,7 +98,7 @@ def main():
             file=sys.stderr,
         )
         return 3
-    cid, files, live = newest
+    cid, dirs, live = newest
 
     if not args.detail:
         print(live)
@@ -96,8 +107,8 @@ def main():
     print(f"state_live_bytes={live}")
     print(f"state_live_mib={live / (1024 * 1024):.2f}")
     print(f"state_checkpoint_id={cid}")
-    print(f"state_subtask_files={files}")
-    print(f"state_ids_retained={len(by_id)}")
+    print(f"state_subtask_dirs={dirs}")
+    print(f"state_ids_retained={len({i for per in by_dir.values() for i in per})}")
     print(f"state_dir_bytes={total_bytes}")
     print(f"state_dir_files={total_files}")
     return 0
