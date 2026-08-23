@@ -141,6 +141,9 @@ kill_campaign_processes() {  # host
 }
 verify_fail() {
     echo "campaign: FUNCTIONAL VERIFICATION FAILED - $1" >&2
+    # Chaos first: a controller left running keeps firing at whatever is
+    # wedged, and the evidence then records faults nothing was judging.
+    on_host "$OPS_PUB" "touch /qual/q6-chaos.jsonl.stop; pkill -INT -f '[c]haos.py'; true" || true
     collect_container_logs || true
     for j in "${JOB_ID:-}"; do
         [ -n "$j" ] && curl -fsS -X POST \
@@ -310,6 +313,22 @@ start_on_host "$OPS_PUB" q6-generator.log \
      --base-ms $BASE_MS --max-jitter-ms 0 --window-ms 10000 \
      --key-epoch-ms $KEY_EPOCH_MS --progress /qual/q6-progress.json"
 
+# Recreate the control plane and workers with a wiped HA store. Needed
+# whenever a job wedges (finding 73: RUNNING, uncheckpointing, cancel
+# ignored) - it holds its slots and nothing else can deploy. Coordinator
+# DOWN before the wipe, or its replacement resurrects the manifests
+# (finding 69).
+reset_stack() {
+    echo "campaign: resetting the control plane (wedged or unkillable job)"
+    on_host "$COORD_PUB" "cd /qual && docker compose -f coordinator.yml down >/dev/null 2>&1; \
+        rm -rf /qual/ha/jobs /qual/ha/history; mkdir -p /qual/ha; \
+        docker compose -f coordinator.yml up -d" >/dev/null 2>&1
+    for wp in $WORKER_PUBS; do
+        on_host "$wp" "cd /qual && docker compose -f worker.yml up -d --force-recreate" >/dev/null 2>&1
+    done
+    sleep 20
+}
+
 job_status() {  # job id
     local body
     body=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/$1" 2>/dev/null) || {
@@ -358,7 +377,12 @@ for rung in $LADDER; do
         for _t in $(seq 1 36); do
             case "$(job_status "$JOB_ID")" in RUNNING|RESTARTING|UNREACHABLE) sleep 5 ;; *) break ;; esac
         done
-        on_host "$COORD_PUB" "rm -rf /qual/ha/jobs/${JOB_ID} 2>/dev/null; true"
+        # A job that ignores cancel (finding 73) still holds its slots; the
+        # next rung would then fail on capacity and report the wrong thing.
+        case "$(job_status "$JOB_ID")" in
+            RUNNING|RESTARTING) reset_stack ;;
+            *) on_host "$COORD_PUB" "rm -rf /qual/ha/jobs/${JOB_ID} 2>/dev/null; true" ;;
+        esac
         psql_q "TRUNCATE public.q6_out" >/dev/null
     fi
 
@@ -471,12 +495,48 @@ except Exception:
         break
     fi
 
+    # Recovery gate: the claim is "runs under faults", so a rung is only
+    # green if it survives a controlled worker kill - checkpoint id and the
+    # folded total must both advance past their pre-kill values. Finding 73
+    # is exactly the failure this catches: deploys fine, wedges on loss.
+    KILL_WORKER=$(echo "$WORKER_PUBS" | awk '{print $NF}')
+    PRE_CKPT=$(ckpt_id "$JOB_ID")
+    PRE_SUM=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q6_out" | tr -d '\r')
+    T_KILL=$(date +%s)
+    on_host "$KILL_WORKER" "docker kill -s SIGKILL clink-worker >/dev/null 2>&1; sleep 8; \
+        cd /qual && docker compose -f worker.yml up -d" >/dev/null 2>&1
+    RECOVERED=no; RECOVERY_S=-1
+    rw=0
+    while [ "$rw" -lt "${RECOVERY_GATE_S:-600}" ]; do
+        sleep 15; rw=$(( rw + 15 ))
+        CK=$(ckpt_id "$JOB_ID")
+        SM=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q6_out" | tr -d '\r')
+        if [ "$(job_status "$JOB_ID")" = "RUNNING" ] && \
+           [ "${CK:-0}" -gt "${PRE_CKPT:-0}" ] && [ "${SM:-0}" -gt "${PRE_SUM:-0}" ]; then
+            RECOVERED=yes; RECOVERY_S=$(( $(date +%s) - T_KILL )); break
+        fi
+    done
+    if [ "$RECOVERED" != "yes" ]; then
+        { echo "branches=$B"; echo "expected_ops=$EXPECTED_OPS"; echo "deployed_ops=$DEPLOYED_OPS";
+          echo "subtasks=${DEPLOYED_TASKS:-$SUBTASKS}"; echo "parallelism=$P"; echo "deploy_s=$DEPLOY_S";
+          echo "first_checkpoint_s=$FIRST_CKPT_S"; echo "status=recovery-failed";
+          echo "reason=deployed and checkpointed, but did not recover a worker kill within ${RECOVERY_GATE_S:-600}s";
+        } > "$RUNG_FILE"
+        collect_container_logs
+        echo "campaign: rung $RUNG failed RECOVERY; ladder ends here"
+        # The failed job is very likely wedged (finding 73): reset rather
+        # than trust cancel.
+        reset_stack
+        JOB_ID=""
+        break
+    fi
     { echo "branches=$B"; echo "expected_ops=$EXPECTED_OPS"; echo "deployed_ops=$DEPLOYED_OPS";
       echo "subtasks=${DEPLOYED_TASKS:-$SUBTASKS}"; echo "parallelism=$P"; echo "deploy_s=$DEPLOY_S";
-      echo "first_checkpoint_s=$FIRST_CKPT_S"; echo "status=green"; echo "reason=";
+      echo "first_checkpoint_s=$FIRST_CKPT_S"; echo "recovery_s=$RECOVERY_S";
+      echo "status=green"; echo "reason=";
     } > "$RUNG_FILE"
-    echo "campaign: rung $RUNG GREEN (deploy ${DEPLOY_S}s, first checkpoint ${FIRST_CKPT_S}s, $DEPLOYED_OPS ops)"
-    FINAL_B=$B; FINAL_P=$P; FINAL_SUBTASKS=$SUBTASKS
+    echo "campaign: rung $RUNG GREEN (deploy ${DEPLOY_S}s, first ckpt ${FIRST_CKPT_S}s, recovered a worker kill in ${RECOVERY_S}s)"
+    FINAL_B=$B; FINAL_P=$P; FINAL_SUBTASKS=${DEPLOYED_TASKS:-$SUBTASKS}
 done
 
 # The ladder cancels each green rung before trying the next, so when a
@@ -485,6 +545,8 @@ done
 # the battery - the boundary rung's record stands as the measured limit.
 if [ -z "$JOB_ID" ] && [ -n "$FINAL_B" ]; then
     echo "campaign: redeploying the largest green rung (B=$FINAL_B par=$FINAL_P) as the claim job"
+    # The boundary rung's job may be wedged and holding slots.
+    reset_stack
     psql_q "TRUNCATE public.q6_out" >/dev/null
     python3 "$HERE/dag-gen.py" --branches "$FINAL_B" --run-tag "$RUN_ID-claim" \
         | sed -e "s|__BROKERS__|$BROKER_LIST|g" \

@@ -49,8 +49,9 @@ def write_evidence(d, *, rungs=2, boundary=False, width_mismatch=False,
                    subtasks=204 if n == 1 else 588,
                    expected_ops=(ops + 1) if (width_mismatch and n == rungs) else ops)
     if boundary:
+        st = "recovery-failed" if boundary == "recovery" else "capacity"
         write_rung(d, rungs + 1, branches=48, ops=-1, subtasks=2328,
-                   status="capacity", reason="slots 2400 < subtasks 2328 after margin")
+                   status=st, reason="boundary")
     (d / "q6-verdict.json").write_text(json.dumps({
         "samples": 30, "findings": list(findings), "stuck": stuck,
         "last_stats": {"sum_n": sum_n}}))
@@ -108,6 +109,8 @@ CASES = [
     # The scale-campaign essence: hitting a limit is a boundary, not a red.
     ("a capacity boundary above the greens is still a PASS",
      {"boundary": True}, "PASS"),
+    ("a recovery-failed boundary above the greens is still a PASS",
+     {"boundary": "recovery"}, "PASS"),
     ("a deployed width disagreeing with the claim is a FAIL",
      {"width_mismatch": True}, "FAIL"),
     ("no rung green at all is INCONCLUSIVE", {"rungs": 0, "boundary": True}, "INCONCLUSIVE"),

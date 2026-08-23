@@ -138,7 +138,7 @@ def build(out_dir, run_id, profile):
                 rung_problems.append(
                     f"rung {n} deployed {deployed_ops} ops against a claim of {expected_ops}")
             green.append((n, r))
-        elif status in ("capacity", "deploy-failed"):
+        elif status in ("capacity", "deploy-failed", "recovery-failed"):
             boundary = (n, r)
             break
         else:
