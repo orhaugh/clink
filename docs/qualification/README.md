@@ -27,12 +27,15 @@ Two rules govern what appears here:
 | Exactly-once into PostgreSQL through two-phase commit, including database outages during recovery | [QUAL-02](qual-02-postgres-two-phase-commit.md) | 21 August 2026, engine `2e55943` |
 | Exactly-once into S3-compatible object storage through staged multipart commits, including store outages during recovery | [QUAL-03](qual-03-s3-staged-commits.md) | 22 August 2026, engine `625cc82` |
 | Tens of GiB of keyed state on a disaggregated backend, every key correct under process, coordinator, broker and network faults | [QUAL-04](qual-04-large-keyed-state.md) | 23 August 2026, engine `6ba73b5` |
+| Bounded state through declared retention: an 8.3M-event run under faults holding a flat 67 MiB plateau with every key exact | [QUAL-05](qual-05-ttl-steady-state.md) | 23 August 2026, engine `bed138c` |
 
 ## Not yet campaigned
 
-Keyed state at the 100 GB+ tier, and multi-day steady-state resource
-behaviour, are architecturally supported and covered by the engine's test
-suites, but have not yet been through a campaign of this kind. QUAL-04
-qualifies keyed state at 29 GiB; the larger tier is a separate campaign. Pages are added to the
+Keyed state at the 100 GB+ tier, multi-day steady-state resource
+behaviour, and retention on the disaggregated backends are architecturally
+supported and covered by the engine's test suites, but have not yet been
+through a campaign of this kind. QUAL-04 qualifies keyed state at 29 GiB
+and QUAL-05 qualifies bounded state over 90 minutes; the larger tier and
+longer durations are separate campaigns. Pages are added to the
 table above only when a campaign concludes with useful results and
 retained evidence.
