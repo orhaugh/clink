@@ -1,0 +1,61 @@
+-- QUAL-05 pipeline: Kafka -> TTL'd DISTINCT -> TTL'd unwindowed GROUP BY
+-- -> Postgres upsert table.
+--
+-- What is under test is RETENTION: whether a job whose key space keeps
+-- turning over holds BOUNDED state instead of growing for as long as it
+-- runs. So the shape is built to accumulate state that a `state_ttl` must
+-- release, and to stay exactly verifiable while it does:
+--
+--   * The generator's key space ADVANCES with event time (detspec's
+--     key_epoch_ms): each epoch draws from its own disjoint block of keys,
+--     so a key is touched only during its epoch and never again. Without
+--     that, every key keeps being touched, nothing is ever eligible to
+--     expire, and a flat state curve would prove nothing.
+--   * SELECT DISTINCT over event_id holds one entry per EVENT, so its
+--     state tracks the arrival rate rather than the key count - the larger
+--     of the two retained populations, and the operator whose retention
+--     was broken until 5f431bb.
+--   * An unwindowed GROUP BY never closes, so without retention its
+--     accumulators live for the whole run. It is the construct the
+--     bounded-state gate refuses outright unless a bound is declared.
+--
+-- Verifiability. A key's events all fall inside one epoch, so provided the
+-- TTL comfortably exceeds the epoch length no key's aggregate is ever
+-- truncated mid-life: each key's final n is its true event count, and
+-- SUM(n) over the settled table equals the number of events produced. The
+-- campaign asserts that relationship rather than assuming it.
+--
+-- The DISTINCT is inside the verified path deliberately: if it expired an
+-- event_id early and a fault later replayed that event, the event would be
+-- counted twice and SUM(n) would exceed what the generator produced. The
+-- TTL must therefore also exceed the worst replay lag (checkpoint interval
+-- plus recovery), which it does by two orders of magnitude here.
+--
+-- __BROKERS__, __CONNINFO__, __WM_LAG_MS__, __GROUP__, __RETENTION__ and
+-- __UNBOUNDED__ are substituted by the campaign driver. The two arms take
+-- DIFFERENT consumer groups so the subject does not resume from where the
+-- control left off and skip the events it has to fold. __RETENTION__ is
+-- the declared bound for the subject arm and empty for the control arm;
+-- __UNBOUNDED__ is the reverse. The two arms differ in nothing else, which
+-- is what makes the control a control.
+CREATE TABLE q5_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
+  WITH (connector='kafka', format='json', brokers='__BROKERS__',
+        topic='qual05-in', group_id='__GROUP__',
+        auto_offset_reset='earliest',
+        event_time_column='ts', watermark_lag_ms='__WM_LAG_MS__'__RETENTION__);
+
+CREATE TABLE q5_out (k BIGINT, n BIGINT)
+  WITH (connector='postgres',
+        conninfo='__CONNINFO__',
+        "table"='public.q5_out',
+        mode='upsert',
+        primary_key='k');
+
+-- Every projected expression is ALIASED to its target column. The
+-- JSON-family SQL sinks resolve a row's columns BY NAME while the planner
+-- names an unaliased expression _col1, so an unaliased COUNT(*) would
+-- write NULL into n for every row, silently. Found on QUAL-04.
+INSERT INTO q5_out
+SELECT k, COUNT(*) AS n
+FROM (SELECT DISTINCT event_id, k FROM q5_in) d
+GROUP BY k__UNBOUNDED__;

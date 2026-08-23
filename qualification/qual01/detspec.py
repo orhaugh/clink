@@ -26,9 +26,11 @@ def splitmix64(x: int) -> int:
 class Spec:
     def __init__(self, seed: int, partitions: int, keys: int,
                  events_per_sec_per_partition: int, base_ms: int,
-                 max_jitter_ms: int, window_ms: int):
+                 max_jitter_ms: int, window_ms: int,
+                 key_epoch_ms: int = 0):
         assert events_per_sec_per_partition > 0
         assert window_ms > 0 and max_jitter_ms >= 0
+        assert key_epoch_ms >= 0
         self.seed = seed
         self.partitions = partitions
         self.keys = keys
@@ -36,15 +38,36 @@ class Spec:
         self.base_ms = base_ms
         self.max_jitter_ms = max_jitter_ms
         self.window_ms = window_ms
+        # 0 (the default) keeps the fixed key space every campaign before
+        # QUAL-05 used: `keys` distinct keys, each touched for the whole run.
+        #
+        # Non-zero makes the key space TURN OVER. Event time is cut into
+        # epochs of this length and each epoch draws from its own disjoint
+        # block of `keys` keys, so a key is touched only during its epoch
+        # and never again. That is what gives a retention campaign a
+        # workload whose state can plateau: with a state_ttl of T the live
+        # population settles at about keys * (1 + T / key_epoch_ms), which
+        # is a level the campaign can predict and then measure against.
+        self.key_epoch_ms = key_epoch_ms
 
     def event(self, partition: int, seq: int):
         """(key, amount, event_time_ms) for one event. Pure."""
         h = splitmix64(self.seed ^ (partition << 40) ^ seq)
-        key = h % self.keys
         amount = (h >> 24) % 1000
         jitter = ((h >> 44) % (self.max_jitter_ms + 1)) if self.max_jitter_ms else 0
-        ts = self.base_ms + (seq * 1000) // self.eps - jitter
-        return key, amount, ts
+        # The epoch is taken from the UNJITTERED time, so a key's epoch is a
+        # pure function of seq and no event can be pulled across an epoch
+        # boundary by its jitter. A key's whole lifetime is therefore at
+        # most key_epoch_ms + max_jitter_ms of event time, which is what a
+        # campaign's TTL has to exceed for a key's aggregate never to be
+        # truncated mid-life.
+        base_ts = self.base_ms + (seq * 1000) // self.eps
+        if self.key_epoch_ms:
+            epoch = (base_ts - self.base_ms) // self.key_epoch_ms
+            key = epoch * self.keys + (h % self.keys)
+        else:
+            key = h % self.keys
+        return key, amount, base_ts - jitter
 
     def event_json(self, partition: int, seq: int) -> str:
         key, amount, ts = self.event(partition, seq)

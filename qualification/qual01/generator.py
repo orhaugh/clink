@@ -65,6 +65,9 @@ def main() -> int:
                     help="event-time epoch base (ms); fixed per campaign")
     ap.add_argument("--max-jitter-ms", type=int, default=1500)
     ap.add_argument("--window-ms", type=int, default=10000)
+    # 0 (the default) keeps the fixed key space every campaign before
+    # QUAL-05 used. Non-zero makes the key space TURN OVER: see detspec.
+    ap.add_argument("--key-epoch-ms", type=int, default=0)
     ap.add_argument("--progress", required=True)
     ap.add_argument("--duration-s", type=int, default=0, help="0 = run until stopped")
     ap.add_argument("--stop-file", default="",
@@ -77,7 +80,8 @@ def main() -> int:
 
     per_part_rate = max(1, args.rate // args.partitions)
     spec = Spec(args.seed, args.partitions, args.keys, per_part_rate,
-                args.base_ms, args.max_jitter_ms, args.window_ms)
+                args.base_ms, args.max_jitter_ms, args.window_ms,
+                args.key_epoch_ms)
 
     producer = Producer({
         "bootstrap.servers": args.brokers,

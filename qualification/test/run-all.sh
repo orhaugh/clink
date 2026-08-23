@@ -62,6 +62,24 @@ run "QUAL-04 driver parses" \
 run "QUAL-04 summariser result logic (a small run must never pass as a large one)" \
     python3 "$HERE/test_summarise4.py"
 
+run "QUAL-05 driver parses" \
+    bash -n "$HERE/../qual05/campaign.sh"
+
+# The two shapes this campaign turns on: a state curve still climbing must
+# never pass, and neither must a flat one whose CONTROL arm did not grow -
+# a workload that never accumulated anything is also flat.
+run "QUAL-05 summariser result logic (a climbing curve, or an ungrown control, must never pass)" \
+    python3 "$HERE/test_summarise5.py"
+
+# The generator spec is shared by every campaign, so QUAL-05's key-epoch
+# mode has to be additive: a byte-for-byte identical default path, or
+# QUAL-01 to QUAL-04's oracles silently change what they expect.
+run "QUAL-05 detspec key epochs (default path must be byte-identical)" \
+    python3 "$HERE/test_detspec_epochs.py"
+
+run "QUAL-05 state instrument (must refuse rather than report zero)" \
+    python3 "$HERE/test_ckptsize.py"
+
 if [ "${1:-}" = "--with-docker" ]; then
     # The QUAL-02 oracle is the one component that was tested offline from the
     # start, and it found a real defect in itself on the first attempt - a
