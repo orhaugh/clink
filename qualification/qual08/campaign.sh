@@ -544,7 +544,10 @@ SP_OUT=$(on_host "$COORD_PUB" "docker exec clink-coordinator clink savepoint \
     --job-id=$JOB_ID --timeout-s=$SAVEPOINT_TIMEOUT_S" 2>&1 | tr -d '\r') || true
 echo "$SP_OUT" > "$OUT_DIR/savepoint.txt"
 SP_OK=$(echo "$SP_OUT" | sed -n 's/.*ok=\([01]\).*/\1/p' | head -1)
-SP_DIR=$(echo "$SP_OUT" | sed -n 's/.*dir=\([^ ]*\).*/\1/p' | head -1)
+# The tool prints dir="..." - the quotes are part of the output, not the
+# path. The first local smoke fed the quoted string to find and got "no
+# snapshot files" for a savepoint that was sitting right there.
+SP_DIR=$(echo "$SP_OUT" | sed -n 's/.*dir=\([^ ]*\).*/\1/p' | head -1 | tr -d '"')
 SP_ID=$(echo "$SP_OUT" | sed -n 's/.*id=\([0-9]*\).*/\1/p' | head -1)
 SAVEPOINT_S=$(( $(date +%s) - T_SP0 ))
 if [ "${SP_OK:-0}" != "1" ] || [ -z "$SP_DIR" ] || [ -z "$SP_ID" ]; then
@@ -554,18 +557,45 @@ if [ "${SP_OK:-0}" != "1" ] || [ -z "$SP_DIR" ] || [ -z "$SP_ID" ]; then
     verify_fail "the savepoint did not complete: $SP_OUT"
 fi
 echo "campaign: savepoint id=$SP_ID dir=$SP_DIR in ${SAVEPOINT_S}s"
-SP_BYTES=$(state_bytes "$CKPT_DIR_V0")
+
+# Relocate the savepoint IMMEDIATELY, exactly as the tool's contract asks
+# ("physical relocation to a portable path is the operator's
+# responsibility"). This is not optional tidiness: snapshot retention for
+# some operators keeps only the newest checkpoint, so the savepoint's
+# files are garbage-collected as soon as the NEXT checkpoint completes -
+# one interval after the handle is printed. The first local smoke lost 4
+# of 10 subtask snapshots this way and the restore (correctly) refused.
+# Hard links, not a byte copy: instant at any state size, so the window
+# stays milliseconds even on a rig-scale savepoint; retention's unlink
+# then only drops the original link. Layout preserved relative to the
+# checkpoint root: v<gen>/<subtask>/checkpoint-<id>.snap{,.meta} plus the
+# _jobs completion markers the restore reads participants from.
+SP_PORTABLE="/qual/state/$RUN_ID/savepoint-$SP_ID"
+on_host "$OPS_PUB" "rm -rf '$SP_PORTABLE' && mkdir -p '$SP_PORTABLE' && cd '$SP_DIR' && \
+    find . -type f \( -name 'checkpoint-${SP_ID}.snap' -o -name 'checkpoint-${SP_ID}.snap.meta' \
+             -o -path './_jobs/*' \) -exec cp -l --parents {} '$SP_PORTABLE/' \;" \
+    || verify_fail "could not relocate the savepoint to $SP_PORTABLE"
+# The relocation itself can lose the race (the window is the ssh round
+# trip): every participant directory in the live tree must have
+# contributed its snapshot, or the restore would refuse later with a
+# message that points at the engine instead of at this copy.
+# Relative matching, from inside the tree: the ABSOLUTE path contains the
+# campaign's own .../v0 component, so '*/v*/*' would also count _jobs/1.
+DIRS_N=$(on_host "$OPS_PUB" "cd '$SP_DIR' && find . -mindepth 2 -maxdepth 2 -type d -path './v*/*' | wc -l" | tr -d ' \r')
+SNAPS_N=$(on_host "$OPS_PUB" "find '$SP_PORTABLE' -name 'checkpoint-${SP_ID}.snap' | wc -l" | tr -d ' \r')
+[ "${SNAPS_N:-0}" -ge "${DIRS_N:-1}" ] \
+    || verify_fail "the savepoint relocation raced retention: ${SNAPS_N} of ${DIRS_N} subtask snapshots survived to the copy"
+SP_BYTES=$(state_bytes "$SP_PORTABLE")
 case "$SP_BYTES" in ''|*[!0-9]*) SP_BYTES=0 ;; esac
-echo "campaign: savepoint measures $(( SP_BYTES / 1024 / 1024 )) MiB"
+echo "campaign: savepoint relocated to $SP_PORTABLE (${SNAPS_N} subtask snapshots, $(( SP_BYTES / 1024 / 1024 )) MiB)"
 
 # --- the check-savepoint gate, run INSIDE the new image -------------------------
 echo "campaign: check-savepoint under $IMAGE_V1"
-# Exact name, not a wildcard: checkpoint-1* would also match the job's
-# later checkpoints (10, 11, ...), which keep being written while this
-# gate runs. Layout per ckptsize.py: one checkpoint-<id>.snap per subtask
-# directory.
-SNAPS=$(on_host "$OPS_PUB" "find '$SP_DIR' -name 'checkpoint-${SP_ID}.snap' 2>/dev/null | sort" | tr -d '\r')
-[ -n "$SNAPS" ] || { echo "campaign: no snapshot files found for checkpoint $SP_ID under $SP_DIR" >&2; exit 2; }
+# Against the PORTABLE copy - the live tree can keep losing files to
+# retention while this gate runs. Exact name, not a wildcard:
+# checkpoint-1* would also match later checkpoints (10, 11, ...).
+SNAPS=$(on_host "$OPS_PUB" "find '$SP_PORTABLE' -name 'checkpoint-${SP_ID}.snap' 2>/dev/null | sort" | tr -d '\r')
+[ -n "$SNAPS" ] || verify_fail "no snapshot files found for checkpoint $SP_ID under $SP_DIR"
 CHECKSAVE=ok
 : > "$OUT_DIR/checksave.txt"
 for f in $SNAPS; do
@@ -621,14 +651,14 @@ RUNNING_IMG=$(on_host "$COORD_PUB" "docker inspect --format '{{.Image}}' clink-c
     || { echo "campaign: the recreated coordinator is not running the v1 image ($RUNNING_IMG)" >&2; exit 2; }
 
 # --- restore on v1 ---------------------------------------------------------------
-echo "campaign: resubmitting with --restore-from-dir $SP_DIR id $SP_ID"
+echo "campaign: resubmitting with --restore-from-dir $SP_PORTABLE id $SP_ID"
 T_SUBMIT=$(date +%s)
 "$SUBMIT_BIN" --file "$OUT_DIR/pipeline.sql" \
     --coordinator-host "$COORD_PUB" --coordinator-port 8095 \
     --parallelism "$PARTITIONS" \
     --checkpoint-dir "$CKPT_DIR_V1" \
     --checkpoint-interval-ms "$CHECKPOINT_INTERVAL_MS" \
-    --restore-from-dir "$SP_DIR" \
+    --restore-from-dir "$SP_PORTABLE" \
     --restore-from-checkpoint-id "$SP_ID" \
     --max-restarts-on-worker-loss "$MAX_RESTARTS" \
     > "$OUT_DIR/submit-v1.log" 2>&1 || true
