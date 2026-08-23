@@ -1,0 +1,47 @@
+-- QUAL-08 pipeline: Kafka -> TTL'd DISTINCT -> TTL'd unwindowed GROUP BY
+-- -> Postgres upsert table. The QUAL-05 retention shape, reused on purpose.
+--
+-- What is under test here is the UPGRADE, not the workload: the same SQL
+-- script is submitted to engine revision vN, savepointed, and resubmitted
+-- to revision vN+1 with --restore-from-dir. The workload's job is to make
+-- that savepoint worth carrying:
+--
+--   * the TTL'd DISTINCT holds one entry per recent EVENT, so the savepoint
+--     carries a large keyed population with live deadline slots;
+--   * the unwindowed GROUP BY carries accumulators whose values the oracle
+--     can recompute from the seed, so a key lost or doubled ACROSS THE
+--     BOUNDARY is caught exactly;
+--   * the generator never stops, so the end-state accounting spans the
+--     upgrade: SUM(n) over the settled table must equal every event
+--     produced before, during and after the swap.
+--
+-- The consumer group is the same on both sides of the boundary. Source
+-- offsets ride the savepoint, so the restored job resumes from the exact
+-- offsets the savepoint captured; the group id is not the recovery
+-- mechanism, and giving each side its own group would test nothing.
+--
+-- __BROKERS__, __CONNINFO__, __WM_LAG_MS__, __GROUP__ and __STATE_TTL_MS__
+-- are substituted by the campaign driver. There is no control arm: QUAL-05
+-- owns the retention claim, and this campaign asserts retention is merely
+-- ENGAGED, not that it plateaus.
+CREATE TABLE q8_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT)
+  WITH (connector='kafka', format='json', brokers='__BROKERS__',
+        topic='qual08-in', group_id='__GROUP__',
+        auto_offset_reset='earliest',
+        event_time_column='ts', watermark_lag_ms='__WM_LAG_MS__',
+        state_ttl='__STATE_TTL_MS__', state_ttl_domain='event_time');
+
+CREATE TABLE q8_out (k BIGINT, n BIGINT)
+  WITH (connector='postgres',
+        conninfo='__CONNINFO__',
+        "table"='public.q8_out',
+        mode='upsert',
+        primary_key='k');
+
+-- COUNT(*) is aliased to its target column: the JSON-family SQL sinks
+-- resolve columns BY NAME and an unaliased expression is planned as _col1,
+-- which would write NULL into n for every row, silently. Found on QUAL-04.
+INSERT INTO q8_out
+SELECT k, COUNT(*) AS n
+FROM (SELECT DISTINCT event_id, k FROM q8_in) d
+GROUP BY k;

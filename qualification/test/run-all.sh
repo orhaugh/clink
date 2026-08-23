@@ -102,6 +102,16 @@ run "QUAL-06 driver parses" \
 run "QUAL-06 summariser result logic (a boundary is not a failure; a wrong width is)" \
     python3 "$HERE/test_summarise6.py"
 
+run "QUAL-08 driver parses" \
+    bash -n "$HERE/../qual08/campaign.sh"
+
+# The upgrade-campaign essence: every failure of the savepoint -> swap ->
+# restore sequence is a FAIL of the campaign's subject, never an
+# infrastructure inconclusive - and a same-image run must be labelled a
+# smoke so it can never be mistaken for an upgrade claim.
+run "QUAL-08 summariser result logic (the upgrade sequence is the subject)" \
+    python3 "$HERE/test_summarise8.py"
+
 if [ "${1:-}" = "--with-docker" ]; then
     # The QUAL-02 oracle is the one component that was tested offline from the
     # start, and it found a real defect in itself on the first attempt - a
