@@ -426,6 +426,16 @@ print(jid)")
         done
     fi
     DEPLOYED_OPS=$(graph_ops "$JOB_ID")
+    # The deployed TASK count comes from the coordinator, not from ops x
+    # par arithmetic: source chains cap their parallelism at the topic's
+    # partition count, so the arithmetic overstates width (rung 3 of the
+    # first rig run claimed 2,328 by arithmetic and deployed 1,160).
+    DEPLOYED_TASKS=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/$JOB_ID" 2>/dev/null | python3 -c "
+import json,sys
+try:
+    print(int(json.load(sys.stdin).get('expected_completion') or 0))
+except Exception:
+    print(-1)" 2>/dev/null || echo -1)
 
     if [ "$DEPLOY_S" -lt 0 ] || [ "$FIRST_CKPT_S" -lt 0 ]; then
         { echo "branches=$B"; echo "expected_ops=$EXPECTED_OPS"; echo "deployed_ops=$DEPLOYED_OPS";
@@ -462,12 +472,54 @@ print(jid)")
     fi
 
     { echo "branches=$B"; echo "expected_ops=$EXPECTED_OPS"; echo "deployed_ops=$DEPLOYED_OPS";
-      echo "subtasks=$SUBTASKS"; echo "parallelism=$P"; echo "deploy_s=$DEPLOY_S";
+      echo "subtasks=${DEPLOYED_TASKS:-$SUBTASKS}"; echo "parallelism=$P"; echo "deploy_s=$DEPLOY_S";
       echo "first_checkpoint_s=$FIRST_CKPT_S"; echo "status=green"; echo "reason=";
     } > "$RUNG_FILE"
     echo "campaign: rung $RUNG GREEN (deploy ${DEPLOY_S}s, first checkpoint ${FIRST_CKPT_S}s, $DEPLOYED_OPS ops)"
     FINAL_B=$B; FINAL_P=$P; FINAL_SUBTASKS=$SUBTASKS
 done
+
+# The ladder cancels each green rung before trying the next, so when a
+# higher rung fails the largest green one is no longer running. The claim
+# is made at the largest GREEN size, so redeploy that configuration for
+# the battery - the boundary rung's record stands as the measured limit.
+if [ -z "$JOB_ID" ] && [ -n "$FINAL_B" ]; then
+    echo "campaign: redeploying the largest green rung (B=$FINAL_B par=$FINAL_P) as the claim job"
+    psql_q "TRUNCATE public.q6_out" >/dev/null
+    python3 "$HERE/dag-gen.py" --branches "$FINAL_B" --run-tag "$RUN_ID-claim" \
+        | sed -e "s|__BROKERS__|$BROKER_LIST|g" \
+              -e "s|__CONNINFO__|$CONNINFO|g" \
+              -e "s|__WM_LAG_MS__|$WM_LAG_MS|g" \
+              -e "s|__STATE_TTL_MS__|$STATE_TTL_MS|g" \
+        > "$OUT_DIR/pipeline-claim.sql"
+    "$SUBMIT_BIN" --file "$OUT_DIR/pipeline-claim.sql" \
+        --coordinator-host "$COORD_PUB" --coordinator-port 8095 \
+        --parallelism "$FINAL_P" \
+        --checkpoint-dir "/qual/state/$RUN_ID/claim" \
+        --checkpoint-interval-ms "$CHECKPOINT_INTERVAL_MS" \
+        --max-restarts-on-worker-loss "$MAX_RESTARTS" \
+        > "$OUT_DIR/submit-claim.log" 2>&1 || true
+    JOB_ID=$(python3 -c "
+import json
+jid=''
+for line in open('$OUT_DIR/submit-claim.log'):
+    line=line.strip()
+    if line.startswith('{'):
+        try:
+            d=json.loads(line)
+        except Exception:
+            continue
+        if d.get('ok') and d.get('job_id') is not None:
+            jid=str(d['job_id'])
+print(jid)")
+    RUNG=claim
+    dw=0
+    while [ "$dw" -lt "$DEPLOY_TIMEOUT_S" ]; do
+        [ "$(job_status "$JOB_ID")" = "RUNNING" ] && [ "$(ckpt_id "$JOB_ID")" -ge 1 ] && break
+        sleep 5; dw=$(( dw + 5 ))
+    done
+    [ "$dw" -lt "$DEPLOY_TIMEOUT_S" ] || { echo "campaign: the claim redeploy never went green" >&2; JOB_ID=""; }
+fi
 
 [ -n "$JOB_ID" ] || { echo "campaign: no rung is green and running; summarising what was measured" >&2
     python3 "$HERE/summarise.py" --out-dir "$OUT_DIR" --run-id "$RUN_ID" \
@@ -532,7 +584,7 @@ while [ "$(date +%s)" -lt "$END" ]; do
     if [ "$WATCH_MAX_LOOPS" != "0" ] && [ "$WATCH_LOOPS" -ge "$WATCH_MAX_LOOPS" ]; then break; fi
     WATCH_LOOPS=$(( WATCH_LOOPS + 1 ))
     sleep "$SAMPLE_INTERVAL_S"
-    B=$(on_host "$OPS_PUB" "python3 /qual/ckptsize.py --dir '/qual/state/$RUN_ID/L$RUNG'" 2>/dev/null | tr -d '\r' || true)
+    B=$(on_host "$OPS_PUB" "python3 /qual/ckptsize.py --dir '/qual/state/$RUN_ID/'"$( [ "$RUNG" = claim ] && echo claim || echo L$RUNG )"" 2>/dev/null | tr -d '\r' || true)
     case "$B" in ''|*[!0-9]*) : ;; *)
         echo "$(( $(date +%s) - SOAK_START )),$B" >> "$OUT_DIR/state-series-steady.csv" ;;
     esac
