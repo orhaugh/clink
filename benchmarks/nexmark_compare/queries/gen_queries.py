@@ -372,7 +372,11 @@ QUERIES = {
                "GROUP BY window_start, window_end, channel"),
     ),
     "q17": dict(
-        note="Auction statistics: five aggregates per auction per 10s window.",
+        note=("Auction statistics: five aggregates per auction per 10s window. "
+              "Flink casts the price to DOUBLE inside AVG for the same reason q4 "
+              "does: AVG of an exact numeric type truncates there, while clink's "
+              "AVG already returns a real number. The row-count gate never saw "
+              "the difference; a value-level comparison does."),
         streams=["bid"],
         sink=[("auction", "BIGINT"), ("total", "BIGINT"), ("minp", "BIGINT"),
               ("maxp", "BIGINT"), ("avgp", "DOUBLE")],
@@ -380,24 +384,30 @@ QUERIES = {
                "AVG(price) AS avgp FROM bid "
                "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction"),
         flink=("SELECT auction, COUNT(*) AS total, MIN(price) AS minp, MAX(price) AS maxp, "
-               "AVG(price) AS avgp FROM "
+               "AVG(CAST(price AS DOUBLE)) AS avgp FROM "
                "TABLE(TUMBLE(TABLE bid, DESCRIPTOR(ts), INTERVAL '10' SECOND)) "
                "GROUP BY window_start, window_end, auction"),
     ),
     "q18": dict(
         note=("Latest bid per bidder/auction pair: deduplication by ROW_NUMBER = 1 "
               "over a descending time order. Unbounded keyspace, one retained row "
-              "per key."),
+              "per key. The ORDER BY is made TOTAL for the same reason as q5 and "
+              "q19: two bids by one bidder on one auction in the same millisecond "
+              "have no defined 'latest', and each engine would retain an arbitrary "
+              "one. price then url break the tie - together with the partition key "
+              "and datetime they identify a bid in this dataset."),
         streams=["bid"],
         sink=[("auction", "BIGINT"), ("bidder", "BIGINT"), ("price", "BIGINT"),
               ("channel", "VARCHAR"), ("url", "VARCHAR"), ("datetime", "BIGINT")],
         pk=["bidder", "auction"],
         clink=("SELECT * FROM (SELECT *, ROW_NUMBER() OVER "
-               "(PARTITION BY bidder, auction ORDER BY datetime DESC) AS rn FROM bid) AS R "
+               "(PARTITION BY bidder, auction "
+               "ORDER BY datetime DESC, price DESC, url DESC) AS rn FROM bid) AS R "
                "WHERE rn = 1"),
         flink=("SELECT auction, bidder, price, channel, url, `datetime` FROM "
                "(SELECT *, ROW_NUMBER() OVER "
-               "(PARTITION BY bidder, auction ORDER BY `datetime` DESC) AS rn FROM bid) AS R "
+               "(PARTITION BY bidder, auction "
+               "ORDER BY `datetime` DESC, price DESC, url DESC) AS rn FROM bid) AS R "
                "WHERE rn = 1"),
     ),
     "q19": dict(

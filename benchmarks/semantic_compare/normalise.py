@@ -19,14 +19,20 @@ Judgement classes (declared per query in queries.json, with reasons):
 
   append       every output row is final: normalise, sort, byte-diff.
   materialised the query emits an UPDATE stream (unbounded GROUP BY,
-               top-N): engines legitimately differ in emit cadence, so
-               the streams are folded by primary key (last write wins)
-               and the FINAL IMAGES are compared. The key columns are
-               part of the declaration.
-  tolerance    like append or materialised, but named float fields
+               top-N): engines legitimately differ in emit cadence and
+               revision count, so each engine's upsert topic is reduced
+               to its FINAL STATE by read_upsert_topic.py --json (last
+               write per broker key, tombstoned keys removed - the
+               reduction both sinks' upsert contract guarantees) and the
+               two states are compared BY KEY. Key-paired, never
+               position-paired: a canonical row string sorts by its
+               alphabetically-first field, so a float wobble in a field
+               like avgp would misalign a positional zip.
+  tolerance    a per-field annotation on either mode: named float fields
                compare within a declared absolute epsilon (reduction
-               order across parallelism makes float sums
-               run-dependent). Everything undeclared stays exact.
+               order across parallelism makes float sums run-dependent,
+               and two engines legitimately render the same IEEE double
+               differently). Everything undeclared stays exact.
 """
 import json
 import math
@@ -62,20 +68,20 @@ def load_rows(path):
     return rows
 
 
-def materialise(rows, key_fields):
-    """Fold an update stream to final images: last write per key wins.
-    Order within the file IS the update order per key (a Kafka sink
-    partition preserves per-key order when keyed; the drain writes in
-    offset order per partition and the fold is per key)."""
-    final = {}
-    for r in rows:
-        obj = json.loads(r)
-        try:
-            key = tuple(obj[k] for k in key_fields)
-        except KeyError as e:
-            raise ValueError(f"materialised row lacks key field {e}: {r[:80]}") from e
-        final[key] = r
-    return sorted(final.values())
+def load_state(path):
+    """A read_upsert_topic.py --json dump -> {key: canonical row string}.
+    The reducer already folded the changelog (last write per broker key,
+    tombstoned keys removed); each surviving row still goes through
+    normalise_row so integer-valued floats collapse identically on both
+    sides. Raises on a dump that carries an error or no state: a failed
+    drain must fail the comparison, never read as an empty-but-equal one."""
+    with open(path) as fh:
+        dump = json.load(fh)
+    if "error" in dump:
+        raise ValueError(f"upsert drain failed for {dump.get('topic')}: {dump['error']}")
+    if "state" not in dump:
+        raise ValueError(f"not an upsert state dump: {path}")
+    return {k: normalise_row(v) for k, v in dump["state"].items()}
 
 
 def within_tolerance(a_row, b_row, tol_fields, epsilon):
@@ -96,22 +102,21 @@ def within_tolerance(a_row, b_row, tol_fields, epsilon):
     return True
 
 
-def compare(a_path, b_path, *, mode, key_fields=(), tol_fields=(), epsilon=0.0):
-    """Compare two drained sinks. Returns (equal, detail) where detail
+def compare(a_path, b_path, *, mode, tol_fields=(), epsilon=0.0):
+    """Compare two engines' outputs. Returns (equal, detail) where detail
     names counts and up to three sample divergences - a diff nobody can
-    see is a diff nobody can diagnose."""
-    a_rows, b_rows = load_rows(a_path), load_rows(b_path)
+    see is a diff nobody can diagnose. append: two drained sink files,
+    normalised, sorted, multiset-compared. materialised: two upsert state
+    dumps, compared by key."""
     if mode == "materialised":
-        a_cmp, b_cmp = materialise(a_rows, key_fields), materialise(b_rows, key_fields)
-    else:
-        a_cmp, b_cmp = sorted(a_rows), sorted(b_rows)
+        return compare_states(a_path, b_path, tol_fields=tol_fields, epsilon=epsilon)
 
-    if len(a_cmp) != len(b_cmp):
-        return False, (f"row-count mismatch: {len(a_cmp)} vs {len(b_cmp)} "
-                       f"(raw {len(a_rows)} vs {len(b_rows)})")
+    a_rows, b_rows = sorted(load_rows(a_path)), sorted(load_rows(b_path))
+    if len(a_rows) != len(b_rows):
+        return False, f"row-count mismatch: {len(a_rows)} vs {len(b_rows)}"
 
     samples = []
-    for i, (x, y) in enumerate(zip(a_cmp, b_cmp)):
+    for i, (x, y) in enumerate(zip(a_rows, b_rows)):
         if x == y:
             continue
         if tol_fields and within_tolerance(x, y, set(tol_fields), epsilon):
@@ -121,5 +126,32 @@ def compare(a_path, b_path, *, mode, key_fields=(), tol_fields=(), epsilon=0.0):
             break
     if samples:
         return False, f"{len(samples)}+ divergent rows, first: " + " | ".join(samples)
-    return True, f"{len(a_cmp)} rows identical" + (
-        f" ({len(a_rows)} updates folded)" if mode == "materialised" else "")
+    return True, f"{len(a_rows)} rows identical"
+
+
+def compare_states(a_path, b_path, *, tol_fields=(), epsilon=0.0):
+    """Compare two upsert state dumps BY KEY - the pairing the changelog
+    contract defines, immune to the positional misalignment a sorted-string
+    zip suffers when a tolerance field sorts early in the canonical row."""
+    a_state, b_state = load_state(a_path), load_state(b_path)
+    only_a = sorted(set(a_state) - set(b_state))
+    only_b = sorted(set(b_state) - set(a_state))
+    if only_a or only_b:
+        def name(side, keys):
+            return f"{len(keys)} keys only in {side} (first: {', '.join(keys[:3])})"
+        parts = [name(s, k) for s, k in (("a", only_a), ("b", only_b)) if k]
+        return False, "key-set mismatch: " + "; ".join(parts)
+
+    samples = []
+    for key in sorted(a_state):
+        x, y = a_state[key], b_state[key]
+        if x == y:
+            continue
+        if tol_fields and within_tolerance(x, y, set(tol_fields), epsilon):
+            continue
+        samples.append(f"key {key}: {x} != {y}")
+        if len(samples) == 3:
+            break
+    if samples:
+        return False, f"{len(samples)}+ divergent keys, first: " + " | ".join(samples)
+    return True, f"{len(a_state)} final images identical"

@@ -1,0 +1,107 @@
+{
+  "_contract": [
+    "QUAL-07's per-query judgement declarations. Each query is compared",
+    "under the STRICTEST class its semantics allow, decided here in",
+    "advance with the reason written down - a class chosen after seeing",
+    "a diff is a gate bent to pass. Downgrading a query's class during a",
+    "run makes that run INCONCLUSIVE.",
+    "",
+    "mode append: every output row is final; the drained kafka-sink",
+    "  topics compare as normalised sorted multisets, byte-exact.",
+    "mode materialised: the query emits an update stream, so emit",
+    "  cadence and revision count are implementation detail; each",
+    "  engine's upsert topic reduces to final state (last write per key,",
+    "  tombstones removed) and the states compare BY KEY. variant is",
+    "  'upsert' because an updating result cannot land in an append",
+    "  Kafka sink on either engine.",
+    "tol_fields/epsilon: named float fields compare within an absolute",
+    "  epsilon; everything undeclared stays exact. Every epsilon here is",
+    "  1e-6, covering RENDERING only (two engines legitimately print the",
+    "  same IEEE double differently): in this dataset every declared",
+    "  float is either a per-record product or a mean whose partial sums",
+    "  are integer-valued doubles far below 2^53, so the VALUES are",
+    "  order-independent and IEEE-identical - a genuine numeric",
+    "  divergence is orders of magnitude above 1e-6 and still fails."
+  ],
+  "q1": {
+    "mode": "append", "variant": "kafka",
+    "tol_fields": ["price"], "epsilon": 1e-6,
+    "reason": "Per-record projection; price = 0.908 * price is IEEE-identical on both engines, epsilon covers rendering; auction, bidder, datetime exact."
+  },
+  "q2": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Expression filter plus integer projection; every column exact."
+  },
+  "q3": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Equi-join of two insert-only streams emits inserts only; strings and integers exact."
+  },
+  "q4": {
+    "mode": "materialised", "variant": "upsert", "key": ["category"],
+    "tol_fields": ["avgp"], "epsilon": 1e-6,
+    "reason": "Unbounded GROUP BY revises one row per category. Both engines average over DOUBLE (the cast premise is reconciled in the shared definition); the partial sums are integer-valued doubles below 2^53, so the mean is order-independent and epsilon covers rendering only."
+  },
+  "q5": {
+    "mode": "materialised", "variant": "upsert", "key": ["wstart"],
+    "reason": "Top-1 per hop window revises its window's single row as panes arrive. The rank order (num DESC, auction ASC) is total, so the winner is defined; all output columns integers, exact."
+  },
+  "q7": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Windowed MAX/MIN; each pane is final at the watermark; integers exact."
+  },
+  "q11": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Session counts per bidder; sessions close at the watermark and emit once; integers exact."
+  },
+  "qhop": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Hop counts per auction; each of the five overlapping panes is final; integers exact."
+  },
+  "qhopv": {
+    "mode": "append", "variant": "kafka",
+    "reason": "qhop with the window start projected. The pk exists for the row-count harness's value gate; here append is the STRICTER judgement (the full pane multiset, not just the folded state), so it is the one used."
+  },
+  "qcum": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Cumulate panes are final at each step; integers exact."
+  },
+  "q14": {
+    "mode": "append", "variant": "kafka",
+    "tol_fields": ["price"], "epsilon": 1e-6,
+    "reason": "Same float product as q1, epsilon covers rendering; the CASE-derived bidtimetype string and the integers exact."
+  },
+  "q15": {
+    "mode": "append", "variant": "kafka",
+    "reason": "COUNT plus two COUNT(DISTINCT) per tumbling window; integers exact."
+  },
+  "q16": {
+    "mode": "append", "variant": "kafka",
+    "reason": "The q15 shape keyed by channel; string and integers exact."
+  },
+  "q17": {
+    "mode": "append", "variant": "kafka",
+    "tol_fields": ["avgp"], "epsilon": 1e-6,
+    "reason": "Five aggregates per auction per pane, panes final. avgp is a double mean with integer-valued partial sums below 2^53 (the AVG cast premise is reconciled in the shared definition, as q4), so the value is order-independent and epsilon covers rendering; total, minp, maxp exact."
+  },
+  "q18": {
+    "mode": "materialised", "variant": "upsert", "key": ["bidder", "auction"],
+    "reason": "Dedup-latest revises one row per (bidder, auction). The order is made total in the shared definition (datetime, price, url), so the retained bid is defined; all columns exact."
+  },
+  "q19": {
+    "mode": "materialised", "variant": "upsert",
+    "key": ["auction", "bidder", "price", "datetime"],
+    "reason": "Top-10 per auction retracts as higher bids arrive, so the topic carries tombstones the state reduction resolves. The order was made total on 2026-07-28 (price, datetime, bidder); all columns exact."
+  },
+  "q20": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Bid expanded with its auction's itemname; insert-only join emits inserts only; string and integers exact."
+  },
+  "q21": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Per-record CASE over the channel string; every column exact."
+  },
+  "q22": {
+    "mode": "append", "variant": "kafka",
+    "reason": "Per-record SPLIT_INDEX of the url; every column exact."
+  }
+}
