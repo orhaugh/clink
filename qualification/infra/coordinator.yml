@@ -12,6 +12,18 @@ services:
     image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}
     container_name: clink-coordinator
     network_mode: host
+    # Item 72's measured deploy boundary at ~1,160 tasks was this, in the
+    # end: the container default gives the engine process a SOFT nofile of
+    # 1,024, and a few hundred subtasks of listeners, bridge sockets and
+    # state files blow through it - accept then fails with EMFILE, which
+    # the engine (since c2eb51f) reports loudly instead of cascading
+    # silently. The hard limit is already half a million; raise the soft
+    # limit to the kernel's fs.nr_open so width is bounded by the machine,
+    # not by a shell default.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     command:
       - --role=coordinator
       - --port=6123
