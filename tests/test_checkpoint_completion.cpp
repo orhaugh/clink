@@ -820,6 +820,10 @@ TEST(CheckpointCompletion, PersistentCheckpointFailureFailsTheJobInsteadOfCrashl
 
     Coordinator::Config cfg;
     cfg.checkpoint_failure_restart_limit = 3;
+    // Count-only semantics for this test: the wall-clock window (item 80)
+    // exists so a TRANSIENT window is not read as persistent, and it gets
+    // its own test below; here the subject is the count.
+    cfg.checkpoint_failure_restart_window = std::chrono::milliseconds{0};
     Coordinator coordinator(cfg);
     const auto port = coordinator.start();
     coordinator.expect_workers({"w"});
@@ -902,6 +906,10 @@ TEST(CheckpointCompletion, ACompletedCheckpointResetsTheFailureRestartCount) {
 
     Coordinator::Config cfg;
     cfg.checkpoint_failure_restart_limit = 3;
+    // Count-only: with the item-80 wall-clock window active, the window
+    // (not the reset under test) would keep the job alive and this test
+    // would pass against a broken reset.
+    cfg.checkpoint_failure_restart_window = std::chrono::milliseconds{0};
     Coordinator coordinator(cfg);
     const auto port = coordinator.start();
     coordinator.expect_workers({"w"});
@@ -974,6 +982,91 @@ TEST(CheckpointCompletion, ACompletedCheckpointResetsTheFailureRestartCount) {
         << "the job died after two-fail/success/two-fail: a completed checkpoint did not "
            "reset the consecutive count, so unrelated transients accumulate into a "
            "spurious failure";
+
+    (void)coordinator.cancel_job(job_id);
+    for (const auto& [role, sub] : tasks) {
+        (void)w.send_finished(job_id, role, sub);
+    }
+    (void)coordinator.await_job_completion(job_id, 10s);
+    w.close();
+    coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// Item 80, QUAL-09's cloud run: the breaker's count alone reads a TRANSIENT
+// full-disk window as a persistent cause - five failures one checkpoint
+// interval apart is ~75 seconds, and the run watched a 109-second ENOSPC
+// window get the job terminally failed 37 seconds before the window
+// released. Persistence is a property of duration: with the wall-clock
+// window configured, reaching the count within seconds must keep the job
+// restarting (riding the transient out), not fail it.
+TEST(CheckpointCompletion, ReachingTheFailureCountWithinTheWindowIsNotPersistent) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ckpt_breaker_window_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.checkpoint_failure_restart_limit = 2;
+    cfg.checkpoint_failure_restart_window = std::chrono::minutes{10};
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"w"});
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    ckpt.interval_ms = 100;
+    ckpt.max_restarts_on_worker_loss = 100000;
+    const auto job_id = coordinator.submit_job(
+        two_subtask_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+
+    std::vector<std::pair<std::string, std::uint32_t>> tasks;
+    auto learn_deploy = [&]() -> bool {
+        auto deploy = w.await_frame(MessageKind::Deploy, 10s);
+        if (!deploy.has_value()) {
+            return false;
+        }
+        tasks.clear();
+        std::uint16_t fake_port = 48000;
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            tasks.emplace_back(t.role, t.subtask_idx);
+            if (!w.report_listening(job_id, t.role, t.subtask_idx, fake_port++)) {
+                return false;
+            }
+        }
+        return !tasks.empty();
+    };
+    ASSERT_TRUE(learn_deploy());
+
+    // Four consecutive failures - twice the count limit - all inside one
+    // ten-minute window. Every one must produce a RESTART (a redeploy),
+    // never the terminal verdict.
+    std::uint64_t last_ckpt = 0;
+    for (int cycle = 1; cycle <= 4; ++cycle) {
+        const auto id = await_trigger_above(w, last_ckpt);
+        ASSERT_TRUE(id.has_value()) << "no fresh trigger in cycle " << cycle;
+        last_ckpt = *id;
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, *id, role, sub, /*ok=*/false));
+        }
+        ASSERT_TRUE(w.await_frame(MessageKind::CancelJob, 10s).has_value())
+            << "no cancel after failure " << cycle;
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.send_finished(job_id, role, sub));
+        }
+        ASSERT_TRUE(learn_deploy())
+            << "no redeploy after failure " << cycle
+            << ": the breaker fired inside the wall-clock window, reading a transient "
+               "as persistent (item 80)";
+    }
+    EXPECT_FALSE(coordinator.await_job_completion(job_id, 2s))
+        << "the job was terminally failed within seconds of its first failed checkpoint";
 
     (void)coordinator.cancel_job(job_id);
     for (const auto& [role, sub] : tasks) {

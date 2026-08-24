@@ -299,6 +299,20 @@ public:
         // the cause is the safe escalation, exactly as the drain deadline
         // concluded. 0 disables (the pre-77b behaviour).
         std::uint32_t checkpoint_failure_restart_limit{5};
+        // ...AND the failures must have SPANNED this much wall time before
+        // the job is failed (followups item 80). The limit alone counts
+        // ticks, and five failures spaced one checkpoint interval apart is
+        // ~75 seconds at a 15s interval: QUAL-09's cloud run measured a
+        // 109-second transient ENOSPC window being declared "persistent"
+        // 37 seconds before it released, terminally killing a job that a
+        // rewind WOULD have repaired. Persistence is a property of
+        // duration, not of a count: the job fails only when
+        // consecutive >= limit AND the run of failures has lasted at
+        // least this window since its first failure. Restart pacing is
+        // already bounded by the drain timeout, so a persistent cause
+        // still terminates in bounded, diagnosable time (~20 paced
+        // attempts at the default). Zero = count-only.
+        std::chrono::milliseconds checkpoint_failure_restart_window{std::chrono::minutes(10)};
         // Cluster-level default state-backend URI applied to a submitted job
         // that chose none (empty CheckpointConfig.state_backend_uri). Lets an
         // operator point every job at a deferring backend (e.g.
@@ -950,10 +964,14 @@ private:
         bool awaiting_restart{false};
         std::uint32_t restart_attempts{0};
         // Whole-job restarts caused by FAILED CHECKPOINTS since the last
-        // checkpoint that COMPLETED. Reset on completion; at
-        // Config::checkpoint_failure_restart_limit the job fails with the
-        // cause instead of restarting again (item 77b).
+        // checkpoint that COMPLETED. Reset on completion; the job fails
+        // with the cause instead of restarting again only when the count
+        // reaches Config::checkpoint_failure_restart_limit AND the run of
+        // failures has spanned checkpoint_failure_restart_window since
+        // first_consecutive_ckpt_failure_at - a count alone reads a
+        // transient full-disk window as a persistent cause (items 77b, 80).
         std::uint32_t consecutive_ckpt_failure_restarts{0};
+        std::chrono::steady_clock::time_point first_consecutive_ckpt_failure_at{};
         // (role, subtask_idx) entries from the lost worker that need to be
         // re-deployed onto a survivor.
         std::vector<std::pair<std::string, std::uint32_t>> restart_pending;

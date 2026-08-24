@@ -6957,15 +6957,32 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                     // deadline-protected cancel broadcast a fatal subtask
                     // error uses.
                     ++job.consecutive_ckpt_failure_restarts;
+                    if (job.consecutive_ckpt_failure_restarts == 1) {
+                        job.first_consecutive_ckpt_failure_at = std::chrono::steady_clock::now();
+                    }
                     const auto limit = cfg_.checkpoint_failure_restart_limit;
-                    if (limit != 0 && job.consecutive_ckpt_failure_restarts >= limit) {
+                    // Persistence is a property of DURATION, not of a count
+                    // (item 80): five failures one checkpoint interval apart
+                    // is ~75 seconds at a 15s interval, and QUAL-09's cloud
+                    // run watched a 109-second transient ENOSPC window get
+                    // declared "persistent" 37 seconds before it released.
+                    // The job fails only when the count is reached AND the
+                    // run of failures has spanned the configured window; a
+                    // zero window keeps count-only semantics.
+                    const auto failure_span =
+                        std::chrono::steady_clock::now() - job.first_consecutive_ckpt_failure_at;
+                    if (limit != 0 && job.consecutive_ckpt_failure_restarts >= limit &&
+                        failure_span >= cfg_.checkpoint_failure_restart_window) {
                         log::error(
                             "coordinator.checkpoint",
                             "job_id=" + std::to_string(msg.job_id) + " has restarted " +
                                 std::to_string(job.consecutive_ckpt_failure_restarts) +
-                                " consecutive times from FAILED checkpoints with none "
-                                "completing in between; the cause is persistent and a rewind "
-                                "cannot repair it. Failing the job.");
+                                " consecutive times from FAILED checkpoints over " +
+                                std::to_string(
+                                    std::chrono::duration_cast<std::chrono::seconds>(failure_span)
+                                        .count()) +
+                                "s with none completing in between; the cause is persistent "
+                                "and a rewind cannot repair it. Failing the job.");
                         job.errors.push_back(
                             std::to_string(job.consecutive_ckpt_failure_restarts) +
                             " consecutive restarts from failed checkpoints with no completed "
@@ -7004,6 +7021,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             // transient: the 77b circuit-breaker counts only CONSECUTIVE
             // failure-restarts, and this is where consecutive ends.
             job.consecutive_ckpt_failure_restarts = 0;
+            job.first_consecutive_ckpt_failure_at = {};
             job.latest_completed_checkpoint_id =
                 std::max(job.latest_completed_checkpoint_id, msg.checkpoint_id);
             // The restore point has moved past the last rescale, so every
