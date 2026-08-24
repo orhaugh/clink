@@ -291,10 +291,24 @@ print([h['private_ip'] for h in inv['hosts'] if h['public_ip']=='$wp'][0])")
 done
 sleep 25
 
-job_status() { curl -fsS "http://${COORD_PUB}:8095/api/v1/jobs/$1" 2>/dev/null \
-    | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("status",""))
-except Exception: print("")'; }
+# UNREACHABLE is not GONE. This campaign deliberately CRASHES the
+# coordinator (the marker-window 2PC faults do exactly that), so for a
+# stretch of every run the job's status is unknowable rather than absent
+# - and a probe that cannot reach the coordinator must say so, or the
+# campaign reports its own injected fault as the job disappearing. It
+# did, on qual11-local-i, ~100s into the battery.
+job_status() {  # job id
+    local body
+    body=$(curl -fsS --max-time 20 "http://${COORD_PUB}:8095/api/v1/jobs/$1" 2>/dev/null) || {
+        echo UNREACHABLE; return 0; }
+    [ -n "$body" ] || { echo UNREACHABLE; return 0; }
+    echo "$body" | python3 -c "
+import json,sys
+try:
+    print(json.load(sys.stdin).get('status') or 'UNKNOWN')
+except Exception:
+    print('GONE')" 2>/dev/null || echo GONE
+}
 ckpt_id() { curl -fsS "http://${COORD_PUB}:8095/api/v1/jobs/$1" 2>/dev/null \
     | python3 -c 'import json,sys
 try: print(int(json.load(sys.stdin).get("latest_completed_checkpoint_id",0) or 0))
@@ -557,9 +571,22 @@ bstart=$(date +%s)
 while [ $(( $(date +%s) - bstart )) -lt "$DURATION_S" ]; do
     sleep "$JOB_PROBE_INTERVAL_S"
     st=$(job_status "$JOB_ID")
-    if [ -z "$st" ]; then
-        echo "job_id=$JOB_ID" > "$OUT_DIR/job-gone.txt"
-        verify_fail "the job disappeared from the coordinator"
+    if [ "$st" != "RUNNING" ]; then
+        # Probe repeatedly before believing it, and never count a read
+        # taken while the coordinator is down (see job_status).
+        NOT_RUNNING=0; PROBES=""
+        for _probe in 1 2 3 4 5 6; do
+            ALIVE=$(job_status "$JOB_ID")
+            PROBES="${PROBES}${ALIVE} "
+            [ "$ALIVE" = "RUNNING" ] && { NOT_RUNNING=0; break; }
+            [ "$ALIVE" = "UNREACHABLE" ] || NOT_RUNNING=$(( NOT_RUNNING + 1 ))
+            [ "$_probe" -lt 6 ] && sleep "$JOB_PROBE_INTERVAL_S"
+        done
+        if [ "$NOT_RUNNING" -ge 6 ]; then
+            { echo "job_id=$JOB_ID"; echo "probes=$PROBES"; } > "$OUT_DIR/job-gone.txt"
+            verify_fail "the job is no longer RUNNING (probes: $PROBES)"
+        fi
+        st=$(job_status "$JOB_ID")
     fi
     echo "campaign: battery $(( $(date +%s) - bstart ))s: status=$st ckpt=$(ckpt_id "$JOB_ID")"
 done
