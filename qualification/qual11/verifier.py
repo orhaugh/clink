@@ -17,18 +17,33 @@ questions can be answered from it:
    by determinism, so taking the max-n row is robust to replay; a
    DISAGREEING duplicate at the same n is a separate, fatal finding.
 
-2. STATE CARRIED ACROSS THE MIGRATION. For each key that existed before
-   the boundary, its first v2 row must continue that key's count: n ==
-   (last v1 n) + 1. A key restarting at n == 1 is state loss wearing the
-   costume of a healthy job - the exact defect this campaign exists to
-   catch, and invisible to a row-count check.
+2. STATE CARRIED ACROSS THE MIGRATION. A key's first post-boundary
+   emission is the v2 row with the SMALLEST n for that key - not the
+   first one encountered while scanning. Two things make scan order
+   useless: the sink is not keyed, so one key's rows are spread across
+   partitions, and the restore rewinds the source to the savepoint's
+   offsets, so v2 legitimately RE-EMITS counts v1 already emitted.
+   State carried means that smallest n continues the key's history
+   (min_v2_n <= last_v1_n + 1, replay overlap allowed); state LOST means
+   it restarts at 1 while the key had a v1 history - the defect this
+   campaign exists to catch, wearing the costume of a healthy job.
 
 3. THE MIGRATION'S EFFECT, PREDICTED. The registered v1->v2 migration
-   seeds vmin/vmax with the empty-range sentinels, so the first v2 row
-   for a pre-existing key must carry vmin == vmax == that row's own
-   contribution: the sentinels collapse onto the first post-boundary
-   amount. If the migration had carried garbage, invented values, or
-   silently dropped the field, this is where it shows.
+   seeds vmin/vmax with the empty-range sentinels, so the row at that
+   smallest post-boundary n must carry vmin == vmax: the sentinels
+   collapse onto the first amount folded after the migration. If the
+   migration had carried garbage, invented values, or silently dropped
+   the field, this is where it shows.
+
+WHAT IS DELIBERATELY NOT JUDGED: per-row duplicates. The sink is
+at-least-once and the restore replays, so the same (key, count) is
+re-emitted by design - and across the boundary it is re-emitted under a
+DIFFERENT schema, so a naive "same key and count, different payload"
+check flags every replayed row. Worse, a key's events can arrive on
+several partitions, so even the running sum at a given count is not
+required to be stable across a replay with different interleaving. Only
+the CONVERGED final state and the per-key monotone facts above are
+judgeable here; duplicates are counted and reported, never failed on.
 
 A key that first appears AFTER the boundary is not evidence about the
 migration (nothing to carry), and is judged only on exactness.
@@ -147,10 +162,10 @@ def main():
 
     # --- fold the per-key history ------------------------------------------
     best = {}          # key -> row with the max n (the key's final state)
-    conflicting = 0    # same (key, n) seen with DIFFERENT values
-    seen_at_n = {}     # (key, n) -> (sum, v)
+    duplicates = 0     # re-emissions of a (key, n) - expected, informational
+    seen_at_n = set()  # (key, n) pairs already seen
     last_v1_n = {}     # key -> the highest n seen while the job was v1
-    first_v2 = {}      # key -> the FIRST v2 row for that key
+    first_v2 = {}      # key -> the v2 row with the SMALLEST n for that key
     malformed = 0
     for _p, _off, value in raw:
         if value is None or len(value) == 0:
@@ -162,19 +177,18 @@ def main():
         except Exception:  # noqa: BLE001 - a corrupt row is a finding, not a skip
             malformed += 1
             continue
-        prev = seen_at_n.get((k, n))
-        if prev is not None and prev != (s, v):
-            conflicting += 1
-        seen_at_n[(k, n)] = (s, v)
+        if (k, n) in seen_at_n:
+            duplicates += 1
+        seen_at_n.add((k, n))
         if k not in best or n > best[k]["n"]:
             best[k] = row
         if v == 1:
             last_v1_n[k] = max(last_v1_n.get(k, 0), n)
-        elif v == 2 and k not in first_v2:
+        elif v == 2 and (k not in first_v2 or n < int(first_v2[k]["n"])):
             first_v2[k] = row
     result["rows"] = len(raw)
     result["malformed_rows"] = malformed
-    result["conflicting_rows"] = conflicting
+    result["duplicate_rows"] = duplicates
 
     # --- 1. exactness ------------------------------------------------------
     counts, sums = oracle_from_spec(spec, seqs)
@@ -201,13 +215,17 @@ def main():
     for key, row in sorted(first_v2.items()):
         if key not in last_v1_n:
             continue  # a key born after the boundary says nothing about migration
-        expect_n = last_v1_n[key] + 1
-        if int(row["n"]) == expect_n:
+        # Continuity, with replay overlap allowed: the first post-boundary
+        # count must be at or before where v1 left off + 1. A key that
+        # restarts at 1 despite having a v1 history is state loss.
+        first_n = int(row["n"])
+        if first_n > 1 and first_n <= last_v1_n[key] + 1:
             carried += 1
         else:
             reset += 1
             if len(samples) < 5:
-                samples.append({"k": key, "first_v2_n": int(row["n"]), "expected_n": expect_n,
+                samples.append({"k": key, "first_v2_n": first_n,
+                                "last_v1_n": last_v1_n[key],
                                 "why": "count did not continue across the migration"})
         # The sentinels collapse onto this row's own amount: vmin == vmax.
         vmin, vmax = row.get("vmin"), row.get("vmax")

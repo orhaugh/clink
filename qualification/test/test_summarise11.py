@@ -27,7 +27,7 @@ SUMMARISE = HERE.parent / "qual11" / "summarise.py"
 def write_evidence(d, *, check_v2="pass", check_broken="refused", savepoint=True,
                    restore=True, same_job=True, caught_up=True, quiesced=True,
                    keys=500, missing=0, wrong_n=0, wrong_sum=0, fabricated=0,
-                   conflicting=0, malformed=0, rows=5000,
+                   duplicates=0, malformed=0, rows=5000,
                    across=400, carried=None, reset=0, effect_ok=None, effect_bad=0,
                    verify=True, job_gone=False, faults=("worker_sigkill", "coordinator_restart")):
     carried = across - reset if carried is None else carried
@@ -42,7 +42,7 @@ def write_evidence(d, *, check_v2="pass", check_broken="refused", savepoint=True
     if verify:
         (d / "q11-verify.json").write_text(json.dumps({
             "topic": "qual11-out", "rows": rows, "malformed_rows": malformed,
-            "conflicting_rows": conflicting, "keys_expected": keys, "keys_seen": keys,
+            "duplicate_rows": duplicates, "keys_expected": keys, "keys_seen": keys,
             "keys_missing": missing, "keys_wrong_n": wrong_n, "keys_wrong_sum": wrong_sum,
             "keys_fabricated": fabricated, "keys_across_boundary": across,
             "keys_carried": carried, "keys_reset": reset,
@@ -100,7 +100,8 @@ CASES = [
     ("a wrong count is a FAIL", {"wrong_n": 1}, "FAIL"),
     ("a wrong sum is a FAIL", {"wrong_sum": 1}, "FAIL"),
     ("an invented key is a FAIL", {"fabricated": 1}, "FAIL"),
-    ("conflicting duplicates are a FAIL", {"conflicting": 1}, "FAIL"),
+    ("re-emitted rows are NOT a failure (at-least-once + replay is by design)",
+     {"duplicates": 900}, "PASS"),
     ("a malformed row is a FAIL", {"malformed": 1}, "FAIL"),
     ("behind is INCONCLUSIVE, not a correctness FAIL",
      {"caught_up": False, "missing": 12}, "INCONCLUSIVE"),

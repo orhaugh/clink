@@ -21,9 +21,10 @@ pure function predicts. Four gates, each able to fail on its own:
 3. CONTINUITY AND EXACTNESS ACROSS THE BOUNDARY. One logical job (a
    second job id appearing means the "restore" was a fresh start), the
    generator's events all accounted for, and every key's final count and
-   sum equal to the deterministic spec's recomputation. Conflicting
-   duplicates (same key and count, different value) are fatal
-   separately: that is two answers to one question.
+   sum equal to the deterministic spec's recomputation. Re-emitted rows
+   are NOT judged: the sink is at-least-once and the restore replays, so
+   duplicates are by design (the verifier's header explains why even the
+   running sum at a given count need not be stable across a replay).
 
 4. THE MIGRATION'S EFFECT, PREDICTED AND MEASURED. Keys that existed
    before the boundary must CARRY their counts (a key restarting at 1 is
@@ -112,10 +113,13 @@ def build(out_dir, run_id, local):
     wrong_n = int(verify.get("keys_wrong_n", 0) or 0)
     wrong_sum = int(verify.get("keys_wrong_sum", 0) or 0)
     fabricated = int(verify.get("keys_fabricated", 0) or 0)
-    conflicting = int(verify.get("conflicting_rows", 0) or 0)
+    duplicates = int(verify.get("duplicate_rows", 0) or 0)
     malformed = int(verify.get("malformed_rows", 0) or 0)
     exact = have_verify and keys_expected > 0 and missing == 0 and wrong_n == 0 and wrong_sum == 0
-    clean = fabricated == 0 and conflicting == 0 and malformed == 0
+    # Duplicates are NOT a defect signal here: the sink is at-least-once
+    # and the restore replays, so re-emission is by design (see the
+    # verifier's header). Fabricated keys and malformed rows still are.
+    clean = fabricated == 0 and malformed == 0
 
     # --- gate 4: the migration's effect ------------------------------------
     across = int(verify.get("keys_across_boundary", 0) or 0)
@@ -174,7 +178,8 @@ def build(out_dir, run_id, local):
     a(f"- caught up before judging: {'yes' if caught_up else 'NO'}")
     a(f"- keys judged: {keys_expected}; missing {missing}, wrong count {wrong_n},"
       f" wrong sum {wrong_sum}, invented {fabricated}")
-    a(f"- conflicting duplicate rows: {conflicting}; malformed rows: {malformed}")
+    a(f"- re-emitted rows (expected under at-least-once + replay): {duplicates};"
+      f" malformed rows: {malformed}")
     a("")
     a("## The migration's effect")
     a("")
