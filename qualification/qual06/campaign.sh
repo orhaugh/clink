@@ -9,7 +9,8 @@
 # boundary, reported as such, not a campaign failure.
 #
 # THE LADDER. Each rung generates a wider SQL pipeline (dag-gen.py: B
-# branches -> 6B+3 operators, verified against the planner by
+# branches -> 6B+4 operators (the +4 gained a sink-boundary schema
+# binding op with item 78), verified against the planner by
 # test_dag_gen.py), deploys it, and must go green on deploy + first
 # checkpoint + sink filling within its budget. Only the final green rung
 # gets the full battery, the drain and the every-key oracle - exactness at
@@ -36,7 +37,7 @@ SEED="${SEED:-20260824}"
 CHECKPOINT_INTERVAL_MS="${CHECKPOINT_INTERVAL_MS:-15000}"
 WM_LAG_MS="${WM_LAG_MS:-2000}"
 STATE_TTL_MS="${STATE_TTL_MS:-600000}"
-# "branches:parallelism" per rung, in ladder order. Subtasks = (6B+3) x par.
+# "branches:parallelism" per rung, in ladder order. Subtasks = (6B+4) x par.
 LADDER="${LADDER:-8:4 24:4 48:8}"
 # Per-rung gate budgets and the final rung's battery length.
 DEPLOY_TIMEOUT_S="${DEPLOY_TIMEOUT_S:-300}"

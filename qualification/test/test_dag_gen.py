@@ -77,8 +77,8 @@ else:
                 ops = len(json.loads(out.stdout)["ops"])
             except Exception:
                 ops = -1
-            check(f"B={b} compiles to 6B+3 = {6 * b + 3} operators",
-                  ops == 6 * b + 3, f"got {ops}")
+            check(f"B={b} compiles to 6B+4 = {6 * b + 4} operators",
+                  ops == 6 * b + 4, f"got {ops}")
         finally:
             os.unlink(path)
 
