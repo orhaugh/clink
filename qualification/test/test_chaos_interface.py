@@ -33,7 +33,12 @@ for campaign in sorted(QUAL.glob("qual*/campaign.sh")):
     # closing quote of that command.
     spliced = text.replace("\\\n", " ")
     # The LAUNCH line, not the to_host copy of the script itself.
-    m = re.search(r'python3 chaos\.py([^"]*)', spliced)
+    # Match the launch however it names the script: campaigns copy chaos.py
+    # to /qual and start_on_host cds there, so both `python3 chaos.py` and
+    # `python3 /qual/chaos.py` occur. Anchoring on the bare name silently
+    # SKIPPED every campaign using the absolute form (QUAL-09 and QUAL-11),
+    # while this test still reported covering "every campaign".
+    m = re.search(r'python3 [^ "]*chaos\.py([^"]*)', spliced)
     if not m:
         continue  # a campaign that does not launch chaos has nothing to drift
     used = set(re.findall(r"(--[a-z-]+)", m.group(1)))

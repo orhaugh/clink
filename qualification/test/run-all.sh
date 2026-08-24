@@ -138,6 +138,9 @@ run "QUAL-07 summariser result logic (coverage and drift gates)" \
 # deploy (INCONCLUSIVE), a check that ACCEPTS the deliberately broken
 # job is a FAIL (the instrument is inert), state that resets across the
 # boundary is loss, and no keys across the boundary is no evidence.
+run "QUAL-11 driver parses" \
+    bash -n "$HERE/../qual11/campaign.sh"
+
 run "QUAL-11 summariser result logic (the four evolution gates)" \
     python3 "$HERE/test_summarise11.py"
 

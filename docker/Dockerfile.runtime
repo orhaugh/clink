@@ -68,6 +68,11 @@ ARG CLINK_ISA_BASELINE=
 # qualification campaign asserts it before using the profile.
 ARG CLINK_ENABLE_FAULT_INJECTION=OFF
 
+# QUAL-11's schema-evolution job plugins (three .so variants from one
+# source). Opt-in like fault injection: a shipped image carries no
+# campaign fixtures unless the qualification build asks.
+ARG CLINK_BUILD_QUAL11_JOBS=OFF
+
 # The commit this image was built from.
 #
 # The build normally derives it from .git, which a source archive does
@@ -94,6 +99,7 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
         -DCLINK_ISA_BASELINE=${CLINK_ISA_BASELINE} \
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
         -DCLINK_ABI_HASH=${CLINK_GIT_SHA} \
+        -DCLINK_BUILD_QUAL11_JOBS=${CLINK_BUILD_QUAL11_JOBS} \
     # Build EVERYTHING (tests off): `cmake --install` below installs every
     # tool the install rules cover, and a selective build leaves some of
     # them missing (clink_submit_sql was the one that failed). The extra
@@ -107,6 +113,15 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
     && mkdir -p /opt/clink/jobs \
     && cp build/examples/k8s_smoke_job.so /opt/clink/jobs/k8s_smoke_job.so \
     && cp build/examples/rescale_test_job.so /opt/clink/jobs/rescale_test_job.so \
+    # QUAL-11's schema-evolution trio, when the qualification build asked
+    # for them. They MUST be built here rather than shipped in: the plugin
+    # ABI fingerprint is the engine's git SHA, so a .so built anywhere else
+    # is rejected at submit by the gate that exists to catch exactly that.
+ && if [ "${CLINK_BUILD_QUAL11_JOBS}" = "ON" ]; then \
+        cp build/qualification/qual11/qual11_job_v1.so \
+           build/qualification/qual11/qual11_job_v2.so \
+           build/qualification/qual11/qual11_job_v2_broken.so /opt/clink/jobs/; \
+    fi \
     # Install the SDK (headers, static libs, CMake package) into /usr/local
     # before dropping the build tree: a job plugin must be compiled on the
     # WORKERS' platform against the SAME clink commit (the ABI gate compares
