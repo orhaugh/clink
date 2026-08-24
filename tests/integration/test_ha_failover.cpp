@@ -26,11 +26,13 @@
 // over). It needs a lease-based store - etcd - and is build-gated on it.
 // See docs/production-hardening-plan.md, W15.
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -39,6 +41,7 @@
 
 #include "clink/cluster/coordinator.hpp"
 
+#include "tests/integration/await_port.hpp"
 #include "tests/integration/cluster_harness.hpp"
 
 namespace {
@@ -314,23 +317,54 @@ TEST_F(HaFailoverTest, TheJobManifestRecordsTheWritingLeadersEpoch) {
     ASSERT_TRUE(c.await_workers_registered(1));
     auto sub = submit(c);
     ASSERT_NE(sub, nullptr);
+
+    // The manifest is persisted at submission and RETIRED at terminal (item
+    // 69: what recovery would re-run is deleted once the job finishes, with
+    // a TERMINAL tombstone in its place), so the epoch check has to read it
+    // while the job is LIVE. The job runs for seconds against a 50ms poll,
+    // so the window is wide; this used to read after exit and went red the
+    // day retirement landed.
+    const auto jobs_dir = c.ha_dir() / "jobs";
+    const auto find_manifest = [&]() -> std::optional<std::filesystem::path> {
+        std::error_code ec;
+        if (!std::filesystem::exists(jobs_dir, ec)) {
+            return std::nullopt;
+        }
+        for (const auto& e : std::filesystem::directory_iterator(jobs_dir, ec)) {
+            const auto manifest = e.path() / "manifest.json";
+            if (std::filesystem::exists(manifest)) {
+                return manifest;
+            }
+        }
+        return std::nullopt;
+    };
+    ASSERT_TRUE(clink::itest::await_condition([&] { return find_manifest().has_value(); },
+                                              std::chrono::seconds{60}))
+        << "no manifest.json appeared under the HA dir while the job ran";
+    EXPECT_EQ(clink::cluster::metadata_stored_epoch(find_manifest()->string()), *epoch)
+        << "the live manifest does not record the epoch of the leader that wrote it";
+
     ASSERT_TRUE(sub->await_exit(std::chrono::seconds(90)).has_value());
 
-    // Find the manifest the leader persisted for whatever job id it assigned.
-    const auto jobs_dir = c.ha_dir() / "jobs";
-    ASSERT_TRUE(std::filesystem::exists(jobs_dir)) << "no job was persisted under the HA dir";
-    bool checked = false;
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(jobs_dir, ec)) {
-        const auto manifest = e.path() / "manifest.json";
-        if (!std::filesystem::exists(manifest)) {
-            continue;
+    // The terminal half of the same lifecycle: retirement removes the
+    // manifest and leaves the tombstone, so a later takeover cannot
+    // resurrect the finished job. Retirement runs inside completion
+    // signalling; the bound covers a slow store, not a design delay.
+    const auto tombstone_exists = [&] {
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(jobs_dir, ec)) {
+            if (std::filesystem::exists(e.path() / "TERMINAL")) {
+                return true;
+            }
         }
-        EXPECT_EQ(clink::cluster::metadata_stored_epoch(manifest.string()), *epoch)
-            << manifest.string() << " does not record the epoch of the leader that wrote it";
-        checked = true;
-    }
-    EXPECT_TRUE(checked) << "no manifest.json was found to check";
+        return false;
+    };
+    EXPECT_TRUE(clink::itest::await_condition(
+        [&] { return !find_manifest().has_value() && tombstone_exists(); },
+        std::chrono::seconds{30}))
+        << "the finished job was not retired: manifest "
+        << (find_manifest().has_value() ? "still present" : "gone") << ", tombstone "
+        << (tombstone_exists() ? "present" : "absent") << " (item 69)";
 }
 
 // --- exactly-once across a COORDINATOR failure ----------------------------
