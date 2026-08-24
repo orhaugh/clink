@@ -1168,8 +1168,12 @@ public:
                 }
             }
             // Drain any timers still due at shutdown so close-time
-            // emissions aren't silently dropped.
-            if (!should_stop()) {
+            // emissions aren't silently dropped. Gated on the INPUT's close
+            // reason too (item 79): an input closed by cancellation is
+            // teardown racing this subtask's own stop token, and firing due
+            // timers + flushing open windows here emits a partial tail into
+            // a still-live sink - the exact leak QUAL-07's qcum measured.
+            if (!should_stop() && !in_channel->close_cancelled()) {
                 if (aec) {
                     // drain (quiesce in-flight reads so no key is held, releasing
                     // any watermark markers) -> fire + forward those event-time
@@ -1456,8 +1460,13 @@ public:
                 }
                 outs.back()->push(std::move(*maybe));
             }
-            for (auto& o : outs) {
-                o->close();
+            {
+                const auto reason = should_stop() || in_channel->close_cancelled()
+                                        ? ChannelCloseReason::Cancelled
+                                        : ChannelCloseReason::Finished;
+                for (auto& o : outs) {
+                    o->close(reason);
+                }
             }
         };
         runner.cancel = [in_channel, outs] {
@@ -1615,8 +1624,13 @@ public:
                     }
                 }
             }
-            for (auto& o : outs) {
-                o->close();
+            {
+                const auto reason = should_stop() || in_channel->close_cancelled()
+                                        ? ChannelCloseReason::Cancelled
+                                        : ChannelCloseReason::Finished;
+                for (auto& o : outs) {
+                    o->close(reason);
+                }
             }
         };
         runner.cancel = [in_channel, outs, cutover_gate] {
@@ -2066,7 +2080,9 @@ public:
                 }
                 std::this_thread::sleep_for(1ms);
             }
-            merged->close();
+            merged->close(should_stop() || external->close_cancelled()
+                              ? ChannelCloseReason::Cancelled
+                              : ChannelCloseReason::Finished);
         };
         runner.cancel = [external, feedback, merged] {
             external->close(ChannelCloseReason::Cancelled);
@@ -2122,7 +2138,9 @@ public:
                 }
                 std::this_thread::sleep_for(1ms);
             }
-            feedback->close();
+            feedback->close(should_stop() || body_out->close_cancelled()
+                                ? ChannelCloseReason::Cancelled
+                                : ChannelCloseReason::Finished);
         };
         runner.cancel = [body_out, feedback] {
             body_out->close(ChannelCloseReason::Cancelled);
@@ -3649,8 +3667,12 @@ public:
             // pointless) - mirrors the single-input runner's if(!should_stop())
             // guard. The sync path keeps its existing unconditional fire_due +
             // flush.
+            // Cancel-or-cancelled-input skips the EOS ceremony (item 79),
+            // matching the single-input runner.
+            const bool clean_eos =
+                !should_stop() && !left_ch->close_cancelled() && !right_ch->close_cancelled();
             if (aec) {
-                if (!should_stop()) {
+                if (clean_eos) {
                     aec->drain();                // quiesce in-flight -> release any wm markers
                     flush_drained_watermarks();  // fire + forward deferred event-time windows
                     aec->drain();                // complete fire coroutines -> forward releases
@@ -3658,7 +3680,7 @@ public:
                     aec->drain();
                     op->flush(out_emitter);
                 }
-            } else {
+            } else if (clean_eos) {
                 fire_due();
                 op->flush(out_emitter);
             }
@@ -4106,16 +4128,18 @@ public:
                 // on how many inputs an operator happened to have: cancelling a
                 // job drained a multi-input sink's buffered window and join state
                 // while a single-input one discarded it.
-                if (!should_stop()) {
-                    sink->flush();
-                }
                 // Forward WHY the stream ended (item 79): a cancelled exit -
                 // own stop or an input that closed by cancellation - must
                 // carry the reason downstream (NetworkBridgeSink puts it on
-                // the wire) instead of reading as clean end-of-input.
+                // the wire) instead of reading as clean end-of-input; and the
+                // flush itself is part of the EOS ceremony, so it obeys the
+                // same gate.
                 bool in_cancelled = false;
                 for (auto& ch : ins) {
                     in_cancelled = in_cancelled || ch->close_cancelled();
+                }
+                if (!should_stop() && !in_cancelled) {
+                    sink->flush();
                 }
                 if (should_stop() || in_cancelled) {
                     sink->close_cancelled();
@@ -4256,8 +4280,13 @@ public:
                         }
                     }
                 }
-                for (auto& e : per_branch_emitters) {
-                    e->close_all();
+                {
+                    const auto reason = should_stop() || in_ch->close_cancelled()
+                                            ? ChannelCloseReason::Cancelled
+                                            : ChannelCloseReason::Finished;
+                    for (auto& e : per_branch_emitters) {
+                        e->close_all(reason);
+                    }
                 }
             };
             runner.cancel = [in_ch, per_branch_emitters] {
@@ -4538,7 +4567,7 @@ public:
                     snap_worker->drain_and_join();
                 }
             }
-            if (!should_stop()) {
+            if (!should_stop() && !in_channel->close_cancelled()) {
                 sink->flush();
                 // A committing sink must not close while a prepared handle is
                 // still awaiting its CommitCheckpoint: the dispatch arrives on
@@ -4796,14 +4825,20 @@ private:
                         std::this_thread::sleep_for(1ms);
                     }
                 }
+                bool in_cancelled = should_stop();
+                for (auto& ch : ins) {
+                    in_cancelled = in_cancelled || ch->close_cancelled();
+                }
                 // Clean exit only - see the multi-input sink runner above for
-                // why cancel must not flush.
-                if (!should_stop()) {
+                // why cancel must not flush; a cancelled INPUT close is the
+                // same teardown one race earlier (item 79).
+                if (!in_cancelled) {
                     op->flush(out_emitter);
                 }
                 op->close();
                 op->attach_runtime(nullptr);
-                stage_emitter->close_all();
+                stage_emitter->close_all(in_cancelled ? ChannelCloseReason::Cancelled
+                                                      : ChannelCloseReason::Finished);
             };
             runner.cancel = [ins, stage_emitter] {
                 for (auto& ch : ins) {
