@@ -221,10 +221,27 @@ print([h['private_ip'] for h in inv['hosts'] if h['public_ip']=='$bp'][0])")
     bi=$(( bi + 1 ))
 done
 sleep 25
-on_host "$OPS_PUB" "docker run --rm --network host docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
-    rpk topic create $IN_TOPIC -p $PARTITIONS -r 3 --brokers $BROKER_LIST" >/dev/null 2>&1 || true
-on_host "$OPS_PUB" "docker run --rm --network host docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
-    rpk topic create $OUT_TOPIC -p $PARTITIONS -r 3 --brokers $BROKER_LIST" >/dev/null 2>&1 || true
+# The proven helper shape (QUAL-08/09): --entrypoint rpk against ONE
+# broker. A previous version used --network host with the full broker
+# list, silenced its failure with `|| true`, and the campaign then spent
+# the whole fill window watching a job that could not see its input
+# topic. Topic creation is now LOUD: no topic, no run.
+REPL=$(python3 -c "print(min(3, len('$BROKER_PRIVS'.split())))")
+rpk_ops() {
+    on_host "$OPS_PUB" "docker run --rm --entrypoint rpk \
+        docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
+        $1 --brokers $BROKER_ONE:9092"
+}
+for t in "$IN_TOPIC" "$OUT_TOPIC"; do
+    rpk_ops "topic delete $t" >/dev/null 2>&1 || true
+    rpk_ops "topic create $t -p $PARTITIONS -r $REPL" >/dev/null \
+        || { echo "campaign: could not create topic $t" >&2; exit 2; }
+done
+for t in "$IN_TOPIC" "$OUT_TOPIC"; do
+    rpk_ops "topic list" 2>/dev/null | grep -q "$t" \
+        || { echo "campaign: topic $t is not visible after creation" >&2; exit 2; }
+done
+echo "campaign: topics $IN_TOPIC and $OUT_TOPIC created (p=$PARTITIONS r=$REPL)"
 
 # --- engine -------------------------------------------------------------------
 to_host "$COORD_PUB" "$HERE/../infra/coordinator.yml" /qual/coordinator.yml
@@ -492,10 +509,8 @@ LAST=0; STILL=0; CAUGHT=no
 cstart=$(date +%s)
 while [ $(( $(date +%s) - cstart )) -lt "$CATCHUP_TIMEOUT_S" ]; do
     sleep 30
-    N=$(on_host "$OPS_PUB" "docker run --rm --network host \
-        docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
-        rpk topic describe $OUT_TOPIC -p --brokers $BROKER_LIST 2>/dev/null \
-        | awk 'NR>1 {s+=\$3} END {print s+0}'" | tr -d '\r')
+    N=$(rpk_ops "topic describe $OUT_TOPIC -p" 2>/dev/null \
+        | awk 'NR>1 {s+=$3} END {print s+0}' | tr -d '\r')
     case "$N" in ''|*[!0-9]*) continue ;; esac
     echo "campaign: catch-up $N rows"
     if [ "$N" = "$LAST" ]; then
