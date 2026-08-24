@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <mutex>
@@ -13,6 +14,19 @@
 
 namespace clink {
 
+// Why a channel closed. The distinction is load-bearing for event time
+// (followups item 79): a FINISHED input has genuinely ended - its max
+// watermark already flowed, and downstream alignment may stop letting it
+// constrain the running minimum - while a CANCELLED close is teardown,
+// where reading end-of-input would advance downstream time to end-of-time
+// and fire every open window into a still-live sink. QUAL-07 measured
+// exactly that: a cancelled job appended a nondeterministic partial tail
+// of open cumulate panes, correct-valued and premature.
+enum class ChannelCloseReason : std::uint8_t {
+    Finished = 0,   // clean end-of-stream: the producer ran out of input
+    Cancelled = 1,  // teardown: cancel, failover, shutdown - NOT end-of-input
+};
+
 // A simple, thread-safe, bounded MPMC channel.
 //
 // This is the unit of backpressure: when the channel is full, push() blocks
@@ -20,7 +34,9 @@ namespace clink {
 // and consumers can be on different threads.
 //
 // Closing the channel is one-way; once closed pop() returns nullopt after the
-// queue drains.
+// queue drains. The first close's reason wins (a Finished close racing a
+// teardown close keeps whichever landed first - by then the consumer's
+// behaviour is already decided).
 template <typename T>
 class BoundedChannel {
 public:
@@ -170,13 +186,26 @@ public:
         return value;
     }
 
-    void close() {
+    void close(ChannelCloseReason reason = ChannelCloseReason::Finished) {
         {
             std::lock_guard lock(mu_);
+            if (!closed_) {
+                close_reason_ = reason;
+            }
             closed_ = true;
         }
         not_empty_.notify_all();
         not_full_.notify_all();
+    }
+
+    // Meaningful once closed(); Finished until then.
+    [[nodiscard]] ChannelCloseReason close_reason() const {
+        std::lock_guard lock(mu_);
+        return close_reason_;
+    }
+    [[nodiscard]] bool close_cancelled() const {
+        std::lock_guard lock(mu_);
+        return closed_ && close_reason_ == ChannelCloseReason::Cancelled;
     }
 
     std::size_t size() const {
@@ -209,6 +238,7 @@ private:
     std::size_t capacity_{};
     std::string name_;
     bool closed_{false};
+    ChannelCloseReason close_reason_{ChannelCloseReason::Finished};
     int push_waiters_{0};
     int pop_waiters_{0};
     std::atomic<std::size_t> max_depth_{0};

@@ -1147,6 +1147,13 @@ public:
 
     virtual void open() {}
     virtual void close() {}
+    // close(), but the subtask is being CANCELLED rather than reaching clean
+    // end-of-input. Defaults to close(), so sinks that make no distinction
+    // are unchanged. NetworkBridgeSink overrides it to carry the reason to
+    // the peer: a downstream watermark aligner that reads a cancelled close
+    // as end-of-input advances event time to end-of-time and fires every
+    // open window into whatever is still attached (followups item 79).
+    virtual void close_cancelled() { close(); }
 
     virtual void on_data(const Batch<In>& batch) = 0;
     // Move-friendly overload: sinks that can take ownership of the

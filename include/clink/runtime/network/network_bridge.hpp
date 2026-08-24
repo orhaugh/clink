@@ -98,6 +98,15 @@ public:
         channel_.close_send();
     }
 
+    // Cancel-path close: the Close frame carries the reason so the peer's
+    // receive side closes its local channel as Cancelled and downstream
+    // watermark alignment never reads teardown as end-of-input (item 79).
+    void close_cancelled() override {
+        closing_ = true;
+        clink::metrics::net::close_send();
+        channel_.close_send(/*cancelled=*/true);
+    }
+
     std::string name() const override { return name_; }
 
 private:
@@ -382,6 +391,14 @@ public:
         std::lock_guard lock(mu_);
         if (inner_) {
             inner_->close();
+            inner_.reset();
+        }
+    }
+
+    void close_cancelled() override {
+        std::lock_guard lock(mu_);
+        if (inner_) {
+            inner_->close_cancelled();
             inner_.reset();
         }
     }

@@ -614,11 +614,12 @@ public:
             }
             source->close();
             source->attach_runtime(nullptr);
-            channel->close();
+            channel->close(should_stop() ? ChannelCloseReason::Cancelled
+                                         : ChannelCloseReason::Finished);
         };
         runner.cancel = [source, channel] {
             source->cancel();
-            channel->close();
+            channel->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [] { return std::size_t{0}; };
         runner.input_capacity = [] { return std::size_t{0}; };
@@ -1196,7 +1197,9 @@ public:
             }
             op->close();
             op->attach_runtime(nullptr);
-            out_channel->close();
+            out_channel->close(should_stop() || in_channel->close_cancelled()
+                                   ? ChannelCloseReason::Cancelled
+                                   : ChannelCloseReason::Finished);
             // Close any side output channels so their consumers drain.
             if (side_channels) {
                 for (auto& [_, entry] : *side_channels) {
@@ -1208,8 +1211,8 @@ public:
         };
         runner.cancel = [in_channel, out_channel, chain_epoch = chain_epoch_] {
             chain_epoch->abort();
-            in_channel->close();
-            out_channel->close();
+            in_channel->close(ChannelCloseReason::Cancelled);
+            out_channel->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [in_channel] { return in_channel->size(); };
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
@@ -1386,7 +1389,8 @@ public:
             }
             stage.close_input();
             stage.await();
-            out_channel->close();
+            out_channel->close(should_stop() ? ChannelCloseReason::Cancelled
+                                             : ChannelCloseReason::Finished);
             // Surface any worker failure so the executor records it (mirrors a
             // throwing single-input operator).
             if (!stage.worker_errors().empty()) {
@@ -1397,8 +1401,8 @@ public:
         };
         runner.cancel = [in_channel, out_channel, chain_epoch = chain_epoch_] {
             chain_epoch->abort();
-            in_channel->close();
-            out_channel->close();
+            in_channel->close(ChannelCloseReason::Cancelled);
+            out_channel->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [in_channel] { return in_channel->size(); };
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
@@ -1452,9 +1456,9 @@ public:
             }
         };
         runner.cancel = [in_channel, outs] {
-            in_channel->close();
+            in_channel->close(ChannelCloseReason::Cancelled);
             for (auto& o : outs) {
-                o->close();
+                o->close(ChannelCloseReason::Cancelled);
             }
         };
         runner.input_depth = [in_channel] { return in_channel->size(); };
@@ -1614,9 +1618,9 @@ public:
             if (cutover_gate) {
                 cutover_gate->abort();
             }
-            in_channel->close();
+            in_channel->close(ChannelCloseReason::Cancelled);
             for (auto& o : outs) {
-                o->close();
+                o->close(ChannelCloseReason::Cancelled);
             }
         };
         runner.input_depth = [in_channel] { return in_channel->size(); };
@@ -1737,7 +1741,7 @@ public:
                     if (align.input_paused(i)) {
                         if (!align.input_closed(i) && channels[i]->closed() &&
                             channels[i]->size() == 0) {
-                            align.on_input_closed(i);
+                            align.on_input_closed(i, channels[i]->close_cancelled());
                             if (auto wm_adv = align.refresh_watermark(); wm_adv.forward) {
                                 out_channel->push(StreamElement<T>::watermark(wm_adv.watermark));
                             }
@@ -1750,7 +1754,7 @@ public:
                         // above: a push+close can land between the failed
                         // try_pop and this check.
                         if (channels[i]->closed() && channels[i]->size() == 0) {
-                            align.on_input_closed(i);
+                            align.on_input_closed(i, channels[i]->close_cancelled());
                             if (auto wm_adv = align.refresh_watermark(); wm_adv.forward) {
                                 out_channel->push(StreamElement<T>::watermark(wm_adv.watermark));
                             }
@@ -1786,13 +1790,18 @@ public:
                     std::this_thread::sleep_for(1ms);
                 }
             }
-            out_channel->close();
+            bool in_cancelled = should_stop();
+            for (auto& c : in_channels) {
+                in_cancelled = in_cancelled || c->close_cancelled();
+            }
+            out_channel->close(in_cancelled ? ChannelCloseReason::Cancelled
+                                            : ChannelCloseReason::Finished);
         };
         runner.cancel = [in_channels, out_channel] {
             for (auto& c : in_channels) {
-                c->close();
+                c->close(ChannelCloseReason::Cancelled);
             }
-            out_channel->close();
+            out_channel->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [in_channels] {
             std::size_t total = 0;
@@ -2055,9 +2064,9 @@ public:
             merged->close();
         };
         runner.cancel = [external, feedback, merged] {
-            external->close();
-            feedback->close();
-            merged->close();
+            external->close(ChannelCloseReason::Cancelled);
+            feedback->close(ChannelCloseReason::Cancelled);
+            merged->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [external, feedback] { return external->size() + feedback->size(); };
         runner.input_capacity = [external, feedback] {
@@ -2111,8 +2120,8 @@ public:
             feedback->close();
         };
         runner.cancel = [body_out, feedback] {
-            body_out->close();
-            feedback->close();
+            body_out->close(ChannelCloseReason::Cancelled);
+            feedback->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [body_out] { return body_out->size(); };
         runner.input_capacity = [body_out] { return body_out->capacity(); };
@@ -2712,7 +2721,7 @@ public:
                         // Closed AND drained (see the co_operator runner): a
                         // push+close between the failed try_pop and this check
                         // must not mark the input closed over queued records.
-                        align.on_input_closed(0);
+                        align.on_input_closed(0, left_ch->close_cancelled());
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             evict(wm.watermark.timestamp());
                             out_channel->push(StreamElement<C>::watermark(wm.watermark));
@@ -2729,7 +2738,7 @@ public:
                         any_progress = true;
                         handle_right(*m);
                     } else if (right_ch->closed() && right_ch->size() == 0) {
-                        align.on_input_closed(1);
+                        align.on_input_closed(1, right_ch->close_cancelled());
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             evict(wm.watermark.timestamp());
                             out_channel->push(StreamElement<C>::watermark(wm.watermark));
@@ -2743,12 +2752,15 @@ public:
                     std::this_thread::sleep_for(1ms);
                 }
             }
-            out_channel->close();
+            out_channel->close(should_stop() || left_ch->close_cancelled() ||
+                                       right_ch->close_cancelled()
+                                   ? ChannelCloseReason::Cancelled
+                                   : ChannelCloseReason::Finished);
         };
         runner.cancel = [left_ch, right_ch, out_channel] {
-            left_ch->close();
-            right_ch->close();
-            out_channel->close();
+            left_ch->close(ChannelCloseReason::Cancelled);
+            right_ch->close(ChannelCloseReason::Cancelled);
+            out_channel->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [left_ch, right_ch] { return left_ch->size() + right_ch->size(); };
         runner.input_capacity = [left_ch, right_ch] {
@@ -3033,7 +3045,7 @@ public:
                         handle_main(*m);
                     } else if (main_ch->closed() && main_ch->size() == 0) {
                         // Closed AND drained (see the co_operator runner note).
-                        align.on_input_closed(0);
+                        align.on_input_closed(0, main_ch->close_cancelled());
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             out_channel->push(StreamElement<Out>::watermark(wm.watermark));
                         }
@@ -3049,7 +3061,7 @@ public:
                         any_progress = true;
                         handle_brod(*b);
                     } else if (brod_ch->closed() && brod_ch->size() == 0) {
-                        align.on_input_closed(1);
+                        align.on_input_closed(1, brod_ch->close_cancelled());
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             out_channel->push(StreamElement<Out>::watermark(wm.watermark));
                         }
@@ -3062,12 +3074,15 @@ public:
                     std::this_thread::sleep_for(1ms);
                 }
             }
-            out_channel->close();
+            out_channel->close(should_stop() || main_ch->close_cancelled() ||
+                                       brod_ch->close_cancelled()
+                                   ? ChannelCloseReason::Cancelled
+                                   : ChannelCloseReason::Finished);
         };
         runner.cancel = [main_ch, brod_ch, out_channel] {
-            main_ch->close();
-            brod_ch->close();
-            out_channel->close();
+            main_ch->close(ChannelCloseReason::Cancelled);
+            brod_ch->close(ChannelCloseReason::Cancelled);
+            out_channel->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [main_ch, brod_ch] { return main_ch->size() + brod_ch->size(); };
         runner.input_capacity = [main_ch, brod_ch] {
@@ -3563,7 +3578,7 @@ public:
                         // align.all_closed() breaks the loop, and the batch is
                         // dropped (observed in CI as an all-zero co-op run
                         // when the other input was empty and closed at start).
-                        align.on_input_closed(0);
+                        align.on_input_closed(0, left_ch->close_cancelled());
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             forward_watermark(wm.watermark);
                         }
@@ -3579,7 +3594,7 @@ public:
                         any_progress = true;
                         handle_right(*m);
                     } else if (right_ch->closed() && right_ch->size() == 0) {
-                        align.on_input_closed(1);
+                        align.on_input_closed(1, right_ch->close_cancelled());
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             forward_watermark(wm.watermark);
                         }
@@ -3651,7 +3666,10 @@ public:
             }
             op->close();
             op->attach_runtime(nullptr);
-            out_channel->close();
+            out_channel->close(should_stop() || left_ch->close_cancelled() ||
+                                       right_ch->close_cancelled()
+                                   ? ChannelCloseReason::Cancelled
+                                   : ChannelCloseReason::Finished);
             if (side_channels) {
                 for (auto& [_, entry] : *side_channels) {
                     if (entry.close_fn) {
@@ -3661,9 +3679,9 @@ public:
             }
         };
         runner.cancel = [left_ch, right_ch, out_channel] {
-            left_ch->close();
-            right_ch->close();
-            out_channel->close();
+            left_ch->close(ChannelCloseReason::Cancelled);
+            right_ch->close(ChannelCloseReason::Cancelled);
+            out_channel->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [left_ch, right_ch] { return left_ch->size() + right_ch->size(); };
         runner.input_capacity = [left_ch, right_ch] {
@@ -3916,7 +3934,7 @@ public:
             runner.cancel = [source, emitter] {
                 source->cancel();
                 // Close all output channels owned by this subtask.
-                emitter->close_all();
+                emitter->close_all(ChannelCloseReason::Cancelled);
             };
             runner.input_depth = [] { return std::size_t{0}; };
             runner.input_capacity = [] { return std::size_t{0}; };
@@ -4042,7 +4060,7 @@ public:
                             // note): a push+close can land between the failed
                             // try_pop and this check.
                             if (ins[k]->closed() && ins[k]->size() == 0) {
-                                align.on_input_closed(k);
+                                align.on_input_closed(k, ins[k]->close_cancelled());
                             }
                             continue;
                         }
@@ -4082,12 +4100,24 @@ public:
                 if (!should_stop()) {
                     sink->flush();
                 }
-                sink->close();
+                // Forward WHY the stream ended (item 79): a cancelled exit -
+                // own stop or an input that closed by cancellation - must
+                // carry the reason downstream (NetworkBridgeSink puts it on
+                // the wire) instead of reading as clean end-of-input.
+                bool in_cancelled = false;
+                for (auto& ch : ins) {
+                    in_cancelled = in_cancelled || ch->close_cancelled();
+                }
+                if (should_stop() || in_cancelled) {
+                    sink->close_cancelled();
+                } else {
+                    sink->close();
+                }
                 sink->attach_runtime(nullptr);
             };
             runner.cancel = [ins] {
                 for (auto& ch : ins) {
-                    ch->close();
+                    ch->close(ChannelCloseReason::Cancelled);
                 }
             };
             const auto ins_copy = ins;
@@ -4222,9 +4252,9 @@ public:
                 }
             };
             runner.cancel = [in_ch, per_branch_emitters] {
-                in_ch->close();
+                in_ch->close(ChannelCloseReason::Cancelled);
                 for (auto& e : per_branch_emitters) {
-                    e->close_all();
+                    e->close_all(ChannelCloseReason::Cancelled);
                 }
             };
             runner.input_depth = [in_ch] { return in_ch->size(); };
@@ -4528,12 +4558,20 @@ public:
                     }
                 }
             }
-            sink->close();
+            // Forward WHY the stream ended (item 79): a cancelled exit - own
+            // stop or an input closed by cancellation - carries the reason
+            // downstream (NetworkBridgeSink puts it on the wire) instead of
+            // reading as clean end-of-input.
+            if (should_stop() || in_channel->close_cancelled()) {
+                sink->close_cancelled();
+            } else {
+                sink->close();
+            }
             sink->attach_runtime(nullptr);
         };
         runner.cancel = [in_channel, chain_epoch = chain_epoch_] {
             chain_epoch->abort();
-            in_channel->close();
+            in_channel->close(ChannelCloseReason::Cancelled);
         };
         runner.input_depth = [in_channel] { return in_channel->size(); };
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
@@ -4711,7 +4749,7 @@ private:
                             // note): a push+close can land between the failed
                             // try_pop and this check.
                             if (ins[k]->closed() && ins[k]->size() == 0) {
-                                align.on_input_closed(k);
+                                align.on_input_closed(k, ins[k]->close_cancelled());
                             }
                             continue;
                         }
@@ -4760,9 +4798,9 @@ private:
             };
             runner.cancel = [ins, stage_emitter] {
                 for (auto& ch : ins) {
-                    ch->close();
+                    ch->close(ChannelCloseReason::Cancelled);
                 }
-                stage_emitter->close_all();
+                stage_emitter->close_all(ChannelCloseReason::Cancelled);
             };
             const auto ins_copy = ins;
             runner.input_depth = [ins_copy] {

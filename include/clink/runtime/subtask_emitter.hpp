@@ -137,9 +137,9 @@ public:
 
     // Close every owned output channel. Used by source/operator runner
     // cancel hooks so downstream consumers drain and exit promptly.
-    void close_all() {
+    void close_all(ChannelCloseReason reason = ChannelCloseReason::Finished) {
         for (auto& ch : outputs_) {
-            ch->close();
+            ch->close(reason);
         }
     }
 

@@ -269,9 +269,18 @@ public:
     // and reads the Close marker. On the local fast path, closing the
     // BoundedChannel achieves the same: the receiver's pop returns
     // nullopt once the queue drains.
-    void close_send() {
+    //
+    // `cancelled` names WHY the stream ends (item 79): a trailing reason
+    // byte on the Close frame, using the same optional-trailing-byte
+    // compatibility rule as the Barrier mode byte - a legacy empty payload
+    // reads as a clean finish, a legacy peer ignores the extra byte. The
+    // receiver closes its local channel with the reason, so downstream
+    // watermark alignment can tell teardown from genuine end-of-input.
+    void close_send(bool cancelled = false) {
+        const auto reason =
+            cancelled ? ChannelCloseReason::Cancelled : ChannelCloseReason::Finished;
         if (local_channel_) {
-            local_channel_->close();
+            local_channel_->close(reason);
             return;
         }
         if (fd_ < 0) {
@@ -279,6 +288,7 @@ public:
         }
         std::vector<std::byte> payload;
         payload.push_back(static_cast<std::byte>(Kind::Close));
+        payload.push_back(static_cast<std::byte>(cancelled ? 1 : 0));
         send_frame(payload);
         NetworkSocket::shutdown_write(fd_);
     }
@@ -618,9 +628,12 @@ public:
     std::uint16_t bound_port() const noexcept { return bound_port_; }
 
     // Wake any thread blocked in pop() and the socket-side recv
-    // thread. Subsequent pop() calls return nullopt.
+    // thread. Subsequent pop() calls return nullopt. This is the OWNER's
+    // teardown path, never clean end-of-input, so the close is Cancelled
+    // (first-close-wins: a Close frame that already landed keeps its
+    // reason).
     void shutdown_recv() {
-        local_channel_->close();
+        local_channel_->close(ChannelCloseReason::Cancelled);
         if (peer_fd_ >= 0) {
             NetworkSocket::shutdown_read(peer_fd_);
         }
@@ -649,11 +662,19 @@ private:
         // pop() unblocks) on every exit path from this function -
         // including parse errors, schema mismatches, socket EOF, and
         // the destructor-driven listener-fd close that wakes accept.
+        // The exit-path close carries the reason the loop LEARNED: only an
+        // explicit Close frame without the cancelled bit is clean
+        // end-of-input. Everything else - bare EOF (the peer vanished
+        // between frames), parse failure, teardown waking accept - closes
+        // Cancelled, so downstream watermark alignment never reads a lost
+        // or cancelled peer as end-of-time (item 79). recv_close_reason_
+        // defaults to Cancelled for exactly that.
         struct CloseOnExit {
             std::shared_ptr<LocalEndpointChannel<T>> ch;
-            ~CloseOnExit() { ch->close(); }
+            const ChannelCloseReason* reason;
+            ~CloseOnExit() { ch->close(*reason); }
         };
-        CloseOnExit guard{local_channel_};
+        CloseOnExit guard{local_channel_, &recv_close_reason_};
         peer_fd_ = NetworkSocket::accept_one(listener_fd_);
         if (peer_fd_ < 0) {
             const int err = errno;
@@ -802,6 +823,13 @@ private:
                     break;
                 }
                 case Kind::Close:
+                    // Optional trailing reason byte (same compatibility rule
+                    // as the Barrier mode byte): absent = a legacy clean
+                    // finish; 1 = the sender was CANCELLED, and this close
+                    // must not read as end-of-input downstream (item 79).
+                    recv_close_reason_ = (!body.empty() && body[0] == std::byte{1})
+                                             ? ChannelCloseReason::Cancelled
+                                             : ChannelCloseReason::Finished;
                     return;
             }
         }
@@ -858,6 +886,13 @@ private:
     // String literal naming the protocol corruption the recv thread hit;
     // nullptr while the stream is healthy. See failure_reason().
     std::atomic<const char*> failure_{nullptr};
+    // Why the recv loop's exit closes the local channel. Defaults to
+    // Cancelled - only an explicit Close frame without the cancelled bit
+    // proves the peer FINISHED; a bare EOF, a parse failure, or teardown
+    // must never read as clean end-of-input downstream (item 79). Written
+    // by the recv thread before it returns; read by CloseOnExit on the
+    // same thread.
+    ChannelCloseReason recv_close_reason_{ChannelCloseReason::Cancelled};
     std::mutex send_mu_;
     // Unified queue for both socket-recv path and same-process
     // LocalDataPlane pushes. The recv-thread (when a socket peer

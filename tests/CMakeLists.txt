@@ -169,6 +169,7 @@ add_executable(clink_core_tests
     test_bounded_channel.cpp
     test_timer_service.cpp
     test_checkpoint_retention.cpp
+    test_close_reason_alignment.cpp
     test_side_output.cpp
     test_real_connectors_factory.cpp
     test_file_backed_state.cpp

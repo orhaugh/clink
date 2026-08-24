@@ -25,7 +25,12 @@ namespace clink::network {
 //                      each record: [u8 has_time][i64 time_be][u32 value_len][value_bytes]
 //   1  Watermark    - [i64 timestamp_be]
 //   2  Barrier      - [u64 ck_id_be]
-//   3  Close        - empty payload; signals end-of-stream from the sender
+//   3  Close        - signals end-of-stream from the sender. Optional
+//                      trailing reason byte (same compatibility rule as the
+//                      Barrier mode byte): absent or 0 = the sender FINISHED
+//                      (clean end-of-input); 1 = the sender was CANCELLED,
+//                      and the receiver's close must not read as
+//                      end-of-input downstream (item 79)
 //   4  CreditUpdate - [u32 delta_be]; reverse-direction frame (receiver → sender)
 //                      that grants `delta` additional records' worth of send
 //                      credit. The sender's push pauses on cv when credit

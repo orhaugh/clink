@@ -37,6 +37,7 @@ public:
         : input_wm_(input_count, Watermark::min()),
           paused_(input_count, false),
           closed_(input_count, false),
+          cancelled_close_(input_count, false),
           idle_(input_count, false) {}
 
     // Stamp the aligner with the OperatorId.value() of the operator
@@ -154,12 +155,19 @@ public:
 
     // Mark input i as closed. Closed inputs are excluded from alignment
     // checks (they implicitly satisfy any in-flight barrier and contribute
-    // EventTime::max() to the watermark min).
-    BarrierAdvance on_input_closed(std::size_t i) {
+    // EventTime::max() to the watermark min, so survivors' time is never
+    // held back by a gone input). `cancelled` records WHY it closed
+    // (followups item 79): a FINISHED close is genuine end-of-input, but a
+    // CANCELLED close is teardown, and once every input is gone the
+    // recompute must not read the wreckage as end-of-time - that fired
+    // every open window into a still-live sink during cancel, appending a
+    // nondeterministic partial tail (QUAL-07's qcum, 11,532 rows).
+    BarrierAdvance on_input_closed(std::size_t i, bool cancelled = false) {
         if (closed_[i]) {
             return {};
         }
         closed_[i] = true;
+        cancelled_close_[i] = cancelled;
         input_wm_[i] = Watermark::max();  // closed inputs no longer hold back time
         // A close may complete alignment for a pending barrier; check each.
         for (auto& [id, _] : seen_barriers_) {
@@ -214,6 +222,7 @@ public:
         input_wm_.push_back(Watermark{emitted_wm_.timestamp()});
         paused_.push_back(false);
         closed_.push_back(false);
+        cancelled_close_.push_back(false);
         idle_.push_back(false);
         return input_wm_.size() - 1;
     }
@@ -368,6 +377,22 @@ private:
             return WatermarkAdvance{};
         }
         // Cases 1 and 3: at least one active input OR everyone closed.
+        //
+        // Everyone-closed carries a caveat (item 79): closed inputs sit at
+        // Watermark::max(), so the min over an all-closed set is
+        // end-of-time - correct when every input FINISHED (a bounded
+        // pipeline's genuine end of input), but a set that includes a
+        // CANCELLED close is teardown wreckage, and emitting end-of-time
+        // from it fires every open event-time window into whatever is
+        // still attached downstream. Cancel is not end-of-input: hold the
+        // watermark where it was and let the runner exit.
+        if (!any_alive) {
+            for (std::size_t i = 0; i < cancelled_close_.size(); ++i) {
+                if (cancelled_close_[i]) {
+                    return WatermarkAdvance{};
+                }
+            }
+        }
         Watermark current = *std::min_element(input_wm_.begin(), input_wm_.end());
         if (last_emitted_idle_) {
             // Coming back from all-idle: force-emit even if the
@@ -413,6 +438,11 @@ private:
     std::vector<Watermark> input_wm_;
     std::vector<bool> paused_;
     std::vector<bool> closed_;
+    // Whether each closed input closed by CANCELLATION rather than clean
+    // end-of-input. Only consulted once every input is closed: an
+    // all-closed set that includes a cancelled close is teardown, and the
+    // recompute must not turn it into an end-of-time watermark (item 79).
+    std::vector<bool> cancelled_close_;
     std::vector<bool> idle_;
     std::unordered_map<std::uint64_t, std::vector<bool>> seen_barriers_;
     // First-input-delivery time per in-flight checkpoint id. Stamped
