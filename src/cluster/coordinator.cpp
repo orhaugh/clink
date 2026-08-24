@@ -6944,18 +6944,66 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 if (!job.awaiting_restart && !job.completion_signalled && !job.cancel_requested &&
                     !job.checkpoint.checkpoint_dir.empty() &&
                     job.restart_attempts < effective_max_restarts(job.checkpoint)) {
-                    failed_ckpt_deploys = initiate_job_restart_locked_(
-                        job,
-                        "checkpoint failure",
-                        "checkpoint " + std::to_string(msg.checkpoint_id) +
-                            " failed; its aborted sink transactions carried one interval of "
-                            "output that only a rewind re-emits",
-                        failed_ckpt_cancels);
+                    // The circuit-breaker (item 77b): a restart rewinds and
+                    // re-emits an interval through every sink, which repairs
+                    // a TRANSIENT snapshot failure and only amplifies a
+                    // persistent one - QUAL-09's state volume at ENOSPC
+                    // crashlooped ~100 rewind-restarts, each visibly
+                    // shrinking upsert output, until a drain timeout ended
+                    // it by accident. Consecutive means no completed
+                    // checkpoint in between (the completion branch below
+                    // resets the counter); at the limit the job FAILS
+                    // carrying the cause, through the same
+                    // deadline-protected cancel broadcast a fatal subtask
+                    // error uses.
+                    ++job.consecutive_ckpt_failure_restarts;
+                    const auto limit = cfg_.checkpoint_failure_restart_limit;
+                    if (limit != 0 && job.consecutive_ckpt_failure_restarts >= limit) {
+                        log::error(
+                            "coordinator.checkpoint",
+                            "job_id=" + std::to_string(msg.job_id) + " has restarted " +
+                                std::to_string(job.consecutive_ckpt_failure_restarts) +
+                                " consecutive times from FAILED checkpoints with none "
+                                "completing in between; the cause is persistent and a rewind "
+                                "cannot repair it. Failing the job.");
+                        job.errors.push_back(
+                            std::to_string(job.consecutive_ckpt_failure_restarts) +
+                            " consecutive restarts from failed checkpoints with no completed "
+                            "checkpoint between them (last: checkpoint " +
+                            std::to_string(msg.checkpoint_id) +
+                            "); the cause is persistent - check the state volume (ENOSPC?) "
+                            "and the workers' snapshot errors.");
+                        if (!job.error_cancel_broadcast) {
+                            job.error_cancel_broadcast = true;
+                            job.terminal_cancel_deadline =
+                                std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+                            for (const auto& [worker_id2, _] : job.tasks_by_worker) {
+                                auto cit = registered_.find(worker_id2);
+                                if (cit != registered_.end() && !cit->second->lost &&
+                                    cit->second->conn) {
+                                    failed_ckpt_cancels.emplace_back(cit->second->conn.get(),
+                                                                     msg.job_id);
+                                }
+                            }
+                        }
+                    } else {
+                        failed_ckpt_deploys = initiate_job_restart_locked_(
+                            job,
+                            "checkpoint failure",
+                            "checkpoint " + std::to_string(msg.checkpoint_id) +
+                                " failed; its aborted sink transactions carried one interval "
+                                "of output that only a rewind re-emits",
+                            failed_ckpt_cancels);
+                    }
                 }
             }
         }
         if (all_subtasks_answered && !checkpoint_failed) {
             job.failed_checkpoint_acks.erase(msg.checkpoint_id);
+            // A completed checkpoint is the proof the failure cause was
+            // transient: the 77b circuit-breaker counts only CONSECUTIVE
+            // failure-restarts, and this is where consecutive ends.
+            job.consecutive_ckpt_failure_restarts = 0;
             job.latest_completed_checkpoint_id =
                 std::max(job.latest_completed_checkpoint_id, msg.checkpoint_id);
             // The restore point has moved past the last rescale, so every

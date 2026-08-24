@@ -286,6 +286,19 @@ public:
         // aborts the cutover to the replan path. Generous because the
         // deploy phase includes a state restore.
         std::chrono::milliseconds hot_cutover_phase_timeout{60000};
+        // How many CONSECUTIVE whole-job restarts triggered by FAILED
+        // checkpoints - with no completed checkpoint between them - the
+        // coordinator tolerates before failing the job with the cause.
+        // A failed checkpoint's restart rewinds and re-emits an interval
+        // through every sink, so a PERSISTENT cause (a state volume at
+        // ENOSPC, above all) used to crashloop indefinitely: QUAL-09
+        // measured ~100 rewind-restarts in 35 minutes, each one visibly
+        // shrinking upsert-sink output, bounded only by a restart budget
+        // sized for worker loss (followups item 77b). Rewinding into a
+        // cause that does not heal repairs nothing; failing loudly with
+        // the cause is the safe escalation, exactly as the drain deadline
+        // concluded. 0 disables (the pre-77b behaviour).
+        std::uint32_t checkpoint_failure_restart_limit{5};
         // Cluster-level default state-backend URI applied to a submitted job
         // that chose none (empty CheckpointConfig.state_backend_uri). Lets an
         // operator point every job at a deferring backend (e.g.
@@ -936,6 +949,11 @@ private:
         // bookkeeping, and increments restart_attempts.
         bool awaiting_restart{false};
         std::uint32_t restart_attempts{0};
+        // Whole-job restarts caused by FAILED CHECKPOINTS since the last
+        // checkpoint that COMPLETED. Reset on completion; at
+        // Config::checkpoint_failure_restart_limit the job fails with the
+        // cause instead of restarting again (item 77b).
+        std::uint32_t consecutive_ckpt_failure_restarts{0};
         // (role, subtask_idx) entries from the lost worker that need to be
         // re-deployed onto a survivor.
         std::vector<std::pair<std::string, std::uint32_t>> restart_pending;

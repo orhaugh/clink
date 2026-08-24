@@ -781,3 +781,207 @@ TEST(CheckpointCompletion, ACancelledJobIsNotResurrectedByRecovery) {
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
 }
+
+// Item 77b. A whole-job restart repairs a TRANSIENT snapshot failure and
+// only amplifies a persistent one: each rewind re-emits an interval
+// through every sink, so a cause that does not heal (QUAL-09: the state
+// volume at ENOSPC) used to crashloop indefinitely - ~100 rewind-restarts
+// in 35 minutes, output visibly shrinking, bounded only by a restart
+// budget sized for worker loss. The breaker: at N CONSECUTIVE
+// failure-restarts with no completed checkpoint between them, the job
+// FAILS carrying the cause.
+namespace {
+
+// Triggers keep arriving on the interval and survive restarts in the
+// fake worker's inbox; a cycle must ack a FRESH id or its acks land on a
+// checkpoint the coordinator already aborted.
+std::optional<std::uint64_t> await_trigger_above(FakeWorker& w, std::uint64_t last) {
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto r = w.await_frame(MessageKind::TriggerCheckpoint, 2s);
+        if (!r.has_value()) {
+            continue;
+        }
+        const auto id = decode_trigger_checkpoint(*r).checkpoint_id;
+        if (id > last) {
+            return id;
+        }
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+TEST(CheckpointCompletion, PersistentCheckpointFailureFailsTheJobInsteadOfCrashlooping) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ckpt_breaker_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.checkpoint_failure_restart_limit = 3;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"w"});
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    ckpt.interval_ms = 100;
+    ckpt.max_restarts_on_worker_loss = 100000;  // the budget must NOT be the bound
+    const auto job_id = coordinator.submit_job(
+        two_subtask_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+
+    std::vector<std::pair<std::string, std::uint32_t>> tasks;
+    auto learn_deploy = [&]() -> bool {
+        auto deploy = w.await_frame(MessageKind::Deploy, 10s);
+        if (!deploy.has_value()) {
+            return false;
+        }
+        tasks.clear();
+        std::uint16_t fake_port = 46000;
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            tasks.emplace_back(t.role, t.subtask_idx);
+            if (!w.report_listening(job_id, t.role, t.subtask_idx, fake_port++)) {
+                return false;
+            }
+        }
+        return !tasks.empty();
+    };
+    ASSERT_TRUE(learn_deploy());
+
+    std::uint64_t last_ckpt = 0;
+    for (int cycle = 1; cycle <= 3; ++cycle) {
+        const auto id = await_trigger_above(w, last_ckpt);
+        ASSERT_TRUE(id.has_value()) << "no fresh trigger in cycle " << cycle;
+        last_ckpt = *id;
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, *id, role, sub, /*ok=*/false));
+        }
+        // Every failure cancels the deployment: the first two to drain for
+        // a restart, the third - the breaker - to fail the job.
+        ASSERT_TRUE(w.await_frame(MessageKind::CancelJob, 10s).has_value())
+            << "no cancel after failure " << cycle;
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.send_finished(job_id, role, sub));
+        }
+        if (cycle < 3) {
+            ASSERT_TRUE(learn_deploy()) << "no redeploy after failure " << cycle;
+        }
+    }
+
+    EXPECT_TRUE(coordinator.await_job_completion(job_id, 10s))
+        << "three consecutive failure-restarts and the job is still going: the crashloop "
+           "has no circuit-breaker (item 77b)";
+    const auto errors = coordinator.job_errors(job_id);
+    bool named = false;
+    for (const auto& e : errors) {
+        named =
+            named || e.find("consecutive restarts from failed checkpoints") != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the failure does not carry the persistent-cause verdict";
+
+    w.close();
+    coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// The other half of "consecutive": one completed checkpoint proves the
+// cause was transient and must reset the count, or a long-lived job
+// accumulates unrelated transients into a spurious failure.
+TEST(CheckpointCompletion, ACompletedCheckpointResetsTheFailureRestartCount) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ckpt_breaker_reset_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.checkpoint_failure_restart_limit = 3;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"w"});
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    ckpt.interval_ms = 100;
+    ckpt.max_restarts_on_worker_loss = 100000;
+    const auto job_id = coordinator.submit_job(
+        two_subtask_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+
+    std::vector<std::pair<std::string, std::uint32_t>> tasks;
+    auto learn_deploy = [&]() -> bool {
+        auto deploy = w.await_frame(MessageKind::Deploy, 10s);
+        if (!deploy.has_value()) {
+            return false;
+        }
+        tasks.clear();
+        std::uint16_t fake_port = 47000;
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            tasks.emplace_back(t.role, t.subtask_idx);
+            if (!w.report_listening(job_id, t.role, t.subtask_idx, fake_port++)) {
+                return false;
+            }
+        }
+        return !tasks.empty();
+    };
+    ASSERT_TRUE(learn_deploy());
+
+    std::uint64_t last_ckpt = 0;
+    auto fail_one_cycle = [&](int label) {
+        const auto id = await_trigger_above(w, last_ckpt);
+        ASSERT_TRUE(id.has_value()) << "no fresh trigger at step " << label;
+        last_ckpt = *id;
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, *id, role, sub, /*ok=*/false));
+        }
+        ASSERT_TRUE(w.await_frame(MessageKind::CancelJob, 10s).has_value());
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.send_finished(job_id, role, sub));
+        }
+        ASSERT_TRUE(learn_deploy()) << "no redeploy at step " << label;
+    };
+
+    // Two failures (limit is three), then one SUCCESS, then two more
+    // failures. Without the reset this is four consecutive and the job
+    // dies at the fourth; with it, the count stands at two.
+    fail_one_cycle(1);
+    fail_one_cycle(2);
+    {
+        const auto id = await_trigger_above(w, last_ckpt);
+        ASSERT_TRUE(id.has_value());
+        last_ckpt = *id;
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, *id, role, sub, /*ok=*/true));
+        }
+        ASSERT_TRUE(ckpt_await([&] {
+            return coordinator.latest_completed_checkpoint(job_id) >= last_ckpt;
+        })) << "the healthy checkpoint never completed; the reset premise is gone";
+    }
+    fail_one_cycle(3);
+    fail_one_cycle(4);
+
+    EXPECT_FALSE(coordinator.await_job_completion(job_id, 2s))
+        << "the job died after two-fail/success/two-fail: a completed checkpoint did not "
+           "reset the consecutive count, so unrelated transients accumulate into a "
+           "spurious failure";
+
+    (void)coordinator.cancel_job(job_id);
+    for (const auto& [role, sub] : tasks) {
+        (void)w.send_finished(job_id, role, sub);
+    }
+    (void)coordinator.await_job_completion(job_id, 10s);
+    w.close();
+    coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
