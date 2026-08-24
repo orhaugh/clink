@@ -2802,6 +2802,19 @@ void Worker::run_generic_subtask_(JobId job_id,
                     m.error = std::move(error);
                     send_frame_(encode_frame(MessageKind::SubtaskCheckpointed, m));
                 },
+            // Checkpoint-retention registration, exactly as the single-op
+            // path wires it. This was MISSING here, and the omission is
+            // followups item 77a: every chain task's snapshot directory
+            // was never purged - the SQL pipelines' interior operators all
+            // run as chains, so five campaigns' state trees quietly held
+            // every checkpoint since 1, and QUAL-09's bounded state volume
+            // turned that into ENOSPC and a restart crashloop in 40
+            // minutes.
+            .register_checkpoint_backend =
+                [this, job_id, sub = task.subtask_idx](std::shared_ptr<StateBackend> backend) {
+                    std::lock_guard lock(mu_);
+                    per_job_backends_[job_id][sub] = std::move(backend);
+                },
             .runner_role = task.role,
         };
         LocalExecutor exec(std::move(dag), clink::plugin::detail::make_subtask_job_config(rctx));
@@ -2827,6 +2840,16 @@ void Worker::run_generic_subtask_(JobId job_id,
                 it->second.erase(task.subtask_idx);
                 if (it->second.empty()) {
                     per_job_aborters_.erase(it);
+                }
+            }
+            // Drop the retention backend handle too (mirrors the single-op
+            // path): a late CommitCheckpoint must not purge through a
+            // backend whose task has exited, and the map must not grow
+            // across the restarts a long campaign accumulates.
+            if (auto it = per_job_backends_.find(job_id); it != per_job_backends_.end()) {
+                it->second.erase(task.subtask_idx);
+                if (it->second.empty()) {
+                    per_job_backends_.erase(it);
                 }
             }
         }
