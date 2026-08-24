@@ -97,6 +97,7 @@ nav:
       - qualification/qual-05-ttl-steady-state.md
       - qualification/qual-06-dag-scaling.md
       - qualification/qual-08-rolling-upgrade.md
+      - qualification/qual-09-infrastructure-faults.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md
