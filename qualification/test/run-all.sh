@@ -119,6 +119,11 @@ run "QUAL-09 driver parses" \
 run "QUAL-09 summariser result logic (engagement gates; the environment split)" \
     python3 "$HERE/test_summarise9.py"
 
+# QUAL-07's comparator is its false-pass surface: every normalisation
+# rule needs a negative case or a mutation passes everything silently.
+run "QUAL-07 comparator (each rule maps only true equivalents)" \
+    python3 "$HERE/test_semantic_normaliser.py"
+
 # The upgrade-campaign essence: every failure of the savepoint -> swap ->
 # restore sequence is a FAIL of the campaign's subject, never an
 # infrastructure inconclusive - and a same-image run must be labelled a
