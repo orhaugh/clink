@@ -19,7 +19,10 @@
 //                        REFUSE this .so; a check that approves it
 //                        approves anything.
 //
-// Pipeline: Kafka JSON events {"k":"...","amount":N,...} -> key by k ->
+// Pipeline: Kafka JSON events {"k":N,"amount":N,"ts":N,...} - the SHARED
+// qualification generator's payload, so the campaign inherits its exact
+// deterministic oracle (key and amount are pure functions of partition
+// and sequence) - keyed by k ->
 // keyed process folding AccountState (count += 1, sum += amount; v2 also
 // folds vmin/vmax) -> per-event JSON emit -> Kafka sink. The sink stream
 // is an update stream (one row per event, last-per-key = the key's final
@@ -125,17 +128,6 @@ clink::Codec<AccountState> account_state_codec() {
 
 // --- tiny JSON field readers (inputs are the generator's flat objects) ------
 
-std::string json_string_field(const std::string& s, const std::string& key) {
-    const auto k = "\"" + key + "\":\"";
-    const auto p = s.find(k);
-    if (p == std::string::npos) {
-        return {};
-    }
-    const auto start = p + k.size();
-    const auto end = s.find('"', start);
-    return end == std::string::npos ? std::string{} : s.substr(start, end - start);
-}
-
 std::int64_t json_int_field(const std::string& s, const std::string& key) {
     const auto k = "\"" + key + "\":";
     const auto p = s.find(k);
@@ -145,37 +137,27 @@ std::int64_t json_int_field(const std::string& s, const std::string& key) {
     return std::strtoll(s.c_str() + p + k.size(), nullptr, 10);
 }
 
-// FNV-1a over the account key: the routing hash, stable across variants.
-std::int64_t route_hash(const std::string& k) {
-    std::uint64_t h = 1469598103934665603ULL;
-    for (const char ch : k) {
-        h ^= static_cast<std::uint8_t>(ch);
-        h *= 1099511628211ULL;
-    }
-    return static_cast<std::int64_t>(h);
-}
-
 // --- the keyed fold -----------------------------------------------------------
 
 class AccountFold final
     : public clink::KeyedProcessFunction<std::int64_t, std::string, std::string> {
 public:
     void open(clink::RuntimeContext& ctx) override {
-        accounts_ = std::make_unique<clink::KeyedState<std::string, AccountState>>(
-            ctx.keyed_state<std::string, AccountState>(
-                "account_state", clink::string_codec(), account_state_codec()));
-        events_ = std::make_unique<clink::KeyedState<std::string, std::int64_t>>(
-            ctx.keyed_state<std::string, std::int64_t>(
-                "event_counter", clink::string_codec(), clink::int64_codec()));
+        accounts_ = std::make_unique<clink::KeyedState<std::int64_t, AccountState>>(
+            ctx.keyed_state<std::int64_t, AccountState>(
+                "account_state", clink::int64_codec(), account_state_codec()));
+        events_ = std::make_unique<clink::KeyedState<std::int64_t, std::int64_t>>(
+            ctx.keyed_state<std::int64_t, std::int64_t>(
+                "event_counter", clink::int64_codec(), clink::int64_codec()));
     }
 
     void process_element(const std::string& line,
                          clink::ProcessFunctionContext<std::string>& /*ctx*/,
                          clink::Collector<std::string>& out) override {
-        const auto key = json_string_field(line, "k");
-        if (key.empty()) {
+        if (line.find("\"k\":") == std::string::npos) {
             return;  // not a data record; the generator never emits these
         }
+        const auto key = json_int_field(line, "k");
         const auto amount = json_int_field(line, "amount");
         auto st = accounts_->get(key).value_or(AccountState{});
         st.count += 1;
@@ -187,7 +169,7 @@ public:
         accounts_->put(key, st);
         events_->put(key, events_->get(key).value_or(0) + 1);
 
-        std::string row = "{\"k\":\"" + key + "\",\"n\":" + std::to_string(st.count) +
+        std::string row = "{\"k\":" + std::to_string(key) + ",\"n\":" + std::to_string(st.count) +
                           ",\"sum\":" + std::to_string(st.sum);
 #ifdef QUAL11_SCHEMA_V2
         // The empty-range sentinels never reach the sink: a key is only
@@ -203,8 +185,8 @@ public:
     std::string name() const override { return "account_fold"; }
 
 private:
-    std::unique_ptr<clink::KeyedState<std::string, AccountState>> accounts_;
-    std::unique_ptr<clink::KeyedState<std::string, std::int64_t>> events_;
+    std::unique_ptr<clink::KeyedState<std::int64_t, AccountState>> accounts_;
+    std::unique_ptr<clink::KeyedState<std::int64_t, std::int64_t>> events_;
 };
 
 // --- the job -----------------------------------------------------------------
@@ -248,7 +230,10 @@ void define_job(clink::api::Pipeline& pipeline) {
     auto sink = clink::api::KafkaTextSink::builder().brokers(brokers).topic("qual11_out").build();
 
     pipeline.source<std::string>(source, "qual11-source")
-        .key_by([](const std::string& line) { return route_hash(json_string_field(line, "k")); })
+        // Route by the account key itself: the keyed state is keyed by k,
+        // so routing must partition on k or a subtask would hold state for
+        // keys it never sees again after a rescale.
+        .key_by([](const std::string& line) { return json_int_field(line, "k"); })
         .process<std::string>(std::make_shared<AccountFold>(), "account-fold")
         .uid("account-agg")
         .sink(sink, "qual11-sink");
