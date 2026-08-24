@@ -51,6 +51,10 @@ on:
         description: "Bake in the ForSt state backend (forst:// and the forst_s3 schemes). Adds ~5-8 min and publishes -forst suffixed tags."
         type: boolean
         default: false
+      qual11_jobs:
+        description: "Bake in QUAL-11's schema-evolution job plugins (campaign fixtures). Publishes -qual11 suffixed tags: a shipped image must never carry campaign fixtures silently."
+        type: boolean
+        default: false
       fault_injection:
         description: "Compile in the named fault points (2PC crash windows) for a qualification campaign. Publishes -faultinj suffixed tags: a shipped image must never gain a fault surface silently."
         type: boolean
@@ -118,6 +122,10 @@ jobs:
           # SILENT no-op, so the surface has to be visible in the tag - and
           # the tag must never be one a deployment pulls blindly.
           if [ "${{ inputs.fault_injection }}" = "true" ]; then suffix="${suffix}-faultinj"; fi
+          # Same rule as the fault surface: campaign fixtures are visible
+          # in the tag, never silently present in an image a deployment
+          # might pull.
+          if [ "${{ inputs.qual11_jobs }}" = "true" ]; then suffix="${suffix}-qual11"; fi
           short="$(echo "${GITHUB_SHA}" | cut -c1-12)"
           tags="${IMAGE}:sha-${short}${suffix}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
@@ -141,6 +149,7 @@ jobs:
             CLINK_WITH_FORST=${{ inputs.with_forst == true && 'ON' || 'OFF' }}
             CLINK_ISA_BASELINE=${{ inputs.isa_baseline }}
             CLINK_ENABLE_FAULT_INJECTION=${{ inputs.fault_injection == true && 'ON' || 'OFF' }}
+            CLINK_BUILD_QUAL11_JOBS=${{ inputs.qual11_jobs == true && 'ON' || 'OFF' }}
             CLINK_GIT_SHA=${{ github.sha }}
           tags: ${{ steps.tags.outputs.tags }}
           labels: |
