@@ -116,6 +116,11 @@ def main():
     # order the broker holds it, which is the order last-write-wins resolves.
     ap.add_argument("--raw", action="store_true",
                     help="dump every message as partition/offset/key/value, in order")
+    ap.add_argument("--values", action="store_true",
+                    help="dump every message VALUE as one line, in per-partition "
+                         "offset order - the drain for an APPEND topic, where no "
+                         "reduction applies. An empty value prints as 'null' so a "
+                         "content comparison fails loudly instead of skipping it.")
     ap.add_argument("--key", default=None,
                     help="with --raw, only messages whose key contains this substring")
     ap.add_argument("--timeout", type=float, default=20.0)
@@ -126,6 +131,13 @@ def main():
     except Exception as e:  # noqa: BLE001 - the caller only needs the reason
         print(json.dumps({"error": str(e), "topic": args.topic}))
         return 1
+    if args.values:
+        for _, _, _, value in msgs:
+            if value is None or len(value) == 0:
+                print("null")
+            else:
+                print(value.decode("utf-8", "replace"))
+        return 0
     if args.raw:
         for part, off, key, value in msgs:
             k = key.decode("utf-8", "replace") if key is not None else "<null>"

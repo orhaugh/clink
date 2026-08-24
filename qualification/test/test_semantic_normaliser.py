@@ -157,6 +157,36 @@ check("tolerance never leaks onto undeclared fields", not eq, why)
 eq, why = cmp_files(['{"k":1}'], ['{"k":1}', '{"k":2}'], mode="append")
 check("a count mismatch is named", not eq and "row-count mismatch" in why, why)
 
+# --- judge: nothing proven must never read as agreement -------------------------
+import judge  # noqa: E402
+
+
+def run_judge(a_lines, b_lines, decl, reason=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        a = pathlib.Path(tmp) / "a"
+        b = pathlib.Path(tmp) / "b"
+        a.write_text("\n".join(a_lines) + "\n" if a_lines else "")
+        b.write_text("\n".join(b_lines) + "\n" if b_lines else "")
+        return judge.judge("qx", decl, str(a), str(b), reason)
+
+
+APPEND = {"mode": "append"}
+v = run_judge(['{"k":1}'], ['{"k":1}'], APPEND)
+check("judge: agreement is gated and equal", v["gated"] and v["equal"], v["detail"])
+v = run_judge(['{"k":1}'], ['{"k":2}'], APPEND)
+check("judge: a divergence is gated and NOT equal", v["gated"] and not v["equal"], v["detail"])
+v = run_judge([], [], APPEND)
+check("judge: two empty sides are NOT gated (0 == 0 proves nothing)",
+      not v["gated"] and not v["equal"], v["detail"])
+v = run_judge(['{"k":1}'], [], APPEND)
+check("judge: one empty side is NOT gated", not v["gated"], v["detail"])
+v = run_judge(['{"k":1}'], ['{"k":1}'], APPEND, reason="clink submit failed")
+check("judge: a run-level failure is recorded and never equal",
+      not v["gated"] and not v["equal"] and "submit failed" in v["detail"], v["detail"])
+v = run_judge(['{"k":1}', 'garbage'], ['{"k":1}'], APPEND)
+check("judge: a corrupt drain refuses rather than passes",
+      not v["gated"] and "refused" in v["detail"], v["detail"])
+
 # --- the classification cannot drift from the query definitions -----------------
 # queries.json declares HOW each query is judged; gen_queries.py declares
 # WHAT each query is. A query added to one and not the other, a
