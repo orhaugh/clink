@@ -121,14 +121,20 @@ def build(out_dir, run_id, local):
     # verifier's header). Fabricated keys and malformed rows still are.
     clean = fabricated == 0 and malformed == 0
 
-    # --- gate 4: the migration's effect ------------------------------------
-    across = int(verify.get("keys_across_boundary", 0) or 0)
-    carried = int(verify.get("keys_carried", 0) or 0)
-    reset = int(verify.get("keys_reset", 0) or 0)
-    effect_ok = int(verify.get("migration_effect_ok", 0) or 0)
-    effect_bad = int(verify.get("migration_effect_bad", 0) or 0)
-    gate4_evidence = across > 0
-    gate4_ok = gate4_evidence and reset == 0 and effect_bad == 0 and carried > 0 and effect_ok > 0
+    # --- gate 4: the migration's effect, read from the STATE ----------------
+    # From the savepoints, not the output stream: the sink is
+    # at-least-once and buffers, so an unrelated fault can destroy the
+    # stream-side evidence while the engine behaves perfectly (it did).
+    effect = read_json(os.path.join(out_dir, "q11-effect.json"))
+    have_effect = bool(effect) and "error" not in effect
+    carried = int(effect.get("carried", 0) or 0)
+    lost = int(effect.get("lost", 0) or 0)
+    untouched = int(effect.get("untouched", 0) or 0)
+    predicted_ok = int(effect.get("predicted_ok", 0) or 0)
+    predicted_bad = int(effect.get("predicted_bad", 0) or 0)
+    gate4_evidence = have_effect and carried + lost > 0
+    gate4_ok = (gate4_evidence and lost == 0 and predicted_bad == 0
+                and carried > 0 and predicted_ok > 0)
 
     gaps = [f for f in MANDATORY_FAULTS if faults.get(f, 0) == 0]
 
@@ -137,7 +143,7 @@ def build(out_dir, run_id, local):
         or job_gone
         or (have_verify and not clean)
         or (have_verify and caught_up and not exact)
-        or (gate4_evidence and (reset > 0 or effect_bad > 0))
+        or (gate4_evidence and (lost > 0 or predicted_bad > 0))
     )
     if hard_fail:
         result = "FAIL"
@@ -181,17 +187,20 @@ def build(out_dir, run_id, local):
     a(f"- re-emitted rows (expected under at-least-once + replay): {duplicates};"
       f" malformed rows: {malformed}")
     a("")
-    a("## The migration's effect")
+    a("## The migration's effect (read from the savepoints)")
     a("")
     if not gate4_evidence:
-        a("- NO KEYS OBSERVED ACROSS THE BOUNDARY - the migration has no evidence")
+        a("- NO STATE EVIDENCE - the migration's effect was not measured")
     else:
-        a(f"- keys living across the boundary: {across}")
-        a(f"- counts carried: {carried}; RESET (state loss): {reset}")
-        a(f"- migrated range fields matching the prediction: {effect_ok}; "
-          f"NOT matching: {effect_bad}")
-    for s in verify.get("samples", [])[:5]:
-        a(f"  - sample: {json.dumps(s)}")
+        a(f"- keys carried across the boundary: {carried}; LOST: {lost}")
+        a(f"- keys still untouched after the restore: {untouched}")
+        a(f"- untouched keys holding the migration's exact predicted output: "
+          f"{predicted_ok}; NOT holding it: {predicted_bad}")
+        if untouched == 0:
+            a("  - no untouched key survived to the second savepoint, so the")
+            a("    predicted-output half has no evidence")
+    for smp in effect.get("samples", [])[:5]:
+        a(f"  - sample: {json.dumps(smp)}")
     a("")
     a("## Faults applied (on the migrated engine)")
     a("")

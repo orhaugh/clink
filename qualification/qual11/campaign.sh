@@ -490,6 +490,41 @@ fi
 write_boundary yes "$CHECK_V2" "$CHECK_BROKEN" yes yes
 echo "campaign: migrated job $JOB_ID RUNNING in ${RESTORE_S}s"
 
+# --- gate 4's evidence: the migrated STATE, before the battery -----------------
+# Read from the savepoints, not the output stream. The sink is
+# at-least-once and buffers, so the obvious signal (the first
+# post-boundary row showing the seeded sentinels collapse) can be
+# destroyed by any unrelated fault - qual11-local-e proved that, losing
+# the evidence to a worker kill while the engine behaved perfectly.
+# A second savepoint here captures the migrated state while some keys are
+# still untouched, which is what makes the migration's exact output
+# checkable.
+cw=0
+while [ "$cw" -lt "$DEPLOY_TIMEOUT_S" ]; do
+    [ "$(ckpt_id "$JOB_ID")" -ge 1 ] && break
+    sleep 5; cw=$(( cw + 5 ))
+done
+SP2_OUT=$(on_host "$COORD_PUB" "docker exec clink-coordinator clink savepoint \
+    --job-id=$JOB_ID --timeout-s=$SAVEPOINT_TIMEOUT_S" 2>&1 | tr -d '\r') || true
+echo "$SP2_OUT" > "$OUT_DIR/savepoint-v2.txt"
+SP2_DIR=$(echo "$SP2_OUT" | sed -n 's/.*dir=\([^ ]*\).*/\1/p' | head -1 | tr -d '"')
+SP2_ID=$(echo "$SP2_OUT" | sed -n 's/.*id=\([0-9]*\).*/\1/p' | head -1)
+if [ -n "$SP2_DIR" ] && [ -n "$SP2_ID" ]; then
+    SNAP2=$(on_host "$OPS_PUB" "find '$SP2_DIR' -name 'checkpoint-${SP2_ID}.snap' | head -1" | tr -d '\r')
+    for pair in "v1:$SNAP_ONE" "v2:$SNAP2"; do
+        tag="${pair%%:*}"; snap="${pair#*:}"
+        [ -n "$snap" ] || continue
+        on_host "$COORD_PUB" "docker exec clink-coordinator clink state-cat \
+            --file='$snap' --json --max-rows=0" > "$OUT_DIR/state-$tag.json" 2>/dev/null || true
+    done
+    python3 "$HERE/migration_effect.py" --v1-dump "$OUT_DIR/state-v1.json" \
+        --v2-dump "$OUT_DIR/state-v2.json" --out "$OUT_DIR/q11-effect.json" \
+        > "$OUT_DIR/effect.log" 2>&1 || true
+    echo "campaign: migration-effect evidence captured"
+else
+    echo "campaign: WARNING - no post-restore savepoint; gate 4 has no state evidence" >&2
+fi
+
 # --- battery on the MIGRATED job ----------------------------------------------
 to_host "$OPS_PUB" "$OUT_DIR/inventory.json" /qual/inventory.json
 # Flags INLINE, not via a variable: the harness's chaos-interface drift

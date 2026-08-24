@@ -241,9 +241,14 @@ def main():
                 samples.append({"k": key, "vmin": vmin, "vmax": vmax,
                                 "why": "migrated range fields are not the predicted "
                                        "single-amount collapse"})
-    result.update(keys_across_boundary=carried + reset, keys_carried=carried,
-                  keys_reset=reset, migration_effect_ok=effect_ok,
-                  migration_effect_bad=effect_bad, samples=samples)
+    # Reported, not judged: gate 4 reads the STATE (migration_effect.py),
+    # because this stream-side view can be erased by an unrelated fault -
+    # an at-least-once sink's buffer discarded by a worker kill takes the
+    # first post-boundary rows with it, which is exactly what happened on
+    # qual11-local-e while the engine behaved correctly.
+    result.update(keys_across_boundary=carried + reset, keys_continued=carried,
+                  keys_restarted=reset, first_row_sentinel_collapse=effect_ok,
+                  samples=samples)
 
     with open(args.out, "w") as fh:
         json.dump(result, fh, indent=1)

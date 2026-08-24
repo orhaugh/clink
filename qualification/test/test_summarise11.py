@@ -10,7 +10,7 @@ The shapes that matter for a SCHEMA-EVOLUTION campaign:
   * state loss wearing a healthy costume is fatal: a key whose count
     restarts at 1 after the boundary, or a migrated field that does not
     match the migration's predicted output;
-  * no keys across the boundary is no evidence, never a pass;
+  * no state evidence, or no untouched key, is no evidence - never a pass;
   * everything the earlier campaigns established carries over: one
     logical job, exactness only when caught up, invented keys fatal.
 """
@@ -28,10 +28,10 @@ def write_evidence(d, *, check_v2="pass", check_broken="refused", savepoint=True
                    restore=True, same_job=True, caught_up=True, quiesced=True,
                    keys=500, missing=0, wrong_n=0, wrong_sum=0, fabricated=0,
                    duplicates=0, malformed=0, rows=5000,
-                   across=400, carried=None, reset=0, effect_ok=None, effect_bad=0,
+                   carried=400, lost=0, untouched=50, predicted_ok=None, predicted_bad=0,
+                   effect=True,
                    verify=True, job_gone=False, faults=("worker_sigkill", "coordinator_restart")):
-    carried = across - reset if carried is None else carried
-    effect_ok = across - effect_bad if effect_ok is None else effect_ok
+    predicted_ok = untouched - predicted_bad if predicted_ok is None else predicted_ok
     (d / "boundary.txt").write_text(
         f"savepoint_ok={'yes' if savepoint else 'no'}\nsavepoint_id=42\nsavepoint_s=2\n"
         f"check_v2={check_v2}\ncheck_v2_broken={check_broken}\n"
@@ -44,9 +44,12 @@ def write_evidence(d, *, check_v2="pass", check_broken="refused", savepoint=True
             "topic": "qual11-out", "rows": rows, "malformed_rows": malformed,
             "duplicate_rows": duplicates, "keys_expected": keys, "keys_seen": keys,
             "keys_missing": missing, "keys_wrong_n": wrong_n, "keys_wrong_sum": wrong_sum,
-            "keys_fabricated": fabricated, "keys_across_boundary": across,
-            "keys_carried": carried, "keys_reset": reset,
-            "migration_effect_ok": effect_ok, "migration_effect_bad": effect_bad,
+            "keys_fabricated": fabricated, "samples": []}))
+    if effect:
+        (d / "q11-effect.json").write_text(json.dumps({
+            "slot": "account_state", "v1_keys": carried + lost, "v2_keys": carried,
+            "carried": carried, "lost": lost, "untouched": untouched,
+            "predicted_ok": predicted_ok, "predicted_bad": predicted_bad,
             "samples": []}))
     if job_gone:
         (d / "job-gone.txt").write_text("gone\n")
@@ -89,7 +92,7 @@ CASES = [
     ("a missing negative control is INCONCLUSIVE",
      {"check_broken": "missing"}, "INCONCLUSIVE"),
     ("an inert gate is a FAIL even when everything else is perfect",
-     {"check_broken": "accepted", "across": 400, "reset": 0}, "FAIL"),
+     {"check_broken": "accepted", "carried": 400, "lost": 0}, "FAIL"),
 
     # Gate 3: continuity and exactness.
     ("a second job id (a fresh start, not a restore) is INCONCLUSIVE",
@@ -109,13 +112,15 @@ CASES = [
     ("unquiesced is INCONCLUSIVE", {"quiesced": False}, "INCONCLUSIVE"),
     ("a vanished job is a FAIL", {"job_gone": True}, "FAIL"),
 
-    # Gate 4: the migration's effect.
-    ("a key whose count RESET across the boundary is a FAIL (state loss)",
-     {"reset": 1}, "FAIL"),
-    ("a migrated field not matching the prediction is a FAIL",
-     {"effect_bad": 1}, "FAIL"),
-    ("no keys across the boundary is INCONCLUSIVE (no evidence)",
-     {"across": 0, "carried": 0, "effect_ok": 0}, "INCONCLUSIVE"),
+    # Gate 4: the migration's effect, read from the savepoints.
+    ("a key LOST across the boundary is a FAIL (state loss)",
+     {"lost": 1}, "FAIL"),
+    ("an untouched key not holding the migration's predicted output is a FAIL",
+     {"predicted_bad": 1}, "FAIL"),
+    ("no state evidence at all is INCONCLUSIVE",
+     {"effect": False}, "INCONCLUSIVE"),
+    ("no untouched key means no predicted-output evidence: INCONCLUSIVE",
+     {"untouched": 0, "predicted_ok": 0}, "INCONCLUSIVE"),
 
     # Coverage.
     ("a missing mandatory fault is INCONCLUSIVE",
@@ -123,7 +128,7 @@ CASES = [
 
     # Precedence.
     ("state loss dominates a coverage gap (FAIL beats INCONCLUSIVE)",
-     {"reset": 1, "faults": ()}, "FAIL"),
+     {"lost": 1, "faults": ()}, "FAIL"),
 ]
 
 for name, kwargs, want in CASES:

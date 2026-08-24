@@ -141,6 +141,13 @@ run "QUAL-07 summariser result logic (coverage and drift gates)" \
 run "QUAL-11 driver parses" \
     bash -n "$HERE/../qual11/campaign.sh"
 
+# Gate 4 reads the migrated STATE rather than the output stream, because
+# the stream-side signal can be destroyed by an unrelated fault (an
+# at-least-once sink's buffer discarded by a worker kill). Every case is
+# a byte-level statement about what the migration wrote.
+run "QUAL-11 migration-effect gate (read from the savepoints)" \
+    python3 "$HERE/test_migration_effect.py"
+
 run "QUAL-11 summariser result logic (the four evolution gates)" \
     python3 "$HERE/test_summarise11.py"
 
