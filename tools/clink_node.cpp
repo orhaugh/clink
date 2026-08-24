@@ -45,6 +45,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/resource.h>
+
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/ha_coordinator.hpp"
 #include "clink/connectors/arrow_s3_lifecycle.hpp"
@@ -2893,6 +2895,34 @@ int run_worker(int argc, char** argv) {
         };
     }
 
+    // Say what the process's open-file budget IS, in the first lines of the
+    // log. A worker's fd appetite scales with deployed subtasks (per-edge
+    // listeners, bridge sockets, credit readers, state files), and the
+    // difference between a container's shell default (1,024 soft) and its
+    // hard limit (hundreds of thousands) was a two-campaign mystery: wide
+    // deploys died at ~776 subtasks with EMFILE while every local rig,
+    // whose dockerd hands out a million, was fine (followups item 72). An
+    // operator should meet this number here, not in a post-mortem.
+    {
+        struct rlimit nofile{};
+        if (::getrlimit(RLIMIT_NOFILE, &nofile) == 0) {
+            const auto soft = static_cast<unsigned long long>(nofile.rlim_cur);
+            const auto hard = static_cast<unsigned long long>(nofile.rlim_max);
+            clink::log::info(
+                "worker.limits",
+                "open-file limit: soft " + std::to_string(soft) + " hard " + std::to_string(hard));
+            if (soft < 65536) {
+                clink::log::warn(
+                    "worker.limits",
+                    "the soft open-file limit (" + std::to_string(soft) +
+                        ") is low for a worker: a wide job spends several descriptors per "
+                        "subtask on bridge sockets and state files, and accept() fails with "
+                        "EMFILE once it is spent. Raise the service or container nofile "
+                        "ulimit (the hard limit here is " +
+                        std::to_string(hard) + ").");
+            }
+        }
+    }
     WorkerSupervisor supervisor(worker_id, data_host, supervisor_cfg, std::move(discover));
 #ifdef CLINK_LINKED_TLS
     if (!tls_ca.empty()) {
