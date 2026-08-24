@@ -98,6 +98,22 @@ class Chaos:
         # must exclude it, or --ensure-coverage chases an unfireable point
         # and the summariser's required-coverage gate can never PASS.
         self.twopc_points = tuple(twopc_points) if twopc_points else self.TWOPC_POINTS
+        # Faults this ENVIRONMENT cannot apply (e.g. clock_step on the
+        # local rig, whose docker-in-docker hosts share one VM kernel - a
+        # step there steps every host at once). Skips are recorded, never
+        # silent, and the summariser's environment-split mandatory set is
+        # what keeps a skipped fault from weakening a cloud verdict.
+        self.skip_faults = set()
+        # How long partition_sustained holds. Must outlive the restart
+        # drain deadline so the full cycle runs (loss -> degraded restart
+        # -> heal -> re-register); the campaign passes it from the same
+        # value it configures the coordinator with.
+        self.sustained_partition_s = 420
+        # Outstanding revert commands, drained on ANY controller exit. A
+        # tc rule left behind is noise; a stepped clock or a filler file
+        # holding the state volume at ENOSPC poisons everything after it.
+        # Each infra fault registers its revert BEFORE applying the fault.
+        self.pending_reverts = []
         self._fault_surface = None
         # (host, container) -> the image it was first seen running, so a
         # restart that brings it back on a different build is caught.
@@ -172,6 +188,48 @@ class Chaos:
             f.write(json.dumps(entry) + "\n")
         print(f"chaos: {entry['fault']} -> {entry['target']} "
               f"(ckpt {checkpoint_id})", flush=True)
+
+    # --- revert registry ---------------------------------------------------
+
+    def register_revert_(self, host: dict, command: str, label: str):
+        self.pending_reverts.append((host, command, label))
+
+    def clear_revert_(self, label: str):
+        self.pending_reverts = [r for r in self.pending_reverts if r[2] != label]
+
+    def drain_reverts(self):
+        """Run every outstanding revert. Called from main's finally, so a
+        stop-file exit, an oracle-dirty stop, a signal or a crash all
+        leave the rig clean; a fault's own in-band revert clears its entry
+        first, making this a no-op on the healthy path."""
+        for host, command, label in self.pending_reverts:
+            try:
+                self.rig.ssh(host, command)
+                self.record(host["name"], "revert_drained", "exiting", 0,
+                            {"reverted": label})
+            except Exception as exc:  # noqa: BLE001 - draining must not stop
+                self.record(host["name"], "revert_failed", "exiting", 0,
+                            {"reverted": label, "error": str(exc)})
+        self.pending_reverts = []
+
+    def coordinator_metric_(self, name: str) -> float:
+        """Sum of a counter across the coordinator's /metrics, 0.0 when
+        unreachable - callers compare before/after, so an unreachable
+        scrape reads as 'no evidence', never as a crash."""
+        try:
+            with urllib.request.urlopen(
+                    f"{self.coordinator_url}/metrics", timeout=10) as r:
+                body = r.read().decode("utf-8", "replace")
+        except (urllib.error.URLError, OSError):
+            return 0.0
+        total = 0.0
+        for line in body.splitlines():
+            if line.startswith(name):
+                try:
+                    total += float(line.rsplit(None, 1)[-1])
+                except ValueError:
+                    pass
+        return total
 
     # --- faults ----------------------------------------------------------
 
@@ -362,6 +420,124 @@ class Chaos:
         time.sleep(dur)
         self.rig.ssh(host, f"iptables -D OUTPUT -d {coord_ip} -j DROP || true")
         self.record(host["name"], "partition_healed", "partitioned", ckpt)
+
+    def disk_pressure(self, state, ckpt):
+        """The state filesystem at ENOSPC: fill it with a named filler,
+        hold, release. The campaign mounts /qual/state from a BOUNDED
+        loopback image, so full means full of a sandbox - never the ops
+        host's root disk. ENGAGEMENT is the point (an infra fault that
+        never bit proves nothing): the record carries the free bytes
+        during the hold and the coordinator's failed-checkpoint counter
+        before and after, and the summariser refuses coverage credit for
+        a window in which no checkpoint even tried to fail."""
+        ops = self.rig.hosts("ops")[0]
+        dur = self.rng.uniform(60, 120)
+        filler = "/qual/state/.chaos-fill"
+        failed_before = self.coordinator_metric_("clink_ckpt_failed_total")
+        self.register_revert_(ops, f"rm -f {filler}; sync", "disk_pressure")
+        # dd runs until ENOSPC - the deterministic "fill whatever is left".
+        self.rig.ssh(ops, f"dd if=/dev/zero of={filler} bs=1M 2>/dev/null; sync; true")
+        avail = (self.rig.ssh(
+            ops, "df -B1 /qual/state | awk 'NR==2{print $4}'").stdout or "").strip()
+        self.record(ops["name"], "disk_pressure", state, ckpt,
+                    {"duration_s": round(dur, 1),
+                     "avail_bytes_during": avail,
+                     "ckpt_failed_before": failed_before})
+        time.sleep(dur)
+        self.rig.ssh(ops, f"rm -f {filler}; sync")
+        self.clear_revert_("disk_pressure")
+        failed_after = self.coordinator_metric_("clink_ckpt_failed_total")
+        self.record(ops["name"], "disk_pressure_released", "full", ckpt,
+                    {"ckpt_failed_before": failed_before,
+                     "ckpt_failed_after": failed_after,
+                     "engaged": failed_after > failed_before})
+
+    def partition_sustained(self, state, ckpt):
+        """A partition that outlives every recovery deadline, so the FULL
+        cycle runs: heartbeats lapse, the worker is declared lost, the job
+        restarts degraded on the survivors, the partition heals, the
+        worker re-registers and rejoins. The short partition fault tests
+        lease expiry; this one tests the return path - the machinery items
+        69 and 75 repaired."""
+        host = self.rng.choice(self.rig.hosts("worker"))
+        coord_ip = self.rig.hosts("coordinator")[0]["private_ip"]
+        dur = float(self.sustained_partition_s)
+        lost_before = self.coordinator_metric_("clink_coordinator_workers_lost_total")
+        self.register_revert_(
+            host, f"iptables -D OUTPUT -d {coord_ip} -j DROP || true", "partition_sustained")
+        self.rig.ssh(host, f"iptables -A OUTPUT -d {coord_ip} -j DROP")
+        self.record(host["name"], "partition_sustained", state, ckpt,
+                    {"duration_s": round(dur, 1), "workers_lost_before": lost_before})
+        time.sleep(dur)
+        self.rig.ssh(host, f"iptables -D OUTPUT -d {coord_ip} -j DROP || true")
+        self.clear_revert_("partition_sustained")
+        lost_after = self.coordinator_metric_("clink_coordinator_workers_lost_total")
+        # The return half: the healed worker must re-register. Bounded
+        # poll of the worker's own registration through its heartbeat
+        # reaching the coordinator - observable as the worker's http
+        # endpoint answering AND no fresh loss for it.
+        rejoined = False
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            res = self.rig.ssh(host, "docker ps --filter name=clink-worker --format up")
+            if "up" in (res.stdout or ""):
+                rejoined = True
+                break
+            time.sleep(10)
+        self.record(host["name"], "partition_sustained_healed", "partitioned", ckpt,
+                    {"workers_lost_before": lost_before,
+                     "workers_lost_after": lost_after,
+                     "engaged": lost_after > lost_before,
+                     "rejoined": rejoined})
+
+    def clock_step(self, state, ckpt):
+        """Step ONE worker host's realtime clock, hold, resync. The engine
+        is steady_clock-disciplined for every deadline, and the claim is
+        exactly that a stepped wall clock does not disturb correctness -
+        so the ENGAGEMENT evidence is the measured offset between the
+        stepped host and the ops host, not any engine symptom. RIG-ONLY:
+        the local rig's docker-in-docker hosts share one VM kernel, so
+        the campaign skips it there (recorded, and the summariser's
+        local mandatory set excludes it)."""
+        if "clock_step" in self.skip_faults:
+            self.record("controller", "clock_step_skipped", state, ckpt,
+                        {"note": "environment cannot isolate a realtime clock "
+                                 "step (shared kernel); cloud coverage only"})
+            return
+        host = self.rng.choice(self.rig.hosts("worker"))
+        ops = self.rig.hosts("ops")[0]
+        offset = self.rng.choice([-1, 1]) * self.rng.uniform(30, 120)
+
+        def measured_offset():
+            a = self.rig.ssh(host, "date +%s").stdout
+            b = self.rig.ssh(ops, "date +%s").stdout
+            try:
+                return int((a or "0").strip()) - int((b or "0").strip())
+            except ValueError:
+                return None
+
+        before = measured_offset()
+        resync = ("chronyc -a makestep 2>/dev/null || "
+                  "(systemctl restart systemd-timesyncd 2>/dev/null; sleep 5); true")
+        self.register_revert_(host, resync, "clock_step")
+        self.rig.ssh(host, f"date -s @$(( $(date +%s) + {int(offset)} )) >/dev/null")
+        during = measured_offset()
+        self.record(host["name"], "clock_step", state, ckpt,
+                    {"offset_s": int(offset),
+                     "measured_offset_before": before,
+                     "measured_offset_during": during,
+                     "engaged": during is not None and abs(during) >= 20})
+        time.sleep(60)
+        self.rig.ssh(host, resync)
+        # A resync that has nothing to sync against must not leave the
+        # clock stepped: fall back to the reverse arithmetic step.
+        after = measured_offset()
+        if after is None or abs(after) > 5:
+            self.rig.ssh(host, f"date -s @$(( $(date +%s) - {int(offset)} )) >/dev/null")
+            after = measured_offset()
+        self.clear_revert_("clock_step")
+        self.record(host["name"], "clock_restored", "stepped", ckpt,
+                    {"measured_offset_after": after})
 
     def broker_unavailable(self, state, ckpt):
         """Every broker down briefly: the source and the transactional
@@ -601,6 +777,14 @@ PROFILES = {
         ("twopc_window_fault", 5),
     ],
     "twopc": [("twopc_window_fault", 1)],
+    # QUAL-09: the infrastructure matrix, composed with the process-fault
+    # workhorses so a kill can land DURING pressure or a step (the
+    # interesting overlaps come from the dice, as ever).
+    "infra": [
+        ("kill_worker", 4), ("kill_coordinator", 2),
+        ("disk_pressure", 4), ("partition_sustained", 2), ("clock_step", 3),
+        ("network_latency", 1), ("twopc_window_fault", 2),
+    ],
 }
 
 
@@ -644,6 +828,17 @@ def mandatory_faults(twopc_points):
         "network_latency",
         "partition_worker_from_coordinator",
     )
+
+
+# QUAL-09's coverage: the infra faults ARE the campaign, so they follow
+# the verification-gated kill_worker directly; the process workhorses
+# close. partition_sustained sits last of the three because it is the
+# slowest (it must outlive the drain deadline), and a curtailed soak
+# should lose the slowest repetition, never the campaign's subject.
+def mandatory_faults_infra(twopc_points, skip):
+    base = ("kill_worker", "disk_pressure", "clock_step", "partition_sustained") + tuple(
+        f"twopc:{p}" for p in twopc_points) + ("kill_coordinator",)
+    return tuple(f for f in base if f not in skip)
 
 
 def main() -> int:
@@ -692,6 +887,18 @@ def main() -> int:
                          "cleared before exit. A file because the spawn "
                          "discipline starts this process with SIGINT "
                          "ignored; see qual01/verifier.py's docstring.")
+    ap.add_argument("--skip-faults", default="",
+                    help="comma-separated faults this ENVIRONMENT cannot "
+                         "apply (e.g. clock_step on the local rig, whose "
+                         "docker-in-docker hosts share one kernel). Each "
+                         "skip is recorded; the summariser's environment-"
+                         "split mandatory set decides what a PASS may lack.")
+    ap.add_argument("--sustained-partition-s", type=int, default=420,
+                    help="how long partition_sustained holds. Must outlive "
+                         "the coordinator's restart drain deadline so the "
+                         "full loss/degraded/heal/re-register cycle runs; "
+                         "pass it from the same value the campaign "
+                         "configures the coordinator with.")
     ap.add_argument("--ensure-coverage", action="store_true",
                     help="before the weighted-random loop, apply every "
                          "mandatory fault once in a fixed order, so a PASS "
@@ -705,9 +912,13 @@ def main() -> int:
     chaos = Chaos(rig, args.coordinator_url, args.job_id, args.log,
                   args.run_id, rng, twopc_points=twopc_points,
                   recovery_timeout_s=args.recovery_timeout_s)
+    chaos.skip_faults = set(f for f in args.skip_faults.split(",") if f)
+    chaos.sustained_partition_s = args.sustained_partition_s
 
     weighted = []
     for name, weight in PROFILES[args.profile]:
+        if name in chaos.skip_faults:
+            continue
         weighted.extend([name] * weight)
     # Campaign-specific extras recur through the soak, not only in the
     # coverage pre-pass: QUAL-02's pg_unavailable must keep composing with
@@ -729,19 +940,41 @@ def main() -> int:
         # down while a recovery needs it - which a 10-minute local soak
         # never reached while network_latency and a partition did.
         extra = tuple(f for f in args.extra_faults.split(",") if f)
-        base = mandatory_faults(chaos.twopc_points)
-        infra = ("kill_coordinator", "restart_broker", "network_latency",
-                 "partition_worker_from_coordinator")
-        head = tuple(f for f in base if f not in infra)
-        tail = tuple(f for f in base if f in infra)
-        for name in head + extra + tail:
-            schedule.append(name)
+        if args.profile == "infra":
+            for name in mandatory_faults_infra(chaos.twopc_points, chaos.skip_faults):
+                schedule.append(name)
+            for name in sorted(chaos.skip_faults):
+                chaos.record("controller", "fault_skipped", "scheduling", 0,
+                             {"skipped": name,
+                              "note": "excluded by --skip-faults for this environment"})
+        else:
+            base = mandatory_faults(chaos.twopc_points)
+            infra = ("kill_coordinator", "restart_broker", "network_latency",
+                     "partition_worker_from_coordinator")
+            head = tuple(f for f in base if f not in infra)
+            tail = tuple(f for f in base if f in infra)
+            for name in head + extra + tail:
+                schedule.append(name)
 
     started = time.time()
     last_ckpt = 0
     faults = 0
     consecutive_failures = 0
     stop_file = args.stop_file or (args.log + ".stop")
+    try:
+        return run_loop_(args, chaos, rng, weighted, schedule, started, stop_file)
+    finally:
+        # ANY exit - stop file, duration, oracle-dirty, five-failures,
+        # signal, crash - leaves the rig clean: a stepped clock or a
+        # filler holding the state volume at ENOSPC poisons everything
+        # after it, starting with the campaign's own drain phase.
+        chaos.drain_reverts()
+
+
+def run_loop_(args, chaos, rng, weighted, schedule, started, stop_file) -> int:
+    last_ckpt = 0
+    faults = 0
+    consecutive_failures = 0
     while True:
         if os.path.exists(stop_file):
             print("chaos: stop requested; finishing cleanly", flush=True)

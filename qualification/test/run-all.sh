@@ -105,6 +105,20 @@ run "QUAL-06 summariser result logic (a boundary is not a failure; a wrong width
 run "QUAL-08 driver parses" \
     bash -n "$HERE/../qual08/campaign.sh"
 
+# The infra faults are the first whose leftovers poison everything after
+# them: these pin the revert registry (drained on any exit), the loud
+# skip list, and the per-fault engagement evidence.
+run "QUAL-09 chaos controller (infra faults, reverts, skips, engagement)" \
+    python3 "$HERE/test_chaos_infra.py"
+
+run "QUAL-09 driver parses" \
+    bash -n "$HERE/../qual09/campaign.sh"
+
+# The infra-campaign essence: coverage credit requires engagement, the
+# environment split is loud, a failed revert is a dirty rig.
+run "QUAL-09 summariser result logic (engagement gates; the environment split)" \
+    python3 "$HERE/test_summarise9.py"
+
 # The upgrade-campaign essence: every failure of the savepoint -> swap ->
 # restore sequence is a FAIL of the campaign's subject, never an
 # infrastructure inconclusive - and a same-image run must be labelled a
