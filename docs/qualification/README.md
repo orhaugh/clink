@@ -29,6 +29,7 @@ Two rules govern what appears here:
 | Tens of GiB of keyed state on a disaggregated backend, every key correct under process, coordinator, broker and network faults | [QUAL-04](qual-04-large-keyed-state.md) | 23 August 2026, engine `6ba73b5` |
 | Bounded state through declared retention: an 8.3M-event run under faults holding a flat 67 MiB plateau with every key exact | [QUAL-05](qual-05-ttl-steady-state.md) | 23 August 2026, engine `bed138c` |
 | Wide job graphs: 147 operators as 292 network-bridged subtasks, exactly once under faults, with 28-second recovery from a worker kill at that width | [QUAL-06](qual-06-dag-scaling.md) | 24 August 2026, engine `3c7ffd1` |
+| A rolling engine upgrade (`bed138c` → `3c7ffd1`) with exactly-once continuity: 2s savepoint, 2s restore, 114s downtime, every event across the boundary counted once | [QUAL-08](qual-08-rolling-upgrade.md) | 24 August 2026 |
 
 ## Not yet campaigned
 
