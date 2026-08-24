@@ -1465,6 +1465,16 @@ foreach(_pair
     clink_set_warnings(${_bin})
 endforeach()
 
+# QUAL-11's schema-evolution plugin jobs (three .so variants from one
+# source). Off by default; the qualification image build enables it so
+# the jobs are built at exactly the image's engine revision (the plugin
+# ABI fingerprint is the git SHA). Added BEFORE tests/ so the
+# integration suite's if(TARGET ...) wiring can see the targets.
+option(CLINK_BUILD_QUAL11_JOBS "Build the QUAL-11 schema-evolution job plugins" OFF)
+if(CLINK_BUILD_QUAL11_JOBS)
+    add_subdirectory(qualification/qual11)
+endif()
+
 # ---------------------------------------------------------------------------
 # Core test suite. Per-impl tests live under impls/<x>/tests/.
 # ---------------------------------------------------------------------------
@@ -1504,14 +1514,6 @@ if(CLINK_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
-# QUAL-11's schema-evolution plugin jobs (three .so variants from one
-# source). Off by default; the qualification image build enables it so
-# the jobs are built at exactly the image's engine revision (the plugin
-# ABI fingerprint is the git SHA).
-option(CLINK_BUILD_QUAL11_JOBS "Build the QUAL-11 schema-evolution job plugins" OFF)
-if(CLINK_BUILD_QUAL11_JOBS)
-    add_subdirectory(qualification/qual11)
-endif()
 
 # ---------------------------------------------------------------------------
 # Benchmarks (placeholder; off by default)

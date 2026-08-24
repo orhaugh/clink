@@ -403,6 +403,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_coordinator_ha_failover.cpp
         integration/test_coordinator_rescale.cpp
         integration/test_schema_evo_check.cpp
+        integration/test_qual11_predeploy.cpp
         test_helpers/register_linked_impls.cpp
     )
     target_link_libraries(clink_integration_tests PRIVATE
@@ -512,6 +513,18 @@ if(CLINK_INTEGRATION_TESTS)
             add_dependencies(clink_integration_tests ${_job})
         endif()
     endforeach()
+    # QUAL-11's schema-evolution job variants (built only with
+    # -DCLINK_BUILD_QUAL11_JOBS=ON). Same staleness rule as above: when
+    # present they MUST be dependencies, or the ABI fingerprint (= git
+    # SHA) goes stale on the next commit and reads like a regression.
+    if(TARGET clink_qual11_job_v1)
+        target_compile_definitions(clink_integration_tests PRIVATE
+            CLINK_QUAL11_V1_PATH=\"$<TARGET_FILE:clink_qual11_job_v1>\"
+            CLINK_QUAL11_V2_PATH=\"$<TARGET_FILE:clink_qual11_job_v2>\"
+            CLINK_QUAL11_V2_BROKEN_PATH=\"$<TARGET_FILE:clink_qual11_job_v2_broken>\")
+        add_dependencies(clink_integration_tests
+            clink_qual11_job_v1 clink_qual11_job_v2 clink_qual11_job_v2_broken)
+    endif()
     clink_set_warnings(clink_integration_tests)
     # RESOURCE_LOCK on the whole integration binary, so ctest runs its cases one at a
     # time while every OTHER label still runs in parallel.

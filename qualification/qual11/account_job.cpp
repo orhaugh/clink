@@ -42,17 +42,18 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
-#include <optional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "clink/api/kafka_builders.hpp"
 #include "clink/api/pipeline.hpp"
-#include "clink/kafka/install.hpp"
+#include "clink/cluster/built_in_factories.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/job/register_job.hpp"
+#include "clink/kafka/install.hpp"
 #include "clink/operators/process_function.hpp"
 #include "clink/state/keyed_state.hpp"
 #include "clink/state/schema_version.hpp"
@@ -209,9 +210,11 @@ private:
 // --- the job -----------------------------------------------------------------
 
 void define_job(clink::api::Pipeline& pipeline) {
-    // The .so is dlopened RTLD_LOCAL with clink statically linked, so the
-    // kafka factories must be installed into THIS job's registry - the
-    // host's registrations are a different instance.
+    // The .so is dlopened RTLD_LOCAL with clink statically linked, so
+    // every registration must land in THIS .so's instances: the built-in
+    // channel types (std::string for the source/sink lines) and the kafka
+    // factories both - the host's registrations are different objects.
+    clink::cluster::ensure_built_ins_registered();
     clink::kafka::install(pipeline.registry());
 #ifdef QUAL11_SCHEMA_V2
     constexpr std::uint32_t kAccountVersion = 2;
@@ -242,8 +245,7 @@ void define_job(clink::api::Pipeline& pipeline) {
                       .group_id("qual11-job")
                       .auto_offset_reset("earliest")
                       .build();
-    auto sink =
-        clink::api::KafkaTextSink::builder().brokers(brokers).topic("qual11_out").build();
+    auto sink = clink::api::KafkaTextSink::builder().brokers(brokers).topic("qual11_out").build();
 
     pipeline.source<std::string>(source, "qual11-source")
         .key_by([](const std::string& line) { return route_hash(json_string_field(line, "k")); })
