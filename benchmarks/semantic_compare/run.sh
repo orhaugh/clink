@@ -111,9 +111,14 @@ slots=$(( PAR * 12 )); [ "$slots" -lt 8 ] && slots=8
     >"$RESULTS/clink-coordinator.log" 2>&1 &
 CLINK_PIDS+=($!)
 sleep 2
+# Each worker gets a DISTINCT --http-port: the /jobs/:id/operators
+# endpoint the settle loop polls aggregates by SCRAPING every worker's
+# http server, and a worker without one contributes nothing - the sum
+# reads 0 forever and every query lands NOT GATED "never settled".
 for i in 1 2 3 4; do
     "$BUILD_DIR/clink_node" --role=worker --coordinator-host=127.0.0.1 \
         --coordinator-port=$COORD_PORT --id=worker-$i --slots="$slots" \
+        --http-port=$(( JM_HTTP + i )) \
         >"$RESULTS/clink-worker-$i.log" 2>&1 &
     CLINK_PIDS+=($!)
 done
