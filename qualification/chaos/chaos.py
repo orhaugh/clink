@@ -517,9 +517,17 @@ class Chaos:
                 return None
 
         before = measured_offset()
-        resync = ("chronyc -a makestep 2>/dev/null || "
+        # Stop the time service for the hold window or the step never
+        # means anything: the campaign's first cloud run applied -47s and
+        # measured -1s one second later - systemd-timesyncd had already
+        # corrected it, and the engagement gate (correctly) refused the
+        # fault credit. Restarting the service IS the revert: it resyncs.
+        resync = ("systemctl start systemd-timesyncd 2>/dev/null; "
+                  "chronyc -a makestep 2>/dev/null || "
                   "(systemctl restart systemd-timesyncd 2>/dev/null; sleep 5); true")
         self.register_revert_(host, resync, "clock_step")
+        self.rig.ssh(host, "systemctl stop systemd-timesyncd 2>/dev/null; "
+                           "systemctl stop chrony 2>/dev/null; true")
         self.rig.ssh(host, f"date -s @$(( $(date +%s) + {int(offset)} )) >/dev/null")
         during = measured_offset()
         self.record(host["name"], "clock_step", state, ckpt,
