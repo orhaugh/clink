@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <signal.h>
@@ -70,7 +71,9 @@ std::filesystem::path canonical_job_path() {
 #endif
 }
 
-pid_t spawn_proc(const std::vector<std::string>& argv, const std::filesystem::path& binary_path) {
+pid_t spawn_proc(const std::vector<std::string>& argv,
+                 const std::filesystem::path& binary_path,
+                 const std::filesystem::path& stdout_path = {}) {
     std::vector<char*> raw_argv;
     raw_argv.reserve(argv.size() + 1);
     for (const auto& s : argv) {
@@ -78,8 +81,19 @@ pid_t spawn_proc(const std::vector<std::string>& argv, const std::filesystem::pa
     }
     raw_argv.push_back(nullptr);
     pid_t pid = -1;
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_t* actions_ptr = nullptr;
+    if (!stdout_path.empty()) {
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_addopen(
+            &actions, STDOUT_FILENO, stdout_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        actions_ptr = &actions;
+    }
     const auto rc =
-        posix_spawn(&pid, binary_path.c_str(), nullptr, nullptr, raw_argv.data(), environ);
+        posix_spawn(&pid, binary_path.c_str(), actions_ptr, nullptr, raw_argv.data(), environ);
+    if (actions_ptr != nullptr) {
+        posix_spawn_file_actions_destroy(&actions);
+    }
     return rc == 0 ? pid : -1;
 }
 
@@ -175,13 +189,16 @@ TEST(JobPluginE2E, CanonicalPipelineRunsAcrossSeparateProcesses) {
     ASSERT_TRUE(clink::itest::await_log_matches(coordinator_log, " slots=", 6))
         << "not all six workers registered with the coordinator";
 
+    const auto submit_out =
+        std::filesystem::temp_directory_path() / "clink_job_plugin_e2e_submit.out";
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
                                          "--coordinator-host=127.0.0.1",
                                          "--coordinator-port=" + std::to_string(coordinator_port),
                                          "--wait-timeout-s=30",
                                          "--name=canonical-pipeline-e2e"},
-                                        submit);
+                                        submit,
+                                        submit_out);
     ASSERT_GT(submit_pid, 0);
 
     int submit_exit = -1;
@@ -194,6 +211,20 @@ TEST(JobPluginE2E, CanonicalPipelineRunsAcrossSeparateProcesses) {
 
     ASSERT_TRUE(exited) << "clink_submit_job did not exit within 45s";
     EXPECT_EQ(submit_exit, 0) << "clink_submit_job exited non-zero (" << submit_exit << ")";
+
+    // The submit must report the JOB ID it created, machine-readably. The
+    // id is the handle for savepoint, cancel and status, and this was the
+    // one submission path that never printed it - which made a compiled
+    // job operationally second-class and blocked QUAL-11's driver until it
+    // was fixed.
+    {
+        std::ifstream in(submit_out);
+        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const auto pos = body.find("\"job_id\":");
+        ASSERT_NE(pos, std::string::npos) << "submit printed no machine-readable job_id: " << body;
+        const auto id = std::strtoull(body.c_str() + pos + 9, nullptr, 10);
+        EXPECT_GT(id, 0U) << "submit reported job_id 0: " << body;
+    }
 
     // The pipeline emits one int64 per (key, window) on EOS flush.
     // Inputs 1..5 -> *10 -> 10,20,30,40,50; filter >20 -> 30,40,50;

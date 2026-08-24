@@ -221,8 +221,17 @@ int clink_cmd_run(int argc, char** argv) {
 
     const auto result = submitter.submit(graph_json, {job_abs.string()}, opts);
 
-    std::cout << "submit: name=" << job_name << " completed=" << result.completed
-              << " ok=" << result.ok;
+    // Machine-readable first, matching what the SQL submit path emits (the
+    // coordinator's JSON reply, carrying job_id). Without this a compiled
+    // job was operationally second-class: the id is the handle for
+    // savepoint, cancel and status, and `clink run --job=...` was the one
+    // submission path that never told you what it was. It is printed even
+    // when the completion wait times out - a streaming job never completes,
+    // so that is exactly when the id is needed most.
+    std::cout << "{\"ok\":" << (result.ok ? "true" : "false") << ",\"job_id\":" << result.job_id
+              << ",\"completed\":" << (result.completed ? "true" : "false") << "}\n";
+    std::cout << "submit: name=" << job_name << " job_id=" << result.job_id
+              << " completed=" << result.completed << " ok=" << result.ok;
     if (!result.reject_message.empty()) {
         std::cout << " reject=" << result.reject_message;
     }

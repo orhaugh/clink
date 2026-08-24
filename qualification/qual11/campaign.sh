@@ -265,10 +265,30 @@ submit_job() {  # so-name, ckpt-dir, [restore-dir restore-id] -> prints job id
         --name=qual11 --parallelism=$PARTITIONS \
         --checkpoint-dir=$ckpt --checkpoint-interval-ms=$CHECKPOINT_INTERVAL_MS \
         --max-restarts-on-worker-loss=$MAX_RESTARTS \
-        --wait-timeout-s=120 $extra" 2>&1
+        --wait-timeout-s=0 $extra" 2>&1
 }
-parse_job_id() { grep -oE '"job_id"[: ]*[0-9]+|job[ _]id[= ]+[0-9]+' "$1" \
-    | grep -oE '[0-9]+' | head -1; }
+# --wait-timeout-s=0 above: the submitter's wait is for job COMPLETION, and
+# a streaming job never completes - waiting turns every submit into a
+# timeout that reads like a failure (it did, on the first local run). The
+# campaign waits for RUNNING via the coordinator's own status instead.
+#
+# The id comes from the machine-readable line the submitter prints
+# ({"ok":..,"job_id":N,..}), the same contract the SQL submit path has.
+parse_job_id() {
+    python3 -c "
+import json, sys
+jid = ''
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if line.startswith('{'):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get('job_id'):
+            jid = str(d['job_id'])
+print(jid)" "$1"
+}
 
 # --- generator ----------------------------------------------------------------
 on_host "$OPS_PUB" "mkdir -p /qual && rm -f /qual/progress.json /qual/progress.json.spec \
