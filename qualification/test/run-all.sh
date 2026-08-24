@@ -124,6 +124,16 @@ run "QUAL-09 summariser result logic (engagement gates; the environment split)" 
 run "QUAL-07 comparator (each rule maps only true equivalents)" \
     python3 "$HERE/test_semantic_normaliser.py"
 
+run "QUAL-07 runner parses" \
+    bash -n "$HERE/../../benchmarks/semantic_compare/run.sh"
+
+# The semantic-campaign essence: a divergence is the campaign working
+# (FAIL, named); anything short of full gated coverage - not-gated,
+# silent absence, undeclared verdict, declaration drift - is
+# INCONCLUSIVE, never PASS.
+run "QUAL-07 summariser result logic (coverage and drift gates)" \
+    python3 "$HERE/test_summarise7.py"
+
 # The upgrade-campaign essence: every failure of the savepoint -> swap ->
 # restore sequence is a FAIL of the campaign's subject, never an
 # infrastructure inconclusive - and a same-image run must be labelled a
