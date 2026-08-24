@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -655,9 +656,29 @@ private:
         CloseOnExit guard{local_channel_};
         peer_fd_ = NetworkSocket::accept_one(listener_fd_);
         if (peer_fd_ < 0) {
-            // accept woken by shutdown / destructor. CloseOnExit
-            // closes the channel; any local sink pushes still in the
-            // channel will drain before pop() returns nullopt.
+            const int err = errno;
+            // EBADF/EINVAL are the owner waking us for shutdown (the
+            // destructor closes or shuts down the listener while we block
+            // here): an orderly end. CloseOnExit closes the channel; any
+            // local sink pushes still in the channel drain before pop()
+            // returns nullopt. accept_one already retried the transient
+            // errnos (EINTR/ECONNABORTED), so anything ELSE here - file
+            // descriptor exhaustion above all - is a real failure, and
+            // returning silently would convert it into a clean
+            // end-of-stream: the task completes "ok" holding nothing, its
+            // upstream hits the dead connection as "peer gone", and the
+            // origin of the cascade never appears in any log (item 72's
+            // silent half). Fail loudly instead; the bridge source turns
+            // failure_reason() into a task failure.
+            if (err != EBADF && err != EINVAL) {
+                std::fprintf(stderr,
+                             "CLINK_NETWORK_CHANNEL_ACCEPT_FAILED port=%u errno=%d\n",
+                             static_cast<unsigned>(bound_port_.load()),
+                             err);
+                fail_((err == EMFILE || err == ENFILE)
+                          ? "accept failed: out of file descriptors"
+                          : "accept failed: unexpected socket error (errno on stderr)");
+            }
             return;
         }
         NetworkSocket::close(listener_fd_);

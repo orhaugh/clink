@@ -51,7 +51,28 @@ int NetworkSocket::connect_to(const std::string& host, std::uint16_t port) {
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     if (::connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-        ::close(fd);
+        // A blocking connect interrupted by a signal (EINTR) continues in
+        // the background and the socket's state is ambiguous; the portable
+        // recovery is a fresh socket and a fresh connect, bounded so a
+        // genuinely unreachable peer still fails promptly.
+        int attempts = 0;
+        while (errno == EINTR && attempts < 3) {
+            ::close(fd);
+            fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+            if (fd < 0) {
+                break;
+            }
+            int nd = 1;
+            ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+            if (::connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
+                ::freeaddrinfo(res);
+                return fd;
+            }
+            ++attempts;
+        }
+        if (fd >= 0) {
+            ::close(fd);
+        }
         ::freeaddrinfo(res);
         return -1;
     }
@@ -111,8 +132,27 @@ int NetworkSocket::listen_on(std::uint16_t& port, std::string_view bind_host) {
 int NetworkSocket::accept_one(int listener_fd) {
     sockaddr_in peer{};
     socklen_t len = sizeof(peer);
-    int fd = ::accept(listener_fd, reinterpret_cast<sockaddr*>(&peer), &len);
-    if (fd < 0) {
+    int fd = -1;
+    for (;;) {
+        fd = ::accept(listener_fd, reinterpret_cast<sockaddr*>(&peer), &len);
+        if (fd >= 0) {
+            break;
+        }
+        // EINTR (a signal landed while blocked) and ECONNABORTED (the
+        // pending connection died in the backlog before we reached it)
+        // are transients the next accept can succeed past - and at graph
+        // width they stop being rare: a wide deploy has hundreds of
+        // accepts in flight, one takes the transient, and treating it as
+        // terminal turned into a CLEAN end-of-stream for the task, whose
+        // upstream then hit the reset backlog connection as "peer gone"
+        // and a whole-job restart followed (QUAL-06, followups item 72:
+        // intermittent at ~292 deployed tasks, deterministic at ~1,160).
+        // Anything else - including EBADF/EINVAL from the owner closing
+        // the listener to wake us for shutdown - stays terminal, with
+        // errno preserved for the caller to classify.
+        if (errno == EINTR || errno == ECONNABORTED) {
+            continue;
+        }
         return -1;
     }
     int one = 1;

@@ -1,5 +1,8 @@
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -667,4 +670,54 @@ TEST(NetworkChannelFailure, TheBridgeSurfacesAFailedChannelAsATaskError) {
         },
         std::runtime_error);
     sender.join();
+}
+
+// accept_one must retry past a signal (EINTR) rather than treat it as
+// terminal. At graph width the treat-as-terminal path was item 72's silent
+// cascade origin: one interrupted accept read as an orderly shutdown, the
+// task saw a clean end-of-stream, and its upstream hit the reset backlog
+// connection as "peer gone" - a whole-job restart from a transient a retry
+// absorbs. The test parks a thread in accept_one, peppers it with a
+// handler-installed signal (no SA_RESTART, so the accept genuinely returns
+// EINTR), then connects; the accept must deliver the connection.
+namespace {
+void eintr_test_noop_handler(int) {}
+}  // namespace
+
+TEST(NetworkSocketAccept, ASignalInterruptedAcceptStillDeliversTheConnection) {
+    struct sigaction sa{};
+    sa.sa_handler = eintr_test_noop_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  // deliberately NOT SA_RESTART: accept must see EINTR
+    struct sigaction prev{};
+    ASSERT_EQ(::sigaction(SIGUSR1, &sa, &prev), 0);
+
+    std::uint16_t port = 0;
+    const int listener_fd = NetworkSocket::listen_on(port, "127.0.0.1");
+    ASSERT_GE(listener_fd, 0);
+
+    std::atomic<int> accepted{-2};
+    std::thread acceptor([&] { accepted.store(NetworkSocket::accept_one(listener_fd)); });
+
+    // Interrupt the blocked accept repeatedly across a window that
+    // comfortably covers the thread reaching accept(), then connect.
+    const auto native = acceptor.native_handle();
+    for (int i = 0; i < 20; ++i) {
+        ::pthread_kill(native, SIGUSR1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const int client_fd = NetworkSocket::connect_to("127.0.0.1", port);
+    ASSERT_GE(client_fd, 0);
+
+    acceptor.join();
+    EXPECT_GE(accepted.load(), 0)
+        << "an EINTR while blocked in accept was treated as terminal (item 72): the "
+           "connection that arrived moments later was never delivered";
+
+    if (accepted.load() >= 0) {
+        NetworkSocket::close(accepted.load());
+    }
+    NetworkSocket::close(client_fd);
+    NetworkSocket::close(listener_fd);
+    ::sigaction(SIGUSR1, &prev, nullptr);
 }
