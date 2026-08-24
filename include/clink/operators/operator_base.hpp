@@ -619,6 +619,18 @@ public:
     virtual void cancel() { cancelled_.store(true, std::memory_order_relaxed); }
     bool cancelled() const noexcept { return cancelled_.load(std::memory_order_relaxed); }
 
+    // True when the source stopped producing because of a CANCELLATION it
+    // observed - its own, or (for a relay like NetworkBridgeSource) its
+    // FEED closing by cancellation. The runner consults this at exit so a
+    // relay whose upstream worker was cancelled first closes its output
+    // Cancelled even though this task's own stop token has not flipped
+    // yet: reasons race per subtask, and one relay reading teardown as
+    // clean end-of-input lets downstream watermark alignment advance to
+    // end-of-time and fire every open window (followups item 79 - the
+    // residue QUAL-07's rerun caught after the first fix). Default: the
+    // source's own cancel flag.
+    [[nodiscard]] virtual bool exit_cancelled() const { return cancelled(); }
+
     // Boundedness contract (BATCH-1). A bounded source emits a finite stream:
     // produce() eventually returns false at genuine end-of-input rather than
     // blocking for more. The runtime uses this two ways:

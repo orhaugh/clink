@@ -614,6 +614,12 @@ public:
     // before they finish draining queued records.
     bool closed() const noexcept { return closed_; }
 
+    // True when the local channel closed by CANCELLATION - the peer's Close
+    // frame carried the cancelled bit, the peer vanished (bare EOF), or the
+    // owner tore this receiver down. A relay source forwards this at exit
+    // so teardown never reads as clean end-of-input downstream (item 79).
+    [[nodiscard]] bool close_cancelled() const { return local_channel_->close_cancelled(); }
+
     // Non-null once the recv thread hit unambiguous protocol corruption:
     // a truncated or oversized frame, an undecodable Arrow IPC payload, a
     // schema mismatch, or the retired legacy frame kind. The stream's

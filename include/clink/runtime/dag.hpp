@@ -614,8 +614,13 @@ public:
             }
             source->close();
             source->attach_runtime(nullptr);
-            channel->close(should_stop() ? ChannelCloseReason::Cancelled
-                                         : ChannelCloseReason::Finished);
+            // exit_cancelled() and not just should_stop(): a RELAY source's
+            // feed may have been cancelled on the sending worker before this
+            // task's own stop token flipped, and closing Finished here lets
+            // downstream alignment read teardown as end-of-input (item 79).
+            channel->close(should_stop() || source->exit_cancelled()
+                               ? ChannelCloseReason::Cancelled
+                               : ChannelCloseReason::Finished);
         };
         runner.cancel = [source, channel] {
             source->cancel();
@@ -3928,8 +3933,12 @@ public:
                 source->attach_runtime(nullptr);
                 // Close all downstream channels so consumers drain and
                 // exit; without this the parallel pipeline hangs forever
-                // after the source exhausts its records.
-                emitter->close_all();
+                // after the source exhausts its records. exit_cancelled()
+                // and not just should_stop(): a relay's feed may have been
+                // cancelled on the sending worker first (item 79).
+                emitter->close_all(should_stop() || source->exit_cancelled()
+                                       ? ChannelCloseReason::Cancelled
+                                       : ChannelCloseReason::Finished);
             };
             runner.cancel = [source, emitter] {
                 source->cancel();

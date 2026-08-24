@@ -183,6 +183,15 @@ public:
     // twice will throw the second time.
     std::uint16_t prepare_listen() { return channel_.listen(); }
 
+    // A relay ends for its FEED's reason, not just its own: the sending
+    // worker may be cancelled before this one's stop token flips, and the
+    // runner closing this relay's output as clean end-of-input would let
+    // downstream watermark alignment advance to end-of-time and fire every
+    // open window (item 79 - QUAL-07's rerun caught exactly this residue).
+    [[nodiscard]] bool exit_cancelled() const override {
+        return this->cancelled() || channel_.close_cancelled();
+    }
+
     void open() override {
         // Point the channel's per-operator byte counter at the operator this
         // bridge's received bytes belong to (the chain's primary op). Set
