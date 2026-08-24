@@ -134,6 +134,13 @@ run "QUAL-07 runner parses" \
 run "QUAL-07 summariser result logic (coverage and drift gates)" \
     python3 "$HERE/test_summarise7.py"
 
+# The schema-evolution campaign's essence: a refused check does not
+# deploy (INCONCLUSIVE), a check that ACCEPTS the deliberately broken
+# job is a FAIL (the instrument is inert), state that resets across the
+# boundary is loss, and no keys across the boundary is no evidence.
+run "QUAL-11 summariser result logic (the four evolution gates)" \
+    python3 "$HERE/test_summarise11.py"
+
 # The upgrade-campaign essence: every failure of the savepoint -> swap ->
 # restore sequence is a FAIL of the campaign's subject, never an
 # infrastructure inconclusive - and a same-image run must be labelled a
