@@ -572,6 +572,12 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
     {
         const auto store = make_coordination_store(ha_dir_);
         const auto job_prefix = "jobs/" + std::to_string(job_id);
+        // A tombstoned job reached a terminal state under a previous
+        // leader; its manifest (if the deletion was interrupted) is
+        // history, not work (item 69).
+        if (store->exists(job_prefix + "/TERMINAL")) {
+            return;
+        }
         const auto manifest = store->get(job_prefix + "/manifest.json");
         if (!manifest.has_value())
             return;
@@ -6253,6 +6259,31 @@ std::vector<PluginBinary> Coordinator::plugins_for_worker_locked_(const JobState
     return out;
 }
 
+void Coordinator::retire_job_manifest_(JobId job_id, const char* status) {
+    if (ha_dir_.empty()) {
+        return;
+    }
+    try {
+        const auto store = make_coordination_store(ha_dir_);
+        const auto prefix = "jobs/" + std::to_string(job_id);
+        store->put(prefix + "/TERMINAL", std::string{"{\"status\":\""} + status + "\"}");
+        // Trailing slash: an object-store list is a string-prefix match,
+        // and "jobs/1" would also sweep jobs/10's keys.
+        for (const auto& key : store->list(prefix + "/")) {
+            if (std::filesystem::path(key).filename() != "TERMINAL") {
+                store->remove(key);
+            }
+        }
+    } catch (const std::exception& e) {
+        // Worst case is the pre-fix behaviour (a recoverable manifest),
+        // and the tombstone may already have landed, which alone is
+        // enough for recovery to skip the job.
+        log::warn("coordinator.ha",
+                  "job_id=" + std::to_string(job_id) +
+                      " could not retire the HA manifest at terminal: " + e.what());
+    }
+}
+
 void Coordinator::signal_job_completion_locked_(JobState& job) {
     if (job.completion_signalled) {
         return;
@@ -6298,6 +6329,12 @@ void Coordinator::signal_job_completion_locked_(JobState& job) {
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
         persist_history_record_(ha_dir_, rec, epoch());
+        // The history record preserves what the job WAS; the manifest is
+        // what recovery would RE-RUN. A terminal job must keep the former
+        // and lose the latter, or the next coordinator takeover resurrects
+        // a job the operator cancelled (item 69 - it re-ran QUAL-05's
+        // control arm mid-campaign and competed for the subject's slots).
+        retire_job_manifest_(job.id, status);
         history_.push_back(std::move(rec));
         while (history_.size() > kCoordinatorHistoryCap) {
             history_.pop_front();

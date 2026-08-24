@@ -30,6 +30,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -206,6 +208,17 @@ public:
             .upstream_role = role, .upstream_subtask_idx = 0, .port = port});
         std::lock_guard lock(send_mu_);
         return send_frame(*conn_, encode_frame(MessageKind::SubtaskListening, m));
+    }
+
+    [[nodiscard]] bool send_finished(JobId job_id, const std::string& role, std::uint32_t subtask) {
+        SubtaskFinishedMsg m;
+        m.job_id = job_id;
+        m.worker_id = id_;
+        m.role = role;
+        m.subtask_idx = subtask;
+        m.had_error = false;
+        std::lock_guard lock(send_mu_);
+        return send_frame(*conn_, encode_frame(MessageKind::SubtaskFinished, m));
     }
 
     [[nodiscard]] bool ack_checkpoint(JobId job_id,
@@ -632,6 +645,135 @@ TEST(CheckpointCompletion, RecoveryRestoresFromTheLastCompletedCheckpoint) {
                "completed checkpoint is invisible to recovery and the job restarts from "
                "scratch.";
 
+        w.close();
+        b.stop();
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+// A cancelled job must STAY cancelled across a coordinator takeover.
+//
+// Recovery redeploys every job whose HA manifest exists, and cancellation
+// used to leave the manifest in place - so the next takeover resurrected
+// jobs the operator had killed (followups item 69: QUAL-05's cancelled
+// control arm came back mid-campaign and competed for the subject's
+// slots; every campaign carried a manual manifest wipe as the
+// workaround). Terminal signalling now tombstones the job's HA prefix and
+// deletes the manifest; recovery honours the tombstone even when the
+// deletion was interrupted, which this test simulates by putting the
+// manifest BACK beside the tombstone before the second leader recovers.
+TEST(CheckpointCompletion, ACancelledJobIsNotResurrectedByRecovery) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_terminal_manifest_" + std::to_string(::getpid()));
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(ckpt_dir);
+
+    JobId job_id = 0;
+    std::string manifest_bytes;
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(a.await_registrations(2s));
+
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 100;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        ASSERT_GT(job_id, 0U);
+
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value());
+        const auto tasks = decode_deploy(*deploy).tasks;
+        ASSERT_FALSE(tasks.empty());
+        std::uint16_t port_seed = 45000;
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+        }
+
+        // Complete one checkpoint BEFORE cancelling. The premise matters:
+        // recovery restores from the latest COMPLETED-N on disk, and a job
+        // with none is refused by config lint (restore id 0) long before
+        // the tombstone is consulted - the first cut of this test passed
+        // against a disabled tombstone check exactly that way. The
+        // campaign jobs item 69 resurrected all had checkpoints.
+        auto trigger = w.await_frame(MessageKind::TriggerCheckpoint);
+        ASSERT_TRUE(trigger.has_value());
+        const auto ckpt_id = decode_trigger_checkpoint(*trigger).checkpoint_id;
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, ckpt_id, t.role, t.subtask_idx, /*ok=*/true));
+        }
+        const auto ckpt_deadline = std::chrono::steady_clock::now() + 5s;
+        while (a.latest_completed_checkpoint(job_id) != ckpt_id &&
+               std::chrono::steady_clock::now() < ckpt_deadline) {
+            std::this_thread::sleep_for(20ms);
+        }
+        ASSERT_EQ(a.latest_completed_checkpoint(job_id), ckpt_id)
+            << "the checkpoint never completed; the resurrection premise is gone";
+
+        // Capture the manifest while the job is live - it is the artefact
+        // whose afterlife is under test.
+        const auto manifest_path = ha_dir / "jobs" / std::to_string(job_id) / "manifest.json";
+        ASSERT_TRUE(std::filesystem::exists(manifest_path))
+            << "no manifest was persisted; the premise of the test is gone";
+        {
+            std::ifstream in(manifest_path, std::ios::binary);
+            manifest_bytes.assign(std::istreambuf_iterator<char>(in),
+                                  std::istreambuf_iterator<char>());
+        }
+        ASSERT_FALSE(manifest_bytes.empty());
+
+        const auto ack = a.cancel_job(job_id);
+        ASSERT_TRUE(ack.ok) << ack.message;
+        ASSERT_TRUE(w.await_frame(MessageKind::CancelJob).has_value());
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.send_finished(job_id, t.role, t.subtask_idx));
+        }
+        ASSERT_TRUE(a.await_job_completion(job_id, 10s));
+        w.close();
+        a.stop();
+    }
+
+    // The retirement itself: tombstone present, manifest gone.
+    const auto job_prefix = ha_dir / "jobs" / std::to_string(job_id);
+    EXPECT_TRUE(std::filesystem::exists(job_prefix / "TERMINAL"))
+        << "terminal signalling wrote no tombstone";
+    EXPECT_FALSE(std::filesystem::exists(job_prefix / "manifest.json"))
+        << "the manifest survived the terminal transition";
+
+    // Simulate the interrupted deletion: the tombstone landed, the
+    // manifest did not go. Recovery must honour the tombstone alone.
+    {
+        std::ofstream out(job_prefix / "manifest.json", std::ios::binary);
+        out << manifest_bytes;
+    }
+
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(b.await_registrations(2s));
+
+        b.recover_persisted_jobs();
+
+        // 5s comfortably exceeds the 1s worker-settle recovery waits for;
+        // a resurrected job's Deploy would land well inside it.
+        EXPECT_FALSE(w.await_frame(MessageKind::Deploy, 5s).has_value())
+            << "the cancelled job was resurrected by recovery (item 69)";
         w.close();
         b.stop();
     }

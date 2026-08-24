@@ -1399,6 +1399,14 @@ private:
     // Callers hold mu_ and have checked the conn is non-null and the
     // submit ack is already on the wire (JobState::submit_ack_sent).
     void push_job_completed_locked_(JobState& job);
+    // Retire a terminal job's HA manifest so no later coordinator recovery
+    // can resurrect it (followups item 69: a cancelled job came back on
+    // the next takeover because cancellation left the manifest in place).
+    // Tombstone first, then delete the manifest and plugin blobs - a crash
+    // between the two leaves the tombstone, which recovery honours.
+    // Best-effort like persist_history_record_: a store hiccup must not
+    // turn completion signalling into a throw.
+    void retire_job_manifest_(JobId job_id, const char* status);
     // After every surviving-worker subtask of `job` has drained on
     // awaiting_restart=true, rebuild tasks_by_worker by round-robin
     // assigning the original task set onto survivor workers, reset
