@@ -28,6 +28,7 @@ Two rules govern what appears here:
 | Exactly-once into S3-compatible object storage through staged multipart commits, including store outages during recovery | [QUAL-03](qual-03-s3-staged-commits.md) | 22 August 2026, engine `625cc82` |
 | Tens of GiB of keyed state on a disaggregated backend, every key correct under process, coordinator, broker and network faults | [QUAL-04](qual-04-large-keyed-state.md) | 23 August 2026, engine `6ba73b5` |
 | Bounded state through declared retention: an 8.3M-event run under faults holding a flat 67 MiB plateau with every key exact | [QUAL-05](qual-05-ttl-steady-state.md) | 23 August 2026, engine `bed138c` |
+| Wide job graphs: 147 operators as 292 network-bridged subtasks, exactly once under faults, with 28-second recovery from a worker kill at that width | [QUAL-06](qual-06-dag-scaling.md) | 24 August 2026, engine `3c7ffd1` |
 
 ## Not yet campaigned
 

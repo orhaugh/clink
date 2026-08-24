@@ -95,6 +95,7 @@ nav:
       - qualification/qual-03-s3-staged-commits.md
       - qualification/qual-04-large-keyed-state.md
       - qualification/qual-05-ttl-steady-state.md
+      - qualification/qual-06-dag-scaling.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md
