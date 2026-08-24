@@ -2065,10 +2065,63 @@ std::string compile_node(const LogicalPlan& node,
 
         if (ch == Channel::Row) {
             auto binding = row_sink_binding_for(table);
+            std::string before_sink = std::move(input_id);
+            // The sink-boundary schema contract (followups item 78): what a
+            // sink writes is the TABLE's declared schema, not the row's
+            // internal one. The SELECT's output columns bind POSITIONALLY to
+            // the declared columns - rename a binder-synthesised _colN or a
+            // bound-projected window_start to the declared name, and drop
+            // every field the declaration does not have (a windowed
+            // aggregate's unprojected window bounds ride the row otherwise).
+            // Emitted unconditionally for every Row-channel sink: the JSON
+            // family serialises the bound row verbatim, the file sink too,
+            // and the typed batcher sinks pick fields BY NAME from the
+            // declared schema, so an unrenamed _colN silently writes null
+            // there. No sink consumes an incoming Arrow sidecar (they all
+            // batch row-by-row from schema_columns), so the extra map hop
+            // costs one rebuild per record at the sink boundary only.
+            {
+                const auto in_schema = sink.input().schema();
+                std::vector<std::string> select_names;
+                if (in_schema != nullptr) {
+                    select_names = in_schema->field_names();
+                }
+                std::vector<std::string> sink_names;
+                sink_names.reserve(table.columns.size());
+                for (const auto& c : table.columns) {
+                    sink_names.push_back(c.name);
+                }
+                if (select_names.size() != sink_names.size()) {
+                    unsupported("INSERT INTO " + table.name + ": the query produces " +
+                                std::to_string(select_names.size()) +
+                                " columns but the table "
+                                "declares " +
+                                std::to_string(sink_names.size()));
+                }
+                if (!select_names.empty()) {
+                    auto csv = [](const std::vector<std::string>& v) {
+                        std::string out;
+                        for (const auto& s : v) {
+                            if (!out.empty())
+                                out += ',';
+                            out += s;
+                        }
+                        return out;
+                    };
+                    cluster::OperatorSpec bind;
+                    bind.id = "sinkbind_" + std::to_string(next_id++);
+                    bind.type = "row_bind_columns";
+                    bind.inputs = {std::move(before_sink)};
+                    bind.out_channel = std::string{kChannelRow};
+                    bind.params["select_columns"] = csv(select_names);
+                    bind.params["sink_columns"] = csv(sink_names);
+                    before_sink = bind.id;
+                    spec.ops.push_back(std::move(bind));
+                }
+            }
             // If the connector consumes std::string (kafka_sink_string),
             // emit a bridge first so the Row chain ends with a JSON
             // serialiser before reaching the sink.
-            std::string before_sink = std::move(input_id);
             if (!binding.bridge_op.empty()) {
                 cluster::OperatorSpec bridge;
                 bridge.id = "bridge_" + std::to_string(next_id++);
@@ -2351,9 +2404,11 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
     auto is_passthrough = [](const std::string& t) {
         // Ops that forward __row_kind unchanged. union_row is multi-input, so the
         // walk below follows ALL inputs of a pass-through, not just the first.
+        // row_bind_columns is the sink-boundary schema binding (item 78): it
+        // renames and drops COLUMNS but carries __row_kind through verbatim.
         return t == "row_compute_key" || t == "filter_row_predicate" || t == "project_row" ||
                t == "identity_row" || t == "assign_timestamps_row" || t == "union_row" ||
-               t == "async_lookup_join_row";
+               t == "async_lookup_join_row" || t == "row_bind_columns";
     };
     // Walk back (breadth-first over all inputs) from each `start` through
     // pass-throughs, marking every aggregate_row reached. The graph is a DAG;

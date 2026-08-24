@@ -5158,6 +5158,100 @@ TEST(SqlRuntime, TumbleWindowAggregatesByUserPerSecond) {
     std::filesystem::remove(out_path);
 }
 
+// The sink-boundary schema contract (followups item 78): what a sink writes is
+// the TABLE's declared schema - exactly its column names, nothing else. Found
+// by QUAL-07's content-level comparison, invisible to every row-count check:
+//
+//   * a windowed aggregate's emit row always carries window_start/window_end,
+//     and when the SELECT does not project them they leaked into the sink
+//     JSON as extra fields (78a - seven of the campaign's nineteen queries);
+//   * an unaliased SELECT expression kept its binder-synthesised _colN name
+//     in the payload where the declared column name was expected (78b - the
+//     values were right, the field name violated the schema).
+TEST(SqlRuntime, SinkWritesExactlyTheDeclaredSchema) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_declschema_in.ndjson";
+    const auto win_out = std::filesystem::temp_directory_path() / "clink_sql_declschema_win.ndjson";
+    const auto expr_out =
+        std::filesystem::temp_directory_path() / "clink_sql_declschema_expr.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(win_out);
+    std::filesystem::remove(expr_out);
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100,"amount":10})",
+                    R"({"user_id":1,"ts":300,"amount":30})",
+                    R"({"user_id":2,"ts":1500,"amount":50})",
+                });
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE events (user_id BIGINT, ts BIGINT, amount BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE win_t (user_id BIGINT, total BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     win_out.string() +
+                     "');"
+                     "CREATE TABLE expr_t (user_id BIGINT, amount DOUBLE) "
+                     "WITH (connector='file', format='json', path='" +
+                     expr_out.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[2]));
+
+    const auto expect_exact_keys = [](const std::filesystem::path& path,
+                                      const std::set<std::string>& want) {
+        auto lines = read_lines(path);
+        ASSERT_FALSE(lines.empty());
+        for (const auto& l : lines) {
+            auto js = clink::config::parse(l);
+            ASSERT_TRUE(js.is_object());
+            std::set<std::string> got;
+            for (const auto& [k, v] : js.as_object()) {
+                (void)v;
+                got.insert(std::string{k});
+            }
+            EXPECT_EQ(got, want) << "sink payload does not match the declared schema: " << l;
+        }
+    };
+
+    {
+        auto spec = compile(cat,
+                            "INSERT INTO win_t SELECT user_id, SUM(amount) AS total FROM events "
+                            "GROUP BY TUMBLE(ts, 1000), user_id");
+        InProcessCluster cluster("worker-sql-declschema-a", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+        EXPECT_TRUE(result.ok);
+        expect_exact_keys(win_out, {"user_id", "total"});
+    }
+    {
+        auto spec = compile(cat, "INSERT INTO expr_t SELECT user_id, amount * 2 FROM events");
+        InProcessCluster cluster("worker-sql-declschema-b", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+        EXPECT_TRUE(result.ok);
+        expect_exact_keys(expr_out, {"user_id", "amount"});
+        auto lines = read_lines(expr_out);
+        std::set<double> amounts;
+        for (const auto& l : lines) {
+            amounts.insert(clink::config::parse(l).at("amount").as_number());
+        }
+        EXPECT_EQ(amounts, (std::set<double>{20.0, 60.0, 100.0}))
+            << "the renamed expression column must still carry the computed values";
+    }
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(win_out);
+    std::filesystem::remove(expr_out);
+}
+
 // A windowed GROUP BY can project the synthetic window bounds (window_start /
 // window_end) into the output, honouring a SELECT alias and landing the bounds
 // at the right sink position alongside keys and aggregates.

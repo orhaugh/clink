@@ -155,8 +155,36 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
             }
         }
     }
-    EXPECT_EQ(replay_rows, live_rows)
-        << "replayed emissions differ from the live sink output\nreplay:\n"
+    // The window operator's emissions carry the synthetic window bounds; the
+    // sink-boundary binding (followups item 78) renames the SELECT outputs to
+    // the table's declared columns and drops the bounds before the sink
+    // writes. So the live sink file is the operator's emissions MINUS the
+    // bound columns - strip them from the replay before comparing (rows and
+    // order must still match exactly).
+    const auto canon = [](const std::string& line, bool strip_bounds) {
+        auto js = clink::config::parse(line);
+        if (strip_bounds && js.is_object()) {
+            auto& obj = js.as_object();
+            for (const auto* k : {"window_start", "window_end"}) {
+                if (auto it = obj.find(k); it != obj.end()) {
+                    obj.erase(it);
+                }
+            }
+        }
+        return js.serialize();
+    };
+    std::vector<std::string> replay_rows_bound;
+    replay_rows_bound.reserve(replay_rows.size());
+    for (const auto& r : replay_rows) {
+        replay_rows_bound.push_back(canon(r, /*strip_bounds=*/true));
+    }
+    std::vector<std::string> live_rows_canon;
+    live_rows_canon.reserve(live_rows.size());
+    for (const auto& l : live_rows) {
+        live_rows_canon.push_back(canon(l, /*strip_bounds=*/false));
+    }
+    EXPECT_EQ(replay_rows_bound, live_rows_canon)
+        << "replayed emissions (bounds stripped) differ from the live sink output\nreplay:\n"
         << replay.output << "\nlive:\n"
         << live_out;
 

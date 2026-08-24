@@ -10188,6 +10188,51 @@ void install(clink::plugin::PluginRegistry& reg) {
                                             [](const Row& r) { return r; }, "identity_row");
                                     });
 
+    // row_bind_columns: the sink-boundary schema contract (followups item
+    // 78). Binds the SELECT's output columns POSITIONALLY to the sink
+    // table's declared columns: reads each field by its planner-side name
+    // (select_columns), emits it under the declared name (sink_columns),
+    // and drops everything else - a windowed aggregate's unprojected
+    // window bounds, a binder-synthesised _colN expression name, any
+    // internal field. Without it the JSON sink serialises the row's
+    // INTERNAL schema, which is not what the table declared. A field the
+    // row does not carry stays absent (the row path's convention for an
+    // absent value, distinct from an explicit null). __row_kind survives:
+    // it is the changelog tag the upsert/2PC sinks read, not a column.
+    reg.register_operator<Row, Row>(
+        "row_bind_columns", [](const BuildContext& ctx) -> std::shared_ptr<Operator<Row, Row>> {
+            auto from = projection_from_csv(ctx.param_or("select_columns", ""));
+            auto to = projection_from_csv(ctx.param_or("sink_columns", ""));
+            if (from.empty() || from.size() != to.size()) {
+                throw std::runtime_error(
+                    "row_bind_columns: select_columns and sink_columns must be non-empty "
+                    "and the same length (got " +
+                    std::to_string(from.size()) + " and " + std::to_string(to.size()) + ")");
+            }
+            std::vector<clink::config::InternedName> from_names;
+            std::vector<clink::config::InternedName> to_names;
+            from_names.reserve(from.size());
+            to_names.reserve(to.size());
+            for (std::size_t i = 0; i < from.size(); ++i) {
+                from_names.emplace_back(from[i]);
+                to_names.emplace_back(to[i]);
+            }
+            return std::make_shared<MapOperator<Row, Row>>(
+                [from_names, to_names](const Row& r) -> Row {
+                    Row out;
+                    for (std::size_t i = 0; i < from_names.size(); ++i) {
+                        if (auto it = r.values.find(from_names[i]); it != r.values.end()) {
+                            out.values[to_names[i]] = it->second;
+                        }
+                    }
+                    if (auto it = r.values.find(row_kind_name()); it != r.values.end()) {
+                        out.values[row_kind_name()] = it->second;
+                    }
+                    return out;
+                },
+                "row_bind_columns");
+        });
+
     // SQL-native AI: ml_predict_row. Builds the model provider from the namespaced
     // model.* params (provider / endpoint / task / ...) via ModelProviderRegistry,
     // injecting the query-level feature/output column lists so the provider knows the
