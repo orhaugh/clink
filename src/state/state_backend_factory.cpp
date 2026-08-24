@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -11,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -350,12 +352,59 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
         // Assigned parents contribute their FULL snapshot: keyed rows (narrowed
         // to this subtask's key-group range on restore) plus their operator
         // rows. A single parent stays a plain copy (no re-streaming).
+        // Same-subtask reads get a bounded visibility retry (item 75c): on a
+        // shared mount, a snapshot another client durably renamed moments ago
+        // can be invisible to this client's first lookups (NFS negative-dentry
+        // and attribute caches). An ABSENT or INCOMPLETE verdict is re-checked
+        // within the budget - a visibility race heals inside the cache
+        // windows, real incompleteness never does - while Corrupt and
+        // Unsupported fail immediately: full-length bytes with a wrong
+        // checksum are a byte problem no wait heals. Rescale keeps its plain
+        // single reads: absent parents are legitimate there, and waiting on
+        // every one would turn a legal gap into a stall.
+        const auto read_with_visibility_retry =
+            [&](const std::filesystem::path& p) -> std::vector<std::byte> {
+            const auto budget = std::chrono::milliseconds{state::restore_verify_retry_ms()};
+            const auto deadline = std::chrono::steady_clock::now() + budget;
+            constexpr auto kStep = std::chrono::milliseconds{2500};
+            for (;;) {
+                std::string transient;
+                try {
+                    auto b = read_file(p);
+                    if (!b.empty()) {
+                        return b;
+                    }
+                    transient = "snapshot absent";
+                } catch (const state::CheckpointIntegrityError& e) {
+                    if (e.status() != state::CheckpointStatus::Incomplete) {
+                        throw;
+                    }
+                    if (std::chrono::steady_clock::now() + kStep > deadline) {
+                        throw;
+                    }
+                    transient = e.what();
+                }
+                if (std::chrono::steady_clock::now() + kStep > deadline) {
+                    return {};
+                }
+                clink::log::warn("state.restore",
+                                 "subtask " + std::to_string(spec.subtask_idx) + ": " + transient +
+                                     " at " + p.string() +
+                                     "; re-checking within the visibility-retry budget (a shared "
+                                     "mount can hide a just-renamed file from a first lookup)");
+                std::this_thread::sleep_for(kStep);
+            }
+        };
+
         std::vector<std::vector<std::byte>> parts;
         parts.reserve(parent_count);
         for (std::uint32_t i = 0; i < parent_count; ++i) {
-            auto b = read_file(std::filesystem::path{state_dir_for(
-                                   restore_path, spec.restore_generation, src_first + i)} /
-                               ckpt_name);
+            const auto snap_path = std::filesystem::path{state_dir_for(
+                                       restore_path, spec.restore_generation, src_first + i)} /
+                                   ckpt_name;
+            auto b = (!is_rescale && !clink::state::allow_missing_restore_state())
+                         ? read_with_visibility_retry(snap_path)
+                         : read_file(snap_path);
             if (!b.empty()) {
                 parts.push_back(std::move(b));
             }

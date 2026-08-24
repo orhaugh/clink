@@ -45,6 +45,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -366,6 +367,30 @@ inline void write_checkpoint_meta(const std::filesystem::path& payload_path,
     const char* p = std::getenv("CLINK_ALLOW_MISSING_RESTORE_STATE");
     return p != nullptr && std::string_view(p) != "0" && std::string_view(p) != "false" &&
            *p != '\0';
+}
+
+// How long a same-subtask restore keeps re-checking a snapshot that reads
+// as ABSENT or INCOMPLETE before it lets that verdict stand, in
+// milliseconds. On a shared mount, a file another client durably renamed
+// moments ago can be invisible to this client's first lookups (NFS
+// negative-dentry and attribute caches hold for seconds); QUAL-06 watched
+// a completion-marked checkpoint read as "cannot read sidecar" on a
+// reader nine seconds after the writer's ack, and the refusal - correct
+// against real damage - was wrong against a cache (followups item 75c).
+// A visibility race heals within the cache windows; real incompleteness
+// never does, so a bounded re-check converts only the false refusals.
+// Corrupt (full-length bytes, wrong checksum) is a byte problem no wait
+// heals and is never retried. 0 disables.
+[[nodiscard]] inline std::uint64_t restore_verify_retry_ms() {
+    const char* p = std::getenv("CLINK_RESTORE_VERIFY_RETRY_MS");
+    if (p == nullptr || *p == '\0') {
+        return 15000;
+    }
+    try {
+        return std::stoull(p);
+    } catch (...) {
+        return 15000;
+    }
 }
 
 // True when `verdict` is the specific "legacy directory, no sidecar" case

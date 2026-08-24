@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -778,11 +779,102 @@ TEST(StateBackendFactory, ASameSubtaskRestoreRefusesWhenItsOwnSnapshotIsAbsent) 
     spec.restore_checkpoint_id = ckpt_id;
     // Not a rescale: the sentinel leaves src_first == subtask_idx.
 
+    // The refusal is this test's subject; the visibility-retry budget that
+    // precedes it (item 75c) is its own tests' subject below. Waiting out
+    // the default 15s here would test patience, not the refusal.
+    ::setenv("CLINK_RESTORE_VERIFY_RETRY_MS", "0", 1);
     EXPECT_THROW(
         { (void)clink::StateBackendFactory::default_instance().build(spec); }, std::runtime_error)
         << "a subtask whose own snapshot is missing came up with empty state instead of "
            "refusing. Its peers restore fully, so the job resumes with one operator's state "
            "silently gone.";
+    ::unsetenv("CLINK_RESTORE_VERIFY_RETRY_MS");
+}
+
+// The bounded visibility retry (item 75c), absent-payload flavour: a
+// snapshot that APPEARS within the budget restores instead of refusing. On
+// a shared mount, a file another client durably renamed moments ago can be
+// invisible to a first lookup (NFS negative-dentry and attribute caches);
+// QUAL-06 watched a completion-marked checkpoint refused on a reader nine
+// seconds after the writer's ack, with retention having purged every older
+// fallback - a visibility race turned fatal. The writer thread here IS
+// that other client, three seconds late.
+TEST(StateBackendFactory, AnAbsentOwnSnapshotThatAppearsWithinTheRetryBudgetRestores) {
+    const auto base = make_temp_dir("late_visible_snapshot");
+    const std::uint64_t ckpt_id = 7;
+    const clink::OperatorId op{1};
+    const auto snap_path = gen_dir(base, 1) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap");
+
+    clink::InMemoryStateBackend seed;
+    seed.put(op, clink::StateBackend::KeyView{"k"}, clink::StateBackend::ValueView{"V"});
+    const auto snap = seed.snapshot(clink::CheckpointId{ckpt_id});
+
+    std::thread late_writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{3000});
+        publish_snapshot(snap_path, snap.bytes, ckpt_id);
+    });
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 1;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+
+    ::setenv("CLINK_RESTORE_VERIFY_RETRY_MS", "20000", 1);
+    clink::BuiltStateBackend built;
+    EXPECT_NO_THROW({ built = clink::StateBackendFactory::default_instance().build(spec); })
+        << "a snapshot that became visible within the retry budget was refused (item 75c)";
+    ::unsetenv("CLINK_RESTORE_VERIFY_RETRY_MS");
+    late_writer.join();
+    ASSERT_NE(built.backend, nullptr);
+    ASSERT_TRUE(built.restore_from.has_value());
+    EXPECT_EQ(built.restore_from->checkpoint_id.value(), ckpt_id);
+}
+
+// The same retry, incomplete-sidecar flavour: payload visible, sidecar not
+// yet - the exact shape the QUAL-06 reader hit ("cannot read sidecar").
+// Incomplete within the budget is re-checked; Corrupt never is (a checksum
+// mismatch over full-length bytes is not a visibility problem), which the
+// corrupt-checkpoint test above keeps pinned.
+TEST(StateBackendFactory, AnIncompleteOwnSnapshotThatCompletesWithinTheRetryBudgetRestores) {
+    const auto base = make_temp_dir("late_sidecar_snapshot");
+    const std::uint64_t ckpt_id = 7;
+    const clink::OperatorId op{1};
+    const auto snap_path = gen_dir(base, 1) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap");
+
+    clink::InMemoryStateBackend seed;
+    seed.put(op, clink::StateBackend::KeyView{"k"}, clink::StateBackend::ValueView{"V"});
+    const auto snap = seed.snapshot(clink::CheckpointId{ckpt_id});
+
+    // Payload only: verifies as Incomplete until the sidecar lands.
+    std::filesystem::create_directories(snap_path.parent_path());
+    {
+        std::ofstream out(snap_path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(snap.bytes.data()),
+                  static_cast<std::streamsize>(snap.bytes.size()));
+    }
+
+    std::thread late_writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{3000});
+        clink::state::write_checkpoint_meta(
+            snap_path, ckpt_id, snap.bytes.data(), snap.bytes.size());
+    });
+
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 1;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+
+    ::setenv("CLINK_RESTORE_VERIFY_RETRY_MS", "20000", 1);
+    clink::BuiltStateBackend built;
+    EXPECT_NO_THROW({ built = clink::StateBackendFactory::default_instance().build(spec); })
+        << "a sidecar that landed within the retry budget was still refused (item 75c)";
+    ::unsetenv("CLINK_RESTORE_VERIFY_RETRY_MS");
+    late_writer.join();
+    ASSERT_NE(built.backend, nullptr);
+    ASSERT_TRUE(built.restore_from.has_value());
+    EXPECT_EQ(built.restore_from->checkpoint_id.value(), ckpt_id);
 }
 
 // The escape hatch, for the one legitimate case: a stateful operator newly added
