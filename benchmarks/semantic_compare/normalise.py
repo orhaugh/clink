@@ -68,20 +68,38 @@ def load_rows(path):
     return rows
 
 
-def load_state(path):
-    """A read_upsert_topic.py --json dump -> {key: canonical row string}.
-    The reducer already folded the changelog (last write per broker key,
-    tombstoned keys removed); each surviving row still goes through
-    normalise_row so integer-valued floats collapse identically on both
-    sides. Raises on a dump that carries an error or no state: a failed
-    drain must fail the comparison, never read as an empty-but-equal one."""
+def load_state(path, key_fields):
+    """A read_upsert_topic.py --json dump -> {declared key tuple: canonical
+    row string}. The reducer already folded the changelog (last write per
+    broker key, tombstoned keys removed). The BROKER key is deliberately
+    discarded here: the engines encode it differently (one concatenates
+    the primary-key columns, the other writes a JSON object), so it can
+    never pair rows across engines - the declared key columns, present in
+    every value, can. Each surviving row goes through normalise_row so
+    integer-valued floats collapse identically on both sides. Raises on a
+    dump that carries an error or no state (a failed drain must fail the
+    comparison, never read as an empty-but-equal one), on a row missing a
+    key column, and on two live rows sharing one declared key (the
+    primary key was not a key - a defect, not a tie to shrug at)."""
     with open(path) as fh:
         dump = json.load(fh)
     if "error" in dump:
         raise ValueError(f"upsert drain failed for {dump.get('topic')}: {dump['error']}")
     if "state" not in dump:
         raise ValueError(f"not an upsert state dump: {path}")
-    return {k: normalise_row(v) for k, v in dump["state"].items()}
+    state = {}
+    for broker_key, value in dump["state"].items():
+        row = normalise_row(value)
+        obj = json.loads(row)
+        try:
+            key = tuple(normalise_value(obj[k]) for k in key_fields)
+        except KeyError as e:
+            raise ValueError(f"state row lacks declared key field {e}: {row[:80]}") from e
+        if key in state and state[key] != row:
+            raise ValueError(
+                f"two live rows share declared key {key}: {state[key][:60]} vs {row[:60]}")
+        state[key] = row
+    return state
 
 
 def within_tolerance(a_row, b_row, tol_fields, epsilon):
@@ -102,14 +120,15 @@ def within_tolerance(a_row, b_row, tol_fields, epsilon):
     return True
 
 
-def compare(a_path, b_path, *, mode, tol_fields=(), epsilon=0.0):
+def compare(a_path, b_path, *, mode, key_fields=(), tol_fields=(), epsilon=0.0):
     """Compare two engines' outputs. Returns (equal, detail) where detail
     names counts and up to three sample divergences - a diff nobody can
     see is a diff nobody can diagnose. append: two drained sink files,
     normalised, sorted, multiset-compared. materialised: two upsert state
-    dumps, compared by key."""
+    dumps, compared by the declared key extracted from each value."""
     if mode == "materialised":
-        return compare_states(a_path, b_path, tol_fields=tol_fields, epsilon=epsilon)
+        return compare_states(a_path, b_path, key_fields=key_fields,
+                              tol_fields=tol_fields, epsilon=epsilon)
 
     a_rows, b_rows = sorted(load_rows(a_path)), sorted(load_rows(b_path))
     if len(a_rows) != len(b_rows):
@@ -129,16 +148,21 @@ def compare(a_path, b_path, *, mode, tol_fields=(), epsilon=0.0):
     return True, f"{len(a_rows)} rows identical"
 
 
-def compare_states(a_path, b_path, *, tol_fields=(), epsilon=0.0):
-    """Compare two upsert state dumps BY KEY - the pairing the changelog
-    contract defines, immune to the positional misalignment a sorted-string
+def compare_states(a_path, b_path, *, key_fields, tol_fields=(), epsilon=0.0):
+    """Compare two upsert state dumps BY DECLARED KEY - the pairing the
+    changelog contract defines, engine-independent (unlike the broker key
+    encoding) and immune to the positional misalignment a sorted-string
     zip suffers when a tolerance field sorts early in the canonical row."""
-    a_state, b_state = load_state(a_path), load_state(b_path)
+    if not key_fields:
+        raise ValueError("materialised comparison requires the declared key fields")
+    a_state = load_state(a_path, key_fields)
+    b_state = load_state(b_path, key_fields)
     only_a = sorted(set(a_state) - set(b_state))
     only_b = sorted(set(b_state) - set(a_state))
     if only_a or only_b:
         def name(side, keys):
-            return f"{len(keys)} keys only in {side} (first: {', '.join(keys[:3])})"
+            first = ", ".join(str(k) for k in keys[:3])
+            return f"{len(keys)} keys only in {side} (first: {first})"
         parts = [name(s, k) for s, k in (("a", only_a), ("b", only_b)) if k]
         return False, "key-set mismatch: " + "; ".join(parts)
 

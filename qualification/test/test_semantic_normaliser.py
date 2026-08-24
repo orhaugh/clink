@@ -63,10 +63,12 @@ try:
 except ValueError:
     check("a corrupt sink line fails the comparison", True)
 
-# --- materialised: upsert state dumps compared BY KEY ---------------------------
+# --- materialised: upsert state dumps compared by the DECLARED key --------------
 # The inputs are read_upsert_topic.py --json dumps: the reducer already
-# folded the changelog (last write per broker key, tombstones removed);
-# these tests pin what the comparator does with two such states.
+# folded the changelog (last write per broker key, tombstones removed).
+# The broker key is DISCARDED - the engines encode it differently (one
+# concatenates the pk columns, the other writes JSON) - and rows pair by
+# the declared key columns extracted from each value.
 
 
 def cmp_states(a_state, b_state, **kw):
@@ -78,43 +80,64 @@ def cmp_states(a_state, b_state, **kw):
         return N.compare(str(a), str(b), **kw)
 
 
+# clink-style broker keys on one side, Flink-style JSON on the other: the
+# encodings must not matter, the value's key columns pair the rows.
 eq, why = cmp_states({"1": '{"cat":1,"n":2}', "2": '{"n":5,"cat":2}'},
-                     {"1": '{"n":2,"cat":1}', "2": '{"cat":2,"n":5}'},
-                     mode="materialised")
-check("identical final images unify (field order included)", eq, why)
-eq, why = cmp_states({"1": '{"cat":1,"n":2}'}, {"1": '{"cat":1,"n":3}'},
-                     mode="materialised")
+                     {'{"cat":1}': '{"n":2,"cat":1}', '{"cat":2}': '{"cat":2,"n":5}'},
+                     mode="materialised", key_fields=("cat",))
+check("identical final images unify across broker-key encodings", eq, why)
+eq, why = cmp_states({"1": '{"cat":1,"n":2}'}, {"k1": '{"cat":1,"n":3}'},
+                     mode="materialised", key_fields=("cat",))
 check("a different final image survives and names its key",
-      not eq and "key 1" in why, why)
-eq, why = cmp_states({"1": '{"n":2}', "2": '{"n":5}'}, {"1": '{"n":2}'},
-                     mode="materialised")
+      not eq and "(1,)" in why, why)
+eq, why = cmp_states({"1": '{"cat":1,"n":2}', "2": '{"cat":2,"n":5}'},
+                     {"1": '{"cat":1,"n":2}'},
+                     mode="materialised", key_fields=("cat",))
 check("a missing key is a key-set mismatch", not eq and "key-set" in why, why)
-eq, _ = cmp_states({"1": '{"avg":49975.0}'}, {"1": '{"avg":49975}'},
-                   mode="materialised")
+eq, _ = cmp_states({"1": '{"cat":1,"avg":49975.0}'}, {"1": '{"cat":1,"avg":49975}'},
+                   mode="materialised", key_fields=("cat",))
 check("integer-valued floats collapse inside state values", eq)
+eq, _ = cmp_states({"1": '{"cat":7.0,"n":1}'}, {"1": '{"cat":7,"n":1}'},
+                   mode="materialised", key_fields=("cat",))
+check("integer-valued floats collapse inside the KEY itself", eq)
 # The pairing discipline: canonical rows sort by their alphabetically-first
 # field, so with avgp differing slightly across engines a POSITIONAL zip of
-# sorted values pairs key 1's row with key 2's. Keyed pairing must not.
+# sorted values pairs cat 1's row with cat 2's. Keyed pairing must not.
 eq, why = cmp_states(
-    {"1": '{"avgp":10.0001,"total":7}', "2": '{"avgp":10.0002,"total":9}'},
-    {"1": '{"avgp":10.0002,"total":7}', "2": '{"avgp":10.0001,"total":9}'},
-    mode="materialised", tol_fields=("avgp",), epsilon=0.001)
-check("rows pair by key, not by sorted position", eq, why)
-eq, why = cmp_states({"1": '{"avgp":10.0,"total":7}'},
-                     {"1": '{"avgp":10.5,"total":7}'},
-                     mode="materialised", tol_fields=("avgp",), epsilon=0.001)
+    {"1": '{"avgp":10.0001,"cat":1,"total":7}', "2": '{"avgp":10.0002,"cat":2,"total":9}'},
+    {"1": '{"avgp":10.0002,"cat":1,"total":7}', "2": '{"avgp":10.0001,"cat":2,"total":9}'},
+    mode="materialised", key_fields=("cat",), tol_fields=("avgp",), epsilon=0.001)
+check("rows pair by declared key, not by sorted position", eq, why)
+eq, why = cmp_states({"1": '{"avgp":10.0,"cat":1}'},
+                     {"1": '{"avgp":10.5,"cat":1}'},
+                     mode="materialised", key_fields=("cat",),
+                     tol_fields=("avgp",), epsilon=0.001)
 check("state tolerance outside epsilon survives", not eq, why)
-eq, why = cmp_states({"1": '{"avgp":10.0,"total":7}'},
-                     {"1": '{"avgp":10.0,"total":8}'},
-                     mode="materialised", tol_fields=("avgp",), epsilon=0.001)
+eq, why = cmp_states({"1": '{"avgp":10.0,"cat":1,"total":7}'},
+                     {"1": '{"avgp":10.0,"cat":1,"total":8}'},
+                     mode="materialised", key_fields=("cat",),
+                     tol_fields=("avgp",), epsilon=0.001)
 check("state tolerance never leaks onto undeclared fields", not eq, why)
+try:
+    cmp_states({"1": '{"n":2}'}, {"1": '{"n":2}'},
+               mode="materialised", key_fields=("cat",))
+    check("a state row missing its declared key field fails", False)
+except ValueError:
+    check("a state row missing its declared key field fails", True)
+try:
+    cmp_states({"a": '{"cat":1,"n":2}', "b": '{"cat":1,"n":3}'},
+               {"a": '{"cat":1,"n":2}'},
+               mode="materialised", key_fields=("cat",))
+    check("two live rows sharing one declared key fail (pk was not a key)", False)
+except ValueError:
+    check("two live rows sharing one declared key fail (pk was not a key)", True)
 try:
     with tempfile.TemporaryDirectory() as tmp:
         a = pathlib.Path(tmp) / "a"
         b = pathlib.Path(tmp) / "b"
         a.write_text(json.dumps({"topic": "t", "error": "topic t not found"}))
         b.write_text(json.dumps({"topic": "t", "state": {}}))
-        N.compare(str(a), str(b), mode="materialised")
+        N.compare(str(a), str(b), mode="materialised", key_fields=("cat",))
     check("a failed drain fails the comparison, never reads as empty", False)
 except ValueError:
     check("a failed drain fails the comparison, never reads as empty", True)
