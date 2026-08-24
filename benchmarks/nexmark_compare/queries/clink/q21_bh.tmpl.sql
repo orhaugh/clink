@@ -5,7 +5,7 @@
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q21bh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_q21 (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR) WITH (connector='blackhole');
 INSERT INTO sink_q21
 SELECT auction, bidder, price, CASE WHEN channel = 'apple' THEN '0' WHEN channel = 'google' THEN '1' WHEN channel = 'facebook' THEN '2' WHEN channel = 'baidu' THEN '3' ELSE channel END AS channel FROM bid;

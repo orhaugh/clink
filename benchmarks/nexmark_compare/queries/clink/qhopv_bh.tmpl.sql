@@ -10,7 +10,7 @@
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-qhopvbh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_qhopv (wstart BIGINT, auction BIGINT, num BIGINT) WITH (connector='blackhole');
 INSERT INTO sink_qhopv
 SELECT window_start AS wstart, auction, COUNT(*) AS num FROM bid GROUP BY HOP(datetime, INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction;

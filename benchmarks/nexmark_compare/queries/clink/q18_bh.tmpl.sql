@@ -10,7 +10,7 @@
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q18bh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_q18 (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT) WITH (connector='blackhole');
 INSERT INTO sink_q18
 SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY bidder, auction ORDER BY datetime DESC, price DESC, url DESC) AS rn FROM bid) AS R WHERE rn = 1;

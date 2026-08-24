@@ -13,11 +13,11 @@
 CREATE TABLE auction (id BIGINT, itemname VARCHAR, initialbid BIGINT, reserve BIGINT, expires BIGINT, seller BIGINT, category BIGINT, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-auction',
         group_id='clink-q4bh-auction', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q4bh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_q4 (category BIGINT, avgp DOUBLE) WITH (connector='blackhole');
 INSERT INTO sink_q4
 SELECT A.category AS category, AVG(B.price) AS avgp FROM auction AS A JOIN bid AS B ON A.id = B.auction GROUP BY A.category;

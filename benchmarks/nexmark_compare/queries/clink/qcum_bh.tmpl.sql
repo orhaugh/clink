@@ -11,7 +11,7 @@
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-qcumbh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_qcum (bidder BIGINT, num BIGINT) WITH (connector='blackhole');
 INSERT INTO sink_qcum
 SELECT bidder, COUNT(*) AS num FROM bid GROUP BY CUMULATE(datetime, INTERVAL '2' SECOND, INTERVAL '10' SECOND), bidder;

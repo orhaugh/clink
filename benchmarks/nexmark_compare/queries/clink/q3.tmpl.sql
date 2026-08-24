@@ -6,11 +6,11 @@
 CREATE TABLE auction (id BIGINT, itemname VARCHAR, initialbid BIGINT, reserve BIGINT, expires BIGINT, seller BIGINT, category BIGINT, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-auction',
         group_id='clink-q3-auction', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE person (id BIGINT, name VARCHAR, emailaddress VARCHAR, city VARCHAR, state VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-person',
         group_id='clink-q3-person', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_q3 (name VARCHAR, city VARCHAR, state VARCHAR, id BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='__OUT__');
 INSERT INTO sink_q3

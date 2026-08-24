@@ -5,7 +5,7 @@
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q16bh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_q16 (channel VARCHAR, total BIGINT, distinct_bidder BIGINT) WITH (connector='blackhole');
 INSERT INTO sink_q16
 SELECT channel, COUNT(*) AS total, COUNT(DISTINCT bidder) AS distinct_bidder FROM bid GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), channel;

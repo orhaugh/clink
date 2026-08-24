@@ -5,7 +5,7 @@
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q1bh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_q1 (auction BIGINT, bidder BIGINT, price DOUBLE, datetime BIGINT) WITH (connector='blackhole');
 INSERT INTO sink_q1
 SELECT auction, bidder, price * 0.908, datetime FROM bid;

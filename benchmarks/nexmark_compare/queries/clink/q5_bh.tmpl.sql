@@ -9,7 +9,7 @@
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q5bh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_q5 (wstart BIGINT, auction BIGINT, num BIGINT) WITH (connector='blackhole');
 INSERT INTO sink_q5
 SELECT wstart, auction, num FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC, auction ASC) AS rn FROM (SELECT auction, COUNT(*) AS num, window_start AS wstart FROM bid GROUP BY HOP(datetime, INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction) AS W) AS R WHERE rn <= 1;

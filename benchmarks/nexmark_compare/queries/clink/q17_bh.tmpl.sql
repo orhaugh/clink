@@ -8,7 +8,7 @@
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q17bh-bid', auto_offset_reset='earliest',
-        event_time_column='datetime', watermark_lag_ms='4000');
+        event_time_column='datetime', watermark_lag_ms='4001');
 CREATE TABLE sink_q17 (auction BIGINT, total BIGINT, minp BIGINT, maxp BIGINT, avgp DOUBLE) WITH (connector='blackhole');
 INSERT INTO sink_q17
 SELECT auction, COUNT(*) AS total, MIN(price) AS minp, MAX(price) AS maxp, AVG(price) AS avgp FROM bid GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction;

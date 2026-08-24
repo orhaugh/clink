@@ -77,6 +77,19 @@ STREAMS = {
 
 WATERMARK_LAG_MS = 4000
 
+# The two dialects' bounded-out-of-orderness watermarks differ by exactly
+# one millisecond: the reference emits maxTimestamp - lag - 1ms (its
+# BoundedOutOfOrderness convention), clink emits maxTimestamp - lag. On
+# aligned windows (TUMBLE/HOP/CUMULATE ends are step-multiples) the 1ms
+# never crosses a pane boundary, but a SESSION's fire point is an
+# arbitrary millisecond (last event + gap), and QUAL-07 measured the
+# difference as exactly one session: a singleton whose fire point landed
+# ON clink's final watermark and one ms past the reference's. clink's lag
+# is declared 1ms deeper so the two effective watermarks are identical
+# and the fired sets compare equal - the same premise-reconciliation
+# discipline as q4/q17's AVG cast and q18's total order.
+CLINK_WATERMARK_LAG_MS = WATERMARK_LAG_MS + 1
+
 
 def clink_source(name, tag):
     s = STREAMS[name]
@@ -85,7 +98,7 @@ def clink_source(name, tag):
         f"CREATE TABLE {name} ({cols})\n"
         f"  WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='{s['topic']}',\n"
         f"        group_id='clink-{tag}-{name}', auto_offset_reset='earliest',\n"
-        f"        event_time_column='datetime', watermark_lag_ms='{WATERMARK_LAG_MS}');"
+        f"        event_time_column='datetime', watermark_lag_ms='{CLINK_WATERMARK_LAG_MS}');"
     )
 
 
