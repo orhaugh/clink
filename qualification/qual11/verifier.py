@@ -128,6 +128,10 @@ def main():
     ap.add_argument("--progress", required=True, help="the generator's per-partition progress")
     ap.add_argument("--out", required=True)
     ap.add_argument("--timeout-s", type=float, default=180.0)
+    # Passed explicitly, as QUAL-05 does: the generator's spec record does
+    # not carry it, and guessing 0 here would recompute a DIFFERENT key
+    # space than the generator produced.
+    ap.add_argument("--key-epoch-ms", type=int, default=0)
     args = ap.parse_args()
 
     with open(args.spec) as fh:
@@ -140,10 +144,11 @@ def main():
         base_ms=spec_rec["base_ms"],
         max_jitter_ms=spec_rec.get("max_jitter_ms", 1500),
         window_ms=spec_rec.get("window_ms", 10000),
-        # QUAL-11 runs a FIXED key space (no epoch turnover): every key must
-        # live on both sides of the evolution boundary, or there is nothing
-        # for the migration to carry.
-        key_epoch_ms=spec_rec.get("key_epoch_ms", 0),
+        # QUAL-11 turns the key space over deliberately: keys from earlier
+        # epochs go DORMANT, and a dormant key is what still holds the
+        # migration's seeded sentinels at the second savepoint - the only
+        # population that can evidence the migration's exact output.
+        key_epoch_ms=args.key_epoch_ms,
     )
     with open(args.progress) as fh:
         progress = json.load(fh)

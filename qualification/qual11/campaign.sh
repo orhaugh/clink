@@ -42,10 +42,16 @@ DURATION_S="${DURATION_S:-1800}"
 PROFILE="${PROFILE:-aggressive}"
 RATE="${RATE:-1000}"
 PARTITIONS="${PARTITIONS:-4}"
-# A FIXED key space (no epoch turnover): every key must live on both sides
-# of the boundary, or there is nothing for the migration to carry and
-# gate 4 has no evidence.
 KEYS="${KEYS:-2000}"
+# The key space TURNS OVER, deliberately. A fixed key space at any real
+# rate touches every key within seconds of the restore, and gate 4's
+# predicted-output half needs keys that are still UNTOUCHED when the
+# second savepoint is taken - those are the ones still holding the
+# sentinels the migration wrote. With epochs, keys from earlier epochs go
+# dormant and provide exactly that population, while the current epoch's
+# keys provide the carried-and-active one. (No TTL on this job, so
+# dormant keys persist rather than expiring.)
+KEY_EPOCH_MS="${KEY_EPOCH_MS:-30000}"
 SEED="${SEED:-20260825}"
 CHECKPOINT_INTERVAL_MS="${CHECKPOINT_INTERVAL_MS:-15000}"
 FILL_S="${FILL_S:-240}"
@@ -343,7 +349,7 @@ echo "$BASE_MS" > "$OUT_DIR/base_ms"
 start_on_host "$OPS_PUB" q11-generator.log \
     "python3 /qual/generator.py --brokers '$BROKER_LIST' --topic $IN_TOPIC \
      --rate $RATE --partitions $PARTITIONS --keys $KEYS --seed $SEED \
-     --base-ms $BASE_MS --progress /qual/progress.json"
+     --base-ms $BASE_MS --key-epoch-ms $KEY_EPOCH_MS --progress /qual/progress.json"
 echo "campaign: generator started"
 
 # --- v1: the pre-boundary job -------------------------------------------------
@@ -592,7 +598,7 @@ ST=$(job_status "$JOB_ID")
 echo "campaign: verifying"
 on_host "$OPS_PUB" "python3 /qual/verifier.py --brokers '$BROKER_LIST' --topic $OUT_TOPIC \
     --spec /qual/progress.json.spec --progress /qual/progress.json \
-    --out /qual/q11-verify.json" > "$OUT_DIR/verify.log" 2>&1 || true
+    --key-epoch-ms $KEY_EPOCH_MS --out /qual/q11-verify.json" > "$OUT_DIR/verify.log" 2>&1 || true
 on_host "$OPS_PUB" "cat /qual/q11-verify.json" > "$OUT_DIR/q11-verify.json" 2>/dev/null || true
 
 # --- evidence + verdict ---------------------------------------------------------
