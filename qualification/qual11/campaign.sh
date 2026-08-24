@@ -532,6 +532,13 @@ else
 fi
 
 # --- battery on the MIGRATED job ----------------------------------------------
+# Derived from the summariser so the driver and the verdict cannot
+# disagree about which points this campaign fires (the QUAL-09 form).
+Q11_POINTS=$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+import summarise
+print(','.join(summarise.TWOPC_POINTS))")
+[ -n "$Q11_POINTS" ] || { echo "campaign: no 2PC points from the summariser" >&2; exit 78; }
 to_host "$OPS_PUB" "$OUT_DIR/inventory.json" /qual/inventory.json
 # Flags INLINE, not via a variable: the harness's chaos-interface drift
 # test reads the launch line statically, and arguments hidden behind a
@@ -541,6 +548,7 @@ start_on_host "$OPS_PUB" q11-chaos.log \
     "python3 /qual/chaos.py --inventory /qual/inventory.json --log /qual/q11-chaos.jsonl \
      --coordinator-url http://${COORD_PRIV}:8095 --job-id $JOB_ID --run-id $RUN_ID \
      --profile $PROFILE --seed $SEED --min-gap-s $MIN_GAP_S \
+     --twopc-points '$Q11_POINTS' \
      --recovery-timeout-s $RECOVERY_TIMEOUT_S --duration-s $(( DURATION_S + 600 )) \
      --ensure-coverage"
 echo "campaign: battery started for ${DURATION_S}s"

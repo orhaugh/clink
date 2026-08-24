@@ -78,6 +78,20 @@ def load_chaos(path):
     return recs
 
 
+# The 2PC crash windows this campaign can actually fire. The job's sink
+# is at-least-once, so NO sink-side point is reachable - arming one makes
+# the coverage pre-pass chase a fault that can never fire, which is
+# exactly what chaos.py's own comment warns about and what kept an
+# otherwise-green local run INCONCLUSIVE: the controller burned a whole
+# battery on two unreachable sink points, failed twice in a row, and
+# never advanced far enough to restart the coordinator. The
+# COORDINATOR-side checkpoint-marker windows are reachable whatever the
+# sink is, and they are the ones that matter around a migrated job.
+TWOPC_POINTS = (
+    "coordinator.before_completed_marker",
+    "coordinator.after_completed_marker",
+)
+
 MANDATORY_FAULTS = ("worker_sigkill", "coordinator_restart")
 
 
