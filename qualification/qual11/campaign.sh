@@ -220,7 +220,23 @@ print([h['private_ip'] for h in inv['hosts'] if h['public_ip']=='$bp'][0])")
         '$bi' '$bpriv' '$SEED_LIST' > /qual/.env && docker compose -f broker.yml up -d"
     bi=$(( bi + 1 ))
 done
-sleep 25
+
+# WAIT for the brokers rather than guessing: a fixed sleep is a race the
+# campaign loses on a cold rig (the first attempt got "connection refused"
+# 25s in). Poll the cluster until it answers, then create topics.
+BROKERS_UP=no
+for _t in $(seq 1 40); do
+    if on_host "$OPS_PUB" "docker run --rm --entrypoint rpk \
+        docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
+        cluster info --brokers $BROKER_ONE:9092" >/dev/null 2>&1; then
+        BROKERS_UP=yes; break
+    fi
+    sleep 6
+done
+[ "$BROKERS_UP" = "yes" ] \
+    || { echo "campaign: the brokers never became reachable" >&2; exit 2; }
+echo "campaign: brokers up"
+
 # The proven helper shape (QUAL-08/09): --entrypoint rpk against ONE
 # broker. A previous version used --network host with the full broker
 # list, silenced its failure with `|| true`, and the campaign then spent
