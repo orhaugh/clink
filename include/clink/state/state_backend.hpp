@@ -310,6 +310,16 @@ public:
     // in-memory backends that keep no per-checkpoint artefacts.
     virtual void purge_checkpoint(CheckpointId /*id*/) {}
 
+    // Enumerate the checkpoint ids this backend currently holds artefacts
+    // for, so the retention manager can sweep orphans it never saw
+    // complete. Purges ride the CommitCheckpoint broadcast, and a worker
+    // that misses one (partitioned at completion time, or restarted) would
+    // otherwise leave that id's artefacts on disk forever - each missed
+    // broadcast is a permanent leak on a bounded volume. A backend that
+    // returns its held ids gets a self-healing sweep on every subsequent
+    // broadcast; the default (empty) keeps broadcast-driven purging only.
+    [[nodiscard]] virtual std::vector<CheckpointId> list_checkpoints() const { return {}; }
+
     // --- expiry compaction hook -------------------------------------------
     //
     // TTL'd state has to be physically reclaimed, not merely hidden from

@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <regex>
 #include <string>
@@ -153,6 +154,45 @@ TEST(CheckpointRetentionE2E, EverySubtaskDirectoryOnDiskIsBoundedByTheRetentionD
                             << "): this directory is never purged, and on a bounded volume "
                                "that is a countdown to ENOSPC (item 77a)";
     }
+
+    // --- the missed-broadcast orphan (QUAL-09, finding 77's residue) ----
+    //
+    // Purges ride the CommitCheckpoint broadcast, so a worker partitioned
+    // at completion time (or restarted since) never hears about the ids
+    // that completed while it was away - and a purge keyed on "ids I saw
+    // complete" leaves those snapshots on disk FOREVER. Two 150-second
+    // partitions at a 5-second checkpoint interval measured 30 orphans on
+    // the campaign's bounded volume. The on-disk shape of a missed
+    // broadcast is exactly an old-id snapshot the retention tracker does
+    // not retain, so inject one into every subtask directory and require
+    // the sweep that now rides every subsequent broadcast to remove them.
+    const char* orphan = "checkpoint-1.snap";
+    std::vector<std::filesystem::path> injected;
+    for (const auto& [dir, n] : counts) {
+        (void)n;
+        const auto snap = std::filesystem::path(dir) / orphan;
+        std::ofstream(snap) << "orphaned by a missed CommitCheckpoint";
+        std::ofstream(snap.string() + ".meta") << "orphan sidecar";
+        injected.push_back(snap);
+    }
+    const auto sweep_deadline = std::chrono::steady_clock::now() + 20s;
+    auto orphans_left = [&] {
+        int left = 0;
+        for (const auto& snap : injected) {
+            std::error_code ec;
+            if (std::filesystem::exists(snap, ec) ||
+                std::filesystem::exists(snap.string() + ".meta", ec)) {
+                ++left;
+            }
+        }
+        return left;
+    };
+    while (orphans_left() > 0 && std::chrono::steady_clock::now() < sweep_deadline) {
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_EQ(orphans_left(), 0)
+        << "orphan snapshots from a missed completion broadcast were never swept: "
+           "on a bounded volume every missed broadcast is a permanent leak (item 77)";
 
     (void)coordinator.cancel_job(job_id);
     (void)coordinator.await_job_completion(job_id, 10s);

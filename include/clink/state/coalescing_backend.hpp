@@ -73,6 +73,9 @@ public:
         return inner_->combine_snapshots(std::move(parts));
     }
     void purge_checkpoint(CheckpointId id) override { inner_->purge_checkpoint(id); }
+    [[nodiscard]] std::vector<CheckpointId> list_checkpoints() const override {
+        return inner_->list_checkpoints();
+    }
     void set_state_versions(StateVersionMap v) override {
         inner_->set_state_versions(std::move(v));
     }

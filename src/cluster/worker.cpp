@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1018,6 +1019,9 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
     // bounded. Collect the (backend, id) work under the lock, run the
     // purges (filesystem remove_all / unlink) outside it.
     std::vector<std::pair<std::shared_ptr<StateBackend>, CheckpointId>> to_purge;
+    std::vector<std::shared_ptr<StateBackend>> sweep_backends;
+    std::uint64_t sweep_cutoff = 0;
+    std::set<std::uint64_t> sweep_retained;
     std::string receipt_store_root;
     std::vector<CheckpointId> receipt_purge_ids;
     {
@@ -1039,22 +1043,41 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
             std::erase_if(purge_ids,
                           [&](const CheckpointId id) { return id.value() >= msg.retain_floor; });
         }
-        if (!purge_ids.empty()) {
-            if (auto be_it = per_job_backends_.find(msg.job_id); be_it != per_job_backends_.end()) {
-                for (const auto& [_, backend] : be_it->second) {
-                    if (!backend) {
-                        continue;
-                    }
-                    for (const auto id : purge_ids) {
-                        to_purge.emplace_back(backend, id);
-                    }
+        // Self-healing sweep inputs: the tracker only ever returns ids it
+        // SAW complete, so a completion broadcast this worker missed
+        // (partitioned at completion time, or a worker restart since) is a
+        // snapshot no broadcast will ever purge - a permanent leak on a
+        // bounded volume (QUAL-09 measured 30 orphans from two 150s
+        // partitions). Every broadcast therefore also sweeps ids on disk
+        // below the retention cutoff that the tracker does not retain.
+        // The floor clamps the cutoff for the same reason it filters
+        // purge_ids: nothing at or above the newest CONFIRMED checkpoint
+        // may go.
+        sweep_cutoff = ret_it->second.sweep_cutoff().value();
+        if (msg.retain_floor > 0) {
+            sweep_cutoff = std::min(sweep_cutoff, msg.retain_floor);
+        }
+        sweep_retained = ret_it->second.retained_ids();
+        if (auto be_it = per_job_backends_.find(msg.job_id); be_it != per_job_backends_.end()) {
+            for (const auto& [_, backend] : be_it->second) {
+                if (!backend) {
+                    continue;
+                }
+                for (const auto id : purge_ids) {
+                    to_purge.emplace_back(backend, id);
+                }
+                if (sweep_cutoff > 0) {
+                    sweep_backends.push_back(backend);
                 }
             }
+        }
+        if (!purge_ids.empty() || sweep_cutoff > 0) {
             // Commit receipts ride the same retention window: a purged
-            // checkpoint's receipts (sub<K>-<id>, any subtask) go with it.
-            // The retain_floor filter above already keeps every receipt at
-            // or above the newest CONFIRMED checkpoint - the ones recovery
-            // and replay suppression still read.
+            // checkpoint's receipts (sub<K>-<id>, any subtask) go with it,
+            // and the orphan sweep covers receipts too. The retain_floor
+            // filter above already keeps every receipt at or above the
+            // newest CONFIRMED checkpoint - the ones recovery and replay
+            // suppression still read.
             if (auto cp_it = per_job_checkpoint_.find(msg.job_id);
                 cp_it != per_job_checkpoint_.end() && !cp_it->second.checkpoint_dir.empty()) {
                 receipt_store_root = cp_it->second.checkpoint_dir;
@@ -1069,7 +1092,31 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
             // Best-effort: a failed purge only leaves disk un-reclaimed.
         }
     }
-    if (!receipt_store_root.empty() && !receipt_purge_ids.empty()) {
+    // The orphan sweep, outside the lock (it walks the backend's storage).
+    // Runs after the broadcast-driven purges so a just-evicted id is
+    // already gone rather than double-purged.
+    const auto is_sweepable = [&](const std::uint64_t id) {
+        return sweep_cutoff > 0 && id < sweep_cutoff && !sweep_retained.contains(id);
+    };
+    for (const auto& backend : sweep_backends) {
+        std::vector<CheckpointId> held;
+        try {
+            held = backend->list_checkpoints();
+        } catch (...) {
+            continue;
+        }
+        for (const auto id : held) {
+            if (!is_sweepable(id.value())) {
+                continue;
+            }
+            try {
+                backend->purge_checkpoint(id);
+            } catch (...) {
+                // Best-effort, as above.
+            }
+        }
+    }
+    if (!receipt_store_root.empty()) {
         const auto store = make_coordination_store(receipt_store_root);
         const auto prefix = "_jobs/" + std::to_string(msg.job_id) + "/receipts";
         for (const auto& key : store->list(prefix)) {
@@ -1079,11 +1126,12 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
                 continue;
             }
             const auto id = std::strtoull(name.c_str() + dash + 1, nullptr, 10);
+            bool drop = is_sweepable(id);
             for (const auto purge_id : receipt_purge_ids) {
-                if (id == purge_id.value()) {
-                    store->remove(key);
-                    break;
-                }
+                drop = drop || id == purge_id.value();
+            }
+            if (drop) {
+                store->remove(key);
             }
         }
     }

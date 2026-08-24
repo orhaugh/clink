@@ -212,6 +212,17 @@ public:
         return state::verify_checkpoint(path_for(id));
     }
 
+    // Every checkpoint id with a snapshot file in this directory, so the
+    // retention manager can sweep ids whose completion broadcast this
+    // worker never received (see StateBackend::list_checkpoints).
+    [[nodiscard]] std::vector<CheckpointId> list_checkpoints() const override {
+        std::vector<CheckpointId> out;
+        for (const auto id : snapshot_ids_on_disk_(0)) {
+            out.push_back(CheckpointId{id});
+        }
+        return out;
+    }
+
     // Highest checkpoint id in this directory that passes verification,
     // considering only ids <= `at_most` (0 = no ceiling).
     //
@@ -223,32 +234,7 @@ public:
     [[nodiscard]] std::optional<CheckpointId> latest_valid_checkpoint(
         std::uint64_t at_most = 0,
         std::vector<std::pair<CheckpointId, state::VerifyResult>>* rejected = nullptr) const {
-        std::vector<std::uint64_t> ids;
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir_, ec)) {
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-            const auto name = entry.path().filename().string();
-            constexpr std::string_view kPrefix = "checkpoint-";
-            constexpr std::string_view kSuffix = ".snap";
-            if (name.rfind(kPrefix, 0) != 0 || name.size() <= kPrefix.size() + kSuffix.size()) {
-                continue;
-            }
-            if (name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
-                continue;
-            }
-            const auto digits =
-                name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
-            if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
-                continue;
-            }
-            const auto id = std::stoull(digits);
-            if (at_most != 0 && id > at_most) {
-                continue;
-            }
-            ids.push_back(id);
-        }
+        auto ids = snapshot_ids_on_disk_(at_most);
         std::sort(ids.begin(), ids.end(), std::greater<>());
         for (const auto id : ids) {
             const CheckpointId cid{id};
@@ -316,6 +302,38 @@ private:
         // the two leaves an unpublished (incomplete) checkpoint rather than
         // a valid-looking one - see checkpoint_integrity.hpp.
         state::write_checkpoint_meta(path, id.value(), bytes.data(), bytes.size());
+    }
+
+    // Every checkpoint-<id>.snap id in the directory, unordered; ids above
+    // `at_most` are skipped (0 = no ceiling).
+    [[nodiscard]] std::vector<std::uint64_t> snapshot_ids_on_disk_(std::uint64_t at_most) const {
+        std::vector<std::uint64_t> ids;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir_, ec)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const auto name = entry.path().filename().string();
+            constexpr std::string_view kPrefix = "checkpoint-";
+            constexpr std::string_view kSuffix = ".snap";
+            if (name.rfind(kPrefix, 0) != 0 || name.size() <= kPrefix.size() + kSuffix.size()) {
+                continue;
+            }
+            if (name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+                continue;
+            }
+            const auto digits =
+                name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
+            if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+                continue;
+            }
+            const auto id = std::stoull(digits);
+            if (at_most != 0 && id > at_most) {
+                continue;
+            }
+            ids.push_back(id);
+        }
+        return ids;
     }
 
     [[nodiscard]] std::filesystem::path path_for(CheckpointId id) const {
