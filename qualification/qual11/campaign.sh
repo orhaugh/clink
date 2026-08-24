@@ -216,8 +216,13 @@ import json
 inv=json.load(open('$OUT_DIR/inventory.json'))
 print([h['private_ip'] for h in inv['hosts'] if h['public_ip']=='$bp'][0])")
     to_host "$bp" "$HERE/../infra/broker.yml" /qual/broker.yml
-    on_host "$bp" "cd /qual && printf 'BROKER_ID=%s\nBROKER_IP=%s\nSEEDS=%s\n' \
-        '$bi' '$bpriv' '$SEED_LIST' > /qual/.env && docker compose -f broker.yml up -d"
+    # broker.yml interpolates NODE_ID / PRIVATE_IP / SEEDS, passed INLINE
+    # (the QUAL-09 form). Writing differently-named keys into .env left
+    # --node-id empty and every broker crash-looped on an unparseable
+    # flag, which the campaign only saw as "brokers never became
+    # reachable" four minutes later.
+    on_host "$bp" "cd /qual && NODE_ID=$bi PRIVATE_IP=$bpriv SEEDS='$SEED_LIST' \
+        docker compose -f broker.yml up -d"
     bi=$(( bi + 1 ))
 done
 
@@ -261,8 +266,11 @@ echo "campaign: topics $IN_TOPIC and $OUT_TOPIC created (p=$PARTITIONS r=$REPL)"
 
 # --- engine -------------------------------------------------------------------
 to_host "$COORD_PUB" "$HERE/../infra/coordinator.yml" /qual/coordinator.yml
-on_host "$COORD_PUB" "cd /qual && printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\n' \
-    '$CLINK_IMAGE' '$COORD_PRIV' > /qual/.env && docker compose -f coordinator.yml up -d"
+on_host "$COORD_PUB" "cd /qual && docker compose -f coordinator.yml down >/dev/null 2>&1; \
+    rm -rf /qual/ha/jobs /qual/ha/history; mkdir -p /qual/ha; \
+    printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nRESTART_DRAIN_TIMEOUT_MS=%s\n' \
+    '$CLINK_IMAGE' '$COORD_PRIV' '$RESTART_DRAIN_TIMEOUT_MS' > /qual/.env && \
+    docker compose -f coordinator.yml up -d"
 wi=0
 for wp in $WORKER_PUBS; do
     wpriv=$(python3 -c "
