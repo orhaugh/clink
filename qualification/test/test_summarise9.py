@@ -35,7 +35,8 @@ def write_evidence(d, *, local=False, findings=(), stuck=False, quiesced=True,
                    caught_up=True, endstate=True,
                    job_gone=False, chaos_died=False, oracle_dirty=False,
                    infra=("disk_pressure", "partition_sustained", "clock_step"),
-                   unengaged=(), skips=(), revert_failed=(), revert_drained=()):
+                   unengaged=(), skips=(), revert_failed=(), revert_drained=(),
+                   max_snaps=4, audit=True):
     (d / "q9-verdict.json").write_text(json.dumps({
         "samples": 30, "findings": list(findings), "stuck": stuck,
         "last_stats": {"sum_n": sum_n}}))
@@ -54,6 +55,9 @@ def write_evidence(d, *, local=False, findings=(), stuck=False, quiesced=True,
         (d / "chaos-died.txt").write_text("died\n")
     if oracle_dirty:
         (d / "oracle-dirty.txt").write_text("dirty\n")
+    if audit:
+        (d / "retention-audit.txt").write_text(
+            f"max_snaps_per_dir={max_snaps}\nretained_configured=3\n")
 
     lines = []
     for ev in q9.MANDATORY_CORE:
@@ -120,6 +124,13 @@ CASES = [
     ("skip records do NOT excuse a cloud run",
      {"infra": ("partition_sustained",),
       "skips": ("disk_pressure", "clock_step")}, "INCONCLUSIVE"),
+    # The retention audit (item 77a's standing gate).
+    ("an unbounded snapshot pile is INCONCLUSIVE",
+     {"max_snaps": 81}, "INCONCLUSIVE"),
+    ("a missing retention audit is INCONCLUSIVE",
+     {"audit": False}, "INCONCLUSIVE"),
+    ("a pile inside the slack is bounded",
+     {"max_snaps": 15}, "PASS"),
     # Revert hygiene.
     ("a failed revert is a FAIL", {"revert_failed": ("clock_step",)}, "FAIL"),
     ("a drained revert is tolerated", {"revert_drained": ("disk_pressure",)}, "PASS"),

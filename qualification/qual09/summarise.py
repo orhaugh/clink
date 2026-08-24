@@ -101,6 +101,13 @@ def count_faults(recs):
     return counts
 
 
+# Snapshot piles deeper than this many beyond the configured retention
+# read as unbounded growth: purges lag completions by the in-flight
+# checkpoint plus windows in which completions stalled (fault holds), so
+# the slack is generous - but 81-of-81 must never pass again.
+RETENTION_SLACK = 12
+
+
 def build(out_dir, run_id, profile, local):
     verdict = read_json(os.path.join(out_dir, "q9-verdict.json"))
     comp = read_kv(os.path.join(out_dir, "completeness.txt"))
@@ -164,6 +171,11 @@ def build(out_dir, run_id, profile, local):
         keys_clean = keys_clean and missing == 0 and wrong == 0
     quiesced = quiesce.get("quiesced", "no") == "yes"
 
+    audit = read_kv(os.path.join(out_dir, "retention-audit.txt"))
+    max_snaps = int(audit.get("max_snaps_per_dir", 0) or 0)
+    retained = int(audit.get("retained_configured", 3) or 3)
+    retention_bounded = bool(audit) and 0 < max_snaps <= retained + RETENTION_SLACK
+
     hard_fail = (
         bool(findings) or stuck or oracle_dirty or job_gone
         or bool(reverts_failed)
@@ -176,6 +188,8 @@ def build(out_dir, run_id, profile, local):
     elif not have_endstate or checked == 0 or not caught_up or not exact:
         result = "INCONCLUSIVE"
     elif gaps or unengaged or silent_absences or chaos_died or not quiesced:
+        result = "INCONCLUSIVE"
+    elif not retention_bounded:
         result = "INCONCLUSIVE"
     else:
         result = "PASS"
@@ -219,6 +233,15 @@ def build(out_dir, run_id, profile, local):
         a(f"- REVERTS FAILED: "
           f"{', '.join(sorted(set(r.get('reverted', '?') for r in reverts_failed)))}"
           " - the rig may be dirty and nothing after the failure is trustworthy")
+    a("")
+    a("## Retention audit (from the disk)")
+    a("")
+    if not audit:
+        a("- NO AUDIT RETAINED - bounded retention has no evidence")
+    else:
+        a(f"- deepest snapshot pile: {max_snaps} against retained={retained}"
+          f" (+{RETENTION_SLACK} slack): "
+          f"{'bounded' if retention_bounded else 'UNBOUNDED GROWTH (item 77a)'}")
     a("")
     a("## Correctness")
     a("")

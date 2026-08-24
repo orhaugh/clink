@@ -660,6 +660,16 @@ PY
 done
 echo "quiesced=$QUIESCED" > "$OUT_DIR/final-quiesce.txt"
 
+# Retention audit (item 77a's standing gate): the deepest snapshot pile
+# across every subtask directory, judged from the DISK. ckptsize sizes
+# only the newest snapshot per subtask, which is exactly how unbounded
+# retention stayed invisible through five campaigns until a bounded
+# volume made it terminal.
+MAX_SNAPS=$(on_host "$OPS_PUB" "for d in \$(find '$CKPT_DIR' -mindepth 2 -maxdepth 2 -type d -path '*/v*/*' 2>/dev/null); do ls \$d 2>/dev/null | grep -c 'snap\$'; done | sort -n | tail -1" | tr -d ' \r')
+{ echo "max_snaps_per_dir=${MAX_SNAPS:-0}"; echo "retained_configured=3";
+} > "$OUT_DIR/retention-audit.txt"
+cat "$OUT_DIR/retention-audit.txt"
+
 on_host "$OPS_PUB" "python3 /qual/endstate.py --dsn '$DSN' --table public.q9_out \
     --progress /qual/q9-progress.json --seed $SEED --partitions $PARTITIONS \
     --keys $KEYS --eps $EPS --base-ms $BASE_MS --key-epoch-ms $KEY_EPOCH_MS" \
