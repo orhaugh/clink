@@ -32,6 +32,7 @@ Two rules govern what appears here:
 | Content-level agreement with an independent reference engine: 19 of 19 queries, byte-exact multisets and key-paired final states, under pre-declared judgement classes | [QUAL-07](qual-07-semantic-comparison.md) | 24 August 2026, engine `998e0ff` |
 | A rolling engine upgrade (`bed138c` → `3c7ffd1`) with exactly-once continuity: 2s savepoint, 2s restore, 114s downtime, every event across the boundary counted once | [QUAL-08](qual-08-rolling-upgrade.md) | 24 August 2026 |
 | Infrastructure faults: ENOSPC on the state volume, a 7-minute partition, stepped clocks - 3.38M events exactly once, checkpoint storage held at its configured bound | [QUAL-09](qual-09-infrastructure-faults.md) | 24 August 2026, engine `73b6565` |
+| A running job's keyed-state TYPE changed and migrated at restore: 74,000 keys exact across the boundary, 10,000 verified byte-for-byte against the migration's own output | [QUAL-11](qual-11-schema-evolution.md) | 25 August 2026, engine `ba680f9` |
 
 ## Not yet campaigned
 

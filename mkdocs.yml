@@ -99,6 +99,7 @@ nav:
       - qualification/qual-07-semantic-comparison.md
       - qualification/qual-08-rolling-upgrade.md
       - qualification/qual-09-infrastructure-faults.md
+      - qualification/qual-11-schema-evolution.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
       - internals/README.md
