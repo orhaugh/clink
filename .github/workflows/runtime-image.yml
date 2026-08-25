@@ -77,8 +77,24 @@ env:
 
 jobs:
   publish:
-    name: Build + push clink-runtime
-    runs-on: ubuntu-24.04
+    name: Build + push clink-runtime (${{ matrix.arch }})
+    # One NATIVE runner per architecture. Emulating arm64 here is not an
+    # option worth costing: this job compiles the whole engine in Release
+    # plus RocksDB, and QEMU turns that from a long build into an unusable
+    # one. The arm64 half exists so `docker run` on an Apple Silicon laptop
+    # runs the real thing rather than an emulated x86 image - which is the
+    # difference between trying clink and watching it crawl.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
@@ -103,28 +119,75 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build + push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runtime
+          platforms: ${{ matrix.platform }}
+          # Untagged per-arch pushes; the merge job below applies the tags to
+          # a manifest list covering both. Tagging here would leave whichever
+          # arch finished last owning ":latest", which is how a multi-arch
+          # image quietly becomes single-arch.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            BASE_IMAGE=${{ env.TOOLCHAIN }}:${{ inputs.toolchain_tag || 'main' }}
+            CLINK_WITH_FORST=${{ inputs.with_forst == true && 'ON' || 'OFF' }}
+            CLINK_ISA_BASELINE=${{ inputs.isa_baseline }}
+            CLINK_ENABLE_FAULT_INJECTION=${{ inputs.fault_injection == true && 'ON' || 'OFF' }}
+            CLINK_BUILD_QUAL11_JOBS=${{ inputs.qual11_jobs == true && 'ON' || 'OFF' }}
+            CLINK_GIT_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=clink streaming runtime (clink_node + the clink client CLI)
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max
+
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  manifest:
+    name: Tag the multi-arch manifest
+    needs: publish
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # This runner is amd64, and the checks below RUN the arm64 image to
+      # prove the example works there too. Emulation is fine for that: the
+      # assertion is that rows come out, not how fast.
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Resolve tags
         id: tags
-        # A tag push publishes the released version plus :latest; a manual run
-        # refreshes :main. Both carry :sha-<short> so a running pod can always
-        # be traced to a commit.
         run: |
           set -euo pipefail
           suffix=""
           if [ "${{ inputs.with_forst }}" = "true" ]; then suffix="-forst"; fi
-          # An ISA-raised image is NOT portable (it faults on CPUs below the level),
-          # so it must never take the :main or :latest tag a deployment pulls blindly.
-          # The suffix keeps it addressable for an A/B while leaving those alone.
           isa="${{ inputs.isa_baseline }}"
           if [ -n "$isa" ]; then suffix="${suffix}-isa$(echo "$isa" | tr -cd 'a-zA-Z0-9')"; fi
-          # A fault-injection build is for campaigns only. Arming
-          # CLINK_FAULT_INJECT against an image that lacks the points is a
-          # SILENT no-op, so the surface has to be visible in the tag - and
-          # the tag must never be one a deployment pulls blindly.
           if [ "${{ inputs.fault_injection }}" = "true" ]; then suffix="${suffix}-faultinj"; fi
-          # Same rule as the fault surface: campaign fixtures are visible
-          # in the tag, never silently present in an image a deployment
-          # might pull.
           if [ "${{ inputs.qual11_jobs }}" = "true" ]; then suffix="${suffix}-qual11"; fi
           short="$(echo "${GITHUB_SHA}" | cut -c1-12)"
           tags="${IMAGE}:sha-${short}${suffix}"
@@ -137,27 +200,38 @@ jobs:
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           echo "Publishing: ${tags}"
 
-      - name: Build + push
-        uses: docker/build-push-action@v6
+      - uses: actions/download-artifact@v4
         with:
-          context: .
-          file: docker/Dockerfile.runtime
-          push: true
-          platforms: linux/amd64
-          build-args: |
-            BASE_IMAGE=${{ env.TOOLCHAIN }}:${{ inputs.toolchain_tag || 'main' }}
-            CLINK_WITH_FORST=${{ inputs.with_forst == true && 'ON' || 'OFF' }}
-            CLINK_ISA_BASELINE=${{ inputs.isa_baseline }}
-            CLINK_ENABLE_FAULT_INJECTION=${{ inputs.fault_injection == true && 'ON' || 'OFF' }}
-            CLINK_BUILD_QUAL11_JOBS=${{ inputs.qual11_jobs == true && 'ON' || 'OFF' }}
-            CLINK_GIT_SHA=${{ github.sha }}
-          tags: ${{ steps.tags.outputs.tags }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.description=clink streaming runtime (clink_node + the clink client CLI)
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          pattern: runtime-digest-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Create the manifest
+        run: |
+          set -euo pipefail
+          cd /tmp/digests
+          # Refuse BEFORE tagging, not after. fail-fast is off so a broken
+          # arm64 build still lets amd64 finish, and merging whatever showed
+          # up would publish a single-arch image under ":latest" - working,
+          # pullable, and wrong for half the people who pull it. The tags are
+          # the thing that must never lie; failing here leaves the previous
+          # ones in place.
+          n="$(ls -1 | wc -l | tr -d ' ')"
+          if [ "$n" -ne 2 ]; then
+            echo "::error::expected 2 per-arch digests, found ${n} - refusing to tag a partial manifest"
+            ls -la
+            exit 1
+          fi
+          refs=""
+          for d in *; do refs="${refs} ${IMAGE}@sha256:${d}"; done
+          targs=""
+          IFS=','
+          for t in ${{ steps.tags.outputs.tags }}; do targs="${targs} -t ${t}"; done
+          unset IFS
+          echo "Merging${refs} into${targs}"
+          docker buildx imagetools create ${targs} ${refs}
+          first="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          docker buildx imagetools inspect "$first"
 
       - name: Smoke the published image
         # Cheap proof that what was pushed actually runs, rather than merely
@@ -168,3 +242,43 @@ jobs:
           echo "Smoking ${ref}"
           docker run --rm --entrypoint clink_node "${ref}" --help
           docker run --rm --entrypoint clink "${ref}" --help
+
+      - name: The manifest really covers both architectures
+        # The failure this guards is silent: if one arch's build dropped out,
+        # the merge still succeeds and publishes a perfectly working
+        # single-arch image. Nobody notices until someone on a laptop gets
+        # an emulated one, or no image at all.
+        run: |
+          set -euo pipefail
+          ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          arches="$(docker buildx imagetools inspect "$ref" --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')"
+          echo "manifest covers: ${arches}"
+          for want in linux/amd64 linux/arm64; do
+            case " ${arches} " in
+              *" ${want} "*) ;;
+              *) echo "::error::${ref} does not cover ${want}"; exit 1 ;;
+            esac
+          done
+
+      - name: The one-command example runs, on both architectures
+        # The README's first command is a promise. It breaks quietly: the
+        # example is copied in a build step, its data path is rewritten by a
+        # sed, and the entrypoint has to route a subcommand rather than a
+        # flag. Any of those can regress without a single test noticing, and
+        # the person who finds out is someone trying clink for the first time.
+        run: |
+          set -euo pipefail
+          ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          for platform in linux/amd64 linux/arm64; do
+            echo "== ${platform} =="
+            out="$(docker run --rm --platform "${platform}" "${ref}" \
+                     run /opt/clink/examples/sql/hello.sql)"
+            echo "${out}"
+            echo "${out}" | grep -q '"region":"emea"' \
+              || { echo "::error::the bundled example produced no rows on ${platform}"; exit 1; }
+            # Results, not startup logs: the one-off path defaults to warn.
+            if echo "${out}" | grep -q "coordinator.submit"; then
+              echo "::error::the example printed engine logs over its results on ${platform}"
+              exit 1
+            fi
+          done

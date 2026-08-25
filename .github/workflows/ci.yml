@@ -49,7 +49,7 @@ env:
 
 jobs:
   toolchain-image:
-    name: Pinned toolchain image
+    name: Pinned toolchain image (${{ matrix.arch }})
     # Push events only: on a pull_request run (fork or same-repo) the
     # GITHUB_TOKEN is read-only for packages, so the GHCR push would 403.
     # PR runs skip this job and consume the image from the latest main
@@ -58,45 +58,121 @@ jobs:
     # the setup scripts) is tested against the pre-change image until it
     # lands on main; CONTRIBUTING.md tells authors to flag such PRs.
     if: github.event_name == 'push'
-    runs-on: ubuntu-24.04
-    outputs:
-      ref: ${{ steps.meta.outputs.ref }}
+    # One NATIVE runner per architecture rather than one runner emulating the
+    # other. The arm64 half of this image is not cheap to fake: the mongo c
+    # and c++ drivers are compiled from source here, and under QEMU that is
+    # the difference between minutes and most of an hour. Arrow itself is
+    # restored from the checksum-pinned prebuilt archive on both arches
+    # (scripts/fetch-deps.sh), which is why arm64 is affordable at all.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - id: meta
-        run: echo "ref=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build + push pinned image (layer-cached)
+      - name: Build + push by digest (layer-cached)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          push: true
-          # The per-SHA tag pins this run; the `:main` moving tag is what
-          # pull_request runs (which skip this job) pull instead.
-          tags: |
-            ${{ steps.meta.outputs.ref }}
-            ${{ env.IMAGE }}:main
-          # Registry-backed layer cache: the expensive from-source Arrow /
-          # aws-sdk / iceberg-cpp layers are reused across runs and only
-          # rebuilt when their COPYed scripts change (see docker/Dockerfile).
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          platforms: ${{ matrix.platform }}
+          # No tags here. Each arch pushes an untagged manifest and reports
+          # its digest; the merge job below is what turns the pair into the
+          # tags anything else pulls. Tagging per-arch instead would leave
+          # whichever finished last as ":main", which is how a multi-arch
+          # image silently becomes single-arch again.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # Registry-backed layer cache: the expensive from-source layers are
+          # reused across runs. Keyed PER ARCH - a shared key has the two
+          # builds overwrite each other's manifest and neither gets a hit.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          # The filename IS the digest; the merge job reassembles the refs
+          # from these names, so one empty file per arch is the whole payload.
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: toolchain-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  toolchain-manifest:
+    name: Pinned toolchain image (manifest)
+    if: github.event_name == 'push'
+    needs: toolchain-image
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.meta.outputs.ref }}
+    steps:
+      - id: meta
+        run: echo "ref=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: toolchain-digest-*
+          merge-multiple: true
+          path: /tmp/digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch tags
+        # The per-SHA tag pins this run; the `:main` moving tag is what
+        # pull_request runs (which skip these jobs) pull instead. Both are
+        # manifest lists, so a puller on either architecture resolves its own
+        # image and nothing has to know which it is.
+        run: |
+          set -euo pipefail
+          cd /tmp/digests
+          # Same rule as the runtime image: refuse before tagging. ":main" is
+          # what every PR run and both image workflows pull, so a partial
+          # merge here does not fail loudly - it quietly gives one
+          # architecture a base image and the other nothing.
+          n="$(ls -1 | wc -l | tr -d ' ')"
+          if [ "$n" -ne 2 ]; then
+            echo "::error::expected 2 per-arch digests, found ${n} - refusing to tag a partial manifest"
+            ls -la
+            exit 1
+          fi
+          refs=""
+          for d in *; do refs="${refs} ${IMAGE}@sha256:${d}"; done
+          echo "Merging:${refs}"
+          docker buildx imagetools create \
+            -t "${IMAGE}:${GITHUB_SHA}" \
+            -t "${IMAGE}:main" \
+            ${refs}
+          docker buildx imagetools inspect "${IMAGE}:${GITHUB_SHA}"
 
   build:
     name: Build + full ctest
     runs-on: ubuntu-24.04
-    needs: toolchain-image
+    needs: toolchain-manifest
     # Run when the image job succeeded (push) or was skipped (pull_request);
     # in the skipped case fall back to the `:main` image.
     if: ${{ !cancelled() && (needs.toolchain-image.result == 'success' || needs.toolchain-image.result == 'skipped') }}
     container:
-      image: ${{ needs.toolchain-image.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
+      image: ${{ needs.toolchain-manifest.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -294,10 +370,10 @@ jobs:
   install-smoke:
     name: Install + downstream consume
     runs-on: ubuntu-24.04
-    needs: toolchain-image
+    needs: toolchain-manifest
     if: ${{ !cancelled() && (needs.toolchain-image.result == 'success' || needs.toolchain-image.result == 'skipped') }}
     container:
-      image: ${{ needs.toolchain-image.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
+      image: ${{ needs.toolchain-manifest.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -374,10 +450,10 @@ jobs:
     # dance) and runs exactly those two tests as a blocking gate.
     name: Release SQL runtime ITs
     runs-on: ubuntu-24.04
-    needs: toolchain-image
+    needs: toolchain-manifest
     if: ${{ !cancelled() && (needs.toolchain-image.result == 'success' || needs.toolchain-image.result == 'skipped') }}
     container:
-      image: ${{ needs.toolchain-image.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
+      image: ${{ needs.toolchain-manifest.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
