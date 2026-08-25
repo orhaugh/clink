@@ -1,0 +1,12 @@
+{"ts": 1700000000000, "region": "emea", "device": "sensor-a", "reading": 21.4}
+{"ts": 1700000001000, "region": "emea", "device": "sensor-b", "reading": 23.9}
+{"ts": 1700000002000, "region": "amer", "device": "sensor-c", "reading": 19.2}
+{"ts": 1700000003000, "region": "emea", "device": "sensor-a", "reading": 22.7}
+{"ts": 1700000004000, "region": "apac", "device": "sensor-d", "reading": 27.1}
+{"ts": 1700000005000, "region": "amer", "device": "sensor-c", "reading": 18.8}
+{"ts": 1700000006000, "region": "emea", "device": "sensor-b", "reading": 24.6}
+{"ts": 1700000007000, "region": "apac", "device": "sensor-e", "reading": 29.3}
+{"ts": 1700000008000, "region": "amer", "device": "sensor-f", "reading": 20.5}
+{"ts": 1700000009000, "region": "emea", "device": "sensor-a", "reading": 23.1}
+{"ts": 1700000010000, "region": "apac", "device": "sensor-d", "reading": 28.0}
+{"ts": 1700000011000, "region": "amer", "device": "sensor-c", "reading": 19.9}

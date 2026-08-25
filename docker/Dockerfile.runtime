@@ -111,6 +111,20 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
     && cp build/clink_submit_job /usr/local/bin/clink_submit_job \
     && strip /usr/local/bin/clink_node /usr/local/bin/clink /usr/local/bin/clink_submit_job \
     && mkdir -p /opt/clink/jobs \
+    # The runnable example ships INSIDE the image so trying clink is one
+    # command with nothing to fetch, clone or configure: the SQL and the
+    # data it reads sit next to each other under /opt/clink/examples, and
+    # WORKDIR below makes the relative path in the script resolve.
+    && mkdir -p /opt/clink/examples \
+    && cp -r examples/sql /opt/clink/examples/ \
+    # In the repo the script reads its data by a repo-relative path so
+    # `clink run examples/sql/hello.sql` works from a checkout. In the image
+    # there is no checkout and no fixed working directory, so the shipped
+    # copy points at itself absolutely.
+    && sed -i "s#'examples/sql/events.ndjson'#'/opt/clink/examples/sql/events.ndjson'#" \
+        /opt/clink/examples/sql/hello.sql \
+    && cp docker/entrypoint.sh /usr/local/bin/clink-entrypoint \
+    && chmod +x /usr/local/bin/clink-entrypoint \
     && cp build/examples/k8s_smoke_job.so /opt/clink/jobs/k8s_smoke_job.so \
     && cp build/examples/rescale_test_job.so /opt/clink/jobs/rescale_test_job.so \
     # QUAL-11's schema-evolution trio, when the qualification build asked
@@ -150,4 +164,4 @@ ENV CLINK_RESCALE_COUNT=1000000000 \
 # the compose-internal network so no explicit EXPOSE needed.
 EXPOSE 6123 8081
 
-ENTRYPOINT ["clink_node"]
+ENTRYPOINT ["/usr/local/bin/clink-entrypoint"]

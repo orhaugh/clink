@@ -97,6 +97,44 @@ Status section below.
 
 ## Quick start
 
+### Try it in one command
+
+Nothing to clone, install or configure:
+
+```bash
+docker run --rm ghcr.io/orhaugh/clink-runtime:latest run /opt/clink/examples/sql/hello.sql
+```
+
+The pipeline and the data it reads both ship inside the image. It groups
+a small stream of device readings by region and prints the result:
+
+```
+{"avg_reading":21.4,"peak":21.4,"readings":1,"region":"emea"}
+{"avg_reading":22.65,"peak":23.9,"readings":2,"region":"emea"}
+{"avg_reading":19.2,"peak":19.2,"readings":1,"region":"amer"}
+{"avg_reading":22.666666666666668,"peak":23.9,"readings":3,"region":"emea"}
+...
+```
+
+Those rows are the point. A batch engine prints one line per region at
+the end; clink prints a line per *update*, because the aggregate is a
+stream and you are watching it change. The same file, unchanged, submits
+to a distributed cluster.
+
+Run your own without cloning anything by mounting a file next to it:
+
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/orhaugh/clink-runtime:latest run /work/mine.sql
+```
+
+Or, with a checkout and a build (below), the same thing locally:
+
+```bash
+./build/clink run examples/sql/hello.sql
+```
+
+### Build from source
+
 clink builds from source, against a pinned Apache Arrow toolchain in
 `~/.clink-deps`. The bootstrap step downloads a prebuilt, checksum-pinned
 archive of that toolchain when one exists for your platform (macOS arm64
