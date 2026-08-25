@@ -14,6 +14,7 @@
 #include "clink/core/stream_element.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/bounded_channel.hpp"
+#include "clink/runtime/network/local_data_plane.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
@@ -720,4 +721,81 @@ TEST(NetworkSocketAccept, ASignalInterruptedAcceptStillDeliversTheConnection) {
     NetworkSocket::close(client_fd);
     NetworkSocket::close(listener_fd);
     ::sigaction(SIGUSR1, &prev, nullptr);
+}
+
+// The SINK-side data-loss detector, which had no test at all.
+//
+// NetworkBridgeSink::require_sent_ throws when a push is refused, and it
+// was made to throw from an incident rather than from a red test: a send
+// whose false return was discarded left no error, no failed task and no log
+// line, and the resulting short stream surfaced six operators downstream as
+// a windowed top-N quietly disagreeing with another engine. The source side
+// of that contract is pinned by TheBridgeSurfacesAFailedChannelAsATaskError;
+// the send side was not pinned by anything, which is how a change that
+// stopped it failing the task passed every suite (followups item 83).
+//
+// A co-located endpoint makes the refusal deterministic: the local data
+// plane hands the sink a BoundedChannel, and a closed BoundedChannel
+// refuses a push without any socket timing involved.
+namespace {
+
+// A registered local endpoint the test can close underneath the sink.
+std::shared_ptr<clink::network::LocalEndpointChannel<std::int64_t>> register_local_peer(
+    std::uint16_t port) {
+    auto ch = std::make_shared<clink::network::LocalEndpointChannel<std::int64_t>>(16);
+    clink::network::LocalDataPlane::instance().register_endpoint<std::int64_t>(
+        "127.0.0.1", port, ch);
+    return ch;
+}
+
+Batch<std::int64_t> one_record() {
+    Batch<std::int64_t> b;
+    b.emplace(7, EventTime{1});
+    return b;
+}
+
+}  // namespace
+
+TEST(NetworkBridgeSinkLoss, ARefusedSendThrowsRatherThanShorteningTheStream) {
+    const std::uint16_t port = 53991;
+    auto peer = register_local_peer(port);
+    NetworkBridgeSink<std::int64_t> sink("127.0.0.1", port, int64_codec());
+    sink.open();
+
+    // The peer goes away while the job is still running. Anything pushed now
+    // is NOT in the stream, and silence about it is the defect.
+    peer->close();
+
+    EXPECT_THROW(sink.on_data(one_record()), std::runtime_error)
+        << "a send the channel refused was accepted silently: the stream is now short by "
+           "those records and nothing says so";
+    clink::network::LocalDataPlane::instance().unregister_endpoint("127.0.0.1", port);
+}
+
+TEST(NetworkBridgeSinkLoss, AWatermarkRefusedAfterThePeerLeftAlsoThrows) {
+    const std::uint16_t port = 53992;
+    auto peer = register_local_peer(port);
+    NetworkBridgeSink<std::int64_t> sink("127.0.0.1", port, int64_codec());
+    sink.open();
+    peer->close();
+
+    EXPECT_THROW(sink.on_watermark(Watermark{EventTime{5}}), std::runtime_error);
+    clink::network::LocalDataPlane::instance().unregister_endpoint("127.0.0.1", port);
+}
+
+// The other half of the contract, and the reason the detector can be trusted:
+// our OWN shutdown must not read as loss. close() sets closing_ before it
+// closes the channel, so an element racing teardown is an orderly stop.
+TEST(NetworkBridgeSinkLoss, AnElementRacingOurOwnCloseIsNotTreatedAsLoss) {
+    const std::uint16_t port = 53993;
+    auto peer = register_local_peer(port);
+    NetworkBridgeSink<std::int64_t> sink("127.0.0.1", port, int64_codec());
+    sink.open();
+
+    sink.close();  // sets closing_, then closes the send side
+    peer->close();
+
+    EXPECT_NO_THROW(sink.on_data(one_record()))
+        << "an orderly shutdown must not be reported as a lost record";
+    clink::network::LocalDataPlane::instance().unregister_endpoint("127.0.0.1", port);
 }
