@@ -308,24 +308,29 @@ void run_source_dispatch(std::shared_ptr<Source<Out>> src,
                          const std::vector<ResolvedOutputGroup>& groups,
                          Codec<Out> codec,
                          OperatorChainSpec::OutputRouting routing,
-                         const std::string& selector_fn) {
+                         const std::string& selector_fn,
+                         const std::shared_ptr<std::atomic<bool>>& cancel_token) {
     Dag dag;
     auto h0 = dag.template add_source<Out>(src);
     attach_output_groups<Out>(
         dag, h0, groups, codec, builtin_arrow_batcher<Out>(), routing, selector_fn);
     LocalExecutor exec(std::move(dag));
-    exec.run();
+    // NOT a bare exec.run(): the executor CATCHES operator-thread exceptions
+    // into operator_errors_ and returns normally, so a bare run() reports a
+    // clean exit for a subtask whose operator threw. See item 82.
+    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
 }
 
 // Sink kind: bridges -> union (optional) -> factory<Sink<In>>
 template <typename In>
 void run_sink_dispatch(const std::vector<std::shared_ptr<void>>& in_bridges,
-                       std::shared_ptr<Sink<In>> sink) {
+                       std::shared_ptr<Sink<In>> sink,
+                       const std::shared_ptr<std::atomic<bool>>& cancel_token) {
     Dag dag;
     auto h0 = build_input_stage<In>(dag, in_bridges);
     dag.template add_sink<In>(h0, sink);
     LocalExecutor exec(std::move(dag));
-    exec.run();
+    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
 }
 
 // Operator kind: bridges -> union -> Operator<In, Out> -> output groups
@@ -335,14 +340,15 @@ void run_operator_dispatch(const std::vector<std::shared_ptr<void>>& in_bridges,
                            const std::vector<ResolvedOutputGroup>& groups,
                            Codec<Out> out_codec,
                            OperatorChainSpec::OutputRouting routing,
-                           const std::string& selector_fn) {
+                           const std::string& selector_fn,
+                           const std::shared_ptr<std::atomic<bool>>& cancel_token) {
     Dag dag;
     auto h0 = build_input_stage<In>(dag, in_bridges);
     auto h1 = dag.template add_operator<In, Out>(h0, op);
     attach_output_groups<Out>(
         dag, h1, groups, out_codec, builtin_arrow_batcher<Out>(), routing, selector_fn);
     LocalExecutor exec(std::move(dag));
-    exec.run();
+    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
 }
 
 // compose_chain_step was removed when chain dispatch was migrated to
@@ -393,7 +399,7 @@ SubtaskRunner make_int64_int64_match_join_runner() {
                                           ctx.chain.output_routing,
                                           ctx.chain.output_selector_fn);
         LocalExecutor exec(std::move(dag));
-        exec.run();
+        clink::plugin::detail::run_subtask_to_completion(exec, ctx.cancel_token);
     };
 }
 
@@ -2872,7 +2878,7 @@ void Worker::run_generic_subtask_(JobId job_id,
         // executor and the StateBackend it owns are destroyed, on every exit
         // path including a throw from run().
         CommitDispatchRetirer commit_retirer(dispatch_gate);
-        exec.run();
+        clink::plugin::detail::run_subtask_to_completion(exec, rctx.cancel_token);
         // Drop this subtask's fused-source commit/abort callbacks now the runner
         // has exited; a late CommitCheckpoint/AbortCheckpoint then finds none
         // registered (mirrors the SubtaskRunner path's cleanup above).
@@ -2904,6 +2910,23 @@ void Worker::run_generic_subtask_(JobId job_id,
         return;
     }
 
+    // The built-in int64/string dispatch arms below register no cancel
+    // token of their own (only the SubtaskRunner path above does), so look
+    // up this subtask's if one exists. It decides whether an operator-thread
+    // exception is a genuine failure or the legitimate teardown throw of a
+    // cancelled subtask - see run_subtask_to_completion. Absent (the common
+    // case here) means every operator exception is reported, which is the
+    // point: these arms used to discard them entirely (item 82).
+    const auto subtask_cancel_token = [&]() -> std::shared_ptr<std::atomic<bool>> {
+        std::lock_guard lock(mu_);
+        if (auto it = per_job_cancel_tokens_.find(job_id); it != per_job_cancel_tokens_.end()) {
+            if (auto s = it->second.find(task.subtask_idx); s != it->second.end()) {
+                return s->second;
+            }
+        }
+        return nullptr;
+    }();
+
     if (op.kind == OperatorKind::Source) {
         const auto* fac = reg.find_source(op.type, op.out_channel);
         if (fac == nullptr) {
@@ -2920,14 +2943,16 @@ void Worker::run_generic_subtask_(JobId job_id,
                                               resolved_groups,
                                               int64_codec(),
                                               chain.output_routing,
-                                              chain.output_selector_fn);
+                                              chain.output_selector_fn,
+                                              subtask_cancel_token);
         } else if (op.out_channel == kChannelString) {
             auto src = std::static_pointer_cast<Source<std::string>>(raw);
             run_source_dispatch<std::string>(src,
                                              resolved_groups,
                                              string_codec(),
                                              chain.output_routing,
-                                             chain.output_selector_fn);
+                                             chain.output_selector_fn,
+                                             subtask_cancel_token);
         } else {
             throw std::runtime_error("generic subtask: unsupported source out_channel '" +
                                      op.out_channel + "'");
@@ -2962,11 +2987,11 @@ void Worker::run_generic_subtask_(JobId job_id,
         if (op.in_channel == kChannelInt64) {
             auto sink = std::static_pointer_cast<Sink<std::int64_t>>(raw);
             sink->set_uid(sink_uid);
-            run_sink_dispatch<std::int64_t>(in_bridges, sink);
+            run_sink_dispatch<std::int64_t>(in_bridges, sink, subtask_cancel_token);
         } else if (op.in_channel == kChannelString) {
             auto sink = std::static_pointer_cast<Sink<std::string>>(raw);
             sink->set_uid(sink_uid);
-            run_sink_dispatch<std::string>(in_bridges, sink);
+            run_sink_dispatch<std::string>(in_bridges, sink, subtask_cancel_token);
         } else {
             throw std::runtime_error("generic subtask: unsupported sink in_channel '" +
                                      op.in_channel + "'");
@@ -2999,7 +3024,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                                                           resolved_groups,
                                                           int64_codec(),
                                                           chain.output_routing,
-                                                          chain.output_selector_fn);
+                                                          chain.output_selector_fn,
+                                                          subtask_cancel_token);
     } else if (op.in_channel == std::string{clink::cluster::kChannelString} &&
                op.out_channel == std::string{clink::cluster::kChannelString}) {
         auto op_typed = std::static_pointer_cast<Operator<std::string, std::string>>(raw);
@@ -3008,7 +3034,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                                                         resolved_groups,
                                                         string_codec(),
                                                         chain.output_routing,
-                                                        chain.output_selector_fn);
+                                                        chain.output_selector_fn,
+                                                        subtask_cancel_token);
     } else if (op.in_channel == std::string{clink::cluster::kChannelInt64} &&
                op.out_channel == std::string{clink::cluster::kChannelString}) {
         auto op_typed = std::static_pointer_cast<Operator<std::int64_t, std::string>>(raw);
@@ -3017,7 +3044,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                                                          resolved_groups,
                                                          string_codec(),
                                                          chain.output_routing,
-                                                         chain.output_selector_fn);
+                                                         chain.output_selector_fn,
+                                                         subtask_cancel_token);
     } else if (op.in_channel == std::string{clink::cluster::kChannelString} &&
                op.out_channel == std::string{clink::cluster::kChannelInt64}) {
         auto op_typed = std::static_pointer_cast<Operator<std::string, std::int64_t>>(raw);
@@ -3026,7 +3054,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                                                          resolved_groups,
                                                          int64_codec(),
                                                          chain.output_routing,
-                                                         chain.output_selector_fn);
+                                                         chain.output_selector_fn,
+                                                         subtask_cancel_token);
     } else {
         throw std::runtime_error("generic subtask: unsupported (in,out) channel pair");
     }

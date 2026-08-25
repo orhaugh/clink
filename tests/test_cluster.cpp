@@ -25,6 +25,8 @@
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/cluster/runner_registry.hpp"
+#include "clink/cluster/type_registry.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/connectors/capability.hpp"
 #include "clink/core/codec.hpp"
@@ -32,6 +34,7 @@
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
+#include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/local_executor.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
@@ -2928,4 +2931,113 @@ TEST(CommitDispatchGate, ARetiredCallbackIsPrunedRatherThanBlockingTheLiveOneBes
     EXPECT_FALSE(threw) << "the surviving callback must dispatch cleanly";
     EXPECT_EQ(live_ran, 1) << "the live callback must have run";
     EXPECT_EQ(dead_ran, 0) << "the retired callback must not have run";
+}
+
+// A subtask whose OPERATOR throws must fail the job, never complete it
+// silently (followups item 82).
+//
+// The LocalExecutor deliberately CATCHES operator-thread exceptions into
+// operator_errors_ and returns normally, so an in-process caller can
+// inspect them rather than have the process die. On the cluster path that
+// makes the check mandatory: a bare exec.run() reports a clean exit for a
+// subtask whose operator threw on the first record, and the coordinator
+// then completes the job as ok having emitted NOTHING. Silent data loss
+// presented as success - the worst shape a failure can take, because
+// nothing anywhere says the answer is wrong.
+//
+// The built-in int64 dispatch arms had exactly that bare run(). This drives
+// a real cluster job - range source -> throwing operator -> file sink - and
+// requires the throw to reach the coordinator's job errors.
+TEST(Cluster, AnOperatorThatThrowsFailsTheJobRatherThanCompletingItEmpty) {
+    ensure_built_ins_registered();
+    // Registered through the PLUGIN api, not the bare OperatorRegistry: the
+    // fused-chain path builds its Dag from the per-op DagBuilder that
+    // register_operator<In, Out> installs, and an op without one cannot be
+    // chained at all.
+    {
+        clink::plugin::PluginRegistry reg(TypeRegistry::default_instance(),
+                                          RunnerRegistry::default_instance(),
+                                          SelectorRegistry::default_instance());
+        reg.register_operator<std::int64_t, std::int64_t>(
+            "clink_test_throwing_int64",
+            [](const clink::plugin::BuildContext&)
+                -> std::shared_ptr<Operator<std::int64_t, std::int64_t>> {
+                return std::make_shared<MapOperator<std::int64_t, std::int64_t>>(
+                    [](const std::int64_t&) -> std::int64_t {
+                        throw std::runtime_error("deliberate-operator-throw");
+                    },
+                    "clink_test_throwing_int64");
+            });
+    }
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;  // the first failure is the verdict
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"worker-op-throw"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 8;
+    Worker worker("worker-op-throw", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(5s));
+
+    const auto out_path = std::filesystem::temp_directory_path() /
+                          ("clink_op_throw_" + std::to_string(::getpid()) + ".txt");
+    std::filesystem::remove(out_path);
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "16"}};
+    g.ops.push_back(src);
+    OperatorSpec boom;
+    boom.type = "clink_test_throwing_int64";
+    boom.id = "boom";
+    boom.inputs = {"src"};
+    boom.parallelism = 1;
+    boom.out_channel = std::string{kChannelInt64};
+    g.ops.push_back(boom);
+    // A SECOND mid-chain op after the throwing one, so the two FUSE into a
+    // single subtask. That is the shape the defect actually took: a fused
+    // chain dispatches through the generic DagBuilder path, which is where
+    // the bare exec.run() lived. A single-op chain takes the typed
+    // SubtaskRunner path, which already propagated - so a one-op version of
+    // this test passes with the defect present and pins nothing.
+    OperatorSpec pass;
+    pass.type = "identity_int64";
+    pass.id = "pass";
+    pass.inputs = {"boom"};
+    pass.parallelism = 1;
+    pass.out_channel = std::string{kChannelInt64};
+    g.ops.push_back(pass);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"pass"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    const auto job_id = coordinator.submit_job(g,
+                                               OperatorRegistry::default_instance(),
+                                               std::vector<PluginBinary>{},
+                                               CheckpointConfig{},
+                                               nullptr);
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, 30s));
+
+    const auto errors = coordinator.job_errors(job_id);
+    ASSERT_FALSE(errors.empty())
+        << "the job completed with no errors although its operator threw on every record; "
+           "a subtask that lost its operator to an exception reported a clean exit";
+    bool named = false;
+    for (const auto& e : errors) {
+        named = named || e.find("deliberate-operator-throw") != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the job failed but no error names the operator's exception: "
+                       << errors.front();
+    std::filesystem::remove(out_path);
 }
