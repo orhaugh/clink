@@ -32,6 +32,10 @@ struct DockerPostgresOptions {
     // to the postgres process. Useful for tests that need
     // `wal_level=logical` or other server settings.
     std::vector<std::string> postgres_args{};
+    // Extra arguments inserted BEFORE the image name, for the docker run
+    // itself rather than the postgres process - a bind mount carrying
+    // server certificates, for instance (QUAL-12's TLS rows).
+    std::string extra_docker_args{};
 };
 
 class DockerPostgres {
@@ -51,7 +55,9 @@ public:
             "-e POSTGRES_USER=postgres "
             "-e POSTGRES_DB=postgres "
             "--name " +
-            container_name_ + " " + opts.image;
+            container_name_ + " " +
+            (opts.extra_docker_args.empty() ? std::string{} : opts.extra_docker_args + " ") +
+            opts.image;
         for (const auto& a : opts.postgres_args) {
             cmd += " ";
             cmd += a;

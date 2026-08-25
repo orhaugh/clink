@@ -405,6 +405,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_coordinator_rescale.cpp
         integration/test_schema_evo_check.cpp
         integration/test_qual11_predeploy.cpp
+        integration/test_qual12_pg_transport_live.cpp
         test_helpers/register_linked_impls.cpp
     )
     target_link_libraries(clink_integration_tests PRIVATE
