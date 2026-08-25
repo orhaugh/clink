@@ -170,6 +170,7 @@ add_executable(clink_core_tests
     test_timer_service.cpp
     test_checkpoint_retention.cpp
     test_close_reason_alignment.cpp
+    test_cli_tls_args.cpp
     test_side_output.cpp
     test_real_connectors_factory.cpp
     test_file_backed_state.cpp

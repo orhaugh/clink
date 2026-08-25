@@ -195,6 +195,8 @@
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
 #include "clink/sql/view.hpp"
+
+#include "cli_tls_args.hpp"
 #endif
 
 namespace {
@@ -2096,6 +2098,22 @@ int run_coordinator(int argc, char** argv) {
                                  "'; export disabled");
         }
     }
+    // Refuse an incoherent or unsupportable TLS request BEFORE binding
+    // anything: every branch this rejects used to come up plaintext, one
+    // of them with no message at all (followups item 81).
+    if (const auto tls_err = clink::cli::validate_coordinator_tls_args(tls_cert,
+                                                                       tls_key,
+                                                                       tls_client_ca,
+#ifdef CLINK_LINKED_TLS
+                                                                       true
+#else
+                                                                       false
+#endif
+        );
+        tls_err.has_value()) {
+        std::cerr << "coordinator: " << *tls_err << "\n";
+        return 2;
+    }
 #ifdef CLINK_LINKED_TLS
     if (!tls_cert.empty() && !tls_key.empty()) {
         auto server_ctx = std::make_shared<clink::network::TlsServerContext>(tls_cert, tls_key);
@@ -2107,10 +2125,6 @@ int run_coordinator(int argc, char** argv) {
         });
         std::cout << "coordinator TLS enabled (cert=" << tls_cert
                   << (tls_client_ca.empty() ? "" : ", mTLS=on") << ")\n";
-    }
-#else
-    if (!tls_cert.empty() || !tls_key.empty() || !tls_client_ca.empty()) {
-        clink::log::warn("coordinator.tls", "--tls-* flags ignored (clink_tls not linked)");
     }
 #endif
     const auto want_port = static_cast<std::uint16_t>(std::stoi(port_str));
@@ -2924,6 +2938,19 @@ int run_worker(int argc, char** argv) {
         }
     }
     WorkerSupervisor supervisor(worker_id, data_host, supervisor_cfg, std::move(discover));
+    if (const auto tls_err = clink::cli::validate_worker_tls_args(tls_ca,
+                                                                  tls_client_cert,
+                                                                  tls_client_key,
+#ifdef CLINK_LINKED_TLS
+                                                                  true
+#else
+                                                                  false
+#endif
+        );
+        tls_err.has_value()) {
+        std::cerr << "worker: " << *tls_err << "\n";
+        return 2;
+    }
 #ifdef CLINK_LINKED_TLS
     if (!tls_ca.empty()) {
         auto client_ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
@@ -2935,10 +2962,6 @@ int run_worker(int argc, char** argv) {
         });
         std::cout << "worker TLS enabled (ca=" << tls_ca
                   << (tls_client_cert.empty() ? "" : ", mTLS=on") << ")\n";
-    }
-#else
-    if (!tls_ca.empty() || !tls_client_cert.empty() || !tls_client_key.empty()) {
-        clink::log::warn("worker.tls", "--tls-* flags ignored (clink_tls not linked)");
     }
 #endif
 
