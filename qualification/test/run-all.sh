@@ -148,6 +148,16 @@ run "QUAL-11 driver parses" \
 run "QUAL-11 migration-effect gate (read from the savepoints)" \
     python3 "$HERE/test_migration_effect.py"
 
+# QUAL-12's two drivers: the matrix runner and the image check. The
+# image check is the only thing that can prove the SHIPPED binary calls
+# its own validator, so a syntax error silently skipping it would take
+# the campaign's strongest evidence with it.
+run "QUAL-12 matrix runner parses" \
+    bash -n "$HERE/../qual12/run-matrix.sh"
+
+run "QUAL-12 image smoke parses" \
+    bash -n "$HERE/../qual12/image-smoke.sh"
+
 # QUAL-12 is a set of REFUSALS, so its matrix is the contract: these
 # check the document itself (every row carries the reason it was
 # declared, every surface has at least one ACCEPT row - a matrix of pure
