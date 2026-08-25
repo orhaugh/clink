@@ -148,6 +148,18 @@ run "QUAL-11 driver parses" \
 run "QUAL-11 migration-effect gate (read from the savepoints)" \
     python3 "$HERE/test_migration_effect.py"
 
+# QUAL-12 is a set of REFUSALS, so its matrix is the contract: these
+# check the document itself (every row carries the reason it was
+# declared, every surface has at least one ACCEPT row - a matrix of pure
+# refusals would pass an engine that refused everything).
+run "QUAL-12 refusal matrix is well-formed" \
+    python3 "$HERE/test_refusal_matrix.py"
+
+# An unproven row and a missing row must never look alike - which is how
+# this campaign's own premise went wrong before it started.
+run "QUAL-12 summariser result logic (unexercised is never a pass)" \
+    python3 "$HERE/test_summarise12.py"
+
 run "QUAL-11 summariser result logic (the four evolution gates)" \
     python3 "$HERE/test_summarise11.py"
 
