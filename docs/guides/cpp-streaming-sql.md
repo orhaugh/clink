@@ -1,5 +1,5 @@
 ---
-title: Streaming SQL in C++ — Clink
+title: Streaming SQL in C++ - Clink
 description: Run streaming SQL from a native C++23 engine with event time, windows, joins, state, exactly-once checkpoints, and Kafka, database, and object-store connectors.
 ---
 

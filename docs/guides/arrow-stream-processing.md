@@ -1,5 +1,5 @@
 ---
-title: Apache Arrow Stream Processing in C++ — Clink
+title: Apache Arrow Stream Processing in C++ - Clink
 description: Clink is an Arrow-native C++23 stream processing engine using Arrow for columnar execution, open state, interoperability, and native analytics workflows.
 ---
 

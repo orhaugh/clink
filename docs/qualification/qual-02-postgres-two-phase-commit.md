@@ -21,6 +21,7 @@ left behind.**
 |---|---|
 | Campaign run | `qual02-20260821b`, 2 hours, aggressive chaos profile |
 | Engine | clink v0.7.0, revision `2e55943` (clean tree) |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host - provisioned for this run and destroyed after it ([what that is](README.md#the-rig)) |
 | Preceded by | `qual02-smoke-a`, a 45-minute rehearsal of the same battery at the same revision: 3,037,900 events, all exactly once |
 
 ## How the claim was measured

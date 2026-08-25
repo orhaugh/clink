@@ -13,7 +13,7 @@ counts, judged only after the pipeline had provably caught up.
 |---|---|
 | Campaign run | `qual09-20260824c`: 5-minute state fill, then a 45-minute `infra` battery, then quiesce, catch-up and end-state verification |
 | Engine | revision `73b6565` (runtime image `sha-73b656549ed1-faultinj`, digest-verified provenance) |
-| Rig | 8 dedicated cloud hosts: coordinator, 3 workers, 3 brokers, ops; state on an NFS export deliberately backed by a **4 GiB loopback volume** so ENOSPC is real, reachable and safe |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host ([what that is](README.md#the-rig)) - with one deliberate change: state on an NFS export backed by a **4 GiB loopback volume**, so ENOSPC is real, reachable and safe |
 | Preceded by | two green local-rig gates and two failed cloud runs whose findings were fixed first (below) - the campaign publishes only a green run |
 | Workload | the QUAL-05 retention shape: TTL'd `SELECT DISTINCT` into an unwindowed `GROUP BY`, 1,000 events/s over 4 partitions, key space turning over in 60-second epochs, `state_ttl='10m'`, 15-second checkpoints, upsert sink into Postgres |
 

@@ -17,6 +17,7 @@ and zero foreign records.**
 |---|---|
 | Campaign run | `qual01-20260820h`, 2 hours, aggressive chaos profile |
 | Engine | revision `33f30e7` (runtime image `sha-33f30e732fad-faultinj`) |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host - provisioned for this run and destroyed after it ([what that is](README.md#the-rig)) |
 | Preceded by | `qual01-smoke-d`, a 45-minute rehearsal of the same battery at the same revision: 6,108,400 events, 303 of 303 windows correct |
 
 ## How the claim was measured

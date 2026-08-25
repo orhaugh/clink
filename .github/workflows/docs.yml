@@ -41,6 +41,12 @@ jobs:
         # generation breaks plugins and theming with no migration path.
         run: pip install 'mkdocs-material>=9.7,<10'
 
+      - name: No em dashes in tracked prose
+        # The voice rule is a spaced hyphen or a restructured sentence. Em
+        # dashes reached the published site once through page titles and the
+        # site name, where nobody rereading body copy would look. Gate what
+        # gets published, before it is built.
+        run: ./scripts/check-no-em-dashes.py
       - name: Build site
         run: mkdocs build --site-dir _site
 

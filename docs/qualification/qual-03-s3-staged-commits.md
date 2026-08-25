@@ -21,6 +21,7 @@ records, and zero corrupted objects.**
 |---|---|
 | Campaign run | `qual03-20260821a`, 2 hours, aggressive chaos profile |
 | Engine | revision `625cc82` (runtime image `sha-625cc82d69af-faultinj`) |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host - provisioned for this run and destroyed after it ([what that is](README.md#the-rig)) |
 | Preceded by | `qual03-smoke-a`, a 45-minute rehearsal of the same battery at the same revision: 2,917,500 events, all committed exactly once |
 | Sink | `s3_2pc_sink`, confirmed deployed from the worker's own open-time log before the soak began |
 

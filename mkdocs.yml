@@ -5,7 +5,7 @@
 # exclude_docs is an allowlist mirroring .gitignore: only the tracked,
 # published content can reach a build, even one run locally.
 
-site_name: Clink — C++23 Stream Processing Engine
+site_name: Clink - C++23 Stream Processing Engine
 site_description: >-
   Clink is an embedded-first, Arrow-native C++23 stream processing engine with
   streaming SQL, event time, exactly-once checkpoints, stateful operators,

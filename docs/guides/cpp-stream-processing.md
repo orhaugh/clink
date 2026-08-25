@@ -1,5 +1,5 @@
 ---
-title: C++ Stream Processing Engine — Clink
+title: C++ Stream Processing Engine - Clink
 description: Use Clink as an embedded or distributed C++23 stream processing engine with event time, state, checkpoints, SQL, Arrow data, and production connectors.
 ---
 

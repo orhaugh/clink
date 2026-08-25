@@ -12,6 +12,7 @@ declared.**
 |---|---|
 | Matrix | `qualification/qual12/refusals.json` - each row declares the misconfiguration, the outcome clink must produce, and the reason it is declared that way, before it is measured |
 | Run | `qual12-local-c`, engine `0ca5936`: 15/15 rows as declared, including all 5 that need a real server |
+| Rig | none - no cloud rig and no cost. Every refusal here manifests while parsing arguments, before a socket is opened, so it needs the binary and its image rather than a cluster ([why](README.md#the-rig)) |
 | Live rows | Kafka SASL refusals against a real broker; Postgres transport against real servers with TLS off and on |
 | Shipped-binary check | the control-plane refusals run against a built image, before and after the fix - a validator the binary never calls would refuse nothing, and a unit test cannot see that wiring |
 

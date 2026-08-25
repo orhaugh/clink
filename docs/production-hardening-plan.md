@@ -1250,7 +1250,7 @@ that is detectable at the moment the mistake is made rather than at the next
 restore. It needs the owned range plumbed into the backend, which is a bigger
 change than is wise to land unreviewed at the end of a session.
 
-### F39. Four integration failures that only happen on Linux — 2 of 4 fixed
+### F39. Four integration failures that only happen on Linux: 2 of 4 fixed
 
 **Final status, from a frozen tree (three runs each):** the two side-output
 failures are fixed and pass 3/3. `HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover`
@@ -3451,7 +3451,7 @@ TIME THEY WERE WRITTEN and are deliberately not rewritten.
 
 ## 4. What was implemented, with evidence
 
-### W1 - Fault-injection framework — Done
+### W1 - Fault-injection framework: Done
 
 **Source:** `include/clink/fault/fault_injection.hpp`, `src/fault/fault_injection.cpp`
 
@@ -3493,7 +3493,7 @@ the reasoning is recorded in the header so it is not undone.
 
 **Tests:** `tests/test_fault_injection.cpp`, 17 cases.
 
-### W2 - Checkpoint integrity — Done
+### W2 - Checkpoint integrity: Done
 
 **Source:** `include/clink/state/checkpoint_integrity.hpp`,
 `include/clink/state/file_backed_state_backend.hpp`
@@ -3547,7 +3547,7 @@ valid payloads and no sidecars, so a strict reader classifies it
 fault-injected short writes at the real durable-write call site, death
 before publish, and death between payload and sidecar.
 
-### W3 - Durable coordinator writes — Done
+### W3 - Durable coordinator writes: Done
 
 **Source:** `src/cluster/coordinator.cpp`
 
@@ -3562,7 +3562,7 @@ is the safe side: the prepared transactions stay prepared and are resolved
 at the next successful checkpoint or at restore, whereas committing without
 a durable record is unrecoverable.
 
-### W4 - Durable rescale snapshot write — Done
+### W4 - Durable rescale snapshot write: Done
 
 **Source:** `src/state/state_backend_factory.cpp`
 
@@ -3578,7 +3578,7 @@ way the production writer does (payload + sidecar) rather than with a bare
 `ofstream`. That strengthens them: they now exercise the real published-
 checkpoint shape.
 
-### W5 - Connector capability contract — Partial
+### W5 - Connector capability contract: Partial
 
 **Source:** `include/clink/connectors/capability.hpp`,
 `src/connectors/capability.cpp`, `src/connectors/builtin_capabilities.cpp`,
@@ -3617,7 +3617,7 @@ crash-after-prepare, idempotent recommit, transaction timeout, ...) are
 **not** implemented. That is W-open work; several would need containerised
 services in CI.
 
-### W6 - End-to-end delivery-guarantee analyser — Partial
+### W6 - End-to-end delivery-guarantee analyser: Partial
 
 **Source:** `include/clink/connectors/delivery_guarantee.hpp`,
 `src/connectors/delivery_guarantee.cpp`
@@ -3651,7 +3651,7 @@ validation, so it does not currently block a real job. Wiring it into
 `Coordinator::submit_job` and SQL `EXPLAIN` is the next step and is the
 single highest-value remaining item.
 
-### W7 - Deterministic multi-process harness — Done
+### W7 - Deterministic multi-process harness: Done
 
 **Source:** `tests/integration/cluster_harness.hpp`
 
@@ -3683,7 +3683,7 @@ This paid for itself immediately: the first run failed, and the dumped child
 log said `worker requires --id` - a missing flag in the harness itself,
 diagnosed from the transcript in one read rather than by re-running locally.
 
-### W8 - Fault-tolerance scenarios — Partial
+### W8 - Fault-tolerance scenarios: Partial
 
 **Source:** `tests/integration/test_fault_recovery.cpp`
 
@@ -3725,7 +3725,7 @@ recovery; side-output checkpoint propagation. Each needs a fault point wired
 into the corresponding runtime path first; the framework is in place, the
 points are not all placed.
 
-### W9 - Automated sanitizers — Done
+### W9 - Automated sanitizers: Done
 
 **Source:** `.github/workflows/sanitizers.yml`
 
@@ -3747,7 +3747,7 @@ ASan diagnostics collide with assertions on child stdout) is excluded **by
 name** from the PR subset, as a reviewable list. The nightly full run still
 executes them, so the tail stays visible and cannot quietly grow.
 
-### W10 - `clink checkpoint-verify` — Done
+### W10 - `clink checkpoint-verify`: Done
 
 **Source:** `tools/clink_checkpoint_verify.cpp`
 
@@ -3756,7 +3756,7 @@ starting the job. `--repair` is the supported migration for pre-0.7
 directories; `--json` for automation. Exit 0 all valid, 1 at least one not,
 2 bad usage.
 
-### W11 - SQL bounded-state validator — Partial
+### W11 - SQL bounded-state validator: Partial
 
 **Source:** `include/clink/sql/bounded_state.hpp`, `src/sql/bounded_state.cpp`
 
@@ -3777,7 +3777,7 @@ currently rejected. Wiring needs the `ALLOW UNBOUNDED STATE` suffix in
 `src/sql/preparse.cpp`, a boundedness verdict threaded from the scan's table
 definition, and the metric for the unsafe override.
 
-### W20 - Non-determinism — Partial
+### W20 - Non-determinism: Partial
 
 `DeterminismFacts` exists in the analyser and its effect on the report is
 tested (`NonDeterminismIsWarnedAboutSeparatelyFromDelivery`). What is **not**
@@ -3879,7 +3879,7 @@ end-to-end through the planner: a windowless GROUP BY over a known
 unbounded source is refused; the same query over a file is accepted; and
 both `state_ttl` and `ALLOW UNBOUNDED STATE` unlock it.
 
-### W12 - State TTL depth — Partial
+### W12 - State TTL depth: Partial
 
 **Source:** `include/clink/state/keyed_state.hpp`
 
@@ -4133,7 +4133,7 @@ them stays a real choice rather than a coin flip.
   S3-backed variants inherit the default (no hook), so they fall back to
   scanning - correct, just slower to give memory back.
 
-### W13 - Strict rejection of unsupported SQL semantics — Partial
+### W13 - Strict rejection of unsupported SQL semantics: Partial
 
 **Source:** `include/clink/sql/ast.hpp` (constraint capture),
 `src/sql/ast_builder.cpp`, `src/sql/catalog.cpp`,
@@ -4206,7 +4206,7 @@ earlier reading):
 
 ---
 
-### W15 - Coordinator fencing — Partial
+### W15 - Coordinator fencing: Partial
 
 **Source:** `include/clink/cluster/protocol.hpp`,
 `include/clink/cluster/messages.hpp`, `include/clink/cluster/coordinator.hpp`,
@@ -4356,7 +4356,7 @@ accepting, a registration counted - with a deadline as a failure bound only.
 
 ---
 
-### W16 - Protocol version negotiation — Partial
+### W16 - Protocol version negotiation: Partial
 
 **Source:** `include/clink/cluster/protocol.hpp`,
 `include/clink/cluster/messages.hpp`,
@@ -4441,7 +4441,7 @@ one". The unit-level cases alone survive both.
 
 ---
 
-### W14 - Resource and overload limits — Partial
+### W14 - Resource and overload limits: Partial
 
 **Source:** `include/clink/cluster/frame_io.hpp` (new),
 `include/clink/cluster/protocol.hpp` (`MessageReader::read_count`),
@@ -4525,7 +4525,7 @@ production failure.
 
 ---
 
-### W21 - Cancellation and shutdown — Partial
+### W21 - Cancellation and shutdown: Partial
 
 **Source:** `src/cluster/worker.cpp` (`Worker::stop`),
 `tests/integration/test_graceful_shutdown.cpp` (new)
@@ -4587,7 +4587,7 @@ and "survives a real rollout" are the same claim.
 
 ---
 
-### W22 - Side-output propagation — Partial
+### W22 - Side-output propagation: Partial
 
 **Source:** `tests/test_side_output.cpp` (one new case),
 `include/clink/connectors/delivery_guarantee.hpp`,
@@ -4650,7 +4650,7 @@ gap this section used to record.
 
 ---
 
-### F28/F29 - Checkpoint completion and recovery — Done
+### F28/F29 - Checkpoint completion and recovery: Done
 
 **Source:** `include/clink/cluster/coordinator.hpp`,
 `src/cluster/coordinator.cpp`, `tests/test_checkpoint_completion.cpp` (new)
@@ -4696,7 +4696,7 @@ recovery's reach fails with the two ids side by side.
 
 ---
 
-### W23 - Fuzz targets — Partial
+### W23 - Fuzz targets: Partial
 
 **Source:** `fuzz/` (new: `fuzz_targets.hpp`, five entry points,
 `generate_seeds.cpp`, `CMakeLists.txt`, `README.md`),
@@ -4782,7 +4782,7 @@ hard CMake error naming the fix, not a silent skip.
 
 ---
 
-### W17 - Config linter and recovery profiles — Partial
+### W17 - Config linter and recovery profiles: Partial
 
 **Source:** `include/clink/cluster/config_lint.hpp`,
 `src/cluster/config_lint.cpp`, wired into `Coordinator::submit_job`,
@@ -4869,7 +4869,7 @@ document criticises elsewhere and it would have been indefensible to leave:
 
 ---
 
-### W19 - Production metrics — Partial
+### W19 - Production metrics: Partial
 
 **Source:** `include/clink/metrics/checkpoint_metrics.hpp`,
 `include/clink/metrics/orchestration_metrics.hpp`,
@@ -5016,7 +5016,7 @@ consistent with a test that reads an empty directory.
 
 ---
 
-### W24 - Widening the blocking integration gate — Partial
+### W24 - Widening the blocking integration gate: Partial
 
 **Source:** `.github/workflows/ci.yml`
 

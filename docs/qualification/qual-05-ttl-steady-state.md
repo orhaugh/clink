@@ -18,6 +18,7 @@ keys holding exactly their seed-derived count.**
 |---|---|
 | Campaign run | `qual05-20260823a`, 90-minute soak after a control arm and warm-up, aggressive chaos profile |
 | Engine | revision `bed138c` (runtime image `sha-bed138c3e94a-faultinj`) |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host - provisioned for this run and destroyed after it ([what that is](README.md#the-rig)) |
 | Preceded by | three isolated local runs at the same revision, each folding its stream exactly (52,890 = 52,890, three times) |
 | State backend | file-backed snapshots on a shared mount; retention via `state_ttl='10m'`, event-time domain |
 

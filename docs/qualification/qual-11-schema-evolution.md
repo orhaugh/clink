@@ -17,7 +17,7 @@ migration function is defined to write.**
 | Engine | revision `ba680f9` throughout - ONE engine; the JOB is what changes |
 | Job | a compiled plugin (`CLINK_REGISTER_JOB`), three variants built from one source at the image's own revision: v1, v2, and a deliberately broken v2 |
 | State evolved | `AccountState` v1 `{count,sum}` (16 bytes) -> v2 `{count,sum,vmin,vmax}` (32 bytes), schema version 1 -> 2, with a registered v1->v2 migration |
-| Rig | 8 dedicated cloud hosts: coordinator, 3 workers, 3 brokers, ops; savepoint on an NFS export every worker can read |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host ([what that is](README.md#the-rig)); the savepoint on an NFS export every worker can read |
 | Workload | 1,000 events/s over 4 partitions, 2,000 keys per 60-second epoch, 15-second checkpoints |
 
 ## What is being evolved, and what carries it

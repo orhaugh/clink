@@ -15,6 +15,7 @@ their seed-derived count.**
 |---|---|
 | Campaign run | `qual06-20260824d`, recovery-gated ladder then a 45-minute battery at the claim rung, aggressive chaos profile |
 | Engine | revision `3c7ffd1` (runtime image `sha-3c7ffd1cff9b-faultinj`) |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host - provisioned for this run and destroyed after it ([what that is](README.md#the-rig)) |
 | Preceded by | a local-rig pass at the same revision (three rungs, 264,000 = 264,000 exact), and three earlier rig runs at `bed138c` whose failures drove the engine fixes below |
 | Graph shape | N-branch SQL `UNION ALL`: per-branch Kafka source, JSON decode, watermark assigner, filter and projection, a binary union tree, one keyed aggregate, one upsert sink |
 

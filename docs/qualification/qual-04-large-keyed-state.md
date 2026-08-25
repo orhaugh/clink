@@ -19,6 +19,7 @@ seed-derived expectation.**
 |---|---|
 | Campaign run | `qual04-20260823a`, 1 hour of faults after a 35-minute fill, aggressive chaos profile |
 | Engine | revision `6ba73b5` (runtime image `sha-6ba73b56dd12-faultinj`) |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host ([what that is](README.md#the-rig)); the S3-compatible object store ran on the operations host |
 | Preceded by | `qual04-smoke-g`, a shorter rehearsal of the same battery at the same revision: 415,224 events, exact, all sampled keys correct |
 | State backend | `remote-read://` - S3-compatible object storage, per-subtask memory cache bounded at 256 MiB |
 

@@ -15,6 +15,7 @@ survived faults.
 | Campaign run | `qual08-20260824a`: 15-minute fill on the old revision, the upgrade, then a 45-minute aggressive battery on the new one |
 | Upgraded from | revision `bed138c` (runtime image `sha-bed138c3e94a-faultinj`) - the engine QUAL-05 qualified |
 | Upgraded to | revision `3c7ffd1` (runtime image `sha-3c7ffd1cff9b-faultinj`) - the engine QUAL-06 qualified |
+| Rig | the standard 8-host cloud rig - 3 workers, coordinator, 3 brokers, operations host - provisioned for this run and destroyed after it ([what that is](README.md#the-rig)) |
 | Preceded by | a single-image machinery smoke on the local rig (exact across the boundary), which found and fixed three harness defects and one engine finding before any spend |
 | Workload | the QUAL-05 retention shape: TTL'd `SELECT DISTINCT` into an unwindowed `GROUP BY`, 1,000 events/s, key space turning over in 60-second epochs, `state_ttl='10m'`, 15-second checkpoints |
 

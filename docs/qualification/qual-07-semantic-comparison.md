@@ -13,6 +13,7 @@ class was declared, with its reason, before any run.
 |---|---|
 | Campaign run | `qual07-runf`: all 19 queries, one 460,000-bid dataset (plus auction and person streams), parallelism 4 on both engines |
 | Engine | clink revision `998e0ff` (host build); the reference engine containerised at its pinned release |
+| Rig | none - no cloud rig and no cost. Both engines run on one machine against identical input, which is the point of a comparison rather than a compromise |
 | Query set | the nexmark-derived cross-engine suite: projections, filters, string functions, tumble/hop/session/cumulate windows, COUNT DISTINCT, stream-stream joins, dedup-latest, top-N per key, unbounded GROUP BY |
 | Judgement | per-query declared classes: 15 append (sorted multiset, byte-exact), 4 materialised (upsert changelog reduced to final state, compared by key); float tolerance 1e-6 declared on 4 queries for rendering only |
 | Scale | from 49 window rows to 1,493,218 hop panes per query; 455,895 final images on the dedup query; 460,000-row per-record queries byte-exact |

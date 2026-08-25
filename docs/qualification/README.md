@@ -35,6 +35,46 @@ Two rules govern what appears here:
 | A running job's keyed-state TYPE changed and migrated at restore: 74,000 keys exact across the boundary, 10,000 verified byte-for-byte against the migration's own output | [QUAL-11](qual-11-schema-evolution.md) | 25 August 2026, engine `ba680f9` |
 | Refusing to silently weaken a security posture: 15 declared refusals measured as declared, 5 against real SASL and TLS servers, with the control-plane wiring proven in a published image | [QUAL-12](qual-12-security-refusals.md) | 25 August 2026, engine `0ca5936` |
 
+## The rig
+
+Nine of the eleven campaigns ran on the same disposable cloud rig, so
+their results are comparable and none of them is a bespoke arrangement
+assembled to flatter a particular number. Eight hosts on Hetzner Cloud
+(Falkenstein, Ubuntu 24.04), on a private network:
+
+| Role | Hosts | Instance |
+|---|---|---|
+| clink workers | 3 | cpx32 |
+| clink coordinator | 1 | cpx22 |
+| Brokers - Redpanda 24.2.7 speaking the Kafka protocol, replication 3 | 3 | cpx22 |
+| Operations host - generator, oracle, chaos controller, shared state | 1 | cpx32 |
+
+The operations host sits outside the engine's failure domain deliberately.
+The generator that produces the input, the oracle that judges the output
+and the chaos controller that injects the faults must not be casualties
+of the faults they are measuring, or a lost result becomes
+indistinguishable from a lost record.
+
+The rig is provisioned per run by `qualification/infra/provision.sh`,
+labelled with the run id, and destroyed when the campaign ends;
+`teardown.sh --check` then verifies nothing is left running or billing.
+The host inventory for each run is retained with that campaign's
+evidence, so the rig a result came from is recoverable rather than
+remembered.
+
+Two campaigns needed no rig, and their pages say so. QUAL-07 compares
+clink against a reference engine on one machine, where a shared host is
+the point rather than a compromise: both engines meet identical input.
+QUAL-12's refusals are all process-start properties that manifest while
+parsing arguments, before a socket is opened, so they need the binary
+and its image rather than a cluster. Eight hosts would have observed the
+same eight exits an hour later, for money.
+
+Where a campaign needed something the standard rig does not provide, its
+page states it: QUAL-09 put the shared state on an NFS export backed by
+a deliberately small loopback volume, because an ENOSPC campaign needs a
+disk that can genuinely fill.
+
 ## Not yet campaigned
 
 Keyed state at the 100 GB+ tier, multi-day steady-state resource
