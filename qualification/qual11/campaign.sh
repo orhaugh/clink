@@ -352,6 +352,14 @@ print(jid)" "$1"
 }
 
 # --- generator ----------------------------------------------------------------
+# The ops host runs the generator and the verifier, both of which talk
+# Kafka directly. Every campaign installs this; omitting it cost a
+# provisioned rig its first run (the generator died on import, and the
+# start check reported only that it "did not start").
+on_host "$OPS_PUB" "pip3 install --break-system-packages -q confluent-kafka 2>/dev/null || true"
+on_host "$OPS_PUB" "python3 -c 'import confluent_kafka'" \
+    || { echo "campaign: the ops host cannot import confluent_kafka" >&2; exit 2; }
+
 on_host "$OPS_PUB" "mkdir -p /qual && rm -f /qual/progress.json /qual/progress.json.spec \
     /qual/progress.json.stop /qual/q11-chaos.jsonl /qual/q11-chaos.jsonl.stop"
 for f in "$HERE/../qual01/detspec.py" "$HERE/../qual01/generator.py" \
