@@ -20,126 +20,154 @@
     "or config checks; `live` rows need a real server in a container and",
     "cannot be satisfied by a hermetic test. A row whose proof could not",
     "run is NOT a pass - the runner reports it as unexercised, because an",
-    "unproven row and a missing row must never look alike."
+    "unproven row and a missing row must never look alike.",
+    "",
+    "proof_binary/proof_test name the test that exercises the row. A row that names no test cannot be exercised and therefore cannot pass; the well-formedness gate requires both, so a row can never drift away from the thing that proves it."
   ],
-
   "_prefixes": {
     "control_plane": "cp",
     "kafka": "kafka",
     "postgres": "pg"
   },
-
   "control_plane": [
     {
       "id": "cp.tls_on_non_tls_build",
       "case": "coordinator or worker given --tls-* flags on a binary built without TLS support",
       "outcome": "REFUSE",
       "proof": "unit",
-      "reason": "It warned and served plaintext on the port configured for TLS. A log line is not a security control: the process still answered (item 81)."
+      "reason": "It warned and served plaintext on the port configured for TLS. A log line is not a security control: the process still answered (item 81).",
+      "proof_binary": "core",
+      "proof_test": "CliTlsArgs.TlsRequestedOnABuildWithoutTlsIsRefused:CliTlsArgs.AnyLoneTlsFlagOnANonTlsBuildIsRefused"
     },
     {
       "id": "cp.incomplete_server_pair",
       "case": "coordinator given --tls-cert without --tls-key (or the reverse)",
       "outcome": "REFUSE",
       "proof": "unit",
-      "reason": "The enabling condition was `cert && key` with no else branch, so a one-flag typo produced a plaintext listener with nothing logged at all."
+      "reason": "The enabling condition was `cert && key` with no else branch, so a one-flag typo produced a plaintext listener with nothing logged at all.",
+      "proof_binary": "core",
+      "proof_test": "CliTlsArgs.AnIncompleteServerPairIsRefusedAndNamesTheMissingHalf"
     },
     {
       "id": "cp.mtls_without_server_cert",
       "case": "coordinator given --tls-client-ca with no server certificate",
       "outcome": "REFUSE",
       "proof": "unit",
-      "reason": "mTLS was requested; without a server certificate the listener is plaintext and verifies nothing."
+      "reason": "mTLS was requested; without a server certificate the listener is plaintext and verifies nothing.",
+      "proof_binary": "core",
+      "proof_test": "CliTlsArgs.MutualTlsWithoutAServerCertificateIsRefused"
     },
     {
       "id": "cp.client_creds_without_transport",
       "case": "worker given --tls-client-cert/--tls-client-key without --tls-ca",
       "outcome": "REFUSE",
       "proof": "unit",
-      "reason": "Credentials configured for a connection that is not protected at all - the shape the Kafka connector already refuses by policy."
+      "reason": "Credentials configured for a connection that is not protected at all - the shape the Kafka connector already refuses by policy.",
+      "proof_binary": "core",
+      "proof_test": "CliTlsArgs.ClientCredentialsWithoutAProtectedTransportAreRefused:CliTlsArgs.AnIncompleteClientPairIsRefusedAndNamesTheMissingHalf"
     },
     {
       "id": "cp.deliberate_plaintext",
       "case": "no TLS flags at all",
       "outcome": "ACCEPT",
       "proof": "unit",
-      "reason": "An operator who asked for nothing and got nothing has not been downgraded. Refusing this would break every private-network deployment to no benefit."
+      "reason": "An operator who asked for nothing and got nothing has not been downgraded. Refusing this would break every private-network deployment to no benefit.",
+      "proof_binary": "core",
+      "proof_test": "CliTlsArgs.NoTlsFlagsIsLegalOnEitherBuild:CliTlsArgs.ACompleteServerPairIsAccepted:CliTlsArgs.ACompleteMutualTlsConfigurationIsAccepted:CliTlsArgs.AWorkerMayVerifyTheServerWithoutOfferingAClientCert"
     }
   ],
-
   "kafka": [
     {
       "id": "kafka.creds_without_sasl_protocol",
       "case": "SASL username/password with no SASL security protocol",
       "outcome": "REFUSE",
       "proof": "unit",
-      "reason": "Credentials would be configured for a transport that never authenticates - the client would connect anonymously while the operator believes it authenticated."
+      "reason": "Credentials would be configured for a transport that never authenticates - the client would connect anonymously while the operator believes it authenticated.",
+      "proof_binary": "kafka",
+      "proof_test": "KafkaSecurityConf.SaslCredentialsWithoutASaslProtocolAreRefused"
     },
     {
       "id": "kafka.creds_over_plaintext",
       "case": "SASL credentials with security.protocol explicitly PLAINTEXT",
       "outcome": "REFUSE",
       "proof": "unit",
-      "reason": "The credentials would cross the wire unprotected, or not at all; either way the configuration cannot mean what it says."
+      "reason": "The credentials would cross the wire unprotected, or not at all; either way the configuration cannot mean what it says.",
+      "proof_binary": "kafka",
+      "proof_test": "KafkaSecurityConf.SaslCredentialsOverAnExplicitPlaintextProtocolAreRefused"
     },
     {
       "id": "kafka.tls_material_without_tls_protocol",
       "case": "certificate/CA material with a non-TLS security protocol",
       "outcome": "REFUSE",
       "proof": "unit",
-      "reason": "TLS material named but not used means the operator expects an encrypted link that will not exist."
+      "reason": "TLS material named but not used means the operator expects an encrypted link that will not exist.",
+      "proof_binary": "kafka",
+      "proof_test": "KafkaSecurityConf.TlsMaterialWithoutATlsProtocolIsRefused"
     },
     {
       "id": "kafka.passthrough_cannot_weaken",
       "case": "a raw kafka.* passthrough property that would downgrade the negotiated transport",
       "outcome": "REFUSE",
       "proof": "unit",
-      "reason": "An escape hatch that can silently undo the checks above would make every other row unenforceable."
+      "reason": "An escape hatch that can silently undo the checks above would make every other row unenforceable.",
+      "proof_binary": "kafka",
+      "proof_test": "KafkaSecurityConf.ThePassthroughCannotSilentlyWeakenTheTransport"
     },
     {
       "id": "kafka.plain_handshake_refused_by_broker",
       "case": "PLAIN handshake against a real broker that enables only SCRAM",
       "outcome": "REFUSE",
       "proof": "live",
-      "reason": "The refusal must come back naming the mechanisms the broker does enable, rather than surfacing as an opaque connection failure the operator cannot act on."
+      "reason": "The refusal must come back naming the mechanisms the broker does enable, rather than surfacing as an opaque connection failure the operator cannot act on.",
+      "proof_binary": "kafka",
+      "proof_test": "TxnResumeSaslLive.APlainHandshakeIsRefusedByAScramOnlyBrokerNamingScram"
     },
     {
       "id": "kafka.unauthenticated_against_sasl_listener",
       "case": "unauthenticated client against a SASL-required listener",
       "outcome": "REFUSE",
       "proof": "live",
-      "reason": "Must surface as a transport failure, never as a silent fallback or a guess about why the connection ended."
+      "reason": "Must surface as a transport failure, never as a silent fallback or a guess about why the connection ended.",
+      "proof_binary": "kafka",
+      "proof_test": "TxnResumeSaslLive.NoCredentialsAgainstASaslBrokerFallsBackAsTransportError"
     },
     {
       "id": "kafka.deliberate_plaintext",
       "case": "no credentials and no TLS material, against a plaintext listener",
       "outcome": "ACCEPT",
       "proof": "unit",
-      "reason": "The trusted-network deployment stays legal, as does SASL_PLAINTEXT with credentials on a network the operator has chosen to trust."
+      "reason": "The trusted-network deployment stays legal, as does SASL_PLAINTEXT with credentials on a network the operator has chosen to trust.",
+      "proof_binary": "kafka",
+      "proof_test": "KafkaSecurityConf.DeliberatePlaintextWithNoCredentialsIsAccepted:KafkaSecurityConf.SaslPlaintextIsAcceptedForATrustedNetwork"
     }
   ],
-
   "postgres": [
     {
       "id": "pg.asked_for_tls_and_did_not_get_it",
       "case": "sslmode=require/verify-ca/verify-full but the established connection is unencrypted",
       "outcome": "REFUSE",
       "proof": "live",
-      "reason": "libpq should already refuse; asserting PQsslInUse makes the invariant clink's own, so a future libpq default or a build without SSL cannot quietly weaken it."
+      "reason": "libpq should already refuse; asserting PQsslInUse makes the invariant clink's own, so a future libpq default or a build without SSL cannot quietly weaken it.",
+      "proof_binary": "integration",
+      "proof_test": "Qual12PgTransportLive.AnEstablishedUnencryptedConnectionThatDemandedTlsIsRefused:Qual12PgTransportLive.RequiringTlsFromAPlaintextServerNeverConnects"
     },
     {
       "id": "pg.silent_downgrade_is_stated",
       "case": "no sslmode given and the connection comes up unencrypted",
       "outcome": "WARN",
       "proof": "live",
-      "reason": "libpq's default is sslmode=prefer: try TLS and fall back SILENTLY. Plaintext on a private network is legitimate, so the requirement is that the fallback is stated, naming the option that fixes it - not that it is refused."
+      "reason": "libpq's default is sslmode=prefer: try TLS and fall back SILENTLY. Plaintext on a private network is legitimate, so the requirement is that the fallback is stated, naming the option that fixes it - not that it is refused.",
+      "proof_binary": "integration",
+      "proof_test": "Qual12PgTransportLive.AnUnrequestedPlaintextConnectionIsStatedNotSilent"
     },
     {
       "id": "pg.encrypted_is_recorded",
       "case": "the connection is encrypted",
       "outcome": "ACCEPT",
       "proof": "live",
-      "reason": "Recorded at info so an operator can prove from the log what the transport actually was, rather than inferring it from configuration."
+      "reason": "Recorded at info so an operator can prove from the log what the transport actually was, rather than inferring it from configuration.",
+      "proof_binary": "integration",
+      "proof_test": "Qual12PgTransportLive.AnEncryptedConnectionIsAcceptedAndRecorded"
     }
   ]
 }

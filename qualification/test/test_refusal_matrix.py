@@ -58,6 +58,12 @@ for surface, rows in surfaces.items():
         # first thing to be argued away when it fails.
         check(f"{rid}: carries the reason it is declared that way",
               len(row.get("reason", "")) > 40, row.get("reason"))
+        # A row that names no proof cannot be exercised, so it could
+        # never legitimately pass - requiring both fields here means a
+        # row can never drift away from the thing that proves it.
+        check(f"{rid}: names the binary and test that prove it",
+              bool(row.get("proof_binary")) and bool(row.get("proof_test")),
+              f"{row.get('proof_binary')!r} / {row.get('proof_test')!r}")
         check(f"{rid}: id uses its surface's declared prefix",
               surface in prefixes and rid.startswith(prefixes[surface] + "."),
               f"{rid} vs prefix {prefixes.get(surface)!r}")
