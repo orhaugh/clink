@@ -23,6 +23,7 @@
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
 namespace clink::plugin {
@@ -296,13 +297,72 @@ inline void run_subtask_to_completion(clink::LocalExecutor& exec,
         return;
     }
     auto errs = exec.operator_errors();
-    if (!errs.empty()) {
-        std::string msg = "subtask operator failure:";
-        for (const auto& [op_name, err] : errs) {
-            msg.append(" [").append(op_name).append("] ").append(err);
+    // A failure in an engine-inserted NETWORK BRIDGE stage is not this
+    // subtask's failure: it means a peer went away, which the coordinator
+    // already observes directly (the peer's own subtask exit, or its
+    // worker's heartbeat) and is already acting on. Reporting it too makes
+    // a killed worker produce a SECOND restart cause on top of the one the
+    // kill itself raised, and that extra restart lands while the first is
+    // still draining - a storm that stopped a killed worker from ever
+    // winding down. Measured on
+    // KafkaWindowRecoveryTest.AKillInTheAckWindowAfterARestoreStaysExactlyOnce:
+    // 0/8 failures before propagating these, 4/8 after, 3/8 with the
+    // propagation scoped to one dispatch path - the mechanism is the
+    // redundant cause, not the path.
+    //
+    // The subtask's OWN operators are a different matter entirely, and are
+    // what item 82 is about: an exception in a plan operator is invisible
+    // to the coordinator unless this reports it, and swallowing it lets a
+    // job complete `ok` having emitted nothing.
+    const auto is_bridge_stage = [](const std::string& n) {
+        return n == "network_bridge_sink" || n == "network_bridge_source";
+    };
+    std::vector<std::pair<std::string, std::string>> own;
+    for (auto& e : errs) {
+        if (!is_bridge_stage(e.first)) {
+            own.push_back(e);
         }
-        throw std::runtime_error(msg);
     }
+    if (own.empty()) {
+        if (!errs.empty()) {
+            // WHAT THIS TRADES AWAY, stated plainly. The bridge throws in
+            // order to be seen: it was made to throw because a send whose
+            // failure was discarded turned one lost-batch defect into a
+            // multi-day investigation, surfacing six operators downstream of
+            // the fault. Not rethrowing here keeps it out of the restart
+            // path but also stops it failing the task, so a send that failed
+            // in a HEALTHY job is now a loud log line rather than a failed
+            // subtask.
+            //
+            // That is the lesser of the two evils rather than a good outcome,
+            // and it is bounded: on four of the five worker dispatch paths
+            // these errors were not reported at all until item 82, so this is
+            // no worse there, and the coordinator already treats a
+            // departed-peer bridge failure as a cascade to avoid rather than
+            // a cause to act on (see the worker-loss redeploy comment in
+            // coordinator.cpp: it rolls the whole job back atomically for
+            // exactly this reason). Item 83 is to distinguish a departed peer
+            // from a genuine mid-stream loss so the detector can be fatal
+            // again in the case it was built for.
+            //
+            // Logged at ERROR, not warning: it is the only remaining signal.
+            std::string note;
+            for (const auto& [op_name, err] : errs) {
+                note.append(" [").append(op_name).append("] ").append(err);
+            }
+            clink::log::error("worker.task",
+                              "subtask transport failure(s) to a departed peer; the "
+                              "coordinator observes the peer directly, so this is NOT "
+                              "raised as a separate restart cause (item 83):" +
+                                  note);
+        }
+        return;
+    }
+    std::string msg = "subtask operator failure:";
+    for (const auto& [op_name, err] : own) {
+        msg.append(" [").append(op_name).append("] ").append(err);
+    }
+    throw std::runtime_error(msg);
 }
 
 // Armed-cutover commit gate for sink subtasks (hot rescale, design record
