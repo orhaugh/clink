@@ -291,7 +291,8 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
 // cancelled: teardown can legitimately throw (closed channels) and a cancelled
 // job must not spuriously restart - run_task_ already reports had_error there.
 inline void run_subtask_to_completion(clink::LocalExecutor& exec,
-                                      const std::shared_ptr<std::atomic<bool>>& cancel_token) {
+                                      const std::shared_ptr<std::atomic<bool>>& cancel_token,
+                                      bool report_transport_failures = true) {
     exec.run();
     if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
         return;
@@ -314,8 +315,15 @@ inline void run_subtask_to_completion(clink::LocalExecutor& exec,
     // what item 82 is about: an exception in a plan operator is invisible
     // to the coordinator unless this reports it, and swallowing it lets a
     // job complete `ok` having emitted nothing.
-    const auto is_bridge_stage = [](const std::string& n) {
-        return n == "network_bridge_sink" || n == "network_bridge_source";
+    // Only the callers that never reported ANY operator error before item 82
+    // pass report_transport_failures=false. On every other path the bridge's
+    // throw already reached the coordinator and must keep doing so: it is a
+    // data-loss detector, added because a discarded send turned one
+    // lost-batch defect into a multi-day investigation. Weakening it where it
+    // worked would trade item 82's silent wrongness for a quieter one.
+    const auto is_bridge_stage = [report_transport_failures](const std::string& n) {
+        return !report_transport_failures &&
+               (n == "network_bridge_sink" || n == "network_bridge_source");
     };
     std::vector<std::pair<std::string, std::string>> own;
     for (auto& e : errs) {
@@ -325,27 +333,21 @@ inline void run_subtask_to_completion(clink::LocalExecutor& exec,
     }
     if (own.empty()) {
         if (!errs.empty()) {
-            // WHAT THIS TRADES AWAY, stated plainly. The bridge throws in
-            // order to be seen: it was made to throw because a send whose
-            // failure was discarded turned one lost-batch defect into a
-            // multi-day investigation, surfacing six operators downstream of
-            // the fault. Not rethrowing here keeps it out of the restart
-            // path but also stops it failing the task, so a send that failed
-            // in a HEALTHY job is now a loud log line rather than a failed
-            // subtask.
+            // Reached only from the worker dispatch paths, which discarded
+            // EVERY operator error before item 82 - so not reporting a
+            // transport failure here is exactly what they already did, and
+            // nothing regresses. It is logged rather than discarded, which is
+            // strictly more than they used to do.
             //
-            // That is the lesser of the two evils rather than a good outcome,
-            // and it is bounded: on four of the five worker dispatch paths
-            // these errors were not reported at all until item 82, so this is
-            // no worse there, and the coordinator already treats a
-            // departed-peer bridge failure as a cascade to avoid rather than
-            // a cause to act on (see the worker-loss redeploy comment in
-            // coordinator.cpp: it rolls the whole job back atomically for
-            // exactly this reason). Item 83 is to distinguish a departed peer
-            // from a genuine mid-stream loss so the detector can be fatal
-            // again in the case it was built for.
+            // Reporting it instead was tried and measured: it gives a killed
+            // worker a second restart cause on top of the one the kill
+            // raised, and the killed worker then never winds down (0/8
+            // failures before, 4/8 after, on the ack-window kill-after-restore
+            // recovery test). The coordinator reasons the same way - see its
+            // worker-loss redeploy, which rolls the whole job back atomically
+            // so no survivor is left holding a stale bridge.
             //
-            // Logged at ERROR, not warning: it is the only remaining signal.
+            // Logged at ERROR, not warning: on this path it is the only signal.
             std::string note;
             for (const auto& [op_name, err] : errs) {
                 note.append(" [").append(op_name).append("] ").append(err);

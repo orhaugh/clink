@@ -318,7 +318,9 @@ void run_source_dispatch(std::shared_ptr<Source<Out>> src,
     // NOT a bare exec.run(): the executor CATCHES operator-thread exceptions
     // into operator_errors_ and returns normally, so a bare run() reports a
     // clean exit for a subtask whose operator threw. See item 82.
-    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
+    clink::plugin::detail::run_subtask_to_completion(exec,
+                                                     cancel_token,
+                                                     /*report_transport_failures=*/false);
 }
 
 // Sink kind: bridges -> union (optional) -> factory<Sink<In>>
@@ -330,7 +332,9 @@ void run_sink_dispatch(const std::vector<std::shared_ptr<void>>& in_bridges,
     auto h0 = build_input_stage<In>(dag, in_bridges);
     dag.template add_sink<In>(h0, sink);
     LocalExecutor exec(std::move(dag));
-    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
+    clink::plugin::detail::run_subtask_to_completion(exec,
+                                                     cancel_token,
+                                                     /*report_transport_failures=*/false);
 }
 
 // Operator kind: bridges -> union -> Operator<In, Out> -> output groups
@@ -348,7 +352,9 @@ void run_operator_dispatch(const std::vector<std::shared_ptr<void>>& in_bridges,
     attach_output_groups<Out>(
         dag, h1, groups, out_codec, builtin_arrow_batcher<Out>(), routing, selector_fn);
     LocalExecutor exec(std::move(dag));
-    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
+    clink::plugin::detail::run_subtask_to_completion(exec,
+                                                     cancel_token,
+                                                     /*report_transport_failures=*/false);
 }
 
 // compose_chain_step was removed when chain dispatch was migrated to
@@ -399,7 +405,9 @@ SubtaskRunner make_int64_int64_match_join_runner() {
                                           ctx.chain.output_routing,
                                           ctx.chain.output_selector_fn);
         LocalExecutor exec(std::move(dag));
-        clink::plugin::detail::run_subtask_to_completion(exec, ctx.cancel_token);
+        clink::plugin::detail::run_subtask_to_completion(exec,
+                                                         ctx.cancel_token,
+                                                         /*report_transport_failures=*/false);
     };
 }
 
@@ -2878,7 +2886,9 @@ void Worker::run_generic_subtask_(JobId job_id,
         // executor and the StateBackend it owns are destroyed, on every exit
         // path including a throw from run().
         CommitDispatchRetirer commit_retirer(dispatch_gate);
-        clink::plugin::detail::run_subtask_to_completion(exec, rctx.cancel_token);
+        clink::plugin::detail::run_subtask_to_completion(exec,
+                                                         rctx.cancel_token,
+                                                         /*report_transport_failures=*/false);
         // Drop this subtask's fused-source commit/abort callbacks now the runner
         // has exited; a late CommitCheckpoint/AbortCheckpoint then finds none
         // registered (mirrors the SubtaskRunner path's cleanup above).
