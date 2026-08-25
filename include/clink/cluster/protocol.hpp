@@ -549,6 +549,23 @@ struct SubtaskFinishedMsg {
     // restarting when set. Appended at the tail, eof-guarded, defaults
     // false, so frames from older workers keep their old meaning.
     bool fatal{false};
+    // Every failure this subtask saw was a network-bridge TRANSPORT failure -
+    // a send refused because the downstream peer went away - and none came
+    // from the subtask's own operators. That distinction decides whether the
+    // coordinator may act on this error directly: a departed peer is a
+    // SYMPTOM whose cause (the peer's own exit, or its worker's loss) is on
+    // its way, and restarting on the symptom races ahead of the cause and
+    // enters recovery from the wrong path (item 83). A subtask's own operator
+    // failure has no such cause coming and must be acted on.
+    //
+    // Not "ignore this": with no other cause, a refused send IS the cause and
+    // the coordinator acts on it once its deadline expires. Suppressing it
+    // outright would restore the silent short stream the bridge's throw
+    // exists to catch.
+    //
+    // Appended at the tail, eof-guarded, defaults false, so frames from older
+    // workers keep their old meaning (an error is acted on immediately).
+    bool transport_only{false};
 };
 
 struct HeartbeatMsg {

@@ -191,6 +191,9 @@ inline void encode_body(MessageBuilder& b, const SubtaskFinishedMsg& m) {
     // Tail field (item 19): non-retryable failure marker. Old readers stop
     // before it; old writers never produce it (defaults false).
     b.put_u8(m.fatal ? 1 : 0);
+    // Tail field (item 83): every failure was a bridge transport failure, so
+    // this is a symptom of a departed peer rather than a cause to act on.
+    b.put_u8(m.transport_only ? 1 : 0);
 }
 
 inline void encode_body(MessageBuilder& b, const HeartbeatMsg& m) {
@@ -684,6 +687,9 @@ inline SubtaskFinishedMsg decode_subtask_finished(MessageReader& r) {
     m.error_message = r.read_string();
     if (!r.eof()) {
         m.fatal = r.read_u8() != 0;
+    }
+    if (!r.eof()) {
+        m.transport_only = r.read_u8() != 0;
     }
     return m;
 }

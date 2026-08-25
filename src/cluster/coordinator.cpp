@@ -4620,6 +4620,33 @@ void Coordinator::watchdog_loop_() {
                     }
                 }
             }
+            // A transport failure that waited for its cause and never got
+            // one. In a healthy job nothing else is coming: the refused send
+            // IS the cause, and acting on it here is what keeps the bridge's
+            // detector meaningful rather than advisory (item 83). Placed with
+            // the deadline sweep because, like the restart backstop below, the
+            // condition is a property of the job's state rather than of any
+            // one tick's events.
+            for (auto& [_, job] : jobs_) {
+                if (!job->awaiting_restart && !job->completion_signalled &&
+                    !job->cancel_requested &&
+                    job->transport_error_deadline != std::chrono::steady_clock::time_point{} &&
+                    now > job->transport_error_deadline) {
+                    const std::string cause = job->transport_pending_cause;
+                    job->transport_error_deadline = {};
+                    job->transport_pending_cause.clear();
+                    log::warn(
+                        "coordinator.restart",
+                        "job_id=" + std::to_string(job->id) + " a transport failure waited " +
+                            std::to_string(cfg_.transport_symptom_grace.count()) +
+                            "ms and no cause arrived, so it IS the cause; restarting: " + cause);
+                    auto deploys = initiate_job_restart_locked_(
+                        *job, "transport failure", cause, survivor_cancels);
+                    for (auto& d : deploys) {
+                        deferred_restart_deploys.push_back(std::move(d));
+                    }
+                }
+            }
             for (auto& [_, job] : jobs_) {
                 if (job->awaiting_restart && !job->completion_signalled &&
                     job->restart_deadline != std::chrono::steady_clock::time_point{} &&
@@ -4854,6 +4881,10 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
         // restart_drain_timeout, the watchdog fails the job rather than
         // wedge (e.g. a survivor that hangs without acking the cancel).
         job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+        // The worker's loss IS the cause the held transport failures were
+        // waiting for; absorb them (item 83).
+        job.transport_error_deadline = {};
+        job.transport_pending_cause.clear();
         // Redeploy set on worker loss = the FULL topology rolled back to
         // the last checkpoint: drain every surviving in-flight subtask
         // (restart_drain_expected) and redeploy every subtask that is not
@@ -6086,6 +6117,52 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
             if (restart_drain_covered_(job) && !stage_in_doubt_resolution_locked_(job)) {
                 restart_deploys = restart_job_locked_(job);
             }
+        } else if (!retry && msg.had_error && msg.transport_only && !msg.fatal &&
+                   !job.completion_signalled && !job.cancel_requested &&
+                   !job.checkpoint.checkpoint_dir.empty() &&
+                   job.restart_attempts < effective_max_restarts(job.checkpoint)) {
+            // TRANSPORT-only: every failure this subtask saw was a send refused
+            // by a departed peer. That is a SYMPTOM. The cause - the peer's own
+            // exit, or its worker's loss - is already on its way here, and
+            // restarting on the symptom races ahead of it: recovery is entered
+            // from the bridge path instead of the worker-loss path, the other
+            // survivors are still running and still failing on stale bridges,
+            // and the redeploy does not converge. Measured: one killed worker
+            // produced restart attempts 1 and 2 within a second, and the killed
+            // worker then never wound down (item 83).
+            //
+            // So hold it. Free the slot and retire it from pending exactly as
+            // the restart path does, record the cause, and arm a short deadline.
+            // If a real cause arrives first it starts the restart and clears
+            // this. If none arrives - a healthy job, where nothing else is
+            // coming - the sweep acts on it, because a refused send that
+            // nobody acts on is the silent short stream the bridge's throw
+            // exists to prevent.
+            auto pending_it = job.pending_per_worker.find(msg.worker_id);
+            if (pending_it != job.pending_per_worker.end()) {
+                std::erase_if(pending_it->second, [&](const auto& p) {
+                    return p.first == msg.role && p.second == msg.subtask_idx;
+                });
+            }
+            auto worker_it = registered_.find(msg.worker_id);
+            if (worker_it != registered_.end() && worker_it->second->slots_in_use > 0) {
+                --worker_it->second->slots_in_use;
+                metrics::coordinator::slots_in_use_delta(-1);
+            }
+            job.errors.push_back(msg.worker_id + "/" + msg.role + "[" +
+                                 std::to_string(msg.subtask_idx) + "]: " + msg.error_message);
+            if (job.transport_pending_cause.empty()) {
+                job.transport_pending_cause = msg.error_message;
+                job.transport_error_deadline =
+                    std::chrono::steady_clock::now() + cfg_.transport_symptom_grace;
+                log::info("coordinator.restart",
+                          "job_id=" + std::to_string(job.id) +
+                              " transport failure held pending its cause for " +
+                              std::to_string(cfg_.transport_symptom_grace.count()) +
+                              "ms (a departed peer is a symptom; the cause restarts the job, "
+                              "and if none arrives this does): " +
+                              msg.error_message);
+            }
         } else if (!retry && msg.had_error && !msg.fatal && !job.completion_signalled &&
                    !job.cancel_requested && !job.checkpoint.checkpoint_dir.empty() &&
                    job.restart_attempts < effective_max_restarts(job.checkpoint)) {
@@ -6696,6 +6773,12 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
     const std::string& cause,
     std::vector<std::pair<network::Connection*, JobId>>& cancels) {
     job.awaiting_restart = true;
+    // A real cause is now driving recovery, so any transport failure held
+    // pending is absorbed as the symptom it was (item 83). The error text
+    // stays in job.errors for diagnosis; it just no longer needs its own
+    // restart.
+    job.transport_error_deadline = {};
+    job.transport_pending_cause.clear();
     job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
     // Drain the still-IN-FLIGHT subtasks (pending_per_worker, minus anything
     // the caller already removed), and redeploy EVERY subtask of the job

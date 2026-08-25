@@ -147,7 +147,8 @@ public:
                                      const std::string& role,
                                      std::uint32_t subtask,
                                      bool had_error,
-                                     bool fatal = false) {
+                                     bool fatal = false,
+                                     bool transport_only = false) {
         SubtaskFinishedMsg m;
         m.job_id = job_id;
         m.worker_id = id_;
@@ -155,6 +156,7 @@ public:
         m.subtask_idx = subtask;
         m.had_error = had_error;
         m.fatal = fatal;
+        m.transport_only = transport_only;
         m.error_message = had_error ? (fatal ? "injected FATAL restore refusal (checkpoint corrupt)"
                                              : "injected bridge failure (peer gone)")
                                     : "";
@@ -489,4 +491,143 @@ TEST(ErrorCancelConvergence, ATaskConstructedAcrossTheCancelStartsPreCancelled) 
     coordinator.stop();
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+// ----- Item 83: a departed peer is a symptom, not a cause -----
+//
+// A network-bridge send refused because the peer went away is reported as
+// an error, because those records did not reach the stream. But it must not
+// START recovery: the real cause (the peer's own exit, or its worker's
+// loss) is already travelling here, and restarting on the symptom races
+// ahead of it. Measured before this split: one killed worker produced
+// restart attempts 1 and 2 within a second, entered recovery from the
+// bridge path instead of the worker-loss path, and the killed worker never
+// wound down.
+//
+// The other half matters just as much. In a healthy job no cause is coming,
+// and a refused send that nobody acts on is the silent short stream the
+// bridge's throw exists to catch - so once the grace expires, the transport
+// failure IS the cause.
+
+namespace {
+
+// Deploy the graph and record each worker's (role, subtask) pairs.
+struct EccDeployed {
+    std::vector<std::pair<std::string, std::uint32_t>> a, b;
+};
+
+EccDeployed ecc_deploy(EccFakeWorker& wa, EccFakeWorker& wb, JobId job_id) {
+    EccDeployed d;
+    std::uint16_t fake_port = 44000;
+    EccFakeWorker* workers[2] = {&wa, &wb};
+    std::vector<std::pair<std::string, std::uint32_t>>* slots[2] = {&d.a, &d.b};
+    for (int i = 0; i < 2; ++i) {
+        auto deploy = workers[i]->await_frame(MessageKind::Deploy);
+        if (!deploy.has_value()) {
+            return d;
+        }
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            slots[i]->emplace_back(t.role, t.subtask_idx);
+            (void)workers[i]->report_listening(job_id, t.role, t.subtask_idx, fake_port++);
+        }
+    }
+    return d;
+}
+
+}  // namespace
+
+TEST(ErrorCancelConvergence, ATransportFailureWithNoCauseBehindItStillDrivesRecovery) {
+    ensure_built_ins_registered();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ecc_transport_alone_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.transport_symptom_grace = 300ms;  // the wait under test
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"ecc-a", "ecc-b"});
+    auto wa = std::make_unique<EccFakeWorker>(port, "ecc-a");
+    auto wb = std::make_unique<EccFakeWorker>(port, "ecc-b");
+    ASSERT_TRUE(wa->valid() && wb->valid());
+    ASSERT_TRUE(wa->register_and_ack());
+    ASSERT_TRUE(wb->register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    const auto job_id = coordinator.submit_job(
+        ecc_three_task_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    auto d = ecc_deploy(*wa, *wb, job_id);
+    ASSERT_FALSE(d.a.empty() || d.b.empty()) << "the graph never deployed across both workers";
+
+    // One subtask reports a transport-only failure, and nothing else happens:
+    // no worker dies, no other subtask errors.
+    ASSERT_TRUE(wa->send_finished(job_id,
+                                  d.a[0].first,
+                                  d.a[0].second,
+                                  /*had_error=*/true,
+                                  /*fatal=*/false,
+                                  /*transport_only=*/true));
+
+    // The grace expires with no cause behind it, so the transport failure IS
+    // the cause and recovery starts on it. Without this, a refused send in a
+    // healthy job is a log line and the stream stays silently short.
+    EXPECT_TRUE(wb->await_frame(MessageKind::CancelJob, 5s).has_value())
+        << "a transport failure with no cause behind it was never acted on: the job carried on "
+           "with records missing from its stream";
+    std::filesystem::remove_all(dir);
+}
+
+TEST(ErrorCancelConvergence, ATransportFailureDoesNotStartRecoveryAheadOfItsCause) {
+    ensure_built_ins_registered();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ecc_transport_absorbed_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    // Long enough that the grace CANNOT be what starts recovery here: anything
+    // that happens inside this window was driven by the real cause.
+    cfg.transport_symptom_grace = 60s;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"ecc-a", "ecc-b"});
+    auto wa = std::make_unique<EccFakeWorker>(port, "ecc-a");
+    auto wb = std::make_unique<EccFakeWorker>(port, "ecc-b");
+    ASSERT_TRUE(wa->valid() && wb->valid());
+    ASSERT_TRUE(wa->register_and_ack());
+    ASSERT_TRUE(wb->register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    const auto job_id = coordinator.submit_job(
+        ecc_three_task_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    auto d = ecc_deploy(*wa, *wb, job_id);
+    ASSERT_FALSE(d.a.empty() || d.b.empty());
+
+    // The survivor notices the departing peer first. This ordering - symptom
+    // ahead of cause - is what produced the cascade.
+    ASSERT_TRUE(wa->send_finished(job_id,
+                                  d.a[0].first,
+                                  d.a[0].second,
+                                  /*had_error=*/true,
+                                  /*fatal=*/false,
+                                  /*transport_only=*/true));
+
+    // It must not start recovery on its own.
+    EXPECT_FALSE(wb->await_frame(MessageKind::CancelJob, 1s).has_value())
+        << "the symptom started recovery before its cause arrived, which is how one killed "
+           "worker produced two restarts and never wound down";
+
+    // Now the cause: an ordinary (non-transport) failure. Recovery starts from
+    // THAT, well inside the 60s grace, and the held symptom is absorbed.
+    ASSERT_TRUE(wb->send_finished(job_id, d.b[0].first, d.b[0].second, /*had_error=*/true));
+    EXPECT_TRUE(wa->await_frame(MessageKind::CancelJob, 5s).has_value())
+        << "the real cause did not drive recovery";
+    std::filesystem::remove_all(dir);
 }

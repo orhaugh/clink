@@ -318,9 +318,7 @@ void run_source_dispatch(std::shared_ptr<Source<Out>> src,
     // NOT a bare exec.run(): the executor CATCHES operator-thread exceptions
     // into operator_errors_ and returns normally, so a bare run() reports a
     // clean exit for a subtask whose operator threw. See item 82.
-    clink::plugin::detail::run_subtask_to_completion(exec,
-                                                     cancel_token,
-                                                     /*report_transport_failures=*/false);
+    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
 }
 
 // Sink kind: bridges -> union (optional) -> factory<Sink<In>>
@@ -332,9 +330,7 @@ void run_sink_dispatch(const std::vector<std::shared_ptr<void>>& in_bridges,
     auto h0 = build_input_stage<In>(dag, in_bridges);
     dag.template add_sink<In>(h0, sink);
     LocalExecutor exec(std::move(dag));
-    clink::plugin::detail::run_subtask_to_completion(exec,
-                                                     cancel_token,
-                                                     /*report_transport_failures=*/false);
+    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
 }
 
 // Operator kind: bridges -> union -> Operator<In, Out> -> output groups
@@ -352,9 +348,7 @@ void run_operator_dispatch(const std::vector<std::shared_ptr<void>>& in_bridges,
     attach_output_groups<Out>(
         dag, h1, groups, out_codec, builtin_arrow_batcher<Out>(), routing, selector_fn);
     LocalExecutor exec(std::move(dag));
-    clink::plugin::detail::run_subtask_to_completion(exec,
-                                                     cancel_token,
-                                                     /*report_transport_failures=*/false);
+    clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
 }
 
 // compose_chain_step was removed when chain dispatch was migrated to
@@ -405,9 +399,7 @@ SubtaskRunner make_int64_int64_match_join_runner() {
                                           ctx.chain.output_routing,
                                           ctx.chain.output_selector_fn);
         LocalExecutor exec(std::move(dag));
-        clink::plugin::detail::run_subtask_to_completion(exec,
-                                                         ctx.cancel_token,
-                                                         /*report_transport_failures=*/false);
+        clink::plugin::detail::run_subtask_to_completion(exec, ctx.cancel_token);
     };
 }
 
@@ -1795,6 +1787,7 @@ void Worker::run_task_(JobId job_id,
     const auto task_start = std::chrono::steady_clock::now();
     bool had_error = false;
     bool fatal = false;
+    bool transport_only = false;
     std::string err_msg;
     try {
         // SQL-declared UDFs shipped with the job: register each before any
@@ -1835,6 +1828,14 @@ void Worker::run_task_(JobId job_id,
         // message instead of restarting (item 19).
         had_error = true;
         fatal = true;
+        err_msg = e.what();
+    } catch (const clink::plugin::detail::TransportOnlyFailure& e) {
+        // Every failure was a refused send to a departed peer. Still an error
+        // - the records did not reach the stream - but a SYMPTOM: the cause
+        // is already travelling to the coordinator, which waits briefly for
+        // it rather than restarting on this and racing ahead of it (item 83).
+        had_error = true;
+        transport_only = true;
         err_msg = e.what();
     } catch (const std::exception& e) {
         had_error = true;
@@ -1882,6 +1883,7 @@ void Worker::run_task_(JobId job_id,
     done.had_error = had_error;
     done.error_message = err_msg;
     done.fatal = fatal;
+    done.transport_only = transport_only;
     send_frame_(encode_frame(MessageKind::SubtaskFinished, done));
 
     {
@@ -2886,9 +2888,7 @@ void Worker::run_generic_subtask_(JobId job_id,
         // executor and the StateBackend it owns are destroyed, on every exit
         // path including a throw from run().
         CommitDispatchRetirer commit_retirer(dispatch_gate);
-        clink::plugin::detail::run_subtask_to_completion(exec,
-                                                         rctx.cancel_token,
-                                                         /*report_transport_failures=*/false);
+        clink::plugin::detail::run_subtask_to_completion(exec, rctx.cancel_token);
         // Drop this subtask's fused-source commit/abort callbacks now the runner
         // has exited; a late CommitCheckpoint/AbortCheckpoint then finds none
         // registered (mirrors the SubtaskRunner path's cleanup above).
@@ -2920,13 +2920,10 @@ void Worker::run_generic_subtask_(JobId job_id,
         return;
     }
 
-    // The built-in int64/string dispatch arms below register no cancel
-    // token of their own (only the SubtaskRunner path above does), so look
-    // up this subtask's if one exists. It decides whether an operator-thread
-    // exception is a genuine failure or the legitimate teardown throw of a
-    // cancelled subtask - see run_subtask_to_completion. Absent (the common
-    // case here) means every operator exception is reported, which is the
-    // point: these arms used to discard them entirely (item 82).
+    // These built-in dispatch arms register no cancel token of their own (only
+    // the SubtaskRunner path above does), so look up this subtask's if one
+    // exists. It decides whether an operator exception is a genuine failure or
+    // the legitimate teardown throw of a cancelled subtask.
     const auto subtask_cancel_token = [&]() -> std::shared_ptr<std::atomic<bool>> {
         std::lock_guard lock(mu_);
         if (auto it = per_job_cancel_tokens_.find(job_id); it != per_job_cancel_tokens_.end()) {

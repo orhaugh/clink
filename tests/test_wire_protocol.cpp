@@ -1214,3 +1214,60 @@ TEST(WireProtocol, PluginBinaryReferenceRoundTripsInsideDeploy) {
     EXPECT_EQ(out.plugins[0].content_hash, "aabbccddeeff0011");
     EXPECT_EQ(out.plugins[0].name, "hello");
 }
+
+// The transport_only tail field (item 83). It decides whether the
+// coordinator may act on a subtask error directly or must wait for the
+// cause behind it, so a frame that loses it in transit would turn a symptom
+// back into a restart cause - the exact cascade the field exists to stop.
+TEST(WireProtocol, SubtaskFinishedCarriesTransportOnly) {
+    SubtaskFinishedMsg in{.job_id = 7,
+                          .worker_id = "worker-c",
+                          .role = "generic",
+                          .subtask_idx = 2,
+                          .had_error = true,
+                          .error_message = "network_bridge_sink: failed to send a watermark",
+                          .fatal = false,
+                          .transport_only = true};
+    auto out = round_trip(MessageKind::SubtaskFinished, in, decode_subtask_finished);
+    EXPECT_TRUE(out.had_error);
+    EXPECT_FALSE(out.fatal);
+    EXPECT_TRUE(out.transport_only)
+        << "a transport-only error that arrives without its marker is acted on as a cause";
+    EXPECT_EQ(out.error_message, in.error_message);
+}
+
+// An ordinary operator failure must NOT come back marked transport-only:
+// held pending a cause that is never coming, it would wait out the grace
+// before the job reacted at all.
+TEST(WireProtocol, SubtaskFinishedDefaultsTransportOnlyFalse) {
+    SubtaskFinishedMsg in{.job_id = 8,
+                          .worker_id = "worker-d",
+                          .role = "generic",
+                          .subtask_idx = 1,
+                          .had_error = true,
+                          .error_message = "json_value_expr: unknown op 'f'"};
+    auto out = round_trip(MessageKind::SubtaskFinished, in, decode_subtask_finished);
+    EXPECT_TRUE(out.had_error);
+    EXPECT_FALSE(out.transport_only);
+}
+
+// Compatibility: a frame from a worker that predates the field stops before
+// it, and the absent tail must read as "act on this now" - the behaviour
+// that worker's coordinator would have given it.
+TEST(WireProtocol, SubtaskFinishedFromAnOlderWorkerActsOnTheErrorImmediately) {
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::SubtaskFinished));
+    b.put_u64_be(11);
+    b.put_string("worker-old");
+    b.put_string("generic");
+    b.put_u32_be(4);
+    b.put_u8(1);
+    b.put_string("some failure");
+    // Stops here: no fatal byte, no transport_only byte.
+    MessageReader r(body_of(b.finalize()));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::SubtaskFinished);
+    auto out = decode_subtask_finished(r);
+    EXPECT_TRUE(out.had_error);
+    EXPECT_FALSE(out.fatal);
+    EXPECT_FALSE(out.transport_only);
+}

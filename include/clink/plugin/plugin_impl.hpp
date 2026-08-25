@@ -280,6 +280,16 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     return cfg;
 }
 
+// Every failure a subtask saw came from a network-bridge TRANSPORT stage:
+// a send refused because the downstream peer went away. Typed so the worker
+// can mark the SubtaskFinished frame transport_only and the coordinator can
+// tell a SYMPTOM from a CAUSE (item 83). Mirrors how CheckpointIntegrityError
+// carries "non-retryable" up to the same place.
+class TransportOnlyFailure : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 // Run a deployed subtask's LocalExecutor to completion and PROPAGATE any
 // operator-thread failure. The executor catches operator exceptions into
 // operator_errors_ and returns normally (so an in-process caller can inspect
@@ -291,39 +301,27 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
 // cancelled: teardown can legitimately throw (closed channels) and a cancelled
 // job must not spuriously restart - run_task_ already reports had_error there.
 inline void run_subtask_to_completion(clink::LocalExecutor& exec,
-                                      const std::shared_ptr<std::atomic<bool>>& cancel_token,
-                                      bool report_transport_failures = true) {
+                                      const std::shared_ptr<std::atomic<bool>>& cancel_token) {
     exec.run();
     if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
         return;
     }
     auto errs = exec.operator_errors();
-    // A failure in an engine-inserted NETWORK BRIDGE stage is not this
-    // subtask's failure: it means a peer went away, which the coordinator
-    // already observes directly (the peer's own subtask exit, or its
-    // worker's heartbeat) and is already acting on. Reporting it too makes
-    // a killed worker produce a SECOND restart cause on top of the one the
-    // kill itself raised, and that extra restart lands while the first is
-    // still draining - a storm that stopped a killed worker from ever
-    // winding down. Measured on
-    // KafkaWindowRecoveryTest.AKillInTheAckWindowAfterARestoreStaysExactlyOnce:
-    // 0/8 failures before propagating these, 4/8 after, 3/8 with the
-    // propagation scoped to one dispatch path - the mechanism is the
-    // redundant cause, not the path.
+    if (errs.empty()) {
+        return;
+    }
+    // Split the subtask's OWN operator failures from network-bridge TRANSPORT
+    // failures. BOTH are reported - suppressing either is how a stream goes
+    // silently short - but they mean different things to the coordinator, so
+    // they leave here as different exception types.
     //
-    // The subtask's OWN operators are a different matter entirely, and are
-    // what item 82 is about: an exception in a plan operator is invisible
-    // to the coordinator unless this reports it, and swallowing it lets a
-    // job complete `ok` having emitted nothing.
-    // Only the callers that never reported ANY operator error before item 82
-    // pass report_transport_failures=false. On every other path the bridge's
-    // throw already reached the coordinator and must keep doing so: it is a
-    // data-loss detector, added because a discarded send turned one
-    // lost-batch defect into a multi-day investigation. Weakening it where it
-    // worked would trade item 82's silent wrongness for a quieter one.
-    const auto is_bridge_stage = [report_transport_failures](const std::string& n) {
-        return !report_transport_failures &&
-               (n == "network_bridge_sink" || n == "network_bridge_source");
+    // An operator failure is invisible to the coordinator unless this reports
+    // it, and swallowing it lets a job complete `ok` having emitted nothing
+    // (item 82). A transport failure is a departed peer, whose cause is
+    // already on its way to the coordinator; acting on it directly races
+    // ahead of that cause and enters recovery from the wrong path (item 83).
+    const auto is_bridge_stage = [](const std::string& n) {
+        return n == "network_bridge_sink" || n == "network_bridge_source";
     };
     std::vector<std::pair<std::string, std::string>> own;
     for (auto& e : errs) {
@@ -332,33 +330,17 @@ inline void run_subtask_to_completion(clink::LocalExecutor& exec,
         }
     }
     if (own.empty()) {
-        if (!errs.empty()) {
-            // Reached only from the worker dispatch paths, which discarded
-            // EVERY operator error before item 82 - so not reporting a
-            // transport failure here is exactly what they already did, and
-            // nothing regresses. It is logged rather than discarded, which is
-            // strictly more than they used to do.
-            //
-            // Reporting it instead was tried and measured: it gives a killed
-            // worker a second restart cause on top of the one the kill
-            // raised, and the killed worker then never winds down (0/8
-            // failures before, 4/8 after, on the ack-window kill-after-restore
-            // recovery test). The coordinator reasons the same way - see its
-            // worker-loss redeploy, which rolls the whole job back atomically
-            // so no survivor is left holding a stale bridge.
-            //
-            // Logged at ERROR, not warning: on this path it is the only signal.
-            std::string note;
-            for (const auto& [op_name, err] : errs) {
-                note.append(" [").append(op_name).append("] ").append(err);
-            }
-            clink::log::error("worker.task",
-                              "subtask transport failure(s) to a departed peer; the "
-                              "coordinator observes the peer directly, so this is NOT "
-                              "raised as a separate restart cause (item 83):" +
-                                  note);
+        std::string msg = "subtask transport failure:";
+        for (const auto& [op_name, err] : errs) {
+            msg.append(" [").append(op_name).append("] ").append(err);
         }
-        return;
+        // A departed peer is a symptom: its cause (the peer's own exit, or its
+        // worker's loss) is already on its way to the coordinator, and acting
+        // on the symptom races ahead of the cause and enters recovery from the
+        // wrong path. The coordinator waits briefly for that cause and acts on
+        // THIS only if none arrives - so a refused send in a healthy job,
+        // where no cause is coming, still fails the job (item 83).
+        throw TransportOnlyFailure(msg);
     }
     std::string msg = "subtask operator failure:";
     for (const auto& [op_name, err] : own) {

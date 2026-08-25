@@ -271,6 +271,19 @@ public:
         // watch item 63; reproduced locally by the orphaned-commit gate:
         // two sinks blocked on a paused broker, drain expired, job dead).
         std::chrono::milliseconds restart_drain_timeout{120000};
+        // How long a TRANSPORT-only subtask error waits for its cause before
+        // it is treated as the cause itself (item 83). A refused send to a
+        // departed peer is a symptom: the peer's own exit or its worker's
+        // loss is already on its way, and restarting on the symptom races
+        // ahead of the cause and enters recovery from the wrong path, which
+        // is how one killed worker produced two restarts and never wound
+        // down. Waiting briefly lets the real cause arrive and absorb it.
+        //
+        // Not a licence to ignore it: in a healthy job no cause is coming,
+        // and when this expires the transport failure IS the cause and the
+        // job restarts on it - otherwise the stream silently shortens, which
+        // is exactly what the bridge's throw exists to prevent.
+        std::chrono::milliseconds transport_symptom_grace{3000};
         // How long the SubmitJob handler waits for spare slots before
         // returning a rejection ack to the client. 0 means "never wait,
         // reject immediately". Useful when clusters auto-scale.
@@ -962,6 +975,11 @@ private:
         std::uint64_t latest_confirmed_checkpoint_id{};
         // bookkeeping, and increments restart_attempts.
         bool awaiting_restart{false};
+        // Set when a transport-only subtask error is held pending its cause;
+        // cleared the moment any real cause starts a restart. Non-zero means
+        // the sweep will act on transport_pending_cause when it expires.
+        std::chrono::steady_clock::time_point transport_error_deadline{};
+        std::string transport_pending_cause;
         std::uint32_t restart_attempts{0};
         // Whole-job restarts caused by FAILED CHECKPOINTS since the last
         // checkpoint that COMPLETED. Reset on completion; the job fails
