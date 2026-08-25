@@ -356,6 +356,13 @@ print(jid)" "$1"
 # Kafka directly. Every campaign installs this; omitting it cost a
 # provisioned rig its first run (the generator died on import, and the
 # start check reported only that it "did not start").
+# The chaos controller runs ON the ops host and SSHes to the others; it
+# defaults to /root/.ssh/id_ed25519 there. Without this the controller
+# reaches nothing and stops itself after five consecutive failures - a
+# soak with no faults in it, which is what the first cloud run produced.
+to_host "$OPS_PUB" "$KEY_FILE" /root/.ssh/id_ed25519
+on_host "$OPS_PUB" "chmod 600 /root/.ssh/id_ed25519"
+
 on_host "$OPS_PUB" "pip3 install --break-system-packages -q confluent-kafka 2>/dev/null || true"
 on_host "$OPS_PUB" "python3 -c 'import confluent_kafka'" \
     || { echo "campaign: the ops host cannot import confluent_kafka" >&2; exit 2; }
@@ -538,12 +545,19 @@ echo "$SP2_OUT" > "$OUT_DIR/savepoint-v2.txt"
 SP2_DIR=$(echo "$SP2_OUT" | sed -n 's/.*dir=\([^ ]*\).*/\1/p' | head -1 | tr -d '"')
 SP2_ID=$(echo "$SP2_OUT" | sed -n 's/.*id=\([0-9]*\).*/\1/p' | head -1)
 if [ -n "$SP2_DIR" ] && [ -n "$SP2_ID" ]; then
-    SNAP2=$(on_host "$OPS_PUB" "find '$SP2_DIR' -name 'checkpoint-${SP2_ID}.snap' | head -1" | tr -d '\r')
-    for pair in "v1:$SNAP_ONE" "v2:$SNAP2"; do
-        tag="${pair%%:*}"; snap="${pair#*:}"
-        [ -n "$snap" ] || continue
-        on_host "$COORD_PUB" "docker exec clink-coordinator clink state-cat \
-            --file='$snap' --json --max-rows=0" > "$OUT_DIR/state-$tag.json" 2>/dev/null || true
+    # EVERY subtask's snapshot, not just one: keyed state is partitioned
+    # across subtasks, and subtask 0 holds only the source's offsets - a
+    # single-file dump found no account_state at all and gate 4 reported
+    # "no state evidence" against a perfectly migrated job.
+    for pair in "v1:$SP_PORTABLE:$SP_ID" "v2:$SP2_DIR:$SP2_ID"; do
+        tag="${pair%%:*}"; rest="${pair#*:}"; dir="${rest%%:*}"; id="${rest##*:}"
+        : > "$OUT_DIR/state-$tag.json"
+        for snap in $(on_host "$OPS_PUB" "find '$dir' -name 'checkpoint-${id}.snap' | sort" | tr -d '\r'); do
+            on_host "$COORD_PUB" "docker exec clink-coordinator clink state-cat \
+                --file='$snap' --json --max-rows=0" 2>/dev/null \
+                | tr -d '\n' >> "$OUT_DIR/state-$tag.json"
+            echo >> "$OUT_DIR/state-$tag.json"
+        done
     done
     python3 "$HERE/migration_effect.py" --v1-dump "$OUT_DIR/state-v1.json" \
         --v2-dump "$OUT_DIR/state-v2.json" --out "$OUT_DIR/q11-effect.json" \

@@ -66,9 +66,24 @@ def parse_value(rendered):
 
 
 def load_entries(path, slot_filter="account_state"):
-    """{key bytes hex -> value bytes} for one slot across every operator."""
+    """{key -> value bytes} for one slot, across every operator AND every
+    subtask snapshot. The file holds one state-cat dump per line, because
+    keyed state is partitioned across subtasks and no single snapshot
+    holds it all (subtask 0 typically holds only the source's offsets)."""
+    dumps = []
     with open(path) as fh:
-        dump = json.load(fh)
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            dumps.append(json.loads(line))
+    out = {}
+    for dump in dumps:
+        out.update(_entries_of(dump, slot_filter))
+    return out
+
+
+def _entries_of(dump, slot_filter):
     out = {}
     for op in dump.get("operators", []):
         for slot in op.get("slots", []):
