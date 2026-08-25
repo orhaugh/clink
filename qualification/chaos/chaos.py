@@ -785,6 +785,18 @@ PROFILES = {
         ("twopc_window_fault", 5),
     ],
     "twopc": [("twopc_window_fault", 1)],
+    # QUAL-10: the leak profile. Weighted hard toward RECOVERY CYCLES,
+    # because the leaks this campaign hunts are per-restart - sockets not
+    # closed, threads not joined, per-job maps never erased, error lists
+    # never trimmed - and each one needs a full teardown/redeploy to
+    # accumulate. Network faults are present but light: they perturb
+    # without replacing a process, so they buy far less amplification per
+    # unit of run time. The steady-state half of the campaign is bought by
+    # a QUIET WINDOW in the schedule rather than by the mix.
+    "trend": [
+        ("kill_worker", 6), ("kill_coordinator", 3), ("restart_broker", 2),
+        ("twopc_window_fault", 3), ("network_latency", 1),
+    ],
     # QUAL-09: the infrastructure matrix, composed with the process-fault
     # workhorses so a kill can land DURING pressure or a step (the
     # interesting overlaps come from the dice, as ever).

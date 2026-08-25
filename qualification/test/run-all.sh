@@ -148,6 +148,18 @@ run "QUAL-11 driver parses" \
 run "QUAL-11 migration-effect gate (read from the savepoints)" \
     python3 "$HERE/test_migration_effect.py"
 
+# QUAL-10's verdict is a statistical claim, and statistics are easy to
+# write so that nothing can fail them. Both sides are driven: an injected
+# leak must FAIL each band, and the healthy shapes this campaign actually
+# produces - a restart sawtooth, a step at an incarnation boundary, noise -
+# must not.
+run "QUAL-10 trend math (an injected leak must fail the bands)" \
+    python3 "$HERE/test_trend_math.py"
+
+run "QUAL-10 sampler parses" \
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
+    "$HERE/../qual10/sampler.py"
+
 # QUAL-12's two drivers: the matrix runner and the image check. The
 # image check is the only thing that can prove the SHIPPED binary calls
 # its own validator, so a syntax error silently skipping it would take
