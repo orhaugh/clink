@@ -21,6 +21,15 @@ import argparse
 import json
 import os
 
+# The 2PC crash windows the trend profile arms. Same pair QUAL-09 uses:
+# they bracket the completed-marker write, which is where a commit either
+# is or is not durable. Here they are a leak amplifier rather than a
+# correctness probe - each firing is another full teardown and redeploy.
+TWOPC_POINTS = (
+    "coordinator.before_completed_marker",
+    "coordinator.after_completed_marker",
+)
+
 
 def read_json(path):
     try:
@@ -44,6 +53,12 @@ def build(out_dir, run_id, profile, local=False):
     a = lines.append
 
     a(f"# QUAL-10 - leak and stability ({run_id})")
+    if leak and leak.get("rehearsal"):
+        a("")
+        a("**Machinery rehearsal.** This run was too short for its own "
+          "workload to reach a plateau, so the leak bands are not judged. "
+          "What it verifies is that the instrument, the collection and the "
+          "judgement all work end to end.")
     a("")
 
     if leak is None:
@@ -80,8 +95,15 @@ def build(out_dir, run_id, profile, local=False):
                 if m:
                     a(f"- {metric}: median {m['median']}, peak {m['max']}")
             a("")
-        for f in leak["findings"]:
-            (unknowns if ("INCONCLUSIVE" in f or "never judged" in f) else problems).append(f)
+        if leak.get("rehearsal"):
+            # A rehearsal verifies the MACHINERY and says so. Reporting it as
+            # a FAIL would be worse than useless: the first thing a reader
+            # learns is to discount this campaign's failures.
+            unknowns.extend(leak["findings"])
+        else:
+            for f in leak["findings"]:
+                (unknowns if ("INCONCLUSIVE" in f or "never judged" in f)
+                 else problems).append(f)
 
         if leak.get("charts"):
             a("## What it looked like")

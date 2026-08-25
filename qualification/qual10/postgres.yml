@@ -1,0 +1,36 @@
+# QUAL-10 verification database.
+#
+# Runs on the ops host, outside the clink failure domain, so a fault aimed
+# at clink never takes the oracle's evidence store with it.
+#
+# This is the VERIFICATION channel, not the subject. QUAL-10's subject is
+# INFRASTRUCTURE FAULTS - whether exactly-once holds under ENOSPC, sustained partitions and stepped clocks
+# - and the upsert table is how an external oracle reads the engine's
+# per-key answers without asking the engine anything. The table itself is
+# deliberately not subject to retention: it accumulates one row per key
+# ever seen, which is what makes each key's final count checkable against
+# the seed long after the engine released that key's state.
+#
+# max_connections is raised because the sink opens one connection per
+# subtask and the oracle samples alongside it.
+services:
+  postgres:
+    image: postgres:16
+    container_name: qual10-postgres
+    restart: "no"
+    environment:
+      POSTGRES_USER: qual
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+      POSTGRES_DB: qual
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - log_min_messages=warning
+    ports:
+      - "5432:5432"
+    volumes:
+      - qual10-pgdata:/var/lib/postgresql/data
+volumes:
+  qual10-pgdata:

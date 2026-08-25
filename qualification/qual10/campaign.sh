@@ -85,7 +85,7 @@ RESTART_DRAIN_TIMEOUT_MS="${RESTART_DRAIN_TIMEOUT_MS:-300000}"
 SUSTAINED_PARTITION_S="${SUSTAINED_PARTITION_S:-$(( RESTART_DRAIN_TIMEOUT_MS / 1000 + 120 ))}"
 CLINK_IMAGE="${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}"
 KEY_FILE="${SSH_KEY_FILE:-$HOME/.ssh/clink-qual-ed25519}"
-PGPASSWORD="${PGPASSWORD:-qual09-$(echo "$RUN_ID" | tr -cd 'a-zA-Z0-9')}"
+PGPASSWORD="${PGPASSWORD:-qual10-$(echo "$RUN_ID" | tr -cd 'a-zA-Z0-9')}"
 SUBMIT_BIN="${SUBMIT_BIN:-$REPO_ROOT/build/clink_submit_sql}"
 
 DURATION_S="${DURATION_S:-$(python3 -c "print(int(float('$DURATION_H') * 3600))")}"
@@ -217,7 +217,7 @@ verify_fail() {
     # Chaos first (the QUAL-06 lesson), and for THIS campaign doubly so:
     # the controller's exit drains its revert registry, so a stepped
     # clock or a filler at ENOSPC is put back before anything else runs.
-    on_host "$OPS_PUB" "touch /qual/q9-chaos.jsonl.stop; pkill -INT -f '[c]haos.py'; true" || true
+    on_host "$OPS_PUB" "touch /qual/q10-chaos.jsonl.stop; pkill -INT -f '[c]haos.py'; true" || true
     collect_container_logs || true
     [ -n "${JOB_ID:-}" ] && curl -fsS -X POST \
         "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}/cancel" >/dev/null 2>&1 || true
@@ -225,7 +225,7 @@ verify_fail() {
     exit 4
 }
 
-echo "campaign: QUAL-09 run $RUN_ID, battery ${DURATION_S}s, profile=$PROFILE"
+echo "campaign: QUAL-10 run $RUN_ID, battery ${DURATION_S}s, profile=$PROFILE"
 echo "campaign: skip_faults='${SKIP_FAULTS}' state_loop=$STATE_LOOP sustained_partition=${SUSTAINED_PARTITION_S}s"
 { echo "skip_faults=$SKIP_FAULTS"; echo "state_loop=$STATE_LOOP";
   echo "sustained_partition_s=$SUSTAINED_PARTITION_S";
@@ -311,14 +311,14 @@ on_host "$OPS_PUB" "grep -q '^PGPASSWORD=' /qual/.env 2>/dev/null || echo 'PGPAS
 on_host "$OPS_PUB" "cd /qual && PGPASSWORD='$PGPASSWORD' docker compose -f postgres.yml down -v >/dev/null 2>&1; true"
 on_host "$OPS_PUB" "cd /qual && PGPASSWORD='$PGPASSWORD' docker compose -f postgres.yml up -d"
 pgready=0
-until on_host "$OPS_PUB" "docker exec qual09-postgres pg_isready -U qual >/dev/null 2>&1"; do
+until on_host "$OPS_PUB" "docker exec qual10-postgres pg_isready -U qual >/dev/null 2>&1"; do
     pgready=$(( pgready + 3 )); sleep 3
     [ "$pgready" -lt 180 ] || { echo "campaign: postgres never became ready" >&2; exit 2; }
 done
 CONNINFO="host=${OPS_PRIV} port=5432 dbname=qual user=qual password=${PGPASSWORD}"
 DSN="host=127.0.0.1 port=5432 dbname=qual user=qual password=${PGPASSWORD}"
-psql_q() { on_host "$OPS_PUB" "docker exec qual09-postgres psql -U qual -d qual -tAc \"$1\""; }
-psql_q "DROP TABLE IF EXISTS public.q9_out; CREATE TABLE public.q9_out (k BIGINT PRIMARY KEY, n BIGINT)" >/dev/null
+psql_q() { on_host "$OPS_PUB" "docker exec qual10-postgres psql -U qual -d qual -tAc \"$1\""; }
+psql_q "DROP TABLE IF EXISTS public.q10_out; CREATE TABLE public.q10_out (k BIGINT PRIMARY KEY, n BIGINT)" >/dev/null
 
 # --- stack ------------------------------------------------------------------
 i=0
@@ -377,16 +377,16 @@ rpk_ops() {
         docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
         $1 --brokers $BROKER_ONE:9092"
 }
-rpk_ops "topic delete qual09-in" >/dev/null 2>&1 || true
+rpk_ops "topic delete qual10-in" >/dev/null 2>&1 || true
 for _t in $(seq 1 30); do
-    rpk_ops "topic list" 2>/dev/null | grep -q "qual09-in" || break
+    rpk_ops "topic list" 2>/dev/null | grep -q "qual10-in" || break
     sleep 2
 done
 REPL=$(python3 -c "print(min(3, len('$BROKER_PRIVS'.split())))")
-rpk_ops "topic create qual09-in -p $PARTITIONS -r $REPL" >/dev/null
+rpk_ops "topic create qual10-in -p $PARTITIONS -r $REPL" >/dev/null
 
-on_host "$OPS_PUB" "rm -f /qual/q9-*.stop /qual/q9-progress.json /qual/q9-verdict.json \
-    /qual/q9-chaos.jsonl /qual/q9-generator.log /qual/q9-verifier.log /qual/q9-chaos.log"
+on_host "$OPS_PUB" "rm -f /qual/q10-*.stop /qual/q10-progress.json /qual/q10-verdict.json \
+    /qual/q10-chaos.jsonl /qual/q10-generator.log /qual/q10-verifier.log /qual/q10-chaos.log"
 for f in "$HERE/../qual01/detspec.py" "$HERE/../qual01/generator.py" \
          "$HERE/../qual05/verifier.py" "$HERE/../qual05/endstate.py" \
          "$HERE/../qual05/ckptsize.py" "$HERE/../chaos/chaos.py"; do
@@ -414,9 +414,17 @@ print(' '.join(h['public_ip'] for h in inv['hosts']))")
 echo "campaign: starting samplers on: $ALL_HOSTS"
 for H in $ALL_HOSTS; do
     to_host "$H" "$HERE/sampler.py" /qual/sampler.py
-    on_host "$H" "rm -f /qual/q10-metrics.jsonl.stop; mkdir -p /qual/metrics"
+    # Kill any sampler left over from an earlier run before starting this
+    # one, and give each run its OWN file. Both matter: a detached sampler
+    # outlives a campaign that stopped early, and two of them appending to
+    # one path interleaves two runs into a single series - which reads as a
+    # sawtooth nobody scheduled, or hides a real one. Found in the local
+    # rehearsal, which is what it is for.
+    on_host "$H" "pkill -f '[s]ampler.py' 2>/dev/null; true"
+    on_host "$H" "rm -f /qual/q10-metrics.jsonl.stop; mkdir -p /qual/metrics; \
+                  rm -f /qual/metrics/$RUN_ID-*.jsonl"
     start_on_host "$H" q10-sampler.log \
-        "python3 /qual/sampler.py --out /qual/metrics/\$(hostname).jsonl \
+        "python3 /qual/sampler.py --out /qual/metrics/$RUN_ID-\$(hostname).jsonl \
          --interval $SAMPLE_INTERVAL_S --state-dir /qual/state \
          --fs / --stop-file /qual/q10-metrics.jsonl.stop"
 done
@@ -424,7 +432,7 @@ done
 # sampler that never started reads exactly like a flat engine.
 sleep $(( SAMPLE_INTERVAL_S * 2 + 5 ))
 for H in $ALL_HOSTS; do
-    N=$(on_host "$H" "cat /qual/metrics/*.jsonl 2>/dev/null | wc -l" | tr -d ' \r')
+    N=$(on_host "$H" "cat /qual/metrics/$RUN_ID-*.jsonl 2>/dev/null | wc -l" | tr -d ' \r')
     echo "campaign: sampler on $H has $N sample(s)"
     [ "${N:-0}" -ge 1 ] || { echo "campaign: the sampler on $H recorded nothing; the run cannot be judged" >&2; exit 78; }
 done
@@ -434,17 +442,17 @@ EPS=$(( RATE / PARTITIONS ))
 BASE_MS=$(python3 -c "import time; print(int(time.time()*1000))")
 echo "$BASE_MS" > "$OUT_DIR/base_ms"
 
-start_on_host "$OPS_PUB" q9-generator.log \
-    "python3 /qual/generator.py --brokers '$BROKER_LIST' --topic qual09-in \
+start_on_host "$OPS_PUB" q10-generator.log \
+    "python3 /qual/generator.py --brokers '$BROKER_LIST' --topic qual10-in \
      --rate $RATE --partitions $PARTITIONS --keys $KEYS --seed $SEED \
      --base-ms $BASE_MS --max-jitter-ms 0 --window-ms 10000 \
-     --key-epoch-ms $KEY_EPOCH_MS --progress /qual/q9-progress.json"
+     --key-epoch-ms $KEY_EPOCH_MS --progress /qual/q10-progress.json"
 
 # --- pipeline + submit -----------------------------------------------------------
 sed -e "s|__BROKERS__|$BROKER_LIST|g" \
     -e "s|__CONNINFO__|$CONNINFO|g" \
     -e "s|__WM_LAG_MS__|$WM_LAG_MS|g" \
-    -e "s|__GROUP__|qual09-$RUN_ID|g" \
+    -e "s|__GROUP__|qual10-$RUN_ID|g" \
     -e "s|__STATE_TTL_MS__|$STATE_TTL_MS|g" \
     "$HERE/pipeline.sql.tmpl" > "$OUT_DIR/pipeline.sql"
 
@@ -499,10 +507,10 @@ state_bytes() {  # checkpoint dir
 # --- functional verification -----------------------------------------------------
 echo "campaign: functional verification"
 P1=$(on_host "$OPS_PUB" "python3 -c \"
-import json;d=json.load(open('/qual/q9-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
+import json;d=json.load(open('/qual/q10-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
 sleep 45
 P2=$(on_host "$OPS_PUB" "python3 -c \"
-import json;d=json.load(open('/qual/q9-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
+import json;d=json.load(open('/qual/q10-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
 [ "${P2:-0}" -gt "${P1:-0}" ] || verify_fail "no input is flowing (progress ${P1} -> ${P2})"
 
 JOB_HEALTHY=no
@@ -528,7 +536,7 @@ print(sum(1 for j in js if (j.get('status') or '').upper() in live))" 2>/dev/nul
 
 SINK_OK=no
 for _t in $(seq 1 20); do
-    C=$(psql_q "SELECT count(*) FROM public.q9_out" | tr -d '\r')
+    C=$(psql_q "SELECT count(*) FROM public.q10_out" | tr -d '\r')
     [ "${C:-0}" -gt 0 ] && { SINK_OK=yes; break; }
     sleep 15
 done
@@ -543,11 +551,11 @@ for _t in $(seq 1 20); do
 done
 [ "$STATE_OK" = "yes" ] || verify_fail "the state instrument cannot measure the checkpoints"
 
-start_on_host "$OPS_PUB" q9-verifier.log \
-    "python3 /qual/verifier.py --dsn '$DSN' --table public.q9_out \
-     --progress /qual/q9-progress.json --out /qual/q9-verdict.json --interval-s 20"
+start_on_host "$OPS_PUB" q10-verifier.log \
+    "python3 /qual/verifier.py --dsn '$DSN' --table public.q10_out \
+     --progress /qual/q10-progress.json --out /qual/q10-verdict.json --interval-s 20"
 
-{ echo "campaign=QUAL-09"; echo "run_id=$RUN_ID"; echo "job_id=$JOB_ID";
+{ echo "campaign=QUAL-10"; echo "run_id=$RUN_ID"; echo "job_id=$JOB_ID";
   echo "state_ttl_ms=$STATE_TTL_MS"; echo "key_epoch_ms=$KEY_EPOCH_MS";
   echo "rate=$RATE"; echo "partitions=$PARTITIONS"; echo "keys_per_epoch=$KEYS";
   echo "checkpoint_interval_ms=$CHECKPOINT_INTERVAL_MS"; echo "fill_s=$FILL_S";
@@ -568,6 +576,13 @@ done
 # leak: one long-lived incarnation per process, drifting or not, with
 # nothing resetting it. Skipping it would leave the analyser judging only
 # across restarts - which passes an engine that leaks per record.
+# The judged window opens HERE - after functional verification and after
+# the fill, which grows state on purpose. Recorded as a fact rather than
+# derived as a fraction of the clock: the local rehearsal judged the fill's
+# cold-start climb as an 831%/h leak, which is what a guessed warm-up buys
+# you.
+JUDGE_FROM_EPOCH=$(date +%s)
+echo "campaign: judged window opens at $JUDGE_FROM_EPOCH (after fill)"
 QUIET_S=$(( QUIET_END_S - WARMUP_S ))
 if [ "$QUIET_S" -gt 0 ]; then
     echo "campaign: === quiet window (${QUIET_S}s, no faults) ==="
@@ -586,24 +601,24 @@ fi
 
 # --- the battery ---------------------------------------------------------------
 echo "campaign: === fault battery (${FAULT_WINDOW_S}s, gap ${MIN_GAP_S}s) ==="
-Q9_POINTS=$(python3 -c "
+Q10_POINTS=$(python3 -c "
 import sys; sys.path.insert(0, '$HERE')
 import summarise
 print(','.join(summarise.TWOPC_POINTS))")
-[ -n "$Q9_POINTS" ] || { echo "campaign: no 2PC points from the summariser" >&2; exit 78; }
+[ -n "$Q10_POINTS" ] || { echo "campaign: no 2PC points from the summariser" >&2; exit 78; }
 SKIP_ARG=""
 [ -n "$SKIP_FAULTS" ] && SKIP_ARG="--skip-faults $SKIP_FAULTS"
-start_on_host "$OPS_PUB" q9-chaos.log \
-    "python3 /qual/chaos.py --inventory /qual/inventory.json --log /qual/q9-chaos.jsonl \
+start_on_host "$OPS_PUB" q10-chaos.log \
+    "python3 /qual/chaos.py --inventory /qual/inventory.json --log /qual/q10-chaos.jsonl \
      --coordinator-url http://${COORD_PRIV}:8095 --job-id $JOB_ID --run-id $RUN_ID \
      --profile $PROFILE --seed $SEED --min-gap-s $MIN_GAP_S \
-     --twopc-points '$Q9_POINTS' --recovery-timeout-s $RECOVERY_TIMEOUT_S \
+     --twopc-points '$Q10_POINTS' --recovery-timeout-s $RECOVERY_TIMEOUT_S \
      --sustained-partition-s $SUSTAINED_PARTITION_S $SKIP_ARG \
      --duration-s $(( FAULT_WINDOW_S + 300 )) --ensure-coverage"
 
 FAULTED=no
 for _t in $(seq 1 60); do
-    N=$(on_host "$OPS_PUB" "wc -l < /qual/q9-chaos.jsonl 2>/dev/null || echo 0" | tr -d ' \r')
+    N=$(on_host "$OPS_PUB" "wc -l < /qual/q10-chaos.jsonl 2>/dev/null || echo 0" | tr -d ' \r')
     [ "${N:-0}" -gt 0 ] && { FAULTED=yes; break; }
     sleep 20
 done
@@ -618,12 +633,12 @@ for _t in $(seq 1 30); do
 done
 [ "$LOST" = "yes" ] || verify_fail "a fault was recorded but the engine shows no worker loss"
 
-BEFORE=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q9_out" | tr -d '\r')
+BEFORE=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q10_out" | tr -d '\r')
 RECOVERED=no
 for _p in $(seq 1 "$RECOVER_PROBES"); do
     sleep 30
     S=$(job_status "$JOB_ID")
-    AFTER=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q9_out" | tr -d '\r')
+    AFTER=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q10_out" | tr -d '\r')
     if [ "$S" = "RUNNING" ] && [ "${AFTER:-0}" -gt "${BEFORE:-0}" ]; then RECOVERED=yes; break; fi
 done
 [ "$RECOVERED" = "yes" ] || verify_fail "the job did not resume making progress after the first fault"
@@ -637,11 +652,11 @@ while [ "$(date +%s)" -lt "$END" ]; do
     if [ "$WATCH_MAX_LOOPS" != "0" ] && [ "$WATCH_LOOPS" -ge "$WATCH_MAX_LOOPS" ]; then break; fi
     WATCH_LOOPS=$(( WATCH_LOOPS + 1 ))
     sleep "$SAMPLE_INTERVAL_S"
-    for f in q9-verdict.json q9-chaos.jsonl q9-progress.json q9-generator.log q9-verifier.log q9-chaos.log; do
+    for f in q10-verdict.json q10-chaos.jsonl q10-progress.json q10-generator.log q10-verifier.log q10-chaos.log; do
         scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null || true
     done
 
-    DIRTY=$(python3 - "$OUT_DIR/q9-verdict.json" <<'PY' || echo ""
+    DIRTY=$(python3 - "$OUT_DIR/q10-verdict.json" <<'PY' || echo ""
 import json, sys
 try:
     v = json.load(open(sys.argv[1]))
@@ -653,7 +668,7 @@ PY
     if [ "$DIRTY" = "DIRTY" ]; then
         echo "campaign: ORACLE DIRTY - freezing faults and collecting evidence" >&2
         { echo "oracle_dirty=yes"; echo "noticed_at_utc=$(date -u +%H:%M)"; } > "$OUT_DIR/oracle-dirty.txt"
-        on_host "$OPS_PUB" "touch /qual/q9-chaos.jsonl.stop"
+        on_host "$OPS_PUB" "touch /qual/q10-chaos.jsonl.stop"
         on_host "$OPS_PUB" "pkill -INT -f '[c]haos.py' || true"
         collect_container_logs
         break
@@ -661,14 +676,14 @@ PY
 
     if [ -z "$CHAOS_DIED_AT" ] && ! on_host "$OPS_PUB" "pgrep -f '[c]haos.py' >/dev/null"; then
         CHAOS_DIED_AT=$(date -u +%H:%M)
-        NFAULTS=$(on_host "$OPS_PUB" "wc -l < /qual/q9-chaos.jsonl 2>/dev/null || echo 0" | tr -d '\r')
+        NFAULTS=$(on_host "$OPS_PUB" "wc -l < /qual/q10-chaos.jsonl 2>/dev/null || echo 0" | tr -d '\r')
         echo "campaign: WARNING - the chaos controller is no longer running (${NFAULTS} faults)" >&2
         { echo "chaos_controller_died=yes"; echo "noticed_at_utc=$CHAOS_DIED_AT";
           echo "fault_records_at_death=$NFAULTS"; } > "$OUT_DIR/chaos-died.txt"
     fi
 
-    K=$(psql_q "SELECT count(*) FROM public.q9_out" 2>/dev/null | tr -d '\r' || echo '?')
-    SM=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q9_out" 2>/dev/null | tr -d '\r' || echo '?')
+    K=$(psql_q "SELECT count(*) FROM public.q10_out" 2>/dev/null | tr -d '\r' || echo '?')
+    SM=$(psql_q "SELECT coalesce(sum(n),0) FROM public.q10_out" 2>/dev/null | tr -d '\r' || echo '?')
     echo "campaign: $(date -u +%H:%M) battery $(( $(date +%s) - SOAK_START ))s: $K keys, sum $SM"
 
     if [ -z "$JOB_GONE_AT" ]; then
@@ -690,7 +705,7 @@ done
 
 # --- drain and final judgement ------------------------------------------------
 echo "campaign: battery complete, draining"
-on_host "$OPS_PUB" "touch /qual/q9-chaos.jsonl.stop"
+on_host "$OPS_PUB" "touch /qual/q10-chaos.jsonl.stop"
 cwaited=0
 while [ "$cwaited" -lt 300 ]; do
     on_host "$OPS_PUB" "pgrep -f '[c]haos.py' >/dev/null" || break
@@ -716,7 +731,7 @@ done
 [ "$settle" -lt 300 ] \
     || echo "campaign: WARNING - the job had not completed a fresh checkpoint 300s after the last fault" >&2
 
-on_host "$OPS_PUB" "touch /qual/q9-progress.json.stop"
+on_host "$OPS_PUB" "touch /qual/q10-progress.json.stop"
 on_host "$OPS_PUB" "pkill -INT -f '[g]enerator.py'; true"
 gwaited=0
 while [ "$gwaited" -lt 60 ]; do
@@ -727,10 +742,10 @@ done
 echo "campaign: waiting for the pipeline to catch up with the generator"
 CATCHUP=no
 PRODUCED_FINAL=$(on_host "$OPS_PUB" "python3 -c \"
-import json;d=json.load(open('/qual/q9-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
+import json;d=json.load(open('/qual/q10-progress.json'));print(sum(d['produced_high'].values()))\"" 2>/dev/null || echo 0)
 cwait=0; LAST_FOLDED=-1; STALL_S=0; FOLDED=0
 while [ "$cwait" -lt "$CATCHUP_TIMEOUT_S" ]; do
-    FOLDED=$(psql_q "SELECT coalesce(sum(n), 0) FROM public.q9_out" | tr -d '\r')
+    FOLDED=$(psql_q "SELECT coalesce(sum(n), 0) FROM public.q10_out" | tr -d '\r')
     if [ "${FOLDED:-0}" -ge "${PRODUCED_FINAL:-1}" ]; then CATCHUP=yes; break; fi
     if [ "${FOLDED:-0}" -le "${LAST_FOLDED}" ]; then
         STALL_S=$(( STALL_S + 30 ))
@@ -750,8 +765,8 @@ QUIESCED=no
 waited=0
 prev_sum=-1
 while [ "$waited" -lt "$FINAL_WAIT_S" ]; do
-    scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/q9-verdict.json" "$OUT_DIR/" 2>/dev/null || true
-    s=$(python3 - "$OUT_DIR/q9-verdict.json" <<'PY' || echo -1
+    scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/q10-verdict.json" "$OUT_DIR/" 2>/dev/null || true
+    s=$(python3 - "$OUT_DIR/q10-verdict.json" <<'PY' || echo -1
 import json, sys
 try:
     v = json.load(open(sys.argv[1]))
@@ -776,8 +791,8 @@ MAX_SNAPS=$(on_host "$OPS_PUB" "for d in \$(find '$CKPT_DIR' -mindepth 2 -maxdep
 } > "$OUT_DIR/retention-audit.txt"
 cat "$OUT_DIR/retention-audit.txt"
 
-on_host "$OPS_PUB" "python3 /qual/endstate.py --dsn '$DSN' --table public.q9_out \
-    --progress /qual/q9-progress.json --seed $SEED --partitions $PARTITIONS \
+on_host "$OPS_PUB" "python3 /qual/endstate.py --dsn '$DSN' --table public.q10_out \
+    --progress /qual/q10-progress.json --seed $SEED --partitions $PARTITIONS \
     --keys $KEYS --eps $EPS --base-ms $BASE_MS --key-epoch-ms $KEY_EPOCH_MS" \
     > "$OUT_DIR/completeness.txt" \
     || echo "campaign: WARNING - the end-state pass failed; correctness has no evidence" >&2
@@ -786,7 +801,7 @@ cat "$OUT_DIR/completeness.txt" 2>/dev/null || true
 curl -fsS -X POST "http://${COORD_PUB}:8095/api/v1/jobs/${JOB_ID}/cancel" >/dev/null 2>&1 || true
 sleep 30
 kill_campaign_processes "$OPS_PUB" || true
-for f in q9-verdict.json q9-chaos.jsonl q9-progress.json q9-generator.log q9-verifier.log q9-chaos.log; do
+for f in q10-verdict.json q10-chaos.jsonl q10-progress.json q10-generator.log q10-verifier.log q10-chaos.log; do
     scp "${SSH_OPTS[@]}" -q "root@${OPS_PUB}:/qual/$f" "$OUT_DIR/" 2>/dev/null \
         || echo "campaign: WARNING - could not retain /qual/$f in the evidence" >&2
 done
@@ -804,7 +819,7 @@ sleep $(( SAMPLE_INTERVAL_S + 3 ))
 
 mkdir -p "$OUT_DIR/metrics"
 for H in $ALL_HOSTS; do
-    scp "${SSH_OPTS[@]}" -q "root@${H}:/qual/metrics/*.jsonl" "$OUT_DIR/metrics/" 2>/dev/null \
+    scp "${SSH_OPTS[@]}" -q "root@${H}:/qual/metrics/$RUN_ID-*.jsonl" "$OUT_DIR/metrics/" 2>/dev/null \
         || echo "campaign: WARNING - no metrics retrieved from $H" >&2
 done
 SAMPLE_FILES=$(ls "$OUT_DIR"/metrics/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
@@ -817,10 +832,11 @@ echo "campaign: retrieved metric series from $SAMPLE_FILES host(s)"
 if [ "${SAMPLE_FILES:-0}" -ge 1 ]; then
     python3 "$HERE/analyse.py" \
         --samples "$OUT_DIR"/metrics/*.jsonl \
-        --events "$OUT_DIR/q9-chaos.jsonl" \
+        --events "$OUT_DIR/q10-chaos.jsonl" \
         --charts-dir "$OUT_DIR/charts" \
         --out-json "$OUT_DIR/leak-report.json" \
-        --warmup-hours "$WARMUP_HOURS" \
+        --judge-from-epoch "$JUDGE_FROM_EPOCH" \
+        --plateau-seconds "$(( STATE_TTL_MS / 1000 ))" \
         --min-incarnation-hours "$MIN_INCARNATION_HOURS" \
         > "$OUT_DIR/leak-summary.txt" 2>&1 || true
     cat "$OUT_DIR/leak-summary.txt"

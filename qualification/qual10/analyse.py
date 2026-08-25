@@ -239,6 +239,24 @@ def main():
     ap.add_argument("--charts-dir", default="")
     ap.add_argument("--out-json", default="")
     ap.add_argument("--warmup-hours", type=float, default=DEFAULTS["warmup_hours"])
+    ap.add_argument("--plateau-seconds", type=float, default=0.0,
+                    help="how long this workload needs before its state "
+                         "PLATEAUS (its retention/TTL horizon). A judged "
+                         "window shorter than a few of these cannot show "
+                         "flatness at all - state is still filling by "
+                         "design - so the leak bands are reported as not "
+                         "judged rather than failed. Without this a "
+                         "compressed rehearsal reports a cold start as an "
+                         "831%/h leak, which is how a harness teaches its "
+                         "owner to ignore it.")
+    ap.add_argument("--judge-from-epoch", type=float, default=0.0,
+                    help="wall-clock second at which the judged window opens. "
+                         "Preferred over --warmup-hours because it is a FACT "
+                         "the campaign recorded rather than a fraction of the "
+                         "clock: the fill phase grows state on purpose, and a "
+                         "warm-up guessed as a share of the run leaves that "
+                         "cold-start climb inside the judged window, where it "
+                         "reads as a leak")
     ap.add_argument("--min-incarnation-hours", type=float,
                     default=DEFAULTS["min_incarnation_hours"],
                     help="scales with the run: a compressed rehearsal has a "
@@ -260,14 +278,46 @@ def main():
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if e.get("ts"):
-                events.append(((e["ts"] - t0) / 3600.0,
+            # The chaos controller stamps ISO-8601 in "time"; accept an
+            # epoch "ts" too rather than assuming one shape. Getting this
+            # wrong is silent: the charts simply render with no fault
+            # markers, and a reader sees a sawtooth with nothing explaining
+            # it - which is the opposite of what the markers are for.
+            ts = None
+            if isinstance(e.get("ts"), (int, float)):
+                ts = float(e["ts"])
+            elif e.get("time"):
+                try:
+                    from datetime import datetime, timezone
+                    ts = datetime.fromisoformat(
+                        str(e["time"]).replace("Z", "+00:00")
+                    ).replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    ts = None
+            if ts is not None:
+                events.append(((ts - t0) / 3600.0,
                                e.get("fault") or e.get("kind") or "fault"))
 
     hosts, procs = collect(samples, t0)
-    cfg = dict(DEFAULTS, warmup_hours=args.warmup_hours,
+    warmup_hours = args.warmup_hours
+    if args.judge_from_epoch:
+        warmup_hours = max(0.0, (args.judge_from_epoch - t0) / 3600.0)
+    cfg = dict(DEFAULTS, warmup_hours=warmup_hours,
                min_incarnation_hours=args.min_incarnation_hours)
+    judged_hours = max(0.0, duration - cfg["warmup_hours"])
+    plateau_hours = args.plateau_seconds / 3600.0
+    # Three horizons: one to fill, one to plateau, one to judge the plateau.
+    rehearsal = bool(plateau_hours) and judged_hours < plateau_hours * 3
     findings, per_process = judge(procs, cfg, events)
+    if rehearsal:
+        # Not a pass and not a failure: this run verified the MACHINERY -
+        # samplers on every host, collection, judgement, charts - and cannot
+        # speak to flatness, because the workload it ran was still filling.
+        findings = [f"this run is a machinery rehearsal, not a leak verdict: "
+                    f"the judged window is {judged_hours * 60:.0f} min against a "
+                    f"workload that needs {plateau_hours * 60:.0f} min just to "
+                    f"plateau, so RSS is expected to climb and the bands are "
+                    f"NOT judged"]
 
     charts = []
     if args.charts_dir:
@@ -281,6 +331,7 @@ def main():
         "fault_events": len(events),
         "bands": cfg,
         "per_process": per_process,
+        "rehearsal": rehearsal,
         "findings": findings,
         "charts": charts,
     }
