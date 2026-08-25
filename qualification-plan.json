@@ -1,252 +1,302 @@
 {
-  "baseline_revision": "8fa61d76692446b9a3a96ea6e8b32be3c99104f6",
-  "audited_revision": "d6e8fbae2199fb505d81b6aefe27dce7e9a10623",
-  "qualification_version": 1,
-  "notes": "Phase A closes the residual code gaps from the 2026-08-15 external audit; Phase B qualifies the result against real infrastructure (Hetzner Cloud, project 'clink', cost-capped). Every experiment must leave retained machine-readable evidence under qualification-results/ (gitignored). PUBLICATION CONTRACT (owner directive, 2026-08-16): docs/qualification/ carries a campaign page ONLY once that campaign is fully fixed and empirically verified green with useful results. Test failures, void runs, harness defects and the reasons behind them are NOT published there - they live in the fixes, their regression tests, the commit messages, and the gitignored internal record (docs/qualification-internal-record.md). A campaign is done when it is green; only then does it get a page.",
-  "items": [
-    {
-      "id": "HARDEN-00",
-      "category": "code",
-      "priority": "P0",
-      "title": "HttpServer::stop() waits for the listen loop before stopping it (watch item 64)",
-      "status": "completed",
-      "result_revision": "7bf9187",
-      "evidence": [
-        "tests/test_http_auth.cpp HttpLifecycle.ImmediateStopAfterStartNeverWedges: ~550ms with the fix across 3 runs; mutant (wait_until_ready removed) wedges within 90s, verified by disassembly of both binaries",
-        "core label green post-fix: 2157 passed / 0 failed / 5 platform skips"
-      ]
+ "baseline_revision": "8fa61d76692446b9a3a96ea6e8b32be3c99104f6",
+ "audited_revision": "d6e8fbae2199fb505d81b6aefe27dce7e9a10623",
+ "qualification_version": 1,
+ "notes": "Phase A closes the residual code gaps from the 2026-08-15 external audit; Phase B qualifies the result against real infrastructure (Hetzner Cloud, project 'clink', cost-capped). Every experiment must leave retained machine-readable evidence under qualification-results/ (gitignored). PUBLICATION CONTRACT (owner directive, 2026-08-16): docs/qualification/ carries a campaign page ONLY once that campaign is fully fixed and empirically verified green with useful results. Test failures, void runs, harness defects and the reasons behind them are NOT published there - they live in the fixes, their regression tests, the commit messages, and the gitignored internal record (docs/qualification-internal-record.md). A campaign is done when it is green; only then does it get a page. STATUS AUTHORITY (2026-08-25): the published page under docs/qualification/ is the authoritative record of a campaign's status; this file records intent (scope, priority, what is still planned) and must follow it. scripts/check-qualification-status.py gates the two against each other in CI - a published campaign must be `completed` here with the engine revision the index names, and a `completed` campaign must have a published page.",
+ "items": [
+  {
+   "id": "HARDEN-00",
+   "category": "code",
+   "priority": "P0",
+   "title": "HttpServer::stop() waits for the listen loop before stopping it (watch item 64)",
+   "status": "completed",
+   "result_revision": "7bf9187",
+   "evidence": [
+    "tests/test_http_auth.cpp HttpLifecycle.ImmediateStopAfterStartNeverWedges: ~550ms with the fix across 3 runs; mutant (wait_until_ready removed) wedges within 90s, verified by disassembly of both binaries",
+    "core label green post-fix: 2157 passed / 0 failed / 5 platform skips"
+   ]
+  },
+  {
+   "id": "HARDEN-01",
+   "category": "code",
+   "priority": "P0",
+   "title": "SQL inline constraint semantics: honour PRIMARY KEY fully, refuse the rest loudly",
+   "status": "completed",
+   "evidence": [
+    "Pre-existing since audit: inline PK reaches catalogue; NOT NULL/CHECK/UNIQUE/DEFAULT/REFERENCES refused with actionable diagnostic (Option B)",
+    "New: conflicting inline vs WITH primary_key is refused (was: WITH silently won); multiple inline PRIMARY KEY columns refused with composite WITH form in the diagnostic; table-level constraints refused with the supported form named; inline PK canonicalised into the properties bag so it survives the catalog JSON round trip (was silently dropped on reload - real defect found during this work); upsert planning binds against an inline-only key",
+    "Mutation-checked: reverting catalog.cpp+ast_builder.cpp to pre-change semantics fails exactly the 4 new gate tests"
+   ],
+   "result_revision": "committed post-baseline (feat(sql): inline PRIMARY KEY is one honest declaration)"
+  },
+  {
+   "id": "HARDEN-02",
+   "category": "code",
+   "priority": "P0",
+   "title": "Reject unavailable connectors before deployment (local plan-time + cluster-authoritative submission)",
+   "status": "completed",
+   "evidence": [
+    "check_connector_availability (src/cluster/connector_availability.cpp) gates Coordinator::submit_job before planning/allocation; availability read from the registries the job deploys against (bundle-aware), never a hardcoded list; message names the connector, this build's available source/sink connectors (capability registry) and the CLINK_WITH_* rebuild flag",
+    "Cluster-authoritative by construction: the gate runs in the submission-owning process (in-proc coordinator for clink run; target coordinator for POST /api/v1/jobs/spec and /jobs/sql); GET /api/v1/connectors already serves the cluster manifest to CLIs",
+    "8 tests in tests/test_connector_availability.cpp (missing connector, registry-decides/CLI-vs-cluster, runner-only registration, non-connector pass-through, always-built pass, longest-prefix vocabulary + boundary, vocabulary-completeness pin over declared capabilities, coordinator-level pre-deploy rejection) + SqlPhysical.ASourceOnlyConnectorRequestedAsASinkIsRefused pins the role mismatch; guarantee gate already pins unsupported exactly-once requests",
+    "Mutation-checked: gate call removed from submit_job compiles and fails the coordinator-level test; core label 2170/2170 green with the gate in place"
+   ]
+  },
+  {
+   "id": "HARDEN-03",
+   "category": "code",
+   "priority": "P1",
+   "title": "Adaptive unaligned-checkpoint wiring: measured backpressure drives the existing resolver in clink's own runtimes",
+   "status": "completed",
+   "evidence": [
+    "checkpoint::AdaptiveModePolicy (header-only): threshold + consecutive-window hysteresis both directions + bounded history + switch counter; deterministic, driven by synthetic pressure in tests",
+    "In-process wiring: CheckpointCoordinator::enable_adaptive_mode(pressure_fn) behind the existing set_mode_resolver seam; Dag::channel_pressure_fn() = max depth/capacity across runner input channels; trigger() emits clink_ckpt_mode_total{mode} and clink_ckpt_adaptive_switch_total",
+    "Cluster wiring: CheckpointAlignment::Adaptive; coordinator trigger sweep observes last completed checkpoint duration / interval and stamps TriggerCheckpointMsg.barrier_mode_plus1 (trailing wire field, 0 = legacy/static); DeployMsg.adaptive_barrier_mode (trailing, before the epoch per contract) makes sources forward the injected stamp instead of re-stamping; per-op overrides still win; lint covers Adaptive-without-periodic",
+    "Tests: 8 AdaptiveModePolicy behaviours incl. spike-no-switch and hysteresis both ways; wire round-trips + 3 tail-truncation compat shapes; mode-flip correctness rests on the aligner's per-barrier pinning proven in test_co_operator_unaligned",
+    "Mutation-checked: hysteresis mutant (switch on first pressured window) compiles and fails the policy suite; core label 2179/2179 green"
+   ]
+  },
+  {
+   "id": "HARDEN-04",
+   "category": "code",
+   "priority": "P1",
+   "title": "Release qualification tooling: scripts/qualification/run.sh --ref <git-ref> with full provenance recording",
+   "status": "completed",
+   "evidence": [
+    "scripts/qualification/run.sh --ref <git-ref>: detached-worktree build + suite + provenance (SHA, 87 build flags, compiler, 10 dependency pins, capability manifest, host, timestamps) into a retained per-run evidence dir; destroy.sh deletes a run's cloud resources by label",
+    "Demonstrated: PASS at 0199248a5f6b, 2180/2180 in 20 minutes, provenance.json + results.json retained",
+    "Its first invocation found a real defect: cmake/GitHooks.cmake aborted configure in any git worktree (.git is a file there), so every worktree build of clink was broken"
+   ]
+  },
+  {
+   "id": "QUAL-01",
+   "category": "qualification",
+   "priority": "P0",
+   "title": "Multi-day Kafka exactly-once failure campaign with independent oracle",
+   "status": "completed",
+   "infrastructure": [
+    "Hetzner fsn1, run qual01-20260816: 1 ops (cpx42, also image builder + NFS export) + 1 coordinator + 3 workers (cpx32) + 3 Redpanda brokers (cpx22), EUR 0.315/h",
+    "Shared checkpoint state over NFS from the ops host - proven required: state is per-subtask under one dir resolved on each node's own filesystem, so a redeployed subtask on another host finds nothing",
+    "Qualification image built ON the rig at the commit under test, with CLINK_ENABLE_FAULT_INJECTION=ON"
+   ],
+   "results": {
+    "local_dry_run": "harness proven end to end before any spend: 46,800 deterministic events, 1,137 committed output records, every judged window correct; mutation-tested by injecting a foreign record (caught, foreign=1) which exposed and fixed a verifier defect that reported 317 phantom missing results",
+    "functional_verification": {
+     "passed": true,
+     "at": "2026-08-15T21:31Z",
+     "input_events_observed": 140200,
+     "committed_output_records": 104340,
+     "windows_judged": 4,
+     "windows_correct": 4,
+     "faults_landed": 2,
+     "first_fault": "worker SIGKILL at checkpoint 341 while RUNNING, restarted 26s later",
+     "recovered_after_first_fault": true,
+     "note": "the campaign refuses to enter its soak until every one of these is observed; each was a step that had previously failed silently in some form"
     },
-    {
-      "id": "HARDEN-01",
-      "category": "code",
-      "priority": "P0",
-      "title": "SQL inline constraint semantics: honour PRIMARY KEY fully, refuse the rest loudly",
-      "status": "completed",
-      "evidence": [
-        "Pre-existing since audit: inline PK reaches catalogue; NOT NULL/CHECK/UNIQUE/DEFAULT/REFERENCES refused with actionable diagnostic (Option B)",
-        "New: conflicting inline vs WITH primary_key is refused (was: WITH silently won); multiple inline PRIMARY KEY columns refused with composite WITH form in the diagnostic; table-level constraints refused with the supported form named; inline PK canonicalised into the properties bag so it survives the catalog JSON round trip (was silently dropped on reload - real defect found during this work); upsert planning binds against an inline-only key",
-        "Mutation-checked: reverting catalog.cpp+ast_builder.cpp to pre-change semantics fails exactly the 4 new gate tests"
-      ],
-      "result_revision": "committed post-baseline (feat(sql): inline PRIMARY KEY is one honest declaration)"
-    },
-    {
-      "id": "HARDEN-02",
-      "category": "code",
-      "priority": "P0",
-      "title": "Reject unavailable connectors before deployment (local plan-time + cluster-authoritative submission)",
-      "status": "completed",
-      "evidence": [
-        "check_connector_availability (src/cluster/connector_availability.cpp) gates Coordinator::submit_job before planning/allocation; availability read from the registries the job deploys against (bundle-aware), never a hardcoded list; message names the connector, this build's available source/sink connectors (capability registry) and the CLINK_WITH_* rebuild flag",
-        "Cluster-authoritative by construction: the gate runs in the submission-owning process (in-proc coordinator for clink run; target coordinator for POST /api/v1/jobs/spec and /jobs/sql); GET /api/v1/connectors already serves the cluster manifest to CLIs",
-        "8 tests in tests/test_connector_availability.cpp (missing connector, registry-decides/CLI-vs-cluster, runner-only registration, non-connector pass-through, always-built pass, longest-prefix vocabulary + boundary, vocabulary-completeness pin over declared capabilities, coordinator-level pre-deploy rejection) + SqlPhysical.ASourceOnlyConnectorRequestedAsASinkIsRefused pins the role mismatch; guarantee gate already pins unsupported exactly-once requests",
-        "Mutation-checked: gate call removed from submit_job compiles and fails the coordinator-level test; core label 2170/2170 green with the gate in place"
-      ]
-    },
-    {
-      "id": "HARDEN-03",
-      "category": "code",
-      "priority": "P1",
-      "title": "Adaptive unaligned-checkpoint wiring: measured backpressure drives the existing resolver in clink's own runtimes",
-      "status": "completed",
-      "evidence": [
-        "checkpoint::AdaptiveModePolicy (header-only): threshold + consecutive-window hysteresis both directions + bounded history + switch counter; deterministic, driven by synthetic pressure in tests",
-        "In-process wiring: CheckpointCoordinator::enable_adaptive_mode(pressure_fn) behind the existing set_mode_resolver seam; Dag::channel_pressure_fn() = max depth/capacity across runner input channels; trigger() emits clink_ckpt_mode_total{mode} and clink_ckpt_adaptive_switch_total",
-        "Cluster wiring: CheckpointAlignment::Adaptive; coordinator trigger sweep observes last completed checkpoint duration / interval and stamps TriggerCheckpointMsg.barrier_mode_plus1 (trailing wire field, 0 = legacy/static); DeployMsg.adaptive_barrier_mode (trailing, before the epoch per contract) makes sources forward the injected stamp instead of re-stamping; per-op overrides still win; lint covers Adaptive-without-periodic",
-        "Tests: 8 AdaptiveModePolicy behaviours incl. spike-no-switch and hysteresis both ways; wire round-trips + 3 tail-truncation compat shapes; mode-flip correctness rests on the aligner's per-barrier pinning proven in test_co_operator_unaligned",
-        "Mutation-checked: hysteresis mutant (switch on first pressured window) compiles and fails the policy suite; core label 2179/2179 green"
-      ]
-    },
-    {
-      "id": "HARDEN-04",
-      "category": "code",
-      "priority": "P1",
-      "title": "Release qualification tooling: scripts/qualification/run.sh --ref <git-ref> with full provenance recording",
-      "status": "completed",
-      "evidence": [
-        "scripts/qualification/run.sh --ref <git-ref>: detached-worktree build + suite + provenance (SHA, 87 build flags, compiler, 10 dependency pins, capability manifest, host, timestamps) into a retained per-run evidence dir; destroy.sh deletes a run's cloud resources by label",
-        "Demonstrated: PASS at 0199248a5f6b, 2180/2180 in 20 minutes, provenance.json + results.json retained",
-        "Its first invocation found a real defect: cmake/GitHooks.cmake aborted configure in any git worktree (.git is a file there), so every worktree build of clink was broken"
-      ]
-    },
-    {
-      "id": "QUAL-01",
-      "category": "qualification",
-      "priority": "P0",
-      "title": "Multi-day Kafka exactly-once failure campaign with independent oracle",
-      "status": "in_progress",
-      "infrastructure": [
-        "Hetzner fsn1, run qual01-20260816: 1 ops (cpx42, also image builder + NFS export) + 1 coordinator + 3 workers (cpx32) + 3 Redpanda brokers (cpx22), EUR 0.315/h",
-        "Shared checkpoint state over NFS from the ops host - proven required: state is per-subtask under one dir resolved on each node's own filesystem, so a redeployed subtask on another host finds nothing",
-        "Qualification image built ON the rig at the commit under test, with CLINK_ENABLE_FAULT_INJECTION=ON"
-      ],
-      "results": {
-        "local_dry_run": "harness proven end to end before any spend: 46,800 deterministic events, 1,137 committed output records, every judged window correct; mutation-tested by injecting a foreign record (caught, foreign=1) which exposed and fixed a verifier defect that reported 317 phantom missing results",
-        "functional_verification": {
-          "passed": true,
-          "at": "2026-08-15T21:31Z",
-          "input_events_observed": 140200,
-          "committed_output_records": 104340,
-          "windows_judged": 4,
-          "windows_correct": 4,
-          "faults_landed": 2,
-          "first_fault": "worker SIGKILL at checkpoint 341 while RUNNING, restarted 26s later",
-          "recovered_after_first_fault": true,
-          "note": "the campaign refuses to enter its soak until every one of these is observed; each was a step that had previously failed silently in some form"
-        },
-        "harness_defects_found_and_fixed": [
-          "chaos controller polled a job status field that did not exist - would have applied zero faults",
-          "backgrounding over ssh hung the driver twice while the remote process ran happily",
-          "verifier reused a fixed consumer group - a re-run got a partial assignment and reported 317 phantom missing results",
-          "verifier required exact high-water position, unreachable on a live stream - deferred judgement forever",
-          "verifier stored a null offset snapshot when the group was still assigning - those windows could never be judged",
-          "campaign did not own its topics - a previous run's events made the oracle report 161,111 missing that were never its to produce"
-        ]
-      }
-    },
-    {
-      "id": "QUAL-02",
-      "category": "qualification",
-      "priority": "P0",
-      "title": "PostgreSQL PREPARE TRANSACTION campaign with pg_prepared_xacts monitoring",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-03",
-      "category": "qualification",
-      "priority": "P0",
-      "title": "Object-store checkpoint + transactional sink fault campaign",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-04",
-      "category": "qualification",
-      "priority": "P1",
-      "title": "Large-state campaign (100GB+, progressive), per backend",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-05",
-      "category": "qualification",
-      "priority": "P1",
-      "title": "TTL steady-state campaign across GROUP BY / DISTINCT / join / CEP / typed state",
-      "status": "completed",
-      "infrastructure": [],
-      "results": {
-        "run": "qual05-20260823a",
-        "verdict": "PASS",
-        "produced": 8326400,
-        "folded": 8326400,
-        "keys_exact": "694996/694996",
-        "plateau_mib": 67.4,
-        "drift_pct": 1.9,
-        "control_growth_x": 12.9,
-        "engine_defects_found": "items 69 (open), 70, 71 + sweep starvation (all but 69 fixed)",
-        "evidence": "~/personal/clink-qual-evidence/qual05-20260823a"
-      },
-      "result_revision": "bed138c"
-    },
-    {
-      "id": "QUAL-06",
-      "category": "qualification",
-      "priority": "P1",
-      "title": "Large DAG / high-parallelism scaling limits (thread-per-subtask knee)",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-07",
-      "category": "qualification",
-      "priority": "P1",
-      "title": "Reference-engine semantic comparison on deterministic workloads",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-08",
-      "category": "qualification",
-      "priority": "P0",
-      "title": "Rolling upgrade qualification (previous release -> candidate, candidate -> candidate)",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-09",
-      "category": "qualification",
-      "priority": "P0",
-      "title": "Reusable chaos controller + infrastructure failure matrix",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-10",
-      "category": "qualification",
-      "priority": "P1",
-      "title": "Long-running leak and resource campaign (24h/72h/7d) with trend detection",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-11",
-      "category": "qualification",
-      "priority": "P1",
-      "title": "Schema evolution campaign over long-running jobs",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "QUAL-12",
-      "category": "qualification",
-      "priority": "P1",
-      "title": "Security configuration failure tests (no silent downgrade invariant)",
-      "status": "planned",
-      "infrastructure": [],
-      "results": {}
-    },
-    {
-      "id": "HARDEN-05",
-      "category": "code",
-      "priority": "P0",
-      "title": "SQL cluster submissions can configure checkpointing (found by the QUAL-01 feasibility check)",
-      "status": "completed",
-      "evidence": [
-        "Both submit endpoints + clink_submit_sql now carry checkpoint_dir, checkpoint_interval_ms, restore_from_*, max_restarts_on_worker_loss and alignment through one shared parser; malformed values refused, not defaulted",
-        "Verified on a real coordinator: the QUAL-01 pipeline submits at parallelism 4 and is classified END_TO_END_EXACTLY_ONCE - previously unreachable for any SQL cluster job",
-        "in-doubt resolution now counts resolved vs unresolved so a campaign can tell clink's two recovery guarantees apart"
-      ]
-    },
-    {
-      "id": "HARDEN-06",
-      "category": "code",
-      "priority": "P0",
-      "title": "No silent transport downgrade (Postgres TLS assertion, Kafka SASL coherence)",
-      "status": "completed",
-      "evidence": [
-        "Postgres: zero sslmode handling existed anywhere; libpq's default silently falls back to plaintext. Every connect site now asserts the established transport (PQsslInUse) - refuses when encryption was demanded, warns when unstated and unencrypted, records when encrypted",
-        "Kafka: SASL credentials with no security_protocol, and TLS material with a plaintext protocol, are refused before a byte reaches a broker; the passthrough cannot weaken a transport under configured credentials. 10/10 security tests"
-      ]
-    },
-    {
-      "id": "HARDEN-07",
-      "category": "code",
-      "priority": "P1",
-      "title": "Worker task-thread handle leak; job status on the HTTP API",
-      "status": "completed",
-      "evidence": [
-        "Finished subtasks were never joined until worker shutdown, holding an 8MB stack mapping each - invisible to a thread count. Reaped now; regression test asserts on the retained handle count (mutation: 2 handles after one job vs 14 after seven)",
-        "GET /api/v1/jobs/:id and /jobs gained an explicit status; the ops API previously exposed none, and the chaos controller's gate silently never fired"
-      ]
-    }
-  ]
+    "harness_defects_found_and_fixed": [
+     "chaos controller polled a job status field that did not exist - would have applied zero faults",
+     "backgrounding over ssh hung the driver twice while the remote process ran happily",
+     "verifier reused a fixed consumer group - a re-run got a partial assignment and reported 317 phantom missing results",
+     "verifier required exact high-water position, unreachable on a live stream - deferred judgement forever",
+     "verifier stored a null offset snapshot when the group was still assigning - those windows could never be judged",
+     "campaign did not own its topics - a previous run's events made the oracle report 161,111 missing that were never its to produce"
+    ],
+    "run": "qual01-20260820h",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-01-kafka-exactly-once.md"
+   },
+   "result_revision": "33f30e7"
+  },
+  {
+   "id": "QUAL-02",
+   "category": "qualification",
+   "priority": "P0",
+   "title": "PostgreSQL PREPARE TRANSACTION campaign with pg_prepared_xacts monitoring",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual02-20260821b",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-02-postgres-two-phase-commit.md"
+   },
+   "result_revision": "2e55943"
+  },
+  {
+   "id": "QUAL-03",
+   "category": "qualification",
+   "priority": "P0",
+   "title": "Object-store checkpoint + transactional sink fault campaign",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual03-20260821a",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-03-s3-staged-commits.md"
+   },
+   "result_revision": "625cc82"
+  },
+  {
+   "id": "QUAL-04",
+   "category": "qualification",
+   "priority": "P1",
+   "title": "Large-state campaign (100GB+, progressive), per backend",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual04-20260823a",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-04-large-keyed-state.md"
+   },
+   "result_revision": "6ba73b5"
+  },
+  {
+   "id": "QUAL-05",
+   "category": "qualification",
+   "priority": "P1",
+   "title": "TTL steady-state campaign across GROUP BY / DISTINCT / join / CEP / typed state",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual05-20260823a",
+    "verdict": "PASS",
+    "produced": 8326400,
+    "folded": 8326400,
+    "keys_exact": "694996/694996",
+    "plateau_mib": 67.4,
+    "drift_pct": 1.9,
+    "control_growth_x": 12.9,
+    "engine_defects_found": "items 69 (open), 70, 71 + sweep starvation (all but 69 fixed)",
+    "evidence": "~/personal/clink-qual-evidence/qual05-20260823a",
+    "published_page": "docs/qualification/qual-05-ttl-steady-state.md"
+   },
+   "result_revision": "bed138c"
+  },
+  {
+   "id": "QUAL-06",
+   "category": "qualification",
+   "priority": "P1",
+   "title": "Large DAG / high-parallelism scaling limits (thread-per-subtask knee)",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual06-20260824d",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-06-dag-scaling.md"
+   },
+   "result_revision": "3c7ffd1"
+  },
+  {
+   "id": "QUAL-07",
+   "category": "qualification",
+   "priority": "P1",
+   "title": "Reference-engine semantic comparison on deterministic workloads",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual07-runf",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-07-semantic-comparison.md"
+   },
+   "result_revision": "998e0ff"
+  },
+  {
+   "id": "QUAL-08",
+   "category": "qualification",
+   "priority": "P0",
+   "title": "Rolling upgrade qualification (previous release -> candidate, candidate -> candidate)",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual08-20260824a",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-08-rolling-upgrade.md"
+   },
+   "result_revision": "3c7ffd1"
+  },
+  {
+   "id": "QUAL-09",
+   "category": "qualification",
+   "priority": "P0",
+   "title": "Reusable chaos controller + infrastructure failure matrix",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual09-20260824c",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-09-infrastructure-faults.md"
+   },
+   "result_revision": "73b6565"
+  },
+  {
+   "id": "QUAL-10",
+   "category": "qualification",
+   "priority": "P1",
+   "title": "Long-running leak and resource campaign (24h/72h/7d) with trend detection",
+   "status": "planned",
+   "infrastructure": [],
+   "results": {}
+  },
+  {
+   "id": "QUAL-11",
+   "category": "qualification",
+   "priority": "P1",
+   "title": "Schema evolution campaign over long-running jobs",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual11-20260825c",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-11-schema-evolution.md"
+   },
+   "result_revision": "ba680f9"
+  },
+  {
+   "id": "QUAL-12",
+   "category": "qualification",
+   "priority": "P1",
+   "title": "Security configuration failure tests (no silent downgrade invariant)",
+   "status": "completed",
+   "infrastructure": [],
+   "results": {
+    "run": "qual12-local-c",
+    "verdict": "PASS",
+    "published_page": "docs/qualification/qual-12-security-refusals.md"
+   },
+   "result_revision": "0ca5936"
+  },
+  {
+   "id": "HARDEN-05",
+   "category": "code",
+   "priority": "P0",
+   "title": "SQL cluster submissions can configure checkpointing (found by the QUAL-01 feasibility check)",
+   "status": "completed",
+   "evidence": [
+    "Both submit endpoints + clink_submit_sql now carry checkpoint_dir, checkpoint_interval_ms, restore_from_*, max_restarts_on_worker_loss and alignment through one shared parser; malformed values refused, not defaulted",
+    "Verified on a real coordinator: the QUAL-01 pipeline submits at parallelism 4 and is classified END_TO_END_EXACTLY_ONCE - previously unreachable for any SQL cluster job",
+    "in-doubt resolution now counts resolved vs unresolved so a campaign can tell clink's two recovery guarantees apart"
+   ]
+  },
+  {
+   "id": "HARDEN-06",
+   "category": "code",
+   "priority": "P0",
+   "title": "No silent transport downgrade (Postgres TLS assertion, Kafka SASL coherence)",
+   "status": "completed",
+   "evidence": [
+    "Postgres: zero sslmode handling existed anywhere; libpq's default silently falls back to plaintext. Every connect site now asserts the established transport (PQsslInUse) - refuses when encryption was demanded, warns when unstated and unencrypted, records when encrypted",
+    "Kafka: SASL credentials with no security_protocol, and TLS material with a plaintext protocol, are refused before a byte reaches a broker; the passthrough cannot weaken a transport under configured credentials. 10/10 security tests"
+   ]
+  },
+  {
+   "id": "HARDEN-07",
+   "category": "code",
+   "priority": "P1",
+   "title": "Worker task-thread handle leak; job status on the HTTP API",
+   "status": "completed",
+   "evidence": [
+    "Finished subtasks were never joined until worker shutdown, holding an 8MB stack mapping each - invisible to a thread count. Reaped now; regression test asserts on the retained handle count (mutation: 2 handles after one job vs 14 after seven)",
+    "GET /api/v1/jobs/:id and /jobs gained an explicit status; the ops API previously exposed none, and the chaos controller's gate silently never fired"
+   ]
+  }
+ ]
 }

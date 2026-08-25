@@ -275,6 +275,22 @@ jobs:
           path: /root/.ccache
           key: ccache-build-${{ github.run_id }}
 
+  qualification-status:
+    name: Qualification status matches the published pages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Plan and published pages agree
+        # The evidence trail is only worth anything if its records agree.
+        # qualification-plan.json and docs/qualification/ are two records of
+        # the same fact and drifted: ten of twelve campaigns sat at "planned"
+        # while their pages were published green. Conflicting status is worse
+        # than none - a reader cannot tell which record is stale. The page is
+        # authoritative (a page exists only for a green campaign, per the
+        # publication contract) and this gate holds the plan to it. No build,
+        # no toolchain: it must run on every push regardless.
+        run: ./scripts/check-qualification-status.py
+
   install-smoke:
     name: Install + downstream consume
     runs-on: ubuntu-24.04

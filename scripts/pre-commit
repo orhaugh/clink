@@ -4,6 +4,17 @@ set -euo pipefail
 # Run clang-format check via the CMake format-check target. Exits
 # non-zero if any source file violates formatting.
 
+# Deliberately ABOVE the build-directory guard below: this check needs no
+# build, and a status claim that contradicts the published evidence should
+# never reach a commit just because someone has no cmake-build-debug.
+echo "pre-commit: checking qualification status against the published pages..."
+if ! ./scripts/check-qualification-status.py; then
+    echo ""
+    echo "pre-commit: qualification-plan.json disagrees with docs/qualification/."
+    echo "The published page is authoritative; the plan must follow it."
+    exit 1
+fi
+
 BUILD_DIR="cmake-build-debug"
 
 if [ ! -d "$BUILD_DIR" ]; then
