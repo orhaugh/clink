@@ -62,8 +62,16 @@ def load_results(path):
     return out
 
 
-def build(matrix_path, results_path, run_id):
+def build(matrix_path, results_path, run_id, surfaces=None):
     rows = load_matrix(matrix_path)
+    # A run may legitimately cover only some surfaces - the image smoke
+    # exercises the control plane and nothing else. It must then be
+    # judged against exactly the rows it CLAIMS, or every unrun surface
+    # reads as a missing result. What it must never do is escape the rule
+    # inside its own scope: a row missing from a claimed surface is still
+    # a gap.
+    if surfaces:
+        rows = [r for r in rows if r["surface"] in surfaces]
     results = load_results(results_path)
 
     agreed, wrong, unexercised, missing = [], [], [], []
@@ -92,6 +100,9 @@ def build(matrix_path, results_path, run_id):
     a = lines.append
     a(f"# QUAL-12 - security downgrades: the refusal matrix ({run_id})")
     a("")
+    if surfaces:
+        a(f"- scope: {', '.join(sorted(surfaces))} only "
+          f"(a partial run claims only the surfaces it names)")
     a(f"- declared rows: {len(rows)}; measured as declared: {len(agreed)}")
     live = [r for r in rows if r.get("proof") == "live"]
     live_ok = [r for r, _ in agreed if r.get("proof") == "live"]
@@ -145,8 +156,12 @@ def main():
     ap.add_argument("--matrix", default=os.path.join(here, "refusals.json"))
     ap.add_argument("--results", required=True)
     ap.add_argument("--run-id", required=True)
+    ap.add_argument("--surfaces", default="",
+                    help="comma-separated surfaces this run claims to cover; "
+                         "empty means the whole matrix")
     args = ap.parse_args()
-    text, _ = build(args.matrix, args.results, args.run_id)
+    surfaces = {s for s in args.surfaces.split(",") if s} or None
+    text, _ = build(args.matrix, args.results, args.run_id, surfaces)
     sys.stdout.write(text)
     return 0
 

@@ -33,6 +33,7 @@ Two rules govern what appears here:
 | A rolling engine upgrade (`bed138c` → `3c7ffd1`) with exactly-once continuity: 2s savepoint, 2s restore, 114s downtime, every event across the boundary counted once | [QUAL-08](qual-08-rolling-upgrade.md) | 24 August 2026 |
 | Infrastructure faults: ENOSPC on the state volume, a 7-minute partition, stepped clocks - 3.38M events exactly once, checkpoint storage held at its configured bound | [QUAL-09](qual-09-infrastructure-faults.md) | 24 August 2026, engine `73b6565` |
 | A running job's keyed-state TYPE changed and migrated at restore: 74,000 keys exact across the boundary, 10,000 verified byte-for-byte against the migration's own output | [QUAL-11](qual-11-schema-evolution.md) | 25 August 2026, engine `ba680f9` |
+| Refusing to silently weaken a security posture: 15 declared refusals measured as declared, 5 against real SASL and TLS servers, with the control-plane wiring proven in a published image | [QUAL-12](qual-12-security-refusals.md) | 25 August 2026, engine `0ca5936` |
 
 ## Not yet campaigned
 

@@ -10,7 +10,12 @@ The shapes that matter for a REFUSAL campaign:
     unproven row and a missing row must not look alike, which is exactly
     how this campaign's own premise went wrong before it started;
   * a result for a row nobody declared is INCONCLUSIVE: the matrix is
-    the contract, and a runner testing something else is drift.
+    the contract, and a runner testing something else is drift;
+  * a run covering only some surfaces (the image smoke runs the control
+    plane and nothing else) is judged against exactly the surfaces it
+    claims - otherwise every unrun surface reads as a missing result -
+    but must NOT escape any of the rules above inside that scope. A
+    scope that silences findings would be worse than no scope at all.
 """
 import json
 import pathlib
@@ -34,7 +39,7 @@ MATRIX = {
 ALL_GOOD = {"cp.a": "REFUSE", "cp.ok": "ACCEPT", "pg.warn": "WARN"}
 
 
-def run(results):
+def run(results, surfaces=""):
     with tempfile.TemporaryDirectory() as tmp:
         d = pathlib.Path(tmp)
         (d / "m.json").write_text(json.dumps(MATRIX))
@@ -43,7 +48,8 @@ def run(results):
                       for k, v in results.items()) + "\n")
         out = subprocess.run(
             [sys.executable, str(SUMMARISE), "--matrix", str(d / "m.json"),
-             "--results", str(d / "r.jsonl"), "--run-id", "t"],
+             "--results", str(d / "r.jsonl"), "--run-id", "t",
+             "--surfaces", surfaces],
             capture_output=True, text=True)
         assert out.returncode == 0, out.stderr
         for line in out.stdout.splitlines():
@@ -93,5 +99,34 @@ check("a result for an undeclared row is INCONCLUSIVE (the matrix is the contrac
 r, _ = run({**ALL_GOOD, "cp.a": "ACCEPT", "pg.warn": "UNEXERCISED"})
 check("a wrong outcome dominates an unexercised row (FAIL beats INCONCLUSIVE)", r, "FAIL")
 
-print(f"\n{9 - len(failures)} passed, {len(failures)} failed")
+# Scoped runs. The image smoke exercises the control plane only, so it
+# must be judged against those rows - and must stay just as strict there.
+r, text = run({"cp.a": "REFUSE", "cp.ok": "ACCEPT"}, surfaces="control_plane")
+check("a run claiming one surface is judged on that surface alone", r, "PASS")
+check("the scoped run states what it covered", "scope: control_plane" in text, True, text)
+
+r, _ = run({"cp.a": "ACCEPT", "cp.ok": "ACCEPT"}, surfaces="control_plane")
+check("a scope does not excuse a wrong outcome inside it", r, "FAIL")
+
+r, _ = run({"cp.a": "REFUSE"}, surfaces="control_plane")
+check("a row missing from a CLAIMED surface is still a gap", r, "INCONCLUSIVE")
+
+r, _ = run({"cp.a": "REFUSE", "cp.ok": "ACCEPT", "pg.warn": "WARN"},
+           surfaces="control_plane")
+check("a result outside the claimed scope is drift, not a bonus", r, "INCONCLUSIVE")
+
+r, _ = run(ALL_GOOD, surfaces="nosuchsurface")
+check("a scope naming no declared surface proves nothing, never everything",
+      r, "INCONCLUSIVE")
+
+# The empty run, isolated. Above, the out-of-scope results made this
+# INCONCLUSIVE as drift, so nothing was pinning the zero-rows guard
+# itself - a mutation check caught that. A runner that measures nothing
+# and names a surface that does not exist is the worst shape a gate can
+# have: no evidence, presented as a clean sheet.
+r, _ = run({}, surfaces="nosuchsurface")
+check("a run that judged NO rows and measured nothing is never a PASS",
+      r, "INCONCLUSIVE")
+
+print(f"\n{15 - len(failures)} passed, {len(failures)} failed")
 sys.exit(1 if failures else 0)
