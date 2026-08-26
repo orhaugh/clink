@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(clink
-        VERSION 0.7.0
+        VERSION 0.8.0
         DESCRIPTION "Semantics-first, Arrow-native, stateful stream processing engine in modern C++"
         LANGUAGES CXX)
 

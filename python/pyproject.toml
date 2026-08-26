@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyclink"
-version = "0.7.0"
+version = "0.8.0"
 description = "Embed the clink stream engine in Python: run streaming SQL in-process, read results as Arrow"
 readme = "README.md"
 license = "Apache-2.0"

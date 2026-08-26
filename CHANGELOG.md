@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.8.0 (unreleased)
+
+The launch release: the qualification programme run across the engine's
+guarantee surface, and the repository reshaped for public use.
+
+**Ten further qualification campaigns, published green.** After v0.7.0's
+QUAL-01, ten more campaigns ran under continuous fault injection, judged by
+independent oracles, and were published only once green with evidence
+retained: PostgreSQL two-phase commit (QUAL-02), S3 staged multipart commits
+(QUAL-03), 29 GiB of keyed state on a disaggregated backend (QUAL-04),
+bounded state through declared retention (QUAL-05), wide job graphs at 147
+operators and 292 subtasks (QUAL-06), content-level agreement with an
+independent reference engine on 19 of 19 queries (QUAL-07), a rolling engine
+upgrade with exactly-once continuity (QUAL-08), infrastructure faults from
+ENOSPC to stepped clocks (QUAL-09), a running job's keyed-state type changed
+and migrated at restore (QUAL-11), and a declared security-refusal matrix
+(QUAL-12). The published page is now the authority for a campaign's status,
+enforced by a repository gate in CI and the pre-commit hook.
+
+**Engine defects the campaigns found and fixed.** A committing sink holds
+open until its final commit lands; checkpoint orphans left by missed
+completion broadcasts are swept; chain tasks' state backends register for
+retention; a job whose checkpoints fail persistently fails instead of
+crashlooping, and the checkpoint-failure circuit breaker judges duration
+rather than ticks; a terminal job's HA manifest is retired so recovery
+cannot resurrect it; an absent or incomplete snapshot is re-checked before a
+restore is refused; savepoints are pinned against retention for the life of
+their job; a departed peer is no longer read as a restart cause of its own,
+and the network bridge's data-loss detector stays on the send side, where it
+works; a worker releases a job's per-operator registrations when the job's
+last subtask leaves it; terminal-cancel convergence is bounded, worker
+cancels latch for still-constructing tasks, and drain accounting no longer
+waits on dead workers; restart drains tolerate a worker lost or replaced
+mid-drain; channel closes carry a reason, so a cancel never reads as
+end-of-input, relay sources forward their feed's cancellation, and the
+end-of-stream ceremony obeys the close reason; the stuck-channel warning
+backs off exponentially and states when the wait ended; SQL sinks write the
+table's declared schema rather than the row's internal one; the columnar
+watermark assigner stamps event times it used to discard; a declared
+`state_ttl` bounds DISTINCT and set operations, a retention deadline can
+never precede the record that set it, `ALLOW UNBOUNDED STATE` reaches the
+planner, and retention is observable through tracked-key and released-key
+metrics; `RemoteReadBackend::scan` sees the durable tier, not just what is
+hot; the compiled-job submit path reports the job id it created; a subtask
+whose operator threw fails instead of completing empty; transient accept
+failures no longer read as a clean end-of-stream; the control plane refuses
+a TLS configuration it cannot honour, in every build configuration; and the
+worker reports its open-file limit at startup, loudly when low.
+
+**Runtime image.** jemalloc is now the image's default allocator, with
+Arrow's pool routed to the process allocator (`ARROW_DEFAULT_MEMORY_POOL=
+system`). Under repeated recovery, glibc arena retention plus Arrow's
+bundled pool kept gigabytes of freed memory resident; the paired defaults
+return it - allocator retention, measured, not an engine leak. The
+capability manifest and `clink_node --version` report the allocator in use.
+The image is published for arm64 as well as amd64, and one command runs a
+complete example with the pipeline and its data baked in:
+`docker run --rm ghcr.io/orhaugh/clink-runtime:latest run
+/opt/clink/examples/sql/hello.sql`.
+
+**Repository, prepared for launch.** The README is a concise landing page
+and `docs/capabilities.md` is the authoritative capability catalogue; the
+closed production-hardening record is archived under `docs/history/`; the
+security policy is release-oriented; structured bug reports, a PR template
+and a Discussions route ship under `.github/`; the commit-subject
+convention is enforced by a hook rather than described.
+
+No REST API breaks. Wire protocol v2 unchanged in negotiation
+(`CommitCheckpoint` gained a backwards-compatible tail field). Snapshot
+format unchanged. Plugin ABI v1 unchanged.
+
 ## v0.7.0 (August 2026)
 
 The qualification release. 318 commits whose centre of gravity is one
