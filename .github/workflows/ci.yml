@@ -38,6 +38,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual fallback: on 2026-08-26 two consecutive pushes to main produced
+  # no push-triggered run (CodeQL fired for the same events), which left the
+  # release gate with no way to run its required checks.
+  workflow_dispatch:
 
 permissions:
   contents: read
