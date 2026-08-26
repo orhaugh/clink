@@ -236,6 +236,12 @@ struct BuildFacts {
     bool wasm{false};
     bool onnx{false};
     bool fault_injection{false};
+    // The process allocator, read from the loaded library rather than a
+    // build variable (see allocator_info.hpp). In the manifest because
+    // QUAL-10 showed it decides whether a worker's memory comes back after
+    // repeated recovery (item 84), and a campaign's provenance should record
+    // the thing that decides its own memory result.
+    std::string allocator;
     bool allows_unverified_checkpoints{false};
     std::uint32_t checkpoint_meta_version{0};
 };

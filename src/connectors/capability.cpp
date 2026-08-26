@@ -3,6 +3,7 @@
 #include <atomic>
 #include <sstream>
 
+#include "clink/core/allocator_info.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/plugin/abi_version.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
@@ -231,6 +232,7 @@ BuildFacts current_build_facts() {
     f.onnx = true;
 #endif
     f.fault_injection = clink::fault::available();
+    f.allocator = clink::allocator_name();
     f.allows_unverified_checkpoints = clink::state::unverified_checkpoints_allowed();
     f.checkpoint_meta_version = clink::state::kCheckpointMetaVersion;
     return f;
@@ -321,6 +323,7 @@ std::string render_manifest_text(const BuildFacts& facts,
     os << "wasm udfs                     " << yn(facts.wasm) << "\n";
     os << "onnx inference                " << yn(facts.onnx) << "\n";
     os << "checkpoint metadata version   " << facts.checkpoint_meta_version << "\n";
+    os << "allocator                     " << facts.allocator << "\n";
     os << "fault injection compiled in   " << yn(facts.fault_injection);
     if (facts.fault_injection) {
         os << "   (test/debug surface; CLINK_FAULT_INJECT is live)";
@@ -395,6 +398,7 @@ std::string render_manifest_json(const BuildFacts& facts,
     out += ",\"wasm\":" + jbool(facts.wasm);
     out += ",\"onnx\":" + jbool(facts.onnx);
     out += ",\"fault_injection\":" + jbool(facts.fault_injection);
+    out += ",\"allocator\":" + jq(facts.allocator);
     out += ",\"allows_unverified_checkpoints\":" + jbool(facts.allows_unverified_checkpoints);
     out += ",\"checkpoint_meta_version\":" + std::to_string(facts.checkpoint_meta_version);
     out += "}";
