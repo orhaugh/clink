@@ -395,7 +395,7 @@ vector implementation and dispatch on the CPU at runtime regardless of clink's f
 Kept as a knob for a deployment with a known hardware floor, not as a recommendation.
 Numbers: [`benchmarks/nexmark_compare/cloud/README.md`](benchmarks/nexmark_compare/cloud/README.md).
 
-### Allocator: `CLINK_WITH_JEMALLOC` (opt-in, Linux)
+### Allocator: `CLINK_WITH_JEMALLOC` (Linux; on by default in the runtime image)
 
 ```bash
 cmake -S . -B build -DCLINK_WITH_JEMALLOC=ON          # needs libjemalloc-dev
@@ -407,19 +407,35 @@ Links jemalloc as the process allocator, PUBLIC on `clink::core` so every binary
 and every consumer of the install uses it - an allocator only part of a process
 uses is worse than none.
 
-**Default OFF on measured evidence.** Against the same clink binary with only the
-allocator changed, on the two-node nexmark rig: **+5% sustained throughput on the
-windowed query (q12), neutral on the stateless one (q0), neutral CPU per event,
-and no change in memory.** That malloc is on the critical path is not in doubt -
-capping glibc to two arenas (`MALLOC_ARENA_MAX=2`) halves throughput, and
-jemalloc's per-thread caches are why it avoids that contention - but 5% on one
-query shape does not earn a hard dependency. Numbers and method:
-[`benchmarks/nexmark_compare/cloud/README.md`](benchmarks/nexmark_compare/cloud/README.md).
+**Two measurements, two answers.** In steady state, on the two-node nexmark
+rig with only the allocator changed: **+5% sustained throughput on the windowed
+query (q12), neutral on the stateless one (q0), neutral CPU per event, and no
+change in memory.** That alone did not earn a hard dependency, and the source
+build still defaults to `OFF` (numbers:
+[`benchmarks/nexmark_compare/cloud/README.md`](benchmarks/nexmark_compare/cloud/README.md)).
 
-It is **not** a fix for memory. clink's memory advantage comes from the engine
-(nexmark q0: 72 MB against a JVM engine's 1,146 MB) and jemalloc changed neither
-that nor the windowed query's footprint, which is dominated by the query's own
-retained window state.
+Under **repeated recovery** the answer is different, and it is why the runtime
+image now links jemalloc by default. QUAL-10 ran a worker through 27 whole-job
+restarts on glibc malloc: its RSS went from 292 MiB - flat to within 1 MiB over a
+two-hour fault-free window - to 1.66 GB, and on a denser local schedule to 3.3 GB,
+and it kept that memory after the job was cancelled, with 17 threads left and
+nothing to hold it. That is not a leak in the engine (a second job in the same
+process reused the memory rather than adding to it) but it is a process that gets
+OOM-killed on a small node all the same. It is allocator retention in **two
+layers**, and each was measured on its own: glibc's per-thread arenas (the
+mapping table showed 19 regions of exactly 64 MiB, glibc's arena heap size), and
+libarrow's *bundled* jemalloc, which governs Arrow buffers and answers to neither
+the process allocator nor `MALLOC_ARENA_MAX`. With a purging jemalloc as the
+process allocator **and** Arrow's pool routed to it
+(`ARROW_DEFAULT_MEMORY_POOL=system`), per-recovery growth fell from ~14 MiB per
+restart to under 1 MiB and the retained memory was returned. Fixing either layer
+alone left the other's retention in place (930 MiB with an arena cap only, 760
+MiB with jemalloc only). The image sets both, as environment an operator can
+override; `MALLOC_ARENA_MAX=2` is not the remedy, because it halves throughput.
+
+clink's steady-state memory advantage is the engine's (nexmark q0: 72 MB against a
+JVM engine's 1,146 MB) and jemalloc changes neither that nor a windowed query's
+footprint, which is dominated by the query's own retained window state.
 
 `ON` is refused on macOS with a configure error rather than accepted: jemalloc
 does not replace the system allocator by linking alone there, so the build would

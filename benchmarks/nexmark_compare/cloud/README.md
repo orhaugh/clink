@@ -656,6 +656,14 @@ fixed.
 
 ### jemalloc: measured, worth having, not a memory fix
 
+*Steady state only.* The memory conclusion below holds for a job left running:
+the footprint is the query's retained state and the allocator does not move it.
+Under repeated recovery it does not hold: QUAL-10 measured a worker on glibc
+retaining 3.3 GB after 27 whole-job restarts with the job gone, and jemalloc
+with prompt purging - plus Arrow's bundled pool routed to it - returning it. That
+is why the runtime image now links jemalloc by default; the throughput numbers
+here were not the reason. Details in the root README's allocator section.
+
 Tested by deriving an image from the SAME clink binary with `libjemalloc2` preloaded, so
 the only variable is the allocator. Two trials each against glibc on the same node:
 

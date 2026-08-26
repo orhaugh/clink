@@ -50,7 +50,14 @@ ARG CLINK_WITH_FORST=OFF
 #     -f docker/Dockerfile.runtime .
 # `clink_node --version` prints the allocator, so an image can be checked rather
 # than assumed.
-ARG CLINK_WITH_JEMALLOC=OFF
+# ON by default since QUAL-10 (followups item 84). Under repeated recovery
+# a worker on glibc malloc reached 3.3 GB and kept it after the job was
+# gone, with the per-thread-arena signature (19 mappings of exactly 64 MiB);
+# jemalloc with prompt purging held ~1 GB at peak and returned it. Not a
+# leak - measured as allocator retention - but a process that grows to
+# 3.3 GB and stays there is one that gets OOM-killed on a small node.
+# Pass OFF to compare against the system allocator.
+ARG CLINK_WITH_JEMALLOC=ON
 # Raise the instruction-set baseline for compiled code, e.g. x86-64-v3 (AVX2) or
 # x86-64-v4 (AVX-512). Empty = the toolchain default, which on x86-64 is SSE2.
 # A PORTABILITY decision: an image built this way will not run on CPUs below the
@@ -162,6 +169,23 @@ ENV CLINK_RESCALE_COUNT=1000000000 \
 # 8081: coordinator dashboard + HTTP API (also worker HTTP API when set)
 # 6124+: data plane ports - left implicit (auto-bound), reachable via
 # the compose-internal network so no explicit EXPOSE needed.
+# Allocator policy for the shipped image (item 84). Both halves matter and
+# were measured separately: fixing one layer leaves the other's retention
+# in place.
+#
+#   MALLOC_CONF: jemalloc returns freed pages to the OS promptly instead of
+#   holding them as dirty; without a background thread the purge only runs
+#   on allocation activity, which an idle-after-failover worker has none of.
+#
+#   ARROW_DEFAULT_MEMORY_POOL: libarrow carries a BUNDLED jemalloc for its
+#   default pool, governed by neither the process allocator nor MALLOC_CONF.
+#   Routing it to the system allocator puts every allocation in the process
+#   under one policy. Arrow reads this at startup.
+#
+# Operators can override either at deploy; they are environment, not code.
+ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0 \
+    ARROW_DEFAULT_MEMORY_POOL=system
+
 EXPOSE 6123 8081
 
 ENTRYPOINT ["/usr/local/bin/clink-entrypoint"]
