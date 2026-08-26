@@ -206,7 +206,7 @@ Queryable state exposes keyed operator state for external reads over HTTP - a se
 | `RemoteReadBackend` `io_threads` | ctor / `?io_threads=` | `async::kDefaultIoThreads` |
 | `kMaxPinnedSkips` (eviction skip-scan cap) | `remote_read_backend.hpp` | 256 (compile-time) |
 | `remote-read://` query params | S3 scheme | `endpoint`, `region`, `anonymous`, `hot_max_bytes`, `io_threads` |
-| fsync of file checkpoints | `write_fsync_rename` | on; `CLINK_STATE_FSYNC=0` disables (per the README Status) |
+| fsync of file checkpoints | `write_fsync_rename` | on; `CLINK_STATE_FSYNC=0` disables |
 | Queryable-state `treat_missing_as_404` | `register_routes` | true |
 
 ## Guarantees and caveats
@@ -219,7 +219,7 @@ Queryable state exposes keyed operator state for external reads over HTTP - a se
 - TTL has no background sweep: expired entries are skipped on read/scan and lazy-purged on first observation, so a key that is never read again keeps occupying its slot until something sweeps it.
 - **A snapshot does not drop expired entries.** An earlier version of this page said it did. It cannot: the expiry stamp is a `KeyedState` layer convention over the value's first eight bytes, and the backends store opaque bytes with no TTL awareness at all, so `snapshot()` persists expired entries and `restore()` brings them back. Reclaiming memory means calling `cleanup_batch` (see the TTL section above); nothing in the runtime does that for a hand-written operator.
 - Queryable state is read-only (no write-through, no delete) and byte-level (the client agrees the value codec out of band). The worker-side registered closure captures references to the operator's state, so the operator should unregister in `close()` if the registry outlives the backend. Coordinator-side key routing returns the single subtask owning a key's key group; without it a client must query each worker.
-- Rescale of file / RocksDB / changelog backends repartitions by key group without full replay (scale-up and scale-down); sources must store offsets as operator-state to survive rescale (see the README Status section and [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md)).
+- Rescale of file / RocksDB / changelog backends repartitions by key group without full replay (scale-up and scale-down); sources must store offsets as operator-state to survive rescale (see [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md)).
 
 ## Related
 

@@ -162,7 +162,7 @@ The coordinator defaults shown are the `clink_node` command-line defaults; `Coor
 - The columnar fast path is taken only when an operator opts in and the input batch carries an Arrow sidecar; row-form inputs fall back to `process()`. See [./columnar-execution.md](./columnar-execution.md).
 - The async, disaggregated-state path activates only when both the operator opts in and the state backend can genuinely defer reads; otherwise execution stays on the synchronous path. See [./async-state-execution.md](./async-state-execution.md).
 - The SQL frontend and the HTTP API are build-gated (`CLINK_BUILD_SQL` off by default, `CLINK_BUILD_HTTP` on by default but disabled unless `--http-port` is set).
-- Several capabilities carry their own correctness caveats called out in the project README Status section and on the per-subsystem pages; consult those before relying on a feature in production.
+- Several capabilities carry their own correctness caveats called out in the [capability catalogue](../capabilities.md) and on the per-subsystem pages; consult those before relying on a feature in production.
 
 ## Related
 

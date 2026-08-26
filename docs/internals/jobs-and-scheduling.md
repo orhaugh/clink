@@ -178,7 +178,7 @@ Decision (roadmap C5): a cooperative / shared-thread scheduler is **not** built 
 - Placement is greedy first-fit in worker map iteration order, not load-aware or locality-aware. It only checks slot availability.
 - Chaining requires equal parallelism and a single-consumer/single-input edge, and never chains across a keyed boundary at parallelism greater than 1. Only ops resolvable in the operator registry are chained; registry-only ops (inline-lambda or plugin ops) run in their own subtasks rather than being folded in.
 - Source/sink fusion is off by default and only applies to parallelism-1 chains.
-- Rescale restores keyed state by key group without a full replay, but per the root README it carries a caveat: sources must store offsets as operator-state to survive a rescale. The `RescaleCoordinator` itself is only the state machine; dispatch correctness depends on the surrounding layer.
+- Rescale restores keyed state by key group without a full replay, but it carries a caveat (stated in the [capability catalogue](../capabilities.md) too): sources must store offsets as operator-state to survive a rescale. The `RescaleCoordinator` itself is only the state machine; dispatch correctness depends on the surrounding layer.
 - A uid is required for stable state across topology edits. Without one, the stage-index id changes when the graph changes and stale keyed state is silently abandoned.
 
 ## Related
