@@ -156,6 +156,10 @@ run "QUAL-11 migration-effect gate (read from the savepoints)" \
 run "QUAL-10 trend math (an injected leak must fail the bands)" \
     python3 "$HERE/test_trend_math.py"
 
+run "QUAL-10 per-recovery attribution tool parses" \
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
+    "$HERE/../qual10/ab_recovery.py"
+
 run "QUAL-10 sampler parses" \
     python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
     "$HERE/../qual10/sampler.py"

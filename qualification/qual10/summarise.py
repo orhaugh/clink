@@ -118,6 +118,14 @@ def build(out_dir, run_id, profile, local=False):
                 a("")
 
     # The correctness gates: flat memory over wrong output is not a pass.
+    # A chaos controller that FINISHED is not a controller that died. It
+    # applies faults for the battery window and then exits, printing its own
+    # summary line - and the campaign's liveness probe can easily run just
+    # after that, which marks a clean exit as a death and fails an otherwise
+    # good run. Trust the controller's own last word over the probe's timing.
+    chaos_log = read_text(os.path.join(out_dir, "q10-chaos.log")) or ""
+    chaos_finished = "faults applied" in chaos_log.splitlines()[-1] if chaos_log else False
+
     for label, path, bad in (
         ("the job vanished mid-run", "job-gone.txt", True),
         ("the chaos controller died", "chaos-died.txt", True),
@@ -125,8 +133,16 @@ def build(out_dir, run_id, profile, local=False):
         ("no metrics were retrieved", "metrics-missing.txt", True),
     ):
         txt = read_text(os.path.join(out_dir, path))
-        if txt:
-            (problems if bad else unknowns).append(f"{label}: {txt[:200]}")
+        if not txt:
+            continue
+        if path == "chaos-died.txt" and chaos_finished:
+            # Recorded, never silent - but not a finding.
+            unknowns.append(
+                "the campaign's liveness probe noticed the chaos controller "
+                "gone after it had already finished its battery cleanly "
+                f"({chaos_log.splitlines()[-1].strip()}); not counted as a death")
+            continue
+        (problems if bad else unknowns).append(f"{label}: {txt[:200]}")
 
     if problems:
         result = "FAIL"

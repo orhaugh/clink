@@ -41,6 +41,15 @@ services:
       - --http-bind=0.0.0.0
     environment:
       CLINK_DATA_BIND_HOST: 0.0.0.0
+      # Allocator A/B knob (QUAL-10, item 84). Empty = glibc default. Set to
+      # 2 to test whether per-recovery RSS growth is arena retention rather
+      # than an object leak: with 191 threads glibc spreads allocations over
+      # many 64 MiB arenas and keeps freed memory inside them.
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-}
+      # Allocator substitution for the same A/B: preload jemalloc (or any
+      # allocator) without an engine rebuild, and pass it its config.
+      LD_PRELOAD: ${CLINK_LD_PRELOAD:-}
+      MALLOC_CONF: ${MALLOC_CONF:-}
       CLINK_FAULT_INJECT: ${CLINK_FAULT_INJECT:-}
       # Object-store credentials for campaigns whose sink is S3-compatible
       # (QUAL-03's MinIO). Empty for every other campaign; the metadata

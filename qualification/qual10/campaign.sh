@@ -335,8 +335,8 @@ done
 to_host "$COORD_PUB" "$HERE/../infra/coordinator.yml" /qual/coordinator.yml
 on_host "$COORD_PUB" "cd /qual && docker compose -f coordinator.yml down >/dev/null 2>&1; \
     rm -rf /qual/ha/jobs /qual/ha/history; mkdir -p /qual/ha; \
-    printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nRESTART_DRAIN_TIMEOUT_MS=%s\n' \
-    '$CLINK_IMAGE' '$COORD_PRIV' '$RESTART_DRAIN_TIMEOUT_MS' > /qual/.env && \
+    printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nRESTART_DRAIN_TIMEOUT_MS=%s\nMALLOC_ARENA_MAX=%s\nCLINK_LD_PRELOAD=%s\nMALLOC_CONF=%s\n' \
+    '$CLINK_IMAGE' '$COORD_PRIV' '$RESTART_DRAIN_TIMEOUT_MS' '${MALLOC_ARENA_MAX:-}' '${CLINK_LD_PRELOAD:-}' '${MALLOC_CONF:-}' > /qual/.env && \
     docker compose -f coordinator.yml up -d"
 wi=0
 for wp in $WORKER_PUBS; do
@@ -345,8 +345,11 @@ import json
 inv=json.load(open('$OUT_DIR/inventory.json'))
 print([h['private_ip'] for h in inv['hosts'] if h['public_ip']=='$wp'][0])")
     to_host "$wp" "$HERE/../infra/worker.yml" /qual/worker.yml
-    on_host "$wp" "cd /qual && printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nWORKER_ID=%s\nWORKER_IP=%s\n' \
-        '$CLINK_IMAGE' '$COORD_PRIV' 'w$wi' '$wpriv' > /qual/.env && \
+    # The allocator knob rides in .env so the chaos controller's own
+    # `docker compose up` after a kill recreates the worker WITH it; an env
+    # prefix on this one invocation would be lost at the first recovery.
+    on_host "$wp" "cd /qual && printf 'CLINK_IMAGE=%s\nCONTROL_IP=%s\nWORKER_ID=%s\nWORKER_IP=%s\nMALLOC_ARENA_MAX=%s\nCLINK_LD_PRELOAD=%s\nMALLOC_CONF=%s\n' \
+        '$CLINK_IMAGE' '$COORD_PRIV' 'w$wi' '$wpriv' '${MALLOC_ARENA_MAX:-}' '${CLINK_LD_PRELOAD:-}' '${MALLOC_CONF:-}' > /qual/.env && \
         docker compose -f worker.yml up -d --force-recreate"
     wi=$(( wi + 1 ))
 done
@@ -644,7 +647,11 @@ done
 [ "$RECOVERED" = "yes" ] || verify_fail "the job did not resume making progress after the first fault"
 
 SOAK_START=$(date +%s)
-END=$(( SOAK_START + DURATION_S ))
+# The battery runs for the FAULT WINDOW, not the whole run. This line was
+# inherited from a campaign whose DURATION_S WAS its battery, and here it
+# ran the 10-hour cloud battery for ten hours on top of the setup and the
+# quiet window - a 14-hour run sold as a 10-hour one.
+END=$(( SOAK_START + FAULT_WINDOW_S ))
 CHAOS_DIED_AT=""
 JOB_GONE_AT=""
 WATCH_LOOPS=0

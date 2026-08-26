@@ -59,6 +59,15 @@ services:
       # write ceiling. Scales with the backend, so the campaign sets it.
       - --restart-drain-timeout-ms=${RESTART_DRAIN_TIMEOUT_MS:-120000}
     environment:
+      # Allocator A/B knob (QUAL-10, item 84). Empty = glibc default. Set to
+      # 2 to test whether per-recovery RSS growth is arena retention rather
+      # than an object leak: with 191 threads glibc spreads allocations over
+      # many 64 MiB arenas and keeps freed memory inside them.
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-}
+      # Allocator substitution for the same A/B: preload jemalloc (or any
+      # allocator) without an engine rebuild, and pass it its config.
+      LD_PRELOAD: ${CLINK_LD_PRELOAD:-}
+      MALLOC_CONF: ${MALLOC_CONF:-}
       # Armed per-restart by the chaos controller for targeted 2PC-window
       # faults; empty in normal operation.
       CLINK_FAULT_INJECT: ${CLINK_FAULT_INJECT:-}
