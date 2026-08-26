@@ -631,3 +631,129 @@ TEST(ErrorCancelConvergence, ATransportFailureDoesNotStartRecoveryAheadOfItsCaus
         << "the real cause did not drive recovery";
     std::filesystem::remove_all(dir);
 }
+
+// ----- Item 73: a worker lost WHILE a whole-job restart is draining -----
+//
+// QUAL-06 at 292 tasks: a startup bridge failure began a whole-job restart,
+// and the chaos controller's first worker kill landed in the same second.
+// The restart reported success and the job never made progress again -
+// RUNNING for 40 minutes with the checkpoint id frozen. At 20 tasks QUAL-05
+// folded three overlapping worker losses correctly, so the first question is
+// whether the overlap itself is handled at small width: a restart mid-drain
+// when one of the survivors it is waiting on dies. Two ways to die - the
+// watchdog notices a silent worker, or the worker comes back under the same
+// id before the watchdog does - and both must end in a redeploy, never in a
+// job that waits for a drain report that can no longer come.
+
+TEST(ErrorCancelConvergence, AWorkerLostMidDrainDoesNotWedgeTheRestart) {
+    ensure_built_ins_registered();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ecc_overlap_lost_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.heartbeat_timeout = 600ms;
+    cfg.restart_drain_timeout = 20s;  // long: the fold, not the deadline, must free the restart
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"ecc-a", "ecc-b"});
+    auto wa = std::make_unique<EccFakeWorker>(port, "ecc-a");
+    auto wb = std::make_unique<EccFakeWorker>(port, "ecc-b");
+    ASSERT_TRUE(wa->valid() && wb->valid());
+    ASSERT_TRUE(wa->register_and_ack());
+    ASSERT_TRUE(wb->register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    const auto job_id = coordinator.submit_job(
+        ecc_three_task_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    auto d = ecc_deploy(*wa, *wb, job_id);
+    ASSERT_FALSE(d.a.empty() || d.b.empty()) << "the graph never deployed across both workers";
+
+    // A non-fatal error on worker A starts a whole-job restart. Every other
+    // in-flight subtask - A's remaining ones and B's - is now expected to
+    // drain before the redeploy.
+    ASSERT_TRUE(wa->send_finished(job_id, d.a[0].first, d.a[0].second, /*had_error=*/true));
+    ASSERT_TRUE(wa->await_frame(MessageKind::CancelJob, 5s).has_value())
+        << "the restart never broadcast its cancels";
+
+    // THE OVERLAP: worker B dies before it can report anything. Its drain
+    // reports can never come. The watchdog must notice, fold B's subtasks out
+    // of the drain expectation, and let the restart proceed.
+    wb->close();
+    wb.reset();
+    // A's other subtasks obey the cancel.
+    for (std::size_t i = 1; i < d.a.size(); ++i) {
+        ASSERT_TRUE(wa->send_finished(job_id, d.a[i].first, d.a[i].second, /*had_error=*/false));
+    }
+
+    // The redeploy must reach the surviving worker. Not "eventually at the
+    // drain deadline" - the fold is what frees it, well inside 20s.
+    EXPECT_TRUE(wa->await_frame(MessageKind::Deploy, 10s).has_value())
+        << "no redeploy within 10s of the overlap: the restart is waiting on a worker that "
+           "is gone (item 73)";
+    std::filesystem::remove_all(dir);
+}
+
+TEST(ErrorCancelConvergence, AWorkerReturningUnderItsOwnIdMidDrainDoesNotWedgeTheRestart) {
+    ensure_built_ins_registered();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ecc_overlap_rereg_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    // Generous: a fast same-id return must NOT depend on the watchdog ever
+    // declaring the old session lost.
+    cfg.heartbeat_timeout = 30s;
+    cfg.restart_drain_timeout = 20s;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"ecc-a", "ecc-b"});
+    auto wa = std::make_unique<EccFakeWorker>(port, "ecc-a");
+    auto wb = std::make_unique<EccFakeWorker>(port, "ecc-b");
+    ASSERT_TRUE(wa->valid() && wb->valid());
+    ASSERT_TRUE(wa->register_and_ack());
+    ASSERT_TRUE(wb->register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    const auto job_id = coordinator.submit_job(
+        ecc_three_task_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    auto d = ecc_deploy(*wa, *wb, job_id);
+    ASSERT_FALSE(d.a.empty() || d.b.empty());
+
+    ASSERT_TRUE(wa->send_finished(job_id, d.a[0].first, d.a[0].second, /*had_error=*/true));
+    ASSERT_TRUE(wa->await_frame(MessageKind::CancelJob, 5s).has_value());
+
+    // THE OVERLAP, orchestrator-style: B is killed and comes straight back
+    // under the same id, heartbeating happily, before any watchdog tick
+    // could call it lost. Its previous session's drain reports are gone.
+    wb->close();
+    wb.reset();
+    auto wb2 = std::make_unique<EccFakeWorker>(port, "ecc-b");
+    ASSERT_TRUE(wb2->valid());
+    ASSERT_TRUE(wb2->register_and_ack());
+    for (std::size_t i = 1; i < d.a.size(); ++i) {
+        ASSERT_TRUE(wa->send_finished(job_id, d.a[i].first, d.a[i].second, /*had_error=*/false));
+    }
+
+    // Redeploy lands on A or the new B; either is a restart that fired.
+    bool redeployed = false;
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline && !redeployed) {
+        redeployed = wa->await_frame(MessageKind::Deploy, 500ms).has_value() ||
+                     wb2->await_frame(MessageKind::Deploy, 500ms).has_value();
+    }
+    EXPECT_TRUE(redeployed)
+        << "no redeploy within 10s: the restart is waiting on a session that was replaced "
+           "(item 73, same-id return)";
+    std::filesystem::remove_all(dir);
+}
