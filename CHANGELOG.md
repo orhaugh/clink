@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+**The runtime image's multi-arch manifest is published again.** v0.8.0's
+tag run built and pushed both architectures and then failed at the final
+step, so `:0.8.0` was never published and `:latest` still pointed at the
+previous, amd64-only index: pulling the image on an arm64 machine
+reported no matching manifest. The cause was a shell subtlety rather than
+anything in the image. `IFS` governs the word splitting of expansions,
+not of literal words in the source, so setting `IFS=','` and looping over
+a comma-joined tag list that arrives as a literal ran the body once and
+emitted `-t a,b,c`, which the registry refused as an invalid reference
+format. The split now goes through an expansion.
+
+The same change makes that failure shape cheap to recover from, because
+its cost was structural: two long builds succeed, one registry operation
+fails, and the only remedy was building both images again. A
+`manifest_only` dispatch mode re-creates the manifest from per-arch
+digests already in the registry, in about a minute, and the existing
+guards still apply to it - the refusal to tag anything but a complete
+pair, the smoke run of both binaries, and the check that what was
+published really covers both architectures. The v0.8.0 tags were
+republished that way and now carry linux/amd64 and linux/arm64.
+
 ## v0.8.0 (August 2026)
 
 The launch release: the qualification programme run across the engine's
