@@ -84,6 +84,21 @@ leaky = trend.split_incarnations(
 _, found = trend.judge_within(leaky, max_pct_per_hour=0.5, min_hours=2)
 check("a 2%/h climb inside one incarnation is flagged", len(found), 1)
 
+# A survivor whose subtasks were redeployed onto it steps up ONCE and then
+# holds. That is a new high-water mark, not a trend; the claim under test is
+# "no monotonic growth", and a step that settles is not monotonic growth.
+step_then_flat = trend.split_incarnations(
+    inc(series(400, 4, lambda h: 400.0 if h < 1.0 else 640.0, noise=2.0), 1))
+_, found = trend.judge_within(step_then_flat, max_pct_per_hour=0.5, min_hours=2)
+check("a single step that then holds flat is not drift", found, [])
+
+# But a process that keeps climbing after the step IS drifting: the second
+# half rises too, and that is what the settled-half rule reads.
+step_then_climb = trend.split_incarnations(
+    inc(series(400, 4, lambda h: (400.0 if h < 1.0 else 640.0) + 400.0 * 0.02 * max(0, h - 1.0), noise=2.0), 1))
+_, found = trend.judge_within(step_then_climb, max_pct_per_hour=0.5, min_hours=2)
+check("a step followed by a continued climb is still flagged", len(found), 1)
+
 short = trend.split_incarnations(inc(series(20, 0.4, lambda h: 400.0), 1))
 judged, found = trend.judge_within(short, max_pct_per_hour=0.5, min_hours=2)
 check("an incarnation too short to judge is not judged", judged, 0)

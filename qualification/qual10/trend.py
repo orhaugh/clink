@@ -91,21 +91,34 @@ def split_incarnations(samples):
 
 
 def judge_within(incarnations, max_pct_per_hour, min_hours):
-    """Every incarnation that ran long enough must be flat while it ran."""
+    """Every incarnation that ran long enough must SETTLE flat.
+
+    The claim is "no monotonic growth", so the judged slope is over the
+    SECOND HALF of an incarnation's settled samples. A single step that then
+    holds - a survivor whose subtasks were redeployed onto it mid-life
+    reaches a new high-water mark once and stays there - is not a trend,
+    and reading it as one failed a run whose process was flat for its last
+    twenty-five minutes. A leak keeps climbing in the second half; a step
+    does not. Both halves are reported so a reader can see which it was.
+    """
     findings, judged = [], 0
     for inc, pts in incarnations:
         if not pts:
             continue
-        span = max(p[0] for p in pts) - min(p[0] for p in pts)
+        pts = sorted(pts)
+        span = pts[-1][0] - pts[0][0]
         if span < min_hours:
             continue  # too short to say anything; not evidence either way
         judged += 1
-        s = slope_pct_per_hour(pts)
-        if s is None:
+        half = pts[len(pts) // 2:]
+        s_all = slope_pct_per_hour(pts)
+        s_half = slope_pct_per_hour(half)
+        if s_half is None:
             continue
-        if s > max_pct_per_hour:
+        if s_half > max_pct_per_hour:
             findings.append({
-                "incarnation": inc, "slope_pct_per_hour": round(s, 4),
+                "incarnation": inc, "slope_pct_per_hour": round(s_half, 4),
+                "whole_incarnation_slope_pct_per_hour": round(s_all, 4) if s_all is not None else None,
                 "span_hours": round(span, 2), "limit": max_pct_per_hour,
             })
     return judged, findings

@@ -132,11 +132,37 @@ def to_hours(series, t0):
 
 
 def judge(procs, cfg, events_hours):
+    """Judge the SUBJECT's processes. Everything else on the rig - brokers,
+    the verification database - is charted for context but not judged: a
+    broker's memory curve is not a claim this campaign makes, and the
+    aggressive profile's broker restarts made Redpanda's refill read as a
+    finding against clink.
+
+    Within an incarnation the judged window opens one plateau horizon AFTER
+    the incarnation's own first sample, not after the run's warm-up: a
+    restarted process refills its state from the checkpoint, and that ramp
+    is the workload doing what it is for, not drift. Judging it as drift
+    failed every post-restart incarnation on the aggressive profile.
+    """
+    import re
+    subject = re.compile(cfg.get("subject", "clink"))
+    plateau_h = cfg.get("plateau_hours", 0.0)
     findings, per_process = [], {}
     for key, P in sorted(procs.items()):
         if not P["inc"]:
             continue
-        after = [(i, h, v) for i, h, v in P["inc"] if h >= cfg["warmup_hours"]]
+        if not subject.search(key):
+            per_process[key] = {"infrastructure": True,
+                                "note": "charted, not judged: not the subject"}
+            continue
+        # Per-incarnation warm-up: drop each incarnation's first plateau
+        # horizon before judging it.
+        first_seen = {}
+        for i, h, v in P["inc"]:
+            if i not in first_seen or h < first_seen[i]:
+                first_seen[i] = h
+        after = [(i, h, v) for i, h, v in P["inc"]
+                 if h >= cfg["warmup_hours"] and h >= first_seen[i] + plateau_h]
         incs = trend.split_incarnations(after)
         judged, within = trend.judge_within(
             incs, cfg["rss_pct_per_hour"], cfg["min_incarnation_hours"])
@@ -146,8 +172,9 @@ def judge(procs, cfg, events_hours):
                  "across": across, "gaps": gaps,
                  "overall_slope_pct_per_hour": trend.slope_pct_per_hour(
                      [(h, v) for h, v in P["rss"] if h >= cfg["warmup_hours"]])}
+        settled_hours = {h for _, h, _ in after}
         for metric in ("threads", "fds"):
-            pts = [v for h, v in P[metric] if h >= cfg["warmup_hours"]]
+            pts = [v for h, v in P[metric] if h >= cfg["warmup_hours"] and h in settled_hours]
             med = trend.median(pts)
             if med:
                 hi = max(pts)
@@ -249,6 +276,9 @@ def main():
                          "compressed rehearsal reports a cold start as an "
                          "831%/h leak, which is how a harness teaches its "
                          "owner to ignore it.")
+    ap.add_argument("--subject", default="clink",
+                    help="regex over 'host/container'; only matching processes "
+                         "are JUDGED (the rest are charted as infrastructure)")
     ap.add_argument("--judge-from-epoch", type=float, default=0.0,
                     help="wall-clock second at which the judged window opens. "
                          "Preferred over --warmup-hours because it is a FACT "
@@ -303,7 +333,9 @@ def main():
     if args.judge_from_epoch:
         warmup_hours = max(0.0, (args.judge_from_epoch - t0) / 3600.0)
     cfg = dict(DEFAULTS, warmup_hours=warmup_hours,
-               min_incarnation_hours=args.min_incarnation_hours)
+               min_incarnation_hours=args.min_incarnation_hours,
+               plateau_hours=args.plateau_seconds / 3600.0,
+               subject=args.subject)
     judged_hours = max(0.0, duration - cfg["warmup_hours"])
     plateau_hours = args.plateau_seconds / 3600.0
     # Three horizons: one to fill, one to plateau, one to judge the plateau.

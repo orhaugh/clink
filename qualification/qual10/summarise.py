@@ -79,7 +79,13 @@ def build(out_dir, run_id, profile, local=False):
         a("")
         a("## Per process")
         a("")
+        infra = [n for n, p in leak["per_process"].items() if p.get("infrastructure")]
+        if infra:
+            a(f"Infrastructure processes charted but not judged: {', '.join(sorted(infra))}")
+            a("")
         for name, p in sorted(leak["per_process"].items()):
+            if p.get("infrastructure"):
+                continue
             across = p["across"]
             slope = p.get("overall_slope_pct_per_hour")
             a(f"### `{name}`")
