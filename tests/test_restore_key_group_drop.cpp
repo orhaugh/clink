@@ -1,6 +1,6 @@
 // A restore that discards keyed state must say so.
 //
-// The silent case is F38 in docs/production-hardening-plan.md, and it cost a
+// The silent case is F38 in docs/history/production-hardening-2026-08.md, and it cost a
 // day to find from the outside. A job restored, reported success, and came
 // back with half its keyed state missing. The mechanism:
 //

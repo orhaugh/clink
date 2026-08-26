@@ -2,8 +2,14 @@
 
 ## Supported versions
 
-clink is pre-1.0. Only the latest commit on `main` is supported; fixes are
-not backported to earlier states.
+clink is pre-1.0 and ships 0.x releases. The latest patch release of the
+newest minor line (currently v0.8.x) is the recommended production
+target and the only line that receives security fixes. `main` is active,
+unreleased development: fixes land there first, but it is not a
+supported deployment target. Fixes are not backported to older minor
+lines; upgrading is the supported path, and snapshots carry schema
+versions with a migrate-at-restore path so an upgrade does not
+invalidate checkpoints or savepoints.
 
 ## Reporting a vulnerability
 
@@ -19,7 +25,9 @@ The cluster control plane (Coordinator/Worker RPC) and the HTTP API
 are designed to run inside a trusted network. Operating beyond one:
 
 - Enable TLS / mTLS on the transport (`clink_node --tls-cert` /
-  `--tls-ca`, and `--tls-client-*` for mutual auth).
+  `--tls-ca`, and `--tls-client-*` for mutual auth). A TLS
+  configuration the control plane cannot honour is refused at startup
+  rather than silently served plaintext.
 - Set `CLINK_AUTH_TOKEN` on `clink_node` so the HTTP control plane
   requires a bearer token; without it the API is open to whoever can reach
   the port. The HTTP server is off entirely unless `--http-port` is set.
@@ -31,3 +39,7 @@ are designed to run inside a trusted network. Operating beyond one:
   designed to be exposed directly to untrusted users.
 - Connector credentials can be supplied via `env://` indirection so
   secrets stay out of SQL text and job specs.
+
+The engine's refusal behaviour on misconfigured security settings is
+qualified and published:
+[QUAL-12, security refusals](https://orhaugh.github.io/clink/qualification/qual-12-security-refusals/).

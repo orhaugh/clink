@@ -1,5 +1,11 @@
 # Production hardening: findings, work items, status
 
+> **Archived.** The historical record of the production-hardening round
+> that closed in August 2026, kept as the audit trail for that work.
+> Nothing here is current unfinished work; the tree and the published
+> [qualification pages](https://orhaugh.github.io/clink/qualification/) are
+> authoritative for the present state.
+
 > An audit of clink's failure, recovery and validation behaviour, the work
 > done against it, the evidence for each claim, and - stated as plainly as
 > the rest - what is still not demonstrated.
@@ -37,7 +43,7 @@ survivor's drain ack left a ready restart nothing ever fired. The fix
 (restart_drain_covered_ as the single readiness predicate) is pinned
 deterministically by tests/test_restart_drain_readiness.cpp and the soak
 runs green serially in CI. The live tracker for these rounds is
-planned-prs.json (PR-01..PR-16).
+planned-prs-2026-08.json, archived beside this document (PR-01..PR-16).
 
 **Status date:** 2026-08-04 (round CLOSED - see section 8; preface above
 updated 2026-08-10)
@@ -5665,7 +5671,7 @@ A fresh external audit arrived on 2026-08-14, after the follow-up backlog
 had effectively closed (57 of 59 items, findings F1-F101). Its premise was
 verify-first: every recommendation checked against HEAD before any code
 moved. Base revision `3c47c93`; machine-readable tracking in
-`planned-prs.json` at the repo root.
+`planned-prs-2026-08.json`, archived beside this document.
 
 ### What the sweep confirmed was already done
 

@@ -1,7 +1,7 @@
 // The shipped Prometheus alert rules reference metrics that exist.
 //
 // deploy/prometheus/clink-alerts.yaml is the answer to a gap recorded in
-// docs/production-hardening-plan.md W19: the metrics supported the obvious
+// docs/history/production-hardening-2026-08.md W19: the metrics supported the obvious
 // alerts and no rule file shipped, so every operator derived the same
 // queries independently and got the subtleties wrong independently too.
 //

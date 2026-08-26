@@ -1,6 +1,6 @@
 // Shutdown releases what startup took.
 //
-// docs/production-hardening-plan.md W21 recorded the gap plainly: "No leak
+// docs/history/production-hardening-2026-08.md W21 recorded the gap plainly: "No leak
 // check. Nothing asserts that threads, file descriptors or temporary files
 // are released on shutdown. A clean exit code is not evidence of a clean
 // teardown."

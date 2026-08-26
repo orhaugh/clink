@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/orhaugh/clink/discussions
+    about: Ask a question or discuss an idea in GitHub Discussions; issues are for bugs and concrete feature requests.
+  - name: Security vulnerabilities
+    url: https://github.com/orhaugh/clink/security/advisories/new
+    about: Report privately via GitHub security advisories, never in a public issue.

@@ -5,7 +5,7 @@
 # perf(sql), docs(hardening), test(integration) - and nothing enforced it, so it
 # drifted: a long session read the last few subjects (its own, by then) instead
 # of the convention and put thirteen unprefixed commits in before anyone noticed.
-# A copy of the convention in CLAUDE.md is worth having; a check that runs is
+# A copy of the convention in AGENTS.md is worth having; a check that runs is
 # worth more.
 #
 # This validates the PREFIX and nothing else, deliberately:

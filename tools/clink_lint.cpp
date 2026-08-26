@@ -1,6 +1,6 @@
 // clink lint - check a configuration without submitting a job.
 //
-// The gap this closes (docs/production-hardening-plan.md W17): the config
+// The gap this closes (docs/history/production-hardening-2026-08.md W17): the config
 // linter ran only at submission and behind `--profile`, so the way to find
 // out whether a deployment's flags were coherent was to submit a job with
 // them. On a production cluster that is not a check anyone runs.

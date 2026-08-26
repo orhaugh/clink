@@ -24,7 +24,7 @@
 // which the file coordinator cannot do (the fcntl lock is released only on
 // process death, so a SIGSTOPped leader keeps it and no standby takes
 // over). It needs a lease-based store - etcd - and is build-gated on it.
-// See docs/production-hardening-plan.md, W15.
+// See docs/history/production-hardening-2026-08.md, W15.
 
 #include <chrono>
 #include <cstdint>

@@ -1,6 +1,6 @@
 // Cross-sink commit atomicity, under failure.
 //
-// docs/production-hardening-plan.md W22 records the gap: nothing verified
+// docs/history/production-hardening-2026-08.md W22 records the gap: nothing verified
 // that a job's two transactional sinks agree about what they published when
 // a failure lands between their commits. The gating code was read, never
 // exercised.

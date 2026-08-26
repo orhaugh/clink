@@ -1,0 +1,49 @@
+name: Bug report
+description: Something behaved incorrectly
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: clink version
+      description: Output of `clink_node --version`, or the release tag / commit SHA you built.
+      placeholder: "clink 0.8.0 (plugin ABI v1, ...)"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Deployment mode
+      options:
+        - Embedded (clink run / libclink / pyclink)
+        - Distributed cluster (clink_node coordinator/worker)
+        - Docker image (ghcr.io/orhaugh/clink-runtime)
+        - Kubernetes (Helm chart / operator)
+        - Building from source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and platform
+      placeholder: e.g. Ubuntu 24.04 x86_64, macOS 15 arm64
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: What happened, and how to reproduce it
+      description: The smallest SQL script, pipeline or command sequence that shows the problem, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: State backend, checkpointing and connectors (if relevant)
+      description: State backend URI, checkpoint settings, and the connectors involved.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and capability manifest
+      description: Relevant log output. When the problem involves connectors or build options, include `clink --capabilities-json` from the binary in question.
+      render: text

@@ -213,7 +213,7 @@ Frame IO is one shared implementation (`include/clink/cluster/frame_io.hpp`), an
 
 Each of the four frame-handling loops - the coordinator's accept loop, its per-client and per-worker readers, and `Worker::reader_loop_` - wraps a single frame in a try. A frame that does not decode costs the peer its connection, is logged, and increments `clink_malformed_frames_total`. This is load-bearing rather than defensive: the decoders throw by design on a malformed payload, and an exception leaving a thread function is `std::terminate`, so before this a single malformed frame killed the process.
 
-None of that bounds the number of connections, the rate of frames, or aggregate memory across peers. See `docs/production-hardening-plan.md`, W14.
+None of that bounds the number of connections, the rate of frames, or aggregate memory across peers. See `docs/history/production-hardening-2026-08.md`, W14.
 
 #### Protocol version negotiation
 

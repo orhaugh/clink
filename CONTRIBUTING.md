@@ -22,7 +22,7 @@ ctest --test-dir build --parallel 8
 ```
 
 `./build_and_test.sh` is the reproducible path CI runs, optionally inside
-the pinned Docker image (see the README's "Build & test" section). Useful
+the pinned Docker image (see the "Build & test" section of AGENTS.md). Useful
 ctest labels: `-L core`, `-L kafka`, `-L postgres`, `-L clickhouse`,
 `-L s3`, `-L rocksdb`, `-L tls`. The multi-process integration suite is
 opt-in: configure with `-DCLINK_INTEGRATION_TESTS=ON` and run

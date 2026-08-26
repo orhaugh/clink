@@ -86,7 +86,7 @@ First campaign, 2026-08-03, three targets on macOS/arm64 under
 | `state_version_map` | 6,559,848 | none |
 
 20.8 million executions, no crashes. Worth reading precisely: it says the
-hardening in `docs/production-hardening-plan.md` W14 holds against inputs
+hardening in `docs/history/production-hardening-2026-08.md` W14 holds against inputs
 nobody wrote down. It does not say the decoders are correct - a fuzzer
 finds crashes, not wrong answers, and 45 seconds per target is a smoke
 test rather than a campaign.

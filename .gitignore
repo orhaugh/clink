@@ -87,6 +87,7 @@ benchmarks/prod_compare/*/rocksdb:/
 # as do the docs-site pages: landing, capabilities, design decisions)
 /docs/*
 !/docs/consumer-examples/
+!/docs/guides/
 !/docs/connectors/
 !/docs/internals/
 !/docs/design/
@@ -96,12 +97,12 @@ benchmarks/prod_compare/*/rocksdb:/
 !/docs/benchmarks.md
 !/docs/efficiency.md
 !/docs/sql.md
-# The production-hardening record. Tracked deliberately: it is the audit
-# trail for the failure/recovery work and the honest statement of what is
-# still not demonstrated, which belongs in the repository rather than in
-# someone's local notes. NOT added to mkdocs' exclude_docs allowlist, so it
-# is reviewable in git without being published as a user-facing site page.
-!/docs/production-hardening-plan.md
+# Historical records (closed audits and their work trackers). Tracked
+# deliberately: they are the audit trail for the hardening work, which
+# belongs in the repository rather than in someone's local notes. NOT added
+# to mkdocs' exclude_docs allowlist, so they are reviewable in git without
+# being published as user-facing site pages.
+!/docs/history/
 !/docs/assets/
 
 # MkDocs build output

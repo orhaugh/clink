@@ -1,11 +1,10 @@
 # Capability catalogue
 
 The complete shipped feature surface, one area per section, each row linking
-to the page that documents it in depth. A capability appears here only when it
-is backed by code and tests in the repository; config-gated or partial
-features carry their caveat in the row. The
-[README status tables](https://github.com/orhaugh/clink#status) remain the
-fine-grained per-subsystem inventory; this page is the navigable map.
+to the page that documents it in depth. This page is the authoritative
+capability inventory: a capability appears here only when it is backed by
+code and tests in the repository, and a config-gated or partial feature
+carries its caveat in the row.
 
 ## Execution model
 
@@ -29,8 +28,9 @@ fine-grained per-subsystem inventory; this page is the navigable map.
 
 ## SQL
 
-Built behind `CLINK_BUILD_SQL=ON` (default off). One SQL file runs embedded or
-submits to a cluster, unchanged.
+Built behind `CLINK_BUILD_SQL` (on by default, matching what CI, the release
+binaries, the runtime image and the Python wheel all build). One SQL file runs
+embedded or submits to a cluster, unchanged.
 
 | Capability | Notes | Reference |
 | --- | --- | --- |
@@ -75,13 +75,14 @@ submits to a cluster, unchanged.
 | Kubernetes | Helm chart and a `ClinkCluster`/`ClinkJob` operator with savepoint-on-upgrade | [Distributed runtime](internals/distributed-runtime.md) |
 | HTTP API and console | JSON API, Prometheus metrics, SSE events, embedded dashboard; the full [operations console](https://github.com/orhaugh/clink-fe) is a separate project | [Distributed runtime](internals/distributed-runtime.md) |
 | Efficiency | Measured 1.9x to 5.3x less CPU per event than a JVM stream processor (median 2.45x, all 17 nexmark queries, five-node cluster, correctness-gated, raw per-run data published); a separate page prices it in instances, dollars and modelled CO2e | [Benchmarks](benchmarks.md) / [Cost and environmental footprint](efficiency.md) |
-| Allocator choice | jemalloc as the process allocator: on by default in the runtime image, opt-in for source builds (`CLINK_WITH_JEMALLOC=ON`, Linux). Steady state: +5% throughput on a windowed query, neutral elsewhere, no memory change. Under repeated recovery (QUAL-10): a glibc worker retained 3.3 GB after 27 restarts with the job gone; jemalloc with prompt purging plus Arrow's pool routed to it (`ARROW_DEFAULT_MEMORY_POOL=system`) cut per-restart growth from ~14 MiB to under 1 MiB and returned the memory. Allocator retention, not a leak - measured, not inferred. The allocator in use is reported by `clink_node --version` and at node startup | [Build options](https://github.com/orhaugh/clink#allocator-clink_with_jemalloc-linux-on-by-default-in-the-runtime-image) |
+| Allocator choice | jemalloc as the process allocator: on by default in the runtime image, opt-in for source builds (`CLINK_WITH_JEMALLOC=ON`, Linux). Steady state: +5% throughput on a windowed query, neutral elsewhere, no memory change. Under repeated recovery (measured across 27 whole-job restarts): a glibc worker retained 3.3 GB with the job gone; jemalloc with prompt purging plus Arrow's pool routed to it (`ARROW_DEFAULT_MEMORY_POOL=system`) cut per-restart growth from ~14 MiB to under 1 MiB and returned the memory. Allocator retention, not a leak - measured, not inferred. The allocator in use is reported by `clink_node --version` and at node startup | [Steady-state A/B](https://github.com/orhaugh/clink/blob/main/benchmarks/nexmark_compare/cloud/README.md) |
 
 ## Observability and debugging
 
 | Capability | Notes | Reference |
 | --- | --- | --- |
 | Metrics | Counter and gauge registry, Prometheus exposition, per-process system gauges | [Distributed runtime](internals/distributed-runtime.md) |
+| OTLP export | Metrics plus lifecycle spans (submit, checkpoint, HA recovery, rescale) to any OpenTelemetry collector over OTLP/HTTP JSON; off unless `--otlp-endpoint` is given | [Distributed runtime](internals/distributed-runtime.md) |
 | Structured logging | `clink::log` facade with an in-memory ring served over HTTP and zstd-rotated files | [Distributed runtime](internals/distributed-runtime.md) |
 | Data lineage | Per-job source/sink dataset graph with column-level lineage for SQL; built-in OpenLineage exporter | [Data lineage](internals/data-lineage.md) |
 | Deterministic replay | Flight recorder captures per-epoch operator input; `clink replay` re-executes byte-identically offline and can freeze an incident into a regression test | [Replay determinism](internals/replay-determinism.md) |

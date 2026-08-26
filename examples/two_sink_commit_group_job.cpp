@@ -2,7 +2,7 @@
 // share a commit_group.
 //
 // Exists to test cross-sink commit ATOMICITY under failure, which
-// docs/production-hardening-plan.md W22 records as analysed but never
+// docs/history/production-hardening-2026-08.md W22 records as analysed but never
 // exercised: sinks sharing a commit_group are supposed to commit as a unit,
 // gated on the group's collective ack, and nothing verified that a failure
 // between their two commits cannot leave one published and the other not.
