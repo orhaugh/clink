@@ -844,9 +844,17 @@ inline CommitCheckpointMsg decode_commit_checkpoint(MessageReader& r) {
     // Retention floor (commit-confirmed restore). Absent from an older
     // coordinator: 0 = no constraint, the pre-protocol behaviour.
     m.retain_floor = r.eof() ? std::uint64_t{0} : r.read_u64_be();
-    // Pinned checkpoints (item 74). Absent from an older coordinator: none.
+    // Pinned checkpoints. Absent from an older coordinator: none.
+    //
+    // read_count(), not read_u32_be() + reserve(n): the count is untrusted
+    // bytes off the wire, and reserving from it before any bounds-checked
+    // read could reject it turned a 96-byte garbage frame into a 22 GB
+    // allocation - an ASan out-of-memory in FrameRobustness, and in
+    // production a way for one corrupt frame to take a worker down.
+    // read_count throws when the count exceeds the bytes left in the frame,
+    // which bounds the reserve by the frame size.
     if (!r.eof()) {
-        const auto n = r.read_u32_be();
+        const auto n = r.read_count();
         m.pinned_checkpoint_ids.reserve(n);
         for (std::uint32_t i = 0; i < n && !r.eof(); ++i) {
             m.pinned_checkpoint_ids.push_back(r.read_u64_be());
