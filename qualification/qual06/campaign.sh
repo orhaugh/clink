@@ -366,7 +366,12 @@ FINAL_B=""; FINAL_P=""; FINAL_SUBTASKS=""
 for rung in $LADDER; do
     B=${rung%%:*}; P=${rung##*:}
     RUNG=$(( RUNG + 1 ))
-    EXPECTED_OPS=$(( 6 * B + 3 ))
+    # 6 ops per branch, then union tree glue, aggregate, sink - AND the
+    # sink-boundary schema bind the planner has emitted in front of every
+    # Row-channel sink since item 78 (2dd2e23). The formula lagged that by
+    # one and failed a fully-green 150-subtask run for deploying "76 ops
+    # against a claim of 75".
+    EXPECTED_OPS=$(( 6 * B + 4 ))
     SUBTASKS=$(( EXPECTED_OPS * P ))
     RUNG_FILE="$OUT_DIR/rung-$RUNG.txt"
     echo "campaign: === rung $RUNG: B=$B par=$P -> $EXPECTED_OPS ops, $SUBTASKS subtasks ==="

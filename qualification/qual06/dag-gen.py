@@ -26,7 +26,7 @@ Two decisions here are correctness, not style:
 Width arithmetic (pinned by test_dag_gen.py against the real planner):
 each branch plans to source + json decode + assigner + filter + project,
 the union tree adds B-1 binary nodes, and the tail is keyer + aggregate +
-json + sink: ops = 6B + 3.
+json + sink, plus the planner's sink-boundary bind (item 78): deployed ops = 6B + 4.
 """
 import argparse
 import sys
