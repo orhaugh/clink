@@ -155,3 +155,77 @@ TEST(BoundedChannel, HighWaterMarkTracksPeakDepth) {
     }
     EXPECT_EQ(ch.high_water_mark(), 5u);
 }
+
+// Item 76: the stuck-channel diagnostic must not out-shout the evidence.
+// One line per 3s per channel filled three workers' entire 200k-line log
+// windows on the first QUAL-06 width probe and rotated out the task starts
+// and bridge errors that would have named the stall. The warn gap now
+// doubles per repetition, capped, and a warned wait that unblocks says so.
+
+TEST(BoundedChannel, StuckWarnGapDoublesAndCaps) {
+    using ms = std::chrono::milliseconds;
+    auto g = ms{3000};
+    std::vector<long> gaps;
+    for (int i = 0; i < 10; ++i) {
+        g = BoundedChannel<int>::stuck_warn_backoff(g);
+        gaps.push_back(g.count());
+    }
+    EXPECT_EQ(gaps[0], 6000);
+    EXPECT_EQ(gaps[1], 12000);
+    EXPECT_EQ(gaps[2], 24000);
+    EXPECT_EQ(gaps.back(), 300000) << "the gap must cap, not double forever";
+    // A 40-minute stall at this schedule is ~12 lines, not ~800.
+    long t = 3000, lines = 1, gap = 3000;
+    while (t < 40 * 60 * 1000) {
+        gap = BoundedChannel<int>::stuck_warn_backoff(ms{gap}).count();
+        t += gap;
+        ++lines;
+    }
+    EXPECT_LE(lines, 15) << "the schedule no longer bounds the flood";
+}
+
+TEST(BoundedChannel, StuckWarnsAreExponentiallySpacedAndUnblockIsStated) {
+    BoundedChannel<int> ch(1, "spacing-probe");
+    ch.set_stuck_warn_base_for_testing(std::chrono::milliseconds{300});
+
+    testing::internal::CaptureStderr();
+    std::thread consumer([&] {
+        // Blocked pop on an empty channel for ~1.05s: warns land at 0.3s and
+        // 0.9s under the backoff (0.3 + 0.6). The fixed-interval behaviour
+        // this replaces would land three (0.3, 0.6, 0.9) - which is exactly
+        // what the mutation check flips back to.
+        auto v = ch.pop();
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(*v, 7);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{1050});
+    ASSERT_TRUE(ch.push(7));
+    consumer.join();
+    const std::string err = testing::internal::GetCapturedStderr();
+
+    const auto count = [&](const std::string& needle) {
+        std::size_t n = 0, pos = 0;
+        while ((pos = err.find(needle, pos)) != std::string::npos) {
+            ++n;
+            pos += needle.size();
+        }
+        return n;
+    };
+    EXPECT_EQ(count("BOUNDED_CHANNEL_STUCK pop"), 2u) << err;
+    EXPECT_EQ(count("BOUNDED_CHANNEL_UNBLOCKED pop"), 1u) << err;
+    EXPECT_NE(err.find("warns=2"), std::string::npos) << err;
+    EXPECT_NE(err.find("closed=0"), std::string::npos) << err;
+}
+
+TEST(BoundedChannel, AWarnedWaitEndedByCloseSaysSo) {
+    BoundedChannel<int> ch(1, "close-probe");
+    ch.set_stuck_warn_base_for_testing(std::chrono::milliseconds{200});
+    testing::internal::CaptureStderr();
+    std::thread consumer([&] { EXPECT_FALSE(ch.pop().has_value()); });
+    std::this_thread::sleep_for(std::chrono::milliseconds{350});
+    ch.close();
+    consumer.join();
+    const std::string err = testing::internal::GetCapturedStderr();
+    EXPECT_NE(err.find("BOUNDED_CHANNEL_UNBLOCKED pop"), std::string::npos) << err;
+    EXPECT_NE(err.find("closed=1"), std::string::npos) << err;
+}

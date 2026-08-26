@@ -53,6 +53,26 @@ public:
         name_ = std::move(name);
     }
 
+    // The spacing between stuck-warnings for one continuous wait: double the
+    // previous gap, capped at five minutes. The first QUAL-06 width probe
+    // filled three workers' ENTIRE 200,000-line log windows with one line per
+    // channel per 3s tick - the diagnostic rotated out the task starts and
+    // bridge errors that would have named the stall it existed to diagnose
+    // (item 76). With this schedule a 40-minute stall costs ~12 lines, each
+    // still carrying the cumulative held= time, so nothing about the stall is
+    // lost - only the repetition.
+    static std::chrono::milliseconds stuck_warn_backoff(std::chrono::milliseconds previous) {
+        return std::min(previous * 2, std::chrono::milliseconds{kStuckWarnCapSeconds * 1000});
+    }
+    static constexpr int kStuckWarnCapSeconds = 300;
+
+    // Test seam: the schedule is real time, and a test proving two warns at
+    // the default base would take nine seconds of it.
+    void set_stuck_warn_base_for_testing(std::chrono::milliseconds base) {
+        std::lock_guard lock(mu_);
+        stuck_warn_base_ = base;
+    }
+
     // Blocking push. Returns false if the channel was closed before the value
     // could be enqueued.
     bool push(T value) {
@@ -68,7 +88,9 @@ public:
             // its own stderr, and clink_node forwards both streams.
             using clock = std::chrono::steady_clock;
             const auto start = clock::now();
-            auto next_warn = start + std::chrono::seconds{kStuckWarnInterval};
+            auto gap = stuck_warn_base_;
+            auto next_warn = start + gap;
+            int warns = 0;
             while (queue_.size() >= capacity_ && !closed_) {
                 if (not_full_.wait_until(lock, next_warn) == std::cv_status::timeout) {
                     const auto held =
@@ -84,10 +106,27 @@ public:
                                  push_waiters_,
                                  pop_waiters_,
                                  static_cast<long long>(held));
-                    next_warn += std::chrono::seconds{kStuckWarnInterval};
+                    ++warns;
+                    gap = stuck_warn_backoff(gap);
+                    next_warn += gap;
                 }
             }
             --push_waiters_;
+            if (warns > 0) {
+                // The other half of the diagnosis: a wait that warned and then
+                // moved is a stall that CLEARED, and when it cleared is often
+                // the fact that names the mechanism. One line per warned wait.
+                const auto held =
+                    std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start).count();
+                std::fprintf(stderr,
+                             "BOUNDED_CHANNEL_UNBLOCKED push name=\"%s\" ch=%p held=%llds "
+                             "warns=%d closed=%d\n",
+                             name_.c_str(),
+                             static_cast<const void*>(this),
+                             static_cast<long long>(held),
+                             warns,
+                             closed_ ? 1 : 0);
+            }
         }
         if (closed_) {
             return false;
@@ -121,7 +160,9 @@ public:
             // See push() for the stuck-warning rationale.
             using clock = std::chrono::steady_clock;
             const auto start = clock::now();
-            auto next_warn = start + std::chrono::seconds{kStuckWarnInterval};
+            auto gap = stuck_warn_base_;
+            auto next_warn = start + gap;
+            int warns = 0;
             while (queue_.empty() && !closed_) {
                 if (not_empty_.wait_until(lock, next_warn) == std::cv_status::timeout) {
                     const auto held =
@@ -137,10 +178,24 @@ public:
                                  push_waiters_,
                                  pop_waiters_,
                                  static_cast<long long>(held));
-                    next_warn += std::chrono::seconds{kStuckWarnInterval};
+                    ++warns;
+                    gap = stuck_warn_backoff(gap);
+                    next_warn += gap;
                 }
             }
             --pop_waiters_;
+            if (warns > 0) {
+                const auto held =
+                    std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start).count();
+                std::fprintf(stderr,
+                             "BOUNDED_CHANNEL_UNBLOCKED pop  name=\"%s\" ch=%p held=%llds "
+                             "warns=%d closed=%d\n",
+                             name_.c_str(),
+                             static_cast<const void*>(this),
+                             static_cast<long long>(held),
+                             warns,
+                             closed_ ? 1 : 0);
+            }
         }
         if (queue_.empty()) {
             return std::nullopt;
@@ -229,6 +284,9 @@ private:
     // Seconds before a still-blocked push/pop logs a stuck-warning.
     // Picked > the longest legitimate backpressure stall we expect
     // under steady-state load so normal slow consumers don't spam.
+    // Seconds before a still-blocked push/pop logs its FIRST stuck-warning.
+    // Picked > the longest legitimate backpressure stall we expect under
+    // steady-state load so normal slow consumers don't spam.
     static constexpr int kStuckWarnInterval = 3;
 
     mutable std::mutex mu_;
@@ -237,6 +295,7 @@ private:
     std::deque<T> queue_;
     std::size_t capacity_{};
     std::string name_;
+    std::chrono::milliseconds stuck_warn_base_{kStuckWarnInterval * 1000};
     bool closed_{false};
     ChannelCloseReason close_reason_{ChannelCloseReason::Finished};
     int push_waiters_{0};
