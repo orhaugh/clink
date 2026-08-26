@@ -168,6 +168,32 @@ upgrade does not silently invalidate checkpoints or savepoints. What the
 engine can do, feature by feature with caveats stated, lives in the
 [capability catalogue](https://orhaugh.github.io/clink/capabilities/).
 
+## Road to 1.0
+
+The path to 1.0 is primarily about stability and operational evidence rather
+than adding another broad layer of features.
+
+Before 1.0, the priorities are:
+
+- **Long-duration qualification.** Complete multi-day production-style
+  campaigns and continue expanding the measured state, scale and recovery
+  envelope.
+- **Stable public APIs.** Settle the C++, C and SQL-facing interfaces that
+  should carry compatibility guarantees across the 1.x line.
+- **Stable extension model.** Reduce coupling between compiled plugins and
+  individual clink revisions, with a clearly defined compatibility contract.
+- **Native type ergonomics.** Make a single schema declaration sufficient for
+  Arrow conversion, state serialization and distributed type registration.
+- **Operational maturity.** Incorporate real-world deployment feedback,
+  strengthen upgrade and diagnostic tooling, and close issues found by
+  external workloads.
+
+1.0 will mean that these compatibility and operational contracts are ready to
+be relied upon. It will not mean that feature development stops.
+
+See [GitHub issues](https://github.com/orhaugh/clink/issues) for work currently
+in progress.
+
 ## Documentation
 
 Everything below is published at
