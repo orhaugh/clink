@@ -59,6 +59,18 @@ on:
         description: "Compile in the named fault points (2PC crash windows) for a qualification campaign. Publishes -faultinj suffixed tags: a shipped image must never gain a fault surface silently."
         type: boolean
         default: false
+      manifest_only:
+        description: "Skip the builds and only (re)create the multi-arch manifest from per-arch digests already in the registry. Recovery for a run whose builds succeeded but whose manifest step did not."
+        type: string
+        default: ""
+      manifest_digests:
+        description: "manifest_only: comma-separated per-arch image digests already pushed (sha256:... , one per architecture)."
+        type: string
+        default: ""
+      manifest_tags:
+        description: "manifest_only: comma-separated full tag refs to publish, overriding the ones this run would compute from its ref."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -84,6 +96,7 @@ jobs:
     # one. The arm64 half exists so `docker run` on an Apple Silicon laptop
     # runs the real thing rather than an emulated x86 image - which is the
     # difference between trying clink and watching it crawl.
+    if: ${{ inputs.manifest_only != 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -162,6 +175,9 @@ jobs:
   manifest:
     name: Tag the multi-arch manifest
     needs: publish
+    # always(), because the recovery path deliberately skips the build job:
+    # a skipped dependency would otherwise skip this one too.
+    if: ${{ always() && (inputs.manifest_only == 'true' || needs.publish.result == 'success') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -197,10 +213,17 @@ jobs:
           else
             tags="${tags},${IMAGE}:main${suffix}"
           fi
+          # An explicit list wins: a recovery run dispatched from a branch
+          # would otherwise compute that branch's tags and publish the
+          # rebuilt manifest under the wrong names.
+          if [ -n "${{ inputs.manifest_tags }}" ]; then
+            tags="${{ inputs.manifest_tags }}"
+          fi
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           echo "Publishing: ${tags}"
 
       - uses: actions/download-artifact@v4
+        if: ${{ inputs.manifest_only != 'true' }}
         with:
           pattern: runtime-digest-*
           merge-multiple: true
@@ -209,25 +232,41 @@ jobs:
       - name: Create the manifest
         run: |
           set -euo pipefail
-          cd /tmp/digests
+          # Per-arch images come from the build job's digest artefacts, or -
+          # on the recovery path - from digests named explicitly because they
+          # are already in the registry from an earlier run whose builds
+          # succeeded and whose manifest step did not.
+          refs=""
+          if [ "${{ inputs.manifest_only }}" = "true" ]; then
+            for d in $(echo '${{ inputs.manifest_digests }}' | tr ',' ' '); do
+              case "$d" in sha256:*) ;; *) d="sha256:${d}" ;; esac
+              refs="${refs} ${IMAGE}@${d}"
+            done
+          else
+            cd /tmp/digests
+            for d in *; do refs="${refs} ${IMAGE}@sha256:${d}"; done
+          fi
           # Refuse BEFORE tagging, not after. fail-fast is off so a broken
           # arm64 build still lets amd64 finish, and merging whatever showed
           # up would publish a single-arch image under ":latest" - working,
           # pullable, and wrong for half the people who pull it. The tags are
           # the thing that must never lie; failing here leaves the previous
           # ones in place.
-          n="$(ls -1 | wc -l | tr -d ' ')"
+          n="$(echo ${refs} | wc -w | tr -d ' ')"
           if [ "$n" -ne 2 ]; then
             echo "::error::expected 2 per-arch digests, found ${n} - refusing to tag a partial manifest"
-            ls -la
+            echo "refs:${refs}"
             exit 1
           fi
-          refs=""
-          for d in *; do refs="${refs} ${IMAGE}@sha256:${d}"; done
+          # Split the tag list through an EXPANSION. `IFS=, ; for t in <literal>`
+          # does NOT split: IFS governs expansions, not literal words in the
+          # source, so all three tags arrived as one argument and `-t a,b,c`
+          # was refused as an invalid reference format. v0.8.0's tag run died
+          # exactly here, with both architectures already built and pushed.
           targs=""
-          IFS=','
-          for t in ${{ steps.tags.outputs.tags }}; do targs="${targs} -t ${t}"; done
-          unset IFS
+          for t in $(echo '${{ steps.tags.outputs.tags }}' | tr ',' ' '); do
+            targs="${targs} -t ${t}"
+          done
           echo "Merging${refs} into${targs}"
           docker buildx imagetools create ${targs} ${refs}
           first="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
