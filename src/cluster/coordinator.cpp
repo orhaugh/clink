@@ -3234,6 +3234,10 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
         ack.message = "savepoint timed out after " + std::to_string(timeout.count()) + "ms";
         return ack;
     }
+    // The handle the operator is about to be given must not decay under
+    // them. Pinned here, once the checkpoint has COMPLETED, so a savepoint
+    // that failed pins nothing (item 74).
+    it->second->pinned_checkpoint_ids.insert(ckpt_id);
     ack.ok = true;
     ack.checkpoint_id = ckpt_id;
     ack.message = "savepoint complete";
@@ -7431,6 +7435,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                     job.pending_confirms.erase(job.pending_confirms.begin());
                 }
                 cc.retain_floor = std::max<std::uint64_t>(job.latest_confirmed_checkpoint_id, 1);
+            }
+            // Savepoints ride every commit, whether or not the job runs the
+            // confirmed-restore protocol above: a pin that only reached the
+            // workers under one protocol would be a pin that sometimes holds.
+            if (job_it != jobs_.end()) {
+                cc.pinned_checkpoint_ids.assign(job_it->second->pinned_checkpoint_ids.begin(),
+                                                job_it->second->pinned_checkpoint_ids.end());
             }
         }
         const auto frame = fenced_frame_(MessageKind::CommitCheckpoint, cc);

@@ -3150,3 +3150,130 @@ TEST(Cluster, CancellingAJobReleasesTheWorkersRegistrationsForIt) {
                          << "would stack another set on top of these";
     std::filesystem::remove(out_path);
 }
+
+// A savepoint must outlive the checkpoints taken after it (followups item 74).
+//
+// `clink savepoint` hands the operator a (dir, id) and tells them to relocate
+// it. On an operator whose retention keeps only the newest snapshot, the next
+// periodic checkpoint used to unlink the savepoint's files - a window of ONE
+// checkpoint interval to copy a possibly multi-GiB tree. QUAL-08's rehearsal
+// lost 4 of 10 subtask snapshots of a savepoint before its restore ran.
+//
+// The coordinator now pins every savepoint id for the job's lifetime and
+// carries the pinned set on CommitCheckpoint; the worker's purge and sweep
+// both skip it. This drives a real cluster with keep-newest retention and a
+// fast checkpoint clock, takes a savepoint, lets several checkpoints complete
+// and commit, and then requires the savepoint's snapshot to be present in
+// EVERY subtask directory while the unpinned checkpoint before it is gone -
+// so the test can tell "pinned" from "nothing was swept at all".
+TEST(Cluster, ASavepointSurvivesTheCheckpointsTakenAfterIt) {
+    ensure_built_ins_registered();
+    const auto ckpt_dir = std::filesystem::temp_directory_path() /
+                          ("clink_savepoint_pin_" + std::to_string(::getpid()));
+    const auto out_path = ckpt_dir / "out.txt";
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::create_directories(ckpt_dir);
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"worker-pin"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 8;
+    wcfg.checkpoint_num_retained = 1;  // keep-newest: the policy that ate savepoints
+    Worker worker("worker-pin", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(5s));
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "50000000"}, {"delay_ms", "1"}};
+    g.ops.push_back(src);
+    OperatorSpec a;
+    a.type = "identity_int64";
+    a.id = "a";
+    a.inputs = {"src"};
+    a.parallelism = 2;
+    a.out_channel = std::string{kChannelInt64};
+    g.ops.push_back(a);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"a"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = ckpt_dir.string();
+    ckpt.interval_ms = 200;
+    const auto job_id = coordinator.submit_job(
+        g, OperatorRegistry::default_instance(), std::vector<PluginBinary>{}, ckpt, nullptr);
+    ASSERT_GT(job_id, 0U);
+
+    const auto completed = [&]() -> std::uint64_t {
+        const auto snap = coordinator.snapshot_job(job_id);
+        return snap ? snap->latest_completed_checkpoint_id : 0;
+    };
+    const auto await_completed = [&](std::uint64_t at_least, std::chrono::seconds budget) {
+        const auto deadline = std::chrono::steady_clock::now() + budget;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (completed() >= at_least) {
+                return true;
+            }
+            std::this_thread::sleep_for(50ms);
+        }
+        return false;
+    };
+    ASSERT_TRUE(await_completed(2, 20s)) << "the job never checkpointed";
+
+    const auto sp = coordinator.take_savepoint(job_id, 20s);
+    ASSERT_TRUE(sp.ok) << sp.message;
+    const std::uint64_t S = sp.checkpoint_id;
+    ASSERT_GE(S, 2u);
+
+    // Several more checkpoints complete and commit; each commit runs the
+    // worker's retention.
+    ASSERT_TRUE(await_completed(S + 4, 30s)) << "checkpoints stopped after the savepoint";
+    std::this_thread::sleep_for(500ms);  // let the last commit's sweep land
+
+    // Every subtask directory that holds snapshots must still hold S.
+    const std::string want = "checkpoint-" + std::to_string(S) + ".snap";
+    const std::string prev = "checkpoint-" + std::to_string(S - 1) + ".snap";
+    std::size_t dirs_with_snapshots = 0, dirs_with_savepoint = 0, dirs_with_prev = 0;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(ckpt_dir)) {
+        if (!e.is_directory()) {
+            continue;
+        }
+        bool any = false, has_want = false, has_prev = false;
+        for (const auto& f : std::filesystem::directory_iterator(e.path())) {
+            const auto name = f.path().filename().string();
+            if (name.starts_with("checkpoint-") && name.ends_with(".snap")) {
+                any = true;
+                has_want = has_want || name == want;
+                has_prev = has_prev || name == prev;
+            }
+        }
+        if (any) {
+            ++dirs_with_snapshots;
+            dirs_with_savepoint += has_want;
+            dirs_with_prev += has_prev;
+        }
+    }
+    (void)coordinator.cancel_job(job_id);
+    ASSERT_GT(dirs_with_snapshots, 0u) << "no snapshot directories under " << ckpt_dir;
+    EXPECT_EQ(dirs_with_savepoint, dirs_with_snapshots)
+        << "the savepoint's snapshot is missing from "
+        << (dirs_with_snapshots - dirs_with_savepoint) << " of " << dirs_with_snapshots
+        << " subtask directories - retention swept it";
+    EXPECT_EQ(dirs_with_prev, 0u)
+        << "the unpinned checkpoint before the savepoint is still present in " << dirs_with_prev
+        << " directories, so retention did not run and this test proves nothing about the pin";
+    std::filesystem::remove_all(ckpt_dir);
+}

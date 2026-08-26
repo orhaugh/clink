@@ -1028,6 +1028,7 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
     std::vector<std::shared_ptr<StateBackend>> sweep_backends;
     std::uint64_t sweep_cutoff = 0;
     std::set<std::uint64_t> sweep_retained;
+    std::set<std::uint64_t> pinned;
     std::string receipt_store_root;
     std::vector<CheckpointId> receipt_purge_ids;
     {
@@ -1039,6 +1040,11 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
                          .first;
         }
         auto purge_ids = ret_it->second.record_completed(CheckpointId{msg.checkpoint_id});
+        // A savepoint is a checkpoint the operator asked to keep. Neither the
+        // keep-newest purge nor the orphan sweep below may touch it (item 74).
+        pinned.insert(msg.pinned_checkpoint_ids.begin(), msg.pinned_checkpoint_ids.end());
+        std::erase_if(purge_ids,
+                      [&](const CheckpointId id) { return pinned.contains(id.value()); });
         // Commit-confirmed restore protocol: the coordinator's retention
         // floor forbids purging anything at or above the newest CONFIRMED
         // checkpoint - that is the job's restore target while newer
@@ -1102,7 +1108,8 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
     // Runs after the broadcast-driven purges so a just-evicted id is
     // already gone rather than double-purged.
     const auto is_sweepable = [&](const std::uint64_t id) {
-        return sweep_cutoff > 0 && id < sweep_cutoff && !sweep_retained.contains(id);
+        return sweep_cutoff > 0 && id < sweep_cutoff && !sweep_retained.contains(id) &&
+               !pinned.contains(id);
     };
     for (const auto& backend : sweep_backends) {
         std::vector<CheckpointId> held;

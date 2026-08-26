@@ -883,6 +883,13 @@ struct CommitCheckpointMsg {
     // eof-guarded, defaulted to 0 by older peers - which yields exactly
     // the pre-protocol behaviour.
     std::uint64_t retain_floor{0};
+    // Checkpoint ids the worker must never purge or sweep, however old: the
+    // job's savepoints. A savepoint handle is printed to an operator who then
+    // has to relocate a multi-GiB tree; before this field the files were
+    // unlinked one checkpoint interval later on any operator that keeps only
+    // the newest snapshot (item 74). Tail field, absent from an older
+    // coordinator: empty = nothing pinned, the previous behaviour.
+    std::vector<std::uint64_t> pinned_checkpoint_ids;
 };
 
 // coordinator → worker. Broadcast when the coordinator decides a checkpoint

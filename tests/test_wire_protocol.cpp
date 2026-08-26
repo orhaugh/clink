@@ -1054,27 +1054,42 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
     }
     {
         // CommitCheckpoint's tail has grown: the fencing epoch (8 bytes) plus
-        // the commit-confirmed retention floor (8 bytes). A peer that predates
-        // BOTH sends neither, so 16 bytes come off, not 8.
+        // the commit-confirmed retention floor (8 bytes), then the pinned
+        // savepoint list (item 74: a 4-byte count, empty here). A peer that
+        // predates ALL of them sends none, so 20 bytes come off, not 8.
         CommitCheckpointMsg in{
             .job_id = 1, .checkpoint_id = 22, .coordinator_epoch = 9, .retain_floor = 5};
         auto out = round_trip_without_epoch_field(
-            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint, /*tail_bytes=*/16);
+            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint, /*tail_bytes=*/20);
         EXPECT_EQ(out.checkpoint_id, 22U);
         EXPECT_EQ(out.coordinator_epoch, 0U);
         EXPECT_EQ(out.retain_floor, 0U);
     }
     {
-        // The intermediate peer: has fencing, predates the retention floor.
-        // Chops only the floor; the epoch must survive and the floor must
-        // read 0 = no retention constraint, the pre-protocol behaviour.
+        // The intermediate peer: has fencing, predates the retention floor
+        // (and therefore the pinned list too). Chops the floor and the count;
+        // the epoch must survive and the floor must read 0 = no retention
+        // constraint, the pre-protocol behaviour.
         CommitCheckpointMsg in{
             .job_id = 1, .checkpoint_id = 23, .coordinator_epoch = 9, .retain_floor = 5};
         auto out = round_trip_without_epoch_field(
-            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint, /*tail_bytes=*/8);
+            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint, /*tail_bytes=*/12);
         EXPECT_EQ(out.checkpoint_id, 23U);
         EXPECT_EQ(out.coordinator_epoch, 9U);
         EXPECT_EQ(out.retain_floor, 0U);
+        EXPECT_TRUE(out.pinned_checkpoint_ids.empty());
+    }
+    {
+        // The next rung: has the retention floor, predates pinned savepoints
+        // (item 74). Chops only the 4-byte count; floor survives, nothing
+        // pinned - which is what that peer's workers always did.
+        CommitCheckpointMsg in{
+            .job_id = 1, .checkpoint_id = 24, .coordinator_epoch = 9, .retain_floor = 5};
+        auto out = round_trip_without_epoch_field(
+            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint, /*tail_bytes=*/4);
+        EXPECT_EQ(out.coordinator_epoch, 9U);
+        EXPECT_EQ(out.retain_floor, 5U);
+        EXPECT_TRUE(out.pinned_checkpoint_ids.empty());
     }
     {
         // TriggerCheckpoint's tail has grown: the fencing epoch (8 bytes),
@@ -1270,4 +1285,35 @@ TEST(WireProtocol, SubtaskFinishedFromAnOlderWorkerActsOnTheErrorImmediately) {
     EXPECT_TRUE(out.had_error);
     EXPECT_FALSE(out.fatal);
     EXPECT_FALSE(out.transport_only);
+}
+
+// Pinned checkpoints on CommitCheckpoint (item 74). The worker's retention
+// sweep unlinks whatever this list does not protect, so a frame that lost
+// the list in transit would turn every savepoint into a one-interval handle
+// again - which is exactly the defect.
+TEST(WireProtocol, CommitCheckpointCarriesPinnedCheckpoints) {
+    CommitCheckpointMsg in{.job_id = 5, .checkpoint_id = 90};
+    in.coordinator_epoch = 3;
+    in.retain_floor = 88;
+    in.pinned_checkpoint_ids = {12, 48, 77};
+    auto out = round_trip(MessageKind::CommitCheckpoint, in, decode_commit_checkpoint);
+    EXPECT_EQ(out.checkpoint_id, 90u);
+    EXPECT_EQ(out.retain_floor, 88u);
+    EXPECT_EQ(out.pinned_checkpoint_ids, (std::vector<std::uint64_t>{12, 48, 77}));
+}
+
+TEST(WireProtocol, CommitCheckpointFromAnOlderCoordinatorPinsNothing) {
+    // A pre-item-74 coordinator stops after retain_floor. Nothing pinned is
+    // the behaviour that coordinator's workers had, so it is what they keep.
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::CommitCheckpoint));
+    b.put_u64_be(5);
+    b.put_u64_be(90);
+    b.put_u64_be(3);   // epoch
+    b.put_u64_be(88);  // retain_floor
+    MessageReader r(body_of(b.finalize()));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::CommitCheckpoint);
+    auto out = decode_commit_checkpoint(r);
+    EXPECT_EQ(out.retain_floor, 88u);
+    EXPECT_TRUE(out.pinned_checkpoint_ids.empty());
 }

@@ -283,6 +283,12 @@ inline void encode_body(MessageBuilder& b, const CommitCheckpointMsg& m) {
     // reading here still decodes the rest correctly.
     b.put_u64_be(m.coordinator_epoch);
     b.put_u64_be(m.retain_floor);
+    // Pinned checkpoints (item 74): count, then ids. Tail, so an older
+    // worker stops reading before it.
+    b.put_u32_be(static_cast<std::uint32_t>(m.pinned_checkpoint_ids.size()));
+    for (const auto id : m.pinned_checkpoint_ids) {
+        b.put_u64_be(id);
+    }
 }
 
 inline void encode_body(MessageBuilder& b, const AbortCheckpointMsg& m) {
@@ -838,6 +844,14 @@ inline CommitCheckpointMsg decode_commit_checkpoint(MessageReader& r) {
     // Retention floor (commit-confirmed restore). Absent from an older
     // coordinator: 0 = no constraint, the pre-protocol behaviour.
     m.retain_floor = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    // Pinned checkpoints (item 74). Absent from an older coordinator: none.
+    if (!r.eof()) {
+        const auto n = r.read_u32_be();
+        m.pinned_checkpoint_ids.reserve(n);
+        for (std::uint32_t i = 0; i < n && !r.eof(); ++i) {
+            m.pinned_checkpoint_ids.push_back(r.read_u64_be());
+        }
+    }
     return m;
 }
 

@@ -973,6 +973,13 @@ private:
         std::set<std::string> confirm_task_keys;
         std::map<std::uint64_t, std::set<std::string>> pending_confirms;
         std::uint64_t latest_confirmed_checkpoint_id{};
+        // Checkpoints an operator has asked to KEEP: every savepoint taken on
+        // this job. Carried to the workers on each CommitCheckpoint, where the
+        // retention sweep and the keep-newest purge both skip them. Pinned for
+        // the job's lifetime: a savepoint exists to outlive the moment it was
+        // taken, and before this it survived exactly one checkpoint interval
+        // on operators that keep only the newest snapshot (item 74).
+        std::set<std::uint64_t> pinned_checkpoint_ids;
         // bookkeeping, and increments restart_attempts.
         bool awaiting_restart{false};
         // Set when a transport-only subtask error is held pending its cause;
