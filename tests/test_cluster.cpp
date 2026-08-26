@@ -3041,3 +3041,112 @@ TEST(Cluster, AnOperatorThatThrowsFailsTheJobRatherThanCompletingItEmpty) {
                        << errors.front();
     std::filesystem::remove(out_path);
 }
+
+// A surviving worker must not accumulate one set of per-op registrations
+// per recovery (followups item 84).
+//
+// At deploy, a subtask's output-attach path registers drain, cutover-arm,
+// group-cutover and input-rebind hooks into per-job buckets keyed by op.
+// Those buckets were APPEND-ONLY: a whole-job restart redeploys the same
+// job id and pushes another set in, and nothing ever took the previous
+// set out. Each closure pins its generation's operator state, channels
+// and backends, so a worker that survives the restarts grows by one
+// generation of engine state per recovery while a worker that was killed
+// starts clean - which is exactly the shape a 9.4-hour campaign measured:
+// a survivor at 292 MiB after a fault-free window, 1656 MiB after 27
+// recoveries, flat to within 1 MiB whenever it was left alone.
+//
+// CancelJob is where a restart tears the old generation down, so it is
+// where the registrations must go. This drives a real job, waits until
+// the worker holds registrations for it, cancels, and requires zero.
+TEST(Cluster, CancellingAJobReleasesTheWorkersRegistrationsForIt) {
+    ensure_built_ins_registered();
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"worker-regs"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 8;
+    Worker worker("worker-regs", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(5s));
+
+    const auto out_path = std::filesystem::temp_directory_path() /
+                          ("clink_regs_" + std::to_string(::getpid()) + ".txt");
+    std::filesystem::remove(out_path);
+
+    // Two mid-chain ops so the graph has network-bridged edges on both
+    // sides of an operator: that is what registers the output-side and
+    // input-side hooks. A long source keeps the job running while we look.
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "50000000"}, {"delay_ms", "1"}};
+    g.ops.push_back(src);
+    OperatorSpec a;
+    a.type = "identity_int64";
+    a.id = "a";
+    a.inputs = {"src"};
+    a.parallelism = 2;
+    a.out_channel = std::string{kChannelInt64};
+    g.ops.push_back(a);
+    OperatorSpec b;
+    b.type = "identity_int64";
+    b.id = "b";
+    b.inputs = {"a"};
+    b.parallelism = 2;
+    b.out_channel = std::string{kChannelInt64};
+    g.ops.push_back(b);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"b"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    const auto job_id = coordinator.submit_job(g,
+                                               OperatorRegistry::default_instance(),
+                                               std::vector<PluginBinary>{},
+                                               CheckpointConfig{},
+                                               nullptr);
+    ASSERT_GT(job_id, 0U);
+
+    // The worker must actually HOLD registrations for the job before the
+    // cancel, or "zero afterwards" proves nothing.
+    std::size_t before = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        before = worker.registration_count(job_id);
+        if (before > 0) {
+            break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(before, 0U) << "the deployed job registered no per-op hooks on this worker, so "
+                             "this test cannot see whether cancel releases them";
+
+    (void)coordinator.cancel_job(job_id);
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, 30s));
+
+    // Cancel is processed on the worker's reader thread; give it a bounded
+    // moment rather than asserting the instant the coordinator sees completion.
+    std::size_t after = before;
+    const auto d2 = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < d2) {
+        after = worker.registration_count(job_id);
+        if (after == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_EQ(after, 0U) << "the worker still holds " << after << " registration(s) for a "
+                         << "cancelled job (held " << before << " while it ran); a restart "
+                         << "would stack another set on top of these";
+    std::filesystem::remove(out_path);
+}

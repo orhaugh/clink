@@ -1789,6 +1789,10 @@ void Worker::run_task_(JobId job_id,
     bool fatal = false;
     bool transport_only = false;
     std::string err_msg;
+    {
+        std::lock_guard lock(mu_);
+        ++per_job_live_subtasks_[job_id];
+    }
     try {
         // SQL-declared UDFs shipped with the job: register each before any
         // operator runs so expression evaluation resolves them. Process-wide
@@ -1874,6 +1878,39 @@ void Worker::run_task_(JobId job_id,
                                      .count()) +
                   "s had_error=" + (had_error ? "true" : "false") +
                   (err_msg.empty() ? "" : " error=" + err_msg));
+
+    {
+        // The last subtask of this job to leave this worker takes the job's
+        // per-op registrations with it. Those buckets - drain, cutover-arm,
+        // group-cutover, input-rebind hooks and the barrier injectors - are
+        // APPEND-ONLY at deploy: every redeploy of the same job pushes a
+        // fresh set in, and until now nothing took the previous set out. A
+        // worker that SURVIVED repeated restarts therefore stacked one
+        // generation of closures per recovery, each pinning its
+        // generation's operator state, channels and backends.
+        //
+        // Measured on a 9.4h campaign at 27 recoveries: a surviving
+        // worker's RSS 292 MiB -> 1656 MiB, threads 136 -> 224, fds
+        // 42 -> 67, while a fault-free window on the SAME process stayed
+        // flat to within 1 MiB over two hours (item 84).
+        //
+        // Here rather than at CancelJob: a subtask still mid-deploy when the
+        // cancel lands registers its hooks AFTER a cancel-time erase and they
+        // survive - the regression test caught exactly that. A subtask's own
+        // exit is the one point both dispatch paths share, and the
+        // coordinator drains every old subtask before a restart redeploys,
+        // so the count reaching zero is the old generation being gone.
+        std::lock_guard lock(mu_);
+        auto live = per_job_live_subtasks_.find(job_id);
+        if (live != per_job_live_subtasks_.end() && --live->second == 0) {
+            per_job_live_subtasks_.erase(live);
+            per_job_drain_callbacks_.erase(job_id);
+            per_job_arm_callbacks_.erase(job_id);
+            per_job_group_cutovers_.erase(job_id);
+            per_job_rebinds_.erase(job_id);
+            per_job_injectors_.erase(job_id);
+        }
+    }
 
     SubtaskFinishedMsg done;
     done.job_id = job_id;
@@ -3228,6 +3265,28 @@ void Worker::stop() {
 std::size_t Worker::retained_task_thread_count() const {
     std::lock_guard lock(mu_);
     return task_threads_.size();
+}
+
+std::size_t Worker::registration_count(JobId job_id) const {
+    std::lock_guard lock(mu_);
+    std::size_t n = 0;
+    if (auto it = per_job_drain_callbacks_.find(job_id); it != per_job_drain_callbacks_.end()) {
+        for (const auto& [_, v] : it->second)
+            n += v.size();
+    }
+    if (auto it = per_job_arm_callbacks_.find(job_id); it != per_job_arm_callbacks_.end()) {
+        for (const auto& [_, v] : it->second)
+            n += v.size();
+    }
+    if (auto it = per_job_group_cutovers_.find(job_id); it != per_job_group_cutovers_.end()) {
+        for (const auto& [_, v] : it->second)
+            n += v.size();
+    }
+    if (auto it = per_job_rebinds_.find(job_id); it != per_job_rebinds_.end()) {
+        for (const auto& [_, v] : it->second)
+            n += v.size();
+    }
+    return n;
 }
 
 void Worker::reap_finished_task_threads_locked_() {

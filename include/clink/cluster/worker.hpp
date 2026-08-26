@@ -189,6 +189,15 @@ public:
     // mapping survives, so only the handle count shows it.
     [[nodiscard]] std::size_t retained_task_thread_count() const;
 
+    // Per-op registrations this worker still holds for a job: the drain,
+    // cutover-arm, group-cutover and input-rebind hooks its subtasks
+    // registered at deploy, summed. Every redeploy of the job APPENDS a
+    // fresh set and each closure pins its generation's operator state, so
+    // on a worker that survives repeated restarts this is the number that
+    // must not grow with the restart count. Exposed because the growth is
+    // invisible from outside: RSS climbs, but nothing names why (item 84).
+    [[nodiscard]] std::size_t registration_count(JobId job_id) const;
+
     // ----- Snapshot API for the HTTP read endpoints -----
     //
     // Same shape as the coordinator side: take mu_ briefly, copy state into a
@@ -549,6 +558,10 @@ private:
         std::jthread thread;
     };
     std::unordered_map<JobId, std::vector<RebindPump>> per_job_rebind_pumps_;
+    // Subtasks of each job currently running on this worker, on either
+    // dispatch path. Reaching zero is the signal that the job's generation
+    // has left this worker and its per-op registrations can go (item 84).
+    std::unordered_map<JobId, std::size_t> per_job_live_subtasks_;
 
     void cancel_rebind_pumps_locked_(JobId job_id);
 
