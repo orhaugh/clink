@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.8.0 (unreleased)
+## v0.8.0 (August 2026)
 
 The launch release: the qualification programme run across the engine's
 guarantee surface, and the repository reshaped for public use.
