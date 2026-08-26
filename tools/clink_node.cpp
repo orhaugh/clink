@@ -195,9 +195,14 @@
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
 #include "clink/sql/view.hpp"
-
-#include "cli_tls_args.hpp"
 #endif
+
+// NOT inside the SQL guard above: the TLS argument validation is part of the
+// control plane and exists in every build. Placed there originally, it
+// vanished with -DCLINK_BUILD_SQL=OFF and broke exactly the builds the
+// normal CI never compiles - the sanitizer matrix found it as a compile
+// error in all three modes at once.
+#include "cli_tls_args.hpp"
 
 namespace {
 
