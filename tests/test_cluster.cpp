@@ -3063,11 +3063,14 @@ TEST(Cluster, CancellingAJobReleasesTheWorkersRegistrationsForIt) {
     ensure_built_ins_registered();
     Coordinator::Config cfg;
     cfg.max_restarts = 0;
+    cfg.heartbeat_timeout = clink::test_support::scale_slack(cfg.heartbeat_timeout);
     Coordinator coordinator(cfg);
     const auto port = coordinator.start();
     coordinator.expect_workers({"worker-regs"});
     Worker::Config wcfg;
     wcfg.slot_count = 8;
+    wcfg.coordinator_heartbeat_timeout =
+        clink::test_support::scale_slack(wcfg.coordinator_heartbeat_timeout);
     Worker worker("worker-regs", "127.0.0.1", wcfg);
     worker.connect_to_coordinator("127.0.0.1", port);
     ASSERT_TRUE(coordinator.await_registrations(5s));
@@ -3085,7 +3088,12 @@ TEST(Cluster, CancellingAJobReleasesTheWorkersRegistrationsForIt) {
     src.id = "src";
     src.parallelism = 1;
     src.out_channel = std::string{kChannelInt64};
-    src.params = {{"count", "50000000"}, {"delay_ms", "1"}};
+    // Long-lived, not huge: at 1 ms per record 2M records outlive any
+    // budget below by a wide margin. The built-in range source materialises
+    // its whole record vector at construction, so a count in the tens of
+    // millions kept a sanitizer build inside the factory for longer than the
+    // cancel budget - nothing observes a cancel before the executor exists.
+    src.params = {{"count", "2000000"}, {"delay_ms", "1"}};
     g.ops.push_back(src);
     OperatorSpec a;
     a.type = "identity_int64";
@@ -3176,11 +3184,19 @@ TEST(Cluster, ASavepointSurvivesTheCheckpointsTakenAfterIt) {
 
     Coordinator::Config cfg;
     cfg.max_restarts = 0;
+    // Liveness timeouts are not this test's contract. Under a sanitizer a
+    // 200 ms checkpoint cadence with snapshot workers churning can hold the
+    // heartbeat thread off the CPU past the 2 s default, and a worker
+    // declared lost checkpoints nothing - which then reads as "the job
+    // never checkpointed".
+    cfg.heartbeat_timeout = clink::test_support::scale_slack(cfg.heartbeat_timeout);
     Coordinator coordinator(cfg);
     const auto port = coordinator.start();
     coordinator.expect_workers({"worker-pin"});
     Worker::Config wcfg;
     wcfg.slot_count = 8;
+    wcfg.coordinator_heartbeat_timeout =
+        clink::test_support::scale_slack(wcfg.coordinator_heartbeat_timeout);
     wcfg.checkpoint_num_retained = 1;  // keep-newest: the policy that ate savepoints
     Worker worker("worker-pin", "127.0.0.1", wcfg);
     worker.connect_to_coordinator("127.0.0.1", port);
@@ -3192,7 +3208,8 @@ TEST(Cluster, ASavepointSurvivesTheCheckpointsTakenAfterIt) {
     src.id = "src";
     src.parallelism = 1;
     src.out_channel = std::string{kChannelInt64};
-    src.params = {{"count", "50000000"}, {"delay_ms", "1"}};
+    // Long-lived, not huge (see CancellingAJobReleasesTheWorkersRegistrationsForIt).
+    src.params = {{"count", "2000000"}, {"delay_ms", "1"}};
     g.ops.push_back(src);
     OperatorSpec a;
     a.type = "identity_int64";
@@ -3231,7 +3248,8 @@ TEST(Cluster, ASavepointSurvivesTheCheckpointsTakenAfterIt) {
         }
         return false;
     };
-    ASSERT_TRUE(await_completed(2, 20s)) << "the job never checkpointed";
+    ASSERT_TRUE(await_completed(2, clink::test_support::scale_slack(20s)))
+        << "the job never checkpointed";
 
     const auto sp = coordinator.take_savepoint(job_id, 20s);
     ASSERT_TRUE(sp.ok) << sp.message;
@@ -3240,7 +3258,8 @@ TEST(Cluster, ASavepointSurvivesTheCheckpointsTakenAfterIt) {
 
     // Several more checkpoints complete and commit; each commit runs the
     // worker's retention.
-    ASSERT_TRUE(await_completed(S + 4, 30s)) << "checkpoints stopped after the savepoint";
+    ASSERT_TRUE(await_completed(S + 4, clink::test_support::scale_slack(30s)))
+        << "checkpoints stopped after the savepoint";
     std::this_thread::sleep_for(500ms);  // let the last commit's sweep land
 
     // Every subtask directory that holds snapshots must still hold S.
