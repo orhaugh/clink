@@ -752,7 +752,15 @@ private:
         std::uint32_t protocol_version{0};
         // Transport. Owns the underlying fd (or TLS session). Reader
         // thread borrows; close() runs on watchdog teardown.
-        std::unique_ptr<network::Connection> conn;
+        //
+        // Shared, not unique: control frames are staged under mu_ and sent
+        // after it is released, and reap_finished_workers_() drops this
+        // reference under mu_. With unique ownership the reaper freed a
+        // Connection a sender had already copied the raw pointer of - a
+        // use-after-free TSan caught in a same-id re-registration during a
+        // restart drain. Every off-lock sender now holds its own reference,
+        // so the object outlives the last send that touches it.
+        std::shared_ptr<network::Connection> conn;
         std::thread reader;
         // Set by the reader as its LAST act, so another thread can tell a
         // finished reader from a running one and join it safely.
@@ -1373,7 +1381,7 @@ private:
     void handle_cancel_job_(network::Connection& conn, MessageReader& r);
     // Deferred control-plane frame: staged under mu_, sent outside it.
     struct PendingDeploy {
-        network::Connection* conn;
+        std::shared_ptr<network::Connection> conn;
         std::vector<std::byte> frame;
     };
 
@@ -1487,7 +1495,7 @@ private:
         JobState& job,
         const std::string& reason,
         const std::string& cause,
-        std::vector<std::pair<network::Connection*, JobId>>& cancels);
+        std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>>& cancels);
 
     // Replan a job at a changed per-operator parallelism.
     //

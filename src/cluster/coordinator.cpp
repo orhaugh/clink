@@ -1349,8 +1349,11 @@ std::size_t Coordinator::reap_finished_workers_() {
                 }
                 // Drop the socket too. shutdown_read() only half-closes, so
                 // without this the fd survives every lost worker for the life of
-                // the process. Every send site already null-checks conn, which is
-                // why releasing it here is safe rather than a new invariant.
+                // the process. This releases the map's reference only: a sender
+                // that staged a frame under mu_ holds its own shared_ptr and
+                // the Connection lives until that send returns. The null check
+                // at every send site was never enough on its own - a raw
+                // pointer copied before this reset dangled after it.
                 worker->conn.reset();
             }
             if (worker->conn) {
@@ -1899,7 +1902,7 @@ CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
     // Collect worker connections inside the lock, fan out outside. A blocked
     // send on one peer must not stall every other client / worker holding mu_
     // (heartbeats, SubtaskFinished, ...).
-    std::vector<network::Connection*> worker_conns;
+    std::vector<std::shared_ptr<network::Connection>> worker_conns;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -1925,7 +1928,7 @@ CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
                 auto worker_it = registered_.find(worker_id);
                 if (worker_it != registered_.end() && !worker_it->second->lost &&
                     worker_it->second->conn) {
-                    worker_conns.push_back(worker_it->second->conn.get());
+                    worker_conns.push_back(worker_it->second->conn);
                 }
             }
             ack.ok = true;
@@ -1937,7 +1940,7 @@ CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
         CancelJobMsg cj;
         cj.job_id = job_id;
         const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
-        for (auto* c : worker_conns) {
+        for (const auto& c : worker_conns) {
             send_frame(*c, frame);
         }
     }
@@ -1955,7 +1958,7 @@ RescaleJobAckMsg Coordinator::rescale_job(
     RescaleJobAckMsg ack;
     ack.job_id = job_id;
 
-    std::vector<network::Connection*> worker_conns;
+    std::vector<std::shared_ptr<network::Connection>> worker_conns;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -2116,7 +2119,7 @@ RescaleJobAckMsg Coordinator::rescale_job(
             auto worker_it = registered_.find(worker_id);
             if (worker_it != registered_.end() && !worker_it->second->lost &&
                 worker_it->second->conn) {
-                worker_conns.push_back(worker_it->second->conn.get());
+                worker_conns.push_back(worker_it->second->conn);
             }
         }
 
@@ -2133,7 +2136,7 @@ RescaleJobAckMsg Coordinator::rescale_job(
     CancelJobMsg cj;
     cj.job_id = job_id;
     const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
-    for (auto* c : worker_conns) {
+    for (const auto& c : worker_conns) {
         send_frame(*c, frame);
     }
 
@@ -2193,7 +2196,7 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
         return RescaleCoordinator::RequestResult{.ok = false, .reason = reason};
     };
 
-    std::vector<network::Connection*> worker_conns;
+    std::vector<std::shared_ptr<network::Connection>> worker_conns;
     std::vector<PendingDeploy> hot_frames;
     bool hot_engaged = false;
     std::uint32_t old_parallelism = 0;
@@ -2363,7 +2366,7 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
                 auto worker_it = registered_.find(worker_id);
                 if (worker_it != registered_.end() && !worker_it->second->lost &&
                     worker_it->second->conn) {
-                    worker_conns.push_back(worker_it->second->conn.get());
+                    worker_conns.push_back(worker_it->second->conn);
                 }
             }
             log::info("coordinator.rescale",
@@ -2389,7 +2392,7 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
     CancelJobMsg cj;
     cj.job_id = job_id;
     const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
-    for (auto* c : worker_conns) {
+    for (const auto& c : worker_conns) {
         send_frame(*c, frame);
     }
     return RescaleCoordinator::RequestResult{.ok = true, .accepted_target = new_parallelism};
@@ -2613,7 +2616,7 @@ bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
     for (const auto& worker_id : arm_workers) {
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn.get(), frame});
+            out_frames.push_back({it->second->conn, frame});
         }
     }
 
@@ -2666,7 +2669,7 @@ void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
     for (const auto& [worker_id, _] : job.tasks_by_worker) {
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn.get(), frame});
+            out_frames.push_back({it->second->conn, frame});
         }
     }
     hot.phase = JobState::HotCutover::Phase::AwaitingCut;
@@ -2758,7 +2761,7 @@ void Coordinator::hot_cutover_begin_rebind_locked_(JobState& job,
     for (const auto& worker_id : fed_workers) {
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn.get(), frame});
+            out_frames.push_back({it->second->conn, frame});
         }
     }
     log::info("coordinator.rescale",
@@ -2855,7 +2858,7 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         dm.adaptive_barrier_mode = job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         dm.expected_state_versions_packed = job.expected_state_versions_packed;
         dm.udfs_packed = job.udfs_packed;
-        out_frames.push_back({it->second->conn.get(), fenced_frame_(MessageKind::Deploy, dm)});
+        out_frames.push_back({it->second->conn, fenced_frame_(MessageKind::Deploy, dm)});
     }
     hot.phase = JobState::HotCutover::Phase::Deploying;
     hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
@@ -2912,8 +2915,7 @@ void Coordinator::hot_cutover_complete_locked_(JobState& job,
         msg.job_id = job.id;
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back(
-                {it->second->conn.get(), fenced_frame_(MessageKind::PeerUpdate, msg)});
+            out_frames.push_back({it->second->conn, fenced_frame_(MessageKind::PeerUpdate, msg)});
         }
     }
 
@@ -2967,7 +2969,7 @@ void Coordinator::hot_cutover_complete_locked_(JobState& job,
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
             out_frames.push_back(
-                {it->second->conn.get(), fenced_frame_(MessageKind::CutoverPeerUpdate, msg)});
+                {it->second->conn, fenced_frame_(MessageKind::CutoverPeerUpdate, msg)});
         }
     }
 
@@ -3053,7 +3055,7 @@ void Coordinator::abort_hot_cutover_locked_(JobState& job,
     for (const auto& [worker_id, _] : job.tasks_by_worker) {
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn.get(), frame});
+            out_frames.push_back({it->second->conn, frame});
         }
     }
 }
@@ -3136,7 +3138,7 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
     // frames outside the lock to avoid stalling readers.
     std::uint64_t ckpt_id = 0;
     std::uint64_t gen_for_trigger = 0;
-    std::vector<network::Connection*> worker_conns;
+    std::vector<std::shared_ptr<network::Connection>> worker_conns;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -3193,7 +3195,7 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
             auto worker_it = registered_.find(worker_id);
             if (worker_it != registered_.end() && !worker_it->second->lost &&
                 worker_it->second->conn) {
-                worker_conns.push_back(worker_it->second->conn.get());
+                worker_conns.push_back(worker_it->second->conn);
             }
         }
         ack.checkpoint_dir = job.checkpoint.checkpoint_dir;
@@ -3205,7 +3207,7 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
     tc.checkpoint_id = ckpt_id;
     tc.generation = gen_for_trigger;
     const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, tc);
-    for (auto* c : worker_conns) {
+    for (const auto& c : worker_conns) {
         send_frame(*c, frame);
     }
     log::info("coordinator.savepoint",
@@ -3251,7 +3253,7 @@ StopJobAckMsg Coordinator::stop_job(JobId job_id, std::chrono::milliseconds time
         timeout = std::chrono::milliseconds{60'000};
     }
 
-    std::vector<network::Connection*> worker_conns;
+    std::vector<std::shared_ptr<network::Connection>> worker_conns;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -3280,7 +3282,7 @@ StopJobAckMsg Coordinator::stop_job(JobId job_id, std::chrono::milliseconds time
             auto worker_it = registered_.find(worker_id);
             if (worker_it != registered_.end() && !worker_it->second->lost &&
                 worker_it->second->conn) {
-                worker_conns.push_back(worker_it->second->conn.get());
+                worker_conns.push_back(worker_it->second->conn);
             }
         }
         log::info("coordinator.stop",
@@ -3292,7 +3294,7 @@ StopJobAckMsg Coordinator::stop_job(JobId job_id, std::chrono::milliseconds time
     StopSubtasksMsg msg;
     msg.job_id = job_id;
     const auto frame = fenced_frame_(MessageKind::StopSubtasks, msg);
-    for (auto* c : worker_conns) {
+    for (const auto& c : worker_conns) {
         send_frame(*c, frame);
     }
 
@@ -4492,7 +4494,7 @@ void Coordinator::watchdog_loop_() {
         }
         const auto now = std::chrono::steady_clock::now();
         bool any_lost = false;
-        std::vector<std::pair<network::Connection*, JobId>> survivor_cancels;
+        std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> survivor_cancels;
         std::vector<PendingDeploy> deferred_restart_deploys;
         {
             std::lock_guard lock(mu_);
@@ -4554,7 +4556,7 @@ void Coordinator::watchdog_loop_() {
                     for (const auto& [worker_id, _] : job->tasks_by_worker) {
                         auto it = registered_.find(worker_id);
                         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-                            survivor_cancels.emplace_back(it->second->conn.get(), job_id);
+                            survivor_cancels.emplace_back(it->second->conn, job_id);
                         }
                     }
                     // If the job is awaiting_restart and no surviving
@@ -4981,7 +4983,7 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
 // default. F64 / follow-up 46.
 void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id) {
     bool touched = false;
-    std::vector<std::pair<std::shared_ptr<WorkerConnection>, JobId>> survivor_cancels;
+    std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> survivor_cancels;
     {
         std::lock_guard lock(mu_);
         for (auto& [job_id, job] : jobs_) {
@@ -5011,15 +5013,15 @@ void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id
                 }
                 auto it = registered_.find(other_worker_id);
                 if (it != registered_.end() && !it->second->lost && it->second->conn) {
-                    survivor_cancels.emplace_back(it->second, job_id);
+                    survivor_cancels.emplace_back(it->second->conn, job_id);
                 }
             }
         }
     }
-    for (const auto& [survivor, job_id] : survivor_cancels) {
+    for (const auto& [conn, job_id] : survivor_cancels) {
         CancelJobMsg cancel;
         cancel.job_id = job_id;
-        (void)send_frame(*survivor->conn, fenced_frame_(MessageKind::CancelJob, cancel));
+        (void)send_frame(*conn, fenced_frame_(MessageKind::CancelJob, cancel));
     }
     // A fold may have emptied the drain, which is the condition that fires the
     // redeploy, and a fresh restart needs the watchdog to act on it. Either way,
@@ -5747,8 +5749,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
             job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
-        out.push_back(
-            {worker_it->second->conn.get(), fenced_frame_(MessageKind::Deploy, deploy_msg)});
+        out.push_back({worker_it->second->conn, fenced_frame_(MessageKind::Deploy, deploy_msg)});
     }
     return out;
 }
@@ -5785,7 +5786,7 @@ void Coordinator::dispatch_begin_rescale_locked_(JobState& job,
         if (worker_it == registered_.end() || worker_it->second->lost || !worker_it->second->conn) {
             continue;
         }
-        out.push_back({worker_it->second->conn.get(), frame});
+        out.push_back({worker_it->second->conn, frame});
         ++dispatched;
     }
     log::info("coordinator.rescale",
@@ -5981,8 +5982,7 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
             job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
-        out.push_back(
-            {worker_it->second->conn.get(), fenced_frame_(MessageKind::Deploy, deploy_msg)});
+        out.push_back({worker_it->second->conn, fenced_frame_(MessageKind::Deploy, deploy_msg)});
     }
 }
 
@@ -5997,7 +5997,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
     std::vector<PendingDeploy> restart_deploys;
     // CancelJob frames to drain still-running subtasks when a subtask error
     // triggers a whole-job restart of a checkpointed job; sent outside mu_.
-    std::vector<std::pair<network::Connection*, JobId>> error_restart_cancels;
+    std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> error_restart_cancels;
     {
         std::lock_guard lock(mu_);
         auto job_it = jobs_.find(job_id);
@@ -6257,7 +6257,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                     for (const auto& [worker_id2, _] : job.tasks_by_worker) {
                         auto cit = registered_.find(worker_id2);
                         if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
-                            error_restart_cancels.emplace_back(cit->second->conn.get(), job_id);
+                            error_restart_cancels.emplace_back(cit->second->conn, job_id);
                             ++peers;
                         }
                     }
@@ -6775,7 +6775,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
     JobState& job,
     const std::string& reason,
     const std::string& cause,
-    std::vector<std::pair<network::Connection*, JobId>>& cancels) {
+    std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>>& cancels) {
     job.awaiting_restart = true;
     // A real cause is now driving recovery, so any transport failure held
     // pending is absorbed as the symptom it was (item 83). The error text
@@ -6835,7 +6835,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
     for (const auto& [worker_id, _] : job.tasks_by_worker) {
         auto cit = registered_.find(worker_id);
         if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
-            cancels.emplace_back(cit->second->conn.get(), job.id);
+            cancels.emplace_back(cit->second->conn, job.id);
         }
     }
     return {};
@@ -6875,7 +6875,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     // discards a staged interval only a rewind re-emits). Collected under
     // the lock; dispatched outside it, after the abort broadcast.
     std::vector<PendingDeploy> failed_ckpt_deploys;
-    std::vector<std::pair<network::Connection*, JobId>> failed_ckpt_cancels;
+    std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> failed_ckpt_cancels;
     // BeginRescale frames queued by the checkpoint-completed
     // path. When the cutover checkpoint ack closes, any operator still
     // in Preparing advances to Draining and we send BeginRescale to
@@ -7085,8 +7085,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                                 auto cit = registered_.find(worker_id2);
                                 if (cit != registered_.end() && !cit->second->lost &&
                                     cit->second->conn) {
-                                    failed_ckpt_cancels.emplace_back(cit->second->conn.get(),
-                                                                     msg.job_id);
+                                    failed_ckpt_cancels.emplace_back(cit->second->conn, msg.job_id);
                                 }
                             }
                         }
@@ -7240,7 +7239,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     // so the receiving worker processes the abort first; aborted-group
     // sinks then no-op on the following CommitCheckpoint.
     for (const auto& [jid, ckpt_id] : groups_to_abort) {
-        std::vector<network::Connection*> worker_conns;
+        std::vector<std::shared_ptr<network::Connection>> worker_conns;
         {
             std::lock_guard lock(mu_);
             auto job_it = jobs_.find(jid);
@@ -7249,7 +7248,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                     auto worker_it = registered_.find(worker_id);
                     if (worker_it != registered_.end() && !worker_it->second->lost &&
                         worker_it->second->conn) {
-                        worker_conns.push_back(worker_it->second->conn.get());
+                        worker_conns.push_back(worker_it->second->conn);
                     }
                 }
             }
@@ -7258,7 +7257,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         ac.job_id = jid;
         ac.checkpoint_id = ckpt_id;
         const auto frame = fenced_frame_(MessageKind::AbortCheckpoint, ac);
-        for (auto* c : worker_conns)
+        for (const auto& c : worker_conns)
             send_frame(*c, frame);
     }
     // The failed-checkpoint restart: cancels drain the in-flight subtasks
@@ -7378,7 +7377,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         // transactions, the marker is durable, so a crash mid-broadcast
         // still lets recovery find COMPLETED-N and commit on restore.
         CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCommitBroadcast);
-        std::vector<network::Connection*> worker_conns;
+        std::vector<std::shared_ptr<network::Connection>> worker_conns;
         {
             std::lock_guard lock(mu_);
             auto job_it = jobs_.find(jid);
@@ -7405,7 +7404,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                     auto worker_it = registered_.find(worker_id);
                     if (worker_it != registered_.end() && !worker_it->second->lost &&
                         worker_it->second->conn) {
-                        worker_conns.push_back(worker_it->second->conn.get());
+                        worker_conns.push_back(worker_it->second->conn);
                     }
                 }
             }
@@ -7445,7 +7444,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             }
         }
         const auto frame = fenced_frame_(MessageKind::CommitCheckpoint, cc);
-        for (auto* c : worker_conns)
+        for (const auto& c : worker_conns)
             send_frame(*c, frame);
     }
     // Wake anyone waiting on latest_completed_checkpoint_id to advance
@@ -7624,15 +7623,15 @@ void Coordinator::checkpoint_trigger_loop_() {
             m.barrier_mode_plus1 = mode_plus1;
             const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, m);
             for (const auto& worker_id : worker_ids) {
-                network::Connection* c = nullptr;
+                std::shared_ptr<network::Connection> c;
                 {
                     std::lock_guard lock(mu_);
                     auto it = registered_.find(worker_id);
                     if (it != registered_.end() && !it->second->lost && it->second->conn) {
-                        c = it->second->conn.get();
+                        c = it->second->conn;
                     }
                 }
-                if (c != nullptr) {
+                if (c) {
                     send_frame(*c, frame);
                 }
             }
