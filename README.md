@@ -77,6 +77,14 @@ mounting it:
 docker run --rm -v "$PWD:/work" ghcr.io/orhaugh/clink-runtime:latest run /work/mine.sql
 ```
 
+Want to build something real? Follow the
+[Kafka to clink to ClickHouse tutorial](https://orhaugh.github.io/clink/tutorials/kafka-to-clickhouse/):
+one `docker compose up` gives you a broker, a database and a small clink
+cluster running an event-time windowed pipeline; you then kill the Worker
+mid-stream, watch it recover from its checkpoint, verify every result
+independently, and open the job's state as an Arrow table. The example
+lives in [examples/kafka-to-clickhouse](examples/kafka-to-clickhouse/).
+
 ## Build from source
 
 clink builds against a pinned Apache Arrow toolchain in `~/.clink-deps`.
@@ -217,6 +225,10 @@ Everything below is published at
 - [Benchmarks](https://orhaugh.github.io/clink/benchmarks/) and
   [cost footprint](https://orhaugh.github.io/clink/efficiency/).
 - [Qualification](https://orhaugh.github.io/clink/qualification/).
+- [Tutorial](https://orhaugh.github.io/clink/tutorials/kafka-to-clickhouse/):
+  Kafka to clink to ClickHouse on your machine, with a deliberate Worker
+  kill and independent verification
+  ([examples/kafka-to-clickhouse](examples/kafka-to-clickhouse/)).
 - [Runnable examples](docs/consumer-examples/): every core feature as a
   standalone buildable program, from hello-pipeline to the testing
   framework and state-as-data workflows.

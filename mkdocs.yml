@@ -49,6 +49,7 @@ exclude_docs: |
   !/sql.md
   /*/
   !/guides/
+  !/tutorials/
   !/internals/
   !/connectors/
   !/design/
@@ -80,6 +81,8 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Tutorials:
+      - Your first real Clink pipeline: tutorials/kafka-to-clickhouse.md
   - Guides:
       - C++ stream processing engine: guides/cpp-stream-processing.md
       - Streaming SQL in C++: guides/cpp-streaming-sql.md

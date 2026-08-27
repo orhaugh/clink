@@ -1,0 +1,170 @@
+# Kafka -> clink -> ClickHouse, on one machine.
+#
+#   docker compose up -d           # Kafka, ClickHouse, a clink Coordinator and
+#                                  # Worker; the pipeline is submitted for you
+#   ./scripts/produce_events.py    # stream the readings in
+#   ./scripts/verify.py            # check ClickHouse against the expectation
+#   docker compose down -v         # remove everything, data included
+#
+# The walkthrough is docs/tutorials/kafka-to-clickhouse.md (published at
+# https://orhaugh.github.io/clink/tutorials/kafka-to-clickhouse/).
+#
+# Two clink roles run here because that is how clink recovers: the Worker
+# runs the operators, the Coordinator drives checkpoints and, when the Worker
+# dies, restarts the job from the last completed checkpoint. Both share the
+# `clink-state` volume, where checkpoints live. Kill the Worker, start it
+# again, and watch the Coordinator do exactly that.
+#
+# Host ports (override if they collide with something you run locally):
+#   CLINK_HTTP_PORT       Coordinator HTTP API      default 8081
+#   CLICKHOUSE_HTTP_PORT  ClickHouse HTTP interface default 8123
+# CLINK_IMAGE picks a different clink image (default: the published :latest).
+
+services:
+  kafka:
+    # Single-node KRaft broker. Only reachable inside this compose network as
+    # kafka:9092; scripts/produce_events.py writes through the container's own
+    # console producer, so nothing Kafka-specific is needed on the host.
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # The topic is created explicitly by kafka-init below, so a typo in a
+      # producer command fails loudly instead of auto-creating a stray topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 10s
+
+  # One-shot: create the input topic. clink assigns Kafka partitions itself at
+  # start-up, so the topic must exist before the pipeline is submitted.
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command:
+      - --bootstrap-server=kafka:9092
+      - --create
+      - --if-not-exists
+      - --topic=readings
+      - --partitions=1
+      - --replication-factor=1
+    restart: "no"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    environment:
+      # The image restricts its passwordless `default` user to localhost, so
+      # the pipeline connects as this network-reachable user instead
+      # (pipeline.sql carries the same credentials).
+      CLICKHOUSE_USER: clink
+      CLICKHOUSE_PASSWORD: clink
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    volumes:
+      # Creates the sensor_window_stats table on first start.
+      - ./clickhouse-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      # Healthy only once the init script has created the table the
+      # pipeline writes to.
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1 FROM sensor_window_stats LIMIT 0'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  coordinator:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    command:
+      - --role=coordinator
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=coordinator
+      - --http-port=8081
+      - --http-bind=0.0.0.0
+      # Persist job manifests, so a Coordinator that is killed and started
+      # again recovers its running jobs instead of forgetting them.
+      - --ha-dir=/state/ha
+    ports:
+      - "${CLINK_HTTP_PORT:-8081}:8081"
+    volumes:
+      - clink-state:/state
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  worker:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    command:
+      - --role=worker
+      - --id=worker-1
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    volumes:
+      - clink-state:/state
+    healthcheck:
+      # The Worker answers 200 only once it is registered with the
+      # Coordinator, which is what `submit` needs to wait for.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  # One-shot: submit pipeline.sql to the Coordinator. The same command, without
+  # the --coordinator-* flags, would run the file embedded in one process.
+  submit:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    depends_on:
+      worker:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./pipeline.sql:/pipeline.sql:ro
+    command:
+      - run
+      - /pipeline.sql
+      - --coordinator-host=coordinator
+      - --coordinator-port=8081
+      - --name=sensor-windows
+      # Checkpoint every two seconds into the shared volume. Short on purpose:
+      # the tutorial kills the Worker and wants a recent recovery point.
+      - --checkpoint-dir=/state/checkpoints
+      - --checkpoint-interval-ms=2000
+    restart: "no"
+
+volumes:
+  clink-state:

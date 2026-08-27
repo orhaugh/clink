@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+**A first end-to-end tutorial, and what building it found.** `examples/kafka-to-clickhouse`
+brings up Kafka, ClickHouse and a clink Coordinator and Worker with one
+`docker compose up`, streams a deterministic sensor workload through an
+event-time windowed SQL pipeline into ClickHouse, has the reader kill the
+Worker mid-stream and start it again, verifies every window against an
+expectation recomputed independently of the engine, and opens the job's
+keyed state as an Arrow table. The walkthrough is published as "Your first
+real Clink pipeline"; `run.sh` runs the whole thing unattended and is what
+CI executes against the published runtime image. The same pipeline was run
+unchanged, at parallelism four, on a distributed Coordinator/Worker cluster
+with a Worker killed mid-stream.
+
+Writing it against the real engine surfaced four defects, all fixed here.
+The ClickHouse sink never flushed at a checkpoint barrier, so a row still
+in its buffer when the process died after that checkpoint was lost on
+recovery, against a connector documented (and, in its own capability
+record, declared) as at-least-once; it now flushes in `on_barrier`, and
+the tutorial's SQL sets `batch_rows='1'` so it is also correct on v0.8.0.
+`clink --capabilities` rendered its manifest before any connector's
+`install()` had run, so the published image's manifest listed six
+built-ins and stated that Kafka, ClickHouse and every other compiled-in
+connector were absent; the CLI now installs the linked connectors first,
+and the manifest gate checks the CLI's output as well as the registry. An
+idle snapshot-worker queue was reported as `BOUNDED_CHANNEL_STUCK` every
+few seconds, escalating to `held=189s`, on a Worker with nothing to do;
+`BoundedChannel::mark_idle_pop_normal` lets a consumer that legitimately
+waits declare so, and the push-side stall warning is untouched. And the
+state inspection commands (`state-cat`, `state-diff`, `state-export`,
+`state-query`, `check-savepoint`, `capture-cat`, `replay-diff`) default
+their log level to off, as `--capabilities` already did, so `state-query`
+no longer prints the embedded engine's task lifecycle around its rows.
+
 **The runtime image's multi-arch manifest is published again.** v0.8.0's
 tag run built and pushed both architectures and then failed at the final
 step, so `:0.8.0` was never published and `:latest` still pointed at the

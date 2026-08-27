@@ -17,6 +17,10 @@ daemons; `libclink` embeds the engine in any service behind a pure-C ABI, and
 unchanged, submits to a distributed Coordinator/Worker cluster with
 parallelism, failover, and rescale.
 
+New here? [Your first real Clink pipeline](tutorials/kafka-to-clickhouse.md)
+runs Kafka, clink and ClickHouse on your machine, kills the Worker while data
+is flowing, and verifies the recovery independently. About ten minutes.
+
 If you are evaluating stream processing in C++, start with the focused guides:
 
 - [C++ stream processing engine](guides/cpp-stream-processing.md)
@@ -68,6 +72,8 @@ including the trade-offs accepted and the consequences that followed.
 
 - [Connector catalogue](connectors/README.md): every source and sink, with
   dependencies, factory names, options, and SQL usage.
+- [Tutorial](tutorials/kafka-to-clickhouse.md): Kafka to clink to ClickHouse
+  on one machine, with a deliberate Worker kill and independent verification.
 - [Runnable examples](consumer-examples/README.md): buildable programs from
   hello-pipeline to the testing framework and state-as-data workflows.
 - [Repository](https://github.com/orhaugh/clink) and
