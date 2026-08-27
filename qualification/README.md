@@ -28,6 +28,7 @@ Ground rules, non-negotiable:
 | `infra/*.yml` | Per-role docker compose files, host-networked on the private net |
 | `qual01/` | Kafka exactly-once campaign: deterministic generator, independent verifier, pipeline SQL, campaign driver |
 | `chaos/chaos.py` | The reusable fault controller (QUAL-09): kills, restarts, latency, partitions, targeted 2PC-window faults |
+| `tutorial-portability/` | NOT a campaign: one run asking whether the laptop tutorial's workflow holds on a real Coordinator/Worker deployment. No published page, no plan row. |
 
 ## The QUAL-01 oracle in one paragraph
 

@@ -40,6 +40,26 @@ run "chaos interface (every campaign's invocation parses)" \
 run "QUAL-02 driver parses" \
     bash -n "$HERE/../qual02/campaign.sh"
 
+# The tutorial-portability check is NOT a campaign (see its README), but it
+# drives the same rig with the same ssh discipline, and an unparseable
+# driver discovered after a provision costs the same paid minutes.
+run "tutorial-portability driver parses" \
+    bash -n "$HERE/../tutorial-portability/check.sh"
+
+run "tutorial-portability rig producer parses" \
+    python3 -c "import ast, pathlib; ast.parse(pathlib.Path('$HERE/../tutorial-portability/rig_produce.py').read_text())"
+
+# The check adapts the tutorial's pipeline.sql by string substitution, so a
+# renamed host in the tutorial must fail HERE, in seconds, rather than
+# twenty paid minutes into a rig.
+run "tutorial-portability can still adapt the tutorial's pipeline" \
+    python3 -c "
+import pathlib, sys
+sql = pathlib.Path('$HERE/../../examples/kafka-to-clickhouse/pipeline.sql').read_text()
+missing = [s for s in (\"brokers           = 'kafka:9092'\", \"host      = 'clickhouse'\")
+           if s not in sql]
+sys.exit('pipeline.sql no longer contains: %s' % missing if missing else 0)"
+
 run "QUAL-02 summariser result logic (PASS is earned, never assumed)" \
     python3 "$HERE/test_summarise2.py"
 

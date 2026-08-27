@@ -1,0 +1,31 @@
+# The tutorial-portability check's sink.
+#
+# Runs on the ops host, outside the clink failure domain, so the Worker
+# kill cannot take the results with it - the same placement rule the
+# campaigns use for their sinks and oracles.
+#
+# The image's passwordless `default` user is restricted to localhost, so
+# the pipeline connects as a network-reachable user created here. Same
+# credentials as the laptop tutorial, and the same init script, so the
+# table definition on the rig is the one the tutorial ships rather than a
+# rig-only variant.
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    container_name: tut-clickhouse
+    restart: "no"
+    environment:
+      CLICKHOUSE_USER: clink
+      CLICKHOUSE_PASSWORD: clink
+    volumes:
+      - ./clickhouse-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - tut-clickhouse-data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+volumes:
+  tut-clickhouse-data:
