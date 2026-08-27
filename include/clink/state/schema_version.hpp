@@ -133,6 +133,47 @@ private:
 // pure: they read input bytes and produce output bytes; they do not
 // touch the live state map or any operator. The registry composes
 // single-step migrations into multi-step chains as needed.
+// Shape fingerprints, keyed (op_id, keyed-state slot). Written into
+// snapshots beside the version map (its own metadata key, an additive
+// change per the snapshot format contract) and consulted at KeyedState
+// bind time: a stored fingerprint that differs from the live type's is a
+// shape change nobody declared, and the bind refuses rather than
+// misreading bytes. A completed migration CLEARS the migrated slots'
+// fingerprints, so a declared bump + migration passes the gate and the
+// next snapshot stamps the new shape. Absent fingerprints (older
+// snapshots, undescribed types, backends that do not store them) gate
+// nothing.
+class StateFingerprintMap {
+public:
+    // slot must not contain '\n' or '|' (pack delimiters); it is the
+    // keyed-state slot name, never empty at the stamp site.
+    void set(OperatorId op, const std::string& slot, std::uint64_t fingerprint);
+    [[nodiscard]] std::optional<std::uint64_t> get(OperatorId op, const std::string& slot) const;
+    // Remove the stamp for one slot, or every slot under `op` when slot
+    // is empty (the migrator's whole-operator entries).
+    void clear_for(OperatorId op, const std::string& slot);
+    [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
+    void clear() noexcept { entries_.clear(); }
+    // "<op>|<slot>|<16-hex-digit fp>" lines. Strict unpack: three fields
+    // exactly, lowercase-or-uppercase hex; malformed input throws
+    // std::runtime_error (a corrupt savepoint, not an absent map).
+    [[nodiscard]] std::string pack() const;
+    static StateFingerprintMap unpack(std::string_view packed);
+
+private:
+    struct Key {
+        std::uint64_t op;
+        std::string slot;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& k) const noexcept {
+            return std::hash<std::uint64_t>{}(k.op) ^ (std::hash<std::string>{}(k.slot) << 1);
+        }
+    };
+    std::unordered_map<Key, std::uint64_t, KeyHash> entries_;
+};
+
 class StateMigrationRegistry {
 public:
     using MigrationFn = std::function<std::vector<std::byte>(std::span<const std::byte> input)>;

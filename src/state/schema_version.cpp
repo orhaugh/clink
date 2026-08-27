@@ -1,8 +1,10 @@
 #include "clink/state/schema_version.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstring>
+#include <iomanip>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -363,6 +365,95 @@ StateVersionMap StateVersionMap::unpack(std::string_view packed) {
         if (nl == std::string_view::npos)
             break;
         start = nl + 1;
+    }
+    return map;
+}
+
+namespace {
+void validate_fp_slot(const std::string& slot) {
+    if (slot.find('|') != std::string::npos || slot.find('\n') != std::string::npos) {
+        throw std::invalid_argument(
+            "StateFingerprintMap: slot must not contain '\\n' or '|' (delimiters reserved "
+            "for the packing format)");
+    }
+}
+}  // namespace
+
+void StateFingerprintMap::set(OperatorId op, const std::string& slot, std::uint64_t fingerprint) {
+    validate_fp_slot(slot);
+    entries_[Key{op.value(), slot}] = fingerprint;
+}
+
+std::optional<std::uint64_t> StateFingerprintMap::get(OperatorId op,
+                                                      const std::string& slot) const {
+    const auto it = entries_.find(Key{op.value(), slot});
+    return it == entries_.end() ? std::nullopt : std::optional{it->second};
+}
+
+void StateFingerprintMap::clear_for(OperatorId op, const std::string& slot) {
+    if (!slot.empty()) {
+        entries_.erase(Key{op.value(), slot});
+        return;
+    }
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        it = it->first.op == op.value() ? entries_.erase(it) : std::next(it);
+    }
+}
+
+std::string StateFingerprintMap::pack() const {
+    // Sorted for a deterministic packing (unordered_map iteration order
+    // must not leak into snapshot bytes).
+    std::vector<std::pair<Key, std::uint64_t>> sorted(entries_.begin(), entries_.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.first.op, a.first.slot) < std::tie(b.first.op, b.first.slot);
+    });
+    std::ostringstream oss;
+    bool first = true;
+    for (const auto& [k, fp] : sorted) {
+        if (!first) {
+            oss << '\n';
+        }
+        oss << k.op << '|' << k.slot << '|' << std::hex << std::setw(16) << std::setfill('0') << fp
+            << std::dec;
+        first = false;
+    }
+    return oss.str();
+}
+
+StateFingerprintMap StateFingerprintMap::unpack(std::string_view packed) {
+    StateFingerprintMap map;
+    std::size_t start = 0;
+    while (start < packed.size()) {
+        const auto nl = packed.find('\n', start);
+        const std::string_view line =
+            packed.substr(start, nl == std::string_view::npos ? packed.size() - start : nl - start);
+        start = nl == std::string_view::npos ? packed.size() : nl + 1;
+        if (line.empty()) {
+            continue;
+        }
+        const auto p1 = line.find('|');
+        const auto p2 =
+            p1 == std::string_view::npos ? std::string_view::npos : line.find('|', p1 + 1);
+        if (p1 == std::string_view::npos || p2 == std::string_view::npos ||
+            line.find('|', p2 + 1) != std::string_view::npos) {
+            throw std::runtime_error(
+                "StateFingerprintMap::unpack: a line is not '<op>|<slot>|<fp-hex>'");
+        }
+        const std::string op_str{line.substr(0, p1)};
+        const std::string slot{line.substr(p1 + 1, p2 - p1 - 1)};
+        const std::string fp_str{line.substr(p2 + 1)};
+        if (op_str.empty() || !std::all_of(op_str.begin(), op_str.end(), [](unsigned char c) {
+                return c >= '0' && c <= '9';
+            })) {
+            throw std::runtime_error("StateFingerprintMap::unpack: invalid op_id");
+        }
+        if (fp_str.empty() || fp_str.size() > 16 ||
+            !std::all_of(fp_str.begin(), fp_str.end(), [](unsigned char c) {
+                return std::isxdigit(c) != 0;
+            })) {
+            throw std::runtime_error("StateFingerprintMap::unpack: invalid fingerprint hex");
+        }
+        map.set(OperatorId{std::stoull(op_str)}, slot, std::stoull(fp_str, nullptr, 16));
     }
     return map;
 }

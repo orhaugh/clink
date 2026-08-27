@@ -76,7 +76,8 @@ void SnapshotArrowWriter::append(std::uint64_t op_id,
     ++impl_->rows;
 }
 
-std::vector<std::byte> SnapshotArrowWriter::finish(const StateVersionMap& versions) {
+std::vector<std::byte> SnapshotArrowWriter::finish(const StateVersionMap& versions,
+                                                   const StateFingerprintMap& fingerprints) {
     std::shared_ptr<arrow::Array> op_arr, key_arr, val_arr;
     if (auto s = impl_->op_b.Finish(&op_arr); !s.ok()) {
         throw_arrow("finish (op)", s);
@@ -94,6 +95,9 @@ std::vector<std::byte> SnapshotArrowWriter::finish(const StateVersionMap& versio
         meta->Append(kSnapshotFormatVersionKey, kSnapshotFormatVersion);
         if (!versions.empty()) {
             meta->Append(kStateVersionsMetadataKey, versions.pack());
+        }
+        if (!fingerprints.empty()) {
+            meta->Append(kStateFingerprintsMetadataKey, fingerprints.pack());
         }
         schema = schema->WithMetadata(meta);
     }

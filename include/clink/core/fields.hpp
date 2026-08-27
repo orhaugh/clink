@@ -20,7 +20,13 @@
 // frontend populates this same trait and the macro becomes optional;
 // nothing downstream changes.
 
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <string>
 #include <tuple>
+#include <type_traits>
+#include <vector>
 
 namespace clink {
 
@@ -53,6 +59,138 @@ struct ArrowFields {
 
 template <typename T>
 concept HasArrowFields = ArrowFields<T>::registered;
+
+}  // namespace clink
+
+namespace clink {
+
+namespace fields_detail {
+
+template <typename>
+struct fp_is_vector : std::false_type {};
+template <typename E, typename A>
+struct fp_is_vector<std::vector<E, A>> : std::true_type {};
+template <typename>
+struct fp_is_optional : std::false_type {};
+template <typename E>
+struct fp_is_optional<std::optional<E>> : std::true_type {};
+template <typename>
+struct fp_is_map : std::false_type {};
+template <typename K, typename V, typename C, typename A>
+struct fp_is_map<std::map<K, V, C, A>> : std::true_type {};
+
+// The FROZEN kind-tag table. These bytes are hashed into every shape
+// fingerprint that snapshots persist, so a value here may NEVER change
+// or be reused; new kinds append new values. The golden static_asserts
+// in tests/test_state_fingerprint_gate.cpp pin the derivation.
+enum class FpKind : std::uint8_t {
+    kI8 = 0x01,
+    kI16 = 0x02,
+    kI32 = 0x03,
+    kI64 = 0x04,
+    kU8 = 0x05,
+    kU16 = 0x06,
+    kU32 = 0x07,
+    kU64 = 0x08,
+    kF32 = 0x09,
+    kF64 = 0x0A,
+    kBool = 0x0B,
+    kString = 0x0C,
+    kOptional = 0x0D,
+    kVector = 0x0E,
+    kMap = 0x0F,
+    kNestedBegin = 0x10,
+    kNestedEnd = 0x11,
+};
+
+constexpr std::uint64_t kFpOffset = 14695981039346656037ULL;  // FNV-1a 64
+constexpr std::uint64_t kFpPrime = 1099511628211ULL;
+
+constexpr std::uint64_t fp_byte(std::uint64_t h, std::uint8_t b) {
+    return (h ^ b) * kFpPrime;
+}
+constexpr std::uint64_t fp_cstr(std::uint64_t h, const char* s) {
+    for (; *s != '\0'; ++s) {
+        h = fp_byte(h, static_cast<std::uint8_t>(*s));
+    }
+    return fp_byte(h, 0);  // terminator, so "ab"+"c" never equals "a"+"bc"
+}
+
+template <typename T>
+constexpr std::uint64_t fp_record(std::uint64_t h);
+
+template <typename F>
+constexpr std::uint64_t fp_kind(std::uint64_t h) {
+    if constexpr (std::is_same_v<F, bool>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kBool));
+    } else if constexpr (std::is_same_v<F, std::int8_t>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kI8));
+    } else if constexpr (std::is_same_v<F, std::int16_t>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kI16));
+    } else if constexpr (std::is_same_v<F, std::int32_t>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kI32));
+    } else if constexpr (std::is_same_v<F, std::int64_t>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kI64));
+    } else if constexpr (std::is_same_v<F, std::uint8_t>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kU8));
+    } else if constexpr (std::is_same_v<F, std::uint16_t>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kU16));
+    } else if constexpr (std::is_same_v<F, std::uint32_t>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kU32));
+    } else if constexpr (std::is_same_v<F, std::uint64_t>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kU64));
+    } else if constexpr (std::is_same_v<F, float>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kF32));
+    } else if constexpr (std::is_same_v<F, double>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kF64));
+    } else if constexpr (std::is_same_v<F, std::string>) {
+        return fp_byte(h, static_cast<std::uint8_t>(FpKind::kString));
+    } else if constexpr (fp_is_optional<F>::value) {
+        return fp_kind<typename F::value_type>(
+            fp_byte(h, static_cast<std::uint8_t>(FpKind::kOptional)));
+    } else if constexpr (fp_is_vector<F>::value) {
+        return fp_kind<typename F::value_type>(
+            fp_byte(h, static_cast<std::uint8_t>(FpKind::kVector)));
+    } else if constexpr (fp_is_map<F>::value) {
+        return fp_kind<typename F::mapped_type>(
+            fp_kind<typename F::key_type>(fp_byte(h, static_cast<std::uint8_t>(FpKind::kMap))));
+    } else if constexpr (HasArrowFields<F>) {
+        return fp_byte(fp_record<F>(fp_byte(h, static_cast<std::uint8_t>(FpKind::kNestedBegin))),
+                       static_cast<std::uint8_t>(FpKind::kNestedEnd));
+    } else {
+        static_assert(sizeof(F) == 0,
+                      "clink: no shape-fingerprint mapping for this field type (the supported "
+                      "set matches the derived codec's)");
+        return h;
+    }
+}
+
+template <typename T>
+constexpr std::uint64_t fp_record(std::uint64_t h) {
+    return std::apply(
+        [&](const auto&... d) {
+            ((h = fp_kind<typename std::remove_cvref_t<decltype(d)>::field_type>(
+                  fp_cstr(h, d.name))),
+             ...);
+            return h;
+        },
+        ArrowFields<T>::descriptors());
+}
+
+}  // namespace fields_detail
+
+// The shape fingerprint of a described type: a stable 64-bit hash over the
+// ordered (field name, wire kind) sequence, recursive into composites. Two
+// declarations produce the same fingerprint exactly when the derived codec
+// would produce interchangeable bytes for them, so a snapshot stamped with
+// one fingerprint and bound against a type with another is a shape change:
+// the restore gate refuses it unless a schema-version bump and migration
+// intervened. Collision quality is gate-quality, not identity (64-bit
+// FNV-1a); deliberate.
+template <typename T>
+    requires HasArrowFields<T>
+inline constexpr std::uint64_t fields_fingerprint_v =
+    fields_detail::fp_record<T>(fields_detail::kFpOffset);
 
 }  // namespace clink
 
@@ -136,7 +274,7 @@ concept HasArrowFields = ArrowFields<T>::registered;
            (a namespaced type invoked as CLINK_ARROW_FIELDS(ns::T, ...)     \
            registers as "ns::T"). */                                        \
         static constexpr const char* name = #T;                             \
-        static auto descriptors() {                                         \
+        static constexpr auto descriptors() {                               \
             return ::std::make_tuple(CLINK_ARROW_FOR_EACH(T, __VA_ARGS__)); \
         }                                                                   \
     }

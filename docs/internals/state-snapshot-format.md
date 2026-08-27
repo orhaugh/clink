@@ -28,6 +28,7 @@ The schema's `KeyValueMetadata` carries:
 | --- | --- | --- |
 | `clink.format_version` | `"1"` | Stamped on every stream the writer produces. A reader MUST treat absence as version 1 (streams written before the marker existed). |
 | `clink.state_versions` | packed `StateVersionMap` | Present when the job registered schema-evolution stamps; absent means "no stamps recorded" (the control plane then assumes version 1 per state type). |
+| `clink.state_fingerprints` | packed `StateFingerprintMap` (`<op>\|<slot>\|<fp-hex>` lines) | Shape fingerprints of described types, stamped at KeyedState bind. Absent on older snapshots and for undescribed types; absence gates nothing. A stored fingerprint differing from the live type's with no schema-version bump refuses the restore at bind. |
 
 The `StateVersionMap` packing is line-oriented text: one `<op_id>|<state_type>|<version>` triple per line, `\n`-separated, empty string for an empty map (`StateVersionMap::pack` / `unpack`, `include/clink/state/schema_version.hpp`). Unparseable content is a corrupt snapshot, not an absent map.
 

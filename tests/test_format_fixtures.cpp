@@ -32,6 +32,7 @@
 #include "clink/core/derived_codec.hpp"
 #include "clink/runtime/record_capture.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
+#include "clink/state/schema_version.hpp"
 #include "clink/state_processor/savepoint.hpp"
 #include "clink/state_processor/state_diff.hpp"
 
@@ -296,4 +297,26 @@ TEST(FormatFixtures, DerivedCodecV1StaysReadableAndWritable) {
     const auto back = codec.decode(frozen);
     ASSERT_TRUE(back.has_value());
     EXPECT_EQ(*back, v);
+}
+
+TEST(FormatFixtures, StateFingerprintsV1StayReadableAndDerivable) {
+    // Freezes BOTH halves of the fingerprint contract: the packing format
+    // of clink.state_fingerprints, and the derivation itself (kind-tag
+    // table + FNV chaining) via the reference record's absolute value. A
+    // drift in either would strand every stamped snapshot.
+    const auto path = fixture_path("state-fingerprints-v1.txt");
+    clink::StateFingerprintMap m;
+    m.set(clink::OperatorId{7}, "fx_slot", clink::fields_fingerprint_v<FxDrvRecord>);
+    m.set(clink::OperatorId{9}, "fx_nested", clink::fields_fingerprint_v<FxDrvNested>);
+    if (regen()) {
+        const auto packed = m.pack();
+        write_file(path, packed.data(), packed.size());
+    }
+    const auto frozen = read_text(path);
+    ASSERT_FALSE(frozen.empty());
+    EXPECT_EQ(m.pack(), frozen)
+        << "the fingerprint derivation or packing drifted from its v1 fixture";
+    const auto back = clink::StateFingerprintMap::unpack(frozen);
+    EXPECT_EQ(back.get(clink::OperatorId{7}, "fx_slot"),
+              std::optional<std::uint64_t>{clink::fields_fingerprint_v<FxDrvRecord>});
 }

@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -13,6 +14,7 @@
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/fields.hpp"
 #include "clink/core/stream_element.hpp"
 #include "clink/core/types.hpp"
 #include "clink/metrics/operator_metrics.hpp"
@@ -398,6 +400,7 @@ public:
                 "RuntimeContext::keyed_state: no state backend configured "
                 "(set JobConfig::state_backend before running)");
         }
+        fingerprint_gate_<V>(slot_name);
         return KeyedState<K, V>(
             *backend_, op_id_, std::move(slot_name), std::move(kc), std::move(vc));
     }
@@ -415,6 +418,7 @@ public:
                 "RuntimeContext::keyed_state: no state backend configured "
                 "(set JobConfig::state_backend before running)");
         }
+        fingerprint_gate_<V>(slot_name);
         return KeyedState<K, V>(
             *backend_, op_id_, std::move(slot_name), std::move(kc), std::move(vc), ttl);
     }
@@ -544,6 +548,35 @@ public:
                                    std::move(vc),
                                    std::move(reduce_fn),
                                    ttl);
+    }
+
+    // The shape-fingerprint gate (design record 009, increment 3). For a
+    // described V: a fingerprint restored from the snapshot that differs
+    // from the live type's means the field list changed with no declared
+    // schema-version bump - reading on would misinterpret every value, so
+    // the bind refuses with the remedy. A completed migration cleared the
+    // stamp, so the legitimate path passes; absent stamps (older snapshot,
+    // undescribed type, backend without storage) gate nothing. The live
+    // fingerprint is then recorded so the next snapshot carries it.
+    template <typename V>
+    void fingerprint_gate_(const std::string& slot_name) {
+        if constexpr (HasArrowFields<V>) {
+            constexpr std::uint64_t live = fields_fingerprint_v<V>;
+            if (const auto stored = backend_->restored_state_fingerprint(op_id_, slot_name);
+                stored.has_value() && *stored != live) {
+                std::ostringstream oss;
+                oss << "clink: state shape changed with no declared version bump: slot '"
+                    << slot_name << "' of operator " << op_id_.value()
+                    << " was persisted with shape fingerprint " << std::hex << *stored
+                    << " but the live type's is " << live << std::dec
+                    << ". Reading on would misinterpret every value. If the type's field "
+                       "list changed deliberately, bump SchemaVersionTrait<T> and register "
+                       "a migration (include/clink/state/schema_version.hpp); the migration "
+                       "path clears this stamp.";
+                throw std::runtime_error(oss.str());
+            }
+            backend_->record_state_fingerprint(op_id_, slot_name, live);
+        }
     }
 
 private:

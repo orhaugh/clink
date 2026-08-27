@@ -174,6 +174,22 @@ public:
         return state_versions_;
     }
 
+    void record_state_fingerprint(OperatorId op,
+                                  const std::string& slot,
+                                  std::uint64_t fp) override {
+        std::lock_guard lock(mu_);
+        state_fingerprints_.set(op, slot, fp);
+    }
+    [[nodiscard]] std::optional<std::uint64_t> restored_state_fingerprint(
+        OperatorId op, const std::string& slot) const override {
+        std::lock_guard lock(mu_);
+        return state_fingerprints_.get(op, slot);
+    }
+    void clear_state_fingerprint(OperatorId op, const std::string& slot) override {
+        std::lock_guard lock(mu_);
+        state_fingerprints_.clear_for(op, slot);
+    }
+
     std::string description() const override { return "in-memory state backend"; }
 
     // Enumerate OperatorIds that currently have any keyed entries. Cheap
@@ -239,6 +255,7 @@ private:
     // is a range erase.
     std::map<std::uint64_t, std::unordered_map<OperatorId, PerOp>> staged_;
     StateVersionMap state_versions_;
+    StateFingerprintMap state_fingerprints_;
     // Set at snapshot(). Atomic and outside mu_ so the worker's heartbeat thread
     // can read it while an operator thread is mutating state, which is the whole
     // point of sampling a snapshot size rather than measuring live state.

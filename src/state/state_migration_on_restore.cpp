@@ -73,6 +73,11 @@ void migrate_restored_state(StateBackend& backend,
                         key,
                         std::string_view{reinterpret_cast<const char*>(val.data()), val.size()});
         }
+        // The migration rewrote this entry's values, so the shape
+        // fingerprint stamped by the OLD type no longer describes them.
+        // Clearing it is what lets a declared bump + migration pass the
+        // bind-time gate; the next bind re-stamps the new shape.
+        backend.clear_state_fingerprint(e.op_id, e.slot);
     }
     // Re-stamp so the next snapshot records the migrated versions and a
     // re-restore from it needs no further migration. MERGE (not replace)

@@ -153,6 +153,19 @@ public:
     [[nodiscard]] StateVersionMap restored_state_versions() const override {
         return inner_->restored_state_versions();
     }
+
+    void record_state_fingerprint(OperatorId op,
+                                  const std::string& slot,
+                                  std::uint64_t fp) override {
+        inner_->record_state_fingerprint(op, slot, fp);
+    }
+    [[nodiscard]] std::optional<std::uint64_t> restored_state_fingerprint(
+        OperatorId op, const std::string& slot) const override {
+        return inner_->restored_state_fingerprint(op, slot);
+    }
+    void clear_state_fingerprint(OperatorId op, const std::string& slot) override {
+        inner_->clear_state_fingerprint(op, slot);
+    }
     // Live export = the INNER backend's current view (reads pass through
     // to it, so it holds the up-to-date state); the write-ahead log is a
     // durability artefact, not part of the live contents.

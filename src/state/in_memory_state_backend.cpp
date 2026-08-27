@@ -113,7 +113,7 @@ std::vector<std::byte> InMemoryStateBackend::export_arrow_snapshot() const {
                           std::string_view(reinterpret_cast<const char*>(v.data()), v.size()));
         }
     }
-    return writer.finish(state_versions_);
+    return writer.finish(state_versions_, state_fingerprints_);
 }
 
 Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
@@ -171,7 +171,7 @@ Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
                 }
             }
         }
-        bytes = writer.finish(state_versions_);
+        bytes = writer.finish(state_versions_, state_fingerprints_);
         // Consume: this id's staging is used up, and anything at or below it
         // (aborted or superseded checkpoints) will never be asked for again.
         staged_.erase(staged_.begin(), staged_.upper_bound(id.value()));
@@ -196,6 +196,7 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
     std::lock_guard lock(mu_);
     state_.clear();
     state_versions_.clear();
+    state_fingerprints_.clear();
     // Staged rows belong to the incarnation that staged them; a restored
     // instance must not let them substitute into its own checkpoints.
     staged_.clear();
@@ -234,6 +235,9 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
     if (const auto& metadata = reader->schema()->metadata(); metadata) {
         if (auto idx = metadata->FindKey(kStateVersionsMetadataKey); idx != -1) {
             state_versions_ = StateVersionMap::unpack(metadata->value(idx));
+        }
+        if (auto idx = metadata->FindKey(kStateFingerprintsMetadataKey); idx != -1) {
+            state_fingerprints_ = StateFingerprintMap::unpack(metadata->value(idx));
         }
     }
 

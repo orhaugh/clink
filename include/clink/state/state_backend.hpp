@@ -371,6 +371,21 @@ public:
     virtual void set_state_versions(StateVersionMap /*versions*/) {}
     virtual StateVersionMap restored_state_versions() const { return {}; }
 
+    // Shape fingerprints (design record 009): stamped at KeyedState bind
+    // for described types, persisted beside the version map, and consulted
+    // at the next bind after a restore. The defaults store nothing, which
+    // means no gate on backends that have not wired them - identical to a
+    // pre-fingerprint snapshot. clear_state_fingerprint with an empty slot
+    // clears every slot under the operator (the migrator's whole-op form).
+    virtual void record_state_fingerprint(OperatorId /*op*/,
+                                          const std::string& /*slot*/,
+                                          std::uint64_t /*fingerprint*/) {}
+    virtual std::optional<std::uint64_t> restored_state_fingerprint(
+        OperatorId /*op*/, const std::string& /*slot*/) const {
+        return std::nullopt;
+    }
+    virtual void clear_state_fingerprint(OperatorId /*op*/, const std::string& /*slot*/) {}
+
     // State-as-data: render the backend's LIVE contents as the canonical
     // Arrow IPC state-snapshot stream (op_id / key_bytes / value_bytes;
     // see docs/internals/state-snapshot-format.md). A per-backend atomic

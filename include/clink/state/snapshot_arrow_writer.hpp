@@ -40,6 +40,11 @@ namespace clink {
 // Shared by the writer and every restore/inspection path that reads it.
 inline constexpr char kStateVersionsMetadataKey[] = "clink.state_versions";
 
+// Schema-metadata key under which the packed StateFingerprintMap rides.
+// An ADDITIVE metadata key per the format contract below: readers that do
+// not know it ignore it, and its absence gates nothing.
+inline constexpr char kStateFingerprintsMetadataKey[] = "clink.state_fingerprints";
+
 // Schema-metadata key carrying the snapshot FORMAT version, stamped on
 // every stream this writer produces. Readers treat absence as version 1
 // (streams written before the marker existed). The format contract and
@@ -126,7 +131,8 @@ public:
     // Build the complete IPC stream. A non-empty versions map is embedded
     // in the schema metadata; an empty one leaves the schema bare (the
     // reader treats absence as "no stamps recorded"). Call once.
-    std::vector<std::byte> finish(const StateVersionMap& versions = {});
+    std::vector<std::byte> finish(const StateVersionMap& versions = {},
+                                  const StateFingerprintMap& fingerprints = {});
 
 private:
     struct Impl;
