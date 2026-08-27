@@ -299,6 +299,22 @@ jobs:
             esac
           done
 
+      - name: The tutorial runs against this image
+        # Kafka -> clink -> ClickHouse on compose, with a Worker killed
+        # mid-stream and every result verified against an expectation
+        # computed independently of the engine: the walkthrough a new user
+        # follows, run unattended against the image this workflow is about
+        # to tag. ci.yml runs the same script against the published image,
+        # which cannot see an engine regression until it is published; this
+        # step sees it first. Native amd64 only - the point is the engine's
+        # behaviour under a kill, and emulating a whole cluster would test
+        # QEMU's patience rather than clink's recovery.
+        run: |
+          set -euo pipefail
+          ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          echo "Running the tutorial against ${ref}"
+          CLINK_IMAGE="${ref}" examples/kafka-to-clickhouse/run.sh
+
       - name: The one-command example runs, on both architectures
         # The README's first command is a promise. It breaks quietly: the
         # example is copied in a build step, its data path is rewritten by a

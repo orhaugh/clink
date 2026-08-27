@@ -355,6 +355,25 @@ jobs:
           path: /root/.ccache
           key: ccache-build-${{ github.run_id }}
 
+  tutorial-kafka-clickhouse:
+    name: Tutorial - Kafka to ClickHouse (published runtime image)
+    # The tutorial exactly as a reader runs it: stock Kafka and ClickHouse
+    # images, the published clink-runtime image, the example's own compose
+    # file and scripts, the Worker kill and the independent verification.
+    # It runs examples/kafka-to-clickhouse/run.sh, which is documented as
+    # the unattended form of the walkthrough, so there is no CI-only copy
+    # of the tutorial to drift from it. A plain runner, not the toolchain
+    # container: it needs the runner's Docker daemon. Against the published
+    # image this catches rot in the example and its dependencies; the
+    # runtime-image workflow runs the same script against each newly built
+    # image before tagging it, which is where an engine regression shows.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the tutorial end to end
+        run: examples/kafka-to-clickhouse/run.sh
+
   qualification-status:
     name: Qualification status matches the published pages
     runs-on: ubuntu-latest
