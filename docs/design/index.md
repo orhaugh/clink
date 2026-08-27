@@ -19,3 +19,4 @@ subsystems work today, and take precedence wherever detail has evolved.
 | [006](006-deterministic-replay.md) | Incidents replay deterministically from captured input |
 | [007](007-state-generations.md) | State directories are namespaced by topology generation |
 | [008](008-hot-rescale.md) | Rescale one operator at a barrier, without stopping the job |
+| [009](009-one-declaration-per-type.md) | One declaration describes a type everywhere (proposed, v0.9) |

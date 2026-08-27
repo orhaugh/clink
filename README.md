@@ -183,7 +183,8 @@ Before 1.0, the priorities are:
 - **Stable extension model.** Reduce coupling between compiled plugins and
   individual clink revisions, with a clearly defined compatibility contract.
 - **Native type ergonomics.** Make a single schema declaration sufficient for
-  Arrow conversion, state serialisation and distributed type registration.
+  Arrow conversion, state serialisation and distributed type registration
+  ([design record 009](docs/design/009-one-declaration-per-type.md)).
 - **Operational maturity.** Incorporate real-world deployment feedback,
   strengthen upgrade and diagnostic tooling, and close issues found by
   external workloads.
