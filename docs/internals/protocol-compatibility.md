@@ -38,6 +38,7 @@ co-evolve past its own history.
 | Embedded C ABI | 1 (`CLINK_EMBED_ABI_VERSION`) | caller-checked | `include/clink/embed/clink.h` |
 | Incident capture (`.cap`) | 2 (`kCaptureVersion`) | header-gated | `include/clink/runtime/record_capture.hpp` |
 | Capabilities manifest JSON | 1 (`schema_version`) | additive-only within 1 | `include/clink/connectors/capability.hpp` |
+| Derived record codec (described types) | 1 (layout specified in the header) | 1 | `include/clink/core/derived_codec.hpp`; fixture `derived-codec-v1.bin` |
 
 ## Cluster control protocol
 

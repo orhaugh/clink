@@ -48,6 +48,7 @@ add_executable(clink_core_tests
     test_columnar_nested.cpp
     test_row_columnar_batcher.cpp
     test_columnar_registration.cpp
+    test_derived_codec.cpp
     test_columnar_parquet.cpp
     test_parquet_2pc_sink.cpp
     test_columnar_parquet_factories.cpp

@@ -194,6 +194,11 @@ std::shared_ptr<arrow::DataType> arrow_datatype() {
         return arrow_datatype<typename F::value_type>();
     } else if constexpr (is_std_vector<F>::value) {
         using E = typename F::value_type;
+        // Matches the derived codec's refusal (derived_codec.hpp): the two
+        // representations of a described type must accept the same fields.
+        static_assert(!std::is_same_v<E, bool>,
+                      "clink: std::vector<bool> is a bit-packed proxy container; store "
+                      "std::vector<std::uint8_t> instead");
         return arrow::list(arrow::field("item", arrow_datatype<E>(), is_field_nullable<E>()));
     } else if constexpr (is_std_map<F>::value) {
         using K = typename F::key_type;

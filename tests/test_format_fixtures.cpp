@@ -29,6 +29,7 @@
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/messages.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/derived_codec.hpp"
 #include "clink/runtime/record_capture.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state_processor/savepoint.hpp"
@@ -242,3 +243,57 @@ TEST(FormatFixtures, CaptureHeaderV2StaysDecodable) {
 }
 
 }  // namespace
+
+// --- derived record codec, layout v1 (design record 009) --------------------
+//
+// The described types live at namespace scope because CLINK_ARROW_FIELDS
+// specialises clink::ArrowFields<T>. The fixture freezes one encoding
+// covering every leaf and composite kind the layout defines.
+
+struct FxDrvNested {
+    std::int32_t n{};
+    std::string tag;
+    bool operator==(const FxDrvNested&) const = default;
+};
+CLINK_ARROW_FIELDS(FxDrvNested, n, tag);
+
+struct FxDrvRecord {
+    std::int64_t id{};
+    std::uint32_t seq{};
+    double price{};
+    bool live{};
+    std::string sym;
+    std::optional<std::int64_t> maybe;
+    std::vector<std::int32_t> xs;
+    std::map<std::int32_t, std::string> m;
+    FxDrvNested inner;
+    bool operator==(const FxDrvRecord&) const = default;
+};
+CLINK_ARROW_FIELDS(FxDrvRecord, id, seq, price, live, sym, maybe, xs, m, inner);
+
+TEST(FormatFixtures, DerivedCodecV1StaysReadableAndWritable) {
+    const auto path = fixture_path("derived-codec-v1.bin");
+    FxDrvRecord v;
+    v.id = -42;
+    v.seq = 7;
+    v.price = 101.25;
+    v.live = true;
+    v.sym = "CLNK";
+    v.maybe = 9;
+    v.xs = {1, -1, 3};
+    v.m = {{1, "x"}, {2, ""}};
+    v.inner = FxDrvNested{5, "z"};
+    const auto codec = clink::derived_codec<FxDrvRecord>();
+    if (regen()) {
+        const auto bytes = codec.encode(v);
+        write_file(path, bytes.data(), bytes.size());
+    }
+    const auto frozen = read_bytes(path);
+    ASSERT_FALSE(frozen.empty());
+    // Both directions against the frozen bytes: the current writer must
+    // still produce them, and the current reader must still accept them.
+    EXPECT_EQ(codec.encode(v), frozen) << "the derived layout drifted from its v1 fixture";
+    const auto back = codec.decode(frozen);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(*back, v);
+}

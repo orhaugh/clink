@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "clink/core/codec.hpp"
+#include "clink/core/derived_codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
@@ -98,7 +99,8 @@ clink::Codec<Click> click_codec() {
                 return out;
             },
         .decode = [](clink::Codec<Click>::BytesView b) -> std::optional<Click> {
-            if (b.size() < 20) return std::nullopt;
+            if (b.size() < 20)
+                return std::nullopt;
             const auto read_i64 = [&](std::size_t off) {
                 std::uint64_t v = 0;
                 for (int i = 0; i < 8; ++i) {
@@ -119,7 +121,8 @@ clink::Codec<Click> click_codec() {
             c.user_id = read_i64(0);
             c.timestamp_ms = read_i64(8);
             const auto url_len = read_u32(16);
-            if (b.size() < 20 + url_len) return std::nullopt;
+            if (b.size() < 20 + url_len)
+                return std::nullopt;
             c.url.assign(reinterpret_cast<const char*>(b.data() + 20), url_len);
             return c;
         }};
@@ -185,7 +188,8 @@ Measurement run_current_path(const std::string& payload_name,
     std::thread consumer([&] {
         while (records_received < total) {
             auto el = source.pop();
-            if (!el.has_value()) break;
+            if (!el.has_value())
+                break;
             if (el->is_data()) {
                 records_received += el->as_data().size();
             }
@@ -223,8 +227,7 @@ Measurement run_current_path(const std::string& payload_name,
     m.path = "current";
     m.records = records_received;
     m.bytes_wire = bytes_received;
-    m.wall_ms =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() / 1'000'000.0;
+    m.wall_ms = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() / 1'000'000.0;
     return m;
 }
 
@@ -240,8 +243,8 @@ Measurement run_current_path(const std::string& payload_name,
 // specialization per payload type.
 template <typename T>
 std::shared_ptr<arrow::RecordBatch> records_to_recordbatch(const std::vector<T>& records,
-                                                            std::size_t offset,
-                                                            std::size_t count);
+                                                           std::size_t offset,
+                                                           std::size_t count);
 
 template <>
 std::shared_ptr<arrow::RecordBatch> records_to_recordbatch<std::int64_t>(
@@ -258,8 +261,8 @@ std::shared_ptr<arrow::RecordBatch> records_to_recordbatch<std::int64_t>(
 
 template <>
 std::shared_ptr<arrow::RecordBatch> records_to_recordbatch<Click>(const std::vector<Click>& records,
-                                                                   std::size_t offset,
-                                                                   std::size_t count) {
+                                                                  std::size_t offset,
+                                                                  std::size_t count) {
     arrow::Int64Builder user_id_b;
     arrow::Int64Builder ts_b;
     arrow::StringBuilder url_b;
@@ -286,8 +289,8 @@ std::shared_ptr<arrow::RecordBatch> records_to_recordbatch<Click>(const std::vec
     auto f3 = url_b.Finish(&url_arr);
     (void)f3;
     auto schema = arrow::schema({arrow::field("user_id", arrow::int64()),
-                                  arrow::field("timestamp_ms", arrow::int64()),
-                                  arrow::field("url", arrow::utf8())});
+                                 arrow::field("timestamp_ms", arrow::int64()),
+                                 arrow::field("url", arrow::utf8())});
     return arrow::RecordBatch::Make(
         schema, static_cast<int64_t>(count), {user_id_arr, ts_arr, url_arr});
 }
@@ -296,8 +299,8 @@ std::shared_ptr<arrow::RecordBatch> records_to_recordbatch<Click>(const std::vec
 // [u32 BE length][IPC payload]. Matches the existing NetworkChannel
 // framing prefix so the wire shape is comparable.
 bool send_ipc(int fd, const std::shared_ptr<arrow::RecordBatch>& batch) {
-    auto buffer_result = arrow::ipc::SerializeRecordBatch(*batch,
-                                                           arrow::ipc::IpcWriteOptions::Defaults());
+    auto buffer_result =
+        arrow::ipc::SerializeRecordBatch(*batch, arrow::ipc::IpcWriteOptions::Defaults());
     if (!buffer_result.ok()) {
         std::cerr << "SerializeRecordBatch failed: " << buffer_result.status().ToString() << "\n";
         return false;
@@ -309,7 +312,8 @@ bool send_ipc(int fd, const std::shared_ptr<arrow::RecordBatch>& batch) {
     header[1] = static_cast<std::byte>((len >> 16) & 0xFF);
     header[2] = static_cast<std::byte>((len >> 8) & 0xFF);
     header[3] = static_cast<std::byte>(len & 0xFF);
-    if (!clink::network::NetworkSocket::send_all(fd, header.data(), header.size())) return false;
+    if (!clink::network::NetworkSocket::send_all(fd, header.data(), header.size()))
+        return false;
     return clink::network::NetworkSocket::send_all(
         fd, reinterpret_cast<const std::byte*>(buffer->data()), buffer->size());
 }
@@ -317,12 +321,14 @@ bool send_ipc(int fd, const std::shared_ptr<arrow::RecordBatch>& batch) {
 // Receive one IPC frame; deserialize into a RecordBatch.
 std::shared_ptr<arrow::RecordBatch> recv_ipc(int fd, const std::shared_ptr<arrow::Schema>& schema) {
     std::array<std::byte, 4> header{};
-    if (!clink::network::NetworkSocket::recv_all(fd, header.data(), header.size())) return nullptr;
+    if (!clink::network::NetworkSocket::recv_all(fd, header.data(), header.size()))
+        return nullptr;
     const std::uint32_t len = (static_cast<std::uint32_t>(header[0]) << 24) |
-                               (static_cast<std::uint32_t>(header[1]) << 16) |
-                               (static_cast<std::uint32_t>(header[2]) << 8) |
-                               static_cast<std::uint32_t>(header[3]);
-    if (len == 0) return nullptr;
+                              (static_cast<std::uint32_t>(header[1]) << 16) |
+                              (static_cast<std::uint32_t>(header[2]) << 8) |
+                              static_cast<std::uint32_t>(header[3]);
+    if (len == 0)
+        return nullptr;
     std::vector<uint8_t> body(len);
     if (!clink::network::NetworkSocket::recv_all(
             fd, reinterpret_cast<std::byte*>(body.data()), body.size()))
@@ -341,8 +347,8 @@ std::shared_ptr<arrow::RecordBatch> recv_ipc(int fd, const std::shared_ptr<arrow
 
 template <typename T>
 Measurement run_arrow_path(const std::string& payload_name,
-                            std::vector<T> records,
-                            std::size_t batch_size) {
+                           std::vector<T> records,
+                           std::size_t batch_size) {
     using namespace clink::network;
     const std::size_t total = records.size();
 
@@ -350,7 +356,8 @@ Measurement run_arrow_path(const std::string& payload_name,
     // current path so latency profile is comparable).
     std::uint16_t port = 0;
     const int listener_fd = NetworkSocket::listen_on(port, "127.0.0.1");
-    if (listener_fd < 0) throw std::runtime_error("listen failed");
+    if (listener_fd < 0)
+        throw std::runtime_error("listen failed");
 
     int sender_fd = -1;
     int receiver_fd = -1;
@@ -358,7 +365,8 @@ Measurement run_arrow_path(const std::string& payload_name,
     sender_fd = NetworkSocket::connect_to("127.0.0.1", port);
     accept_thread.join();
     NetworkSocket::close(listener_fd);
-    if (sender_fd < 0 || receiver_fd < 0) throw std::runtime_error("socket pair failed");
+    if (sender_fd < 0 || receiver_fd < 0)
+        throw std::runtime_error("socket pair failed");
 
     auto schema = records_to_recordbatch<T>(records, 0, 1)->schema();
     std::size_t bytes_received = 0;
@@ -367,7 +375,8 @@ Measurement run_arrow_path(const std::string& payload_name,
     std::thread consumer([&] {
         while (records_received < total) {
             auto batch = recv_ipc(receiver_fd, schema);
-            if (!batch) break;
+            if (!batch)
+                break;
             records_received += static_cast<std::size_t>(batch->num_rows());
         }
     });
@@ -378,8 +387,8 @@ Measurement run_arrow_path(const std::string& payload_name,
         auto batch = records_to_recordbatch<T>(records, i, n);
         // Track bytes per batch for the first batch only and extrapolate.
         if (i == 0) {
-            auto buf = arrow::ipc::SerializeRecordBatch(*batch,
-                                                         arrow::ipc::IpcWriteOptions::Defaults());
+            auto buf =
+                arrow::ipc::SerializeRecordBatch(*batch, arrow::ipc::IpcWriteOptions::Defaults());
             if (buf.ok()) {
                 bytes_received = (*buf)->size() * (total / batch_size + 1);
             }
@@ -400,24 +409,58 @@ Measurement run_arrow_path(const std::string& payload_name,
     m.path = "arrow";
     m.records = records_received;
     m.bytes_wire = bytes_received;
-    m.wall_ms =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() / 1'000'000.0;
+    m.wall_ms = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() / 1'000'000.0;
     return m;
 }
 
 #endif  // CLINK_HAS_ARROW
 
+// ---------------------------------------------------------------------------
+// Pure codec A/B: encode_into + decode over every record, no sockets, so a
+// generated codec is answerable to the hand-written one on exactly the
+// bytes-in/bytes-out work (design record 009 increment 1's parity gate).
+// ---------------------------------------------------------------------------
+template <typename T>
+Measurement run_pure_codec_path(const std::string& payload_name,
+                                const std::string& path_name,
+                                const std::vector<T>& records,
+                                clink::Codec<T> codec) {
+    typename clink::Codec<T>::Bytes buf;
+    std::size_t bytes = 0;
+    std::size_t decoded = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (const auto& r : records) {
+        buf.clear();
+        clink::encode_append(codec, r, buf);
+        bytes += buf.size();
+        auto back = codec.decode(buf);
+        decoded += back.has_value() ? 1 : 0;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (decoded != records.size()) {
+        throw std::runtime_error(path_name + ": decode failures in the codec A/B");
+    }
+    Measurement m;
+    m.payload = payload_name;
+    m.path = path_name;
+    m.records = records.size();
+    m.bytes_wire = bytes;
+    m.wall_ms = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() / 1'000'000.0;
+    return m;
+}
+
 void print_human(const Measurement& m) {
     const auto rps = m.records_per_sec();
     const auto mbs = m.bytes_per_sec() / (1024.0 * 1024.0);
-    std::printf("  %-7s payload=%-6s records=%zu wall=%.2fms rps=%.2fM ns/rec=%.1f wire=%.1f MiB/s\n",
-                m.path.c_str(),
-                m.payload.c_str(),
-                m.records,
-                m.wall_ms,
-                rps / 1'000'000.0,
-                m.ns_per_record(),
-                mbs);
+    std::printf(
+        "  %-7s payload=%-6s records=%zu wall=%.2fms rps=%.2fM ns/rec=%.1f wire=%.1f MiB/s\n",
+        m.path.c_str(),
+        m.payload.c_str(),
+        m.records,
+        m.wall_ms,
+        rps / 1'000'000.0,
+        m.ns_per_record(),
+        mbs);
 }
 
 void write_csv_row(std::ofstream& out, const Measurement& m) {
@@ -426,6 +469,10 @@ void write_csv_row(std::ofstream& out, const Measurement& m) {
 }
 
 }  // namespace
+
+// At global scope: the macro specialises clink::ArrowFields<Click>, which an
+// anonymous namespace cannot contain. Click itself stays TU-local.
+CLINK_ARROW_FIELDS(Click, user_id, timestamp_ms, url);
 
 int main(int argc, char** argv) {
     const std::size_t records = std::stoull(get_arg(argc, argv, "records", "1000000"));
@@ -443,8 +490,7 @@ int main(int argc, char** argv) {
                 records,
                 batch_size,
                 payload.c_str(),
-                "enabled (always-on)"
-    );
+                "enabled (always-on)");
 
     std::vector<Measurement> results;
 
@@ -452,7 +498,8 @@ int main(int argc, char** argv) {
     if (payload == "int64" || payload == "all") {
         std::vector<std::int64_t> data;
         data.reserve(records);
-        for (std::size_t i = 0; i < records; ++i) data.push_back(static_cast<std::int64_t>(i));
+        for (std::size_t i = 0; i < records; ++i)
+            data.push_back(static_cast<std::int64_t>(i));
         results.push_back(
             run_current_path<std::int64_t>("int64", data, batch_size, clink::int64_codec()));
 #ifdef CLINK_HAS_ARROW
@@ -471,6 +518,9 @@ int main(int argc, char** argv) {
                 .url = "https://example.com/page/" + std::to_string(i % 1000),
             });
         }
+        results.push_back(run_pure_codec_path<Click>("click", "hand", data, click_codec()));
+        results.push_back(
+            run_pure_codec_path<Click>("click", "derived", data, clink::derived_codec<Click>()));
         results.push_back(run_current_path<Click>("click", data, batch_size, click_codec()));
 #ifdef CLINK_HAS_ARROW
         results.push_back(run_arrow_path<Click>("click", std::move(data), batch_size));
@@ -478,9 +528,11 @@ int main(int argc, char** argv) {
     }
 
     std::printf("\nResults:\n");
-    for (const auto& m : results) print_human(m);
+    for (const auto& m : results)
+        print_human(m);
     if (csv) {
-        for (const auto& m : results) write_csv_row(*csv, m);
+        for (const auto& m : results)
+            write_csv_row(*csv, m);
     }
     return 0;
 }
