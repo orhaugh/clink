@@ -14,6 +14,7 @@
 // (the exempt map below). Both maps are maintained by hand ON PURPOSE - the
 // point of the gate is that a human states the classification.
 
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <set>
@@ -168,3 +169,46 @@ TEST(ConnectorManifestGate, TheMapsAreDisjointAndNotObviouslyStale) {
         }
     }
 }
+
+#ifdef CLINK_CLI_BINARY
+// The same coverage, through the front door. `clink --capabilities` rendered
+// the registry before any impl's install() had run, so it listed the six
+// built-ins and told the reader that every other connector "was not compiled
+// in" - Kafka and ClickHouse included, in a binary that carried both. The
+// published image's manifest, recorded as campaign evidence by
+// qualification/infra/pull-image.sh, under-reported the same way.
+TEST(ConnectorManifestGate, TheCliManifestCoversEveryEnabledImpl) {
+    const std::string cmd = std::string{CLINK_CLI_BINARY} + " --capabilities-json";
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    ASSERT_NE(pipe, nullptr) << "could not run " << cmd;
+    std::string out;
+    char buf[4096];
+    std::size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, pipe)) > 0) {
+        out.append(buf, n);
+    }
+    ASSERT_EQ(::pclose(pipe), 0) << cmd << " failed; output:\n" << out;
+
+    std::vector<std::string> failures;
+    for (const auto& impl : split_csv(kClinkEnabledImpls)) {
+        if (kExempt.count(impl) != 0) {
+            continue;
+        }
+        const auto it = kExpectedRecords.find(impl);
+        if (it == kExpectedRecords.end()) {
+            continue;  // the registry gate above reports the unclassified impl
+        }
+        for (const auto& record : it->second) {
+            if (out.find("\"name\":\"" + record + "\"") == std::string::npos) {
+                failures.push_back(impl + ": record '" + record +
+                                   "' is declared by install() but absent from the CLI manifest");
+            }
+        }
+    }
+    std::string joined;
+    for (const auto& f : failures) {
+        joined += "\n  - " + f;
+    }
+    EXPECT_TRUE(failures.empty()) << failures.size() << " manifest omission(s):" << joined;
+}
+#endif

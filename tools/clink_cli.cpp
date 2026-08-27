@@ -13,6 +13,8 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/connectors/capability.hpp"
+#include "clink/plugin/install_defaults.hpp"
+#include "clink/plugin/plugin.hpp"
 
 // Subcommand entry points. Each lives in its own .cpp under tools/.
 // Signatures match the original per-binary main(): the dispatcher
@@ -107,6 +109,17 @@ int main(int argc, char** argv) {
         // Only defaulted, so an explicit CLINK_LOG_LEVEL still wins.
         ::setenv("CLINK_LOG_LEVEL", "off", /*overwrite=*/0);
         clink::cluster::ensure_built_ins_registered();
+        // The impls declare their capability records inside their install()
+        // hooks, and nothing on this path called them: the manifest listed
+        // the six built-ins and told the reader that Kafka, ClickHouse and
+        // every other connector compiled into the binary were absent.
+        // Install the linked connectors into a scratch registry first,
+        // exactly as `clink run` does before a script, so the manifest
+        // describes the binary rather than the subset that self-registers.
+        {
+            clink::plugin::PluginRegistry linked;
+            clink::plugin::install_defaults(linked);
+        }
         auto facts = clink::connectors::current_build_facts();
 #ifdef CLINK_CLI_HAS_SQL
         // The frontend is LINKED into this binary even though nothing has
@@ -132,6 +145,18 @@ int main(int argc, char** argv) {
     int sub_argc = argc - 1;
     char** sub_argv = argv + 1;
     sub_argv[0] = prog_name.data();
+
+    // The inspection commands answer a question about files or a running
+    // job, and the answer must not be interleaved with the engine's own
+    // operational log: state-query starts an embedded engine to run its
+    // SQL, and printed the engine's task lifecycle around its result rows.
+    // Only defaulted, so an explicit CLINK_LOG_LEVEL still wins - the same
+    // rule --capabilities applies above.
+    if (cmd == "state-cat" || cmd == "state-diff" || cmd == "state-export" ||
+        cmd == "state-query" || cmd == "check-savepoint" || cmd == "capture-cat" ||
+        cmd == "replay-diff") {
+        ::setenv("CLINK_LOG_LEVEL", "off", /*overwrite=*/0);
+    }
 
     if (cmd == "run") {
         return clink_cmd_run(sub_argc, sub_argv);

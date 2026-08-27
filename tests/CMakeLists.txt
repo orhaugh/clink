@@ -355,6 +355,11 @@ if(CLINK_BUILD_IMPLS)
     target_link_libraries(clink_manifest_tests PRIVATE
         clink::clink
         GTest::gtest_main)
+    # The gate also runs `clink --capabilities-json` and checks the rendered
+    # manifest covers the same impls the registry does.
+    target_compile_definitions(clink_manifest_tests PRIVATE
+        CLINK_CLI_BINARY=\"$<TARGET_FILE:clink>\")
+    add_dependencies(clink_manifest_tests clink)
     clink_set_warnings(clink_manifest_tests)
     include(GoogleTest)
     gtest_discover_tests(clink_manifest_tests PROPERTIES LABELS "manifest" DISCOVERY_TIMEOUT 60)
