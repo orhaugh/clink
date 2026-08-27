@@ -214,7 +214,8 @@ finished. It is a stream; it does not intend to.
     `kafka_source_string` means nothing is being read from Kafka. There is a
     known intermittent where a fresh stack's source assigns its partition and
     then reads nothing, silently
-    ([issue #8](https://github.com/orhaugh/clink/issues/8));
+    ([issue #8](https://github.com/orhaugh/clink/issues/8), fixed in the
+    tree after v0.8.0; the published image can still hit it);
     `docker compose restart worker` clears it, and the aggregates stay exact
     because nothing had been consumed yet.
 

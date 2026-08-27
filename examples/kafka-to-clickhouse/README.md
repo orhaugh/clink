@@ -184,7 +184,8 @@ means ClickHouse is refusing the inserts.
 One known intermittent: on a freshly created stack the Kafka source can
 assign its partition and then read nothing at all - every `records_out`
 stays 0 with no error anywhere
-([issue #8](https://github.com/orhaugh/clink/issues/8), seen on roughly one
-fresh stack in six on a loaded machine). `docker compose restart worker`
-clears it; the job then consumes everything from the beginning, exactly once
-into its aggregates, because nothing had been read yet.
+([issue #8](https://github.com/orhaugh/clink/issues/8), fixed in the tree
+after v0.8.0; the published image can still hit it under a loaded host).
+`docker compose restart worker` clears it; the job then consumes everything
+from the beginning, exactly once into its aggregates, because nothing had
+been read yet.

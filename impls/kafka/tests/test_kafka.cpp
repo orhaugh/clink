@@ -995,23 +995,28 @@ TEST(Kafka, SnapshotPrunesUnownedPartitionRowsAfterAssignment) {
 // A source whose group has never committed must consume even when the
 // broker cannot answer for that group yet.
 //
-// Written while chasing the intermittent zero-read stall the Kafka ->
-// ClickHouse tutorial hit on fresh stacks (issue #8): the broker's log
-// showed the group's first offset lookup triggering the lazy creation of
-// __consumer_offsets inside the assign window, which made a refused first
-// OffsetFetch the leading suspect. This test DISPROVED that: with the mock
-// coordinator refusing the first four OffsetFetch requests exactly as a
-// still-loading coordinator does, the source recovers and consumes
-// everything, unchanged. The stall's mechanism is still open.
+// The Kafka -> ClickHouse tutorial hit this in the field (issue #8): on a
+// fresh stack the consumer's first OffsetFetch answered NOT_COORDINATOR
+// while the broker's lazily created __consumer_offsets topic settled.
+// librdkafka's Refresh action re-confirmed the SAME coordinator - no state
+// transition - and the pending manual assignment was never served again:
+// fetch state stayed `none`, no Fetch was ever sent, and the source read
+// nothing, silently, until the process restarted. Every gauge read zero
+// and healthy - the worst failure shape a stream processor has. Before the
+// fix, injecting that exact error here wedged this test identically (0 of
+// 10 records after 20 s).
 //
-// Kept because the property is load-bearing on its own: a first-run group
-// has no committed offset anywhere, its lookup is allowed to fail
-// transiently, and a source that gave up on the first answer would stall
-// for ever while reporting zero errors - the worst failure shape a stream
-// processor has, every gauge reading zero and healthy.
-TEST(Kafka, SourceConsumesWhenTheGroupCoordinatorIsNotReadyYet) {
+// The fix resolves a concrete start offset before assign() - committed
+// offset with engine-owned bounded retries, then the reset policy - so the
+// fetch position never depends on the group coordinator answering. Both
+// coordinator-outage shapes are pinned: the one that wedged (the field
+// error) and the plain still-loading refusal.
+
+namespace {
+
+void source_consumes_through_group_coordinator_outage(rd_kafka_resp_err_t err) {
     MockCluster mock;
-    const std::string topic = "coordinator-not-ready";
+    const std::string topic = "coordinator-outage";
     mock.create_topic(topic);
 
     KafkaSink::Options sink_opts;
@@ -1026,14 +1031,7 @@ TEST(Kafka, SourceConsumesWhenTheGroupCoordinatorIsNotReadyYet) {
     sink_h.sink->flush();
     ASSERT_EQ(sink_h.sink->delivered_count(), 10u);
 
-    // The window: the group's coordinator refuses its first offset lookups
-    // while its own log is being created. Transient - a later attempt
-    // succeeds - which is exactly why a source that gives up on the first
-    // answer stalls for ever while a source that resolves its own position
-    // simply proceeds.
-    mock.inject_request_error(MockCluster::kApiKeyOffsetFetch,
-                              RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS,
-                              /*count=*/4);
+    mock.inject_request_error(MockCluster::kApiKeyOffsetFetch, err, /*count=*/4);
 
     KafkaSource::Options src_opts;
     src_opts.brokers = mock.brokers();
@@ -1052,6 +1050,20 @@ TEST(Kafka, SourceConsumesWhenTheGroupCoordinatorIsNotReadyYet) {
         EXPECT_EQ(got.front().payload, "payload-0");
         EXPECT_EQ(got.back().payload, "payload-9");
     }
+}
+
+}  // namespace
+
+TEST(Kafka, SourceConsumesWhenTheCoordinatorAnswersNotCoordinator) {
+    // The field error (issue #8): wedged the source for ever before the fix.
+    source_consumes_through_group_coordinator_outage(RD_KAFKA_RESP_ERR_NOT_COORDINATOR);
+}
+
+TEST(Kafka, SourceConsumesWhenTheGroupCoordinatorIsNotReadyYet) {
+    // The still-loading refusal: recovered even before the fix; pinned so
+    // the resolver never regresses the path that already worked.
+    source_consumes_through_group_coordinator_outage(
+        RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS);
 }
 
 #else  // !CLINK_HAS_KAFKA || !CLINK_HAS_KAFKA_MOCK

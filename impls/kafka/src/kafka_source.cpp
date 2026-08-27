@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -191,6 +192,70 @@ std::int32_t partition_count_for(RdKafka::KafkaConsumer& consumer,
         }
     }
     return 0;
+}
+
+// A concrete start offset for a partition with no clink-side position: the
+// group's committed offset when one exists, else the auto.offset.reset
+// policy via the broker's watermarks, else the broker-resolved logical
+// BEGINNING/END. Every query is bounded and retried, and the result is
+// NEVER OFFSET_STORED: handing librdkafka an unresolved STORED offset at
+// assign() makes the fetch position depend on the group coordinator
+// answering, and issue #8 measured what that costs on a fresh broker - the
+// first OffsetFetch answered NOT_COORDINATOR while the lazily created
+// __consumer_offsets topic settled, librdkafka re-confirmed the same
+// coordinator without re-serving the pending assignment, and the partition
+// never fetched again: zero records, zero errors, every gauge healthy,
+// until the process was restarted. Resolving here keeps the courtesy
+// group-offset lookup (bounded, engine-owned retries) while taking the
+// coordinator out of the fetch path entirely.
+std::pair<std::int64_t, std::string> resolve_fresh_start_offset(RdKafka::KafkaConsumer& consumer,
+                                                                const std::string& topic,
+                                                                const std::string& reset_policy,
+                                                                std::int32_t partition) {
+    // The group's committed offset, the same courtesy subscription-based
+    // consumption extended. Retried: the one failure mode this exists to
+    // absorb is a coordinator that needs a moment (broker start, offsets
+    // topic creation), which settles in seconds.
+    bool committed_answered = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::vector<RdKafka::TopicPartition*> committed;
+        committed.push_back(RdKafka::TopicPartition::create(topic, partition));
+        const auto rc = consumer.committed(committed, 2'000);
+        const std::int64_t off = committed[0]->offset();
+        RdKafka::TopicPartition::destroy(committed);
+        if (rc == RdKafka::ERR_NO_ERROR) {
+            committed_answered = true;
+            if (off >= 0) {
+                return {off, "committed"};
+            }
+            break;  // a definitive "no committed offset": fall to the reset policy
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    }
+    if (reset_policy == "none") {
+        // The policy that demands a pre-existing position. No committed
+        // offset (or no answer at all) is a refusal, exactly as the STORED
+        // path would eventually have errored - but loudly, at open().
+        throw std::runtime_error("KafkaSource: auto_offset_reset='none' and no committed offset " +
+                                 std::string{committed_answered ? "exists" : "could be fetched"} +
+                                 " for " + topic + " [" + std::to_string(partition) + "]");
+    }
+    const bool latest = reset_policy == "latest";
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::int64_t low = 0;
+        std::int64_t high = 0;
+        if (consumer.query_watermark_offsets(topic, partition, &low, &high, 2'000) ==
+            RdKafka::ERR_NO_ERROR) {
+            return {latest ? high : low, reset_policy + "-watermark"};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    }
+    // Every broker query failed inside its budget. The logical offsets are
+    // resolved broker-side per partition on the fetch path itself, with no
+    // group coordinator anywhere near them - degraded to the reset policy's
+    // semantics, never to an indefinite wait.
+    return {latest ? RdKafka::Topic::OFFSET_END : RdKafka::Topic::OFFSET_BEGINNING,
+            reset_policy + "-logical"};
 }
 
 }  // namespace
@@ -412,9 +477,16 @@ void KafkaSource::assign_owned_(std::int32_t partition_count) {
             // No clink-side position: resolve the group's committed offset,
             // falling back to auto.offset.reset - the same semantics
             // subscription-based consumption had for a partition without
-            // engine state.
-            offset = RdKafka::Topic::OFFSET_STORED;
-            origin = "stored/" + opts.auto_offset_reset;
+            // engine state. Resolved HERE, to a concrete offset, never
+            // OFFSET_STORED (see resolve_fresh_start_offset for the field
+            // failure that rule comes from). A numeric resolution also
+            // seeds next_offsets, so the first checkpoint's resume row for
+            // this partition is the same number the fetch starts from.
+            std::tie(offset, origin) =
+                resolve_fresh_start_offset(*impl_->consumer, opts.topic, opts.auto_offset_reset, p);
+            if (offset >= 0) {
+                impl_->next_offsets[p] = offset;
+            }
         }
         impl_->restored_offsets.erase(p);  // applied; a reassign resumes, never rewinds
         assignment.push_back(RdKafka::TopicPartition::create(opts.topic, p, offset));

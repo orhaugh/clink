@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**A Kafka source can no longer be wedged by its group coordinator.** The
+tutorial's fresh stacks intermittently read nothing at all: the source
+assigned its partition and every gauge sat at zero, healthy, until the
+Worker was restarted. librdkafka's own debug log named the mechanism -
+the partition was assigned at `OFFSET_STORED`, the first OffsetFetch
+answered `NOT_COORDINATOR` while the broker's lazily created offsets
+topic settled, and the client re-confirmed the same coordinator without
+ever re-serving the pending assignment, so no fetch was ever sent. A
+fresh partition's start offset is now resolved to a concrete number
+before `assign()`: the group's committed offset with bounded retries,
+else the reset policy via broker watermarks, else the broker-resolved
+logical offset - the group coordinator is out of the fetch path
+entirely. Reproduced deterministically against the mock cluster (the
+same injection wedged the old code and passes now), with both
+coordinator-outage shapes pinned as tests.
+
 **A first end-to-end tutorial, and what building it found.** `examples/kafka-to-clickhouse`
 brings up Kafka, ClickHouse and a clink Coordinator and Worker with one
 `docker compose up`, streams a deterministic sensor workload through an
