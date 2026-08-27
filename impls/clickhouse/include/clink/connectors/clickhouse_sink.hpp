@@ -18,8 +18,9 @@ namespace clink {
 // Multi-column inserts will follow once we have a typed Row<...> seam.
 //
 // Backed by clickhouse-cpp when CMake finds it; throws on construction
-// otherwise.
-class ClickHouseSink final : public Sink<std::string> {
+// otherwise. Not final: a test observes the barrier-to-flush dispatch through
+// a subclass, which needs no server.
+class ClickHouseSink : public Sink<std::string> {
 public:
     enum class Format : std::uint8_t {
         // Treat each record as one row in TSV (tab-separated values).
@@ -50,6 +51,15 @@ public:
 
     void open() override;
     void on_data(const Batch<std::string>& batch) override;
+    // A checkpoint barrier flushes whatever is buffered. The runner snapshots
+    // and acks the checkpoint right after this returns, and a recovery resumes
+    // the source past the records already consumed - so a row still sitting in
+    // the buffer at the barrier would be lost by the next crash, and the
+    // connector's declared at-least-once delivery would be false across a
+    // restart. A flush that fails throws, which fails the checkpoint instead of
+    // completing it over rows that never reached ClickHouse. Same shape as the
+    // Postgres JSON sink.
+    void on_barrier(CheckpointBarrier /*barrier*/) override { flush(); }
     void flush() override;
     void close() override;
 

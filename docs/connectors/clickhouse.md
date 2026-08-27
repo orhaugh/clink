@@ -148,14 +148,14 @@ The source side is reached through the registered factories (`clickhouse_row_sou
 
 ## Delivery semantics
 
-Sink: at-least-once. Records are buffered and flushed by row count (`batch_rows`) or time (`batch_interval_ms`), and `close()` flushes the remaining buffer. There is no two-phase commit and no row deduplication, so an INSERT replayed after a failure re-inserts its rows. The SQL planner reflects this: it rejects `exactly_once` and `mode='upsert'`.
+Sink: at-least-once. Records are buffered and flushed by row count (`batch_rows`), by time (`batch_interval_ms`), and at every checkpoint barrier (`on_barrier` flushes before the runner snapshots and acks, so no row consumed before a completed checkpoint can still be sitting in the buffer when the process dies); `close()` flushes the remaining buffer. Before that barrier flush existed (up to and including v0.8.0) a row buffered across a checkpoint was lost if the process died before the next size or time flush, which `batch_rows='1'` avoids on those versions. There is no two-phase commit and no row deduplication, so an INSERT replayed after a failure re-inserts its rows; a `ReplacingMergeTree` keyed by the row's natural key absorbs the duplicates on the ClickHouse side. The SQL planner reflects this: it rejects `exactly_once` and `mode='upsert'`.
 
 Source: a `SELECT` materialises a finite (bounded) result set. The source persists a cursor (the row index into the materialised snapshot) and can resume mid result-set after a restart; `open()` clamps a restored cursor to the re-materialised row count. Exactly-once at the source boundary holds only for a deterministically ordered query (an explicit `ORDER BY`) over data unchanged between runs, because row index N is "the same row" only under those conditions. The SQL source binding treats it as a bounded query with no cursor checkpoint.
 
 ## Limitations
 
 - Sink input is a single `std::string` per record, interpreted as one row (TSV or JSONEachRow). It is not a multi-column typed insert at the C++ sink layer; multi-column Rows are serialised to a JSON object string upstream (the SQL path) before the sink sees them.
-- Sink batches are concatenated in memory and inserted with `client.Execute()`; there is no streaming insert, no 2PC, and no upsert/dedup.
+- Sink batches are concatenated in memory and inserted with `client.Execute()`; there is no streaming insert, no 2PC, and no upsert/dedup. A failed flush at a barrier throws, which fails that checkpoint rather than completing it over rows ClickHouse never received.
 - Source is a one-shot bounded `SELECT`, not a streaming tail or CDC feed. Result-row order is arbitrary without an explicit `ORDER BY`.
 - The `clickhouse_source` (string-channel JSON) requires column names from the server; if they are absent it fails loudly rather than emit positional keys.
 - The connector path is not Arrow-native; records cross the boundary as `std::string` or typed `ClickHouseRow` text values, with type coercion left to downstream operators.
