@@ -207,6 +207,15 @@ public:
     template <typename T>
     void register_type(const std::string& name, Codec<T> codec, ArrowBatcher<T> batcher);
 
+    // The everything-derived overload for a CLINK_ARROW_FIELDS type: the
+    // channel name is the declared type name, the codec is the derived
+    // codec (clink/core/derived_codec.hpp), and the batcher auto-selects
+    // typed columnar. The explicit overloads above remain for types that
+    // need a different name or a hand-tuned codec.
+    template <typename T>
+        requires HasArrowFields<T>
+    void register_type();
+
     // Look up the Codec<T> the user registered for T. Used by fluent
     // API methods that need to wire the codec into operators with a
     // persistent state path (e.g. the tumbling aggregate operator's

@@ -67,6 +67,16 @@ struct ColRegOpaque {
     std::int64_t b;
 };
 
+// A described struct for the everything-derived registration overloads:
+// no explicit name, no hand codec. Unique name, namespace scope (the
+// macro specialises clink::ArrowFields<T>).
+struct ColRegDefaulted {
+    std::int64_t id{};
+    std::string tag;
+    bool operator==(const ColRegDefaulted&) const = default;
+};
+CLINK_ARROW_FIELDS(ColRegDefaulted, id, tag);
+
 namespace {
 
 // A hand-written Codec<ColRegTrade>: little-endian fixed fields plus a
@@ -592,4 +602,35 @@ TEST(FusedSourceCommit, SinkHooksDriveTypedSinkCommitAndAreWeak) {
     commit_cb(14);  // weak: safe no-op after teardown
     abort_cb(15);
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------
+// The everything-derived overloads (design record 009, increment 2): one
+// declaration, and registration needs nothing else - the channel name is
+// the declared type name and the codec is the derived codec.
+// ---------------------------------------------------------------------
+
+TEST(DerivedRegistration, TypeRegistryDefaultsToTheDeclaredNameAndDerivedCodec) {
+    TypeRegistry tr;
+    tr.register_typed<ColRegDefaulted>();
+    EXPECT_NE(tr.find("ColRegDefaulted"), nullptr)
+        << "the declared type name must be the channel name";
+    EXPECT_EQ(tr.channel_for_typeid(typeid(ColRegDefaulted).name()), "ColRegDefaulted");
+}
+
+TEST(DerivedRegistration, PluginRegistryDefaultsRegisterAWorkingDerivedCodec) {
+    TypeRegistry tr;
+    clink::plugin::PluginRegistry preg(tr,
+                                       clink::cluster::RunnerRegistry::default_instance(),
+                                       clink::cluster::SelectorRegistry::default_instance());
+    preg.register_type<ColRegDefaulted>();
+    EXPECT_NE(tr.find("ColRegDefaulted"), nullptr);
+    const auto codec = preg.codec_for<ColRegDefaulted>();
+    ASSERT_NE(codec, nullptr) << "the derived codec must back state lookups";
+    const ColRegDefaulted v{.id = -7, .tag = "t"};
+    EXPECT_EQ(codec->encode(v), clink::derived_codec<ColRegDefaulted>().encode(v))
+        << "the registered codec must BE the derived layout, not a variant of it";
+    const auto back = codec->decode(codec->encode(v));
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(*back, v);
 }

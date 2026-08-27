@@ -20,6 +20,7 @@
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/runner_helpers.hpp"
 #include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
+#include "clink/core/derived_codec.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
@@ -418,6 +419,12 @@ inline bool await_armed_cutover_commit(ArmedCutoverCommitGate& gate,
 }
 
 }  // namespace detail
+
+template <typename T>
+    requires HasArrowFields<T>
+void PluginRegistry::register_type() {
+    register_type<T>(ArrowFields<T>::name, derived_codec<T>());
+}
 
 template <typename T>
 void PluginRegistry::register_type(const std::string& name, Codec<T> codec) {

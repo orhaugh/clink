@@ -19,6 +19,7 @@
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
+#include "clink/core/derived_codec.hpp"
 #include "clink/runtime/columnar_split.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/key_groups.hpp"
@@ -195,6 +196,13 @@ public:
     template <typename T>
     void register_typed(const std::string& name, Codec<T> codec, ArrowBatcher<T> batcher);
 
+    // The everything-derived overload (mirrors PluginRegistry::register_type
+    // with no arguments): declared type name as the channel name, derived
+    // codec, auto-selected batcher.
+    template <typename T>
+        requires HasArrowFields<T>
+    void register_typed();
+
     // Lookup. Returns nullptr if the channel isn't registered. Falls
     // through to `parent` on miss (for per-job registries layered over
     // built-ins).
@@ -225,6 +233,12 @@ private:
 template <typename T>
 inline void TypeRegistry::register_typed(const std::string& name, Codec<T> codec) {
     register_typed<T>(name, codec, make_auto_arrow_batcher<T>(codec));
+}
+
+template <typename T>
+    requires HasArrowFields<T>
+inline void TypeRegistry::register_typed() {
+    register_typed<T>(ArrowFields<T>::name, derived_codec<T>());
 }
 
 template <typename T>

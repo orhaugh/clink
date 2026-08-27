@@ -132,6 +132,10 @@ concept HasArrowFields = ArrowFields<T>::registered;
     template <>                                                             \
     struct clink::ArrowFields<T> {                                          \
         static constexpr bool registered = true;                            \
+        /* The declared spelling, the default channel name at registration  \
+           (a namespaced type invoked as CLINK_ARROW_FIELDS(ns::T, ...)     \
+           registers as "ns::T"). */                                        \
+        static constexpr const char* name = #T;                             \
         static auto descriptors() {                                         \
             return ::std::make_tuple(CLINK_ARROW_FOR_EACH(T, __VA_ARGS__)); \
         }                                                                   \
