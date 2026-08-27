@@ -83,6 +83,7 @@ public:
     // aren't in librdkafka's public headers.
     static constexpr std::int16_t kApiKeyProduce = 0;
     static constexpr std::int16_t kApiKeyFetch = 1;
+    static constexpr std::int16_t kApiKeyOffsetFetch = 9;
 
     void inject_request_error(std::int16_t api_key,
                               rd_kafka_resp_err_t err,
@@ -989,6 +990,68 @@ TEST(Kafka, SnapshotPrunesUnownedPartitionRowsAfterAssignment) {
     EXPECT_FALSE(
         backend.get_operator_state(op_id, StateBackend::KeyView{"__kafka_off__:2", 15}).has_value())
         << "non-owned partition 2 must be pruned";
+}
+
+// A source whose group has never committed must consume even when the
+// broker cannot answer for that group yet.
+//
+// Written while chasing the intermittent zero-read stall the Kafka ->
+// ClickHouse tutorial hit on fresh stacks (issue #8): the broker's log
+// showed the group's first offset lookup triggering the lazy creation of
+// __consumer_offsets inside the assign window, which made a refused first
+// OffsetFetch the leading suspect. This test DISPROVED that: with the mock
+// coordinator refusing the first four OffsetFetch requests exactly as a
+// still-loading coordinator does, the source recovers and consumes
+// everything, unchanged. The stall's mechanism is still open.
+//
+// Kept because the property is load-bearing on its own: a first-run group
+// has no committed offset anywhere, its lookup is allowed to fail
+// transiently, and a source that gave up on the first answer would stall
+// for ever while reporting zero errors - the worst failure shape a stream
+// processor has, every gauge reading zero and healthy.
+TEST(Kafka, SourceConsumesWhenTheGroupCoordinatorIsNotReadyYet) {
+    MockCluster mock;
+    const std::string topic = "coordinator-not-ready";
+    mock.create_topic(topic);
+
+    KafkaSink::Options sink_opts;
+    sink_opts.brokers = mock.brokers();
+    sink_opts.topic = topic;
+    SinkHarness sink_h(sink_opts);
+    Batch<KafkaMessage> batch;
+    for (int i = 0; i < 10; ++i) {
+        batch.emplace(KafkaMessage{"payload-" + std::to_string(i)});
+    }
+    sink_h.sink->on_data(batch);
+    sink_h.sink->flush();
+    ASSERT_EQ(sink_h.sink->delivered_count(), 10u);
+
+    // The window: the group's coordinator refuses its first offset lookups
+    // while its own log is being created. Transient - a later attempt
+    // succeeds - which is exactly why a source that gives up on the first
+    // answer stalls for ever while a source that resolves its own position
+    // simply proceeds.
+    mock.inject_request_error(MockCluster::kApiKeyOffsetFetch,
+                              RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS,
+                              /*count=*/4);
+
+    KafkaSource::Options src_opts;
+    src_opts.brokers = mock.brokers();
+    src_opts.topic = topic;
+    // A group id no one has ever committed under, as a first run always has.
+    src_opts.group_id = "never-committed-group";
+    src_opts.auto_offset_reset = "earliest";
+    src_opts.max_batch_size = 4;
+
+    SourceHarness src(src_opts);
+    const auto got = drain(*src.source, 10, 20s);
+    EXPECT_EQ(got.size(), 10u) << "the source read " << got.size()
+                               << " of 10 records; a start offset that could not be resolved on "
+                                  "the first attempt must not leave the partition unfetched";
+    if (got.size() == 10u) {
+        EXPECT_EQ(got.front().payload, "payload-0");
+        EXPECT_EQ(got.back().payload, "payload-9");
+    }
 }
 
 #else  // !CLINK_HAS_KAFKA || !CLINK_HAS_KAFKA_MOCK
