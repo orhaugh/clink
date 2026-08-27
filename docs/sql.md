@@ -67,7 +67,10 @@ WITH ( <key>='<value>' [, ...] )
 ```
 
 Every `WITH` value is a single-quoted string literal, including numeric ones
-(`watermark_lag_ms='200'`, not `200`). Columns are `name TYPE` pairs. An inline
+(`watermark_lag_ms='200'`, not `200`). An option KEY containing a dot (the
+connector passthroughs, such as Kafka's `kafka.<property>`) is an identifier
+and takes double quotes: `"kafka.client.rack" = 'eu-central-1a'`. A
+single-quoted key is a string literal, which the parser rejects. Columns are `name TYPE` pairs. An inline
 `PRIMARY KEY` on a single column is honoured: it populates exactly the same
 catalogue metadata as `WITH (primary_key='col')`, and if both forms are given
 they must agree or the statement is rejected. A composite key is declared with
@@ -117,7 +120,7 @@ arrival time. Declare which column carries it and how far out of order it may be
 ```sql
 CREATE TABLE bids (auction BIGINT, price BIGINT, datetime BIGINT)
 WITH (connector='kafka', format='json', topic='bids',
-      'bootstrap.servers'='localhost:9092',
+      brokers='localhost:9092',
       event_time_column='datetime', watermark_lag_ms='2000');
 ```
 
