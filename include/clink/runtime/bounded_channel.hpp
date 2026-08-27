@@ -53,6 +53,19 @@ public:
         name_ = std::move(name);
     }
 
+    // Declare that an idle pop on this channel is normal. Some consumers wait
+    // an unbounded time for their next item by design - the snapshot worker
+    // sits between checkpoints - and a long empty wait there is not the stall
+    // the BOUNDED_CHANNEL_STUCK diagnostic exists to catch. It printed one
+    // regardless: a worker with nothing to do logged "STUCK" in capitals every
+    // few seconds, escalating to held=189s, which is the first thing a new
+    // user reads in an idle worker's log. Push-side warnings are unaffected:
+    // a producer blocked on a full channel is still a stall worth naming.
+    void mark_idle_pop_normal() {
+        std::lock_guard lock(mu_);
+        warn_on_idle_pop_ = false;
+    }
+
     // The spacing between stuck-warnings for one continuous wait: double the
     // previous gap, capped at five minutes. The first QUAL-06 width probe
     // filled three workers' ENTIRE 200,000-line log windows with one line per
@@ -155,7 +168,12 @@ public:
     // Blocking pop. Returns nullopt only when the channel is closed AND empty.
     std::optional<T> pop() {
         std::unique_lock lock(mu_);
-        if (queue_.empty() && !closed_) {
+        if (queue_.empty() && !closed_ && !warn_on_idle_pop_) {
+            // Idle by design (mark_idle_pop_normal): a plain wait, no diagnostic.
+            ++pop_waiters_;
+            not_empty_.wait(lock, [this] { return !queue_.empty() || closed_; });
+            --pop_waiters_;
+        } else if (queue_.empty() && !closed_) {
             ++pop_waiters_;
             // See push() for the stuck-warning rationale.
             using clock = std::chrono::steady_clock;
@@ -296,6 +314,7 @@ private:
     std::size_t capacity_{};
     std::string name_;
     std::chrono::milliseconds stuck_warn_base_{kStuckWarnInterval * 1000};
+    bool warn_on_idle_pop_{true};
     bool closed_{false};
     ChannelCloseReason close_reason_{ChannelCloseReason::Finished};
     int push_waiters_{0};

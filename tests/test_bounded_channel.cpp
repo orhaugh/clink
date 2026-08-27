@@ -229,3 +229,36 @@ TEST(BoundedChannel, AWarnedWaitEndedByCloseSaysSo) {
     EXPECT_NE(err.find("BOUNDED_CHANNEL_UNBLOCKED pop"), std::string::npos) << err;
     EXPECT_NE(err.find("closed=1"), std::string::npos) << err;
 }
+
+// The snapshot worker's queue: empty between checkpoints by design, so an
+// idle pop must not be reported as a stall - while a producer blocked on the
+// same channel's full side still is.
+TEST(BoundedChannel, AConsumerIdleByDesignDoesNotWarnOnAnEmptyWait) {
+    BoundedChannel<int> ch(1, "idle-by-design");
+    ch.set_stuck_warn_base_for_testing(std::chrono::milliseconds{100});
+    ch.mark_idle_pop_normal();
+    testing::internal::CaptureStderr();
+
+    std::thread consumer([&] {
+        auto v = ch.pop();  // empty for ~450 ms: four base intervals of silence
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(*v, 3);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{450});
+    ASSERT_TRUE(ch.push(3));
+    consumer.join();
+
+    // The push side is untouched: fill the channel, block a producer on it
+    // past the base interval, then drain.
+    ASSERT_TRUE(ch.push(4));
+    std::thread producer([&] { ASSERT_TRUE(ch.push(5)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    EXPECT_EQ(ch.pop().value_or(-1), 4);
+    producer.join();
+    EXPECT_EQ(ch.pop().value_or(-1), 5);
+
+    const std::string err = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(err.find("BOUNDED_CHANNEL_STUCK pop"), std::string::npos) << err;
+    EXPECT_EQ(err.find("BOUNDED_CHANNEL_UNBLOCKED pop"), std::string::npos) << err;
+    EXPECT_NE(err.find("BOUNDED_CHANNEL_STUCK push"), std::string::npos) << err;
+}

@@ -41,7 +41,13 @@ public:
         ack_fn_t ack;
     };
 
-    explicit SnapshotWorker(std::size_t capacity = 1) : queue_(capacity, "snapshot-worker") {}
+    explicit SnapshotWorker(std::size_t capacity = 1) : queue_(capacity, "snapshot-worker") {
+        // Between checkpoints this queue is empty and its consumer waits, for
+        // as long as the checkpoint interval says: idle, not stuck. The
+        // push side keeps its warning - an operator blocked on enqueue()
+        // means a persist is running long, which IS worth a line.
+        queue_.mark_idle_pop_normal();
+    }
 
     SnapshotWorker(const SnapshotWorker&) = delete;
     SnapshotWorker& operator=(const SnapshotWorker&) = delete;
