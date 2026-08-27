@@ -1,7 +1,8 @@
 # 009: One declaration describes a type everywhere
 
-**Status:** proposed, targeting v0.9. Nothing on this page is shipped;
-the [capability catalogue](../capabilities.md) is unaffected until it is.
+**Status:** accepted, implemented 2026-08-27 (the v0.9 tree). The
+implementation record: [Declared types](../internals/derived-types.md).
+Two details refined at implementation and noted below in place.
 
 ## Context
 
@@ -82,9 +83,13 @@ What the declaration derives:
    sees a changed fingerprint under an unchanged version **refuses**
    instead of misreading bytes. The explicit version keeps expressing
    migration intent; the fingerprint is the gate that catches the bump
-   nobody made. Carrying it is itself a snapshot-format evolution, so it
-   lands as an eof-guarded optional field, pinned by fixtures like every
-   other tail this codebase has grown.
+   nobody made. As implemented it rides a NEW snapshot metadata key
+   (`clink.state_fingerprints`), because the snapshot format contract
+   already declares added metadata keys a compatible change - simpler and
+   safer for downgrade readers than the eof-guarded binary tail this
+   record first sketched. A completed migration clears the migrated
+   slots' stamps, which is what reduces the bind-time rule to "stored
+   differs from live means refuse" with no version consultation.
 
 ### The derived encoding, specified
 

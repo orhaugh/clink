@@ -53,6 +53,14 @@ add_executable(10_http_surface 10_http_surface.cpp)
 target_link_libraries(10_http_surface PRIVATE clink::core)
 add_test(NAME 10_http_surface COMMAND 10_http_surface)
 
+# 11 is the one-declaration-per-type walkthrough (design record 009): a
+# CLINK_FIELDS declaration driving the derived codec, keyed state, a
+# snapshot/restore, and the shape-fingerprint gate refusing an undeclared
+# field reorder. Self-checking like 09 and 10.
+add_executable(11_declared_types 11_declared_types.cpp)
+target_link_libraries(11_declared_types PRIVATE clink::core)
+add_test(NAME 11_declared_types COMMAND 11_declared_types)
+
 # 08 is a plugin .so (clink_submit_job loads it). It must be linked as
 # MODULE, not an executable. Built only when CLINK_BUILD_PLUGIN_EXAMPLE
 # is set, since most consumers don't need the cluster-submit flow.

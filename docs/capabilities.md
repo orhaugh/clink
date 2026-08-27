@@ -96,6 +96,7 @@ embedded or submits to a cluster, unchanged.
 | Python | `pyclink` returns results as pyarrow tables | [Embedded execution](internals/embedded.md) |
 | Arrow wire format | Every operator-to-operator data frame is an Arrow IPC stream; columnar schemas for built-in types, binary fallback for user types | [Network stack](internals/network-stack.md) |
 | Testing framework | Public `clink::test` harnesses: state inspection, snapshot/restore, failure injection, `MiniCluster` | [Testing framework](internals/testing-framework.md) |
+| Declared types | One `CLINK_FIELDS` declaration per C++ type derives the byte codec (frozen layout, fixture-pinned), the Arrow schema and columnar batcher, registration defaults (channel name = type name), and a shape fingerprint that refuses a restore whose field list changed with no declared version bump | [Declared types](internals/derived-types.md) |
 
 ## Connectors
 

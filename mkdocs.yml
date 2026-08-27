@@ -113,6 +113,7 @@ nav:
       - internals/time-and-windowing.md
       - internals/state-and-backends.md
       - internals/state-snapshot-format.md
+      - internals/derived-types.md
       - internals/protocol-compatibility.md
       - internals/runbook.md
       - internals/testing-framework.md

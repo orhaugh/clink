@@ -177,6 +177,23 @@ constexpr std::uint64_t fp_record(std::uint64_t h) {
         ArrowFields<T>::descriptors());
 }
 
+// Aggregate member counting for the CLINK_FIELDS completeness assert: an
+// aggregate accepts FEWER initialisers than members, so the arity is the
+// largest probe count that still brace-initialises.
+struct ArityProbe {
+    template <typename U>
+    constexpr operator U() const;  // never defined: unevaluated context only
+};
+
+template <typename T, typename... Probes>
+constexpr std::size_t aggregate_arity() {
+    if constexpr (requires { T{Probes{}..., ArityProbe{}}; }) {
+        return aggregate_arity<T, Probes..., ArityProbe>();
+    } else {
+        return sizeof...(Probes);
+    }
+}
+
 }  // namespace fields_detail
 
 // The shape fingerprint of a described type: a stable 64-bit hash over the
@@ -195,17 +212,28 @@ inline constexpr std::uint64_t fields_fingerprint_v =
 }  // namespace clink
 
 // ---------------------------------------------------------------------
-// CLINK_ARROW_FIELDS - describe a struct's fields once
+// CLINK_FIELDS - describe a struct's fields once
 // ---------------------------------------------------------------------
 //
-// Usage (at namespace scope, after T is fully defined):
+// Usage (at namespace scope, after T is fully defined; a type living in
+// a namespace is invoked as CLINK_FIELDS(ns::T, ...) from the global
+// scope, because the macro specialises clink::ArrowFields<T>):
 //
 //     struct Trade { std::int64_t id; std::string symbol; double px; };
-//     CLINK_ARROW_FIELDS(Trade, id, symbol, px)
+//     CLINK_FIELDS(Trade, id, symbol, px);
 //
 // Expands to an explicit specialisation of clink::ArrowFields<T> whose
 // descriptors() returns a tuple of (name, &T::field) pairs. Supports up
 // to 16 fields; extend the FE_/PICK lists below for more.
+//
+// For an aggregate type the macro also asserts COMPLETENESS: the field
+// count in the list must equal the aggregate's member count, because a
+// member missing from the list is silently absent from the wire, from
+// every snapshot and from every Parquet file. The probe counts a base
+// subobject as one member, so a type with base classes may trip it
+// conservatively; CLINK_FIELDS_SUBSET is the explicit opt-out for that
+// and for a deliberate partial description. CLINK_ARROW_FIELDS is the
+// historical spelling, kept as a deprecated alias of CLINK_FIELDS.
 
 #define CLINK_ARROW_PP_EXPAND(...) __VA_ARGS__
 
@@ -266,15 +294,34 @@ inline constexpr std::uint64_t fields_fingerprint_v =
                                               CLINK_ARROW_FE_2,  \
                                               CLINK_ARROW_FE_1)(T, __VA_ARGS__))
 
-#define CLINK_ARROW_FIELDS(T, ...)                                          \
+// The deliberate-partial-description form: no completeness assert. Also
+// the escape hatch for types with base classes, where the arity probe
+// counts each base subobject as one member.
+#define CLINK_FIELDS_SUBSET(T, ...)                                         \
     template <>                                                             \
     struct clink::ArrowFields<T> {                                          \
         static constexpr bool registered = true;                            \
         /* The declared spelling, the default channel name at registration  \
-           (a namespaced type invoked as CLINK_ARROW_FIELDS(ns::T, ...)     \
+           (a namespaced type invoked as CLINK_FIELDS(ns::T, ...)           \
            registers as "ns::T"). */                                        \
         static constexpr const char* name = #T;                             \
         static constexpr auto descriptors() {                               \
             return ::std::make_tuple(CLINK_ARROW_FOR_EACH(T, __VA_ARGS__)); \
         }                                                                   \
     }
+
+#define CLINK_FIELDS(T, ...)                                                                   \
+    CLINK_FIELDS_SUBSET(T, __VA_ARGS__);                                                       \
+    static_assert(!::std::is_aggregate_v<T> ||                                                 \
+                      ::std::tuple_size_v<decltype(::clink::ArrowFields<T>::descriptors())> == \
+                          ::clink::fields_detail::aggregate_arity<T>(),                        \
+                  "clink: CLINK_FIELDS(" #T                                                    \
+                  ", ...) does not name every member of the aggregate - a field missing "      \
+                  "from the list is silently absent from the wire, from every snapshot "       \
+                  "and from every Parquet file. List every member, or use "                    \
+                  "CLINK_FIELDS_SUBSET for a deliberate partial description (types with "      \
+                  "base classes may need it too: a base subobject counts as one member)")
+
+// Deprecated alias: the historical spelling, upgraded in place to the
+// guarded form. New code writes CLINK_FIELDS.
+#define CLINK_ARROW_FIELDS(T, ...) CLINK_FIELDS(T, __VA_ARGS__)

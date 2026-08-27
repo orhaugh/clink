@@ -31,7 +31,7 @@
 
 #include "clink/api/builtin_connectors.hpp"
 #include "clink/api/pipeline.hpp"
-#include "clink/core/codec.hpp"
+#include "clink/core/fields.hpp"
 #include "clink/job/register_job.hpp"
 
 namespace heavy {
@@ -49,109 +49,16 @@ struct Order {
     std::int64_t count{0};
 };
 
-// ---------- byte codec helpers ----------
+}  // namespace heavy
 
-inline void put_u32(std::vector<std::byte>& out, std::uint32_t v) {
-    for (int i = 0; i < 4; ++i) {
-        out.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));
-    }
-}
+// One declaration per type (design record 009): everything the two hand
+// codecs, the explicit channel names and the Arrow descriptions used to
+// say separately now derives from these. At global scope because the
+// macro specialises clink::ArrowFields<T>.
+CLINK_FIELDS(heavy::Customer, id, region, product, amount);
+CLINK_FIELDS(heavy::Order, region, total_amount, count);
 
-inline void put_i64(std::vector<std::byte>& out, std::int64_t v) {
-    const auto u = static_cast<std::uint64_t>(v);
-    for (int i = 0; i < 8; ++i) {
-        out.push_back(static_cast<std::byte>((u >> (i * 8)) & 0xFF));
-    }
-}
-
-inline void put_str(std::vector<std::byte>& out, const std::string& s) {
-    put_u32(out, static_cast<std::uint32_t>(s.size()));
-    const auto* p = reinterpret_cast<const std::byte*>(s.data());
-    out.insert(out.end(), p, p + s.size());
-}
-
-inline bool read_u32(std::span<const std::byte> b, std::size_t& pos, std::uint32_t& v) {
-    if (pos + 4 > b.size()) {
-        return false;
-    }
-    v = 0;
-    for (int i = 0; i < 4; ++i) {
-        v |= static_cast<std::uint32_t>(static_cast<unsigned char>(b[pos + i])) << (i * 8);
-    }
-    pos += 4;
-    return true;
-}
-
-inline bool read_i64(std::span<const std::byte> b, std::size_t& pos, std::int64_t& v) {
-    if (pos + 8 > b.size()) {
-        return false;
-    }
-    std::uint64_t u = 0;
-    for (int i = 0; i < 8; ++i) {
-        u |= static_cast<std::uint64_t>(static_cast<unsigned char>(b[pos + i])) << (i * 8);
-    }
-    pos += 8;
-    v = static_cast<std::int64_t>(u);
-    return true;
-}
-
-inline bool read_str(std::span<const std::byte> b, std::size_t& pos, std::string& s) {
-    std::uint32_t len = 0;
-    if (!read_u32(b, pos, len)) {
-        return false;
-    }
-    if (pos + len > b.size()) {
-        return false;
-    }
-    s.assign(reinterpret_cast<const char*>(b.data() + pos), len);
-    pos += len;
-    return true;
-}
-
-inline clink::Codec<Customer> customer_codec() {
-    return clink::Codec<Customer>{
-        .encode =
-            [](const Customer& c) {
-                std::vector<std::byte> out;
-                out.reserve(64);
-                put_i64(out, c.id);
-                put_str(out, c.region);
-                put_str(out, c.product);
-                put_i64(out, c.amount);
-                return out;
-            },
-        .decode = [](std::span<const std::byte> b) -> std::optional<Customer> {
-            Customer c;
-            std::size_t pos = 0;
-            if (!read_i64(b, pos, c.id) || !read_str(b, pos, c.region) ||
-                !read_str(b, pos, c.product) || !read_i64(b, pos, c.amount)) {
-                return std::nullopt;
-            }
-            return c;
-        }};
-}
-
-inline clink::Codec<Order> order_codec() {
-    return clink::Codec<Order>{.encode =
-                                   [](const Order& o) {
-                                       std::vector<std::byte> out;
-                                       out.reserve(32);
-                                       put_str(out, o.region);
-                                       put_i64(out, o.total_amount);
-                                       put_i64(out, o.count);
-                                       return out;
-                                   },
-                               .decode = [](std::span<const std::byte> b) -> std::optional<Order> {
-                                   Order o;
-                                   std::size_t pos = 0;
-                                   if (!read_str(b, pos, o.region) ||
-                                       !read_i64(b, pos, o.total_amount) ||
-                                       !read_i64(b, pos, o.count)) {
-                                       return std::nullopt;
-                                   }
-                                   return o;
-                               }};
-}
+namespace heavy {
 
 // Build the 99-customer input deterministically. The test relies on
 // these counts and per-region totals (see test_heavy_pipeline_e2e.cpp).
@@ -186,13 +93,13 @@ inline std::string output_base_path() {
 }
 
 inline void define_job(clink::api::Pipeline& pipeline) {
-    // Register the custom typed channels. Goes through pipeline.registry()
-    // so the registrations land in the per-job bundle on the coordinator/worker
-    // AND the .so's local default-instance (via the mirror
-    // in plugin_impl.hpp::register_type) so the .so's runtime
-    // template instantiations resolve them too.
-    pipeline.registry().register_type<Customer>("heavy.customer", customer_codec());
-    pipeline.registry().register_type<Order>("heavy.order", order_codec());
+    // Register the custom typed channels from their declarations alone:
+    // channel name = the declared type name, codec = the derived codec,
+    // batcher auto-selected. Still through pipeline.registry() so the
+    // registrations land in the per-job bundle AND the .so's local
+    // default-instance (the mirror in plugin_impl.hpp::register_type).
+    pipeline.registry().register_type<Customer>();
+    pipeline.registry().register_type<Order>();
 
     pipeline.from_elements<Customer>(make_customers())
         .map<Order>([](const Customer& c) { return Order{c.region, c.amount, 1}; })

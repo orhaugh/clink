@@ -36,7 +36,7 @@ the source it cites. Keep these pages current when a subsystem changes.
 
 | Subsystem | Source | Internals page |
 |-----------|--------|----------------|
-| Engine core (types, StreamElement, batches) | `include/clink/core/` | `docs/internals/architecture.md` |
+| Engine core (types, StreamElement, batches) | `include/clink/core/` | `docs/internals/architecture.md`; declared types + derived codec: `docs/internals/derived-types.md` |
 | Operators + DAG + fluent API | `include/clink/operators/`, `include/clink/runtime/dag.hpp`, `include/clink/api/` | `docs/internals/operator-model.md` |
 | Local runtime / task lifecycle | `src/runtime/local_executor.cpp`, `include/clink/runtime/` | `docs/internals/task-lifecycle.md` |
 | Jobs, parallelism, scheduling, key groups | `include/clink/cluster/job_graph.hpp`, `include/clink/job/` | `docs/internals/jobs-and-scheduling.md` |
