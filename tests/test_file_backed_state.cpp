@@ -18,6 +18,8 @@
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/derived_codec.hpp"
+#include "clink/core/fields.hpp"
 #include "clink/core/types.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -27,7 +29,9 @@
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/file_backed_state_backend.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/state/schema_version.hpp"
 #include "clink/state/state_backend.hpp"
+#include "clink/state/state_migration_on_restore.hpp"
 
 namespace {
 
@@ -666,6 +670,117 @@ TEST(FileBackedStateBackend, PurgeCheckpointRemovesOnlyTheTargetSnapshot) {
     FileBackedStateBackend restored(dir);
     restored.restore(Snapshot{.checkpoint_id = CheckpointId{2}, .bytes = {}});
     EXPECT_EQ(as_string(*restored.get(OperatorId{1}, "k")), "v");
+
+    std::filesystem::remove_all(dir);
+}
+
+}  // namespace
+
+// Described type for the stamp tests, at namespace scope (the macro
+// specialises clink::ArrowFields<T>); Fbs-prefixed against cross-TU
+// collisions.
+struct FbsCounter {
+    std::int64_t v{};
+    bool operator==(const FbsCounter&) const = default;
+};
+CLINK_FIELDS(FbsCounter, v);
+
+namespace {
+
+constexpr auto kFbsOp = OperatorId{31};
+const std::string kFbsSlot = "fbs_slot";
+
+// --- Version and fingerprint stamps ride the on-disk snapshot ---
+//
+// These were missing (base no-op hooks) until 2026-09, on the DEFAULT
+// file:// scheme: fresh-start version stamps were dropped, restores
+// assumed v1 and re-ran migrations over current bytes, and the shape
+// fingerprint gate never fired. The three tests below pin the fix.
+
+TEST(FileBackedStateBackend, StateVersionsSurviveSnapshotAndDiskRestore) {
+    const auto dir = scratch_dir("versions_roundtrip");
+    clink::StateVersionMap stamps;
+    stamps.set(kFbsOp, "fbs.counter", 2, kFbsSlot);
+    {
+        FileBackedStateBackend writer(dir);
+        writer.set_state_versions(stamps);
+        writer.put(kFbsOp, "k", as_view("v"));
+        writer.snapshot(CheckpointId{3});
+    }
+    FileBackedStateBackend reader(dir);
+    reader.restore(Snapshot{.checkpoint_id = CheckpointId{3}, .bytes = {}});
+    EXPECT_EQ(reader.restored_state_versions().pack(), stamps.pack())
+        << "version stamps must ride the on-disk snapshot of the default file:// scheme";
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(FileBackedStateBackend, StateFingerprintsSurviveSnapshotAndDiskRestore) {
+    const auto dir = scratch_dir("fingerprints_roundtrip");
+    {
+        FileBackedStateBackend writer(dir);
+        RuntimeContext ctx(kFbsOp, "fbs", &writer, nullptr);
+        auto st = ctx.keyed_state<std::int64_t, FbsCounter>(
+            kFbsSlot, int64_codec(), clink::derived_codec<FbsCounter>());
+        st.put(1, FbsCounter{.v = 41});
+        writer.snapshot(CheckpointId{4});
+    }
+    FileBackedStateBackend reader(dir);
+    reader.restore(Snapshot{.checkpoint_id = CheckpointId{4}, .bytes = {}});
+    const auto stored = reader.restored_state_fingerprint(kFbsOp, kFbsSlot);
+    ASSERT_TRUE(stored.has_value()) << "the bind-time stamp must survive the disk round trip";
+    EXPECT_EQ(*stored, clink::fields_fingerprint_v<FbsCounter>);
+
+    // And the gate consumes it: binding the same shape passes and reads back.
+    RuntimeContext ctx(kFbsOp, "fbs", &reader, nullptr);
+    auto st = ctx.keyed_state<std::int64_t, FbsCounter>(
+        kFbsSlot, int64_codec(), clink::derived_codec<FbsCounter>());
+    const auto got = st.get(1);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, (FbsCounter{.v = 41}));
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(FileBackedStateBackend, RestoredVersionStampsPreventReMigration) {
+    // THE defect this fix is answerable to: before the forwarding
+    // overrides, restored_state_versions() on file:// returned {} so a
+    // restore assumed v1 (the documented absent-stamp default) and re-ran
+    // the 1->2 migration over already-v2 bytes - silent double-migration.
+    const auto dir = scratch_dir("no_remigration");
+    const std::string state_type = "fbs.counter.no_remigration";
+    auto runs = std::make_shared<int>(0);
+    clink::StateMigrationRegistry::global().register_migration(
+        state_type, 1, 2, [runs](std::span<const std::byte> in) {
+            ++*runs;
+            return std::vector<std::byte>{in.begin(), in.end()};
+        });
+
+    clink::StateVersionMap v2_stamp;
+    v2_stamp.set(kFbsOp, state_type, 2, kFbsSlot);
+    {
+        FileBackedStateBackend writer(dir);
+        RuntimeContext ctx(kFbsOp, "fbs", &writer, nullptr);
+        auto st = ctx.keyed_state<std::int64_t, FbsCounter>(
+            kFbsSlot, int64_codec(), clink::derived_codec<FbsCounter>());
+        st.put(1, FbsCounter{.v = 7});
+        writer.set_state_versions(v2_stamp);
+        writer.snapshot(CheckpointId{5});
+    }
+    FileBackedStateBackend reader(dir);
+    reader.restore(Snapshot{.checkpoint_id = CheckpointId{5}, .bytes = {}});
+
+    clink::StateVersionMap expected;
+    expected.set(kFbsOp, state_type, 2, kFbsSlot);
+    clink::migrate_restored_state(reader, expected);
+    EXPECT_EQ(*runs, 0) << "a restore already at the expected version must not re-migrate";
+
+    RuntimeContext ctx(kFbsOp, "fbs", &reader, nullptr);
+    auto st = ctx.keyed_state<std::int64_t, FbsCounter>(
+        kFbsSlot, int64_codec(), clink::derived_codec<FbsCounter>());
+    const auto got = st.get(1);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, (FbsCounter{.v = 7}));
 
     std::filesystem::remove_all(dir);
 }

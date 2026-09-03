@@ -87,6 +87,32 @@ public:
         return inner_.export_arrow_snapshot();
     }
 
+    // Version and fingerprint stamps forward to the inner backend, whose
+    // Arrow snapshot bytes ARE this backend's on-disk payload - so the
+    // stamps ride every .snap for free. These were missing (base no-ops)
+    // until 2026-09: on the default file:// scheme a fresh start's
+    // set_state_versions stamp was dropped, so a later restore read
+    // value_or(1) and re-ran v1->vN migrations over already-current bytes,
+    // and the shape-fingerprint gate never fired at all.
+    void set_state_versions(StateVersionMap versions) override {
+        inner_.set_state_versions(std::move(versions));
+    }
+    [[nodiscard]] StateVersionMap restored_state_versions() const override {
+        return inner_.restored_state_versions();
+    }
+    void record_state_fingerprint(OperatorId op,
+                                  const std::string& slot,
+                                  std::uint64_t fingerprint) override {
+        inner_.record_state_fingerprint(op, slot, fingerprint);
+    }
+    [[nodiscard]] std::optional<std::uint64_t> restored_state_fingerprint(
+        OperatorId op, const std::string& slot) const override {
+        return inner_.restored_state_fingerprint(op, slot);
+    }
+    void clear_state_fingerprint(OperatorId op, const std::string& slot) override {
+        inner_.clear_state_fingerprint(op, slot);
+    }
+
     // FileBacked supports the async split: its capture() is already a
     // fully detached byte blob, so the durable write moves off-thread
     // cleanly with no shared mutable state.

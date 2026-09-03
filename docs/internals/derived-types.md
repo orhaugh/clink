@@ -96,11 +96,13 @@ stamps as it rewrites their values, so after a legitimate bump +
 migration the bind sees no stale stamp and re-stamps the new shape.
 There is deliberately no override flag; migrations are the path.
 
-Backends: the in-memory backend (and everything layered on it - the
-file-backed, sharded, changelog and coalescing paths) stores and
-persists fingerprints. RocksDB and ForSt inherit the base no-op hooks
-for now, so their snapshots carry no fingerprints and get no gate -
-never a false refusal - until their metadata channels are wired.
+Backends: the in-memory backend and the paths layered on it - the
+file-backed, changelog and coalescing wrappers - store and persist
+fingerprints (the file-backed forwarding landed 2026-09; before that its
+snapshots dropped both the version and fingerprint stamps). The sharded
+in-memory backend, RocksDB and ForSt inherit the base no-op hooks for
+now, so their snapshots carry no fingerprints and get no gate - never a
+false refusal - until their metadata channels are wired.
 
 ## Worked example
 
