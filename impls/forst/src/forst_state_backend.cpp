@@ -85,6 +85,12 @@ namespace {
 // offline Arrow export recover the stamps from any checkpoint dir.
 constexpr const char* kStateVersionsKey = "__clink.state_versions";
 
+// Same channel for the shape fingerprints (design record 009): a second
+// reserved key in the default CF, packed StateFingerprintMap, written
+// through on record/clear so the next checkpoint carries it and
+// restore/export recover it from any checkpoint dir.
+constexpr const char* kStateFingerprintsKey = "__clink.state_fingerprints";
+
 // List SST basenames currently in a ForSt instance. The engine names
 // every SST file <N>.sst where N is a monotonically-increasing integer;
 // the same file appears in every checkpoint dir for as long as it's
@@ -329,6 +335,38 @@ struct ForStStateBackend::Impl {
             return {};
         }
         return StateVersionMap::unpack(out);
+    }
+
+    // Shape fingerprints: authoritative in-memory copy under the same
+    // versions_mu (identical call paths); persisted under
+    // kStateFingerprintsKey beside the version map.
+    StateFingerprintMap fingerprints;
+
+    [[nodiscard]] StateFingerprintMap read_persisted_fingerprints() const {
+        if (default_cf_ == nullptr) {
+            return {};
+        }
+        std::string out;
+        auto st = db->Get(forstdb::ReadOptions{}, default_cf_, kStateFingerprintsKey, &out);
+        if (!st.ok()) {
+            return {};
+        }
+        return StateFingerprintMap::unpack(out);
+    }
+
+    // Overwrite-Put the full repack of the in-memory map (never a blob
+    // read-modify-write). An empty map still writes so clears propagate.
+    // Caller holds versions_mu.
+    void write_through_fingerprints() {
+        if (default_cf_ == nullptr) {
+            return;
+        }
+        auto st = db->Put(
+            keyed_state_write_options(), default_cf_, kStateFingerprintsKey, fingerprints.pack());
+        if (!st.ok()) {
+            throw std::runtime_error("ForStStateBackend: fingerprint write-through failed: " +
+                                     st.ToString());
+        }
     }
 
     [[nodiscard]] forstdb::ColumnFamilyHandle* cf_for(OperatorId op) {
@@ -641,6 +679,7 @@ ForStStateBackend::ForStStateBackend(Options opts) : impl_(std::make_unique<Impl
     impl_->restore_base = std::move(opts.restore_base);
     // A restart over an existing working dir recovers the persisted stamps.
     impl_->versions = impl_->read_persisted_versions();
+    impl_->fingerprints = impl_->read_persisted_fingerprints();
 }
 
 void ForStStateBackend::set_restore_base(const std::string& dir) {
@@ -828,6 +867,31 @@ void ForStStateBackend::set_state_versions(StateVersionMap versions) {
     if (!st.ok()) {
         throw std::runtime_error("ForStStateBackend::set_state_versions failed: " + st.ToString());
     }
+}
+
+void ForStStateBackend::record_state_fingerprint(OperatorId op,
+                                                 const std::string& slot,
+                                                 std::uint64_t fingerprint) {
+    std::lock_guard lock(impl_->versions_mu);
+    // Bind fires on every restart; skip the WAL write when nothing changed.
+    if (const auto cur = impl_->fingerprints.get(op, slot);
+        cur.has_value() && *cur == fingerprint) {
+        return;
+    }
+    impl_->fingerprints.set(op, slot, fingerprint);
+    impl_->write_through_fingerprints();
+}
+
+std::optional<std::uint64_t> ForStStateBackend::restored_state_fingerprint(
+    OperatorId op, const std::string& slot) const {
+    std::lock_guard lock(impl_->versions_mu);
+    return impl_->fingerprints.get(op, slot);
+}
+
+void ForStStateBackend::clear_state_fingerprint(OperatorId op, const std::string& slot) {
+    std::lock_guard lock(impl_->versions_mu);
+    impl_->fingerprints.clear_for(op, slot);
+    impl_->write_through_fingerprints();
 }
 
 StateVersionMap ForStStateBackend::restored_state_versions() const {
@@ -1035,6 +1099,7 @@ void ForStStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg_fi
         // first/primary parent; scale-down parents share one job-level map).
         std::lock_guard vlock(impl_->versions_mu);
         impl_->versions = impl_->read_persisted_versions();
+        impl_->fingerprints = impl_->read_persisted_fingerprints();
     }
 
     // Scale-down: merge any additional parent checkpoints into the live
@@ -1187,7 +1252,8 @@ std::vector<std::byte> export_cfs_to_arrow(
     forstdb::DB& db,
     const std::vector<std::pair<std::uint64_t, forstdb::ColumnFamilyHandle*>>& cfs,
     const forstdb::ReadOptions& read_opts,
-    const StateVersionMap& versions) {
+    const StateVersionMap& versions,
+    const StateFingerprintMap& fingerprints) {
     auto sorted = cfs;
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
         return a.first < b.first;
@@ -1202,7 +1268,7 @@ std::vector<std::byte> export_cfs_to_arrow(
                 op_id, std::string_view(k.data(), k.size()), std::string_view(v.data(), v.size()));
         }
     }
-    return writer.finish(versions);
+    return writer.finish(versions, fingerprints);
 }
 
 }  // namespace
@@ -1227,13 +1293,15 @@ std::vector<std::byte> ForStStateBackend::export_arrow_snapshot() const {
         }
     }
     StateVersionMap versions;
+    StateFingerprintMap fingerprints;
     {
         std::lock_guard lock(impl_->versions_mu);
         versions = impl_->versions;
+        fingerprints = impl_->fingerprints;
     }
     std::vector<std::byte> bytes;
     try {
-        bytes = export_cfs_to_arrow(*impl_->db, cfs, ro, versions);
+        bytes = export_cfs_to_arrow(*impl_->db, cfs, ro, versions, fingerprints);
     } catch (...) {
         impl_->db->ReleaseSnapshot(snap);
         throw;
@@ -1255,20 +1323,25 @@ std::vector<std::byte> forst_checkpoint_to_arrow(const std::string& checkpoint_d
     std::vector<std::pair<std::uint64_t, forstdb::ColumnFamilyHandle*>> cfs;
     cfs.reserve(handles.size());
     StateVersionMap versions;
+    StateFingerprintMap fingerprints;
     for (std::size_t i = 0; i < handles.size(); ++i) {
         if (auto op = op_from_cf_name(names[i])) {
             cfs.emplace_back(op->value(), handles[i]);
         } else if (names[i] == forstdb::kDefaultColumnFamilyName) {
-            // The checkpoint's persisted version stamps ride the default CF.
+            // The checkpoint's persisted stamps ride the default CF.
             std::string out;
             if (db->Get(forstdb::ReadOptions{}, handles[i], kStateVersionsKey, &out).ok()) {
                 versions = StateVersionMap::unpack(out);
+            }
+            std::string fp_out;
+            if (db->Get(forstdb::ReadOptions{}, handles[i], kStateFingerprintsKey, &fp_out).ok()) {
+                fingerprints = StateFingerprintMap::unpack(fp_out);
             }
         }
     }
     std::vector<std::byte> bytes;
     try {
-        bytes = export_cfs_to_arrow(*db, cfs, forstdb::ReadOptions{}, versions);
+        bytes = export_cfs_to_arrow(*db, cfs, forstdb::ReadOptions{}, versions, fingerprints);
     } catch (...) {
         for (auto* h : handles) {
             (void)db->DestroyColumnFamilyHandle(h);

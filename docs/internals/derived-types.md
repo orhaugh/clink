@@ -100,11 +100,9 @@ Backends: the in-memory backend and the paths layered on it - the
 file-backed, sharded, changelog and coalescing wrappers - store and
 persist fingerprints (the file-backed and sharded wiring landed 2026-09;
 before that the file-backed path dropped both the version and fingerprint
-stamps). RocksDB persists them through the same reserved default-CF key
-channel as its version stamps, so they ride every checkpoint and both
-Arrow exports. ForSt inherits the base no-op hooks for now, so its
-snapshots carry no fingerprints and get no gate - never a false refusal -
-until its metadata channel is wired.
+stamps). RocksDB and ForSt persist them through the same reserved
+default-CF key channel as their version stamps, so they ride every
+checkpoint and both Arrow exports on either LSM backend.
 
 ## Worked example
 

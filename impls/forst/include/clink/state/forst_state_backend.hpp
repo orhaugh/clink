@@ -162,6 +162,16 @@ public:
     // schema metadata.
     void set_state_versions(StateVersionMap versions) override;
     [[nodiscard]] StateVersionMap restored_state_versions() const override;
+    // Shape fingerprints (design record 009) ride the same reserved-key
+    // channel: written through on record/clear so every checkpoint carries
+    // them, recovered on construction and restore, embedded in the Arrow
+    // exports beside the version map.
+    void record_state_fingerprint(OperatorId op,
+                                  const std::string& slot,
+                                  std::uint64_t fingerprint) override;
+    [[nodiscard]] std::optional<std::uint64_t> restored_state_fingerprint(
+        OperatorId op, const std::string& slot) const override;
+    void clear_state_fingerprint(OperatorId op, const std::string& slot) override;
     void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override;
     // Set the relocated savepoint directory used to rebase cp-dir
     // references on the next restore (see Options::restore_base).
