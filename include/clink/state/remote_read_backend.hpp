@@ -401,7 +401,35 @@ public:
                 e.key,
                 std::string_view(reinterpret_cast<const char*>(e.value.data()), e.value.size()));
         }
-        return writer.finish(restored_state_versions());
+        return writer.finish(hot_.restored_state_versions(), hot_.restored_state_fingerprints());
+    }
+
+    // Version and shape-fingerprint stamps forward to the hot tier, so
+    // loader-only snapshots (which ARE hot_'s Arrow bytes) and the export
+    // above carry them. POOL-MODE LIMITATION, deliberate and re-deferred:
+    // RemotePool::commit has no metadata slot, so in pool mode the stamps do
+    // not survive process death - the same as before this forwarding, no
+    // regression. Persisting them in the pool manifest is the named
+    // follow-on (a manifest-format change of its own). An in-process lazy
+    // restore keeps them: hot_.clear() in restore() deliberately preserves
+    // the metadata maps.
+    void set_state_versions(StateVersionMap versions) override {
+        hot_.set_state_versions(std::move(versions));
+    }
+    [[nodiscard]] StateVersionMap restored_state_versions() const override {
+        return hot_.restored_state_versions();
+    }
+    void record_state_fingerprint(OperatorId op,
+                                  const std::string& slot,
+                                  std::uint64_t fingerprint) override {
+        hot_.record_state_fingerprint(op, slot, fingerprint);
+    }
+    [[nodiscard]] std::optional<std::uint64_t> restored_state_fingerprint(
+        OperatorId op, const std::string& slot) const override {
+        return hot_.restored_state_fingerprint(op, slot);
+    }
+    void clear_state_fingerprint(OperatorId op, const std::string& slot) override {
+        hot_.clear_state_fingerprint(op, slot);
     }
 
     // Synchronous snapshot = capture (point-in-time delta on the operator

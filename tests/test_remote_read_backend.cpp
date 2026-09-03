@@ -735,3 +735,46 @@ TEST(RemoteReadBackend, ScanSeesDurableStateAfterALazyRestore) {
     EXPECT_EQ(seen["offset_p0"], "1000");
     EXPECT_EQ(seen["offset_p1"], "2000");
 }
+
+// ----- version and shape-fingerprint stamps -----
+
+// Loader-only: snapshot bytes ARE the hot tier's Arrow output, so stamps
+// forwarded to it ride the snapshot and come back on restore.
+TEST(RemoteReadBackend, LoaderOnlyStampsSurviveSnapshotRestore) {
+    RemoteReadBackend writer(
+        [](OperatorId, std::string) -> std::optional<StateBackend::Value> { return std::nullopt; });
+    StateVersionMap versions;
+    versions.set(OperatorId{5}, "rr.counter", 2, "rr_slot");
+    writer.set_state_versions(versions);
+    writer.record_state_fingerprint(OperatorId{5}, "rr_slot", 0xabcdef0123456789ULL);
+    writer.put(OperatorId{5}, sv("k"), sv("v"));
+    const auto snap = writer.snapshot(CheckpointId{1});
+
+    RemoteReadBackend reader(
+        [](OperatorId, std::string) -> std::optional<StateBackend::Value> { return std::nullopt; });
+    reader.restore(snap);
+    EXPECT_EQ(reader.restored_state_versions().pack(), versions.pack());
+    const auto fp = reader.restored_state_fingerprint(OperatorId{5}, "rr_slot");
+    ASSERT_TRUE(fp.has_value());
+    EXPECT_EQ(*fp, 0xabcdef0123456789ULL);
+}
+
+// Pool-backed: the stamps do not survive process death (the pool manifest
+// carries no metadata - a named follow-on), but the LIVE export must carry
+// what the running backend holds rather than the previous empty map.
+TEST(RemoteReadBackend, PoolExportCarriesLiveStamps) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    RemoteReadBackend b(pool);
+    StateVersionMap versions;
+    versions.set(OperatorId{6}, "rr.window", 3, "rr_pool_slot");
+    b.set_state_versions(versions);
+    b.record_state_fingerprint(OperatorId{6}, "rr_pool_slot", 0x1111222233334444ULL);
+    b.put(OperatorId{6}, sv("k"), sv("v"));
+
+    InMemoryStateBackend ref;
+    ref.restore(Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = b.export_arrow_snapshot()});
+    EXPECT_EQ(ref.restored_state_versions().pack(), versions.pack());
+    const auto fp = ref.restored_state_fingerprint(OperatorId{6}, "rr_pool_slot");
+    ASSERT_TRUE(fp.has_value());
+    EXPECT_EQ(*fp, 0x1111222233334444ULL);
+}

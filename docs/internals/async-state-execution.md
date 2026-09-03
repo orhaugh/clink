@@ -86,6 +86,14 @@ A watermark-driven operator that drops late records at ingest needs the watermar
 - **Loader-only.** Cold reads go through an arbitrary `RemoteLoader` callable; snapshot/restore capture the hot tier only; there is no durable remote write-back. Used for read-through caching over an external loader, and for tests.
 - **Pool-backed (production).** State is durable in a `RemotePool`. Cold reads fetch `(op, key)` from the pool as of the last committed checkpoint; snapshot commits only the delta since the last checkpoint; restore is lazy (cold reads serve the restored checkpoint, nothing is loaded eagerly), which is the fast-recovery and fast-rescale win.
 
+Version and shape-fingerprint stamps forward to the hot tier, so they ride
+loader-only snapshots and both live in the Arrow export. In pool mode the
+stamps do NOT survive process death: `RemotePool::commit` carries no
+metadata slot, so persisting them durably is an explicitly deferred
+follow-on (a manifest-format change of its own); an in-process lazy
+restore keeps them because `hot_.clear()` deliberately preserves the
+metadata maps.
+
 `get(op, key)` (synchronous) returns a hot hit immediately, otherwise does a blocking remote load with the lock released and fills the result through into the hot tier. `get_async(op, key[, order_key])` is the non-blocking twin: a hot hit `co_return`s with no suspension; on a cold miss with a wired resume scheduler it suspends on a `RemoteLoad` awaiter whose `await_suspend` posts the blocking load to the completion executor and, on completion, calls `post_resume_` to hand the handle back to the runner; `await_resume` (on the runner) does the write-through under the lock. If no resume scheduler is wired, `get_async` degrades to a safe inline blocking load. `get_many_async` serves hot hits immediately then fetches all cold misses in one batched call with a single suspension (`RemoteLoadMany`).
 
 The completion source behind the awaiter is the `CompletionExecutor` (`include/clink/async/completion_executor.hpp`). The default is a per-backend `ThreadPoolCompletionExecutor` sized by `io_threads` (default `kDefaultIoThreads = 8`); a shared or io_uring-backed executor can be injected at construction. `submit_blocking` runs an opaque callable (the production case, an S3 GET through the AWS SDK) on a worker thread; `submit_read` does a file-descriptor read. The executor never resumes a coroutine and never touches the hot tier; it only runs the load off-thread and posts the handle.
