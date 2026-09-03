@@ -712,6 +712,24 @@ struct CheckpointConfig {
     return c.max_restarts_on_worker_loss;
 }
 
+// Client → coordinator, inside SubmitJobMsg: the identity a plugin's
+// handshake symbols report, read by the submitter's own dlopen so the
+// coordinator can refuse an incompatible plugin on the FIRST, references-only
+// exchange - before any plugin bytes ship. Best-effort: a submitter that
+// cannot read the symbols (or predates this field) sends no advert and the
+// coordinator's load-time gate remains the authority. Deliberately excludes
+// the per-header manifest (~19KB): on a rejection the coordinator returns ITS
+// manifest in the ack and the client, which holds the plugin locally, names
+// the differing headers itself.
+struct PluginAbiAdvert {
+    std::string content_hash;  // pairs the advert with its PluginBinary
+    std::string abi_fingerprint;
+    std::string abi_hash;  // for strict mode, which gates on the exact commit
+    std::uint32_t abi_version{0};
+    std::string target_triple;
+    std::string toolchain;
+};
+
 // Client → coordinator. Carries a JobGraphSpec serialized as JSON, plus any
 // plugin .so/.dylib files referenced by the graph, plus optional
 // checkpointing config.
@@ -719,6 +737,10 @@ struct SubmitJobMsg {
     std::string graph_json;
     std::vector<PluginBinary> plugins;
     CheckpointConfig checkpoint;
+    // ABI identity per plugin (see PluginAbiAdvert). Appended at the wire
+    // tail, eof-guarded: absent from older clients, ignored by older
+    // coordinators.
+    std::vector<PluginAbiAdvert> plugin_abi_adverts;
 };
 
 // coordinator → Client. Returned in response to SubmitJob. job_id is 0 on rejection.
@@ -731,6 +753,15 @@ struct SubmitJobAckMsg {
     // "re-send with bytes for these"; the submitter retries once on the
     // same connection. Appended at the tail, eof-guarded, defaults empty.
     std::vector<std::string> missing_plugin_hashes;
+    // The cluster's own ABI identity, appended at the tail (eof-guarded,
+    // absent from older coordinators). The identity trio is always filled;
+    // cluster_abi_manifest carries the per-header surface manifest ONLY when
+    // the submit was refused by the ABI preflight, so the client can name the
+    // differing headers against its local copy of the plugin.
+    std::string cluster_abi_fingerprint;
+    std::string cluster_target_triple;
+    std::string cluster_toolchain;
+    std::string cluster_abi_manifest;
 };
 
 // coordinator → Client. One per submitted job, sent when every subtask has finished

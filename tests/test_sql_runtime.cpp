@@ -4356,8 +4356,14 @@ TEST(SqlRuntime, RankAndDenseRankTopNSemantics) {
 TEST(SqlRuntime, DerivedTableFeedsOuterAggregate) {
     ensure_sql_installed_once();
 
-    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_dt_in.ndjson";
-    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_dt_out.ndjson";
+    // "dt" = derived table here; DateTimeFunctionsPerRow abbreviated
+    // date/time to the same prefix, and under ctest -j the two tests ran
+    // concurrently and clobbered each other's fixture files (one read the
+    // other's rows and failed on a missing key). Distinct names per test.
+    const auto in_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_derived_table_in.ndjson";
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_derived_table_out.ndjson";
     std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
 
@@ -10618,8 +10624,12 @@ TEST(SqlRuntime, LookupJoinEnrichesProbeStream) {
 TEST(SqlRuntime, DateTimeFunctionsPerRow) {
     ensure_sql_installed_once();
 
-    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_dt_in.ndjson";
-    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_dt_out.ndjson";
+    // Was clink_sql_e2e_dt_*, which collided with DerivedTableFeedsOuterAggregate
+    // under ctest -j (see the note there).
+    const auto in_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_datetime_in.ndjson";
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_datetime_out.ndjson";
     std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
     write_lines(in_path, {R"({"id":1,"ts":1000000000000})", R"({"id":2,"ts":0})"});

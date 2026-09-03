@@ -34,7 +34,7 @@ co-evolve past its own history.
 | State snapshots and savepoints | 1 (`clink.format_version`) | 1 (absence reads as 1) | `docs/internals/state-snapshot-format.md` |
 | Job plan (`JobGraphSpec` JSON) | unversioned, additive-only | n/a | `JobGraphSpec::from_json`, `src/cluster/job_graph.cpp` |
 | Connector offsets and committables | ride the snapshot format | n/a | per-connector state encodings, `docs/internals/sink-committer-framework.md` |
-| Plugin ABI | `kAbiVersion` + structural fingerprint | exact fingerprint match | `src/cluster/plugin_loader.cpp` |
+| Plugin ABI | `kAbiVersion` + declared-surface fingerprint + toolchain identity | exact match on all three gates | `src/cluster/plugin_loader.cpp`, `scripts/plugin-abi-surface.txt` |
 | Embedded C ABI | 1 (`CLINK_EMBED_ABI_VERSION`) | caller-checked | `include/clink/embed/clink.h` |
 | Incident capture (`.cap`) | 2 (`kCaptureVersion`) | header-gated | `include/clink/runtime/record_capture.hpp` |
 | Capabilities manifest JSON | 1 (`schema_version`) | additive-only within 1 | `include/clink/connectors/capability.hpp` |
@@ -149,16 +149,26 @@ rows, CONFIRMED markers, idempotent re-delivery of executed commits) is
 
 ## Plugin ABI
 
-Three exported constants (`include/clink/plugin/abi_version.hpp`, generated):
-`kAbiVersion` (manual bump for semantic breaks), `kAbiFingerprint` (hash of
-the public headers, ABI-relevant compile options and `kAbiVersion`), and
-`kAbiHash` (exact git commit, informational). The loader
-(`src/cluster/plugin_loader.cpp`) admits a plugin iff the structural
-fingerprints match exactly; `CLINK_STRICT_PLUGIN_ABI=1` restores exact
+Five exported constants (`include/clink/plugin/abi_version.hpp` and
+`abi_surface.hpp`, both generated): `kAbiVersion` (manual bump for semantic
+breaks), `kAbiFingerprint` (hash of the DECLARED extension surface - the
+headers in `scripts/plugin-abi-surface.txt` - plus the build options that
+surface uses, the pinned Arrow version and `kAbiVersion`), `kToolchain`
+(preprocessor-composed stdlib / dual-ABI / sanitizer identity),
+`kAbiSurfaceManifest` (per-header "path=sha256" lines, so a refusal names
+what differs), and `kAbiHash` (exact git commit, informational). The loader
+(`src/cluster/plugin_loader.cpp`) admits a plugin iff the fingerprints, the
+target triples and - when the plugin exports the symbol - the toolchain
+identities all match exactly; `CLINK_STRICT_PLUGIN_ABI=1` restores exact
 commit-hash matching, and a legacy plugin exporting no fingerprint symbol is
-held to the strict rule rather than waved through. There is no N-1
-tolerance by design: a plugin links `clink_core` statically, so "compatible"
-means "built against identical headers".
+held to the strict rule rather than waved through. The submitter advertises
+each plugin's identity inside `SubmitJob` (`PluginAbiAdvert`, an eof-guarded
+tail) and the coordinator refuses an incompatible plugin before requesting
+bytes; `SubmitJobAck` carries the cluster's identity (and, on such a refusal,
+its manifest) in eof-guarded tail fields. There is no N-1 tolerance by
+design: a plugin links `clink_core` statically, so "compatible" means "built
+against an identical declared surface with a layout-compatible toolchain"
+(design record `docs/design/010-stable-extension-model.md`).
 
 ## Embedded C ABI
 

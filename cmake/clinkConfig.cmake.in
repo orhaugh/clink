@@ -78,6 +78,10 @@ endif()
 # --- Targets ---------------------------------------------------------------
 include("${CMAKE_CURRENT_LIST_DIR}/clinkTargets.cmake")
 
+# clink_add_job_module(): the supported recipe for building a job/plugin
+# module against this package (see ClinkJobModule.cmake for the contract).
+include("${CMAKE_CURRENT_LIST_DIR}/ClinkJobModule.cmake")
+
 # Manifest of impls that were built and installed alongside this package.
 # Consumers can `if(clink_kafka IN_LIST clink_AVAILABLE_IMPLS)` to gate
 # usage of an optional connector.

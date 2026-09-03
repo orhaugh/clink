@@ -10,6 +10,7 @@
 #ifdef __APPLE__
 #include <libproc.h>
 #endif
+#include <dlfcn.h>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -25,6 +26,7 @@
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
 #include "clink/cluster/worker.hpp"
@@ -1758,6 +1760,22 @@ std::uint64_t counter_value(const char* name) {
     return MetricsRegistry::global().counter(name).value();
 }
 
+std::filesystem::path cluster_mismatched_fingerprint_plugin_path() {
+#ifdef CLINK_MISMATCHED_FINGERPRINT_PLUGIN_PATH
+    return std::filesystem::path{CLINK_MISMATCHED_FINGERPRINT_PLUGIN_PATH};
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path cluster_integrity_throw_job_path() {
+#ifdef CLINK_INTEGRITY_THROW_JOB_PATH
+    return std::filesystem::path{CLINK_INTEGRITY_THROW_JOB_PATH};
+#else
+    return {};
+#endif
+}
+
 }  // namespace
 
 // Content-addressed plugin shipping (item 30), end to end and in process:
@@ -1848,6 +1866,122 @@ TEST(Cluster, PluginBytesShipOncePerWorkerConnection) {
     std::filesystem::remove(out2);
     worker.stop();
     coordinator.stop();
+}
+
+// Submit-time ABI preflight: a plugin whose advertised identity fails the
+// cluster's gate is refused on the FIRST, references-only exchange - the
+// coordinator never requests bytes, nothing lands in its cache, and the
+// rejection names the differing headers (computed client-side by the
+// submitter from the plugin's local manifest against the cluster manifest
+// carried in the ack tail).
+TEST(Cluster, IncompatiblePluginIsRefusedBeforeAnyBytesShip) {
+    const auto plugin = cluster_mismatched_fingerprint_plugin_path();
+    if (plugin.empty() || !std::filesystem::exists(plugin)) {
+        GTEST_SKIP() << "mismatched_fingerprint_plugin not built";
+    }
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+
+    // Any parseable graph does: the preflight fires before planning ever
+    // sees these operator types.
+    clink::cluster::JobGraphSpec g;
+    clink::cluster::OperatorSpec src;
+    src.id = "src";
+    src.type = "never.Planned";
+    src.out_channel = "never.Type";
+    g.ops.push_back(std::move(src));
+
+    const auto refusals_before = counter_value("clink_coordinator_submit_preflight_refusals_total");
+
+    clink::application::JobSubmitter submitter("127.0.0.1", port);
+    clink::application::SubmitOptions opts;
+    opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
+    auto r = submitter.submit(g.to_json(), {plugin.string()}, opts);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.reject_message.find("submit preflight refused plugin"), std::string::npos)
+        << r.reject_message;
+    EXPECT_NE(r.reject_message.find("fingerprint mismatch"), std::string::npos) << r.reject_message;
+    // The named diff, computed client-side against the ack's cluster manifest.
+    EXPECT_NE(r.reject_message.find("added_by_fixture.hpp"), std::string::npos) << r.reject_message;
+    EXPECT_GT(counter_value("clink_coordinator_submit_preflight_refusals_total"), refusals_before);
+
+    // Zero bytes shipped: the refused module never reached this process's
+    // plugin cache (only write_plugin_to_cache populates it, and the
+    // coordinator rejects before ever asking for bytes).
+    const auto bin = clink::cluster::make_plugin_binary_from_file(plugin.string());
+    EXPECT_TRUE(clink::cluster::find_plugin_in_cache(bin.content_hash).empty())
+        << "the coordinator cached bytes for a plugin it refused at preflight";
+
+    coordinator.stop();
+}
+
+// The cross-boundary typed-catch contract (item 19), pinned end to end: an
+// operator inside a plugin .so throws clink::state::CheckpointIntegrityError;
+// the worker - host code of the same process, across the dlopen seam -
+// catches it BY TYPE and marks the failure fatal, so the job fails with the
+// cause instead of consuming restart budget restoring onto fresh state. The
+// catch works under RTLD_LOCAL because both standard libraries fall back to
+// typeinfo NAME comparison for default-visibility types; that is exactly why
+// clink_add_job_module's HIDDEN_VISIBILITY option stays experimental until
+// this test also passes under it.
+TEST(Cluster, PluginThrownIntegrityErrorIsFatalAcrossTheDlopenSeam) {
+    const auto job_so = cluster_integrity_throw_job_path();
+    if (job_so.empty() || !std::filesystem::exists(job_so)) {
+        GTEST_SKIP() << "integrity_throw_job not built";
+    }
+
+    // The graph JSON lives inside the .so (its inline ops are minted by the
+    // plugin's build_fn); extract it the way clink_submit_job does.
+    void* handle = ::dlopen(job_so.c_str(), RTLD_NOW | RTLD_LOCAL);
+    ASSERT_NE(handle, nullptr) << ::dlerror();
+    using JobBuildFn = int (*)(const char**, std::size_t*);
+    JobBuildFn job_build = nullptr;
+    void* symbol = ::dlsym(handle, "clink_job_build");
+    ASSERT_NE(symbol, nullptr);
+    std::memcpy(&job_build, &symbol, sizeof(job_build));
+    const char* graph_data = nullptr;
+    std::size_t graph_size = 0;
+    ASSERT_EQ(job_build(&graph_data, &graph_size), 0);
+    const std::string graph_json{graph_data, graph_size};
+
+    Coordinator::Config cfg;
+    // A restart budget EXISTS; the fatal classification must leave it unspent.
+    cfg.max_restarts = 3;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-integrity"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-integrity", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto restarts_before = counter_value("clink_coordinator_job_restarts_total");
+
+    clink::application::JobSubmitter submitter("127.0.0.1", port);
+    clink::application::SubmitOptions opts;
+    opts.wait_for_completion = true;
+    opts.wait_timeout = clink::test_support::scale_slack(10s);
+    opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
+    auto r = submitter.submit(graph_json, {job_so.string()}, opts);
+    ASSERT_TRUE(r.completed) << r.reject_message;
+    ASSERT_FALSE(r.ok) << "a job whose operator throws must not complete cleanly";
+    bool named = false;
+    for (const auto& e : r.errors) {
+        if (e.find("deliberately damaged restore point") != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named) << "the typed exception's message must survive the boundary as the cause";
+    EXPECT_EQ(counter_value("clink_coordinator_job_restarts_total"), restarts_before)
+        << "a fatal integrity error must fail the job, not spend restart budget";
+
+    worker.stop();
+    coordinator.stop();
+    ::dlclose(handle);
 }
 
 // A hash-only reference the worker cannot resolve fails the deploy LOUDLY

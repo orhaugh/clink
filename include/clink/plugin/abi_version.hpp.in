@@ -4,16 +4,87 @@
 
 #pragma once
 
+// Forces the standard library's configuration macros (__GLIBCXX__,
+// _LIBCPP_VERSION, _GLIBCXX_USE_CXX11_ABI) to be visible below regardless of
+// what the including TU pulled in first - without this, kToolchain could
+// compose differently across TUs of the same build.
+#include <cstddef>
+
+#if defined(__has_feature)
+#define CLINK_ABI_HAS_FEATURE(x) __has_feature(x)
+#else
+#define CLINK_ABI_HAS_FEATURE(x) 0
+#endif
+
+// Standard-library identity. The value of __GLIBCXX__ / _LIBCPP_VERSION is
+// deliberately NOT included: both libraries keep a stable ABI across releases,
+// so folding a version number in would rotate the gate on every toolchain
+// bump with no layout change behind it. What must match is which library it
+// is, and for libstdc++ the dual-ABI choice.
+#if defined(_LIBCPP_VERSION)
+#define CLINK_ABI_TOOLCHAIN_STDLIB "libc++"
+#elif defined(__GLIBCXX__)
+#if defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 0
+#define CLINK_ABI_TOOLCHAIN_STDLIB "libstdc++-cxx11abi0"
+#else
+#define CLINK_ABI_TOOLCHAIN_STDLIB "libstdc++-cxx11abi1"
+#endif
+#else
+#define CLINK_ABI_TOOLCHAIN_STDLIB "unknown-stdlib"
+#endif
+
+// _GLIBCXX_DEBUG swaps container layouts wholesale.
+#if defined(_GLIBCXX_DEBUG)
+#define CLINK_ABI_TOOLCHAIN_DEBUG ";glibcxx-debug"
+#else
+#define CLINK_ABI_TOOLCHAIN_DEBUG ""
+#endif
+
+// Sanitizers that require every module in the process to be instrumented
+// (interceptors, shadow memory, container annotations). UBSan is deliberately
+// absent: it neither changes layout nor requires whole-process instrumentation.
+#if defined(__SANITIZE_ADDRESS__) || CLINK_ABI_HAS_FEATURE(address_sanitizer)
+#define CLINK_ABI_TOOLCHAIN_ASAN ";asan"
+#else
+#define CLINK_ABI_TOOLCHAIN_ASAN ""
+#endif
+#if defined(__SANITIZE_THREAD__) || CLINK_ABI_HAS_FEATURE(thread_sanitizer)
+#define CLINK_ABI_TOOLCHAIN_TSAN ";tsan"
+#else
+#define CLINK_ABI_TOOLCHAIN_TSAN ""
+#endif
+#if CLINK_ABI_HAS_FEATURE(memory_sanitizer)
+#define CLINK_ABI_TOOLCHAIN_MSAN ";msan"
+#else
+#define CLINK_ABI_TOOLCHAIN_MSAN ""
+#endif
+
 namespace clink::plugin {
 
-// Structural ABI fingerprint - the DEFAULT load gate. A hash of the public
-// header content + ABI-relevant compile options + kAbiVersion, computed at
-// clink configure time (CMakeLists.txt) and baked in identically to the cluster
-// and to any plugin built against these headers. The loader accepts a plugin
-// whose kAbiFingerprint equals the cluster's and refuses otherwise. It rotates
-// when the ABI/behaviour surface actually changes but NOT on .cpp / test / doc /
-// build-only commits, so a cluster patch rebuild keeps loading existing plugins
-// while a real ABI change auto-invalidates them - no human bump required.
+// Toolchain identity: the layout-affecting facts of the COMPILING translation
+// unit that the build system cannot hash into the fingerprint (they are
+// decided by the compiler environment, not by CMake options). Composed by the
+// preprocessor, so a plugin TU bakes the plugin's toolchain and a cluster TU
+// bakes the cluster's. The loader refuses a plugin whose toolchain string
+// differs from the cluster's - e.g. a TSan cluster and an uninstrumented
+// plugin, or a libc++ host and a libstdc++ module. Plugins that predate the
+// clink_plugin_toolchain symbol skip this check: they are already refused by
+// the fingerprint gate, which rotated when this constant was introduced.
+inline constexpr const char* kToolchain =
+    CLINK_ABI_TOOLCHAIN_STDLIB CLINK_ABI_TOOLCHAIN_DEBUG CLINK_ABI_TOOLCHAIN_ASAN
+        CLINK_ABI_TOOLCHAIN_TSAN CLINK_ABI_TOOLCHAIN_MSAN;
+
+// Structural ABI fingerprint - the DEFAULT load gate. A hash of the DECLARED
+// extension surface (the headers named by scripts/plugin-abi-surface.txt: the
+// transitive include closure of the plugin authoring entry points) + the
+// ABI-relevant build options that surface uses + the pinned Arrow version +
+// kAbiVersion, computed at clink configure time (CMakeLists.txt) and baked in
+// identically to the cluster and to any plugin built against these headers.
+// The loader accepts a plugin whose kAbiFingerprint equals the cluster's and
+// refuses otherwise. It rotates when the surface a plugin can reach across the
+// dlopen boundary actually changes, but NOT on host-side header edits (sql/,
+// embed/, ...) or .cpp / test / doc / build-only commits - so a cluster
+// rebuild keeps loading existing plugins unless the contract genuinely moved.
 inline constexpr const char* kAbiFingerprint = "@CLINK_ABI_FINGERPRINT@";
 
 // Manual ABI-break knob, folded INTO kAbiFingerprint. Bump it (CLINK_ABI_VERSION

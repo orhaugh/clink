@@ -126,4 +126,12 @@ function(clink_install_finalize)
             "${CMAKE_CURRENT_BINARY_DIR}/cmake/clinkConfig.cmake"
             "${CMAKE_CURRENT_BINARY_DIR}/cmake/clinkConfigVersion.cmake"
         DESTINATION ${CLINK_INSTALL_CMAKE_DIR})
+
+    # The supported job-module recipe ships with the package, so out-of-tree
+    # consumers build plugins the same way the tree does (clinkConfig.cmake
+    # includes ClinkJobModule.cmake, which includes the debug-split module).
+    install(FILES
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ClinkJobModule.cmake"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ClinkPluginDebugSplit.cmake"
+        DESTINATION ${CLINK_INSTALL_CMAKE_DIR})
 endfunction()

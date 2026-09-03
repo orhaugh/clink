@@ -642,8 +642,20 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
             const auto path = write_plugin_to_cache(p);
             auto load_result = PluginLoader::default_instance().load_into(path, bundle_preg);
             if (!load_result.ok) {
-                log::warn("coordinator.ha",
-                          "plugin '" + p.name + "' failed to recover: " + load_result.error);
+                // Refusing is correct - mismatched bytes must never run, and
+                // parking would wedge forever (persisted bytes cannot become
+                // compatible). The failure mode to defend against is SILENCE:
+                // after an engine upgrade that rotated the ABI surface, every
+                // persisted job whose plugin predates it lands here, and the
+                // operator's remedy (resubmit a rebuilt plugin) starts with
+                // seeing it happen. Hence error level + a counter, with the
+                // gate's own message naming what differs.
+                log::error("coordinator.ha",
+                           "job NOT recovered: plugin '" + p.name +
+                               "' failed this build's load gate and the job needs a "
+                               "resubmit with a rebuilt plugin: " +
+                               load_result.error);
+                clink::metrics::orch::ha_recovery_skipped_plugin_inc();
                 plugins_ok = false;
                 break;
             }
@@ -3378,7 +3390,42 @@ void Coordinator::handle_list_jobs_(network::Connection& conn) {
 void Coordinator::handle_submit_(network::Connection& conn, MessageReader& r) {
     auto sj = decode_submit_job(r);
     SubmitJobAckMsg ack;
+    // The cluster's ABI identity rides every ack (old clients EOF before it):
+    // cheap constants, and a rejected client can say what it was refused by.
+    ack.cluster_abi_fingerprint = cluster_abi_fingerprint();
+    ack.cluster_target_triple = cluster_target_triple();
+    ack.cluster_toolchain = cluster_toolchain();
     JobId assigned = 0;
+    // ABI preflight: refuse an incompatible plugin on the references-only
+    // exchange, BEFORE resolving references or requesting bytes. Adverts are
+    // best-effort claims by the client, so passing here proves nothing - the
+    // load-time gate below remains the authority; failing here only saves
+    // shipping bytes that gate would refuse. The manifest tail lets the
+    // client name the differing headers against its local copy.
+    for (const auto& ad : sj.plugin_abi_adverts) {
+        AbiCheckInput in;
+        in.strict = strict_plugin_abi_enabled();
+        in.plugin_has_fingerprint = !ad.abi_fingerprint.empty();
+        in.plugin_fingerprint = ad.abi_fingerprint;
+        in.cluster_fingerprint = cluster_abi_fingerprint();
+        in.plugin_hash = ad.abi_hash;
+        in.cluster_hash = cluster_abi_hash();
+        in.plugin_triple = ad.target_triple;
+        in.cluster_triple = cluster_target_triple();
+        in.plugin_has_toolchain = !ad.toolchain.empty();
+        in.plugin_toolchain = ad.toolchain;
+        in.cluster_toolchain = cluster_toolchain();
+        if (auto check = check_plugin_abi(in); !check.error.empty()) {
+            ack.job_id = 0;
+            ack.ok = false;
+            ack.message = "submit preflight refused plugin (content hash " + ad.content_hash +
+                          "): " + check.error;
+            ack.cluster_abi_manifest = cluster_abi_manifest();
+            metrics::coordinator::submit_preflight_refusal();
+            send_frame(conn, encode_frame(MessageKind::SubmitJobAck, ack));
+            return;
+        }
+    }
     try {
         const auto graph = JobGraphSpec::from_json(sj.graph_json);
         // Allocate a per-job bundle whose registries are parented at
@@ -6056,11 +6103,26 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
         // job back to its last checkpoint + replaying (the branch below), so a
         // per-subtask redeploy (which leaves the other subtasks un-rolled-back)
         // would break exactly-once - skip it when there is a checkpoint dir.
-        if (msg.had_error && cfg_.max_restarts > 0 && job.checkpoint.checkpoint_dir.empty()) {
-            const int attempts = ++job.attempt_counts[key];
-            if (attempts <= cfg_.max_restarts) {
-                auto rec_it = job.task_records.find(key);
-                if (rec_it != job.task_records.end()) {
+        //
+        // Two exclusions, both found by driving a plugin job through this path:
+        // - !msg.fatal: a FATAL error (damaged restore point, plugin gate
+        //   refusal) is deterministic for the artefacts involved; retrying it
+        //   converts one loud failure into max_restarts identical ones.
+        // - role tasks only, never kGenericSubtaskRole: a chained generic
+        //   subtask cannot be retried piecemeal - its peers keep running or
+        //   complete, so a lone redeploy waits on input edges that will never
+        //   reopen. (It also never worked: the clink_attempt marker appended
+        //   below corrupted the chain-spec JSON in extra_config, so every
+        //   generic retry died parsing its own chain and the retry loop only
+        //   masked the original error. Role handlers own their extra_config
+        //   format and parse the marker as a line, which is where it stays.)
+        if (msg.had_error && !msg.fatal && cfg_.max_restarts > 0 &&
+            job.checkpoint.checkpoint_dir.empty()) {
+            auto rec_it = job.task_records.find(key);
+            if (rec_it != job.task_records.end() &&
+                rec_it->second.second.role != kGenericSubtaskRole) {
+                const int attempts = ++job.attempt_counts[key];
+                if (attempts <= cfg_.max_restarts) {
                     retry = true;
                     retry_task = rec_it->second.second;
                     if (!retry_task.extra_config.empty() &&

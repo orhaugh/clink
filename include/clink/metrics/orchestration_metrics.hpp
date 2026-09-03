@@ -188,6 +188,15 @@ inline void ha_recovered_jobs_inc(std::uint64_t n = 1) {
     MetricsRegistry::global().counter(kHaRecoveredJobs).increment(n);
 }
 
+// A persisted job was NOT recovered because its plugin failed this
+// coordinator's load gate - the expected outcome for a job whose plugin
+// predates an engine upgrade that rotated the ABI surface. The job needs a
+// resubmit with a rebuilt plugin; recovery refusing to run mismatched bytes
+// is the contract, and this counter is what makes the skip visible.
+inline void ha_recovery_skipped_plugin_inc() {
+    MetricsRegistry::global().counter("clink_ha_recovery_skipped_plugin_total").increment();
+}
+
 }  // namespace orch
 
 }  // namespace clink::metrics

@@ -1572,6 +1572,7 @@ void Worker::handle_deploy_(MessageReader& r) {
     // SubtaskFinished for every task in this deploy, so the coordinator doesn't
     // wedge waiting for a subtask that never started.
     std::string plugin_err;
+    auto plugin_failure = clink::cluster::PluginLoadFailure::None;
     for (const auto& plug : msg.plugins) {
         try {
             // A hash-only reference (item 30) claims this worker's cache
@@ -1598,6 +1599,7 @@ void Worker::handle_deploy_(MessageReader& r) {
                 clink::cluster::PluginLoader::default_instance().load_into(path, bundle_preg);
             if (!res.ok) {
                 plugin_err = "plugin '" + plug.name + "': " + res.error;
+                plugin_failure = res.failure;
                 break;
             }
             job_bundle->retain_plugin(std::move(res.plugin));
@@ -1607,6 +1609,23 @@ void Worker::handle_deploy_(MessageReader& r) {
         }
     }
     if (!plugin_err.empty()) {
+        // The three deterministic gate refusals can never succeed on a retry
+        // of the same binaries, so they are FATAL: the coordinator fails the
+        // job with this cause instead of burning its restart budget through
+        // redeploy-and-refuse loops. Reachable only on a mixed-version
+        // cluster (the coordinator admitted the plugin with ITS gate at
+        // submit), i.e. mid rolling upgrade - failing loudly with both
+        // identities named beats a non-deterministic retry, because the
+        // scheduler has no notion of ABI affinity to retry TOWARDS. Cache
+        // misses, dlopen I/O errors and register-hook failures keep the
+        // ordinary retry semantics: those can be environmental or job logic.
+        const bool gate_refusal = clink::cluster::is_plugin_gate_refusal(plugin_failure);
+        if (gate_refusal) {
+            metrics::worker::plugin_gate_refused();
+            log::error("worker.plugin",
+                       "deploy refused by the plugin ABI gate (job " + std::to_string(msg.job_id) +
+                           "): " + plugin_err);
+        }
         for (const auto& task : msg.tasks) {
             SubtaskFinishedMsg done;
             done.job_id = msg.job_id;
@@ -1615,6 +1634,7 @@ void Worker::handle_deploy_(MessageReader& r) {
             done.subtask_idx = task.subtask_idx;
             done.had_error = true;
             done.error_message = plugin_err;
+            done.fatal = gate_refusal;
             send_frame_(encode_frame(MessageKind::SubtaskFinished, done));
         }
         return;
@@ -1990,8 +2010,18 @@ void Worker::run_generic_subtask_(JobId job_id,
     }
     const auto& bundle_tr = *job_tr;
 
-    // 1. Parse the OperatorChainSpec embedded by the JobPlanner.
-    auto chain = OperatorChainSpec::from_json(task.extra_config);
+    // 1. Parse the OperatorChainSpec embedded by the JobPlanner. A bare
+    // parser message ("TAPE_ERROR: ...") with no payload is unactionable, so
+    // name the artefact and carry a bounded excerpt of what arrived.
+    OperatorChainSpec chain;
+    try {
+        chain = OperatorChainSpec::from_json(task.extra_config);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            std::string{"generic subtask: planner chain spec failed to parse ("} + e.what() +
+            "); extra_config[" + std::to_string(task.extra_config.size()) +
+            " bytes] begins: " + task.extra_config.substr(0, 256));
+    }
     if (chain.ops.empty()) {
         throw std::runtime_error("generic subtask: chain has no ops");
     }

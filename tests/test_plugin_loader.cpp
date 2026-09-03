@@ -38,6 +38,51 @@ std::filesystem::path schema_evo_job_path() {
 #endif
 }
 
+std::filesystem::path mismatched_fingerprint_plugin_path() {
+#ifdef CLINK_MISMATCHED_FINGERPRINT_PLUGIN_PATH
+    return std::filesystem::path{CLINK_MISMATCHED_FINGERPRINT_PLUGIN_PATH};
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path mismatched_triple_plugin_path() {
+#ifdef CLINK_MISMATCHED_TRIPLE_PLUGIN_PATH
+    return std::filesystem::path{CLINK_MISMATCHED_TRIPLE_PLUGIN_PATH};
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path mismatched_toolchain_plugin_path() {
+#ifdef CLINK_MISMATCHED_TOOLCHAIN_PLUGIN_PATH
+    return std::filesystem::path{CLINK_MISMATCHED_TOOLCHAIN_PLUGIN_PATH};
+#else
+    return {};
+#endif
+}
+
+// Loads a deliberately incompatible fixture .so through a private loader and
+// asserts the refusal: !ok, the expected classification, the expected message
+// content, and - via the fixture's poisoned register hook (rc=99) - that
+// registration never ran.
+void expect_so_refused(const std::filesystem::path& path,
+                       clink::cluster::PluginLoadFailure want,
+                       const std::string& want_in_error) {
+    if (!std::filesystem::exists(path)) {
+        GTEST_SKIP() << "mismatched-abi fixture not built; expected at " << path;
+    }
+    clink::cluster::PluginLoader loader;
+    clink::cluster::JobBundle bundle;
+    auto preg = bundle.as_plugin_registry();
+    auto result = loader.load_into(path.string(), preg);
+    ASSERT_FALSE(result.ok) << "an incompatible plugin was admitted";
+    EXPECT_EQ(result.failure, want) << result.error;
+    EXPECT_NE(result.error.find(want_in_error), std::string::npos) << result.error;
+    EXPECT_EQ(result.error.find("register hook"), std::string::npos)
+        << "the register hook ran on a plugin the gate should have refused: " << result.error;
+}
+
 }  // namespace
 
 TEST(PluginLoader, LoadsValidHelloPluginEndToEnd) {
@@ -55,6 +100,7 @@ TEST(PluginLoader, LoadsValidHelloPluginEndToEnd) {
     EXPECT_EQ(result.plugin.abi_version, clink::cluster::cluster_abi_version());
     EXPECT_EQ(result.plugin.abi_hash, clink::cluster::cluster_abi_hash());
     EXPECT_EQ(result.plugin.target_triple, clink::cluster::cluster_target_triple());
+    EXPECT_EQ(result.plugin.toolchain, clink::cluster::cluster_toolchain());
 
     // The plugin's registrations are now in the global registries.
     const auto& tr = clink::cluster::TypeRegistry::default_instance();
@@ -78,8 +124,9 @@ TEST(PluginAbiGate, FingerprintMatchLoadsAcrossDifferentCommitHashes) {
     in.cluster_fingerprint = "fp-abc";
     in.plugin_hash = "aaaaaaa-plugin-built-earlier";
     in.cluster_hash = "bbbbbbb-cluster-built-later";
-    EXPECT_EQ(clink::cluster::check_plugin_abi(in), "")
-        << "same fingerprint must load regardless of commit hash";
+    const auto check = clink::cluster::check_plugin_abi(in);
+    EXPECT_EQ(check.error, "") << "same fingerprint must load regardless of commit hash";
+    EXPECT_EQ(check.failure, clink::cluster::PluginLoadFailure::None);
 }
 
 TEST(PluginAbiGate, FingerprintMismatchIsRefused) {
@@ -89,8 +136,9 @@ TEST(PluginAbiGate, FingerprintMismatchIsRefused) {
     in.cluster_fingerprint = "fp-new";
     in.plugin_hash = "x";
     in.cluster_hash = "y";
-    const auto err = clink::cluster::check_plugin_abi(in);
-    EXPECT_NE(err.find("fingerprint mismatch"), std::string::npos) << err;
+    const auto check = clink::cluster::check_plugin_abi(in);
+    EXPECT_NE(check.error.find("fingerprint mismatch"), std::string::npos) << check.error;
+    EXPECT_EQ(check.failure, clink::cluster::PluginLoadFailure::AbiMismatch);
 }
 
 // Strict mode restores the exact commit-hash gate: same fingerprint but a
@@ -103,11 +151,11 @@ TEST(PluginAbiGate, StrictModeRequiresExactHash) {
     in.cluster_fingerprint = "fp-abc";
     in.plugin_hash = "aaa";
     in.cluster_hash = "bbb";
-    EXPECT_NE(clink::cluster::check_plugin_abi(in).find("hash mismatch"), std::string::npos);
+    EXPECT_NE(clink::cluster::check_plugin_abi(in).error.find("hash mismatch"), std::string::npos);
 
     in.plugin_hash = "same";
     in.cluster_hash = "same";
-    EXPECT_EQ(clink::cluster::check_plugin_abi(in), "");
+    EXPECT_EQ(clink::cluster::check_plugin_abi(in).error, "");
 }
 
 // A legacy plugin with no fingerprint symbol falls back to the exact-hash gate
@@ -120,11 +168,133 @@ TEST(PluginAbiGate, LegacyPluginFallsBackToHash) {
     in.cluster_fingerprint = "fp-new";
     in.plugin_hash = "old";
     in.cluster_hash = "new";
-    EXPECT_NE(clink::cluster::check_plugin_abi(in).find("hash mismatch"), std::string::npos);
+    EXPECT_NE(clink::cluster::check_plugin_abi(in).error.find("hash mismatch"), std::string::npos);
 
     in.plugin_hash = "match";
     in.cluster_hash = "match";
-    EXPECT_EQ(clink::cluster::check_plugin_abi(in), "");
+    EXPECT_EQ(clink::cluster::check_plugin_abi(in).error, "");
+}
+
+// The target-triple gate, previously applied by the loader outside the pure
+// function and therefore untestable without a real .so.
+TEST(PluginAbiGate, TripleMismatchIsRefused) {
+    clink::cluster::AbiCheckInput in;
+    in.plugin_has_fingerprint = true;
+    in.plugin_fingerprint = "fp";
+    in.cluster_fingerprint = "fp";
+    in.plugin_triple = "linux-x86_64";
+    in.cluster_triple = "darwin-arm64";
+    const auto check = clink::cluster::check_plugin_abi(in);
+    EXPECT_NE(check.error.find("target-triple mismatch"), std::string::npos) << check.error;
+    EXPECT_EQ(check.failure, clink::cluster::PluginLoadFailure::TripleMismatch);
+}
+
+// The toolchain gate refuses a plugin whose stdlib / sanitizer identity
+// differs from the cluster's - the same headers hash to the same fingerprint
+// under ASan and without it, so the fingerprint alone cannot catch this.
+TEST(PluginAbiGate, ToolchainMismatchIsRefused) {
+    clink::cluster::AbiCheckInput in;
+    in.plugin_has_fingerprint = true;
+    in.plugin_fingerprint = "fp";
+    in.cluster_fingerprint = "fp";
+    in.plugin_has_toolchain = true;
+    in.plugin_toolchain = "libstdc++-cxx11abi1";
+    in.cluster_toolchain = "libstdc++-cxx11abi1;tsan";
+    const auto check = clink::cluster::check_plugin_abi(in);
+    EXPECT_NE(check.error.find("toolchain mismatch"), std::string::npos) << check.error;
+    EXPECT_EQ(check.failure, clink::cluster::PluginLoadFailure::ToolchainMismatch);
+}
+
+// A plugin without the toolchain symbol predates fingerprint v2 (which
+// introduced it), so the fingerprint gate already refuses it; when the
+// fingerprints DO match, the absent symbol must not refuse a compatible
+// plugin.
+TEST(PluginAbiGate, MissingToolchainSymbolSkipsTheToolchainGate) {
+    clink::cluster::AbiCheckInput in;
+    in.plugin_has_fingerprint = true;
+    in.plugin_fingerprint = "fp";
+    in.cluster_fingerprint = "fp";
+    in.plugin_has_toolchain = false;
+    in.cluster_toolchain = "libc++";
+    EXPECT_EQ(clink::cluster::check_plugin_abi(in).error, "");
+}
+
+// A fingerprint refusal with both manifests available names the headers that
+// differ instead of only reporting two opaque hashes.
+TEST(PluginAbiGate, FingerprintMismatchNamesTheDifferingHeaders) {
+    clink::cluster::AbiCheckInput in;
+    in.plugin_has_fingerprint = true;
+    in.plugin_fingerprint = "fp-old";
+    in.cluster_fingerprint = "fp-new";
+    in.plugin_manifest = "include/clink/runtime/dag.hpp=aaa\ninclude/clink/core/codec.hpp=x\n";
+    in.cluster_manifest = "include/clink/runtime/dag.hpp=bbb\ninclude/clink/core/codec.hpp=x\n";
+    const auto check = clink::cluster::check_plugin_abi(in);
+    EXPECT_NE(check.error.find("include/clink/runtime/dag.hpp (changed)"), std::string::npos)
+        << check.error;
+    EXPECT_EQ(check.error.find("codec.hpp"), std::string::npos)
+        << "an unchanged header must not be named: " << check.error;
+}
+
+// Identical manifests with differing fingerprints mean the difference is in
+// the non-header material (build options, Arrow pin, ABI version) - say so
+// rather than presenting an empty diff.
+TEST(PluginAbiGate, FingerprintMismatchWithIdenticalManifestsBlamesTheOptions) {
+    clink::cluster::AbiCheckInput in;
+    in.plugin_has_fingerprint = true;
+    in.plugin_fingerprint = "fp-asan-build";
+    in.cluster_fingerprint = "fp-plain-build";
+    in.plugin_manifest = "include/clink/runtime/dag.hpp=aaa\n";
+    in.cluster_manifest = "include/clink/runtime/dag.hpp=aaa\n";
+    const auto check = clink::cluster::check_plugin_abi(in);
+    EXPECT_NE(check.error.find("build options"), std::string::npos) << check.error;
+}
+
+TEST(ManifestDiff, ChangedAndOneSidedEntriesAreNamed) {
+    const std::string plugin =
+        "a.hpp=1\n"
+        "b.hpp=2\n"
+        "c.hpp=3\n";
+    const std::string cluster =
+        "a.hpp=1\n"
+        "b.hpp=CHANGED\n"
+        "d.hpp=4\n";
+    const auto diff = clink::cluster::summarise_manifest_diff(plugin, cluster, 10);
+    EXPECT_NE(diff.find("b.hpp (changed)"), std::string::npos) << diff;
+    EXPECT_NE(diff.find("c.hpp (only in plugin)"), std::string::npos) << diff;
+    EXPECT_NE(diff.find("d.hpp (only in cluster)"), std::string::npos) << diff;
+    EXPECT_EQ(diff.find("a.hpp"), std::string::npos) << diff;
+}
+
+TEST(ManifestDiff, TruncatesAtMaxNames) {
+    std::string plugin;
+    std::string cluster;
+    for (int i = 0; i < 8; ++i) {
+        plugin += "h" + std::to_string(i) + ".hpp=old\n";
+        cluster += "h" + std::to_string(i) + ".hpp=new\n";
+    }
+    const auto diff = clink::cluster::summarise_manifest_diff(plugin, cluster, 3);
+    EXPECT_NE(diff.find("and 5 more"), std::string::npos) << diff;
+}
+
+TEST(ManifestDiff, EqualOrEmptyManifestsProduceNothing) {
+    EXPECT_EQ(clink::cluster::summarise_manifest_diff("a.hpp=1\n", "a.hpp=1\n", 5), "");
+    EXPECT_EQ(clink::cluster::summarise_manifest_diff("", "a.hpp=1\n", 5), "");
+    EXPECT_EQ(clink::cluster::summarise_manifest_diff("a.hpp=1\n", "", 5), "");
+}
+
+// The deploy-time fatal contract: exactly the three deterministic gate
+// refusals fail the job with the cause; everything else (environmental or
+// job-logic failures) keeps ordinary retry semantics.
+TEST(PluginAbiGate, OnlyDeterministicGateRefusalsAreFatalForDeploys) {
+    using F = clink::cluster::PluginLoadFailure;
+    EXPECT_TRUE(clink::cluster::is_plugin_gate_refusal(F::AbiMismatch));
+    EXPECT_TRUE(clink::cluster::is_plugin_gate_refusal(F::TripleMismatch));
+    EXPECT_TRUE(clink::cluster::is_plugin_gate_refusal(F::ToolchainMismatch));
+    EXPECT_FALSE(clink::cluster::is_plugin_gate_refusal(F::None));
+    EXPECT_FALSE(clink::cluster::is_plugin_gate_refusal(F::Dlopen));
+    EXPECT_FALSE(clink::cluster::is_plugin_gate_refusal(F::MissingSymbol));
+    EXPECT_FALSE(clink::cluster::is_plugin_gate_refusal(F::NullMetadata));
+    EXPECT_FALSE(clink::cluster::is_plugin_gate_refusal(F::RegisterFailed));
 }
 
 TEST(PluginLoader, LoadIsIdempotent) {
@@ -214,4 +384,30 @@ TEST(PluginLoader, MissingFileFailsCleanly) {
     auto result = loader.load("/tmp/does-not-exist-12345.so");
     EXPECT_FALSE(result.ok);
     EXPECT_FALSE(result.error.empty());
+    EXPECT_EQ(result.failure, clink::cluster::PluginLoadFailure::Dlopen);
+}
+
+// The refusal paths against REAL dlopen'd modules (fixtures built from
+// plugin_examples/mismatched_abi_plugin.cpp, one doctored identity value
+// each). The pure-function PluginAbiGate tests cannot prove the loader reads
+// the symbols, classifies the failure, or leaves the register hook unrun.
+
+TEST(MismatchedPluginSo, BogusFingerprintIsRefusedWithTheNamedDiff) {
+    // The fixture's manifest differs from the cluster's by one appended
+    // header, so the refusal must name it.
+    expect_so_refused(mismatched_fingerprint_plugin_path(),
+                      clink::cluster::PluginLoadFailure::AbiMismatch,
+                      "include/clink/imaginary/added_by_fixture.hpp (only in plugin)");
+}
+
+TEST(MismatchedPluginSo, BogusTripleIsRefused) {
+    expect_so_refused(mismatched_triple_plugin_path(),
+                      clink::cluster::PluginLoadFailure::TripleMismatch,
+                      "vax-780");
+}
+
+TEST(MismatchedPluginSo, BogusToolchainIsRefused) {
+    expect_so_refused(mismatched_toolchain_plugin_path(),
+                      clink::cluster::PluginLoadFailure::ToolchainMismatch,
+                      "fortran-iv");
 }

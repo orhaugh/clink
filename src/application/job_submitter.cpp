@@ -4,6 +4,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <dlfcn.h>
 #include <optional>
 #include <poll.h>
 #include <stdexcept>
@@ -13,6 +15,7 @@
 #include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/plugin_cache.hpp"
+#include "clink/cluster/plugin_loader.hpp"  // summarise_manifest_diff
 #include "clink/cluster/protocol.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
@@ -104,6 +107,59 @@ std::optional<std::vector<std::byte>> read_frame_with_timeout(int fd,
     return body;
 }
 
+// What the submitter's own dlopen of a plugin reports: the wire advert plus
+// the local per-header manifest, which never ships (the coordinator returns
+// ITS manifest on a rejection and the diff is computed here, client-side).
+struct LocalPluginIdentity {
+    PluginAbiAdvert advert;
+    std::string manifest;
+};
+
+// Read the ABI identity a plugin's handshake symbols report, via a private
+// dlopen. Best-effort: any failure returns nullopt and the submit proceeds
+// exactly as before the preflight existed - the coordinator's load-time gate
+// stays the authority. Only the constexpr-string getters are called, never
+// the register hook, so no module closure can escape and the handle is safe
+// to close (the strings are copied out first).
+std::optional<LocalPluginIdentity> read_plugin_identity(const std::string& path,
+                                                        const std::string& content_hash) {
+    void* handle = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        return std::nullopt;
+    }
+    auto read_str = [handle](const char* sym) -> std::string {
+        using Fn = const char* (*)();
+        void* p = ::dlsym(handle, sym);
+        if (p == nullptr) {
+            return {};
+        }
+        Fn fn = nullptr;
+        std::memcpy(&fn, &p, sizeof(fn));
+        const char* v = fn();
+        return v == nullptr ? std::string{} : std::string{v};
+    };
+    LocalPluginIdentity id;
+    id.advert.content_hash = content_hash;
+    id.advert.abi_fingerprint = read_str("clink_plugin_abi_fingerprint");
+    id.advert.abi_hash = read_str("clink_plugin_abi_hash");
+    id.advert.target_triple = read_str("clink_plugin_target_triple");
+    id.advert.toolchain = read_str("clink_plugin_toolchain");
+    id.manifest = read_str("clink_plugin_abi_manifest");
+    if (void* p = ::dlsym(handle, "clink_plugin_abi_version"); p != nullptr) {
+        using VerFn = int (*)();
+        VerFn fn = nullptr;
+        std::memcpy(&fn, &p, sizeof(fn));
+        id.advert.abi_version = static_cast<std::uint32_t>(fn());
+    }
+    ::dlclose(handle);
+    if (id.advert.abi_hash.empty() && id.advert.abi_fingerprint.empty()) {
+        // Not a clink plugin handshake; advertise nothing rather than a
+        // guaranteed-mismatching empty identity.
+        return std::nullopt;
+    }
+    return id;
+}
+
 }  // namespace
 
 JobSubmitter::JobSubmitter(std::string coordinator_host, std::uint16_t coordinator_port)
@@ -163,6 +219,18 @@ SubmitResult JobSubmitter::submit(const std::string& graph_json,
             PluginBinary{.name = plug.name, .content_hash = plug.content_hash, .bytes = {}});
     }
     sj.checkpoint = opts.checkpoint;
+    // ABI preflight material: advertise each plugin's handshake identity so an
+    // incompatible plugin is refused on this references-only exchange, before
+    // any bytes ship. Best-effort per plugin; the local manifests stay here
+    // for naming the differing headers if the coordinator refuses.
+    std::vector<std::string> local_manifests(plugin_paths.size());
+    for (std::size_t i = 0; i < plugin_paths.size(); ++i) {
+        if (auto id = read_plugin_identity(plugin_paths[i], plugins[i].content_hash);
+            id.has_value()) {
+            sj.plugin_abi_adverts.push_back(std::move(id->advert));
+            local_manifests[i] = std::move(id->manifest);
+        }
+    }
 
     const auto submit_and_read_ack =
         [&](const SubmitJobMsg& msg) -> std::optional<SubmitJobAckMsg> {
@@ -218,6 +286,21 @@ SubmitResult JobSubmitter::submit(const std::string& graph_json,
     const auto& ack = *ack_opt;
     if (!ack.ok) {
         result.reject_message = ack.message;
+        // An ABI-preflight refusal carries the cluster's per-header manifest;
+        // the plugin's own manifest is local, so the headers that differ are
+        // named here rather than shipped.
+        if (!ack.cluster_abi_manifest.empty()) {
+            for (const auto& manifest : local_manifests) {
+                if (manifest.empty()) {
+                    continue;
+                }
+                const auto diff =
+                    cluster::summarise_manifest_diff(manifest, ack.cluster_abi_manifest, 5);
+                if (!diff.empty()) {
+                    result.reject_message += ". " + diff;
+                }
+            }
+        }
         return result;
     }
     result.job_id = ack.job_id;

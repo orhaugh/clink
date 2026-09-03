@@ -62,13 +62,14 @@ target_link_libraries(11_declared_types PRIVATE clink::core)
 add_test(NAME 11_declared_types COMMAND 11_declared_types)
 
 # 08 is a plugin .so (clink_submit_job loads it). It must be linked as
-# MODULE, not an executable. Built only when CLINK_BUILD_PLUGIN_EXAMPLE
-# is set, since most consumers don't need the cluster-submit flow.
+# MODULE, not an executable, and it uses clink_add_job_module - the helper
+# the installed clink CMake package ships precisely so out-of-tree job
+# builds follow the supported recipe (PREFIX "", split-debug on ELF, the
+# handshake symbols kept). Built only when CLINK_BUILD_PLUGIN_EXAMPLE is
+# set, since most consumers don't need the cluster-submit flow.
 option(CLINK_BUILD_PLUGIN_EXAMPLE "Build the CLINK_REGISTER_JOB plugin example" OFF)
 if(CLINK_BUILD_PLUGIN_EXAMPLE)
-    add_library(08_cluster_job_plugin MODULE 08_cluster_job_plugin.cpp)
-    target_link_libraries(08_cluster_job_plugin PRIVATE clink::core)
-    set_target_properties(08_cluster_job_plugin PROPERTIES
-        PREFIX ""              # produce 08_cluster_job_plugin.so, not lib08...so
-        SUFFIX ".so")
+    clink_add_job_module(08_cluster_job_plugin
+        SOURCES 08_cluster_job_plugin.cpp
+        SUFFIX ".so")  # produce 08_cluster_job_plugin.so on every platform
 endif()

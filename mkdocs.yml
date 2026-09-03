@@ -165,6 +165,7 @@ nav:
       - design/007-state-generations.md
       - design/008-hot-rescale.md
       - design/009-one-declaration-per-type.md
+      - design/010-stable-extension-model.md
   - Examples:
       - consumer-examples/README.md
       - consumer-examples/state_as_data/README.md

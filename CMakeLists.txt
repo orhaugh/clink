@@ -212,7 +212,10 @@ option(CLINK_INTEGRATION_TESTS "Build integration tests that need external servi
 include(CompilerWarnings)
 include(GNUInstallDirs)
 include(cmake/ClinkInstall.cmake)
-include(cmake/ClinkPluginDebugSplit.cmake)
+# Pulls in ClinkPluginDebugSplit.cmake and defines clink_add_job_module(),
+# the one supported recipe for building a job/plugin module (also installed
+# with the CMake package for out-of-tree consumers).
+include(cmake/ClinkJobModule.cmake)
 
 # Always emit compile_commands.json so clang-tidy / clangd / IDEs can
 # resolve per-TU flags without extra plumbing. Cheap to leave on.
@@ -282,33 +285,10 @@ elseif(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
 endif()
 message(STATUS "clink: plugin ABI hash = ${CLINK_ABI_HASH} (clean: ${CLINK_ABI_HASH_CLEAN})")
 
-# Structural ABI fingerprint: a hash of the public header content plus the
-# ABI-relevant compile options and CLINK_ABI_VERSION. This is the DEFAULT
-# compatibility gate. It rotates when the plugin ABI/behaviour surface actually
-# changes - a public header edit (layout, virtual, inline/template body, macro),
-# a toggled ABI option, or a manual CLINK_ABI_VERSION bump - but NOT on the
-# majority of commits that touch only .cpp / tests / docs / build scaffolding.
-# So a cluster patch rebuild keeps loading existing plugins, while a real ABI
-# change auto-invalidates them without anyone remembering to bump a number.
-# Errs toward over-invalidation (hashes the whole public include tree, not a
-# curated ABI subset) - the safe direction for a load gate. CLINK_ABI_VERSION
-# folds in as a manual force-rotate for a semantic break the header text can't
-# capture. The generated header is in the BINARY dir, so it is not self-hashed.
-file(GLOB_RECURSE _clink_abi_headers CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_SOURCE_DIR}/include/clink/*.hpp")
-list(SORT _clink_abi_headers)
-set(_clink_abi_material "abi_version=${CLINK_ABI_VERSION};flat_hash_map=${CLINK_USE_FLAT_HASH_MAP};")
-foreach(_clink_h IN LISTS _clink_abi_headers)
-    file(SHA256 "${_clink_h}" _clink_h_hash)
-    string(APPEND _clink_abi_material "${_clink_h_hash}")
-endforeach()
-string(SHA256 CLINK_ABI_FINGERPRINT "${_clink_abi_material}")
-message(STATUS "clink: plugin ABI fingerprint = ${CLINK_ABI_FINGERPRINT} (abi v${CLINK_ABI_VERSION})")
-
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/clink/plugin/abi_version.hpp.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/include/clink/plugin/abi_version.hpp"
-    @ONLY)
+# The structural ABI fingerprint (the DEFAULT plugin compatibility gate) is
+# computed further down, after dependency detection: its material includes the
+# pinned Arrow version and the resolved ABI-relevant build options, which are
+# not known yet at this point. See "Plugin ABI fingerprint" below.
 
 # WS4 open-addressing state container. Fetched + made global BEFORE any target
 # so the CLINK_USE_FLAT_HASH_MAP define and the ankerl include reach every TU
@@ -693,6 +673,116 @@ find_package(Parquet REQUIRED)
 target_link_libraries(clink_core PUBLIC Parquet::parquet_shared)
 target_compile_definitions(clink_core PUBLIC CLINK_HAS_PARQUET=1)
 message(STATUS "clink::core - Parquet enabled")
+
+# ---------------------------------------------------------------------------
+# Plugin ABI fingerprint: the DEFAULT plugin compatibility gate.
+#
+# A SHA256 over the DECLARED extension surface - the tracked manifest
+# scripts/plugin-abi-surface.txt, generated as the transitive include closure
+# of the plugin authoring entry points (scripts/gen-plugin-abi-surface.py) -
+# plus the ABI-relevant build options named by the manifest's [options]
+# section, the pinned Arrow version and CLINK_ABI_VERSION. It rotates when
+# the surface a plugin can actually reach across the dlopen boundary changes,
+# and NOT on edits to host-side headers (sql/, embed/, queryable_state/, ...)
+# or to .cpp / tests / docs / build scaffolding - so a cluster rebuild keeps
+# loading existing plugins unless the contract genuinely moved. A header
+# entering or leaving the closure shows up as a reviewed manifest diff, gated
+# by the --check mode in CI and the pre-commit hook. CLINK_ABI_VERSION folds
+# in as a manual force-rotate for a semantic break the header text cannot
+# capture. The generated header is in the BINARY dir, so it is not self-hashed
+# (its .hpp.in template is hashed instead, via the manifest).
+# ---------------------------------------------------------------------------
+set(_clink_abi_manifest "${CMAKE_CURRENT_SOURCE_DIR}/scripts/plugin-abi-surface.txt")
+if(NOT EXISTS "${_clink_abi_manifest}")
+    message(FATAL_ERROR
+        "clink: scripts/plugin-abi-surface.txt is missing. Regenerate it with "
+        "scripts/gen-plugin-abi-surface.py.")
+endif()
+file(STRINGS "${_clink_abi_manifest}" _clink_abi_manifest_lines)
+set(_clink_abi_headers "")
+set(_clink_abi_options "")
+set(_clink_abi_section "")
+foreach(_l IN LISTS _clink_abi_manifest_lines)
+    if(_l MATCHES "^#" OR _l STREQUAL "")
+        continue()
+    elseif(_l STREQUAL "[headers]")
+        set(_clink_abi_section "headers")
+    elseif(_l STREQUAL "[options]")
+        set(_clink_abi_section "options")
+    elseif(_clink_abi_section STREQUAL "headers")
+        list(APPEND _clink_abi_headers "${_l}")
+    elseif(_clink_abi_section STREQUAL "options")
+        list(APPEND _clink_abi_options "${_l}")
+    else()
+        message(FATAL_ERROR
+            "clink: unrecognised line in scripts/plugin-abi-surface.txt: '${_l}'")
+    endif()
+endforeach()
+
+# Each [options] token maps to the build's resolved value, normalised to 0/1
+# so ON/TRUE/1 spellings cannot diverge. An unmapped token means a surface
+# header gained a new conditional-compilation knob: decide whether it is
+# ABI-relevant and add the mapping here - refusing to guess is the point.
+set(_clink_abi_material "abi_version=${CLINK_ABI_VERSION};arrow_version=${CLINK_PINNED_ARROW_VERSION};")
+foreach(_opt IN LISTS _clink_abi_options)
+    if(_opt STREQUAL "CLINK_USE_FLAT_HASH_MAP")
+        set(_clink_opt_value "${CLINK_USE_FLAT_HASH_MAP}")
+    elseif(_opt STREQUAL "CLINK_FAULT_INJECTION")
+        # fault_injection.hpp swaps a class declaration on this macro, so a
+        # test-configured build (AUTO -> ON) and a runtime build (OFF) are
+        # genuinely different ABIs.
+        set(_clink_opt_value "${CLINK_FAULT_INJECTION_ACTIVE}")
+    elseif(_opt STREQUAL "CLINK_HAS_ARROW")
+        set(_clink_opt_value ON)  # find_package(Arrow REQUIRED) above
+    elseif(_opt STREQUAL "CLINK_HAS_PARQUET")
+        set(_clink_opt_value ON)  # find_package(Parquet REQUIRED) above
+    elseif(_opt STREQUAL "CLINK_HAS_ARROW_COMPUTE")
+        set(_clink_opt_value "${CLINK_ARROW_COMPUTE_FOUND}")
+    else()
+        message(FATAL_ERROR
+            "clink: plugin-abi-surface.txt declares option '${_opt}' with no "
+            "value mapping in CMakeLists.txt. Add one where the fingerprint "
+            "material is assembled.")
+    endif()
+    if(_clink_opt_value)
+        string(APPEND _clink_abi_material "${_opt}=1;")
+    else()
+        string(APPEND _clink_abi_material "${_opt}=0;")
+    endif()
+endforeach()
+
+set(CLINK_ABI_SURFACE_MANIFEST "")
+foreach(_clink_h IN LISTS _clink_abi_headers)
+    set(_clink_h_path "${CMAKE_CURRENT_SOURCE_DIR}/${_clink_h}")
+    if(NOT EXISTS "${_clink_h_path}")
+        message(FATAL_ERROR
+            "clink: scripts/plugin-abi-surface.txt lists a missing header: "
+            "${_clink_h}. Regenerate the manifest with "
+            "scripts/gen-plugin-abi-surface.py and review the diff.")
+    endif()
+    file(SHA256 "${_clink_h_path}" _clink_h_hash)
+    string(APPEND _clink_abi_material "${_clink_h_hash}")
+    string(APPEND CLINK_ABI_SURFACE_MANIFEST "${_clink_h}=${_clink_h_hash}\n")
+    # A content edit to any hashed header must re-run configure, or a stale
+    # fingerprint would be baked into the next build.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_clink_h_path}")
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_clink_abi_manifest}")
+string(SHA256 CLINK_ABI_FINGERPRINT "${_clink_abi_material}")
+list(LENGTH _clink_abi_headers _clink_abi_header_count)
+message(STATUS "clink: plugin ABI fingerprint = ${CLINK_ABI_FINGERPRINT} "
+               "(abi v${CLINK_ABI_VERSION}, ${_clink_abi_header_count} surface headers)")
+
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/clink/plugin/abi_version.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/include/clink/plugin/abi_version.hpp"
+    @ONLY)
+# The per-header manifest, baked in beside the fingerprint so a refusal can
+# name the differing headers (see abi_surface.hpp.in).
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/clink/plugin/abi_surface.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/include/clink/plugin/abi_surface.hpp"
+    @ONLY)
 
 # ---------------------------------------------------------------------------
 # Logging: spdlog behind the clink::logging module. clink does not use fmt

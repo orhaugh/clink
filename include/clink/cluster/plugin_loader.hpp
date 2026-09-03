@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -28,9 +29,36 @@ struct LoadedPlugin {
     int abi_version{0};           // From clink_plugin_abi_version() (diagnostic; 0 = legacy).
     std::string abi_hash;         // From clink_plugin_abi_hash() (informational / strict gate).
     std::string target_triple;    // From clink_plugin_target_triple().
+    std::string toolchain;        // From clink_plugin_toolchain() ("" = legacy plugin).
     std::shared_ptr<void> module;
     void* dl_handle{nullptr};  // Non-owning alias of module.get(), for dlsym callers.
 };
+
+// Structured classification of a load failure. The deterministic gate
+// refusals (kAbiMismatch / kTripleMismatch / kToolchainMismatch) can never
+// succeed on retry with the same binaries, so callers may treat them as
+// terminal for the artifact (the worker marks them fatal on deploy); the
+// remaining kinds keep ordinary retry semantics - a dlopen error can be
+// environmental and a register failure is the job's own logic.
+enum class PluginLoadFailure : std::uint8_t {
+    None,
+    Dlopen,
+    MissingSymbol,
+    AbiMismatch,        // fingerprint (default) or exact-hash (strict/legacy) gate
+    TripleMismatch,     // built for a different platform
+    ToolchainMismatch,  // stdlib / sanitizer identity differs
+    NullMetadata,
+    RegisterFailed,
+};
+
+// True for the deterministic gate refusals that cannot succeed on a retry
+// with the same binaries (ABI surface / target triple / toolchain). Deploy
+// paths mark these fatal so the job fails with the cause instead of consuming
+// restart budget on redeploy-and-refuse loops.
+[[nodiscard]] constexpr bool is_plugin_gate_refusal(PluginLoadFailure f) noexcept {
+    return f == PluginLoadFailure::AbiMismatch || f == PluginLoadFailure::TripleMismatch ||
+           f == PluginLoadFailure::ToolchainMismatch;
+}
 
 // Outcome of a load attempt. Holds the parsed LoadedPlugin on success
 // or a structured error otherwise. The error message is human-readable
@@ -39,6 +67,7 @@ struct PluginLoadResult {
     bool ok{false};
     LoadedPlugin plugin;
     std::string error;
+    PluginLoadFailure failure{PluginLoadFailure::None};
 };
 
 // PluginLoader is the cluster-side machinery that loads a .so from a
@@ -117,6 +146,17 @@ const char* cluster_abi_hash() noexcept;
 // it as a runtime string for diagnostics.
 const char* cluster_target_triple() noexcept;
 
+// The cluster's toolchain identity (stdlib, dual-ABI choice, sanitizer
+// instrumentation - see kToolchain in the generated abi_version.hpp). A plugin
+// exporting a different value is refused; a plugin without the symbol predates
+// the fingerprint that introduced it and is refused by the fingerprint gate.
+const char* cluster_toolchain() noexcept;
+
+// The cluster's per-header surface manifest ("path=sha256" lines, from the
+// generated abi_surface.hpp). Used to name the differing headers when a
+// plugin's fingerprint does not match.
+const char* cluster_abi_manifest() noexcept;
+
 // True when strict plugin-ABI matching is requested (CLINK_STRICT_PLUGIN_ABI=1
 // in the environment). In strict mode the loader falls back to the historic
 // exact commit-hash gate instead of the fingerprint gate.
@@ -124,11 +164,19 @@ bool strict_plugin_abi_enabled() noexcept;
 
 // Pure decision for whether a plugin is ABI-compatible with the cluster,
 // factored out of PluginLoader::load so it can be unit-tested without a real
-// .so. Returns an empty string when compatible, otherwise a human-readable
-// rejection reason. The target-triple gate is applied separately by the loader.
+// .so. Returns an empty error when compatible, otherwise a human-readable
+// rejection reason plus its PluginLoadFailure classification.
 //
-// Default: compare structural fingerprints. Strict mode, or a legacy plugin
-// that predates the fingerprint symbol, falls back to the exact commit-hash.
+// Order of gates:
+//   1. Default: compare structural fingerprints. Strict mode, or a legacy
+//      plugin that predates the fingerprint symbol, falls back to the exact
+//      commit-hash. On a fingerprint mismatch with both manifests supplied,
+//      the error names the differing headers (or blames the build options
+//      when the manifests are identical).
+//   2. Target triple: unconditional equality.
+//   3. Toolchain identity: equality iff the plugin exports the symbol
+//      (plugin_has_toolchain); a legacy plugin skips this gate because the
+//      fingerprint that introduced the symbol already refuses it.
 struct AbiCheckInput {
     bool strict{false};                  // strict mode requested (exact-hash gate)
     bool plugin_has_fingerprint{false};  // plugin exports clink_plugin_abi_fingerprint
@@ -136,7 +184,26 @@ struct AbiCheckInput {
     std::string cluster_fingerprint;
     std::string plugin_hash;
     std::string cluster_hash;
+    std::string plugin_triple;  // "" (default) compares equal for legacy unit tests
+    std::string cluster_triple;
+    bool plugin_has_toolchain{false};  // plugin exports clink_plugin_toolchain
+    std::string plugin_toolchain;
+    std::string cluster_toolchain;
+    std::string plugin_manifest;   // "path=sha256" lines; "" = symbol absent
+    std::string cluster_manifest;  // "" = do not attempt to name the diff
 };
-std::string check_plugin_abi(const AbiCheckInput& in);
+struct AbiCheckResult {
+    std::string error;  // empty = compatible
+    PluginLoadFailure failure{PluginLoadFailure::None};
+};
+AbiCheckResult check_plugin_abi(const AbiCheckInput& in);
+
+// Names the difference between two "path=sha256" manifests: headers whose
+// hash changed, headers only one side has, capped at max_names entries with
+// a "+N more" tail. Returns "" when the manifests are equal or either is
+// empty. Pure; exposed for unit tests.
+std::string summarise_manifest_diff(const std::string& plugin_manifest,
+                                    const std::string& cluster_manifest,
+                                    std::size_t max_names);
 
 }  // namespace clink::cluster

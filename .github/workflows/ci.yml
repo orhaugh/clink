@@ -390,6 +390,21 @@ jobs:
         # no toolchain: it must run on every push regardless.
         run: ./scripts/check-qualification-status.py
 
+  plugin-abi-surface:
+    name: Plugin ABI surface manifest is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Manifest matches the authoring-surface include closure
+        # scripts/plugin-abi-surface.txt names the exact headers hashed into
+        # the plugin ABI fingerprint - the compatibility contract between a
+        # compiled plugin .so and a cluster. If a header enters or leaves the
+        # closure without the manifest being regenerated, the contract and the
+        # gate silently disagree: either deployed plugins are invalidated by a
+        # change the contract says is compatible, or (worse) a layout change
+        # goes unhashed. No build, no toolchain: it must run on every push.
+        run: ./scripts/gen-plugin-abi-surface.py --check
+
   install-smoke:
     name: Install + downstream consume
     runs-on: ubuntu-24.04
@@ -453,10 +468,15 @@ jobs:
         # what keeps the exported test framework (clink::test_support) and
         # the component-gated dependency resolution consumable - 09 runs as
         # a self-checking test of the harnesses from the install prefix.
+        # CLINK_BUILD_PLUGIN_EXAMPLE=ON exercises clink_add_job_module from
+        # the INSTALLED package: the supported out-of-tree job-module recipe
+        # fails this gate on any packaging mistake.
         run: |
-          cmake -S docs/consumer-examples -B /tmp/consumer-examples
+          cmake -S docs/consumer-examples -B /tmp/consumer-examples \
+            -DCLINK_BUILD_PLUGIN_EXAMPLE=ON
           cmake --build /tmp/consumer-examples -j "$(( $(nproc) / 2 ))"
           /tmp/consumer-examples/09_testing_framework
+          test -f /tmp/consumer-examples/08_cluster_job_plugin.so
       - name: Save compiler cache
         if: always()
         uses: actions/cache/save@v4

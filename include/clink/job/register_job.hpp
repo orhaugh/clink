@@ -157,7 +157,7 @@ inline std::string register_into(::clink::plugin::PluginRegistry& registry, Buil
         return state;                                                                            \
     }                                                                                            \
     }                                                                                            \
-    extern "C" int clink_plugin_register(                                                        \
+    extern "C" CLINK_PLUGIN_EXPORT int clink_plugin_register(                                    \
         void* registry_ptr, char* err_buf, ::std::size_t err_buf_size) {                         \
         auto& s = clink_job_state_();                                                            \
         /* Cache the deterministic graph and populate module-local state   */                    \
@@ -178,7 +178,8 @@ inline std::string register_into(::clink::plugin::PluginRegistry& registry, Buil
         }                                                                                        \
         return 0;                                                                                \
     }                                                                                            \
-    extern "C" int clink_job_build(const char** out_json, ::std::size_t* out_size) {             \
+    extern "C" CLINK_PLUGIN_EXPORT int clink_job_build(const char** out_json,                    \
+                                                       ::std::size_t* out_size) {                \
         auto& s = clink_job_state_();                                                            \
         ::clink::job::ensure_built(s, (build_fn));                                               \
         if (!s.build_error.empty()) {                                                            \
@@ -192,7 +193,7 @@ inline std::string register_into(::clink::plugin::PluginRegistry& registry, Buil
         }                                                                                        \
         return 0;                                                                                \
     }                                                                                            \
-    extern "C" int clink_job_check_restore_compatibility(                                        \
+    extern "C" CLINK_PLUGIN_EXPORT int clink_job_check_restore_compatibility(                    \
         const char* stored_packed, const char** out_packed, ::std::size_t* out_size) {           \
         auto& s = clink_job_state_();                                                            \
         /* Fire build_fn so the env's expect_state_version calls land in    */                   \

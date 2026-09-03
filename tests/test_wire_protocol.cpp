@@ -1317,3 +1317,90 @@ TEST(WireProtocol, CommitCheckpointFromAnOlderCoordinatorPinsNothing) {
     EXPECT_EQ(out.retain_floor, 88u);
     EXPECT_TRUE(out.pinned_checkpoint_ids.empty());
 }
+
+// ----- SubmitJob / SubmitJobAck: the plugin ABI preflight tails -----
+
+TEST(WireProtocol, SubmitJobRoundTripsPluginAbiAdverts) {
+    SubmitJobMsg in;
+    in.graph_json = R"({"ops":[]})";
+    in.plugins.push_back(PluginBinary{.name = "job", .content_hash = "abcd1234", .bytes = {}});
+    in.checkpoint.checkpoint_dir = "/tmp/ckpt";
+    PluginAbiAdvert ad;
+    ad.content_hash = "abcd1234";
+    ad.abi_fingerprint = "fp-1";
+    ad.abi_hash = "commit-1";
+    ad.abi_version = 1;
+    ad.target_triple = "darwin-arm64";
+    ad.toolchain = "libc++";
+    in.plugin_abi_adverts.push_back(ad);
+
+    auto out = round_trip(MessageKind::SubmitJob, in, decode_submit_job);
+    EXPECT_EQ(out.graph_json, in.graph_json);
+    ASSERT_EQ(out.plugin_abi_adverts.size(), 1u);
+    EXPECT_EQ(out.plugin_abi_adverts[0].content_hash, "abcd1234");
+    EXPECT_EQ(out.plugin_abi_adverts[0].abi_fingerprint, "fp-1");
+    EXPECT_EQ(out.plugin_abi_adverts[0].abi_hash, "commit-1");
+    EXPECT_EQ(out.plugin_abi_adverts[0].abi_version, 1u);
+    EXPECT_EQ(out.plugin_abi_adverts[0].target_triple, "darwin-arm64");
+    EXPECT_EQ(out.plugin_abi_adverts[0].toolchain, "libc++");
+    // The pre-existing fields still land where they always did.
+    EXPECT_EQ(out.checkpoint.checkpoint_dir, "/tmp/ckpt");
+}
+
+TEST(WireProtocol, SubmitJobWithoutAdvertTailDecodesToNoAdverts) {
+    // An old client's frame ends at the capture-config tail; the decoder
+    // must leave the adverts empty and the preflight is simply skipped.
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::SubmitJob));
+    b.put_string(R"({"ops":[]})");
+    b.put_u32_be(0);   // no plugins
+    b.put_string("");  // checkpoint_dir
+    b.put_u64_be(0);   // interval_ms
+    b.put_string("");  // restore_from_dir
+    b.put_u64_be(0);   // restore_from_checkpoint_id
+    b.put_u32_be(0);   // max_restarts_on_worker_loss
+    b.put_u8(0);       // alignment
+    b.put_string("");  // state_backend_uri
+    b.put_string("");  // capture_dir
+    b.put_u64_be(0);   // capture_records
+    MessageReader r(body_of(b.finalize()));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::SubmitJob);
+    auto out = decode_submit_job(r);
+    EXPECT_TRUE(out.plugin_abi_adverts.empty());
+}
+
+TEST(WireProtocol, SubmitJobAckRoundTripsClusterAbiIdentity) {
+    SubmitJobAckMsg in;
+    in.job_id = 0;
+    in.ok = false;
+    in.message = "submit preflight refused plugin";
+    in.cluster_abi_fingerprint = "fp-cluster";
+    in.cluster_target_triple = "linux-x86_64";
+    in.cluster_toolchain = "libstdc++-cxx11abi1";
+    in.cluster_abi_manifest = "include/clink/runtime/dag.hpp=aaa\n";
+    auto out = round_trip(MessageKind::SubmitJobAck, in, decode_submit_job_ack);
+    EXPECT_EQ(out.message, in.message);
+    EXPECT_EQ(out.cluster_abi_fingerprint, "fp-cluster");
+    EXPECT_EQ(out.cluster_target_triple, "linux-x86_64");
+    EXPECT_EQ(out.cluster_toolchain, "libstdc++-cxx11abi1");
+    EXPECT_EQ(out.cluster_abi_manifest, "include/clink/runtime/dag.hpp=aaa\n");
+}
+
+TEST(WireProtocol, SubmitJobAckWithoutIdentityTailDecodesEmpty) {
+    // A pre-preflight coordinator's ack ends at missing_plugin_hashes; the
+    // identity fields must stay empty so the client shows the plain message.
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::SubmitJobAck));
+    b.put_u64_be(7);       // job_id
+    b.put_u8(1);           // ok
+    b.put_string("fine");  // message
+    b.put_u32_be(0);       // missing_plugin_hashes: none
+    MessageReader r(body_of(b.finalize()));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::SubmitJobAck);
+    auto out = decode_submit_job_ack(r);
+    EXPECT_TRUE(out.ok);
+    EXPECT_TRUE(out.cluster_abi_fingerprint.empty());
+    EXPECT_TRUE(out.cluster_target_triple.empty());
+    EXPECT_TRUE(out.cluster_toolchain.empty());
+    EXPECT_TRUE(out.cluster_abi_manifest.empty());
+}

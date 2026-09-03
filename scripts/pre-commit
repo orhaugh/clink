@@ -22,6 +22,16 @@ if ! ./scripts/check-qualification-status.py; then
     exit 1
 fi
 
+echo "pre-commit: checking the declared plugin-ABI surface manifest..."
+if ! ./scripts/gen-plugin-abi-surface.py --check; then
+    echo ""
+    echo "pre-commit: scripts/plugin-abi-surface.txt no longer matches the include"
+    echo "closure of the plugin authoring surface. Regenerate it with"
+    echo "scripts/gen-plugin-abi-surface.py and review the diff - it is a change"
+    echo "to the extension compatibility contract."
+    exit 1
+fi
+
 BUILD_DIR="cmake-build-debug"
 
 if [ ! -d "$BUILD_DIR" ]; then

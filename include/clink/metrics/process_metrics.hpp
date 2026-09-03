@@ -203,6 +203,15 @@ inline void submit_plugin_cache_hit() {
         .increment();
 }
 
+// A submit was refused by the ABI preflight: an advertised plugin identity
+// (fingerprint / triple / toolchain) the load-time gate would reject, caught
+// on the references-only exchange before any bytes shipped.
+inline void submit_preflight_refusal() {
+    MetricsRegistry::global()
+        .counter("clink_coordinator_submit_preflight_refusals_total")
+        .increment();
+}
+
 }  // namespace coordinator
 
 namespace worker {
@@ -252,6 +261,14 @@ inline void subtask_failed() {
     MetricsRegistry::global().counter(kWorkerSubtasksFailedTotal).increment();
     MetricsRegistry::global().gauge(kWorkerSubtasksRunning).sub(1);
     MetricsRegistry::global().gauge(kWorkerSlotsInUse).sub(1);
+}
+
+// A deploy's plugin was refused by this worker's ABI gate (fingerprint /
+// triple / toolchain). Reachable only on a mixed-version cluster - the
+// coordinator admits with ITS gate at submit - so a non-zero value during a
+// rolling upgrade names the worker that still runs the other build.
+inline void plugin_gate_refused() {
+    MetricsRegistry::global().counter("clink_worker_plugin_gate_refusals_total").increment();
 }
 
 }  // namespace worker

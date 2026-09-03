@@ -236,6 +236,17 @@ inline void encode_body(MessageBuilder& b, const SubmitJobMsg& m) {
     // Trailing record-capture config. Older coordinators see EOF and leave it off.
     b.put_string(m.checkpoint.capture_dir);
     b.put_u64_be(m.checkpoint.capture_records);
+    // Trailing per-plugin ABI adverts (the submit-time preflight). Older
+    // coordinators see EOF and gate at load time only.
+    b.put_u32_be(static_cast<std::uint32_t>(m.plugin_abi_adverts.size()));
+    for (const auto& ad : m.plugin_abi_adverts) {
+        b.put_string(ad.content_hash);
+        b.put_string(ad.abi_fingerprint);
+        b.put_string(ad.abi_hash);
+        b.put_u32_be(ad.abi_version);
+        b.put_string(ad.target_triple);
+        b.put_string(ad.toolchain);
+    }
 }
 
 inline void encode_body(MessageBuilder& b, const SubmitJobAckMsg& m) {
@@ -248,6 +259,13 @@ inline void encode_body(MessageBuilder& b, const SubmitJobAckMsg& m) {
     for (const auto& h : m.missing_plugin_hashes) {
         b.put_string(h);
     }
+    // Trailing cluster ABI identity (the submit-time preflight): the trio is
+    // always filled, the manifest only on an ABI-preflight rejection. Old
+    // readers stop before these.
+    b.put_string(m.cluster_abi_fingerprint);
+    b.put_string(m.cluster_target_triple);
+    b.put_string(m.cluster_toolchain);
+    b.put_string(m.cluster_abi_manifest);
 }
 
 inline void encode_body(MessageBuilder& b, const JobCompletedMsg& m) {
@@ -793,6 +811,24 @@ inline SubmitJobMsg decode_submit_job(MessageReader& r) {
     if (!r.eof()) {
         m.checkpoint.capture_records = r.read_u64_be();
     }
+    // Trailing per-plugin ABI adverts. Absent from older clients -> the
+    // submit-time preflight is skipped and the load-time gate decides alone.
+    // read_count, not read_u32_be + reserve: the count is untrusted (see the
+    // ack decoder below for the fuzz finding that rule comes from).
+    if (!r.eof()) {
+        const auto n = r.read_count();
+        m.plugin_abi_adverts.reserve(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            PluginAbiAdvert ad;
+            ad.content_hash = r.read_string();
+            ad.abi_fingerprint = r.read_string();
+            ad.abi_hash = r.read_string();
+            ad.abi_version = r.read_u32_be();
+            ad.target_triple = r.read_string();
+            ad.toolchain = r.read_string();
+            m.plugin_abi_adverts.push_back(std::move(ad));
+        }
+    }
     return m;
 }
 
@@ -815,6 +851,21 @@ inline SubmitJobAckMsg decode_submit_job_ack(MessageReader& r) {
         for (std::uint32_t i = 0; i < n; ++i) {
             m.missing_plugin_hashes.push_back(r.read_string());
         }
+    }
+    // Trailing cluster ABI identity (submit-time preflight). Absent from a
+    // pre-preflight coordinator -> all four stay empty and the client shows
+    // the plain rejection message.
+    if (!r.eof()) {
+        m.cluster_abi_fingerprint = r.read_string();
+    }
+    if (!r.eof()) {
+        m.cluster_target_triple = r.read_string();
+    }
+    if (!r.eof()) {
+        m.cluster_toolchain = r.read_string();
+    }
+    if (!r.eof()) {
+        m.cluster_abi_manifest = r.read_string();
     }
     return m;
 }

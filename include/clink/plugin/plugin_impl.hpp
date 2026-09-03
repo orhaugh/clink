@@ -22,6 +22,7 @@
 #include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
 #include "clink/core/derived_codec.hpp"
 #include "clink/metrics/metrics_registry.hpp"
+#include "clink/plugin/abi_surface.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/log_buffer.hpp"
@@ -1234,25 +1235,41 @@ void PluginRegistry::register_selector(const std::string& name, std::function<in
 #define CLINK_PLUGIN_TARGET_TRIPLE "unknown"
 #endif
 
+// The handshake symbols must stay in the module's dynamic symbol table even if
+// a plugin is compiled with -fvisibility=hidden: the loader dlsym()s them by
+// name, and a module whose handshake is hidden looks like a legacy plugin (or
+// fails the required-symbol checks outright).
+#if defined(__GNUC__) || defined(__clang__)
+#define CLINK_PLUGIN_EXPORT __attribute__((visibility("default")))
+#else
+#define CLINK_PLUGIN_EXPORT
+#endif
+
 // CLINK_DECLARE_PLUGIN(name, version, description)
 //
-// Emits the three extern "C" handshake getters the loader uses to
-// decide whether to load this plugin. Place once at file scope. All
-// strings must be literals.
+// Emits the extern "C" handshake getters the loader uses to decide whether to
+// load this plugin. Place once at file scope. All strings must be literals.
 #define CLINK_DECLARE_PLUGIN(plugin_name, plugin_version, plugin_description)   \
-    extern "C" const char* clink_plugin_abi_fingerprint() {                     \
+    extern "C" CLINK_PLUGIN_EXPORT const char* clink_plugin_abi_fingerprint() { \
         return ::clink::plugin::kAbiFingerprint;                                \
     }                                                                           \
-    extern "C" int clink_plugin_abi_version() {                                 \
+    extern "C" CLINK_PLUGIN_EXPORT int clink_plugin_abi_version() {             \
         return ::clink::plugin::kAbiVersion;                                    \
     }                                                                           \
-    extern "C" const char* clink_plugin_abi_hash() {                            \
+    extern "C" CLINK_PLUGIN_EXPORT const char* clink_plugin_abi_hash() {        \
         return ::clink::plugin::kAbiHash;                                       \
     }                                                                           \
-    extern "C" const char* clink_plugin_target_triple() {                       \
+    extern "C" CLINK_PLUGIN_EXPORT const char* clink_plugin_target_triple() {   \
         return CLINK_PLUGIN_TARGET_TRIPLE;                                      \
     }                                                                           \
-    extern "C" const ::clink::plugin::PluginMetadata* clink_plugin_metadata() { \
+    extern "C" CLINK_PLUGIN_EXPORT const char* clink_plugin_toolchain() {       \
+        return ::clink::plugin::kToolchain;                                     \
+    }                                                                           \
+    extern "C" CLINK_PLUGIN_EXPORT const char* clink_plugin_abi_manifest() {    \
+        return ::clink::plugin::kAbiSurfaceManifest;                            \
+    }                                                                           \
+    extern "C" CLINK_PLUGIN_EXPORT const ::clink::plugin::PluginMetadata*       \
+    clink_plugin_metadata() {                                                   \
         static const ::clink::plugin::PluginMetadata m{                         \
             (plugin_name), (plugin_version), (plugin_description), nullptr};    \
         return &m;                                                              \
@@ -1265,7 +1282,7 @@ void PluginRegistry::register_selector(const std::string& name, std::function<in
 // loader calls. Catches exceptions, fills a caller-supplied error
 // buffer, and returns 0/non-zero. Only POD across the boundary.
 #define CLINK_REGISTER_PLUGIN(user_register_fn)                                                 \
-    extern "C" int clink_plugin_register(                                                       \
+    extern "C" CLINK_PLUGIN_EXPORT int clink_plugin_register(                                   \
         void* registry_ptr, char* err_buf, ::std::size_t err_buf_size) {                        \
         try {                                                                                   \
             auto* reg = static_cast<::clink::plugin::PluginRegistry*>(registry_ptr);            \

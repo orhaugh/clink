@@ -97,6 +97,7 @@ embedded or submits to a cluster, unchanged.
 | Arrow wire format | Every operator-to-operator data frame is an Arrow IPC stream; columnar schemas for built-in types, binary fallback for user types | [Network stack](internals/network-stack.md) |
 | Testing framework | Public `clink::test` harnesses: state inspection, snapshot/restore, failure injection, `MiniCluster` | [Testing framework](internals/testing-framework.md) |
 | Declared types | One `CLINK_FIELDS` declaration per C++ type derives the byte codec (frozen layout, fixture-pinned), the Arrow schema and columnar batcher, registration defaults (channel name = type name), and a shape fingerprint that refuses a restore whose field list changed with no declared version bump | [Declared types](internals/derived-types.md) |
+| Extension compatibility | A compiled job/plugin binary loads on any engine build whose declared extension surface matches: the gate hashes a tracked header manifest plus the build options that surface uses, the pinned Arrow version and a toolchain identity (stdlib, sanitizers), so host-side changes do not invalidate deployed plugins. A refusal names the differing headers; an incompatible submit is refused before any plugin bytes ship; out-of-tree modules build with the packaged `clink_add_job_module()` | [Design record 010](design/010-stable-extension-model.md) |
 
 ## Connectors
 

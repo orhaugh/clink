@@ -6,14 +6,21 @@
 // uploads the .so as part of SubmitJob; the coordinator distributes it to workers;
 // workers dlopen and call into it.
 //
-// ABI compatibility:
-//   * The plugin and the cluster MUST be built from the same clink
-//     commit. The build system embeds git rev-parse HEAD into both;
-//     the loader compares byte-for-byte. Mismatches are rejected.
+// ABI compatibility (design record 010):
+//   * The plugin and the cluster MUST agree on the DECLARED extension
+//     surface: the fingerprint baked into both (abi_version.hpp) hashes the
+//     headers named by scripts/plugin-abi-surface.txt plus the build options
+//     that surface uses, the pinned Arrow version and CLINK_ABI_VERSION. The
+//     loader refuses a mismatch and names the differing headers. The target
+//     triple and the toolchain identity (stdlib, dual-ABI choice, sanitizer
+//     instrumentation) are gated separately and unconditionally.
+//     CLINK_STRICT_PLUGIN_ABI=1 restores the historic exact-commit gate.
 //   * STL types (std::string, std::function, std::shared_ptr, codecs)
-//     ARE used across the plugin/cluster boundary. The commit-hash
-//     gate guarantees both sides use the same standard-library ABI,
-//     same compiler, and same template instantiations.
+//     ARE used across the plugin/cluster boundary. The fingerprint plus the
+//     toolchain gate guarantee both sides compiled identical declarations
+//     with a layout-compatible standard library; supported plugin code
+//     includes only headers inside the declared surface (the manifest
+//     generator checks every in-tree plugin source for this).
 //
 // Crash safety:
 //   * Plugin loaded with RTLD_LOCAL so its symbols don't pollute the
