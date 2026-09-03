@@ -1,6 +1,7 @@
 #include "clink/state/state_migration_on_restore.hpp"
 
 #include <charconv>
+#include <iomanip>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -157,6 +158,124 @@ std::vector<StateIncompatibility> unpack_incompatibilities(std::string_view pack
 
         if (nl == std::string_view::npos)
             break;
+        start = nl + 1;
+    }
+    return out;
+}
+
+std::vector<StateFingerprintMismatch> check_fingerprint_compatibility(
+    const StateFingerprintMap& stored,
+    const StateFingerprintMap& declared,
+    const StateVersionMap& stored_versions,
+    const StateVersionMap& expected_versions) {
+    std::vector<StateFingerprintMismatch> out;
+    const auto expected_entries = expected_versions.entries();
+    for (const auto& d : declared.entries()) {
+        const auto stored_fp = stored.get(d.op_id, d.slot);
+        if (!stored_fp.has_value() || *stored_fp == d.fingerprint) {
+            continue;  // absence gates nothing; equal shapes pass
+        }
+        // Migration intent: a declared version bump covering this slot (or the
+        // whole operator) means the restore-time migrator will rewrite the
+        // values and clear the stamp - the shape change was declared. Whether
+        // the migration chain exists is check_restore_compatibility's job.
+        bool intent = false;
+        for (const auto& e : expected_entries) {
+            if (e.op_id != d.op_id || (!e.slot.empty() && e.slot != d.slot)) {
+                continue;
+            }
+            const auto stored_version = stored_versions.get(e.op_id, e.state_type).value_or(1);
+            if (stored_version != e.version) {
+                intent = true;
+                break;
+            }
+        }
+        if (!intent) {
+            out.push_back(StateFingerprintMismatch{.op_id = d.op_id,
+                                                   .slot = d.slot,
+                                                   .stored_fingerprint = *stored_fp,
+                                                   .declared_fingerprint = d.fingerprint});
+        }
+    }
+    return out;
+}
+
+namespace {
+
+void append_fp_hex(std::ostringstream& oss, std::uint64_t fp) {
+    oss << std::hex << std::setw(16) << std::setfill('0') << fp << std::dec;
+}
+
+std::uint64_t parse_fp_hex(std::string_view s, const char* what) {
+    if (s.empty() || s.size() > 16) {
+        throw std::runtime_error(std::string{"unpack_fingerprint_mismatches: invalid "} + what);
+    }
+    std::uint64_t v = 0;
+    auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v, 16);
+    if (ec != std::errc{} || end != s.data() + s.size()) {
+        throw std::runtime_error(std::string{"unpack_fingerprint_mismatches: invalid "} + what);
+    }
+    return v;
+}
+
+}  // namespace
+
+std::string pack_fingerprint_mismatches(const std::vector<StateFingerprintMismatch>& mismatches) {
+    std::ostringstream oss;
+    bool first = true;
+    for (const auto& m : mismatches) {
+        if (!first) {
+            oss << '\n';
+        }
+        oss << m.op_id.value() << '|' << m.slot << '|';
+        append_fp_hex(oss, m.stored_fingerprint);
+        oss << '|';
+        append_fp_hex(oss, m.declared_fingerprint);
+        first = false;
+    }
+    return oss.str();
+}
+
+std::vector<StateFingerprintMismatch> unpack_fingerprint_mismatches(std::string_view packed) {
+    std::vector<StateFingerprintMismatch> out;
+    if (packed.empty()) {
+        return out;
+    }
+    std::size_t start = 0;
+    while (start < packed.size()) {
+        auto nl = packed.find('\n', start);
+        std::string_view line =
+            packed.substr(start, nl == std::string_view::npos ? packed.size() - start : nl - start);
+        if (line.empty()) {
+            start = nl == std::string_view::npos ? packed.size() : nl + 1;
+            continue;
+        }
+        auto p1 = line.find('|');
+        auto p2 = p1 == std::string_view::npos ? std::string_view::npos : line.find('|', p1 + 1);
+        auto p3 = p2 == std::string_view::npos ? std::string_view::npos : line.find('|', p2 + 1);
+        if (p1 == std::string_view::npos || p2 == std::string_view::npos ||
+            p3 == std::string_view::npos) {
+            throw std::runtime_error(
+                "unpack_fingerprint_mismatches: expected 3 '|' separators in line");
+        }
+        std::string_view op_str = line.substr(0, p1);
+        std::string_view slot_str = line.substr(p1 + 1, p2 - p1 - 1);
+        std::uint64_t op_val = 0;
+        auto [op_end, op_ec] =
+            std::from_chars(op_str.data(), op_str.data() + op_str.size(), op_val);
+        if (op_ec != std::errc{} || op_end != op_str.data() + op_str.size()) {
+            throw std::runtime_error("unpack_fingerprint_mismatches: invalid op_id");
+        }
+        out.push_back(StateFingerprintMismatch{
+            .op_id = OperatorId{op_val},
+            .slot = std::string{slot_str},
+            .stored_fingerprint =
+                parse_fp_hex(line.substr(p2 + 1, p3 - p2 - 1), "stored fingerprint"),
+            .declared_fingerprint = parse_fp_hex(line.substr(p3 + 1), "declared fingerprint")});
+
+        if (nl == std::string_view::npos) {
+            break;
+        }
         start = nl + 1;
     }
     return out;

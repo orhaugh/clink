@@ -52,6 +52,50 @@ struct StateIncompatibility {
 [[nodiscard]] std::string pack_incompatibilities(const std::vector<StateIncompatibility>& incompat);
 [[nodiscard]] std::vector<StateIncompatibility> unpack_incompatibilities(std::string_view packed);
 
+// One (operator, slot) whose stored shape fingerprint differs from the shape
+// the job declares, with no version bump declared to cover it - the "bump
+// nobody made", caught before deploy instead of at bind time on a worker.
+struct StateFingerprintMismatch {
+    OperatorId op_id{};
+    std::string slot;
+    std::uint64_t stored_fingerprint{};
+    std::uint64_t declared_fingerprint{};
+};
+
+// The pre-deploy twin of the bind-time fingerprint gate
+// (RuntimeContext::fingerprint_gate_), evaluated BEFORE migrations run, so it
+// must predict the migrator's stamp-clearing rather than observe it. For each
+// DECLARED (op, slot, fingerprint) - a job's opt-in expect_state_shape<V>()
+// stamps - the rule is:
+//   - no stored fingerprint for (op, slot): pass (older snapshot, undescribed
+//     type, unwired backend - absence gates nothing);
+//   - stored equals declared: pass;
+//   - otherwise: pass iff MIGRATION INTENT is declared - some expected-version
+//     entry for the same op, with the same slot or the op-wide empty slot,
+//     whose version differs from the stored one (value_or(1), matching the
+//     SchemaVersionTrait default). The migration rewrites the slot's values
+//     and clears the stamp at restore; whether the chain exists is
+//     check_restore_compatibility's verdict, not this one's. No intent means
+//     a mismatch is reported.
+// Stored-but-undeclared slots are ignored (the job did not opt in for them;
+// the bind-time gate remains the restore-time backstop). Pure - touches no
+// backend, no registry.
+[[nodiscard]] std::vector<StateFingerprintMismatch> check_fingerprint_compatibility(
+    const StateFingerprintMap& stored,
+    const StateFingerprintMap& declared,
+    const StateVersionMap& stored_versions,
+    const StateVersionMap& expected_versions);
+
+// Pack / unpack a fingerprint-compatibility result across the job-.so C-ABI
+// boundary: one "<op_id>|<slot>|<stored-16-hex>|<declared-16-hex>" per line
+// (zero-padded lowercase hex, the same rendering StateFingerprintMap::pack
+// uses), lines separated by '\n'. Empty input/output means "compatible".
+// unpack throws std::runtime_error on a malformed line.
+[[nodiscard]] std::string pack_fingerprint_mismatches(
+    const std::vector<StateFingerprintMismatch>& mismatches);
+[[nodiscard]] std::vector<StateFingerprintMismatch> unpack_fingerprint_mismatches(
+    std::string_view packed);
+
 // Migrate a freshly-restored backend's stored state up to the expected
 // versions, in place, BEFORE any operator reads it. For each expected
 // (op, state_type) whose stored version differs, the values of that
