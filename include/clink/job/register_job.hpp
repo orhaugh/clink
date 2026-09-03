@@ -95,6 +95,10 @@ struct JobBuilderState {
     // pointer is valid only until the next call - single-shot per load,
     // which is all the CLI / coordinator gate need.
     std::string check_result;
+    // Same contract for clink_job_check_restore_fingerprints. Its own
+    // string, so interleaved calls to the two exports cannot clobber each
+    // other's returned pointer.
+    std::string fingerprint_check_result;
 };
 
 // Implementation detail: runs build_fn under call_once, captures the
@@ -222,6 +226,46 @@ inline std::string register_into(::clink::plugin::PluginRegistry& registry, Buil
         }                                                                                        \
         if (out_size != nullptr) {                                                               \
             *out_size = s.check_result.size();                                                   \
+        }                                                                                        \
+        return 0;                                                                                \
+    }                                                                                            \
+    extern "C" CLINK_PLUGIN_EXPORT int clink_job_check_restore_fingerprints(                     \
+        const char* stored_fingerprints_packed,                                                  \
+        const char* stored_versions_packed,                                                      \
+        const char** out_packed,                                                                 \
+        ::std::size_t* out_size) {                                                               \
+        /* The pre-deploy twin of the bind-time shape gate. Runs .so-side    */                  \
+        /* like the version check above, because the DECLARED fingerprints   */                  \
+        /* live in this .so's graph JSON (expect_state_shape<V> stamps).     */                  \
+        /* Optional on the host side: an older .so simply lacks the symbol   */                  \
+        /* and the host skips the check - absence gates nothing.             */                  \
+        auto& s = clink_job_state_();                                                            \
+        ::clink::job::ensure_built(s, (build_fn));                                               \
+        if (!s.build_error.empty()) {                                                            \
+            return 1;                                                                            \
+        }                                                                                        \
+        try {                                                                                    \
+            const auto graph = ::clink::cluster::JobGraphSpec::from_json(s.graph_json);          \
+            const auto stored_fps = ::clink::StateFingerprintMap::unpack(                        \
+                stored_fingerprints_packed != nullptr ? stored_fingerprints_packed : "");        \
+            const auto stored_versions = ::clink::StateVersionMap::unpack(                       \
+                stored_versions_packed != nullptr ? stored_versions_packed : "");                \
+            const auto mismatches =                                                              \
+                ::clink::check_fingerprint_compatibility(stored_fps,                             \
+                                                         graph.expected_state_fingerprints,      \
+                                                         stored_versions,                        \
+                                                         graph.expected_state_versions);         \
+            s.fingerprint_check_result = ::clink::pack_fingerprint_mismatches(mismatches);       \
+        } catch (...) {                                                                          \
+            /* Malformed stored maps or graph JSON: a hard error, never a    */                  \
+            /* silent "compatible". */                                                           \
+            return 2;                                                                            \
+        }                                                                                        \
+        if (out_packed != nullptr) {                                                             \
+            *out_packed = s.fingerprint_check_result.data();                                     \
+        }                                                                                        \
+        if (out_size != nullptr) {                                                               \
+            *out_size = s.fingerprint_check_result.size();                                       \
         }                                                                                        \
         return 0;                                                                                \
     }                                                                                            \

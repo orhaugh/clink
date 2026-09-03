@@ -127,4 +127,116 @@ TEST(SchemaEvoCheck, MalformedStoredMapReportsDecodeError) {
     EXPECT_TRUE(incompat.empty());
 }
 
+// ----- the fingerprint export (design record 009 follow-on) -----
+
+// dlopen the fixture and call clink_job_check_restore_fingerprints with the
+// two packed stamp maps; returns the unpacked mismatch list.
+std::vector<clink::StateFingerprintMismatch> check_fps(const std::string& stored_fps_packed,
+                                                       const std::string& stored_versions_packed,
+                                                       int& rc_out) {
+    const char* path = schema_evo_job_path();
+    void* handle = ::dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_NE(handle, nullptr) << ::dlerror();
+    if (handle == nullptr) {
+        rc_out = -1;
+        return {};
+    }
+    using FpCheckFn = int (*)(const char*, const char*, const char**, std::size_t*);
+    auto sym = ::dlsym(handle, "clink_job_check_restore_fingerprints");
+    EXPECT_NE(sym, nullptr) << ".so missing clink_job_check_restore_fingerprints";
+    if (sym == nullptr) {
+        ::dlclose(handle);
+        rc_out = -1;
+        return {};
+    }
+    FpCheckFn fn = nullptr;
+    std::memcpy(&fn, &sym, sizeof(fn));
+
+    const char* out_packed = nullptr;
+    std::size_t out_size = 0;
+    rc_out = fn(stored_fps_packed.c_str(), stored_versions_packed.c_str(), &out_packed, &out_size);
+    std::string packed{out_packed != nullptr ? out_packed : "", out_size};
+    ::dlclose(handle);
+    if (rc_out != 0) {
+        return {};
+    }
+    return clink::unpack_fingerprint_mismatches(packed);
+}
+
+TEST(SchemaEvoCheck, FingerprintAbsentStoredIsCompatible) {
+    if (schema_evo_job_path() == nullptr) {
+        GTEST_SKIP() << "schema_evo_test_job .so not built";
+    }
+    int rc = 0;
+    const auto mm = check_fps("", "", rc);
+    EXPECT_EQ(rc, 0);
+    EXPECT_TRUE(mm.empty());
+}
+
+TEST(SchemaEvoCheck, FingerprintUndeclaredShapeChangeIsReported) {
+    if (schema_evo_job_path() == nullptr) {
+        GTEST_SKIP() << "schema_evo_test_job .so not built";
+    }
+    // A stored stamp that cannot equal the fixture's declared one, versions
+    // already at the expected v3 (no migration intent).
+    clink::StateFingerprintMap stored_fps;
+    stored_fps.set(counter_op(), "counter_slot", 0xdeadbeefdeadbeefULL);
+    clink::StateVersionMap stored_versions;
+    stored_versions.set(counter_op(), "counter", 3);
+    int rc = 0;
+    const auto mm = check_fps(stored_fps.pack(), stored_versions.pack(), rc);
+    EXPECT_EQ(rc, 0);
+    ASSERT_EQ(mm.size(), 1u);
+    EXPECT_EQ(mm[0].op_id, counter_op());
+    EXPECT_EQ(mm[0].slot, "counter_slot");
+    EXPECT_EQ(mm[0].stored_fingerprint, 0xdeadbeefdeadbeefULL);
+}
+
+TEST(SchemaEvoCheck, FingerprintShapeChangeWithDeclaredBumpPasses) {
+    if (schema_evo_job_path() == nullptr) {
+        GTEST_SKIP() << "schema_evo_test_job .so not built";
+    }
+    // Same mismatching stamp, but stored version 1 vs the fixture's expected
+    // v3 declares migration intent - the migrator clears the stamp at restore.
+    clink::StateFingerprintMap stored_fps;
+    stored_fps.set(counter_op(), "counter_slot", 0xdeadbeefdeadbeefULL);
+    clink::StateVersionMap stored_versions;
+    stored_versions.set(counter_op(), "counter", 1);
+    int rc = 0;
+    const auto mm = check_fps(stored_fps.pack(), stored_versions.pack(), rc);
+    EXPECT_EQ(rc, 0);
+    EXPECT_TRUE(mm.empty());
+}
+
+TEST(SchemaEvoCheck, FingerprintMalformedStoredMapReportsDecodeError) {
+    if (schema_evo_job_path() == nullptr) {
+        GTEST_SKIP() << "schema_evo_test_job .so not built";
+    }
+    int rc = 0;
+    const auto mm = check_fps("not-a-number|slot|zz", "", rc);
+    EXPECT_EQ(rc, 2);
+    EXPECT_TRUE(mm.empty());
+}
+
+TEST(SchemaEvoCheck, FingerprintExportsInterleaveWithoutClobbering) {
+    if (schema_evo_job_path() == nullptr) {
+        GTEST_SKIP() << "schema_evo_test_job .so not built";
+    }
+    // The two exports keep separate result strings in the module: calling
+    // the version check between two fingerprint calls must not invalidate
+    // or corrupt either result.
+    clink::StateFingerprintMap stored_fps;
+    stored_fps.set(counter_op(), "counter_slot", 0xdeadbeefdeadbeefULL);
+    clink::StateVersionMap v3;
+    v3.set(counter_op(), "counter", 3);
+    int rc_fp = 0;
+    int rc_v = 0;
+    const auto mm = check_fps(stored_fps.pack(), v3.pack(), rc_fp);
+    const auto incompat = check(v3.pack(), rc_v);
+    EXPECT_EQ(rc_fp, 0);
+    EXPECT_EQ(rc_v, 0);
+    ASSERT_EQ(mm.size(), 1u);
+    EXPECT_TRUE(incompat.empty());
+}
+
 }  // namespace

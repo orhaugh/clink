@@ -28,8 +28,18 @@
 
 #include "clink/api/builtin_connectors.hpp"
 #include "clink/api/pipeline.hpp"
+#include "clink/core/fields.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/state/schema_version.hpp"
+
+// Described type for the fingerprint pre-deploy check
+// (clink_job_check_restore_fingerprints): the shape declared via
+// expect_state_shape below. Namespace scope - the macro specialises
+// clink::ArrowFields<T>.
+struct EvoCounter {
+    std::int64_t count{};
+};
+CLINK_FIELDS(EvoCounter, count);
 
 namespace {
 
@@ -47,6 +57,9 @@ void define_job(clink::api::Pipeline& pipeline) {
         .sink(clink::api::FileInt64Sink::builder().path("/tmp/schema_evo_test_out.txt").build());
 
     pipeline.expect_state_version("counter-op", "counter", 3);
+    // The shape declaration the fingerprint export reads from this .so's
+    // own graph JSON.
+    pipeline.expect_state_shape<EvoCounter>("counter-op", "counter_slot");
 }
 
 }  // namespace

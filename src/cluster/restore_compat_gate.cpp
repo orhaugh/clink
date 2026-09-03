@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <sstream>
 
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend.hpp"
@@ -15,11 +16,19 @@ namespace clink::cluster {
 
 namespace {
 
-// Read subtask 0's snapshot bytes and recover its packed StateVersionMap.
-// nullopt on any failure (missing file, I/O, decode) so the gate degrades
-// to "could not check" rather than a false block.
-std::optional<std::string> read_stored_versions_packed(const std::string& restore_from_dir,
-                                                       std::uint64_t checkpoint_id) {
+// Both packed stamp maps a savepoint carries, from the one restore of
+// subtask 0's snapshot into the reference reader (which unpacks both
+// metadata keys).
+struct StoredStamps {
+    std::string versions_packed;
+    std::string fingerprints_packed;
+};
+
+// Read subtask 0's snapshot bytes and recover its packed stamps. nullopt on
+// any failure (missing file, I/O, decode) so the gate degrades to "could not
+// check" rather than a false block.
+std::optional<StoredStamps> read_stored_stamps(const std::string& restore_from_dir,
+                                               std::uint64_t checkpoint_id) {
     namespace fs = std::filesystem;
     const fs::path path = fs::path{restore_from_dir} / "0" /
                           ("checkpoint-" + std::to_string(checkpoint_id) + ".snap");
@@ -48,7 +57,8 @@ std::optional<std::string> read_stored_versions_packed(const std::string& restor
         clink::InMemoryStateBackend backend;
         backend.restore(clink::Snapshot{.checkpoint_id = clink::CheckpointId{checkpoint_id},
                                         .bytes = std::move(bytes)});
-        return backend.restored_state_versions().pack();
+        return StoredStamps{.versions_packed = backend.restored_state_versions().pack(),
+                            .fingerprints_packed = backend.restored_state_fingerprints().pack()};
     } catch (...) {
         return std::nullopt;
     }
@@ -73,6 +83,26 @@ std::string format_reject(const std::vector<clink::StateIncompatibility>& incomp
     return reason;
 }
 
+std::string format_fingerprint_reject(const std::vector<clink::StateFingerprintMismatch>& mm,
+                                      const std::string& so_path) {
+    std::ostringstream oss;
+    oss << "restore incompatible with job binary: " << mm.size()
+        << " state slot(s) changed shape with no declared version bump [";
+    bool first = true;
+    for (const auto& m : mm) {
+        if (!first) {
+            oss << ", ";
+        }
+        oss << "op=" << m.op_id.value() << " slot='" << m.slot << "' stored=" << std::hex
+            << m.stored_fingerprint << " declared=" << m.declared_fingerprint << std::dec;
+        first = false;
+    }
+    oss << "]; if the shape change is deliberate, bump SchemaVersionTrait and register a "
+           "migration; inspect with `clink check-savepoint --file=<savepoint> --expected="
+        << so_path << "`";
+    return oss.str();
+}
+
 }  // namespace
 
 std::string check_restore_compatibility_via_plugins(const std::vector<std::string>& plugin_so_paths,
@@ -81,8 +111,8 @@ std::string check_restore_compatibility_via_plugins(const std::vector<std::strin
     if (restore_from_dir.empty()) {
         return "";  // fresh start - nothing to gate
     }
-    const auto stored_packed = read_stored_versions_packed(restore_from_dir, restore_checkpoint_id);
-    if (!stored_packed.has_value()) {
+    const auto stamps = read_stored_stamps(restore_from_dir, restore_checkpoint_id);
+    if (!stamps.has_value()) {
         return "";  // best-effort: savepoint not coordinator-readable -> rely on C at worker start
     }
 
@@ -127,25 +157,56 @@ std::string check_restore_compatibility_via_plugins(const std::vector<std::strin
         std::memcpy(&fn, &sym, sizeof(fn));
         const char* out_packed = nullptr;
         std::size_t out_size = 0;
-        const int rc = fn(stored_packed->c_str(), &out_packed, &out_size);
+        const int rc = fn(stamps->versions_packed.c_str(), &out_packed, &out_size);
         const std::string packed{out_packed != nullptr ? out_packed : "", out_size};
-        ::dlclose(handle);
         if (rc != 0) {
             // build_fn failed or version map could not decode .so-side:
             // best-effort, don't block (the real submit/deploy will
             // surface the same build failure with a clearer message).
+            ::dlclose(handle);
             return "";
         }
-        if (packed.empty()) {
-            return "";  // the job .so says compatible
+        if (!packed.empty()) {
+            ::dlclose(handle);
+            std::vector<clink::StateIncompatibility> incompat;
+            try {
+                incompat = clink::unpack_incompatibilities(packed);
+            } catch (...) {
+                return "";  // malformed result -> don't block
+            }
+            return format_reject(incompat, so_path);
         }
-        std::vector<clink::StateIncompatibility> incompat;
+
+        // Versions compatible. Second, OPTIONAL gate on the same handle: the
+        // fingerprint check (design record 009 follow-on). An older .so lacks
+        // the symbol and is simply not fingerprint-gated - absence gates
+        // nothing, and the bind-time gate remains the restore-time backstop.
+        using FpCheckFn = int (*)(const char*, const char*, const char**, std::size_t*);
+        auto* fp_sym = ::dlsym(handle, "clink_job_check_restore_fingerprints");
+        if (fp_sym == nullptr) {
+            ::dlclose(handle);
+            return "";
+        }
+        FpCheckFn fp_fn = nullptr;
+        std::memcpy(&fp_fn, &fp_sym, sizeof(fp_fn));
+        const char* fp_out = nullptr;
+        std::size_t fp_out_size = 0;
+        const int fp_rc = fp_fn(stamps->fingerprints_packed.c_str(),
+                                stamps->versions_packed.c_str(),
+                                &fp_out,
+                                &fp_out_size);
+        const std::string fp_packed{fp_out != nullptr ? fp_out : "", fp_out_size};
+        ::dlclose(handle);
+        if (fp_rc != 0 || fp_packed.empty()) {
+            return "";  // best-effort on error; empty = compatible
+        }
+        std::vector<clink::StateFingerprintMismatch> mismatches;
         try {
-            incompat = clink::unpack_incompatibilities(packed);
+            mismatches = clink::unpack_fingerprint_mismatches(fp_packed);
         } catch (...) {
             return "";  // malformed result -> don't block
         }
-        return format_reject(incompat, so_path);
+        return format_fingerprint_reject(mismatches, so_path);
     }
     return "";  // no .so exported the check -> cannot gate
 }
