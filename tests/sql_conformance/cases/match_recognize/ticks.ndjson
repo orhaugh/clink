@@ -1,0 +1,6 @@
+{"symbol": "X", "price": 10, "ts": 1000}
+{"symbol": "X", "price": 8, "ts": 2000}
+{"symbol": "X", "price": 6, "ts": 3000}
+{"symbol": "X", "price": 9, "ts": 4000}
+{"symbol": "Y", "price": 5, "ts": 1000}
+{"symbol": "Y", "price": 7, "ts": 2000}

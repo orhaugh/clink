@@ -650,12 +650,20 @@ if(CLINK_BUILD_SQL)
         test_embedded_engine.cpp
         test_replay_cli.cpp
         test_replay_plugin_types.cpp
+        test_sql_conformance.cpp
+        test_sql_catalog_fixtures.cpp
     )
     target_link_libraries(clink_sql_tests PRIVATE
         clink::sql
         clink::embed
         GTest::gtest_main
     )
+    # The frozen SQL conformance corpus (design record 011) and the persisted
+    # catalog fixtures: files written by one build that every later one must
+    # keep honouring. See test_sql_conformance.cpp for the additions-only rule.
+    target_compile_definitions(clink_sql_tests PRIVATE
+        CLINK_SQL_CONFORMANCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/sql_conformance\"
+        CLINK_SQL_FIXTURE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/fixtures\")
     # SQL-native AI: link the vector_search impl so the in-process SqlRuntime cluster
     # can register + run vector_search_row end to end (guarded - the impl may be off).
     if(TARGET clink::vector_search)

@@ -1897,6 +1897,17 @@ inline ValueNodePtr compile_value_expr(const clink::config::JsonValue& expr) {
     }
 
     OpExtras ex;
+    if (op == "udf") {
+        // Explicit user-defined function call (the binder emits this form when
+        // the name is registered at bind time, so a UDF shadows a built-in of
+        // the same name). `name` is looked up in the ScalarFunctionRegistry at
+        // evaluation time, as before, so DROP FUNCTION still takes effect.
+        if (!expr.contains("name") || !expr.at("name").is_string()) {
+            return malformed("json_value_expr: 'udf' needs a string 'name'");
+        }
+        return std::make_unique<OpNode>(
+            ValueOp::Udf, expr.at("name").as_string(), std::move(children), std::move(ex));
+    }
     const auto vo = lookup_value_op(op);
     if (!vo.has_value()) {
         return std::make_unique<OpNode>(ValueOp::Udf, op, std::move(children), std::move(ex));

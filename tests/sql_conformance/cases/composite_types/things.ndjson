@@ -1,0 +1,2 @@
+{"id": 1, "tags": ["x", "y"], "attrs": {"colour": "red", "size": "L"}, "addr": {"city": "Leeds", "zip": 10}}
+{"id": 2, "tags": [], "attrs": {"colour": "blue"}, "addr": {"city": "York", "zip": 20}}

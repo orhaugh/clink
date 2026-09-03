@@ -19,10 +19,16 @@ Two global rules hold everywhere:
   either handled or refused by name.
 
 The frozen-bytes fixtures in `tests/fixtures/` (exercised by
-`tests/test_format_fixtures.cpp`) pin the persistent and wire encodings from
-outside the codebase: the fixture files were written by one build and must
-stay readable by every later one, so an encode/decode pair cannot silently
-co-evolve past its own history.
+`tests/test_format_fixtures.cpp` and, for the SQL catalog,
+`tests/test_sql_catalog_fixtures.cpp`) pin the persistent and wire encodings
+from outside the codebase: the fixture files were written by one build and
+must stay readable by every later one, so an encode/decode pair cannot
+silently co-evolve past its own history.
+
+This page is about bytes. The API-level promise (which headers, C symbols and
+SQL statements a 1.x release holds stable) is the published
+[Compatibility](../compatibility.md) page and design record
+`docs/design/011-public-api-tiers.md`.
 
 ## Domain inventory
 
@@ -40,6 +46,7 @@ co-evolve past its own history.
 | Capabilities manifest JSON | 1 (`schema_version`) | additive-only within 1 | `include/clink/connectors/capability.hpp` |
 | Derived record codec (described types) | 1 (layout specified in the header) | 1 | `include/clink/core/derived_codec.hpp`; fixture `derived-codec-v1.bin` |
 | State shape fingerprints | 1 (kind-tag table in `fields.hpp`) | additive: absence gates nothing | `clink.state_fingerprints` metadata key; fixture `state-fingerprints-v1.txt` |
+| Persisted SQL catalog (`--catalog-dir` JSON) | 1 (unversioned, additive-only) | readers ignore unknown keys | `Catalog::to_json` / `from_json`, `src/sql/catalog.cpp`; fixtures `catalog-{table,function,model}-v1.json` |
 
 ## Cluster control protocol
 
@@ -196,6 +203,24 @@ bump, and within 1.x it never bumps again.
 - **Tests:** `clink_c_abi_tests` (the shorter-struct and larger-struct reads,
   the zero-size refusal), `clink_c_smoke` (pure C99 consumer), `pyclink`'s
   suite (the ctypes mirror of the struct).
+
+## Persisted SQL catalog
+
+A catalog directory (`--catalog-dir`) holds one JSON document per table,
+model and function (`<name>.json`, `models/<name>.json`,
+`functions/<name>.json`), written by `Catalog::to_json` and read back by
+`from_json`, `model_from_json` and `function_from_json`
+(`src/sql/catalog.cpp`). A 1.0 catalog directory loads on every 1.x release.
+
+- **Compatible additions** are new keys: every reader takes the keys it
+  knows and ignores the rest, pinned by
+  `SqlCatalogFixtures.UnknownKeysAreIgnoredOnLoad`. Column types are stored
+  as their SQL spelling and parsed back through the SQL type grammar, so a
+  type the grammar accepts is a type the catalog can hold.
+- **Tests:** `tests/test_sql_catalog_fixtures.cpp` reads the frozen
+  `tests/fixtures/catalog-table-v1.json`, `catalog-function-v1.json` and
+  `catalog-model-v1.json` (regenerate with `CLINK_REGEN_FORMAT_FIXTURES=1`
+  only to add a fixture).
 
 ## Incident capture (`.cap`)
 

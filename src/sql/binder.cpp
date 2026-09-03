@@ -318,7 +318,17 @@ clink::config::JsonValue lower_value_expr(const ast::Expression& expr,
                 0);
         }
         JsonObject obj;
-        obj["op"] = JsonValue{fc.name};  // lowercase by ast_builder
+        if (ScalarFunctionRegistry::global().lookup(fc.name).has_value()) {
+            // A user-defined function shadows a built-in of the same name
+            // (design record 011): the plan names the call as a UDF explicitly,
+            // so the evaluator never routes it to a built-in that a later
+            // release may add under that name. Resolution stays late (by name,
+            // at evaluation) so DROP FUNCTION behaves exactly as before.
+            obj["op"] = JsonValue{"udf"};
+            obj["name"] = JsonValue{fc.name};
+        } else {
+            obj["op"] = JsonValue{fc.name};  // lowercase by ast_builder
+        }
         JsonArray args;
         for (const auto& sub : fc.args) {
             args.emplace_back(lower_value_expr(sub, source, source_alias));

@@ -1,0 +1,35 @@
+{
+  "columns": [
+    {
+      "name": "id", 
+      "type": "BIGINT"
+    }, 
+    {
+      "name": "customer", 
+      "type": "VARCHAR"
+    }, 
+    {
+      "name": "amount", 
+      "type": "DECIMAL(18, 2)"
+    }, 
+    {
+      "name": "weight", 
+      "type": "DOUBLE"
+    }, 
+    {
+      "name": "gift", 
+      "type": "BOOLEAN"
+    }
+  ], 
+  "name": "orders", 
+  "properties": {
+    "brokers": "localhost:9092", 
+    "connector": "kafka", 
+    "event_time_column": "id", 
+    "format": "json", 
+    "mode": "upsert", 
+    "primary_key": "id", 
+    "topic": "orders", 
+    "watermark_lag_ms": "2000"
+  }
+}

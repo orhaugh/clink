@@ -1,0 +1,2 @@
+{"card":1,"has_tags":false,"id":2,"literal":[1,2,3],"m_lookup":"only","missing":null,"nm":"bob","obj":"{\"id\":2,\"kind\":\"doc\"}","second":null,"single":99,"tags":null}
+{"card":3,"has_tags":true,"id":1,"literal":[1,2,3],"m_lookup":"v1","missing":"v2","nm":"ada","obj":"{\"id\":1,\"kind\":\"doc\"}","second":20,"single":99,"tags":"[\"a\",\"b\"]"}

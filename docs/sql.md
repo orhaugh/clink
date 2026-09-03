@@ -215,8 +215,12 @@ WHERE user_id IN (SELECT user_id FROM vips);
 
 ## Functions
 
-A function name that clink does not recognise as a built-in is resolved as a
-user-defined function (see [Functions you define](#functions-you-define)).
+A function name is resolved as a user-defined function first (see
+[Functions you define](#functions-you-define)) and as a built-in otherwise, so
+a function you define shadows a built-in of the same name, and a built-in
+added in a later release can never change what an existing script computes.
+Which statements, functions and options the 1.x line holds stable is set out
+on the [Compatibility](compatibility.md) page.
 
 ### String
 

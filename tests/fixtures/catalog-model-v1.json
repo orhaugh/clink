@@ -1,0 +1,24 @@
+{
+  "input_columns": [
+    {
+      "name": "body", 
+      "type": "VARCHAR"
+    }
+  ], 
+  "name": "sentiment", 
+  "output_columns": [
+    {
+      "name": "label", 
+      "type": "VARCHAR"
+    }, 
+    {
+      "name": "score", 
+      "type": "DOUBLE"
+    }
+  ], 
+  "properties": {
+    "endpoint": "http://localhost:8900/score", 
+    "provider": "http", 
+    "task": "classification"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "arg_names": [
+    "amount"
+  ], 
+  "arg_types": [
+    "int64"
+  ], 
+  "definitions": [
+    "amount + amount / 10"
+  ], 
+  "kind": "scalar", 
+  "language": "sql", 
+  "module_b64": "", 
+  "name": "with_tax", 
+  "return_type": "int64"
+}

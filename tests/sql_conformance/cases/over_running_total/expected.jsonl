@@ -1,0 +1,4 @@
+{"amount":1,"first_amt":10,"last2":6,"n":3,"prev":5,"running":16,"ts":3000,"user_id":1}
+{"amount":10,"first_amt":10,"last2":10,"n":1,"prev":null,"running":10,"ts":1000,"user_id":1}
+{"amount":5,"first_amt":10,"last2":15,"n":2,"prev":10,"running":15,"ts":2000,"user_id":1}
+{"amount":7,"first_amt":7,"last2":7,"n":1,"prev":null,"running":7,"ts":2500,"user_id":2}

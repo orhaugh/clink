@@ -1,0 +1,3 @@
+{"user_id": 1, "url": "/a", "ts": 1000}
+{"user_id": 2, "url": "/b", "ts": 2000}
+{"user_id": 1, "url": "/c", "ts": 6000}
