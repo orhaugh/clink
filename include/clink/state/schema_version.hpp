@@ -143,6 +143,14 @@ private:
 // next snapshot stamps the new shape. Absent fingerprints (older
 // snapshots, undescribed types, backends that do not store them) gate
 // nothing.
+// One (operator, keyed-state slot) fingerprint stamp, as enumerated by
+// StateFingerprintMap::entries().
+struct StateFingerprintEntry {
+    OperatorId op_id{};
+    std::string slot;
+    std::uint64_t fingerprint{};
+};
+
 class StateFingerprintMap {
 public:
     // slot must not contain '\n' or '|' (pack delimiters); it is the
@@ -152,6 +160,10 @@ public:
     // Remove the stamp for one slot, or every slot under `op` when slot
     // is empty (the migrator's whole-operator entries).
     void clear_for(OperatorId op, const std::string& slot);
+    // Every stamp, sorted by (op, slot) - the same deterministic order
+    // pack() emits - for consumers that redistribute or compare whole
+    // maps (the sharded backend's restore, the pre-deploy check).
+    [[nodiscard]] std::vector<StateFingerprintEntry> entries() const;
     [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
     void clear() noexcept { entries_.clear(); }
     // "<op>|<slot>|<16-hex-digit fp>" lines. Strict unpack: three fields

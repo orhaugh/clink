@@ -189,6 +189,25 @@ TEST(StateFingerprintGate, ClearForAnEmptySlotClearsEveryStampUnderTheOperator) 
     EXPECT_TRUE(m.get(OperatorId{8}, "a").has_value());
 }
 
+TEST(StateFingerprintGate, EntriesEnumeratesDeterministically) {
+    // entries() feeds whole-map consumers (the sharded redistribute, the
+    // pre-deploy check); its order is the same (op, slot) order pack()
+    // emits, independent of insertion order.
+    clink::StateFingerprintMap a;
+    a.set(OperatorId{9}, "zz", 1);
+    a.set(OperatorId{7}, "bb", 2);
+    a.set(OperatorId{7}, "aa", 3);
+    const auto entries = a.entries();
+    ASSERT_EQ(entries.size(), 3u);
+    EXPECT_EQ(entries[0].op_id, OperatorId{7});
+    EXPECT_EQ(entries[0].slot, "aa");
+    EXPECT_EQ(entries[0].fingerprint, 3u);
+    EXPECT_EQ(entries[1].op_id, OperatorId{7});
+    EXPECT_EQ(entries[1].slot, "bb");
+    EXPECT_EQ(entries[2].op_id, OperatorId{9});
+    EXPECT_EQ(entries[2].slot, "zz");
+}
+
 TEST(StateFingerprintGate, PackUnpackRoundTripsAndRejectsMalformedLines) {
     clink::StateFingerprintMap m;
     m.set(kOp, "s1", 0xDEADBEEFCAFE1234ULL);

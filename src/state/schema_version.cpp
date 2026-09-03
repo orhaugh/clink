@@ -400,6 +400,21 @@ void StateFingerprintMap::clear_for(OperatorId op, const std::string& slot) {
     }
 }
 
+std::vector<StateFingerprintEntry> StateFingerprintMap::entries() const {
+    std::vector<StateFingerprintEntry> out;
+    out.reserve(entries_.size());
+    for (const auto& [k, fp] : entries_) {
+        out.push_back(
+            StateFingerprintEntry{.op_id = OperatorId{k.op}, .slot = k.slot, .fingerprint = fp});
+    }
+    // Same deterministic (op, slot) order pack() emits.
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        return a.op_id.value() != b.op_id.value() ? a.op_id.value() < b.op_id.value()
+                                                  : a.slot < b.slot;
+    });
+    return out;
+}
+
 std::string StateFingerprintMap::pack() const {
     // Sorted for a deterministic packing (unordered_map iteration order
     // must not leak into snapshot bytes).

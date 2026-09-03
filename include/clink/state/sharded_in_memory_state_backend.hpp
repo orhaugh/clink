@@ -88,8 +88,10 @@ public:
         InMemoryStateBackend tmp;
         tmp.restore(snap, kg_filter);
         const auto versions = tmp.restored_state_versions();
+        const auto fingerprints = tmp.restored_state_fingerprints();
         for (auto& shard : shards_) {
             shard.set_state_versions(versions);
+            shard.set_state_fingerprints(fingerprints);
         }
         for (const auto op : tmp.operator_ids()) {
             tmp.scan(op, [&](KeyView k, ValueView v) { shard_for_(k).put(op, k, v); });
@@ -115,6 +117,27 @@ public:
     }
     StateVersionMap restored_state_versions() const override {
         return shards_.front().restored_state_versions();
+    }
+
+    // Fingerprint stamps mirror the version shape: broadcast writes keep
+    // every shard's map identical, so whichever shard's blob the snapshot
+    // merge adopts the metadata from (the first non-empty part) carries
+    // the full map; reads come from shard 0.
+    void record_state_fingerprint(OperatorId op,
+                                  const std::string& slot,
+                                  std::uint64_t fp) override {
+        for (auto& shard : shards_) {
+            shard.record_state_fingerprint(op, slot, fp);
+        }
+    }
+    [[nodiscard]] std::optional<std::uint64_t> restored_state_fingerprint(
+        OperatorId op, const std::string& slot) const override {
+        return shards_.front().restored_state_fingerprint(op, slot);
+    }
+    void clear_state_fingerprint(OperatorId op, const std::string& slot) override {
+        for (auto& shard : shards_) {
+            shard.clear_state_fingerprint(op, slot);
+        }
     }
 
     std::string description() const override {

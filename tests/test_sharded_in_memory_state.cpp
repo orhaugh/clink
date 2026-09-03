@@ -165,4 +165,51 @@ TEST(ShardedInMemoryStateBackend, StateVersionsRoundTrip) {
     EXPECT_EQ(*got, 3u);
 }
 
+TEST(ShardedInMemoryStateBackend, StateFingerprintsRoundTrip) {
+    // Stamps ride the merged snapshot's metadata (the merge adopts the
+    // first non-empty part's schema; broadcast recording keeps every
+    // shard's map identical, so any part carries the full map).
+    ShardedInMemoryStateBackend src;
+    src.record_state_fingerprint(OperatorId{8}, "counts_slot", 0xabcdef0123456789ULL);
+    src.put(OperatorId{8}, sv(kg_key(10, "k")), sv("v"));
+
+    ShardedInMemoryStateBackend dst;
+    dst.restore(src.snapshot(CheckpointId{1}));
+    const auto got = dst.restored_state_fingerprint(OperatorId{8}, "counts_slot");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, 0xabcdef0123456789ULL);
+
+    // clear_for's whole-op form broadcasts too.
+    dst.clear_state_fingerprint(OperatorId{8}, "");
+    EXPECT_FALSE(dst.restored_state_fingerprint(OperatorId{8}, "counts_slot").has_value());
+}
+
+TEST(ShardedInMemoryStateBackend, FingerprintsCrossBackendCompatBothWays) {
+    const OperatorId op{9};
+    const std::string slot = "xb_slot";
+
+    // mono -> sharded
+    {
+        InMemoryStateBackend mono;
+        mono.record_state_fingerprint(op, slot, 0x1111222233334444ULL);
+        mono.put(op, sv(kg_key(9, "p")), sv("P"));
+        ShardedInMemoryStateBackend sharded;
+        sharded.restore(mono.snapshot(CheckpointId{1}));
+        const auto got = sharded.restored_state_fingerprint(op, slot);
+        ASSERT_TRUE(got.has_value());
+        EXPECT_EQ(*got, 0x1111222233334444ULL);
+    }
+    // sharded -> mono
+    {
+        ShardedInMemoryStateBackend sharded;
+        sharded.record_state_fingerprint(op, slot, 0x5555666677778888ULL);
+        sharded.put(op, sv(kg_key(99, "q")), sv("Q"));
+        InMemoryStateBackend mono;
+        mono.restore(sharded.snapshot(CheckpointId{1}));
+        const auto got = mono.restored_state_fingerprint(op, slot);
+        ASSERT_TRUE(got.has_value());
+        EXPECT_EQ(*got, 0x5555666677778888ULL);
+    }
+}
+
 }  // namespace

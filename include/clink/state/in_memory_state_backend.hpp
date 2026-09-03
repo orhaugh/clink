@@ -190,6 +190,19 @@ public:
         state_fingerprints_.clear_for(op, slot);
     }
 
+    // Whole-map fingerprint accessors, concrete rather than base virtuals:
+    // the consumers that need the full map (the sharded backend's restore
+    // redistribute, the pre-deploy savepoint reader, the check-savepoint
+    // CLI) all hold this concrete type, mirroring the version pair above.
+    void set_state_fingerprints(StateFingerprintMap fingerprints) {
+        std::lock_guard lock(mu_);
+        state_fingerprints_ = std::move(fingerprints);
+    }
+    [[nodiscard]] StateFingerprintMap restored_state_fingerprints() const {
+        std::lock_guard lock(mu_);
+        return state_fingerprints_;
+    }
+
     std::string description() const override { return "in-memory state backend"; }
 
     // Enumerate OperatorIds that currently have any keyed entries. Cheap
