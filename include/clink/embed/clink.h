@@ -9,6 +9,27 @@
  * table receives as typed Arrow batches through the Arrow C stream
  * interface (zero-copy into pyarrow, DuckDB, polars, or Arrow C++).
  *
+ * Compatibility (design record 011). This header is the Stable C surface
+ * for the 1.x line, and these are the rules it grows by:
+ *
+ *   - CLINK_EMBED_ABI_VERSION changes only for an incompatible change,
+ *     which within 1.x is never. Compare clink_abi_version() against it
+ *     once, before using anything else. clink_version() names the library
+ *     release for logging; it is not a compatibility check.
+ *   - Functions are only ever added. A function scheduled for removal at
+ *     the next major release carries CLINK_DEPRECATED for at least one
+ *     minor release first and keeps working until then.
+ *   - clink_engine_options grows by appending fields, never by reordering
+ *     or retyping one. struct_size tells the library how much of the
+ *     struct the caller compiled: a field beyond the caller's size reads
+ *     as its default, and a struct larger than the library knows is read
+ *     only as far as the library knows. Initialise with
+ *     CLINK_ENGINE_OPTIONS_INIT so struct_size is always right.
+ *   - Return conventions are fixed: int-returning calls use 0 for success
+ *     and the non-zero codes each one documents.
+ *   - The exported symbol set is tracked in scripts/libclink-abi-symbols.txt
+ *     and checked against this header and the built library.
+ *
  * Threading: one engine handle may be shared across threads; each collect
  * table allows exactly one consumer. Blocking calls (job waits, stream
  * get_next) are safe alongside calls on other threads.
@@ -88,16 +109,33 @@ struct ArrowArrayStream {
 #define CLINK_EMBED_API __attribute__((visibility("default")))
 #endif
 
+/* Marks a function scheduled for removal at the next major release. It
+ * keeps working for at least one minor release after the mark appears. */
+#if defined(__GNUC__) || defined(__clang__)
+#define CLINK_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#elif defined(_MSC_VER)
+#define CLINK_DEPRECATED(msg) __declspec(deprecated(msg))
+#else
+#define CLINK_DEPRECATED(msg)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define CLINK_EMBED_ABI_VERSION 1
+/* Version 2: clink_engine_options gained the leading struct_size field so
+ * the struct can grow without another bump. Version 1 callers must be
+ * recompiled. */
+#define CLINK_EMBED_ABI_VERSION 2
 
 /* Opaque engine handle. */
 typedef struct clink_engine clink_engine;
 
 typedef struct clink_engine_options {
+    /* sizeof(clink_engine_options) as the CALLER compiled it. The library
+     * reads only the fields this size covers; 0 is refused by name. Set by
+     * CLINK_ENGINE_OPTIONS_INIT. */
+    size_t struct_size;
     /* Uniform op parallelism for compiled jobs. 0 means 1. */
     uint32_t parallelism;
     /* Per-job state backend URI (e.g. "rocksdb:///tmp/state"). NULL keeps
@@ -110,11 +148,25 @@ typedef struct clink_engine_options {
     int64_t checkpoint_interval_ms;
     /* Persistent catalog directory. NULL keeps a session-only catalog. */
     const char* catalog_dir;
+    /* New options are appended here, never inserted above. */
 } clink_engine_options;
+
+/* Default options with struct_size filled in; every other field is zero
+ * (its documented default). Usage:
+ *
+ *     clink_engine_options opts = CLINK_ENGINE_OPTIONS_INIT;
+ *     opts.parallelism = 4;
+ */
+#define CLINK_ENGINE_OPTIONS_INIT {sizeof(clink_engine_options)}
 
 /* The ABI version this library was built as. Compare against
  * CLINK_EMBED_ABI_VERSION before using anything else. */
 CLINK_EMBED_API int32_t clink_abi_version(void);
+
+/* The library's release version as a string ("1.2.0"). For logging and
+ * diagnostics; the ABI question is answered by clink_abi_version(). The
+ * pointer is static and valid for the life of the process. */
+CLINK_EMBED_API const char* clink_version(void);
 
 /* Start an engine (in-process Coordinator + Worker). NULL `options`
  * uses defaults. Returns NULL on failure; see clink_open_error(). */

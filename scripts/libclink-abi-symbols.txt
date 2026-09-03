@@ -1,0 +1,27 @@
+# libclink exported C symbols - the Stable C ABI (design record 011).
+#
+# Checked by scripts/check-c-abi-symbols.py: the [symbols] section must equal
+# the CLINK_EMBED_API declarations in include/clink/embed/clink.h, and (with
+# --library) the clink_* symbols the built libclink actually exports. Within
+# the 1.x line a symbol is never removed from this list; a new function is
+# appended. [abi-version] mirrors CLINK_EMBED_ABI_VERSION and moves only for
+# an incompatible change, which within 1.x is never.
+
+[abi-version]
+2
+
+[symbols]
+clink_abi_version
+clink_await_all
+clink_cancel_all
+clink_collect_stream
+clink_engine_close
+clink_engine_open
+clink_exec
+clink_job_cancel
+clink_job_count
+clink_job_id_at
+clink_job_wait
+clink_last_error
+clink_open_error
+clink_version

@@ -5,6 +5,7 @@
 // place rather than written to stderr, since this is a library.
 
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <exception>
 #include <memory>
@@ -22,11 +23,24 @@
 #include "clink/embed/embedded_engine.hpp"
 #include "clink/plugin/install_defaults.hpp"
 
+#ifndef CLINK_VERSION_STRING
+#define CLINK_VERSION_STRING "unknown"
+#endif
+
 namespace {
 
 thread_local std::string g_open_error;
 
 constexpr std::chrono::milliseconds kWaitSlice{200};
+
+// struct_size gating (clink.h, "Compatibility"): a field is readable only
+// when the caller's declared size covers it in full. A caller compiled
+// against an older header with fewer trailing fields declares a smaller
+// size and gets the defaults for what it never knew; a caller compiled
+// against a newer header declares a larger size and is read only as far as
+// this library knows.
+#define CLINK_OPTION_PRESENT(opts, field) \
+    ((opts)->struct_size >= offsetof(clink_engine_options, field) + sizeof((opts)->field))
 
 }  // namespace
 
@@ -66,7 +80,21 @@ int32_t clink_abi_version(void) {
     return CLINK_EMBED_ABI_VERSION;
 }
 
+const char* clink_version(void) {
+    return CLINK_VERSION_STRING;
+}
+
 clink_engine* clink_engine_open(const clink_engine_options* options) {
+    if (options != nullptr && options->struct_size == 0) {
+        // Refused by name rather than guessed at: a zero size is a caller
+        // that zero-initialised the struct without CLINK_ENGINE_OPTIONS_INIT,
+        // and reading its fields would silently apply defaults it did not ask
+        // for.
+        g_open_error =
+            "clink_engine_open: clink_engine_options.struct_size is 0; initialise the struct "
+            "with CLINK_ENGINE_OPTIONS_INIT (or set struct_size = sizeof(clink_engine_options))";
+        return nullptr;
+    }
     // Shared guard (clink/embed/arrow_pool_pin.hpp): binds this library's
     // Arrow copy to the system pool before any Arrow allocation. Original
     // finding here: libclink loaded before a pyarrow import crashed inside
@@ -82,19 +110,21 @@ clink_engine* clink_engine_open(const clink_engine_options* options) {
     auto handle = std::make_unique<clink_engine>();
     clink::embed::EngineOptions opts;
     if (options != nullptr) {
-        if (options->parallelism > 0) {
+        if (CLINK_OPTION_PRESENT(options, parallelism) && options->parallelism > 0) {
             opts.parallelism = options->parallelism;
         }
-        if (options->state_backend_uri != nullptr) {
+        if (CLINK_OPTION_PRESENT(options, state_backend_uri) &&
+            options->state_backend_uri != nullptr) {
             opts.state_backend_uri = options->state_backend_uri;
         }
-        if (options->checkpoint_dir != nullptr) {
+        if (CLINK_OPTION_PRESENT(options, checkpoint_dir) && options->checkpoint_dir != nullptr) {
             opts.checkpoint_dir = options->checkpoint_dir;
         }
-        if (options->checkpoint_interval_ms > 0) {
+        if (CLINK_OPTION_PRESENT(options, checkpoint_interval_ms) &&
+            options->checkpoint_interval_ms > 0) {
             opts.checkpoint_interval_ms = options->checkpoint_interval_ms;
         }
-        if (options->catalog_dir != nullptr) {
+        if (CLINK_OPTION_PRESENT(options, catalog_dir) && options->catalog_dir != nullptr) {
             opts.catalog_dir = options->catalog_dir;
         }
     }

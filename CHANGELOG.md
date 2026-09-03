@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**The embedded C ABI is version 2, and can now grow without a version 3.**
+`clink_engine_options` gained a leading `struct_size` field, filled in by
+the new `CLINK_ENGINE_OPTIONS_INIT`; the library reads only the fields the
+caller's declared size covers, so options appended in later 1.x releases
+are invisible to older binaries and older binaries get defaults from newer
+libraries. A zero `struct_size` is refused by name rather than guessed at.
+`clink_version()` returns the library release string for logging. The
+exported symbol set is now a tracked, append-only manifest
+(`scripts/libclink-abi-symbols.txt`), held equal to the header in CI and
+to the built library's dynamic symbol table as a test. This is the one
+deliberate break before 1.0 (`CLINK_EMBED_ABI_VERSION` 1 to 2): C callers
+recompile against the new header and initialise their options with the
+macro; `pyclink` tracks the change and exposes `Engine.version`.
+
 **A Kafka source can no longer be wedged by its group coordinator.** The
 tutorial's fresh stacks intermittently read nothing at all: the source
 assigned its partition and every gauge sat at zero, healthy, until the

@@ -19,6 +19,7 @@
 
 int main(void) {
     CHECK(clink_abi_version() == CLINK_EMBED_ABI_VERSION, "abi version");
+    CHECK(clink_version() != NULL && clink_version()[0] != '\0', "library version string");
 
     /* Input data. */
     const char* data_path = "/tmp/clink_c_smoke_orders.ndjson";
@@ -28,7 +29,11 @@ int main(void) {
     fputs("{\"user_id\":2,\"amount\":32}\n", f);
     fclose(f);
 
-    clink_engine* e = clink_engine_open(NULL);
+    /* The documented way to build options: INIT fills struct_size, every
+     * other field starts at its default. */
+    clink_engine_options opts = CLINK_ENGINE_OPTIONS_INIT;
+    opts.parallelism = 1;
+    clink_engine* e = clink_engine_open(&opts);
     if (e == NULL) {
         fprintf(stderr, "FAIL: open: %s\n", clink_open_error());
         return 1;
@@ -40,7 +45,8 @@ int main(void) {
 
     /* A full pipeline: file source -> collect sink. */
     char sql[1024];
-    snprintf(sql, sizeof(sql),
+    snprintf(sql,
+             sizeof(sql),
              "CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
              "WITH (connector='file', format='json', path='%s');"
              "CREATE TABLE results (user_id BIGINT, amount BIGINT) "

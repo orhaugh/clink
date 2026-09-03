@@ -42,7 +42,7 @@ import pyarrow as _pa  # noqa: F401  (used in collect)
 
 __all__ = ["Engine", "ClinkError"]
 
-_ABI_VERSION = 1
+_ABI_VERSION = 2
 
 
 class ClinkError(RuntimeError):
@@ -50,7 +50,11 @@ class ClinkError(RuntimeError):
 
 
 class _EngineOptions(ctypes.Structure):
+    # Mirrors clink_engine_options field for field. struct_size leads (ABI v2)
+    # so the struct can grow: libclink reads only the fields our declared size
+    # covers, and a newer library's appended options default for us.
     _fields_ = [
+        ("struct_size", ctypes.c_size_t),
         ("parallelism", ctypes.c_uint32),
         ("state_backend_uri", ctypes.c_char_p),
         ("checkpoint_dir", ctypes.c_char_p),
@@ -113,6 +117,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     h = ctypes.c_void_p
     lib.clink_abi_version.restype = ctypes.c_int32
     lib.clink_abi_version.argtypes = []
+    lib.clink_version.restype = ctypes.c_char_p
+    lib.clink_version.argtypes = []
     lib.clink_engine_open.restype = h
     lib.clink_engine_open.argtypes = [ctypes.POINTER(_EngineOptions)]
     lib.clink_open_error.restype = ctypes.c_char_p
@@ -162,6 +168,7 @@ class Engine:
         if abi != _ABI_VERSION:
             raise ClinkError(f"libclink speaks ABI v{abi}; this pyclink expects v{_ABI_VERSION}")
         opts = _EngineOptions(
+            ctypes.sizeof(_EngineOptions),
             parallelism,
             _enc(state_backend_uri),
             _enc(checkpoint_dir),
@@ -171,6 +178,12 @@ class Engine:
         self._h = self._lib.clink_engine_open(ctypes.byref(opts))
         if not self._h:
             raise ClinkError(self._lib.clink_open_error().decode() or "engine open failed")
+
+    @property
+    def version(self) -> str:
+        """The loaded libclink's release version (for logging; the ABI check
+        already happened in __init__)."""
+        return self._lib.clink_version().decode()
 
     # -- lifecycle -----------------------------------------------------
 

@@ -47,6 +47,7 @@ def test_collect_end_to_end():
         data = pathlib.Path(d) / "orders.ndjson"
         _write_orders(data)
         with pyclink.Engine(lib_path=_lib_path()) as e:
+            assert e.version and e.version != "unknown"
             e.execute(
                 "CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
                 f"WITH (connector='file', format='json', path='{data}');"

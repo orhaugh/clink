@@ -4,6 +4,9 @@
 // libclink, mirroring a real embedding. Everything crosses the boundary
 // through the pure-C surface in clink/embed/clink.h.
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -39,6 +42,77 @@ std::string pipeline_sql(const fs::path& in_path) {
 
 TEST(ClinkCAbi, AbiVersionMatchesHeader) {
     EXPECT_EQ(clink_abi_version(), CLINK_EMBED_ABI_VERSION);
+}
+
+// --- the v2 growth contract (design record 011) -----------------------------
+
+TEST(ClinkCAbi, AbiVersionTwoIsTheStructSizeContract) {
+    // v2 introduced clink_engine_options.struct_size so the struct can grow
+    // without another bump; within 1.x this number never moves again.
+    EXPECT_EQ(clink_abi_version(), 2);
+}
+
+TEST(ClinkCAbi, LibraryVersionIsAReleaseString) {
+    const char* v = clink_version();
+    ASSERT_NE(v, nullptr);
+    EXPECT_GT(std::strlen(v), 0u);
+    EXPECT_NE(std::string{v}, "unknown");
+    // Static storage: the same pointer every call, for the life of the process.
+    EXPECT_EQ(v, clink_version());
+}
+
+TEST(ClinkCAbi, InitialisedOptionsOpen) {
+    clink_engine_options opts = CLINK_ENGINE_OPTIONS_INIT;
+    EXPECT_EQ(opts.struct_size, sizeof(clink_engine_options));
+    EXPECT_EQ(opts.parallelism, 0u);
+    EXPECT_EQ(opts.catalog_dir, nullptr);
+    opts.parallelism = 2;
+    clink_engine* e = clink_engine_open(&opts);
+    ASSERT_NE(e, nullptr) << clink_open_error();
+    clink_engine_close(e);
+}
+
+TEST(ClinkCAbi, ZeroStructSizeIsRefusedByName) {
+    clink_engine_options opts{};  // zero-initialised WITHOUT the INIT macro
+    ASSERT_EQ(opts.struct_size, 0u);
+    EXPECT_EQ(clink_engine_open(&opts), nullptr);
+    EXPECT_NE(std::string{clink_open_error()}.find("struct_size"), std::string::npos);
+}
+
+TEST(ClinkCAbi, AShorterStructIsReadOnlyAsFarAsItDeclares) {
+    // A caller compiled against an earlier v2 header whose struct ended after
+    // `parallelism`. Emulated with a buffer that declares that size and holds
+    // poison where the later pointer fields would be: the library must not
+    // read them, or it would dereference 0xFF.. as a C string.
+    alignas(clink_engine_options) unsigned char buf[sizeof(clink_engine_options)];
+    std::memset(buf, 0xFF, sizeof(buf));
+    const std::size_t declared =
+        offsetof(clink_engine_options, parallelism) + sizeof(std::uint32_t);
+    const std::uint32_t parallelism = 1;
+    std::memcpy(buf + offsetof(clink_engine_options, struct_size), &declared, sizeof(declared));
+    std::memcpy(
+        buf + offsetof(clink_engine_options, parallelism), &parallelism, sizeof(parallelism));
+    const auto* opts = reinterpret_cast<const clink_engine_options*>(buf);
+    clink_engine* e = clink_engine_open(opts);
+    ASSERT_NE(e, nullptr) << clink_open_error();
+    clink_engine_close(e);
+}
+
+TEST(ClinkCAbi, ALargerStructIsReadOnlyAsFarAsTheLibraryKnows) {
+    // A caller compiled against a FUTURE header with an appended field: it
+    // declares a larger size, and this library reads only what it knows.
+    struct Future {
+        clink_engine_options base;
+        std::uint64_t appended_later;
+    };
+    Future f{};
+    f.base = CLINK_ENGINE_OPTIONS_INIT;
+    f.base.struct_size = sizeof(Future);
+    f.base.parallelism = 1;
+    f.appended_later = 7;
+    clink_engine* e = clink_engine_open(&f.base);
+    ASSERT_NE(e, nullptr) << clink_open_error();
+    clink_engine_close(e);
 }
 
 TEST(ClinkCAbi, ExecErrorSetsLastError) {

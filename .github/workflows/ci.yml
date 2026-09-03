@@ -418,6 +418,12 @@ jobs:
         # to the compatibility contract and must land as a reviewed manifest
         # diff, never as a side effect. No build, no toolchain.
         run: ./scripts/gen-public-api-surface.py --check
+      - name: C ABI symbol manifest matches clink.h
+        # scripts/libclink-abi-symbols.txt is the Stable C ABI: every
+        # CLINK_EMBED_API declaration, append-only within 1.x. The build job
+        # additionally checks the manifest against the built library's
+        # dynamic symbol table (ClinkCAbiSymbolManifest).
+        run: ./scripts/check-c-abi-symbols.py
 
   install-smoke:
     name: Install + downstream consume

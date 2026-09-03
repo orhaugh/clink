@@ -119,7 +119,15 @@ EmbeddedEngine, `clink_exec` runs a script, `clink_job_wait` /
 `clink_await_all` / `clink_cancel_all` control the submitted jobs, and
 `clink_last_error` carries diagnostics - in library mode the engine's err
 stream is captured into the handle rather than written to stderr. ABI
-compatibility is guarded by `clink_abi_version()`.
+compatibility is guarded by `clink_abi_version()` (compare it with
+`CLINK_EMBED_ABI_VERSION` once, at load); `clink_version()` names the
+library release for logging. Options travel in `clink_engine_options`,
+initialised with `CLINK_ENGINE_OPTIONS_INIT`: its leading `struct_size` lets
+the struct gain fields across 1.x releases without a version bump, because
+the library reads only the fields the caller's size covers. The header
+states the full growth rules; the exported symbol set is the tracked
+manifest `scripts/libclink-abi-symbols.txt` (see
+[protocol compatibility](protocol-compatibility.md#embedded-c-abi)).
 
 Rows reach the host through `connector='collect'`: the sink converts each
 Row batch to a typed Arrow RecordBatch with the same schema-driven batcher

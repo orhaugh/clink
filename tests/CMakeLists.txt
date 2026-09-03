@@ -731,6 +731,22 @@ if(CLINK_BUILD_SQL)
     target_link_libraries(clink_c_smoke PRIVATE clink_shared)
     add_test(NAME ClinkCSmoke COMMAND clink_c_smoke)
     set_tests_properties(ClinkCSmoke PROPERTIES TIMEOUT 60 LABELS sql)
+
+    # The Stable C ABI symbol manifest (design record 011): the clink_* symbols
+    # the built libclink exports must equal scripts/libclink-abi-symbols.txt,
+    # which the header-side check (CI, pre-commit) already holds equal to the
+    # declarations in clink.h. A declared-but-undefined function or a leaked
+    # extern "C" clink_* symbol fails here.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        set(_clink_c_abi_python "${Python3_EXECUTABLE}")
+    else()
+        set(_clink_c_abi_python python3)
+    endif()
+    add_test(NAME ClinkCAbiSymbolManifest
+        COMMAND "${_clink_c_abi_python}" "${CMAKE_SOURCE_DIR}/scripts/check-c-abi-symbols.py"
+                --library "$<TARGET_FILE:clink_shared>")
+    set_tests_properties(ClinkCAbiSymbolManifest PROPERTIES TIMEOUT 60 LABELS sql)
 endif()
 
 # SQL-on-disaggregated-state end-to-end. Needs both the SQL frontend and the

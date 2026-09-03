@@ -35,7 +35,7 @@ co-evolve past its own history.
 | Job plan (`JobGraphSpec` JSON) | unversioned, additive-only | n/a | `JobGraphSpec::from_json`, `src/cluster/job_graph.cpp` |
 | Connector offsets and committables | ride the snapshot format | n/a | per-connector state encodings, `docs/internals/sink-committer-framework.md` |
 | Plugin ABI | `kAbiVersion` + declared-surface fingerprint + toolchain identity | exact match on all three gates | `src/cluster/plugin_loader.cpp`, `scripts/plugin-abi-surface.txt` |
-| Embedded C ABI | 1 (`CLINK_EMBED_ABI_VERSION`) | caller-checked | `include/clink/embed/clink.h` |
+| Embedded C ABI | 2 (`CLINK_EMBED_ABI_VERSION`) | caller-checked; grows by appended functions and `struct_size`-gated fields | `include/clink/embed/clink.h`; symbol manifest `scripts/libclink-abi-symbols.txt` |
 | Incident capture (`.cap`) | 2 (`kCaptureVersion`) | header-gated | `include/clink/runtime/record_capture.hpp` |
 | Capabilities manifest JSON | 1 (`schema_version`) | additive-only within 1 | `include/clink/connectors/capability.hpp` |
 | Derived record codec (described types) | 1 (layout specified in the header) | 1 | `include/clink/core/derived_codec.hpp`; fixture `derived-codec-v1.bin` |
@@ -172,9 +172,30 @@ against an identical declared surface with a layout-compatible toolchain"
 
 ## Embedded C ABI
 
-`CLINK_EMBED_ABI_VERSION = 1` (`include/clink/embed/clink.h`). The contract
+`CLINK_EMBED_ABI_VERSION = 2` (`include/clink/embed/clink.h`). The contract
 is caller-side: compare `clink_abi_version()` against the macro you compiled
-with before using anything else. Covered by `clink_c_abi_tests`.
+with before using anything else. Version 2 is the one deliberate break before
+1.0 (design record `docs/design/011-public-api-tiers.md`): `clink_engine_options`
+gained a leading `struct_size`, so the surface can now grow without another
+bump, and within 1.x it never bumps again.
+
+- **Compatible additions** are new functions (appended to
+  `scripts/libclink-abi-symbols.txt`) and new fields appended to
+  `clink_engine_options`. The library reads a field only when the caller's
+  declared `struct_size` covers it, so a binary built against an older header
+  gets the defaults for fields it never knew, and one built against a newer
+  header is read only as far as the library knows. A zero `struct_size` is
+  refused by name. `CLINK_ENGINE_OPTIONS_INIT` fills the size in.
+- **Removals** happen only at a major release, after the function has carried
+  `CLINK_DEPRECATED` for at least one minor.
+- **Enforcement:** `scripts/check-c-abi-symbols.py` holds the manifest equal
+  to the header's `CLINK_EMBED_API` declarations (CI and the pre-commit hook,
+  no build) and, as the `ClinkCAbiSymbolManifest` test, to the dynamic symbol
+  table of the built `libclink`. `clink_version()` names the library release
+  for logging; the ABI question is `clink_abi_version()`.
+- **Tests:** `clink_c_abi_tests` (the shorter-struct and larger-struct reads,
+  the zero-size refusal), `clink_c_smoke` (pure C99 consumer), `pyclink`'s
+  suite (the ctypes mirror of the struct).
 
 ## Incident capture (`.cap`)
 
