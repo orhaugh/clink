@@ -189,6 +189,13 @@ struct JobGraphSpec {
     // single packed string in to_json/from_json.
     StateVersionMap expected_state_versions;
 
+    // Shape fingerprints the job declares per (op, keyed-state slot), via
+    // env.expect_state_shape<V>(...). Opt-in; consumed by the pre-deploy
+    // fingerprint check (the .so-side export reads its own graph). Empty for
+    // jobs that declare nothing - absence blocks nothing. Serialized as a
+    // single packed string, additive in the plan JSON.
+    StateFingerprintMap expected_state_fingerprints;
+
     // SQL-declared scalar functions (CREATE FUNCTION ... LANGUAGE ...)
     // this job's expressions call, module payloads included. The coordinator
     // threads them to every Worker in the DeployMsg; a worker registers

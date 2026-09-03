@@ -291,6 +291,10 @@ std::string JobGraphSpec::to_json() const {
     // State schema evolution: a single packed (op|type|ver\n...) string.
     // Emitted only when non-empty so the JSON shape is unchanged for
     // jobs that declare no expected versions.
+    if (!expected_state_fingerprints.empty()) {
+        out += ",\"expected_state_fingerprints\":";
+        out += escape_json_string(expected_state_fingerprints.pack());
+    }
     if (!expected_state_versions.empty()) {
         out += ",\"expected_state_versions\":";
         out += escape_json_string(expected_state_versions.pack());
@@ -433,6 +437,9 @@ JobGraphSpec JobGraphSpec::from_json(std::string_view json_text) {
     }
     // State schema evolution: unpack the expected-version map if the
     // spec carries one (absent for jobs that declare nothing).
+    if (const auto packed = root.string_or("expected_state_fingerprints", ""); !packed.empty()) {
+        spec.expected_state_fingerprints = StateFingerprintMap::unpack(packed);
+    }
     if (const auto packed = root.string_or("expected_state_versions", ""); !packed.empty()) {
         spec.expected_state_versions = StateVersionMap::unpack(packed);
     }

@@ -254,6 +254,28 @@ TEST(JobGraphSpec, BoundsRoundTripThroughJson) {
 // env.expect_state_version(...) rides the spec to the coordinator/worker. It is keyed
 // by operator_id_from_uid (the same derivation the runtime stamps state
 // under) and survives the JSON round-trip; absent when nothing declared.
+TEST(JobGraphSpec, ExpectedStateFingerprintsRoundTripThroughJson) {
+    const char* base =
+        R"({"ops":[{"id":"src","type":"int64_range_source","out_channel":"int64"}]})";
+    auto spec = JobGraphSpec::from_json(base);
+    const auto agg = clink::operator_id_from_uid("agg");
+    spec.expected_state_fingerprints.set(agg, "window_slot", 0xabcdef0123456789ULL);
+
+    const auto serialised = spec.to_json();
+    EXPECT_NE(serialised.find("expected_state_fingerprints"), std::string::npos);
+
+    auto spec2 = JobGraphSpec::from_json(serialised);
+    const auto got = spec2.expected_state_fingerprints.get(agg, "window_slot");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, 0xabcdef0123456789ULL);
+
+    // A spec that declares nothing omits the key entirely, and a plan
+    // without the key parses with an empty map (additive-only JSON).
+    EXPECT_EQ(JobGraphSpec::from_json(base).to_json().find("expected_state_fingerprints"),
+              std::string::npos);
+    EXPECT_TRUE(JobGraphSpec::from_json(base).expected_state_fingerprints.empty());
+}
+
 TEST(JobGraphSpec, ExpectedStateVersionsRoundTripThroughJson) {
     const char* base =
         R"({"ops":[{"id":"src","type":"int64_range_source","out_channel":"int64"}]})";

@@ -18,6 +18,15 @@
 #include "clink/cluster/job_planner.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/runner_registry.hpp"
+#include "clink/core/fields.hpp"
+
+// Described type for the expect_state_shape test, at namespace scope (the
+// macro specialises clink::ArrowFields<T>), Se-prefixed against cross-TU
+// collisions.
+struct SeCounter {
+    std::int64_t count{};
+};
+CLINK_FIELDS(SeCounter, count);
 
 namespace {
 
@@ -39,6 +48,22 @@ TEST(StreamEnvBuilder, SourceAndSinkAppendIntoJobGraphSpec) {
     EXPECT_EQ(graph.ops[1].type, "file_int64_sink");
     EXPECT_EQ(graph.ops[1].inputs, std::vector<std::string>{graph.ops[0].id});
     EXPECT_EQ(graph.ops[1].params.at("path"), "/tmp/clink_env_test.out");
+}
+
+TEST(StreamEnvBuilder, ExpectStateShapeLandsFingerprintInGraph) {
+    // The typed declaration records the described type's compile-time
+    // fingerprint on the graph, keyed the way the runtime stamps (op, slot).
+    auto env = Pipeline::create();
+    env.expect_state_shape<SeCounter>("agg", "counts_slot");
+
+    const auto entries = env.graph().expected_state_fingerprints.entries();
+    ASSERT_EQ(entries.size(), 1u);
+    EXPECT_EQ(entries[0].op_id, clink::operator_id_from_uid("agg"));
+    EXPECT_EQ(entries[0].slot, "counts_slot");
+    EXPECT_EQ(entries[0].fingerprint, clink::fields_fingerprint_v<SeCounter>);
+
+    // An empty slot could never match a stamp; declaring one is refused.
+    EXPECT_THROW(env.expect_state_shape<SeCounter>("agg", ""), std::invalid_argument);
 }
 
 TEST(StreamEnvBuilder, ExpectStateVersionRecordsSlotInGraph) {

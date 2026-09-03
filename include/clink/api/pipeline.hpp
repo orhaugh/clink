@@ -19,6 +19,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/core/fields.hpp"  // HasArrowFields, fields_fingerprint_v
 #include "clink/operators/async_co_process_function.hpp"
 #include "clink/operators/async_process_function.hpp"
 #include "clink/operators/evicting_tumbling_window_operator.hpp"
@@ -236,6 +237,30 @@ public:
                                    std::string slot = {}) {
         graph_.expected_state_versions.set(
             clink::operator_id_from_uid(uid), std::move(state_type), version, std::move(slot));
+        return *this;
+    }
+
+    // Declare the SHAPE this job expects for a keyed-state slot: the described
+    // type V whose fields_fingerprint_v the operator's keyed_state<K, V> bind
+    // will stamp. Opt-in, and the pre-deploy counterpart of the bind-time
+    // fingerprint gate: with it declared, a savepoint whose stored fingerprint
+    // differs with no version bump covering the slot is refused at SUBMIT
+    // (and by clink check-savepoint --expected) instead of at restore on a
+    // worker. Absence declares nothing and blocks nothing - the bind gate
+    // remains the restore-time backstop. `slot` is the keyed-state slot name
+    // passed to RuntimeContext::keyed_state; it cannot be empty, because a
+    // stamp's slot never is (an empty declaration could never match one).
+    template <typename V>
+        requires HasArrowFields<V>
+    Pipeline& expect_state_shape(const std::string& uid, std::string slot) {
+        if (slot.empty()) {
+            throw std::invalid_argument(
+                "expect_state_shape: slot must be the keyed-state slot name (stamps are "
+                "always recorded under a named slot, so an empty declaration would never "
+                "match anything)");
+        }
+        graph_.expected_state_fingerprints.set(
+            clink::operator_id_from_uid(uid), slot, fields_fingerprint_v<V>);
         return *this;
     }
 
