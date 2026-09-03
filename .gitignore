@@ -95,6 +95,7 @@ benchmarks/prod_compare/*/rocksdb:/
 !/docs/qualification/
 !/docs/index.md
 !/docs/capabilities.md
+!/docs/compatibility.md
 !/docs/benchmarks.md
 !/docs/efficiency.md
 !/docs/sql.md

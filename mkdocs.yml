@@ -44,6 +44,7 @@ exclude_docs: |
   /*.md
   !/index.md
   !/capabilities.md
+  !/compatibility.md
   !/benchmarks.md
   !/efficiency.md
   !/sql.md
@@ -89,6 +90,7 @@ nav:
       - Clink vs Apache Flink: guides/clink-vs-flink.md
       - Arrow-native stream processing: guides/arrow-stream-processing.md
   - Capabilities: capabilities.md
+  - Compatibility: compatibility.md
   - SQL: sql.md
   - Benchmarks: benchmarks.md
   - Qualification:
@@ -166,6 +168,7 @@ nav:
       - design/008-hot-rescale.md
       - design/009-one-declaration-per-type.md
       - design/010-stable-extension-model.md
+      - design/011-public-api-tiers.md
   - Examples:
       - consumer-examples/README.md
       - consumer-examples/state_as_data/README.md

@@ -35,7 +35,9 @@ This site is the deep reference for the engine, organised in three layers:
 The [capability catalogue](capabilities.md) is the complete, shipped feature
 surface in one page: execution model, SQL, state, delivery guarantees,
 operations, observability, and embedding APIs, each row linking to the page
-that documents it in depth.
+that documents it in depth. [Compatibility](compatibility.md) states which
+of those surfaces the 1.x line promises to hold stable, and how each promise
+is enforced.
 
 ## What it costs to run
 

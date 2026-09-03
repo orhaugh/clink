@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**The public API is tiered, and the Stable tier is held by gates.** Design
+record 011 settles what "stable public APIs" means for the 1.x line: source
+compatibility on a declared Stable tier, change-with-notice on an Evolving
+tier, and no promise on the Internal headers a plugin's include closure
+happens to reach. Every installed header now carries a tier in
+`scripts/public-api-surface.txt` (126 Stable, 71 Evolving, 265 Internal at
+adoption), generated and checked in CI; the manifest also names the
+lower-tier headers a Stable header exposes, so a newly reached internal type
+is a reviewed diff rather than a side effect. Which members are promised is
+enumerated by `tests/api_conformance/`, compile-only units that use every
+promised class, function, macro and virtual hook (hooks overridden with
+`override`, so a changed signature fails the build), alongside a check that
+compiles each Stable header on its own. The SQL dialect gets the same
+treatment: `tests/sql_conformance/` freezes thirty scripts with their inputs
+and outputs, run through the embedded engine; a persisted catalog directory
+is a compatibility domain with frozen fixtures; and a user-defined function
+now shadows a built-in of the same name, so adding a built-in in a later
+release can never change what an existing script computes. The published
+[Compatibility](https://orhaugh.github.io/clink/compatibility/) page states
+the promise surface by surface.
+
 **The embedded C ABI is version 2, and can now grow without a version 3.**
 `clink_engine_options` gained a leading `struct_size` field, filled in by
 the new `CLINK_ENGINE_OPTIONS_INIT`; the library reads only the fields the

@@ -168,8 +168,11 @@ claims: [Qualification](https://orhaugh.github.io/clink/qualification/).
 
 clink is young and pre-1.0. Its guarantees are qualified within the
 published bounds above, not battle-tested by years of third-party
-production deployments; public C++ APIs may still change between minor
-releases, and every such change is called out in the
+production deployments. The public surface is tiered ahead of 1.0
+([Compatibility](https://orhaugh.github.io/clink/compatibility/)): the
+Stable tier of the C++ API, the C ABI and the SQL dialect is declared in
+tracked manifests and frozen conformance suites, and every change to it
+before 1.0, and every Evolving-tier change after, is called out in the
 [CHANGELOG](CHANGELOG.md). Durable state is treated conservatively:
 snapshots carry schema versions with a migrate-at-restore path, so an
 upgrade does not silently invalidate checkpoints or savepoints. What the
@@ -186,8 +189,10 @@ Before 1.0, the priorities are:
 - **Long-duration qualification.** Complete multi-day production-style
   campaigns and continue expanding the measured state, scale and recovery
   envelope.
-- **Stable public APIs.** Settle the C++, C and SQL-facing interfaces that
-  should carry compatibility guarantees across the 1.x line.
+- **Stable public APIs.** Settled: the C++, C and SQL-facing interfaces
+  that carry compatibility guarantees across the 1.x line are declared by
+  tier and held by conformance gates ([design record
+  011](docs/design/011-public-api-tiers.md)); 1.0 freezes the manifest.
 - **Stable extension model.** Reduce coupling between compiled plugins and
   individual clink revisions, with a clearly defined compatibility contract.
 - **Native type ergonomics.** Make a single schema declaration sufficient for
