@@ -698,6 +698,99 @@ TEST(RocksDBStateBackend, ArrowExportsCarryStateVersions) {
     EXPECT_EQ(ref2.restored_state_versions().pack(), versions.pack());
 }
 
+// Shape fingerprints ride the sibling reserved key exactly like the
+// versions: recorded on the live backend, persisted by every checkpoint,
+// recovered by restore into a fresh backend - so the bind-time gate works
+// over rocksdb:// restores, not only in-memory ones.
+TEST(RocksDBStateBackend, StateFingerprintsSurviveSnapshotAndRestore) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    auto dir = std::filesystem::temp_directory_path() / "clink_rocks_fingerprints";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    RocksDBStateBackend backend(
+        RocksDBStateBackend::Options{.path = (dir / "db").string(), .create_if_missing = true});
+
+    backend.record_state_fingerprint(OperatorId{1}, "counter_slot", 0xabcdef0123456789ULL);
+    backend.record_state_fingerprint(OperatorId{9}, "window_slot", 0x1111222233334444ULL);
+    backend.put(OperatorId{1}, sv(std::string{"\x05"} + "s|k"), sv(std::string{"v"}));
+    const auto snap = backend.snapshot(CheckpointId{11});
+
+    RocksDBStateBackend fresh(
+        RocksDBStateBackend::Options{.path = (dir / "db2").string(), .create_if_missing = true});
+    EXPECT_FALSE(fresh.restored_state_fingerprint(OperatorId{1}, "counter_slot").has_value());
+    fresh.restore(snap);
+    const auto got = fresh.restored_state_fingerprint(OperatorId{1}, "counter_slot");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, 0xabcdef0123456789ULL);
+    const auto got2 = fresh.restored_state_fingerprint(OperatorId{9}, "window_slot");
+    ASSERT_TRUE(got2.has_value());
+    EXPECT_EQ(*got2, 0x1111222233334444ULL);
+}
+
+// Both Arrow exports embed the fingerprints beside the versions, so an
+// exported rocksdb checkpoint restored into the in-memory reference
+// reader carries them - the pre-deploy savepoint reader sees real stamps.
+TEST(RocksDBStateBackend, ArrowExportsCarryStateFingerprints) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    auto dir = std::filesystem::temp_directory_path() / "clink_rocks_fingerprints_export";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    RocksDBStateBackend backend(
+        RocksDBStateBackend::Options{.path = (dir / "db").string(), .create_if_missing = true});
+    backend.record_state_fingerprint(OperatorId{7}, "agg_slot", 0x5555666677778888ULL);
+    backend.put(OperatorId{7}, sv(std::string{"\x05"} + "s|k"), sv(std::string{"v"}));
+
+    // Live export.
+    InMemoryStateBackend ref;
+    ref.restore(
+        Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = backend.export_arrow_snapshot()});
+    const auto live = ref.restored_state_fingerprint(OperatorId{7}, "agg_slot");
+    ASSERT_TRUE(live.has_value());
+    EXPECT_EQ(*live, 0x5555666677778888ULL);
+
+    // Offline checkpoint-dir export.
+    const auto snap = backend.snapshot(CheckpointId{21});
+    std::string cp_dir(snap.bytes.size(), '\0');
+    std::memcpy(cp_dir.data(), snap.bytes.data(), snap.bytes.size());
+    InMemoryStateBackend ref2;
+    ref2.restore(
+        Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = rocksdb_checkpoint_to_arrow(cp_dir)});
+    const auto offline = ref2.restored_state_fingerprint(OperatorId{7}, "agg_slot");
+    ASSERT_TRUE(offline.has_value());
+    EXPECT_EQ(*offline, 0x5555666677778888ULL);
+}
+
+// The migrator's whole-operator clear (empty slot) must persist: after a
+// clear and a reopen of the same working dir, the stamps stay gone.
+TEST(RocksDBStateBackend, ClearFingerprintWholeOpPersistsAcrossReopen) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    auto dir = std::filesystem::temp_directory_path() / "clink_rocks_fp_clear";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto db_path = (dir / "db").string();
+    {
+        RocksDBStateBackend backend(
+            RocksDBStateBackend::Options{.path = db_path, .create_if_missing = true});
+        backend.record_state_fingerprint(OperatorId{3}, "slot_a", 0x1ULL);
+        backend.record_state_fingerprint(OperatorId{3}, "slot_b", 0x2ULL);
+        backend.record_state_fingerprint(OperatorId{4}, "slot_c", 0x3ULL);
+        backend.clear_state_fingerprint(OperatorId{3}, "");
+    }
+    RocksDBStateBackend reopened(
+        RocksDBStateBackend::Options{.path = db_path, .create_if_missing = false});
+    EXPECT_FALSE(reopened.restored_state_fingerprint(OperatorId{3}, "slot_a").has_value());
+    EXPECT_FALSE(reopened.restored_state_fingerprint(OperatorId{3}, "slot_b").has_value());
+    const auto kept = reopened.restored_state_fingerprint(OperatorId{4}, "slot_c");
+    ASSERT_TRUE(kept.has_value());
+    EXPECT_EQ(*kept, 0x3ULL);
+}
+
 // --- expiry compaction ------------------------------------------------------
 
 TEST(RocksDBStateBackend, ExpiryFilterDropsEntriesDuringCompaction) {
