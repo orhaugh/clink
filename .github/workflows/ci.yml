@@ -405,6 +405,20 @@ jobs:
         # goes unhashed. No build, no toolchain: it must run on every push.
         run: ./scripts/gen-plugin-abi-surface.py --check
 
+  public-api-surface:
+    name: Public API tier manifest is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Manifest matches the header tiers and the Stable include reach
+        # scripts/public-api-surface.txt assigns every installed header its
+        # 1.x compatibility tier (design record 011) and lists the lower-tier
+        # headers a Stable header's include closure exposes. A header changing
+        # tier, or a Stable header newly reaching an Internal one, is a change
+        # to the compatibility contract and must land as a reviewed manifest
+        # diff, never as a side effect. No build, no toolchain.
+        run: ./scripts/gen-public-api-surface.py --check
+
   install-smoke:
     name: Install + downstream consume
     runs-on: ubuntu-24.04
