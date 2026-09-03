@@ -96,6 +96,19 @@ stamps as it rewrites their values, so after a legitimate bump +
 migration the bind sees no stale stamp and re-stamps the new shape.
 There is deliberately no override flag; migrations are the path.
 
+The gate also has a pre-deploy twin. A job that declares its slot shapes
+via `expect_state_shape<V>(uid, slot)` carries the declared fingerprints
+in its graph, and its `.so` exports
+`clink_job_check_restore_fingerprints`; the coordinator's submit gate and
+`clink check-savepoint --expected` then refuse an undeclared shape change
+BEFORE deploy instead of at bind time on a worker. The pure rule
+(`check_fingerprint_compatibility`) predicts the migrator: a stored
+fingerprint differing from the declared one passes only when a version
+bump covering the slot is declared, because that bump is what clears the
+stamp at restore. Opt-in and absence-tolerant in every direction - an
+undeclared job, an older `.so`, or a stampless savepoint is simply not
+pre-gated, and the bind-time gate stays the backstop.
+
 Backends: the in-memory backend and the paths layered on it - the
 file-backed, sharded, changelog and coalescing wrappers - store and
 persist fingerprints (the file-backed and sharded wiring landed 2026-09;

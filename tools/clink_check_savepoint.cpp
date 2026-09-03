@@ -60,19 +60,23 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
 void usage() {
     std::cerr << "Usage: clink check-savepoint --file=<path> [--expected=<job.so>] [--quiet]\n"
               << "\n"
-              << "Inspects state-schema version stamps inside a snapshot file.\n"
-              << "Prints one row per (op_id, state_type, version) plus a\n"
-              << "summary count of keyed entries.\n"
+              << "Inspects state-schema version stamps and shape fingerprints\n"
+              << "inside a snapshot file. Prints one row per stamped\n"
+              << "(op_id, state_type, version) and per (op_id, slot,\n"
+              << "fingerprint), plus a summary count of keyed entries.\n"
               << "\n"
               << "With --expected=<job.so>, additionally checks whether the\n"
               << "savepoint can be restored into that job binary: the .so is\n"
               << "dlopened and asked (.so-side, where its migration registry\n"
-              << "lives) to report any (op, state_type) it cannot migrate to\n"
-              << "its expected versions.\n"
+              << "and shape declarations live) to report any (op, state_type)\n"
+              << "it cannot migrate to its expected versions, and any declared\n"
+              << "slot whose stored shape changed with no version bump. A .so\n"
+              << "built before the fingerprint export is version-checked only.\n"
               << "\n"
               << "Exit codes: 0 = read OK (and compatible if --expected set),\n"
               << "1 = I/O or decode error, 2 = .so load / check error,\n"
-              << "3 = incompatible savepoint (migration path missing).\n";
+              << "3 = incompatible savepoint (migration path missing or\n"
+              << "undeclared shape change).\n";
 }
 
 // Call a job .so's .so-side compatibility check. Returns the CLI exit
@@ -80,7 +84,10 @@ void usage() {
 // inside the .so because the StateMigrationRegistry is .so-local
 // (clink_core is statically linked, so this process's global() is a
 // separate, empty instance).
-int run_compat_check(const std::string& so_path, const std::string& stored_packed, bool quiet) {
+int run_compat_check(const std::string& so_path,
+                     const std::string& stored_packed,
+                     const std::string& stored_fps_packed,
+                     bool quiet) {
     void* handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr) {
         std::cerr << "clink check-savepoint: dlopen failed: " << ::dlerror() << "\n";
@@ -110,6 +117,26 @@ int run_compat_check(const std::string& so_path, const std::string& stored_packe
     }
     // Copy the result out before dlclose invalidates the .so's memory.
     const std::string packed{out_packed != nullptr ? out_packed : "", out_size};
+
+    // Shape fingerprints: the optional second export. An older .so lacks it
+    // and stays version-checked only - said out loud rather than silently.
+    std::string fp_packed;
+    bool fp_checked = false;
+    int fp_rc = 0;
+    {
+        using FpCheckFn = int (*)(const char*, const char*, const char**, std::size_t*);
+        auto fp_sym = ::dlsym(handle, "clink_job_check_restore_fingerprints");
+        if (fp_sym != nullptr) {
+            FpCheckFn fp_check = nullptr;
+            std::memcpy(&fp_check, &fp_sym, sizeof(fp_check));
+            const char* fp_out = nullptr;
+            std::size_t fp_out_size = 0;
+            fp_rc =
+                fp_check(stored_fps_packed.c_str(), stored_packed.c_str(), &fp_out, &fp_out_size);
+            fp_packed.assign(fp_out != nullptr ? fp_out : "", fp_out_size);
+            fp_checked = true;
+        }
+    }
     ::dlclose(handle);
 
     std::vector<clink::StateIncompatibility> incompat;
@@ -121,10 +148,49 @@ int run_compat_check(const std::string& so_path, const std::string& stored_packe
     }
 
     if (incompat.empty()) {
-        if (!quiet) {
-            std::cout << "compatible: savepoint restores into " << so_path << "\n";
+        if (!fp_checked) {
+            if (!quiet) {
+                std::cout << "compatible: savepoint restores into " << so_path << "\n";
+                std::cout << "  (fingerprint check skipped: the .so predates "
+                             "clink_job_check_restore_fingerprints)\n";
+            }
+            return 0;
         }
-        return 0;
+        if (fp_rc != 0) {
+            std::cerr << "clink check-savepoint: .so fingerprint check returned " << fp_rc
+                      << (fp_rc == 1 ? " (job build_fn failed)" : " (could not decode stamp maps)")
+                      << "\n";
+            return 2;
+        }
+        std::vector<clink::StateFingerprintMismatch> mismatches;
+        try {
+            mismatches = clink::unpack_fingerprint_mismatches(fp_packed);
+        } catch (const std::exception& e) {
+            std::cerr << "clink check-savepoint: malformed fingerprint result: " << e.what()
+                      << "\n";
+            return 2;
+        }
+        if (mismatches.empty()) {
+            if (!quiet) {
+                std::cout << "compatible: savepoint restores into " << so_path << "\n";
+            }
+            return 0;
+        }
+        std::cerr << "INCOMPATIBLE: " << mismatches.size()
+                  << " state slot(s) changed shape with no declared version bump in " << so_path
+                  << "\n";
+        std::cerr << "  op_id  slot                        stored -> declared\n";
+        std::cerr << "  -----  --------------------------  ------------------\n";
+        for (const auto& m : mismatches) {
+            std::cerr << "  " << m.op_id.value() << "      " << m.slot;
+            if (m.slot.size() < 26) {
+                std::cerr << std::string(26 - m.slot.size(), ' ');
+            }
+            std::cerr << "  " << std::hex << m.stored_fingerprint << " -> "
+                      << m.declared_fingerprint << std::dec << "\n";
+        }
+        std::cerr << "  remedy: bump SchemaVersionTrait and register a migration\n";
+        return 3;
     }
     std::cerr << "INCOMPATIBLE: " << incompat.size() << " state slot(s) have no migration path in "
               << so_path << "\n";
@@ -194,11 +260,14 @@ int clink_cmd_check_savepoint(int argc, char** argv) {
         backend.restore(
             clink::Snapshot{.checkpoint_id = clink::CheckpointId{0}, .bytes = std::move(bytes)});
         auto versions = backend.restored_state_versions();
+        auto fingerprints = backend.restored_state_fingerprints();
         const auto entry_count = count_state_entries(backend);
+        const auto fp_entries = fingerprints.entries();
 
         if (!quiet) {
             std::cout << "file=" << file << " entries=" << entry_count
-                      << " versioned_ops=" << versions.size() << "\n";
+                      << " versioned_ops=" << versions.size()
+                      << " fingerprinted_slots=" << fp_entries.size() << "\n";
             if (versions.empty()) {
                 std::cout << "  (no state version stamps recorded)\n";
             } else {
@@ -214,11 +283,24 @@ int clink_cmd_check_savepoint(int argc, char** argv) {
                     std::cout << "  " << e.version << "\n";
                 }
             }
+            if (fp_entries.empty()) {
+                std::cout << "  (no shape fingerprints recorded)\n";
+            } else {
+                std::cout << "  op_id  slot                        fingerprint\n";
+                std::cout << "  -----  --------------------------  ----------------\n";
+                for (const auto& e : fp_entries) {
+                    std::cout << "  " << e.op_id.value() << "      " << e.slot;
+                    if (e.slot.size() < 26) {
+                        std::cout << std::string(26 - e.slot.size(), ' ');
+                    }
+                    std::cout << "  " << std::hex << e.fingerprint << std::dec << "\n";
+                }
+            }
         }
 
         // Pre-deploy compatibility check against a live job binary.
         if (!expected_so.empty()) {
-            return run_compat_check(expected_so, versions.pack(), quiet);
+            return run_compat_check(expected_so, versions.pack(), fingerprints.pack(), quiet);
         }
         return 0;
     } catch (const std::exception& e) {

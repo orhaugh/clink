@@ -19,9 +19,25 @@
 #include <gtest/gtest.h>
 #include <sys/wait.h>
 
+#include "clink/core/fields.hpp"
 #include "clink/core/types.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/schema_version.hpp"
+
+// Shapes for the fingerprint CLI tests. The fixture job declares
+// expect_state_shape<EvoCounter>("counter-op", "counter_slot") with
+// EvoCounter = {int64 count}; the fingerprint hashes (field name, kind), not
+// the type name, so the same-shaped local type reproduces it and the
+// other-shaped one is guaranteed to differ.
+struct CliEvoSameShape {
+    std::int64_t count{};
+};
+CLINK_FIELDS(CliEvoSameShape, count);
+
+struct CliEvoOtherShape {
+    std::string count;
+};
+CLINK_FIELDS(CliEvoOtherShape, count);
 
 namespace {
 
@@ -267,6 +283,102 @@ TEST(CheckSavepointCli, ExpectedRejectsIncompatibleSavepoint) {
     EXPECT_NE(result.stderr_text.find("INCOMPATIBLE"), std::string::npos)
         << "stderr: " << result.stderr_text;
     EXPECT_NE(result.stderr_text.find("counter"), std::string::npos);
+
+    std::filesystem::remove(path);
+}
+
+// ----- shape fingerprints in the CLI -----
+
+TEST(CheckSavepointCli, PrintsStampedFingerprints) {
+    CLINK_SKIP_CLI_UNDER_SANITIZER();
+    auto backend = std::make_shared<clink::InMemoryStateBackend>();
+    backend->put(clink::OperatorId{1}, "k", std::string_view{"v"});
+    backend->record_state_fingerprint(
+        clink::OperatorId{1}, "counts_slot", clink::fields_fingerprint_v<CliEvoSameShape>);
+    auto snap = backend->snapshot(clink::CheckpointId{1});
+    auto path = write_savepoint_file(snap, "fp" + std::to_string(getpid()));
+
+    auto result = run_cli("check-savepoint --file=" + path.string());
+    EXPECT_EQ(result.exit_code, 0) << "stderr: " << result.stderr_text;
+    EXPECT_NE(result.stdout_text.find("fingerprinted_slots=1"), std::string::npos)
+        << "stdout: " << result.stdout_text;
+    EXPECT_NE(result.stdout_text.find("counts_slot"), std::string::npos)
+        << "stdout: " << result.stdout_text;
+
+    std::filesystem::remove(path);
+}
+
+TEST(CheckSavepointCli, ReportsNoFingerprintsWhenUnstamped) {
+    CLINK_SKIP_CLI_UNDER_SANITIZER();
+    auto backend = std::make_shared<clink::InMemoryStateBackend>();
+    backend->put(clink::OperatorId{1}, "k", std::string_view{"v"});
+    auto snap = backend->snapshot(clink::CheckpointId{1});
+    auto path = write_savepoint_file(snap, "fpu" + std::to_string(getpid()));
+
+    auto result = run_cli("check-savepoint --file=" + path.string());
+    EXPECT_EQ(result.exit_code, 0) << "stderr: " << result.stderr_text;
+    EXPECT_NE(result.stdout_text.find("fingerprinted_slots=0"), std::string::npos)
+        << "stdout: " << result.stdout_text;
+    EXPECT_NE(result.stdout_text.find("(no shape fingerprints recorded)"), std::string::npos)
+        << "stdout: " << result.stdout_text;
+
+    std::filesystem::remove(path);
+}
+
+TEST(CheckSavepointCli, ExpectedRejectsUndeclaredShapeChange) {
+    CLINK_SKIP_CLI_UNDER_SANITIZER();
+    if (schema_evo_job_path() == nullptr) {
+        GTEST_SKIP() << "schema_evo_test_job .so not built";
+    }
+    // Versions already at the fixture's expected v3 (no migration intent);
+    // the stored shape stamp differs from the declared EvoCounter shape.
+    auto backend = std::make_shared<clink::InMemoryStateBackend>();
+    const auto op = clink::operator_id_from_uid("counter-op");
+    backend->put(op, "k", std::string_view{"v"});
+    clink::StateVersionMap versions;
+    versions.set(op, "counter", 3);
+    backend->set_state_versions(versions);
+    backend->record_state_fingerprint(
+        op, "counter_slot", clink::fields_fingerprint_v<CliEvoOtherShape>);
+    auto snap = backend->snapshot(clink::CheckpointId{1});
+    auto path = write_savepoint_file(snap, "fpshape" + std::to_string(getpid()));
+
+    auto result =
+        run_cli("check-savepoint --file=" + path.string() + " --expected=" + schema_evo_job_path());
+    EXPECT_EQ(result.exit_code, 3) << "stderr: " << result.stderr_text;
+    EXPECT_NE(result.stderr_text.find("changed shape"), std::string::npos)
+        << "stderr: " << result.stderr_text;
+    EXPECT_NE(result.stderr_text.find("counter_slot"), std::string::npos)
+        << "stderr: " << result.stderr_text;
+    EXPECT_NE(result.stderr_text.find("SchemaVersionTrait"), std::string::npos)
+        << "the remedy must be named: " << result.stderr_text;
+
+    std::filesystem::remove(path);
+}
+
+TEST(CheckSavepointCli, ExpectedAcceptsDeclaredBumpShapeChange) {
+    CLINK_SKIP_CLI_UNDER_SANITIZER();
+    if (schema_evo_job_path() == nullptr) {
+        GTEST_SKIP() << "schema_evo_test_job .so not built";
+    }
+    // Same mismatching shape stamp, but stored version 1 vs expected 3 is
+    // declared migration intent: compatible, exit 0.
+    auto backend = std::make_shared<clink::InMemoryStateBackend>();
+    const auto op = clink::operator_id_from_uid("counter-op");
+    backend->put(op, "k", std::string_view{"v"});
+    clink::StateVersionMap versions;
+    versions.set(op, "counter", 1);
+    backend->set_state_versions(versions);
+    backend->record_state_fingerprint(
+        op, "counter_slot", clink::fields_fingerprint_v<CliEvoOtherShape>);
+    auto snap = backend->snapshot(clink::CheckpointId{1});
+    auto path = write_savepoint_file(snap, "fpbump" + std::to_string(getpid()));
+
+    auto result =
+        run_cli("check-savepoint --file=" + path.string() + " --expected=" + schema_evo_job_path());
+    EXPECT_EQ(result.exit_code, 0) << "stderr: " << result.stderr_text;
+    EXPECT_NE(result.stdout_text.find("compatible"), std::string::npos)
+        << "stdout: " << result.stdout_text;
 
     std::filesystem::remove(path);
 }
