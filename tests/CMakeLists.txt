@@ -754,3 +754,8 @@ endif()
 # Item 30: the test plugins ship on every PluginSubmission-family submit;
 # strip them the same way the example jobs are stripped.
 clink_split_debug_and_strip_modules_in_dir()
+
+# Stable public API gates (design record 011): every Stable header compiles on
+# its own, and the frozen member enumeration under api_conformance/ compiles.
+add_subdirectory(api_conformance)
+
