@@ -507,6 +507,30 @@ TEST_F(FaultRecoveryTest, TwoSeparatedWorkerFailuresAreSurvived) {
 // overlapping restarts are a different scenario with a known gap (F12), and mixing
 // them in would make a failure here ambiguous.
 TEST_F(FaultRecoveryTest, AJobFailsOnceItsRestartBudgetIsSpent) {
+    // This scenario needs the job to still be RUNNING when the second kill
+    // lands, and with the fixture's default source it is not reliably: the 2PC
+    // job's source is bounded, so kTotalRecords at a 50 ms tick is about two
+    // seconds of emission, and less than that after the first recovery replays
+    // from the last checkpoint. Between the two kills this test waits for a
+    // redeploy, a fresh checkpoint, a worker respawn and a re-registration.
+    // When that outlasts what the source has left - which is what a contended
+    // machine does to it - the job simply COMPLETES, the submitter exits 0, and
+    // the budget assertion below reads a successful job as an unenforced gate.
+    // That is how this test failed in CI (run 33839925755) with the gate it is
+    // named for working correctly, and why it failed FASTER than it passes.
+    // Standing a 5 s sleep in for the slow machine reproduces that failure
+    // exactly, and does not reproduce it once this override is in place.
+    //
+    // So give this one scenario a source that cannot drain inside it: a minute
+    // of emission against a sequence that takes seconds. The rate is unchanged,
+    // so this adds no load to the machine whose slowness is the hazard, and the
+    // job's own length is nothing this test asserts on - it ends on the
+    // submitter exiting, never on a drain. SetUp re-sets both knobs before
+    // every test, so the override cannot leak into another one, and the count
+    // is deliberately NOT kTotalRecords, which the output-equality tests assert
+    // against.
+    ::setenv("CLINK_2PC_TOTAL", "1200", 1);
+
     Cluster c(spec());
     ScopedDiagnostics diag(c);
     bring_up(c);
@@ -539,6 +563,15 @@ TEST_F(FaultRecoveryTest, AJobFailsOnceItsRestartBudgetIsSpent) {
     ASSERT_TRUE(c.await_workers_registered(3))
         << "worker 0 never re-registered, so the second kill would leave the cluster empty and "
            "this test would prove nothing about the budget";
+
+    // Everything below assumes the job is still running. Check it, so that if
+    // the source ever does drain in here the failure says the scenario never
+    // ran instead of accusing the restart-budget gate of a fault it does not
+    // have. Polling caches the exit code, so the await at the end still sees it.
+    ASSERT_TRUE(sub->running())
+        << "the job ended before the second kill, so the restart budget was never exercised: the "
+           "source drained during the restart rather than the gate ending the job. Raise this "
+           "test's CLINK_2PC_TOTAL override.";
 
     // Second loss: the budget is gone. The job must END, not restart again - even
     // though a worker is available to run it.
