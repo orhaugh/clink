@@ -584,8 +584,17 @@ TEST_F(FaultRecoveryTest, AJobFailsOnceItsRestartBudgetIsSpent) {
     // Without this the test is vacuous, and it was: with only two workers, killing
     // the second leaves nowhere to redeploy and the job fails for lack of capacity
     // whatever the budget says. Mutating the gate to `true` (budget never runs out)
-    // still passed. Restoring capacity makes the BUDGET the only thing that can end
-    // the job, which is what this test is named for.
+    // still passed. Restoring capacity removes that confound.
+    //
+    // It was not the only one, which is worth recording: capacity was fixed here
+    // first and this comment then claimed the budget was "the only thing that can
+    // end the job", while a second confound in the opposite direction survived
+    // for months - a bounded source that DRAINS mid-sequence ends the job by
+    // succeeding. Both are now closed, capacity by the restart above and the
+    // drain by the override at the top plus the precondition below. The engine's
+    // own history had already recorded this exact family once, for the
+    // graceful-stop test that "would have passed on a stop that did nothing,
+    // because the source is bounded and the job finishes either way".
     ASSERT_TRUE(c.restart_worker(0));
     ASSERT_TRUE(c.await_workers_registered(3))
         << "worker 0 never re-registered, so the second kill would leave the cluster empty and "
