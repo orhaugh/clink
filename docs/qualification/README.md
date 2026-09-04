@@ -85,3 +85,17 @@ and QUAL-05 qualifies bounded state over 90 minutes; the larger tier and
 longer durations are separate campaigns. Pages are added to the
 table above only when a campaign concludes with useful results and
 retained evidence.
+
+"Covered by the engine's test suites" is deliberately weaker than a green
+suite sounds, and one finding is worth stating plainly. A fault test can
+pass without ever observing its fault. In September 2026 three worker-loss
+tests in the deterministic suite were found able to do exactly that: two
+submit a bounded workload that had already finished by the time the second
+fault landed, so the job ended by succeeding rather than by surviving, and
+the third timed the restart it was measuring by waiting for one of the two
+log lines a lost worker can produce. All three are fixed, and each now
+asserts that the job is still running at the moment the fault is supposed
+to matter. That is the reason a campaign is not replaced by a green test
+run: the suite says a mechanism works where it is exercised, and a
+campaign says the guarantee holds for hours on real hosts with faults
+arriving in the narrowest windows.
