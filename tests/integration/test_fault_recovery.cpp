@@ -458,6 +458,25 @@ TEST_F(FaultRecoveryTest, AJobSurvivesASecondLossDuringTheFirstRestartsDrain) {
 // the part of "multiple consecutive worker failures" the engine handles
 // today, and pinning it keeps that from regressing while F12 is open.
 TEST_F(FaultRecoveryTest, TwoSeparatedWorkerFailuresAreSurvived) {
+    // Same bounded-source hazard as the budget test below, in its vacuous
+    // form. This test expects the job to SURVIVE, so if the job instead
+    // completes before the second kill, the second loss lands on a worker with
+    // nothing on it, the submitter still exits 0 and the test passes without
+    // ever observing the second recovery it is named for. Demonstrated:
+    // standing a 5 s sleep in for a slow window between the two kills ends the
+    // job early every time, and the precondition below catches it.
+    //
+    // So the source needs to outlast the window between the first recovery and
+    // the second kill - normally well under a second - without outlasting the
+    // submitter's own wait, because unlike the budget test this one does need
+    // the job to finish (--wait-timeout-s=90). Ten seconds of emission is the
+    // balance: it absorbs the 5 s forcing that reliably breaks the 40-record
+    // version, and still finishes an order of magnitude inside the wait. The
+    // margin is not free and is not pretended to be: measured on one host,
+    // 14.9-15.5 s at 40 records against 23.6 s here, so about eight seconds on
+    // a test that is one of ~199 in a serial gate of ~890 s.
+    ::setenv("CLINK_2PC_TOTAL", "200", 1);
+
     Cluster c(spec());
     ScopedDiagnostics diag(c);
     bring_up(c);
@@ -479,6 +498,14 @@ TEST_F(FaultRecoveryTest, TwoSeparatedWorkerFailuresAreSurvived) {
         clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > before_first; },
                             std::chrono::seconds(60)))
         << "the job never checkpointed again after the first worker loss";
+
+    // The second loss has to land on a RUNNING job or this test proves nothing:
+    // a job that already finished exits 0 whatever the second kill does. Assert
+    // it, so that outcome fails loudly instead of passing as a survival.
+    ASSERT_TRUE(sub->running())
+        << "the job completed before the second worker loss, so the second recovery this test is "
+           "named for never happened and its exit code proves nothing. The source drained inside "
+           "the window: raise this test's CLINK_2PC_TOTAL override.";
 
     c.worker(1).kill_hard();
     ASSERT_TRUE(c.await_process_gone(1));
