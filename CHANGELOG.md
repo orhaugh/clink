@@ -47,6 +47,23 @@ deliberate break before 1.0 (`CLINK_EMBED_ABI_VERSION` 1 to 2): C callers
 recompile against the new header and initialise their options with the
 macro; `pyclink` tracks the change and exposes `Engine.version`.
 
+**Two worker-loss gates could pass without proving what they claim.** Both
+fault-recovery tests that kill a worker twice submit a job whose source is
+bounded, and neither made sure the job outlived the sequence. In the
+restart-budget test that produced a real CI failure blaming the restart gate
+for a job that had simply finished: the assertion reads a clean exit as an
+unenforced budget, and it failed faster than it passes. Its sibling had the
+same hazard in the quieter direction, since it expects the job to survive, so
+an early finish let the second worker loss land on an idle worker and the test
+passed without ever observing the second recovery it is named for. Both now
+give the source enough runtime to outlast the kill sequence, and both assert
+the job is still running before the second kill, so that outcome fails naming
+its own cause instead of being read as a verdict on the engine. The mechanism
+was demonstrated rather than inferred: standing a five-second sleep in for a
+slow machine at the point the race lives reproduces the CI failure exactly and
+makes the sibling's silent pass reproducible, and neither survives the same
+forcing once the fix is in. Nothing in the engine changed.
+
 **A Kafka source can no longer be wedged by its group coordinator.** The
 tutorial's fresh stacks intermittently read nothing at all: the source
 assigned its partition and every gauge sat at zero, healthy, until the
