@@ -184,20 +184,33 @@ engine can do, feature by feature with caveats stated, lives in the
 The path to 1.0 is primarily about stability and operational evidence rather
 than adding another broad layer of features.
 
-Before 1.0, the priorities are:
+Settled, each under a design record and held by gates in CI:
+
+- **Stable public APIs.** The C++, C and SQL-facing interfaces that carry
+  compatibility guarantees across the 1.x line are declared by tier and held
+  by conformance gates: a tracked header manifest, an append-only C symbol
+  manifest, compile-only conformance units and a frozen SQL corpus
+  ([design record 011](docs/design/011-public-api-tiers.md),
+  [Compatibility](https://orhaugh.github.io/clink/compatibility/)). 1.0
+  freezes the manifest.
+- **Stable extension model.** A compiled job or plugin loads on any engine
+  build whose declared extension surface matches. The contract is a tracked
+  177-header manifest plus the build options, pinned Arrow version and
+  toolchain identity that shape its layout; a refusal names the differing
+  headers, an incompatible submit is refused before any bytes ship, and
+  out-of-tree modules build with the packaged `clink_add_job_module()`
+  ([design record 010](docs/design/010-stable-extension-model.md)).
+- **Native type ergonomics.** One `CLINK_FIELDS` declaration per type derives
+  the byte codec, the Arrow schema and columnar batcher, distributed type
+  registration, and a shape fingerprint that refuses a restore whose field
+  list changed without a declared version bump
+  ([design record 009](docs/design/009-one-declaration-per-type.md)).
+
+Still open before 1.0:
 
 - **Long-duration qualification.** Complete multi-day production-style
   campaigns and continue expanding the measured state, scale and recovery
   envelope.
-- **Stable public APIs.** Settled: the C++, C and SQL-facing interfaces
-  that carry compatibility guarantees across the 1.x line are declared by
-  tier and held by conformance gates ([design record
-  011](docs/design/011-public-api-tiers.md)); 1.0 freezes the manifest.
-- **Stable extension model.** Reduce coupling between compiled plugins and
-  individual clink revisions, with a clearly defined compatibility contract.
-- **Native type ergonomics.** Make a single schema declaration sufficient for
-  Arrow conversion, state serialisation and distributed type registration
-  ([design record 009](docs/design/009-one-declaration-per-type.md)).
 - **Operational maturity.** Incorporate real-world deployment feedback,
   strengthen upgrade and diagnostic tooling, and close issues found by
   external workloads.
