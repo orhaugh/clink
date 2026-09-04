@@ -1,6 +1,6 @@
 ---
 title: Clink vs Apache Flink - Native C++23 Stream Processing
-description: Compare Clink and Apache Flink for stream processing: native C++23 embedding and Arrow state versus Flink's mature JVM ecosystem and production history.
+description: "Compare Clink and Apache Flink for stream processing: native C++23 embedding and Arrow state versus Flink's mature JVM ecosystem and production history."
 ---
 
 # Clink vs Apache Flink

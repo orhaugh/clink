@@ -47,6 +47,13 @@ jobs:
         # site name, where nobody rereading body copy would look. Gate what
         # gets published, before it is built.
         run: ./scripts/check-no-em-dashes.py
+      - name: Page front matter parses
+        # Invalid YAML front matter does not fail an MkDocs build: the block
+        # is left in the document and rendered as the page's opening
+        # paragraph, and the page silently loses its title and its meta
+        # description. The Flink comparison guide published that way. Gate it
+        # before the build, like the em-dash rule above.
+        run: ./scripts/check-docs-front-matter.py
       - name: Build site
         run: mkdocs build --site-dir _site
 

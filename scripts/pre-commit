@@ -14,6 +14,15 @@ if ! ./scripts/check-no-em-dashes.py; then
     exit 1
 fi
 
+echo "pre-commit: checking page front matter parses..."
+if ! ./scripts/check-docs-front-matter.py; then
+    echo ""
+    echo "pre-commit: a page's YAML front matter does not parse. MkDocs would render it as"
+    echo "body text and drop the page's title and meta description. Quote any value"
+    echo "containing a colon-space."
+    exit 1
+fi
+
 echo "pre-commit: checking qualification status against the published pages..."
 if ! ./scripts/check-qualification-status.py; then
     echo ""
