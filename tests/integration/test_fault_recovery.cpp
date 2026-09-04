@@ -387,9 +387,12 @@ TEST_F(FaultRecoveryTest, TwoConsecutiveWorkerFailuresAreSurvived) {
 // "consecutive" case waits for a re-registration first, and the "separated" case
 // waits for a whole checkpoint. Both let the first restart finish.
 //
-// Entered deterministically rather than by racing a sleep against it. The
-// coordinator logs "awaiting_restart (attempt" the moment it begins draining for a
-// restart, so the second kill waits for THAT line and cannot land early or late. The
+// Entered deterministically rather than by racing a sleep against it: the second
+// kill waits for the coordinator to say it has begun draining for a restart, so it
+// cannot land early or late. It waits for EITHER wording, because which of the two
+// detection paths gets there first is not this test's business - see the poll
+// below, and note that an earlier version of this comment asserted the watchdog's
+// wording was the one "the moment it begins draining", which cost a CI failure. The
 // second worker's subtasks were survivors at the first loss, so they sit in
 // restart_drain_expected and can never drain - their worker is now dead - and the
 // drain never completes, so the job wedges in awaiting_restart until the submitter
@@ -426,17 +429,33 @@ TEST_F(FaultRecoveryTest, AJobSurvivesASecondLossDuringTheFirstRestartsDrain) {
     ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
                                     std::chrono::seconds(45)));
 
-    const auto restarts_before = c.count_in_coordinator_log("awaiting_restart (attempt");
+    // A hard kill is detected by whichever of two independent mechanisms gets
+    // there first, and they log different lines: the watchdog's heartbeat
+    // timeout says "awaiting_restart (attempt N/M)", while the dead worker's
+    // torn data-plane connection surfaces as a transport failure whose restart
+    // says "<reason> -> whole-job restart (attempt N/M)". Both open the drain
+    // window this test needs to kill inside, so count both. Polling only the
+    // watchdog's wording made this test lose a race it has no stake in: in CI
+    // (run 33863331163) the transport failure won by about two seconds, the
+    // restart it started was invisible to this poll, and the test spent its
+    // whole 60 s budget waiting for a drain that had already begun.
+    //
+    // Not the looser "(attempt " needle: an unreachable-broker retry logs that
+    // too, and matching it would read a broker retry as a whole-job restart.
+    const auto restart_drains_begun = [&c] {
+        return c.count_in_coordinator_log("awaiting_restart (attempt") +
+               c.count_in_coordinator_log("-> whole-job restart (attempt");
+    };
+    const auto restarts_before = restart_drains_begun();
 
     c.worker(0).kill_hard();
     ASSERT_TRUE(c.await_process_gone(0));
 
     // The drain is now in progress. Kill the second worker inside that window.
-    ASSERT_TRUE(clink::itest::await(
-        [&] { return c.count_in_coordinator_log("awaiting_restart (attempt") > restarts_before; },
-        std::chrono::seconds(60)))
-        << "the coordinator never began a restart drain, so there was no window to kill "
-           "the second worker inside";
+    ASSERT_TRUE(clink::itest::await([&] { return restart_drains_begun() > restarts_before; },
+                                    std::chrono::seconds(60)))
+        << "the coordinator never began a restart drain by either route, so there was no "
+           "window to kill the second worker inside";
 
     c.worker(1).kill_hard();
     ASSERT_TRUE(c.await_process_gone(1));

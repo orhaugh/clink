@@ -362,7 +362,16 @@ TEST_F(SideOutputRecoveryTest, AWorkerThatDiesAndReturnsImmediatelyDoesNotHangTh
     // or fails it, and doing neither is the defect.
     ASSERT_TRUE(clink::itest::await(
         [&] {
+            // Three wordings, one question: did the coordinator react? A
+            // watchdog-detected loss says "awaiting_restart", a loss the data
+            // plane notices first restarts through the transport-failure path
+            // and says "whole-job restart" instead, and a give-up says "failed
+            // errors=". Matching only the first two-thirds of that set would
+            // fail this test for a coordinator that reacted perfectly well by
+            // the other route (the shape of the CI failure in run 33863331163,
+            // in the fault-recovery suite).
             return c.coordinator().log_contains("awaiting_restart") ||
+                   c.coordinator().log_contains("whole-job restart") ||
                    c.coordinator().log_contains("failed errors=");
         },
         std::chrono::seconds(60)))
