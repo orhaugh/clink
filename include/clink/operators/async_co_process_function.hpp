@@ -46,6 +46,11 @@ namespace clink {
 template <typename K, typename I1, typename I2, typename O>
 class AsyncKeyedCoProcessFunction {
 public:
+    using key_type = K;
+    using input1_type = I1;
+    using input2_type = I2;
+    using output_type = O;
+
     virtual ~AsyncKeyedCoProcessFunction() = default;
 
     virtual void open(RuntimeContext& /*ctx*/) {}
@@ -252,5 +257,31 @@ private:
 };
 
 }  // namespace detail
+
+// The Stable construction path (design record 011) from an
+// AsyncKeyedCoProcessFunction to a two-input operator; the co-input twin of
+// make_async_keyed_process_operator.
+template <typename Fn, typename KeyFn1, typename KeyFn2>
+std::shared_ptr<
+    CoOperator<typename Fn::input1_type, typename Fn::input2_type, typename Fn::output_type>>
+make_async_keyed_co_process_operator(std::shared_ptr<Fn> fn,
+                                     KeyFn1 key_fn1,
+                                     KeyFn2 key_fn2,
+                                     Codec<typename Fn::key_type> key_codec,
+                                     std::string name = "async_keyed_co_process_function") {
+    using K = typename Fn::key_type;
+    using I1 = typename Fn::input1_type;
+    using I2 = typename Fn::input2_type;
+    using O = typename Fn::output_type;
+    static_assert(std::is_base_of_v<AsyncKeyedCoProcessFunction<K, I1, I2, O>, Fn>,
+                  "make_async_keyed_co_process_operator: Fn must derive from "
+                  "AsyncKeyedCoProcessFunction<K, I1, I2, O>");
+    return std::make_shared<detail::AsyncKeyedCoProcessFunctionAdapter<K, I1, I2, O>>(
+        std::move(fn),
+        std::move(key_fn1),
+        std::move(key_fn2),
+        std::move(key_codec),
+        std::move(name));
+}
 
 }  // namespace clink

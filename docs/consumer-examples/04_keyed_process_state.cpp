@@ -57,11 +57,12 @@ int main() {
         Record<std::int64_t>{1}, Record<std::int64_t>{2},
     });
 
+    // The public path from a KeyedProcessFunction to an operator: the key
+    // function partitions records onto current_key(); the types are deduced
+    // from RunningTotal itself.
     auto fn      = std::make_shared<RunningTotal>();
-    auto adapter =
-        std::make_shared<detail::KeyedProcessFunctionAdapter<std::int64_t, std::int64_t, std::int64_t>>(
-            fn, [](const std::int64_t& v) { return v; });
-    auto sink = std::make_shared<FunctionSink<std::int64_t>>(
+    auto adapter = make_keyed_process_operator(fn, [](const std::int64_t& v) { return v; });
+    auto sink    = std::make_shared<FunctionSink<std::int64_t>>(
         [](const std::int64_t& v) { std::cout << "running total = " << v << '\n'; });
 
     auto s0 = dag.add_source<std::int64_t>(src);

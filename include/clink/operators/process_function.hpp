@@ -348,6 +348,10 @@ private:
 template <typename I1, typename I2, typename O>
 class CoProcessFunction {
 public:
+    using input1_type = I1;
+    using input2_type = I2;
+    using output_type = O;
+
     virtual ~CoProcessFunction() = default;
 
     virtual void open(RuntimeContext& /*ctx*/) {}
@@ -377,6 +381,8 @@ public:
 template <typename K, typename I1, typename I2, typename O>
 class KeyedCoProcessFunction : public CoProcessFunction<I1, I2, O> {
 public:
+    using key_type = K;
+
     const K& current_key() const noexcept { return current_key_; }
     void set_current_key_(K k) { current_key_ = std::move(k); }
 
@@ -1540,5 +1546,82 @@ private:
 };
 
 }  // namespace detail
+
+// ---------------------------------------------------------------------------
+// From a process function to an operator, without naming an adapter.
+//
+// The Stable path (design record 011) for wiring a ProcessFunction family
+// object into a Dag by hand: `dag.add_operator(h, make_keyed_process_operator(
+// fn, key_fn))`. The fluent Pipeline API and the test harnesses build the same
+// adapters internally; these factories give a Dag-direct consumer the same
+// construction without depending on the detail namespace. Types are deduced
+// from the function class (`input_type`, `output_type`, `key_type`, ...), so a
+// std::shared_ptr to the user's derived class is enough.
+// ---------------------------------------------------------------------------
+
+template <typename Fn>
+std::shared_ptr<Operator<typename Fn::input_type, typename Fn::output_type>> make_process_operator(
+    std::shared_ptr<Fn> fn, std::string name = "process_function") {
+    using I = typename Fn::input_type;
+    using O = typename Fn::output_type;
+    static_assert(std::is_base_of_v<ProcessFunction<I, O>, Fn>,
+                  "make_process_operator: Fn must derive from ProcessFunction<I, O>");
+    return std::make_shared<detail::ProcessFunctionAdapter<I, O>>(std::move(fn), std::move(name));
+}
+
+// `timer_key_fn` turns a timer's string key back into K for on_timer; leave it
+// null when the function registers no per-key timers.
+template <typename Fn, typename KeyFn>
+std::shared_ptr<Operator<typename Fn::input_type, typename Fn::output_type>>
+make_keyed_process_operator(
+    std::shared_ptr<Fn> fn,
+    KeyFn key_fn,
+    std::function<typename Fn::key_type(const std::string&)> timer_key_fn = nullptr,
+    std::string name = "keyed_process_function") {
+    using K = typename Fn::key_type;
+    using I = typename Fn::input_type;
+    using O = typename Fn::output_type;
+    static_assert(std::is_base_of_v<KeyedProcessFunction<K, I, O>, Fn>,
+                  "make_keyed_process_operator: Fn must derive from KeyedProcessFunction<K, I, O>");
+    return std::make_shared<detail::KeyedProcessFunctionAdapter<K, I, O>>(
+        std::move(fn), std::move(key_fn), std::move(timer_key_fn), std::move(name));
+}
+
+template <typename Fn>
+std::shared_ptr<
+    CoOperator<typename Fn::input1_type, typename Fn::input2_type, typename Fn::output_type>>
+make_co_process_operator(std::shared_ptr<Fn> fn, std::string name = "co_process_function") {
+    using I1 = typename Fn::input1_type;
+    using I2 = typename Fn::input2_type;
+    using O = typename Fn::output_type;
+    static_assert(std::is_base_of_v<CoProcessFunction<I1, I2, O>, Fn>,
+                  "make_co_process_operator: Fn must derive from CoProcessFunction<I1, I2, O>");
+    return std::make_shared<detail::CoProcessFunctionAdapter<I1, I2, O>>(std::move(fn),
+                                                                         std::move(name));
+}
+
+template <typename Fn, typename KeyFn1, typename KeyFn2>
+std::shared_ptr<
+    CoOperator<typename Fn::input1_type, typename Fn::input2_type, typename Fn::output_type>>
+make_keyed_co_process_operator(
+    std::shared_ptr<Fn> fn,
+    KeyFn1 key_fn1,
+    KeyFn2 key_fn2,
+    std::function<typename Fn::key_type(const std::string&)> timer_key_fn = nullptr,
+    std::string name = "keyed_co_process_function") {
+    using K = typename Fn::key_type;
+    using I1 = typename Fn::input1_type;
+    using I2 = typename Fn::input2_type;
+    using O = typename Fn::output_type;
+    static_assert(std::is_base_of_v<KeyedCoProcessFunction<K, I1, I2, O>, Fn>,
+                  "make_keyed_co_process_operator: Fn must derive from "
+                  "KeyedCoProcessFunction<K, I1, I2, O>");
+    return std::make_shared<detail::KeyedCoProcessFunctionAdapter<K, I1, I2, O>>(
+        std::move(fn),
+        std::move(key_fn1),
+        std::move(key_fn2),
+        std::move(timer_key_fn),
+        std::move(name));
+}
 
 }  // namespace clink

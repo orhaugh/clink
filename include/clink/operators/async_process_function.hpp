@@ -130,6 +130,10 @@ private:
 template <typename K, typename I, typename O>
 class AsyncKeyedProcessFunction {
 public:
+    using key_type = K;
+    using input_type = I;
+    using output_type = O;
+
     virtual ~AsyncKeyedProcessFunction() = default;
 
     virtual void open(RuntimeContext& /*ctx*/) {}
@@ -300,5 +304,25 @@ private:
 };
 
 }  // namespace detail
+
+// The Stable construction path (design record 011) from an
+// AsyncKeyedProcessFunction to an operator; see make_keyed_process_operator in
+// process_function.hpp for the synchronous family. `key_codec` encodes the key
+// for the per-key gate and the timer key.
+template <typename Fn, typename KeyFn>
+std::shared_ptr<Operator<typename Fn::input_type, typename Fn::output_type>>
+make_async_keyed_process_operator(std::shared_ptr<Fn> fn,
+                                  KeyFn key_fn,
+                                  Codec<typename Fn::key_type> key_codec,
+                                  std::string name = "async_keyed_process_function") {
+    using K = typename Fn::key_type;
+    using I = typename Fn::input_type;
+    using O = typename Fn::output_type;
+    static_assert(std::is_base_of_v<AsyncKeyedProcessFunction<K, I, O>, Fn>,
+                  "make_async_keyed_process_operator: Fn must derive from "
+                  "AsyncKeyedProcessFunction<K, I, O>");
+    return std::make_shared<detail::AsyncKeyedProcessFunctionAdapter<K, I, O>>(
+        std::move(fn), std::move(key_fn), std::move(key_codec), std::move(name));
+}
 
 }  // namespace clink

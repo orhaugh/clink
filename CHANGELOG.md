@@ -23,6 +23,16 @@ release can never change what an existing script computes. The published
 [Compatibility](https://orhaugh.github.io/clink/compatibility/) page states
 the promise surface by surface.
 
+**A process function becomes an operator through a public factory.** A
+Dag-direct consumer used to reach into `clink::detail` for the adapter that
+turns a `KeyedProcessFunction` into an operator; consumer example 04 did.
+`make_process_operator`, `make_keyed_process_operator`,
+`make_co_process_operator`, `make_keyed_co_process_operator`,
+`make_async_keyed_process_operator` and `make_async_keyed_co_process_operator`
+now do that on the Stable tier, deducing the key, input and output types from
+the function class; the co-input and async bases gained the type aliases that
+deduction reads. The adapters stay where they were, unpromised.
+
 **The embedded C ABI is version 2, and can now grow without a version 3.**
 `clink_engine_options` gained a leading `struct_size` field, filled in by
 the new `CLINK_ENGINE_OPTIONS_INIT`; the library reads only the fields the
