@@ -87,6 +87,7 @@ embedded or submits to a cluster, unchanged.
 | Structured logging | `clink::log` facade with an in-memory ring served over HTTP and zstd-rotated files | [Distributed runtime](internals/distributed-runtime.md) |
 | Data lineage | Per-job source/sink dataset graph with column-level lineage for SQL; built-in OpenLineage exporter | [Data lineage](internals/data-lineage.md) |
 | Deterministic replay | Flight recorder captures per-epoch operator input; `clink replay` re-executes byte-identically offline and can freeze an incident into a regression test | [Replay determinism](internals/replay-determinism.md) |
+| Agent-facing diagnostics (MCP) | `clink-mcp`, a Python MCP server over the diagnostic surface: checkpoint and savepoint inspection, capture and replay, lineage, queryable state, lint and `EXPLAIN`, as tools for any MCP client. Read-only; `replay` writes only to caller-named paths. Not on PyPI yet | [Diagnosing a pipeline with an agent](guides/diagnosing-a-pipeline-with-an-agent.md) |
 
 ## Embedding and APIs
 

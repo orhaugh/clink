@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**An MCP server over the diagnostic surface.** `clink-mcp`
+(`python/clink-mcp`, Python 3.10+, depends only on the MCP SDK) exposes
+what the engine already ships for diagnosing a pipeline as tools any MCP
+client can call: `checkpoint_verify`, `state_cat`, `state_diff`,
+`state_query`, `capture_cat` (with a regex filter over the epoch dump),
+`replay` (`op`, `verify`, `out`, `plugin`, `emit_test`), `replay_diff`,
+`search_file`, `explain`, `lint`, `clink_capabilities`, and, given a
+coordinator URL, `jobs`, `job`, `job_graph`, `job_operators`, `job_lineage`,
+`cluster`, `health`, `logs`, `queryable_state_lookup` and
+`queryable_state_scan`; plus a `diagnose_incident` prompt. It adds no engine
+feature and is read-only by construction: nothing in it submits, cancels,
+stops, rescales, savepoints or commits, and `replay` writes only to the paths
+its caller names. The server absorbs two CLI ergonomics (a checkpoint root
+where the CLI wants the generation directory; `op-<id>` names where it wants
+the bare id) and returns exit code, stdout and stderr with every answer.
+Tested end to end over stdio against a real embedded run
+(`python/clink-mcp/tests`). The client-neutral walkthrough,
+[Diagnosing a pipeline with an agent](https://orhaugh.github.io/clink/guides/diagnosing-a-pipeline-with-an-agent/),
+takes a fat-fingered order from a wrong running total to the record, the
+exact emission, a determinism check and a frozen regression bundle; its
+generator is `examples/agent-diagnosis/make_incident.py`. The claim is
+diagnosable by agents, not self-healing.
+
 **The exactly-once protocol is a machine-checked specification.** Design
 record 012 states the protocol that four parts of the engine implement
 between them - barrier checkpoints with ack-after-durable snapshots, the

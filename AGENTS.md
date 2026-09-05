@@ -58,6 +58,7 @@ the source it cites. Keep these pages current when a subsystem changes.
 | Data lineage (capture + pluggable export) | `include/clink/lineage/`, `src/lineage/` | `docs/internals/data-lineage.md` |
 | Connectors (sources/sinks/backends) | `impls/<name>/` (WebSocket: RFC 6455 in-tree under `impls/websocket/`, no client lib) | `docs/connectors/<name>.md` |
 | Testing framework (public, for library consumers) | `include/clink/test/` | `docs/internals/testing-framework.md` |
+| Agent-facing diagnostics (MCP server over the CLI and HTTP diagnostic surface) | `python/clink-mcp/` (`clink_mcp/server.py`, tests), `examples/agent-diagnosis/` | `docs/guides/diagnosing-a-pipeline-with-an-agent.md` |
 | Exactly-once protocol specification (TLA+, model-checked in CI) | `formal/` (`ExactlyOnce.tla`, `models/`, `mutants/`, `tools.env`), `scripts/formal-check.sh` | `docs/internals/exactly-once-specification.md`, design record 012 |
 
 ## Pinned toolchain (one-time bootstrap)

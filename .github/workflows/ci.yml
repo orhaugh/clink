@@ -495,6 +495,18 @@ jobs:
             -DCLINK_BUILD_SQL=ON
           cmake --build build -j "$(( $(nproc) / 2 ))"
           cmake --install build --prefix /usr/local
+      - name: clink-mcp tests against the installed binary
+        # python/clink-mcp is the MCP server over the diagnostic surface. Its
+        # suite generates the guide's incident, runs it with the REAL clink just
+        # installed above, starts the server over stdio as a client would, and
+        # exercises every tool - so it needs the CLI, which only the container
+        # jobs have. The image ships Python 3.13 without pip or venv; Debian's
+        # python3-venv provides both.
+        run: |
+          apt-get install -y -q --no-install-recommends python3-venv
+          python3 -m venv "${RUNNER_TEMP}/mcpvenv"
+          "${RUNNER_TEMP}/mcpvenv/bin/pip" install -q ./python/clink-mcp pytest
+          CLINK_BIN=/usr/local/bin/clink "${RUNNER_TEMP}/mcpvenv/bin/pytest" python/clink-mcp/tests -q -p no:cacheprovider
       - name: Tiny downstream find_package smoke
         run: |
           mkdir -p /tmp/smoke && cd /tmp/smoke

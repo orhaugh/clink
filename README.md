@@ -235,6 +235,9 @@ Everything below is published at
 
 - [Capability catalogue](https://orhaugh.github.io/clink/capabilities/):
   the complete shipped feature surface, with caveats.
+- [Diagnosing a pipeline with an agent](https://orhaugh.github.io/clink/guides/diagnosing-a-pipeline-with-an-agent/):
+  the diagnostic surface as MCP tools, read-only, walked through a real
+  incident by any MCP client.
 - [SQL reference](https://orhaugh.github.io/clink/sql/): the supported
   SQL surface, from DDL through windows, joins, `MATCH_RECOGNIZE`, UDFs
   and SQL-native ML.

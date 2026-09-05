@@ -89,6 +89,7 @@ nav:
       - Streaming SQL in C++: guides/cpp-streaming-sql.md
       - Clink vs Apache Flink: guides/clink-vs-flink.md
       - Arrow-native stream processing: guides/arrow-stream-processing.md
+      - Diagnosing a pipeline with an agent: guides/diagnosing-a-pipeline-with-an-agent.md
   - Capabilities: capabilities.md
   - Compatibility: compatibility.md
   - SQL: sql.md
