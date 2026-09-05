@@ -1,6 +1,6 @@
 # Apache Avro (serialization)
 
-> An Avro serialization codec for typed records, usable with any clink source or sink. It is an encoding, not a source or sink in its own right.
+> An Avro serialization codec for typed records, usable with any clink source or sink. It is an encoding, not a source or sink in its own right. For Avro values framed for a schema registry on a Kafka topic (the common enterprise shape), use `format='avro'` on the Kafka connector, documented under [Schema Registry formats](schema-registry.md); that path is built on the same library.
 
 ## Overview
 The `clink::avro` impl ships only `Codec<T>` templates: there are no built-in Avro sources or sinks. The codecs encode and decode `avrogencpp`-generated record structs (any type for which `avro::codec_traits<T>` is specialised) to and from Avro's binary and JSON text wire formats. You compose them with an existing connector, for example registering an Avro codec for a record type and then reading or writing that type through a Kafka, file, or state-backend channel. Three codecs are provided: binary, JSON text, and a keyed-record wrapper that pairs a UTF-8 partition key with an Avro-binary payload.
@@ -9,7 +9,7 @@ The `clink::avro` impl ships only `Codec<T>` templates: there are no built-in Av
 
 | Component | Provenance | Version |
 | --- | --- | --- |
-| Avro C++ (`avrocpp` / AvroCpp) | System package via apt (Debian, e.g. `libavrocpp-dev`) / brew (macOS, `avro-cpp`) | Not pinned by clink |
+| Avro C++ (`avrocpp` / AvroCpp) | From-source pin in the Debian image (`scripts/install-connector-deps.sh`, release tarball checksum-verified) / brew (macOS, `avro-cpp`, whose formula pins the same tarball) | `1.12.1` (`AVRO_CPP_VERSION` in `scripts/versions.env`) |
 
 The codecs depend only on the Avro C++ library and `clink::core`. They do not use Arrow.
 
@@ -20,7 +20,7 @@ The impl is gated by the CMake cache variable `CLINK_WITH_AVRO`, which defaults 
 - `ON`: requires Avro C++; configuration fails with `CLINK_WITH_AVRO=ON but AvroCpp not found` if it is absent.
 - `OFF`: the target is not defined.
 
-Avro C++ is not pre-installed in the base build environment, so under `AUTO` the impl is built only where the library is present (install it via apt or brew first). When built, the target defines `CLINK_HAS_AVRO` and links `AvroCpp::AvroCpp`.
+The pinned toolchain image carries Avro C++ (built from source into `/usr/local`), so under `AUTO` the impl is built in CI and in every image-based build; on a host without it (`brew install avro-cpp` on macOS) the impl is skipped quietly. When built, the target defines `CLINK_HAS_AVRO` and links `AvroCpp::AvroCpp`, and `impls/schema_registry` gains its `format='avro'`.
 
 ```bash
 cmake -S . -B build -DCLINK_WITH_AVRO=ON

@@ -15,18 +15,24 @@ if(CLINK_WITH_AVRO STREQUAL "OFF")
 endif()
 
 set(_avro_found FALSE)
+# GLOBAL: impls/schema_registry (a sibling directory) links clink::avro and
+# so needs the imported AvroCpp target visible outside this directory.
+set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
 find_package(AvroCpp QUIET CONFIG)
 if(AvroCpp_FOUND)
     set(_avro_found TRUE)
 endif()
 if(NOT _avro_found)
-    # Homebrew on macOS ships avro-cpp via pkg-config rather than a
-    # CMake config - probe for the header + library directly.
+    # The pinned toolchain (scripts/versions.env AVRO_CPP_VERSION: the Debian image
+    # builds the release tarball into /usr/local, the macOS host uses Homebrew's
+    # avro-cpp) installs an `avro-cpp` package config, not an `AvroCpp` one, and
+    # older Homebrew bottles installed none - probe for the header + library
+    # directly, which covers every one of those layouts.
     find_path(_avro_include avro/Specific.hh PATHS /opt/homebrew/include /usr/local/include)
     find_library(_avro_lib avrocpp PATHS /opt/homebrew/lib /usr/local/lib)
     if(_avro_include AND _avro_lib)
         set(_avro_found TRUE)
-        add_library(AvroCpp::AvroCpp UNKNOWN IMPORTED)
+        add_library(AvroCpp::AvroCpp UNKNOWN IMPORTED GLOBAL)
         set_target_properties(AvroCpp::AvroCpp PROPERTIES
             IMPORTED_LOCATION "${_avro_lib}"
             INTERFACE_INCLUDE_DIRECTORIES "${_avro_include}")

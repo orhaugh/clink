@@ -57,6 +57,7 @@ the source it cites. Keep these pages current when a subsystem changes.
 | Embedded execution (`clink run <file>.sql`, EmbeddedEngine) | `include/clink/embed/`, `src/embed/`, `include/clink/sql/script_runner.hpp`, `tools/clink_run_sql.cpp` | `docs/internals/embedded.md` |
 | Data lineage (capture + pluggable export) | `include/clink/lineage/`, `src/lineage/` | `docs/internals/data-lineage.md` |
 | Connectors (sources/sinks/backends) | `impls/<name>/` (WebSocket: RFC 6455 in-tree under `impls/websocket/`, no client lib) | `docs/connectors/<name>.md` |
+| Schema Registry wire format + value formats (Avro, Protobuf, JSON Schema on Kafka) | `impls/schema_registry/` (client, framing, formats; linked by `impls/kafka/`) | `docs/connectors/schema-registry.md` |
 | Testing framework (public, for library consumers) | `include/clink/test/` | `docs/internals/testing-framework.md` |
 | Agent-facing diagnostics (MCP server over the CLI and HTTP diagnostic surface) | `python/clink-mcp/` (`clink_mcp/server.py`, tests), `examples/agent-diagnosis/` | `docs/guides/diagnosing-a-pipeline-with-an-agent.md` |
 | Exactly-once protocol specification (TLA+, model-checked in CI) | `formal/` (`ExactlyOnce.tla`, `models/`, `mutants/`, `tools.env`), `scripts/formal-check.sh` | `docs/internals/exactly-once-specification.md`, design record 012 |

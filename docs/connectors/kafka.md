@@ -11,6 +11,7 @@ The Kafka connector consumes from and produces to Kafka topics using the librdka
 | Component | Provenance | Version |
 | --- | --- | --- |
 | librdkafka (`rdkafka++`, `rdkafka`) | System package via apt (Debian) / brew (macOS) | Not pinned by clink |
+| `clink::schema_registry` (optional; registry-framed Avro, Protobuf and JSON Schema values) | In-tree library, see [Schema Registry formats](schema-registry.md) for its dependencies | Avro C++ `1.12.1` pinned; protobuf unpinned |
 
 The connector links librdkafka only; it does not use Arrow on its I/O path. CMake discovers the client in three tiers (CMake config package `RdKafka`, then pkg-config `rdkafka`/`rdkafka++`, then a manual header/library probe under the common Homebrew, `/usr/local` and `/usr` prefixes), so Homebrew, vcpkg, Confluent and source builds all resolve without setting `CMAKE_PREFIX_PATH`.
 
@@ -57,6 +58,8 @@ Options are read from `BuildContext` parameters in `impls/kafka/src/register_fac
 | `group_id` | No | `clink` | Consumer group id. |
 | `client_id` | No | `clink-source` | librdkafka client id. |
 | `auto_offset_reset` | No | `earliest` | Where to start when no committed/restored offset exists: `earliest`, `latest` or `none`. |
+| `format` | No | (plain text / JSON) | `avro`, `protobuf` or `json-schema` selects a registry-framed value format on `kafka_text_source` / `kafka_source_string`: each message is decoded to one JSON object text. Takes `schema_registry_url` and the other `schema_registry_*` options; see [Schema Registry formats](schema-registry.md). |
+| `decode_error` | No | `fail` | With a registry format: `fail` stops the job on a message the format cannot decode (topic, partition, offset and reason in the error); `skip` drops it, logs, and continues. |
 | `batch_max_wait_ms` | No | `5` | Bounds TOTAL batch formation time in the source's poll loop. Waiting for the first record of a batch still blocks up to `poll_timeout` (idle stays cheap); once a batch has begun, the fill loop stops when this bound elapses and emits a partial batch instead of waiting to accumulate `max_batch_size` records. Keeps per-record latency on a paced or trickling input proportional to this bound rather than `max_batch_size / input-rate`; a saturated consumer queue fills `max_batch_size` well inside the bound, so throughput at the ceiling is unaffected. `0` disables the bound. |
 
 The `KafkaSource::Options` struct also carries `poll_timeout` (100 ms), `max_batch_size` (2048), `commit_mode` (`Auto` on the struct; the registered factories force `Manual`), `enable_debug` (false), `metric_prefix` (`default`), `partition_discovery_interval` (30 s; 0 disables) and the deterministic-ownership pair `subtask_index`/`source_parallelism` (0/1, meaning a standalone source owns every partition). The ownership pair and the `Manual` commit mode are set by the registered factories from the build context: an engine-managed source must not write consumer-group offsets, because the engine's checkpoints are the only resume authority - librdkafka's auto-commit records consumed positions no checkpoint completed, and a restore for a partition without an offset row would resume from that group offset, past records whose effects died with the rewound attempt. For the same reason a fresh partition's start offset is resolved to a concrete number BEFORE `assign()` - the group's committed offset where one exists (a courtesy lookup with engine-owned, bounded retries), else the `auto_offset_reset` policy via the broker's watermarks, else the broker-resolved logical BEGINNING/END - and never librdkafka's `OFFSET_STORED`: leaving the resolution to the client makes the fetch position depend on the group coordinator answering, and on a fresh broker whose `__consumer_offsets` topic was still settling, one `NOT_COORDINATOR` reply left the assignment pending forever - no records, no error, every gauge zero and healthy (issue #8). The resolved number also seeds the partition's resume row, so even a job's first checkpoint carries one for every partition. The remaining options are not parsed from `BuildContext` parameters, so they take their struct defaults unless the typed class is constructed directly.
@@ -98,6 +101,7 @@ CPU per record is the metric to A/B against.
 | `client_id` | No | `clink-sink` | librdkafka client id. |
 | `acks` | No | `all` | Producer acknowledgement mode: `all`, `1` or `0`. |
 | `compression` | No | `none` | Compression codec: `none`, `gzip`, `snappy`, `lz4` or `zstd`. |
+| `format` | No | (plain text / JSON) | `avro`, `protobuf` or `json-schema` on the string sinks (`kafka_text_sink` / `kafka_sink_string`, and the transactional and upsert sinks below): each JSON row is encoded and framed with a registry schema id. Takes `schema_registry_url`, `schema_registry_subject` (default `<topic>-value`), `schema_registry_auto_register` and the rest; see [Schema Registry formats](schema-registry.md). |
 | `linger_ms` | No | `5` | Producer batching delay (librdkafka `linger.ms`), a non-negative integer of milliseconds. `0` sends as soon as the producer loop runs, trading batching efficiency for per-record latency. An invalid value fails the deploy with a clear error. |
 
 The `KafkaSink::Options` struct additionally carries `produce_timeout` (30000 ms), `flush_timeout` (30000 ms), `fixed_partition` (unset) and `metric_prefix` (`default`), which are not parsed from `BuildContext` parameters and take their struct defaults.
@@ -183,6 +187,8 @@ CREATE TABLE click_counts (
 );
 ```
 
+A table whose values are registry-framed declares `format='avro'`, `'protobuf'` or `'json-schema'` with a `schema_registry_url` instead of `format='json'`; it is Row-channel like a JSON table, the connector decodes each message to JSON text before the bridge and encodes the bridge's rows after it, and the mapping, subject handling and options are on the [Schema Registry formats](schema-registry.md) page.
+
 The columnar JSON bridge (`json_string_to_row_columnar`) is the default for a `format='json'` source table: it decodes straight into typed Arrow columns and attaches the sidecar, so downstream columnar operator fast paths fire on the Kafka path. It is exactly byte-equivalent to the row decode - an incapable schema (FLOAT/DECIMAL columns, reserved `__` names, duplicates) or any batch whose records do not round-trip faithfully falls back to the plain row decode, with an adaptive damper so a systematically unfaithful stream does not pay a double parse. Set `columnar_decode='false'` to opt a table out entirely (the planner emits the row-form `json_string_to_row` bridge).
 
 ## Example
@@ -244,10 +250,13 @@ When going through the plugin registry, call `clink::kafka::install(registry)` o
 - The transactional sink requires a unique `transactional_id`; with `parallelism > 1` the factory appends the subtask index, and the uniqueness contract across producer instances is otherwise the caller's responsibility.
 - The upsert sink requires every input value to be a JSON object; malformed or non-object values are silently skipped, and `primary_key` is mandatory.
 - Sink delivery is at-least-once unless the transactional (`kafka_2pc_sink_string`) variant is used.
+- Registry-framed formats decode and encode message values only; keys are not decoded, and the subject strategy is topic-name or an explicit subject (see the [Schema Registry formats](schema-registry.md) limitations).
 
 ## Testing
 
 The connector suite (`impls/kafka/tests/test_kafka.cpp`) drives librdkafka's in-process mock cluster (`rdkafka_mock.h`), which speaks the real Kafka wire protocol on a localhost port. Its broker-independent tests pin the offset encoding and the deterministic static-member identity. The distributed integration suite adds `KafkaWindowRecoveryTest.WorkerAndHaCoordinatorFailoverKeepSourceWindowAndSinkOnOneCut`: real Redpanda, four partitions, parallelism four, continuous records in an open keyed window while a worker and then the coordinator are killed, stable worker process ids, a transactional sink, and an exact external oracle. It caught partition reassignment replay that every quiescent recovery test missed. The mock tests self-skip when the build has `CLINK_HAS_KAFKA` off (librdkafka absent) or `CLINK_HAS_KAFKA_MOCK` off (librdkafka older than 1.3, which lacks the mock header); the distributed gate self-skips when Docker is unavailable.
+
+`test_registry_formats.cpp` drives the string factories with `format='avro'` end to end through the same mock broker and an in-process Schema Registry double; `test_registry_formats_live.cpp` repeats the round trip for Avro, Protobuf and JSON Schema against a Redpanda broker with its built-in registry when Docker is available (skipped otherwise).
 
 Run them with the `kafka` ctest label:
 

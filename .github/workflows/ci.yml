@@ -239,7 +239,10 @@ jobs:
         run: |
           # Full surface: SQL frontend, WASM UDFs, and the multi-process
           # integration suite all on. CLINK_WITH_WASM=ON fetches the pinned
-          # wasmtime c-api. Integer parallelism cap keeps cc1plus off the OOM
+          # wasmtime c-api; CLINK_WITH_AVRO=ON and CLINK_WITH_PROTOBUF=ON make
+          # the registry-framed formats a hard requirement here rather than an
+          # AUTO that could silently vanish with the image's avro-cpp or
+          # libprotoc-dev. Integer parallelism cap keeps cc1plus off the OOM
           # line on the heavy templated TUs.
           #
           # Debug info is dropped (-g0) and every binary is stripped at link
@@ -256,6 +259,8 @@ jobs:
             -DCLINK_BUILD_TESTS=ON \
             -DCLINK_BUILD_SQL=ON \
             -DCLINK_WITH_WASM=ON \
+            -DCLINK_WITH_AVRO=ON \
+            -DCLINK_WITH_PROTOBUF=ON \
             -DCLINK_INTEGRATION_TESTS=ON \
             -DCMAKE_C_FLAGS_DEBUG=-g0 \
             -DCMAKE_CXX_FLAGS_DEBUG=-g0 \

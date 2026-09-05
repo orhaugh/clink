@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+**The Confluent Schema Registry wire format on the Kafka connector.** A Kafka
+table can now declare `format='avro'`, `'protobuf'` or `'json-schema'` with a
+`schema_registry_url` and read and write registry-framed values (magic byte,
+schema id, encoded payload) against Confluent Schema Registry or any
+registry speaking its REST API (Redpanda, Karapace, Apicurio). The new
+`impls/schema_registry` library carries the registry client (basic or bearer
+auth, TLS, path prefixes, id caching), the framing including Protobuf message
+indexes, and the three value formats; the Kafka connector links it and offers
+the formats on the source and on the plain, transactional and upsert sinks.
+The engine's JSON path is untouched: a source decodes each message into one
+JSON object text ahead of the existing `json_string_to_row_columnar` bridge,
+a sink encodes `row_to_json_string`'s rows as the last step before the
+producer, and the planner only keeps the Row channel and forwards the format.
+Avro rides avro-cpp's generic API with the logical types mapped (decimals as
+exact strings, dates and times as ISO text, every timestamp as epoch
+milliseconds); Protobuf parses `.proto` text at runtime with the compiler
+library, resolves registry references, and walks messages through reflection
+so `int64` stays a JSON integer and field names stay as declared; JSON Schema
+is the header. Sinks derive a schema from the declared columns and register
+it under `<topic>-value` (idempotent; `schema_registry_auto_register='false'`
+writes against the subject's own schema instead), fail at deploy rather than
+on the first record when the registry refuses, and keep decimal digits
+exact. `decode_error='fail'|'skip'` is the poison-message policy. Formats a
+build lacks are refused by name; `clink --capabilities-json` lists the ones
+compiled in. Tested against the reference implementations (payloads produced
+by avro-cpp and libprotobuf's dynamic messages), through librdkafka's mock
+broker, and live against Redpanda with its built-in registry. Documented on
+[Schema Registry formats](https://orhaugh.github.io/clink/connectors/schema-registry/).
+
 **An MCP server over the diagnostic surface.** `clink-mcp`
 (`python/clink-mcp`, Python 3.10+, depends only on the MCP SDK) exposes
 what the engine already ships for diagnosing a pipeline as tools any MCP

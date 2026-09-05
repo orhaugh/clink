@@ -34,6 +34,7 @@ impls/rocksdb-s3/include/clink/rocksdb_s3/install.hpp
 impls/rocksdb/include/clink/rocksdb/install.hpp
 impls/s3/include/clink/api/s3_builders.hpp
 impls/s3/include/clink/s3/install.hpp
+impls/schema_registry/include/clink/schema_registry/install.hpp
 impls/vector_search/include/clink/vector_search/install.hpp
 impls/wasm/include/clink/wasm/install.hpp
 impls/webhdfs/include/clink/webhdfs/install.hpp
@@ -242,6 +243,7 @@ impls/kafka/include/clink/kafka/kafka_message_codec.hpp
 impls/kafka/include/clink/kafka/kafka_security.hpp
 impls/kafka/include/clink/kafka/pipeline_loader.hpp
 impls/kafka/include/clink/kafka/scram.hpp
+impls/kafka/include/clink/kafka/string_channel.hpp
 impls/kafka/include/clink/kafka/txn_resume.hpp
 impls/kafka/include/clink/kafka/typed_sink.hpp
 impls/kafka/include/clink/kafka/typed_source.hpp
@@ -290,6 +292,10 @@ impls/s3/include/clink/s3/s3_remote_pool.hpp
 impls/s3/include/clink/s3/s3_snapshot_store.hpp
 impls/s3/include/clink/s3/state_parquet_export_s3.hpp
 impls/s3/include/clink/s3/typed_sink.hpp
+impls/schema_registry/include/clink/schema_registry/client.hpp
+impls/schema_registry/include/clink/schema_registry/formats.hpp
+impls/schema_registry/include/clink/schema_registry/schema_derivation.hpp
+impls/schema_registry/include/clink/schema_registry/wire_format.hpp
 impls/tls/include/clink/runtime/network/tls_connection.hpp
 impls/tls/include/clink/runtime/network/tls_socket.hpp
 impls/vector_search/include/clink/vector_search/distance_kernels.hpp

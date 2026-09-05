@@ -228,6 +228,73 @@ TEST(SqlPhysical, KafkaConnectorMapsToKafkaFactories) {
     EXPECT_EQ(src->params.at("bootstrap"), "localhost:9092");
 }
 
+// format='avro' | 'protobuf' | 'json-schema' on a kafka table is Row-channel
+// like format='json': the same JSON bridges either side, the format forced
+// back onto the connector op (build_params strips it) and every
+// schema_registry_* option passed through, so the connector can build the
+// registry client and the value codec from the op's params alone. The sink
+// carries schema_columns for auto-registration. Any other connector refuses
+// the format by name.
+TEST(SqlPhysical, KafkaRegistryFormatsRideTheJsonBridgesAndForwardTheirOptions) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE k_avro (id BIGINT, name TEXT, amount DECIMAL(18,2)) "
+        "WITH (connector='kafka', format='avro', brokers='b:9092', topic='orders', "
+        "schema_registry_url='http://sr:8081', schema_registry_auth='env://SR_AUTH');"
+        "CREATE TABLE k_proto (id BIGINT, name TEXT, amount DECIMAL(18,2)) "
+        "WITH (connector='kafka', format='protobuf', brokers='b:9092', topic='out', "
+        "schema_registry_url='http://sr:8081');"
+        "CREATE TABLE k_js (id BIGINT, name TEXT, amount DECIMAL(18,2)) "
+        "WITH (connector='kafka', format='json_schema', brokers='b:9092', topic='out2', "
+        "schema_registry_url='http://sr:8081', mode='upsert', primary_key='id');"
+        "CREATE TABLE f_avro (id BIGINT, name TEXT) "
+        "WITH (connector='file', format='avro', path='/tmp/x.avro');"
+        "CREATE TABLE f_out (id BIGINT, name TEXT) "
+        "WITH (connector='file', format='json', path='/tmp/x.ndjson');");
+    for (auto& stmt : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(stmt));
+    }
+    PhysicalPlanner pp;
+    {
+        auto plan = bind_insert(cat, "INSERT INTO k_proto SELECT id, name, amount FROM k_avro");
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        const auto* src = find_op(spec, "kafka_source_string");
+        ASSERT_NE(src, nullptr);
+        EXPECT_EQ(src->params.at("format"), "avro");
+        EXPECT_EQ(src->params.at("topic"), "orders");
+        EXPECT_EQ(src->params.at("schema_registry_url"), "http://sr:8081");
+        EXPECT_EQ(src->params.at("schema_registry_auth"), "env://SR_AUTH");
+        EXPECT_NE(find_op(spec, "json_string_to_row_columnar"), nullptr)
+            << "the same bridge as format='json'";
+        const auto* snk = find_op(spec, "kafka_sink_string");
+        ASSERT_NE(snk, nullptr);
+        EXPECT_EQ(snk->params.at("format"), "protobuf");
+        EXPECT_EQ(snk->params.at("schema_registry_url"), "http://sr:8081");
+        EXPECT_EQ(snk->params.at("schema_columns"), "id:i64;name:str;amount:dec_18_2");
+        EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+    }
+    {
+        // The alias spelling is canonicalised, and the upsert variant carries it too.
+        auto plan = bind_insert(cat, "INSERT INTO k_js SELECT id, name, amount FROM k_avro");
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        const auto* snk = find_op(spec, "kafka_upsert_sink_string");
+        ASSERT_NE(snk, nullptr);
+        EXPECT_EQ(snk->params.at("format"), "json-schema");
+        EXPECT_EQ(snk->params.at("primary_key"), "id");
+    }
+    {
+        auto plan = bind_insert(cat, "INSERT INTO f_out SELECT id, name FROM f_avro");
+        try {
+            pp.compile(static_cast<const LogicalSink&>(*plan));
+            FAIL() << "a registry format on connector='file' must be refused";
+        } catch (const TranslationError& e) {
+            EXPECT_NE(std::string(e.what()).find("format='avro'"), std::string::npos) << e.what();
+            EXPECT_NE(std::string(e.what()).find("connector='kafka' only"), std::string::npos)
+                << e.what();
+        }
+    }
+}
+
 // connector='websocket' lowers to websocket_source_string; a multi-column
 // format='json' table takes the columnar JSON bridge by default (the kafka
 // treatment - a live feed's declared schema rides the columnar decode) and

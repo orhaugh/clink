@@ -95,6 +95,12 @@ target_link_libraries(clink_kafka
     PUBLIC  clink::core
     PRIVATE ${_kafka_libs}
 )
+# The Confluent Schema Registry wire format and its value formats
+# (format='avro' | 'protobuf' | 'json-schema'). Optional: without the
+# library those formats are refused by name at build time.
+if(TARGET clink::schema_registry)
+    target_link_libraries(clink_kafka PRIVATE clink::schema_registry)
+endif()
 clink_set_warnings(clink_kafka)
 
 # Re-export the underlying rdkafka libs (and mock-header presence) as a

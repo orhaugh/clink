@@ -61,6 +61,7 @@ embedded or submits to a cluster, unchanged.
 | Exactly-once sinks | Generic committer (prepare at barrier, commit on global durability, recover-and-re-commit): file, Kafka, Parquet, raw S3 multipart, Postgres `PREPARE TRANSACTION` | [Sink committer framework](internals/sink-committer-framework.md) |
 | Effectively-once upserts | Changelog upsert and delete by `PRIMARY KEY`: Postgres, MySQL, Cassandra, Redis | [Sink committer framework](internals/sink-committer-framework.md) |
 | Source replay | Source-offset recovery generalised across connectors | [Checkpointing](internals/checkpointing.md) |
+| Schema Registry formats | Confluent Schema Registry wire format on Kafka: registry-framed Avro, Protobuf and JSON Schema values decoded to and encoded from JSON rows, schemas auto-registered from the declared columns, poison-message policy | [Schema Registry formats](connectors/schema-registry.md) |
 | Machine-checked protocol | The exactly-once protocol (barrier completion, 2PC sinks, confirmation markers, in-doubt resolution, recovery) is a TLA+ specification model-checked in CI over bounded configurations, with liveness; every campaign-found defect is a mutant TLC must refute. Proves the model, not the code | [Exactly-once specification](internals/exactly-once-specification.md) |
 
 ## Scale and operations
@@ -108,4 +109,6 @@ Twenty-plus sources and sinks, each documented with dependencies, factory
 names, options, and SQL usage in the [connector catalogue](connectors/README.md):
 Kafka, Postgres (snapshot, CDC, sink), MySQL, ClickHouse, Cassandra, MongoDB,
 Redis, S3 and S3 Parquet, GCS Parquet, Azure Parquet, WebHDFS Parquet,
-Iceberg, Avro, HTTP, MQTT, NATS, Pulsar, RabbitMQ, file and built-ins.
+Iceberg, Avro, HTTP, MQTT, NATS, Pulsar, RabbitMQ, file and built-ins; on
+Kafka, registry-framed Avro, Protobuf and JSON Schema values against a
+Confluent-compatible Schema Registry.

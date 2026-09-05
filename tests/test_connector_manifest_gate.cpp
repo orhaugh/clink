@@ -49,6 +49,8 @@ std::vector<std::string> split_csv(const std::string& s) {
 // fails the gate until a human classifies it.
 const std::map<std::string, std::string> kExempt = {
     {"avro", "codec templates only; install() registers no factories"},
+    {"schema_registry",
+     "registry client + value formats the Kafka connector links; install() registers no factories"},
     {"rocksdb", "state backend, not a connector"},
     {"rocksdb_s3", "state backend composition, not a connector"},
     {"forst", "state backend, not a connector"},

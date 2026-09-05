@@ -31,6 +31,11 @@ struct DockerKafkaOptions {
     bool sasl{false};
     std::string username{"admin"};
     std::string password{"secret"};
+    // Also expose Redpanda's built-in Schema Registry (Confluent-compatible
+    // REST API) on a random host port; schema_registry_url() names it. Off by
+    // default: the extra readiness probe is only worth paying when a test
+    // speaks the registry.
+    bool schema_registry{false};
 };
 
 class DockerKafka {
@@ -39,6 +44,7 @@ public:
 
     explicit DockerKafka(DockerKafkaOptions options) : options_(std::move(options)) {
         port_ = pick_port();
+        registry_port_ = options_.schema_registry ? pick_port() : 0;
         container_name_ = "clink_test_rp_" + std::to_string(port_);
         // Two listeners: `internal` keeps in-container rpk working (rpk dials
         // the ADVERTISED address, which for a single mapped listener would be
@@ -48,13 +54,18 @@ public:
             options_.sasl ? " --set redpanda.enable_sasl=true --set 'redpanda.superusers=[\"" +
                                 options_.username + "\"]'"
                           : "";
+        const std::string registry_port_map =
+            options_.schema_registry ? " -p " + std::to_string(registry_port_) + ":8081" : "";
+        const std::string registry_flags =
+            options_.schema_registry ? " --schema-registry-addr 0.0.0.0:8081" : "";
         const std::string cmd =
-            "docker run -d --rm -p " + std::to_string(port_) + ":19092 --name " + container_name_ +
+            "docker run -d --rm -p " + std::to_string(port_) + ":19092" + registry_port_map +
+            " --name " + container_name_ +
             " redpandadata/redpanda:v24.2.7 redpanda start"
             " --mode dev-container --smp 1"
             " --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092"
             " --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:" +
-            std::to_string(port_) + sasl_flags + " > /dev/null 2>&1";
+            std::to_string(port_) + sasl_flags + registry_flags + " > /dev/null 2>&1";
         if (std::system(cmd.c_str()) != 0) {
             throw std::runtime_error("DockerKafka: docker run failed");
         }
@@ -101,6 +112,20 @@ public:
             stop();
             throw std::runtime_error("DockerKafka: cluster never reported healthy");
         }
+        if (options_.schema_registry) {
+            // The registry answers after the Kafka API does; /subjects is the
+            // cheapest call that proves the REST surface is serving.
+            const auto reg_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            const std::string reg_probe =
+                "curl -sf " + schema_registry_url() + "/subjects > /dev/null 2>&1";
+            while (std::system(reg_probe.c_str()) != 0) {
+                if (std::chrono::steady_clock::now() >= reg_deadline) {
+                    stop();
+                    throw std::runtime_error("DockerKafka: schema registry never became ready");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        }
     }
 
     ~DockerKafka() { stop(); }
@@ -110,6 +135,10 @@ public:
     DockerKafka& operator=(DockerKafka&&) = delete;
 
     [[nodiscard]] std::string brokers() const { return "127.0.0.1:" + std::to_string(port_); }
+    // Empty unless DockerKafkaOptions::schema_registry was set.
+    [[nodiscard]] std::string schema_registry_url() const {
+        return registry_port_ == 0 ? "" : "http://127.0.0.1:" + std::to_string(registry_port_);
+    }
 
     // Create a topic explicitly (1 partition unless asked otherwise), so a
     // test does not depend on auto-creation racing the first produce.
@@ -185,6 +214,7 @@ private:
     }
 
     int port_{0};
+    int registry_port_{0};
     std::string container_name_;
     DockerKafkaOptions options_;
 };

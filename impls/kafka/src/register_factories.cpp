@@ -38,6 +38,7 @@
 #include "clink/kafka/install.hpp"
 #include "clink/kafka/kafka_message_codec.hpp"
 #include "clink/kafka/kafka_security.hpp"
+#include "clink/kafka/string_channel.hpp"
 #include "clink/kafka/txn_resume.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -46,6 +47,9 @@
 #include "clink/state/durable_file_write.hpp"
 #include "clink/state/state_backend.hpp"
 #include "clink/time/event_time.hpp"
+#ifdef CLINK_HAS_SCHEMA_REGISTRY
+#include "clink/schema_registry/formats.hpp"
+#endif
 
 #ifdef CLINK_KAFKA_RESUME_TLS
 #include "clink/runtime/network/tls_connection.hpp"
@@ -55,6 +59,8 @@
 namespace clink::kafka {
 
 namespace {
+
+using clink::plugin::BuildContext;
 
 // Optional millisecond param -> a chrono field on an Options struct
 // (e.g. 'linger_ms' -> sink linger, 'batch_max_wait_ms' -> source batch
@@ -128,11 +134,117 @@ void apply_deterministic_ownership(const plugin::BuildContext& ctx, KafkaSource:
     opts.commit_mode = KafkaSource::CommitMode::Manual;
 }
 
+// Registry-framed value formats on the string channel (format='avro' |
+// 'protobuf' | 'json-schema'): a source decodes each message into the JSON
+// object text the channel carries, a sink encodes the channel's JSON rows
+// into framed messages, so the planner's json_string_to_row and
+// row_to_json_string bridges are unchanged either side. Both are built from
+// the table's WITH options at build time, where a format this build lacks or
+// one missing its registry URL is refused by name; the encoder also talks to
+// the registry there (register or read the subject), so a misconfigured sink
+// fails at deploy, not on its first record. A plain (json / text) table
+// builds neither and pays nothing.
+#ifdef CLINK_HAS_SCHEMA_REGISTRY
+using ValueDecoderPtr = std::shared_ptr<clink::schema_registry::ValueDecoder>;
+using ValueEncoderPtr = std::shared_ptr<clink::schema_registry::ValueEncoder>;
+
+clink::schema_registry::ParsedFormatOptions parse_value_format(const BuildContext& ctx,
+                                                               const char* who) {
+    return clink::schema_registry::parse_format_options(
+        [&ctx](const std::string& key, const std::string& fallback) {
+            return ctx.param_or(key, fallback);
+        },
+        ctx.param_or("topic"),
+        who);
+}
+
+ValueDecoderPtr build_value_decoder(const BuildContext& ctx, const char* who) {
+    auto parsed = parse_value_format(ctx, who);
+    if (!parsed.error.empty()) {
+        throw std::runtime_error(parsed.error);
+    }
+    if (!parsed.options.has_value()) {
+        return nullptr;
+    }
+    auto client = std::make_shared<clink::schema_registry::Client>(parsed.options->client);
+    return clink::schema_registry::make_decoder(*parsed.options, std::move(client));
+}
+
+ValueEncoderPtr build_value_encoder(const BuildContext& ctx, const char* who) {
+    auto parsed = parse_value_format(ctx, who);
+    if (!parsed.error.empty()) {
+        throw std::runtime_error(parsed.error);
+    }
+    if (!parsed.options.has_value()) {
+        return nullptr;
+    }
+    auto client = std::make_shared<clink::schema_registry::Client>(parsed.options->client);
+    try {
+        return clink::schema_registry::make_encoder(*parsed.options, std::move(client));
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string{who} + ": " + e.what());
+    }
+}
+#else
+// Built without impls/schema_registry: the registry formats are refused by
+// name, everything else is untouched.
+struct NoValueDecoder {
+    std::string to_json(std::string_view) { return {}; }
+};
+struct NoValueEncoder {
+    std::string from_json(std::string_view) { return {}; }
+};
+using ValueDecoderPtr = std::shared_ptr<NoValueDecoder>;
+using ValueEncoderPtr = std::shared_ptr<NoValueEncoder>;
+
+void refuse_registry_format(const BuildContext& ctx, const char* who) {
+    const auto fmt = ctx.param_or("format", "");
+    if (fmt == "avro" || fmt == "protobuf" || fmt == "json-schema" || fmt == "json_schema" ||
+        fmt == "jsonschema") {
+        throw std::runtime_error(
+            std::string{who} + ": format='" + fmt +
+            "' needs the schema registry library, which this clink build "
+            "does not include (impls/schema_registry needs clink::http_connector)");
+    }
+}
+ValueDecoderPtr build_value_decoder(const BuildContext& ctx, const char* who) {
+    refuse_registry_format(ctx, who);
+    return nullptr;
+}
+ValueEncoderPtr build_value_encoder(const BuildContext& ctx, const char* who) {
+    refuse_registry_format(ctx, who);
+    return nullptr;
+}
+#endif
+
+// decode_error='fail' (default) | 'skip': what a source does with a message
+// its format cannot decode. fail stops the job with the reason, partition and
+// offset; skip drops the record, logs it (the first, then every 1000th) and
+// carries on - the poison-pill policy for a topic known to carry strays.
+bool skip_undecodable(const BuildContext& ctx, const char* who) {
+    const auto policy = ctx.param_or("decode_error", "fail");
+    if (policy == "fail") {
+        return false;
+    }
+    if (policy == "skip") {
+        return true;
+    }
+    throw std::runtime_error(std::string{who} + ": decode_error must be 'fail' or 'skip' (got '" +
+                             policy + "')");
+}
+
 // Forwarding emitter: convert KafkaMessage batches to string batches;
-// pass watermarks/barriers through.
+// pass watermarks/barriers through. With a value decoder, each payload is
+// translated to the channel's JSON text on the way.
 class StringKafkaSource final : public Source<std::string> {
 public:
-    explicit StringKafkaSource(KafkaSource::Options opts) : inner_(std::move(opts)) {}
+    explicit StringKafkaSource(KafkaSource::Options opts,
+                               ValueDecoderPtr decoder = nullptr,
+                               bool skip_undecodable = false)
+        : topic_(opts.topic),
+          inner_(std::move(opts)),
+          decoder_(std::move(decoder)),
+          skip_undecodable_(skip_undecodable) {}
 
     void open() override { inner_.open(); }
     void close() override { inner_.close(); }
@@ -143,7 +255,7 @@ public:
 
     bool produce(Emitter<std::string>& out) override {
         Emitter<KafkaMessage> forwarder(
-            Emitter<KafkaMessage>::Forward([&out](StreamElement<KafkaMessage> e) -> bool {
+            Emitter<KafkaMessage>::Forward([this, &out](StreamElement<KafkaMessage> e) -> bool {
                 if (e.is_data()) {
                     Batch<std::string> b;
                     // The batch is ours - the emitter moved it here and nothing
@@ -154,6 +266,9 @@ public:
                     Batch<KafkaMessage>& in_batch = e.as_data();  // e is by value, so mutable
                     b.reserve(in_batch.size());
                     for (auto& r : in_batch) {
+                        if (decoder_ && !decode_(r.value())) {
+                            continue;  // skipped under decode_error='skip'
+                        }
                         Record<std::string> rec(std::move(r.value().payload));
                         // Carry the Kafka partition as engine-only metadata so a
                         // downstream watermark assigner can track event time per
@@ -188,7 +303,34 @@ public:
     std::string name() const override { return "kafka_text_source"; }
 
 private:
+    // Replace the message's payload with its JSON text. false = drop it.
+    bool decode_(KafkaMessage& m) {
+        try {
+            m.payload = decoder_->to_json(m.payload);
+            return true;
+        } catch (const std::exception& e) {
+            const std::string where = "kafka source: topic '" + topic_ + "' partition " +
+                                      std::to_string(m.partition) + " offset " +
+                                      std::to_string(m.offset) + ": " + e.what();
+            if (!skip_undecodable_) {
+                throw std::runtime_error(where);
+            }
+            const auto n = ++skipped_;
+            if (n == 1 || n % 1000 == 0) {
+                if (auto* rc = this->runtime(); rc != nullptr) {
+                    rc->log_warn("skipping undecodable record (" + std::to_string(n) +
+                                 " so far): " + where);
+                }
+            }
+            return false;
+        }
+    }
+
+    std::string topic_;
     KafkaSource inner_;
+    ValueDecoderPtr decoder_;
+    bool skip_undecodable_{false};
+    std::uint64_t skipped_{0};
 };
 
 // Adapter that turns a KafkaSink into a Sink<std::string>. Each
@@ -196,13 +338,14 @@ private:
 // headers, partition unset) and forwarded to the inner sink.
 class StringKafkaSink final : public Sink<std::string> {
 public:
-    explicit StringKafkaSink(KafkaSink::Options opts) : inner_(std::move(opts)) {}
+    explicit StringKafkaSink(KafkaSink::Options opts, ValueEncoderPtr encoder = nullptr)
+        : inner_(std::move(opts)), encoder_(std::move(encoder)) {}
 
     void open() override { inner_.open(); }
     void on_data(const Batch<std::string>& b) override {
         Batch<KafkaMessage> out_b;
         for (const auto& r : b) {
-            out_b.emplace(KafkaMessage{r.value()});
+            out_b.emplace(KafkaMessage{encoder_ ? encoder_->from_json(r.value()) : r.value()});
         }
         inner_.on_data(out_b);
     }
@@ -214,6 +357,7 @@ public:
 
 private:
     KafkaSink inner_;
+    ValueEncoderPtr encoder_;
 };
 
 // The dialer + credentials for the resume-protocol clients (EndTxn probes
@@ -355,12 +499,14 @@ class TwoPhaseCommitStringKafkaSink final : public Sink<std::string> {
 public:
     explicit TwoPhaseCommitStringKafkaSink(KafkaSink::Options opts,
                                            std::uint32_t subtask_idx = 0,
-                                           bool replay_suppression = true)
+                                           bool replay_suppression = true,
+                                           ValueEncoderPtr encoder = nullptr)
         : brokers_(opts.brokers),
           transactional_id_(opts.transactional_id),
           subtask_idx_(subtask_idx),
           replay_suppression_(replay_suppression),
-          inner_(std::move(opts)) {}
+          inner_(std::move(opts)),
+          encoder_(std::move(encoder)) {}
 
     void open() override {
         // BEFORE inner_.open(): opening the transactional producer fences
@@ -582,10 +728,17 @@ public:
     std::string name() const override { return "kafka_2pc_sink_string"; }
 
 private:
+    // Rows reach the producer as the channel's JSON text unless a value
+    // format encodes them; suppression above reads the JSON, so encoding
+    // happens here, at the last step before the producer.
+    std::string encode_(std::string row) const {
+        return encoder_ ? encoder_->from_json(row) : std::move(row);
+    }
+
     void forward_(const Batch<std::string>& b) {
         Batch<KafkaMessage> out_b;
         for (const auto& r : b) {
-            out_b.emplace(KafkaMessage{r.value()});
+            out_b.emplace(KafkaMessage{encode_(r.value())});
         }
         if (!out_b.empty()) {
             inner_.on_data(out_b);
@@ -599,7 +752,7 @@ private:
         if (!tail_.empty()) {
             Batch<KafkaMessage> out_b;
             for (auto& v : tail_) {
-                out_b.emplace(KafkaMessage{std::move(v)});
+                out_b.emplace(KafkaMessage{encode_(std::move(v))});
             }
             tail_.clear();
             inner_.on_data(out_b);
@@ -968,6 +1121,7 @@ private:
     std::uint32_t subtask_idx_{0};
     bool replay_suppression_{true};
     KafkaSink inner_;
+    ValueEncoderPtr encoder_;
     std::mutex mu_;
     std::condition_variable pending_cv_;
     std::optional<std::uint64_t> open_txn_ckpt_;
@@ -1002,8 +1156,12 @@ private:
 // the inner KafkaSink unchanged.
 class UpsertKafkaSink final : public Sink<std::string> {
 public:
-    UpsertKafkaSink(KafkaSink::Options opts, std::vector<std::string> primary_key)
-        : inner_(std::move(opts)), primary_key_(std::move(primary_key)) {
+    UpsertKafkaSink(KafkaSink::Options opts,
+                    std::vector<std::string> primary_key,
+                    ValueEncoderPtr encoder = nullptr)
+        : inner_(std::move(opts)),
+          primary_key_(std::move(primary_key)),
+          encoder_(std::move(encoder)) {
         if (primary_key_.empty()) {
             throw std::runtime_error("kafka_upsert_sink_string: 'primary_key' is required");
         }
@@ -1074,11 +1232,17 @@ private:
             }
         }
         std::string payload = clink::config::JsonValue{std::move(payload_obj)}.serialize(0);
+        // The key stays the JSON-derived primary key (compaction keys on it);
+        // only the value takes the registry framing.
+        if (encoder_) {
+            payload = encoder_->from_json(payload);
+        }
         return KafkaMessage{std::move(payload), std::move(key)};
     }
 
     KafkaSink inner_;
     std::vector<std::string> primary_key_;
+    ValueEncoderPtr encoder_;
 };
 
 }  // namespace
@@ -1134,7 +1298,59 @@ clink::connectors::InDoubtResolution resolve_kafka_2pc_handle(const std::string&
             .transport_inconclusive = true};
 }
 
+std::shared_ptr<Source<std::string>> build_string_source(const BuildContext& ctx) {
+    KafkaSource::Options opts;
+    opts.brokers = ctx.param_or("brokers");
+    opts.topic = ctx.param_or("topic");
+    opts.group_id = ctx.param_or("group_id", "clink");
+    opts.client_id = ctx.param_or("client_id", "clink-source");
+    opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
+    apply_batch_max_wait(ctx, opts);
+    apply_batch_shape(ctx, opts);
+    populate_kafka_security_conf(ctx, opts.conf);
+    apply_deterministic_ownership(ctx, opts);
+    if (opts.brokers.empty()) {
+        throw std::runtime_error("kafka source: 'brokers' is required");
+    }
+    if (opts.topic.empty()) {
+        throw std::runtime_error("kafka source: 'topic' is required");
+    }
+    auto decoder = build_value_decoder(ctx, "kafka source");
+    const bool skip = skip_undecodable(ctx, "kafka source");
+    return std::make_shared<StringKafkaSource>(std::move(opts), std::move(decoder), skip);
+}
+
+std::shared_ptr<Sink<std::string>> build_string_sink(const BuildContext& ctx) {
+    KafkaSink::Options opts;
+    opts.brokers = ctx.param_or("brokers");
+    opts.topic = ctx.param_or("topic");
+    opts.client_id = ctx.param_or("client_id", "clink-sink");
+    opts.acks = ctx.param_or("acks", "all");
+    opts.compression_type = ctx.param_or("compression", "none");
+    apply_linger_ms(ctx, opts);
+    populate_kafka_security_conf(ctx, opts.conf);
+    if (opts.brokers.empty()) {
+        throw std::runtime_error("kafka sink: 'brokers' is required");
+    }
+    if (opts.topic.empty()) {
+        throw std::runtime_error("kafka sink: 'topic' is required");
+    }
+    auto encoder = build_value_encoder(ctx, "kafka sink");
+    return std::make_shared<StringKafkaSink>(std::move(opts), std::move(encoder));
+}
+
+std::vector<std::string> string_channel_formats() {
+    std::vector<std::string> formats{"text", "json", "bytes"};
+#ifdef CLINK_HAS_SCHEMA_REGISTRY
+    for (auto& f : clink::schema_registry::supported_format_names()) {
+        formats.push_back(std::move(f));
+    }
+#endif
+    return formats;
+}
+
 void install(clink::plugin::PluginRegistry& reg) {
+    const auto formats = string_channel_formats();
     // The resolver the coordinator's restore-point selection dispatches to
     // for handles staged by the 2PC sink below.
     clink::connectors::TxnResumeRegistry::instance().register_resolver("kafka_2pc",
@@ -1148,7 +1364,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .is_sink = true,
         .build_dependencies = {"librdkafka"},
         .runtime_dependencies = {"kafka broker >= 0.11 for transactions"},
-        .formats = {"text", "json", "bytes"},
+        .formats = formats,
         .boundedness = clink::connectors::Boundedness::Unbounded,
         // KafkaSource::snapshot_offset / restore_offset persist the
         // per-partition next-offset map into operator state, so the source
@@ -1185,7 +1401,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .is_sink = true,
         .build_dependencies = {"librdkafka"},
         .runtime_dependencies = {"kafka broker >= 0.11"},
-        .formats = {"text", "json", "bytes"},
+        .formats = formats,
         .boundedness = clink::connectors::Boundedness::Unbounded,
         .replayable = false,
         .offset_model = clink::connectors::OffsetModel::None,
@@ -1283,45 +1499,11 @@ void install(clink::plugin::PluginRegistry& reg) {
     // same builders are registered under those names too - otherwise the SQL
     // Kafka path compiles but fails at runtime with "unknown operator". (The
     // 2pc / upsert SQL sink variants are registered separately below.)
-    auto text_source_builder = [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
-        KafkaSource::Options opts;
-        opts.brokers = ctx.param_or("brokers");
-        opts.topic = ctx.param_or("topic");
-        opts.group_id = ctx.param_or("group_id", "clink");
-        opts.client_id = ctx.param_or("client_id", "clink-source");
-        opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
-        apply_batch_max_wait(ctx, opts);
-        apply_batch_shape(ctx, opts);
-        populate_kafka_security_conf(ctx, opts.conf);
-        apply_deterministic_ownership(ctx, opts);
-        if (opts.brokers.empty()) {
-            throw std::runtime_error("kafka source: 'brokers' is required");
-        }
-        if (opts.topic.empty()) {
-            throw std::runtime_error("kafka source: 'topic' is required");
-        }
-        return std::make_shared<StringKafkaSource>(std::move(opts));
-    };
+    auto text_source_builder = [](const BuildContext& ctx) { return build_string_source(ctx); };
     reg.register_source<std::string>("kafka_text_source", text_source_builder);
     reg.register_source<std::string>("kafka_source_string", text_source_builder);
 
-    auto text_sink_builder = [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
-        KafkaSink::Options opts;
-        opts.brokers = ctx.param_or("brokers");
-        opts.topic = ctx.param_or("topic");
-        opts.client_id = ctx.param_or("client_id", "clink-sink");
-        opts.acks = ctx.param_or("acks", "all");
-        opts.compression_type = ctx.param_or("compression", "none");
-        apply_linger_ms(ctx, opts);
-        populate_kafka_security_conf(ctx, opts.conf);
-        if (opts.brokers.empty()) {
-            throw std::runtime_error("kafka sink: 'brokers' is required");
-        }
-        if (opts.topic.empty()) {
-            throw std::runtime_error("kafka sink: 'topic' is required");
-        }
-        return std::make_shared<StringKafkaSink>(std::move(opts));
-    };
+    auto text_sink_builder = [](const BuildContext& ctx) { return build_string_sink(ctx); };
     reg.register_sink<std::string>("kafka_text_sink", text_sink_builder);
     reg.register_sink<std::string>("kafka_sink_string", text_sink_builder);
 
@@ -1377,8 +1559,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             // emissions); a feed that delivers records at or below the
             // current watermark should set 'false' (see the connector page).
             const bool replay_suppression = ctx.param_or("replay_suppression", "true") != "false";
+            auto encoder = build_value_encoder(ctx, "kafka_2pc_sink_string");
             auto sink = std::make_shared<TwoPhaseCommitStringKafkaSink>(
-                std::move(opts), ctx.subtask_idx, replay_suppression);
+                std::move(opts), ctx.subtask_idx, replay_suppression, std::move(encoder));
             // Declare commit-group membership so the coordinator can
             // gate this sink's CommitCheckpoint on its group peers.
             if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
@@ -1432,7 +1615,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                     break;
                 pos = end + 1;
             }
-            return std::make_shared<UpsertKafkaSink>(std::move(opts), std::move(pk));
+            auto encoder = build_value_encoder(ctx, "kafka_upsert_sink_string");
+            return std::make_shared<UpsertKafkaSink>(
+                std::move(opts), std::move(pk), std::move(encoder));
         });
 }
 

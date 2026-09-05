@@ -11,7 +11,7 @@ otherwise; set `ON` to require it or `OFF` to exclude it). Most connectors link
 a system client library obtained via apt (Debian) or brew (macOS); a few ride
 the from-source toolchain (Apache Arrow/Parquet `24.0.0`, iceberg-cpp `v0.3.0`,
 aws-sdk-cpp `1.11.795`, Pulsar client `4.2.0`, DataStax cpp-driver `2.17.1`,
-clickhouse-cpp `2.5.1`),
+clickhouse-cpp `2.5.1`, Avro C++ `1.12.1`),
 which is compiled at exact versions into `CLINK_DEPS_PREFIX` on both the host
 and the Debian image. Versions are recorded per connector and in
 [`scripts/versions.env`](../../scripts/versions.env).
@@ -65,7 +65,8 @@ is reachable through the programmatic API only.
 
 | Format | Role | Dependency | Version | SQL `connector=` |
 | --- | --- | --- | --- | --- |
-| [Apache Avro](avro.md) | encoding (codecs) | Avro C++ | system pkg | - |
+| [Apache Avro](avro.md) | encoding (codecs) | Avro C++ | `1.12.1` (from-source pin) | - |
+| [Schema Registry formats](schema-registry.md) | value formats on Kafka (`format='avro'`, `'protobuf'`, `'json-schema'`) | Avro C++, libprotobuf + libprotoc, cpp-httplib (vendored) | Avro `1.12.1`; protobuf system pkg | `kafka` |
 
 ## Built-in sinks (no dependency)
 

@@ -46,10 +46,42 @@ const std::string& require_property(const TableDef& table, const std::string& ke
     return it->second;
 }
 
+// The registry-framed value formats (Confluent Schema Registry wire format
+// over Avro, Protobuf or JSON Schema). Row-channel like format='json', and
+// currently a Kafka connector option: the connector decodes each message to
+// the JSON text the JSON bridges already consume, and encodes the bridges'
+// JSON rows on the way out, so the planner's job is to keep the channel and
+// pass the format through - build_params strips `format`, so the binding
+// forces it back onto the connector op. Which of the three a build actually
+// has is the connector's call at build time (impls/schema_registry).
+std::optional<std::string> registry_format_of(const TableDef& table) {
+    const auto it = table.properties.find("format");
+    if (it == table.properties.end()) {
+        return std::nullopt;
+    }
+    const auto& f = it->second;
+    if (f == "avro" || f == "protobuf") {
+        return f;
+    }
+    if (f == "json-schema" || f == "json_schema" || f == "jsonschema") {
+        return std::string{"json-schema"};
+    }
+    return std::nullopt;
+}
+
+void require_kafka_for_registry_format(const TableDef& table, const std::string& connector) {
+    if (const auto fmt = registry_format_of(table); fmt.has_value() && connector != "kafka") {
+        unsupported("table " + table.name + ": format='" + *fmt +
+                    "' (Confluent Schema Registry framing) is supported on connector='kafka' "
+                    "only (got connector='" +
+                    connector + "')");
+    }
+}
+
 Channel channel_for_table(const TableDef& table) {
     auto fmt = table.properties.find("format");
     const bool json = fmt != table.properties.end() && fmt->second == "json";
-    if (json)
+    if (json || registry_format_of(table).has_value())
         return Channel::Row;
     if (table.columns.size() > 1)
         return Channel::Row;
@@ -242,6 +274,7 @@ std::vector<RowColumn> row_columns_of_schema(const arrow::Schema& schema) {
 
 RowConnectorBinding row_source_binding_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
+    require_kafka_for_registry_format(table, connector);
     if (connector == "file" || connector == "filesystem") {
         return RowConnectorBinding{"file_json_source", kChannelRow, {}};
     }
@@ -263,9 +296,17 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         const auto it = table.properties.find("columnar_decode");
         const bool row_form =
             it != table.properties.end() && (it->second == "false" || it->second == "0");
-        return RowConnectorBinding{"kafka_source_string",
-                                   kChannelString,
-                                   row_form ? "json_string_to_row" : "json_string_to_row_columnar"};
+        RowConnectorBinding binding{
+            "kafka_source_string",
+            kChannelString,
+            row_form ? "json_string_to_row" : "json_string_to_row_columnar"};
+        // A registry-framed table keeps the same JSON bridge: the connector
+        // decodes each message to JSON text first. The format itself rides
+        // as a forced param because build_params strips it.
+        if (const auto fmt = registry_format_of(table)) {
+            binding.extra_params["format"] = *fmt;
+        }
+        return binding;
     }
     if (connector == "rabbitmq") {
         // RabbitMQ / AMQP source: each message body is a JSON object string (string
@@ -372,6 +413,7 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
 
 RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
+    require_kafka_for_registry_format(table, connector);
     const bool upsert = table.is_upsert();
     const bool exactly_once = table.is_exactly_once();
     if (connector == "file" || connector == "filesystem") {
@@ -402,21 +444,31 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             upsert ? "file_json_upsert_sink" : "file_json_sink", kChannelRow, {}};
     }
     if (connector == "kafka") {
+        // Every Kafka sink variant takes the row_to_json_string bridge; with a
+        // registry-framed format the sink then encodes that JSON (Avro,
+        // Protobuf or JSON Schema, framed with the registry id) as the last
+        // step before the producer. The format is forced back onto the sink
+        // op because build_params strips it.
+        std::map<std::string, std::string> extra;
+        if (const auto fmt = registry_format_of(table)) {
+            extra["format"] = *fmt;
+        }
         if (exactly_once) {
             // Row -> row_to_json_string -> kafka_2pc_sink_string.
             // The transactional producer wraps each barrier-bounded
             // run of records in a librdkafka transaction.
             return RowConnectorBinding{
-                "kafka_2pc_sink_string", kChannelString, "row_to_json_string"};
+                "kafka_2pc_sink_string", kChannelString, "row_to_json_string", extra};
         }
         if (upsert) {
             // Row -> row_to_json_string -> kafka_upsert_sink_string
             // (the sink parses the row JSON to extract the PK and
             // tomb-stones on __row_kind=delete).
             return RowConnectorBinding{
-                "kafka_upsert_sink_string", kChannelString, "row_to_json_string"};
+                "kafka_upsert_sink_string", kChannelString, "row_to_json_string", extra};
         }
-        return RowConnectorBinding{"kafka_sink_string", kChannelString, "row_to_json_string"};
+        return RowConnectorBinding{
+            "kafka_sink_string", kChannelString, "row_to_json_string", extra};
     }
     if (connector == "rabbitmq") {
         // RabbitMQ / AMQP sink. Each row -> JSON object string -> basic.publish (persistent +
@@ -994,6 +1046,9 @@ std::string compile_node(const LogicalPlan& node,
             auto binding = row_source_binding_for(table);
             op.type = binding.source_or_sink_op;
             op.out_channel = binding.source_or_sink_channel;
+            for (const auto& [k, v] : binding.extra_params) {
+                op.params[k] = v;  // binding-forced params override passed-through WITH-options
+            }
             std::string src_id = op.id;
             spec.ops.push_back(std::move(op));
             after_src = src_id;

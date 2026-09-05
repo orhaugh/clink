@@ -21,6 +21,12 @@
 # connector means adding a subdirectory in this shape and an
 # add_subdirectory line below; docs/connectors/<x>.md documents it.
 
+# Order matters for the first four: schema_registry links clink::avro and
+# clink::http_connector, and kafka links clink::schema_registry (guarded on
+# `if(TARGET ...)`, so each is optional but must already be decided).
+add_subdirectory(avro)
+add_subdirectory(http_connector)
+add_subdirectory(schema_registry)
 add_subdirectory(kafka)
 add_subdirectory(postgres)
 add_subdirectory(clickhouse)
@@ -29,8 +35,6 @@ add_subdirectory(aws)
 add_subdirectory(rocksdb)
 add_subdirectory(tls)
 add_subdirectory(etcd)
-add_subdirectory(avro)
-add_subdirectory(http_connector)
 add_subdirectory(redis)
 add_subdirectory(mysql)
 add_subdirectory(mqtt)
@@ -68,7 +72,7 @@ add_subdirectory(wasm)
 # clink::clink behaviour (kitchen-sink dep on every available impl).
 add_library(clink_impls_all INTERFACE)
 set(_clink_enabled_impls "")
-foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs websocket rocksdb_s3 vector_search onnx wasm forst forst_s3)
+foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector schema_registry redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs websocket rocksdb_s3 vector_search onnx wasm forst forst_s3)
     if(TARGET clink::${_impl})
         target_link_libraries(clink_impls_all INTERFACE clink::${_impl})
         list(APPEND _clink_enabled_impls ${_impl})

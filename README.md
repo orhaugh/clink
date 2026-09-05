@@ -245,7 +245,8 @@ Everything below is published at
   sources and sinks (Kafka, Postgres incl. CDC, ClickHouse, S3/GCS/Azure
   Parquet, Iceberg, MQTT, NATS, Pulsar, RabbitMQ, Redis, MongoDB,
   Cassandra, HTTP, Avro, WebSocket and more), each with dependencies,
-  options and delivery semantics.
+  options and delivery semantics; Kafka speaks the Confluent Schema Registry
+  wire format (Avro, Protobuf, JSON Schema).
 - [Internals](https://orhaugh.github.io/clink/internals/): every
   subsystem documented the way its code is structured, citing sources.
 - [Design decisions](https://orhaugh.github.io/clink/design/): why the

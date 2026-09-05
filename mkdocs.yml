@@ -156,6 +156,7 @@ nav:
       - connectors/redis.md
       - connectors/s3-parquet.md
       - connectors/s3.md
+      - connectors/schema-registry.md
       - connectors/webhdfs-parquet.md
       - connectors/websocket.md
   - Design decisions:

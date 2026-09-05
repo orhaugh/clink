@@ -14,6 +14,8 @@ add_executable(clink_kafka_tests
     test_pipeline_loader.cpp
     test_pipeline_config.cpp
     test_typed_helpers.cpp
+    test_registry_formats.cpp
+    test_registry_formats_live.cpp
 )
 target_link_libraries(clink_kafka_tests PRIVATE
     clink::core
@@ -24,6 +26,18 @@ target_link_libraries(clink_kafka_tests PRIVATE
 target_compile_definitions(clink_kafka_tests PRIVATE CLINK_HAS_KAFKA)
 if(CLINK_HAS_KAFKA_MOCK)
     target_compile_definitions(clink_kafka_tests PRIVATE CLINK_HAS_KAFKA_MOCK)
+endif()
+# The registry-format round trip drives the string-channel factories against
+# the in-process registry double from impls/schema_registry/tests.
+if(TARGET clink::schema_registry)
+    target_link_libraries(clink_kafka_tests PRIVATE clink::schema_registry)
+    target_include_directories(clink_kafka_tests PRIVATE ${CMAKE_SOURCE_DIR}/impls/schema_registry/tests)
+    if(TARGET clink::avro)
+        target_compile_definitions(clink_kafka_tests PRIVATE CLINK_SCHEMA_REGISTRY_HAS_AVRO)
+    endif()
+    if(CLINK_SCHEMA_REGISTRY_HAS_PROTOBUF)
+        target_compile_definitions(clink_kafka_tests PRIVATE CLINK_SCHEMA_REGISTRY_HAS_PROTOBUF)
+    endif()
 endif()
 clink_set_warnings(clink_kafka_tests)
 gtest_discover_tests(clink_kafka_tests
