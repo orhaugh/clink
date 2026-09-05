@@ -61,6 +61,7 @@ embedded or submits to a cluster, unchanged.
 | Exactly-once sinks | Generic committer (prepare at barrier, commit on global durability, recover-and-re-commit): file, Kafka, Parquet, raw S3 multipart, Postgres `PREPARE TRANSACTION` | [Sink committer framework](internals/sink-committer-framework.md) |
 | Effectively-once upserts | Changelog upsert and delete by `PRIMARY KEY`: Postgres, MySQL, Cassandra, Redis | [Sink committer framework](internals/sink-committer-framework.md) |
 | Source replay | Source-offset recovery generalised across connectors | [Checkpointing](internals/checkpointing.md) |
+| Machine-checked protocol | The exactly-once protocol (barrier completion, 2PC sinks, confirmation markers, in-doubt resolution, recovery) is a TLA+ specification model-checked in CI over bounded configurations, with liveness; every campaign-found defect is a mutant TLC must refute. Proves the model, not the code | [Exactly-once specification](internals/exactly-once-specification.md) |
 
 ## Scale and operations
 

@@ -5450,6 +5450,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     job.tasks_by_worker.clear();
     job.pending_per_worker.clear();
     job.pending_checkpoint_acks.clear();
+    job.rewind_floor_checkpoint_id = 0;
     // Clear the bounded-source final-checkpoint coordination so a replayed EOS
     // after this restart re-requests a FRESH final id seeded from the new task
     // set (the old pending set referenced pre-restart subtask keys).
@@ -7046,6 +7047,24 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         if (all_subtasks_answered) {
             const auto failed_it = job.failed_checkpoint_acks.find(msg.checkpoint_id);
             if (failed_it != job.failed_checkpoint_acks.end() && !failed_it->second.empty()) {
+                // Every checkpoint above this one that is still collecting
+                // acks is invalid too: the rewind re-emits this interval, and
+                // a later checkpoint completing on top of it would restore
+                // the job past the aborted output (see above_rewind_floor).
+                // Only when a rewind will actually run - one begins below, or
+                // a restart is already pending and will restore below this id.
+                // A job that keeps running with no restart budget keeps its
+                // later checkpoints: discarding them would stop it ever
+                // completing another.
+                const bool rewind_pending =
+                    !job.completion_signalled && !job.cancel_requested &&
+                    !job.checkpoint.checkpoint_dir.empty() &&
+                    (job.awaiting_restart ||
+                     job.restart_attempts < effective_max_restarts(job.checkpoint));
+                if (rewind_pending && (job.rewind_floor_checkpoint_id == 0 ||
+                                       msg.checkpoint_id < job.rewind_floor_checkpoint_id)) {
+                    job.rewind_floor_checkpoint_id = msg.checkpoint_id;
+                }
                 // At least one subtask failed to take its snapshot, so
                 // this checkpoint does not exist in full and must not be
                 // recorded as if it did. Withholding COMPLETED-N is the
@@ -7163,24 +7182,56 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 }
             }
         }
-        if (all_subtasks_answered && !checkpoint_failed) {
+        // A checkpoint above the rewind floor answered ok from every subtask,
+        // but it must not complete. Found by the exactly-once model
+        // (formal/ExactlyOnce.tla, design record 012): checkpoint k FAILED and
+        // the job began its rewind, while checkpoint k+1, whose barrier was
+        // already at the sinks, kept collecting acks through the drain and
+        // completed. Its marker made it a restore point; in-doubt resolution
+        // committed its transactions and confirmed it; the job restored from
+        // it - past interval k, whose transactions the failure had aborted and
+        // which only a rewind below k re-emits. Silent loss of one interval,
+        // with every gate green. A checkpoint above the floor is therefore
+        // discarded exactly like a failed one: no marker, and an abort for its
+        // staged transactions, since the rewind re-produces its interval too.
+        const bool above_rewind_floor = all_subtasks_answered && !checkpoint_failed &&
+                                        job.rewind_floor_checkpoint_id != 0 &&
+                                        msg.checkpoint_id > job.rewind_floor_checkpoint_id;
+        if (above_rewind_floor) {
+            log::warn("coordinator.checkpoint",
+                      "checkpoint " + std::to_string(msg.checkpoint_id) + " of job " +
+                          std::to_string(msg.job_id) + " completed above FAILED checkpoint " +
+                          std::to_string(job.rewind_floor_checkpoint_id) +
+                          " while the job rewinds for it; discarded (no COMPLETED marker, "
+                          "staged sink transactions aborted) so the rewind re-emits both "
+                          "intervals");
+            clink::metrics::ckpt::failed();
+            groups_to_abort.emplace_back(msg.job_id, msg.checkpoint_id);
+            job.failed_checkpoint_acks.erase(msg.checkpoint_id);
+            job.pending_checkpoint_start_times.erase(msg.checkpoint_id);
+            job.commit_group_progress.erase(msg.checkpoint_id);
+            job.checkpoint_participants.erase(msg.checkpoint_id);
+            job.pending_checkpoint_acks.erase(ckpt_it);
+        }
+        if (all_subtasks_answered && !checkpoint_failed && !above_rewind_floor) {
             job.failed_checkpoint_acks.erase(msg.checkpoint_id);
             // A completed checkpoint is the proof the failure cause was
             // transient: the 77b circuit-breaker counts only CONSECUTIVE
             // failure-restarts, and this is where consecutive ends.
             job.consecutive_ckpt_failure_restarts = 0;
             job.first_consecutive_ckpt_failure_at = {};
-            job.latest_completed_checkpoint_id =
-                std::max(job.latest_completed_checkpoint_id, msg.checkpoint_id);
-            // The restore point has moved past the last rescale, so every
-            // subtask's own directory now holds state written under the CURRENT
-            // layout and the retained pre-rescale translation is not only
-            // unnecessary but wrong. Drop it.
-            if (!job.stale_layout_blocks.empty() &&
-                job.latest_completed_checkpoint_id > job.stale_layout_through) {
-                job.stale_layout_blocks.clear();
-                job.stale_layout_through = 0;
-            }
+            // latest_completed_checkpoint_id is NOT advanced here. It used to
+            // be, under this lock, with the COMPLETED marker written after the
+            // lock was released - and a restart deciding its restore point in
+            // that window redeployed from a checkpoint whose marker was not on
+            // disk yet. Found by the exactly-once model (formal/ExactlyOnce.tla,
+            // design record 012): the coordinator then died before the fsync
+            // landed, its successor saw no marker and restored lower, and the
+            // recoverable sinks, which had already re-committed the unmarked
+            // checkpoint's handles at open, published its interval twice.
+            // Memory now advances where the marker becomes durable, in the
+            // write loop below, so the restore point never names a checkpoint
+            // the next leader cannot see.
             {
                 // The acking set is about to be erased; capture which subtasks it
                 // covered. Keys are "role:subtask_idx".
@@ -7418,6 +7469,26 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 continue;
             }
             CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAfterCompletedMarker);
+        }
+        // The checkpoint is durable (or the job keeps no directory, so memory
+        // is all there is): advance the restore point now, and only now.
+        {
+            std::lock_guard lock(mu_);
+            auto job_it = jobs_.find(jid);
+            if (job_it != jobs_.end()) {
+                auto& job = *job_it->second;
+                job.latest_completed_checkpoint_id =
+                    std::max(job.latest_completed_checkpoint_id, ckpt_id);
+                // The restore point has moved past the last rescale, so every
+                // subtask's own directory now holds state written under the
+                // CURRENT layout and the retained pre-rescale translation is
+                // not only unnecessary but wrong. Drop it.
+                if (!job.stale_layout_blocks.empty() &&
+                    job.latest_completed_checkpoint_id > job.stale_layout_through) {
+                    job.stale_layout_blocks.clear();
+                    job.stale_layout_through = 0;
+                }
+            }
         }
         // A checkpoint that completed while the job was draining for a
         // restart keeps its durable marker but is NOT committed from here:

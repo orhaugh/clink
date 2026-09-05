@@ -509,6 +509,57 @@ TEST_F(ResolutionFixture, AnExhaustedTransportWalkLeavesMarkersForTheSinks) {
     EXPECT_EQ(read_marker(1, 4), h1);
 }
 
+// The refusal wall, found by the exactly-once model (formal/ExactlyOnce.tla,
+// design record 012) rather than by a rig. A refusal at checkpoint 4 used to
+// end the walk with the completed checkpoint 5 above it never looked at.
+// Subtask 0's commit for 5 executed without its receipt (an ack-window kill);
+// with the restore falling back to 3 and nothing marking the orphan, the
+// redeploy fenced it blind and the replay published its interval twice. The
+// walk now leaves an .unresolved marker for every unreceipted handle above
+// the stop, and the sink's pre-fence describe settles it.
+TEST_F(ResolutionFixture, ARefusalMarksTheUnreceiptedHandlesAboveIt) {
+    write_completed_marker(4);
+    write_snapshot_with_handle(4, 0, handle("refuse", 4));
+    write_completed_marker(5, "0,1");
+    const auto h0 = handle_with_wm("commit", 5, 501);
+    write_snapshot_with_handle(5, 0, h0);
+    write_snapshot_with_handle(5, 1, handle_with_wm("commit", 5, 502));
+    write_receipt(5, 1);
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 5, std::chrono::milliseconds{0}), 3u);
+    EXPECT_FALSE(confirmed_marker_exists(4));
+    EXPECT_FALSE(confirmed_marker_exists(5));
+    // Nothing above the stop is probed over the wire: a probe EXECUTES a
+    // commit, and the job is about to restore below both checkpoints.
+    EXPECT_EQ(seen.size(), 1u);
+    EXPECT_EQ(read_marker(0, 5), h0);
+    EXPECT_FALSE(marker_exists(1, 5)) << "a receipted handle needs no marker";
+}
+
+TEST_F(ResolutionFixture, AnExhaustedWalkMarksTheHandlesAboveItToo) {
+    write_completed_marker(4);
+    const auto h4 = handle_with_wm("transport-always", 4, 400);
+    write_snapshot_with_handle(4, 0, h4);
+    write_completed_marker(5);
+    const auto h5 = handle_with_wm("commit", 5, 500);
+    write_snapshot_with_handle(5, 0, h5);
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 5, std::chrono::milliseconds{0}), 3u);
+    EXPECT_EQ(read_marker(0, 4), h4);
+    EXPECT_EQ(read_marker(0, 5), h5);
+}
+
+TEST_F(ResolutionFixture, ACheckpointThatNeverCompletedAboveTheStopIsNotMarked) {
+    write_completed_marker(4);
+    write_snapshot_with_handle(4, 0, handle("refuse", 4));
+    // 5 has a snapshot with a staged handle but no COMPLETED marker: no commit
+    // was ever broadcast for it, so nothing staged there can have executed.
+    write_snapshot_with_handle(5, 0, handle_with_wm("commit", 5, 500));
+
+    EXPECT_EQ(resolve_in_doubt_commits(dir, kJob, 3, 5, std::chrono::milliseconds{0}), 3u);
+    EXPECT_FALSE(marker_exists(0, 5));
+}
+
 TEST_F(ResolutionFixture, AResolvedHandleRetiresItsStaleMarker) {
     // An earlier failed episode marked sub0's handle; this episode proves
     // the commit over the wire. The stale marker must go with it - a

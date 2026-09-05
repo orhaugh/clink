@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+**The exactly-once protocol is a machine-checked specification.** Design
+record 012 states the protocol that four parts of the engine implement
+between them - barrier checkpoints with ack-after-durable snapshots, the
+two-phase-commit sinks, the coordinator's COMPLETED and CONFIRMED markers,
+and recovery with in-doubt resolution, receipts and unresolved markers - as
+a TLA+ model under `formal/`, with exactly-once written down as invariants
+over the positions each sink has published: no position twice, every
+position below the vouched-for frontier exactly once, a restore that never
+reads snapshots of mixed vintage. TLC model-checks it on every push
+(`scripts/formal-check.sh`, the `formal` CI job, tools pinned by SHA-256 in
+`formal/tools.env`) over bounded configurations that enumerate every
+interleaving of protocol steps and faults within their bounds, and checks
+the liveness property that a run with bounded faults settles with every
+vouched-for position published once. Every defect the qualification
+campaigns found and fixed is a named mutant of the specification: twelve of
+fifteen are refuted by TLC, and the three that are not are recorded as rules
+a later rule now guards as well, so the model is known to see what the rigs
+saw and the rules that are not load-bearing on their own are named. The published
+page is [Exactly-once specification](https://orhaugh.github.io/clink/internals/exactly-once-specification/).
+
+**Three exactly-once defects found by the model, fixed before any rig paid
+for them.** Each was an interleaving no gate had enumerated. The refusal
+wall: in-doubt resolution stopped at the first checkpoint it refused, so a
+commit that had executed without its receipt in a completed checkpoint
+above it was never proven, the redeploy fenced it blind and the replay
+published its interval twice - and the refused checkpoint stood as a wall
+every later walk stopped at. The walk now leaves an `.unresolved` marker for
+every unreceipted handle above its stop, and the sink's pre-fence describe
+settles each one (`ResolutionFixture.ARefusalMarksTheUnreceiptedHandlesAboveIt`).
+The rewind floor: a checkpoint above a FAILED one, already collecting acks
+when the failure began its rewind, could complete during the drain; its
+marker made it a restore point, resolution confirmed it, and the job
+restored past the aborted interval below it. A checkpoint above the failed
+id is now discarded like the failed one until the restart redeploys
+(`CheckpointCompletion.ACheckpointAboveAFailedOneIsDiscardedDuringTheRewind`).
+The restore point ahead of its marker: `latest_completed_checkpoint_id`
+advanced under the lock at completion with the COMPLETED marker written
+after it, and a restart deciding in that window redeployed from a
+checkpoint the next coordinator could not see; the recoverable sinks had
+already re-committed its handles at open. Memory now advances with the
+durable write. None of the three needs a fault the campaigns do not already
+inject; the two-hour QUAL-01 run did not happen to hit them.
+
 **The public API is tiered, and the Stable tier is held by gates.** Design
 record 011 settles what "stable public APIs" means for the 1.x line: source
 compatibility on a declared Stable tier, change-with-notice on an Evolving

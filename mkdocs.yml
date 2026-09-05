@@ -124,6 +124,7 @@ nav:
       - internals/testing-framework.md
       - internals/replay-determinism.md
       - internals/checkpointing.md
+      - internals/exactly-once-specification.md
       - internals/sink-committer-framework.md
       - internals/fault-tolerance-and-rescale.md
       - internals/columnar-execution.md
@@ -169,6 +170,7 @@ nav:
       - design/009-one-declaration-per-type.md
       - design/010-stable-extension-model.md
       - design/011-public-api-tiers.md
+      - design/012-machine-checked-exactly-once.md
   - Examples:
       - consumer-examples/README.md
       - consumer-examples/state_as_data/README.md

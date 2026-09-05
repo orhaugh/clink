@@ -318,7 +318,10 @@ struct CheckpointFixture {
 
     // Register the fake worker and submit a job whose checkpoints the
     // test will answer for. Returns the job id, or 0 on failure.
-    JobId bring_up() {
+    // `max_restarts` is the job's restart budget: 0 keeps a failed
+    // checkpoint from starting a rewind, which most tests here want out of
+    // the way; the rewind tests pass a budget.
+    JobId bring_up(std::uint32_t max_restarts = 0) {
         worker = std::make_unique<FakeWorker>(port, "w");
         if (!worker->valid() || !worker->register_and_ack()) {
             return 0;
@@ -331,7 +334,7 @@ struct CheckpointFixture {
         // Periodic triggers drive the test: a real checkpoint id, issued
         // by the real trigger loop, rather than one the test invented.
         ckpt.interval_ms = 100;
-        ckpt.max_restarts_on_worker_loss = 0;
+        ckpt.max_restarts_on_worker_loss = max_restarts;
         const auto job_id = coordinator->submit_job(
             two_subtask_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
         if (job_id == 0) {
@@ -542,6 +545,89 @@ TEST(CheckpointCompletion, TheRecoveryPointSurvivesALaterFailedCheckpoint) {
     EXPECT_FALSE(fx.marker_exists(job_id, *bad));
     EXPECT_TRUE(fx.marker_exists(job_id, *good))
         << "the failed checkpoint took the good one's marker with it";
+}
+
+// Found by the exactly-once model (formal/ExactlyOnce.tla, design record
+// 012), not by a rig. The trigger loop does not wait for the previous
+// checkpoint's acks, so two checkpoints are routinely in flight. Checkpoint k
+// FAILS (a subtask could not snapshot) and the job begins its rewind; k+1's
+// barrier was already at the sinks, its acks keep arriving through the drain,
+// and it used to complete: a COMPLETED marker, then in-doubt resolution
+// committing its transactions and confirming it, then a restore FROM k+1 -
+// past interval k, whose staged transactions the failure had aborted and
+// which only a rewind below k re-emits. Silent loss of one interval with
+// every gate green. A checkpoint above a failed one must be discarded like
+// the failed one: no marker, and an abort for its staged transactions.
+TEST(CheckpointCompletion, ACheckpointAboveAFailedOneIsDiscardedDuringTheRewind) {
+    CheckpointFixture fx;
+    const auto job_id = fx.bring_up(/*max_restarts=*/3);
+    ASSERT_GT(job_id, 0U);
+
+    // Two checkpoints in flight: neither is answered until both exist.
+    const auto failed = fx.await_trigger();
+    ASSERT_TRUE(failed.has_value());
+    const auto above = fx.await_trigger();
+    ASSERT_TRUE(above.has_value());
+    ASSERT_GT(*above, *failed);
+
+    // k fails; the rewind begins with a cancel to the worker, and k's staged
+    // transactions are aborted.
+    ASSERT_TRUE(fx.ack_all(job_id, *failed, /*ok=*/false));
+    ASSERT_TRUE(fx.worker->await_frame(MessageKind::CancelJob, 5s).has_value())
+        << "a failed checkpoint with restart budget did not begin a rewind";
+    bool aborted_failed = false;
+    for (int i = 0; i < 4 && !aborted_failed; ++i) {
+        auto abort = fx.worker->await_frame(MessageKind::AbortCheckpoint, 5s);
+        ASSERT_TRUE(abort.has_value()) << "no AbortCheckpoint for the failed checkpoint";
+        aborted_failed = decode_abort_checkpoint(*abort).checkpoint_id == *failed;
+    }
+    ASSERT_TRUE(aborted_failed);
+
+    // k+1 answers ok from every subtask during the drain.
+    ASSERT_TRUE(fx.ack_all(job_id, *above, /*ok=*/true));
+
+    // It must not become a restore point: no completion, no marker...
+    EXPECT_FALSE(ckpt_await(
+        [&] { return fx.coordinator->latest_completed_checkpoint(job_id) >= *above; }, 750ms))
+        << "checkpoint " << *above << " completed above failed checkpoint " << *failed
+        << " during the rewind; a restore from it skips the aborted interval";
+    EXPECT_FALSE(fx.marker_exists(job_id, *above))
+        << "a COMPLETED marker was written above a failed checkpoint mid-rewind";
+    // ...and its staged transactions are aborted, since the rewind re-emits
+    // its interval as well.
+    bool aborted_above = false;
+    for (int i = 0; i < 4 && !aborted_above; ++i) {
+        auto abort = fx.worker->await_frame(MessageKind::AbortCheckpoint, 5s);
+        if (!abort.has_value()) {
+            break;
+        }
+        aborted_above = decode_abort_checkpoint(*abort).checkpoint_id == *above;
+    }
+    EXPECT_TRUE(aborted_above)
+        << "no AbortCheckpoint for the checkpoint discarded above the rewind floor";
+}
+
+TEST(CheckpointCompletion, ACheckpointAboveAFailedOneStillCompletesWithoutARewind) {
+    // The control: with no restart budget the job keeps running, and a
+    // later checkpoint completing after a failed one is what keeps it
+    // recoverable at all. Discarding it here would stop the job ever
+    // completing another checkpoint.
+    CheckpointFixture fx;
+    const auto job_id = fx.bring_up(/*max_restarts=*/0);
+    ASSERT_GT(job_id, 0U);
+    const auto failed = fx.await_trigger();
+    ASSERT_TRUE(failed.has_value());
+    const auto above = fx.await_trigger();
+    ASSERT_TRUE(above.has_value());
+    ASSERT_GT(*above, *failed);
+
+    ASSERT_TRUE(fx.ack_all(job_id, *failed, /*ok=*/false));
+    ASSERT_TRUE(fx.ack_all(job_id, *above, /*ok=*/true));
+
+    EXPECT_TRUE(ckpt_await([&] {
+        return fx.coordinator->latest_completed_checkpoint(job_id) >= *above;
+    })) << "with no rewind pending, the checkpoint above a failed one must still complete";
+    EXPECT_TRUE(ckpt_await([&] { return fx.marker_exists(job_id, *above); }));
 }
 
 // --- what recovery restores from ----------------------------------------

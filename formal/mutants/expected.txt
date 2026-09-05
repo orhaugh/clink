@@ -1,0 +1,9 @@
+# What TLC must say about each mutant, judged by scripts/formal-check.sh --mutants.
+#   refuted   the rule the mutant disables is load-bearing: TLC must find a violation
+#   accepted  a later rule guards the same defect (defence in depth): TLC must still
+#             accept the mutant; the day it refutes it, the other guard has gone
+# Unlisted mutants are expected refuted. formal/README.md says why each accepted
+# one is accepted.
+M_broadcast_during_drain accepted
+M_close_aborts_prepared accepted
+M_stop_at_first_refusal accepted

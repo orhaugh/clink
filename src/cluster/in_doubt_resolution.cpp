@@ -274,6 +274,66 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
     };
     const auto store = make_coordination_store(checkpoint_dir);
     const auto job_prefix = "_jobs/" + std::to_string(job_id) + "/";
+    // The refusal wall. Found by the exactly-once model (formal/ExactlyOnce.tla,
+    // design record 012), not by a rig. A walk that stops at checkpoint k -
+    // a final refusal, exhausted transport, a cancel, an unreadable marker -
+    // returns without looking at any completed checkpoint ABOVE k. A commit
+    // that executed there without its receipt (a kill in the ack window) is
+    // then fenced blind when the job redeploys below k, and its interval
+    // replays as duplicates; and because k stays completed-but-refused on
+    // disk, every later walk stops at the same k until a higher CONFIRMED
+    // marker lands, so the hole does not close by itself. The counterexample
+    // is fourteen protocol steps long and needs no fault the campaigns do
+    // not already inject: a completed checkpoint whose broadcast was withheld
+    // and whose transactions a broker outage left unresolved (aborted at the
+    // sinks' next open), then an ack-window kill one checkpoint later.
+    //
+    // So every early stop also leaves an .unresolved marker for each
+    // unreceipted handle staged in a completed checkpoint above the stop,
+    // exactly as it does for the stopped checkpoint's own unsettled handles:
+    // the owning sink's pre-fence DescribeTransactions settles each one
+    // before anything can fence it. A receipt outranks a marker, so handles
+    // whose commit is already on record are left alone.
+    const auto mark_later_unreceipted = [&](std::uint64_t stopped_at) {
+        for (std::uint64_t later = stopped_at + 1; later <= completed; ++later) {
+            const auto later_body = store->get(job_prefix + "COMPLETED-" + std::to_string(later));
+            if (!later_body.has_value()) {
+                continue;  // never completed; nothing staged there can have committed
+            }
+            const auto later_info = read_completed_marker(*later_body);
+            if (!later_info.has_value()) {
+                continue;
+            }
+            const auto later_handles = read_resume_handles(checkpoint_dir, *later_info, later);
+            if (!later_handles.has_value()) {
+                continue;  // logged by the reader; an unreadable snapshot cannot be marked
+            }
+            for (const auto& h : *later_handles) {
+                const auto receipt = job_prefix + "receipts/" +
+                                     clink::connectors::commit_receipt_file_name(h.subtask, later);
+                if (store->exists(receipt)) {
+                    continue;
+                }
+                try {
+                    store->put(receipt + ".unresolved", h.handle);
+                    clink::log::info(
+                        "coordinator.recovery",
+                        "in-doubt resolution: checkpoint " + std::to_string(later) + " subtask " +
+                            std::to_string(h.subtask) +
+                            ": unreceipted handle above the stopped checkpoint " +
+                            std::to_string(stopped_at) +
+                            " marked unresolved; the owning sink describes it before fencing");
+                } catch (const std::exception& e) {
+                    clink::log::error(
+                        "coordinator.recovery",
+                        "in-doubt resolution: checkpoint " + std::to_string(later) + " subtask " +
+                            std::to_string(h.subtask) +
+                            ": unresolved marker could not be written (" + std::string(e.what()) +
+                            "); a restore below may replay an interval whose commit executed");
+                }
+            }
+        }
+    };
     for (std::uint64_t id = confirmed + 1; id <= completed; ++id) {
         // No cancel return here: even a walk cancelled between checkpoints
         // must first read this id's handles and leave unresolved markers
@@ -290,6 +350,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                  " carries no participant set; stopping at confirmed=" +
                                  std::to_string(confirmed));
             clink::metrics::orch::in_doubt_unresolved();
+            mark_later_unreceipted(id);
             return confirmed;
         }
         const auto handles = read_resume_handles(checkpoint_dir, *info, id);
@@ -304,6 +365,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                      std::to_string(confirmed));
             }
             clink::metrics::orch::in_doubt_unresolved();
+            mark_later_unreceipted(id);
             return confirmed;
         }
         // EndTxn IS the resolution - each success EXECUTES a commit - so a
@@ -581,6 +643,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                         "materialised) receipts");
             }
             persist_unresolved_markers();
+            mark_later_unreceipted(id);
             clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
         }
@@ -589,6 +652,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         // so THIS and every later recovery selects it.
         if (cancelled()) {
             clink::metrics::orch::in_doubt_unresolved();
+            mark_later_unreceipted(id);
             return confirmed;
         }
         try {
@@ -601,6 +665,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                   " committed but the CONFIRMED marker could not be written (" +
                                   std::string(e.what()) +
                                   "); stopping so the restore point never outruns its record");
+            mark_later_unreceipted(id);
             return confirmed;
         }
         clink::metrics::orch::in_doubt_resolved();

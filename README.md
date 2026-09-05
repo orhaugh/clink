@@ -164,6 +164,13 @@ results:
 The full table, the rig, the method and every campaign's honesty-bounded
 claims: [Qualification](https://orhaugh.github.io/clink/qualification/).
 
+The protocol those campaigns exercise is also written down as a TLA+
+specification and model-checked on every push, with every defect the
+campaigns ever found kept as a mutant the checker must refute. The model
+found three further interleavings the campaigns had not, fixed before any
+rig paid for them. It proves the model, not the code: [Exactly-once
+specification](https://orhaugh.github.io/clink/internals/exactly-once-specification/).
+
 ## Status and maturity
 
 clink is young and pre-1.0. Its guarantees are qualified within the

@@ -1005,6 +1005,12 @@ private:
         // transient full-disk window as a persistent cause (items 77b, 80).
         std::uint32_t consecutive_ckpt_failure_restarts{0};
         std::chrono::steady_clock::time_point first_consecutive_ckpt_failure_at{};
+        // The FAILED checkpoint a pending rewind is for (0 = none). A checkpoint
+        // above it that finishes collecting acks during the rewind's drain is
+        // discarded rather than completed: its marker would make it a restore
+        // point past the aborted interval. Reset with the transient
+        // coordination state when the restart redeploys.
+        std::uint64_t rewind_floor_checkpoint_id{0};
         // (role, subtask_idx) entries from the lost worker that need to be
         // re-deployed onto a survivor.
         std::vector<std::pair<std::string, std::uint32_t>> restart_pending;

@@ -390,6 +390,39 @@ jobs:
         # no toolchain: it must run on every push regardless.
         run: ./scripts/check-qualification-status.py
 
+  formal:
+    name: Exactly-once specification model-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Cache the pinned TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps/formal-tools
+          key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - name: Every model configuration proves its invariants
+        # formal/ExactlyOnce.tla is the exactly-once protocol as a checkable
+        # model (design record 012). TLC enumerates every interleaving of
+        # protocol steps and faults within each configuration's bounds and
+        # must find no invariant violation, no deadlock and no liveness
+        # violation. The jars are fetched from the upstream releases and
+        # refused unless their SHA-256 matches formal/tools.env. No C++
+        # toolchain: this runs on the bare runner beside the manifest gates.
+        run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh
+      - name: Every mutant is refuted
+        # Each configuration under formal/mutants/ switches one rule back to
+        # a pre-fix form a qualification campaign (or the model itself) found
+        # and fixed. TLC must produce a counterexample for each, or the
+        # mutant is recorded in formal/mutants/expected.txt as one a later
+        # rule guards as well and must stay accepted: either drift is a
+        # regression in the model or its record, not a pass.
+        run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh --mutants
+
   plugin-abi-surface:
     name: Plugin ABI surface manifest is current
     runs-on: ubuntu-latest

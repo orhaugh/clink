@@ -151,3 +151,6 @@ benchmarks/nexmark_compare/cloud/results-split*/
 !/fuzz/corpus/*/timeout-*
 !/fuzz/corpus/*/oom-*
 qualification-results/
+
+# TLC writes its state files beside the model when run by hand (the script uses a temp -metadir)
+/formal/**/states/
