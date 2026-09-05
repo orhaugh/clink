@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
 
 #include "clink/cluster/coordination_store.hpp"
+#include "clink/cluster/protocol_trace.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/txn_resume_registry.hpp"
 #include "clink/metrics/orchestration_metrics.hpp"
@@ -149,7 +151,9 @@ std::optional<CompletedMarkerInfo> read_completed_marker(const std::string& body
 // kTxnResumeStateKeyPrefix + "sub<K>"), and is what pairs the handle with
 // its on-disk commit receipt.
 struct StagedHandle {
-    std::uint32_t subtask{0};
+    std::uint32_t subtask{0};  // the sink-local index the key and the receipt carry
+    std::uint32_t participant{
+        0};  // the job-global subtask the handle was read from (the trace's name for it)
     std::string handle;
 };
 
@@ -222,7 +226,7 @@ std::optional<std::vector<StagedHandle>> read_resume_handles(const std::string& 
                             if (entry.value.find(ckpt_tag) == std::string::npos) {
                                 continue;
                             }
-                            handles.push_back({owner, entry.value});
+                            handles.push_back({owner, sub, entry.value});
                         }
                     }
                 }
@@ -335,12 +339,35 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         }
     };
     for (std::uint64_t id = confirmed + 1; id <= completed; ++id) {
+        // Protocol trace events for this id: the walk's steps as the model
+        // names them (WalkSkips, WalkReadsReceipt, WalkProbes, WalkRetries,
+        // WalkExhausted, WalkCancelled, WalkDecides).
+        const auto trace_walk =
+            [&](const char* event, std::uint64_t sub, const char* verdict, int confirmed_flag) {
+                if (!protocol_trace::enabled()) {
+                    return;
+                }
+                protocol_trace::Event e(event);
+                e.u("job", job_id).u("ckpt", id);
+                if (sub != std::numeric_limits<std::uint64_t>::max()) {
+                    e.u("sub", sub);
+                }
+                if (verdict != nullptr) {
+                    e.s("verdict", verdict);
+                }
+                if (confirmed_flag >= 0) {
+                    e.b("confirmed", confirmed_flag == 1);
+                }
+                e.emit();
+            };
+        constexpr auto kNoSub = std::numeric_limits<std::uint64_t>::max();
         // No cancel return here: even a walk cancelled between checkpoints
         // must first read this id's handles and leave unresolved markers
         // (below) - returning with nothing written is what lets the next
         // deploy fence blind.
         const auto marker_body = store->get(job_prefix + "COMPLETED-" + std::to_string(id));
         if (!marker_body.has_value()) {
+            trace_walk("WalkSkips", kNoSub, nullptr, -1);
             continue;  // this id never completed; its transaction was aborted
         }
         const auto info = read_completed_marker(*marker_body);
@@ -349,6 +376,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                              "in-doubt resolution: COMPLETED-" + std::to_string(id) +
                                  " carries no participant set; stopping at confirmed=" +
                                  std::to_string(confirmed));
+            trace_walk("WalkDecides", kNoSub, nullptr, 0);
             clink::metrics::orch::in_doubt_unresolved();
             mark_later_unreceipted(id);
             return confirmed;
@@ -364,6 +392,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                      " staged no resume handles; stopping at confirmed=" +
                                      std::to_string(confirmed));
             }
+            trace_walk("WalkDecides", kNoSub, nullptr, 0);
             clink::metrics::orch::in_doubt_unresolved();
             mark_later_unreceipted(id);
             return confirmed;
@@ -413,6 +442,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                     job_prefix + "receipts/" +
                     clink::connectors::commit_receipt_file_name((*handles)[i].subtask, id))) {
                 handle_committed[i] = true;
+                trace_walk("WalkReadsReceipt", (*handles)[i].participant, nullptr, -1);
                 retire_marker(i);
                 clink::log::info("coordinator.recovery",
                                  "in-doubt resolution: checkpoint " + std::to_string(id) +
@@ -458,6 +488,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
             }
         };
         if (cancelled()) {
+            trace_walk("WalkCancelled", kNoSub, nullptr, -1);
             persist_unresolved_markers();
             clink::metrics::orch::in_doubt_unresolved();
             return confirmed;
@@ -524,6 +555,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                                                       : "not committed") +
                                      " (" + result.detail + ")");
                 if (result.committed) {
+                    trace_walk("WalkProbes", (*handles)[i].participant, "committed", -1);
                     handle_committed[i] = true;
                     // Materialise the receipt this commit never got to write.
                     // A commit proven over the wire has, by construction, no
@@ -582,6 +614,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                     continue;
                 }
                 if (!result.transport_inconclusive) {
+                    trace_walk("WalkProbes", (*handles)[i].participant, "refused", -1);
                     // A FINAL wire refusal supersedes any stale marker: the
                     // sink's pre-fence describe could not out-know the
                     // broker's own verdict, and a marker surviving past it
@@ -606,6 +639,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                 break;
             }
             if (!verdict_failure && transport_hit && attempt + 1 < kTransportAttempts) {
+                trace_walk("WalkRetries", kNoSub, nullptr, -1);
                 clink::log::info("coordinator.recovery",
                                  "in-doubt resolution: checkpoint " + std::to_string(id) +
                                      " has unreachable broker(s); retrying (attempt " +
@@ -615,6 +649,13 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
             }
         }
         if (!all_committed) {
+            if (cancel != nullptr && cancel->load(std::memory_order_acquire)) {
+                trace_walk("WalkCancelled", kNoSub, nullptr, -1);
+            } else if (!verdict_failure) {
+                trace_walk("WalkExhausted", kNoSub, nullptr, -1);  // transport only, retries spent
+            } else {
+                trace_walk("WalkDecides", kNoSub, nullptr, 0);  // a final refusal
+            }
             // The job now falls back to the commit-confirmed contract: a
             // bounded replay rather than data loss. Counted, because that
             // is a DIFFERENT guarantee from the resolved path and nothing
@@ -651,6 +692,7 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
         // confirmation durably, exactly as handle_commit_confirmed_ does,
         // so THIS and every later recovery selects it.
         if (cancelled()) {
+            trace_walk("WalkCancelled", kNoSub, nullptr, -1);
             clink::metrics::orch::in_doubt_unresolved();
             mark_later_unreceipted(id);
             return confirmed;
@@ -665,14 +707,19 @@ std::uint64_t resolve_in_doubt_commits(const std::string& checkpoint_dir,
                                   " committed but the CONFIRMED marker could not be written (" +
                                   std::string(e.what()) +
                                   "); stopping so the restore point never outruns its record");
+            trace_walk("WalkDecides", kNoSub, nullptr, 0);
             mark_later_unreceipted(id);
             return confirmed;
         }
         clink::metrics::orch::in_doubt_resolved();
+        trace_walk("WalkDecides", kNoSub, nullptr, 1);
         clink::log::info("coordinator.recovery",
                          "job_id=" + std::to_string(job_id) + " checkpoint " + std::to_string(id) +
                              " commit-CONFIRMED by in-doubt resolution");
         confirmed = id;
+    }
+    if (protocol_trace::enabled()) {
+        protocol_trace::Event("WalkFinishes").u("job", job_id).emit();
     }
     return confirmed;
 }

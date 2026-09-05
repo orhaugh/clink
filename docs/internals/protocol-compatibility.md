@@ -47,6 +47,7 @@ SQL statements a 1.x release holds stable) is the published
 | Derived record codec (described types) | 1 (layout specified in the header) | 1 | `include/clink/core/derived_codec.hpp`; fixture `derived-codec-v1.bin` |
 | State shape fingerprints | 1 (kind-tag table in `fields.hpp`) | additive: absence gates nothing | `clink.state_fingerprints` metadata key; fixture `state-fingerprints-v1.txt` |
 | Persisted SQL catalog (`--catalog-dir` JSON) | 1 (unversioned, additive-only) | readers ignore unknown keys | `Catalog::to_json` / `from_json`, `src/sql/catalog.cpp`; fixtures `catalog-{table,function,model}-v1.json` |
+| Protocol trace events (`CLINK_PROTOCOL_TRACE_DIR`) | vocabulary in `formal/trace/events.txt`; fields additive-only | a trace module reading an older trace ignores unknown fields; an unknown event name fails validation | `include/clink/cluster/protocol_trace.hpp`; `scripts/check-protocol-trace-events.py` holds code, vocabulary and `formal/trace/TraceExactlyOnce.tla` in agreement |
 
 ## Cluster control protocol
 

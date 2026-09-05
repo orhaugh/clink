@@ -109,6 +109,7 @@ add_executable(clink_core_tests
     test_plugin_cache.cpp
     test_cancel_teardown.cpp
     test_checkpoint_completion.cpp
+    test_protocol_trace.cpp
     test_checkpoint_retention_e2e.cpp
     test_restart_drain_readiness.cpp
     test_error_cancel_convergence.cpp
@@ -308,6 +309,8 @@ target_compile_definitions(clink_core_tests PRIVATE
     CLINK_INTEGRITY_THROW_JOB_PATH=\"$<TARGET_FILE:clink_integrity_throw_job>\"
     CLINK_CLI_BINARY=\"$<TARGET_FILE:clink>\"
     CLINK_SCHEMA_EVO_JOB_PATH=\"$<TARGET_FILE:clink_schema_evo_test_job>\"
+    # The protocol trace test invokes scripts/formal-check.sh --trace when asked.
+    CLINK_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\"
     # Where the committed fuzz corpus lives. The replay test asserts this
     # resolves, because a moved path would leave it reporting green over
     # zero inputs - a regression corpus that quietly stopped running.

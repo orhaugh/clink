@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/cluster/protocol_trace.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/capability.hpp"
 #include "clink/connectors/kafka_message.hpp"
@@ -508,6 +509,13 @@ public:
           inner_(std::move(opts)),
           encoder_(std::move(encoder)) {}
 
+    // The subtask index the protocol trace names this sink by: the job-global
+    // one the coordinator tracks (RuntimeContext's runner identity), else the
+    // per-operator index a bare test constructs it with.
+    std::uint64_t trace_subtask_() const noexcept {
+        return this->runtime() != nullptr ? this->runtime()->runner_subtask_idx() : subtask_idx_;
+    }
+
     void open() override {
         // BEFORE inner_.open(): opening the transactional producer fences
         // the previous incarnation, which aborts an undecided orphan and
@@ -518,6 +526,12 @@ public:
         inner_.open();
         std::lock_guard lk(mu_);
         arm_replay_suppression_();
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("SinkOpens")
+                .u("sub", trace_subtask_())
+                .s("family", "kafka")
+                .emit();
+        }
     }
 
     // The resume handle staged in on_barrier is state the checkpoint must
@@ -613,6 +627,14 @@ public:
         // beats a silently absent handle.
         stage_resume_handle_(b.id().value());
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterPrepare);
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("SinkPrepare")
+                .u("sub", trace_subtask_())
+                .u("ckpt", b.id().value())
+                .s("family", "kafka")
+                .b("staged", true)
+                .emit();
+        }
     }
 
     void on_commit(std::uint64_t checkpoint_id) override {
@@ -622,6 +644,15 @@ public:
         // claim actually gets decided.
         CLINK_FAULT_POINT(clink::fault::points::kSinkBeforeCommit);
         std::lock_guard lk(mu_);
+        const bool accepted =
+            !closed_ && open_txn_ckpt_.has_value() && *open_txn_ckpt_ == checkpoint_id;
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("DeliverCommit")
+                .u("sub", trace_subtask_())
+                .u("ckpt", checkpoint_id)
+                .b("accepted", accepted)
+                .emit();
+        }
         if (closed_) {
             // The producer was destroyed at close(), so this process can no
             // longer execute the commit. The PREPARED transaction survives
@@ -658,8 +689,20 @@ public:
         // transaction, and a restore below this checkpoint replayed panes
         // the broker had already published (the rig-night duplicate).
         inner_.commit_transaction([&] {
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("SinkCommit")
+                    .u("sub", trace_subtask_())
+                    .u("ckpt", checkpoint_id)
+                    .emit();
+            }
             CLINK_FAULT_POINT(clink::fault::points::kSinkBetweenCommitAndReceipt);
             write_commit_receipt_(checkpoint_id, open_txn_wm_);
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("SinkReceipt")
+                    .u("sub", trace_subtask_())
+                    .u("ckpt", checkpoint_id)
+                    .emit();
+            }
         });
         last_committed_ckpt_ = checkpoint_id;
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
@@ -676,7 +719,15 @@ public:
     // Idempotent against same checkpoint id.
     void on_abort(std::uint64_t checkpoint_id) override {
         std::lock_guard lk(mu_);
-        if (!open_txn_ckpt_.has_value() || *open_txn_ckpt_ != checkpoint_id) {
+        const bool accepted = open_txn_ckpt_.has_value() && *open_txn_ckpt_ == checkpoint_id;
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("DeliverAbort")
+                .u("sub", trace_subtask_())
+                .u("ckpt", checkpoint_id)
+                .b("accepted", accepted)
+                .emit();
+        }
+        if (!accepted) {
             return;
         }
         inner_.abort_transaction();  // aborts, then begins the next txn

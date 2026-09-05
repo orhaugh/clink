@@ -1,0 +1,47 @@
+# The protocol trace vocabulary (design record 012, increment 3).
+#
+# `event <Name>` lines are the events the engine may emit
+# (protocol_trace::Event("<Name>") in the source tree); every one must be
+# consumed by formal/trace/TraceExactlyOnce.tla (Is("<Name>")).
+# `unobserved <Action>` lines are specification actions the engine cannot
+# observe and so never emits; the trace module lets TLC take them as hidden
+# steps. Every other action in ExactlyOnce.tla's Next must be reached by
+# some event. scripts/check-protocol-trace-events.py holds the three in
+# agreement.
+#
+# Fields per event (beyond seq, ts, proc): see docs/internals/exactly-once-specification.md.
+event Trigger
+event DeliverBarrier
+event SinkPrepare
+event SubtaskAck
+event CoordComplete
+event WriteCompleted
+event Broadcast
+event DeliverCommit
+event DeliverAbort
+event SinkCommit
+event SinkReceipt
+event SinkConfirm
+event WriteConfirmed
+event WorkerDies
+event SubtaskDrained
+event CoordRecovers
+event RestartProceeds
+event Redeploy
+event WalkSkips
+event WalkReadsReceipt
+event WalkProbes
+event WalkRetries
+event WalkExhausted
+event WalkCancelled
+event WalkDecides
+event WalkFinishes
+event SinkOpens
+event Placement
+unobserved CoordDies
+unobserved CoordSuperseded
+unobserved ZombieStops
+unobserved TxnExpires
+unobserved BrokerGoesDown
+unobserved BrokerComesBack
+unobserved Done

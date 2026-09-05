@@ -79,6 +79,17 @@ using namespace std::chrono_literals;
 // here waits for it.
 inline constexpr auto kDefaultDeadline = 60s;
 
+// Where the spawned nodes write their protocol traces (design record 012):
+// set by the Cluster that owns them, read by Process::spawn, so every
+// multi-process test records the protocol it drove as a matter of course.
+// The traces are validated against formal/ExactlyOnce.tla by
+// `scripts/formal-check.sh --trace`; a test run keeps them when
+// CLINK_PROTOCOL_TRACE_OUT names a directory (see ~Cluster).
+inline std::string& protocol_trace_dir() {
+    static std::string dir;
+    return dir;
+}
+
 // Poll interval for conditions that cannot be waited on directly. Short
 // enough not to add meaningful latency, long enough not to spin a core.
 inline constexpr auto kPollInterval = 10ms;
@@ -247,6 +258,9 @@ public:
         if (!opts.fault.empty()) {
             env_storage.push_back("CLINK_FAULT_INJECT=" + opts.fault);
         }
+        if (!protocol_trace_dir().empty()) {
+            env_storage.push_back("CLINK_PROTOCOL_TRACE_DIR=" + protocol_trace_dir());
+        }
         for (const auto& [k, v] : opts.env) {
             env_storage.push_back(k + "=" + v);
         }
@@ -387,6 +401,8 @@ public:
         if (spec_.ha) {
             std::filesystem::create_directories(ha_dir());
         }
+        std::filesystem::create_directories(trace_dir());
+        protocol_trace_dir() = trace_dir().string();
     }
 
     Cluster(const Cluster&) = delete;
@@ -406,6 +422,25 @@ public:
             }
         }
         ha_coordinators_.clear();
+        protocol_trace_dir().clear();
+        // Keep the protocol trace for the validator (CI's trace-validation job)
+        // or a fixture refresh: one directory per test under
+        // CLINK_PROTOCOL_TRACE_OUT, named like the harness root.
+        if (const char* out = std::getenv("CLINK_PROTOCOL_TRACE_OUT");
+            out != nullptr && *out != '\0') {
+            std::error_code ec;
+            const auto dest = std::filesystem::path(out) / spec_.root.filename();
+            std::filesystem::remove_all(dest, ec);
+            std::filesystem::create_directories(dest, ec);
+            if (std::filesystem::exists(trace_dir(), ec)) {
+                for (const auto& e : std::filesystem::directory_iterator(trace_dir(), ec)) {
+                    std::filesystem::copy_file(e.path(),
+                                               dest / e.path().filename(),
+                                               std::filesystem::copy_options::overwrite_existing,
+                                               ec);
+                }
+            }
+        }
         if (!keep_artifacts_) {
             std::error_code ec;
             std::filesystem::remove_all(spec_.root, ec);
@@ -418,6 +453,7 @@ public:
         return spec_.root / "checkpoints";
     }
     [[nodiscard]] std::filesystem::path ha_dir() const { return spec_.root / "ha"; }
+    [[nodiscard]] std::filesystem::path trace_dir() const { return spec_.root / "protocol-trace"; }
     [[nodiscard]] std::uint16_t coordinator_port() const noexcept { return coordinator_port_; }
     [[nodiscard]] std::uint16_t http_port() const noexcept { return http_port_; }
     [[nodiscard]] Process& worker(std::size_t i) { return *workers_.at(i); }

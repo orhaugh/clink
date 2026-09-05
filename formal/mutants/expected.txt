@@ -4,6 +4,5 @@
 #             accept the mutant; the day it refutes it, the other guard has gone
 # Unlisted mutants are expected refuted. formal/README.md says why each accepted
 # one is accepted.
-M_broadcast_during_drain accepted
 M_close_aborts_prepared accepted
 M_stop_at_first_refusal accepted

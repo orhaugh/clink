@@ -60,6 +60,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/cluster/protocol_trace.hpp"
 #include "clink/core/types.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -113,6 +114,12 @@ public:
     void open() final {
         on_open();
         recover_all_();
+        if (clink::protocol_trace::enabled()) {
+            clink::protocol_trace::Event("SinkOpens")
+                .u("sub", trace_subtask_())
+                .s("family", "recoverable")
+                .emit();
+        }
     }
 
     void on_data(const Batch<In>& batch) final { write(batch); }
@@ -130,6 +137,17 @@ public:
         // immediately and recover_all_() exists.
         CLINK_FAULT_POINT(clink::fault::points::kSinkBeforePrepare);
         auto committable = prepare_commit(ckpt);
+        // The transaction is sealed: the model's SinkPrepare / SinkPrepareFails
+        // fork point. Emitted before the persist so a capture that fails after
+        // the prepare still shows the prepare the failed ack refers to.
+        if (clink::protocol_trace::enabled()) {
+            clink::protocol_trace::Event("SinkPrepare")
+                .u("sub", trace_subtask_())
+                .u("ckpt", ckpt)
+                .s("family", "recoverable")
+                .b("staged", committable.has_value())
+                .emit();
+        }
         if (!committable.has_value())
             return;  // nothing to commit for this checkpoint
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterPrepare);
@@ -232,6 +250,13 @@ private:
     StateBackend* state_backend_() const noexcept {
         return this->runtime() != nullptr ? this->runtime()->state_backend() : nullptr;
     }
+    // The subtask index the protocol trace names this sink by: the job-global
+    // one the coordinator tracks acks and drains under (RuntimeContext's runner
+    // identity), falling back to the per-operator index when no runtime is
+    // attached (a sink driven directly by a test).
+    std::uint64_t trace_subtask_() const noexcept {
+        return this->runtime() != nullptr ? this->runtime()->runner_subtask_idx() : subtask_idx_;
+    }
 
     static std::string blob_of_(const StateBackend::Value& v) {
         return std::string(reinterpret_cast<const char*>(v.data()), v.size());
@@ -243,6 +268,15 @@ private:
             return;
         const auto key = state_key_(checkpoint_id);
         auto stored = state->get_operator_state(this->id(), key);
+        if (clink::protocol_trace::enabled()) {
+            // The dispatch reached this sink: accepted when a prepared handle
+            // for the id is held, otherwise consumed without effect.
+            clink::protocol_trace::Event(is_commit ? "DeliverCommit" : "DeliverAbort")
+                .u("sub", trace_subtask_())
+                .u("ckpt", checkpoint_id)
+                .b("accepted", stored.has_value())
+                .emit();
+        }
         if (!stored.has_value())
             return;  // idempotent: already finalised
         const Committable committable = deserialize(blob_of_(*stored));
@@ -264,6 +298,12 @@ private:
             CLINK_FAULT_POINT(clink::fault::points::kSinkBeforeCommit);
             commit(committable);
             CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
+            if (clink::protocol_trace::enabled()) {
+                clink::protocol_trace::Event("SinkCommit")
+                    .u("sub", trace_subtask_())
+                    .u("ckpt", checkpoint_id)
+                    .emit();
+            }
         } else {
             abort(committable);
         }

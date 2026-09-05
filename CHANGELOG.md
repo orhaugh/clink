@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+**The engine's protocol traces are validated against the exactly-once
+specification.** Design record 012's increments 3 and 4. With
+`CLINK_PROTOCOL_TRACE_DIR` set, every process appends one JSON line per
+protocol event (trigger, barrier delivery, prepare, ack, completion, marker,
+broadcast, commit delivery and execution, receipt, confirmation, worker
+loss, drain, restart, recovery, each in-doubt walk step, sink open, task
+placement) to its own file; off, each site is one relaxed atomic load. The
+vocabulary (`formal/trace/events.txt`) is a contract with the model:
+`scripts/check-protocol-trace-events.py` (CI and pre-commit) fails when an
+emitted event, the manifest and the trace module disagree, or when a
+specification action is neither reached by an event nor listed as
+unobserved. `formal/trace/TraceExactlyOnce.tla` follows a recorded trace
+through `ExactlyOnce.tla`, with the constants read off the trace and the
+unobservable actions allowed as hidden steps within the fault budgets the
+trace implies; `scripts/formal-check.sh --trace` merges a run's files, runs
+TLC and names the first event no allowed step produces. The multi-process
+harness traces every node it spawns and keeps the run under
+`CLINK_PROTOCOL_TRACE_OUT`; the build job uploads what its tests left and a
+`trace-validation` job model-checks each one, while the `formal` job
+validates the recorded set under `formal/traces/`: a checkpointed run of
+the recoverable family and three Kafka runs (a source-worker kill, a kill in
+the receipt window, a coordinator failover), every one a behaviour the
+specification allows. Writing the module against those traces found three
+places where the specification was narrower than the engine, each fixed in
+it: a recovered coordinator's id floor counts participant snapshots on disk
+as well as markers (`SnapshotIds`); the source's worker can die with no sink
+beside it and still restart the job; and the first checkpoint after a
+redeploy is triggered before a sink has reopened, the barrier waiting in its
+input queue. None is an engine defect, and the last one made the model
+stronger: with it TLC refutes the `broadcast_during_drain` mutant on its
+own, in the shape of the campaign run that found the defect, where before it
+was recorded as guarded by a later rule. The TLA+ tools pin moves from
+1.7.4 to 1.8.0 (`formal/tools.env`), the release the pinned CommunityModules
+jar is compiled against; the models and mutants check unchanged under it.
+Documented under
+[Trace validation](https://orhaugh.github.io/clink/internals/exactly-once-specification/#trace-validation).
+
 **The Confluent Schema Registry wire format on the Kafka connector.** A Kafka
 table can now declare `format='avro'`, `'protobuf'` or `'json-schema'` with a
 `schema_registry_url` and read and write registry-framed values (magic byte,
@@ -68,10 +105,12 @@ reads snapshots of mixed vintage. TLC model-checks it on every push
 interleaving of protocol steps and faults within their bounds, and checks
 the liveness property that a run with bounded faults settles with every
 vouched-for position published once. Every defect the qualification
-campaigns found and fixed is a named mutant of the specification: twelve of
-fifteen are refuted by TLC, and the three that are not are recorded as rules
-a later rule now guards as well, so the model is known to see what the rigs
-saw and the rules that are not load-bearing on their own are named. The published
+campaigns found and fixed is a named mutant of the specification: thirteen
+of fifteen are refuted by TLC (twelve when this landed; the trace-validation
+change below made the withheld broadcast's mutant refutable), and the two
+that are not are recorded as rules a later rule now guards as well, so the
+model is known to see what the rigs saw and the rules that are not
+load-bearing on their own are named. The published
 page is [Exactly-once specification](https://orhaugh.github.io/clink/internals/exactly-once-specification/).
 
 **Three exactly-once defects found by the model, fixed before any rig paid

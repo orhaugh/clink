@@ -1,0 +1,6 @@
+{"seq":1,"ts":1788634800751534,"proc":"process:52854","event":"SinkOpens","sub":1,"family":"kafka"}
+{"seq":2,"ts":1788634800758052,"proc":"process:52854","event":"SinkPrepare","sub":1,"ckpt":1,"family":"kafka","staged":true}
+{"seq":3,"ts":1788634801564692,"proc":"process:52854","event":"DeliverCommit","sub":1,"ckpt":1,"accepted":true}
+{"seq":4,"ts":1788634801572301,"proc":"process:52854","event":"SinkCommit","sub":1,"ckpt":1}
+{"seq":5,"ts":1788634801574939,"proc":"process:52854","event":"SinkReceipt","sub":1,"ckpt":1}
+{"seq":6,"ts":1788634801579954,"proc":"process:52854","event":"SinkPrepare","sub":1,"ckpt":2,"family":"kafka","staged":true}

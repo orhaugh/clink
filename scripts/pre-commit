@@ -74,6 +74,14 @@ if ! ./scripts/check-fault-points.sh; then
     exit 1
 fi
 
+echo "pre-commit: checking the protocol trace vocabulary..."
+if ! ./scripts/check-protocol-trace-events.py; then
+    echo ""
+    echo "pre-commit: the protocol trace events in the code, formal/trace/events.txt"
+    echo "and formal/trace/TraceExactlyOnce.tla disagree. See the message above."
+    exit 1
+fi
+
 echo "pre-commit: checking nested test timeouts..."
 if ! ./scripts/check-nested-timeouts.py; then
     echo ""

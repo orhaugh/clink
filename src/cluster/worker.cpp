@@ -26,6 +26,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/plugin_loader.hpp"
+#include "clink/cluster/protocol_trace.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/service_discovery.hpp"
 #include "clink/cluster/type_registry.hpp"
@@ -418,6 +419,7 @@ Worker::Worker(std::string worker_id, std::string data_host)
 
 Worker::Worker(std::string worker_id, std::string data_host, Config cfg)
     : cfg_(cfg), worker_id_(std::move(worker_id)), data_host_(std::move(data_host)) {
+    protocol_trace::set_process_role("worker");
     if (cfg_.heartbeat_interval.count() < 0) {
         throw std::invalid_argument("Worker: heartbeat_interval must not be negative");
     }
@@ -1000,6 +1002,13 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
             cm.checkpoint_id = msg.checkpoint_id;
             cm.role = kGenericSubtaskRole;
             cm.subtask_idx = sub_idx;
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("SinkConfirm")
+                    .u("job", msg.job_id)
+                    .u("sub", sub_idx)
+                    .u("ckpt", msg.checkpoint_id)
+                    .emit();
+            }
             send_frame_(encode_frame(MessageKind::CommitConfirmed, cm));
         }
     }
@@ -1153,7 +1162,29 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
 void Worker::handle_final_checkpoint_assigned_(MessageReader& r) {
     auto msg = decode_final_checkpoint_assigned(r);
     if (!accept_epoch_(msg.coordinator_epoch, "FinalCheckpointAssigned")) {
+        if (protocol_trace::enabled() && msg.final_checkpoint_id != 0) {
+            protocol_trace::Event("DeliverBarrier")
+                .u("job", msg.job_id)
+                .u("ckpt", msg.final_checkpoint_id)
+                .u("epoch", msg.coordinator_epoch)
+                .s("worker", worker_id_)
+                .b("fenced", true)
+                .b("final", true)
+                .emit();
+        }
         return;
+    }
+    // The assigned id is the final barrier: the source injects it at
+    // end-of-stream the moment this reply lands.
+    if (protocol_trace::enabled() && msg.final_checkpoint_id != 0) {
+        protocol_trace::Event("DeliverBarrier")
+            .u("job", msg.job_id)
+            .u("ckpt", msg.final_checkpoint_id)
+            .u("epoch", msg.coordinator_epoch)
+            .s("worker", worker_id_)
+            .b("fenced", false)
+            .b("final", true)
+            .emit();
     }
     const std::string key =
         std::to_string(msg.job_id) + ":" + msg.role + ":" + std::to_string(msg.subtask_idx);
@@ -1462,6 +1493,15 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
     // checkpoint ids from its own counter, so two coordinators writing
     // into one checkpoint dir would produce two different checkpoint 7s.
     if (!accept_epoch_(msg.coordinator_epoch, "TriggerCheckpoint")) {
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("DeliverBarrier")
+                .u("job", msg.job_id)
+                .u("ckpt", msg.checkpoint_id)
+                .u("epoch", msg.coordinator_epoch)
+                .s("worker", worker_id_)
+                .b("fenced", true)
+                .emit();
+        }
         return;
     }
     // Snapshot per-job injectors under the lock; release before
@@ -1533,6 +1573,15 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
             // Best-effort: if a barrier injection fails the coordinator's ack
             // timeout will surface the missed subtask.
         }
+    }
+    if (protocol_trace::enabled()) {
+        protocol_trace::Event("DeliverBarrier")
+            .u("job", msg.job_id)
+            .u("ckpt", msg.checkpoint_id)
+            .u("epoch", msg.coordinator_epoch)
+            .s("worker", worker_id_)
+            .b("fenced", false)
+            .emit();
     }
 }
 
@@ -2022,6 +2071,14 @@ void Worker::run_generic_subtask_(JobId job_id,
             "); extra_config[" + std::to_string(task.extra_config.size()) +
             " bytes] begins: " + task.extra_config.substr(0, 256));
     }
+    if (protocol_trace::enabled()) {
+        protocol_trace::Event("Placement")
+            .u("job", job_id)
+            .u("sub", task.subtask_idx)
+            .s("worker", worker_id_)
+            .b("source", chain.input_edges.empty())
+            .emit();
+    }
     if (chain.ops.empty()) {
         throw std::runtime_error("generic subtask: chain has no ops");
     }
@@ -2367,6 +2424,15 @@ void Worker::run_generic_subtask_(JobId job_id,
                         } catch (...) {
                             // Best-effort.
                         }
+                    }
+                    if (protocol_trace::enabled()) {
+                        protocol_trace::Event("DeliverBarrier")
+                            .u("job", job_id)
+                            .u("ckpt", ckpt_id)
+                            .u("epoch", bound_epoch_.load(std::memory_order_acquire))
+                            .s("worker", worker_id_)
+                            .b("fenced", false)
+                            .emit();
                     }
                 }
             };

@@ -62,7 +62,7 @@ embedded or submits to a cluster, unchanged.
 | Effectively-once upserts | Changelog upsert and delete by `PRIMARY KEY`: Postgres, MySQL, Cassandra, Redis | [Sink committer framework](internals/sink-committer-framework.md) |
 | Source replay | Source-offset recovery generalised across connectors | [Checkpointing](internals/checkpointing.md) |
 | Schema Registry formats | Confluent Schema Registry wire format on Kafka: registry-framed Avro, Protobuf and JSON Schema values decoded to and encoded from JSON rows, schemas auto-registered from the declared columns, poison-message policy | [Schema Registry formats](connectors/schema-registry.md) |
-| Machine-checked protocol | The exactly-once protocol (barrier completion, 2PC sinks, confirmation markers, in-doubt resolution, recovery) is a TLA+ specification model-checked in CI over bounded configurations, with liveness; every campaign-found defect is a mutant TLC must refute. Proves the model, not the code | [Exactly-once specification](internals/exactly-once-specification.md) |
+| Machine-checked protocol | The exactly-once protocol (barrier completion, 2PC sinks, confirmation markers, in-doubt resolution, recovery) is a TLA+ specification model-checked in CI over bounded configurations, with liveness; every campaign-found defect is a mutant TLC must refute. The engine records a protocol trace on request, and every trace the CI tests leave, plus a committed set, is model-checked as a behaviour of the specification. Proves the model, and that the recorded runs are behaviours of it, not the code in general | [Exactly-once specification](internals/exactly-once-specification.md) |
 
 ## Scale and operations
 

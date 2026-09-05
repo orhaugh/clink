@@ -1,0 +1,7 @@
+{"seq":1,"ts":1788634785067630,"proc":"worker:52430","event":"Placement","job":1,"sub":0,"worker":"worker-0","source":true}
+{"seq":2,"ts":1788634785082846,"proc":"worker:52430","event":"DeliverBarrier","job":1,"ckpt":1,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":3,"ts":1788634785235156,"proc":"worker:52430","event":"DeliverBarrier","job":1,"ckpt":2,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":4,"ts":1788634785387319,"proc":"worker:52430","event":"DeliverBarrier","job":1,"ckpt":3,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":5,"ts":1788634785540322,"proc":"worker:52430","event":"DeliverBarrier","job":1,"ckpt":4,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":6,"ts":1788634785695399,"proc":"worker:52430","event":"DeliverBarrier","job":1,"ckpt":5,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":7,"ts":1788634785748512,"proc":"worker:52430","event":"SinkConfirm","job":1,"sub":0,"ckpt":1}

@@ -154,3 +154,6 @@ qualification-results/
 
 # TLC writes its state files beside the model when run by hand (the script uses a temp -metadir)
 /formal/**/states/
+
+# TLC trace-exploration artefacts it drops beside a spec when a check fails
+formal/**/*_TTrace_*

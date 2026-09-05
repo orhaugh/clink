@@ -1,9 +1,10 @@
 # 012: The exactly-once protocol is a machine-checked specification, and the engine's traces are validated against it
 
-Status: accepted; landing in increments. Increments 1 and 2 (the
-specification model-checked in CI, and the mutants) ship with this record,
-together with the three engine defects the first model check found; the
-remaining increments are listed at the end with their state.
+Status: accepted; increments 1 to 4 shipped (the specification model-checked
+in CI, the mutants, the protocol trace, and trace validation on every push),
+increment 5 shipped except its tail (a validated trace from a qualification
+rig beside its campaign page). The increments are listed at the end with
+their state.
 
 ## Context
 
@@ -235,11 +236,28 @@ control frames is the known upgrade if it proves too loose.
 2. **Mutants.** One constant per campaign-found defect and per model
    finding, a check that TLC refutes each, and the mutant table on the
    published page. Shipped with this record.
-3. **Protocol trace.** The emitter, the environment switch, the event
-   manifest and its check script, unit tests, and the inventory row.
-4. **Trace validation.** The trace module, the validator script, trace
-   capture in the integration harness, the CI validation step, and the
-   committed regression traces.
-5. **Publication.** The internals page, the capability catalogue row, the
-   README, the changelog; then a validated rig trace alongside a campaign
-   page.
+3. **Protocol trace.** The emitter (`include/clink/cluster/protocol_trace.hpp`,
+   `CLINK_PROTOCOL_TRACE_DIR`), the event vocabulary
+   (`formal/trace/events.txt`) and its check script
+   (`scripts/check-protocol-trace-events.py`, also in the pre-commit hook),
+   the protocol trace test, and the inventory row. Shipped.
+4. **Trace validation.** The trace module (`formal/trace/TraceExactlyOnce.tla`),
+   `scripts/formal-check.sh --trace`, trace capture in the multi-process
+   harness (every spawned node traces; `CLINK_PROTOCOL_TRACE_OUT` keeps the
+   run), the `trace-validation` CI job over the traces each build's tests
+   leave, and the recorded traces under `formal/traces/` validated by the
+   `formal` job. Shipped. Writing the module against real traces surfaced
+   three places where the specification was narrower than the engine, each
+   fixed in it: a recovered coordinator's id floor counts participant
+   snapshots on disk as well as markers (`SnapshotIds`); the source's worker
+   can die with no sink beside it and still restart the job (`WorkerDies` on
+   `SrcWorker`); and the first checkpoint after a redeploy is triggered
+   before a sink's `open()` returns, the barrier waiting in its input queue
+   (`Trigger` and `DeliverBarrier` admit an `opening` sink). The recorded
+   traces pin all three: a checkpointed run of the recoverable family, and
+   three Kafka runs with a source-worker kill, a kill in the receipt window
+   and a coordinator failover.
+5. **Publication.** The internals page's trace section, the capability
+   catalogue row, the README, the changelog: shipped. Still to land: a
+   validated rig trace alongside a campaign page, which needs a rig run with
+   `CLINK_PROTOCOL_TRACE_DIR` set.

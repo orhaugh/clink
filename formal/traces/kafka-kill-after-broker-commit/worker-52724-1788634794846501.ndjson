@@ -1,0 +1,8 @@
+{"seq":1,"ts":1788634794846609,"proc":"worker:52724","event":"Placement","job":1,"sub":0,"worker":"worker-0","source":true}
+{"seq":2,"ts":1788634794846656,"proc":"worker:52724","event":"Placement","job":1,"sub":1,"worker":"worker-0","source":false}
+{"seq":3,"ts":1788634794922109,"proc":"worker:52724","event":"DeliverBarrier","job":1,"ckpt":1,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":4,"ts":1788634795075402,"proc":"worker:52724","event":"DeliverBarrier","job":1,"ckpt":2,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":5,"ts":1788634795225868,"proc":"worker:52724","event":"DeliverBarrier","job":1,"ckpt":3,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":6,"ts":1788634795377210,"proc":"worker:52724","event":"DeliverBarrier","job":1,"ckpt":4,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":7,"ts":1788634795528385,"proc":"worker:52724","event":"DeliverBarrier","job":1,"ckpt":5,"epoch":0,"worker":"worker-0","fenced":false}
+{"seq":8,"ts":1788634795680157,"proc":"worker:52724","event":"DeliverBarrier","job":1,"ckpt":6,"epoch":0,"worker":"worker-0","fenced":false}

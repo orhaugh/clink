@@ -276,6 +276,11 @@ jobs:
         # benchmark is excluded entirely: throughput/timing asserts are
         # meaningless on a shared runner in a Debug (-O0) build and belong to
         # the perf harness on real hardware.
+        env:
+          # The protocol trace test (and the multi-process harness below)
+          # keep the traces their runs leave here; the trace-validation job
+          # model-checks every one against formal/ExactlyOnce.tla.
+          CLINK_PROTOCOL_TRACE_OUT: ${{ runner.temp }}/protocol-traces
         run: ctest --test-dir build --output-on-failure -j "$(nproc)" --timeout 180 -LE '^(integration|benchmark|sql|soak)$'
       - name: Test (SQL, low parallelism) [blocking gate]
         # The SQL surface, incl. runtime ITs that stand up in-process
@@ -318,6 +323,8 @@ jobs:
         # the older tests unfit to gate.
         #
         # Serial: each test stands up its own coordinator + workers.
+        env:
+          CLINK_PROTOCOL_TRACE_OUT: ${{ runner.temp }}/protocol-traces
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
           -L integration
@@ -337,6 +344,16 @@ jobs:
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1
           -L '^soak$'
+      - name: Upload the protocol traces the tests left
+        # Every trace a test run recorded (the in-process protocol trace test,
+        # every multi-process harness test), for the trace-validation job.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-traces
+          path: ${{ runner.temp }}/protocol-traces/**
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Upload integration artifacts on failure
         # A multi-process failure with no child logs cannot be diagnosed
         # from a CI transcript. The harness keeps its scratch tree (with
@@ -398,7 +415,10 @@ jobs:
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # The models grew by a third when the specification admitted a checkpoint
+    # triggered before a sink reopens; the run takes about an hour on the
+    # four-core runner.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -427,6 +447,44 @@ jobs:
         # rule guards as well and must stay accepted: either drift is a
         # regression in the model or its record, not a pass.
         run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh --mutants
+      - name: The protocol trace vocabulary agrees with the engine and the trace module
+        # Every event the engine emits is in formal/trace/events.txt and
+        # consumed by the trace module; every specification action is either
+        # reached by an event or listed as unobserved.
+        run: ./scripts/check-protocol-trace-events.py
+      - name: Every recorded trace is a behaviour of the specification
+        # formal/traces/ holds traces recorded from real runs (the in-process
+        # cluster, the multi-process harness). The trace module follows each
+        # event in order; a protocol change that makes a recorded behaviour
+        # impossible fails here even where the test that produced it is
+        # Docker-gated.
+        run: TLC_WORKERS=auto TLC_HEAP=4g ./scripts/formal-check.sh --trace formal/traces
+
+  trace-validation:
+    name: Recorded protocol traces are behaviours of the specification
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Cache the pinned TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps/formal-tools
+          key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: protocol-traces
+          path: ${{ runner.temp }}/protocol-traces
+      - name: Validate every trace the build job's tests left
+        # The traces the unit and integration runs recorded (design record
+        # 012, increment 4): each is model-checked against
+        # formal/ExactlyOnce.tla; TLC must consume every event.
+        run: TLC_WORKERS=auto TLC_HEAP=4g ./scripts/formal-check.sh --trace "${RUNNER_TEMP}/protocol-traces"
 
   plugin-abi-surface:
     name: Plugin ABI surface manifest is current

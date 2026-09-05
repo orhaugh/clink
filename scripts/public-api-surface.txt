@@ -334,6 +334,7 @@ include/clink/cluster/operator_registry.hpp
 include/clink/cluster/plugin_cache.hpp
 include/clink/cluster/plugin_loader.hpp
 include/clink/cluster/protocol.hpp
+include/clink/cluster/protocol_trace.hpp
 include/clink/cluster/refresh_scheduler.hpp
 include/clink/cluster/replay_driver_registry.hpp
 include/clink/cluster/rescale_coordinator.hpp
@@ -506,6 +507,7 @@ include/clink/cluster/dag_builder_registry.hpp
 include/clink/cluster/job_planner.hpp
 include/clink/cluster/operator_registry.hpp
 include/clink/cluster/protocol.hpp
+include/clink/cluster/protocol_trace.hpp
 include/clink/cluster/replay_driver_registry.hpp
 include/clink/cluster/rescale_coordinator.hpp
 include/clink/cluster/rescale_dispatch.hpp

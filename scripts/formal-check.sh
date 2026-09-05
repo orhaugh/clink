@@ -5,6 +5,9 @@
 #   scripts/formal-check.sh MC_KafkaSmall   # one model
 #   scripts/formal-check.sh --mutants       # every mutant under formal/mutants/
 #                                           # must be REFUTED by TLC
+#   scripts/formal-check.sh --trace PATH... # validate recorded protocol traces
+#                                           # (files, run directories, or a
+#                                           # directory of runs) against the spec
 #
 # Fetches the TLA+ tools pinned in formal/tools.env (SHA-256 verified, cached
 # in CLINK_FORMAL_TOOLS_DIR) and runs TLC on each configuration. A model is
@@ -69,6 +72,9 @@ MODE=models
 if [ "${1:-}" = "--mutants" ]; then
     MODE=mutants
     shift
+elif [ "${1:-}" = "--trace" ]; then
+    MODE=trace
+    shift
 fi
 
 # The CommunityModules jar is compiled against a newer TLC than the release
@@ -77,6 +83,91 @@ fi
 WITH_CM=""
 if grep -qsE '^EXTENDS.*\b(Json|IOUtils|SequencesExt|FiniteSetsExt)\b' "$ROOT"/formal/*.tla "$ROOT"/formal/*/*.tla 2>/dev/null; then
     WITH_CM=1
+fi
+
+# --trace: validate recorded protocol traces against the specification
+# (design record 012, increment 4). Each argument is a merged .ndjson trace,
+# a directory of per-process trace files (one run), or a directory of such
+# directories (the recorded set under formal/traces, or what a test run
+# left behind). The trace module follows the events in order; TLC either
+# consumes the whole trace or deadlocks at the first event no allowed step
+# produces, and that event is reported.
+if [ "$MODE" = trace ]; then
+    [ $# -gt 0 ] || { echo "formal-check: --trace needs a trace file or directory" >&2; exit 2; }
+    WORK="$(mktemp -d "${TMPDIR:-/tmp}/clink-formal.XXXXXX")"
+    trap 'rm -rf "$WORK"' EXIT
+    runs=()
+    for arg in "$@"; do
+        if [ -f "$arg" ]; then
+            runs+=("$arg")
+        elif [ -d "$arg" ]; then
+            if compgen -G "$arg/*.ndjson" >/dev/null; then
+                runs+=("$arg")
+            else
+                for sub in "$arg"/*/; do
+                    [ -d "$sub" ] && compgen -G "$sub/*.ndjson" >/dev/null && runs+=("${sub%/}")
+                done
+            fi
+        else
+            echo "formal-check: no such trace: $arg" >&2
+            exit 2
+        fi
+    done
+    [ ${#runs[@]} -gt 0 ] || { echo "formal-check: no traces found under: $*" >&2; exit 2; }
+    failed=()
+    n=0
+    for run in "${runs[@]}"; do
+        n=$((n + 1))
+        name="$(basename "$run" .ndjson)"
+        merged="$WORK/trace-$n.ndjson"
+        if ! python3 "$ROOT/scripts/protocol-trace-merge.py" --out "$merged" "$run" 2>"$WORK/merge-$n.log"; then
+            echo "formal-check: trace $name: $(cat "$WORK/merge-$n.log")"
+            failed+=("$name")
+            continue
+        fi
+        events=$(wc -l <"$merged" | tr -d ' ')
+        echo "formal-check: TLC trace/$name ($events events)"
+        start=$(date +%s)
+        set +e
+        # From the work directory: whatever TLC drops beside a failing run
+        # (trace-exploration files) lands there, not in the tree.
+        # One worker: the trace module keeps its progress in a TLC register,
+        # and the state graph is a few hundred states, so parallelism buys
+        # nothing here. Deadlock checking is off (a hidden-step branch that
+        # dies out is not a verdict); the postcondition TraceAccepted is.
+        (cd "$WORK" && CLINK_TRACE_FILE="$merged" java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-2g}" \
+            "-DTLA-Library=$ROOT/formal" -cp "$TLA_JAR:$CM_JAR" tlc2.TLC \
+            -workers 1 -noGenerateSpecTE -metadir "$WORK/trace-$n.states" \
+            -config "$ROOT/formal/trace/TraceExactlyOnce.cfg" ${TLC_EXTRA:-} \
+            "$ROOT/formal/trace/TraceExactlyOnce.tla") >"$WORK/trace-$n.log" 2>&1
+        rc=$?
+        set -e
+        secs=$(( $(date +%s) - start ))
+        if [ $rc -eq 0 ]; then
+            echo "formal-check:   accepted in ${secs}s: every event is a step the specification allows"
+        elif grep -q '"divergence"' "$WORK/trace-$n.log"; then
+            # The postcondition printed <<"divergence", index, event>>, which
+            # TLC pretty-prints one element per line: the index is on the
+            # line after the marker.
+            at="$(grep -A1 '"divergence"' "$WORK/trace-$n.log" | sed -n '2p' | tr -dc '0-9' || true)"
+            line="$( { [ -n "$at" ] && sed -n "${at}p" "$merged"; } || true)"
+            echo "formal-check:   DIVERGES after ${secs}s at event ${at:-?}: ${line:-(unknown)}"
+            echo "formal-check:   no step of the specification produces this event from any state the trace reached; TLC log: $WORK/trace-$n.log"
+            failed+=("$name")
+            trap - EXIT  # keep the work dir for the log named above
+        else
+            echo "formal-check:   ERROR (TLC exit $rc) after ${secs}s"
+            sed -n '1,200p' "$WORK/trace-$n.log"
+            failed+=("$name")
+            trap - EXIT
+        fi
+    done
+    if [ ${#failed[@]} -ne 0 ]; then
+        echo "formal-check: FAILED: ${failed[*]}" >&2
+        exit 1
+    fi
+    echo "formal-check: all ${#runs[@]} trace(s) accepted"
+    exit 0
 fi
 
 DIR="$ROOT/formal/$MODE"
@@ -104,10 +195,10 @@ for cfg in "${CFGS[@]}"; do
     # -DTLA-Library lets the model modules under formal/models find
     # ExactlyOnce.tla one directory up. Deadlock checking stays ON: a state
     # with no enabled step that is not the run's quiescent end is a wedge.
-    java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-2g}" "-DTLA-Library=$ROOT/formal" \
+    (cd "$WORK" && java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-2g}" "-DTLA-Library=$ROOT/formal" \
         -cp "$TLA_JAR${WITH_CM:+:$CM_JAR}" tlc2.TLC \
-        -workers "${TLC_WORKERS:-auto}" -metadir "$WORK/$name.states" \
-        -config "$cfg" ${TLC_EXTRA:-} "$tla" >"$log" 2>&1
+        -workers "${TLC_WORKERS:-auto}" -noGenerateSpecTE -metadir "$WORK/$name.states" \
+        -config "$cfg" ${TLC_EXTRA:-} "$tla") >"$log" 2>&1
     rc=$?
     set -e
     secs=$(( $(date +%s) - start ))

@@ -168,7 +168,11 @@ The protocol those campaigns exercise is also written down as a TLA+
 specification and model-checked on every push, with every defect the
 campaigns ever found kept as a mutant the checker must refute. The model
 found three further interleavings the campaigns had not, fixed before any
-rig paid for them. It proves the model, not the code: [Exactly-once
+rig paid for them. The engine also records a protocol trace on request, and
+every trace the test suite leaves is model-checked against the
+specification on each push, so the code's recorded behaviour and the model
+are held in agreement rather than assumed to be. It proves the model and the
+recorded runs, not the code in general: [Exactly-once
 specification](https://orhaugh.github.io/clink/internals/exactly-once-specification/).
 
 ## Status and maturity

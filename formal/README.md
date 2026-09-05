@@ -16,6 +16,8 @@ proves and what it does not. This file is the working guide.
 scripts/formal-check.sh                    # every model under formal/models/
 scripts/formal-check.sh MC_KafkaSmall      # one model
 scripts/formal-check.sh --mutants          # every mutant under formal/mutants/
+scripts/formal-check.sh --trace traces/    # every recorded protocol trace
+scripts/formal-check.sh --trace /tmp/run   # a run's per-process trace files
 ```
 
 The script needs a Java 11+ runtime and nothing else. It fetches the TLA+
@@ -40,8 +42,13 @@ while TLC still accepts it.
 | `ExactlyOnce.tla` | The specification: state, actions, faults, invariants, liveness |
 | `models/MC_*.tla`, `models/MC_*.cfg` | The configurations CI checks (constants, invariants, properties) |
 | `mutants/M_*.tla`, `mutants/M_*.cfg`, `mutants/expected.txt` | One configuration per `Bug` value, and what TLC must say about each |
+| `trace/TraceExactlyOnce.tla`, `trace/TraceExactlyOnce.cfg` | The trace module: the specification constrained to a recorded run |
+| `trace/events.txt` | The protocol trace vocabulary the engine emits and the module consumes |
+| `traces/<run>/*.ndjson` | Recorded runs, validated on every push |
 | `tools.env` | The pinned TLA+ tools and their checksums |
 | `../scripts/formal-check.sh` | Fetch, verify, run, judge |
+| `../scripts/protocol-trace-merge.py` | Merge a run's per-process files into one ordered trace |
+| `../scripts/check-protocol-trace-events.py` | Code, vocabulary and module agree |
 
 ## The model in brief
 
@@ -123,7 +130,7 @@ each and judges the outcome against `mutants/expected.txt`.
 
 | Mutant | Rule it disables | Found by | Result |
 |---|---|---|---|
-| `broadcast_during_drain` | The commit broadcast is withheld while the job drains for a restart | qual01-20260818a | accepted: receipts and in-doubt resolution repair a partial commit; the withheld broadcast is defence in depth |
+| `broadcast_during_drain` | The commit broadcast is withheld while the job drains for a restart | qual01-20260818a | refuted: NoDuplicate (accepted as guarded until the specification admitted a checkpoint triggered before a sink reopens; the counterexample is the campaign's shape) |
 | `close_aborts_prepared` | A cancelled sink preserves its barrier-sealed prepared transaction | qual01-20260818a | accepted: the walk refuses an aborted transaction and the replay re-emits its interval, receipts suppressing the committed siblings; preserving it saves a replay, not correctness |
 | `no_receipts` | The sink writes a durable commit receipt the instant the broker acknowledges | qual01-20260818b | refuted: NoDuplicate |
 | `stop_at_first_refusal` | The walk probes every handle of a checkpoint even after a refusal | qual01-20260819f | accepted: the marker rule now marks the unprobed handles too, and the sink describes them before fencing |
@@ -142,9 +149,11 @@ each and judges the outcome against `mutants/expected.txt`.
 A mutant TLC accepts is recorded in `mutants/expected.txt`, not deleted: it
 means a later rule guards the same defect (defence in depth), and the check
 then holds that record in both directions: the day TLC refutes an
-`accepted` mutant, the other guard has gone and the record is wrong. Three of
-the fifteen are accepted today, all three superseded by receipts, in-doubt
-resolution and the marker rule the refusal-wall finding added. The
+`accepted` mutant, the other guard has gone and the record is wrong. Two of
+the fifteen are accepted today, both superseded by receipts, in-doubt
+resolution and the marker rule the refusal-wall finding added; the withheld
+broadcast left that set when trace validation widened the specification,
+and the check would have failed had it stayed recorded as accepted. The
 `no_fencing` mutant is judged by the correctness invariants alone (its
 configuration drops the `Fenced` ghost, which would merely restate the
 mutant); TLC refutes it by deadlock, which is how the model renders the
@@ -180,6 +189,31 @@ mutant above:
    re-committed its handles at open. Fix: memory advances with the durable
    write.
 
+## Trace validation
+
+The engine records its protocol steps when `CLINK_PROTOCOL_TRACE_DIR` names
+a directory: one NDJSON file per process, one event per line
+(`include/clink/cluster/protocol_trace.hpp`). `TraceExactlyOnce.tla`
+extends the specification with a variable `l`, the index of the next event,
+and a next-state relation that takes the specification step each event
+names with the parameters the engine observed, lets the unobservable
+actions (`CoordDies`, `TxnExpires`, the broker going away) happen as hidden
+steps within the budgets the trace implies, and treats events about
+subtasks that are not two-phase sinks as stutters. The constants come off
+the trace (`TraceSinks`, `TraceHost`, `TraceMaxCkpt`, ...), substituted in
+`trace/TraceExactlyOnce.cfg`. Some path consuming the whole trace means the
+run is a behaviour of the specification (the postcondition `TraceAccepted`
+reads the furthest event index any path reached; deadlock checking is off,
+since a hidden-step branch the run did not need dies out harmlessly); a
+shorter reach names the first event no allowed step produced, and
+`formal-check.sh --trace` prints it.
+
+To record a run: set the variable, run the job (the in-process protocol
+trace test and every multi-process harness test do this themselves when
+`CLINK_PROTOCOL_TRACE_OUT` is set), then validate the directory. To add a
+recorded run to the push gate, copy its files to `traces/<name>/` and
+validate that directory.
+
 ## Conventions
 
 - Every action names the engine site it abstracts, in its comment. A rule
@@ -191,7 +225,12 @@ mutant above:
   published page.
 - Mutant modules are generated by hand from a model configuration with the
   `Bug` constant changed; keep their bounds as small as still refutes them.
-- The CommunityModules jar is pinned for the trace validator (design record
-  012, increment 4). It is compiled against a newer TLC than the release jar
-  and shadows classes in it, so the script puts it on the classpath only for
-  modules that import a community module.
+- The CommunityModules jar is pinned for the trace validator. It is compiled
+  against a newer TLC than the release jar and shadows classes in it, so the
+  script puts it on the classpath only for the trace module, which imports
+  `Json` and `IOUtils`.
+- A new emission site in the engine names an event in `trace/events.txt`
+  and a step in `trace/TraceExactlyOnce.tla`; a new action in `Next` is
+  either reached by an event or listed as unobserved.
+  `scripts/check-protocol-trace-events.py` (CI and the pre-commit hook)
+  fails when the three disagree.

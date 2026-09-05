@@ -37,9 +37,14 @@ the rigs saw. Neither proves the code.
 | `formal/models/` | The configurations CI checks, one `.tla` and `.cfg` pair each |
 | `formal/mutants/` | One configuration per defect, and `expected.txt` saying what TLC must find for each |
 | `formal/tools.env` | The pinned TLA+ tools and their SHA-256 checksums |
-| `scripts/formal-check.sh` | Fetches and verifies the tools, runs TLC, judges models and mutants |
-| `.github/workflows/ci.yml`, job `formal` | Runs both forms on every push and pull request |
-| `formal/README.md` | The working guide: running, adding a model, adding a mutant |
+| `formal/trace/TraceExactlyOnce.tla`, `.cfg` | The trace module: follows a recorded protocol trace through the specification |
+| `formal/trace/events.txt` | The trace vocabulary, a contract between the engine and the module |
+| `formal/traces/` | Traces recorded from real runs, validated on every push |
+| `include/clink/cluster/protocol_trace.hpp` | The emitter: `CLINK_PROTOCOL_TRACE_DIR` turns it on |
+| `scripts/formal-check.sh` | Fetches and verifies the tools, runs TLC, judges models, mutants and traces (`--trace`) |
+| `scripts/protocol-trace-merge.py`, `scripts/check-protocol-trace-events.py` | Merges per-process trace files; holds code, vocabulary and module in agreement |
+| `.github/workflows/ci.yml`, jobs `formal` and `trace-validation` | Models, mutants and the recorded traces on every push; the traces each test run leaves, after the build |
+| `formal/README.md` | The working guide: running, adding a model, adding a mutant, recording a trace |
 
 ## How it works
 
@@ -109,14 +114,133 @@ is fenced.
 
 | Model | Family | Bounds | Result |
 |---|---|---|---|
-| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 17.3M distinct states, depth 78, all invariants hold, no deadlock |
-| `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 35,677 distinct states, depth 67, all invariants hold |
-| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 10.3M distinct states, depth 55, all invariants hold |
-| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 3.1M distinct states |
+| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 23.3M distinct states, depth 78, all invariants hold, no deadlock |
+| `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 42,059 distinct states, depth 67, all invariants hold |
+| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 12.6M distinct states, depth 55, all invariants hold |
+| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 4.5M distinct states |
 
 Within its bounds each run is exhaustive: TLC visits every reachable state.
 The bounds are small so that the push gate finishes in minutes; a larger
 run is a deliberate act, not the gate.
+
+## Trace validation
+
+The model proves the model. Trace validation is the check that the code
+behaves as the model says, on real runs: the engine records the protocol
+steps it takes, and TLC follows that record through the specification.
+
+### The protocol trace
+
+Set `CLINK_PROTOCOL_TRACE_DIR` to a directory and every process
+(coordinator, worker, or both in an in-process cluster) appends one JSON
+object per protocol event to its own file there,
+`<role>-<pid>-<start>.ndjson`. A job plugin loaded into a worker carries its
+own copy of the runtime, so a sink inside one writes a second file for the
+same process (`process-<pid>-...`); the validator merges them. Off, each
+site costs one relaxed atomic load, the way fault points do. A line looks
+like this:
+
+```json
+{"seq":12,"ts":1725555555123456,"proc":"coordinator:4242","event":"Trigger","job":1,"ckpt":3,"epoch":1}
+```
+
+`seq` is per process and monotonic, `ts` is microseconds since the Unix
+epoch on that process's clock, and the rest is the event's own. The
+vocabulary is `formal/trace/events.txt`; each event is one step of the
+specification, or a stutter the trace module recognises.
+
+| Event | Emitted by | Fields | Specification step |
+|---|---|---|---|
+| `Trigger` | coordinator, trigger loop | `job`, `ckpt`, `epoch` | `Trigger` (or `ZombieTrigger` from a superseded coordinator) |
+| `DeliverBarrier` | worker, on `TriggerCheckpoint` | `job`, `ckpt`, `epoch`, `worker`, `fenced` | `DeliverBarrier` |
+| `SinkPrepare` | the two-phase sink, transaction sealed | `sub`, `ckpt`, `family`, `staged` | `SinkPrepare` or `SinkPrepareFails`; the ack decides which |
+| `SubtaskAck` | coordinator, on `SubtaskCheckpointed` | `job`, `sub`, `ckpt`, `ok` | `SinkAck` (a non-sink subtask's ack is a stutter) |
+| `CoordComplete` | coordinator, last ack in | `job`, `ckpt`, `outcome` = `completed`, `failed`, `discarded` | `CoordComplete` |
+| `WriteCompleted` | coordinator, marker fsync done | `job`, `ckpt` | `WriteCompleted` |
+| `Broadcast` | coordinator | `job`, `ckpt`, `withheld` | `Broadcast` |
+| `DeliverCommit`, `DeliverAbort` | the sink, on dispatch | `sub`, `ckpt`, `accepted` | `DeliverCommit`, `DeliverAbort` |
+| `SinkCommit` | the sink, external commit executed | `sub`, `ckpt` | `SinkCommit` |
+| `SinkReceipt` | the Kafka sink, receipt durable | `sub`, `ckpt` | `SinkReceipt` |
+| `SinkConfirm` | worker, `CommitConfirmed` sent | `job`, `sub`, `ckpt` | `SinkConfirm` (Kafka family; a stutter otherwise) |
+| `WriteConfirmed` | coordinator, `CONFIRMED` marker written | `job`, `ckpt` | `WriteConfirmed` |
+| `WorkerDies` | coordinator, loss detected | `job`, `worker` | `WorkerDies` |
+| `SubtaskDrained` | coordinator, survivor drained | `job`, `sub` | `SinkDrains` (non-sinks stutter) |
+| `CoordRecovers` | the new leader, per recovered job | `job`, `epoch`, `completed`, `confirmed` | `CoordRecovers` (its `CoordDies` is a hidden step) |
+| `RestartProceeds` | coordinator, restart held for resolution | `job`, `resolving`, `completed`, `confirmed` | `RestartProceeds` into `resolving` |
+| `Redeploy` | coordinator, deploying | `job`, `restore`, `next` | `RestartProceeds` (from the drain) or `Redeploy` (after resolution) |
+| `WalkSkips`, `WalkReadsReceipt`, `WalkProbes`, `WalkRetries`, `WalkExhausted`, `WalkCancelled`, `WalkDecides`, `WalkFinishes` | the in-doubt walk | `job`, `ckpt`, and `sub`, `verdict`, `confirmed` where they apply | the walk's steps, one each |
+| `SinkOpens` | the sink, `open()` done | `sub`, `family` | `SinkOpens` after a redeploy; the first open is the initial state |
+| `Placement` | worker, task deployed | `job`, `sub`, `worker`, `source` | none: tells the module which worker hosts what |
+
+Everything the engine cannot observe is not in the vocabulary: a
+coordinator dying, a superseded coordinator stopping, the broker expiring
+or losing a transaction. The trace module lets TLC take those as hidden
+steps between events, within the fault budgets the trace itself implies
+(one coordinator death per `CoordRecovers`, one expiry per refused probe,
+and so on).
+
+### Validating a trace
+
+```bash
+scripts/formal-check.sh --trace /path/to/run          # a run's per-process files
+scripts/formal-check.sh --trace formal/traces         # every recorded run
+```
+
+The script merges a run's files in timestamp order (causally related
+events from different processes are a network round trip apart, so on one
+machine the clock orders them; a cluster spread over hosts needs the
+reordering window the design record states), keeps one job, and runs TLC on
+`TraceExactlyOnce.tla` with the trace module constraining the
+specification's next-state relation to the recorded events in order. The
+constants are read off the trace: the sinks are the subtasks that prepared
+a transaction, the workers and the source's worker come from `Placement`,
+the checkpoint bound from the highest id seen, the family from the sinks.
+The run is accepted when some path through the specification consumes every
+event (hidden steps make the state graph a small tree, and a branch that took
+a hidden step the run did not need dies out without being a verdict); TLC's
+postcondition reads the furthest event any path reached, and when that is
+short of the end the script names the first event no allowed step produced.
+
+Two kinds of trace are validated on every push. `formal/traces/` holds
+runs recorded from the tests and committed, so a protocol change that makes
+a recorded behaviour impossible fails the `formal` job even where the test
+that produced it is Docker-gated. And the build job keeps every trace its
+own test run leaves (the in-process protocol trace test, every
+multi-process harness test) and the `trace-validation` job model-checks
+them all, so the engine's behaviour under the faults the integration suite
+injects is checked against the model on each commit, not only when a
+fixture is refreshed.
+
+### What a divergence means
+
+A divergence at event `k` says: from every state the first `k - 1` events
+could have reached, the specification has no step that produces event `k`. Either the
+engine took a step the protocol does not allow, which is a defect in the
+engine, or the model abstracts something the engine legitimately does,
+which is a gap in the model. Both are findings; the second is fixed in
+`ExactlyOnce.tla` and the mutants keep it honest.
+
+Known gaps, stated so a divergence there is read correctly: the model's
+`Host` is fixed, so a sink that moves to another worker on redeploy is
+outside it (the source may move; only sinks are pinned); the model has one
+source, so a second source subtask's barrier is a stutter; a checkpoint
+failed by a subtask that is not a two-phase sink has no sink failure for
+the model to see; a commit broadcast withheld because the job was cancelled
+is not modelled; and a `Placement` must precede a sink's first event, so a
+trace started mid-run is not validated. The in-process happy path and the
+multi-process fault tests stay inside those bounds.
+
+Writing the module against real traces found three places where the model
+was narrower than the engine, each fixed in the specification: a recovered
+coordinator's id floor counts participant snapshots on disk as well as
+markers (`SnapshotIds`); the source's worker can die with no sink beside it
+and still restart the job (`WorkerDies` on `SrcWorker`); and the first
+checkpoint after a redeploy is triggered as soon as the job is deployed,
+before a sink's `open()` has returned, the barrier waiting in the sink's
+input queue (`Trigger` and `DeliverBarrier` admit a sink that is `opening`).
+None is an engine defect; each is a behaviour the engine has always had
+that the model had not admitted, and the recorded traces under
+`formal/traces/` now pin all three.
 
 ## The mutants
 
@@ -132,7 +256,7 @@ against the bug it guards is decorative.
 
 | Mutant | Rule it disables | Found by | Refuted |
 |---|---|---|---|
-| `broadcast_during_drain` | The commit broadcast is withheld while the job drains for a restart | qual01-20260818a | no: guarded by receipts and in-doubt resolution |
+| `broadcast_during_drain` | The commit broadcast is withheld while the job drains for a restart | qual01-20260818a | yes, `NoDuplicate` (since the specification admits a checkpoint triggered before a sink reopens; recorded as guarded before that) |
 | `close_aborts_prepared` | A cancelled sink preserves its barrier-sealed prepared transaction | qual01-20260818a | no: guarded by the walk's refusal, the replay and receipts |
 | `no_receipts` | The sink writes a durable commit receipt the instant the broker acknowledges | qual01-20260818b | yes, `NoDuplicate` |
 | `stop_at_first_refusal` | The walk probes every handle of a checkpoint even after a refusal | qual01-20260819f | no: guarded by the marker rule the refusal-wall fix added |
@@ -148,16 +272,21 @@ against the bug it guards is decorative.
 | `complete_above_failed` | A checkpoint above a FAILED one is discarded during the rewind | this model | yes, `NoLoss` |
 | `restore_from_memory` | The in-memory restore point advances with the durable marker, not before | this model | yes, `FrontierCovered` |
 
-Twelve of the fifteen are refuted. The three that are not are recorded in
+Thirteen of the fifteen are refuted. The two that are not are recorded in
 `formal/mutants/expected.txt` rather than deleted, and the check holds that
 record in both directions: each of them disables a rule that a later rule
-now guards as well. The withheld broadcast and the preserved prepared
-transaction predate commit receipts and in-doubt resolution, which repair
-the partial commit either would produce; probe-all predates the marker rule
-the refusal-wall finding added, which marks the unprobed handles for the
-sink's pre-fence describe. Each remains in the engine as defence in depth,
-and the day TLC refutes one of them the check fails, because the other
-guard has gone. The `no_fencing` mutant is judged by the correctness
+now guards as well. The preserved prepared transaction predates commit
+receipts and in-doubt resolution, which repair the partial commit its
+absence would produce; probe-all predates the marker rule the refusal-wall
+finding added, which marks the unprobed handles for the sink's pre-fence
+describe. Each remains in the engine as defence in depth, and the day TLC
+refutes one of them the check fails, because the other guard has gone. The
+withheld broadcast was recorded the same way until trace validation widened
+the specification: once a checkpoint may be triggered before a sink has
+reopened, a barrier can wait in a sink's queue across a drain, complete
+during the resolution that follows, and, broadcast then, publish an
+interval the restore below re-emits. That is the shape of
+qual01-20260818a, and the model now refutes it on its own. The `no_fencing` mutant is judged by the correctness
 invariants alone, its configuration dropping the `Fenced` ghost that would
 merely restate it; TLC refutes it by deadlock, which is how the model
 renders the engine's bounded wait and restart when a stale barrier seals a
@@ -219,18 +348,23 @@ In the honesty categories the qualification pages use:
   reachable interleaving of the modelled protocol steps and faults satisfies
   the invariants, the run never deadlocks, and (in the liveness
   configuration) every run with bounded faults settles with every
-  vouched-for position published exactly once. Twelve of the fifteen mutants
-  produce a counterexample; the three that do not are recorded as guarded by
-  a later rule, and the check fails the day that stops being true.
+  vouched-for position published exactly once. Thirteen of the fifteen
+  mutants produce a counterexample; the two that do not are recorded as
+  guarded by a later rule, and the check fails the day that stops being
+  true.
 - **Tested but bounded:** the bounds. Two sinks, three checkpoints, one or
   two in flight, one fault of each kind. A defect that needs three sinks,
   four checkpoints or two coordinator deaths in one run is outside what the
   push gate has enumerated.
-- **Architecturally supported but not qualified:** trace validation, the
-  check that the engine's recorded behaviour under a real run is a
-  behaviour of the model (design record 012, increments 3 and 4), is not yet
-  wired. Until it is, the model and the code agree by review, and by the
-  pinned tests each finding left behind.
+- **Demonstrated, per run:** the recorded traces under `formal/traces/`
+  and the traces every CI test run leaves are behaviours of the model
+  (design record 012, increments 3 and 4). That is evidence about the runs
+  recorded, at the model's abstraction, under the reordering assumption
+  above; it is not a proof about runs not recorded.
+- **Architecturally supported but not qualified:** a validated trace from
+  a qualification rig alongside its campaign page (increment 5's tail). The
+  rigs run the same binaries and the same switch turns tracing on; none has
+  yet been run with it.
 - **Unknown, by construction:** everything below the abstraction. Records
   and their values; watermarks and the exactness of replay suppression's
   horizon cut; source partition ownership (the QUAL-01 run C defect lived

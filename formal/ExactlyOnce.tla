@@ -190,6 +190,11 @@ DownSink == [up |-> FALSE, openTxn |-> None, ackDue |-> None, ackOk |-> TRUE,
 \* snapshot. A recovered job numbers new checkpoints above all of them
 \* (latest_snapshot_id_on_disk and the marker readers in coordinator.cpp).
 DurableIds == completedDisk \cup confirmedDisk
+
+\* Ids with a participant snapshot on disk, whether or not they completed:
+\* an interval whose capture began leaves its directory behind, and the
+\* engine's id floor counts those too (latest_snapshot_id_on_disk).
+SnapshotIds == {c \in Ckpts : srcCut[c] # 0 \/ \E s \in Sinks : sinkCut[s][c] # 0}
               \cup {c \in Ckpts : srcCut[c] # 0}
               \cup {c \in Ckpts : \E s \in Sinks : sinkCut[s][c] # 0}
 
@@ -237,7 +242,11 @@ Init ==
 \* sender's epoch.
 Trigger ==
     /\ coordUp /\ phase = "running"
-    /\ \A s \in Sinks : sink[s].up      \* the trigger loop visits only fully deployed jobs
+    \* The trigger loop visits a job once it is deployed; a sink still inside
+    \* open() takes the barrier from its input queue afterwards (a trace
+    \* validation run showed the first checkpoint after a redeploy triggered
+    \* before the sink had reopened).
+    /\ \A s \in Sinks : sink[s].up \/ sink[s].opening
     /\ nextCkpt <= MaxCkpt
     /\ Cardinality(inFlight) < MaxInFlight
     /\ LET c == nextCkpt IN
@@ -278,8 +287,9 @@ DeliverBarrier ==
                    /\ srcPos' = srcPos + 1
                    /\ srcCut' = [srcCut EXCEPT ![c] = srcPos + 1]
                    /\ cutOf' = [cutOf EXCEPT ![c] = srcPos + 1]
-                   /\ barriers' = [s \in Sinks |-> IF sink[s].up THEN barriers[s] \cup {c}
-                                                                 ELSE barriers[s]]
+                   /\ barriers' = [s \in Sinks |-> IF sink[s].up \/ sink[s].opening
+                                                  THEN barriers[s] \cup {c}
+                                                  ELSE barriers[s]]
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, sinkCut,
                     sinkHandles, receipts, unresolvedMk, txn, brokerUp, sinkGen, sink,
                     pendingHandles, boundEpoch, frontier, restorePoint, published,
@@ -585,7 +595,10 @@ WriteConfirmed ==
 \* into it.
 WorkerDies(w) ==
     /\ workerDeaths < MaxWorkerDeaths
-    /\ \E s \in Sinks : Host[s] = w /\ sink[s].up
+    \* The worker hosts something of the job: a live sink, or the source (a
+    \* trace validation run showed the source's worker dying with no sink
+    \* beside it, which restarts the job just the same).
+    /\ w = SrcWorker \/ \E s \in Sinks : Host[s] = w /\ sink[s].up
     /\ LET dead == {s \in Sinks : Host[s] = w} IN
        /\ sink' = [s \in Sinks |-> IF s \in dead THEN DownSink ELSE sink[s]]
        /\ pendingHandles' = [s \in Sinks |-> IF s \in dead THEN {} ELSE pendingHandles[s]]
@@ -863,7 +876,8 @@ WalkFinishes ==
 \* restore point is the newest confirmed checkpoint for the commit-confirmed
 \* family and the newest completed one otherwise; the source rewinds to its
 \* cut. A recovered coordinator numbers new checkpoints above every id with a
-\* durable record, never merely above the restore point (qual01-20260817c
+\* durable record - a marker or a participant snapshot - never merely above the
+\* restore point (qual01-20260817c
 \* reused 246; 20260819g assembled one id from two vintages). The ghost
 \* restoreSound records whether the participant snapshots the restore reads
 \* agree on the cut.
@@ -881,7 +895,7 @@ RedeployEffects ==
                 (r = None \/ \A s \in Sinks : sinkCut[s][r] = 0 \/ sinkCut[s][r] = srcCut[r]))
           /\ nextCkpt' = IF ~freshLeader THEN nextCkpt
                          ELSE IF Bug = "id_reuse" THEN r + 1
-                         ELSE Max(DurableIds \cup {r}) + 1
+                         ELSE Max(DurableIds \cup SnapshotIds \cup {r}) + 1
     /\ phase' = "running" /\ freshLeader' = FALSE /\ rewindFloor' = None
     /\ inFlight' = {} /\ completeDue' = None /\ toBroadcast' = None /\ markerDue' = None
     /\ ackedOk' = [c \in Ckpts |-> {}] /\ ackedFail' = [c \in Ckpts |-> {}]

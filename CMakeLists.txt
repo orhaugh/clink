@@ -505,6 +505,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/cluster/restore_compat_gate.cpp
     src/cluster/coordinator.cpp
     src/cluster/in_doubt_resolution.cpp
+    src/cluster/protocol_trace.cpp
     src/cluster/worker.cpp
     src/cluster/worker_supervisor.cpp
     src/cluster/service_discovery.cpp

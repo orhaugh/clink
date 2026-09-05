@@ -28,6 +28,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/plugin_loader.hpp"
+#include "clink/cluster/protocol_trace.hpp"
 #include "clink/cluster/rescale_dispatch.hpp"
 #include "clink/cluster/restore_compat_gate.hpp"
 #include "clink/fault/fault_injection.hpp"
@@ -674,7 +675,28 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         {
             const bool needs_confirmation =
                 body.find("\"requires_commit_confirmation\":true") != std::string::npos;
+            const std::uint64_t completed_on_disk =
+                ckpt.checkpoint_dir.empty()
+                    ? 0
+                    : latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("CoordRecovers")
+                    .u("job", job_id)
+                    .u("epoch", epoch())
+                    .u("completed", completed_on_disk)
+                    .u("confirmed", ckpt.restore_from_checkpoint_id)
+                    .emit();
+            }
             if (needs_confirmation && !ckpt.checkpoint_dir.empty()) {
+                if (protocol_trace::enabled() &&
+                    completed_on_disk > ckpt.restore_from_checkpoint_id) {
+                    protocol_trace::Event("RestartProceeds")
+                        .u("job", job_id)
+                        .b("resolving", true)
+                        .u("completed", completed_on_disk)
+                        .u("confirmed", ckpt.restore_from_checkpoint_id)
+                        .emit();
+                }
                 const auto resolved = resolve_in_doubt_commits(
                     ckpt.checkpoint_dir,
                     job_id,
@@ -716,6 +738,22 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                 std::lock_guard lock(mu_);
                 if (next_job_id_ <= job_id)
                     next_job_id_ = job_id;
+            }
+            if (protocol_trace::enabled()) {
+                // The id floor submit_job applies: above every durable record.
+                std::uint64_t floor = ckpt.restore_from_checkpoint_id;
+                if (!ckpt.checkpoint_dir.empty()) {
+                    floor =
+                        std::max(floor, latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id));
+                    floor =
+                        std::max(floor, latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id));
+                    floor = std::max(floor, latest_snapshot_id_on_disk(ckpt.checkpoint_dir));
+                }
+                protocol_trace::Event("Redeploy")
+                    .u("job", job_id)
+                    .u("restore", ckpt.restore_from_checkpoint_id)
+                    .u("next", floor + 1)
+                    .emit();
             }
             (void)submit_job(graph,
                              OperatorRegistry::default_instance(),
@@ -827,6 +865,14 @@ bool Coordinator::stage_in_doubt_resolution_locked_(JobState& job) {
         return false;
     }
     job.resolving_in_doubt = true;
+    if (protocol_trace::enabled()) {
+        protocol_trace::Event("RestartProceeds")
+            .u("job", job.id)
+            .b("resolving", true)
+            .u("completed", job.latest_completed_checkpoint_id)
+            .u("confirmed", job.latest_confirmed_checkpoint_id)
+            .emit();
+    }
     job.in_doubt_cancel = std::make_shared<std::atomic<bool>>(false);
     job.in_doubt_cancel_requested = false;
     // A fresh hold is a fresh episode for the capacity clock: the deadline
@@ -979,6 +1025,7 @@ Coordinator::~Coordinator() {
 }
 
 std::uint16_t Coordinator::start(std::uint16_t port) {
+    protocol_trace::set_process_role("coordinator");
     listener_fd_ = network::NetworkSocket::listen_on(port, cfg_.bind_host);
     if (listener_fd_ < 0) {
         throw std::runtime_error("Coordinator::start: listen failed");
@@ -4882,6 +4929,9 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
     if (it == job.pending_per_worker.end()) {
         return;
     }
+    if (protocol_trace::enabled()) {
+        protocol_trace::Event("WorkerDies").u("job", job.id).s("worker", worker_id).emit();
+    }
     // Deliberately NOT also returning when the list is EMPTY. A worker can be lost
     // with nothing in flight for this job - every subtask of its already reported
     // finished - and the job must still roll back to the last checkpoint, because
@@ -4975,6 +5025,28 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
                 const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
                 if (in_flight.count(k) == 0) {
                     job.restart_pending.emplace_back(dt.role, dt.subtask_idx);
+                }
+            }
+        }
+        if (protocol_trace::enabled()) {
+            // A survivor that already finished (its input closed with the dead
+            // worker before the loss was detected) owes no drain: the protocol
+            // counts it drained here, so the trace says so before the restart.
+            for (const auto& [other_worker_id, dts] : job.tasks_by_worker) {
+                if (other_worker_id == worker_id) {
+                    continue;
+                }
+                auto other_it = registered_.find(other_worker_id);
+                if (other_it == registered_.end() || other_it->second->lost) {
+                    continue;
+                }
+                for (const auto& dt : dts) {
+                    if (in_flight.count(dt.role + ":" + std::to_string(dt.subtask_idx)) == 0) {
+                        protocol_trace::Event("SubtaskDrained")
+                            .u("job", job.id)
+                            .u("sub", dt.subtask_idx)
+                            .emit();
+                    }
                 }
             }
         }
@@ -5765,6 +5837,13 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
             deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
             deploy_msg.restore_from_checkpoint_id = own_restore_id;
         }
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("Redeploy")
+                .u("job", job.id)
+                .u("restore", deploy_msg.restore_from_checkpoint_id)
+                .u("next", job.next_checkpoint_id)
+                .emit();
+        }
         log::info("coordinator.restart",
                   "job_id=" + std::to_string(job.id) + " restore point: checkpoint " +
                       std::to_string(deploy_msg.restore_from_checkpoint_id) +
@@ -6179,6 +6258,12 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                 metrics::coordinator::slots_in_use_delta(-1);
             }
             job.restart_drained_keys.insert(key);
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("SubtaskDrained")
+                    .u("job", job.id)
+                    .u("sub", msg.subtask_idx)
+                    .emit();
+            }
             // Every expected-to-drain surviving subtask has now reported
             // → time to redeploy.
             if (restart_drain_covered_(job) && !stage_in_doubt_resolution_locked_(job)) {
@@ -6732,6 +6817,14 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
                     // (COMPLETED-<id> + CommitCheckpoint broadcast) once all ack.
                     final_id = job.next_checkpoint_id++;
                     job.final_checkpoint_id = final_id;
+                    if (protocol_trace::enabled()) {
+                        protocol_trace::Event("Trigger")
+                            .u("job", job.id)
+                            .u("ckpt", final_id)
+                            .u("epoch", epoch())
+                            .b("final", true)
+                            .emit();
+                    }
                     std::unordered_set<std::string> pending;
                     for (const auto& [tkey, _] : job.task_records) {
                         pending.insert(tkey);
@@ -6823,6 +6916,12 @@ void Coordinator::handle_commit_confirmed_(MessageReader& r) {
                 ->put("_jobs/" + std::to_string(jid) + "/CONFIRMED-" + std::to_string(confirmed_id),
                       "job=" + std::to_string(jid) +
                           "\ncheckpoint=" + std::to_string(confirmed_id) + "\n");
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("WriteConfirmed")
+                    .u("job", jid)
+                    .u("ckpt", confirmed_id)
+                    .emit();
+            }
         } catch (const std::exception& e) {
             clink::log::error("coordinator.checkpoint",
                               "could not durably record commit confirmation of checkpoint " +
@@ -6868,6 +6967,16 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
             const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
             if (in_flight.count(k) == 0) {
                 job.restart_pending.emplace_back(dt.role, dt.subtask_idx);
+                // Already finished: counted as drained (see the worker-loss path).
+                if (protocol_trace::enabled()) {
+                    auto wit = registered_.find(other_worker);
+                    if (wit != registered_.end() && !wit->second->lost) {
+                        protocol_trace::Event("SubtaskDrained")
+                            .u("job", job.id)
+                            .u("sub", dt.subtask_idx)
+                            .emit();
+                    }
+                }
             }
         }
     }
@@ -6906,6 +7015,14 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
 
 void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     auto msg = decode_subtask_checkpointed(r);
+    if (protocol_trace::enabled()) {
+        protocol_trace::Event("SubtaskAck")
+            .u("job", msg.job_id)
+            .u("sub", msg.subtask_idx)
+            .u("ckpt", msg.checkpoint_id)
+            .b("ok", msg.ok)
+            .emit();
+    }
     // What a completed checkpoint CONSISTS OF, not just that it happened: the
     // generation whose directories hold it, and the subtask indices that acked it.
     // Recorded in the marker so a checkpoint can be verified across subtasks
@@ -7096,6 +7213,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 job.commit_group_progress.erase(msg.checkpoint_id);
                 job.pending_checkpoint_acks.erase(msg.checkpoint_id);
                 checkpoint_failed = true;
+                if (protocol_trace::enabled()) {
+                    protocol_trace::Event("CoordComplete")
+                        .u("job", msg.job_id)
+                        .u("ckpt", msg.checkpoint_id)
+                        .s("outcome", "failed")
+                        .emit();
+                }
                 // The abort above discards every sink's staged interval for
                 // this checkpoint - a barrier-sealed transaction holds the
                 // records of (K-1, K], and once aborted nothing re-emits
@@ -7198,6 +7322,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                                         job.rewind_floor_checkpoint_id != 0 &&
                                         msg.checkpoint_id > job.rewind_floor_checkpoint_id;
         if (above_rewind_floor) {
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("CoordComplete")
+                    .u("job", msg.job_id)
+                    .u("ckpt", msg.checkpoint_id)
+                    .s("outcome", "discarded")
+                    .emit();
+            }
             log::warn("coordinator.checkpoint",
                       "checkpoint " + std::to_string(msg.checkpoint_id) + " of job " +
                           std::to_string(msg.job_id) + " completed above FAILED checkpoint " +
@@ -7214,6 +7345,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             job.pending_checkpoint_acks.erase(ckpt_it);
         }
         if (all_subtasks_answered && !checkpoint_failed && !above_rewind_floor) {
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("CoordComplete")
+                    .u("job", msg.job_id)
+                    .u("ckpt", msg.checkpoint_id)
+                    .s("outcome", "completed")
+                    .emit();
+            }
             job.failed_checkpoint_acks.erase(msg.checkpoint_id);
             // A completed checkpoint is the proof the failure cause was
             // transient: the 77b circuit-breaker counts only CONSECUTIVE
@@ -7469,6 +7607,9 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 continue;
             }
             CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAfterCompletedMarker);
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("WriteCompleted").u("job", jid).u("ckpt", ckpt_id).emit();
+            }
         }
         // The checkpoint is durable (or the job keeps no directory, so memory
         // is all there is): advance the restore point now, and only now.
@@ -7498,6 +7639,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         // or skip uncommitted ones (loss). The restart's held in-doubt
         // resolution finalises it as one decision instead.
         if (suppress_commit) {
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("Broadcast")
+                    .u("job", jid)
+                    .u("ckpt", ckpt_id)
+                    .b("withheld", true)
+                    .emit();
+            }
             log::info("coordinator.checkpoint",
                       "job_id=" + std::to_string(jid) + " checkpoint " + std::to_string(ckpt_id) +
                           " completed during a restart drain; commit broadcast withheld for "
@@ -7526,6 +7674,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 // no held resolution behind it: a partial commit there is
                 // permanent.
                 if (job_it->second->awaiting_restart || job_it->second->cancel_requested) {
+                    if (protocol_trace::enabled()) {
+                        protocol_trace::Event("Broadcast")
+                            .u("job", jid)
+                            .u("ckpt", ckpt_id)
+                            .b("withheld", true)
+                            .emit();
+                    }
                     log::info("coordinator.checkpoint",
                               "job_id=" + std::to_string(jid) + " checkpoint " +
                                   std::to_string(ckpt_id) +
@@ -7575,6 +7730,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 cc.pinned_checkpoint_ids.assign(job_it->second->pinned_checkpoint_ids.begin(),
                                                 job_it->second->pinned_checkpoint_ids.end());
             }
+        }
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("Broadcast")
+                .u("job", jid)
+                .u("ckpt", ckpt_id)
+                .b("withheld", false)
+                .emit();
         }
         const auto frame = fenced_frame_(MessageKind::CommitCheckpoint, cc);
         for (const auto& c : worker_conns)
@@ -7679,6 +7841,13 @@ void Coordinator::checkpoint_trigger_loop_() {
                 }
                 job.last_checkpoint_trigger_at = now;
                 const auto next_id = job.next_checkpoint_id++;
+                if (protocol_trace::enabled()) {
+                    protocol_trace::Event("Trigger")
+                        .u("job", job.id)
+                        .u("ckpt", next_id)
+                        .u("epoch", epoch())
+                        .emit();
+                }
                 std::unordered_set<std::string> pending;
                 for (const auto& [key, _] : job.task_records) {
                     pending.insert(key);
