@@ -43,7 +43,9 @@ apt-get update && apt-get install -y --no-install-recommends \
     libgrpc-dev \
     protobuf-compiler-grpc \
     libprotobuf-dev \
+    libprotoc-dev \
     protobuf-compiler \
+    libfmt-dev \
     libcpprest-dev
 
 # Kafka mock-broker tests rely on rdkafka_mock.h, which ships with
@@ -106,6 +108,37 @@ if [ ! -f "/usr/local/lib/cmake/mongocxx-${MONGO_CXX_DRIVER_VERSION}/mongocxxCon
         -DENABLE_TESTS=OFF -DBUILD_SHARED_AND_STATIC_LIBS=OFF
     cmake --build "${_mongo_tmp}/build-cxx" --target install -j "${_mongo_jobs}"
     rm -rf "${_mongo_tmp}"
+    ldconfig
+fi
+
+# -- Apache Avro C++ (avro codec impl + registry-framed Avro on the Kafka connector) --
+# Not in Debian apt, so build the pinned release tarball from source into /usr/local,
+# checksum-verified (versions.env). 1.12 needs no Boost; fmt (libfmt-dev, apt block above)
+# is header-only at build time and zlib is already in the system layer. Tests and the
+# avrogencpp executable are skipped: clink links the library only. The release tarball
+# omits cmake/avro-cpp-config.cmake.in, which its CMakeLists configures unconditionally,
+# so that one file is fetched from the release tag and verified the same way (the
+# Homebrew formula carries the identical workaround). libprotoc-dev above is what lets
+# impls/schema_registry parse .proto text for the registry-framed Protobuf format.
+if [ ! -f /usr/local/include/avro/Specific.hh ]; then
+    echo "▶ Building avro-cpp ${AVRO_CPP_VERSION} from source..."
+    _avro_jobs="${CLINK_BUILD_JOBS:-$(nproc)}"
+    _avro_tmp="$(mktemp -d)"
+    curl -fsSL "https://archive.apache.org/dist/avro/avro-${AVRO_CPP_VERSION}/cpp/avro-cpp-${AVRO_CPP_VERSION}.tar.gz" \
+        -o "${_avro_tmp}/avro-cpp.tar.gz"
+    echo "${AVRO_CPP_SHA256}  ${_avro_tmp}/avro-cpp.tar.gz" | sha256sum -c -
+    mkdir -p "${_avro_tmp}/src"
+    tar xzf "${_avro_tmp}/avro-cpp.tar.gz" -C "${_avro_tmp}/src" --strip-components=1
+    mkdir -p "${_avro_tmp}/src/cmake"
+    curl -fsSL "https://github.com/apache/avro/raw/refs/tags/release-${AVRO_CPP_VERSION}/lang/c++/cmake/avro-cpp-config.cmake.in" \
+        -o "${_avro_tmp}/src/cmake/avro-cpp-config.cmake.in"
+    echo "${AVRO_CPP_CONFIG_IN_SHA256}  ${_avro_tmp}/src/cmake/avro-cpp-config.cmake.in" | sha256sum -c -
+    cmake -S "${_avro_tmp}/src" -B "${_avro_tmp}/build" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DAVRO_BUILD_TESTS=OFF -DAVRO_BUILD_EXECUTABLES=OFF \
+        -DAVRO_BUILD_SHARED=ON -DAVRO_BUILD_STATIC=OFF
+    cmake --build "${_avro_tmp}/build" --target install -j "${_avro_jobs}"
+    rm -rf "${_avro_tmp}"
     ldconfig
 fi
 
