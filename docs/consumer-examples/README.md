@@ -7,7 +7,7 @@ its dependencies.
 
 ## Prerequisites
 
-1. clink installed on the system. See the [top-level README](../../README.md)
+1. clink installed on the system. See the [top-level README](https://github.com/orhaugh/clink#installing)
    for build/install instructions. The short version:
    ```bash
    cmake -S /path/to/clink -B build -DCMAKE_INSTALL_PREFIX=/usr/local
@@ -53,7 +53,7 @@ cmake --build build --target 08_cluster_job_plugin --parallel 10
 | 01 | [`01_hello_pipeline.cpp`](01_hello_pipeline.cpp) | The bare-minimum DAG: `VectorSource` → `MapOperator` → `FilterOperator` → `FunctionSink`. `LocalExecutor::run()` blocks until the source is drained. |
 | 02 | [`02_event_time_tumbling.cpp`](02_event_time_tumbling.cpp) | Keyed event-time tumbling windows. `KeyByOperator` partitions by user, `TumblingWindowOperator` aggregates per (key, window). Source emits `Watermark::max()` at end-of-stream, flushing all windows. |
 | 03 | [`03_sliding_window_aggregate.cpp`](03_sliding_window_aggregate.cpp) | Sliding event-time windows. Same shape as #02 but the operator emits each window once per slide; each event contributes to `size/slide` overlapping windows. |
-| 04 | [`04_keyed_process_state.cpp`](04_keyed_process_state.cpp) | `KeyedProcessFunction` + per-key persistent state via `RuntimeContext::keyed_state()`, wired into the `Dag` through `make_keyed_process_operator` (the public path from a process function to an operator). Backed by `InMemoryStateBackend` here; swap to `RocksDbStateBackend` (linked via `clink::rocksdb`) for durability. |
+| 04 | [`04_keyed_process_state.cpp`](04_keyed_process_state.cpp) | `KeyedProcessFunction` + per-key persistent state via `RuntimeContext::keyed_state()`, wired into the `Dag` through `make_keyed_process_operator` (the public path from a process function to an operator). Backed by `InMemoryStateBackend` here; swap to `RocksDBStateBackend` (linked via `clink::rocksdb`) for durability. |
 | 05 | [`05_interval_join.cpp`](05_interval_join.cpp) | Two-stream interval join on a shared key with an event-time window `[lower, upper]`. Default is inner join; pass a `Dag::JoinType::LeftOuter` (and friends) for outer joins with watermark-driven emission of unmatched rows. |
 | 06 | [`06_file_io.cpp`](06_file_io.cpp) | `FileSource<string>` + `FileSink<string>` against a `TextFormat<T>` codec. Word-count over newline-delimited input, written as TSV. |
 | 07 | [`07_parquet_io.cpp`](07_parquet_io.cpp) | `ParquetSink<T>` + `ParquetSource<T>` over the shared `ArrowBatcher<T>` seam. The resulting file is a vanilla Parquet stream - open it from pyarrow / duckdb / polars to confirm. |
@@ -96,14 +96,15 @@ Threads (no connector SDKs), shipping `clink::core`, `clink::clink` and
 
 ## Where to go next
 
-* [`include/clink/api/pipeline.hpp`](../../include/clink/api/pipeline.hpp)
-  - the higher-level fluent builder used by #08. Comparable to `DataStream` API.
-* [`include/clink/runtime/dag.hpp`](../../include/clink/runtime/dag.hpp)
-  - the lower-level DAG used by #01-#07. Comparable to `StreamGraph`. The fluent env lowers to this.
+* [`include/clink/api/pipeline.hpp`](https://github.com/orhaugh/clink/blob/main/include/clink/api/pipeline.hpp)
+  - the higher-level fluent builder used by #08: `Pipeline`, `DataStream<T>`,
+  `KeyedDataStream<T>`.
+* [`include/clink/runtime/dag.hpp`](https://github.com/orhaugh/clink/blob/main/include/clink/runtime/dag.hpp)
+  - the lower-level operator DAG used by #01-#07. The fluent pipeline lowers to this.
 * [`docs/internals/architecture.md`](../internals/architecture.md) - engine concepts in
   more depth (watermarks, checkpoints, state, alignment, …).
-* [`examples/`](../../examples/) - additional in-tree examples that are
+* [`examples/`](https://github.com/orhaugh/clink/tree/main/examples) - additional in-tree examples that are
   built and run as part of the upstream test suite.
-* [`state_as_data/`](state_as_data/) - a CLI + Python workflow (not a C++ build
+* [`state_as_data/`](state_as_data/README.md) - a CLI + Python workflow (not a C++ build
   target): export a running job's keyed state as Parquet / Iceberg and query it
   with DuckDB / pyarrow. Shows clink's open state format end to end.

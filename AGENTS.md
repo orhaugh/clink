@@ -56,7 +56,7 @@ the source it cites. Keep these pages current when a subsystem changes.
 | SQL frontend (parse -> bind -> plan -> ops) | `include/clink/sql/`, `src/sql/` | `docs/internals/sql-frontend.md` |
 | Embedded execution (`clink run <file>.sql`, EmbeddedEngine) | `include/clink/embed/`, `src/embed/`, `include/clink/sql/script_runner.hpp`, `tools/clink_run_sql.cpp` | `docs/internals/embedded.md` |
 | Data lineage (capture + pluggable export) | `include/clink/lineage/`, `src/lineage/` | `docs/internals/data-lineage.md` |
-| Connectors (sources/sinks/backends) | `impls/<name>/` (WebSocket: RFC 6455 in-tree under `impls/websocket/`, no client lib) | `docs/connectors/<name>.md` |
+| Connectors (sources/sinks/backends) | `impls/<name>/` (WebSocket: RFC 6455 in-tree under `impls/websocket/`, no client lib); the Delta Lake sink is part of the SQL frontend (`include/clink/sql/delta_row_sink.hpp`, `include/clink/connectors/delta_log.hpp`, registered in `src/sql/install.cpp`) | `docs/connectors/<name>.md` |
 | Schema Registry wire format + value formats (Avro, Protobuf, JSON Schema on Kafka) | `impls/schema_registry/` (client, framing, formats; linked by `impls/kafka/`) | `docs/connectors/schema-registry.md` |
 | Testing framework (public, for library consumers) | `include/clink/test/` | `docs/internals/testing-framework.md` |
 | Agent-facing diagnostics (MCP server over the CLI and HTTP diagnostic surface) | `python/clink-mcp/` (`clink_mcp/server.py`, tests), `examples/agent-diagnosis/` | `docs/guides/diagnosing-a-pipeline-with-an-agent.md` |

@@ -120,7 +120,7 @@ the details.
 **Embedded.** `clink run pipeline.sql` runs the whole engine in one
 process: SQL frontend, operators, state backends, checkpointing,
 connectors. First result in about 155 ms from process start, a figure
-gated by a release test so it cannot silently regress. The same engine
+gated by a Release-build test so it cannot silently regress. The same engine
 embeds behind a pure-C ABI ([libclink](https://orhaugh.github.io/clink/internals/embedded/)),
 from Python ([pyclink](python/README.md)), and over
 [Arrow Flight SQL](https://orhaugh.github.io/clink/internals/embedded/)
@@ -134,10 +134,14 @@ savepoints. A [Helm chart and Kubernetes operator](deploy/helm/clink)
 ship in-tree.
 
 ```bash
-clink_node --role=coordinator --rpc-port=6123 &
+clink_node --role=coordinator --port=6123 --http-port=8081 &
 clink_node --role=worker --coordinator-host=127.0.0.1 --coordinator-port=6123 &
 clink run pipeline.sql --coordinator-host=127.0.0.1 --coordinator-port=8081
 ```
+
+Workers join the coordinator on its RPC port; a SQL submission goes to its
+HTTP port, and a compiled job plugin submits over RPC
+(`clink run --job=pipeline.so --coordinator-host=127.0.0.1 --coordinator-port=6123`).
 
 Typed C++ pipelines (the fluent `Pipeline` / `DataStream<T>` API, keyed
 process functions, windows, joins, CEP) are documented with runnable
@@ -206,7 +210,7 @@ Settled, each under a design record and held by gates in CI:
   freezes the manifest.
 - **Stable extension model.** A compiled job or plugin loads on any engine
   build whose declared extension surface matches. The contract is a tracked
-  177-header manifest plus the build options, pinned Arrow version and
+  header manifest plus the build options, pinned Arrow version and
   toolchain identity that shape its layout; a refusal names the differing
   headers, an incompatible submit is refused before any bytes ship, and
   out-of-tree modules build with the packaged `clink_add_job_module()`
@@ -247,7 +251,7 @@ Everything below is published at
   and SQL-native ML.
 - [Connectors](https://orhaugh.github.io/clink/connectors/): twenty-plus
   sources and sinks (Kafka, Postgres incl. CDC, ClickHouse, S3/GCS/Azure
-  Parquet, Iceberg, MQTT, NATS, Pulsar, RabbitMQ, Redis, MongoDB,
+  Parquet, Iceberg, Delta Lake, MQTT, NATS, Pulsar, RabbitMQ, Redis, MongoDB,
   Cassandra, HTTP, Avro, WebSocket and more), each with dependencies,
   options and delivery semantics; Kafka speaks the Confluent Schema Registry
   wire format (Avro, Protobuf, JSON Schema).

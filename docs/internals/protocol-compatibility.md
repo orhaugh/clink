@@ -77,7 +77,7 @@ may differ as long as each side can speak something the other accepts.
   coordinator's version.
 - **Tests:** `tests/test_protocol_versioning.cpp` (both refusal directions
   end to end, pre-versioning decode, refusal legibility);
-  `fuzz/cluster_frame` with its committed-reproducer replay;
+  `fuzz/fuzz_cluster_frame.cpp` with its committed-reproducer replay;
   `tests/fixtures/register-msg-v1.bin` pins the handshake bytes.
 
 ## Data plane (operator-to-operator wire frames)
@@ -98,7 +98,7 @@ and never talks to a peer of unknown vintage.
   self-describing Arrow IPC validated with `ValidateFull` before use, and
   the receiver checks the embedded schema against its registered batcher.
 - **Tests:** `tests/test_network_channel.cpp` (oversized frames),
-  `fuzz/data_frame` with the decode-reencode round-trip property.
+  `fuzz/fuzz_data_frame.cpp` with the decode-reencode round-trip property.
 
 ## Checkpoint metadata sidecar
 
@@ -115,7 +115,7 @@ COMPLETED marker that makes a checkpoint eligible for restore.
 - **Failure ordering:** verification runs before restore and before any
   sink is told to commit; an unverifiable checkpoint cannot cause an
   external side effect.
-- **Tests:** `tests/test_checkpoint_integrity.cpp`, `fuzz/checkpoint_meta`,
+- **Tests:** `tests/test_checkpoint_integrity.cpp`, `fuzz/fuzz_checkpoint_meta.cpp`,
   `tests/fixtures/checkpoint-meta-v1.txt`.
 
 ## State snapshots and savepoints

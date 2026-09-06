@@ -50,7 +50,7 @@ names the subtasks that could not snapshot.
    permissions. A checkpoint completes only when every subtask acks, so one stuck
    subtask stalls the whole job.
 2. **A subtask is wedged, not failing.** No FAILED line at all, just silence. The
-   barrier has not reached it. Check `clink_operator_input_queue_depth` for a
+   barrier has not reached it. Check `clink_op_input_depth` for a
    backpressured operator upstream of the quiet one.
 
    One cause of this used to be invisible: a source whose barrier could not be sent
@@ -96,15 +96,18 @@ a storage-layer problem and check whether two processes share a state directory.
 p99 checkpoint duration above 20s. A warning, not an outage: checkpoints are
 completing, just slowly.
 
-**Look at:** `clink_state_snapshot_bytes` alongside the duration. If bytes are
-growing steadily, this is state growth, not a storage problem.
+**Look at:** the size of each completed checkpoint alongside the duration: the
+checkpoint directory on disk (`du -sh <checkpoint_dir>/<id>` over the last few
+ids), or `clink_disagg_checkpoint_object_bytes` on a disaggregated backend.
+There is no per-snapshot bytes metric. If the size is growing steadily, this is
+state growth, not a storage problem.
 
 **Likely causes:**
 
 1. **Unbounded keyed state.** A GROUP BY or a window with no TTL accumulates
    indefinitely. The SQL planner refuses the clearest cases at submission, but a
    hand-built DAG can still do it. Set a state TTL.
-2. **Slow durable storage.** Compare against `clink_state_snapshot_bytes / duration`
+2. **Slow durable storage.** Divide the checkpoint size by `clink_ckpt_duration_ms`
    for an effective write rate and check it against the device.
 3. **Checkpoint interval too short for the state size.** If a snapshot takes 20s and
    the interval is 10s, checkpoints queue behind each other and the p99 climbs
@@ -216,6 +219,10 @@ today.
 ## ClinkWorkerControlDisconnected
 
 `clink_worker_control_connected == 0`
+
+This alert is not in the shipped rule set (`deploy/prometheus/clink-alerts.yaml`);
+define it from the expression above if you want it. The metrics it reads are
+exported by every worker.
 
 The worker process is alive but has no admitted coordinator session. Its health
 endpoint returns 503 while it drains the old session, discovers a leader, or waits

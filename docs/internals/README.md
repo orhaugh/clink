@@ -8,7 +8,7 @@ code.
 
 For source and sink connectors (Kafka, S3, Postgres, and the rest), see the
 [connector reference](../connectors/README.md). For runnable API examples, see
-[consumer-examples](../consumer-examples/).
+[consumer-examples](../consumer-examples/README.md).
 
 Start with [Architecture and component stack](architecture.md) for the big picture,
 then follow the links into each subsystem.

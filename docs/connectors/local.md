@@ -37,6 +37,10 @@ No client library and no `CLINK_WITH_*` knob: the `file` connector needs nothing
 | `parquet_row_sink` | sink | row | typed-columnar |
 | `parquet_row_2pc_sink` | sink | row | exactly-once typed-columnar |
 
+In `clink --capabilities` these appear under four connector identities: `file`,
+`file_2pc`, `parquet` and `parquet_2pc` (the 2PC records carry the
+exactly-once declaration; the plain ones are at-least-once).
+
 ## Configuration
 
 Options are read from `BuildContext` params in `src/cluster/built_in_factories.cpp` (the `file`/`parquet` source/sink factories) and `src/sql/install.cpp` (the row-channel factories). On the SQL path they are the `WITH (...)` properties.

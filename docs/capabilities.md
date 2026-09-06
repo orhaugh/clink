@@ -22,7 +22,7 @@ carries its caveat in the row.
 | Capability | Notes | Reference |
 | --- | --- | --- |
 | Event time and watermarks | Assigner strategies: monotonic, bounded out-of-orderness | [Time and windowing](internals/time-and-windowing.md) |
-| Windows | Tumbling, sliding, session; custom triggers (tumbling/sliding), `allowed_lateness`, late output tags. No evictors | [Time and windowing](internals/time-and-windowing.md) |
+| Windows | Tumbling, sliding, session and evicting tumbling windows; custom triggers (tumbling/sliding), `CountEvictor`/`TimeEvictor` on the evicting operator, `allowed_lateness`, late output tags. Evictors are not available on the aggregate window operators | [Time and windowing](internals/time-and-windowing.md) |
 | Interval join | Keyed stream-stream join, all 8 join types, watermark-driven eviction, late-arrival policy | [Time and windowing](internals/time-and-windowing.md) |
 | Complex event processing | NFA-based `Pattern` DSL: linear patterns, greedy quantifiers, strict/relaxed contiguity; reachable from SQL `MATCH_RECOGNIZE` | [Time and windowing](internals/time-and-windowing.md) |
 
@@ -94,11 +94,11 @@ embedded or submits to a cluster, unchanged.
 
 | Capability | Notes | Reference |
 | --- | --- | --- |
-| Embedded engine | `clink run pipeline.sql`: one process, no daemons; first result in ~155 ms (gated by a release test) | [Embedded execution](internals/embedded.md) |
+| Embedded engine | `clink run pipeline.sql`: one process, no daemons; first result in ~155 ms (gated by a Release-build test) | [Embedded execution](internals/embedded.md) |
 | C ABI | `libclink` embeds the engine behind a pure-C ABI with Arrow C stream results | [Embedded execution](internals/embedded.md) |
 | Python | `pyclink` returns results as pyarrow tables | [Embedded execution](internals/embedded.md) |
 | Arrow wire format | Every operator-to-operator data frame is an Arrow IPC stream; columnar schemas for built-in types, binary fallback for user types | [Network stack](internals/network-stack.md) |
-| Testing framework | Public `clink::test` harnesses: state inspection, snapshot/restore, failure injection, `MiniCluster` | [Testing framework](internals/testing-framework.md) |
+| Testing framework | Public `clink::test` harnesses: state inspection, snapshot/restore, failure injection, `TestCluster` | [Testing framework](internals/testing-framework.md) |
 | Declared types | One `CLINK_FIELDS` declaration per C++ type derives the byte codec (frozen layout, fixture-pinned), the Arrow schema and columnar batcher, registration defaults (channel name = type name), and a shape fingerprint that refuses a restore whose field list changed with no declared version bump | [Declared types](internals/derived-types.md) |
 | API compatibility | Every installed header, C symbol and SQL statement carries a 1.x tier: Stable (source-compatible for the line, held by a tracked header manifest, an append-only C symbol manifest, compile-only conformance units and a frozen SQL corpus), Evolving (changes with notice), or Internal | [Compatibility](compatibility.md), [design record 011](design/011-public-api-tiers.md) |
 | Extension compatibility | A compiled job/plugin binary loads on any engine build whose declared extension surface matches: the gate hashes a tracked header manifest plus the build options that surface uses, the pinned Arrow version and a toolchain identity (stdlib, sanitizers), so host-side changes do not invalidate deployed plugins. A refusal names the differing headers; an incompatible submit is refused before any plugin bytes ship; out-of-tree modules build with the packaged `clink_add_job_module()` | [Design record 010](design/010-stable-extension-model.md) |
@@ -109,6 +109,7 @@ Twenty-plus sources and sinks, each documented with dependencies, factory
 names, options, and SQL usage in the [connector catalogue](connectors/README.md):
 Kafka, Postgres (snapshot, CDC, sink), MySQL, ClickHouse, Cassandra, MongoDB,
 Redis, S3 and S3 Parquet, GCS Parquet, Azure Parquet, WebHDFS Parquet,
-Iceberg, Avro, HTTP, MQTT, NATS, Pulsar, RabbitMQ, file and built-ins; on
+Iceberg, Delta Lake (sink), Avro, HTTP, MQTT, NATS, Pulsar, RabbitMQ, file
+and built-ins; on
 Kafka, registry-framed Avro, Protobuf and JSON Schema values against a
 Confluent-compatible Schema Registry.

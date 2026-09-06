@@ -323,9 +323,8 @@ state), both under `run-all-live.sh`. Live adapters self-skip via the
 required `available()` member when their server is unreachable. Kafka's
 2PC is deliberately NOT instantiated: it is not `CommittingSink`-shaped,
 and its commit is non-recoverable - neither librdkafka nor the Java
-client exposes a supported resume-prepared-transaction API (Flink's sink
-does it by reflecting into the Java producer's private internals; KIP-939
-is the sanctioned future path) - so its contract
+client exposes a supported resume-prepared-transaction API (KIP-939 is
+the sanctioned future path) - so its contract
 (never-missing/never-foreign, duplicates bounded to one interval per
 kill) is held by the commit-confirmed restore protocol tests in
 `tests/integration/` instead.

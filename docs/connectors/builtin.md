@@ -1,11 +1,12 @@
-# Built-in connectors (blackhole, changelog, print, collect, queryable_state)
+# Built-in connectors (blackhole, changelog, print, collect, queryable_state, generator)
 
 Row-channel sinks compiled into the engine itself - no client library, no
 `CLINK_WITH_*` knob, always available when `CLINK_BUILD_SQL=ON`. They are
 selected by connector name in `CREATE TABLE ... WITH (connector='...')` and
 take no further option. blackhole, changelog and print are registered by
 `clink::sql::install()` (`src/sql/install.cpp`); collect is registered by the
-embedded engine and only works there.
+embedded engine and only works there. The one built-in that is not a SQL
+connector, the programmatic `GeneratorSource<T>`, is described at the end.
 
 blackhole, changelog and print natively accept changelog streams (retracting
 GROUP BY, Top-N, outer joins), which append-only sinks reject; collect is
@@ -94,3 +95,16 @@ INSERT INTO results SELECT user_id, SUM(amount) FROM orders GROUP BY user_id;
 (An unbounded GROUP BY emits the running total per input row - the last
 batch row per key is the final answer, the same convention as the file
 sink.)
+
+## `generator` (programmatic only)
+
+`GeneratorSource<T>` (`include/clink/operators/source_operator.hpp`) turns a
+callable returning `std::optional<Record<T>>` into a source; returning
+`std::nullopt` ends the stream. Whether the generator is bounded cannot be
+inferred, so it is declared at construction (`bounded=true` opts a finite
+generator into the end-of-input drain and batch execution path; the default
+is unbounded). It is the test and benchmark source behind many of the
+repository's own examples and appears in `clink --capabilities` as the
+`generator` record (formats `int64` and `text/lines`, bounded, replayable).
+There is no `connector='generator'` in SQL, although the record declares a
+SQL surface; use `nexmark` or a `file` table for a SQL-side generator.

@@ -1,19 +1,20 @@
 // 08 - Pipeline packaged as a job plugin (.so) for cluster submission.
 //
 // All previous examples ran in-process via LocalExecutor. This one uses
-// the fluent Pipeline + CLINK_REGISTER_JOB macro. The
-// resulting .so is the the equivalent of a user JAR, submitted
-// to a running cluster via the `clink` CLI:
+// the fluent Pipeline + CLINK_REGISTER_JOB macro. The resulting .so is the
+// unit of deployment for a compiled job, submitted to a running cluster via
+// the `clink` CLI:
 //
-//     # In one terminal - start a Coordinator:
-//     clink_node --role=coordinator --rpc-port=6123
+//     # In one terminal - start a Coordinator (RPC on 6123):
+//     clink_node --role=coordinator --port=6123
 //
 //     # In another - start at least one Worker:
 //     clink_node --role=worker --coordinator-host=127.0.0.1 --coordinator-port=6123
 //
-//     # Submit the job. The .so path comes from this CMakeLists when
-//     # CLINK_BUILD_PLUGIN_EXAMPLE=ON:
-//     clink run --coordinator 127.0.0.1:6123 ./build/08_cluster_job_plugin.so
+//     # Submit the job over the RPC port. The .so path comes from this
+//     # CMakeLists when CLINK_BUILD_PLUGIN_EXAMPLE=ON:
+//     clink run --job=./build/08_cluster_job_plugin.so \
+//         --coordinator-host=127.0.0.1 --coordinator-port=6123
 //
 // Pipeline:
 //   from_elements([1..5]) -> map(*10) -> filter(>20)

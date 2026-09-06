@@ -71,7 +71,7 @@ int main() {
 
     // Any operator that calls ctx.keyed_state() needs a backend on the
     // JobConfig. InMemoryStateBackend is fine for examples and tests;
-    // RocksDbStateBackend is durable.
+    // RocksDBStateBackend is durable.
     JobConfig cfg;
     cfg.state_backend = std::make_shared<InMemoryStateBackend>();
 

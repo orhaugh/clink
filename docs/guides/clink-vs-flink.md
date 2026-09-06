@@ -51,4 +51,4 @@ Consider Clink when native embedding, Arrow-native state/data, a small deploymen
 
 Consider Flink when ecosystem breadth, organisational familiarity, managed-service availability, and accumulated production mileage matter more than native embedding.
 
-Clink is intentionally not presented as a blanket Flink replacement. See the [capability catalogue](../capabilities.md), [benchmarks](../benchmarks.md), and [production qualification material](../qualification/) for the evidence behind its current claims.
+Clink is intentionally not presented as a blanket Flink replacement. See the [capability catalogue](../capabilities.md), [benchmarks](../benchmarks.md), and [production qualification material](../qualification/README.md) for the evidence behind its current claims.

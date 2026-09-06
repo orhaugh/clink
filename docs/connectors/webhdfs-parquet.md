@@ -27,14 +27,15 @@ cmake -S . -B build -DCLINK_WITH_WEBHDFS=ON
 
 | Factory name | Direction | Record type |
 | --- | --- | --- |
-| `webhdfs_parquet_int64_sink` | sink | `int64` |
-| `webhdfs_parquet_string_sink` | sink | `string` |
-| `webhdfs_parquet_2pc_int64_sink` | sink | `int64` (two-phase commit, one staged file per checkpoint) |
-| `webhdfs_parquet_2pc_string_sink` | sink | `string` (two-phase commit, one staged file per checkpoint) |
+| `webhdfs_parquet_int64_sink` | sink | `int64`; with `path`, the at-least-once single-object sink; with `prefix`, the two-phase-commit sink (`WebHdfsParquetSink2PC<T>`, one staged file per checkpoint) |
+| `webhdfs_parquet_string_sink` | sink | `string`; the same `path` / `prefix` selection |
 | `webhdfs_parquet_int64_source` | source | `int64` |
 | `webhdfs_parquet_string_source` | source | `string` |
 
-Exact registered names from `impls/webhdfs/src/register_factories.cpp`.
+Exact registered names from `impls/webhdfs/src/register_factories.cpp`. Unlike
+the object-store Parquet connectors there is no separate `_2pc_` factory name:
+one sink factory builds either class, chosen by whether `path` or `prefix` is
+given (they are mutually exclusive).
 
 ## Configuration
 
@@ -135,7 +136,7 @@ In a deployed job the factories are usually looked up by name from the plugin re
 
 The default single-object sink is at-least-once. The Parquet file is created and finalised in a single upload on `close()`; a failure mid-upload throws and the job replays from the last checkpoint (`webhdfs_parquet_sink.hpp`). There is no two-phase commit and no incremental upload. The two-step write fails loudly if `CREATE` does not return a `307` redirect to a datanode, because `CREATE` carries no body and a non-redirect `2xx` would create an empty file rather than upload the Parquet bytes; a gateway that only does single-request inline writes is not supported.
 
-For exactly-once, use the 2PC sink: `webhdfs_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `path`. It stages one Parquet file per checkpoint interval under `<prefix>/staging` and commits with an atomic HDFS `RENAME` to `<prefix>/committed` only when the checkpoint completes globally (`MKDIRS` prepares the dirs, abort `DELETE`s staging, and recovery on open re-runs the rename idempotently). This is a true atomic rename rather than a copy. Read the result with the source pointed at `<prefix>/committed`.
+For exactly-once, use the 2PC sink: give the `webhdfs_parquet_{int64,string}_sink` factory a `prefix` instead of a `path` (or construct `WebHdfsParquetSink2PC<T>` directly), or set `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `path`. It stages one Parquet file per checkpoint interval under `<prefix>/staging` and commits with an atomic HDFS `RENAME` to `<prefix>/committed` only when the checkpoint completes globally (`MKDIRS` prepares the dirs, abort `DELETE`s staging, and recovery on open re-runs the rename idempotently). This is a true atomic rename rather than a copy. Read the result with the source pointed at `<prefix>/committed`.
 
 The source reports `is_bounded() == true`: it reads a single Parquet object to its last row group and then stops. On `OPEN` it follows a `307` redirect and GETs the datanode bytes, or accepts a direct `2xx` body if the gateway returns the file inline (`webhdfs_parquet_source.hpp`).
 

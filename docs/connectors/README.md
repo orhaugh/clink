@@ -14,7 +14,7 @@ aws-sdk-cpp `1.11.795`, Pulsar client `4.2.0`, DataStax cpp-driver `2.17.1`,
 clickhouse-cpp `2.5.1`, Avro C++ `1.12.1`),
 which is compiled at exact versions into `CLINK_DEPS_PREFIX` on both the host
 and the Debian image. Versions are recorded per connector and in
-[`scripts/versions.env`](../../scripts/versions.env).
+[`scripts/versions.env`](https://github.com/orhaugh/clink/blob/main/scripts/versions.env).
 
 The `SQL connector=` column lists the string to use in a SQL
 `CREATE TABLE ... WITH (connector='...')` statement. A dash means the connector
@@ -36,11 +36,12 @@ is reachable through the programmatic API only.
 | Connector | I/O | Client dependency | Version | SQL `connector=` |
 | --- | --- | --- | --- | --- |
 | [Amazon S3 (Parquet)](s3-parquet.md) | source + sink | Arrow S3FileSystem + aws-sdk-cpp | Arrow `24.0.0`, aws-sdk `1.11.795` | `s3_parquet` |
-| [Amazon S3 (raw objects)](s3.md) | sink | aws-sdk-cpp | `1.11.795` | `s3` |
+| [Amazon S3 (raw objects)](s3.md) | sink (+ programmatic line source) | aws-sdk-cpp | `1.11.795` | `s3` |
 | [Google Cloud Storage](gcs-parquet.md) | source + sink | Arrow GcsFileSystem (`ARROW_GCS`) | Arrow `24.0.0` | `gcs_parquet` |
 | [Azure Blob Storage](azure-parquet.md) | source + sink | Arrow AzureFileSystem (`ARROW_AZURE`) | Arrow `24.0.0` | `azure_parquet` |
 | [WebHDFS / HttpFS](webhdfs-parquet.md) | source + sink | clink::http_connector (vendored httplib) | Arrow `24.0.0` | `webhdfs_parquet` |
 | [Apache Iceberg](iceberg.md) | source + sink | iceberg-cpp + Arrow | iceberg-cpp `v0.3.0`, Arrow `24.0.0` | `iceberg` |
+| [Delta Lake](delta.md) | sink | SQL frontend + Arrow (aws-sdk-cpp for `s3://` roots) | Arrow `24.0.0` | `delta` |
 | [Local files and Parquet](local.md) | source + sink | core (Arrow for Parquet) | built in | `file`, `filesystem`, `parquet` |
 
 ## Databases and key-value stores
@@ -80,6 +81,7 @@ Compiled into the SQL frontend itself; always available when
 | [Print (stdout)](builtin.md#print) | sink | `print` |
 | [Collect (Arrow to host, embedded only)](builtin.md#collect-embedded-only) | sink | `collect` |
 | [Queryable state (another job's live state)](builtin.md#queryable_state-source) | source | `queryable_state` |
+| [Generator (`GeneratorSource<T>`, tests and benchmarks)](builtin.md#generator-programmatic-only) | source | - |
 
 ## The capability manifest
 
@@ -91,10 +93,15 @@ idempotency-key requirements, auth/TLS surface, and limitations. `clink
 --capabilities` prints the manifest for the binary at hand, the delivery
 analyser computes end-to-end guarantees from it at submission, and each
 record's internal coherence is checked by `self_check()`. Coverage is
-enforced mechanically: a build-generated list of enabled connector modules
-feeds a gate test (`tests/test_connector_manifest_gate.cpp`), so a new
-connector cannot register factories without either declaring its record or
-being explicitly classified as a non-connector module.
+enforced mechanically for the `impls/` modules: a build-generated list of
+enabled connector modules feeds a gate test
+(`tests/test_connector_manifest_gate.cpp`), so a new connector module cannot
+register factories without either declaring its record or being explicitly
+classified as a non-connector module. The gate does not reach the sinks the
+SQL frontend registers itself: `file`, `parquet`, `generator` and `blackhole`
+carry records, but the [Delta Lake sink](delta.md) and the `print`,
+`changelog`, `collect` and `queryable_state` built-ins do not, so they are
+absent from `clink --capabilities` and unknown to the delivery analyser.
 
 ## Notes on delivery semantics
 

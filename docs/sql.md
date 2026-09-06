@@ -134,10 +134,14 @@ windows.
 `rabbitmq`, `websocket`, `nats`, `pulsar`, `postgres`, `mysql`, `clickhouse`,
 `parquet`, `s3_parquet` (and `gcs_parquet` / `azure_parquet` / `webhdfs_parquet`),
 `kinesis`, `http_poll`, `pubsub`, `redis`, `iceberg`, `nexmark`, `lookup` and
-`queryable_state`. Sinks you can write to include `file`, `kafka`, `parquet`,
-`s3` / `s3_parquet`, `postgres`, `mysql`, `clickhouse`, `http`, `elasticsearch`,
-`opensearch`, `splunk_hec`, `prometheus`, `firehose`, `dynamodb`, `redis`,
-`changelog`, and the debugging sinks `print`, `collect` and `blackhole`.
+`queryable_state`. Sinks you can write to include `file`, `kafka`, `rabbitmq`,
+`nats`, `pulsar`, `pubsub`, `parquet`, `s3` / `s3_parquet` (and `gcs_parquet` /
+`azure_parquet` / `webhdfs_parquet`), `iceberg`, `delta`, `postgres`, `mysql`,
+`clickhouse`, `cassandra`, `redis`, `http`, `elasticsearch`, `opensearch`,
+`splunk_hec` (alias `splunk`), `influxdb`, `prometheus`, `firehose`, `dynamodb`,
+`changelog`, and the debugging sinks `print`, `collect` and `blackhole`. The
+[connector catalogue](connectors/README.md) has the full list with each
+connector's options and delivery guarantee.
 
 A connector must be linked into the runtime you run. The planner always emits the
 right factory name; a connector that is not linked fails at deploy time, not
@@ -300,6 +304,8 @@ through), text (`TEXT`/`VARCHAR`) and `BOOLEAN`. Casting to date, timestamp or
 | `cardinality(x)`, `element(x)` | element count; sole element of a singleton |
 
 JSON paths support `$`, `.key` and `[index]`.
+
+<a id="deterministic-by-design"></a>
 
 !!! note "Deterministic by design"
     Two things follow from clink keeping SQL results reproducible:

@@ -38,12 +38,14 @@ opt-in: configure with `-DCLINK_INTEGRATION_TESTS=ON` and run
   and schema evolution key on it; a missing uid is a correctness bug.
 - Docs updated in the same change: the affected `docs/connectors/<name>.md`
   or `docs/internals/<page>.md`, and the README if a capability changed.
-- Formatting: a pre-commit hook (installed at configure time) runs
-  clang-format; `cmake --build build --target format` fixes everything in
-  place.
-- British English in comments and docs. Plain commit messages in the
-  existing style: `area: what changed` (e.g. `fix(net): ...`,
-  `docs(internals): ...`).
+- Formatting: a pre-commit hook (copied into `.git/hooks` at configure time;
+  `scripts/install-git-hooks.sh` installs it and the commit-msg hook as shims
+  onto the tracked scripts) runs clang-format and the docs gates;
+  `cmake --build build --target format` fixes formatting in place.
+- British English in comments and docs, no em dashes. Commit subjects take a
+  conventional prefix with a scope, enforced by the commit-msg hook
+  (`fix(net): ...`, `docs(internals): ...`; plain `docs:` is accepted); the
+  body explains why.
 
 ## Pull requests
 

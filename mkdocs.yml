@@ -141,6 +141,7 @@ nav:
       - connectors/builtin.md
       - connectors/cassandra.md
       - connectors/clickhouse.md
+      - connectors/delta.md
       - connectors/gcs-parquet.md
       - connectors/http.md
       - connectors/iceberg.md

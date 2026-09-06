@@ -217,4 +217,5 @@ The source side of exactly-once is `snapshot_offset` / `restore_offset` on `Sour
 - [time-and-windowing.md](./time-and-windowing.md): watermarks, which share the in-band channel and the same alignment machinery as barriers.
 - [operator-model.md](./operator-model.md) and [task-lifecycle.md](./task-lifecycle.md): the operator runners in `dag.hpp` that drive barrier flow and snapshot-on-barrier.
 - [distributed-runtime.md](./distributed-runtime.md): the Coordinator ack tracking, `COMPLETED-N` markers and `CommitCheckpoint`/`AbortCheckpoint` broadcast on the cluster path.
+- [exactly-once-specification.md](./exactly-once-specification.md): the TLA+ model of this protocol, the invariants TLC checks in CI, and the protocol trace the engine records at these decision points when `CLINK_PROTOCOL_TRACE_DIR` is set, validated against the model.
 - [../connectors/README.md](../connectors/README.md): which source/sink connectors implement the 2PC and source-offset contracts.

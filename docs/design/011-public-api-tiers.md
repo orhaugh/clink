@@ -106,7 +106,7 @@ with `override` so a changed virtual signature fails to compile. The
 directory is frozen in the same sense as the fixtures under
 `tests/fixtures/`: entries are added, never edited or removed, and a change
 that a build needs in order to keep compiling is by definition a Stable-tier
-break. Every Stable header is also compiled on its own (`api_headers_check`),
+break. Every Stable header is also compiled on its own (`clink_api_headers_check`),
 because a header that only compiles after some other header is not a usable
 contract.
 
