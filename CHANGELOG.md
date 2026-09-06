@@ -266,6 +266,26 @@ whole surface. Documented under
 [Declared types](https://orhaugh.github.io/clink/internals/derived-types/) and
 [Fault tolerance, rescale and schema evolution](https://orhaugh.github.io/clink/internals/fault-tolerance-and-rescale/).
 
+**A shard dying mid-checkpoint can no longer hang the sharded keyed stage.**
+`ShardedKeyedStage::checkpoint()` broadcasts the barrier to every shard and
+waits for each to deliver; a shard whose operator threw delivered a failure on
+its own behalf and then closed its queue. In that order there was a window:
+the dying shard's delivery ran before the round was active and so counted for
+nothing, `checkpoint()` then activated the round and pushed the barrier into
+the still-open queue, and the close stranded it with nobody left to deliver.
+The checkpoint waited forever, which is the outcome the stage exists to
+prevent, and `ShardedKeyedStage.WorkerDeathDoesNotHangCheckpoint` timed out
+in CI once in a few hundred runs and every few runs on a laptop. The shard now
+closes its queue first and delivers second, so a push after the close fails
+and the coordinator delivers on the shard's behalf, and a push before it means
+the round is active when the shard's own delivery lands; both deliveries stay
+idempotent per shard per round. Repetition does not reach the losing schedule
+on purpose (four thousand runs of the old order under load did not), so the
+pin is a fault point, `sharded_stage.death_before_delivery`, between the
+shard's close and its delivery: a new test parks the dying shard there,
+broadcasts a barrier meanwhile, and requires `checkpoint()` to return while
+the shard is still parked.
+
 **The Redeploy protocol event is recorded once per restart.** The
 coordinator emitted it from inside the loop that builds one deploy frame per
 worker, so a restart that redeployed onto two workers recorded two identical

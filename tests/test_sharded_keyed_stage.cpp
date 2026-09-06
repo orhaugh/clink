@@ -7,6 +7,7 @@
 // range, and pinning never changes results.
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <cstdint>
@@ -26,6 +27,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/core/record.hpp"
 #include "clink/core/stream_element.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/operator_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -914,6 +916,70 @@ TEST(ShardedKeyedStage, WorkerDeathDoesNotHangCheckpoint) {
     stage.await();
     EXPECT_FALSE(stage.worker_errors().empty());
 }
+
+#if CLINK_FAULT_ENABLED
+// The interleaving that hung the test above once in a few hundred CI runs, made
+// deterministic. A dying shard used to deliver its failure for the round in
+// flight and THEN close its queue. When the delivery ran before checkpoint()
+// had activated the round it counted for nothing, checkpoint() then pushed the
+// barrier into the still-open queue, and the close stranded it: nobody was
+// left to deliver for that shard and the rendezvous never completed. The shard
+// now closes first and delivers second. Parking it between the two while the
+// barrier is broadcast is exactly the losing schedule: the push must fail on
+// the closed queue and the coordinator must deliver on the shard's behalf, so
+// checkpoint() returns while the shard is still parked. Repetition does not
+// reach this schedule on purpose (four thousand runs under load did not), a
+// fault point does.
+TEST(ShardedKeyedStage, WorkerDeathRacingTheBarrierBroadcastDoesNotHang) {
+    constexpr std::size_t kShards = 4;
+    const char* const point = clink::fault::points::kShardedStageDeathBeforeDelivery;
+    clink::fault::Registry::instance().reset();
+    const clink::fault::ScopedFault park(
+        clink::fault::Rule{.point = point, .action = clink::fault::Action::Block, .arg = 0});
+
+    ShardedKeyedStage<std::int64_t, std::int64_t> stage(
+        kShards,
+        OperatorId{7},
+        [](std::size_t) { return std::make_unique<ThrowingOnKeyOp>(5); },
+        int64_key_bytes(),
+        [](StreamElement<std::int64_t>) { return true; });
+    stage.start();
+    {
+        Batch<std::int64_t> b;
+        for (std::int64_t k = 0; k < 50; ++k) {
+            b.emplace(k);  // includes the poison key 5
+        }
+        stage.submit(std::move(b));
+    }
+    // Wait until the poisoned shard is parked: it has recorded its error and
+    // closed its queue, and has not delivered anything yet.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (clink::fault::Registry::instance().hits(point) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(clink::fault::Registry::instance().hits(point), 1u)
+        << "the poisoned shard never reached its death path";
+
+    // Broadcast with the shard parked. With the old order this push landed in
+    // an open queue and this call never returned.
+    auto r = stage.checkpoint(
+        CheckpointBarrier{CheckpointId{1}, false, CheckpointBarrier::Mode::Aligned});
+    EXPECT_FALSE(r.ok) << "the parked shard's queue is closed; its failure is delivered on "
+                          "its behalf";
+
+    // Let the shard finish dying; its own late delivery is a no-op for the
+    // completed round and must not disturb the next one.
+    clink::fault::Registry::instance().release(point);
+    auto r2 = stage.checkpoint(
+        CheckpointBarrier{CheckpointId{2}, false, CheckpointBarrier::Mode::Aligned});
+    EXPECT_FALSE(r2.ok);
+
+    stage.close_input();
+    stage.await();
+    EXPECT_FALSE(stage.worker_errors().empty());
+}
+#endif  // CLINK_FAULT_ENABLED
 
 // snapshot()/restore() enforce the QUIESCED precondition: calling them while
 // the workers are running throws rather than producing a torn blob.

@@ -297,6 +297,13 @@ inline constexpr char kSinkBeforeCommit[] = "sink.before_commit";
 inline constexpr char kSinkBetweenCommitAndReceipt[] = "sink.between_commit_and_receipt";
 inline constexpr char kSinkAfterExternalCommit[] = "sink.after_external_commit";
 
+// Sharded keyed stage: a shard whose operator threw, between closing its
+// input queue and delivering its failure for the control round in flight.
+// Parking a shard here while checkpoint() broadcasts the barrier pins the
+// interleaving that used to hang the rendezvous when the two happened in
+// the other order.
+inline constexpr char kShardedStageDeathBeforeDelivery[] = "sharded_stage.death_before_delivery";
+
 // State backend + restore.
 inline constexpr char kStateBeforeRestore[] = "state.before_restore";
 

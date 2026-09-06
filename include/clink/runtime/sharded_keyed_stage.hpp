@@ -67,6 +67,7 @@
 
 #include "clink/core/stream_element.hpp"
 #include "clink/core/types.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/operator_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/async_execution_controller.hpp"
@@ -619,16 +620,27 @@ private:
                 std::lock_guard lock(errors_mu_);
                 worker_errors_.emplace_back(i, ex.what());
             }
-            // If a checkpoint is in flight and this worker had not yet
-            // delivered, deliver a failure so the coordinator wakes instead of
-            // waiting forever for a capture that will never come. Then close
-            // this queue: a later checkpoint's push will fail and the
-            // coordinator delivers-on-behalf (idempotent), so no checkpoint can
-            // hang on a dead worker.
-            deliver_capture_(i, {}, false, "sharded stage worker threw: " + std::string(ex.what()));
+            // Close this queue FIRST, then deliver a failure for any round in
+            // flight. The close is the linearisation point against
+            // coordinate_(): a control element pushed after it fails and the
+            // coordinator delivers on this shard's behalf; one pushed before it
+            // means the round was already active when the delivery below runs,
+            // so the delivery counts. Delivering before closing left a window
+            // where the delivery ran as a no-op (no round active yet), the
+            // coordinator then activated the round and pushed into the still
+            // open queue, and the close stranded that control element with
+            // nobody left to deliver for it: checkpoint() waited forever for
+            // the shard whose death it was meant to survive. Both deliveries
+            // are idempotent per shard per round, so the overlap is harmless.
             if (sh.queue) {
                 sh.queue->close();
             }
+            // A test parks the shard here (Block) and broadcasts a barrier
+            // meanwhile: the push must fail on the closed queue and the
+            // coordinator must deliver on this shard's behalf, so
+            // checkpoint() returns before this delivery lands.
+            CLINK_FAULT_POINT(fault::points::kShardedStageDeathBeforeDelivery);
+            deliver_capture_(i, {}, false, "sharded stage worker threw: " + std::string(ex.what()));
         }
         if (sh.op) {
             sh.op->attach_runtime(nullptr);
