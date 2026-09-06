@@ -266,6 +266,18 @@ whole surface. Documented under
 [Declared types](https://orhaugh.github.io/clink/internals/derived-types/) and
 [Fault tolerance, rescale and schema evolution](https://orhaugh.github.io/clink/internals/fault-tolerance-and-rescale/).
 
+**The capability manifest no longer claims a SQL surface for API-only
+connectors.** The `mqtt`, `mongo` and `generator` records declared
+`available_in_sql` although the SQL planner binds no `connector='mqtt'`,
+`'mongo'` or `'generator'`, so `clink --capabilities` promised what a
+`CREATE TABLE` then refused, and the connector pages contradicted the binary.
+The three records now say `sql: no`, and the manifest gate grows a SQL arm:
+for every record that claims a SQL surface it compiles a probe statement per
+declared direction through the planner (a variant record such as `kafka_2pc`
+through its base name; `s3` and `http` through the longer vocabulary names
+their impls also register), so a claim no `connector='...'` reaches fails the
+test step instead of reaching a reader.
+
 **Two worker-loss gates could pass without proving what they claim.** Both
 fault-recovery tests that kill a worker twice submit a job whose source is
 bounded, and neither made sure the job outlived the sequence. In the

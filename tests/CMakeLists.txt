@@ -371,6 +371,12 @@ if(CLINK_BUILD_IMPLS)
     target_link_libraries(clink_manifest_tests PRIVATE
         clink::clink
         GTest::gtest_main)
+    # The SQL-surface arm compiles one probe statement per record through the
+    # planner, so a record cannot claim `available_in_sql` for a connector no
+    # `connector='...'` reaches. Needs the frontend when it is built.
+    if(TARGET clink::sql)
+        target_link_libraries(clink_manifest_tests PRIVATE clink::sql)
+    endif()
     # The gate also runs `clink --capabilities-json` and checks the rendered
     # manifest covers the same impls the registry does.
     target_compile_definitions(clink_manifest_tests PRIVATE

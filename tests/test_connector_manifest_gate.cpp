@@ -214,3 +214,131 @@ TEST(ConnectorManifestGate, TheCliManifestCoversEveryEnabledImpl) {
     EXPECT_TRUE(failures.empty()) << failures.size() << " manifest omission(s):" << joined;
 }
 #endif
+
+#if CLINK_HAS_SQL
+#include <variant>
+
+#include "clink/sql/binder.hpp"
+#include "clink/sql/catalog.hpp"
+#include "clink/sql/parser.hpp"
+#include "clink/sql/physical_plan.hpp"
+
+namespace {
+
+// Whether the SQL planner recognises `connector` as a source or a sink on
+// either channel. Recognised means the planner's connector dispatch bound the
+// name: a refusal further on (a missing required option, an unsupported
+// mode) still proves the binding exists, so only the dispatch's own
+// unknown-connector message counts as "not bound". The fixed side of each
+// probe statement is the file connector, which binds on both channels.
+bool planner_binds(const std::string& connector, bool as_source) {
+    for (const bool row : {false, true}) {
+        const std::string cols = row ? "(a BIGINT, b TEXT)" : "(line TEXT)";
+        const std::string fmt = row ? ", format='json'" : "";
+        const std::string projection = row ? "a, b" : "line";
+        const std::string under_test = "connector='" + connector + "'" + fmt;
+        const std::string fixed = "connector='file', path='/tmp/manifest-gate-probe'" + fmt;
+        try {
+            clink::sql::Catalog cat;
+            auto register_table = [&](const std::string& ddl) {
+                auto script = clink::sql::parse(ddl);
+                cat.register_table(
+                    std::get<clink::sql::ast::CreateTableStmt>(script.statements[0]));
+            };
+            register_table("CREATE TABLE src_t " + cols + " WITH (" +
+                           (as_source ? under_test : fixed) + ")");
+            register_table("CREATE TABLE dst_t " + cols + " WITH (" +
+                           (as_source ? fixed : under_test) + ")");
+            clink::sql::Binder binder(cat);
+            auto plan = binder.bind_insert(std::get<clink::sql::ast::InsertStmt>(
+                clink::sql::parse("INSERT INTO dst_t SELECT " + projection + " FROM src_t")
+                    .statements[0]));
+            clink::sql::PhysicalPlanner planner;
+            (void)planner.compile(static_cast<const clink::sql::LogicalSink&>(*plan));
+            return true;
+        } catch (const clink::sql::TranslationError& e) {
+            // The dispatch refuses an unknown connector in one of two shapes
+            // per direction: the string channel's "unsupported source/sink
+            // connector '<name>'", and the row channel's "format='json'
+            // source/sink requires connector=... (got '<name>')". Anything
+            // else is a refusal of a recognised connector.
+            const std::string message = e.what();
+            const std::string direction = as_source ? "source" : "sink";
+            const std::string string_channel =
+                "unsupported " + direction + " connector '" + connector + "'";
+            const std::string row_channel = "format='json' " + direction + " requires connector=";
+            const std::string got = "(got '" + connector + "')";
+            const bool unknown_connector = message.find(string_channel) != std::string::npos ||
+                                           (message.find(row_channel) != std::string::npos &&
+                                            message.find(got) != std::string::npos);
+            if (!unknown_connector) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+// A record that declares a SQL surface must be reachable from SQL: the
+// planner has to bind the record's connector family in every direction the
+// record declares. Three records (mqtt, mongo, generator) once claimed a
+// surface that no `connector='...'` reached, so `clink --capabilities` and
+// the connector pages disagreed about what SQL could do. Variant records
+// (kafka_2pc, postgres_upsert) are reached through their base name plus a
+// WITH option, and two identities also cover a longer SQL vocabulary name
+// their impl registers factories for (s3 -> s3_parquet, http -> http_poll).
+TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
+    clink::plugin::PluginRegistry reg;
+    clink::plugin::install_defaults(reg);
+
+    static const std::map<std::string, std::vector<std::string>> kAliases = {
+        {"s3", {"s3_parquet"}},
+        {"http", {"http_poll"}},
+    };
+    std::vector<std::string> failures;
+    for (const auto& cap : clink::connectors::CapabilityRegistry::instance().all()) {
+        if (!cap.available_in_sql) {
+            continue;
+        }
+        std::string base = cap.name;
+        for (const char* suffix : {"_2pc", "_upsert"}) {
+            const std::string s = suffix;
+            if (base.size() > s.size() && base.compare(base.size() - s.size(), s.size(), s) == 0) {
+                base.resize(base.size() - s.size());
+            }
+        }
+        std::vector<std::string> candidates{base};
+        if (auto it = kAliases.find(base); it != kAliases.end()) {
+            candidates.insert(candidates.end(), it->second.begin(), it->second.end());
+        }
+        auto bound = [&](bool as_source) {
+            for (const auto& c : candidates) {
+                if (planner_binds(c, as_source)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (cap.is_source && !bound(true)) {
+            failures.push_back(cap.name +
+                               ": declares available_in_sql as a source, but the planner "
+                               "binds no connector='" +
+                               base + "' source");
+        }
+        if (cap.is_sink && !bound(false)) {
+            failures.push_back(cap.name +
+                               ": declares available_in_sql as a sink, but the planner "
+                               "binds no connector='" +
+                               base + "' sink");
+        }
+    }
+    std::string joined;
+    for (const auto& f : failures) {
+        joined += "\n  - " + f;
+    }
+    EXPECT_TRUE(failures.empty()) << failures.size()
+                                  << " SQL surface claim(s) the planner does not honour:" << joined;
+}
+#endif  // CLINK_HAS_SQL

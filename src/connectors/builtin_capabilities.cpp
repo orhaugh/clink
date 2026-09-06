@@ -169,7 +169,9 @@ void declare_builtin_capabilities() {
         .delivery = DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .backpressure = true,
-        .available_in_sql = true,
+        // A programmatic source (GeneratorSource<T>); the SQL planner binds
+        // no connector='generator'.
+        .available_in_sql = false,
         .limitations = {"a test and benchmark source; the record set is derived from the "
                         "op params, not read from anywhere"},
     });

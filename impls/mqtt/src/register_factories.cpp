@@ -72,7 +72,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .backpressure = true,
         .retries = false,
         .timeout_options = {"ack_timeout_ms"},
-        .available_in_sql = true,
+        .available_in_sql = false,  // no connector='mqtt' binding in the SQL planner
         .limitations = {"qos=0 is fire-and-forget (at-most-once) on both sides",
                         "a clean session discards the redelivery state recovery depends on"},
     });

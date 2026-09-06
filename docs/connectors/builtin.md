@@ -106,5 +106,5 @@ generator into the end-of-input drain and batch execution path; the default
 is unbounded). It is the test and benchmark source behind many of the
 repository's own examples and appears in `clink --capabilities` as the
 `generator` record (formats `int64` and `text/lines`, bounded, replayable).
-There is no `connector='generator'` in SQL, although the record declares a
-SQL surface; use `nexmark` or a `file` table for a SQL-side generator.
+There is no `connector='generator'` in SQL, and the record says so
+(`sql: no`); use `nexmark` or a `file` table for a SQL-side generator.

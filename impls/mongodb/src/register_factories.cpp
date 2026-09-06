@@ -39,7 +39,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .backpressure = true,
         .retries = false,
         .timeout_options = {},
-        .available_in_sql = true,
+        .available_in_sql = false,  // no connector='mongo' binding in the SQL planner
         .limitations = {"effectively-once only with on_duplicate='replace' and a stable key_field",
                         "a resume token older than the oplog window cannot resume"},
     });
