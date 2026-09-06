@@ -266,6 +266,22 @@ whole surface. Documented under
 [Declared types](https://orhaugh.github.io/clink/internals/derived-types/) and
 [Fault tolerance, rescale and schema evolution](https://orhaugh.github.io/clink/internals/fault-tolerance-and-rescale/).
 
+**The Redeploy protocol event is recorded once per restart.** The
+coordinator emitted it from inside the loop that builds one deploy frame per
+worker, so a restart that redeployed onto two workers recorded two identical
+`Redeploy` events a few milliseconds apart. The specification takes that step
+once (deploying to running), so the first run of the trace-validation job on
+`main` reported the trace of every multi-worker restart, and every rescale
+replan, as diverging at the second event: eleven of the fifty-eight runs the
+build's tests left. The restore point is now decided once per restart, every
+frame carries the same one, and the event is emitted once, after the frames
+are built and only when at least one was. The engine's behaviour is
+unchanged; only the recording and one duplicated log line are. Regenerated,
+those traces walk past the restart and then diverge at two shapes the
+specification does not yet allow, both open: a second worker lost while the
+first redeploy's placements are still landing, and a sink preparing the
+final checkpoint before the periodic one ahead of it has completed.
+
 **The capability manifest no longer claims a SQL surface for API-only
 connectors.** The `mqtt`, `mongo` and `generator` records declared
 `available_in_sql` although the SQL planner binds no `connector='mqtt'`,

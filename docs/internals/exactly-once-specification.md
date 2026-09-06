@@ -167,7 +167,7 @@ specification, or a stutter the trace module recognises.
 | `SubtaskDrained` | coordinator, survivor drained | `job`, `sub` | `SinkDrains` (non-sinks stutter) |
 | `CoordRecovers` | the new leader, per recovered job | `job`, `epoch`, `completed`, `confirmed` | `CoordRecovers` (its `CoordDies` is a hidden step) |
 | `RestartProceeds` | coordinator, restart held for resolution | `job`, `resolving`, `completed`, `confirmed` | `RestartProceeds` into `resolving` |
-| `Redeploy` | coordinator, deploying | `job`, `restore`, `next` | `RestartProceeds` (from the drain) or `Redeploy` (after resolution) |
+| `Redeploy` | coordinator, deploying: once per restart, after the deploy frames are built, whatever their number | `job`, `restore`, `next` | `RestartProceeds` (from the drain) or `Redeploy` (after resolution) |
 | `WalkSkips`, `WalkReadsReceipt`, `WalkProbes`, `WalkRetries`, `WalkExhausted`, `WalkCancelled`, `WalkDecides`, `WalkFinishes` | the in-doubt walk | `job`, `ckpt`, and `sub`, `verdict`, `confirmed` where they apply | the walk's steps, one each |
 | `SinkOpens` | the sink, `open()` done | `sub`, `family` | `SinkOpens` after a redeploy; the first open is the initial state |
 | `Placement` | worker, task deployed | `job`, `sub`, `worker`, `source` | none: tells the module which worker hosts what |
