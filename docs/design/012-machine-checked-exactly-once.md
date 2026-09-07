@@ -246,7 +246,8 @@ control frames is the known upgrade if it proves too loose.
    harness (every spawned node traces; `CLINK_PROTOCOL_TRACE_OUT` keeps the
    run), the `trace-validation` CI job over the traces each build's tests
    leave, and the recorded traces under `formal/traces/` validated by the
-   `formal` job. Shipped. Writing the module against real traces surfaced
+   `formal` job. Shipped; the CI job is advisory as of 2026-09-07, its
+   budget and the divergences it reports still open. Writing the module against real traces surfaced
    three places where the specification was narrower than the engine, each
    fixed in it: a recovered coordinator's id floor counts participant
    snapshots on disk as well as markers (`SnapshotIds`); the source's worker

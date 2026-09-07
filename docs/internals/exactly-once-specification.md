@@ -43,7 +43,7 @@ the rigs saw. Neither proves the code.
 | `include/clink/cluster/protocol_trace.hpp` | The emitter: `CLINK_PROTOCOL_TRACE_DIR` turns it on |
 | `scripts/formal-check.sh` | Fetches and verifies the tools, runs TLC, judges models, mutants and traces (`--trace`) |
 | `scripts/protocol-trace-merge.py`, `scripts/check-protocol-trace-events.py` | Merges per-process trace files; holds code, vocabulary and module in agreement |
-| `.github/workflows/ci.yml`, jobs `formal` and `trace-validation` | Models, mutants and the recorded traces on every push; the traces each test run leaves, after the build |
+| `.github/workflows/ci.yml`, jobs `formal` and `trace-validation` | Models, mutants and the recorded traces on every push; the traces each test run leaves, after the build (advisory until it fits its budget and every trace validates) |
 | `formal/README.md` | The working guide: running, adding a model, adding a mutant, recording a trace |
 
 ## How it works
@@ -209,7 +209,9 @@ own test run leaves (the in-process protocol trace test, every
 multi-process harness test) and the `trace-validation` job model-checks
 them all, so the engine's behaviour under the faults the integration suite
 injects is checked against the model on each commit, not only when a
-fixture is refreshed.
+fixture is refreshed. That job is advisory for now: it has yet to fit its
+time budget or accept every trace it reaches, so it reports as a warning
+rather than gating the run until both hold.
 
 ### What a divergence means
 

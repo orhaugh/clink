@@ -20,7 +20,8 @@ trace implies; `scripts/formal-check.sh --trace` merges a run's files, runs
 TLC and names the first event no allowed step produces. The multi-process
 harness traces every node it spawns and keeps the run under
 `CLINK_PROTOCOL_TRACE_OUT`; the build job uploads what its tests left and a
-`trace-validation` job model-checks each one, while the `formal` job
+`trace-validation` job model-checks each one (advisory until it fits its
+budget and every trace validates), while the `formal` job
 validates the recorded set under `formal/traces/`: a checkpointed run of
 the recoverable family and three Kafka runs (a source-worker kill, a kill in
 the receipt window, a coordinator failover), every one a behaviour the
