@@ -1553,8 +1553,16 @@ TEST_F(KafkaWindowRecoveryTest, ARestartStormStaysExactlyOnce) {
     Cluster cluster(spec);
     ScopedDiagnostics diagnostics(cluster);
     ASSERT_TRUE(cluster.start_ha_coordinators(1));
+    // Worker 1 is the survivor of every cycle's first kill. Hold its exit
+    // reports back for twenty seconds, so the drain the first loss opens
+    // stays open while the second loss is detected inside it: the rig's
+    // shape, where drains took seconds, made deterministic on a machine
+    // where they take milliseconds. Nothing else in the job waits on those
+    // reports; the worker is killed before the hold ever lapses.
+    const clink::itest::ProcOptions slow_to_wind_down{
+        .fault = "worker.before_subtask_finished=delay:20000"};
     ASSERT_TRUE(cluster.start_ha_worker(0));
-    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(cluster.start_ha_worker(1, slow_to_wind_down));
     ASSERT_TRUE(cluster.await_workers_registered(2));
 
     const std::string sql =
@@ -1627,17 +1635,35 @@ TEST_F(KafkaWindowRecoveryTest, ARestartStormStaysExactlyOnce) {
     ASSERT_TRUE(clink::itest::await(
         [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > 0; }, 60s));
 
-    // Three storm cycles. The second kill lands ~1s after the first, inside
-    // the first restart's drain, so the coordinator folds it - the exact
-    // "second worker lost during restart drain" shape from the rig.
+    // Three storm cycles, each the exact "second worker lost during restart
+    // drain" shape from the rig, by construction rather than by timing: the
+    // first kill must have opened a drain before the second lands, and the
+    // second loss must be detected while that drain is still open. A
+    // one-second sleep between the kills promised neither. On a fast machine
+    // neither loss was noticed inside the second, the test respawned both
+    // workers, and their re-registration retired the two dead sessions
+    // together: one tidy restart, nothing to drain, no fold, and this gate
+    // reported "the storm shape never formed" on a coordinator that was
+    // behaving correctly. Now the test waits for the coordinator's own line
+    // for each step, and the hold above keeps the drain open for the second.
+    constexpr const char* kDrainOpened = "awaiting_restart (attempt";
+    constexpr const char* kFolded = "second worker lost during restart drain";
     for (int cycle = 0; cycle < 3; ++cycle) {
         SCOPED_TRACE("storm cycle " + std::to_string(cycle));
         const auto confirmed_before = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+        const auto drains_before = cluster.count_in_coordinator_log(kDrainOpened);
+        const auto folds_before = cluster.count_in_coordinator_log(kFolded);
         cluster.worker(0).kill_and_reap();
-        std::this_thread::sleep_for(1s);
+        ASSERT_TRUE(clink::itest::await(
+            [&] { return cluster.count_in_coordinator_log(kDrainOpened) > drains_before; }, 60s))
+            << "the first loss of the cycle never opened a restart drain";
         cluster.worker(1).kill_and_reap();
+        ASSERT_TRUE(clink::itest::await(
+            [&] { return cluster.count_in_coordinator_log(kFolded) > folds_before; }, 60s))
+            << "the second loss of the cycle was not folded into the open drain; the storm "
+               "shape did not form";
         ASSERT_TRUE(cluster.restart_worker_ha(0));
-        ASSERT_TRUE(cluster.restart_worker_ha(1));
+        ASSERT_TRUE(cluster.restart_worker_ha(1, slow_to_wind_down));
         ASSERT_TRUE(clink::itest::await(
             [&] {
                 return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") >=
@@ -1646,11 +1672,10 @@ TEST_F(KafkaWindowRecoveryTest, ARestartStormStaysExactlyOnce) {
             120s))
             << "the job never resumed confirmed commits after storm cycle " << cycle;
     }
-    // The storm must actually have stormed: at least one fold proves two
-    // losses landed inside one drain, or this was three tidy restarts and
-    // the gate tested nothing.
-    EXPECT_GT(cluster.count_in_coordinator_log("second worker lost during restart drain"), 0)
-        << "no restart ever folded; the storm shape never formed";
+    // Every cycle folded, or the loop above would not have left it; this is
+    // the count the oracle below is answerable to.
+    EXPECT_GE(cluster.count_in_coordinator_log(kFolded), 3u)
+        << "fewer folds than cycles; the storm shape did not form every time";
 
     const auto produced_at_recovery = produced.load(std::memory_order_acquire);
     ASSERT_TRUE(clink::itest::await(

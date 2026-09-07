@@ -322,6 +322,13 @@ inline constexpr char kWorkerDeployDispatch[] = "worker.deploy_dispatch";
 // an orphan of a cancelled deployment (followups item 75b). The latch in
 // the registration block is what the armed window proves.
 inline constexpr char kWorkerTaskTokenRegister[] = "worker.task_token_register";
+// A subtask has exited on this worker and its SubtaskFinished is about to be
+// sent (clean exits and failures alike). A Delay here is a survivor slow to
+// wind down: the restart drain a worker loss opens stays open for as long as
+// the hold lasts, which is how a test lands a second loss inside it on
+// purpose - the storm shape from the rig, where drains took seconds, on a
+// machine where they take milliseconds.
+inline constexpr char kWorkerBeforeSubtaskFinished[] = "worker.before_subtask_finished";
 
 // ----- Rescale lifecycle -----
 //

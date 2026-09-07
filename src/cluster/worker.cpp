@@ -1997,6 +1997,9 @@ void Worker::run_task_(JobId job_id,
     done.error_message = err_msg;
     done.fatal = fatal;
     done.transport_only = transport_only;
+    // A Delay here holds this worker's exit reports back, so a restart drain
+    // that is waiting on them stays open for the duration (test aid).
+    CLINK_FAULT_POINT(clink::fault::points::kWorkerBeforeSubtaskFinished);
     send_frame_(encode_frame(MessageKind::SubtaskFinished, done));
 
     {
