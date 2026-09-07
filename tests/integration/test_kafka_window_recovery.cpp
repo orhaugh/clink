@@ -1740,7 +1740,19 @@ TEST_F(KafkaWindowRecoveryTest, ABrokerOutageDuringRecoveryStaysExactlyOnce) {
     Cluster cluster(spec);
     ScopedDiagnostics diagnostics(cluster);
     ASSERT_TRUE(cluster.start_ha_coordinators(1));
-    ASSERT_TRUE(cluster.start_ha_worker(0));
+    // Worker 0 carries the ack-window fault from the start, and the fault
+    // PARKS rather than kills: the sixth commit on worker 0 stops after the
+    // broker has accepted it and before the receipt is written, which is the
+    // ack window frozen in place, and the test then chooses the moment of the
+    // loss. A fresh deployment places tasks round-robin by index over two
+    // empty workers, so two of the four exactly-once sinks run on worker 0
+    // and the sixth window arrives within seconds of the first confirmed
+    // commit. Killing worker 0 and re-arming its replacement, as this test
+    // used to, left the sinks' placement to whatever the restart found free,
+    // and one attempt in two ran the armed worker with no sink on it at all.
+    const clink::itest::ProcOptions ack_window_parked{
+        .fault = "sink.between_commit_and_receipt=block@6"};
+    ASSERT_TRUE(cluster.start_ha_worker(0, ack_window_parked));
     ASSERT_TRUE(cluster.start_ha_worker(1));
     ASSERT_TRUE(cluster.await_workers_registered(2));
 
@@ -1815,49 +1827,46 @@ TEST_F(KafkaWindowRecoveryTest, ABrokerOutageDuringRecoveryStaysExactlyOnce) {
     ASSERT_TRUE(clink::itest::await(
         [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > 0; }, 60s));
 
-    // The composition: a kill INSIDE the ack window (the armed fault
-    // guarantees a completed-but-unconfirmed checkpoint, so the walk MUST
-    // run) with the broker frozen while the walk probes. The walk starts
-    // within about a second of the loss and docker pause takes ~100ms, so
-    // the pause usually lands inside the walk's first retry round - but
-    // not always, and a clean resolution that wins the race is a valid
-    // (vacuous) episode, so it is retried: up to three armed kills until
-    // the transport-inconclusive line proves the composition formed.
+    // The composition, by construction: the ack window is already open on
+    // worker 0 (a transaction the broker committed with no receipt on disk),
+    // the broker goes down FIRST and the worker is lost second, so whatever
+    // the in-doubt walk probes, it probes a paused broker. The old shape
+    // raced a thirty-second window against loss detection, the survivor's
+    // drain against a paused broker and one full transport round, and on
+    // this machine that sum was never inside the window.
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return cluster.worker(0).log_contains("fired: sink.between_commit_and_receipt"); },
+        60s))
+        << "no exactly-once sink on worker 0 reached its sixth commit; the ack window never "
+           "opened";
     const auto w1_pid = cluster.worker(1).pid();
-    bool composed = false;
-    for (int attempt = 0; attempt < 3 && !composed; ++attempt) {
-        SCOPED_TRACE("outage attempt " + std::to_string(attempt));
-        const auto unreachable_before =
-            cluster.count_in_coordinator_log("has unreachable broker(s)");
-        cluster.worker(0).kill_and_reap();
-        ASSERT_TRUE(cluster.start_ha_worker(
-            0, ProcOptions{.fault = "sink.between_commit_and_receipt=exit:72@6"}));
-        // 240s, not 120s: the redeploy that brings the armed sink its
-        // commit waves first waits out the survivor drain, and a sink
-        // blocked in a bounded librdkafka call against the just-paused
-        // broker legitimately holds the drain for its own timeouts (the
-        // restart drain deadline is 120s for exactly that reason). The
-        // await must dominate drain + walk + deploy + six waves.
-        ASSERT_TRUE(clink::itest::await([&] { return !cluster.worker(0).running(); }, 240s))
-            << "the ack-window fault never fired";
-        kafka_->pause_broker();
-        composed = clink::itest::await(
-            [&] {
-                return cluster.count_in_coordinator_log("has unreachable broker(s)") >
-                       unreachable_before;
-            },
-            30s);
-        kafka_->unpause_broker();
-        ASSERT_TRUE(cluster.restart_worker_ha(0));
-        const auto confirmed_now = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
-        ASSERT_TRUE(clink::itest::await(
-            [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > confirmed_now; },
-            180s))
-            << "the job never resumed confirmed commits after the outage healed";
-    }
-    ASSERT_TRUE(composed)
-        << "three armed kills never overlapped the walk with the outage; the composition "
+    const auto held_before =
+        cluster.count_in_coordinator_log("restart held for in-doubt resolution");
+    const auto unreachable_before = cluster.count_in_coordinator_log("has unreachable broker(s)");
+    kafka_->pause_broker();
+    cluster.worker(0).kill_and_reap();
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return cluster.count_in_coordinator_log("restart held for in-doubt resolution") >
+                   held_before;
+        },
+        180s))
+        << "the loss never reached the in-doubt walk";
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return cluster.count_in_coordinator_log("has unreachable broker(s)") >
+                   unreachable_before;
+        },
+        120s))
+        << "the walk probed a paused broker without finding it unreachable; the composition "
            "did not form";
+    kafka_->unpause_broker();
+    ASSERT_TRUE(cluster.restart_worker_ha(0));
+    const auto confirmed_now = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > confirmed_now; },
+        180s))
+        << "the job never resumed confirmed commits after the outage healed";
 
     EXPECT_EQ(cluster.worker(1).pid(), w1_pid) << "worker 1 must survive the whole episode";
     EXPECT_EQ(cluster.count_in_coordinator_log("worker lost: worker-1"), 0)
@@ -1930,7 +1939,19 @@ TEST_F(KafkaWindowRecoveryTest, AnOrphanedCommitIsResolvedBeforeFencing) {
     Cluster cluster(spec);
     ScopedDiagnostics diagnostics(cluster);
     ASSERT_TRUE(cluster.start_ha_coordinators(1));
-    ASSERT_TRUE(cluster.start_ha_worker(0));
+    // Worker 0 carries the ack-window fault from the start, and the fault
+    // PARKS rather than kills: the sixth commit on worker 0 stops after the
+    // broker has accepted it and before the receipt is written, which is the
+    // ack window frozen in place, and the test then chooses the moment of the
+    // loss. A fresh deployment places tasks round-robin by index over two
+    // empty workers, so two of the four exactly-once sinks run on worker 0
+    // and the sixth window arrives within seconds of the first confirmed
+    // commit. Killing worker 0 and re-arming its replacement, as this test
+    // used to, left the sinks' placement to whatever the restart found free,
+    // and one attempt in two ran the armed worker with no sink on it at all.
+    const clink::itest::ProcOptions ack_window_parked{
+        .fault = "sink.between_commit_and_receipt=block@6"};
+    ASSERT_TRUE(cluster.start_ha_worker(0, ack_window_parked));
     ASSERT_TRUE(cluster.start_ha_worker(1));
     ASSERT_TRUE(cluster.await_workers_registered(2));
 
@@ -2005,49 +2026,38 @@ TEST_F(KafkaWindowRecoveryTest, AnOrphanedCommitIsResolvedBeforeFencing) {
     ASSERT_TRUE(clink::itest::await(
         [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > 0; }, 60s));
 
-    // The composition: the armed kill guarantees a committed-unreceipted
-    // orphan; the pause must then hold the broker down long enough for the
-    // walk to run OUT (five transport rounds, ~75-90s) or be cancelled -
-    // either exit writes the unresolved markers, which is the composed
-    // signal. A walk that wins the race before the pause lands resolves
-    // cleanly (valid, vacuous) and the episode retries.
-    bool composed = false;
-    for (int attempt = 0; attempt < 3 && !composed; ++attempt) {
-        SCOPED_TRACE("orphan attempt " + std::to_string(attempt));
-        const auto markers_before =
-            cluster.count_in_coordinator_log("unresolved orphan marker written");
-        cluster.worker(0).kill_and_reap();
-        ASSERT_TRUE(cluster.start_ha_worker(
-            0, ProcOptions{.fault = "sink.between_commit_and_receipt=exit:72@6"}));
-        // 240s, not 120s: the redeploy that brings the armed sink its
-        // commit waves first waits out the survivor drain, and a sink
-        // blocked in a bounded librdkafka call against the just-paused
-        // broker legitimately holds the drain for its own timeouts (the
-        // restart drain deadline is 120s for exactly that reason). The
-        // await must dominate drain + walk + deploy + six waves.
-        ASSERT_TRUE(clink::itest::await([&] { return !cluster.worker(0).running(); }, 240s))
-            << "the ack-window fault never fired";
-        kafka_->pause_broker();
-        composed = clink::itest::await(
-            [&] {
-                return cluster.count_in_coordinator_log("unresolved orphan marker written") >
-                       markers_before;
-            },
-            150s);
-        if (!composed) {
-            kafka_->unpause_broker();
-            cluster.worker(0).kill_and_reap();
-            ASSERT_TRUE(cluster.start_ha_worker(0));
-            const auto confirmed_now = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
-            ASSERT_TRUE(clink::itest::await(
-                [&] {
-                    return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") > confirmed_now;
-                },
-                180s));
-        }
-    }
-    ASSERT_TRUE(composed) << "three armed kills never left the walk unresolved against the "
-                             "outage; the orphan corner did not form";
+    // The composition, by construction: the ack window is already open on
+    // worker 0 (a transaction the broker committed with no receipt on disk),
+    // the broker goes down FIRST and the worker is lost second, and the
+    // broker stays down for the whole walk, so its five transport rounds run
+    // out and the unresolved markers are written. The old shape raced the
+    // pause against a walk that could win before it landed, and retried.
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return cluster.worker(0).log_contains("fired: sink.between_commit_and_receipt"); },
+        60s))
+        << "no exactly-once sink on worker 0 reached its sixth commit; the ack window never "
+           "opened";
+    const auto held_before =
+        cluster.count_in_coordinator_log("restart held for in-doubt resolution");
+    const auto markers_before =
+        cluster.count_in_coordinator_log("unresolved orphan marker written");
+    kafka_->pause_broker();
+    cluster.worker(0).kill_and_reap();
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return cluster.count_in_coordinator_log("restart held for in-doubt resolution") >
+                   held_before;
+        },
+        180s))
+        << "the loss never reached the in-doubt walk";
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return cluster.count_in_coordinator_log("unresolved orphan marker written") >
+                   markers_before;
+        },
+        300s))
+        << "the walk did not run out against the paused broker, so no orphan was left "
+           "unresolved and the corner this test is named for did not form";
 
     // Marker written, broker still paused. Return the worker: the restore
     // below deploys, the marked sink refuses to fence blind (its open
