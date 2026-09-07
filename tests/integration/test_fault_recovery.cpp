@@ -587,16 +587,31 @@ TEST_F(FaultRecoveryTest, AJobFailsOnceItsRestartBudgetIsSpent) {
     ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
                                     std::chrono::seconds(45)))
         << "no checkpoint completed before the first kill; the scenario never ran";
-    const auto before_first = latest_completed(c.checkpoint_dir());
 
-    // First loss: inside the budget, so the job must recover.
+    // First loss: inside the budget, so the job must recover. Wait for the
+    // coordinator's OWN account of that recovery - the restart line it writes
+    // once the survivor has drained and the job is redeployed - and only then
+    // for a checkpoint completed after it. Waiting for "a checkpoint newer than
+    // the one before the kill" was not the same thing: a checkpoint completing
+    // in the same instant as the kill satisfies it before the loss has even
+    // been noticed, the test then respawns worker 0 and kills worker 1 while
+    // the first drain is still waiting on it, the coordinator folds the second
+    // loss into the first restart exactly as it is designed to, one attempt
+    // covers both kills, and the job runs to completion. That read as an
+    // unenforced budget in CI (run 34097642703) with the gate working.
     c.worker(0).kill_hard();
     ASSERT_TRUE(c.await_process_gone(0));
     ASSERT_TRUE(
-        clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > before_first; },
+        clink::itest::await([&] { return c.coordinator().log_contains("attempt=1 survivors="); },
                             std::chrono::seconds(60)))
-        << "the job never checkpointed again after the FIRST worker loss, so the budget was "
-           "never actually spent and what follows would prove nothing";
+        << "the coordinator never restarted the job after the FIRST worker loss, so the budget "
+           "was never actually spent and what follows would prove nothing";
+    const auto after_restart = latest_completed(c.checkpoint_dir());
+    ASSERT_TRUE(
+        clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > after_restart; },
+                            std::chrono::seconds(60)))
+        << "the job never checkpointed again after its first restart, so the two losses are not "
+           "separated by a completed checkpoint and this is not the scenario the test names";
 
     // Bring worker 0 back BEFORE the second kill, so the job has somewhere to run.
     //
