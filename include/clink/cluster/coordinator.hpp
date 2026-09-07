@@ -1195,6 +1195,21 @@ private:
             // (fed task key, new upstream idx) pairs whose rebind port has
             // not yet arrived.
             std::set<std::pair<std::string, std::uint32_t>> rebind_ports_pending;
+            // Old subtasks whose SubtaskFinished landed while C was still
+            // completing. An exit at C is a drained ack, but the state machine
+            // only counts drains once C has completed (Preparing -> Draining),
+            // so they are held here and replayed the moment it does; dropping
+            // them lost the rendezvous, the cut never finished and the phase
+            // deadline aborted the cutover to the replan. The exit itself is
+            // already a fact: the subtask left pending_per_worker when it
+            // reported. Its slot is released by the rebind teardown with every
+            // other old subtask's, or by the abort if the cutover never gets
+            // there, which is what the worker id is for.
+            struct EarlyDrain {
+                std::uint32_t subtask_idx_in_op{0};
+                std::string worker_id;
+            };
+            std::vector<EarlyDrain> early_drains;
         };
         std::optional<HotCutover> hot_cutover;
 
@@ -1651,6 +1666,20 @@ private:
     [[nodiscard]] static bool restart_drain_covered_(const JobState& job);
 
     mutable std::mutex mu_;
+    // Gate for the rescale.hot_cut_ack fault point: the cutover checkpoint a hot
+    // cutover is awaiting (0 = none) and the keys ("role:idx") of the tasks the
+    // rescaled operator feeds, whose acks close the cut in practice. Read by
+    // handle_subtask_checkpointed_ BEFORE mu_ - one relaxed load per ack, the
+    // key set only for an ack of that checkpoint - so a Delay armed on the point
+    // holds the fed side's ack back on its own connection thread while the other
+    // connections' frames, the old subtasks' exits at C, are processed: the
+    // schedule that once lost those drains. A test aid; nothing decides on it.
+    std::atomic<std::uint64_t> hot_cut_ack_pin_ckpt_{0};
+    std::mutex hot_cut_ack_pin_mu_;
+    std::shared_ptr<const std::unordered_set<std::string>> hot_cut_ack_pin_keys_;
+    void set_hot_cut_ack_pin_locked_(std::uint64_t checkpoint_id,
+                                     const std::vector<std::string>& fed_task_keys);
+    void clear_hot_cut_ack_pin_locked_();
     std::condition_variable cv_;
     std::vector<std::string> expected_workers_;
     std::unordered_map<std::string, std::shared_ptr<WorkerConnection>> registered_;

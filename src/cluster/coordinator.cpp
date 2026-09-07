@@ -2690,6 +2690,23 @@ bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
     return true;
 }
 
+void Coordinator::set_hot_cut_ack_pin_locked_(std::uint64_t checkpoint_id,
+                                              const std::vector<std::string>& fed_task_keys) {
+    auto keys = std::make_shared<std::unordered_set<std::string>>(fed_task_keys.begin(),
+                                                                  fed_task_keys.end());
+    {
+        std::lock_guard pin_lock(hot_cut_ack_pin_mu_);
+        hot_cut_ack_pin_keys_ = std::move(keys);
+    }
+    hot_cut_ack_pin_ckpt_.store(checkpoint_id, std::memory_order_relaxed);
+}
+
+void Coordinator::clear_hot_cut_ack_pin_locked_() {
+    hot_cut_ack_pin_ckpt_.store(0, std::memory_order_relaxed);
+    std::lock_guard pin_lock(hot_cut_ack_pin_mu_);
+    hot_cut_ack_pin_keys_.reset();
+}
+
 void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
                                                 std::vector<PendingDeploy>& out_frames) {
     // Every arm ack has landed; the cutover checkpoint has not been
@@ -2733,6 +2750,7 @@ void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
     }
     hot.phase = JobState::HotCutover::Phase::AwaitingCut;
     hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
+    set_hot_cut_ack_pin_locked_(ckpt_id, hot.fed_task_keys);
     log::info("coordinator.rescale",
               "hot cutover checkpoint triggered job_id=" + std::to_string(job.id) +
                   " op_id=" + hot.op_id + " ckpt_id=" + std::to_string(ckpt_id));
@@ -2745,6 +2763,7 @@ void Coordinator::hot_cutover_begin_rebind_locked_(JobState& job,
     // running subtasks - the window a hold-open or a worker kill aims at.
     CLINK_FAULT_POINT(clink::fault::points::kHotCutoverCuttingOver);
     auto& hot = *job.hot_cutover;
+    clear_hot_cut_ack_pin_locked_();
     // Tear down the drained old subtasks' bookkeeping. Their
     // SubtaskFinished arrivals were counted as drained acks, not as
     // completions; remove records, identity and slots so the job's
@@ -2788,6 +2807,9 @@ void Coordinator::hot_cutover_begin_rebind_locked_(JobState& job,
             --job.expected_completion;
         }
     }
+    // The teardown above released every old subtask's slot, the early ones
+    // included; an abort from here on must not release them again.
+    hot.early_drains.clear();
 
     // Ask the fed tasks to bind listeners for the new upstream indices.
     hot.rebind_ports_pending.clear();
@@ -3089,16 +3111,34 @@ void Coordinator::abort_hot_cutover_locked_(JobState& job,
     const auto op_id = job.hot_cutover->op_id;
     const auto old_p = job.hot_cutover->old_parallelism;
     const auto target = job.hot_cutover->target_parallelism;
+    const auto ended_early = job.hot_cutover->early_drains.size();
     log::warn("coordinator.rescale",
               "hot cutover ABORTED job_id=" + std::to_string(job.id) + " op_id=" + op_id + " (" +
                   reason + "); falling back to the replan path at parallelism " +
-                  std::to_string(target));
+                  std::to_string(target) +
+                  (ended_early == 0
+                       ? std::string{}
+                       : "; " + std::to_string(ended_early) +
+                             " old subtask(s) had already ended at C, released to the replan"));
     if (job.rescale_coordinator) {
         job.rescale_coordinator->abort(op_id, reason);
         // The replan path drives Preparing -> mark_replan_complete, so the
         // machine must accept a fresh request.
         (void)job.rescale_coordinator->request_rescale(op_id, target);
     }
+    // Old subtasks that ended at C before this abort were held as early drains:
+    // their exits are real, they already left pending_per_worker, and no drain
+    // ack is coming from them again. The rebind teardown that would have freed
+    // their slots will not run now, so free them here; the replan re-places the
+    // operator, and the drain it stages below covers only what still runs.
+    for (const auto& early : job.hot_cutover->early_drains) {
+        if (auto w = registered_.find(early.worker_id);
+            w != registered_.end() && w->second->slots_in_use > 0) {
+            --w->second->slots_in_use;
+            metrics::coordinator::slots_in_use_delta(-1);
+        }
+    }
+    clear_hot_cut_ack_pin_locked_();
     job.hot_cutover.reset();
 
     // The proven stop-the-world staging, exactly as request_operator_rescale
@@ -6184,6 +6224,31 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                         dispatch_cutover_deploy_locked_(job, ack.op_id, restart_deploys);
                     }
                 }
+            } else if (st.has_value() && st->state == RescaleState::Preparing && !msg.had_error &&
+                       job.hot_cutover.has_value() && job.hot_cutover->op_id == ack.op_id &&
+                       job.hot_cutover->phase == JobState::HotCutover::Phase::AwaitingCut) {
+                // An old subtask of the hot operator ended at C before C's own
+                // completion was processed: the old subtasks stop the moment
+                // they forward the barrier, while C completes only on the last
+                // participant's ack, the sink's. The exit IS the drained ack;
+                // the state machine cannot count it until C completes, so hold
+                // it there and let the completion replay it. Falling through to
+                // the completion accounting below is what lost it before: the
+                // drain tally never reached the old parallelism and the cut sat
+                // at its phase deadline. A failed exit is not a drain; it takes
+                // the error path below as before. The exit is a fact for the
+                // worker's bookkeeping now: it leaves pending_per_worker, so a
+                // replan staged before C completes drains only what still runs
+                // (the abort releases its slot; the rebind teardown does when
+                // the cut completes).
+                job.hot_cutover->early_drains.push_back({ack.subtask_idx_in_op, msg.worker_id});
+                if (auto pending_it = job.pending_per_worker.find(msg.worker_id);
+                    pending_it != job.pending_per_worker.end()) {
+                    std::erase_if(pending_it->second, [&](const auto& p) {
+                        return p.first == msg.role && p.second == msg.subtask_idx;
+                    });
+                }
+                was_drain = true;
             }
         }
 
@@ -7070,6 +7135,24 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     // in Preparing advances to Draining and we send BeginRescale to
     // every worker hosting it.
     std::vector<PendingDeploy> rescale_frames;
+    // A hot cutover awaiting its cut, and this is an ack for C from a task the
+    // rescaled operator feeds - the ack that closes the cut in practice, since
+    // the fed side acks after every barrier has reached it. Reached before the
+    // lock, on this connection's reader thread, so a Delay armed on the point
+    // holds this ack back while the other connections' frames - the old
+    // subtasks' exits at C - are processed. A test aid; one relaxed load.
+    if (msg.checkpoint_id != 0 &&
+        msg.checkpoint_id == hot_cut_ack_pin_ckpt_.load(std::memory_order_relaxed)) {
+        std::shared_ptr<const std::unordered_set<std::string>> pinned;
+        {
+            std::lock_guard pin_lock(hot_cut_ack_pin_mu_);
+            pinned = hot_cut_ack_pin_keys_;
+        }
+        if (pinned != nullptr &&
+            pinned->count(msg.role + ":" + std::to_string(msg.subtask_idx)) != 0) {
+            CLINK_FAULT_POINT(clink::fault::points::kHotCutoverCutAck);
+        }
+    }
     {
         std::lock_guard lock(mu_);
         auto job_it = jobs_.find(msg.job_id);
@@ -7451,15 +7534,33 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 if (job.hot_cutover.has_value()) {
                     // Hot cutover: the arm went out BEFORE this checkpoint
                     // was triggered (stopping at a barrier that has already
-                    // passed would stop nothing), so only the state machine
-                    // advances here - and only for the reserved id.
+                    // passed would stop nothing), so no BeginRescale goes out
+                    // here - only the state machine advances, and only for the
+                    // reserved id. Old subtasks whose exits at C landed before
+                    // this completion were held in early_drains (the finish
+                    // handler cannot count a drain until the op is Draining);
+                    // they are counted now, and if that is every one of them
+                    // the cut is done and the rebind goes out from here. The
+                    // order between an exit and C's completion no longer
+                    // decides whether the cutover completes.
                     auto& hot = *job.hot_cutover;
                     if (msg.checkpoint_id == hot.cutover_checkpoint &&
                         hot.phase == JobState::HotCutover::Phase::AwaitingCut) {
-                        (void)job.rescale_coordinator->mark_checkpoint_ready(hot.op_id,
-                                                                             msg.checkpoint_id);
                         hot.phase_deadline =
                             std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
+                        if (job.rescale_coordinator->mark_checkpoint_ready(hot.op_id,
+                                                                           msg.checkpoint_id)) {
+                            for (const auto& early : hot.early_drains) {
+                                (void)job.rescale_coordinator->mark_old_drained(
+                                    hot.op_id, early.subtask_idx_in_op);
+                            }
+                            if (auto post = job.rescale_coordinator->status(hot.op_id);
+                                post.has_value() && post->state == RescaleState::CuttingOver) {
+                                // begin_rebind may abort and reset hot_cutover;
+                                // nothing touches `hot` after this call.
+                                hot_cutover_begin_rebind_locked_(job, rescale_frames);
+                            }
+                        }
                     }
                 } else {
                     for (const auto& op_status : job.rescale_coordinator->all()) {

@@ -1119,6 +1119,29 @@ TEST_F(HotRescaleTest, HoldingTheHotPreCompleteWindowOpenStaysExactlyOnce) {
     run_hot_and_assert(c, kMaxParallelism, "hot pre-complete window held");
 }
 
+// The old subtasks end at C the moment they forward it. C completes only when
+// every participant has acked, and the fed side (the sink) acks last, after
+// both barriers have reached it, so an exit can reach the coordinator before
+// C's completion does. The coordinator used to count an exit as a drain only
+// once C had completed, and one that landed first was dropped: the cut never
+// finished, the phase deadline aborted the cutover to the replan, and two of
+// the tests above failed that way in CI (exits 160 to 545 ms after the
+// trigger) and never on demand. Holding the sink's ack for C back for two
+// seconds is that schedule on purpose: the exit on the sink's own worker queues
+// behind the held ack, the other worker's lands while C is still open, and the
+// cutover has to complete regardless.
+TEST_F(HotRescaleTest, OldSubtasksEndingBeforeTheCutCompletesStillCutOver) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(
+        c.start_coordinator(clink::itest::ProcOptions{.fault = "rescale.hot_cut_ack=delay:2000"}));
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    run_hot_and_assert(c, kMaxParallelism, "old subtasks ended before the cut completed");
+}
+
 // A worker lost mid-cutover: the hot path aborts and the proven replan
 // finishes the rescale on the survivor - and the output is STILL
 // exactly-once. This is also what keeps the happy-path source assertion

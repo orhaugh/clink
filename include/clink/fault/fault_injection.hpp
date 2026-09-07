@@ -351,6 +351,18 @@ inline constexpr char kRescaleBeforeFirstCheckpoint[] = "rescale.before_first_ch
 inline constexpr char kHotCutoverBeforeTrigger[] = "rescale.hot_before_trigger";
 inline constexpr char kHotCutoverCuttingOver[] = "rescale.hot_cutting_over";
 inline constexpr char kHotCutoverBeforeComplete[] = "rescale.hot_before_complete";
+// An ack for the cutover checkpoint C from a task the rescaled operator FEEDS
+// has arrived and is about to be processed, on that worker's connection thread,
+// before the coordinator lock. The fed side acks after every barrier has
+// reached it, so its ack is what closes C in practice, while the old subtasks
+// end at C the moment they forward it: an exit can reach the coordinator before
+// C's completion does. A Delay here holds that order open on purpose - the exit
+// on the fed task's own worker queues behind the held ack, the other worker's
+// lands first. The coordinator once counted an exit as a drain only after C had
+// completed and dropped one that came first: the cut never finished and the
+// phase deadline aborted the cutover to the replan, twice in CI at 160 to
+// 545 ms after the trigger and never on demand.
+inline constexpr char kHotCutoverCutAck[] = "rescale.hot_cut_ack";
 
 // Every name here MUST have a CLINK_FAULT_POINT somewhere in include/ or src/.
 // `scripts/check-fault-points.sh` enforces that, and it is not a style rule.

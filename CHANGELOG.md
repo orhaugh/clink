@@ -400,6 +400,30 @@ pair, the smoke run of both binaries, and the check that what was
 published really covers both architectures. The v0.8.0 tags were
 republished that way and now carry linux/amd64 and linux/arm64.
 
+**A hot cutover no longer stalls when an old subtask's exit reaches the
+coordinator before the cutover checkpoint completes.** The rescaled
+operator's old subtasks end at the cutover checkpoint C the moment they
+forward it, while C completes only on the last participant's ack, the
+sink's, so an exit can land first. The coordinator counted an exit as a
+drained ack only once C had completed, and one that came earlier fell
+through to the ordinary completion accounting: the drain tally never
+reached the old parallelism, the cut sat at its phase deadline, and sixty
+seconds later the cutover aborted to the replan. The job still rescaled,
+but by stopping, and the `HotRescaleTest` hold-open cases failed that way
+twice in CI (exits 160 to 545 ms after the trigger) and never on demand.
+An exit that beats the completion is now held on the cutover and counted
+the moment C completes, with the rebind dispatched from there when that
+closes the drain, so the order between the two no longer decides the
+outcome; if the cutover aborts first, the held exits are released to the
+replan rather than waited for, which the worker-loss case of the same
+family checks. The schedule is pinned rather than repeated: a fault point,
+`rescale.hot_cut_ack`, is reached before the coordinator lock on an ack for C
+from a task the operator feeds, and
+`HotRescaleTest.OldSubtasksEndingBeforeTheCutCompletesStillCutOver` holds the
+sink's ack back for two seconds so an exit lands while C is still open and
+requires the cutover to complete anyway. Mutation-checked: with the pin and
+without the fix, the cut times out and the test fails.
+
 ## v0.8.0 (August 2026)
 
 The launch release: the qualification programme run across the engine's
