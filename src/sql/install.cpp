@@ -67,6 +67,7 @@
 #include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
+#include "clink/sql/spill_store.hpp"
 #include "clink/sql/state_ttl.hpp"
 #include "clink/time/watermark_strategy.hpp"
 #include "clink/time/window_arithmetic.hpp"
@@ -4394,14 +4395,16 @@ public:
                    bool async_state = false,
                    bool emit_changelog = false,
                    std::int64_t state_ttl_ms = 0,
-                   bool ttl_event_time = true)
+                   bool ttl_event_time = true,
+                   std::string spill_dir = {})
         : group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
           group_key_outputs_(intern_names(group_key_outputs)),
           async_state_(async_state),
           effective_async_state_(async_state),
           emit_changelog_(emit_changelog),
-          ttl_(state_ttl_ms, ttl_event_time) {
+          ttl_(state_ttl_ms, ttl_event_time),
+          spill_dir_(std::move(spill_dir)) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             // default: emit each key under its raw name
             group_key_outputs_ = intern_names(group_keys_);
@@ -4586,6 +4589,7 @@ public:
                 }
                 for (std::size_t g = 0; g < groups.size(); ++g) {
                     const auto& idxs = groups[g];
+                    load_spilled_key_(group_keys[g]);
                     auto sit = state_.find(group_keys[g]);
                     if (sit == state_.end()) {
                         sit = state_
@@ -4678,6 +4682,7 @@ public:
         emit_batch.reserve(groups.size());
         for (std::size_t g = 0; g < groups.size(); ++g) {
             const auto& idxs = groups[g];
+            load_spilled_key_(group_keys[g]);
             auto sit = state_.find(group_keys[g]);
             if (sit == state_.end()) {
                 // New group: build the bucket directly from the first index's key
@@ -4714,6 +4719,7 @@ public:
     // process() keeps the byte-for-byte in-memory path and the runner stays
     // synchronous - existing jobs are unchanged.
     void open() override {
+        ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         memory_.bind(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_state_ =
             async_state_ || (this->runtime() != nullptr && this->runtime()->has_state_backend() &&
@@ -4725,10 +4731,18 @@ public:
         // paths, so a job can move between storage modes across restarts.
         persist_inmem_ = !effective_async_state_ && this->runtime() != nullptr &&
                          this->runtime()->has_state_backend();
+        if (!effective_async_state_ && memory_.enabled()) {
+            if (spill_dir_.empty()) {
+                if (const auto* path = std::getenv("CLINK_SQL_SPILL_DIR"))
+                    spill_dir_ = path;
+            }
+            if (!spill_dir_.empty())
+                spill_ = std::make_unique<SpillStore>(spill_dir_);
+        }
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan([&](const std::string& key, const AggBucket& bucket) {
                 state_[key] = bucket;
-                account_key_(key);
+                account_or_spill_(key);
             });
         }
         // Deadlines are absolute, so a restored group resumes its original
@@ -4766,18 +4780,17 @@ public:
             clink::queryable_state::Registry::global().register_json_slot(
                 queryable_slot_, [this](const std::string& key) -> std::optional<std::string> {
                     std::lock_guard lk(serving_mu_);
-                    auto it = state_.find(key);
-                    if (it == state_.end() && key.find('\x1f') == std::string::npos &&
+                    auto bucket = lookup_bucket_(key);
+                    if (!bucket && key.find('\x1f') == std::string::npos &&
                         (key.empty() || key.front() != '"')) {
                         // UX fallback: a bare string key retried in its
                         // JSON-serialised form (group_key_ stores values as
                         // their JSON literals, so TEXT keys carry quotes).
-                        it = state_.find(clink::config::JsonValue{key}.serialize(0));
+                        bucket = lookup_bucket_(clink::config::JsonValue{key}.serialize(0));
                     }
-                    if (it == state_.end()) {
+                    if (!bucket)
                         return std::nullopt;
-                    }
-                    return serving_row_json_(it->second);
+                    return serving_row_json_(*bucket);
                 });
             // Bounded whole-slot scan: state-as-table. Holds the serving
             // lock for its duration; the route layer clamps the limit.
@@ -4786,6 +4799,17 @@ public:
                 [this](std::size_t limit) -> clink::queryable_state::JsonScanResult {
                     clink::queryable_state::JsonScanResult out;
                     std::lock_guard lk(serving_mu_);
+                    if (spilling_) {
+                        spill_->scan([&](const std::string& key, const SpillStore::Bytes& bytes) {
+                            if (out.entries.size() >= limit) {
+                                out.truncated = true;
+                                return false;
+                            }
+                            out.entries.emplace_back(key, serving_row_json_(decode_spill_(bytes)));
+                            return true;
+                        });
+                        return out;
+                    }
                     for (const auto& [key, bucket] : state_) {
                         if (out.entries.size() >= limit) {
                             out.truncated = true;
@@ -4971,6 +4995,8 @@ private:
     void handle_record_inmem_(const Row& row, Batch<Row>& out) {
         // Transparent probe with the scratch key (see WindowRowOp).
         const auto key = group_key_scratch_(row);
+        if (spilling_)
+            load_spilled_key_(std::string(key));
         auto it = state_.find(key);
         if (it == state_.end()) {
             it = state_.emplace(std::string(key), init_bucket_(row)).first;
@@ -5001,6 +5027,67 @@ private:
         return clink::config::JsonValue{clink::sql::to_json_object(result.values)}.serialize(0);
     }
 
+    AggBucket decode_spill_(const SpillStore::Bytes& bytes) const {
+        auto bucket = agg_bucket_codec().decode(bytes);
+        if (!bucket)
+            throw std::runtime_error("SQL_SPILL_ERROR: invalid aggregate bucket");
+        return std::move(*bucket);
+    }
+
+    std::optional<AggBucket> lookup_bucket_(const std::string& key) const {
+        if (spilling_) {
+            auto bytes = spill_->get(key);
+            if (bytes)
+                return decode_spill_(*bytes);
+            return std::nullopt;
+        }
+        const auto it = state_.find(key);
+        return it == state_.end() ? std::nullopt : std::optional<AggBucket>{it->second};
+    }
+
+    void load_spilled_key_(const std::string& key) {
+        if (!spilling_ || state_.contains(key))
+            return;
+        auto bytes = spill_->get(key);
+        if (bytes) {
+            state_.emplace(key, decode_spill_(*bytes));
+            // A group must fit on its own, including after restore or a limit
+            // reduction. Disk storage cannot bound one growing accumulator.
+            account_key_(key);
+        }
+    }
+
+    void account_or_spill_(const std::string& key) {
+        try {
+            account_key_(key);
+        } catch (const MemoryLimitExceeded&) {
+            if (!spill_ || spilling_)
+                throw;
+            // Switch the whole working set to disk. No resident key index or
+            // dirty set grows with spilled cardinality; subsequent folds keep
+            // just their active group in memory and write it back immediately.
+            for (const auto& [stored_key, bucket] : state_)
+                spill_->put(stored_key, agg_bucket_codec().encode(bucket));
+            decltype(state_){}.swap(state_);
+            decltype(dirty_){}.swap(dirty_);
+            memory_ = KeyedMemoryAccount{};
+            memory_.bind(this->runtime()->memory_budget());
+            spilling_ = true;
+            load_spilled_key_(key);  // Refuse a single group larger than the budget.
+            if (this->runtime())
+                this->runtime()->log_info(
+                    "SQL GROUP BY switched to local spill after memory pressure");
+        }
+        if (spilling_) {
+            auto it = state_.find(key);
+            if (it != state_.end()) {
+                spill_->put(key, agg_bucket_codec().encode(it->second));
+                state_.erase(it);
+                memory_.erase(key);
+            }
+        }
+    }
+
     void account_key_(const std::string& key) {
         if (!memory_.enabled())
             return;
@@ -5015,15 +5102,18 @@ private:
     }
 
     void mark_dirty_(const std::string& key) {
-        account_key_(key);
-        if (persist_inmem_) {
-            dirty_.insert(key);
+        // Spilling can erase the map node whose key the caller passed.
+        const std::string owned_key = spill_ ? key : std::string{};
+        const auto& stable_key = spill_ ? owned_key : key;
+        account_or_spill_(stable_key);
+        if (persist_inmem_ && !spilling_) {
+            dirty_.insert(stable_key);
         }
         // Retention is refreshed by DATA touching the group, and this is
         // the one place every write path funnels through. Note it is
         // outside the persist_inmem_ guard: the async/KeyedState path holds
         // its buckets in the backend but still needs deadlines.
-        ttl_touch_(key);
+        ttl_touch_(stable_key);
     }
 
     void flush_dirty_() {
@@ -5031,13 +5121,20 @@ private:
         // keeps its buckets in the backend already, but its deadlines live
         // here and would be lost on a restart without this.
         flush_ttl_dirty_();
-        if (!persist_inmem_ || dirty_.empty()) {
+        if (!persist_inmem_ || (!spilling_ && dirty_.empty())) {
             return;
         }
         // Serving lock: a queryable lookup must not observe buckets while
         // this thread iterates them (same discipline as the fold paths).
         std::lock_guard serving_lock(serving_mu_);
         auto kv = keyed_state_();
+        if (spilling_) {
+            spill_->scan([&](const std::string& key, const SpillStore::Bytes& bytes) {
+                kv.put(key, decode_spill_(bytes));
+                return true;
+            });
+            return;
+        }
         for (const auto& key : dirty_) {
             auto it = state_.find(key);
             if (it != state_.end()) {
@@ -5095,6 +5192,8 @@ private:
             dl.emplace(deadline_state_());
         }
         for (const auto& key : doomed) {
+            if (spilling_)
+                spill_->erase(key);
             state_.erase(key);
             memory_.erase(key);
             dirty_.erase(key);
@@ -5128,7 +5227,9 @@ public:
     // Groups evicted by retention so far. Read by the TTL tests and
     // available for metrics reporting.
     [[nodiscard]] std::uint64_t ttl_expired_groups() const noexcept { return ttl_.expired_total(); }
-    [[nodiscard]] std::size_t live_group_count() const noexcept { return state_.size(); }
+    [[nodiscard]] std::size_t live_group_count() const noexcept {
+        return spilling_ ? spill_->size() : state_.size();
+    }
 
 private:
     std::vector<std::string> group_keys_;
@@ -5137,6 +5238,9 @@ private:
     // Retention. Set from the table's `state_ttl` / `state_ttl_domain`
     // options via the physical planner; disabled (and free) when unset.
     StateTtlTracker ttl_;
+    std::string spill_dir_;
+    std::unique_ptr<SpillStore> spill_;
+    bool spilling_ = false;
     bool async_state_ = false;
     // Effective decision: async_state_ OR the bound backend can defer reads.
     // Seeded from async_state_ in the ctor and finalised in open() once the
@@ -5274,6 +5378,7 @@ public:
     // by mutating the OTHER side's entries (a read-modify-write of both sides,
     // serialised under the per-key gate so it is consistent).
     void open() override {
+        ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
         // The async path emits from inside its coroutines, which do not run
@@ -6023,6 +6128,7 @@ public:
     // NULL right poisons probes ACROSS keys (per-position wildcard match) and
     // it is already a parallelism-1 operator, so it does not fit per-key state.
     void open() override {
+        ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = !null_aware_ && this->runtime() != nullptr &&
                            this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
@@ -6711,6 +6817,7 @@ public:
     // KeyedState get/put. Either way the per-key state is checkpointed - the
     // former in-memory maps were not, so a restore re-emitted or dropped rows.
     void open() override {
+        ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
         if (!ttl_.enabled() || this->runtime() == nullptr ||
@@ -8261,6 +8368,7 @@ public:
     // process() drives the synchronous KeyedState get/put. Either way the
     // seen-set is checkpointed - unlike the former in-memory set.
     void open() override {
+        ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
         if (!ttl_.enabled() || this->runtime() == nullptr ||
@@ -11635,7 +11743,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                     async_state,
                                                     emit_changelog,
                                                     ttl.ms,
-                                                    ttl.event_time);
+                                                    ttl.event_time,
+                                                    ctx.param_or("spill_dir", ""));
         });
 
     // project_row: per-row expression evaluation. The 'outputs' param

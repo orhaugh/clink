@@ -239,3 +239,13 @@ because a checkpoint can hold both the working and encoded copies. See
 - [./distributed-runtime.md](./distributed-runtime.md) - the coordinator/worker cluster the queryable-state coordinator routes run on
 - [./columnar-execution.md](./columnar-execution.md) - the Arrow stack the IPC snapshot format reuses
 - [../connectors/README.md](../connectors/README.md) - sources and sinks, including the S3 and RocksDB impls that register state-backend schemes
+
+### SQL aggregate working-state spill
+
+With a memory budget and `CLINK_SQL_SPILL_DIR`, synchronous windowless GROUP BY
+can move its operator-owned working map to local scratch files on pressure.
+This is separate from backend selection: spilled groups are still copied to
+the normal backend slot before a checkpoint and restored from that slot.
+Memory/file backends can therefore still run out of budget at checkpoint time;
+use a disk-backed backend for larger durable state. See
+[Memory budgets](memory-management.md#sql-group-by-spill) for the complete scope.

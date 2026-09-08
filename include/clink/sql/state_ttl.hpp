@@ -54,6 +54,7 @@
 
 #include "clink/core/codec.hpp"
 #include "clink/metrics/state_metrics.hpp"
+#include "clink/runtime/keyed_memory_account.hpp"
 #include "clink/state/keyed_state.hpp"
 
 namespace clink::sql {
@@ -65,6 +66,10 @@ public:
     StateTtlTracker() = default;
     StateTtlTracker(std::int64_t ttl_ms, bool event_time)
         : ttl_ms_(ttl_ms), event_time_(event_time) {}
+
+    void bind_memory_budget(std::shared_ptr<MemoryBudget> budget) {
+        memory_.bind(std::move(budget));
+    }
 
     [[nodiscard]] bool enabled() const noexcept { return ttl_ms_ > 0; }
     [[nodiscard]] std::uint64_t expired_total() const noexcept { return expired_total_; }
@@ -113,15 +118,18 @@ public:
                 // against it until the first watermark arrives anyway.
                 deadlines_[key] = high_event_ts_ + ttl_ms_;
                 dirty_.insert(key);
+                account_key_(key);
                 return;
             }
             pre_clock_.insert(key);
+            account_key_(key);
             return;
         }
         const auto base =
             (event_time_ && high_event_ts_ != kNoEventTs) ? std::max(*now, high_event_ts_) : *now;
         deadlines_[key] = base + ttl_ms_;
         dirty_.insert(key);
+        account_key_(key);
     }
 
     // Record that this operator has SEEN a record stamped `ts_ms`. Called
@@ -156,11 +164,13 @@ public:
         // that had not started) and never later (or they never expire at
         // all).
         if (!pre_clock_.empty()) {
-            for (const auto& key : pre_clock_) {
+            while (!pre_clock_.empty()) {
+                const auto key = *pre_clock_.begin();
                 deadlines_[key] = watermark_ms_ + ttl_ms_;
                 dirty_.insert(key);
+                pre_clock_.erase(key);
+                account_key_(key);
             }
-            pre_clock_.clear();
         }
         return true;
     }
@@ -189,6 +199,7 @@ public:
         deadlines_.erase(key);
         dirty_.erase(key);
         pre_clock_.erase(key);
+        memory_.erase(key);
         ++expired_total_;
     }
 
@@ -199,12 +210,14 @@ public:
         if (!enabled() || dirty_.empty()) {
             return;
         }
-        for (const auto& key : dirty_) {
+        while (!dirty_.empty()) {
+            const auto key = *dirty_.begin();
             if (const auto it = deadlines_.find(key); it != deadlines_.end()) {
                 slot.put(key, it->second);
             }
+            dirty_.erase(key);
+            account_key_(key);
         }
-        dirty_.clear();
     }
 
     // Also erase the persisted deadline for an evicted key, so the slot
@@ -217,6 +230,7 @@ public:
         }
         slot.scan([&](const std::string& key, const std::int64_t& deadline) {
             deadlines_[key] = deadline;
+            account_key_(key);
         });
     }
 
@@ -232,6 +246,7 @@ public:
             return;
         }
         pre_clock_.insert(key);
+        account_key_(key);
     }
 
     // Publish this operator's retention position: the population currently
@@ -264,6 +279,20 @@ public:
     }
 
 private:
+    void account_key_(const std::string& key) {
+        if (!memory_.enabled())
+            return;
+        std::size_t bytes = 0;
+        if (const auto it = deadlines_.find(key); it != deadlines_.end())
+            bytes += sizeof(*it) + it->first.capacity() + 1 + 4 * sizeof(void*);
+        for (const auto* set : {&dirty_, &pre_clock_}) {
+            if (const auto it = set->find(key); it != set->end())
+                bytes += sizeof(*it) + it->capacity() + 1 + 4 * sizeof(void*);
+        }
+        memory_.update(key, bytes);
+    }
+
+    KeyedMemoryAccount memory_;
     static constexpr std::int64_t kNoEventTs = std::numeric_limits<std::int64_t>::min();
 
     std::int64_t ttl_ms_{0};

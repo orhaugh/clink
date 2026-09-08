@@ -245,6 +245,18 @@ Mechanics worth knowing before extending it:
   (float division in DuckDB) stays out of the generator; expression ranges
   are bounded so nothing leaves exact-double range.
 
+## Memory pressure in execution
+
+Synchronous windowless GROUP BY can spill its working groups on shared-budget
+pressure when `CLINK_SQL_SPILL_DIR` is configured. It preserves the existing
+aggregate codec, changelog and retraction semantics, checkpoint slot and
+queryable surface. After spilling, each fold reads and writes one group; window
+and join maps do not take this path. The shared SQL TTL tracker also accounts
+its deadline and dirty-key indexes, including keys waiting for a watermark.
+See [Memory budgets](memory-management.md) for configuration, backend requirements
+and the exact allocation coverage. The scratch store is implemented in
+`include/clink/sql/spill_store.hpp` and `src/sql/spill_store.cpp`.
+
 ## Related
 
 - [./operator-model.md](./operator-model.md) - the operator and DAG model the `JobGraphSpec` targets

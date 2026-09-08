@@ -65,8 +65,9 @@ limit. Multiply by the number of concurrent executions when sizing a Worker.
 | --- | --- |
 | DAG local edge queues, including side outputs | Estimated retained bytes are reserved before enqueue and released on dequeue or queue destruction. Row vector capacity and string payloads are counted. SQL Rows include nested JSON and collection capacity. Arrow batches count retained buffers without materialising rows. Shared buffers are deduplicated within one batch but charged separately for separate queued references; slices count their parent buffers. |
 | Blocking exchanges | Retained IPC payload capacity and list-node allocations charge the operator domain. With a configured spill directory, payload refusal migrates the resident prefix to disk and spills subsequent batches, even below the exchange threshold. Control elements and per-batch ordering metadata remain budgeted in memory. Replay releases each entry; destruction releases remaining charges and removes spill files. |
-| SQL windowless `GROUP BY` | Incremental retained-state estimates after each touched group changes, including aggregate vectors, group values, prior changelog output and cold aggregate payloads such as distinct sets, `ARRAY_AGG` and UDAF values. Restore rebuilds charges; TTL expiry releases them. |
+| SQL windowless `GROUP BY` | Incremental retained-state estimates after each touched group changes, including aggregate vectors, group values, prior changelog output and cold aggregate payloads such as distinct sets, `ARRAY_AGG` and UDAF values. Restore rebuilds charges; TTL expiry releases them. With a configured SQL spill directory, pressure switches this operator to disk-backed working groups. |
 | SQL tumbling, hopping and cumulative window aggregates | The same bucket estimates, including each retained pane. Row and columnar ingest update the account; window firing releases pane charges. Empty group containers that the operator retains continue to count. |
+| SQL TTL indexes | Deadline, dirty-key and pre-watermark key estimates charge the operator budget for GROUP BY, equi joins, semi/anti joins, DISTINCT and set operators. Restore rebuilds charges and expiry releases them. These indexes remain in memory and cannot spill. |
 | In-memory and file-backed backend working state | Estimated key/value storage and map overhead, checked before puts and during restore. Erase and clear release charges. Staged barrier copies have separate checkpoint charges. Binding a new domain requires an empty backend. |
 | Canonical snapshot writer | Arrow builder and IPC output allocations use a budgeted pool. The final byte-vector copy is reserved while the writer holds it. Returned snapshot byte vectors are caller-owned and are not continuously tracked. |
 | Async snapshot worker | Captured byte-vector capacity is charged while queued and while persistence runs. A refused enqueue throws; it cannot produce a successful acknowledgement. Backend-specific resources behind opaque capture handles are outside this charge. |
@@ -120,13 +121,64 @@ auto boundary = dag.add_blocking_exchange(input, clink::int64_arrow_batcher(), s
 This policy covers retained exchange storage. Arrow batch construction, IPC
 serialisation scratch space and decoded replay batches remain outside this
 account, so a large batch can exceed the byte limit in actual RAM. Spilling one
-exchange does not reclaim other operators' state. There is no automatic spill
-for SQL working maps, TTL adjustment or eviction of correctness-bearing state.
-Existing window/TTL expiry and backend eviction retain their original semantics.
+exchange does not reclaim other operators' state. Neither spill policy adjusts
+TTL or evicts correctness-bearing state. Existing window/TTL expiry and backend
+eviction retain their original semantics.
 Refusal reaches the existing operator-error path;
 that path closes every local edge so unrelated blocked branches can terminate.
 Checkpoint allocation failures use the existing failed-checkpoint path. Nothing
 changes the durability condition for a successful acknowledgement.
+
+### SQL GROUP BY spill
+
+Set `CLINK_SQL_SPILL_DIR` to an existing writable directory alongside the memory
+limit to enable local spill for the synchronous windowless `GROUP BY` working
+map. A direct operator factory can instead pass `spill_dir`; that overrides the
+environment directory. A memory budget is required. Async/backend-driven
+aggregate execution keeps its existing storage path.
+
+```bash
+mkdir -p /var/tmp/clink-sql-spill
+CLINK_EXECUTION_MEMORY_LIMIT_BYTES=268435456 \
+CLINK_SQL_SPILL_DIR=/var/tmp/clink-sql-spill \
+clink run pipeline.sql --state-backend=rocksdb:///var/tmp/clink-state
+```
+
+The first refused group charge writes the complete resident working map to a
+private spill directory and releases its groups and dirty keys. Subsequent
+folds load one group and write it back immediately, including on the columnar
+path. This favours bounded retained memory over throughput: after the switch,
+each touched group incurs synchronous file I/O and codec work. Each group must
+still fit within the available budget. A single growing `ARRAY_AGG`, a large
+UDAF accumulator or contention from other owners can therefore still fail.
+TTL metadata also remains in RAM and can exhaust the budget independently.
+
+Files contain the existing aggregate codec, including distinct/multiplicity
+state and the prior changelog row. Hashed filenames allow direct lookup without
+an in-memory index; full stored keys and content checksums are verified on
+reads. This uses one file per group under 256 hash-prefix directories, so
+filesystem metadata, inode capacity and disk space matter at high cardinality.
+Writes use atomic replacement. An I/O error or invalid spill content fails the
+operator rather than treating the group as absent. A private directory is
+removed when the operator is destroyed; an abruptly killed process can leave
+scratch directories for operational cleanup.
+
+Spill files are **not checkpoints**. Before a checkpoint, all spilled groups
+are streamed through the normal `agg` state slot. Recovery reads that slot and
+can spill again into a fresh directory. TTL expiry erases both disk working
+state and backend entries, and queryable lookups/scans include spilled groups.
+The snapshot codec and acknowledgement rules do not change.
+
+Use a disk-backed state backend when checkpoints must hold more state than the
+memory budget: memory/file backends retain their working state in RAM, so a
+checkpoint copying a large spill store into them can still be refused. Native
+RocksDB caches remain outside the shared account. Codec buffers, decoded lookup
+results, batch grouping/output buffers and filesystem page cache are also
+outside this coverage. This is not an RSS cap.
+
+Window, join, OVER, ranking and other SQL working maps do not use this spill
+policy. Their existing accounting and failure behaviour are unchanged, apart
+from the newly covered TTL indexes listed above.
 
 For Arrow growth, the pool reserves the whole new allocation while retaining the
 old charge, because a reallocation can temporarily hold both buffers. Refused
@@ -150,7 +202,11 @@ backend state, checkpoint staging, async persistence and failure cancellation.
 replay, charge release, refusal without spill and bounded spill metadata.
 `tests/test_sql_memory_budget.cpp` exercises the real registered aggregate and
 window operators, including growing values, window expiry and restored state.
+It also checks spilled aggregate/retraction parity, columnar folds, checkpoint
+restore, TTL cleanup, queryable scans, oversized groups and corrupt spill files.
 
 The implementation lives in `include/clink/runtime/memory_budget.hpp`,
 `keyed_memory_account.hpp`, `memory_size.hpp`, `arrow_memory_pool.hpp`,
 `src/runtime/memory_size.cpp`, the LocalExecutor and the covered owners above.
+SQL scratch storage lives in `include/clink/sql/spill_store.hpp` and
+`src/sql/spill_store.cpp`; TTL accounting lives in `include/clink/sql/state_ttl.hpp`.

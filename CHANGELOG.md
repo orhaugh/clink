@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**SQL GROUP BY spills working groups under shared-budget pressure.** With
+`CLINK_SQL_SPILL_DIR` configured, synchronous aggregate execution moves its
+resident groups to private scratch files on exhaustion, then loads and writes
+one group at a time. Existing aggregate/changelog codecs, checkpoint slots,
+TTL expiry and queryable results are preserved. One group must still fit;
+checkpointing large state still needs an appropriate backend. SQL TTL indexes
+now charge the operator budget across aggregates, joins, DISTINCT and set
+operators. Window and other SQL maps do not yet spill. See
+[Memory budgets](docs/internals/memory-management.md).
+
 **Blocking exchanges spill on shared-budget pressure.** Retained IPC payloads
 and ordering metadata now share the execution/operator memory budget. With a
 spill directory configured, a refused payload charge migrates the resident
