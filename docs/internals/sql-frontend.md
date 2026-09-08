@@ -247,15 +247,17 @@ Mechanics worth knowing before extending it:
 
 ## Memory pressure in execution
 
-Synchronous windowless GROUP BY can spill its working groups on shared-budget
-pressure when `CLINK_SQL_SPILL_DIR` is configured. It preserves the existing
-aggregate codec, changelog and retraction semantics, checkpoint slot and
-queryable surface. After spilling, each fold reads and writes one group; window
-and join maps do not take this path. The shared SQL TTL tracker also accounts
-its deadline and dirty-key indexes, including keys waiting for a watermark.
+With `CLINK_SQL_SPILL_DIR` and a shared memory budget, synchronous GROUP BY,
+fixed/session windows, equi/interval joins, OVER, last-N and partitioned ranking
+can spill working partitions. Null-aware semi/anti joins spill exact-key maps;
+their cross-key null indexes remain budgeted in RAM. Global top-N heaps also
+count but cannot spill. State codecs preserve changelog, retraction, matching
+and ordering information, with normal backend slots supplying recovery.
+Each active partition must fit; a join needs both sides of its active key.
 See [Memory budgets](memory-management.md) for configuration, backend requirements
-and the exact allocation coverage. The scratch store is implemented in
-`include/clink/sql/spill_store.hpp` and `src/sql/spill_store.cpp`.
+and allocation exclusions. `include/clink/sql/working_set.hpp` implements map
+accounting and streaming mutation scans; `spill_store.hpp` and
+`src/sql/spill_store.cpp` implement scratch storage.
 
 ## Related
 

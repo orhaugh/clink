@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**SQL window, join, OVER and ranking partitions now spill on budget pressure.**
+Fixed/session windows, equi/interval joins, OVER and last-N frames, partitioned
+ranking and null-aware join exact-key maps share retained-state accounting and
+local scratch spill. Checkpoint recovery preserves their state; interval joins
+and null-aware joins now persist their synchronous working data. Null wildcard
+indexes and global top-N heaps are accounted but remain in RAM. Each active
+partition must fit, and temporary allocations remain outside the limit. See
+[Memory budgets](docs/internals/memory-management.md).
+
 **SQL GROUP BY spills working groups under shared-budget pressure.** With
 `CLINK_SQL_SPILL_DIR` configured, synchronous aggregate execution moves its
 resident groups to private scratch files on exhaustion, then loads and writes
@@ -9,7 +18,7 @@ one group at a time. Existing aggregate/changelog codecs, checkpoint slots,
 TTL expiry and queryable results are preserved. One group must still fit;
 checkpointing large state still needs an appropriate backend. SQL TTL indexes
 now charge the operator budget across aggregates, joins, DISTINCT and set
-operators. Window and other SQL maps do not yet spill. See
+operators. See
 [Memory budgets](docs/internals/memory-management.md).
 
 **Blocking exchanges spill on shared-budget pressure.** Retained IPC payloads
@@ -18,7 +27,7 @@ spill directory configured, a refused payload charge migrates the resident
 prefix to disk before the incoming batch, preserving data and control order.
 Replay releases retained charges. Without spill, or when ordering metadata
 exhausts the budget, the execution fails cleanly. IPC scratch space and decoded
-batches remain outside this accounting; SQL working maps do not spill.
+batches remain outside this accounting.
 
 **Opt-in memory budgets share an allowance across covered state, local queues
 and checkpoint work.** `JobConfig` accepts a shared domain or byte limit, with

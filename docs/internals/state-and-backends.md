@@ -240,12 +240,14 @@ because a checkpoint can hold both the working and encoded copies. See
 - [./columnar-execution.md](./columnar-execution.md) - the Arrow stack the IPC snapshot format reuses
 - [../connectors/README.md](../connectors/README.md) - sources and sinks, including the S3 and RocksDB impls that register state-backend schemes
 
-### SQL aggregate working-state spill
+### SQL working-state spill
 
-With a memory budget and `CLINK_SQL_SPILL_DIR`, synchronous windowless GROUP BY
-can move its operator-owned working map to local scratch files on pressure.
+With a memory budget and `CLINK_SQL_SPILL_DIR`, covered synchronous GROUP BY,
+window/session, equi/interval join, OVER, last-N and partitioned ranking maps
+can move to local scratch files on pressure. Null-aware joins also spill their
+exact-key maps while retaining budgeted cross-key null indexes in RAM.
 This is separate from backend selection: spilled groups are still copied to
 the normal backend slot before a checkpoint and restored from that slot.
 Memory/file backends can therefore still run out of budget at checkpoint time;
 use a disk-backed backend for larger durable state. See
-[Memory budgets](memory-management.md#sql-group-by-spill) for the complete scope.
+[Memory budgets](memory-management.md#sql-working-map-spill) for the complete scope.

@@ -69,6 +69,7 @@
 #include "clink/sql/row_kind.hpp"
 #include "clink/sql/spill_store.hpp"
 #include "clink/sql/state_ttl.hpp"
+#include "clink/sql/working_set.hpp"
 #include "clink/time/watermark_strategy.hpp"
 #include "clink/time/window_arithmetic.hpp"
 
@@ -1742,11 +1743,12 @@ public:
         }
         const std::int64_t horizon = drop_horizon_();  // late-data cutoff (live: sync fold)
         for (std::size_t g = 0; g < groups.size(); ++g) {
+            working_.load(group_keys[g]);
             auto& by_window = state_[group_keys[g]];
             for (const std::int64_t idx : groups[g]) {
                 fold_record_into_(by_window, rows[static_cast<std::size_t>(idx)], nullptr, horizon);
-                account_key_(group_keys[g]);
             }
+            working_.commit(group_keys[g]);
         }
         return true;
     }
@@ -1770,7 +1772,6 @@ public:
     // map - never scans all groups. Default (non-deferring backend) keeps the
     // byte-identical in-memory state_ + watermark scan.
     void open() override {
-        memory_.bind(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
         // On the async path the fire happens in on_event_time_timers_async, which
@@ -1790,14 +1791,24 @@ public:
         // between storage modes across restarts.
         persist_inmem_ =
             !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
+
+        working_.bind(
+            this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr,
+            window_map_codec(),
+            [](const auto& windows) {
+                std::size_t bytes = sizeof(windows);
+                for (const auto& [end, bucket] : windows)
+                    bytes +=
+                        sizeof(end) + 4 * sizeof(void*) + aggregate_bucket_retained_bytes(bucket);
+                return bytes;
+            });
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan(
                 [&](const std::string& key, const std::map<std::int64_t, WindowBucket>& by_window) {
                     if (by_window.empty()) {
                         return;
                     }
-                    state_[key] = by_window;
-                    account_key_(key);
+                    working_.restore(key, by_window);
                     // fire_due_'s fast path skips the scan when this bound says
                     // nothing is due, so a restore that did not rebuild it would
                     // leave every restored window unfireable.
@@ -1836,9 +1847,7 @@ public:
             return;  // the async path already holds its windows in KeyedState
         }
         auto kv = keyed_state_();
-        for (const auto& [key, by_window] : state_) {
-            kv.put(key, by_window);
-        }
+        working_.scan([&](const auto& key, const auto& by_window) { kv.put(key, by_window); });
     }
     void restore_timers(StateBackend& backend,
                         OperatorId op_id,
@@ -2176,6 +2185,7 @@ private:
         }
         // Fold each (group_key, window_end) slice into its bucket.
         for (auto& [key, windows] : by_group) {
+            working_.load(key);
             auto& by_window = state_[key];
             for (auto& [win_end, slice] : windows) {
                 auto wit = by_window.find(win_end);
@@ -2196,8 +2206,8 @@ private:
                     earliest_win_end_ = std::min(earliest_win_end_, win_end);
                 }
                 vectorised_fold_slice(aggregates_, agg_cols, slice.idxs, wit->second.agg_states);
-                account_key_(key);
             }
+            working_.commit(key);
         }
     }
 
@@ -2228,12 +2238,14 @@ private:
         // Transparent probe with the scratch key: no per-record string alloc;
         // only a NEW group's insert copies the key.
         const auto key = group_key_scratch_(row);
+        if (working_.enabled())
+            working_.load(std::string(key));
         auto sit = state_.find(key);
         if (sit == state_.end()) {
             sit = state_.emplace(std::string(key), std::map<std::int64_t, WindowBucket>{}).first;
         }
         fold_record_into_(sit->second, row, nullptr, drop_horizon_());
-        account_key_(sit->first);
+        working_.commit(sit->first);
     }
 
     // Append one fired pane straight into the typed output builders: group values
@@ -2345,7 +2357,7 @@ private:
             // WS6 fold, for instance, is not reached by the file source at all, so a
             // regression there would pass the SQL suite. This check makes any test that
             // exercises a missed site fail loudly in a debug build.
-            for (const auto& [dbg_k, dbg_win] : state_) {
+            working_.scan([&](const auto& dbg_k, const auto& dbg_win) {
                 (void)dbg_k;
                 if (!dbg_win.empty()) {
                     assert(earliest_win_end_ <= dbg_win.begin()->first &&
@@ -2353,7 +2365,7 @@ private:
                            "creation site is not updating it, so fire_due_ can skip a due "
                            "window");
                 }
-            }
+            });
 #endif
             return;
         }
@@ -2372,7 +2384,7 @@ private:
                 }
             }
         };
-        for (auto& [k, by_window] : state_) {
+        working_.visit([&](const auto& k, auto& by_window) {
             (void)k;
             for (auto it = by_window.begin(); it != by_window.end();) {
                 // Fire-once-after-grace-band: hold a window open until the
@@ -2398,24 +2410,19 @@ private:
                 emit_batch.push(std::move(fired));
                 it = by_window.erase(it);
             }
-        }
-        if (memory_.enabled()) {
-            for (const auto& [key, windows] : state_) {
-                (void)windows;
-                account_key_(key);
-            }
-        }
+        });
+
         // The scan erased every due window, so the previous bound is stale (too low).
         // Recompute it exactly - each group's window map is ordered, so its smallest
         // window_end is begin(). O(groups), but only on a watermark that actually fired,
         // where the scan above already cost that much.
         earliest_win_end_ = std::numeric_limits<std::int64_t>::max();
-        for (const auto& [k, by_window] : state_) {
+        working_.scan([&](const auto& k, const auto& by_window) {
             (void)k;
             if (!by_window.empty()) {
                 earliest_win_end_ = std::min(earliest_win_end_, by_window.begin()->first);
             }
-        }
+        });
         std::size_t emitted = emit_batch.size();
         if (columnar && !bailed) {
             emitted += columnar_out_->rows();
@@ -2464,23 +2471,6 @@ private:
         rt->report_bad_record(br);
     }
 
-    void account_key_(const std::string& key) {
-        if (!memory_.enabled())
-            return;
-        const auto it = state_.find(key);
-        if (it == state_.end()) {
-            memory_.erase(key);
-            return;
-        }
-        std::size_t bytes = sizeof(*it) + key.capacity() + 1 + 4 * sizeof(void*);
-        for (const auto& [end, bucket] : it->second) {
-            (void)end;
-            bytes += sizeof(end) + 4 * sizeof(void*) + aggregate_bucket_retained_bytes(bucket);
-        }
-        memory_.update(key, bytes);
-    }
-    clink::KeyedMemoryAccount memory_;
-
     bool effective_async_ = false;
     // True when a state backend is attached but the KeyedState paths are not: the
     // in-memory windows are then flushed to the "win" slot at snapshot time and
@@ -2509,6 +2499,7 @@ private:
                    TransparentKeyHash,
                    std::equal_to<>>
         state_;
+    WorkingSet<decltype(state_)> working_{state_};
     // A LOWER BOUND on the smallest window_end held anywhere in state_, so a watermark
     // that cannot fire anything costs one comparison instead of a scan of every group.
     //
@@ -2618,13 +2609,24 @@ public:
         // on restore, with the source resuming past the records that built it.
         persist_inmem_ =
             !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
+
+        working_.bind(
+            this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr,
+            session_map_codec(),
+            [](const auto& windows) {
+                std::size_t bytes = sizeof(windows);
+                for (const auto& [end, bucket] : windows)
+                    bytes +=
+                        sizeof(end) + 4 * sizeof(void*) + aggregate_bucket_retained_bytes(bucket);
+                return bytes;
+            });
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan(
                 [&](const std::string& key, const std::map<std::int64_t, Session>& by_session) {
                     if (by_session.empty()) {
                         return;
                     }
-                    state_[key] = by_session;
+                    working_.restore(key, by_session);
                 });
         }
     }
@@ -2655,9 +2657,7 @@ public:
             return;  // the async path already holds its sessions in KeyedState
         }
         auto kv = keyed_state_();
-        for (const auto& [key, by_session] : state_) {
-            kv.put(key, by_session);
-        }
+        working_.scan([&](const auto& key, const auto& by_session) { kv.put(key, by_session); });
     }
     void restore_timers(StateBackend& backend,
                         OperatorId op_id,
@@ -2811,12 +2811,14 @@ public:
         }
         const std::int64_t late_bound = late_bound_();
         for (std::size_t g = 0; g < groups.size(); ++g) {
+            working_.load(group_keys[g]);
             auto& by_session = state_[group_keys[g]];
             for (const std::int64_t idx : groups[g]) {
                 const Row& r = rows[static_cast<std::size_t>(idx)];
                 const auto ts = event_time_of(r.values.find(time_column_)->second);
                 fold_session_(by_session, r, ts, late_bound);
             }
+            working_.commit(group_keys[g]);
         }
         return true;
     }
@@ -3053,6 +3055,17 @@ private:
     }
 
     void handle_record_(const Row& row) {
+        if (!working_.enabled()) {
+            handle_record_loaded_(row);
+            return;
+        }
+        const std::string key = group_key_(row);
+        working_.load(key);
+        handle_record_loaded_(row);
+        working_.commit(key);
+    }
+
+    void handle_record_loaded_(const Row& row) {
         auto tit = row.values.find(time_column_);
         if (tit == row.values.end() || !tit->second.is_number())
             return;
@@ -3161,6 +3174,7 @@ private:
         }
         std::vector<std::int64_t> one_idx(1);
         for (std::size_t g = 0; g < groups.size(); ++g) {
+            working_.load(group_keys[g]);
             auto& by_session = state_[group_keys[g]];
             for (const std::int64_t idx : groups[g]) {
                 const auto ts = static_cast<std::int64_t>(
@@ -3169,6 +3183,7 @@ private:
                 one_idx[0] = idx;
                 fold_session_columnar_(by_session, rb, ts, key_cols, agg_cols, one_idx);
             }
+            working_.commit(group_keys[g]);
         }
     }
 
@@ -3217,7 +3232,7 @@ private:
     void fire_due_(EventTime wm, Emitter<Row>& out) {
         const auto wm_value = wm.millis();
         Batch<Row> emit_batch;
-        for (auto& [k, by_session] : state_) {
+        working_.visit([&](const auto& k, auto& by_session) {
             (void)k;
             for (auto it = by_session.begin(); it != by_session.end();) {
                 // Fire-once-after-grace-band: a session closes at end + gap, and
@@ -3235,7 +3250,7 @@ private:
                 emit_batch.push(std::move(fired));
                 it = by_session.erase(it);
             }
-        }
+        });
         if (!emit_batch.empty())
             out.emit_data(std::move(emit_batch));
     }
@@ -3423,6 +3438,7 @@ private:
     clink::
         FlatMap<std::string, std::map<std::int64_t, Session>, TransparentKeyHash, std::equal_to<>>
             state_;
+    WorkingSet<decltype(state_)> working_{state_};
     mutable std::string key_scratch_;           // group_key_scratch_'s reused buffer
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
@@ -3523,6 +3539,24 @@ public:
         // move between storage modes across restarts.
         persist_inmem_ =
             !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
+
+        working_.bind(
+            this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr,
+            part_state_codec(),
+            [](const PartState& st) {
+                std::size_t bytes = sizeof(st) + st.agg.capacity() * sizeof(AggState);
+                for (const auto& a : st.agg)
+                    bytes += agg_state_retained_bytes(a) - sizeof(a);
+                if (st.first_row)
+                    bytes += st.first_row->retained_bytes() - sizeof(Row);
+                for (const auto& r : st.recent)
+                    bytes += r.retained_bytes() + 2 * sizeof(void*);
+                for (const auto& [ts, r] : st.pending)
+                    bytes += sizeof(ts) + r.retained_bytes() + 4 * sizeof(void*);
+                for (const auto& [ts, r] : st.folded)
+                    bytes += sizeof(ts) + r.retained_bytes() + 2 * sizeof(void*);
+                return bytes;
+            });
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan([&](const std::string& key, const PartState& st) {
                 if (st.pending.empty() && st.agg.empty() && !st.first_row.has_value() &&
@@ -3539,7 +3573,7 @@ public:
                     (void)row;
                     seq_ = std::max(seq_, ts_seq.second + 1);
                 }
-                state_[key] = st;
+                working_.restore(key, st);
             });
         }
     }
@@ -3621,9 +3655,7 @@ public:
             // handle_record_ never erases a partition entry, so overwriting every
             // key each barrier also overwrites whatever an earlier snapshot held.
             auto kv = keyed_state_();
-            for (const auto& [key, st] : state_) {
-                kv.put(key, st);
-            }
+            working_.scan([&](const auto& key, const auto& st) { kv.put(key, st); });
         }
         // 17 bytes: wm (8) + have_wm flag (1) + the sync tie-break seq_ (8). The
         // seq_ tail is NEW; a reader of the old 9-byte blob ignores it and an old
@@ -3771,6 +3803,17 @@ private:
     }
 
     void handle_record_(const Row& row) {
+        if (!working_.enabled()) {
+            handle_record_loaded_(row);
+            return;
+        }
+        const std::string key = partition_key_(row);
+        working_.load(key);
+        handle_record_loaded_(row);
+        working_.commit(key);
+    }
+
+    void handle_record_loaded_(const Row& row) {
         auto ts_opt = ts_of_(row);
         if (!ts_opt)
             return;  // rows without a usable event time are dropped
@@ -3788,14 +3831,14 @@ private:
         if (wm_value > current_wm_)
             current_wm_ = wm_value;
         Batch<Row> emit_batch;
-        for (auto& [key, st] : state_) {
+        working_.visit([&](const auto& key, auto& st) {
             (void)key;
             while (!st.pending.empty() && st.pending.begin()->first.first <= wm_value) {
                 Row r = std::move(st.pending.begin()->second);
                 st.pending.erase(st.pending.begin());
                 emit_one_(st, r, emit_batch);
             }
-        }
+        });
         if (!emit_batch.empty())
             out.emit_data(std::move(emit_batch));
     }
@@ -4030,6 +4073,7 @@ private:
     std::int64_t max_rows_back_ = 0;   // widest ROWS <n> PRECEDING
     std::int64_t max_range_back_ = 0;  // widest RANGE <n> PRECEDING (ms)
     clink::FlatMap<std::string, PartState> state_;
+    WorkingSet<decltype(state_)> working_{state_};
 };
 
 // Last-N-per-key aggregate. For each partition key it keeps the most-recent
@@ -4130,12 +4174,23 @@ public:
     void open() override {
         persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                          !this->runtime()->state_backend()->supports_async_get();
+
+        working_.bind(this->runtime() ? this->runtime()->memory_budget() : nullptr,
+                      part_state_codec(),
+                      [](const PartState& st) {
+                          std::size_t bytes = sizeof(st) + st.window.capacity() * sizeof(Row);
+                          for (const auto& r : st.window)
+                              bytes += r.retained_bytes() - sizeof(Row);
+                          if (st.prior_emitted)
+                              bytes += st.prior_emitted->retained_bytes() - sizeof(Row);
+                          return bytes;
+                      });
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan([&](const std::string& key, const PartState& st) {
                 if (st.window.empty() && !st.prior_emitted.has_value()) {
                     return;
                 }
-                state_[key] = st;
+                working_.restore(key, st);
             });
         }
     }
@@ -4151,9 +4206,7 @@ public:
         // empty PartState), so overwriting every key each barrier also
         // overwrites whatever an earlier snapshot held for it.
         auto kv = keyed_state_();
-        for (const auto& [key, st] : state_) {
-            kv.put(key, st);
-        }
+        working_.scan([&](const auto& key, const auto& st) { kv.put(key, st); });
     }
 
 private:
@@ -4205,6 +4258,17 @@ private:
     }
 
     void handle_(const Row& row, Batch<Row>& emit_batch) {
+        if (!working_.enabled()) {
+            handle_loaded_(row, emit_batch);
+            return;
+        }
+        const std::string key = partition_key_(row);
+        working_.load(key);
+        handle_loaded_(row, emit_batch);
+        working_.commit(key);
+    }
+
+    void handle_loaded_(const Row& row, Batch<Row>& emit_batch) {
         const bool retract = has_row_kind(row) && is_delete_like(row_kind_of(row));
         auto& st = state_[partition_key_(row)];
         const Row bare = bare_(row);
@@ -4348,6 +4412,7 @@ private:
     // and same stated deferring-backend gap as TopNPerKeyRowOp.
     bool persist_inmem_ = false;
     clink::FlatMap<std::string, PartState> state_;
+    WorkingSet<decltype(state_)> working_{state_};
 };
 
 // Unbounded GROUP BY aggregator (no window TVF).
@@ -5381,6 +5446,17 @@ public:
         ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        auto budget =
+            this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr;
+        auto estimate = [](const std::vector<Entry>& entries) {
+            std::size_t bytes = sizeof(entries) + entries.capacity() * sizeof(Entry);
+            for (const auto& e : entries)
+                bytes += e.row.retained_bytes() - sizeof(Row);
+            return bytes;
+        };
+        left_working_.bind(budget, entry_list_codec(), estimate);
+        right_working_.bind(budget, entry_list_codec(), estimate);
+
         // The async path emits from inside its coroutines, which do not run
         // through emit_joined_, so a shared output builder would accumulate rows
         // nothing ever flushes. Row-form output only there.
@@ -5398,13 +5474,11 @@ public:
             this->runtime()->has_state_backend()) {
             auto kl = kv_left_();
             kl.scan([&](const std::string& key, const std::vector<Entry>& entries) {
-                left_state_[key] = entries;
-                persisted_left_.insert(key);
+                left_working_.restore(key, entries);
             });
             auto kr = kv_right_();
             kr.scan([&](const std::string& key, const std::vector<Entry>& entries) {
-                right_state_[key] = entries;
-                persisted_right_.insert(key);
+                right_working_.restore(key, entries);
             });
             auto dl = deadline_state_();
             ttl_.restore(dl);
@@ -5412,21 +5486,19 @@ public:
             // pre-clock at snapshot time; re-enrol it so the first
             // post-restore watermark starts its clock instead of leaving it
             // immortal.
-            for (const auto& [key, entries] : left_state_) {
-                ttl_.enrol_restored_key(key);
-            }
-            for (const auto& [key, entries] : right_state_) {
-                ttl_.enrol_restored_key(key);
-            }
+            left_working_.scan(
+                [&](const auto& key, const auto& entries) { ttl_.enrol_restored_key(key); });
+            right_working_.scan(
+                [&](const auto& key, const auto& entries) { ttl_.enrol_restored_key(key); });
         }
     }
 
     // Sync-path persistence, called by the co-op runner at every barrier
     // just before it captures the backend. Writes both maps into the
     // KeyedState slots the async path shares (so the two paths restore each
-    // other's state), erases slots for keys the maps no longer hold (a
-    // retraction can empty a key; a stale persisted copy would resurrect it
-    // on restore), and persists the retention deadlines alongside - the
+    // other's state). Empty retracted vectors overwrite previous values;
+    // TTL expiry erases working and backend keys immediately. Retention
+    // deadlines are persisted alongside the data - the
     // tracker's absolute-deadline contract is only real if the deadlines
     // survive with the entries they belong to.
     void snapshot_timers(StateBackend& backend,
@@ -5438,29 +5510,9 @@ public:
             return;
         }
         auto kl = kv_left_();
-        std::unordered_set<std::string> now_left;
-        for (const auto& [key, entries] : left_state_) {
-            kl.put(key, entries);
-            now_left.insert(key);
-        }
-        for (const auto& key : persisted_left_) {
-            if (now_left.count(key) == 0) {
-                kl.erase(key);
-            }
-        }
-        persisted_left_ = std::move(now_left);
+        left_working_.scan([&](const auto& key, const auto& entries) { kl.put(key, entries); });
         auto kr = kv_right_();
-        std::unordered_set<std::string> now_right;
-        for (const auto& [key, entries] : right_state_) {
-            kr.put(key, entries);
-            now_right.insert(key);
-        }
-        for (const auto& key : persisted_right_) {
-            if (now_right.count(key) == 0) {
-                kr.erase(key);
-            }
-        }
-        persisted_right_ = std::move(now_right);
+        right_working_.scan([&](const auto& key, const auto& entries) { kr.put(key, entries); });
         auto dl = deadline_state_();
         ttl_.flush(dl);
     }
@@ -5693,6 +5745,23 @@ private:
     }
 
     void handle_(const Row& row, bool is_left, Batch<Row>& batch) {
+        if (!left_working_.enabled()) {
+            handle_loaded_(row, is_left, batch);
+            return;
+        }
+        auto key = key_of_(row, is_left ? left_key_column_ : right_key_column_);
+        if (!key) {
+            handle_loaded_(row, is_left, batch);
+            return;
+        }
+        left_working_.load(*key);
+        right_working_.load(*key);
+        handle_loaded_(row, is_left, batch);
+        left_working_.commit(*key);
+        right_working_.commit(*key);
+    }
+
+    void handle_loaded_(const Row& row, bool is_left, Batch<Row>& batch) {
         const auto& key_col = is_left ? left_key_column_ : right_key_column_;
         // Scratch key + transparent probes: no per-record key allocation, and
         // the insert path below does one probe instead of three.
@@ -6019,8 +6088,8 @@ private:
             dl.emplace(deadline_state_());
         }
         for (const auto& key : doomed) {
-            left_state_.erase(key);
-            right_state_.erase(key);
+            left_working_.erase(key);
+            right_working_.erase(key);
             ttl_.forget(key);
             if (have_backend) {
                 kl->erase(key);
@@ -6053,12 +6122,10 @@ private:
     bool effective_async_ = false;
     clink::FlatMap<std::string, std::vector<Entry>, TransparentKeyHash, std::equal_to<>>
         left_state_;
+    WorkingSet<decltype(left_state_)> left_working_{left_state_};
     clink::FlatMap<std::string, std::vector<Entry>, TransparentKeyHash, std::equal_to<>>
         right_state_;
-    // Keys persisted by the last snapshot_timers flush, so the next flush
-    // can erase slots whose keys have since emptied.
-    std::unordered_set<std::string> persisted_left_;
-    std::unordered_set<std::string> persisted_right_;
+    WorkingSet<decltype(right_state_)> right_working_{right_state_};
     std::string key_scratch_;  // key_of_scratch_'s reused buffer
 
     // build_'s precomputed output layout (see the constructor).
@@ -6124,16 +6191,36 @@ public:
     // left entries and the right presence-count key by the join tuple, so it
     // rides checkpointed KeyedState and, on a deferring backend, the async
     // path. The former in-memory maps were not snapshotted, so a restore
-    // replayed or dropped rows. The null-aware NOT IN path stays in-memory: a
-    // NULL right poisons probes ACROSS keys (per-position wildcard match) and
-    // it is already a parallelism-1 operator, so it does not fit per-key state.
+    // replayed or dropped rows. Null-aware NOT IN can spill its exact-key maps,
+    // but keeps budgeted cross-key null indexes in RAM for wildcard matching.
+    // Both are persisted at checkpoints on this parallelism-1 path.
     void open() override {
         ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = !null_aware_ && this->runtime() != nullptr &&
                            this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
-        // The data lives in KeyedState on both paths (read-through), so no
-        // hydrate is needed - but the retention DEADLINES must be restored,
+        auto budget = null_aware_ && this->runtime() ? this->runtime()->memory_budget() : nullptr;
+        memory_enabled_ = static_cast<bool>(budget);
+        null_memory_ = MemoryReservation(budget, MemoryCategory::State);
+        left_working_.bind(budget, left_entry_list_codec(), [](const auto& entries) {
+            std::size_t bytes = sizeof(entries) + entries.capacity() * sizeof(LeftEntry);
+            for (const auto& e : entries)
+                bytes += e.row.retained_bytes() - sizeof(Row);
+            return bytes;
+        });
+        right_working_.bind(
+            budget, int64_codec(), [](std::int64_t) { return sizeof(std::int64_t); });
+        if (null_aware_ && this->runtime() && this->runtime()->has_state_backend()) {
+            kv_left_().scan(
+                [&](const auto& key, const auto& rows) { left_working_.restore(key, rows); });
+            kv_right_().scan(
+                [&](const auto& key, auto count) { right_working_.restore(key, count); });
+            if (auto saved = null_slot_().get(""))
+                restore_nulls_(*saved);
+            account_nulls_();
+        }
+
+        // Restore retention DEADLINES for both storage paths,
         // and keys persisted with data but no deadline (pre-clock at
         // snapshot time) re-enrolled, or every restored key is immortal
         // until data happens to touch it again.
@@ -6155,6 +6242,14 @@ public:
                          OperatorId op_id,
                          const std::string& slot) override {
         CoOperator<Row, Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (null_aware_ && this->runtime() && this->runtime()->has_state_backend()) {
+            auto left = kv_left_();
+            auto right = kv_right_();
+            left_working_.scan([&](const auto& key, const auto& rows) { left.put(key, rows); });
+            right_working_.scan([&](const auto& key, auto count) { right.put(key, count); });
+            null_slot_().put("", encode_nulls_());
+        }
+
         if (!ttl_.enabled() || this->runtime() == nullptr ||
             !this->runtime()->has_state_backend()) {
             return;
@@ -6354,6 +6449,24 @@ private:
     }
 
     void handle_left_(const Row& row, Batch<Row>& batch) {
+        if (!memory_enabled_) {
+            handle_left_loaded_(row, batch);
+            return;
+        }
+        auto key = key_of_(row, left_key_columns_);
+        if (key) {
+            left_working_.load(*key);
+            right_working_.load(*key);
+        }
+        handle_left_loaded_(row, batch);
+        if (key) {
+            left_working_.commit(*key);
+            right_working_.commit(*key);
+        }
+        account_nulls_();
+    }
+
+    void handle_left_loaded_(const Row& row, Batch<Row>& batch) {
         auto key = key_of_(row, left_key_columns_);
         if (!key.has_value()) {
             // NULL-component probe.
@@ -6399,6 +6512,24 @@ private:
     }
 
     void handle_right_(const Row& row, Batch<Row>& batch) {
+        if (!memory_enabled_) {
+            handle_right_loaded_(row, batch);
+            return;
+        }
+        auto key = key_of_(row, right_key_columns_);
+        if (key) {
+            left_working_.load(*key);
+            right_working_.load(*key);
+        }
+        handle_right_loaded_(row, batch);
+        if (key) {
+            left_working_.commit(*key);
+            right_working_.commit(*key);
+        }
+        account_nulls_();
+    }
+
+    void handle_right_loaded_(const Row& row, Batch<Row>& batch) {
         auto key = key_of_(row, right_key_columns_);
         if (!key.has_value()) {
             // NULL-component right tuple. For IN (semi) and plain NOT EXISTS a
@@ -6426,7 +6557,7 @@ private:
             }
             return;
         }
-        const int before = right_count_[*key];
+        const auto before = right_count_[*key];
         right_count_[*key] = before + 1;
         // A key is alive while EITHER side keeps receiving rows for it.
         ttl_.touch(*key);
@@ -6515,18 +6646,19 @@ private:
     // Does any right tuple (exact no-null OR null-bearing) potentially-match
     // this (null-bearing) probe? Used for the probe's initial qualification.
     bool na_probe_has_right_match_(const MaskedKey& pk) const {
-        for (const auto& [rkey, cnt] : right_count_) {
-            if (cnt > 0 && potential_match_(pk, masked_key_from_exact_(rkey)))
-                return true;
-        }
-        return na_null_right_matches_(pk);
+        bool matched = false;
+        right_working_.scan([&](const auto& rkey, auto count) {
+            if (!matched && count > 0 && potential_match_(pk, masked_key_from_exact_(rkey)))
+                matched = true;
+        });
+        return matched || na_null_right_matches_(pk);
     }
 
     // A new null-bearing right tuple arrived: retract every currently-emitted
     // probe (no-null in left_state_ and null-bearing in na_null_probes_) it now
     // poisons. The `emitted` guard makes this idempotent (retract at most once).
     void retract_poisoned_(const MaskedKey& rk, Batch<Row>& batch) {
-        for (auto& [k, entries] : left_state_) {
+        left_working_.visit([&](const auto& k, auto& entries) {
             (void)k;
             for (auto& e : entries) {
                 if (e.emitted && potential_match_(masked_key_of_(e.row, left_key_columns_), rk)) {
@@ -6534,7 +6666,7 @@ private:
                     emit_(e.row, kRowKindDelete, batch);
                 }
             }
-        }
+        });
         for (auto& p : na_null_probes_) {
             if (p.emitted && potential_match_(p.key, rk)) {
                 p.emitted = false;
@@ -6710,8 +6842,8 @@ private:
             dl.emplace(deadline_state_());
         }
         for (const auto& key : doomed) {
-            left_state_.erase(key);
-            right_count_.erase(key);
+            left_working_.erase(key);
+            right_working_.erase(key);
             ttl_.forget(key);
             if (have_backend) {
                 // The PERSISTED entries too, not only the in-memory maps and
@@ -6728,6 +6860,67 @@ private:
         }
     }
 
+    void account_nulls_() {
+        if (!memory_enabled_)
+            return;
+        std::size_t bytes = na_null_probes_.capacity() * sizeof(NaProbe) +
+                            na_null_rights_.capacity() * sizeof(MaskedKey);
+        auto key_bytes = [](const MaskedKey& key) {
+            std::size_t n = key.capacity() * sizeof(std::optional<std::string>);
+            for (const auto& value : key)
+                if (value)
+                    n += value->capacity() + 1;
+            return n;
+        };
+        for (const auto& p : na_null_probes_)
+            bytes += p.row.retained_bytes() - sizeof(Row) + key_bytes(p.key);
+        for (const auto& key : na_null_rights_)
+            bytes += key_bytes(key);
+        null_memory_.resize(bytes);
+    }
+    KeyedState<std::string, std::string> null_slot_() {
+        return this->runtime()->template keyed_state<std::string, std::string>(
+            "saNull", string_codec(), string_codec());
+    }
+    std::string encode_nulls_() const {
+        config::JsonArray probes, rights;
+        for (const auto& p : na_null_probes_) {
+            config::JsonObject value;
+            value["row"] = config::JsonValue{to_json_object(p.row.values)};
+            value["emitted"] = config::JsonValue{p.emitted};
+            probes.emplace_back(std::move(value));
+        }
+        for (const auto& key : na_null_rights_) {
+            config::JsonArray tuple;
+            for (const auto& value : key)
+                tuple.emplace_back(value ? config::JsonValue{*value} : config::JsonValue{});
+            rights.emplace_back(std::move(tuple));
+        }
+        config::JsonObject root;
+        root["probes"] = config::JsonValue{std::move(probes)};
+        root["rights"] = config::JsonValue{std::move(rights)};
+        return config::JsonValue{std::move(root)}.serialize(0);
+    }
+    void restore_nulls_(const std::string& bytes) {
+        auto root = config::parse(bytes);
+        for (const auto& value : root.as_object().at("probes").as_array()) {
+            Row row;
+            row.values = row_columns_from_json(value.as_object().at("row").as_object());
+            na_null_probes_.push_back({row,
+                                       masked_key_of_(row, left_key_columns_),
+                                       value.as_object().at("emitted").as_bool()});
+        }
+        for (const auto& value : root.as_object().at("rights").as_array()) {
+            MaskedKey key;
+            for (const auto& cell : value.as_array())
+                key.push_back(cell.is_null() ? std::nullopt
+                                             : std::optional<std::string>{cell.as_string()});
+            na_null_rights_.push_back(std::move(key));
+        }
+    }
+    bool memory_enabled_{false};
+    MemoryReservation null_memory_;
+
     std::vector<std::string> left_key_columns_;
     std::vector<std::string> right_key_columns_;
     bool anti_;
@@ -6738,7 +6931,9 @@ private:
     // process_async{1,2}; otherwise the sync path above.
     bool effective_async_ = false;
     clink::FlatMap<std::string, std::vector<LeftEntry>> left_state_;
-    clink::FlatMap<std::string, int> right_count_;
+    WorkingSet<decltype(left_state_)> left_working_{left_state_};
+    clink::FlatMap<std::string, std::int64_t> right_count_;
+    WorkingSet<decltype(right_count_)> right_working_{right_count_};
     // #49 null-aware NOT IN only: probes with >= 1 NULL key component (never
     // entered left_state_), and the distinct null-bearing right tuples that
     // poison probes position-wise. Empty unless NULLs actually appear, so the
@@ -7871,6 +8066,19 @@ public:
     void open() override {
         persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                          !this->runtime()->state_backend()->supports_async_get();
+
+        working_.bind(this->runtime() ? this->runtime()->memory_budget() : nullptr,
+                      spill_rows_codec_(),
+                      [](const auto& rows) {
+                          std::size_t bytes = sizeof(rows) + rows.capacity() * sizeof(StoredRow);
+                          for (const auto& row : rows) {
+                              bytes += row.encoded.capacity() + 1 +
+                                       row.sort_vals.capacity() * sizeof(config::JsonValue);
+                              for (const auto& v : row.sort_vals)
+                                  bytes += v.retained_bytes() - sizeof(v);
+                          }
+                          return bytes;
+                      });
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan([&](const std::string& key, const std::vector<StoredRow>& rows) {
                 if (rows.empty()) {
@@ -7886,6 +8094,7 @@ public:
                     // comparing. One parse per retained row, on the rare path.
                     part.push_back(StoredRow{sr.encoded, sort_vals_of_(decode_row_(sr.encoded))});
                 }
+                working_.commit(key);
             });
         }
     }
@@ -7901,9 +8110,7 @@ public:
         // overwriting every key each barrier also overwrites any snapshot rows a
         // later eviction removed - a restored partition is exactly the barrier's.
         auto kv = keyed_state_();
-        for (const auto& [key, rows] : state_) {
-            kv.put(key, rows);
-        }
+        working_.scan([&](const auto& key, const auto& rows) { kv.put(key, rows); });
     }
 
 private:
@@ -8058,6 +8265,17 @@ private:
     }
 
     void handle_(const Row& row, Batch<Row>& emit_batch) {
+        if (!working_.enabled()) {
+            handle_loaded_(row, emit_batch);
+            return;
+        }
+        const std::string key = partition_key_(row);
+        working_.load(key);
+        handle_loaded_(row, emit_batch);
+        working_.commit(key);
+    }
+
+    void handle_loaded_(const Row& row, Batch<Row>& emit_batch) {
         if (count_ <= 0)
             return;
         auto key = partition_key_(row);
@@ -8152,6 +8370,19 @@ private:
         };
     }
 
+    Codec<std::vector<StoredRow>> spill_rows_codec_() {
+        auto codec = topn_rows_codec();
+        auto decode = codec.decode;
+        codec.decode = [this, decode](auto bytes) -> std::optional<std::vector<StoredRow>> {
+            auto rows = decode(bytes);
+            if (rows)
+                for (auto& row : *rows)
+                    row.sort_vals = sort_vals_of_(decode_row_(row.encoded));
+            return rows;
+        };
+        return codec;
+    }
+
     // True when a state backend is attached but not a deferring one: state_ is
     // then flushed to the "topn" slot at snapshot time and reloaded in open(), so
     // the retained rows survive a restore. Mirrors the window/session gate; on a
@@ -8160,6 +8391,7 @@ private:
     // than a silent one.
     bool persist_inmem_ = false;
     clink::FlatMap<std::string, std::vector<StoredRow>> state_;
+    WorkingSet<decltype(state_)> working_{state_};
 };
 
 // UNION ALL. Single-input identity map; the OperatorSpec
@@ -8189,6 +8421,11 @@ public:
           count_(count),
           offset_(offset) {}
 
+    void open() override {
+        memory_enabled_ = this->runtime() && this->runtime()->memory_budget();
+        memory_ = MemoryReservation(this->runtime() ? this->runtime()->memory_budget() : nullptr,
+                                    MemoryCategory::State);
+    }
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             for (const auto& rec : element.as_data())
@@ -8226,7 +8463,8 @@ public:
             batch.push(Record<Row>{std::move(sorted[i])});
         if (!batch.empty())
             out.emit_data(std::move(batch));
-        heap_.clear();
+        decltype(heap_){}.swap(heap_);
+        memory_.resize(0);
     }
 
     std::string name() const override { return "top_n_row"; }
@@ -8274,6 +8512,16 @@ private:
     }
 
     void consider_(const Row& row) {
+        consider_unaccounted_(row);
+        if (!memory_enabled_)
+            return;
+        std::size_t bytes = heap_.capacity() * sizeof(decltype(heap_)::value_type);
+        for (const auto& item : heap_)
+            bytes += item.second.retained_bytes() - sizeof(Row);
+        memory_.resize(bytes);
+    }
+
+    void consider_unaccounted_(const Row& row) {
         // Linear scan: heap stays small (count+offset for TOP-N is
         // typically tiny). When at capacity, replace the worst entry
         // only if `row` sorts strictly before it. OFFSET widens the
@@ -8296,6 +8544,8 @@ private:
         }
     }
 
+    bool memory_enabled_{false};
+    MemoryReservation memory_;
     std::vector<std::string> sort_columns_;
     std::vector<bool> sort_descending_;
     std::int64_t count_;
@@ -8647,7 +8897,38 @@ public:
     void open() override {
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        auto budget =
+            this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr;
+        auto estimate = [](const std::vector<Buffered>& entries) {
+            std::size_t bytes = sizeof(entries) + entries.capacity() * sizeof(Buffered);
+            for (const auto& e : entries)
+                bytes += e.row.retained_bytes() - sizeof(Row);
+            return bytes;
+        };
+        left_working_.bind(budget, buffered_list_codec(), estimate);
+        right_working_.bind(budget, buffered_list_codec(), estimate);
+
+        if (!effective_async_ && this->runtime() && this->runtime()->has_state_backend()) {
+            kv_left_().scan([&](const auto& key, const auto& rows) {
+                if (!rows.empty())
+                    left_working_.restore(key, rows);
+            });
+            kv_right_().scan([&](const auto& key, const auto& rows) {
+                if (!rows.empty())
+                    right_working_.restore(key, rows);
+            });
+        }
     }
+    void snapshot_timers(StateBackend& backend, OperatorId id, const std::string& slot) override {
+        CoOperator<Row, Row, Row>::snapshot_timers(backend, id, slot);
+        if (effective_async_ || !this->runtime() || !this->runtime()->has_state_backend())
+            return;
+        auto left = kv_left_();
+        auto right = kv_right_();
+        left_working_.scan([&](const auto& key, const auto& rows) { left.put(key, rows); });
+        right_working_.scan([&](const auto& key, const auto& rows) { right.put(key, rows); });
+    }
+
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
     // The eviction fire (on_event_time_timers_async) reads + writes both side
     // buffers for the due key.
@@ -8693,14 +8974,14 @@ public:
             // negative offset would overflow wm_ms - offset (signed-overflow
             // UB); saturating to INT64_MAX prunes everything, which is the
             // intended end-of-stream behavior.
-            prune_(left_state_,
+            prune_(left_working_,
                    sat_sub_(wm_ms, lower_offset_ms_),
                    left_keeps_unmatched_(),
                    /*present_is_left=*/true,
                    null_pads);
             // Drop right rows whose right.ts + upper_offset_ms < wm
             // (no future left.ts >= wm can match).
-            prune_(right_state_,
+            prune_(right_working_,
                    sat_sub_(wm_ms, upper_offset_ms_),
                    right_keeps_unmatched_(),
                    /*present_is_left=*/false,
@@ -8781,7 +9062,7 @@ private:
         auto it = row.values.find(ts_column);
         if (it == row.values.end() || !it->second.is_number())
             return std::nullopt;
-        return static_cast<std::int64_t>(it->second.as_number());
+        return it->second.as_int();
     }
 
     Row build_joined_(const Row& l, const Row& r) const {
@@ -8794,6 +9075,19 @@ private:
     }
 
     void handle_left_(const Row& l, Emitter<Row>& out) {
+        if (!left_working_.enabled()) {
+            handle_left_loaded_(l, out);
+            return;
+        }
+        const auto key = key_string(l, left_key_column_);
+        left_working_.load(key);
+        right_working_.load(key);
+        handle_left_loaded_(l, out);
+        left_working_.commit(key);
+        right_working_.commit(key);
+    }
+
+    void handle_left_loaded_(const Row& l, Emitter<Row>& out) {
         auto ts_opt = ts_value(l, left_ts_column_);
         if (!ts_opt.has_value())
             return;
@@ -8820,6 +9114,19 @@ private:
     }
 
     void handle_right_(const Row& r, Emitter<Row>& out) {
+        if (!left_working_.enabled()) {
+            handle_right_loaded_(r, out);
+            return;
+        }
+        const auto key = key_string(r, right_key_column_);
+        left_working_.load(key);
+        right_working_.load(key);
+        handle_right_loaded_(r, out);
+        left_working_.commit(key);
+        right_working_.commit(key);
+    }
+
+    void handle_right_loaded_(const Row& r, Emitter<Row>& out) {
         auto ts_opt = ts_value(r, right_ts_column_);
         if (!ts_opt.has_value())
             return;
@@ -8849,32 +9156,19 @@ private:
     // For an OUTER kept side, a row evicted while still unmatched gets a final
     // null-padded emission into `null_pads` - the window is closed, so the
     // unmatched verdict is final and needs no later retraction.
-    void prune_(clink::FlatMap<std::string, std::vector<Buffered>>& side,
+    void prune_(WorkingSet<clink::FlatMap<std::string, std::vector<Buffered>>>& side,
                 std::int64_t cutoff,
                 bool emit_unmatched,
                 bool present_is_left,
                 Batch<Row>& null_pads) {
-        for (auto it = side.begin(); it != side.end();) {
-            auto& vec = it->second;
-            std::size_t w = 0;
-            for (std::size_t r = 0; r < vec.size(); ++r) {
-                if (vec[r].ts < cutoff) {
-                    if (emit_unmatched && !vec[r].matched) {
-                        null_pads.push(Record<Row>{build_outer_(vec[r].row, present_is_left)});
-                    }
-                    continue;  // evicted: do not keep
-                }
-                if (w != r) {
-                    vec[w] = std::move(vec[r]);
-                }
-                ++w;
+        side.visit([&](const auto& key, auto& vec) {
+            evict_side_(vec, cutoff, emit_unmatched, present_is_left, null_pads);
+            if (vec.empty() && this->runtime() && this->runtime()->has_state_backend()) {
+                auto kv = present_is_left ? kv_left_() : kv_right_();
+                kv.erase(key);
             }
-            vec.resize(w);
-            if (vec.empty())
-                it = side.erase(it);
-            else
-                ++it;
-        }
+            return !vec.empty();
+        });
     }
 
     // Evict one side's buffered rows with ts < cutoff (the single-vector twin of
@@ -9039,7 +9333,7 @@ private:
             arr.reserve(es.size());
             for (const auto& e : es) {
                 clink::config::JsonObject o;
-                o["t"] = clink::config::JsonValue{static_cast<double>(e.ts)};
+                o["t"] = clink::config::JsonValue{e.ts};
                 o["r"] = clink::config::JsonValue{clink::sql::to_json_object(e.row.values)};
                 o["m"] = clink::config::JsonValue{e.matched};
                 arr.emplace_back(std::move(o));
@@ -9114,7 +9408,9 @@ private:
     // (process_async{1,2} + eviction timers); otherwise the sync in-memory path.
     bool effective_async_ = false;
     clink::FlatMap<std::string, std::vector<Buffered>> left_state_;
+    WorkingSet<decltype(left_state_)> left_working_{left_state_};
     clink::FlatMap<std::string, std::vector<Buffered>> right_state_;
+    WorkingSet<decltype(right_state_)> right_working_{right_state_};
 };
 
 }  // namespace

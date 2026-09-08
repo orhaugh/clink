@@ -21,9 +21,9 @@ failover, and rescale.
 
 Opt-in [memory budgets](docs/internals/memory-management.md) share a byte allowance
 across covered SQL state, local queues, blocking exchanges and checkpoint buffers.
-Blocking exchanges and SQL GROUP BY can spill on pressure when configured; other
-covered owners refuse allocations
-on exhaustion. Accounting coverage is partial; this is not an RSS cap.
+Blocking exchanges and covered SQL aggregate, window, join, OVER and ranking
+partitions can spill on pressure when configured. Other covered owners refuse
+allocations on exhaustion. Accounting coverage is partial; this is not an RSS cap.
 
 Three capabilities follow from that design:
 

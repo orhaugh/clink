@@ -471,6 +471,7 @@ include/clink/sql/table_option_check.hpp
 include/clink/sql/type.hpp
 include/clink/sql/vector_value.hpp
 include/clink/sql/view.hpp
+include/clink/sql/working_set.hpp
 include/clink/state/changelog_state_backend.hpp
 include/clink/state/checkpoint_integrity.hpp
 include/clink/state/coalescing_backend.hpp
