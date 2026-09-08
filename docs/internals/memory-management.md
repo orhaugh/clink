@@ -11,7 +11,7 @@ If a charge would cross it, the engine refuses the charge with
 `MEMORY_LIMIT_EXCEEDED`, naming the domain, category, requested bytes, current
 usage and limit. The limit is opt-in; existing executions remain unbudgeted.
 
-This is the first increment of memory management. It limits **accounted memory**,
+Memory management limits **accounted memory**,
 not worker RSS. The coverage table below is part of the contract: enabling a
 budget does not make every engine operator or third-party allocation bounded.
 
@@ -64,6 +64,7 @@ limit. Multiply by the number of concurrent executions when sizing a Worker.
 | Memory owner | Accounting and enforcement |
 | --- | --- |
 | DAG local edge queues, including side outputs | Estimated retained bytes are reserved before enqueue and released on dequeue or queue destruction. Row vector capacity and string payloads are counted. SQL Rows include nested JSON and collection capacity. Arrow batches count retained buffers without materialising rows. Shared buffers are deduplicated within one batch but charged separately for separate queued references; slices count their parent buffers. |
+| Blocking exchanges | Retained IPC payload capacity and list-node allocations charge the operator domain. With a configured spill directory, payload refusal migrates the resident prefix to disk and spills subsequent batches, even below the exchange threshold. Control elements and per-batch ordering metadata remain budgeted in memory. Replay releases each entry; destruction releases remaining charges and removes spill files. |
 | SQL windowless `GROUP BY` | Incremental retained-state estimates after each touched group changes, including aggregate vectors, group values, prior changelog output and cold aggregate payloads such as distinct sets, `ARRAY_AGG` and UDAF values. Restore rebuilds charges; TTL expiry releases them. |
 | SQL tumbling, hopping and cumulative window aggregates | The same bucket estimates, including each retained pane. Row and columnar ingest update the account; window firing releases pane charges. Empty group containers that the operator retains continue to count. |
 | In-memory and file-backed backend working state | Estimated key/value storage and map overhead, checked before puts and during restore. Erase and clear release charges. Staged barrier copies have separate checkpoint charges. Binding a new domain requires an empty backend. |
@@ -95,9 +96,34 @@ A budget reservation never waits for another owner to free bytes. Such a wait
 could stop the record, watermark or checkpoint that would release the memory.
 Existing channel-capacity backpressure continues to operate normally.
 
-There is no automatic spill, TTL adjustment or eviction of correctness-bearing
-state in this increment. Existing window/TTL expiry and backend eviction retain
-their original semantics. Refusal reaches the existing operator-error path;
+Blocking exchanges automatically spill on retained-payload pressure when
+`BlockingExchangeOptions::spill_dir` names an existing writable directory. They
+first move any resident data prefix to disk in arrival order, then keep all
+later data on disk. The existing `spill_threshold_bytes` also triggers overflow;
+threshold-triggered overflow keeps the resident prefix as before. No spill
+directory means payload refusal fails the execution. Ordering metadata cannot
+spill: exhaustion there still fails cleanly, including for control-only input.
+An I/O failure also fails the execution; spilling is not a durability guarantee.
+Blocking exchanges remain for bounded jobs without periodic checkpoints.
+
+For an existing `Dag dag` and an `int64_t` input stage `input`, enable spill
+when adding the bounded stage boundary, then configure the executor budget as
+above:
+
+```cpp
+clink::BlockingExchangeOptions spill;
+spill.spill_dir = "/var/tmp/clink-exchange"; // Create this directory before running.
+spill.spill_threshold_bytes = 64ull * 1024 * 1024;
+auto boundary = dag.add_blocking_exchange(input, clink::int64_arrow_batcher(), spill);
+```
+
+This policy covers retained exchange storage. Arrow batch construction, IPC
+serialisation scratch space and decoded replay batches remain outside this
+account, so a large batch can exceed the byte limit in actual RAM. Spilling one
+exchange does not reclaim other operators' state. There is no automatic spill
+for SQL working maps, TTL adjustment or eviction of correctness-bearing state.
+Existing window/TTL expiry and backend eviction retain their original semantics.
+Refusal reaches the existing operator-error path;
 that path closes every local edge so unrelated blocked branches can terminate.
 Checkpoint allocation failures use the existing failed-checkpoint path. Nothing
 changes the durability condition for a successful acknowledgement.
@@ -120,6 +146,8 @@ series as independent allocations. Zero limit means unlimited, not zero capacity
 `tests/test_memory_budget.cpp` covers concurrent and hierarchical reservations,
 allocator ownership across threads, Arrow growth failure, queue rejection,
 backend state, checkpoint staging, async persistence and failure cancellation.
+`tests/test_blocking_exchange.cpp` covers pressure-triggered spilling, ordered
+replay, charge release, refusal without spill and bounded spill metadata.
 `tests/test_sql_memory_budget.cpp` exercises the real registered aggregate and
 window operators, including growing values, window expiry and restored state.
 

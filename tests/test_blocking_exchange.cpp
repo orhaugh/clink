@@ -306,6 +306,7 @@ TEST(BlockingExchange, EndToEndThroughExecutorWithSpill) {
 
     JobConfig config;
     config.execution_mode = JobConfig::ExecutionMode::Batch;
+    config.memory_budget = std::make_shared<MemoryBudget>(4 * 1024 * 1024);
     LocalExecutor exec(std::move(dag), config);
     exec.run_to_completion();
     ASSERT_TRUE(exec.operator_errors().empty())
@@ -318,4 +319,185 @@ TEST(BlockingExchange, EndToEndThroughExecutorWithSpill) {
     EXPECT_EQ(max_wm->load(), kMaxWmMillis);
 
     std::filesystem::remove_all(dir);
+}
+
+TEST(BlockingExchange, SharedBudgetSpillsBelowLocalThresholdAndReleasesOnReplay) {
+    const auto dir = make_temp_spill_dir("budget");
+    auto budget = std::make_shared<MemoryBudget>(8192);
+    MemoryReservation other_owner(budget, MemoryCategory::Checkpoint, 4096);
+    RuntimeContext context(operator_id_from_uid("budget-exchange"), "exchange", nullptr, nullptr);
+    context.set_memory_budget(budget);
+    BlockingExchangeOptions opts;
+    opts.spill_dir = dir.string();
+    BlockingExchangeOperator<std::int64_t> op(int64_arrow_batcher(), opts);
+    op.set_uid("budget-exchange");
+    op.attach_runtime(&context);
+    op.open();
+    std::vector<std::int64_t> values;
+    std::vector<char> order;
+    Emitter<std::int64_t> out([&](StreamElement<std::int64_t> e) {
+        if (e.is_data()) {
+            order.push_back('d');
+            for (const auto& row : e.as_data())
+                values.push_back(row.value());
+        } else if (e.is_watermark()) {
+            order.push_back('w');
+        } else if (e.is_barrier()) {
+            order.push_back('b');
+        } else {
+            order.push_back('r');
+        }
+        return true;
+    });
+    op.process(StreamElement<std::int64_t>::data(make_batch({1, 2})), out);
+    EXPECT_GT(op.buffered_in_memory_bytes(), 0u);
+    op.process(StreamElement<std::int64_t>::watermark(Watermark(EventTime::from_millis(3))), out);
+    op.process(StreamElement<std::int64_t>::barrier(CheckpointBarrier{}), out);
+    // This fits the 64 MiB exchange threshold, but not the shared limit.
+    op.process(StreamElement<std::int64_t>::data(make_range_batch(3, 2000)), out);
+    EXPECT_EQ(op.spilled_batch_count(), 2u);
+    op.process(StreamElement<std::int64_t>::data(make_batch({2003})), out);
+    op.process(StreamElement<std::int64_t>::drain(DrainMarker{1, 2}), out);
+    EXPECT_EQ(op.spilled_batch_count(), 3u);
+    EXPECT_EQ(op.buffered_in_memory_bytes(), 0u);
+    EXPECT_TRUE(values.empty());
+    EXPECT_GT(budget->usage().used, 0u);
+    EXPECT_LE(budget->usage().peak, budget->limit());
+    op.flush(out);
+    ASSERT_EQ(values.size(), 2003u);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        EXPECT_EQ(values[i], static_cast<std::int64_t>(i + 1));
+    EXPECT_EQ(order, (std::vector<char>{'d', 'w', 'b', 'd', 'd', 'r'}));
+    EXPECT_EQ(op.buffered_entry_count(), 0u);
+    EXPECT_EQ(op.buffered_in_memory_bytes(), 0u);
+    EXPECT_EQ(budget->usage().used, other_owner.size());
+    EXPECT_TRUE(std::filesystem::is_empty(dir));
+    op.flush(out);  // Replaying a drained exchange cannot duplicate records.
+    EXPECT_EQ(values.size(), 2003u);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(BlockingExchange, SharedBudgetRefusesWithoutSpillAndRollsBackEntry) {
+    auto budget = std::make_shared<MemoryBudget>(4096);
+    RuntimeContext context(operator_id_from_uid("budget-exchange"), "exchange", nullptr, nullptr);
+    context.set_memory_budget(budget);
+    BlockingExchangeOperator<std::int64_t> op(int64_arrow_batcher());
+    op.set_uid("budget-exchange");
+    op.attach_runtime(&context);
+    op.open();
+    Emitter<std::int64_t> out([](StreamElement<std::int64_t>) { return true; });
+    EXPECT_THROW(op.process(StreamElement<std::int64_t>::data(make_range_batch(0, 2000)), out),
+                 MemoryLimitExceeded);
+    EXPECT_EQ(op.buffered_entry_count(), 0u);
+    EXPECT_EQ(budget->usage().used, 0u);
+}
+
+TEST(BlockingExchange, SpilledOrderingMetadataCannotGrowBeyondBudget) {
+    const auto dir = make_temp_spill_dir("metadata-budget");
+    auto budget = std::make_shared<MemoryBudget>(4096);
+    RuntimeContext context(operator_id_from_uid("budget-exchange"), "exchange", nullptr, nullptr);
+    context.set_memory_budget(budget);
+    {
+        BlockingExchangeOptions opts;
+        opts.spill_dir = dir.string();
+        opts.spill_threshold_bytes = 1;
+        BlockingExchangeOperator<std::int64_t> op(int64_arrow_batcher(), opts);
+        op.set_uid("budget-exchange");
+        op.attach_runtime(&context);
+        op.open();
+        Emitter<std::int64_t> out([](StreamElement<std::int64_t>) { return true; });
+        bool refused = false;
+        for (int i = 0; i < 1000; ++i) {
+            try {
+                op.process(StreamElement<std::int64_t>::data(make_batch({i})), out);
+            } catch (const MemoryLimitExceeded&) {
+                refused = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(refused);
+        EXPECT_GT(op.spilled_batch_count(), 0u);
+        EXPECT_EQ(op.spilled_batch_count(), op.buffered_entry_count());
+        EXPECT_EQ(op.buffered_in_memory_bytes(), 0u);
+        EXPECT_LE(budget->usage().peak, budget->limit());
+    }
+    EXPECT_EQ(budget->usage().used, 0u);
+    EXPECT_TRUE(std::filesystem::is_empty(dir));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(BlockingExchange, FailedSpillReleasesRefusedEntryAndRemovesFile) {
+    const auto dir = make_temp_spill_dir("bad-spill-budget");
+    auto budget = std::make_shared<MemoryBudget>(4096);
+    RuntimeContext context(operator_id_from_uid("budget-exchange"), "exchange", nullptr, nullptr);
+    context.set_memory_budget(budget);
+    {
+        BlockingExchangeOptions opts;
+        opts.spill_dir = (dir / "missing-directory").string();
+        BlockingExchangeOperator<std::int64_t> op(int64_arrow_batcher(), opts);
+        op.set_uid("budget-exchange");
+        op.attach_runtime(&context);
+        op.open();
+        Emitter<std::int64_t> out([](StreamElement<std::int64_t>) { return true; });
+        EXPECT_THROW(op.process(StreamElement<std::int64_t>::data(make_range_batch(0, 2000)), out),
+                     std::runtime_error);
+        EXPECT_EQ(op.spilled_batch_count(), 0u);
+        EXPECT_EQ(op.buffered_entry_count(), 0u);
+        EXPECT_EQ(budget->usage().used, 0u);
+    }
+    EXPECT_TRUE(std::filesystem::is_empty(dir));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(BlockingExchange, ControlOnlyInputCannotBypassBudget) {
+    auto budget = std::make_shared<MemoryBudget>(4096);
+    RuntimeContext context(operator_id_from_uid("budget-exchange"), "exchange", nullptr, nullptr);
+    context.set_memory_budget(budget);
+    BlockingExchangeOperator<std::int64_t> op(int64_arrow_batcher());
+    op.set_uid("budget-exchange");
+    op.attach_runtime(&context);
+    op.open();
+    Emitter<std::int64_t> out([](StreamElement<std::int64_t>) { return true; });
+    bool refused = false;
+    for (int i = 0; i < 1000; ++i) {
+        try {
+            op.process(StreamElement<std::int64_t>::watermark(Watermark(EventTime::from_millis(i))),
+                       out);
+        } catch (const MemoryLimitExceeded&) {
+            refused = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(refused);
+    EXPECT_GT(op.buffered_entry_count(), 0u);
+    op.flush(out);
+    EXPECT_EQ(budget->usage().used, 0u);
+}
+
+TEST(BlockingExchange, ColumnarReplayOwnsBuffersAfterExchangeDestruction) {
+    std::shared_ptr<arrow::RecordBatch> retained;
+    {
+        auto batcher = int64_arrow_batcher();
+        batcher.parse = [](const arrow::RecordBatch& rb) -> std::optional<Batch<std::int64_t>> {
+            return Batch<std::int64_t>(
+                arrow::RecordBatch::Make(rb.schema(), rb.num_rows(), rb.columns()),
+                static_cast<std::size_t>(rb.num_rows()),
+                {});
+        };
+        BlockingExchangeOperator<std::int64_t> op(std::move(batcher));
+        op.set_uid("columnar-replay-exchange");
+        Emitter<std::int64_t> out([&](StreamElement<std::int64_t> e) {
+            retained = e.as_data().arrow();
+            return true;
+        });
+        op.process(StreamElement<std::int64_t>::data(make_range_batch(10, 2000)), out);
+        op.flush(out);
+        EXPECT_EQ(op.buffered_entry_count(), 0u);
+    }
+    ASSERT_NE(retained, nullptr);
+    ASSERT_TRUE(retained->ValidateFull().ok());
+    auto values = std::static_pointer_cast<arrow::Int64Array>(retained->column(1));
+    ASSERT_EQ(values->length(), 2000);
+    for (std::int64_t i = 0; i < 2000; ++i)
+        EXPECT_EQ(values->Value(i), i + 10);
 }

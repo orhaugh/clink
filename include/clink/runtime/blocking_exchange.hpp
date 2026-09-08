@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -55,6 +56,7 @@
 
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/runtime/memory_budget.hpp"
 
 namespace clink {
 
@@ -90,6 +92,14 @@ public:
     BlockingExchangeOperator(BlockingExchangeOperator&&) = delete;
     BlockingExchangeOperator& operator=(BlockingExchangeOperator&&) = delete;
 
+    void open() override {
+        if (!entries_.empty())
+            throw std::logic_error("cannot reopen a populated blocking exchange");
+        budget_ = this->runtime() ? this->runtime()->memory_budget() : nullptr;
+        entries_ = EntryList(BudgetAllocator<Entry>(budget_));
+        spilled_batches_ = 0;
+    }
+
     // Buffer everything; emit nothing. The blocking-edge contract: no element
     // crosses the boundary until the producing side has completed and flush()
     // replays the buffer.
@@ -117,12 +127,15 @@ public:
     // Seal the spill file then replay the whole buffer downstream in arrival
     // order. Called once by the runner at clean end-of-input.
     void flush(Emitter<T>& out) override {
+        if (entries_.empty())
+            return;
         seal_spill_writer_();
         std::shared_ptr<arrow::ipc::RecordBatchStreamReader> spill_reader;
         if (spilled_batches_ > 0) {
             spill_reader = open_spill_reader_();
         }
-        for (const auto& e : entries_) {
+        while (!entries_.empty()) {
+            const auto& e = entries_.front();
             switch (e.kind) {
                 case EntryKind::DataInMemory:
                     out.emit_data(deserialize_bytes_(e.bytes));
@@ -140,7 +153,11 @@ public:
                     out.emit_drain(*e.drain);
                     break;
             }
+            if (e.kind == EntryKind::DataInMemory)
+                in_memory_bytes_ -= e.bytes.size();
+            entries_.pop_front();
         }
+        spill_reader.reset();
         cleanup_spill_file_();
     }
 
@@ -156,6 +173,7 @@ private:
 
     struct Entry {
         EntryKind kind{EntryKind::DataInMemory};
+        MemoryReservation reservation;
         std::string bytes;  // DataInMemory: serialised Arrow IPC stream
         std::optional<Watermark> watermark;
         std::optional<CheckpointBarrier> barrier;
@@ -173,34 +191,59 @@ private:
                                      s.ToString());
         }
         const bool spill_enabled = !opts_.spill_dir.empty();
-        // Spill this batch if the in-memory pool would cross the threshold, OR
-        // if we have already started spilling. The latch matters: spilled
-        // batches do not grow in_memory_bytes_, so without it a later small
-        // batch could slip back into memory after overflow began - which would
-        // both interleave RAM growth with disk and break the "once overflowing,
-        // stays on disk" memory bound. Latching keeps resident memory monotone
-        // after the first spill.
-        if (spill_enabled &&
-            (spill_writer_ != nullptr || in_memory_bytes_ + static_cast<std::size_t>(payload_size) >
-                                             opts_.spill_threshold_bytes)) {
-            // Overflow: append this batch to the on-disk spill stream.
-            ensure_spill_writer_open_();
-            if (auto s = spill_writer_->WriteRecordBatch(*rb); !s.ok()) {
-                throw std::runtime_error("BlockingExchangeOperator: spill WriteRecordBatch: " +
-                                         s.ToString());
+        // Reserve the list node before changing the spill file. Even a fully
+        // spilled exchange retains ordering metadata, which must stay bounded.
+        entries_.emplace_back();
+        auto& entry = entries_.back();
+        try {
+            const bool over_threshold =
+                checked_memory_sum(in_memory_bytes_, static_cast<std::size_t>(payload_size)) >
+                opts_.spill_threshold_bytes;
+            if (spill_enabled && (spilled_batches_ != 0 || over_threshold)) {
+                spill_batch_(*rb, entry);
+                return;
             }
-            Entry e;
-            e.kind = EntryKind::DataSpilled;
-            entries_.push_back(std::move(e));
-            ++spilled_batches_;
-        } else {
-            // Keep in memory as a serialised IPC blob.
-            Entry e;
-            e.kind = EntryKind::DataInMemory;
-            e.bytes = serialize_record_batch_(*rb);
-            in_memory_bytes_ += e.bytes.size();
-            entries_.push_back(std::move(e));
+            entry.bytes = serialize_record_batch_(*rb);
+            try {
+                entry.reservation =
+                    MemoryReservation(budget_, MemoryCategory::State, entry.bytes.capacity() + 1);
+            } catch (const MemoryLimitExceeded&) {
+                if (!spill_enabled)
+                    throw;
+                // Drop the refused serialised copy before writing the batch.
+                // The Arrow batch and IPC scratch space are transient and are
+                // not part of retained exchange accounting.
+                std::string{}.swap(entry.bytes);
+                // No disk batches precede this one: migrate the resident
+                // prefix first, keeping the file's data order equal to the
+                // entry list even with control elements interspersed.
+                for (auto it = entries_.begin(); &*it != &entry; ++it) {
+                    if (it->kind != EntryKind::DataInMemory)
+                        continue;
+                    auto resident = read_bytes_(it->bytes);
+                    spill_batch_(*resident, *it);
+                    in_memory_bytes_ -= it->bytes.size();
+                    std::string{}.swap(it->bytes);
+                    it->reservation.resize(0);
+                }
+                spill_batch_(*rb, entry);
+                return;
+            }
+            in_memory_bytes_ += entry.bytes.size();
+        } catch (...) {
+            entries_.pop_back();
+            throw;
         }
+    }
+
+    void spill_batch_(const arrow::RecordBatch& rb, Entry& entry) {
+        ensure_spill_writer_open_();
+        if (auto s = spill_writer_->WriteRecordBatch(rb); !s.ok()) {
+            throw std::runtime_error("BlockingExchangeOperator: spill WriteRecordBatch: " +
+                                     s.ToString());
+        }
+        entry.kind = EntryKind::DataSpilled;
+        ++spilled_batches_;
     }
 
     std::string serialize_record_batch_(const arrow::RecordBatch& rb) const {
@@ -233,9 +276,13 @@ private:
     }
 
     Batch<T> deserialize_bytes_(const std::string& bytes) const {
-        auto buffer =
-            std::make_shared<arrow::Buffer>(reinterpret_cast<const std::uint8_t*>(bytes.data()),
-                                            static_cast<std::int64_t>(bytes.size()));
+        return parse_or_throw_(read_bytes_(bytes));
+    }
+
+    std::shared_ptr<arrow::RecordBatch> read_bytes_(const std::string& bytes) const {
+        // A custom parser may return a columnar batch that retains IPC buffers.
+        // Give the reader ownership before the replayed entry is released.
+        auto buffer = arrow::Buffer::FromString(bytes);
         auto input = std::make_shared<arrow::io::BufferReader>(buffer);
         auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(input);
         if (!reader_res.ok()) {
@@ -248,7 +295,9 @@ private:
             throw std::runtime_error("BlockingExchangeOperator: in-memory ReadNext: " +
                                      s.ToString());
         }
-        return parse_or_throw_(rb);
+        if (!rb)
+            throw std::runtime_error("BlockingExchangeOperator: empty in-memory IPC stream");
+        return rb;
     }
 
     Batch<T> read_next_spilled_(arrow::ipc::RecordBatchStreamReader& reader) const {
@@ -357,7 +406,9 @@ private:
     BlockingExchangeOptions opts_;
     std::string name_;
 
-    std::vector<Entry> entries_;
+    using EntryList = std::list<Entry, BudgetAllocator<Entry>>;
+    std::shared_ptr<MemoryBudget> budget_;
+    EntryList entries_{BudgetAllocator<Entry>(nullptr)};
     std::size_t in_memory_bytes_{0};
     std::size_t spilled_batches_{0};
 

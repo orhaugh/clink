@@ -20,8 +20,9 @@ submits to a distributed Coordinator/Worker cluster with parallelism,
 failover, and rescale.
 
 Opt-in [memory budgets](docs/internals/memory-management.md) share a byte allowance
-across covered SQL state, local queues and checkpoint buffers, with explicit
-refusal on exhaustion. Accounting coverage is partial; this is not an RSS cap.
+across covered SQL state, local queues, blocking exchanges and checkpoint buffers.
+Blocking exchanges can spill on pressure; other covered owners refuse allocations
+on exhaustion. Accounting coverage is partial; this is not an RSS cap.
 
 Three capabilities follow from that design:
 

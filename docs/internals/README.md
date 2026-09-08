@@ -20,7 +20,7 @@ then follow the links into each subsystem.
 | [Architecture and component stack](architecture.md) | How clink layers the engine core, the connector and backend impls, the cluster control plane, the SQL frontend, and the client/daemon binaries, and how a job flows from submission to running operators. |
 | [The operator model and DAG](operator-model.md) | The typed operator DAG, the in-band stream element model, and how RuntimeContext hands an operator its state, timers and identity. |
 | [Task lifecycle and the local runtime](task-lifecycle.md) | How LocalExecutor runs each operator as a task on its own jthread, driving the open/process/snapshot/close lifecycle while bounded channels carry data and apply backpressure. |
-| [Memory budgets](memory-management.md) | Shared tracked-memory budgets, covered state/queue/checkpoint owners, failure behaviour and allocation coverage limits. |
+| [Memory budgets](memory-management.md) | Shared tracked-memory budgets, covered state/queue/checkpoint owners, blocking-exchange spilling, failure behaviour and allocation coverage limits. |
 | [Jobs, parallelism and scheduling](jobs-and-scheduling.md) | How a logical JobGraphSpec is planned into key-group-routed parallel subtasks and placed onto Worker slots by the Coordinator. |
 
 ## Distribution and data movement

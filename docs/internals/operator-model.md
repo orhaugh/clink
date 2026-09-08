@@ -106,7 +106,7 @@ The builder offers these topology shapes:
 | `broadcast_connect` / `broadcast_process` | a high-volume main stream plus a broadcast control stream over `BroadcastState` |
 | `iterate_stream` / `close_with` | cyclic dataflow with a feedback edge |
 | `add_sharded_keyed` | one keyed operator fanned across N share-nothing state shards |
-| `add_blocking_exchange` | a fully-materialised (spillable) stage boundary for batch execution (Arrow builds) |
+| `add_blocking_exchange` | a fully-materialised stage boundary for batch execution (Arrow builds); spills at its threshold or on shared-budget payload pressure when a spill directory is configured. Ordering metadata remains budgeted in RAM. See [Memory budgets](memory-management.md). |
 
 Multi-input shapes (`union_streams`, `interval_join`, broadcast, the shuffled parallel stage) share `MultiInputAlignment`: data forwards immediately, downstream watermark is the running min, and a barrier delivered on one input pauses that input until every other input delivers the same barrier, at which point it forwards. Records on slower inputs are still processed during alignment because they belong to the same checkpoint epoch. The aligner only marks an input closed once its channel is both closed and fully drained, which is the fix for an earlier startup-race deadlock at higher parallelism.
 

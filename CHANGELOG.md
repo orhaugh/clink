@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Blocking exchanges spill on shared-budget pressure.** Retained IPC payloads
+and ordering metadata now share the execution/operator memory budget. With a
+spill directory configured, a refused payload charge migrates the resident
+prefix to disk before the incoming batch, preserving data and control order.
+Replay releases retained charges. Without spill, or when ordering metadata
+exhausts the budget, the execution fails cleanly. IPC scratch space and decoded
+batches remain outside this accounting; SQL working maps do not spill.
+
 **Opt-in memory budgets share an allowance across covered state, local queues
 and checkpoint work.** `JobConfig` accepts a shared domain or byte limit, with
 optional operator child limits; `CLINK_EXECUTION_MEMORY_LIMIT_BYTES` supplies a
