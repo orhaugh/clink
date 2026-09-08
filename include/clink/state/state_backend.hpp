@@ -12,6 +12,7 @@
 #include "clink/async/task.hpp"
 #include "clink/core/types.hpp"
 #include "clink/runtime/key_groups.hpp"
+#include "clink/runtime/memory_budget.hpp"
 #include "clink/state/schema_version.hpp"
 
 namespace clink {
@@ -66,6 +67,10 @@ public:
     using Value = std::vector<std::byte>;
 
     virtual ~StateBackend() = default;
+
+    // Optional tracked-memory domain. Backends with their own memory controls
+    // may leave this unsupported; callers must consult the coverage contract.
+    virtual void set_memory_budget(std::shared_ptr<MemoryBudget>) {}
 
     // Per-(operator, key) put/get/delete.
     virtual void put(OperatorId op, KeyView key, ValueView value) = 0;

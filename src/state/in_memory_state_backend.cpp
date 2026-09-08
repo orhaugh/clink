@@ -104,7 +104,7 @@ std::vector<std::byte> InMemoryStateBackend::export_arrow_snapshot() const {
     // registered before this snapshot fired ride the schema metadata so
     // (a) any Arrow reader sees them, and (b) the restore path reloads
     // them into state_versions_ for the control plane.
-    SnapshotArrowWriter writer(total_rows);
+    SnapshotArrowWriter writer(total_rows, memory_budget_);
     for (const auto& [op, kv] : state_) {
         const auto op_id_val = op.value();
         for (const auto& [k, v] : kv) {
@@ -147,7 +147,7 @@ Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
                 }
             }
         }
-        SnapshotArrowWriter writer(total_rows);
+        SnapshotArrowWriter writer(total_rows, memory_budget_);
         for (const auto& [op, kv] : state_) {
             const auto op_id_val = op.value();
             const auto* rows = rows_for(op, kv);
@@ -175,6 +175,7 @@ Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
         // Consume: this id's staging is used up, and anything at or below it
         // (aborted or superseded checkpoints) will never be asked for again.
         staged_.erase(staged_.begin(), staged_.upper_bound(id.value()));
+        staged_memory_.erase(staged_memory_.begin(), staged_memory_.upper_bound(id.value()));
     }
     std::lock_guard lock(mu_);
     const auto dt =
@@ -195,11 +196,13 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
     const auto t0 = std::chrono::steady_clock::now();
     std::lock_guard lock(mu_);
     state_.clear();
+    memory_.clear();
     state_versions_.clear();
     state_fingerprints_.clear();
     // Staged rows belong to the incarnation that staged them; a restored
     // instance must not let them substitute into its own checkpoints.
     staged_.clear();
+    staged_memory_.clear();
 
     if (snap.bytes.empty()) {
         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -311,6 +314,10 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
                     }
                 }
             }
+            if (memory_.enabled())
+                memory_.update(memory_key_(OperatorId{op_id_val}, key),
+                               key.size() + val.size() + sizeof(std::string) + sizeof(Value) +
+                                   4 * sizeof(void*));
             slot[std::move(key)] = std::move(val);
         }
     }

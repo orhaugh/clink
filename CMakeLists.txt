@@ -487,6 +487,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/application/job_submitter.cpp
     src/runtime/event_bus.cpp
     src/runtime/local_executor.cpp
+    src/runtime/memory_size.cpp
     src/runtime/local_submitter.cpp
     src/runtime/log_buffer.cpp
     src/runtime/logging.cpp

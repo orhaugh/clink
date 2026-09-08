@@ -1,5 +1,7 @@
 #include "clink/state/snapshot_arrow_writer.hpp"
 
+#include "clink/runtime/arrow_memory_pool.hpp"
+
 #ifndef CLINK_HAS_ARROW
 #error "clink requires CLINK_BUILD_ARROW=ON. The state-snapshot format is Arrow-IPC-only."
 #endif
@@ -33,14 +35,23 @@ std::shared_ptr<arrow::Schema> canonical_schema() {
 }  // namespace
 
 struct SnapshotArrowWriter::Impl {
+    explicit Impl(std::shared_ptr<MemoryBudget> owner)
+        : budget(std::move(owner)),
+          pool(budget, MemoryCategory::Checkpoint),
+          op_b(&pool),
+          key_b(&pool),
+          val_b(&pool) {}
+    std::shared_ptr<MemoryBudget> budget;
+    BudgetArrowMemoryPool pool;
     arrow::UInt64Builder op_b;
     arrow::BinaryBuilder key_b;
     arrow::BinaryBuilder val_b;
     std::int64_t rows{0};
 };
 
-SnapshotArrowWriter::SnapshotArrowWriter(std::size_t reserve_rows)
-    : impl_(std::make_unique<Impl>()) {
+SnapshotArrowWriter::SnapshotArrowWriter(std::size_t reserve_rows,
+                                         std::shared_ptr<MemoryBudget> budget)
+    : impl_(std::make_unique<Impl>(std::move(budget))) {
     if (reserve_rows > 0) {
         const auto n = static_cast<std::int64_t>(reserve_rows);
         if (auto s = impl_->op_b.Reserve(n); !s.ok()) {
@@ -103,7 +114,7 @@ std::vector<std::byte> SnapshotArrowWriter::finish(const StateVersionMap& versio
     }
     auto batch = arrow::RecordBatch::Make(schema, impl_->rows, {op_arr, key_arr, val_arr});
 
-    auto sink_result = arrow::io::BufferOutputStream::Create();
+    auto sink_result = arrow::io::BufferOutputStream::Create(4096, &impl_->pool);
     if (!sink_result.ok()) {
         throw_arrow("finish (create sink)", sink_result.status());
     }
@@ -124,6 +135,8 @@ std::vector<std::byte> SnapshotArrowWriter::finish(const StateVersionMap& versio
         throw_arrow("finish (finish sink)", buf_result.status());
     }
     auto buf = *buf_result;
+    MemoryReservation output_copy(
+        impl_->budget, MemoryCategory::Checkpoint, static_cast<std::size_t>(buf->size()));
     std::vector<std::byte> bytes(static_cast<std::size_t>(buf->size()));
     if (buf->size() > 0) {
         std::memcpy(bytes.data(), buf->data(), static_cast<std::size_t>(buf->size()));

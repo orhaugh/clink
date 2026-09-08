@@ -148,8 +148,11 @@ include/clink/runtime/gated_timer_fire.hpp
 include/clink/runtime/job_config.hpp
 include/clink/runtime/key_group_partitioner.hpp
 include/clink/runtime/key_groups.hpp
+include/clink/runtime/keyed_memory_account.hpp
 include/clink/runtime/local_executor.hpp
 include/clink/runtime/log_buffer.hpp
+include/clink/runtime/memory_budget.hpp
+include/clink/runtime/memory_size.hpp
 include/clink/runtime/multi_input_alignment.hpp
 include/clink/runtime/network/connection.hpp
 include/clink/runtime/network/local_data_plane.hpp

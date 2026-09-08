@@ -53,6 +53,24 @@ public:
     JsonValue(JsonArray v) : value_(std::move(v)) {}
     JsonValue(JsonObject v) : value_(std::move(v)) {}
 
+    // Retained payload estimate, including vector capacity and nested values.
+    // String capacity includes inline storage, deliberately conservative.
+    [[nodiscard]] std::size_t retained_bytes() const {
+        std::size_t bytes = sizeof(*this);
+        if (is_string())
+            bytes += as_string().capacity() + 1;
+        else if (is_array()) {
+            bytes += as_array().capacity() * sizeof(JsonValue);
+            for (const auto& v : as_array())
+                bytes += v.retained_bytes() - sizeof(v);
+        } else if (is_object()) {
+            bytes += as_object().capacity() * sizeof(JsonObject::value_type);
+            for (const auto& [k, v] : as_object())
+                bytes += k.capacity() + 1 + v.retained_bytes() - sizeof(v);
+        }
+        return bytes;
+    }
+
     Type type() const noexcept { return static_cast<Type>(value_.index()); }
 
     bool is_null() const noexcept { return type() == Type::Null; }

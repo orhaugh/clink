@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -19,7 +20,19 @@
 namespace clink {
 
 LocalExecutor::LocalExecutor(Dag dag, JobConfig config)
-    : dag_(std::move(dag)), config_(std::move(config)) {}
+    : dag_(std::move(dag)), config_(std::move(config)) {
+    if (config_.memory_budget && config_.memory_limit_bytes != 0)
+        throw std::invalid_argument("set memory_budget or memory_limit_bytes, not both");
+    if (!config_.memory_budget) {
+        auto limit = config_.memory_limit_bytes;
+        if (limit == 0) {
+            if (const auto* value = std::getenv("CLINK_EXECUTION_MEMORY_LIMIT_BYTES"))
+                limit = parse_memory_limit_bytes(value);
+        }
+        if (limit != 0 || !config_.operator_memory_limits.empty())
+            config_.memory_budget = std::make_shared<MemoryBudget>(limit);
+    }
+}
 
 LocalExecutor::~LocalExecutor() {
     cancel();
@@ -31,43 +44,60 @@ void LocalExecutor::start() {
     if (!running_.compare_exchange_strong(expected, true)) {
         return;
     }
-    // Restore state from snapshot before any operator starts processing.
-    if (config_.state_backend && config_.restore_from.has_value()) {
-        // FOUND-3: hand the backend the relocated savepoint dir (if any) so it
-        // can rebase cp-dir references that embed a capture-time absolute path.
-        if (!config_.restore_base.empty()) {
-            config_.state_backend->set_restore_base(config_.restore_base);
+    try {
+        for (const auto& [id, limit] : config_.operator_memory_limits) {
+            (void)limit;
+            if (std::none_of(dag_.runners().begin(),
+                             dag_.runners().end(),
+                             [id](const auto& runner) { return runner.id == id; }))
+                throw std::invalid_argument("operator memory limit names no runner: " +
+                                            std::to_string(id.value()));
         }
-        // Timed: clink_ckpt_restore_ns is how long a job is dark after a
-        // fault, and it grows with state size - the number a large-state
-        // campaign has to calibrate its recovery deadlines from, rather
-        // than guess. The metric, its registration and a Grafana panel
-        // all existed already; nothing ever called restore_observe(), so
-        // the panel plotted an always-empty series.
-        //
-        // The window covers the migration too, deliberately: what matters
-        // to a recovery deadline is when the job can run again, not when
-        // the backend's own read finished.
-        const auto restore_started = std::chrono::steady_clock::now();
-        config_.state_backend->restore(*config_.restore_from, config_.restore_key_group_filter);
-        // State schema evolution: migrate the restored state up to the
-        // versions the live job expects, before any operator reads it.
-        // has_path-gated; throws on a missing path (the pre-deploy
-        // checker should have caught it, but the HA auto-restart path
-        // can restore without that gate, so this is the last line of
-        // defence against silently reading stale-schema bytes).
-        if (config_.expected_state_versions.has_value()) {
-            migrate_restored_state(*config_.state_backend, *config_.expected_state_versions);
+        if (config_.memory_budget)
+            dag_.set_memory_budget(config_.memory_budget);
+        if (config_.memory_budget && config_.state_backend)
+            config_.state_backend->set_memory_budget(config_.memory_budget);
+        // Restore state from snapshot before any operator starts processing.
+        if (config_.state_backend && config_.restore_from.has_value()) {
+            // FOUND-3: hand the backend the relocated savepoint dir (if any) so it
+            // can rebase cp-dir references that embed a capture-time absolute path.
+            if (!config_.restore_base.empty()) {
+                config_.state_backend->set_restore_base(config_.restore_base);
+            }
+            // Timed: clink_ckpt_restore_ns is how long a job is dark after a
+            // fault, and it grows with state size - the number a large-state
+            // campaign has to calibrate its recovery deadlines from, rather
+            // than guess. The metric, its registration and a Grafana panel
+            // all existed already; nothing ever called restore_observe(), so
+            // the panel plotted an always-empty series.
+            //
+            // The window covers the migration too, deliberately: what matters
+            // to a recovery deadline is when the job can run again, not when
+            // the backend's own read finished.
+            const auto restore_started = std::chrono::steady_clock::now();
+            config_.state_backend->restore(*config_.restore_from, config_.restore_key_group_filter);
+            // State schema evolution: migrate the restored state up to the
+            // versions the live job expects, before any operator reads it.
+            // has_path-gated; throws on a missing path (the pre-deploy
+            // checker should have caught it, but the HA auto-restart path
+            // can restore without that gate, so this is the last line of
+            // defence against silently reading stale-schema bytes).
+            if (config_.expected_state_versions.has_value()) {
+                migrate_restored_state(*config_.state_backend, *config_.expected_state_versions);
+            }
+            clink::metrics::ckpt::restore_observe(
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - restore_started)
+                                               .count()));
+        } else if (config_.state_backend && config_.expected_state_versions.has_value()) {
+            // Fresh start (no restore): stamp the expected versions so the
+            // snapshots this job produces record them, enabling a future
+            // restore to compare and migrate.
+            config_.state_backend->set_state_versions(*config_.expected_state_versions);
         }
-        clink::metrics::ckpt::restore_observe(
-            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now() - restore_started)
-                                           .count()));
-    } else if (config_.state_backend && config_.expected_state_versions.has_value()) {
-        // Fresh start (no restore): stamp the expected versions so the
-        // snapshots this job produces record them, enabling a future
-        // restore to compare and migrate.
-        config_.state_backend->set_state_versions(*config_.expected_state_versions);
+    } catch (...) {
+        running_.store(false, std::memory_order_release);
+        throw;
     }
     register_metrics();
 
@@ -86,6 +116,13 @@ void LocalExecutor::start() {
         const auto& runner = dag_.runners()[i];
         contexts_.push_back(std::make_unique<RuntimeContext>(
             runner.id, runner.name, config_.state_backend.get(), config_.metrics));
+        auto operator_budget = config_.memory_budget;
+        if (auto limit = config_.operator_memory_limits.find(runner.id);
+            limit != config_.operator_memory_limits.end()) {
+            operator_budget =
+                std::make_shared<MemoryBudget>(limit->second, runner.name, config_.memory_budget);
+        }
+        contexts_.back()->set_memory_budget(std::move(operator_budget));
         contexts_.back()->set_side_output_channels(dag_.side_channels_for(i));
         // Network-bridge byte attribution: a bridge's bytes belong to its
         // chain's primary operator, not the bridge's own (internal) op id.
@@ -149,7 +186,6 @@ void LocalExecutor::start() {
         }
         auto* ctx_ptr = contexts_.back().get();
         auto run_fn = runner.run;
-        auto cancel_fn = runner.cancel;
         auto op_name = runner.name;
         // Stop predicate ORs the internal cancel flag with the external
         // token from JobConfig (if set). The Worker wires that
@@ -172,8 +208,7 @@ void LocalExecutor::start() {
         // get closed via the runner's cancel hook so downstream threads
         // can drain and exit cleanly.
         threads_.emplace_back(
-            [this, run_fn, ctx_ptr, stop_predicate, cancel_fn, op_name, core, pin](
-                std::stop_token /*tok*/) {
+            [this, run_fn, ctx_ptr, stop_predicate, op_name, core, pin](std::stop_token /*tok*/) {
                 // Name the thread for diagnostics (top -H, perf, gdb) and pin it
                 // when requested. Both are best-effort and never throw.
                 set_current_thread_name(op_name);
@@ -181,6 +216,7 @@ void LocalExecutor::start() {
                     pin_current_thread_to_core(core);
                 }
                 try {
+                    MemoryBudgetScope memory_scope(ctx_ptr->memory_budget());
                     run_fn(*ctx_ptr, stop_predicate);
                 } catch (const std::exception& e) {
                     std::string message = e.what();
@@ -196,10 +232,9 @@ void LocalExecutor::start() {
                         std::lock_guard lock(error_mu_);
                         operator_errors_.emplace_back(op_name, std::move(message));
                     }
-                    cancel_.store(true, std::memory_order_release);
-                    if (cancel_fn) {
-                        cancel_fn();
-                    }
+                    // Wake every edge, including a producer blocked on an
+                    // unrelated branch of this execution.
+                    cancel();
                 }
             });
     }
@@ -240,6 +275,7 @@ void LocalExecutor::await_termination() {
     if (external_cancel_watch_thread_.joinable()) {
         external_cancel_watch_thread_.join();
     }
+    report_memory_metrics_();
 }
 
 void LocalExecutor::cancel() {
@@ -297,10 +333,30 @@ Snapshot LocalExecutor::take_savepoint(CheckpointId id) {
     return config_.state_backend->snapshot(id);
 }
 
+void LocalExecutor::report_memory_metrics_() {
+    if (!config_.metrics || !config_.memory_budget || dag_.runners().empty())
+        return;
+    const auto usage = config_.memory_budget->usage();
+    const auto labels =
+        "{root_op_id=\"" + std::to_string(dag_.runners().front().id.value()) + "\"}";
+    const auto set = [&](const std::string& suffix, std::size_t value) {
+        config_.metrics->gauge("clink_execution_memory_" + suffix + labels)
+            .set(static_cast<std::int64_t>(std::min(value, static_cast<std::size_t>(INT64_MAX))));
+    };
+    set("used_bytes", usage.used);
+    set("peak_bytes", usage.peak);
+    set("limit_bytes", config_.memory_budget->limit());
+    set("refused", usage.refused);
+    for (std::size_t i = 0; i < usage.categories.size(); ++i)
+        set(std::string(memory_category_name(static_cast<MemoryCategory>(i))) + "_bytes",
+            usage.categories[i]);
+}
+
 void LocalExecutor::register_metrics() {
     if (config_.metrics == nullptr) {
         return;
     }
+    report_memory_metrics_();
     for (const auto& runner : dag_.runners()) {
         const auto id = runner.id.value();
         // Touch the backpressure gauges so they exist before the runner starts;
@@ -347,6 +403,7 @@ void LocalExecutor::metrics_poll_loop_() {
     }
 
     while (running_.load(std::memory_order_acquire) && !cancel_.load(std::memory_order_acquire)) {
+        report_memory_metrics_();
         for (auto& p : probes) {
             const std::int64_t d = p.depth ? static_cast<std::int64_t>(p.depth()) : 0;
             const std::int64_t c = p.capacity ? static_cast<std::int64_t>(p.capacity()) : 0;

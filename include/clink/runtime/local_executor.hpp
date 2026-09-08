@@ -101,6 +101,7 @@ public:
 
 private:
     void register_metrics();
+    void report_memory_metrics_();
     void metrics_poll_loop_();
     // Watches JobConfig::external_cancel_token and calls cancel()
     // when it flips. Lets runners pop_for(long) on idle without

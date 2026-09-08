@@ -198,7 +198,9 @@ include/clink/operators/deadline_keyed_operator.hpp
 include/clink/operators/udf_language_registry.hpp
 include/clink/queryable_state/client.hpp
 include/clink/queryable_state/cluster_client.hpp
+include/clink/runtime/arrow_memory_pool.hpp
 include/clink/runtime/logging.hpp
+include/clink/runtime/memory_budget.hpp
 include/clink/sql/catalog.hpp
 include/clink/sql/script_runner.hpp
 include/clink/sql/table_api.hpp
@@ -416,9 +418,11 @@ include/clink/runtime/event_bus.hpp
 include/clink/runtime/gated_timer_fire.hpp
 include/clink/runtime/key_group_partitioner.hpp
 include/clink/runtime/key_groups.hpp
+include/clink/runtime/keyed_memory_account.hpp
 include/clink/runtime/local_submitter.hpp
 include/clink/runtime/log_buffer.hpp
 include/clink/runtime/log_buffer_sink.hpp
+include/clink/runtime/memory_size.hpp
 include/clink/runtime/multi_input_alignment.hpp
 include/clink/runtime/network/connection.hpp
 include/clink/runtime/network/local_data_plane.hpp
@@ -492,6 +496,7 @@ include/clink/metrics/gauge.hpp
 include/clink/metrics/histogram.hpp
 include/clink/metrics/metrics_registry.hpp
 include/clink/metrics/operator_metrics.hpp
+include/clink/runtime/memory_budget.hpp
 include/clink/sql/catalog.hpp
 include/clink/time/alignment_group.hpp
 
@@ -534,7 +539,9 @@ include/clink/runtime/cutover_gate.hpp
 include/clink/runtime/gated_timer_fire.hpp
 include/clink/runtime/key_group_partitioner.hpp
 include/clink/runtime/key_groups.hpp
+include/clink/runtime/keyed_memory_account.hpp
 include/clink/runtime/log_buffer.hpp
+include/clink/runtime/memory_size.hpp
 include/clink/runtime/multi_input_alignment.hpp
 include/clink/runtime/network/connection.hpp
 include/clink/runtime/network/local_data_plane.hpp

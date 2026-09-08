@@ -41,7 +41,9 @@ public:
         ack_fn_t ack;
     };
 
-    explicit SnapshotWorker(std::size_t capacity = 1) : queue_(capacity, "snapshot-worker") {
+    explicit SnapshotWorker(std::size_t capacity = 1,
+                            std::shared_ptr<MemoryBudget> budget = nullptr)
+        : budget_(std::move(budget)), queue_(capacity, "snapshot-worker") {
         // Between checkpoints this queue is empty and its consumer waits, for
         // as long as the checkpoint interval says: idle, not stuck. The
         // push side keeps its warning - an operator blocked on enqueue()
@@ -71,7 +73,10 @@ public:
     // Operator thread: enqueue a captured checkpoint. Blocks if the worker
     // is still persisting the previous one (backpressure). Returns false if
     // the worker has already been closed.
-    bool enqueue(Job job) { return queue_.push(std::move(job)); }
+    bool enqueue(Job job) {
+        MemoryReservation memory(budget_, MemoryCategory::Checkpoint, job.handle.bytes.capacity());
+        return queue_.push(Pending{std::move(memory), std::move(job)});
+    }
 
     // Clean drain: persist + ack everything still queued, then join. Used
     // on a normal end-of-stream so an in-flight checkpoint the coordinator
@@ -96,7 +101,8 @@ private:
         // pop() returns nullopt only once the queue is closed AND drained,
         // so a clean drain_and_join persists + acks the whole backlog
         // before this loop exits.
-        while (auto job = queue_.pop()) {
+        while (auto pending = queue_.pop()) {
+            auto* job = &pending->job;
             if (drop_pending_.load(std::memory_order_acquire)) {
                 continue;  // hard cancel: skip without acking
             }
@@ -168,7 +174,12 @@ private:
         thread_.join();
     }
 
-    BoundedChannel<Job> queue_;
+    std::shared_ptr<MemoryBudget> budget_;
+    struct Pending {
+        MemoryReservation memory;
+        Job job;
+    };
+    BoundedChannel<Pending> queue_;
     std::atomic<bool> drop_pending_{false};
     // Checkpoint id currently inside backend->persist(), 0 when idle.
     // Read by the join heartbeat to name what the join is waiting on.

@@ -19,6 +19,10 @@ pyarrow tables in a notebook. At scale: the same SQL file, unchanged,
 submits to a distributed Coordinator/Worker cluster with parallelism,
 failover, and rescale.
 
+Opt-in [memory budgets](docs/internals/memory-management.md) share a byte allowance
+across covered SQL state, local queues and checkpoint buffers, with explicit
+refusal on exhaustion. Accounting coverage is partial; this is not an RSS cap.
+
 Three capabilities follow from that design:
 
 - **State is an open dataset.** Snapshots are documented Arrow IPC:

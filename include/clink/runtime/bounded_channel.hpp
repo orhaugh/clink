@@ -7,10 +7,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
+
+#include "clink/runtime/memory_budget.hpp"
 
 namespace clink {
 
@@ -47,6 +50,15 @@ public:
     BoundedChannel& operator=(const BoundedChannel&) = delete;
     BoundedChannel(BoundedChannel&&) = delete;
     BoundedChannel& operator=(BoundedChannel&&) = delete;
+
+    void set_memory_budget(std::shared_ptr<MemoryBudget> budget,
+                           std::function<std::size_t(const T&)> size_of) {
+        std::lock_guard lock(mu_);
+        if (!queue_.empty())
+            throw std::logic_error("cannot budget a non-empty channel");
+        memory_budget_ = std::move(budget);
+        memory_size_ = std::move(size_of);
+    }
 
     void set_name(std::string name) {
         std::lock_guard lock(mu_);
@@ -144,7 +156,9 @@ public:
         if (closed_) {
             return false;
         }
-        queue_.push_back(std::move(value));
+        MemoryReservation reservation(
+            memory_budget_, MemoryCategory::Queue, memory_budget_ ? memory_size_(value) : 0);
+        queue_.push_back(Entry{std::move(reservation), std::move(value)});
         max_depth_.store(std::max(max_depth_.load(), queue_.size()), std::memory_order_relaxed);
         lock.unlock();
         not_empty_.notify_one();
@@ -158,7 +172,9 @@ public:
         if (closed_ || queue_.size() >= capacity_) {
             return false;
         }
-        queue_.push_back(std::move(value));
+        MemoryReservation reservation(
+            memory_budget_, MemoryCategory::Queue, memory_budget_ ? memory_size_(value) : 0);
+        queue_.push_back(Entry{std::move(reservation), std::move(value)});
         max_depth_.store(std::max(max_depth_.load(), queue_.size()), std::memory_order_relaxed);
         lock.unlock();
         not_empty_.notify_one();
@@ -218,7 +234,7 @@ public:
         if (queue_.empty()) {
             return std::nullopt;
         }
-        T value = std::move(queue_.front());
+        T value = std::move(queue_.front().value);
         queue_.pop_front();
         lock.unlock();
         not_full_.notify_one();
@@ -231,7 +247,7 @@ public:
         if (queue_.empty()) {
             return std::nullopt;
         }
-        T value = std::move(queue_.front());
+        T value = std::move(queue_.front().value);
         queue_.pop_front();
         lock.unlock();
         not_full_.notify_one();
@@ -252,7 +268,7 @@ public:
         if (queue_.empty()) {
             return std::nullopt;
         }
-        T value = std::move(queue_.front());
+        T value = std::move(queue_.front().value);
         queue_.pop_front();
         lock.unlock();
         not_full_.notify_one();
@@ -310,7 +326,13 @@ private:
     mutable std::mutex mu_;
     std::condition_variable not_full_;
     std::condition_variable not_empty_;
-    std::deque<T> queue_;
+    struct Entry {
+        MemoryReservation reservation;
+        T value;
+    };
+    std::deque<Entry> queue_;
+    std::shared_ptr<MemoryBudget> memory_budget_;
+    std::function<std::size_t(const T&)> memory_size_;
     std::size_t capacity_{};
     std::string name_;
     std::chrono::milliseconds stuck_warn_base_{kStuckWarnInterval * 1000};

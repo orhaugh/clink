@@ -113,6 +113,7 @@ nav:
       - internals/architecture.md
       - internals/operator-model.md
       - internals/task-lifecycle.md
+      - internals/memory-management.md
       - internals/jobs-and-scheduling.md
       - internals/distributed-runtime.md
       - internals/network-stack.md

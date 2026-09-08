@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Opt-in memory budgets share an allowance across covered state, local queues
+and checkpoint work.** `JobConfig` accepts a shared domain or byte limit, with
+optional operator child limits; `CLINK_EXECUTION_MEMORY_LIMIT_BYTES` supplies a
+per-local-execution default for SQL and Workers. The first increment accounts
+SQL GROUP BY and tumble/hop/cumulate working state, memory/file backend storage,
+queued row and Arrow batches, canonical snapshot allocations and queued captures.
+Refusal names the budget and category, and local operator failure closes every
+edge to wake blocked peers. Usage, peak and category gauges expose the account.
+Coverage is explicit and partial, not an RSS cap or automatic spilling. The new
+memory budget and Arrow pool authoring headers are Evolving; public and plugin
+include manifests record their reach. See [Memory budgets](docs/internals/memory-management.md).
+
 **The engine's protocol traces are validated against the exactly-once
 specification.** Design record 012's increments 3 and 4. With
 `CLINK_PROTOCOL_TRACE_DIR` set, every process appends one JSON line per

@@ -168,6 +168,15 @@ Queryable state exposes keyed operator state for external reads over HTTP - a se
 - Identity plumbing: the DeploymentTask role + global subtask index travel `RunnerContext.runner_role` -> `JobConfig` -> `RuntimeContext::set_runner_identity`, so an operator binds under exactly the address the coordinator routes clients to. In-process/legacy paths carry no role and operators skip binding.
 - Production wiring: `clink_node` registers the worker routes (against `Registry::global()`) and the coordinator routes whenever `--http-port` is set.
 
+## Memory accounting
+
+In-memory and file-backed backends accept an optional shared `MemoryBudget`
+before state is populated. Working key/value estimates and staged checkpoint
+copies charge separate categories in that domain; the canonical snapshot writer
+uses a budgeted Arrow pool. SQL aggregate working maps carry separate charges
+because a checkpoint can hold both the working and encoded copies. See
+[Memory budgets](memory-management.md) for the exact coverage and exclusions.
+
 ## Key types and APIs
 
 | Type / function | Responsibility |

@@ -158,6 +158,7 @@ add_executable(clink_core_tests
     test_subtask_emitter.cpp
     test_keyed_state_multitype.cpp
     test_runtime_context.cpp
+    test_memory_budget.cpp
     test_dead_letter.cpp
     test_operator_lifecycle.cpp
     test_checkpoint_barrier.cpp
@@ -647,6 +648,7 @@ if(CLINK_BUILD_SQL)
         test_sql_unsupported_semantics.cpp
         test_submit_checkpoint_config.cpp
         test_sql_state_ttl_runtime.cpp
+        test_sql_memory_budget.cpp
         test_columnar_split.cpp
         test_key_routing_parity.cpp
         test_json_columnar_decode.cpp

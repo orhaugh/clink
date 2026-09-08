@@ -62,6 +62,9 @@ TIERS = (STABLE, EVOLVING, INTERNAL)
 # internals pages teach; Evolving is real but not yet settled. See
 # docs/design/011-public-api-tiers.md for the reasoning behind each group.
 TIER_RULES: list[tuple[str, str]] = [
+    # Opt-in memory accounting is supported but its coverage is still evolving.
+    (EVOLVING, "include/clink/runtime/memory_budget.hpp"),
+    (EVOLVING, "include/clink/runtime/arrow_memory_pool.hpp"),
     # --- Stable: the fluent pipeline and job/plugin registration -------------
     (STABLE, "include/clink/api/*.hpp"),
     (STABLE, "include/clink/job/register_job.hpp"),

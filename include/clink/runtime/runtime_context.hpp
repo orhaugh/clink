@@ -21,6 +21,7 @@
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/dead_letter.hpp"
 #include "clink/runtime/log_buffer.hpp"
+#include "clink/runtime/memory_budget.hpp"
 #include "clink/runtime/output_tag.hpp"
 #include "clink/runtime/timer_service.hpp"
 #include "clink/state/broadcast_state.hpp"
@@ -105,6 +106,11 @@ public:
     void set_state_backend(StateBackend* b) noexcept { backend_ = b; }
 
     MetricsRegistry* metrics() const noexcept { return metrics_; }
+
+    void set_memory_budget(std::shared_ptr<MemoryBudget> budget) {
+        memory_budget_ = std::move(budget);
+    }
+    const std::shared_ptr<MemoryBudget>& memory_budget() const noexcept { return memory_budget_; }
 
     // Named user accumulator scoped to this operator. The returned handle's
     // add() merges across all of the operator's subtasks, surfaced per
@@ -587,6 +593,7 @@ private:
         }
     }
 
+    std::shared_ptr<MemoryBudget> memory_budget_;
     OperatorId op_id_;
     std::string op_name_;
     StateBackend* backend_{nullptr};

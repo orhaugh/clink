@@ -75,6 +75,15 @@ using RowColumns = clink::config::FlatMap<clink::config::JsonValue, clink::confi
 struct Row {
     RowColumns values;
 
+    [[nodiscard]] std::size_t retained_bytes() const {
+        std::size_t bytes = sizeof(*this) + values.capacity() * sizeof(RowColumns::value_type);
+        for (const auto& [name, value] : values) {
+            (void)name;
+            bytes += value.retained_bytes() - sizeof(value);
+        }
+        return bytes;
+    }
+
     [[nodiscard]] bool has_column(const std::string& name) const {
         return values.find(name) != values.end();
     }

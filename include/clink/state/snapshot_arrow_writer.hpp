@@ -1,4 +1,5 @@
 #pragma once
+#include "clink/runtime/memory_budget.hpp"
 
 // SnapshotArrowWriter - the canonical writer for the engine's Arrow IPC
 // state-snapshot format:
@@ -118,7 +119,8 @@ inline void verify_snapshot_format_version(
 class SnapshotArrowWriter {
 public:
     // `reserve_rows` pre-sizes the column builders (0 = grow on demand).
-    explicit SnapshotArrowWriter(std::size_t reserve_rows = 0);
+    explicit SnapshotArrowWriter(std::size_t reserve_rows = 0,
+                                 std::shared_ptr<MemoryBudget> budget = nullptr);
     ~SnapshotArrowWriter();
 
     SnapshotArrowWriter(const SnapshotArrowWriter&) = delete;

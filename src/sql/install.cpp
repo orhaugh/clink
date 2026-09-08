@@ -53,6 +53,7 @@
 #include "clink/operators/watermark_assigner_operator.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/runtime/async_execution_controller.hpp"
+#include "clink/runtime/keyed_memory_account.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/blackhole_row_sink.hpp"
@@ -270,6 +271,47 @@ struct AggBucket {
     // retract the prior value (update_before) before emitting the new one.
     std::optional<Row> prior_emitted;
 };
+
+// Retained-state estimates are evaluated only when a budget is configured.
+// Include cold aggregate families: one key with ARRAY_AGG can grow without
+// increasing the number of groups.
+std::size_t agg_state_retained_bytes(const AggState& state) {
+    std::size_t bytes = sizeof(state) + state.running_min.retained_bytes() -
+                        sizeof(state.running_min) + state.running_max.retained_bytes() -
+                        sizeof(state.running_max);
+    if (const auto* cold = state.extras_or_null()) {
+        bytes += sizeof(*cold);
+        for (const auto& [key, count] : cold->value_counts) {
+            (void)count;
+            bytes +=
+                sizeof(std::pair<const std::string, int>) + 4 * sizeof(void*) + key.capacity() + 1;
+        }
+        for (const auto& [key, count] : cold->minmax_counts) {
+            (void)count;
+            bytes += sizeof(std::pair<const clink::config::JsonValue, int>) + 4 * sizeof(void*) +
+                     key.retained_bytes() - sizeof(key);
+        }
+        bytes += cold->percentile_values.capacity() * sizeof(double);
+        bytes += cold->array_values.capacity() * sizeof(clink::config::JsonValue);
+        for (const auto& value : cold->array_values)
+            bytes += value.retained_bytes() - sizeof(value);
+        bytes += cold->udaf_acc.retained_bytes() - sizeof(cold->udaf_acc);
+    }
+    return bytes;
+}
+template <class Bucket>
+std::size_t aggregate_bucket_retained_bytes(const Bucket& bucket) {
+    std::size_t bytes = sizeof(bucket) + bucket.group_values.retained_bytes() -
+                        sizeof(bucket.group_values) +
+                        bucket.agg_states.capacity() * sizeof(AggState);
+    for (const auto& state : bucket.agg_states)
+        bytes += agg_state_retained_bytes(state) - sizeof(state);
+    if constexpr (requires { bucket.prior_emitted; }) {
+        if (bucket.prior_emitted)
+            bytes += bucket.prior_emitted->retained_bytes() - sizeof(Row);
+    }
+    return bytes;
+}
 
 // Exact, round-trip serialisation of AggBucket so the SQL GROUP BY operator
 // can hold per-group state in a StateBackend (KeyedState) instead of an
@@ -1702,6 +1744,7 @@ public:
             auto& by_window = state_[group_keys[g]];
             for (const std::int64_t idx : groups[g]) {
                 fold_record_into_(by_window, rows[static_cast<std::size_t>(idx)], nullptr, horizon);
+                account_key_(group_keys[g]);
             }
         }
         return true;
@@ -1726,6 +1769,7 @@ public:
     // map - never scans all groups. Default (non-deferring backend) keeps the
     // byte-identical in-memory state_ + watermark scan.
     void open() override {
+        memory_.bind(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
         // On the async path the fire happens in on_event_time_timers_async, which
@@ -1752,6 +1796,7 @@ public:
                         return;
                     }
                     state_[key] = by_window;
+                    account_key_(key);
                     // fire_due_'s fast path skips the scan when this bound says
                     // nothing is due, so a restore that did not rebuild it would
                     // leave every restored window unfireable.
@@ -2150,6 +2195,7 @@ private:
                     earliest_win_end_ = std::min(earliest_win_end_, win_end);
                 }
                 vectorised_fold_slice(aggregates_, agg_cols, slice.idxs, wit->second.agg_states);
+                account_key_(key);
             }
         }
     }
@@ -2186,6 +2232,7 @@ private:
             sit = state_.emplace(std::string(key), std::map<std::int64_t, WindowBucket>{}).first;
         }
         fold_record_into_(sit->second, row, nullptr, drop_horizon_());
+        account_key_(sit->first);
     }
 
     // Append one fired pane straight into the typed output builders: group values
@@ -2351,6 +2398,12 @@ private:
                 it = by_window.erase(it);
             }
         }
+        if (memory_.enabled()) {
+            for (const auto& [key, windows] : state_) {
+                (void)windows;
+                account_key_(key);
+            }
+        }
         // The scan erased every due window, so the previous bound is stale (too low).
         // Recompute it exactly - each group's window map is ordered, so its smallest
         // window_end is begin(). O(groups), but only on a watermark that actually fired,
@@ -2409,6 +2462,23 @@ private:
         br.direction = "operator";
         rt->report_bad_record(br);
     }
+
+    void account_key_(const std::string& key) {
+        if (!memory_.enabled())
+            return;
+        const auto it = state_.find(key);
+        if (it == state_.end()) {
+            memory_.erase(key);
+            return;
+        }
+        std::size_t bytes = sizeof(*it) + key.capacity() + 1 + 4 * sizeof(void*);
+        for (const auto& [end, bucket] : it->second) {
+            (void)end;
+            bytes += sizeof(end) + 4 * sizeof(void*) + aggregate_bucket_retained_bytes(bucket);
+        }
+        memory_.update(key, bytes);
+    }
+    clink::KeyedMemoryAccount memory_;
 
     bool effective_async_ = false;
     // True when a state backend is attached but the KeyedState paths are not: the
@@ -4314,6 +4384,10 @@ inline void ttl_observe_element_(clink::sql::StateTtlTracker& ttl,
 
 class AggregateRowOp final : public Operator<Row, Row> {
 public:
+    // An allocation refusal can unwind the runner before its normal close.
+    // The process-wide serving registry must not retain this operator then.
+    ~AggregateRowOp() override { close(); }
+
     AggregateRowOp(std::vector<std::string> group_keys,
                    std::vector<AggSpec> aggregates,
                    std::vector<std::string> group_key_outputs = {},
@@ -4640,6 +4714,7 @@ public:
     // process() keeps the byte-for-byte in-memory path and the runner stays
     // synchronous - existing jobs are unchanged.
     void open() override {
+        memory_.bind(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_state_ =
             async_state_ || (this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                              this->runtime()->state_backend()->supports_async_get());
@@ -4651,8 +4726,10 @@ public:
         persist_inmem_ = !effective_async_state_ && this->runtime() != nullptr &&
                          this->runtime()->has_state_backend();
         if (persist_inmem_ && state_.empty()) {
-            keyed_state_().scan(
-                [&](const std::string& key, const AggBucket& bucket) { state_[key] = bucket; });
+            keyed_state_().scan([&](const std::string& key, const AggBucket& bucket) {
+                state_[key] = bucket;
+                account_key_(key);
+            });
         }
         // Deadlines are absolute, so a restored group resumes its original
         // expiry rather than getting a fresh full TTL. Without this a job
@@ -4924,7 +5001,21 @@ private:
         return clink::config::JsonValue{clink::sql::to_json_object(result.values)}.serialize(0);
     }
 
+    void account_key_(const std::string& key) {
+        if (!memory_.enabled())
+            return;
+        const auto it = state_.find(key);
+        if (it == state_.end()) {
+            memory_.erase(key);
+            return;
+        }
+        memory_.update(key,
+                       key.capacity() + 1 + aggregate_bucket_retained_bytes(it->second) +
+                           sizeof(std::string) + 6 * sizeof(void*));
+    }
+
     void mark_dirty_(const std::string& key) {
+        account_key_(key);
         if (persist_inmem_) {
             dirty_.insert(key);
         }
@@ -5005,6 +5096,7 @@ private:
         }
         for (const auto& key : doomed) {
             state_.erase(key);
+            memory_.erase(key);
             dirty_.erase(key);
             ttl_.forget(key);
             if (have_backend) {
@@ -5068,6 +5160,7 @@ private:
     bool persist_inmem_ = false;
     // Group keys mutated since the last flush (write-behind working set).
     std::unordered_set<std::string> dirty_;
+    clink::KeyedMemoryAccount memory_;
     clink::FlatMap<std::string, AggBucket, TransparentKeyHash, std::equal_to<>> state_;
     mutable std::string key_scratch_;  // group_key_scratch_'s reused buffer
     // Columns the columnar ingest reads from each input row (group keys, agg

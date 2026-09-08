@@ -27,6 +27,7 @@
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/cutover_gate.hpp"
 #include "clink/runtime/gated_timer_fire.hpp"
+#include "clink/runtime/memory_size.hpp"
 #include "clink/runtime/multi_input_alignment.hpp"
 #include "clink/runtime/output_tag.hpp"
 #include "clink/runtime/record_capture.hpp"
@@ -297,8 +298,7 @@ public:
             throw std::runtime_error("Dag::side_output_by_index: tag '" + tag.id +
                                      "' already registered on this stage");
         }
-        auto channel =
-            std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_);
+        auto channel = make_budgetable_channel_<T>();
         SideOutputChannelEntry entry;
         entry.channel = std::static_pointer_cast<void>(channel);
         entry.close_fn = [channel] { channel->close(); };
@@ -320,6 +320,12 @@ public:
     // Access (read-only) the side output channels registered for one
     // runner. Used by LocalExecutor to populate each operator's
     // RuntimeContext. Returns an empty map if the runner has none.
+    // Bind all local edge queues before runner threads start.
+    void set_memory_budget(const std::shared_ptr<MemoryBudget>& budget) {
+        for (const auto& bind : memory_bindings_)
+            bind(budget);
+    }
+
     const SideOutputChannelMap& side_channels_for(std::size_t runner_index) const {
         static const SideOutputChannelMap kEmpty;
         if (runner_index >= side_channels_by_runner_.size()) {
@@ -384,8 +390,7 @@ public:
     // ---- Source ----------------------------------------------------------
     template <typename T>
     StageHandle<T> add_source(std::shared_ptr<Source<T>> source) {
-        auto channel =
-            std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_);
+        auto channel = make_budgetable_channel_<T>();
         const OperatorId id = derive_id_with_uid_(*source);
         source->set_id(id);
         sources_.push_back(source);
@@ -645,8 +650,7 @@ public:
     StageHandle<Out> add_operator(StageHandle<In> upstream,
                                   std::shared_ptr<Operator<In, Out>> op,
                                   std::shared_ptr<const Codec<In>> capture_codec = nullptr) {
-        auto out_channel =
-            std::make_shared<BoundedChannel<StreamElement<Out>>>(default_channel_capacity_);
+        auto out_channel = make_budgetable_channel_<Out>();
         const OperatorId id = derive_id_with_uid_(*op);
         op->set_id(id);
 
@@ -744,7 +748,7 @@ public:
             // FileBacked and disk-backed changelog do.
             std::unique_ptr<SnapshotWorker> snap_worker;
             if (ctx.has_state_backend() && ctx.state_backend()->supports_async_persist()) {
-                snap_worker = std::make_unique<SnapshotWorker>();
+                snap_worker = std::make_unique<SnapshotWorker>(1, ctx.memory_budget());
                 snap_worker->start();
             }
             Emitter<Out> emitter(out_channel.get());
@@ -1284,8 +1288,7 @@ public:
         Snapshot restore_from = {},
         std::function<bool(const typename ShardedKeyedStage<In, Out>::CheckpointResult&)>
             on_checkpoint = {}) {
-        auto out_channel =
-            std::make_shared<BoundedChannel<StreamElement<Out>>>(default_channel_capacity_);
+        auto out_channel = make_budgetable_channel_<Out>();
         OperatorId id;
         if (!uid.empty()) {
             if (assigned_uids_.find(uid) != assigned_uids_.end()) {
@@ -1436,8 +1439,7 @@ public:
         std::vector<std::shared_ptr<BoundedChannel<StreamElement<T>>>> outs;
         outs.reserve(n);
         for (std::size_t i = 0; i < n; ++i) {
-            outs.push_back(
-                std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_));
+            outs.push_back(make_budgetable_channel_<T>());
         }
 
         auto in_channel = upstream.output;
@@ -1525,8 +1527,7 @@ public:
         std::vector<std::shared_ptr<BoundedChannel<StreamElement<T>>>> outs;
         outs.reserve(branch_count);
         for (std::size_t i = 0; i < branch_count; ++i) {
-            outs.push_back(
-                std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_));
+            outs.push_back(make_budgetable_channel_<T>());
         }
 
         auto in_channel = upstream.output;
@@ -1677,8 +1678,7 @@ public:
         for (auto& u : upstreams) {
             in_channels.push_back(u.output);
         }
-        auto out_channel =
-            std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_);
+        auto out_channel = make_budgetable_channel_<T>();
         const std::string name = "union_" + std::to_string(n);
         const OperatorId id = derive_id(name);
 
@@ -1940,10 +1940,9 @@ public:
     IterationStream<T> iterate_stream(StageHandle<T> input,
                                       std::optional<Codec<T>> codec = std::nullopt,
                                       IterationConfig config = IterationConfig{}) {
-        auto feedback =
-            std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_);
+        auto feedback = make_budgetable_channel_<T>();
         auto external = input.output;
-        auto merged = std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_);
+        auto merged = make_budgetable_channel_<T>();
 
         const std::string name = "iterate_head";
         const OperatorId id = derive_id(name);
@@ -2231,8 +2230,7 @@ public:
         std::optional<Codec<B>> right_codec = std::nullopt,
         std::optional<Codec<K>> key_codec = std::nullopt,
         LateArrivalPolicy late_policy = LateArrivalPolicy::Allow) {
-        auto out_channel =
-            std::make_shared<BoundedChannel<StreamElement<C>>>(default_channel_capacity_);
+        auto out_channel = make_budgetable_channel_<C>();
         const OperatorId id = derive_id(name);
         auto left_ch = left.output;
         auto right_ch = right.output;
@@ -2885,8 +2883,7 @@ public:
         std::string name = "broadcast_process",
         std::optional<Codec<Main>> main_codec = std::nullopt,
         std::optional<Codec<Brod>> brod_codec = std::nullopt) {
-        auto out_channel =
-            std::make_shared<BoundedChannel<StreamElement<Out>>>(default_channel_capacity_);
+        auto out_channel = make_budgetable_channel_<Out>();
         const OperatorId id = derive_id(name);
         auto main_ch = main_in.output;
         auto brod_ch = broadcast_in.output;
@@ -3135,8 +3132,7 @@ public:
                                      std::shared_ptr<CoOperator<In1, In2, Out>> op,
                                      std::optional<Codec<In1>> in1_codec = std::nullopt,
                                      std::optional<Codec<In2>> in2_codec = std::nullopt) {
-        auto out_channel =
-            std::make_shared<BoundedChannel<StreamElement<Out>>>(default_channel_capacity_);
+        auto out_channel = make_budgetable_channel_<Out>();
         const OperatorId id = derive_id_with_uid_(*op);
         op->set_id(id);
         auto left_ch = left.output;
@@ -3269,7 +3265,7 @@ public:
             // on this thread, forward the barrier, persist + ack off-thread.
             std::unique_ptr<SnapshotWorker> snap_worker;
             if (ctx.has_state_backend() && ctx.state_backend()->supports_async_persist()) {
-                snap_worker = std::make_unique<SnapshotWorker>();
+                snap_worker = std::make_unique<SnapshotWorker>(1, ctx.memory_budget());
                 snap_worker->start();
             }
             Emitter<Out> out_emitter(out_channel.get());
@@ -4033,15 +4029,13 @@ public:
         if (forward) {
             channels.reserve(N);
             for (std::size_t i = 0; i < N; ++i) {
-                channels.push_back(
-                    std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_));
+                channels.push_back(make_budgetable_channel_<T>());
             }
         } else {
             // Fan-in: N×1 = N channels.
             channels.reserve(N);
             for (std::size_t i = 0; i < N; ++i) {
-                channels.push_back(
-                    std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_));
+                channels.push_back(make_budgetable_channel_<T>());
             }
         }
 
@@ -4215,8 +4209,7 @@ public:
         std::vector<std::shared_ptr<BoundedChannel<StreamElement<T>>>> in_channels;
         in_channels.reserve(N);
         for (std::size_t i = 0; i < N; ++i) {
-            in_channels.push_back(
-                std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_));
+            in_channels.push_back(make_budgetable_channel_<T>());
         }
         for (std::size_t i = 0; i < N; ++i) {
             upstream.emitters[i]->attach({in_channels[i]}, {});
@@ -4427,7 +4420,7 @@ public:
             // with no coordinator round-trip).
             std::unique_ptr<SnapshotWorker> snap_worker;
             if (ctx.has_state_backend() && ctx.state_backend()->supports_async_persist()) {
-                snap_worker = std::make_unique<SnapshotWorker>();
+                snap_worker = std::make_unique<SnapshotWorker>(1, ctx.memory_budget());
                 snap_worker->start();
             }
             while (!should_stop()) {
@@ -4712,14 +4705,12 @@ private:
         if (shuffle) {
             channels.reserve(N * M);
             for (std::size_t i = 0; i < N * M; ++i) {
-                channels.push_back(
-                    std::make_shared<BoundedChannel<StreamElement<In>>>(default_channel_capacity_));
+                channels.push_back(make_budgetable_channel_<In>());
             }
         } else {
             channels.reserve(N);
             for (std::size_t i = 0; i < N; ++i) {
-                channels.push_back(
-                    std::make_shared<BoundedChannel<StreamElement<In>>>(default_channel_capacity_));
+                channels.push_back(make_budgetable_channel_<In>());
             }
         }
 
@@ -4929,6 +4920,17 @@ private:
     // runners grab the shared_ptr at construction time (so the closure
     // captures stable storage even if side outputs are added later via
     // Dag::side_output) and close all entries at shutdown.
+    template <class T>
+    std::shared_ptr<BoundedChannel<StreamElement<T>>> make_budgetable_channel_() {
+        auto channel =
+            std::make_shared<BoundedChannel<StreamElement<T>>>(default_channel_capacity_);
+        memory_bindings_.push_back([channel](const std::shared_ptr<MemoryBudget>& budget) {
+            channel->set_memory_budget(budget, stream_element_retained_bytes<T>);
+        });
+        return channel;
+    }
+    std::vector<std::function<void(const std::shared_ptr<MemoryBudget>&)>> memory_bindings_;
+
     SideOutputChannelMap& side_channels_(std::size_t idx) {
         if (idx >= side_channels_by_runner_.size()) {
             side_channels_by_runner_.resize(idx + 1);

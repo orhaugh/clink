@@ -61,6 +61,10 @@ public:
         }
     }
 
+    void set_memory_budget(std::shared_ptr<MemoryBudget> budget) override {
+        inner_.set_memory_budget(std::move(budget));
+    }
+
     void put(OperatorId op, KeyView key, ValueView value) override { inner_.put(op, key, value); }
     std::optional<Value> get(OperatorId op, KeyView key) const override {
         return inner_.get(op, key);

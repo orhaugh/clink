@@ -56,6 +56,8 @@ public:
     using iterator = typename Storage::iterator;
     using const_iterator = typename Storage::const_iterator;
 
+    [[nodiscard]] std::size_t capacity() const noexcept { return data_.capacity(); }
+
     FlatMap() = default;
     FlatMap(std::initializer_list<value_type> init) {
         data_.reserve(init.size());

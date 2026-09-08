@@ -129,6 +129,9 @@ public:
         return arrow_;
     }
 
+    // Inspect owned rows without triggering lazy Arrow materialisation.
+    const std::vector<value_type>& materialized_records() const noexcept { return records_; }
+
     // size()/empty() answer from the sidecar WITHOUT decoding rows.
     std::size_t size() const noexcept { return arrow_ ? arrow_rows_ : records_.size(); }
     bool empty() const noexcept { return size() == 0; }

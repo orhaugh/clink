@@ -111,6 +111,15 @@ When the popped element is a `CheckpointBarrier` and a state backend is configur
 
 Only the chain's checkpoint owner (the most-downstream operator sharing a backend, tracked by `chain_checkpoint_owner_`) snapshots and acks; non-owners stage their timer slice and forward the barrier, keeping a shared backend single-writer for the snapshot. Checkpointing and barrier alignment are covered in depth in [./checkpointing.md](./checkpointing.md).
 
+### Memory budgets
+
+`JobConfig::memory_budget` supplies a shared accounting domain; alternatively,
+`memory_limit_bytes` creates one for this execution. The executor binds local
+queues and supported state backends before restore, then supplies each operator
+with its domain through `RuntimeContext::memory_budget()`. Optional operator
+limits are children of the execution domain. See [Memory budgets](memory-management.md)
+for configuration, covered owners, estimates and exclusions.
+
 ### Backpressure through bounded channels
 
 The DAG owns one `BoundedChannel<StreamElement<T>>` per edge, default capacity 1024 elements (the `Dag` constructor default; `set_default_channel_capacity` overrides it for subsequently-built edges). `BoundedChannel::push` blocks when the queue is at capacity and `pop` blocks when it is empty; a slow consumer therefore fills its inbox, which blocks its producer's `emit`, which fills the producer's inbox, and so on up to the source. No explicit credit protocol is needed within a process: the channel is the unit of backpressure.
@@ -130,7 +139,7 @@ Each runner's `should_stop` predicate ORs the internal `cancel_` flag with the e
 
 ### Exception capture
 
-The whole point of running each operator in its own thread with a `try`/`catch` is that a single operator failure is recorded, not fatal. The thread body catches `std::exception`, records `(operator_name, message)` into `operator_errors_` under `error_mu_`, optionally appends a best-effort `std::stacktrace` (capture site, behind `CLINK_HAS_STACKTRACE`), then flips `cancel_` and invokes the runner's `cancel()` to wind the rest of the job down. After `run()` / `await_termination()` / `run_to_completion()` returns, the caller inspects `operator_errors()` to find any failures. In the cluster, a non-empty result is what surfaces a subtask failure to the recovery machinery. Note the catch handles `std::exception`; a non-`std::exception` throw is not caught here.
+The whole point of running each operator in its own thread with a `try`/`catch` is that a single operator failure is recorded, not fatal. The thread body catches `std::exception`, records `(operator_name, message)` into `operator_errors_` under `error_mu_`, optionally appends a best-effort `std::stacktrace` (capture site, behind `CLINK_HAS_STACKTRACE`), then calls `LocalExecutor::cancel()` to close every local edge and wake blocked peers. After `run()` / `await_termination()` / `run_to_completion()` returns, the caller inspects `operator_errors()` to find any failures. In the cluster, a non-empty result is what surfaces a subtask failure to the recovery machinery. Note the catch handles `std::exception`; a non-`std::exception` throw is not caught here.
 
 ### Bounded jobs and savepoints
 

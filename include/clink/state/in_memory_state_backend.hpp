@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "clink/core/hash_map.hpp"
+#include "clink/runtime/keyed_memory_account.hpp"
 #include "clink/state/state_backend.hpp"
 
 namespace clink {
@@ -41,6 +42,16 @@ struct TransparentStringHash {
 // RocksDB until that backend is wired up.
 class InMemoryStateBackend final : public StateBackend {
 public:
+    void set_memory_budget(std::shared_ptr<MemoryBudget> budget) override {
+        std::lock_guard lock(mu_);
+        if (memory_budget_ == budget)
+            return;
+        if (!state_.empty() || !staged_.empty())
+            throw std::logic_error("set memory budget before populating state");
+        memory_budget_ = std::move(budget);
+        memory_.bind(memory_budget_);
+    }
+
     void put(OperatorId op, KeyView key, ValueView value) override {
         std::lock_guard lock(mu_);
         auto& per_op = state_[op];
@@ -49,6 +60,16 @@ public:
         // existing Value, reusing its heap capacity, so a hot-key put allocates
         // nothing. Only a first INSERT pays a string + value allocation.
         auto it = per_op.find(key);
+        if (memory_.enabled()) {
+            // assign() retains capacity when a value shrinks. Keep charging
+            // that storage until erase/clear actually releases it.
+            const auto retained_value =
+                it == per_op.end() ? value.size() : std::max(value.size(), it->second.capacity());
+            memory_.update(memory_key_(op, key),
+                           key.size() + retained_value + sizeof(std::string) + sizeof(Value) +
+                               4 * sizeof(void*));
+        }
+
         if (it != per_op.end()) {
             it->second.assign(reinterpret_cast<const std::byte*>(value.data()),
                               reinterpret_cast<const std::byte*>(value.data()) + value.size());
@@ -85,6 +106,8 @@ public:
         auto inner = it->second.find(key);
         if (inner != it->second.end()) {
             it->second.erase(inner);
+            if (memory_.enabled())
+                memory_.erase(memory_key_(op, key));
         }
     }
 
@@ -100,6 +123,8 @@ public:
         std::lock_guard lock(mu_);
         state_.clear();
         staged_.clear();
+        staged_memory_.clear();
+        memory_.clear();
     }
 
     void scan(OperatorId op, const ScanVisitor& visit) const override {
@@ -148,7 +173,17 @@ public:
         auto it = state_.find(op);
         // An op with no rows stages an EMPTY copy on purpose: rows the op
         // gains after the barrier must not appear in this checkpoint.
+        MemoryReservation staged_memory(memory_budget_, MemoryCategory::Checkpoint);
+        if (memory_budget_ && it != state_.end()) {
+            std::size_t bytes = 0;
+            for (const auto& [key, value] : it->second)
+                bytes += key.capacity() + 1 + value.capacity() + sizeof(PerOp::value_type) +
+                         4 * sizeof(void*);
+            staged_memory.resize(bytes);
+        }
         staged_[id.value()][op] = (it != state_.end()) ? it->second : PerOp{};
+        if (memory_budget_)
+            staged_memory_[id.value()][op] = std::move(staged_memory);
     }
     // Live export: the same canonical bytes snapshot() produces, without
     // the checkpoint bookkeeping/metrics (see StateBackend for the
@@ -253,6 +288,13 @@ public:
         std::span<const std::byte> snapshot_bytes);
 
 private:
+    static std::string memory_key_(OperatorId op, KeyView key) {
+        return std::to_string(op.value()) + ":" + std::string(key);
+    }
+    std::shared_ptr<MemoryBudget> memory_budget_;
+    KeyedMemoryAccount memory_;
+    std::map<std::uint64_t, std::map<OperatorId, MemoryReservation>> staged_memory_;
+
     // Transparent hash + comparator give heterogeneous (string_view) lookup so
     // the hot path never builds a std::string just to probe.
     using PerOp =

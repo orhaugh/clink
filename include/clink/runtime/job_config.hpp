@@ -11,6 +11,7 @@
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/core/types.hpp"
+#include "clink/runtime/memory_budget.hpp"
 #include "clink/state/schema_version.hpp"
 #include "clink/state/state_backend.hpp"
 
@@ -240,6 +241,17 @@ struct JobConfig {
     // Pinning is best-effort: it is a no-op on platforms without hard affinity
     // (macOS), so this flag never changes correctness, only placement.
     bool pin_operator_threads{false};
+
+    // Shared across this execution's operators, queues and checkpoint work.
+    // A supplied domain may also be shared by multiple local executions.
+    // Null disables accounting. This is a tracked-memory limit, not an RSS cap.
+    std::shared_ptr<MemoryBudget> memory_budget;
+    // Convenience alternative to supplying a shared domain. 0 leaves the
+    // explicit domain or environment default in control.
+    std::size_t memory_limit_bytes{0};
+    // Optional state/allocation limits scoped to stable operator ids. Each
+    // domain also charges the shared execution budget.
+    std::unordered_map<OperatorId, std::size_t> operator_memory_limits;
 };
 
 }  // namespace clink

@@ -796,6 +796,8 @@ public:
                 parent->operator_id(), a_->name(), parent->state_backend(), parent->metrics());
             b_rc_ = std::make_unique<RuntimeContext>(
                 parent->operator_id(), b_->name(), parent->state_backend(), parent->metrics());
+            a_rc_->set_memory_budget(parent->memory_budget());
+            b_rc_->set_memory_budget(parent->memory_budget());
             // Carry the checkpoint-ack so an inner op snapshotting via
             // its own RC still notifies the coordinator. Both inner ops share the
             // same job-level ack callback.
