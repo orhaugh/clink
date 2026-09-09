@@ -67,6 +67,7 @@
 #include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
+#include "clink/sql/spill_heap.hpp"
 #include "clink/sql/spill_store.hpp"
 #include "clink/sql/state_ttl.hpp"
 #include "clink/sql/working_set.hpp"
@@ -5456,6 +5457,7 @@ public:
         };
         left_working_.bind(budget, entry_list_codec(), estimate);
         right_working_.bind(budget, entry_list_codec(), estimate);
+        link_working_sets(left_working_, right_working_);
 
         // The async path emits from inside its coroutines, which do not run
         // through emit_joined_, so a shared output builder would accumulate rows
@@ -6192,7 +6194,7 @@ public:
     // rides checkpointed KeyedState and, on a deferring backend, the async
     // path. The former in-memory maps were not snapshotted, so a restore
     // replayed or dropped rows. Null-aware NOT IN can spill its exact-key maps,
-    // but keeps budgeted cross-key null indexes in RAM for wildcard matching.
+    // and its cross-key null indexes as individually budgeted spill entries.
     // Both are persisted at checkpoints on this parallelism-1 path.
     void open() override {
         ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
@@ -6201,7 +6203,11 @@ public:
                            this->runtime()->state_backend()->supports_async_get();
         auto budget = null_aware_ && this->runtime() ? this->runtime()->memory_budget() : nullptr;
         memory_enabled_ = static_cast<bool>(budget);
-        null_memory_ = MemoryReservation(budget, MemoryCategory::State);
+        null_probes_working_.bind(budget, null_probe_codec_(), [](const NaProbe& probe) {
+            return sizeof(probe) + probe.row.retained_bytes() - sizeof(Row) +
+                   masked_bytes_(probe.key) - sizeof(MaskedKey);
+        });
+        null_rights_working_.bind(budget, masked_codec_(), masked_bytes_);
         left_working_.bind(budget, left_entry_list_codec(), [](const auto& entries) {
             std::size_t bytes = sizeof(entries) + entries.capacity() * sizeof(LeftEntry);
             for (const auto& e : entries)
@@ -6210,6 +6216,8 @@ public:
         });
         right_working_.bind(
             budget, int64_codec(), [](std::int64_t) { return sizeof(std::int64_t); });
+        link_working_sets(
+            left_working_, right_working_, null_probes_working_, null_rights_working_);
         if (null_aware_ && this->runtime() && this->runtime()->has_state_backend()) {
             kv_left_().scan(
                 [&](const auto& key, const auto& rows) { left_working_.restore(key, rows); });
@@ -6217,7 +6225,16 @@ public:
                 [&](const auto& key, auto count) { right_working_.restore(key, count); });
             if (auto saved = null_slot_().get(""))
                 restore_nulls_(*saved);
-            account_nulls_();
+            null_probes_slot_().scan([&](const auto& key, const NaProbe& probe) {
+                next_probe_ =
+                    std::max(next_probe_, static_cast<std::uint64_t>(std::stoull(key)) + 1);
+                null_probes_working_.restore(key, probe);
+            });
+            null_rights_slot_().scan([&](const auto& key, const MaskedKey& mask) {
+                next_right_ =
+                    std::max(next_right_, static_cast<std::uint64_t>(std::stoull(key)) + 1);
+                null_rights_working_.restore(key, mask);
+            });
         }
 
         // Restore retention DEADLINES for both storage paths,
@@ -6247,7 +6264,15 @@ public:
             auto right = kv_right_();
             left_working_.scan([&](const auto& key, const auto& rows) { left.put(key, rows); });
             right_working_.scan([&](const auto& key, auto count) { right.put(key, count); });
-            null_slot_().put("", encode_nulls_());
+            auto probes = null_probes_slot_();
+            auto rights = null_rights_slot_();
+            null_probes_working_.scan(
+                [&](const auto& key, const auto& probe) { probes.put(key, probe); });
+            null_rights_working_.scan(
+                [&](const auto& key, const auto& mask) { rights.put(key, mask); });
+            // Upgrade the legacy single-blob representation atomically with
+            // the normal backend checkpoint; never write it alongside entries.
+            null_slot_().erase("");
         }
 
         if (!ttl_.enabled() || this->runtime() == nullptr ||
@@ -6463,7 +6488,6 @@ private:
             left_working_.commit(*key);
             right_working_.commit(*key);
         }
-        account_nulls_();
     }
 
     void handle_left_loaded_(const Row& row, Batch<Row>& batch) {
@@ -6483,7 +6507,7 @@ private:
                 // non-null positions poisons it. Track it for later poisoning.
                 MaskedKey pk = masked_key_of_(row, left_key_columns_);
                 const bool matched = na_probe_has_right_match_(pk);
-                na_null_probes_.push_back(NaProbe{row, pk, !matched});
+                append_null_probe_(NaProbe{row, pk, !matched});
                 if (!matched)
                     emit_(row, kRowKindInsert, batch);
             }
@@ -6526,7 +6550,6 @@ private:
             left_working_.commit(*key);
             right_working_.commit(*key);
         }
-        account_nulls_();
     }
 
     void handle_right_loaded_(const Row& row, Batch<Row>& batch) {
@@ -6544,14 +6567,12 @@ private:
             // poisons.
             MaskedKey rk = masked_key_of_(row, right_key_columns_);
             bool is_new = true;
-            for (const auto& existing : na_null_rights_) {
-                if (existing == rk) {
+            null_rights_working_.scan([&](const auto&, const auto& existing) {
+                if (existing == rk)
                     is_new = false;
-                    break;
-                }
-            }
+            });
             if (is_new) {
-                na_null_rights_.push_back(rk);
+                append_null_right_(rk);
                 if (anti_)
                     retract_poisoned_(rk, batch);
             }
@@ -6581,14 +6602,14 @@ private:
         }
         // Null-aware NOT IN: a no-null right tuple also poisons null-bearing
         // probes that agree on their non-null positions.
-        if (anti_ && null_aware_ && !na_null_probes_.empty()) {
+        if (anti_ && null_aware_ && next_probe_ != 0) {
             MaskedKey rk = masked_key_of_(row, right_key_columns_);
-            for (auto& p : na_null_probes_) {
+            visit_null_probes_([&](auto& p) {
                 if (p.emitted && potential_match_(p.key, rk)) {
                     p.emitted = false;
                     emit_(p.row, kRowKindDelete, batch);
                 }
-            }
+            });
         }
     }
 
@@ -6636,11 +6657,12 @@ private:
 
     // Does any recorded null-bearing right tuple potentially-match this probe?
     bool na_null_right_matches_(const MaskedKey& pk) const {
-        for (const auto& rk : na_null_rights_) {
+        bool matched = false;
+        null_rights_working_.scan([&](const auto&, const auto& rk) {
             if (potential_match_(pk, rk))
-                return true;
-        }
-        return false;
+                matched = true;
+        });
+        return matched;
     }
 
     // Does any right tuple (exact no-null OR null-bearing) potentially-match
@@ -6667,12 +6689,12 @@ private:
                 }
             }
         });
-        for (auto& p : na_null_probes_) {
+        visit_null_probes_([&](auto& p) {
             if (p.emitted && potential_match_(p.key, rk)) {
                 p.emitted = false;
                 emit_(p.row, kRowKindDelete, batch);
             }
-        }
+        });
     }
 
     // --- plain (non-null-aware) keyed-state path: sync twins of the async
@@ -6860,66 +6882,96 @@ private:
         }
     }
 
-    void account_nulls_() {
-        if (!memory_enabled_)
-            return;
-        std::size_t bytes = na_null_probes_.capacity() * sizeof(NaProbe) +
-                            na_null_rights_.capacity() * sizeof(MaskedKey);
-        auto key_bytes = [](const MaskedKey& key) {
-            std::size_t n = key.capacity() * sizeof(std::optional<std::string>);
-            for (const auto& value : key)
-                if (value)
-                    n += value->capacity() + 1;
-            return n;
-        };
-        for (const auto& p : na_null_probes_)
-            bytes += p.row.retained_bytes() - sizeof(Row) + key_bytes(p.key);
-        for (const auto& key : na_null_rights_)
-            bytes += key_bytes(key);
-        null_memory_.resize(bytes);
+    static std::size_t masked_bytes_(const MaskedKey& key) {
+        std::size_t bytes = sizeof(key) + key.capacity() * sizeof(std::optional<std::string>);
+        for (const auto& value : key)
+            if (value)
+                bytes += value->capacity() + 1;
+        return bytes;
+    }
+    Codec<MaskedKey> masked_codec_() {
+        return {
+            .encode =
+                [](const MaskedKey& key) {
+                    config::JsonArray tuple;
+                    for (const auto& value : key)
+                        tuple.emplace_back(value ? config::JsonValue{*value} : config::JsonValue{});
+                    return string_codec().encode(config::JsonValue{std::move(tuple)}.serialize(0));
+                },
+            .decode = [](Codec<MaskedKey>::BytesView bytes) -> std::optional<MaskedKey> {
+                auto text = string_codec().decode(bytes);
+                if (!text)
+                    return std::nullopt;
+                MaskedKey key;
+                auto parsed = config::parse(*text);
+                for (const auto& cell : parsed.as_array())
+                    key.push_back(cell.is_null() ? std::nullopt
+                                                 : std::optional<std::string>{cell.as_string()});
+                return key;
+            }};
+    }
+    Codec<NaProbe> null_probe_codec_() {
+        auto codec = left_entry_list_codec();
+        return {.encode =
+                    [codec](const NaProbe& probe) {
+                        return codec.encode({LeftEntry{probe.row, probe.emitted}});
+                    },
+                .decode = [this, codec](Codec<NaProbe>::BytesView bytes) -> std::optional<NaProbe> {
+                    auto entries = codec.decode(bytes);
+                    if (!entries || entries->size() != 1)
+                        return std::nullopt;
+                    auto& entry = entries->front();
+                    auto mask = masked_key_of_(entry.row, left_key_columns_);
+                    return NaProbe{std::move(entry.row), std::move(mask), entry.emitted};
+                }};
+    }
+    template <class Visitor>
+    void visit_null_probes_(Visitor visitor) {
+        // Preserve arrival order even after spilling; directory enumeration
+        // order must not decide the sequence of changelog retractions.
+        for (std::uint64_t index = 0; index < next_probe_; ++index) {
+            const auto key = std::to_string(index);
+            null_probes_working_.load(key);
+            visitor(na_null_probes_.at(key));
+            null_probes_working_.commit(key);
+        }
+    }
+    void append_null_probe_(NaProbe probe) {
+        null_probes_working_.restore(std::to_string(next_probe_++), std::move(probe));
+    }
+    void append_null_right_(MaskedKey mask) {
+        null_rights_working_.restore(std::to_string(next_right_++), std::move(mask));
+    }
+    KeyedState<std::string, NaProbe> null_probes_slot_() {
+        return this->runtime()->template keyed_state<std::string, NaProbe>(
+            "saNullProbes", string_codec(), null_probe_codec_());
+    }
+    KeyedState<std::string, MaskedKey> null_rights_slot_() {
+        return this->runtime()->template keyed_state<std::string, MaskedKey>(
+            "saNullRights", string_codec(), masked_codec_());
     }
     KeyedState<std::string, std::string> null_slot_() {
         return this->runtime()->template keyed_state<std::string, std::string>(
             "saNull", string_codec(), string_codec());
-    }
-    std::string encode_nulls_() const {
-        config::JsonArray probes, rights;
-        for (const auto& p : na_null_probes_) {
-            config::JsonObject value;
-            value["row"] = config::JsonValue{to_json_object(p.row.values)};
-            value["emitted"] = config::JsonValue{p.emitted};
-            probes.emplace_back(std::move(value));
-        }
-        for (const auto& key : na_null_rights_) {
-            config::JsonArray tuple;
-            for (const auto& value : key)
-                tuple.emplace_back(value ? config::JsonValue{*value} : config::JsonValue{});
-            rights.emplace_back(std::move(tuple));
-        }
-        config::JsonObject root;
-        root["probes"] = config::JsonValue{std::move(probes)};
-        root["rights"] = config::JsonValue{std::move(rights)};
-        return config::JsonValue{std::move(root)}.serialize(0);
     }
     void restore_nulls_(const std::string& bytes) {
         auto root = config::parse(bytes);
         for (const auto& value : root.as_object().at("probes").as_array()) {
             Row row;
             row.values = row_columns_from_json(value.as_object().at("row").as_object());
-            na_null_probes_.push_back({row,
-                                       masked_key_of_(row, left_key_columns_),
-                                       value.as_object().at("emitted").as_bool()});
+            append_null_probe_({row,
+                                masked_key_of_(row, left_key_columns_),
+                                value.as_object().at("emitted").as_bool()});
         }
         for (const auto& value : root.as_object().at("rights").as_array()) {
             MaskedKey key;
             for (const auto& cell : value.as_array())
                 key.push_back(cell.is_null() ? std::nullopt
                                              : std::optional<std::string>{cell.as_string()});
-            na_null_rights_.push_back(std::move(key));
+            append_null_right_(std::move(key));
         }
     }
     bool memory_enabled_{false};
-    MemoryReservation null_memory_;
 
     std::vector<std::string> left_key_columns_;
     std::vector<std::string> right_key_columns_;
@@ -6946,8 +6998,12 @@ private:
     // instance sees both. The pre-existing global single-column poison had the
     // same parallelism-1 invariant. Raising semi_join_row parallelism would
     // require broadcasting null-bearing right tuples to every instance.
-    std::vector<NaProbe> na_null_probes_;
-    std::vector<MaskedKey> na_null_rights_;
+    std::map<std::string, NaProbe> na_null_probes_;
+    WorkingSet<decltype(na_null_probes_)> null_probes_working_{na_null_probes_};
+    std::map<std::string, MaskedKey> na_null_rights_;
+    WorkingSet<decltype(na_null_rights_)> null_rights_working_{na_null_rights_};
+    std::uint64_t next_probe_{0};
+    std::uint64_t next_right_{0};
 };
 
 // Set operation INTERSECT / EXCEPT (distinct) over two union-compatible
@@ -8422,7 +8478,9 @@ public:
           offset_(offset) {}
 
     void open() override {
-        memory_enabled_ = this->runtime() && this->runtime()->memory_budget();
+        budget_ = this->runtime() ? this->runtime()->memory_budget() : nullptr;
+        spill_directory_ = sql_spill_directory();
+        memory_enabled_ = static_cast<bool>(budget_);
         memory_ = MemoryReservation(this->runtime() ? this->runtime()->memory_budget() : nullptr,
                                     MemoryCategory::State);
     }
@@ -8445,6 +8503,20 @@ public:
         if (flushed_)
             return;
         flushed_ = true;
+        if (spilled_) {
+            spilled_->reverse_order();
+            std::uint64_t skipped = 0;
+            while (spilled_->size()) {
+                auto entry = spilled_->pop();
+                if (skipped++ < static_cast<std::uint64_t>(offset_))
+                    continue;
+                Batch<Row> batch;
+                batch.emplace(std::move(entry.value));
+                out.emit_data(std::move(batch));
+            }
+            spilled_.reset();
+            return;
+        }
         std::vector<Row> sorted;
         sorted.reserve(heap_.size());
         for (auto& [_key, row] : heap_)
@@ -8512,13 +8584,50 @@ private:
     }
 
     void consider_(const Row& row) {
+        if (spilled_) {
+            consider_spilled_(row);
+            return;
+        }
         consider_unaccounted_(row);
         if (!memory_enabled_)
             return;
         std::size_t bytes = heap_.capacity() * sizeof(decltype(heap_)::value_type);
         for (const auto& item : heap_)
             bytes += item.second.retained_bytes() - sizeof(Row);
-        memory_.resize(bytes);
+        try {
+            memory_.resize(bytes);
+        } catch (const MemoryLimitExceeded&) {
+            if (spill_directory_.empty())
+                throw;
+            spilled_ = std::make_unique<SpillHeap<Row>>(
+                spill_directory_,
+                budget_,
+                row_json_codec(),
+                [](const Row& value) { return value.retained_bytes(); },
+                [this](const Row& a, const Row& b) { return compare_(b, a); });
+            // Migrate the already updated candidates; incoming data has been
+            // considered exactly once. No retained row index remains in RAM.
+            memory_.resize(0);
+            for (const auto& item : heap_)
+                spilled_->push(item.second);
+            decltype(heap_){}.swap(heap_);
+        }
+    }
+
+    void consider_spilled_(const Row& row) {
+        const auto capacity =
+            static_cast<std::uint64_t>(count_) + static_cast<std::uint64_t>(offset_);
+        if (spilled_->size() < capacity) {
+            spilled_->push(row);
+            return;
+        }
+        bool replace;
+        {
+            auto worst = spilled_->top();
+            replace = compare_(row, worst.value);
+        }
+        if (replace)
+            spilled_->replace_top(row);
     }
 
     void consider_unaccounted_(const Row& row) {
@@ -8544,6 +8653,9 @@ private:
         }
     }
 
+    std::shared_ptr<MemoryBudget> budget_;
+    std::string spill_directory_;
+    std::unique_ptr<SpillHeap<Row>> spilled_;
     bool memory_enabled_{false};
     MemoryReservation memory_;
     std::vector<std::string> sort_columns_;
@@ -8907,6 +9019,7 @@ public:
         };
         left_working_.bind(budget, buffered_list_codec(), estimate);
         right_working_.bind(budget, buffered_list_codec(), estimate);
+        link_working_sets(left_working_, right_working_);
 
         if (!effective_async_ && this->runtime() && this->runtime()->has_state_backend()) {
             kv_left_().scan([&](const auto& key, const auto& rows) {

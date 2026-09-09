@@ -70,8 +70,8 @@ limit. Multiply by the number of concurrent executions when sizing a Worker.
 | SQL equi and interval joins | Both input maps count entry-vector capacity and nested row storage. Keyed buffers can spill; matching flags survive reload and checkpoint recovery. Interval expiry removes working and backend keys. |
 | SQL OVER and last-N aggregates | Running accumulators, pending/tie-ordered rows, bounded frame history and previous changelog output count. Whole partitions can spill. |
 | SQL partitioned ranking | ROW_NUMBER, RANK and DENSE_RANK candidate vectors, encoded rows and derived sort values count and can spill. Sort values are rebuilt on reload. |
-| SQL null-aware semi/anti joins | Exact-key probe maps and presence counts can spill. Cross-key null probes and wildcard indexes count but stay in RAM. Both exact and null-bearing state are checkpointed. Plain semi/anti joins retain their existing backend-driven path. |
-| SQL global ORDER BY LIMIT | The retained top-N heap and nested rows count, and flush releases the charge. This single global partition cannot spill. |
+| SQL null-aware semi/anti joins | Exact-key maps, cross-key null probes and wildcard tuples count and can spill. Null-bearing collections store individual entries, so the whole index need not fit in RAM. Checkpoints stream entries through separate slots; legacy null-state blobs remain readable. Plain semi/anti joins retain their backend-driven path. |
+| SQL global ORDER BY LIMIT | The retained candidate heap and nested rows count. Pressure can move candidates into a disk-backed binary heap with no resident row index. Final output streams in sort order, respecting OFFSET and LIMIT. A constant number of individual rows must fit simultaneously. |
 | SQL TTL indexes | Deadline, dirty-key and pre-watermark key estimates charge the operator budget for GROUP BY, equi joins, semi/anti joins, DISTINCT and set operators. Restore rebuilds charges and expiry releases them. These indexes remain in memory and cannot spill. |
 | In-memory and file-backed backend working state | Estimated key/value storage and map overhead, checked before puts and during restore. Erase and clear release charges. Staged barrier copies have separate checkpoint charges. Binding a new domain requires an empty backend. |
 | Canonical snapshot writer | Arrow builder and IPC output allocations use a budgeted pool. The final byte-vector copy is reserved while the writer holds it. Returned snapshot byte vectors are caller-owned and are not continuously tracked. |
@@ -139,7 +139,7 @@ changes the durability condition for a successful acknowledgement.
 Set `CLINK_SQL_SPILL_DIR` to an existing writable directory alongside the memory
 limit to enable local spill for the covered synchronous SQL working maps:
 GROUP BY, fixed/session windows, equi/interval joins, OVER, last-N, partitioned
-ranking and null-aware semi/anti exact-key maps. A direct GROUP BY factory can
+ranking, global top-N and null-aware semi/anti state. A direct GROUP BY factory can
 instead pass `spill_dir`, overriding the environment directory for that operator.
 A memory budget is required. Async/backend-driven execution keeps its existing
 storage path.
@@ -159,7 +159,10 @@ each touched group incurs synchronous file I/O and codec work. Each partition mu
 still fit within the available budget; a join needs the active key from both
 inputs at once. A single growing `ARRAY_AGG`, a large
 UDAF accumulator or contention from other owners can therefore still fail.
-TTL metadata also remains in RAM and can exhaust the budget independently.
+TTL metadata remains in RAM and can exhaust the budget independently.
+Sibling working maps within equi, interval and null-aware joins can spill each
+other on pressure before refusing a small active entry. This is operator-local
+coordination, not a global eviction policy across all budget owners.
 
 Files use the operator state codecs, preserving aggregate accumulators,
 window boundaries, join matching flags, frame ordering and prior changelog rows.
@@ -190,12 +193,41 @@ Watermark and cross-key mutation scans rebuild into a separate working store,
 processing one partition at a time so file replacement cannot invalidate an
 active directory traversal. Checkpoint scans are read-only. Scratch encoding,
 decoding and output batches are temporary allocations outside these estimates.
-TTL indexes, null-aware wildcard indexes and the global top-N heap remain in
-RAM and fail on exhaustion; spilling never drops correctness-bearing state.
+TTL indexes remain in RAM and fail on exhaustion; spilling never drops
+correctness-bearing state.
 Other SQL and typed operator maps still need explicit budget integration.
 Last-N and partitioned ranking retain their existing synchronous-backend
 checkpoint requirement; this change does not add deferring-backend recovery
 for those operators.
+
+### Global top-N and null wildcard collections
+
+Global `ORDER BY ... LIMIT ... OFFSET ...` keeps at most `LIMIT + OFFSET`
+candidates. On pressure, it migrates those candidates to a binary heap stored
+one row per file. Candidate updates require logarithmic heap operations; final
+flush rebuilds the heap in output order and emits one row at a time. It does
+not load the complete result set to sort it. Decoded heap entries are charged
+for their lifetimes; heap operations hold at most three entries, in addition
+to caller-owned input/output. Input/output batches and codec scratch retain the
+allocation exclusions above. The spill files are scratch only: global top-N
+retains its existing bounded end-of-input lifecycle and does not gain
+intermediate-checkpoint recovery in this change.
+
+Null-aware joins store null-bearing probes and distinct wildcard tuples as
+individual working entries. Exact matches and wildcard poisoning scan entries
+without hydrating the whole index; probe retractions preserve arrival order.
+Snapshots write `saNullProbes` and `saNullRights` entry slots. Recovery can read
+the previous `saNull` blob, then migrates it to entry slots at the next
+checkpoint. Reading an old blob still needs temporary space for that blob;
+new snapshots avoid the whole-index encoding and decoding step. As before,
+null-aware wildcard matching requires one operator instance.
+
+**An active keyed partition must still fit** for keyed aggregate, window,
+join, OVER, last-N and partitioned ranking values. Their algorithms still
+materialise one key's value. Removing this limit requires finer-grained state
+and operator-specific algorithms; spilling a whole key only bounds the number
+of simultaneously resident keys. A single large row or opaque UDAF accumulator
+also cannot be made bounded merely by moving neighbouring state to disk.
 
 For Arrow growth, the pool reserves the whole new allocation while retaining the
 old charge, because a reallocation can temporarily hold both buffers. Refused
@@ -222,10 +254,13 @@ window operators, including growing values, window expiry and restored state.
 It also checks spilled aggregate/retraction parity, columnar folds, checkpoint
 restore across window/OVER/ranking/join families, interval expiry and timestamp
 precision, TTL cleanup, queryable scans, oversized partitions and corrupt files.
+It also covers disk-heap ordering and OFFSET, bounded heap reads, wildcard
+entry recovery, sibling-map pressure relief and legacy null-state migration.
 
 The implementation lives in `include/clink/runtime/memory_budget.hpp`,
 `keyed_memory_account.hpp`, `memory_size.hpp`, `arrow_memory_pool.hpp`,
 `src/runtime/memory_size.cpp`, the LocalExecutor and the covered owners above.
 SQL working-map accounting lives in `include/clink/sql/working_set.hpp`.
+The disk heap lives in `include/clink/sql/spill_heap.hpp`.
 SQL scratch storage lives in `include/clink/sql/spill_store.hpp` and
 `src/sql/spill_store.cpp`; TTL accounting lives in `include/clink/sql/state_ttl.hpp`.

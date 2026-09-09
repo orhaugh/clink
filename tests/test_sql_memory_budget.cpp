@@ -16,6 +16,7 @@
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
+#include "clink/sql/spill_heap.hpp"
 #include "clink/sql/spill_store.hpp"
 #include "clink/sql/state_ttl.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
@@ -874,6 +875,187 @@ TEST(SqlMemoryBudget, JoinMapsAndNullWildcardRowsRefuseOverBudget) {
             EXPECT_LE(budget->usage().peak, budget->limit());
             EXPECT_TRUE(std::filesystem::is_empty(dir.path));
         }
+    }
+}
+
+TEST(SqlMemoryBudget, GlobalTopNSpillsBeyondBudgetAndStreamsOrderedOffsetResults) {
+    (void)make_operator("aggregate_row");
+    std::vector<std::string> expected, actual;
+    for (bool spilling : {false, true}) {
+        SpillDirectory dir;
+        SpillEnvironment env(spilling ? dir.path.string() : "");
+        auto budget = std::make_shared<MemoryBudget>(8192);
+        RuntimeContext ctx(
+            operator_id_from_uid("memory-test-topn-spill"), "topn", nullptr, nullptr);
+        if (spilling)
+            ctx.set_memory_budget(budget);
+        cluster::OperatorBuildContext build;
+        build.params = {
+            {"sort_columns", "v,k"}, {"sort_descending", "1,0"}, {"count", "80"}, {"offset", "25"}};
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            "top_n_row", std::string{kChannelRow}, std::string{kChannelRow});
+        ASSERT_NE(factory, nullptr);
+        auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(build));
+        op->set_uid("memory-test-topn-spill");
+        op->attach_runtime(&ctx);
+        op->open();
+        auto& result = spilling ? actual : expected;
+        std::size_t largest_batch = 0;
+        Emitter<Row> out([&](StreamElement<Row> e) {
+            if (e.is_data()) {
+                largest_batch = std::max(largest_batch, e.as_data().size());
+                for (const auto& rec : e.as_data())
+                    result.push_back(
+                        config::JsonValue{to_json_object(rec.value().values)}.serialize(0));
+            }
+            return true;
+        });
+        for (int key = 0; key < 250; ++key)
+            feed(*op,
+                 out,
+                 key,
+                 key % 13 == 0 ? config::JsonValue{} : config::JsonValue{(key * 71) % 97});
+        if (spilling)
+            EXPECT_EQ(dir.files(), 105u);
+        op->process(StreamElement<Row>::watermark(Watermark::max()), out);
+        op->flush(out);  // terminal watermark plus final hook must not duplicate results
+        EXPECT_EQ(result.size(), 80u);
+        if (spilling) {
+            EXPECT_EQ(largest_batch, 1u);
+            EXPECT_EQ(budget->usage().used, 0u);
+            EXPECT_LE(budget->usage().peak, budget->limit());
+            EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+        }
+    }
+    EXPECT_EQ(actual, expected);
+}
+
+TEST(SqlMemoryBudget, SpillHeapKeepsBoundedFanInAndValidatesScratch) {
+    SpillDirectory dir;
+    auto budget = std::make_shared<MemoryBudget>(32);
+    {
+        SpillHeap<std::int64_t> heap(
+            dir.path.string(),
+            budget,
+            int64_codec(),
+            [](auto) { return sizeof(std::int64_t); },
+            std::greater<std::int64_t>{});
+        for (std::int64_t value = 0; value < 100; ++value)
+            heap.push(value);
+        EXPECT_EQ(heap.top().value, 99);
+        heap.replace_top(-1);
+        heap.reverse_order();
+        for (std::int64_t value = -1; value < 99; ++value)
+            EXPECT_EQ(heap.pop().value, value);
+        EXPECT_EQ(heap.size(), 0u);
+        EXPECT_EQ(budget->usage().used, 0u);
+        EXPECT_LE(budget->usage().peak, budget->limit());
+        heap.push(3);
+        for (const auto& file : std::filesystem::recursive_directory_iterator(dir.path)) {
+            if (file.is_regular_file()) {
+                std::ofstream corrupt(file.path(), std::ios::binary | std::ios::trunc);
+                corrupt << "invalid";
+            }
+        }
+        EXPECT_THROW(heap.top(), std::runtime_error);
+    }
+    EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+}
+
+TEST(SqlMemoryBudget, NullWildcardEntriesSpillAndRecoverWithoutWholeIndexHydration) {
+    (void)make_operator("aggregate_row");
+    for (int mode = 0; mode < 3; ++mode) {
+        const bool spilling = mode != 0;
+        const bool legacy = mode == 2;
+        SCOPED_TRACE(spilling);
+        SpillDirectory dir;
+        SpillEnvironment env(spilling ? dir.path.string() : "");
+        auto budget = std::make_shared<MemoryBudget>(16384);
+        InMemoryStateBackend backend;
+        std::map<int, std::vector<std::string>> output_kinds;
+        if (legacy) {
+            config::JsonArray probes;
+            for (int key = 0; key < 80; ++key) {
+                config::JsonObject row, probe;
+                row["k"] = config::JsonValue{};
+                row["v"] = config::JsonValue{key};
+                probe["row"] = config::JsonValue{std::move(row)};
+                probe["emitted"] = config::JsonValue{true};
+                probes.emplace_back(std::move(probe));
+                output_kinds[key].push_back(std::string(kRowKindInsert));
+            }
+            config::JsonObject root;
+            root["probes"] = config::JsonValue{std::move(probes)};
+            root["rights"] = config::JsonValue{config::JsonArray{}};
+            RuntimeContext seed(
+                operator_id_from_uid("memory-test-wildcards"), "wildcards", &backend, nullptr);
+            seed.keyed_state<std::string, std::string>("saNull", string_codec(), string_codec())
+                .put("", config::JsonValue{std::move(root)}.serialize(0));
+        }
+        for (int phase = 0; phase < 4; ++phase) {
+            Dag dag;
+            using Channel = BoundedChannel<StreamElement<Row>>;
+            StageHandle<Row> left{std::make_shared<Channel>(16), 0};
+            StageHandle<Row> right{std::make_shared<Channel>(16), 0};
+            plugin::BuildContext build;
+            build.params = {{"left_key_column", "k,v"},
+                            {"right_key_column", "k,v"},
+                            {"anti", "1"},
+                            {"null_aware", "1"}};
+            const auto* builder =
+                cluster::DagBuilderRegistry::default_instance().find("semi_join_row");
+            ASSERT_NE(builder, nullptr);
+            auto built = (*builder)(dag, {std::any{left}, std::any{right}}, build);
+            auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
+            dag.set_runner_identity(output.runner_index, "wildcards", "memory-test-wildcards");
+            Batch<Row> rows;
+            const bool probes = phase == 0 || phase == 3;
+            for (int key = 0; key < (legacy && phase == 0 ? 0 : (probes ? 80 : 40)); ++key) {
+                Row row;
+                row.values["k"] = phase == 1 ? config::JsonValue{1} : config::JsonValue{};
+                row.values["v"] = config::JsonValue{probes ? key : key * 2 + (phase == 2 ? 1 : 0)};
+                rows.emplace(std::move(row));
+            }
+            (probes ? left.output : right.output)->push(StreamElement<Row>::data(std::move(rows)));
+            for (const auto& ch : {left.output, right.output}) {
+                ch->push(StreamElement<Row>::barrier(
+                    CheckpointBarrier{CheckpointId{static_cast<std::uint64_t>(phase + 1)}}));
+                ch->close();
+            }
+            RuntimeContext ctx(
+                operator_id_from_uid("memory-test-wildcards"), "wildcards", &backend, nullptr);
+            if (spilling)
+                ctx.set_memory_budget(budget);
+            std::optional<Snapshot> saved;
+            ctx.set_checkpoint_ack([&](CheckpointId checkpoint, bool ok, std::string error) {
+                EXPECT_TRUE(ok) << error;
+                if (spilling && phase == 0)
+                    EXPECT_GE(dir.files(), 80u);
+                auto legacy_slot = ctx.keyed_state<std::string, std::string>(
+                    "saNull", string_codec(), string_codec());
+                EXPECT_FALSE(legacy_slot.get("").has_value());
+                saved = backend.snapshot(checkpoint);
+            });
+            dag.runners().at(output.runner_index).run(ctx, [&] { return saved.has_value(); });
+            ASSERT_TRUE(saved.has_value());
+            while (auto e = output.output->try_pop()) {
+                if (e->is_data())
+                    for (const auto& rec : e->as_data()) {
+                        const auto key = static_cast<int>(rec.value().values.at("v").as_int());
+                        output_kinds[key].push_back(std::string(row_kind_of(rec.value())));
+                    }
+            }
+            backend.restore(*saved);
+        }
+        ASSERT_EQ(output_kinds.size(), 80u);
+        for (const auto& [key, kinds] : output_kinds)
+            EXPECT_EQ(kinds,
+                      (std::vector<std::string>{std::string(kRowKindInsert),
+                                                std::string(kRowKindDelete)}))
+                << key;
+        EXPECT_EQ(budget->usage().used, 0u);
+        EXPECT_LE(budget->usage().peak, budget->limit());
+        EXPECT_TRUE(std::filesystem::is_empty(dir.path));
     }
 }
 }  // namespace

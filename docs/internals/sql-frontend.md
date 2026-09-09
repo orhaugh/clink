@@ -249,15 +249,20 @@ Mechanics worth knowing before extending it:
 
 With `CLINK_SQL_SPILL_DIR` and a shared memory budget, synchronous GROUP BY,
 fixed/session windows, equi/interval joins, OVER, last-N and partitioned ranking
-can spill working partitions. Null-aware semi/anti joins spill exact-key maps;
-their cross-key null indexes remain budgeted in RAM. Global top-N heaps also
-count but cannot spill. State codecs preserve changelog, retraction, matching
-and ordering information, with normal backend slots supplying recovery.
-Each active partition must fit; a join needs both sides of its active key.
+can spill working partitions. Null-aware semi/anti joins also spill their
+cross-key null entries. Global top-N switches to a disk-backed heap and streams sorted OFFSET/LIMIT results
+without hydrating the full candidate set. Global top-N retains its bounded
+end-of-input lifecycle; it does not gain intermediate-checkpoint recovery.
+Null entries checkpoint individually; the previous null-state blob remains
+readable. Keyed state codecs preserve changelog, retraction, matching and
+ordering information, with normal backend slots supplying recovery.
+Whole keyed partitions still need to fit; a join needs both sides of its
+active key. Global top-N instead needs a constant number of decoded rows.
 See [Memory budgets](memory-management.md) for configuration, backend requirements
 and allocation exclusions. `include/clink/sql/working_set.hpp` implements map
 accounting and streaming mutation scans; `spill_store.hpp` and
-`src/sql/spill_store.cpp` implement scratch storage.
+`src/sql/spill_store.cpp` implement scratch storage. `spill_heap.hpp` implements
+the disk-backed top-N heap.
 
 ## Related
 

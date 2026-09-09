@@ -42,6 +42,13 @@ public:
     }
     bool enabled() const noexcept { return static_cast<bool>(budget_); }
     bool spilled() const noexcept { return spilled_; }
+    void set_pressure_relief(std::function<void()> relief) { pressure_relief_ = std::move(relief); }
+    bool spill_for_pressure() {
+        if (!spill_ || spilled_ || state_.empty())
+            return false;
+        spill_all_();
+        return true;
+    }
 
     void load(const std::string& key) {
         if (!spilled_ || state_.contains(key))
@@ -123,6 +130,7 @@ public:
         WorkingSet next(next_state);
         next.bind(budget_, codec_, estimate_, directory_);
         next.spilled_ = spilled_;
+        next.pressure_relief_ = pressure_relief_;
         if (spilled_) {
             spill_->scan([&](const std::string& key, const SpillStore::Bytes& bytes) {
                 auto value = decode_(bytes);
@@ -182,10 +190,17 @@ private:
             memory_.erase(key);
             return;
         }
-        memory_.update(
-            key,
+        const auto bytes =
             checked_memory_sum(estimate_(it->second),
-                               it->first.capacity() + 1 + sizeof(std::string) + 4 * sizeof(void*)));
+                               it->first.capacity() + 1 + sizeof(std::string) + 4 * sizeof(void*));
+        try {
+            memory_.update(key, bytes);
+        } catch (const MemoryLimitExceeded&) {
+            if (!pressure_relief_)
+                throw;
+            pressure_relief_();
+            memory_.update(key, bytes);
+        }
     }
     void spill_all_() {
         for (const auto& [key, value] : state_)
@@ -195,6 +210,7 @@ private:
         memory_.bind(budget_);
         spilled_ = true;
     }
+    std::function<void()> pressure_relief_;
     Map& state_;
     std::shared_ptr<MemoryBudget> budget_;
     Codec<Value> codec_;
@@ -204,4 +220,16 @@ private:
     std::unique_ptr<SpillStore> spill_;
     bool spilled_{false};
 };
+// Link an operator's working sets only where load/commit sites hold no live
+// references into their peers. Pressure can then release a cold sibling map
+// before refusing a small active entry. All sets must outlive the callbacks.
+template <class... Sets>
+void link_working_sets(Sets&... sets) {
+    auto link = [&](auto& target) {
+        target.set_pressure_relief([&sets..., owner = static_cast<const void*>(&target)] {
+            ((static_cast<const void*>(&sets) != owner ? sets.spill_for_pressure() : false), ...);
+        });
+    };
+    (link(sets), ...);
+}
 }  // namespace clink::sql

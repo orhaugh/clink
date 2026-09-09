@@ -2,12 +2,20 @@
 
 ## Unreleased
 
+**Global top-N and null wildcard collections can spill beyond RAM.** Global
+ORDER BY/LIMIT/OFFSET migrates candidates to a disk-backed heap and streams
+ordered output with a constant number of decoded rows. Null-aware joins spill
+and checkpoint wildcard tuples and null probes individually, retain arrival
+order for retractions, and read the previous null-state checkpoint format.
+Sibling join maps coordinate pressure relief. Whole keyed partitions and
+individual rows still need to fit the configured limit. See
+[Memory budgets](docs/internals/memory-management.md).
+
 **SQL window, join, OVER and ranking partitions now spill on budget pressure.**
 Fixed/session windows, equi/interval joins, OVER and last-N frames, partitioned
 ranking and null-aware join exact-key maps share retained-state accounting and
 local scratch spill. Checkpoint recovery preserves their state; interval joins
-and null-aware joins now persist their synchronous working data. Null wildcard
-indexes and global top-N heaps are accounted but remain in RAM. Each active
+and null-aware joins now persist their synchronous working data. Each active keyed
 partition must fit, and temporary allocations remain outside the limit. See
 [Memory budgets](docs/internals/memory-management.md).
 
