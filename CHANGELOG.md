@@ -2,12 +2,18 @@
 
 ## Unreleased
 
+**More SQL operators support oversized active keys.** GROUP BY stores each
+accumulator separately; fixed/session windows store panes and sessions; OVER splits
+pending rows, frame/LAG history and running accumulators; null-aware joins split
+exact-key probe buckets. Entry checkpoints retain ordering, emitted flags and
+key-group colocation, and migrate legacy whole-partition state. Individual rows,
+pane/session aggregate payloads and growing accumulators must still fit.
+
 **Oversized ranking, last-N and equi/interval join partitions use entry-level storage.**
 With a budget and SQL spill directory configured, these operators scan individual
 rows and checkpoint them separately, preserving partition colocation on rescale.
 Legacy vector snapshots migrate on recovery. Individual rows and growing aggregate
-accumulators still need to fit; GROUP BY, fixed/session windows, OVER and
-null-aware exact-key buckets retain their whole-partition limit.
+accumulators still need to fit.
 
 **Global top-N and null wildcard collections can spill beyond RAM.** Global
 ORDER BY/LIMIT/OFFSET migrates candidates to a disk-backed heap and streams

@@ -26,7 +26,8 @@ public:
     bool bind(RuntimeContext* runtime,
               std::string prefix,
               Codec<T> codec,
-              std::function<std::size_t(const T&)> estimate) {
+              std::function<std::size_t(const T&)> estimate,
+              std::string directory = {}) {
         if (!runtime)
             return false;
         runtime_ = runtime;
@@ -38,7 +39,8 @@ public:
             restored_ = runtime_->state_backend()
                             ->get_operator_state(runtime_->operator_id(), prefix_ + ".format")
                             .has_value();
-        auto directory = sql_spill_directory();
+        if (directory.empty())
+            directory = sql_spill_directory();
         if (!restored_ && (!budget_ || directory.empty()))
             return false;
         if (runtime_->has_state_backend() && runtime_->state_backend()->supports_async_get()) {
@@ -145,12 +147,18 @@ public:
     }
     template <class Visitor>
     void groups(Visitor visitor) const {
+        scan_groups([&](const auto& key, auto count) {
+            visitor(key, count);
+            return true;
+        });
+    }
+    template <class Visitor>
+    void scan_groups(Visitor visitor) const {
         groups_->scan([&](const auto& key, const auto& bytes) {
             auto count = uint64_codec().decode(bytes);
             if (!count)
                 throw std::runtime_error("SQL_SPILL_ERROR: invalid partition length");
-            visitor(key, *count);
-            return true;
+            return visitor(key, *count);
         });
     }
     template <class Visitor>

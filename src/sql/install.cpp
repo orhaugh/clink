@@ -1566,6 +1566,21 @@ inline bool ws3_columnar_projection_benefit(std::size_t needed_value_cols,
 // CUMULATE: each event lands in every slice [anchor, anchor + k*step)
 //           that still contains it; slices share the size-aligned anchor
 // Watermarks fire windows whose end <= watermark.
+// Scratch-backed operators read the same named inputs as their columnar
+// folds. A bare Arrow batch need not carry an event-time column at position 0.
+Row read_spill_input_row(const arrow::RecordBatch& batch,
+                         std::int64_t index,
+                         const std::vector<std::string>& columns) {
+    Row row;
+    for (const auto& name : columns) {
+        const auto column = batch.schema()->GetFieldIndex(name);
+        if (column >= 0)
+            row.values[name] = row_columnar_detail::read_cell(
+                batch.schema()->field(column)->type(), *batch.column(column), index);
+    }
+    return row;
+}
+
 class WindowRowOp final : public Operator<Row, Row> {
 public:
     enum class Kind { Tumble, Hop, Cumulate };
@@ -1667,6 +1682,11 @@ public:
         const auto& rb = element.as_data().arrow();
         if (!rb) {
             return false;
+        }
+        if (entries_.enabled()) {
+            for (std::int64_t index = 0; index < rb->num_rows(); ++index)
+                handle_record_(read_spill_input_row(*rb, index, columnar_needed_));
+            return true;
         }
         const std::int64_t n = rb->num_rows();
         // WS6: fully-columnar window fold when every aggregate is vectorisable
@@ -1794,6 +1814,22 @@ public:
         persist_inmem_ =
             !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
 
+        if (entries_.bind(
+                this->runtime(), "win.entries", window_map_codec(), [](const auto& values) {
+                    std::size_t bytes = sizeof(values);
+                    for (const auto& [key, value] : values)
+                        bytes += sizeof(key) + 4 * sizeof(void*) +
+                                 aggregate_bucket_retained_bytes(value);
+                    return bytes;
+                })) {
+            if (persist_inmem_ && !entries_.restored())
+                keyed_state_().scan([&](const auto& key, const auto& values) {
+                    for (const auto& value : values)
+                        entries_.append(key, EntryMap{value});
+                });
+            return;
+        }
+
         working_.bind(
             this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr,
             window_map_codec(),
@@ -1845,6 +1881,14 @@ public:
             StateBackend::KeyView{wm_key.data(), wm_key.size()},
             StateBackend::ValueView{reinterpret_cast<const char*>(wm_bytes.data()),
                                     wm_bytes.size()});
+        if (entries_.enabled()) {
+            entries_.snapshot();
+            if (persist_inmem_) {
+                auto legacy = keyed_state_();
+                entries_.groups([&](const auto& key, auto) { legacy.erase(key); });
+            }
+            return;
+        }
         if (!persist_inmem_) {
             return;  // the async path already holds its windows in KeyedState
         }
@@ -2233,7 +2277,83 @@ private:
                 "win", clink::string_codec(), window_map_codec());
     }
 
+    void handle_entry_record_(const Row& row) {
+        const auto time = row.values.find(time_column_);
+        if (time == row.values.end() || !time->second.is_number())
+            return;
+        const auto key = group_key_(row);
+        bool folded = false;
+        for (const auto& [start, end] : windows_for_(event_time_of(time->second))) {
+            if (end <= drop_horizon_())
+                continue;
+            folded = true;
+            std::uint64_t position = 0;
+            bool found = false;
+            entries_.scan(key, [&](auto, const auto& value) {
+                if (value.begin()->first >= end) {
+                    found = value.begin()->first == end;
+                    return false;
+                }
+                ++position;
+                return true;
+            });
+            EntryMap value;
+            if (found) {
+                auto entry = entries_.at(key, position);
+                auto& bucket = entry.value.begin()->second;
+                for (std::size_t i = 0; i < aggregates_.size(); ++i)
+                    update_agg(bucket.agg_states[i], aggregates_[i], row);
+                entries_.put(key, position, entry.value);
+            } else {
+                WindowBucket bucket;
+                bucket.window_start = start;
+                bucket.agg_states.resize(aggregates_.size());
+                for (std::size_t i = 0; i < group_keys_.size(); ++i) {
+                    const auto field = row.values.find(group_keys_[i]);
+                    if (field != row.values.end())
+                        bucket.group_values.values[group_key_outputs_[i]] = field->second;
+                }
+                for (std::size_t i = 0; i < aggregates_.size(); ++i)
+                    update_agg(bucket.agg_states[i], aggregates_[i], row);
+                value.emplace(end, std::move(bucket));
+                entries_.insert(key, position, value);
+            }
+        }
+        if (!folded && report_late_)
+            emit_late_(row);
+    }
+    void fire_entries_(EventTime wm, Emitter<Row>& out) {
+        Batch<Row> batch;
+        entries_.visit_groups([&](const auto& key, auto count) {
+            std::uint64_t retained = 0;
+            for (std::uint64_t index = 0; index < count; ++index) {
+                auto entry = entries_.at(key, index);
+                const auto& value = *entry.value.begin();
+                if (clink::sat_add(value.first, allowed_lateness_ms_) <= wm.millis()) {
+                    Record<Row> fired{finalize_window_(value.second, value.first)};
+                    fired.set_event_time(EventTime{clink::sat_sub(value.first, 1)});
+                    batch.push(std::move(fired));
+                    if (batch.size() >= 64) {
+                        out.emit_data(std::move(batch));
+                        batch = Batch<Row>{};
+                    }
+                } else {
+                    if (retained != index)
+                        entries_.put(key, retained, entry.value);
+                    ++retained;
+                }
+            }
+            entries_.truncate(key, retained);
+        });
+        if (!batch.empty())
+            out.emit_data(std::move(batch));
+    }
+
     void handle_record_(const Row& row) {
+        if (entries_.enabled()) {
+            handle_entry_record_(row);
+            return;
+        }
         auto it = row.values.find(time_column_);
         if (it == row.values.end() || !it->second.is_number())
             return;
@@ -2344,6 +2464,10 @@ private:
     }
 
     void fire_due_(EventTime wm, Emitter<Row>& out) {
+        if (entries_.enabled()) {
+            fire_entries_(wm, out);
+            return;
+        }
         const auto wm_value = wm.millis();
         // Nothing can be due: skip the scan of every group. A watermark arrives once per
         // batch, so without this the operator walked all of state_ per batch even when no
@@ -2501,6 +2625,8 @@ private:
                    TransparentKeyHash,
                    std::equal_to<>>
         state_;
+    using EntryMap = std::map<std::int64_t, WindowBucket>;
+    PartitionedList<EntryMap> entries_;
     WorkingSet<decltype(state_)> working_{state_};
     // A LOWER BOUND on the smallest window_end held anywhere in state_, so a watermark
     // that cannot fire anything costs one comparison instead of a scan of every group.
@@ -2612,6 +2738,22 @@ public:
         persist_inmem_ =
             !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
 
+        if (entries_.bind(
+                this->runtime(), "sesswin.entries", session_map_codec(), [](const auto& values) {
+                    std::size_t bytes = sizeof(values);
+                    for (const auto& [key, value] : values)
+                        bytes += sizeof(key) + 4 * sizeof(void*) +
+                                 aggregate_bucket_retained_bytes(value);
+                    return bytes;
+                })) {
+            if (persist_inmem_ && !entries_.restored())
+                keyed_state_().scan([&](const auto& key, const auto& values) {
+                    for (const auto& value : values)
+                        entries_.append(key, EntryMap{value});
+                });
+            return;
+        }
+
         working_.bind(
             this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr,
             session_map_codec(),
@@ -2655,6 +2797,14 @@ public:
             StateBackend::KeyView{wm_key.data(), wm_key.size()},
             StateBackend::ValueView{reinterpret_cast<const char*>(wm_bytes.data()),
                                     wm_bytes.size()});
+        if (entries_.enabled()) {
+            entries_.snapshot();
+            if (persist_inmem_) {
+                auto legacy = keyed_state_();
+                entries_.groups([&](const auto& key, auto) { legacy.erase(key); });
+            }
+            return;
+        }
         if (!persist_inmem_) {
             return;  // the async path already holds its sessions in KeyedState
         }
@@ -2741,6 +2891,11 @@ public:
         const auto& rb = element.as_data().arrow();
         if (!rb) {
             return false;
+        }
+        if (entries_.enabled()) {
+            for (std::int64_t index = 0; index < rb->num_rows(); ++index)
+                handle_record_(read_spill_input_row(*rb, index, columnar_needed_));
+            return true;
         }
         const std::int64_t n = rb->num_rows();
         // WS6: fully-columnar session fold when every aggregate is vectorisable.
@@ -3056,7 +3211,95 @@ private:
         return new_start;
     }
 
+    void handle_entry_record_(const Row& row) {
+        const auto time = row.values.find(time_column_);
+        if (time == row.values.end() || !time->second.is_number())
+            return;
+        const auto ts = event_time_of(time->second);
+        const auto key = group_key_(row);
+        std::optional<Session> merged;
+        MemoryReservation charge(this->runtime()->memory_budget(), MemoryCategory::State);
+        std::uint64_t index = 0;
+        while (index < entries_.size(key)) {
+            auto entry = entries_.at(key, index);
+            auto& session = entry.value.begin()->second;
+            if (clink::sat_add(session.end, gap_ms_) < ts) {
+                ++index;
+                continue;
+            }
+            if (session.start > clink::sat_add(ts, gap_ms_))
+                break;
+            if (!merged)
+                merged = std::move(session);
+            else
+                merge_into(*merged, session, aggregates_);
+            charge.resize(aggregate_bucket_retained_bytes(*merged));
+            entries_.erase(key, index);
+        }
+        if (!merged) {
+            if (clink::sat_add(ts, gap_ms_) <= late_bound_()) {
+                if (report_late_)
+                    emit_late_(row);
+                return;
+            }
+            merged.emplace();
+            merged->start = merged->end = ts;
+            merged->agg_states.resize(aggregates_.size());
+            for (std::size_t i = 0; i < group_keys_.size(); ++i) {
+                auto field = row.values.find(group_keys_[i]);
+                if (field != row.values.end())
+                    merged->group_values.values[group_key_outputs_[i]] = field->second;
+            }
+        }
+        merged->start = std::min(merged->start, ts);
+        merged->end = std::max(merged->end, ts);
+        for (std::size_t i = 0; i < aggregates_.size(); ++i)
+            update_agg(merged->agg_states[i], aggregates_[i], row);
+        charge.resize(aggregate_bucket_retained_bytes(*merged));
+        std::uint64_t position = 0;
+        entries_.scan(key, [&](auto, const auto& value) {
+            if (value.begin()->first >= merged->start)
+                return false;
+            ++position;
+            return true;
+        });
+        const auto start = merged->start;
+        entries_.insert(key, position, EntryMap{{start, std::move(*merged)}});
+    }
+    void fire_entries_(EventTime wm, Emitter<Row>& out) {
+        Batch<Row> batch;
+        entries_.visit_groups([&](const auto& key, auto count) {
+            std::uint64_t retained = 0;
+            for (std::uint64_t index = 0; index < count; ++index) {
+                auto entry = entries_.at(key, index);
+                const auto& value = *entry.value.begin();
+                if (clink::sat_add(clink::sat_add(value.second.end, gap_ms_),
+                                   allowed_lateness_ms_) <= wm.millis()) {
+                    Record<Row> fired{finalize_session_(value.second)};
+                    fired.set_event_time(
+                        EventTime{clink::sat_sub(clink::sat_add(value.second.end, gap_ms_), 1)});
+                    batch.push(std::move(fired));
+                    if (batch.size() >= 64) {
+                        out.emit_data(std::move(batch));
+                        batch = Batch<Row>{};
+                    }
+                } else {
+                    if (retained != index)
+                        entries_.put(key, retained, entry.value);
+                    ++retained;
+                }
+            }
+            entries_.truncate(key, retained);
+        });
+        if (!batch.empty())
+            out.emit_data(std::move(batch));
+    }
+
     void handle_record_(const Row& row) {
+        if (entries_.enabled()) {
+            handle_entry_record_(row);
+            return;
+        }
         if (!working_.enabled()) {
             handle_record_loaded_(row);
             return;
@@ -3232,6 +3475,10 @@ private:
     }
 
     void fire_due_(EventTime wm, Emitter<Row>& out) {
+        if (entries_.enabled()) {
+            fire_entries_(wm, out);
+            return;
+        }
         const auto wm_value = wm.millis();
         Batch<Row> emit_batch;
         working_.visit([&](const auto& k, auto& by_session) {
@@ -3440,6 +3687,8 @@ private:
     clink::
         FlatMap<std::string, std::map<std::int64_t, Session>, TransparentKeyHash, std::equal_to<>>
             state_;
+    using EntryMap = std::map<std::int64_t, Session>;
+    PartitionedList<EntryMap> entries_;
     WorkingSet<decltype(state_)> working_{state_};
     mutable std::string key_scratch_;           // group_key_scratch_'s reused buffer
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
@@ -3541,6 +3790,52 @@ public:
         // move between storage modes across restarts.
         persist_inmem_ =
             !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
+
+        if (entry_meta_.bind(this->runtime(),
+                             "over.entries.meta",
+                             part_state_codec(),
+                             [](const PartState& state) {
+                                 std::size_t bytes = sizeof(state);
+                                 for (const auto& agg : state.agg)
+                                     bytes += agg_state_retained_bytes(agg);
+                                 if (state.first_row)
+                                     bytes += state.first_row->retained_bytes();
+                                 return bytes;
+                             })) {
+            auto estimate = [](const Row& row) { return row.retained_bytes(); };
+            if (!entry_pending_.bind(
+                    this->runtime(), "over.entries.pending", row_json_codec(), estimate) ||
+                !entry_history_.bind(
+                    this->runtime(), "over.entries.history", row_json_codec(), estimate) ||
+                entry_meta_.restored() != entry_pending_.restored() ||
+                entry_meta_.restored() != entry_history_.restored())
+                throw std::runtime_error("SQL_SPILL_ERROR: inconsistent OVER entry format");
+            if (persist_inmem_ && !entry_meta_.restored())
+                keyed_state_().scan([&](const auto& key, const PartState& state) {
+                    for (const auto& [order, row] : state.pending)
+                        entry_pending_.append(key, row);
+                    // Both buffers end at the last folded row. Keep the longer
+                    // suffix to cover both LAG and bounded frame requirements.
+                    if (state.folded.size() >= state.recent.size()) {
+                        for (const auto& [time, row] : state.folded)
+                            entry_history_.append(key, row);
+                    } else {
+                        for (const auto& row : state.recent)
+                            entry_history_.append(key, row);
+                    }
+                    PartState meta;
+                    meta.first_row = state.first_row;
+                    entry_meta_.append(key, meta);
+                    for (std::size_t i = 0; i < specs_.size(); ++i) {
+                        PartState accumulator;
+                        accumulator.agg.resize(1);
+                        if (i < state.agg.size())
+                            accumulator.agg.front() = state.agg[i];
+                        entry_meta_.append(key, accumulator);
+                    }
+                });
+            return;
+        }
 
         working_.bind(
             this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr,
@@ -3653,7 +3948,15 @@ public:
                          OperatorId op_id,
                          const std::string& slot = "") override {
         Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
-        if (persist_inmem_) {
+        if (entry_meta_.enabled()) {
+            entry_meta_.snapshot();
+            entry_pending_.snapshot();
+            entry_history_.snapshot();
+            if (persist_inmem_) {
+                auto legacy = keyed_state_();
+                entry_meta_.groups([&](const auto& key, auto) { legacy.erase(key); });
+            }
+        } else if (persist_inmem_) {
             // handle_record_ never erases a partition entry, so overwriting every
             // key each barrier also overwrites whatever an earlier snapshot held.
             auto kv = keyed_state_();
@@ -3805,6 +4108,31 @@ private:
     }
 
     void handle_record_(const Row& row) {
+        if (entry_meta_.enabled()) {
+            const auto ts = ts_of_(row);
+            if (!ts || (have_wm_ && *ts <= current_wm_))
+                return;
+            const auto key = partition_key_(row);
+            if (!entry_meta_.size(key)) {
+                PartState meta;
+                entry_meta_.append(key, meta);
+                for (std::size_t i = 0; i < specs_.size(); ++i) {
+                    PartState accumulator;
+                    accumulator.agg.resize(1);
+                    entry_meta_.append(key, accumulator);
+                }
+            }
+            std::uint64_t position = 0;
+            entry_pending_.scan(key, [&](auto, const Row& existing) {
+                if (ts_of_(existing).value() > *ts)
+                    return false;
+                ++position;
+                return true;
+            });
+            entry_pending_.insert(key, position, row);
+            return;
+        }
+
         if (!working_.enabled()) {
             handle_record_loaded_(row);
             return;
@@ -3832,6 +4160,10 @@ private:
         have_wm_ = true;
         if (wm_value > current_wm_)
             current_wm_ = wm_value;
+        if (entry_meta_.enabled()) {
+            fire_entries_(wm_value, out);
+            return;
+        }
         Batch<Row> emit_batch;
         working_.visit([&](const auto& key, auto& st) {
             (void)key;
@@ -3843,6 +4175,95 @@ private:
         });
         if (!emit_batch.empty())
             out.emit_data(std::move(emit_batch));
+    }
+
+    void fire_entries_(std::int64_t bound, Emitter<Row>& out) {
+        Batch<Row> batch;
+        entry_meta_.groups([&](const auto& key, auto) {
+            auto meta = entry_meta_.at(key, 0);
+            while (entry_pending_.size(key)) {
+                auto pending = entry_pending_.at(key, 0);
+                const auto ts = ts_of_(pending.value).value();
+                if (ts > bound)
+                    break;
+                const auto& row = pending.value;
+                Row result = row;
+                result.values.erase("__key");
+                auto history = entry_history_.size(key);
+                for (const auto& spec : specs_) {
+                    if (spec.fn != "lag")
+                        continue;
+                    config::JsonValue value{nullptr};
+                    if (history >= static_cast<std::uint64_t>(spec.lag_offset)) {
+                        auto previous = entry_history_.at(key, history - spec.lag_offset);
+                        auto field = previous.value.values.find(spec.input_column);
+                        if (field != previous.value.values.end())
+                            value = field->second;
+                    }
+                    result.values[spec.output_name] = std::move(value);
+                }
+                if (needs_buffer_ || max_lag_ > 0)
+                    entry_history_.append(key, row);
+                history = entry_history_.size(key);
+                if (!meta.value.first_row)
+                    meta.value.first_row = row;
+                for (std::size_t i = 0; i < specs_.size(); ++i) {
+                    const auto& spec = specs_[i];
+                    if (is_running_agg_(spec.fn)) {
+                        if (spec.frame_mode == 0) {
+                            auto accumulator = entry_meta_.at(key, i + 1);
+                            update_agg(accumulator.value.agg.front(), agg_specs_[i], row);
+                            result.values[spec.output_name] =
+                                finalize_agg(accumulator.value.agg.front(), agg_specs_[i]);
+                            entry_meta_.put(key, i + 1, accumulator.value);
+                        } else {
+                            AggState accumulator;
+                            MemoryReservation charge(this->runtime()->memory_budget(),
+                                                     MemoryCategory::State);
+                            const auto span = static_cast<std::uint64_t>(spec.frame_start) + 1;
+                            const auto start =
+                                spec.frame_mode == 1 && history > span ? history - span : 0;
+                            for (auto index = start; index < history; ++index) {
+                                auto value = entry_history_.at(key, index);
+                                if (spec.frame_mode == 2 &&
+                                    static_cast<__int128>(ts) - ts_of_(value.value).value() >
+                                        spec.frame_start)
+                                    continue;
+                                update_agg(accumulator, agg_specs_[i], value.value);
+                                charge.resize(agg_state_retained_bytes(accumulator));
+                            }
+                            result.values[spec.output_name] =
+                                finalize_agg(accumulator, agg_specs_[i]);
+                        }
+                    } else if (spec.fn == "first_value" || spec.fn == "last_value") {
+                        const auto& source = spec.fn == "first_value" ? *meta.value.first_row : row;
+                        const auto field = source.values.find(spec.input_column);
+                        result.values[spec.output_name] =
+                            field == source.values.end() ? config::JsonValue{} : field->second;
+                    }
+                }
+                // Retain the union of the ROWS, RANGE and LAG suffixes.
+                const auto rows_to_keep =
+                    std::max(static_cast<std::uint64_t>(max_lag_),
+                             needs_buffer_ ? static_cast<std::uint64_t>(max_rows_back_) + 1 : 0);
+                while (entry_history_.size(key) > rows_to_keep) {
+                    auto first = entry_history_.at(key, 0);
+                    if (needs_buffer_ &&
+                        static_cast<__int128>(ts) - ts_of_(first.value).value() <= max_range_back_)
+                        break;
+                    entry_history_.erase(key, 0);
+                }
+                entry_meta_.put(key, 0, meta.value);
+                entry_pending_.erase(key, 0);
+                batch.emplace(std::move(result));
+                if (batch.size() >= 64) {
+                    out.emit_data(std::move(batch));
+                    batch = Batch<Row>{};
+                }
+            }
+        });
+        if (!batch.empty())
+            out.emit_data(std::move(batch));
     }
 
     // Fold row r (the current row, in (ts, seq) order) into the running
@@ -4075,6 +4496,8 @@ private:
     std::int64_t max_rows_back_ = 0;   // widest ROWS <n> PRECEDING
     std::int64_t max_range_back_ = 0;  // widest RANGE <n> PRECEDING (ms)
     clink::FlatMap<std::string, PartState> state_;
+    PartitionedList<PartState> entry_meta_;
+    PartitionedList<Row> entry_pending_, entry_history_;
     WorkingSet<decltype(state_)> working_{state_};
 };
 
@@ -4683,6 +5106,42 @@ public:
         }
         // Same serving lock as process(): one acquisition per batch.
         std::lock_guard serving_lock(serving_mu_);
+        if (entries_.enabled()) {
+            Batch<Row> rows;
+            for (std::int64_t index = 0; index < rb->num_rows(); ++index)
+                rows.emplace(read_spill_input_row(*rb, index, columnar_needed_));
+            bool grouped = batch_fold_eligible_;
+            for (const auto& record : rows)
+                if (is_delete_like(row_kind_of(record.value())))
+                    grouped = false;
+            Batch<Row> batch;
+            if (grouped) {
+                std::map<std::string, std::vector<Row>> groups;
+                std::vector<std::string> order;
+                for (const auto& record : rows) {
+                    auto key = group_key_(record.value());
+                    if (!groups.contains(key))
+                        order.push_back(key);
+                    groups[key].push_back(record.value());
+                }
+                for (const auto& key : order) {
+                    const auto& values = groups.at(key);
+                    for (std::size_t index = 0; index < values.size(); ++index)
+                        handle_entry_record_(values[index], batch, index + 1 == values.size());
+                }
+            } else {
+                for (const auto& record : rows) {
+                    handle_entry_record_(record.value(), batch);
+                    if (batch.size() >= 64) {
+                        out.emit_data(std::move(batch));
+                        batch = Batch<Row>{};
+                    }
+                }
+            }
+            if (!batch.empty())
+                out.emit_data(std::move(batch));
+            return true;
+        }
         const std::int64_t n = rb->num_rows();
         // WS6 Increment 1: the fully-columnar vectorised fold (COUNT / SUM-int /
         // AVG-int over a pure-append batch) builds NO per-record Row, so it beats
@@ -4906,7 +5365,14 @@ public:
         // paths, so a job can move between storage modes across restarts.
         persist_inmem_ = !effective_async_state_ && this->runtime() != nullptr &&
                          this->runtime()->has_state_backend();
-        if (!effective_async_state_ && memory_.enabled()) {
+        if (!effective_async_state_)
+            entries_.bind(
+                this->runtime(),
+                "agg.entries",
+                agg_bucket_codec(),
+                [](const AggBucket& bucket) { return aggregate_bucket_retained_bytes(bucket); },
+                spill_dir_);
+        if (!entries_.enabled() && !effective_async_state_ && memory_.enabled()) {
             if (spill_dir_.empty()) {
                 if (const auto* path = std::getenv("CLINK_SQL_SPILL_DIR"))
                     spill_dir_ = path;
@@ -4916,14 +5382,30 @@ public:
         }
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan([&](const std::string& key, const AggBucket& bucket) {
-                state_[key] = bucket;
-                account_or_spill_(key);
+                if (entries_.enabled()) {
+                    if (!entries_.restored()) {
+                        AggBucket meta;
+                        meta.group_values = bucket.group_values;
+                        meta.prior_emitted = bucket.prior_emitted;
+                        entries_.append(key, meta);
+                        for (const auto& state : bucket.agg_states) {
+                            AggBucket value;
+                            value.agg_states.push_back(state);
+                            entries_.append(key, value);
+                        }
+                    }
+                } else {
+                    state_[key] = bucket;
+                    account_or_spill_(key);
+                }
             });
         }
         // Deadlines are absolute, so a restored group resumes its original
         // expiry rather than getting a fresh full TTL. Without this a job
         // that restarts often would never expire anything.
         restore_ttl_();
+        if (entries_.enabled())
+            entries_.groups([&](const auto& key, auto) { ttl_.enrol_restored_key(key); });
         // WS3: within-batch group-by is eligible only for append-mode GROUP BY
         // whose every aggregate is batch-foldable (commutative, no per-value
         // memory). Static decision; the per-batch insert-only check is in
@@ -4955,6 +5437,15 @@ public:
             clink::queryable_state::Registry::global().register_json_slot(
                 queryable_slot_, [this](const std::string& key) -> std::optional<std::string> {
                     std::lock_guard lk(serving_mu_);
+                    if (entries_.enabled()) {
+                        auto result = entry_result_(key);
+                        if (!result && key.find('\x1f') == std::string::npos &&
+                            group_keys_.size() == 1)
+                            result = entry_result_(config::JsonValue{key}.serialize(0));
+                        if (!result)
+                            return std::nullopt;
+                        return config::JsonValue{to_json_object(result->values)}.serialize(0);
+                    }
                     auto bucket = lookup_bucket_(key);
                     if (!bucket && key.find('\x1f') == std::string::npos &&
                         (key.empty() || key.front() != '"')) {
@@ -4974,6 +5465,21 @@ public:
                 [this](std::size_t limit) -> clink::queryable_state::JsonScanResult {
                     clink::queryable_state::JsonScanResult out;
                     std::lock_guard lk(serving_mu_);
+                    if (entries_.enabled()) {
+                        entries_.scan_groups([&](const auto& key, auto) {
+                            if (out.entries.size() >= limit) {
+                                out.truncated = true;
+                                return false;
+                            }
+                            auto result = entry_result_(key);
+                            if (result)
+                                out.entries.emplace_back(
+                                    key,
+                                    config::JsonValue{to_json_object(result->values)}.serialize(0));
+                            return true;
+                        });
+                        return out;
+                    }
                     if (spilling_) {
                         spill_->scan([&](const std::string& key, const SpillStore::Bytes& bytes) {
                             if (out.entries.size() >= limit) {
@@ -5166,8 +5672,76 @@ private:
                clink::config::JsonValue{clink::sql::to_json_object(b.values)}.serialize(0);
     }
 
+    std::optional<Row> entry_result_(const std::string& key) const {
+        if (!entries_.size(key))
+            return std::nullopt;
+        auto meta = entries_.at(key, 0);
+        Row result = meta.value.group_values;
+        for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+            auto entry = entries_.at(key, i + 1);
+            result.values[aggregates_[i].output_name] =
+                finalize_agg(entry.value.agg_states.front(), aggregates_[i]);
+        }
+        return result;
+    }
+
+    void handle_entry_record_(const Row& row, Batch<Row>& out, bool emit = true) {
+        const auto key = group_key_(row);
+        if (!entries_.size(key)) {
+            AggBucket meta;
+            for (std::size_t i = 0; i < group_keys_.size(); ++i) {
+                const auto field = row.values.find(group_keys_[i]);
+                if (field != row.values.end())
+                    meta.group_values.values[group_key_outputs_[i]] = field->second;
+            }
+            entries_.append(key, meta);
+            for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+                AggBucket entry;
+                entry.agg_states.resize(1);
+                entries_.append(key, entry);
+            }
+        }
+        const bool retract = has_row_kind(row) && is_delete_like(row_kind_of(row));
+        for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+            auto entry = entries_.at(key, i + 1);
+            if (retract)
+                retract_agg(entry.value.agg_states.front(), aggregates_[i], row);
+            else
+                update_agg(entry.value.agg_states.front(), aggregates_[i], row);
+            entries_.put(key, i + 1, entry.value);
+        }
+        ttl_.touch(key);
+        if (!emit)
+            return;
+        Row result = *entry_result_(key);
+        if (!emit_changelog_) {
+            if (has_row_kind(row))
+                set_row_kind(result, kRowKindUpdateAfter);
+            out.emplace(std::move(result));
+            return;
+        }
+        auto meta = entries_.at(key, 0);
+        const bool prior = meta.value.prior_emitted.has_value();
+        if (prior && rows_equal_(*meta.value.prior_emitted, result))
+            return;
+        if (prior) {
+            Row before = *meta.value.prior_emitted;
+            set_row_kind(before, kRowKindUpdateBefore);
+            out.emplace(std::move(before));
+        }
+        meta.value.prior_emitted = result;
+        entries_.put(key, 0, meta.value);
+        set_row_kind(result, prior ? kRowKindUpdateAfter : kRowKindInsert);
+        out.emplace(std::move(result));
+    }
+
     // In-memory (default) per-record path.
     void handle_record_inmem_(const Row& row, Batch<Row>& out) {
+        if (entries_.enabled()) {
+            handle_entry_record_(row, out);
+            return;
+        }
+
         // Transparent probe with the scratch key (see WindowRowOp).
         const auto key = group_key_scratch_(row);
         if (spilling_)
@@ -5296,6 +5870,15 @@ private:
         // keeps its buckets in the backend already, but its deadlines live
         // here and would be lost on a restart without this.
         flush_ttl_dirty_();
+        if (entries_.enabled()) {
+            std::lock_guard serving_lock(serving_mu_);
+            entries_.snapshot();
+            if (persist_inmem_) {
+                auto legacy = keyed_state_();
+                entries_.groups([&](const auto& key, auto) { legacy.erase(key); });
+            }
+            return;
+        }
         if (!persist_inmem_ || (!spilling_ && dirty_.empty())) {
             return;
         }
@@ -5367,6 +5950,8 @@ private:
             dl.emplace(deadline_state_());
         }
         for (const auto& key : doomed) {
+            if (entries_.enabled())
+                entries_.erase_group(key);
             if (spilling_)
                 spill_->erase(key);
             state_.erase(key);
@@ -5402,7 +5987,12 @@ public:
     // Groups evicted by retention so far. Read by the TTL tests and
     // available for metrics reporting.
     [[nodiscard]] std::uint64_t ttl_expired_groups() const noexcept { return ttl_.expired_total(); }
-    [[nodiscard]] std::size_t live_group_count() const noexcept {
+    [[nodiscard]] std::size_t live_group_count() const {
+        if (entries_.enabled()) {
+            std::size_t count = 0;
+            entries_.groups([&](const auto&, auto) { ++count; });
+            return count;
+        }
         return spilling_ ? spill_->size() : state_.size();
     }
 
@@ -5416,6 +6006,7 @@ private:
     std::string spill_dir_;
     std::unique_ptr<SpillStore> spill_;
     bool spilling_ = false;
+    PartitionedList<AggBucket> entries_;
     bool async_state_ = false;
     // Effective decision: async_state_ OR the bound backend can defer reads.
     // Seeded from async_state_ in the ctor and finalised in open() once the
@@ -6458,6 +7049,14 @@ public:
                    masked_bytes_(probe.key) - sizeof(MaskedKey);
         });
         null_rights_working_.bind(budget, masked_codec_(), masked_bytes_);
+        if (null_aware_)
+            exact_entries_.bind(
+                this->runtime(), "saExact.entries", left_entry_list_codec(), [](const auto& rows) {
+                    std::size_t bytes = sizeof(rows);
+                    for (const auto& entry : rows)
+                        bytes += sizeof(entry) + entry.row.retained_bytes();
+                    return bytes;
+                });
         left_working_.bind(budget, left_entry_list_codec(), [](const auto& entries) {
             std::size_t bytes = sizeof(entries) + entries.capacity() * sizeof(LeftEntry);
             for (const auto& e : entries)
@@ -6469,8 +7068,14 @@ public:
         link_working_sets(
             left_working_, right_working_, null_probes_working_, null_rights_working_);
         if (null_aware_ && this->runtime() && this->runtime()->has_state_backend()) {
-            kv_left_().scan(
-                [&](const auto& key, const auto& rows) { left_working_.restore(key, rows); });
+            if (!exact_entries_.restored())
+                kv_left_().scan([&](const auto& key, const auto& rows) {
+                    if (exact_entries_.enabled()) {
+                        for (const auto& row : rows)
+                            exact_entries_.append(key, std::vector<LeftEntry>{row});
+                    } else
+                        left_working_.restore(key, rows);
+                });
             kv_right_().scan(
                 [&](const auto& key, auto count) { right_working_.restore(key, count); });
             if (auto saved = null_slot_().get(""))
@@ -6499,6 +7104,8 @@ public:
                 ttl_.enrol_restored_key(key);
             });
         }
+        if (exact_entries_.enabled())
+            exact_entries_.groups([&](const auto& key, auto) { ttl_.enrol_restored_key(key); });
     }
 
     // Persist the retention deadlines alongside the per-key data the
@@ -6512,7 +7119,11 @@ public:
         if (null_aware_ && this->runtime() && this->runtime()->has_state_backend()) {
             auto left = kv_left_();
             auto right = kv_right_();
-            left_working_.scan([&](const auto& key, const auto& rows) { left.put(key, rows); });
+            if (exact_entries_.enabled()) {
+                exact_entries_.snapshot();
+                exact_entries_.groups([&](const auto& key, auto) { left.erase(key); });
+            } else
+                left_working_.scan([&](const auto& key, const auto& rows) { left.put(key, rows); });
             right_working_.scan([&](const auto& key, auto count) { right.put(key, count); });
             auto probes = null_probes_slot_();
             auto rights = null_rights_slot_();
@@ -6538,6 +7149,7 @@ public:
         if (!element.is_data())
             return;
         Batch<Row> batch;
+        entry_output_ = &out;
         if (null_aware_) {
             for (const auto& rec : element.as_data())
                 handle_left_(rec.value(), batch);
@@ -6555,6 +7167,7 @@ public:
         if (!element.is_data())
             return;
         Batch<Row> batch;
+        entry_output_ = &out;
         if (null_aware_) {
             for (const auto& rec : element.as_data())
                 handle_right_(rec.value(), batch);
@@ -6716,11 +7329,15 @@ private:
         return clink::config::JsonValue{std::move(arr)}.serialize(0);
     }
 
-    static void emit_(const Row& row, std::string_view kind, Batch<Row>& batch) {
+    void emit_(const Row& row, std::string_view kind, Batch<Row>& batch) {
         Row r = row;
         r.values.erase("__key");  // drop the synthetic routing key
         set_row_kind(r, kind);
         batch.push(Record<Row>{std::move(r)});
+        if (exact_entries_.enabled() && entry_output_ && batch.size() >= 64) {
+            entry_output_->emit_data(std::move(batch));
+            batch = Batch<Row>{};
+        }
     }
 
     void handle_left_(const Row& row, Batch<Row>& batch) {
@@ -6730,12 +7347,14 @@ private:
         }
         auto key = key_of_(row, left_key_columns_);
         if (key) {
-            left_working_.load(*key);
+            if (!exact_entries_.enabled())
+                left_working_.load(*key);
             right_working_.load(*key);
         }
         handle_left_loaded_(row, batch);
         if (key) {
-            left_working_.commit(*key);
+            if (!exact_entries_.enabled())
+                left_working_.commit(*key);
             right_working_.commit(*key);
         }
     }
@@ -6762,6 +7381,18 @@ private:
                     emit_(row, kRowKindInsert, batch);
             }
             // semi (IN) with a NULL probe: never matches -> not emitted.
+            return;
+        }
+        if (exact_entries_.enabled()) {
+            const bool matched = right_count_[*key] > 0;
+            LeftEntry entry{
+                row,
+                anti_ ? !matched && !na_null_right_matches_(masked_key_of_(row, left_key_columns_))
+                      : matched};
+            exact_entries_.append(*key, std::vector<LeftEntry>{entry});
+            ttl_.touch(*key);
+            if (entry.emitted)
+                emit_(row, kRowKindInsert, batch);
             return;
         }
         auto& entries = left_state_[*key];
@@ -6792,12 +7423,14 @@ private:
         }
         auto key = key_of_(row, right_key_columns_);
         if (key) {
-            left_working_.load(*key);
+            if (!exact_entries_.enabled())
+                left_working_.load(*key);
             right_working_.load(*key);
         }
         handle_right_loaded_(row, batch);
         if (key) {
-            left_working_.commit(*key);
+            if (!exact_entries_.enabled())
+                left_working_.commit(*key);
             right_working_.commit(*key);
         }
     }
@@ -6836,20 +7469,15 @@ private:
             return;  // key already present; no transition (poison already applied)
         // Exact-match transition: emit (semi) / retract (anti) the no-null
         // probes with this exact key.
-        auto it = left_state_.find(*key);
-        if (it != left_state_.end()) {
-            for (auto& e : it->second) {
-                if (!anti_) {
-                    if (!e.emitted) {  // semi: newly matched
-                        e.emitted = true;
-                        emit_(e.row, kRowKindInsert, batch);
-                    }
-                } else if (e.emitted) {  // anti: now matched -> retract
-                    e.emitted = false;
-                    emit_(e.row, kRowKindDelete, batch);
-                }
+        visit_exact_key_(*key, [&](LeftEntry& entry) {
+            if (!anti_ && !entry.emitted) {
+                entry.emitted = true;
+                emit_(entry.row, kRowKindInsert, batch);
+            } else if (anti_ && entry.emitted) {
+                entry.emitted = false;
+                emit_(entry.row, kRowKindDelete, batch);
             }
-        }
+        });
         // Null-aware NOT IN: a no-null right tuple also poisons null-bearing
         // probes that agree on their non-null positions.
         if (anti_ && null_aware_ && next_probe_ != 0) {
@@ -6929,16 +7557,38 @@ private:
     // A new null-bearing right tuple arrived: retract every currently-emitted
     // probe (no-null in left_state_ and null-bearing in na_null_probes_) it now
     // poisons. The `emitted` guard makes this idempotent (retract at most once).
-    void retract_poisoned_(const MaskedKey& rk, Batch<Row>& batch) {
-        left_working_.visit([&](const auto& k, auto& entries) {
-            (void)k;
-            for (auto& e : entries) {
-                if (e.emitted && potential_match_(masked_key_of_(e.row, left_key_columns_), rk)) {
-                    e.emitted = false;
-                    emit_(e.row, kRowKindDelete, batch);
-                }
+    template <class Visitor>
+    void visit_exact_key_(const std::string& key, Visitor visitor) {
+        if (exact_entries_.enabled()) {
+            const auto count = exact_entries_.size(key);
+            for (std::uint64_t index = 0; index < count; ++index) {
+                auto entry = exact_entries_.at(key, index);
+                visitor(entry.value.front());
+                exact_entries_.put(key, index, entry.value);
             }
-        });
+        } else {
+            auto found = left_state_.find(key);
+            if (found != left_state_.end())
+                for (auto& entry : found->second)
+                    visitor(entry);
+        }
+    }
+
+    void retract_poisoned_(const MaskedKey& rk, Batch<Row>& batch) {
+        auto poison = [&](LeftEntry& entry) {
+            if (entry.emitted &&
+                potential_match_(masked_key_of_(entry.row, left_key_columns_), rk)) {
+                entry.emitted = false;
+                emit_(entry.row, kRowKindDelete, batch);
+            }
+        };
+        if (exact_entries_.enabled())
+            exact_entries_.groups([&](const auto& key, auto) { visit_exact_key_(key, poison); });
+        else
+            left_working_.visit([&](const auto&, auto& entries) {
+                for (auto& entry : entries)
+                    poison(entry);
+            });
         visit_null_probes_([&](auto& p) {
             if (p.emitted && potential_match_(p.key, rk)) {
                 p.emitted = false;
@@ -7114,6 +7764,8 @@ private:
             dl.emplace(deadline_state_());
         }
         for (const auto& key : doomed) {
+            if (exact_entries_.enabled())
+                exact_entries_.erase_group(key);
             left_working_.erase(key);
             right_working_.erase(key);
             ttl_.forget(key);
@@ -7233,6 +7885,8 @@ private:
     // process_async{1,2}; otherwise the sync path above.
     bool effective_async_ = false;
     clink::FlatMap<std::string, std::vector<LeftEntry>> left_state_;
+    PartitionedList<std::vector<LeftEntry>> exact_entries_;
+    Emitter<Row>* entry_output_{nullptr};
     WorkingSet<decltype(left_state_)> left_working_{left_state_};
     clink::FlatMap<std::string, std::int64_t> right_count_;
     WorkingSet<decltype(right_count_)> right_working_{right_count_};

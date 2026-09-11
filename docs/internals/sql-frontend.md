@@ -275,10 +275,14 @@ the disk-backed top-N heap.
 
 ### Entry-level SQL partition state
 
-With a memory budget and SQL spill directory configured, partitioned ranking,
-last-N, equi joins and interval joins keep individual entries on disk. Checkpoints
+With a memory budget and SQL spill directory configured, GROUP BY, fixed/session
+windows, OVER, ranking, last-N, equi/interval joins and null-aware exact-key probes
+keep individual entries on disk. Checkpoints
 use `.groups` length slots and `.rows` cell slots under operator-specific prefixes.
 Row cells carry the original partition's key-group byte, rather than the hash of
 their composite identifier. An operator-state `.format` marker is retained in
-all filtered restores. Legacy vector snapshots migrate on open. See
+all filtered restores. Legacy whole-partition snapshots migrate on open. GROUP BY stores metadata at
+index zero and each aggregate at subsequent indexes. OVER separates metadata and
+individual running accumulators from its pending and history lists. Windows store
+one pane per entry; sessions store one session per entry. See
 [memory budgets](memory-management.md) for allocation and recovery limits.

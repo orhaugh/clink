@@ -65,12 +65,12 @@ limit. Multiply by the number of concurrent executions when sizing a Worker.
 | --- | --- |
 | DAG local edge queues, including side outputs | Estimated retained bytes are reserved before enqueue and released on dequeue or queue destruction. Row vector capacity and string payloads are counted. SQL Rows include nested JSON and collection capacity. Arrow batches count retained buffers without materialising rows. Shared buffers are deduplicated within one batch but charged separately for separate queued references; slices count their parent buffers. |
 | Blocking exchanges | Retained IPC payload capacity and list-node allocations charge the operator domain. With a configured spill directory, payload refusal migrates the resident prefix to disk and spills subsequent batches, even below the exchange threshold. Control elements and per-batch ordering metadata remain budgeted in memory. Replay releases each entry; destruction releases remaining charges and removes spill files. |
-| SQL windowless `GROUP BY` | Incremental retained-state estimates after each touched group changes, including aggregate vectors, group values, prior changelog output and cold aggregate payloads such as distinct sets, `ARRAY_AGG` and UDAF values. Restore rebuilds charges; TTL expiry releases them. With a configured SQL spill directory, pressure switches this operator to disk-backed working groups. |
-| SQL tumbling, hopping, cumulative and session windows | Aggregate bucket estimates include every retained pane/session. Row and columnar ingest update the account; firing releases expired values. Whole keyed partitions can spill under pressure. Empty group containers retained for checkpoint replacement continue to count. |
+| SQL windowless `GROUP BY` | Incremental retained-state estimates after each touched group changes, including aggregate vectors, group values, prior changelog output and cold aggregate payloads such as distinct sets, `ARRAY_AGG` and UDAF values. Restore rebuilds charges; TTL expiry releases them. With a configured SQL spill directory, the operator stores each accumulator separately on disk. |
+| SQL tumbling, hopping, cumulative and session windows | Aggregate bucket estimates include every retained pane/session. Row and columnar ingest update the account; firing releases expired values. Configured spilling stores panes/sessions individually. Empty group containers retained for checkpoint replacement continue to count. |
 | SQL equi and interval joins | Both input maps count entry-vector capacity and nested row storage. Configured spilling stores individual rows, allowing oversized active keys; matching flags survive reload and checkpoint recovery. Interval expiry removes working and backend keys. |
-| SQL OVER and last-N aggregates | Running accumulators, pending/tie-ordered rows, bounded frame history and previous changelog output count. OVER spills whole partitions; last-N scans individual frame entries when spilling is configured. |
+| SQL OVER and last-N aggregates | Running accumulators, pending/tie-ordered rows, bounded frame history and previous changelog output count. OVER and last-N scan individual pending/history/frame entries when spilling is configured. |
 | SQL partitioned ranking | ROW_NUMBER, RANK and DENSE_RANK candidate vectors, encoded rows and derived sort values count and can spill. Configured spilling stores individual candidates, including oversized tie groups. Sort values are rebuilt on reload. |
-| SQL null-aware semi/anti joins | Exact-key maps, cross-key null probes and wildcard tuples count and can spill. Null-bearing collections store individual entries, so the whole index need not fit in RAM. Checkpoints stream entries through separate slots; legacy null-state blobs remain readable. Plain semi/anti joins retain their backend-driven path. |
+| SQL null-aware semi/anti joins | Exact-key probes, cross-key null probes and wildcard tuples count and can spill individually. Null-bearing collections store individual entries, so the whole index need not fit in RAM. Checkpoints stream entries through separate slots; legacy null-state blobs remain readable. Plain semi/anti joins retain their backend-driven path. |
 | SQL global ORDER BY LIMIT | The retained candidate heap and nested rows count. Pressure can move candidates into a disk-backed binary heap with no resident row index. Final output streams in sort order, respecting OFFSET and LIMIT. A constant number of individual rows must fit simultaneously. |
 | SQL TTL indexes | Deadline, dirty-key and pre-watermark key estimates charge the operator budget for GROUP BY, equi joins, semi/anti joins, DISTINCT and set operators. Restore rebuilds charges and expiry releases them. These indexes remain in memory and cannot spill. |
 | In-memory and file-backed backend working state | Estimated key/value storage and map overhead, checked before puts and during restore. Erase and clear release charges. Staged barrier copies have separate checkpoint charges. Binding a new domain requires an empty backend. |
@@ -151,22 +151,21 @@ CLINK_SQL_SPILL_DIR=/var/tmp/clink-sql-spill \
 clink run pipeline.sql --state-backend=rocksdb:///var/tmp/clink-state
 ```
 
-The first refused group charge writes the complete resident working map to a
-private spill directory and releases its resident groups. Subsequent
-mutations load one partition and write it back immediately, including on the
-columnar path. This favours bounded retained memory over throughput: after the switch,
-each touched group incurs synchronous file I/O and codec work. Whole-value operators still require each partition to fit within the available budget. A single growing `ARRAY_AGG`, a large
-UDAF accumulator or contention from other owners can therefore still fail.
+Configured GROUP BY, fixed/session windows, OVER, last-N, ranking and equi/interval
+joins use entry-level scratch storage from open. Null-aware exact-key probes also
+use individual entries. The remaining null indexes and global top-N switch to
+scratch on pressure. This favours bounded retained memory over throughput: each
+entry incurs synchronous file I/O and codec work. A growing `ARRAY_AGG`, a large
+UDAF accumulator or contention from other owners can still exhaust the budget.
 TTL metadata remains in RAM and can exhaust the budget independently.
-Sibling working maps within equi, interval and null-aware joins can spill each
-other on pressure before refusing a small active entry. This is operator-local
-coordination, not a global eviction policy across all budget owners.
+Sibling null-aware working maps can release each other's resident entries under
+pressure; this is operator-local coordination, not a global eviction policy.
 
 Files use the operator state codecs, preserving aggregate accumulators,
 window boundaries, join matching flags, frame ordering and prior changelog rows.
 Hashed filenames allow direct lookup without
 an in-memory index; full stored keys and content checksums are verified on
-reads. This uses one file per group under 256 hash-prefix directories, so
+reads. This uses one file per entry or partition root under 256 hash-prefix directories, so
 filesystem metadata, inode capacity and disk space matter at high cardinality.
 Writes use atomic replacement. An I/O error or invalid spill content fails the
 operator rather than treating the group as absent. A private directory is
@@ -188,7 +187,7 @@ results, batch grouping/output buffers and filesystem page cache are also
 outside this coverage. This is not an RSS cap.
 
 Watermark and cross-key mutation scans rebuild into a separate working store,
-processing one partition at a time so file replacement cannot invalidate an
+processing individual entries so file replacement cannot invalidate an
 active directory traversal. Checkpoint scans are read-only. Scratch encoding,
 decoding and output batches are temporary allocations outside these estimates.
 TTL indexes remain in RAM and fail on exhaustion; spilling never drops
@@ -220,15 +219,25 @@ checkpoint. Reading an old blob still needs temporary space for that blob;
 new snapshots avoid the whole-index encoding and decoding step. As before,
 null-aware wildcard matching requires one operator instance.
 
-With a budget and spill directory configured, partitioned ROW_NUMBER, RANK,
-DENSE_RANK, last-N aggregates, equi joins and interval joins use individual disk
-entries from open. They scan or shift entries without loading the whole active
-key. Join output is emitted in small batches. Ranking tie groups and join buffers
-can therefore exceed the tracked budget. Ordered insertion and removal can
-require linear disk I/O; this path favours bounded retained memory over throughput.
-Last-N recomputes its frame by scanning entries and charges its aggregate accumulator.
-An individual row, comparison neighbours or growing aggregate accumulator must
-still fit. Scratch codec buffers remain outside the retained-memory estimate.
+### Entry-level keyed partitions
+
+With a budget and spill directory configured, covered operators scan or shift
+individual entries without loading the whole active key:
+
+| Operator | Entry granularity and algorithm |
+| --- | --- |
+| GROUP BY | Each aggregate accumulator is separate from group values and prior changelog output. Updates and queryable lookups finalise one accumulator at a time; TTL erases all cells. |
+| Fixed windows | Each pane has its own entry. Updates locate one pane; watermark scans emit and compact expired panes. |
+| Sessions | Each session has its own entry. An arriving event scans overlaps, merges one neighbouring session at a time, and writes the merged session back in start order. |
+| OVER | Pending rows, retained frame/LAG history, first row and running accumulators are stored separately. Pending rows retain timestamp and arrival order; bounded frames are recomputed through entry scans. |
+| Null-aware joins | Exact-key probes are individual entries, preserving emitted flags through exact matches, wildcard poisoning and recovery. |
+| Ranking, last-N and equi/interval joins | Individual candidates or buffered rows, with streaming comparisons, frame recomputation and join matching. |
+
+Ordered insertion and removal can require linear disk I/O. Window/session spill
+ingest reads required Arrow columns by name and uses the row fold; GROUP BY keeps
+its append-mode per-batch grouping. Spill window firing emits row batches.
+Join and watermark output are emitted in small batches. These paths favour bounded
+retained memory over throughput and do not impose a total process RAM cap.
 
 Checkpoints store partition lengths and separate row cells. Each cell inherits
 its partition's key group, so rescaling keeps it with its root; an operator-state
@@ -238,10 +247,13 @@ temporary-directory scratch storage if the spill setting is subsequently removed
 Entry-format snapshots require a synchronous backend; deferring backend execution
 continues to use its existing state path.
 
-**An active keyed partition must still fit** for GROUP BY, fixed/session windows,
-OVER and null-aware exact-key buckets. These still materialise one key's value.
-A single large row or opaque UDAF accumulator also cannot be made bounded merely
-by moving neighbouring state to disk.
+**Individual state values must still fit.** One fixed-window pane's aggregate
+payload, one session's merged aggregate payload, an individual row, or a growing
+aggregate accumulator can still exhaust the budget. Session merging also needs
+room for the source and destination payloads. GROUP BY and OVER separate their
+running accumulators, but cannot split an opaque UDAF or a single aggregate's
+collection internally. Codec buffers, input/output batches, TTL indexes and backend
+caches retain the allocation limitations above.
 
 For Arrow growth, the pool reserves the whole new allocation while retaining the
 old charge, because a reallocation can temporarily hold both buffers. Refused

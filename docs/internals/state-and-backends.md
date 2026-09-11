@@ -244,12 +244,14 @@ because a checkpoint can hold both the working and encoded copies. See
 
 With a memory budget and `CLINK_SQL_SPILL_DIR`, covered synchronous GROUP BY,
 window/session, equi/interval join, OVER, last-N and partitioned ranking maps
-can move to local scratch files on pressure. Null-aware joins also spill their
-exact-key maps and individual cross-key null entries. Null probes and wildcard
+use entry-level scratch storage. GROUP BY and OVER split running accumulators;
+windows split panes and sessions; join buffers split rows. Null-aware joins also
+store exact-key probes and cross-key null entries individually. Null probes and wildcard
 tuples checkpoint in separate entry slots; recovery also reads the legacy
 single-blob null-state representation.
 This is separate from backend selection: spilled groups are still copied to
-the normal backend slot before a checkpoint and restored from that slot.
+entry slots before a checkpoint and restored from those slots. Legacy
+whole-partition slots remain readable for migration.
 Memory/file backends can therefore still run out of budget at checkpoint time;
 use a disk-backed backend for larger durable state. See
 [Memory budgets](memory-management.md#sql-working-map-spill) for the complete scope.

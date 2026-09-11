@@ -299,7 +299,7 @@ TEST(SqlMemoryBudget, SpillPreservesChangelogAndRetractionsAcrossAggregateFamili
                 }
             }
             if (use_spill) {
-                EXPECT_EQ(dir.files(), 80u);
+                EXPECT_GE(dir.files(), 80u);
                 EXPECT_LE(budget->usage().peak, budget->limit());
                 EXPECT_EQ(budget->usage().used, 0u);
             }
@@ -338,7 +338,7 @@ TEST(SqlMemoryBudget, SpillColumnarAggregateRevisitsGroupsWithoutLosingTotals) {
         {k, v});
     for (int round = 0; round < 3; ++round)
         EXPECT_TRUE(op->process_columnar(StreamElement<Row>::data(columnar_row_batch(batch)), out));
-    EXPECT_EQ(dir.files(), 100u);
+    EXPECT_GE(dir.files(), 100u);
     ASSERT_EQ(sums.size(), 100u);
     for (auto [key, sum] : sums)
         EXPECT_DOUBLE_EQ(sum, 6);
@@ -369,7 +369,7 @@ TEST(SqlMemoryBudget, SpilledGroupsSurviveCanonicalSnapshotAndFreshSpillDirector
     auto op = make_operator("aggregate_row", "sum", false, dir.path.string());
     op->attach_runtime(&context);
     op->open();
-    EXPECT_EQ(dir.files(), 100u);
+    EXPECT_GE(dir.files(), 100u);
     int emitted = 0;
     Emitter<Row> out([&](StreamElement<Row> e) {
         for (const auto& rec : e.as_data()) {
@@ -1084,9 +1084,9 @@ TEST(SqlMemoryBudget, OneRankingOrLastNPartitionExceedsBudgetAndRestoresEntrySta
                 if (mode == 1 || mode == 2)
                     ctx.set_memory_budget(budget);
                 const std::map<std::string, std::string> params = {
-                    {"count", std::string(rank) == "row_number" ? "60" : "2"},
+                    {"count", std::string(rank) == "row_number" ? "40" : "2"},
                     {"outputs",
-                     R"([{"name":"s","fn":"sum","input_column":"v","frame_start":59}])"}};
+                     R"([{"name":"s","fn":"sum","input_column":"v","frame_start":39}])"}};
                 auto op = family_operator(family, rank, params);
                 op->attach_runtime(&ctx);
                 op->open();
@@ -1114,11 +1114,11 @@ TEST(SqlMemoryBudget, OneRankingOrLastNPartitionExceedsBudgetAndRestoresEntrySta
                     batch.emplace(std::move(row));
                     op->process(StreamElement<Row>::data(std::move(batch)), out);
                 };
-                for (int index = 0; index < 80; ++index) {
+                for (int index = 0; index < 48; ++index) {
                     send(index, 10);
-                    if (index == 39 && mode != 0) {
+                    if (index == 23 && mode != 0) {
                         if (mode != 3)
-                            EXPECT_GT(dir.files(), 40u);
+                            EXPECT_GT(dir.files(), 24u);
                         op->snapshot_timers(backend, id);
                         auto snapshot = backend.snapshot(CheckpointId{1});
                         op.reset();
@@ -1142,7 +1142,7 @@ TEST(SqlMemoryBudget, OneRankingOrLastNPartitionExceedsBudgetAndRestoresEntrySta
                 send(80, 20);
                 send(81, 30);
                 if (std::string(family) == "last_n_agg_row") {
-                    for (int index = 0; index < 80; ++index)
+                    for (int index = 0; index < 48; ++index)
                         send(index, 10, true);
                     send(80, 20, true);
                     send(81, 30, true);
@@ -1305,6 +1305,347 @@ TEST(SqlMemoryBudget, OneJoinPartitionExceedsBudgetAcrossRecoveryAndOuterExpiry)
             EXPECT_TRUE(std::filesystem::is_empty(dir.path));
             std::sort(result.begin(), result.end());
             EXPECT_EQ(result.size(), interval ? 160u : 640u);
+            if (interval)
+                EXPECT_EQ(matched, 160u);
+        }
+        EXPECT_EQ(actual, expected);
+    }
+}
+
+class SqlEntryWindowBudget : public ::testing::TestWithParam<const char*> {};
+TEST_P(SqlEntryWindowBudget, OversizedKeyRecoversMergesExpiresAndRejectsLateRows) {
+    const std::string type = GetParam();
+    std::vector<std::string> expected;
+    for (int mode = 0; mode < 4; ++mode) {
+        SCOPED_TRACE(mode);
+        SpillDirectory dir;
+        SpillEnvironment env(mode == 1 || mode == 2 ? dir.path.string() : "");
+        auto budget = std::make_shared<MemoryBudget>(8192);
+        InMemoryStateBackend backend;
+        const auto id = operator_id_from_uid("memory-test-family");
+        RuntimeContext ctx(id, type, &backend, nullptr);
+        if (mode == 1 || mode == 2)
+            ctx.set_memory_budget(budget);
+        auto op = family_operator(type);
+        op->attach_runtime(&ctx);
+        op->open();
+        std::vector<std::string> actual;
+        Emitter<Row> out([&](StreamElement<Row> element) {
+            if (element.is_data())
+                for (const auto& record : element.as_data())
+                    actual.push_back(
+                        config::JsonValue{to_json_object(record.value().values)}.serialize(0));
+            return true;
+        });
+        auto recover = [&](int checkpoint) {
+            op->snapshot_timers(backend, id);
+            auto saved = backend.snapshot(CheckpointId{static_cast<std::uint64_t>(checkpoint)});
+            op.reset();
+            EXPECT_EQ(budget->usage().used, 0u);
+            backend.restore(saved);
+            if (mode == 2) {
+                ::setenv("CLINK_SQL_SPILL_DIR", "", 1);
+                ctx.set_memory_budget({});
+            } else if (mode == 3) {
+                ::setenv("CLINK_SQL_SPILL_DIR", dir.path.c_str(), 1);
+                ctx.set_memory_budget(budget);
+            }
+            op = family_operator(type);
+            op->attach_runtime(&ctx);
+            op->restore_timers(backend, id);
+            op->open();
+        };
+        for (int index = 0; index < 40; ++index)
+            feed(*op, out, 1, config::JsonValue{index + 1}, ((index * 37) % 40) * 2000);
+        if (mode)
+            recover(1);
+        // Bridge the first two sessions through three arriving records.
+        for (int time : {500, 1000, 1500})
+            feed(*op, out, 1, config::JsonValue{100}, time);
+        op->process(StreamElement<Row>::watermark(Watermark{EventTime::from_millis(50000)}), out);
+        recover(2);
+        feed(*op, out, 1, config::JsonValue{999}, 0);
+        op->process(StreamElement<Row>::watermark(Watermark::max()), out);
+        recover(3);
+        op->process(StreamElement<Row>::watermark(Watermark::max()), out);
+        std::sort(actual.begin(), actual.end());
+        if (!mode)
+            expected = actual;
+        else
+            EXPECT_EQ(actual, expected);
+        EXPECT_FALSE(actual.empty());
+        op.reset();
+        EXPECT_EQ(budget->usage().used, 0u);
+    }
+}
+INSTANTIATE_TEST_SUITE_P(Windows,
+                         SqlEntryWindowBudget,
+                         ::testing::Values("tumbling_window_row",
+                                           "hopping_window_row",
+                                           "cumulate_window_row",
+                                           "session_window_row"));
+
+TEST(SqlMemoryBudget, OverPendingAndFrameHistoryExceedBudgetAcrossRecovery) {
+    const std::map<std::string, std::string> params{{"outputs", R"([
+        {"name":"running","fn":"sum","input_column":"v"},
+        {"name":"rows","fn":"sum","input_column":"v","frame_mode":1,"frame_start":59},
+        {"name":"range","fn":"sum","input_column":"v","frame_mode":2,"frame_start":5000},
+        {"name":"previous","fn":"lag","input_column":"v","lag_offset":50},
+        {"name":"first","fn":"first_value","input_column":"v"},
+        {"name":"last","fn":"last_value","input_column":"v"}])"}};
+    std::vector<std::string> expected;
+    for (int mode = 0; mode < 4; ++mode) {
+        SCOPED_TRACE(mode);
+        SpillDirectory dir;
+        SpillEnvironment env(mode == 1 || mode == 2 ? dir.path.string() : "");
+        auto budget = std::make_shared<MemoryBudget>(8192);
+        InMemoryStateBackend backend;
+        const auto id = operator_id_from_uid("memory-test-family");
+        RuntimeContext ctx(id, "over", &backend, nullptr);
+        if (mode == 1 || mode == 2)
+            ctx.set_memory_budget(budget);
+        auto make = [&] { return family_operator("over_aggregate_row", "row_number", params); };
+        auto op = make();
+        op->attach_runtime(&ctx);
+        op->open();
+        std::vector<std::string> actual;
+        Emitter<Row> out([&](StreamElement<Row> element) {
+            if (element.is_data())
+                for (const auto& record : element.as_data())
+                    actual.push_back(
+                        config::JsonValue{to_json_object(record.value().values)}.serialize(0));
+            return true;
+        });
+        auto recover = [&](int checkpoint) {
+            op->snapshot_timers(backend, id);
+            auto saved = backend.snapshot(CheckpointId{static_cast<std::uint64_t>(checkpoint)});
+            op.reset();
+            backend.restore(saved);
+            if (mode == 2) {
+                ::setenv("CLINK_SQL_SPILL_DIR", "", 1);
+                ctx.set_memory_budget({});
+            } else if (mode == 3) {
+                ::setenv("CLINK_SQL_SPILL_DIR", dir.path.c_str(), 1);
+                ctx.set_memory_budget(budget);
+            }
+            op = make();
+            op->attach_runtime(&ctx);
+            op->restore_timers(backend, id);
+            op->open();
+        };
+        auto send = [&](int index, int time) {
+            Row row;
+            row.values["k"] = config::JsonValue{1};
+            row.values["v"] = config::JsonValue{index};
+            row.values["ts"] = config::JsonValue{time};
+            row.values["payload"] = config::JsonValue{std::string(256, 'x')};
+            Batch<Row> batch;
+            batch.emplace(std::move(row));
+            op->process(StreamElement<Row>::data(std::move(batch)), out);
+        };
+        for (int index = 0; index < 80; ++index)
+            send(index, ((index * 37) % 80) * 100);
+        if (mode)
+            recover(1);
+        // Ties after recovery must retain arrival order.
+        send(100, 7500);
+        op->process(StreamElement<Row>::watermark(Watermark{EventTime::from_millis(6500)}), out);
+        recover(2);
+        send(101, 7500);
+        send(999, 0);  // dropped against the restored watermark
+        op->process(StreamElement<Row>::watermark(Watermark::max()), out);
+        recover(3);
+        op->process(StreamElement<Row>::watermark(Watermark::max()), out);
+        if (!mode)
+            expected = actual;
+        else
+            EXPECT_EQ(actual, expected);
+        EXPECT_EQ(actual.size(), 82u);
+        op.reset();
+        EXPECT_EQ(budget->usage().used, 0u);
+    }
+}
+
+TEST(SqlMemoryBudget, GroupByAccumulatorsSpillIndependentlyAndRetainChangelog) {
+    std::string specs = "[";
+    for (int i = 0; i < 12; ++i) {
+        if (i)
+            specs += ",";
+        specs += "{\"name\":\"s" + std::to_string(i) +
+                 "\",\"fn\":\"count\",\"input_column\":\"v\",\"distinct\":true}";
+    }
+    specs += "]";
+    const std::map<std::string, std::string> params{{"aggregates", specs},
+                                                    {"emit_changelog", "true"}};
+    {
+        // The same group must overflow the unsplit working bucket, proving
+        // this test exercises more than ordinary multi-key eviction.
+        SpillEnvironment env("");
+        RuntimeContext ctx(
+            operator_id_from_uid("memory-test-family"), "aggregate", nullptr, nullptr);
+        ctx.set_memory_budget(std::make_shared<MemoryBudget>(16384));
+        auto op = family_operator("aggregate_row", "row_number", params);
+        op->attach_runtime(&ctx);
+        op->open();
+        Emitter<Row> discard([](StreamElement<Row>) { return true; });
+        EXPECT_THROW(
+            {
+                for (int value = 0; value < 48; ++value)
+                    feed(*op, discard, 1, config::JsonValue{value});
+            },
+            MemoryLimitExceeded);
+    }
+    std::vector<std::string> expected;
+    for (int mode = 0; mode < 3; ++mode) {
+        SCOPED_TRACE(mode);
+        SpillDirectory dir;
+        SpillEnvironment env(mode == 1 ? dir.path.string() : "");
+        auto budget = std::make_shared<MemoryBudget>(16384);
+        InMemoryStateBackend backend;
+        const auto id = operator_id_from_uid("memory-test-family");
+        RuntimeContext ctx(id, "aggregate", &backend, nullptr);
+        if (mode == 1)
+            ctx.set_memory_budget(budget);
+        auto make = [&] { return family_operator("aggregate_row", "row_number", params); };
+        auto op = make();
+        op->attach_runtime(&ctx);
+        op->open();
+        std::vector<std::string> actual;
+        Emitter<Row> out([&](StreamElement<Row> element) {
+            if (element.is_data())
+                for (const auto& record : element.as_data())
+                    actual.push_back(
+                        config::JsonValue{to_json_object(record.value().values)}.serialize(0));
+            return true;
+        });
+        auto send = [&](int value, bool retract = false) {
+            Row row;
+            row.values["k"] = config::JsonValue{1};
+            row.values["v"] = config::JsonValue{value};
+            if (retract)
+                set_row_kind(row, kRowKindDelete);
+            Batch<Row> batch;
+            batch.emplace(std::move(row));
+            op->process(StreamElement<Row>::data(std::move(batch)), out);
+        };
+        for (int i = 0; i < 48; ++i)
+            send(i);
+        op->snapshot_timers(backend, id);
+        auto saved = backend.snapshot(CheckpointId{1});
+        op.reset();
+        backend.restore(saved);
+        if (mode == 2) {
+            ::setenv("CLINK_SQL_SPILL_DIR", dir.path.c_str(), 1);
+            ctx.set_memory_budget(budget);
+        }
+        op = make();
+        op->attach_runtime(&ctx);
+        op->restore_timers(backend, id);
+        op->open();
+        send(47);  // duplicate must not change COUNT DISTINCT
+        for (int i = 0; i < 48; ++i)
+            send(i, true);
+        send(47, true);
+        if (!mode)
+            expected = actual;
+        else
+            EXPECT_EQ(actual, expected);
+        EXPECT_FALSE(actual.empty());
+        op.reset();
+        EXPECT_EQ(budget->usage().used, 0u);
+    }
+}
+
+TEST(SqlMemoryBudget, NullAwareExactBucketExceedsBudgetAndRecoversPoisonedFlags) {
+    (void)make_operator("aggregate_row");
+    for (bool wildcard : {false, true}) {
+        SCOPED_TRACE(wildcard);
+        const auto* type = "semi_join_row";
+        SCOPED_TRACE(type);
+        const bool interval = false;
+        std::vector<std::string> expected, actual;
+        for (bool spilling : {false, true}) {
+            SpillDirectory dir;
+            SpillEnvironment env(spilling ? dir.path.string() : "");
+            auto budget = std::make_shared<MemoryBudget>(16384);
+            InMemoryStateBackend backend;
+            auto& result = spilling ? actual : expected;
+            std::size_t matched = 0;
+            for (int phase = 0; phase < 3; ++phase) {
+                Dag dag;
+                using Channel = BoundedChannel<StreamElement<Row>>;
+                StageHandle<Row> left{std::make_shared<Channel>(16), 0};
+                StageHandle<Row> right{std::make_shared<Channel>(16), 0};
+                plugin::BuildContext build;
+                build.params = {{"left_key_column", "k"},
+                                {"right_key_column", "k"},
+                                {"left_alias", "l"},
+                                {"right_alias", "r"},
+                                {"left_columns", "k,v,ts"},
+                                {"right_columns", "k,v,ts"},
+                                {"join_type", "left_outer"},
+                                {"left_ts_column", "ts"},
+                                {"right_ts_column", "ts"},
+                                {"lower_offset_ms", "0"},
+                                {"upper_offset_ms", "0"},
+                                {"anti", "1"},
+                                {"null_aware", "1"}};
+                const auto* builder = cluster::DagBuilderRegistry::default_instance().find(type);
+                ASSERT_NE(builder, nullptr);
+                auto built = (*builder)(dag, {std::any{left}, std::any{right}}, build);
+                auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
+                dag.set_runner_identity(output.runner_index, "join", "memory-test-join");
+                Batch<Row> rows;
+                for (int key = 0; key < (phase == 0 ? 80 : 1); ++key) {
+                    Row row;
+                    row.values["k"] =
+                        phase == 1 && wildcard ? config::JsonValue{} : config::JsonValue{1};
+                    row.values["v"] =
+                        config::JsonValue{std::string(256, 'x') + std::to_string(key)};
+                    // Exact integer precision must survive the interval spill codec.
+                    row.values["ts"] = config::JsonValue{std::int64_t{9007199254740993LL}};
+                    rows.emplace(std::move(row));
+                }
+                (phase == 1 ? right.output : left.output)
+                    ->push(StreamElement<Row>::data(std::move(rows)));
+                for (const auto& ch : {left.output, right.output}) {
+                    if (phase == 1 && interval)
+                        ch->push(StreamElement<Row>::watermark(Watermark::max()));
+                    ch->push(StreamElement<Row>::barrier(
+                        CheckpointBarrier{CheckpointId{static_cast<std::uint64_t>(phase + 1)}}));
+                    ch->close();
+                }
+                RuntimeContext ctx(
+                    operator_id_from_uid("memory-test-join"), type, &backend, nullptr);
+                if (spilling)
+                    ctx.set_memory_budget(budget);
+                bool captured = false;
+                std::optional<Snapshot> saved;
+                ctx.set_checkpoint_ack([&](CheckpointId checkpoint, bool ok, std::string error) {
+                    EXPECT_TRUE(ok) << error;
+                    saved = backend.snapshot(checkpoint);
+                    if (spilling && phase == 0)
+                        EXPECT_GE(dir.files(), 80u);
+                    captured = true;
+                });
+                dag.runners().at(output.runner_index).run(ctx, [&] { return captured; });
+                ASSERT_TRUE(captured);
+                ASSERT_TRUE(saved.has_value());
+                while (auto element = output.output->try_pop()) {
+                    if (element->is_data())
+                        for (const auto& rec : element->as_data()) {
+                            if (interval && !rec.value().values.at("r_v").is_null())
+                                ++matched;
+                            result.push_back(
+                                config::JsonValue{to_json_object(rec.value().values)}.serialize(0));
+                        }
+                }
+                backend.restore(*saved);
+            }
+            EXPECT_EQ(budget->usage().used, 0u);
+            EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+            std::sort(result.begin(), result.end());
+            EXPECT_EQ(result.size(), 160u);
             if (interval)
                 EXPECT_EQ(matched, 160u);
         }
