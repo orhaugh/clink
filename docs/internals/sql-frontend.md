@@ -272,3 +272,13 @@ the disk-backed top-N heap.
 - [./async-state-execution.md](./async-state-execution.md) - the async-state aggregation path enabled by `set_async_state_for_aggregation`
 - [./state-and-backends.md](./state-and-backends.md) - keyed state behind the stateful logical nodes
 - [../connectors/README.md](../connectors/README.md) - the source and sink connectors the `connector='...'` mapping targets
+
+### Entry-level SQL partition state
+
+With a memory budget and SQL spill directory configured, partitioned ranking,
+last-N, equi joins and interval joins keep individual entries on disk. Checkpoints
+use `.groups` length slots and `.rows` cell slots under operator-specific prefixes.
+Row cells carry the original partition's key-group byte, rather than the hash of
+their composite identifier. An operator-state `.format` marker is retained in
+all filtered restores. Legacy vector snapshots migrate on open. See
+[memory budgets](memory-management.md) for allocation and recovery limits.

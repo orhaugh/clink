@@ -62,6 +62,7 @@
 #include "clink/sql/json_string_to_row_columnar.hpp"
 #include "clink/sql/model_provider.hpp"
 #include "clink/sql/parser.hpp"
+#include "clink/sql/partitioned_list.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
@@ -4107,10 +4108,8 @@ private:
 // upstream delete is paired with a same-close-time re-insert when a winning
 // bid changes); document it for other changelog inputs.
 //
-// DURABILITY: the per-key window lives in a plain in-RAM map with no
-// snapshot/restore (same as TopNPerKeyRowOp / OverAggregateRowOp), so
-// exactly-once across failover relies on deterministic source replay, not
-// checkpointed operator state.
+// Synchronous checkpoints retain the frame and prior changelog row. With
+// configured scratch storage, frame rows are stored and restored individually.
 class LastNAggRowOp final : public Operator<Row, Row> {
 public:
     LastNAggRowOp(std::vector<std::string> partition_columns,
@@ -4135,7 +4134,14 @@ public:
         if (element.is_data()) {
             Batch<Row> emit_batch;
             for (const auto& rec : element.as_data()) {
-                handle_(rec.value(), emit_batch);
+                if (entries_.enabled())
+                    handle_entries_(rec.value(), emit_batch);
+                else
+                    handle_(rec.value(), emit_batch);
+                if (entries_.enabled() && emit_batch.size() >= 64) {
+                    out.emit_data(std::move(emit_batch));
+                    emit_batch = Batch<Row>{};
+                }
             }
             if (!emit_batch.empty())
                 out.emit_data(std::move(emit_batch));
@@ -4176,6 +4182,27 @@ public:
         persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                          !this->runtime()->state_backend()->supports_async_get();
 
+        if (entries_.bind(this->runtime(), "lastn.entries", row_json_codec(), [](const Row& row) {
+                return row.retained_bytes();
+            })) {
+            if (!prior_entries_.bind(
+                    this->runtime(), "lastn.prior", row_json_codec(), [](const Row& row) {
+                        return row.retained_bytes();
+                    }))
+                throw std::runtime_error("SQL_SPILL_ERROR: missing last-N prior state format");
+            if (entries_.restored() != prior_entries_.restored())
+                throw std::runtime_error("SQL_SPILL_ERROR: inconsistent last-N state format");
+            if (!entries_.restored() && persist_inmem_) {
+                keyed_state_().scan([&](const auto& key, const PartState& state) {
+                    for (const auto& row : state.window)
+                        entries_.append(key, row);
+                    if (state.prior_emitted)
+                        prior_entries_.append(key, *state.prior_emitted);
+                });
+            }
+            return;
+        }
+
         working_.bind(this->runtime() ? this->runtime()->memory_budget() : nullptr,
                       part_state_codec(),
                       [](const PartState& st) {
@@ -4200,6 +4227,16 @@ public:
                          OperatorId op_id,
                          const std::string& slot = "") override {
         Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (entries_.enabled()) {
+            entries_.snapshot();
+            prior_entries_.snapshot();
+            if (this->runtime() && this->runtime()->has_state_backend()) {
+                auto legacy = keyed_state_();
+                entries_.groups([&](const auto& key, auto) { legacy.erase(key); });
+                prior_entries_.groups([&](const auto& key, auto) { legacy.erase(key); });
+            }
+            return;
+        }
         if (!persist_inmem_) {
             return;
         }
@@ -4256,6 +4293,76 @@ private:
 
     static bool rows_equal_(const Row& a, const Row& b) {
         return serialize_bare_(a) == serialize_bare_(b);
+    }
+
+    void handle_entries_(const Row& row, Batch<Row>& batch) {
+        const auto key = partition_key_(row);
+        const Row bare = bare_(row);
+        const bool retract = has_row_kind(row) && is_delete_like(row_kind_of(row));
+        if (retract) {
+            const auto encoded = serialize_bare_(bare);
+            std::optional<std::uint64_t> position;
+            entries_.scan(key, [&](auto index, const Row& value) {
+                if (serialize_bare_(value) != encoded)
+                    return true;
+                position = index;
+                return false;
+            });
+            if (position)
+                entries_.erase(key, *position);
+        } else {
+            std::uint64_t position = 0;
+            entries_.scan(key, [&](auto, const Row& value) {
+                if (order_before_(bare, value))
+                    return false;
+                ++position;
+                return true;
+            });
+            entries_.insert(key, position, bare);
+            if (entries_.size(key) > static_cast<std::uint64_t>(capacity_))
+                entries_.erase(key, 0);
+        }
+        std::optional<PartitionedList<Row>::Entry> prior;
+        if (prior_entries_.size(key))
+            prior = prior_entries_.at(key, 0);
+        const auto count = entries_.size(key);
+        if (!count) {
+            if (prior) {
+                Row deleted = prior->value;
+                set_row_kind(deleted, kRowKindDelete);
+                batch.emplace(std::move(deleted));
+                prior_entries_.truncate(key, 0);
+            }
+            return;
+        }
+        Row result;
+        for (const auto& column : partition_columns_) {
+            auto value = row.values.find(column);
+            result.values[column] = value != row.values.end() ? value->second : config::JsonValue{};
+        }
+        for (std::size_t spec = 0; spec < specs_.size(); ++spec) {
+            const auto span = static_cast<std::uint64_t>(specs_[spec].frame_start) + 1;
+            const auto start = count > span ? count - span : 0;
+            AggState accumulator;
+            MemoryReservation charge(this->runtime()->memory_budget(), MemoryCategory::State);
+            for (auto index = start; index < count; ++index) {
+                auto entry = entries_.at(key, index);
+                update_agg(accumulator, agg_specs_[spec], entry.value);
+                charge.resize(agg_state_retained_bytes(accumulator));
+            }
+            result.values[specs_[spec].output_name] = finalize_agg(accumulator, agg_specs_[spec]);
+        }
+        if (prior && rows_equal_(prior->value, result))
+            return;
+        if (prior) {
+            Row before = prior->value;
+            set_row_kind(before, kRowKindUpdateBefore);
+            batch.emplace(std::move(before));
+            prior_entries_.put(key, 0, result);
+        } else
+            prior_entries_.append(key, result);
+        set_row_kind(result, prior ? kRowKindUpdateAfter : kRowKindInsert);
+        batch.emplace(std::move(result));
     }
 
     void handle_(const Row& row, Batch<Row>& emit_batch) {
@@ -4414,6 +4521,8 @@ private:
     bool persist_inmem_ = false;
     clink::FlatMap<std::string, PartState> state_;
     WorkingSet<decltype(state_)> working_{state_};
+    PartitionedList<Row> entries_;
+    PartitionedList<Row> prior_entries_;
 };
 
 // Unbounded GROUP BY aggregator (no window TVF).
@@ -5422,7 +5531,7 @@ public:
             return;
         Batch<Row> batch;
         for (const auto& rec : element.as_data())
-            handle_(rec.value(), /*is_left=*/true, batch);
+            handle_(rec.value(), /*is_left=*/true, batch, out);
         emit_joined_(batch, out);
     }
     void process_element2(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -5431,7 +5540,7 @@ public:
             return;
         Batch<Row> batch;
         for (const auto& rec : element.as_data())
-            handle_(rec.value(), /*is_left=*/false, batch);
+            handle_(rec.value(), /*is_left=*/false, batch, out);
         emit_joined_(batch, out);
     }
 
@@ -5447,6 +5556,31 @@ public:
         ttl_.bind_memory_budget(this->runtime() ? this->runtime()->memory_budget() : nullptr);
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        if (left_entries_.bind(
+                this->runtime(), "join.left.entries", entry_codec_(), entry_bytes_)) {
+            if (!right_entries_.bind(
+                    this->runtime(), "join.right.entries", entry_codec_(), entry_bytes_) ||
+                left_entries_.restored() != right_entries_.restored())
+                throw std::runtime_error("SQL_SPILL_ERROR: inconsistent join entry format");
+            columnar_out_.reset();
+            if (this->runtime()->has_state_backend()) {
+                if (!left_entries_.restored()) {
+                    kv_left_().scan([&](const auto& key, const auto& rows) {
+                        for (const auto& row : rows)
+                            left_entries_.append(key, row);
+                    });
+                    kv_right_().scan([&](const auto& key, const auto& rows) {
+                        for (const auto& row : rows)
+                            right_entries_.append(key, row);
+                    });
+                }
+                auto deadlines = deadline_state_();
+                ttl_.restore(deadlines);
+            }
+            left_entries_.groups([&](const auto& key, auto) { ttl_.enrol_restored_key(key); });
+            right_entries_.groups([&](const auto& key, auto) { ttl_.enrol_restored_key(key); });
+            return;
+        }
         auto budget =
             this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr;
         auto estimate = [](const std::vector<Entry>& entries) {
@@ -5509,6 +5643,17 @@ public:
         CoOperator<Row, Row, Row>::snapshot_timers(backend, op_id, slot);
         if (effective_async_ || this->runtime() == nullptr ||
             !this->runtime()->has_state_backend()) {
+            return;
+        }
+        if (left_entries_.enabled()) {
+            left_entries_.snapshot();
+            right_entries_.snapshot();
+            auto left = kv_left_();
+            auto right = kv_right_();
+            left_entries_.groups([&](const auto& key, auto) { left.erase(key); });
+            right_entries_.groups([&](const auto& key, auto) { right.erase(key); });
+            auto deadlines = deadline_state_();
+            ttl_.flush(deadlines);
             return;
         }
         auto kl = kv_left_();
@@ -5746,7 +5891,107 @@ private:
         columnar_out_.emplace(std::move(cols));
     }
 
-    void handle_(const Row& row, bool is_left, Batch<Row>& batch) {
+    static std::size_t entry_bytes_(const Entry& entry) {
+        return sizeof(entry) + entry.row.retained_bytes() - sizeof(Row);
+    }
+    static Codec<Entry> entry_codec_() {
+        auto codec = entry_list_codec();
+        return {.encode = [codec](const Entry& entry) { return codec.encode({entry}); },
+                .decode = [codec](Codec<Entry>::BytesView bytes) -> std::optional<Entry> {
+                    auto rows = codec.decode(bytes);
+                    if (!rows || rows->size() != 1)
+                        return std::nullopt;
+                    return std::move(rows->front());
+                }};
+    }
+    void handle_entries_(const Row& row, bool is_left, Batch<Row>& batch, Emitter<Row>& out) {
+        const auto key = key_of_(row, is_left ? left_key_column_ : right_key_column_);
+        const bool this_outer = is_left ? left_keeps_unmatched_() : right_keeps_unmatched_();
+        const bool other_outer = is_left ? right_keeps_unmatched_() : left_keeps_unmatched_();
+        const bool retract = is_delete_like(row_kind_of(row));
+        auto flush = [&] {
+            if (batch.size() >= 64) {
+                emit_joined_(batch, out);
+                batch = Batch<Row>{};
+            }
+        };
+        if (!key) {
+            if (this_outer)
+                emit_outer_(row, is_left, retract ? kRowKindDelete : kRowKindInsert, batch);
+            flush();
+            return;
+        }
+        auto& self = is_left ? left_entries_ : right_entries_;
+        auto& other = is_left ? right_entries_ : left_entries_;
+        const auto matches = other.size(*key);
+        if (retract) {
+            std::optional<std::uint64_t> position;
+            self.scan(*key, [&](auto index, const Entry& entry) {
+                if (!entries_match_(entry, row))
+                    return true;
+                position = index;
+                return false;
+            });
+            if (!position)
+                return;
+            auto removed = self.at(*key, *position);
+            self.erase(*key, *position);
+            if (!matches) {
+                if (this_outer && removed.value.null_emitted)
+                    emit_outer_(removed.value.row, is_left, kRowKindDelete, batch);
+                flush();
+                return;
+            }
+            other.scan(*key, [&](auto, const Entry& entry) {
+                if (is_left)
+                    emit_pair_(removed.value.row, entry.row, batch, kRowKindDelete);
+                else
+                    emit_pair_(entry.row, removed.value.row, batch, kRowKindDelete);
+                flush();
+                return true;
+            });
+            if (other_outer && !self.size(*key)) {
+                for (std::uint64_t index = 0; index < matches; ++index) {
+                    auto entry = other.at(*key, index);
+                    if (!entry.value.null_emitted) {
+                        emit_outer_(entry.value.row, !is_left, kRowKindInsert, batch);
+                        entry.value.null_emitted = true;
+                        other.put(*key, index, entry.value);
+                        flush();
+                    }
+                }
+            }
+            flush();
+            return;
+        }
+        self.append(*key, Entry{row, this_outer && !matches});
+        ttl_.touch(*key);
+        if (!matches) {
+            if (this_outer)
+                emit_outer_(row, is_left, kRowKindInsert, batch);
+            flush();
+            return;
+        }
+        for (std::uint64_t index = 0; index < matches; ++index) {
+            auto entry = other.at(*key, index);
+            if (other_outer && entry.value.null_emitted) {
+                emit_outer_(entry.value.row, !is_left, kRowKindDelete, batch);
+                entry.value.null_emitted = false;
+                other.put(*key, index, entry.value);
+            }
+            if (is_left)
+                emit_pair_(row, entry.value.row, batch);
+            else
+                emit_pair_(entry.value.row, row, batch);
+            flush();
+        }
+    }
+
+    void handle_(const Row& row, bool is_left, Batch<Row>& batch, Emitter<Row>& out) {
+        if (left_entries_.enabled()) {
+            handle_entries_(row, is_left, batch, out);
+            return;
+        }
         if (!left_working_.enabled()) {
             handle_loaded_(row, is_left, batch);
             return;
@@ -6090,6 +6335,10 @@ private:
             dl.emplace(deadline_state_());
         }
         for (const auto& key : doomed) {
+            if (left_entries_.enabled()) {
+                left_entries_.erase_group(key);
+                right_entries_.erase_group(key);
+            }
             left_working_.erase(key);
             right_working_.erase(key);
             ttl_.forget(key);
@@ -6128,6 +6377,7 @@ private:
     clink::FlatMap<std::string, std::vector<Entry>, TransparentKeyHash, std::equal_to<>>
         right_state_;
     WorkingSet<decltype(right_state_)> right_working_{right_state_};
+    PartitionedList<Entry> left_entries_, right_entries_;
     std::string key_scratch_;  // key_of_scratch_'s reused buffer
 
     // build_'s precomputed output layout (see the constructor).
@@ -8090,7 +8340,14 @@ public:
         if (element.is_data()) {
             Batch<Row> emit_batch;
             for (const auto& rec : element.as_data()) {
-                handle_(rec.value(), emit_batch);
+                if (entries_.enabled())
+                    handle_entries_(rec.value(), emit_batch, out);
+                else
+                    handle_(rec.value(), emit_batch);
+                if (entries_.enabled() && emit_batch.size() >= 64) {
+                    out.emit_data(std::move(emit_batch));
+                    emit_batch = Batch<Row>{};
+                }
             }
             if (!emit_batch.empty())
                 out.emit_data(std::move(emit_batch));
@@ -8122,6 +8379,17 @@ public:
     void open() override {
         persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                          !this->runtime()->state_backend()->supports_async_get();
+
+        if (entries_.bind(this->runtime(), "topn.entries", entry_codec_(), entry_bytes_)) {
+            if (!entries_.restored() && persist_inmem_) {
+                keyed_state_().scan([&](const auto& key, const auto& rows) {
+                    for (const auto& row : rows)
+                        entries_.append(
+                            key, StoredRow{row.encoded, sort_vals_of_(decode_row_(row.encoded))});
+                });
+            }
+            return;
+        }
 
         working_.bind(this->runtime() ? this->runtime()->memory_budget() : nullptr,
                       spill_rows_codec_(),
@@ -8159,6 +8427,14 @@ public:
                          OperatorId op_id,
                          const std::string& slot = "") override {
         Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (entries_.enabled()) {
+            entries_.snapshot();
+            if (this->runtime() && this->runtime()->has_state_backend()) {
+                auto legacy = keyed_state_();
+                entries_.groups([&](const auto& key, auto) { legacy.erase(key); });
+            }
+            return;
+        }
         if (!persist_inmem_) {
             return;
         }
@@ -8320,6 +8596,77 @@ private:
         return part.size();
     }
 
+    static std::size_t entry_bytes_(const StoredRow& row) {
+        std::size_t bytes = sizeof(row) + row.encoded.capacity() + 1 +
+                            row.sort_vals.capacity() * sizeof(config::JsonValue);
+        for (const auto& value : row.sort_vals)
+            bytes += value.retained_bytes() - sizeof(value);
+        return bytes;
+    }
+    Codec<StoredRow> entry_codec_() {
+        return {.encode = [](const StoredRow& row) { return string_codec().encode(row.encoded); },
+                .decode = [this](Codec<StoredRow>::BytesView bytes) -> std::optional<StoredRow> {
+                    auto encoded = string_codec().decode(bytes);
+                    if (!encoded)
+                        return std::nullopt;
+                    auto values = sort_vals_of_(decode_row_(*encoded));
+                    return StoredRow{std::move(*encoded), std::move(values)};
+                }};
+    }
+    void handle_entries_(const Row& row, Batch<Row>& batch, Emitter<Row>& out) {
+        if (count_ <= 0)
+            return;
+        const auto key = partition_key_(row);
+        StoredRow incoming{encode_row_(row), sort_vals_of_(row)};
+        std::uint64_t position = 0;
+        entries_.scan(key, [&](auto, const auto& existing) {
+            if (!better_(existing.sort_vals, incoming.sort_vals))
+                return false;
+            ++position;
+            return true;
+        });
+        entries_.insert(key, position, incoming);
+        const auto count = entries_.size(key);
+        auto cut = std::min(count, static_cast<std::uint64_t>(count_));
+        if (rank_kind_ != OverRankKind::RowNumber) {
+            cut = count;
+            std::uint64_t group_start = 0, group_index = 0;
+            std::optional<PartitionedList<StoredRow>::Entry> previous;
+            for (std::uint64_t index = 0; index < count; ++index) {
+                auto current = entries_.at(key, index);
+                if (previous && !tied_(current.value.sort_vals, previous->value.sort_vals)) {
+                    group_start = index;
+                    ++group_index;
+                }
+                const auto rank =
+                    rank_kind_ == OverRankKind::Rank ? group_start + 1 : group_index + 1;
+                if (rank > static_cast<std::uint64_t>(count_)) {
+                    cut = index;
+                    break;
+                }
+                previous = std::move(current);
+            }
+        }
+        for (auto index = cut; index < count; ++index) {
+            if (index == position)
+                continue;
+            auto entry = entries_.at(key, index);
+            Row evicted = decode_row_(entry.value.encoded);
+            set_row_kind(evicted, kRowKindDelete);
+            batch.emplace(std::move(evicted));
+            if (batch.size() >= 64) {
+                out.emit_data(std::move(batch));
+                batch = Batch<Row>{};
+            }
+        }
+        entries_.truncate(key, cut);
+        if (position < cut) {
+            Row inserted = row;
+            set_row_kind(inserted, kRowKindInsert);
+            batch.emplace(std::move(inserted));
+        }
+    }
+
     void handle_(const Row& row, Batch<Row>& emit_batch) {
         if (!working_.enabled()) {
             handle_loaded_(row, emit_batch);
@@ -8448,6 +8795,7 @@ private:
     bool persist_inmem_ = false;
     clink::FlatMap<std::string, std::vector<StoredRow>> state_;
     WorkingSet<decltype(state_)> working_{state_};
+    PartitionedList<StoredRow> entries_;
 };
 
 // UNION ALL. Single-input identity map; the OperatorSpec
@@ -9009,6 +9357,24 @@ public:
     void open() override {
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        if (left_entries_.bind(
+                this->runtime(), "interval.left.entries", entry_codec_(), entry_bytes_)) {
+            if (!right_entries_.bind(
+                    this->runtime(), "interval.right.entries", entry_codec_(), entry_bytes_) ||
+                left_entries_.restored() != right_entries_.restored())
+                throw std::runtime_error("SQL_SPILL_ERROR: inconsistent interval entry format");
+            if (!left_entries_.restored() && this->runtime()->has_state_backend()) {
+                kv_left_().scan([&](const auto& key, const auto& rows) {
+                    for (const auto& row : rows)
+                        left_entries_.append(key, row);
+                });
+                kv_right_().scan([&](const auto& key, const auto& rows) {
+                    for (const auto& row : rows)
+                        right_entries_.append(key, row);
+                });
+            }
+            return;
+        }
         auto budget =
             this->runtime() && !effective_async_ ? this->runtime()->memory_budget() : nullptr;
         auto estimate = [](const std::vector<Buffered>& entries) {
@@ -9036,6 +9402,15 @@ public:
         CoOperator<Row, Row, Row>::snapshot_timers(backend, id, slot);
         if (effective_async_ || !this->runtime() || !this->runtime()->has_state_backend())
             return;
+        if (left_entries_.enabled()) {
+            left_entries_.snapshot();
+            right_entries_.snapshot();
+            auto left = kv_left_();
+            auto right = kv_right_();
+            left_entries_.groups([&](const auto& key, auto) { left.erase(key); });
+            right_entries_.groups([&](const auto& key, auto) { right.erase(key); });
+            return;
+        }
         auto left = kv_left_();
         auto right = kv_right_();
         left_working_.scan([&](const auto& key, const auto& rows) { left.put(key, rows); });
@@ -9073,6 +9448,22 @@ public:
     }
 
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
+        if (left_entries_.enabled()) {
+            if (!wm.is_idle()) {
+                prune_entries_(left_entries_,
+                               sat_sub_(wm.timestamp().millis(), lower_offset_ms_),
+                               left_keeps_unmatched_(),
+                               true,
+                               out);
+                prune_entries_(right_entries_,
+                               sat_sub_(wm.timestamp().millis(), upper_offset_ms_),
+                               right_keeps_unmatched_(),
+                               false,
+                               out);
+            }
+            CoOperator<Row, Row, Row>::on_watermark(wm, out);
+            return;
+        }
         if (!wm.is_idle()) {
             const auto wm_ms = wm.timestamp().millis();
             // Sync path only: prune the in-memory buffers. On the async path these
@@ -9187,7 +9578,94 @@ private:
         return out;
     }
 
+    static std::size_t entry_bytes_(const Buffered& entry) {
+        return sizeof(entry) + entry.row.retained_bytes() - sizeof(Row);
+    }
+    static Codec<Buffered> entry_codec_() {
+        auto codec = buffered_list_codec();
+        return {.encode = [codec](const Buffered& entry) { return codec.encode({entry}); },
+                .decode = [codec](Codec<Buffered>::BytesView bytes) -> std::optional<Buffered> {
+                    auto rows = codec.decode(bytes);
+                    if (!rows || rows->size() != 1)
+                        return std::nullopt;
+                    return std::move(rows->front());
+                }};
+    }
+    void handle_entries_(const Row& row, bool is_left, Emitter<Row>& out) {
+        auto timestamp = ts_value(row, is_left ? left_ts_column_ : right_ts_column_);
+        if (!timestamp)
+            return;
+        const auto key = key_string(row, is_left ? left_key_column_ : right_key_column_);
+        auto& self = is_left ? left_entries_ : right_entries_;
+        auto& other = is_left ? right_entries_ : left_entries_;
+        const auto count = other.size(key);
+        bool matched = false;
+        Batch<Row> batch;
+        for (std::uint64_t index = 0; index < count; ++index) {
+            auto entry = other.at(key, index);
+            const auto delta = is_left ? static_cast<__int128>(*timestamp) - entry.value.ts
+                                       : static_cast<__int128>(entry.value.ts) - *timestamp;
+            if (delta < lower_offset_ms_ || delta > upper_offset_ms_)
+                continue;
+            batch.emplace(is_left ? build_joined_(row, entry.value.row)
+                                  : build_joined_(entry.value.row, row));
+            matched = true;
+            if (!entry.value.matched) {
+                entry.value.matched = true;
+                other.put(key, index, entry.value);
+            }
+            if (batch.size() >= 64) {
+                out.emit_data(std::move(batch));
+                batch = Batch<Row>{};
+            }
+        }
+        self.append(key, Buffered{*timestamp, row, matched});
+        if (!batch.empty())
+            out.emit_data(std::move(batch));
+    }
+    void prune_entries_(PartitionedList<Buffered>& side,
+                        std::int64_t cutoff,
+                        bool emit_unmatched,
+                        bool is_left,
+                        Emitter<Row>& out) {
+        Batch<Row> batch;
+        side.visit_groups([&](const auto& key, auto count) {
+            std::uint64_t kept = 0;
+            for (std::uint64_t index = 0; index < count; ++index) {
+                auto entry = side.at(key, index);
+                if (entry.value.ts < cutoff) {
+                    if (emit_unmatched && !entry.value.matched) {
+                        batch.emplace(build_outer_(entry.value.row, is_left));
+                        if (batch.size() >= 64) {
+                            out.emit_data(std::move(batch));
+                            batch = Batch<Row>{};
+                        }
+                    }
+                } else {
+                    if (kept != index)
+                        side.put(key, kept, entry.value);
+                    ++kept;
+                }
+            }
+            if (kept)
+                side.truncate(key, kept);
+            else {
+                side.erase_group(key);
+                if (this->runtime()->has_state_backend()) {
+                    auto legacy = is_left ? kv_left_() : kv_right_();
+                    legacy.erase(key);
+                }
+            }
+        });
+        if (!batch.empty())
+            out.emit_data(std::move(batch));
+    }
+
     void handle_left_(const Row& l, Emitter<Row>& out) {
+        if (left_entries_.enabled()) {
+            handle_entries_(l, true, out);
+            return;
+        }
         if (!left_working_.enabled()) {
             handle_left_loaded_(l, out);
             return;
@@ -9227,6 +9705,10 @@ private:
     }
 
     void handle_right_(const Row& r, Emitter<Row>& out) {
+        if (left_entries_.enabled()) {
+            handle_entries_(r, false, out);
+            return;
+        }
         if (!left_working_.enabled()) {
             handle_right_loaded_(r, out);
             return;
@@ -9524,6 +10006,7 @@ private:
     WorkingSet<decltype(left_state_)> left_working_{left_state_};
     clink::FlatMap<std::string, std::vector<Buffered>> right_state_;
     WorkingSet<decltype(right_state_)> right_working_{right_state_};
+    PartitionedList<Buffered> left_entries_, right_entries_;
 };
 
 }  // namespace

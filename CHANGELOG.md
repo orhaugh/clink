@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Oversized ranking, last-N and equi/interval join partitions use entry-level storage.**
+With a budget and SQL spill directory configured, these operators scan individual
+rows and checkpoint them separately, preserving partition colocation on rescale.
+Legacy vector snapshots migrate on recovery. Individual rows and growing aggregate
+accumulators still need to fit; GROUP BY, fixed/session windows, OVER and
+null-aware exact-key buckets retain their whole-partition limit.
+
 **Global top-N and null wildcard collections can spill beyond RAM.** Global
 ORDER BY/LIMIT/OFFSET migrates candidates to a disk-backed heap and streams
 ordered output with a constant number of decoded rows. Null-aware joins spill

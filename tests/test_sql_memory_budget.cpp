@@ -13,6 +13,7 @@
 #include "clink/runtime/memory_budget.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/install.hpp"
+#include "clink/sql/partitioned_list.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
@@ -512,8 +513,10 @@ struct SpillEnvironment {
     }
 };
 
-std::shared_ptr<Operator<Row, Row>> family_operator(const std::string& type,
-                                                    const std::string& rank = "row_number") {
+std::shared_ptr<Operator<Row, Row>> family_operator(
+    const std::string& type,
+    const std::string& rank = "row_number",
+    const std::map<std::string, std::string>& overrides = {}) {
     (void)make_operator("aggregate_row");
     const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
         type, std::string{kChannelRow}, std::string{kChannelRow});
@@ -534,6 +537,8 @@ std::shared_ptr<Operator<Row, Row>> family_operator(const std::string& type,
                   {"rank_kind", rank},
                   {"aggregates", R"([{"name":"s","fn":"sum","input_column":"v"}])"},
                   {"outputs", R"([{"name":"s","fn":"sum","input_column":"v","frame_start":1}])"}};
+    for (const auto& [key, value] : overrides)
+        ctx.params[key] = value;
     auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(ctx));
     op->set_uid("memory-test-family");
     return op;
@@ -1058,4 +1063,251 @@ TEST(SqlMemoryBudget, NullWildcardEntriesSpillAndRecoverWithoutWholeIndexHydrati
         EXPECT_TRUE(std::filesystem::is_empty(dir.path));
     }
 }
+
+TEST(SqlMemoryBudget, OneRankingOrLastNPartitionExceedsBudgetAndRestoresEntryState) {
+    for (const auto* family : {"top_n_per_key_row", "last_n_agg_row"}) {
+        for (const auto* rank : {"row_number", "rank", "dense_rank"}) {
+            if (std::string(family) == "last_n_agg_row" && std::string(rank) != "row_number")
+                continue;
+            SCOPED_TRACE(std::string(family) + ":" + rank);
+            std::vector<std::string> expected;
+            for (int mode = 0; mode < 4; ++mode) {
+                SCOPED_TRACE(mode);
+                // 0: uninterrupted, 1: entry restore, 2: restore with no memory
+                // configuration, 3: migrate the legacy whole-partition format.
+                SpillDirectory dir;
+                SpillEnvironment env(mode == 1 || mode == 2 ? dir.path.string() : "");
+                auto budget = std::make_shared<MemoryBudget>(8192);
+                const auto id = operator_id_from_uid("memory-test-family");
+                InMemoryStateBackend backend;
+                RuntimeContext ctx(id, family, &backend, nullptr);
+                if (mode == 1 || mode == 2)
+                    ctx.set_memory_budget(budget);
+                const std::map<std::string, std::string> params = {
+                    {"count", std::string(rank) == "row_number" ? "60" : "2"},
+                    {"outputs",
+                     R"([{"name":"s","fn":"sum","input_column":"v","frame_start":59}])"}};
+                auto op = family_operator(family, rank, params);
+                op->attach_runtime(&ctx);
+                op->open();
+                std::vector<std::string> actual;
+                std::size_t largest_batch = 0;
+                Emitter<Row> out([&](StreamElement<Row> e) {
+                    if (e.is_data()) {
+                        largest_batch = std::max(largest_batch, e.as_data().size());
+                        for (const auto& rec : e.as_data())
+                            actual.push_back(
+                                config::JsonValue{to_json_object(rec.value().values)}.serialize(0));
+                    }
+                    return true;
+                });
+                auto send = [&](int index, int value, bool retract = false) {
+                    Row row;
+                    row.values["k"] = config::JsonValue{1};
+                    row.values["v"] = config::JsonValue{value};
+                    row.values["ts"] = config::JsonValue{(index * 73) % 211};
+                    row.values["payload"] =
+                        config::JsonValue{std::string(256, 'x') + std::to_string(index)};
+                    if (retract)
+                        set_row_kind(row, kRowKindDelete);
+                    Batch<Row> batch;
+                    batch.emplace(std::move(row));
+                    op->process(StreamElement<Row>::data(std::move(batch)), out);
+                };
+                for (int index = 0; index < 80; ++index) {
+                    send(index, 10);
+                    if (index == 39 && mode != 0) {
+                        if (mode != 3)
+                            EXPECT_GT(dir.files(), 40u);
+                        op->snapshot_timers(backend, id);
+                        auto snapshot = backend.snapshot(CheckpointId{1});
+                        op.reset();
+                        EXPECT_EQ(budget->usage().used, 0u);
+                        EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+                        backend.restore(snapshot);
+                        if (mode == 2) {
+                            ::setenv("CLINK_SQL_SPILL_DIR", "", 1);
+                            ctx.set_memory_budget({});
+                        }
+                        if (mode == 3) {
+                            ::setenv("CLINK_SQL_SPILL_DIR", dir.path.c_str(), 1);
+                            ctx.set_memory_budget(budget);
+                        }
+                        op = family_operator(family, rank, params);
+                        op->attach_runtime(&ctx);
+                        op->restore_timers(backend, id);
+                        op->open();
+                    }
+                }
+                send(80, 20);
+                send(81, 30);
+                if (std::string(family) == "last_n_agg_row") {
+                    for (int index = 0; index < 80; ++index)
+                        send(index, 10, true);
+                    send(80, 20, true);
+                    send(81, 30, true);
+                }
+                op->snapshot_timers(backend, id);
+                auto snapshot = backend.snapshot(CheckpointId{2});
+                op.reset();
+                backend.restore(snapshot);
+                op = family_operator(family, rank, params);
+                op->attach_runtime(&ctx);
+                op->restore_timers(backend, id);
+                op->open();
+                send(162, 40);  // stale rows and drained frames must not resurrect
+                op.reset();
+                EXPECT_EQ(budget->usage().used, 0u);
+                EXPECT_LE(budget->usage().peak, budget->limit());
+                EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+                if (mode == 0)
+                    expected = actual;
+                else {
+                    EXPECT_EQ(actual, expected);
+                    EXPECT_LE(largest_batch, 64u);
+                }
+            }
+        }
+    }
+}
 }  // namespace
+
+TEST(SqlMemoryBudget, EntryPartitionsRemainCompleteAfterRescaleAndDeletion) {
+    SpillDirectory dir;
+    SpillEnvironment env(dir.path.string());
+    InMemoryStateBackend backend;
+    const auto id = operator_id_from_uid("entry-rescale");
+    RuntimeContext ctx(id, "entries", &backend, nullptr);
+    ctx.set_memory_budget(std::make_shared<MemoryBudget>(4096));
+    PartitionedList<std::string> entries;
+    ASSERT_TRUE(entries.bind(&ctx, "test", string_codec(), [](const auto& value) {
+        return sizeof(value) + value.capacity();
+    }));
+    for (int key = 0; key < 16; ++key)
+        for (int row = 0; row < 32; ++row)
+            entries.append(std::to_string(key), std::string(256, 'a') + std::to_string(row));
+    entries.snapshot();
+    entries.truncate("0", 3);
+    entries.erase_group("1");
+    entries.snapshot();
+    const auto snapshot = backend.snapshot(CheckpointId{1});
+    std::size_t total = 0;
+    for (KeyGroup first = 0; first < kNumKeyGroups; first += 16) {
+        InMemoryStateBackend restored;
+        const KeyGroupRange range{first, static_cast<KeyGroup>(first + 16)};
+        restored.restore(snapshot, range);
+        RuntimeContext restored_ctx(id, "entries", &restored, nullptr);
+        PartitionedList<std::string> recovered;
+        ASSERT_TRUE(recovered.bind(&restored_ctx, "test", string_codec(), [](const auto& value) {
+            return sizeof(value) + value.capacity();
+        }));
+        ASSERT_TRUE(recovered.restored());
+        recovered.groups([&](const auto& key, auto count) {
+            EXPECT_TRUE(range.contains(key_group_for_key(string_codec().encode(key))));
+            EXPECT_NE(key, "1");
+            EXPECT_EQ(count, key == "0" ? 3u : 32u);
+            recovered.scan(key, [&](auto index, const auto& value) {
+                EXPECT_EQ(value, std::string(256, 'a') + std::to_string(index));
+                ++total;
+                return true;
+            });
+        });
+    }
+    EXPECT_EQ(total, 14u * 32u + 3u);
+}
+
+TEST(SqlMemoryBudget, OneJoinPartitionExceedsBudgetAcrossRecoveryAndOuterExpiry) {
+    (void)make_operator("aggregate_row");
+    for (const auto* type : {"equi_join_row", "interval_join_row"}) {
+        SCOPED_TRACE(type);
+        const bool interval = std::string(type) == "interval_join_row";
+        std::vector<std::string> expected, actual;
+        for (bool spilling : {false, true}) {
+            SpillDirectory dir;
+            SpillEnvironment env(spilling ? dir.path.string() : "");
+            auto budget = std::make_shared<MemoryBudget>(16384);
+            InMemoryStateBackend backend;
+            auto& result = spilling ? actual : expected;
+            std::size_t matched = 0;
+            for (int phase = 0; phase < (interval ? 2 : 4); ++phase) {
+                Dag dag;
+                using Channel = BoundedChannel<StreamElement<Row>>;
+                StageHandle<Row> left{std::make_shared<Channel>(16), 0};
+                StageHandle<Row> right{std::make_shared<Channel>(16), 0};
+                plugin::BuildContext build;
+                build.params = {{"left_key_column", "k"},
+                                {"right_key_column", "k"},
+                                {"left_alias", "l"},
+                                {"right_alias", "r"},
+                                {"left_columns", "k,v,ts"},
+                                {"right_columns", "k,v,ts"},
+                                {"join_type", "left_outer"},
+                                {"left_ts_column", "ts"},
+                                {"right_ts_column", "ts"},
+                                {"lower_offset_ms", "0"},
+                                {"upper_offset_ms", "0"},
+                                {"anti", "1"},
+                                {"null_aware", "1"}};
+                const auto* builder = cluster::DagBuilderRegistry::default_instance().find(type);
+                ASSERT_NE(builder, nullptr);
+                auto built = (*builder)(dag, {std::any{left}, std::any{right}}, build);
+                auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
+                dag.set_runner_identity(output.runner_index, "join", "memory-test-join");
+                Batch<Row> rows;
+                for (int key = 0; key < ((phase == 0 || phase == 3) ? 80 : 2); ++key) {
+                    Row row;
+                    row.values["k"] = config::JsonValue{1};
+                    row.values["v"] =
+                        config::JsonValue{std::string(256, 'x') + std::to_string(key)};
+                    // Exact integer precision must survive the interval spill codec.
+                    row.values["ts"] = config::JsonValue{std::int64_t{9007199254740993LL}};
+                    if (phase >= 2)
+                        set_row_kind(row, kRowKindDelete);
+                    rows.emplace(std::move(row));
+                }
+                ((phase == 0 || phase == 3) ? left.output : right.output)
+                    ->push(StreamElement<Row>::data(std::move(rows)));
+                for (const auto& ch : {left.output, right.output}) {
+                    if (phase == 1 && interval)
+                        ch->push(StreamElement<Row>::watermark(Watermark::max()));
+                    ch->push(StreamElement<Row>::barrier(
+                        CheckpointBarrier{CheckpointId{static_cast<std::uint64_t>(phase + 1)}}));
+                    ch->close();
+                }
+                RuntimeContext ctx(
+                    operator_id_from_uid("memory-test-join"), type, &backend, nullptr);
+                if (spilling)
+                    ctx.set_memory_budget(budget);
+                bool captured = false;
+                std::optional<Snapshot> saved;
+                ctx.set_checkpoint_ack([&](CheckpointId checkpoint, bool ok, std::string error) {
+                    EXPECT_TRUE(ok) << error;
+                    saved = backend.snapshot(checkpoint);
+                    if (spilling && phase == 0)
+                        EXPECT_GE(dir.files(), 80u);
+                    captured = true;
+                });
+                dag.runners().at(output.runner_index).run(ctx, [&] { return captured; });
+                ASSERT_TRUE(captured);
+                ASSERT_TRUE(saved.has_value());
+                while (auto element = output.output->try_pop()) {
+                    if (element->is_data())
+                        for (const auto& rec : element->as_data()) {
+                            if (interval && !rec.value().values.at("r_v").is_null())
+                                ++matched;
+                            result.push_back(
+                                config::JsonValue{to_json_object(rec.value().values)}.serialize(0));
+                        }
+                }
+                backend.restore(*saved);
+            }
+            EXPECT_EQ(budget->usage().used, 0u);
+            EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+            std::sort(result.begin(), result.end());
+            EXPECT_EQ(result.size(), interval ? 160u : 640u);
+            if (interval)
+                EXPECT_EQ(matched, 160u);
+        }
+        EXPECT_EQ(actual, expected);
+    }
+}

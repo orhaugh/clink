@@ -456,6 +456,7 @@ include/clink/sql/model_provider.hpp
 include/clink/sql/name_suggest.hpp
 include/clink/sql/optimizer.hpp
 include/clink/sql/parser.hpp
+include/clink/sql/partitioned_list.hpp
 include/clink/sql/physical_plan.hpp
 include/clink/sql/preparse.hpp
 include/clink/sql/ptf_registry.hpp

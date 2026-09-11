@@ -124,3 +124,13 @@ SELECT slot, count(*) FROM 'state.parquet' GROUP BY slot;
 - [./state-and-backends.md](./state-and-backends.md) - the backends that produce and restore this format
 - [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md) - key groups, rescale filtering, and the state CLI verbs
 - [./checkpointing.md](./checkpointing.md) - when snapshots are taken and acknowledged
+
+### Entry-level SQL partition state
+
+With a memory budget and SQL spill directory configured, partitioned ranking,
+last-N, equi joins and interval joins keep individual entries on disk. Checkpoints
+use `.groups` length slots and `.rows` cell slots under operator-specific prefixes.
+Row cells carry the original partition's key-group byte, rather than the hash of
+their composite identifier. An operator-state `.format` marker is retained in
+all filtered restores. Legacy vector snapshots migrate on open. See
+[memory budgets](memory-management.md) for allocation and recovery limits.
