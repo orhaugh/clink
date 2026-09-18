@@ -137,8 +137,9 @@ all filtered restores. Legacy whole-partition snapshots migrate on open. GROUP B
 stores metadata at index zero and each aggregate at subsequent indexes. The
 `agg.values` companion partition stores individual values for the built-in
 distinct, retractable, percentile, string and array collections; recovery upgrades
-both the whole-partition format and the earlier per-accumulator format. OVER
+both the whole-partition format and the earlier per-accumulator format. Fixed
+windows store pane metadata separately and use `win.values` for their growing
+built-in collections, migrating earlier whole-pane entries on recovery. OVER
 separates metadata and individual running accumulators from its pending and
-history lists. Windows store one pane per entry; sessions store one session per
-entry. See
+history lists. Sessions store one session per entry. See
 [memory budgets](memory-management.md) for allocation and recovery limits.

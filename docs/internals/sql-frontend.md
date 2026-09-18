@@ -256,11 +256,11 @@ end-of-input lifecycle; it does not gain intermediate-checkpoint recovery.
 Null entries checkpoint individually; the previous null-state blob remains
 readable. Keyed state codecs preserve changelog, retraction, matching and
 ordering information, with normal backend slots supplying recovery.
-Built-in GROUP BY collections store their values separately: multiplicity cells
-for `COUNT(DISTINCT)`, retractable `MIN`/`MAX`, percentiles and `STRING_AGG`, and
-arrival-ordered cells for `ARRAY_AGG`. Individual rows, opaque aggregate payloads
-and materialised results must still fit. Global top-N needs a constant number of
-decoded rows.
+Built-in GROUP BY and fixed-window collections store their values separately:
+multiplicity cells for `COUNT(DISTINCT)`, retractable `MIN`/`MAX`, percentiles and
+`STRING_AGG`, and arrival-ordered cells for `ARRAY_AGG`. Individual rows, session
+aggregate payloads, opaque accumulators and materialised results must still fit.
+Global top-N needs a constant number of decoded rows.
 See [Memory budgets](memory-management.md) for configuration, backend requirements
 and allocation exclusions. `include/clink/sql/working_set.hpp` implements map
 accounting and streaming mutation scans; `spill_store.hpp` and
@@ -286,8 +286,9 @@ Row cells carry the original partition's key-group byte, rather than the hash of
 their composite identifier. An operator-state `.format` marker is retained in
 all filtered restores. Legacy whole-partition snapshots migrate on open. GROUP BY
 stores metadata at index zero and each aggregate at subsequent indexes. Its
-`agg.values` companion partition stores the individual values for built-in
-GROUP BY collections. Recovery also migrates the earlier per-accumulator layout.
+`agg.values` and `win.values` companion partitions store individual values for
+built-in GROUP BY collections and fixed-window panes. Recovery also migrates the
+earlier per-accumulator and whole-pane layouts.
 OVER separates metadata and individual running accumulators from its pending and
 history lists. Windows store one pane per entry; sessions store one session per
 entry. See

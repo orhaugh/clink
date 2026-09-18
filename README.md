@@ -26,8 +26,9 @@ on pressure. Configured SQL aggregate, window, join, OVER and ranking state uses
 entry-level storage to support oversized active keys. `COUNT(DISTINCT)` and
 retractable `MIN`/`MAX` also store each distinct value separately, and exact
 percentiles stream their ordered value cells. `STRING_AGG` and `ARRAY_AGG` retain
-their values as separate cells too. Individual rows, pane/session aggregate
-payloads, materialised results and opaque aggregate accumulators must still fit.
+their values as separate cells too, including inside fixed windows. Individual
+rows, session aggregate payloads, materialised results and opaque aggregate
+accumulators must still fit.
 Other covered owners refuse allocations on exhaustion. Accounting coverage is
 partial; this is not an RSS cap.
 
