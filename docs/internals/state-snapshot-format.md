@@ -139,7 +139,9 @@ stores metadata at index zero and each aggregate at subsequent indexes. The
 distinct, retractable, percentile, string and array collections; recovery upgrades
 both the whole-partition format and the earlier per-accumulator format. Fixed
 windows store pane metadata separately and use `win.values` for their growing
-built-in collections, migrating earlier whole-pane entries on recovery. OVER
-separates metadata and individual running accumulators from its pending and
-history lists. Sessions store one session per entry. See
+built-in collections, migrating earlier whole-pane entries on recovery. Sessions
+store metadata separately and use `sesswin.values`; session bridges reassign
+cells to the merged start, and recovery migrates earlier whole-session entries.
+OVER separates metadata and individual running accumulators from its pending and
+history lists. See
 [memory budgets](memory-management.md) for allocation and recovery limits.

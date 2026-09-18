@@ -53,6 +53,9 @@ std::shared_ptr<Operator<Row, Row>> make_operator(const std::string& type,
         (fn == "percentile" || fn == "approx_percentile" ? ",\"percentile\":0.37" : "") + "}]";
     context.params["time_column"] = "ts";
     context.params["size_ms"] = "1000";
+    context.params["slide_ms"] = "500";
+    context.params["step_ms"] = "250";
+    context.params["gap_ms"] = "500";
     if (ttl) {
         context.params["state_ttl_ms"] = "100";
         context.params["state_ttl_domain"] = "event_time";
@@ -1478,6 +1481,126 @@ TEST(SqlMemoryBudget, FixedWindowGrowingValueRefusesWithoutSpill) {
     RuntimeContext ctx(operator_id_from_uid("memory-test-aggregate"), "window", nullptr, nullptr);
     ctx.set_memory_budget(budget);
     auto op = make_operator("tumbling_window_row", "array_agg");
+    op->attach_runtime(&ctx);
+    op->open();
+    Emitter<Row> out([](StreamElement<Row>) { return true; });
+    bool refused = false;
+    for (int index = 0; index < 48; ++index) {
+        try {
+            feed(*op,
+                 out,
+                 1,
+                 config::JsonValue{std::string(192, 'a') + std::to_string(index)},
+                 index);
+        } catch (const MemoryLimitExceeded&) {
+            refused = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(refused);
+    op.reset();
+    EXPECT_EQ(budget->usage().used, 0u);
+}
+
+class SqlSessionValueBudget : public ::testing::TestWithParam<const char*> {};
+TEST_P(SqlSessionValueBudget, GrowingAggregateMergesRecoversAndMatchesUnboundedSession) {
+    const std::string parameter = GetParam();
+    const bool distinct = parameter == "count_distinct" || parameter == "array_agg_distinct";
+    const std::string fn = parameter == "count_distinct"
+                               ? "count"
+                               : (parameter == "array_agg_distinct" ? "array_agg" : parameter);
+    std::vector<std::string> expected;
+    for (int mode = 0; mode < 4; ++mode) {
+        SCOPED_TRACE(mode);
+        SpillDirectory dir;
+        SpillEnvironment env(mode == 1 || mode == 3 ? dir.path.string() : "");
+        auto budget = std::make_shared<MemoryBudget>(4096);
+        InMemoryStateBackend backend;
+        const auto id = operator_id_from_uid("memory-test-aggregate");
+        RuntimeContext ctx(id, "session-values", &backend, nullptr);
+        if (mode == 1 || mode == 3)
+            ctx.set_memory_budget(budget);
+        auto make = [&] {
+            return make_operator("session_window_row", fn, false, {}, false, distinct);
+        };
+        auto op = make();
+        op->attach_runtime(&ctx);
+        op->open();
+        std::vector<std::string> actual;
+        Emitter<Row> out([&](StreamElement<Row> element) {
+            if (element.is_data())
+                for (const auto& record : element.as_data())
+                    actual.push_back(
+                        config::JsonValue{to_json_object(record.value().values)}.serialize(0));
+            return true;
+        });
+        auto recover = [&] {
+            op->snapshot_timers(backend, id);
+            auto saved = backend.snapshot(CheckpointId{1});
+            op.reset();
+            backend.restore(saved);
+            if (mode == 2) {
+                ::setenv("CLINK_SQL_SPILL_DIR", dir.path.c_str(), 1);
+                ctx.set_memory_budget(budget);
+            } else if (mode == 3) {
+                ::setenv("CLINK_SQL_SPILL_DIR", "", 1);
+                ctx.set_memory_budget({});
+            }
+            op = make();
+            op->attach_runtime(&ctx);
+            op->restore_timers(backend, id);
+            op->open();
+        };
+        for (int index = 0; index < 48; ++index) {
+            const int time = index < 24 ? index : 1000 + index - 24;
+            config::JsonValue value =
+                fn == "percentile" || fn == "approx_percentile"
+                    ? config::JsonValue{(index * 37) % 48}
+                    : config::JsonValue{std::string(192, 'a') + std::to_string(index)};
+            feed(*op, out, 1, std::move(value), time);
+        }
+        if (mode)
+            recover();
+        feed(*op,
+             out,
+             1,
+             fn == "percentile" || fn == "approx_percentile"
+                 ? config::JsonValue{999}
+                 : config::JsonValue{std::string(192, 'b')},
+             500);
+        if (mode)
+            recover();
+        op->process(StreamElement<Row>::watermark(Watermark::max()), out);
+        ASSERT_EQ(actual.size(), 1u);
+        if (mode) {
+            recover();
+            op->process(StreamElement<Row>::watermark(Watermark::max()), out);
+            EXPECT_EQ(actual.size(), 1u);
+        }
+        if (mode == 0)
+            expected = actual;
+        else
+            EXPECT_EQ(actual, expected);
+        op.reset();
+        EXPECT_EQ(budget->usage().used, 0u);
+        EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+    }
+}
+INSTANTIATE_TEST_SUITE_P(Aggregates,
+                         SqlSessionValueBudget,
+                         ::testing::Values("count_distinct",
+                                           "percentile",
+                                           "approx_percentile",
+                                           "string_agg",
+                                           "array_agg",
+                                           "array_agg_distinct"));
+
+TEST(SqlMemoryBudget, SessionGrowingValueRefusesWithoutSpill) {
+    SpillEnvironment env("");
+    auto budget = std::make_shared<MemoryBudget>(4096);
+    RuntimeContext ctx(operator_id_from_uid("memory-test-aggregate"), "session", nullptr, nullptr);
+    ctx.set_memory_budget(budget);
+    auto op = make_operator("session_window_row", "array_agg");
     op->attach_runtime(&ctx);
     op->open();
     Emitter<Row> out([](StreamElement<Row>) { return true; });

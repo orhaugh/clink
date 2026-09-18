@@ -681,6 +681,13 @@ inline bool is_percentile_fn(const std::string& fn) {
     return fn == "percentile" || fn == "approx_percentile";
 }
 
+inline bool splits_aggregate_values(const AggSpec& spec) {
+    return !spec.is_udaf &&
+           ((spec.fn == "count" && spec.distinct && !spec.input_column.empty()) ||
+            ((spec.fn == "min" || spec.fn == "max") && spec.retractable) ||
+            is_percentile_fn(spec.fn) || spec.fn == "string_agg" || spec.fn == "array_agg");
+}
+
 // The sample-variance family (stddev / variance / *_samp) divides by
 // n-1; the population family (*_pop) divides by n.
 inline bool is_variance_fn(const std::string& fn) {
@@ -2346,12 +2353,7 @@ private:
                 "win", clink::string_codec(), window_map_codec());
     }
 
-    static bool split_values_(const AggSpec& spec) {
-        return !spec.is_udaf &&
-               ((spec.fn == "count" && spec.distinct && !spec.input_column.empty()) ||
-                ((spec.fn == "min" || spec.fn == "max") && spec.retractable) ||
-                is_percentile_fn(spec.fn) || spec.fn == "string_agg" || spec.fn == "array_agg");
-    }
+    static bool split_values_(const AggSpec& spec) { return splits_aggregate_values(spec); }
     bool value_less_(const WindowValueCell& a, const WindowValueCell& b) const {
         if (a.window_end != b.window_end)
             return a.window_end < b.window_end;
@@ -3064,11 +3066,39 @@ public:
                                  aggregate_bucket_retained_bytes(value);
                     return bytes;
                 })) {
+            if (std::any_of(aggregates_.begin(), aggregates_.end(), splits_aggregate_values)) {
+                values_.bind(
+                    this->runtime(),
+                    "sesswin.values",
+                    window_value_cell_codec(),
+                    [](const WindowValueCell& cell) {
+                        return sizeof(cell) + cell.key.capacity() + 1 +
+                               cell.value.retained_bytes() - sizeof(cell.value);
+                    },
+                    {},
+                    /*companion=*/true);
+                if (values_.restored() && !entries_.restored())
+                    throw std::runtime_error(
+                        "SQL_SPILL_ERROR: session value format has no session metadata");
+            }
             if (persist_inmem_ && !entries_.restored())
                 keyed_state_().scan([&](const auto& key, const auto& values) {
-                    for (const auto& value : values)
-                        entries_.append(key, EntryMap{value});
+                    for (const auto& value : values) {
+                        Session session = value.second;
+                        migrate_values_(key, value.first, session);
+                        entries_.append(key, EntryMap{{value.first, std::move(session)}});
+                    }
                 });
+            if (entries_.restored() && values_.enabled() && !values_.restored()) {
+                entries_.groups([&](const auto& key, auto count) {
+                    for (std::uint64_t index = 0; index < count; ++index) {
+                        auto entry = entries_.at(key, index);
+                        auto& [start, session] = *entry.value.begin();
+                        migrate_values_(key, start, session);
+                        entries_.put(key, index, entry.value);
+                    }
+                });
+            }
             return;
         }
 
@@ -3117,6 +3147,8 @@ public:
                                     wm_bytes.size()});
         if (entries_.enabled()) {
             entries_.snapshot();
+            if (values_.enabled())
+                values_.snapshot();
             if (persist_inmem_) {
                 auto legacy = keyed_state_();
                 entries_.groups([&](const auto& key, auto) { legacy.erase(key); });
@@ -3314,7 +3346,10 @@ private:
                   "Session grew, and it is allocated once per live session. Per-session "
                   "storage for a new aggregate family belongs in AggStateExtras.");
 
-    static void merge_into(Session& dst, Session& src, const std::vector<AggSpec>& specs) {
+    static void merge_into(Session& dst,
+                           Session& src,
+                           const std::vector<AggSpec>& specs,
+                           bool split_values = false) {
         dst.start = std::min(dst.start, src.start);
         dst.end = std::max(dst.end, src.end);
         for (std::size_t i = 0; i < specs.size(); ++i) {
@@ -3349,6 +3384,8 @@ private:
                 }
                 continue;
             }
+            if (split_values && splits_aggregate_values(spec))
+                continue;
             // Generic accumulator merge. Every aggregate reads only its own
             // AggState fields at finalize, so merging all of them when two
             // sessions combine is safe and keeps SUM/AVG/COUNT, the variance
@@ -3529,6 +3566,251 @@ private:
         return new_start;
     }
 
+    bool value_less_(const WindowValueCell& a, const WindowValueCell& b) const {
+        if (a.aggregate != b.aggregate)
+            return a.aggregate < b.aggregate;
+        const auto& fn = aggregates_.at(a.aggregate).fn;
+        return fn == "count" || fn == "string_agg" ? a.key < b.key
+                                                   : JsonValueLess{}(a.value, b.value);
+    }
+    void add_value_cell_(const std::string& key, WindowValueCell incoming) {
+        const auto& spec = aggregates_.at(incoming.aggregate);
+        if (spec.fn == "array_agg") {
+            values_.append(key, incoming);
+            return;
+        }
+        std::uint64_t position = 0;
+        bool found = false;
+        bool insert_here = false;
+        values_.scan(key, [&](auto, const WindowValueCell& existing) {
+            if (existing.window_end == incoming.window_end &&
+                existing.aggregate == incoming.aggregate) {
+                if (!value_less_(existing, incoming) && !value_less_(incoming, existing)) {
+                    found = true;
+                    return false;
+                }
+                if ((is_percentile_fn(spec.fn) || spec.fn == "string_agg") &&
+                    value_less_(incoming, existing)) {
+                    insert_here = true;
+                    return false;
+                }
+            }
+            ++position;
+            return true;
+        });
+        if (found) {
+            auto entry = values_.at(key, position);
+            if (incoming.count > std::numeric_limits<std::int64_t>::max() - entry.value.count)
+                throw std::runtime_error("SQL_STATE_ERROR: aggregate multiplicity overflow");
+            entry.value.count += incoming.count;
+            values_.put(key, position, entry.value);
+        } else if (insert_here) {
+            values_.insert(key, position, incoming);
+        } else {
+            values_.append(key, incoming);
+        }
+    }
+    void migrate_values_(const std::string& key, std::int64_t start, Session& session) {
+        if (!values_.enabled())
+            return;
+        for (std::size_t aggregate = 0; aggregate < aggregates_.size(); ++aggregate) {
+            if (!splits_aggregate_values(aggregates_[aggregate]))
+                continue;
+            auto& state = session.agg_states[aggregate];
+            const auto& spec = aggregates_[aggregate];
+            if (spec.fn == "count" || spec.fn == "string_agg") {
+                for (const auto& [value, count] : state.extras_read().value_counts)
+                    add_value_cell_(key, WindowValueCell{start, aggregate, value, {}, count});
+                if (state.cold)
+                    state.cold->value_counts.clear();
+            } else if (spec.fn == "array_agg") {
+                for (const auto& value : state.extras_read().array_values)
+                    add_value_cell_(key, WindowValueCell{start, aggregate, {}, value, 1});
+                if (state.cold)
+                    state.cold->array_values.clear();
+            } else if (is_percentile_fn(spec.fn)) {
+                auto& old = state.extras().percentile_values;
+                std::sort(old.begin(), old.end());
+                for (const auto value : old)
+                    add_value_cell_(
+                        key, WindowValueCell{start, aggregate, {}, config::JsonValue{value}, 1});
+                if (state.cold)
+                    state.cold->percentile_values.clear();
+            } else {
+                for (const auto& [value, count] : state.extras_read().minmax_counts)
+                    add_value_cell_(key, WindowValueCell{start, aggregate, {}, value, count});
+                if (state.cold)
+                    state.cold->minmax_counts.clear();
+            }
+        }
+    }
+    void merge_value_owner_(const std::string& key, std::int64_t source, std::int64_t target) {
+        if (!values_.enabled() || source == target)
+            return;
+        for (;;) {
+            std::uint64_t position = 0;
+            bool found = false;
+            values_.scan(key, [&](auto, const WindowValueCell& cell) {
+                if (cell.window_end == source) {
+                    found = true;
+                    return false;
+                }
+                ++position;
+                return true;
+            });
+            if (!found)
+                return;
+            auto entry = values_.at(key, position);
+            values_.erase(key, position);
+            entry.value.window_end = target;
+            add_value_cell_(key, std::move(entry.value));
+        }
+    }
+    void update_values_(const std::string& key,
+                        std::int64_t start,
+                        std::size_t aggregate,
+                        const Row& row) {
+        const auto& spec = aggregates_[aggregate];
+        const auto field = row.values.find(spec.input_column);
+        if (field == row.values.end() || field->second.is_null())
+            return;
+        if (is_percentile_fn(spec.fn) && !field->second.is_number())
+            return;
+        WindowValueCell cell;
+        cell.window_end = start;
+        cell.aggregate = aggregate;
+        if (spec.fn == "count" || spec.fn == "string_agg")
+            cell.key = agg_value_key(field->second, spec);
+        else
+            cell.value = field->second;
+        add_value_cell_(key, std::move(cell));
+    }
+    config::JsonValue finalize_values_(const std::string& key,
+                                       std::int64_t start,
+                                       std::size_t aggregate) const {
+        const auto& spec = aggregates_[aggregate];
+        if (is_percentile_fn(spec.fn)) {
+            std::uint64_t total = 0;
+            values_.scan(key, [&](auto, const WindowValueCell& cell) {
+                if (cell.window_end == start && cell.aggregate == aggregate) {
+                    const auto count = static_cast<std::uint64_t>(cell.count);
+                    if (count > std::numeric_limits<std::uint64_t>::max() - total)
+                        throw std::runtime_error(
+                            "SQL_STATE_ERROR: aggregate multiplicity overflow");
+                    total += count;
+                }
+                return true;
+            });
+            if (!total)
+                return {};
+            const double rank = spec.percentile * static_cast<double>(total - 1);
+            const auto lower = static_cast<std::uint64_t>(std::floor(rank));
+            const auto upper = static_cast<std::uint64_t>(std::ceil(rank));
+            std::uint64_t seen = 0;
+            double lo = 0.0, hi = 0.0;
+            bool have_lo = false;
+            values_.scan(key, [&](auto, const WindowValueCell& cell) {
+                if (cell.window_end != start || cell.aggregate != aggregate)
+                    return true;
+                const auto end = seen + static_cast<std::uint64_t>(cell.count);
+                if (!have_lo && lower < end) {
+                    lo = cell.value.as_number();
+                    have_lo = true;
+                }
+                if (upper < end) {
+                    hi = cell.value.as_number();
+                    return false;
+                }
+                seen = end;
+                return true;
+            });
+            return config::JsonValue{lo + (hi - lo) * (rank - static_cast<double>(lower))};
+        }
+        if (spec.fn == "string_agg") {
+            std::string result;
+            bool first = true;
+            values_.scan(key, [&](auto, const WindowValueCell& cell) {
+                if (cell.window_end != start || cell.aggregate != aggregate)
+                    return true;
+                const auto repetitions = spec.distinct ? std::int64_t{1} : cell.count;
+                for (std::int64_t i = 0; i < repetitions; ++i) {
+                    if (!first)
+                        result += spec.separator;
+                    result += cell.key;
+                    first = false;
+                }
+                return true;
+            });
+            return first ? config::JsonValue{} : config::JsonValue{std::move(result)};
+        }
+        if (spec.fn == "array_agg") {
+            config::JsonArray result;
+            values_.scan(key, [&](auto index, const WindowValueCell& cell) {
+                if (cell.window_end != start || cell.aggregate != aggregate)
+                    return true;
+                if (spec.distinct) {
+                    const auto encoded = cell.value.serialize(0);
+                    bool seen = false;
+                    values_.scan(key, [&](auto prior, const WindowValueCell& candidate) {
+                        if (prior == index)
+                            return false;
+                        if (candidate.window_end == start && candidate.aggregate == aggregate &&
+                            candidate.value.serialize(0) == encoded) {
+                            seen = true;
+                            return false;
+                        }
+                        return true;
+                    });
+                    if (seen)
+                        return true;
+                }
+                result.push_back(cell.value);
+                return true;
+            });
+            return result.empty() ? config::JsonValue{} : config::JsonValue{std::move(result)};
+        }
+        std::int64_t count = 0;
+        config::JsonValue result;
+        bool have_result = false;
+        values_.scan(key, [&](auto, const WindowValueCell& cell) {
+            if (cell.window_end != start || cell.aggregate != aggregate)
+                return true;
+            if (spec.fn == "count")
+                ++count;
+            else if (!have_result || (spec.fn == "min" ? JsonValueLess{}(cell.value, result)
+                                                       : JsonValueLess{}(result, cell.value))) {
+                result = cell.value;
+                have_result = true;
+            }
+            return true;
+        });
+        return spec.fn == "count" ? config::JsonValue{count} : result;
+    }
+    Row finalize_entry_session_(const std::string& key, const Session& session) const {
+        Row result = session.group_values;
+        for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+            result.values[aggregates_[i].output_name] =
+                values_.enabled() && splits_aggregate_values(aggregates_[i])
+                    ? finalize_values_(key, session.start, i)
+                    : finalize_agg(session.agg_states[i], aggregates_[i]);
+        }
+        result.values[window_start_output_] = config::JsonValue{session.start};
+        result.values[window_end_output_] = config::JsonValue{clink::sat_add(session.end, gap_ms_)};
+        return result;
+    }
+    void erase_values_(const std::string& key, std::int64_t start) {
+        if (!values_.enabled())
+            return;
+        std::uint64_t index = 0;
+        while (index < values_.size(key)) {
+            auto entry = values_.at(key, index);
+            if (entry.value.window_end == start)
+                values_.erase(key, index);
+            else
+                ++index;
+        }
+    }
+
     void handle_entry_record_(const Row& row) {
         const auto time = row.values.find(time_column_);
         if (time == row.values.end() || !time->second.is_number())
@@ -3536,6 +3818,7 @@ private:
         const auto ts = event_time_of(time->second);
         const auto key = group_key_(row);
         std::optional<Session> merged;
+        std::optional<std::int64_t> value_owner;
         MemoryReservation charge(this->runtime()->memory_budget(), MemoryCategory::State);
         std::uint64_t index = 0;
         while (index < entries_.size(key)) {
@@ -3547,10 +3830,13 @@ private:
             }
             if (session.start > clink::sat_add(ts, gap_ms_))
                 break;
-            if (!merged)
+            if (!merged) {
                 merged = std::move(session);
-            else
-                merge_into(*merged, session, aggregates_);
+                value_owner = session.start;
+            } else {
+                merge_into(*merged, session, aggregates_, true);
+                merge_value_owner_(key, session.start, *value_owner);
+            }
             charge.resize(aggregate_bucket_retained_bytes(*merged));
             entries_.erase(key, index);
         }
@@ -3571,8 +3857,14 @@ private:
         }
         merged->start = std::min(merged->start, ts);
         merged->end = std::max(merged->end, ts);
-        for (std::size_t i = 0; i < aggregates_.size(); ++i)
-            update_agg(merged->agg_states[i], aggregates_[i], row);
+        if (value_owner && *value_owner != merged->start)
+            merge_value_owner_(key, *value_owner, merged->start);
+        for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+            if (values_.enabled() && splits_aggregate_values(aggregates_[i]))
+                update_values_(key, merged->start, i, row);
+            else
+                update_agg(merged->agg_states[i], aggregates_[i], row);
+        }
         charge.resize(aggregate_bucket_retained_bytes(*merged));
         std::uint64_t position = 0;
         entries_.scan(key, [&](auto, const auto& value) {
@@ -3593,7 +3885,7 @@ private:
                 const auto& value = *entry.value.begin();
                 if (clink::sat_add(clink::sat_add(value.second.end, gap_ms_),
                                    allowed_lateness_ms_) <= wm.millis()) {
-                    Record<Row> fired{finalize_session_(value.second)};
+                    Record<Row> fired{finalize_entry_session_(key, value.second)};
                     fired.set_event_time(
                         EventTime{clink::sat_sub(clink::sat_add(value.second.end, gap_ms_), 1)});
                     batch.push(std::move(fired));
@@ -3601,6 +3893,7 @@ private:
                         out.emit_data(std::move(batch));
                         batch = Batch<Row>{};
                     }
+                    erase_values_(key, value.second.start);
                 } else {
                     if (retained != index)
                         entries_.put(key, retained, entry.value);
@@ -4007,6 +4300,7 @@ private:
             state_;
     using EntryMap = std::map<std::int64_t, Session>;
     PartitionedList<EntryMap> entries_;
+    PartitionedList<WindowValueCell> values_;
     WorkingSet<decltype(state_)> working_{state_};
     mutable std::string key_scratch_;           // group_key_scratch_'s reused buffer
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
@@ -6027,12 +6321,7 @@ private:
         config::JsonValue value;
         std::int64_t count = 1;
     };
-    static bool split_values_(const AggSpec& spec) {
-        return !spec.is_udaf &&
-               ((spec.fn == "count" && spec.distinct && !spec.input_column.empty()) ||
-                ((spec.fn == "min" || spec.fn == "max") && spec.retractable) ||
-                is_percentile_fn(spec.fn) || spec.fn == "string_agg" || spec.fn == "array_agg");
-    }
+    static bool split_values_(const AggSpec& spec) { return splits_aggregate_values(spec); }
     static bool ordered_values_(const AggSpec& spec) {
         return is_percentile_fn(spec.fn) || spec.fn == "string_agg";
     }

@@ -8,12 +8,12 @@ collections into individual values. Percentile aggregates keep ordered value
 cells and find interpolation ranks with streaming scans. `STRING_AGG` uses ordered
 multiplicity cells; `ARRAY_AGG` stores arrival-ordered values and scans for
 distinct output without a resident index. Fixed windows use the same value cells
-inside separately stored panes; sessions remain one entry each. OVER splits
-pending rows, frame/LAG history and running accumulators; null-aware joins split
-exact-key probe buckets. Entry checkpoints retain ordering, emitted flags and
-key-group colocation, and migrate legacy whole-partition and per-accumulator
-state. Individual rows, session aggregate payloads, materialised results and
-opaque accumulators must still fit.
+inside separately stored panes. Sessions use them too, moving cells to the merged
+start when an event bridges sessions. OVER splits pending rows, frame/LAG history
+and running accumulators; null-aware joins split exact-key probe buckets. Entry
+checkpoints retain ordering, emitted flags and key-group colocation, and migrate
+legacy whole-partition and per-accumulator state. Individual rows, value cells,
+materialised results and opaque accumulators must still fit.
 
 **Oversized ranking, last-N and equi/interval join partitions use entry-level storage.**
 With a budget and SQL spill directory configured, these operators scan individual

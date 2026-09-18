@@ -228,7 +228,7 @@ individual entries without loading the whole active key:
 | --- | --- |
 | GROUP BY | Each aggregate accumulator is separate from group values and prior changelog output. `COUNT(DISTINCT)`, retractable `MIN`/`MAX`, percentile and `STRING_AGG` collections use individual multiplicity cells; `ARRAY_AGG` uses one arrival-ordered cell per value. Percentile and string cells retain their result order. Distinct arrays use bounded duplicate scans instead of a resident index. Other updates and queryable lookups finalise one accumulator at a time; TTL erases both accumulator and value cells. |
 | Fixed windows | Each pane has its own metadata entry. Built-in distinct, percentile, string and array collections use individual value cells keyed by pane end. Updates locate one pane; watermark scans emit and remove its metadata and value cells. |
-| Sessions | Each session has its own entry. An arriving event scans overlaps, merges one neighbouring session at a time, and writes the merged session back in start order. |
+| Sessions | Each session has its own metadata entry and growing built-in collections use individual value cells. An arriving event scans overlaps, merges one neighbouring session at a time, reassigns its cells to the merged start, and writes the metadata back in start order. |
 | OVER | Pending rows, retained frame/LAG history, first row and running accumulators are stored separately. Pending rows retain timestamp and arrival order; bounded frames are recomputed through entry scans. |
 | Null-aware joins | Exact-key probes are individual entries, preserving emitted flags through exact matches, wildcard poisoning and recovery. |
 | Ranking, last-N and equi/interval joins | Individual candidates or buffered rows, with streaming comparisons, frame recomputation and join matching. |
@@ -247,12 +247,12 @@ temporary-directory scratch storage if the spill setting is subsequently removed
 Entry-format snapshots require a synchronous backend; deferring backend execution
 continues to use its existing state path.
 
-**Individual state values must still fit.** One session's merged aggregate
-payload, an individual row, a value cell, or a growing unsplit aggregate
-accumulator can still exhaust the budget. Session merging also needs room for the
-source and destination payloads. Opaque UDAFs remain whole accumulators.
-`STRING_AGG` and `ARRAY_AGG` state is split for GROUP BY and fixed windows, but
-their materialised result and a changelog operator's prior result must still fit.
+**Individual state values must still fit.** An individual row, a value cell, or a
+growing unsplit aggregate accumulator can still exhaust the budget. Cell moves
+and ordered insertion can temporarily hold source and destination cells. Opaque
+UDAFs remain whole accumulators. `STRING_AGG` and `ARRAY_AGG` state is split for
+GROUP BY, fixed windows and sessions, but their materialised result and a
+changelog operator's prior result must still fit.
 Codec buffers, input/output batches, TTL indexes and backend caches retain the
 allocation limitations above.
 
