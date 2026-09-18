@@ -1108,10 +1108,20 @@ TEST(CoordinatorRescale, RefusalsThatCanBeDecidedBeforeDrainingAreDecidedUpFront
     src.out_channel = std::string{kChannelInt64};
     src.params = {{"count", "200000"}};  // long enough to still be running below
     g.ops.push_back(src);
+    OperatorSpec global;
+    global.type = "identity_int64";
+    global.id = "global";
+    global.inputs = {"src"};
+    global.parallelism = 1;
+    global.min_parallelism = 1;
+    global.max_parallelism = 1;
+    global.out_channel = std::string{kChannelInt64};
+    global.params = {{std::string{kForcedSingletonParam}, "true"}};
+    g.ops.push_back(global);
     OperatorSpec snk;
     snk.type = "file_int64_sink";
     snk.id = "snk";
-    snk.inputs = {"src"};
+    snk.inputs = {"global"};
     snk.parallelism = 1;  // deliberately NO bounds
     snk.out_channel = std::string{kChannelInt64};
     snk.params = {{"path", out_path.string()}};
@@ -1169,6 +1179,14 @@ TEST(CoordinatorRescale, RefusalsThatCanBeDecidedBeforeDrainingAreDecidedUpFront
         auto r = coordinator.request_operator_rescale(job_id, "src", 1);
         EXPECT_FALSE(r.ok);
         EXPECT_NE(r.reason.find("already runs at parallelism"), std::string::npos) << r.reason;
+    }
+    // A SQL operator whose result requires the whole input cannot be expanded
+    // through the rescale API, even if a caller asks for it directly.
+    {
+        auto r = coordinator.request_operator_rescale(job_id, "global", 2);
+        EXPECT_FALSE(r.ok);
+        EXPECT_NE(r.reason.find("global SQL view"), std::string::npos) << r.reason;
+        EXPECT_NE(r.reason.find("parallelism 1"), std::string::npos) << r.reason;
     }
     // Every one of the above is answerable from the request and the graph alone,
     // and those assertions are also asserting that ORDER: each returns its own

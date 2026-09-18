@@ -154,6 +154,24 @@ void ensure_sql_installed_once() {
         cluster::ensure_built_ins_registered();
         clink::plugin::PluginRegistry reg;
         clink::sql::install(reg);
+        reg.register_source<Row>(
+            "test_partitioned_row_source",
+            [](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Source<Row>> {
+                const auto count = ctx.param_int64_or("count", 0);
+                const auto parallelism =
+                    static_cast<std::int64_t>(ctx.parallelism == 0 ? 1 : ctx.parallelism);
+                const auto subtask = static_cast<std::int64_t>(ctx.subtask_idx);
+                std::vector<Record<Row>> records;
+                for (std::int64_t i = subtask; i < count; i += parallelism) {
+                    Row row;
+                    row.values["id"] = clink::config::JsonValue{static_cast<double>(i + 1)};
+                    row.values["amount"] = clink::config::JsonValue{static_cast<double>(i + 1)};
+                    row.values["bucket"] = clink::config::JsonValue{1.0};
+                    records.emplace_back(Record<Row>{std::move(row)});
+                }
+                return std::make_shared<VectorSource<Row>>(std::move(records),
+                                                           "test_partitioned_row_source");
+            });
 #ifdef CLINK_TESTS_HAVE_VECTOR_SEARCH
         // SQL-native AI: register vector_search_row after the Row channel exists.
         clink::vector_search::install(reg);
@@ -14136,6 +14154,152 @@ protected:
 };
 
 }  // namespace
+
+TEST(SqlRuntime, GlobalSubqueryAndNullAwareSemanticsAreParallelismInvariant) {
+    ensure_sql_installed_once();
+    const auto dir = std::filesystem::temp_directory_path() / "clink_sql_global_semantics";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Streams scalar_streams{dir / "orders.ndjson", dir / "refs.ndjson", {}};
+    write_lines(scalar_streams.bid,
+                {R"({"id":1,"amount":10})",
+                 R"({"id":2,"amount":20})",
+                 R"({"id":3,"amount":30})",
+                 R"({"id":4,"amount":40})"});
+    write_lines(scalar_streams.auction,
+                {R"({"amount":10})", R"({"amount":20})", R"({"amount":30})", R"({"amount":40})"});
+    const std::multiset<std::string> scalar_expected = {
+        R"({"id":1,"m":40})", R"({"id":2,"m":40})", R"({"id":3,"m":40})", R"({"id":4,"m":40})"};
+
+    Streams anti_streams{dir / "probes.ndjson", dir / "rights.ndjson", {}};
+    write_lines(anti_streams.bid, {R"({"a":3,"b":5,"tag":100})", R"({"a":3,"b":7,"tag":200})"});
+    write_lines(anti_streams.auction, {R"({"x":null,"y":5})", R"({"x":1,"y":2})"});
+    const std::multiset<std::string> anti_expected = {R"({"a":3,"b":7,"tag":200})"};
+
+    for (const std::uint32_t parallelism : {1u, 2u, 4u, 8u}) {
+        {
+            const auto out = dir / ("scalar-" + std::to_string(parallelism) + ".ndjson");
+            std::string error;
+            const auto got = run_query(
+                "CREATE TABLE orders (id BIGINT, amount BIGINT) "
+                "WITH (connector='kafka', format='json', brokers='b', topic='orders', "
+                "group_id='orders');"
+                "CREATE TABLE refs (amount BIGINT) "
+                "WITH (connector='kafka', format='json', brokers='b', topic='refs', "
+                "group_id='refs');"
+                "CREATE TABLE out_t (id BIGINT, m BIGINT) "
+                "WITH (connector='file', format='json', path='" +
+                    out.string() + "');",
+                "INSERT INTO out_t SELECT id, (SELECT max(amount) FROM refs) AS m FROM orders",
+                scalar_streams,
+                out,
+                {"bid", "auction"},
+                false,
+                &error,
+                "worker-sql-scalar-p" + std::to_string(parallelism),
+                parallelism);
+            EXPECT_TRUE(error.empty()) << "parallelism " << parallelism << ": " << error;
+            EXPECT_EQ(got, scalar_expected) << "scalar SELECT at parallelism " << parallelism;
+        }
+        {
+            const auto out = dir / ("anti-" + std::to_string(parallelism) + ".ndjson");
+            std::string error;
+            const auto got = run_query(
+                "CREATE TABLE t (a BIGINT, b BIGINT, tag BIGINT) "
+                "WITH (connector='kafka', format='json', brokers='b', topic='t', group_id='t');"
+                "CREATE TABLE s (x BIGINT, y BIGINT) "
+                "WITH (connector='kafka', format='json', brokers='b', topic='s', group_id='s');"
+                "CREATE TABLE out_t (a BIGINT, b BIGINT, tag BIGINT) "
+                "WITH (connector='file', format='json', changelog='true', path='" +
+                    out.string() + "');",
+                "INSERT INTO out_t SELECT * FROM t WHERE (a, b) NOT IN (SELECT x, y FROM s)",
+                anti_streams,
+                out,
+                {"bid", "auction"},
+                true,
+                &error,
+                "worker-sql-anti-p" + std::to_string(parallelism),
+                parallelism);
+            EXPECT_TRUE(error.empty()) << "parallelism " << parallelism << ": " << error;
+            EXPECT_EQ(got, anti_expected) << "null-aware NOT IN at parallelism " << parallelism;
+        }
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(SqlRuntime, AggregateUsesAllPartitionsAcrossWorkers) {
+    ensure_sql_installed_once();
+    const auto out =
+        std::filesystem::temp_directory_path() / "clink_sql_global_aggregate_multi_worker.ndjson";
+    std::filesystem::remove(out);
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE t (id BIGINT, amount BIGINT, bucket BIGINT) "
+                          "WITH (connector='file', format='json', path='/unused');"
+                          "CREATE TABLE out_t (bucket BIGINT, n BIGINT, total BIGINT, lo BIGINT, "
+                          "hi BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              out.string() + "');");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT bucket, COUNT(*) AS n, SUM(amount) AS total, "
+                        "MIN(amount) AS lo, MAX(amount) AS hi FROM t GROUP BY bucket");
+    cluster::apply_job_parallelism(spec, 4);
+
+    bool replaced_source = false;
+    for (auto& op : spec.ops) {
+        if (op.type == "file_json_source") {
+            op.type = "test_partitioned_row_source";
+            op.parallelism = 4;
+            op.params = {{"count", "16"}};
+            replaced_source = true;
+        } else if (op.type.find("sink") != std::string::npos) {
+            op.parallelism = 1;
+        }
+    }
+    ASSERT_TRUE(replaced_source);
+    spec.validate();
+
+    cluster::Coordinator coordinator;
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"worker-sql-global-a", "worker-sql-global-b"});
+    cluster::Worker::Config small_cfg;
+    small_cfg.slot_count = 2;
+    cluster::Worker::Config large_cfg;
+    large_cfg.slot_count = 24;
+    cluster::Worker worker_a("worker-sql-global-a", "127.0.0.1", small_cfg);
+    cluster::Worker worker_b("worker-sql-global-b", "127.0.0.1", large_cfg);
+    worker_a.connect_to_coordinator("127.0.0.1", port);
+    worker_b.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    application::JobSubmitter submitter("127.0.0.1", port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    const auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    const auto lines = read_lines(out);
+    ASSERT_FALSE(lines.empty());
+    // GROUP BY emits a running snapshot for this append sink. One key has one
+    // state owner, so the last snapshot is the final relation for that key.
+    const auto row = clink::config::parse(lines.back());
+    EXPECT_EQ(static_cast<std::int64_t>(row.at("bucket").as_number()), 1);
+    EXPECT_EQ(static_cast<std::int64_t>(row.at("n").as_number()), 16);
+    EXPECT_EQ(static_cast<std::int64_t>(row.at("total").as_number()), 136);
+    EXPECT_EQ(static_cast<std::int64_t>(row.at("lo").as_number()), 1);
+    EXPECT_EQ(static_cast<std::int64_t>(row.at("hi").as_number()), 16);
+
+    worker_a.stop();
+    worker_b.stop();
+    coordinator.stop();
+    std::filesystem::remove(out);
+}
 
 // --- per-record shapes -----------------------------------------------------
 

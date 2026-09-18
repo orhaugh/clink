@@ -108,9 +108,8 @@ struct OperatorSpec {
     // may scale this operator up to max_parallelism in
     // response to backpressure / load signals. When
     // `min_parallelism < parallelism`, it may scale down to
-    // min_parallelism. Manual rescale via clink_rescale_job already
-    // works without these bounds; these bounds define the policy
-    // surface the RescaleCoordinator + autoscaler consume.
+    // min_parallelism. Manual rescale and the autoscaler both use these
+    // bounds as the declared safe range.
     //
     // Invariants (enforced by validate()):
     //   - If either bound is non-zero, both must be non-zero.
@@ -134,6 +133,10 @@ struct OperatorSpec {
     // side output via "id::tag" in their `inputs` list.
     std::vector<SideOutputDecl> side_outputs;
 };
+
+[[nodiscard]] inline bool is_forced_singleton(const OperatorSpec& op) {
+    return op.params.find(std::string{kForcedSingletonParam}) != op.params.end();
+}
 
 // A SQL-declared scalar function the job's expressions call, shipped with
 // the spec so every Worker can register it at deploy time (the module

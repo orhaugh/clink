@@ -2777,6 +2777,7 @@ TEST(SqlPhysical, InAndNotInEmitSemiJoinRow) {
         EXPECT_EQ(op->params.at("right_key_column"), "user_id");
         EXPECT_EQ(op->params.at("anti"), "0");
         EXPECT_EQ(op->key_by, "row_key");
+        EXPECT_EQ(op->params.at(std::string{cluster::kForcedSingletonParam}), "true");
     }
     {
         auto plan = bind_insert(cat,
@@ -2786,6 +2787,7 @@ TEST(SqlPhysical, InAndNotInEmitSemiJoinRow) {
         const auto* op = find_op(spec, "semi_join_row");
         ASSERT_NE(op, nullptr);
         EXPECT_EQ(op->params.at("anti"), "1");
+        EXPECT_EQ(op->params.at(std::string{cluster::kForcedSingletonParam}), "true");
     }
 }
 
@@ -2813,6 +2815,7 @@ TEST(SqlPhysical, MultiColumnNotInEmitsCompositeAntiSemiJoinRow) {
     EXPECT_EQ(op->params.at("anti"), "1");
     EXPECT_EQ(op->params.at("null_aware"), "1");
     EXPECT_EQ(op->key_by, "row_key");
+    EXPECT_EQ(op->params.at(std::string{cluster::kForcedSingletonParam}), "true");
 }
 
 TEST(SqlPhysical, ScalarSubqueryEmitsBroadcastFilter) {
@@ -2864,6 +2867,7 @@ TEST(SqlPhysical, ScalarSubqueryInSelectEmitsScalarProjectRow) {
     EXPECT_FALSE(op->params.at("output_column").empty());
     EXPECT_EQ(op->params.at("scalar_column"), op->params.at("output_column"));
     ASSERT_EQ(op->inputs.size(), 2U);  // [0]=main, [1]=scalar
+    EXPECT_EQ(op->params.at(std::string{cluster::kForcedSingletonParam}), "true");
     // The scalar side compiled to a global aggregate.
     EXPECT_NE(find_op(spec, "aggregate_row"), nullptr);
 }

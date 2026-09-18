@@ -574,9 +574,13 @@ INTERSECT ALL
 SELECT url FROM clicks_b;
 ```
 
-!!! note "LIMIT is per-subtask"
-    At a parallelism above 1, each subtask emits up to `n` rows, so a global
-    `LIMIT` needs a single-source pipeline.
+!!! note "Global LIMIT semantics"
+    `LIMIT` and `ORDER BY ... LIMIT` keep a single global stage when job
+    parallelism is greater than one, so the bound applies to the query rather
+    than to each subtask. A bare `LIMIT` may select different rows when arrival
+    order changes. For repeatable row selection, use `ORDER BY` with enough
+    columns to define a total order; rows tied on every ordering expression have
+    no specified order.
 
 ## Managing the catalogue
 

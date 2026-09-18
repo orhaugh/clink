@@ -37,6 +37,7 @@ embedded or submits to a cluster, unchanged.
 | --- | --- | --- |
 | DDL and catalog | `CREATE TABLE ... WITH (connector=...)`, session or directory-persisted catalog, `SHOW`/`DROP`, `EXPLAIN` with row estimates, `ANALYZE TABLE` statistics | [SQL frontend](internals/sql-frontend.md) |
 | Queries | Projection and filtering with three-valued null semantics, expressions, aggregates, `GROUP BY` (including windowed), `HAVING`, `ORDER BY` / `LIMIT`, subqueries, `DISTINCT`, top-N | [SQL frontend](internals/sql-frontend.md) |
+| Parallel query semantics | Job parallelism preserves global SQL results by key-routing partitioned state and retaining a singleton stage for operators that need the whole relation. Unordered delivery, incomplete ordering ties, processing time, nondeterministic functions and floating-point low bits remain qualified | [SQL frontend](internals/sql-frontend.md) |
 | Joins | Stream-stream interval joins, multi-way INNER joins with cost-based reordering (applied only when estimated cheaper), lookup joins | [SQL frontend](internals/sql-frontend.md) |
 | Types | `BIGINT`/`DOUBLE`/`VARCHAR`/`BOOLEAN`/timestamps, `DECIMAL` (exact, 128-bit), `ARRAY`/`MAP`/`ROW`, `MULTISET` | [SQL frontend](internals/sql-frontend.md) |
 | Pattern matching | `MATCH_RECOGNIZE` v1 on the CEP engine | [SQL frontend](internals/sql-frontend.md) |

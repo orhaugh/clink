@@ -148,7 +148,9 @@ Coordinator/Worker cluster: parallel subtasks, hash-partitioned keyed
 shuffles, exactly-once checkpoints, failover from the last completed
 checkpoint, hot per-operator rescale, and rolling upgrades through
 savepoints. A [Helm chart and Kubernetes operator](deploy/helm/clink)
-ship in-tree.
+ship in-tree. SQL planning keeps keyed stages partitioned and stages that need
+a global view at one instance, so raising job parallelism does not turn a
+global result into one partial result per subtask.
 
 ```bash
 clink_node --role=coordinator --port=6123 --http-port=8081 &

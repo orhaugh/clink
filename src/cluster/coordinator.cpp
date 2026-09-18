@@ -2098,6 +2098,28 @@ RescaleJobAckMsg Coordinator::rescale_job(
             }
         }
 
+        if (auto requested = role_p.find(kGenericSubtaskRole);
+            requested != role_p.end() && requested->second > 1 && !job.graph_json.empty()) {
+            try {
+                const auto graph = JobGraphSpec::from_json(job.graph_json);
+                const auto global =
+                    std::find_if(graph.ops.begin(), graph.ops.end(), [](const auto& op) {
+                        return is_forced_singleton(op);
+                    });
+                if (global != graph.ops.end()) {
+                    ack.ok = false;
+                    ack.message = "rescale: operator '" + global->id +
+                                  "' requires a global SQL view and must remain at parallelism 1";
+                    return ack;
+                }
+            } catch (const std::exception& e) {
+                ack.ok = false;
+                ack.message =
+                    std::string{"rescale: the job's retained graph does not parse: "} + e.what();
+                return ack;
+            }
+        }
+
         // Validate the rescale request. v1 supports integer scale-up
         // (new_p = k * old_p) and integer scale-down (old_p = k_down *
         // new_p). Non-integer factors would leave key groups straddling
@@ -2320,6 +2342,10 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
         if (new_parallelism == old_parallelism) {
             return refuse("operator '" + op_id + "' already runs at parallelism " +
                           std::to_string(new_parallelism) + "; nothing to do");
+        }
+        if (is_forced_singleton(*op_it)) {
+            return refuse("operator '" + op_id +
+                          "' requires a global SQL view and must remain at parallelism 1");
         }
         // Integer factor only, and refused HERE rather than discovered after
         // the job has already drained. The same helper the redeploy uses.

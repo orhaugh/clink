@@ -1279,6 +1279,9 @@ std::string compile_node(const LogicalPlan& node,
         op.params["right_key_column"] = right_cols;
         op.params["anti"] = jn.anti() ? "1" : "0";
         op.params["null_aware"] = jn.null_aware() ? "1" : "0";
+        if (jn.null_aware()) {
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        }
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
         return id;
@@ -1320,6 +1323,7 @@ std::string compile_node(const LogicalPlan& node,
         cluster::OperatorSpec op;
         op.id = "scalarproj_" + std::to_string(next_id++);
         op.type = "scalar_project_row";
+        op.params[std::string{cluster::kForcedSingletonParam}] = "true";
         op.inputs = {std::move(main_id), std::move(scalar_id)};  // [0]=main, [1]=scalar
         op.out_channel = std::string{kChannelRow};
         op.params["output_column"] = sp.output_column();

@@ -389,6 +389,35 @@ TEST(JobGraphSpec, BoundsEqualToCurrentParallelismAccepted) {
     EXPECT_EQ(spec.ops[0].max_parallelism, 4u);
 }
 
+TEST(JobGraphSpec, ForcedSingletonRejectsParallelismAboveOne) {
+    const std::string json = R"({"ops":[
+        {"id":"global","type":"identity_int64","out_channel":"int64",
+         "parallelism":2,"params":{"forced_singleton":"true"}}
+    ]})";
+    try {
+        (void)JobGraphSpec::from_json(json);
+        FAIL() << "a forced singleton accepted parallelism 2";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("forced singleton"), std::string::npos) << e.what();
+    }
+}
+
+TEST(JobGraphSpec, ForcedSingletonRejectsScalableBounds) {
+    const std::string scalable = R"({"ops":[
+        {"id":"global","type":"identity_int64","out_channel":"int64",
+         "parallelism":1,"min_parallelism":1,"max_parallelism":2,
+         "params":{"forced_singleton":"true"}}
+    ]})";
+    EXPECT_THROW(JobGraphSpec::from_json(scalable), std::runtime_error);
+
+    const std::string pinned = R"({"ops":[
+        {"id":"global","type":"identity_int64","out_channel":"int64",
+         "parallelism":1,"min_parallelism":1,"max_parallelism":1,
+         "params":{"forced_singleton":"true"}}
+    ]})";
+    EXPECT_NO_THROW((void)JobGraphSpec::from_json(pinned));
+}
+
 TEST(JobGraphSpec, FromJsonAcceptsWellFormedDag) {
     // Linear source -> op -> sink. No cycle, all inputs resolve,
     // ids unique. Should round-trip cleanly.

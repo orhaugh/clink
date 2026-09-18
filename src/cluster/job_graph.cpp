@@ -497,6 +497,17 @@ void JobGraphSpec::validate() const {
                                          std::to_string(op.max_parallelism));
             }
         }
+        if (is_forced_singleton(op)) {
+            if (op.parallelism != 1) {
+                throw std::runtime_error("JobGraphSpec::validate: op '" + op.id +
+                                         "' is a forced singleton and must run at parallelism 1");
+            }
+            if (min_set && (op.min_parallelism != 1 || op.max_parallelism != 1)) {
+                throw std::runtime_error(
+                    "JobGraphSpec::validate: op '" + op.id +
+                    "' is a forced singleton and its rescale bounds must both be 1");
+            }
+        }
     }
     // Strip the optional ".N" branch suffix from an input ref. Used so
     // validate() must look past split-branch suffix ("splitter.0") and
@@ -567,13 +578,13 @@ void apply_job_parallelism(JobGraphSpec& spec, std::uint32_t parallelism) {
     if (parallelism <= 1) {
         return;
     }
-    const std::string marker{kForcedSingletonParam};
     for (auto& op : spec.ops) {
         // An operator whose state covers the WHOLE stream must stay on one
         // subtask; fanning it out gives each subtask its own answer over its own
         // shard, so the job emits `parallelism` partial results instead of one.
         // See kForcedSingletonParam for how that shipped and what caught it.
-        if (op.params.find(marker) != op.params.end()) {
+        if (is_forced_singleton(op)) {
+            op.parallelism = 1;
             continue;
         }
         op.parallelism = parallelism;

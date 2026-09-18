@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**SQL job parallelism preserves global query semantics.** Scalar subqueries in
+the SELECT list and null-aware `IN` / `NOT IN` joins now retain one global
+operator instance, matching existing global aggregates, windows, ranking and
+LIMIT stages. Graph validation and coordinator rescale admission prevent an
+explicit override or rescale from expanding these stages. Keyed operators keep
+their configured parallelism.
+
 **Batched model inference adapts to the execution memory budget.** Retained
 `ML_PREDICT` input rows and list storage now share the operator budget. If the
 next row is refused while a batch is buffered, clink submits the current batch
