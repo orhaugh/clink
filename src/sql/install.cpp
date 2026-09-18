@@ -5372,6 +5372,22 @@ public:
                 agg_bucket_codec(),
                 [](const AggBucket& bucket) { return aggregate_bucket_retained_bytes(bucket); },
                 spill_dir_);
+        if (entries_.enabled() &&
+            std::any_of(aggregates_.begin(), aggregates_.end(), split_values_)) {
+            values_.bind(
+                this->runtime(),
+                "agg.values",
+                value_count_codec_(),
+                [](const ValueCount& value) {
+                    return sizeof(value) + value.key.capacity() + 1 + value.value.retained_bytes() -
+                           sizeof(value.value);
+                },
+                spill_dir_,
+                /*companion=*/true);
+            if (values_.restored() && !entries_.restored())
+                throw std::runtime_error(
+                    "SQL_SPILL_ERROR: aggregate value format has no entry metadata");
+        }
         if (!entries_.enabled() && !effective_async_state_ && memory_.enabled()) {
             if (spill_dir_.empty()) {
                 if (const auto* path = std::getenv("CLINK_SQL_SPILL_DIR"))
@@ -5388,15 +5404,30 @@ public:
                         meta.group_values = bucket.group_values;
                         meta.prior_emitted = bucket.prior_emitted;
                         entries_.append(key, meta);
-                        for (const auto& state : bucket.agg_states) {
+                        for (std::size_t i = 0; i < bucket.agg_states.size(); ++i) {
                             AggBucket value;
-                            value.agg_states.push_back(state);
+                            value.agg_states.push_back(bucket.agg_states[i]);
+                            if (values_.enabled() && split_values_(aggregates_.at(i)))
+                                migrate_values_(key, i, value.agg_states.front());
                             entries_.append(key, value);
                         }
                     }
                 } else {
                     state_[key] = bucket;
                     account_or_spill_(key);
+                }
+            });
+        }
+        // The earlier entry layout still carried each accumulator's whole
+        // multiset. Upgrade those cells once, alongside the normal checkpoint.
+        if (entries_.restored() && values_.enabled() && !values_.restored()) {
+            entries_.groups([&](const auto& key, auto) {
+                for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+                    if (!split_values_(aggregates_[i]))
+                        continue;
+                    auto entry = entries_.at(key, i + 1);
+                    migrate_values_(key, i, entry.value.agg_states.front());
+                    entries_.put(key, i + 1, entry.value);
                 }
             });
         }
@@ -5672,15 +5703,140 @@ private:
                clink::config::JsonValue{clink::sql::to_json_object(b.values)}.serialize(0);
     }
 
+    struct ValueCount {
+        std::uint64_t aggregate = 0;
+        std::string key;
+        config::JsonValue value;
+        std::int64_t count = 1;
+    };
+    static bool split_values_(const AggSpec& spec) {
+        return !spec.is_udaf &&
+               ((spec.fn == "count" && spec.distinct && !spec.input_column.empty()) ||
+                ((spec.fn == "min" || spec.fn == "max") && spec.retractable));
+    }
+    static Codec<ValueCount> value_count_codec_() {
+        return {.encode =
+                    [](const ValueCount& value) {
+                        Codec<ValueCount>::Bytes bytes;
+                        agg_codec_detail::put_u64(bytes, value.aggregate);
+                        agg_codec_detail::put_str(bytes, value.key);
+                        agg_codec_detail::put_json(bytes, value.value);
+                        agg_codec_detail::put_u64(bytes, static_cast<std::uint64_t>(value.count));
+                        return bytes;
+                    },
+                .decode = [](Codec<ValueCount>::BytesView bytes) -> std::optional<ValueCount> {
+                    agg_codec_detail::Reader reader{bytes, 0, true};
+                    ValueCount value;
+                    value.aggregate = reader.u64();
+                    value.key = reader.str();
+                    value.value = reader.json();
+                    value.count = static_cast<std::int64_t>(reader.u64());
+                    if (!reader.ok || value.count <= 0)
+                        return std::nullopt;
+                    return value;
+                }};
+    }
+    bool value_less_(const ValueCount& a, const ValueCount& b) const {
+        if (a.aggregate != b.aggregate)
+            return a.aggregate < b.aggregate;
+        return aggregates_.at(a.aggregate).fn == "count" ? a.key < b.key
+                                                         : JsonValueLess{}(a.value, b.value);
+    }
+    void migrate_values_(const std::string& key, std::size_t aggregate, AggState& state) {
+        // Cells need no resident index or ordering: updates and scalar
+        // finalisation scan values, and removal swaps in the final cell.
+        if (aggregates_[aggregate].fn == "count") {
+            for (const auto& [value, count] : state.extras_read().value_counts)
+                values_.append(key, ValueCount{aggregate, value, {}, count});
+            if (state.cold)
+                state.cold->value_counts.clear();
+        } else {
+            for (const auto& [value, count] : state.extras_read().minmax_counts)
+                values_.append(key, ValueCount{aggregate, {}, value, count});
+            if (state.cold)
+                state.cold->minmax_counts.clear();
+        }
+    }
+    void update_values_(const std::string& key,
+                        std::size_t aggregate,
+                        const Row& row,
+                        bool retract) {
+        const auto& spec = aggregates_[aggregate];
+        const auto field = row.values.find(spec.input_column);
+        if (field == row.values.end() || field->second.is_null())
+            return;
+        ValueCount incoming;
+        incoming.aggregate = aggregate;
+        if (spec.fn == "count")
+            incoming.key = agg_value_key(field->second, spec);
+        else
+            incoming.value = field->second;
+        std::uint64_t position = 0;
+        bool found = false;
+        values_.scan(key, [&](auto, const ValueCount& existing) {
+            if (!value_less_(existing, incoming) && !value_less_(incoming, existing)) {
+                found = true;
+                return false;
+            }
+            ++position;
+            return true;
+        });
+        if (!found) {
+            if (!retract)
+                values_.append(key, incoming);
+            return;
+        }
+        auto entry = values_.at(key, position);
+        if (retract && entry.value.count == 1) {
+            const auto last = values_.size(key) - 1;
+            if (position != last) {
+                auto replacement = values_.at(key, last);
+                values_.put(key, position, replacement.value);
+            }
+            values_.truncate(key, last);
+            return;
+        }
+        if (!retract && entry.value.count == std::numeric_limits<std::int64_t>::max())
+            throw std::runtime_error("SQL_STATE_ERROR: aggregate multiplicity overflow");
+        entry.value.count += retract ? -1 : 1;
+        values_.put(key, position, entry.value);
+    }
+    config::JsonValue finalize_values_(const std::string& key, std::size_t aggregate) const {
+        const auto& spec = aggregates_[aggregate];
+        std::int64_t count = 0;
+        config::JsonValue result;
+        bool have_result = false;
+        values_.scan(key, [&](auto, const ValueCount& entry) {
+            if (entry.aggregate != aggregate)
+                return true;
+            if (spec.fn == "count")
+                ++count;
+            else {
+                const bool replace =
+                    !have_result || (spec.fn == "min" ? JsonValueLess{}(entry.value, result)
+                                                      : JsonValueLess{}(result, entry.value));
+                if (replace)
+                    result = entry.value;
+                have_result = true;
+            }
+            return true;
+        });
+        return spec.fn == "count" ? config::JsonValue{count} : result;
+    }
+
     std::optional<Row> entry_result_(const std::string& key) const {
         if (!entries_.size(key))
             return std::nullopt;
         auto meta = entries_.at(key, 0);
         Row result = meta.value.group_values;
         for (std::size_t i = 0; i < aggregates_.size(); ++i) {
-            auto entry = entries_.at(key, i + 1);
-            result.values[aggregates_[i].output_name] =
-                finalize_agg(entry.value.agg_states.front(), aggregates_[i]);
+            if (values_.enabled() && split_values_(aggregates_[i])) {
+                result.values[aggregates_[i].output_name] = finalize_values_(key, i);
+            } else {
+                auto entry = entries_.at(key, i + 1);
+                result.values[aggregates_[i].output_name] =
+                    finalize_agg(entry.value.agg_states.front(), aggregates_[i]);
+            }
         }
         return result;
     }
@@ -5703,6 +5859,10 @@ private:
         }
         const bool retract = has_row_kind(row) && is_delete_like(row_kind_of(row));
         for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+            if (values_.enabled() && split_values_(aggregates_[i])) {
+                update_values_(key, i, row, retract);
+                continue;
+            }
             auto entry = entries_.at(key, i + 1);
             if (retract)
                 retract_agg(entry.value.agg_states.front(), aggregates_[i], row);
@@ -5872,6 +6032,8 @@ private:
         flush_ttl_dirty_();
         if (entries_.enabled()) {
             std::lock_guard serving_lock(serving_mu_);
+            if (values_.enabled())
+                values_.snapshot();
             entries_.snapshot();
             if (persist_inmem_) {
                 auto legacy = keyed_state_();
@@ -5952,6 +6114,8 @@ private:
         for (const auto& key : doomed) {
             if (entries_.enabled())
                 entries_.erase_group(key);
+            if (values_.enabled())
+                values_.erase_group(key);
             if (spilling_)
                 spill_->erase(key);
             state_.erase(key);
@@ -6007,6 +6171,7 @@ private:
     std::unique_ptr<SpillStore> spill_;
     bool spilling_ = false;
     PartitionedList<AggBucket> entries_;
+    PartitionedList<ValueCount> values_;
     bool async_state_ = false;
     // Effective decision: async_state_ OR the bound backend can defer reads.
     // Seeded from async_state_ in the ctor and finalised in open() once the

@@ -3,11 +3,13 @@
 ## Unreleased
 
 **More SQL operators support oversized active keys.** GROUP BY stores each
-accumulator separately; fixed/session windows store panes and sessions; OVER splits
-pending rows, frame/LAG history and running accumulators; null-aware joins split
-exact-key probe buckets. Entry checkpoints retain ordering, emitted flags and
-key-group colocation, and migrate legacy whole-partition state. Individual rows,
-pane/session aggregate payloads and growing accumulators must still fit.
+accumulator separately, and splits `COUNT(DISTINCT)` and retractable `MIN`/`MAX`
+collections into individual values; fixed/session windows store panes and
+sessions; OVER splits pending rows, frame/LAG history and running accumulators;
+null-aware joins split exact-key probe buckets. Entry checkpoints retain ordering,
+emitted flags and key-group colocation, and migrate legacy whole-partition and
+per-accumulator state. Individual rows, pane/session aggregate payloads,
+materialised results and other growing accumulators must still fit.
 
 **Oversized ranking, last-N and equi/interval join partitions use entry-level storage.**
 With a budget and SQL spill directory configured, these operators scan individual

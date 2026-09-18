@@ -27,7 +27,8 @@ public:
               std::string prefix,
               Codec<T> codec,
               std::function<std::size_t(const T&)> estimate,
-              std::string directory = {}) {
+              std::string directory = {},
+              bool companion = false) {
         if (!runtime)
             return false;
         runtime_ = runtime;
@@ -41,7 +42,9 @@ public:
                             .has_value();
         if (directory.empty())
             directory = sql_spill_directory();
-        if (!restored_ && (!budget_ || directory.empty()))
+        // A companion store follows an already-enabled entry layout during
+        // recovery, including when the job no longer has a configured budget.
+        if (!restored_ && !companion && (!budget_ || directory.empty()))
             return false;
         if (runtime_->has_state_backend() && runtime_->state_backend()->supports_async_get()) {
             if (restored_)

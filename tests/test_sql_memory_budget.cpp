@@ -430,7 +430,7 @@ TEST(SqlMemoryBudget, TtlExpiresSpilledGroupsAndPreventsCheckpointResurrection) 
     const auto id = operator_id_from_uid("memory-test-aggregate");
     RuntimeContext context(id, "agg", &backend, nullptr);
     context.set_memory_budget(budget);
-    auto op = make_operator("aggregate_row", "sum", true, dir.path.string());
+    auto op = make_operator("aggregate_row", "count", true, dir.path.string(), false, true);
     op->attach_runtime(&context);
     op->open();
     Emitter<Row> out([](StreamElement<Row>) { return true; });
@@ -444,12 +444,12 @@ TEST(SqlMemoryBudget, TtlExpiresSpilledGroupsAndPreventsCheckpointResurrection) 
     EXPECT_EQ(budget->usage().used, 0u);
     op->snapshot_timers(backend, id);
     op.reset();
-    auto restored = make_operator("aggregate_row", "sum", true, dir.path.string());
+    auto restored = make_operator("aggregate_row", "count", true, dir.path.string(), false, true);
     restored->attach_runtime(&context);
     restored->open();
     Emitter<Row> check([](StreamElement<Row> e) {
         for (const auto& rec : e.as_data())
-            EXPECT_DOUBLE_EQ(rec.value().values.at("s").as_number(), 4);
+            EXPECT_EQ(rec.value().values.at("s").as_int(), 1);
         return true;
     });
     feed(*restored, check, 0, config::JsonValue{4}, 1001);
@@ -1472,7 +1472,7 @@ TEST(SqlMemoryBudget, GroupByAccumulatorsSpillIndependentlyAndRetainChangelog) {
         if (i)
             specs += ",";
         specs += "{\"name\":\"s" + std::to_string(i) +
-                 "\",\"fn\":\"count\",\"input_column\":\"v\",\"distinct\":true}";
+                 "\",\"fn\":\"string_agg\",\"input_column\":\"v\",\"distinct\":true}";
     }
     specs += "]";
     const std::map<std::string, std::string> params{{"aggregates", specs},
@@ -1542,7 +1542,7 @@ TEST(SqlMemoryBudget, GroupByAccumulatorsSpillIndependentlyAndRetainChangelog) {
         op->attach_runtime(&ctx);
         op->restore_timers(backend, id);
         op->open();
-        send(47);  // duplicate must not change COUNT DISTINCT
+        send(47);  // duplicate must not change STRING_AGG DISTINCT
         for (int i = 0; i < 48; ++i)
             send(i, true);
         send(47, true);
@@ -1652,3 +1652,160 @@ TEST(SqlMemoryBudget, NullAwareExactBucketExceedsBudgetAndRecoversPoisonedFlags)
         EXPECT_EQ(actual, expected);
     }
 }
+
+// Seed the previously shipped per-accumulator entry format from a one-aggregate,
+// append-mode legacy bucket. The accumulator bytes stay opaque; only the bucket
+// envelope (group JSON, aggregate count, prior flag) is split here.
+void seed_old_aggregate_entry_layout(InMemoryStateBackend& backend, RuntimeContext& ctx) {
+    std::string backend_key, bytes;
+    backend.scan(ctx.operator_id(), [&](auto key, auto value) {
+        if (key.size() > 5 && key.substr(1, 4) == "agg|") {
+            backend_key = key;
+            bytes = value;
+        }
+    });
+    ASSERT_FALSE(bytes.empty());
+    auto read_u32 = [&](std::size_t offset) {
+        std::uint32_t value = 0;
+        for (std::size_t i = 0; i < 4; ++i)
+            value |= static_cast<std::uint32_t>(static_cast<unsigned char>(bytes.at(offset + i)))
+                     << (8 * i);
+        return value;
+    };
+    const auto group_size = read_u32(0);
+    const std::size_t aggregate_offset = 4 + group_size + 4;
+    ASSERT_EQ(read_u32(4 + group_size), 1u);
+    ASSERT_EQ(read_u32(bytes.size() - 4), 0u);
+    std::string meta = bytes.substr(0, 4 + group_size) + std::string(8, '\0');
+    std::string accumulator;
+    accumulator.push_back(2);
+    accumulator.append(3, '\0');
+    accumulator += "{}";
+    accumulator.push_back(1);
+    accumulator.append(3, '\0');
+    accumulator += bytes.substr(aggregate_offset, bytes.size() - aggregate_offset - 4);
+    accumulator.append(4, '\0');
+    Codec<std::string> opaque{
+        .encode =
+            [](const auto& text) {
+                auto data = std::as_bytes(std::span{text.data(), text.size()});
+                return Codec<std::string>::Bytes(data.begin(), data.end());
+            },
+        .decode = [](Codec<std::string>::BytesView data) -> std::optional<std::string> {
+            return std::string(reinterpret_cast<const char*>(data.data()), data.size());
+        }};
+    PartitionedList<std::string> old;
+    ASSERT_TRUE(
+        old.bind(&ctx, "agg.entries", opaque, [](const auto& text) { return text.capacity(); }));
+    old.append("1", meta);
+    old.append("1", accumulator);
+    old.snapshot();
+    backend.erase(ctx.operator_id(), backend_key);
+}
+
+class SqlAggregateValueBudget : public ::testing::TestWithParam<const char*> {};
+TEST_P(SqlAggregateValueBudget, ScalarResultSupportsAnOversizedValueCollection) {
+    const std::string fn = GetParam();
+    std::vector<config::JsonValue> values;
+    for (int i = 0; i < 48; ++i)
+        values.emplace_back(std::string(256, 'x') + std::to_string((i * 37) % 48));
+    values.emplace_back(1);
+    values.emplace_back(true);
+    values.emplace_back(config::make_dec_value(*config::dec_parse("1.00")));
+    values.emplace_back(config::make_dec_value(*config::dec_parse("1.0")));
+    values.emplace_back(config::JsonValue{});
+    auto make = [&] { return make_operator("aggregate_row", fn, false, {}, false, fn == "count"); };
+    {
+        SpillEnvironment env("");
+        RuntimeContext ctx(operator_id_from_uid("memory-test-aggregate"), fn, nullptr, nullptr);
+        ctx.set_memory_budget(std::make_shared<MemoryBudget>(8192));
+        auto op = make();
+        op->attach_runtime(&ctx);
+        op->open();
+        Emitter<Row> discard([](StreamElement<Row>) { return true; });
+        EXPECT_THROW(
+            {
+                for (const auto& value : values)
+                    feed(*op, discard, 1, value);
+            },
+            MemoryLimitExceeded);
+    }
+    std::vector<std::string> expected;
+    for (int mode = 0; mode < 5; ++mode) {
+        SCOPED_TRACE(mode);
+        // Legacy bucket, previous entry layout, and restoring without memory
+        // configuration all converge on the same current per-value layout.
+        SpillDirectory dir;
+        SpillEnvironment env(mode == 1 || mode == 4 ? dir.path.string() : "");
+        auto budget = std::make_shared<MemoryBudget>(8192);
+        InMemoryStateBackend backend;
+        const auto id = operator_id_from_uid("memory-test-aggregate");
+        RuntimeContext ctx(id, fn, &backend, nullptr);
+        if (mode == 1 || mode == 4)
+            ctx.set_memory_budget(budget);
+        auto op = make();
+        op->attach_runtime(&ctx);
+        op->open();
+        std::vector<std::string> actual;
+        Emitter<Row> out([&](StreamElement<Row> element) {
+            if (element.is_data())
+                for (const auto& record : element.as_data())
+                    actual.push_back(
+                        config::JsonValue{to_json_object(record.value().values)}.serialize(0));
+            return true;
+        });
+        auto send = [&](const config::JsonValue& value, bool retract = false) {
+            Row row;
+            row.values["k"] = config::JsonValue{1};
+            row.values["v"] = value;
+            if (retract)
+                set_row_kind(row, kRowKindDelete);
+            Batch<Row> batch;
+            batch.emplace(std::move(row));
+            op->process(StreamElement<Row>::data(std::move(batch)), out);
+        };
+        auto recover = [&](int checkpoint) {
+            op->snapshot_timers(backend, id);
+            op.reset();
+            if (checkpoint == 1 && (mode == 2 || mode == 3)) {
+                ::setenv("CLINK_SQL_SPILL_DIR", dir.path.c_str(), 1);
+                ctx.set_memory_budget(budget);
+                if (mode == 3)
+                    seed_old_aggregate_entry_layout(backend, ctx);
+            }
+            if (checkpoint == 2 && mode == 4) {
+                ::setenv("CLINK_SQL_SPILL_DIR", "", 1);
+                ctx.set_memory_budget({});
+            }
+            auto saved = backend.snapshot(CheckpointId{static_cast<std::uint64_t>(checkpoint)});
+            backend.restore(saved);
+            op = make();
+            op->attach_runtime(&ctx);
+            op->restore_timers(backend, id);
+            op->open();
+        };
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            send(values[i]);
+            if (i == 11)
+                recover(1);
+        }
+        recover(2);
+        send(values.front());
+        send(config::JsonValue{"never inserted"}, true);
+        for (const auto& value : values)
+            send(value, true);
+        recover(3);
+        send(values.front(), true);
+        recover(4);
+        send(config::JsonValue{99});
+        if (!mode)
+            expected = actual;
+        else
+            EXPECT_EQ(actual, expected);
+        op.reset();
+        EXPECT_EQ(budget->usage().used, 0u);
+        EXPECT_LE(budget->usage().peak, budget->limit());
+        EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+    }
+}
+INSTANTIATE_TEST_SUITE_P(Values, SqlAggregateValueBudget, ::testing::Values("count", "min", "max"));
