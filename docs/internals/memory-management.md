@@ -72,6 +72,7 @@ limit. Multiply by the number of concurrent executions when sizing a Worker.
 | SQL partitioned ranking | ROW_NUMBER, RANK and DENSE_RANK candidate vectors, encoded rows and derived sort values count and can spill. Configured spilling stores individual candidates, including oversized tie groups. Sort values are rebuilt on reload. |
 | SQL null-aware semi/anti joins | Exact-key probes, cross-key null probes and wildcard tuples count and can spill individually. Null-bearing collections store individual entries, so the whole index need not fit in RAM. Checkpoints stream entries through separate slots; legacy null-state blobs remain readable. Plain semi/anti joins retain their backend-driven path. |
 | SQL global ORDER BY LIMIT | The retained candidate heap and nested rows count. Pressure can move candidates into a disk-backed binary heap with no resident row index. Final output streams in sort order, respecting OFFSET and LIMIT. A constant number of individual rows must fit simultaneously. |
+| SQL uncorrelated scalar subqueries | Main-side rows retained until the scalar side settles count against the operator budget. Configured spilling stores one row per scratch entry and emits one output row at a time. The accounted in-memory path emits batches of at most 64 rows. |
 | SQL TTL indexes | Deadline, dirty-key and pre-watermark key estimates charge the operator budget for GROUP BY, equi joins, semi/anti joins, DISTINCT and set operators. Restore rebuilds charges and expiry releases them. These indexes remain in memory and cannot spill. |
 | In-memory and file-backed backend working state | Estimated key/value storage and map overhead, checked before puts and during restore. Erase and clear release charges. Staged barrier copies have separate checkpoint charges. Binding a new domain requires an empty backend. |
 | Canonical snapshot writer | Arrow builder and IPC output allocations use a budgeted pool. The final byte-vector copy is reserved while the writer holds it. Returned snapshot byte vectors are caller-owned and are not continuously tracked. |
@@ -139,10 +140,10 @@ changes the durability condition for a successful acknowledgement.
 Set `CLINK_SQL_SPILL_DIR` to an existing writable directory alongside the memory
 limit to enable local spill for the covered synchronous SQL working maps:
 GROUP BY, fixed/session windows, equi/interval joins, OVER, last-N, partitioned
-ranking, global top-N and null-aware semi/anti state. A direct GROUP BY factory can
-instead pass `spill_dir`, overriding the environment directory for that operator.
-A memory budget is required. Async/backend-driven execution keeps its existing
-storage path.
+ranking, global top-N, scalar-subquery main buffers and null-aware semi/anti state.
+A direct GROUP BY factory can instead pass `spill_dir`, overriding the environment
+directory for that operator. A memory budget is required. Async/backend-driven
+execution keeps its existing storage path.
 
 ```bash
 mkdir -p /var/tmp/clink-sql-spill
@@ -153,8 +154,9 @@ clink run pipeline.sql --state-backend=rocksdb:///var/tmp/clink-state
 
 Configured GROUP BY, fixed/session windows, OVER, last-N, ranking and equi/interval
 joins use entry-level scratch storage from open. Null-aware exact-key probes also
-use individual entries. The remaining null indexes and global top-N switch to
-scratch on pressure. This favours bounded retained memory over throughput: each
+use individual entries. Scalar-subquery main buffers spill each retained row and
+emit bounded output batches. The remaining null indexes and global top-N switch
+to scratch on pressure. This favours bounded retained memory over throughput: each
 entry incurs synchronous file I/O and codec work. A growing `ARRAY_AGG`, a large
 UDAF accumulator or contention from other owners can still exhaust the budget.
 TTL metadata remains in RAM and can exhaust the budget independently.
@@ -232,6 +234,7 @@ individual entries without loading the whole active key:
 | OVER | Pending rows, retained frame/LAG history, first row and running accumulators are stored separately. Pending rows retain timestamp and arrival order; bounded frames are recomputed through entry scans. |
 | Null-aware joins | Exact-key probes are individual entries, preserving emitted flags through exact matches, wildcard poisoning and recovery. |
 | Ranking, last-N and equi/interval joins | Individual candidates or buffered rows, with streaming comparisons, frame recomputation and join matching. |
+| Uncorrelated scalar subqueries | Main-side rows are stored individually until the scalar side settles, then scanned and emitted one row at a time. |
 
 Ordered insertion and removal can require linear disk I/O. Window/session spill
 ingest reads required Arrow columns by name and uses the row fold; GROUP BY keeps
@@ -246,6 +249,8 @@ on open, requiring temporary space for the old vector. New-format recovery uses
 temporary-directory scratch storage if the spill setting is subsequently removed.
 Entry-format snapshots require a synchronous backend; deferring backend execution
 continues to use its existing state path.
+Scalar-subquery scratch retains its existing bounded end-of-input lifecycle and
+does not add checkpoint recovery for the buffered main side.
 
 **Individual state values must still fit.** An individual row, a value cell, or a
 growing unsplit aggregate accumulator can still exhaust the budget. Cell moves

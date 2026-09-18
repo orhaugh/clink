@@ -250,7 +250,9 @@ Mechanics worth knowing before extending it:
 With `CLINK_SQL_SPILL_DIR` and a shared memory budget, synchronous GROUP BY,
 fixed/session windows, equi/interval joins, OVER, last-N and partitioned ranking
 can spill working partitions. Null-aware semi/anti joins also spill their
-cross-key null entries. Global top-N switches to a disk-backed heap and streams sorted OFFSET/LIMIT results
+cross-key null entries. Uncorrelated scalar subqueries spill main-side rows while
+waiting for the scalar side and emit spilled results one row at a time. Global top-N
+switches to a disk-backed heap and streams sorted OFFSET/LIMIT results
 without hydrating the full candidate set. Global top-N retains its bounded
 end-of-input lifecycle; it does not gain intermediate-checkpoint recovery.
 Null entries checkpoint individually; the previous null-state blob remains
@@ -281,7 +283,9 @@ the disk-backed top-N heap.
 
 With a memory budget and SQL spill directory configured, GROUP BY, fixed/session
 windows, OVER, ranking, last-N, equi/interval joins and null-aware exact-key probes
-keep individual entries on disk. Checkpoints
+keep individual entries on disk. Scalar-subquery main buffers use the same
+one-row entry granularity, but retain their existing end-of-input lifecycle rather
+than adding checkpoint recovery. Checkpoints
 use `.groups` length slots and `.rows` cell slots under operator-specific prefixes.
 Row cells carry the original partition's key-group byte, rather than the hash of
 their composite identifier. An operator-state `.format` marker is retained in

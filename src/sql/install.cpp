@@ -9203,6 +9203,65 @@ private:
     bool effective_async_ = false;
 };
 
+// Main-side rows for an uncorrelated scalar subquery have to wait for the
+// scalar side to settle. Keep that retained input inside the execution budget,
+// and use one-row spill entries when SQL scratch storage is configured.
+class ScalarMainBuffer {
+public:
+    void open(RuntimeContext* runtime, std::string prefix) {
+        memory_ =
+            MemoryReservation(runtime ? runtime->memory_budget() : nullptr, MemoryCategory::State);
+        entries_.bind(runtime, std::move(prefix), row_json_codec(), [](const Row& row) {
+            return row.retained_bytes();
+        });
+    }
+
+    void push(const Row& row) {
+        if (entries_.enabled()) {
+            entries_.append("", row);
+            return;
+        }
+        rows_.push_back(row);
+        memory_.resize(retained_bytes_());
+    }
+
+    template <class Visitor>
+    void scan(Visitor visitor) const {
+        if (entries_.enabled()) {
+            entries_.scan("", [&](auto, const Row& row) {
+                visitor(row);
+                return true;
+            });
+            return;
+        }
+        for (const auto& row : rows_)
+            visitor(row);
+    }
+
+    void clear() {
+        if (entries_.enabled())
+            entries_.truncate("", 0);
+        std::vector<Row>{}.swap(rows_);
+        memory_.resize(0);
+    }
+
+    [[nodiscard]] std::size_t output_batch_size() const noexcept {
+        return entries_.enabled() ? 1 : 64;
+    }
+
+private:
+    std::size_t retained_bytes_() const {
+        std::size_t bytes = rows_.capacity() * sizeof(Row);
+        for (const auto& row : rows_)
+            bytes = checked_memory_sum(bytes, row.retained_bytes() - sizeof(Row));
+        return bytes;
+    }
+
+    std::vector<Row> rows_;
+    PartitionedList<Row> entries_;
+    MemoryReservation memory_;
+};
+
 // Inc 4: uncorrelated scalar-subquery filter. The scalar (right) side is
 // a single-value aggregate; main (left) rows are buffered and, at EOS,
 // compared against the settled scalar value (v1 semantics: the scalar is
@@ -9217,11 +9276,13 @@ public:
           comparison_op_(std::move(comparison_op)),
           scalar_column_(std::move(scalar_column)) {}
 
+    void open() override { main_buffer_.open(this->runtime(), "scalar_filter.main"); }
+
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& /*out*/) override {
         if (!element.is_data())
             return;
         for (const auto& rec : element.as_data())
-            main_buffer_.push_back(rec.value());
+            main_buffer_.push(rec.value());
     }
     void process_element2(const StreamElement<Row>& element, Emitter<Row>& /*out*/) override {
         if (!element.is_data())
@@ -9237,22 +9298,29 @@ public:
         }
     }
     void flush(Emitter<Row>& out) override {
-        if (!scalar_set_)
+        if (!scalar_set_) {
+            main_buffer_.clear();
             return;  // no scalar value -> comparison is UNKNOWN -> no rows
+        }
         Batch<Row> batch;
-        for (auto& row : main_buffer_) {
+        main_buffer_.scan([&](const Row& row) {
             auto it = row.values.find(test_column_);
             if (it == row.values.end() || it->second.is_null())
-                continue;  // NULL test value -> UNKNOWN
+                return;  // NULL test value -> UNKNOWN
             if (compare_(it->second, scalar_value_, comparison_op_)) {
                 Row r = row;
                 r.values.erase("__key");
                 set_row_kind(r, kRowKindInsert);
                 batch.push(Record<Row>{std::move(r)});
+                if (batch.size() >= main_buffer_.output_batch_size()) {
+                    out.emit_data(std::move(batch));
+                    batch = Batch<Row>{};
+                }
             }
-        }
+        });
         if (!batch.empty())
             out.emit_data(std::move(batch));
+        main_buffer_.clear();
     }
     std::string name() const override { return "scalar_broadcast_filter_row"; }
 
@@ -9288,7 +9356,7 @@ private:
     std::string test_column_;
     std::string comparison_op_;
     std::string scalar_column_;
-    std::vector<Row> main_buffer_;
+    ScalarMainBuffer main_buffer_;
     clink::config::JsonValue scalar_value_{nullptr};
     bool scalar_set_ = false;
 };
@@ -9307,11 +9375,13 @@ public:
     ScalarProjectRowOp(std::string output_column, std::string scalar_column)
         : output_column_(std::move(output_column)), scalar_column_(std::move(scalar_column)) {}
 
+    void open() override { main_buffer_.open(this->runtime(), "scalar_project.main"); }
+
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& /*out*/) override {
         if (!element.is_data())
             return;
         for (const auto& rec : element.as_data())
-            main_buffer_.push_back(rec.value());
+            main_buffer_.push(rec.value());
     }
     void process_element2(const StreamElement<Row>& element, Emitter<Row>& /*out*/) override {
         if (!element.is_data())
@@ -9326,21 +9396,26 @@ public:
     }
     void flush(Emitter<Row>& out) override {
         Batch<Row> batch;
-        for (auto& row : main_buffer_) {
+        main_buffer_.scan([&](const Row& row) {
             Row r = row;
             r.values.erase("__key");
             r.values[output_column_] = scalar_value_;  // NULL if subquery produced nothing
             batch.push(Record<Row>{std::move(r)});     // keep the main row's __row_kind
-        }
+            if (batch.size() >= main_buffer_.output_batch_size()) {
+                out.emit_data(std::move(batch));
+                batch = Batch<Row>{};
+            }
+        });
         if (!batch.empty())
             out.emit_data(std::move(batch));
+        main_buffer_.clear();
     }
     std::string name() const override { return "scalar_project_row"; }
 
 private:
     clink::config::InternedName output_column_;
     std::string scalar_column_;
-    std::vector<Row> main_buffer_;
+    ScalarMainBuffer main_buffer_;
     clink::config::JsonValue scalar_value_{nullptr};
 };
 

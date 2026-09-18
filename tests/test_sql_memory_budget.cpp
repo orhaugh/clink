@@ -75,6 +75,63 @@ void feed(Operator<Row, Row>& op, Emitter<Row>& out, int key, config::JsonValue 
     op.process(StreamElement<Row>::data(std::move(batch)), out);
 }
 
+struct ScalarBufferResult {
+    std::vector<std::string> rows;
+    std::size_t largest_batch{0};
+};
+
+ScalarBufferResult run_scalar_buffer(const std::string& type,
+                                     const std::shared_ptr<MemoryBudget>& budget) {
+    (void)make_operator("aggregate_row");
+    Dag dag;
+    using Channel = BoundedChannel<StreamElement<Row>>;
+    StageHandle<Row> main{std::make_shared<Channel>(16), 0};
+    StageHandle<Row> scalar{std::make_shared<Channel>(16), 0};
+    plugin::BuildContext build;
+    build.params = type == "scalar_broadcast_filter_row"
+                       ? std::map<std::string, std::string>{{"test_column", "k"},
+                                                            {"comparison_op", "ge"},
+                                                            {"scalar_column", "s"}}
+                       : std::map<std::string, std::string>{{"output_column", "scalar"},
+                                                            {"scalar_column", "s"}};
+    const auto* builder = cluster::DagBuilderRegistry::default_instance().find(type);
+    if (!builder)
+        throw std::runtime_error("missing scalar buffer test builder");
+    auto built = (*builder)(dag, {std::any{main}, std::any{scalar}}, build);
+    auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
+    dag.set_runner_identity(output.runner_index, "scalar", "memory-test-scalar");
+
+    Batch<Row> main_rows;
+    for (int key = 0; key < 96; ++key) {
+        Row row;
+        row.values["k"] = config::JsonValue{key};
+        row.values["payload"] = config::JsonValue{std::string(256, 'x') + std::to_string(key)};
+        main_rows.emplace(std::move(row));
+    }
+    main.output->push(StreamElement<Row>::data(std::move(main_rows)));
+    Batch<Row> scalar_rows;
+    Row scalar_row;
+    scalar_row.values["s"] = config::JsonValue{48};
+    scalar_rows.emplace(std::move(scalar_row));
+    scalar.output->push(StreamElement<Row>::data(std::move(scalar_rows)));
+    main.output->close();
+    scalar.output->close();
+
+    RuntimeContext ctx(operator_id_from_uid("memory-test-scalar"), type, nullptr, nullptr);
+    ctx.set_memory_budget(budget);
+    dag.runners().at(output.runner_index).run(ctx, [] { return false; });
+    ScalarBufferResult result;
+    while (auto element = output.output->try_pop()) {
+        if (!element->is_data())
+            continue;
+        result.largest_batch = std::max(result.largest_batch, element->as_data().size());
+        for (const auto& record : element->as_data())
+            result.rows.push_back(
+                config::JsonValue{to_json_object(record.value().values)}.serialize(0));
+    }
+    return result;
+}
+
 TEST(SqlMemoryBudget, HighCardinalityAggregateFailsWithinConfiguredAccountedLimit) {
     auto budget = std::make_shared<MemoryBudget>(4096);
     RuntimeContext context(
@@ -884,6 +941,41 @@ TEST(SqlMemoryBudget, JoinMapsAndNullWildcardRowsRefuseOverBudget) {
             EXPECT_LE(budget->usage().peak, budget->limit());
             EXPECT_TRUE(std::filesystem::is_empty(dir.path));
         }
+    }
+}
+
+TEST(SqlMemoryBudget, ScalarSubqueryMainBuffersSpillRowsAndBoundOutputBatches) {
+    for (const auto* type : {"scalar_broadcast_filter_row", "scalar_project_row"}) {
+        SCOPED_TRACE(type);
+        SpillDirectory dir;
+        std::vector<std::string> expected;
+        {
+            SpillEnvironment env("");
+            expected = run_scalar_buffer(type, {}).rows;
+        }
+        auto budget = std::make_shared<MemoryBudget>(4096);
+        ScalarBufferResult actual;
+        {
+            SpillEnvironment env(dir.path.string());
+            actual = run_scalar_buffer(type, budget);
+        }
+        EXPECT_EQ(actual.rows, expected);
+        EXPECT_EQ(actual.largest_batch, 1u);
+        EXPECT_EQ(actual.rows.size(), std::string(type) == "scalar_project_row" ? 96u : 48u);
+        EXPECT_EQ(budget->usage().used, 0u);
+        EXPECT_LE(budget->usage().peak, budget->limit());
+        EXPECT_TRUE(std::filesystem::is_empty(dir.path));
+    }
+}
+
+TEST(SqlMemoryBudget, ScalarSubqueryMainBuffersRefuseWithoutSpill) {
+    SpillEnvironment env("");
+    for (const auto* type : {"scalar_broadcast_filter_row", "scalar_project_row"}) {
+        SCOPED_TRACE(type);
+        auto budget = std::make_shared<MemoryBudget>(4096);
+        EXPECT_THROW(run_scalar_buffer(type, budget), MemoryLimitExceeded);
+        EXPECT_EQ(budget->usage().used, 0u);
+        EXPECT_LE(budget->usage().peak, budget->limit());
     }
 }
 

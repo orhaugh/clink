@@ -15,6 +15,13 @@ checkpoints retain ordering, emitted flags and key-group colocation, and migrate
 legacy whole-partition and per-accumulator state. Individual rows, value cells,
 materialised results and opaque accumulators must still fit.
 
+**Scalar-subquery main buffers are budgeted and spillable.** Uncorrelated scalar
+filters and projections retain main-side rows until the scalar side settles. With
+a budget and SQL spill directory, they now store those rows as individual scratch
+entries and emit the final result one row at a time. Without spill, retained
+rows count against the operator budget and fail cleanly on exhaustion. This keeps
+the existing bounded end-of-input lifecycle and does not add checkpoint recovery.
+
 **Oversized ranking, last-N and equi/interval join partitions use entry-level storage.**
 With a budget and SQL spill directory configured, these operators scan individual
 rows and checkpoint them separately, preserving partition colocation on rescale.

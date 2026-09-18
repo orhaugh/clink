@@ -23,7 +23,9 @@ Opt-in [memory budgets](docs/internals/memory-management.md) share a byte allowa
 across covered SQL state, local queues, blocking exchanges and checkpoint buffers.
 Blocking exchanges, global top-N candidates and null wildcard entries can spill
 on pressure. Configured SQL aggregate, window, join, OVER and ranking state uses
-entry-level storage to support oversized active keys. `COUNT(DISTINCT)` and
+entry-level storage to support oversized active keys. Scalar-subquery main inputs
+also spill one row at a time while waiting for the scalar side.
+`COUNT(DISTINCT)` and
 retractable `MIN`/`MAX` also store each distinct value separately, and exact
 percentiles stream their ordered value cells. `STRING_AGG` and `ARRAY_AGG` retain
 their values as separate cells too, including inside fixed and session windows.
