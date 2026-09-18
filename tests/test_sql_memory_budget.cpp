@@ -49,7 +49,8 @@ std::shared_ptr<Operator<Row, Row>> make_operator(const std::string& type,
     context.params["emit_changelog"] = changelog ? "true" : "false";
     context.params["aggregates"] =
         "[{\"name\":\"s\",\"fn\":\"" + fn +
-        "\",\"input_column\":\"v\",\"distinct\":" + (distinct ? "true" : "false") + "}]";
+        "\",\"input_column\":\"v\",\"distinct\":" + (distinct ? "true" : "false") +
+        (fn == "percentile" || fn == "approx_percentile" ? ",\"percentile\":0.37" : "") + "}]";
     context.params["time_column"] = "ts";
     context.params["size_ms"] = "1000";
     if (ttl) {
@@ -1706,19 +1707,26 @@ void seed_old_aggregate_entry_layout(InMemoryStateBackend& backend, RuntimeConte
 class SqlAggregateValueBudget : public ::testing::TestWithParam<const char*> {};
 TEST_P(SqlAggregateValueBudget, ScalarResultSupportsAnOversizedValueCollection) {
     const std::string fn = GetParam();
+    const bool percentile = fn == "percentile" || fn == "approx_percentile";
     std::vector<config::JsonValue> values;
-    for (int i = 0; i < 48; ++i)
-        values.emplace_back(std::string(256, 'x') + std::to_string((i * 37) % 48));
-    values.emplace_back(1);
-    values.emplace_back(true);
-    values.emplace_back(config::make_dec_value(*config::dec_parse("1.00")));
-    values.emplace_back(config::make_dec_value(*config::dec_parse("1.0")));
+    if (percentile) {
+        for (int i = 0; i < 320; ++i)
+            values.emplace_back(static_cast<double>((i * 37) % 7));
+    } else {
+        for (int i = 0; i < 48; ++i)
+            values.emplace_back(std::string(256, 'x') + std::to_string((i * 37) % 48));
+        values.emplace_back(1);
+        values.emplace_back(true);
+        values.emplace_back(config::make_dec_value(*config::dec_parse("1.00")));
+        values.emplace_back(config::make_dec_value(*config::dec_parse("1.0")));
+    }
     values.emplace_back(config::JsonValue{});
+    const std::size_t limit = percentile ? 2048 : 8192;
     auto make = [&] { return make_operator("aggregate_row", fn, false, {}, false, fn == "count"); };
     {
         SpillEnvironment env("");
         RuntimeContext ctx(operator_id_from_uid("memory-test-aggregate"), fn, nullptr, nullptr);
-        ctx.set_memory_budget(std::make_shared<MemoryBudget>(8192));
+        ctx.set_memory_budget(std::make_shared<MemoryBudget>(limit));
         auto op = make();
         op->attach_runtime(&ctx);
         op->open();
@@ -1737,7 +1745,7 @@ TEST_P(SqlAggregateValueBudget, ScalarResultSupportsAnOversizedValueCollection) 
         // configuration all converge on the same current per-value layout.
         SpillDirectory dir;
         SpillEnvironment env(mode == 1 || mode == 4 ? dir.path.string() : "");
-        auto budget = std::make_shared<MemoryBudget>(8192);
+        auto budget = std::make_shared<MemoryBudget>(limit);
         InMemoryStateBackend backend;
         const auto id = operator_id_from_uid("memory-test-aggregate");
         RuntimeContext ctx(id, fn, &backend, nullptr);
@@ -1808,4 +1816,7 @@ TEST_P(SqlAggregateValueBudget, ScalarResultSupportsAnOversizedValueCollection) 
         EXPECT_TRUE(std::filesystem::is_empty(dir.path));
     }
 }
-INSTANTIATE_TEST_SUITE_P(Values, SqlAggregateValueBudget, ::testing::Values("count", "min", "max"));
+INSTANTIATE_TEST_SUITE_P(
+    Values,
+    SqlAggregateValueBudget,
+    ::testing::Values("count", "min", "max", "percentile", "approx_percentile"));

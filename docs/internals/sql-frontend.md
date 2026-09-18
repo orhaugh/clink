@@ -256,10 +256,11 @@ end-of-input lifecycle; it does not gain intermediate-checkpoint recovery.
 Null entries checkpoint individually; the previous null-state blob remains
 readable. Keyed state codecs preserve changelog, retraction, matching and
 ordering information, with normal backend slots supplying recovery.
-`COUNT(DISTINCT)` and retractable `MIN`/`MAX` store each distinct value and
-multiplicity separately. Individual rows, unsplit aggregate payloads and
-materialised results must still fit. Global top-N needs a constant number of
-decoded rows.
+`COUNT(DISTINCT)`, retractable `MIN`/`MAX` and percentile aggregates store each
+distinct value and multiplicity separately. Percentile finalisation streams the
+ordered cells to find both interpolation ranks. Individual rows, unsplit
+aggregate payloads and materialised results must still fit. Global top-N needs a
+constant number of decoded rows.
 See [Memory budgets](memory-management.md) for configuration, backend requirements
 and allocation exclusions. `include/clink/sql/working_set.hpp` implements map
 accounting and streaming mutation scans; `spill_store.hpp` and
@@ -285,9 +286,9 @@ Row cells carry the original partition's key-group byte, rather than the hash of
 their composite identifier. An operator-state `.format` marker is retained in
 all filtered restores. Legacy whole-partition snapshots migrate on open. GROUP BY
 stores metadata at index zero and each aggregate at subsequent indexes. Its
-`agg.values` companion partition stores individual `COUNT(DISTINCT)` and
-retractable `MIN`/`MAX` values. Recovery also migrates the earlier per-accumulator
-layout. OVER separates metadata and individual running accumulators from its
-pending and history lists. Windows store one pane per entry; sessions store one
-session per entry. See
+`agg.values` companion partition stores individual `COUNT(DISTINCT)`, retractable
+`MIN`/`MAX` and percentile values. Recovery also migrates the earlier
+per-accumulator layout. OVER separates metadata and individual running
+accumulators from its pending and history lists. Windows store one pane per
+entry; sessions store one session per entry. See
 [memory budgets](memory-management.md) for allocation and recovery limits.

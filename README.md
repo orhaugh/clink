@@ -24,10 +24,11 @@ across covered SQL state, local queues, blocking exchanges and checkpoint buffer
 Blocking exchanges, global top-N candidates and null wildcard entries can spill
 on pressure. Configured SQL aggregate, window, join, OVER and ranking state uses
 entry-level storage to support oversized active keys. `COUNT(DISTINCT)` and
-retractable `MIN`/`MAX` also store each distinct value separately. Individual
-rows, pane/session aggregate payloads, materialised results and other growing
-accumulators must still fit. Other covered owners refuse allocations on
-exhaustion. Accounting coverage is partial; this is not an RSS cap.
+retractable `MIN`/`MAX` also store each distinct value separately, and exact
+percentiles stream their ordered value cells. Individual rows, pane/session
+aggregate payloads, materialised results and other growing accumulators must
+still fit. Other covered owners refuse allocations on exhaustion. Accounting
+coverage is partial; this is not an RSS cap.
 
 Three capabilities follow from that design:
 

@@ -5712,7 +5712,8 @@ private:
     static bool split_values_(const AggSpec& spec) {
         return !spec.is_udaf &&
                ((spec.fn == "count" && spec.distinct && !spec.input_column.empty()) ||
-                ((spec.fn == "min" || spec.fn == "max") && spec.retractable));
+                ((spec.fn == "min" || spec.fn == "max") && spec.retractable) ||
+                is_percentile_fn(spec.fn));
     }
     static Codec<ValueCount> value_count_codec_() {
         return {.encode =
@@ -5743,13 +5744,30 @@ private:
                                                          : JsonValueLess{}(a.value, b.value);
     }
     void migrate_values_(const std::string& key, std::size_t aggregate, AggState& state) {
-        // Cells need no resident index or ordering: updates and scalar
-        // finalisation scan values, and removal swaps in the final cell.
+        // Cells need no resident index. Percentile cells retain relative sort
+        // order so finalisation can find both ranks with streaming scans.
         if (aggregates_[aggregate].fn == "count") {
             for (const auto& [value, count] : state.extras_read().value_counts)
                 values_.append(key, ValueCount{aggregate, value, {}, count});
             if (state.cold)
                 state.cold->value_counts.clear();
+        } else if (is_percentile_fn(aggregates_[aggregate].fn)) {
+            auto& old = state.extras().percentile_values;
+            std::sort(old.begin(), old.end());
+            std::optional<ValueCount> pending;
+            for (const auto value : old) {
+                if (pending && pending->value.as_number() == value) {
+                    ++pending->count;
+                    continue;
+                }
+                if (pending)
+                    values_.append(key, *pending);
+                pending = ValueCount{aggregate, {}, config::JsonValue{value}, 1};
+            }
+            if (pending)
+                values_.append(key, *pending);
+            if (state.cold)
+                state.cold->percentile_values.clear();
         } else {
             for (const auto& [value, count] : state.extras_read().minmax_counts)
                 values_.append(key, ValueCount{aggregate, {}, value, count});
@@ -5765,6 +5783,8 @@ private:
         const auto field = row.values.find(spec.input_column);
         if (field == row.values.end() || field->second.is_null())
             return;
+        if (is_percentile_fn(spec.fn) && !field->second.is_number())
+            return;
         ValueCount incoming;
         incoming.aggregate = aggregate;
         if (spec.fn == "count")
@@ -5778,22 +5798,26 @@ private:
                 found = true;
                 return false;
             }
+            if (is_percentile_fn(spec.fn) && existing.aggregate == aggregate &&
+                value_less_(incoming, existing))
+                return false;
             ++position;
             return true;
         });
         if (!found) {
-            if (!retract)
-                values_.append(key, incoming);
+            if (!retract) {
+                if (is_percentile_fn(spec.fn) && position != values_.size(key))
+                    values_.insert(key, position, incoming);
+                else
+                    values_.append(key, incoming);
+            }
             return;
         }
         auto entry = values_.at(key, position);
         if (retract && entry.value.count == 1) {
-            const auto last = values_.size(key) - 1;
-            if (position != last) {
-                auto replacement = values_.at(key, last);
-                values_.put(key, position, replacement.value);
-            }
-            values_.truncate(key, last);
+            // Shifting preserves the relative order of percentile cells even
+            // when another aggregate's cells are interleaved in this group.
+            values_.erase(key, position);
             return;
         }
         if (!retract && entry.value.count == std::numeric_limits<std::int64_t>::max())
@@ -5803,6 +5827,8 @@ private:
     }
     config::JsonValue finalize_values_(const std::string& key, std::size_t aggregate) const {
         const auto& spec = aggregates_[aggregate];
+        if (is_percentile_fn(spec.fn))
+            return finalize_percentile_values_(key, aggregate);
         std::int64_t count = 0;
         config::JsonValue result;
         bool have_result = false;
@@ -5822,6 +5848,45 @@ private:
             return true;
         });
         return spec.fn == "count" ? config::JsonValue{count} : result;
+    }
+    config::JsonValue finalize_percentile_values_(const std::string& key,
+                                                  std::size_t aggregate) const {
+        std::uint64_t total = 0;
+        values_.scan(key, [&](auto, const ValueCount& entry) {
+            if (entry.aggregate != aggregate)
+                return true;
+            const auto multiplicity = static_cast<std::uint64_t>(entry.count);
+            if (multiplicity > std::numeric_limits<std::uint64_t>::max() - total)
+                throw std::runtime_error("SQL_STATE_ERROR: aggregate multiplicity overflow");
+            total += multiplicity;
+            return true;
+        });
+        if (!total)
+            return config::JsonValue{};
+        const double index = aggregates_[aggregate].percentile * static_cast<double>(total - 1);
+        const auto lower = static_cast<std::uint64_t>(std::floor(index));
+        const auto upper = static_cast<std::uint64_t>(std::ceil(index));
+        double lower_value = 0.0;
+        double upper_value = 0.0;
+        bool have_lower = false;
+        std::uint64_t seen = 0;
+        values_.scan(key, [&](auto, const ValueCount& entry) {
+            if (entry.aggregate != aggregate)
+                return true;
+            const auto end = seen + static_cast<std::uint64_t>(entry.count);
+            if (!have_lower && lower < end) {
+                lower_value = entry.value.as_number();
+                have_lower = true;
+            }
+            if (upper < end) {
+                upper_value = entry.value.as_number();
+                return false;
+            }
+            seen = end;
+            return true;
+        });
+        const double weight = index - static_cast<double>(lower);
+        return config::JsonValue{lower_value + (upper_value - lower_value) * weight};
     }
 
     std::optional<Row> entry_result_(const std::string& key) const {

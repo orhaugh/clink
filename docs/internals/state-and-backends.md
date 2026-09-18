@@ -245,11 +245,11 @@ because a checkpoint can hold both the working and encoded copies. See
 With a memory budget and `CLINK_SQL_SPILL_DIR`, covered synchronous GROUP BY,
 window/session, equi/interval join, OVER, last-N and partitioned ranking maps
 use entry-level scratch storage. GROUP BY and OVER split running accumulators;
-GROUP BY also splits `COUNT(DISTINCT)` and retractable `MIN`/`MAX` collections
-into individual value cells. Windows split panes and sessions; join buffers split
-rows. Null-aware joins also store exact-key probes and cross-key null entries
-individually. Null probes and wildcard tuples checkpoint in separate entry slots;
-recovery also reads the legacy single-blob null-state representation.
+GROUP BY also splits `COUNT(DISTINCT)`, retractable `MIN`/`MAX` and percentile
+collections into individual value cells. Windows split panes and sessions; join
+buffers split rows. Null-aware joins also store exact-key probes and cross-key
+null entries individually. Null probes and wildcard tuples checkpoint in separate
+entry slots; recovery also reads the legacy single-blob null-state representation.
 This is separate from backend selection: spilled groups are still copied to
 entry slots before a checkpoint and restored from those slots. Legacy
 whole-partition slots remain readable for migration.
