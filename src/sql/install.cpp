@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -11914,11 +11915,28 @@ public:
           max_batch_size_(max_batch_size < 1 ? 1 : max_batch_size),
           null_on_error_(null_on_error) {}
 
+    void open() override {
+        budget_ = this->runtime() ? this->runtime()->memory_budget() : nullptr;
+        if (budget_)
+            budgeted_buffer_.emplace(BudgetAllocator<BufferedRecord>{budget_});
+    }
+
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             for (const auto& rec : element.as_data()) {
-                buffer_.push_back(rec);
-                if (buffer_.size() >= max_batch_size_) {
+                if (budgeted_buffer_) {
+                    try {
+                        budgeted_buffer_->emplace_back(budget_, rec);
+                    } catch (const MemoryLimitExceeded&) {
+                        if (budgeted_buffer_->empty())
+                            throw;
+                        flush_(out);
+                        budgeted_buffer_->emplace_back(budget_, rec);
+                    }
+                } else {
+                    buffer_.push_back(rec);
+                }
+                if (buffer_size_() >= max_batch_size_) {
                     flush_(out);
                 }
             }
@@ -11940,13 +11958,45 @@ public:
     std::string name() const override { return "ml_predict_batch_row"; }
 
 private:
+    struct BufferedRecord {
+        BufferedRecord(std::shared_ptr<MemoryBudget> budget, const Record<Row>& source)
+            : payload(std::move(budget),
+                      MemoryCategory::State,
+                      source.value().retained_bytes() - sizeof(Row)),
+              record(source) {}
+
+        MemoryReservation payload;
+        Record<Row> record;
+    };
+    using BufferedList = std::list<BufferedRecord, BudgetAllocator<BufferedRecord>>;
+
+    [[nodiscard]] std::size_t buffer_size_() const noexcept {
+        return budgeted_buffer_ ? budgeted_buffer_->size() : buffer_.size();
+    }
+    template <class Visitor>
+    void visit_buffer_(Visitor visitor) const {
+        if (budgeted_buffer_) {
+            for (const auto& buffered : *budgeted_buffer_)
+                visitor(buffered.record);
+        } else {
+            for (const auto& record : buffer_)
+                visitor(record);
+        }
+    }
+    void clear_buffer_() {
+        if (budgeted_buffer_)
+            budgeted_buffer_->clear();
+        else
+            buffer_.clear();
+    }
+
     void flush_(Emitter<Row>& out) {
-        if (buffer_.empty()) {
+        if (buffer_size_() == 0) {
             return;
         }
         std::vector<Row> features_batch;
-        features_batch.reserve(buffer_.size());
-        for (const auto& rec : buffer_) {
+        features_batch.reserve(buffer_size_());
+        visit_buffer_([&](const Record<Row>& rec) {
             Row features;
             for (const auto& c : feature_columns_) {
                 auto it = rec.value().values.find(c);
@@ -11955,7 +12005,7 @@ private:
                 }
             }
             features_batch.push_back(std::move(features));
-        }
+        });
         // One request for the whole buffer. Contract: one prediction per input row, same
         // order (a shortfall leaves the tail rows with null OUTPUT columns). on_error=
         // 'null' turns a failed batch request into null OUTPUT columns for every buffered
@@ -11969,8 +12019,9 @@ private:
             }
         }
         Batch<Row> emit_batch;
-        for (std::size_t i = 0; i < buffer_.size(); ++i) {
-            Row out_row = buffer_[i].value();  // input columns (and __row_kind) through
+        std::size_t i = 0;
+        visit_buffer_([&](const Record<Row>& rec) {
+            Row out_row = rec.value();  // input columns (and __row_kind) through
             if (i < preds.size()) {
                 for (const auto& oc : output_columns_) {
                     auto it = preds[i].values.find(oc);
@@ -11978,13 +12029,14 @@ private:
                         it != preds[i].values.end() ? it->second : clink::config::JsonValue{};
                 }
             }
-            if (buffer_[i].event_time().has_value()) {
-                emit_batch.push(Record<Row>{std::move(out_row), *buffer_[i].event_time()});
+            if (rec.event_time().has_value()) {
+                emit_batch.push(Record<Row>{std::move(out_row), *rec.event_time()});
             } else {
                 emit_batch.push(Record<Row>{std::move(out_row)});
             }
-        }
-        buffer_.clear();
+            ++i;
+        });
+        clear_buffer_();
         if (!emit_batch.empty()) {
             out.emit_data(std::move(emit_batch));
         }
@@ -11995,6 +12047,8 @@ private:
     std::vector<std::string> output_columns_;
     std::size_t max_batch_size_;
     bool null_on_error_;
+    std::shared_ptr<MemoryBudget> budget_;
+    std::optional<BufferedList> budgeted_buffer_;
     std::vector<Record<Row>> buffer_;
 };
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Batched model inference adapts to the execution memory budget.** Retained
+`ML_PREDICT` input rows and list storage now share the operator budget. If the
+next row is refused while a batch is buffered, clink submits the current batch
+and retries that row in a fresh one. A single oversized row fails cleanly.
+Feature copies, prediction results and provider-owned inference memory remain
+outside this charge.
+
 **More SQL operators support oversized active keys.** GROUP BY stores each
 accumulator separately, and splits `COUNT(DISTINCT)` and retractable `MIN`/`MAX`
 collections into individual values. Percentile aggregates keep ordered value

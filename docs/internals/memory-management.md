@@ -73,6 +73,7 @@ limit. Multiply by the number of concurrent executions when sizing a Worker.
 | SQL null-aware semi/anti joins | Exact-key probes, cross-key null probes and wildcard tuples count and can spill individually. Null-bearing collections store individual entries, so the whole index need not fit in RAM. Checkpoints stream entries through separate slots; legacy null-state blobs remain readable. Plain semi/anti joins retain their backend-driven path. |
 | SQL global ORDER BY LIMIT | The retained candidate heap and nested rows count. Pressure can move candidates into a disk-backed binary heap with no resident row index. Final output streams in sort order, respecting OFFSET and LIMIT. A constant number of individual rows must fit simultaneously. |
 | SQL uncorrelated scalar subqueries | Main-side rows retained until the scalar side settles count against the operator budget. Configured spilling stores one row per scratch entry and emits one output row at a time. The accounted in-memory path emits batches of at most 64 rows. |
+| SQL batched model inference | Retained input rows and list nodes count against the operator budget. If another row is refused while the buffer is non-empty, the operator submits the current batch and retries the row in a fresh batch. A single oversized row fails cleanly. Feature extraction, prediction results and provider-owned inference memory remain outside this charge. |
 | SQL TTL indexes | Deadline, dirty-key and pre-watermark key estimates charge the operator budget for GROUP BY, equi joins, semi/anti joins, DISTINCT and set operators. Restore rebuilds charges and expiry releases them. These indexes remain in memory and cannot spill. |
 | In-memory and file-backed backend working state | Estimated key/value storage and map overhead, checked before puts and during restore. Erase and clear release charges. Staged barrier copies have separate checkpoint charges. Binding a new domain requires an empty backend. |
 | Canonical snapshot writer | Arrow builder and IPC output allocations use a budgeted pool. The final byte-vector copy is reserved while the writer holds it. Returned snapshot byte vectors are caller-owned and are not continuously tracked. |
@@ -258,8 +259,8 @@ and ordered insertion can temporarily hold source and destination cells. Opaque
 UDAFs remain whole accumulators. `STRING_AGG` and `ARRAY_AGG` state is split for
 GROUP BY, fixed windows and sessions, but their materialised result and a
 changelog operator's prior result must still fit.
-Codec buffers, input/output batches, TTL indexes and backend caches retain the
-allocation limitations above.
+Codec buffers, input/output batches, model feature and prediction vectors, provider
+allocations, TTL indexes and backend caches retain the allocation limitations above.
 
 For Arrow growth, the pool reserves the whole new allocation while retaining the
 old charge, because a reallocation can temporarily hold both buffers. Refused

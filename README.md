@@ -25,6 +25,8 @@ Blocking exchanges, global top-N candidates and null wildcard entries can spill
 on pressure. Configured SQL aggregate, window, join, OVER and ranking state uses
 entry-level storage to support oversized active keys. Scalar-subquery main inputs
 also spill one row at a time while waiting for the scalar side.
+Buffered model inference accounts retained input rows and flushes early under
+memory pressure.
 `COUNT(DISTINCT)` and
 retractable `MIN`/`MAX` also store each distinct value separately, and exact
 percentiles stream their ordered value cells. `STRING_AGG` and `ARRAY_AGG` retain

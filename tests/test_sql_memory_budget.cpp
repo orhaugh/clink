@@ -13,6 +13,7 @@
 #include "clink/runtime/memory_budget.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/install.hpp"
+#include "clink/sql/model_provider.hpp"
 #include "clink/sql/partitioned_list.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_output.hpp"
@@ -130,6 +131,46 @@ ScalarBufferResult run_scalar_buffer(const std::string& type,
                 config::JsonValue{to_json_object(record.value().values)}.serialize(0));
     }
     return result;
+}
+
+std::vector<std::size_t>& memory_batch_provider_calls() {
+    static std::vector<std::size_t> calls;
+    return calls;
+}
+
+class MemoryBatchProvider final : public ModelProvider {
+public:
+    Row predict(const Row& features) override { return predict_batch({features}).front(); }
+    [[nodiscard]] std::size_t max_batch_size() const override { return 1024; }
+    std::vector<Row> predict_batch(const std::vector<Row>& features) override {
+        memory_batch_provider_calls().push_back(features.size());
+        std::vector<Row> result;
+        result.reserve(features.size());
+        for (std::size_t i = 0; i < features.size(); ++i) {
+            Row row;
+            row.values["prediction"] = config::JsonValue{static_cast<std::int64_t>(i)};
+            result.push_back(std::move(row));
+        }
+        return result;
+    }
+    [[nodiscard]] std::string name() const override { return "memory_batch"; }
+};
+
+std::shared_ptr<Operator<Row, Row>> make_memory_batch_operator() {
+    (void)make_operator("aggregate_row");
+    ModelProviderRegistry::global().register_provider(
+        "memory_batch", [](const auto&) { return std::make_shared<MemoryBatchProvider>(); });
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "ml_predict_row", std::string{kChannelRow}, std::string{kChannelRow});
+    if (!factory)
+        throw std::runtime_error("missing ML prediction test factory");
+    cluster::OperatorBuildContext build;
+    build.params = {{"feature_columns", "v"},
+                    {"output_columns", "prediction"},
+                    {"model.provider", "memory_batch"}};
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(build));
+    op->set_uid("memory-test-ml-batch");
+    return op;
 }
 
 TEST(SqlMemoryBudget, HighCardinalityAggregateFailsWithinConfiguredAccountedLimit) {
@@ -977,6 +1018,51 @@ TEST(SqlMemoryBudget, ScalarSubqueryMainBuffersRefuseWithoutSpill) {
         EXPECT_EQ(budget->usage().used, 0u);
         EXPECT_LE(budget->usage().peak, budget->limit());
     }
+}
+
+TEST(SqlMemoryBudget, MlBatchFlushesEarlyUnderBudgetPressure) {
+    memory_batch_provider_calls().clear();
+    auto budget = std::make_shared<MemoryBudget>(4096);
+    RuntimeContext context(
+        operator_id_from_uid("memory-test-ml-batch"), "ml-batch", nullptr, nullptr);
+    context.set_memory_budget(budget);
+    auto op = make_memory_batch_operator();
+    op->attach_runtime(&context);
+    op->open();
+    std::size_t output_rows = 0;
+    Emitter<Row> out([&](StreamElement<Row> element) {
+        if (element.is_data())
+            output_rows += element.as_data().size();
+        return true;
+    });
+    for (int index = 0; index < 24; ++index)
+        feed(*op, out, index, config::JsonValue{std::string(700, 'x')}, index);
+    op->flush(out);
+    EXPECT_EQ(output_rows, 24u);
+    ASSERT_GT(memory_batch_provider_calls().size(), 1u);
+    EXPECT_GT(*std::max_element(memory_batch_provider_calls().begin(),
+                                memory_batch_provider_calls().end()),
+              1u);
+    EXPECT_LT(*std::max_element(memory_batch_provider_calls().begin(),
+                                memory_batch_provider_calls().end()),
+              24u);
+    EXPECT_EQ(budget->usage().used, 0u);
+    EXPECT_LE(budget->usage().peak, budget->limit());
+}
+
+TEST(SqlMemoryBudget, MlBatchRefusesAnIndividualOversizedRow) {
+    auto budget = std::make_shared<MemoryBudget>(4096);
+    RuntimeContext context(
+        operator_id_from_uid("memory-test-ml-batch"), "ml-batch", nullptr, nullptr);
+    context.set_memory_budget(budget);
+    auto op = make_memory_batch_operator();
+    op->attach_runtime(&context);
+    op->open();
+    Emitter<Row> out([](StreamElement<Row>) { return true; });
+    EXPECT_THROW(feed(*op, out, 1, config::JsonValue{std::string(8192, 'x')}), MemoryLimitExceeded);
+    op.reset();
+    EXPECT_EQ(budget->usage().used, 0u);
+    EXPECT_LE(budget->usage().peak, budget->limit());
 }
 
 TEST(SqlMemoryBudget, GlobalTopNSpillsBeyondBudgetAndStreamsOrderedOffsetResults) {
