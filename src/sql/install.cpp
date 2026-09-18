@@ -5713,7 +5713,10 @@ private:
         return !spec.is_udaf &&
                ((spec.fn == "count" && spec.distinct && !spec.input_column.empty()) ||
                 ((spec.fn == "min" || spec.fn == "max") && spec.retractable) ||
-                is_percentile_fn(spec.fn));
+                is_percentile_fn(spec.fn) || spec.fn == "string_agg" || spec.fn == "array_agg");
+    }
+    static bool ordered_values_(const AggSpec& spec) {
+        return is_percentile_fn(spec.fn) || spec.fn == "string_agg";
     }
     static Codec<ValueCount> value_count_codec_() {
         return {.encode =
@@ -5740,17 +5743,23 @@ private:
     bool value_less_(const ValueCount& a, const ValueCount& b) const {
         if (a.aggregate != b.aggregate)
             return a.aggregate < b.aggregate;
-        return aggregates_.at(a.aggregate).fn == "count" ? a.key < b.key
-                                                         : JsonValueLess{}(a.value, b.value);
+        const auto& fn = aggregates_.at(a.aggregate).fn;
+        return fn == "count" || fn == "string_agg" ? a.key < b.key
+                                                   : JsonValueLess{}(a.value, b.value);
     }
     void migrate_values_(const std::string& key, std::size_t aggregate, AggState& state) {
-        // Cells need no resident index. Percentile cells retain relative sort
-        // order so finalisation can find both ranks with streaming scans.
-        if (aggregates_[aggregate].fn == "count") {
+        // Cells need no resident index. Percentile and STRING_AGG cells retain
+        // relative sort order for streaming finalisation.
+        if (aggregates_[aggregate].fn == "count" || aggregates_[aggregate].fn == "string_agg") {
             for (const auto& [value, count] : state.extras_read().value_counts)
                 values_.append(key, ValueCount{aggregate, value, {}, count});
             if (state.cold)
                 state.cold->value_counts.clear();
+        } else if (aggregates_[aggregate].fn == "array_agg") {
+            for (const auto& value : state.extras_read().array_values)
+                values_.append(key, ValueCount{aggregate, {}, value, 1});
+            if (state.cold)
+                state.cold->array_values.clear();
         } else if (is_percentile_fn(aggregates_[aggregate].fn)) {
             auto& old = state.extras().percentile_values;
             std::sort(old.begin(), old.end());
@@ -5785,9 +5794,13 @@ private:
             return;
         if (is_percentile_fn(spec.fn) && !field->second.is_number())
             return;
+        if (spec.fn == "array_agg") {
+            update_array_values_(key, aggregate, field->second, retract);
+            return;
+        }
         ValueCount incoming;
         incoming.aggregate = aggregate;
-        if (spec.fn == "count")
+        if (spec.fn == "count" || spec.fn == "string_agg")
             incoming.key = agg_value_key(field->second, spec);
         else
             incoming.value = field->second;
@@ -5798,7 +5811,7 @@ private:
                 found = true;
                 return false;
             }
-            if (is_percentile_fn(spec.fn) && existing.aggregate == aggregate &&
+            if (ordered_values_(spec) && existing.aggregate == aggregate &&
                 value_less_(incoming, existing))
                 return false;
             ++position;
@@ -5806,7 +5819,7 @@ private:
         });
         if (!found) {
             if (!retract) {
-                if (is_percentile_fn(spec.fn) && position != values_.size(key))
+                if (ordered_values_(spec) && position != values_.size(key))
                     values_.insert(key, position, incoming);
                 else
                     values_.append(key, incoming);
@@ -5815,8 +5828,8 @@ private:
         }
         auto entry = values_.at(key, position);
         if (retract && entry.value.count == 1) {
-            // Shifting preserves the relative order of percentile cells even
-            // when another aggregate's cells are interleaved in this group.
+            // Shifting preserves ordered cells even when another aggregate's
+            // cells are interleaved in this group.
             values_.erase(key, position);
             return;
         }
@@ -5825,10 +5838,36 @@ private:
         entry.value.count += retract ? -1 : 1;
         values_.put(key, position, entry.value);
     }
+    void update_array_values_(const std::string& key,
+                              std::size_t aggregate,
+                              const config::JsonValue& value,
+                              bool retract) {
+        if (!retract) {
+            values_.append(key, ValueCount{aggregate, {}, value, 1});
+            return;
+        }
+        const auto encoded = value.serialize(0);
+        std::uint64_t position = 0;
+        bool found = false;
+        values_.scan(key, [&](auto, const ValueCount& existing) {
+            if (existing.aggregate == aggregate && existing.value.serialize(0) == encoded) {
+                found = true;
+                return false;
+            }
+            ++position;
+            return true;
+        });
+        if (found)
+            values_.erase(key, position);
+    }
     config::JsonValue finalize_values_(const std::string& key, std::size_t aggregate) const {
         const auto& spec = aggregates_[aggregate];
         if (is_percentile_fn(spec.fn))
             return finalize_percentile_values_(key, aggregate);
+        if (spec.fn == "string_agg")
+            return finalize_string_values_(key, aggregate);
+        if (spec.fn == "array_agg")
+            return finalize_array_values_(key, aggregate);
         std::int64_t count = 0;
         config::JsonValue result;
         bool have_result = false;
@@ -5887,6 +5926,51 @@ private:
         });
         const double weight = index - static_cast<double>(lower);
         return config::JsonValue{lower_value + (upper_value - lower_value) * weight};
+    }
+    config::JsonValue finalize_string_values_(const std::string& key, std::size_t aggregate) const {
+        const auto& spec = aggregates_[aggregate];
+        std::string result;
+        bool first = true;
+        values_.scan(key, [&](auto, const ValueCount& entry) {
+            if (entry.aggregate != aggregate)
+                return true;
+            const auto repetitions = spec.distinct ? std::int64_t{1} : entry.count;
+            for (std::int64_t i = 0; i < repetitions; ++i) {
+                if (!first)
+                    result += spec.separator;
+                result += entry.key;
+                first = false;
+            }
+            return true;
+        });
+        return first ? config::JsonValue{} : config::JsonValue{std::move(result)};
+    }
+    config::JsonValue finalize_array_values_(const std::string& key, std::size_t aggregate) const {
+        const auto& spec = aggregates_[aggregate];
+        config::JsonArray result;
+        values_.scan(key, [&](auto index, const ValueCount& entry) {
+            if (entry.aggregate != aggregate)
+                return true;
+            if (spec.distinct) {
+                const auto encoded = entry.value.serialize(0);
+                bool seen = false;
+                values_.scan(key, [&](auto prior, const ValueCount& candidate) {
+                    if (prior == index)
+                        return false;
+                    if (candidate.aggregate == aggregate &&
+                        candidate.value.serialize(0) == encoded) {
+                        seen = true;
+                        return false;
+                    }
+                    return true;
+                });
+                if (seen)
+                    return true;
+            }
+            result.push_back(entry.value);
+            return true;
+        });
+        return result.empty() ? config::JsonValue{} : config::JsonValue{std::move(result)};
     }
 
     std::optional<Row> entry_result_(const std::string& key) const {

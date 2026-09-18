@@ -1467,9 +1467,9 @@ TEST(SqlMemoryBudget, OverPendingAndFrameHistoryExceedBudgetAcrossRecovery) {
     }
 }
 
-TEST(SqlMemoryBudget, GroupByAccumulatorsSpillIndependentlyAndRetainChangelog) {
+TEST(SqlMemoryBudget, GroupByValueCollectionsRetainAggregateIdentityAndChangelog) {
     std::string specs = "[";
-    for (int i = 0; i < 12; ++i) {
+    for (int i = 0; i < 4; ++i) {
         if (i)
             specs += ",";
         specs += "{\"name\":\"s" + std::to_string(i) +
@@ -1484,14 +1484,14 @@ TEST(SqlMemoryBudget, GroupByAccumulatorsSpillIndependentlyAndRetainChangelog) {
         SpillEnvironment env("");
         RuntimeContext ctx(
             operator_id_from_uid("memory-test-family"), "aggregate", nullptr, nullptr);
-        ctx.set_memory_budget(std::make_shared<MemoryBudget>(16384));
+        ctx.set_memory_budget(std::make_shared<MemoryBudget>(4096));
         auto op = family_operator("aggregate_row", "row_number", params);
         op->attach_runtime(&ctx);
         op->open();
         Emitter<Row> discard([](StreamElement<Row>) { return true; });
         EXPECT_THROW(
             {
-                for (int value = 0; value < 48; ++value)
+                for (int value = 0; value < 16; ++value)
                     feed(*op, discard, 1, config::JsonValue{value});
             },
             MemoryLimitExceeded);
@@ -1501,7 +1501,7 @@ TEST(SqlMemoryBudget, GroupByAccumulatorsSpillIndependentlyAndRetainChangelog) {
         SCOPED_TRACE(mode);
         SpillDirectory dir;
         SpillEnvironment env(mode == 1 ? dir.path.string() : "");
-        auto budget = std::make_shared<MemoryBudget>(16384);
+        auto budget = std::make_shared<MemoryBudget>(4096);
         InMemoryStateBackend backend;
         const auto id = operator_id_from_uid("memory-test-family");
         RuntimeContext ctx(id, "aggregate", &backend, nullptr);
@@ -1529,7 +1529,7 @@ TEST(SqlMemoryBudget, GroupByAccumulatorsSpillIndependentlyAndRetainChangelog) {
             batch.emplace(std::move(row));
             op->process(StreamElement<Row>::data(std::move(batch)), out);
         };
-        for (int i = 0; i < 48; ++i)
+        for (int i = 0; i < 16; ++i)
             send(i);
         op->snapshot_timers(backend, id);
         auto saved = backend.snapshot(CheckpointId{1});
@@ -1543,10 +1543,10 @@ TEST(SqlMemoryBudget, GroupByAccumulatorsSpillIndependentlyAndRetainChangelog) {
         op->attach_runtime(&ctx);
         op->restore_timers(backend, id);
         op->open();
-        send(47);  // duplicate must not change STRING_AGG DISTINCT
-        for (int i = 0; i < 48; ++i)
+        send(15);  // duplicate must not change STRING_AGG DISTINCT
+        for (int i = 0; i < 16; ++i)
             send(i, true);
-        send(47, true);
+        send(15, true);
         if (!mode)
             expected = actual;
         else
@@ -1706,7 +1706,9 @@ void seed_old_aggregate_entry_layout(InMemoryStateBackend& backend, RuntimeConte
 
 class SqlAggregateValueBudget : public ::testing::TestWithParam<const char*> {};
 TEST_P(SqlAggregateValueBudget, ScalarResultSupportsAnOversizedValueCollection) {
-    const std::string fn = GetParam();
+    const std::string parameter = GetParam();
+    const bool distinct_array = parameter == "array_agg_distinct";
+    const std::string fn = distinct_array ? "array_agg" : parameter;
     const bool percentile = fn == "percentile" || fn == "approx_percentile";
     std::vector<config::JsonValue> values;
     if (percentile) {
@@ -1722,7 +1724,10 @@ TEST_P(SqlAggregateValueBudget, ScalarResultSupportsAnOversizedValueCollection) 
     }
     values.emplace_back(config::JsonValue{});
     const std::size_t limit = percentile ? 2048 : 8192;
-    auto make = [&] { return make_operator("aggregate_row", fn, false, {}, false, fn == "count"); };
+    auto make = [&] {
+        return make_operator(
+            "aggregate_row", fn, false, {}, false, fn == "count" || distinct_array);
+    };
     {
         SpillEnvironment env("");
         RuntimeContext ctx(operator_id_from_uid("memory-test-aggregate"), fn, nullptr, nullptr);
@@ -1816,7 +1821,13 @@ TEST_P(SqlAggregateValueBudget, ScalarResultSupportsAnOversizedValueCollection) 
         EXPECT_TRUE(std::filesystem::is_empty(dir.path));
     }
 }
-INSTANTIATE_TEST_SUITE_P(
-    Values,
-    SqlAggregateValueBudget,
-    ::testing::Values("count", "min", "max", "percentile", "approx_percentile"));
+INSTANTIATE_TEST_SUITE_P(Values,
+                         SqlAggregateValueBudget,
+                         ::testing::Values("count",
+                                           "min",
+                                           "max",
+                                           "percentile",
+                                           "approx_percentile",
+                                           "string_agg",
+                                           "array_agg",
+                                           "array_agg_distinct"));

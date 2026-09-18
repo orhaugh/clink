@@ -135,8 +135,8 @@ Row cells carry the original partition's key-group byte, rather than the hash of
 their composite identifier. An operator-state `.format` marker is retained in
 all filtered restores. Legacy whole-partition snapshots migrate on open. GROUP BY
 stores metadata at index zero and each aggregate at subsequent indexes. The
-`agg.values` companion partition stores individual `COUNT(DISTINCT)`, retractable
-`MIN`/`MAX` and percentile values with their multiplicities; recovery upgrades
+`agg.values` companion partition stores individual values for the built-in
+distinct, retractable, percentile, string and array collections; recovery upgrades
 both the whole-partition format and the earlier per-accumulator format. OVER
 separates metadata and individual running accumulators from its pending and
 history lists. Windows store one pane per entry; sessions store one session per

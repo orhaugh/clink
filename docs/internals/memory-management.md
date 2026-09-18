@@ -65,7 +65,7 @@ limit. Multiply by the number of concurrent executions when sizing a Worker.
 | --- | --- |
 | DAG local edge queues, including side outputs | Estimated retained bytes are reserved before enqueue and released on dequeue or queue destruction. Row vector capacity and string payloads are counted. SQL Rows include nested JSON and collection capacity. Arrow batches count retained buffers without materialising rows. Shared buffers are deduplicated within one batch but charged separately for separate queued references; slices count their parent buffers. |
 | Blocking exchanges | Retained IPC payload capacity and list-node allocations charge the operator domain. With a configured spill directory, payload refusal migrates the resident prefix to disk and spills subsequent batches, even below the exchange threshold. Control elements and per-batch ordering metadata remain budgeted in memory. Replay releases each entry; destruction releases remaining charges and removes spill files. |
-| SQL windowless `GROUP BY` | Incremental retained-state estimates after each touched group changes, including aggregate vectors, group values, prior changelog output and cold aggregate payloads such as distinct sets, `ARRAY_AGG` and UDAF values. Restore rebuilds charges; TTL expiry releases them. With a configured SQL spill directory, the operator stores each accumulator separately on disk. `COUNT(DISTINCT)`, retractable `MIN`/`MAX` and percentile aggregates also store each distinct value and its multiplicity in a separate cell. |
+| SQL windowless `GROUP BY` | Incremental retained-state estimates after each touched group changes, including aggregate vectors, group values, prior changelog output and cold aggregate payloads. Restore rebuilds charges; TTL expiry releases them. With a configured SQL spill directory, the operator stores each accumulator separately on disk. `COUNT(DISTINCT)`, retractable `MIN`/`MAX`, percentile, `STRING_AGG` and `ARRAY_AGG` collections store their values in separate cells. |
 | SQL tumbling, hopping, cumulative and session windows | Aggregate bucket estimates include every retained pane/session. Row and columnar ingest update the account; firing releases expired values. Configured spilling stores panes/sessions individually. Empty group containers retained for checkpoint replacement continue to count. |
 | SQL equi and interval joins | Both input maps count entry-vector capacity and nested row storage. Configured spilling stores individual rows, allowing oversized active keys; matching flags survive reload and checkpoint recovery. Interval expiry removes working and backend keys. |
 | SQL OVER and last-N aggregates | Running accumulators, pending/tie-ordered rows, bounded frame history and previous changelog output count. OVER and last-N scan individual pending/history/frame entries when spilling is configured. |
@@ -226,7 +226,7 @@ individual entries without loading the whole active key:
 
 | Operator | Entry granularity and algorithm |
 | --- | --- |
-| GROUP BY | Each aggregate accumulator is separate from group values and prior changelog output. `COUNT(DISTINCT)`, retractable `MIN`/`MAX` and percentile aggregates split their value collections into individual multiplicity cells. Percentile cells retain numeric order, so finalisation finds the interpolation ranks in two streaming scans. Other updates and queryable lookups finalise one accumulator at a time; TTL erases both accumulator and value cells. |
+| GROUP BY | Each aggregate accumulator is separate from group values and prior changelog output. `COUNT(DISTINCT)`, retractable `MIN`/`MAX`, percentile and `STRING_AGG` collections use individual multiplicity cells; `ARRAY_AGG` uses one arrival-ordered cell per value. Percentile and string cells retain their result order. Distinct arrays use bounded duplicate scans instead of a resident index. Other updates and queryable lookups finalise one accumulator at a time; TTL erases both accumulator and value cells. |
 | Fixed windows | Each pane has its own entry. Updates locate one pane; watermark scans emit and compact expired panes. |
 | Sessions | Each session has its own entry. An arriving event scans overlaps, merges one neighbouring session at a time, and writes the merged session back in start order. |
 | OVER | Pending rows, retained frame/LAG history, first row and running accumulators are stored separately. Pending rows retain timestamp and arrival order; bounded frames are recomputed through entry scans. |
@@ -251,9 +251,10 @@ continues to use its existing state path.
 payload, one session's merged aggregate payload, an individual row, a distinct
 value cell, or a growing unsplit aggregate accumulator can still exhaust the
 budget. Session merging also needs room for the source and destination payloads.
-`STRING_AGG`, `ARRAY_AGG` and opaque UDAFs remain whole accumulators. Their
-materialised results must fit too. Codec buffers, input/output batches, TTL
-indexes and backend caches retain the allocation limitations above.
+Opaque UDAFs remain whole accumulators. `STRING_AGG` and `ARRAY_AGG` state is
+split, but their materialised result and a changelog operator's prior result must
+still fit. Codec buffers, input/output batches, TTL indexes and backend caches
+retain the allocation limitations above.
 
 For Arrow growth, the pool reserves the whole new allocation while retaining the
 old charge, because a reallocation can temporarily hold both buffers. Refused
