@@ -44,6 +44,7 @@ while TLC still accepts it.
 | `mutants/M_*.tla`, `mutants/M_*.cfg`, `mutants/expected.txt` | One configuration per `Bug` value, and what TLC must say about each |
 | `trace/TraceExactlyOnce.tla`, `trace/TraceExactlyOnce.cfg` | The trace module: the specification constrained to a recorded run |
 | `trace/events.txt` | The protocol trace vocabulary the engine emits and the module consumes |
+| `TraceConstants.tla` (generated, untracked) | The model's constants for one trace as literals, written by `protocol-trace-merge.py --constants` beside the merged trace and placed on TLC's library path; the trace module extends it |
 | `traces/<run>/*.ndjson` | Recorded runs, validated on every push |
 | `tools.env` | The pinned TLA+ tools and their checksums |
 | `../scripts/formal-check.sh` | Fetch, verify, run, judge |

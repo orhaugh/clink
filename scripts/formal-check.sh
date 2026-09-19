@@ -114,59 +114,91 @@ if [ "$MODE" = trace ]; then
         fi
     done
     [ ${#runs[@]} -gt 0 ] || { echo "formal-check: no traces found under: $*" >&2; exit 2; }
-    failed=()
+    # One trace: merge and run TLC. Writes $WORK/result-N (the lines to
+    # print, in order) and $WORK/status-N (accepted | failed). Traces run
+    # TRACE_JOBS at a time (default 1; the CI job sets it to its core count) and
+    # their reports are printed in trace order once all have finished, so the
+    # output reads the same at any parallelism.
+    validate_one() {
+        local n="$1" run="$2" name merged events start rc secs at line
+        name="$(basename "$run" .ndjson)"
+        merged="$WORK/trace-$n.ndjson"
+        {
+            mkdir -p "$WORK/trace-$n"
+            if ! python3 "$ROOT/scripts/protocol-trace-merge.py" --out "$merged" \
+                    --constants "$WORK/trace-$n/TraceConstants.tla" "$run" 2>"$WORK/merge-$n.log"; then
+                echo "formal-check: trace $name: $(cat "$WORK/merge-$n.log")"
+                echo failed >"$WORK/status-$n"
+                return
+            fi
+            events=$(wc -l <"$merged" | tr -d ' ')
+            echo "formal-check: TLC trace/$name ($events events)"
+            start=$(date +%s)
+            set +e
+            # From the work directory: whatever TLC drops beside a failing run
+            # (trace-exploration files) lands there, not in the tree.
+            # One worker: the trace module keeps its progress in a TLC register,
+            # and the state graph is a few hundred states, so parallelism buys
+            # nothing here. Deadlock checking is off (a hidden-step branch that
+            # dies out is not a verdict); the postcondition TraceAccepted is.
+            # The library path carries the generated TraceConstants beside the
+            # specification; see the trace module's header.
+            (cd "$WORK" && CLINK_TRACE_FILE="$merged" java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-2g}" \
+                "-DTLA-Library=$ROOT/formal:$WORK/trace-$n" -cp "$TLA_JAR:$CM_JAR" tlc2.TLC \
+                -workers 1 -noGenerateSpecTE -metadir "$WORK/trace-$n.states" \
+                -config "$ROOT/formal/trace/TraceExactlyOnce.cfg" ${TLC_EXTRA:-} \
+                "$ROOT/formal/trace/TraceExactlyOnce.tla") >"$WORK/trace-$n.log" 2>&1
+            rc=$?
+            set -e
+            secs=$(( $(date +%s) - start ))
+            if [ $rc -eq 0 ]; then
+                echo "formal-check:   accepted in ${secs}s: every event is a step the specification allows"
+                echo accepted >"$WORK/status-$n"
+            elif grep -q '"divergence"' "$WORK/trace-$n.log"; then
+                # The postcondition printed <<"divergence", index, event>>, which
+                # TLC pretty-prints one element per line: the index is on the
+                # line after the marker.
+                at="$(grep -A1 '"divergence"' "$WORK/trace-$n.log" | sed -n '2p' | tr -dc '0-9' || true)"
+                line="$( { [ -n "$at" ] && sed -n "${at}p" "$merged"; } || true)"
+                echo "formal-check:   DIVERGES after ${secs}s at event ${at:-?}: ${line:-(unknown)}"
+                echo "formal-check:   no step of the specification produces this event from any state the trace reached; TLC log: $WORK/trace-$n.log"
+                echo failed >"$WORK/status-$n"
+            else
+                echo "formal-check:   ERROR (TLC exit $rc) after ${secs}s"
+                sed -n '1,200p' "$WORK/trace-$n.log"
+                echo failed >"$WORK/status-$n"
+            fi
+        } >"$WORK/result-$n" 2>&1
+    }
+    jobs_max="${TRACE_JOBS:-1}"
     n=0
     for run in "${runs[@]}"; do
         n=$((n + 1))
-        name="$(basename "$run" .ndjson)"
-        merged="$WORK/trace-$n.ndjson"
-        if ! python3 "$ROOT/scripts/protocol-trace-merge.py" --out "$merged" "$run" 2>"$WORK/merge-$n.log"; then
-            echo "formal-check: trace $name: $(cat "$WORK/merge-$n.log")"
-            failed+=("$name")
-            continue
-        fi
-        events=$(wc -l <"$merged" | tr -d ' ')
-        echo "formal-check: TLC trace/$name ($events events)"
-        start=$(date +%s)
-        set +e
-        # From the work directory: whatever TLC drops beside a failing run
-        # (trace-exploration files) lands there, not in the tree.
-        # One worker: the trace module keeps its progress in a TLC register,
-        # and the state graph is a few hundred states, so parallelism buys
-        # nothing here. Deadlock checking is off (a hidden-step branch that
-        # dies out is not a verdict); the postcondition TraceAccepted is.
-        (cd "$WORK" && CLINK_TRACE_FILE="$merged" java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-2g}" \
-            "-DTLA-Library=$ROOT/formal" -cp "$TLA_JAR:$CM_JAR" tlc2.TLC \
-            -workers 1 -noGenerateSpecTE -metadir "$WORK/trace-$n.states" \
-            -config "$ROOT/formal/trace/TraceExactlyOnce.cfg" ${TLC_EXTRA:-} \
-            "$ROOT/formal/trace/TraceExactlyOnce.tla") >"$WORK/trace-$n.log" 2>&1
-        rc=$?
-        set -e
-        secs=$(( $(date +%s) - start ))
-        if [ $rc -eq 0 ]; then
-            echo "formal-check:   accepted in ${secs}s: every event is a step the specification allows"
-        elif grep -q '"divergence"' "$WORK/trace-$n.log"; then
-            # The postcondition printed <<"divergence", index, event>>, which
-            # TLC pretty-prints one element per line: the index is on the
-            # line after the marker.
-            at="$(grep -A1 '"divergence"' "$WORK/trace-$n.log" | sed -n '2p' | tr -dc '0-9' || true)"
-            line="$( { [ -n "$at" ] && sed -n "${at}p" "$merged"; } || true)"
-            echo "formal-check:   DIVERGES after ${secs}s at event ${at:-?}: ${line:-(unknown)}"
-            echo "formal-check:   no step of the specification produces this event from any state the trace reached; TLC log: $WORK/trace-$n.log"
-            failed+=("$name")
-            trap - EXIT  # keep the work dir for the log named above
+        if [ "$jobs_max" -gt 1 ]; then
+            while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$jobs_max" ]; do
+                sleep 1
+            done
+            validate_one "$n" "$run" &
         else
-            echo "formal-check:   ERROR (TLC exit $rc) after ${secs}s"
-            sed -n '1,200p' "$WORK/trace-$n.log"
-            failed+=("$name")
-            trap - EXIT
+            validate_one "$n" "$run"
         fi
     done
+    wait
+    failed=()
+    accepted=0
+    for i in $(seq 1 "$n"); do
+        cat "$WORK/result-$i"
+        case "$(cat "$WORK/status-$i" 2>/dev/null)" in
+            accepted) accepted=$((accepted + 1)) ;;
+            *) failed+=("$(basename "${runs[$((i - 1))]}" .ndjson)") ;;
+        esac
+    done
     if [ ${#failed[@]} -ne 0 ]; then
+        trap - EXIT  # keep the work dir for the TLC logs named above
         echo "formal-check: FAILED: ${failed[*]}" >&2
         exit 1
     fi
-    echo "formal-check: all ${#runs[@]} trace(s) accepted"
+    echo "formal-check: all ${accepted} trace(s) accepted"
     exit 0
 fi
 

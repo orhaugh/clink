@@ -22,69 +22,40 @@
    Events for subtasks that are not two-phase sinks (they never prepare a
    transaction) are stutters: the model abstracts a job to its source and its
    sinks. Placement events are stutters too; they only tell the module which
-   worker hosts which sink and which hosts the source. *)
-EXTENDS ExactlyOnce, Json, IOUtils, TLC, Sequences
+   worker hosts which sink and which hosts the source.
+
+   The model's constants (the sink set, the hosts, the fault budgets, the
+   checkpoint range) come from TraceConstants, a module of literals the
+   validator generates beside the merged trace (scripts/protocol-trace-merge.py
+   --constants) and puts on TLC's library path. They used to be derived from
+   the trace here; TLC re-evaluates a definition on every reference, so every
+   step walked the whole trace again and validation was quadratic in trace
+   length (180 events in 6 seconds, 900 in 120, 1,500 in 300). The current
+   event is read into a variable once per step for the same reason. *)
+EXTENDS ExactlyOnce, Json, IOUtils, TLC, Sequences, TraceConstants
 
 \* The merged trace, named by the environment (the validator sets it).
+\* Referenced exactly once per step (ev' = Trace[l + 1]); see the header.
 TraceFile == IOEnv.CLINK_TRACE_FILE
 Trace == ndJsonDeserialize(TraceFile)
 
-Rng == {Trace[i] : i \in DOMAIN Trace}
-Of(kind) == {e \in Rng : e.event = kind}
 Has(e, f) == f \in DOMAIN e
 
---------------------------------------------------------------------------------
-(* The model's constants, read off the trace. *)
-
-\* A sink is a subtask that prepared a transaction. Identity = subtask index.
-TraceSinks == {e.sub : e \in Of("SinkPrepare")}
-
-TraceWorkers == {e.worker : e \in Of("Placement")}
-                  \cup {e.worker : e \in Of("DeliverBarrier")}
-                  \cup {e.worker : e \in Of("WorkerDies")}
-
-\* The FIRST placement of a subtask (a redeploy places it again, possibly
-\* elsewhere). The model's Host is fixed, so a trace in which a sink moves
-\* between workers on redeploy is outside it; the source may move, since the
-\* model's SrcWorker only decides whose death drops in-flight barriers and
-\* whose bound epoch fences them.
-PlacementIdx(P(_)) == {i \in DOMAIN Trace : Trace[i].event = "Placement" /\ P(Trace[i])}
-FirstPlacement(P(_)) == Trace[CHOOSE i \in PlacementIdx(P) : \A j \in PlacementIdx(P) : i <= j]
-
-TraceHost == [s \in TraceSinks |-> FirstPlacement(LAMBDA e : e.sub = s).worker]
-
-TraceSrcWorker == FirstPlacement(LAMBDA e : e.source).worker
-
-CkptIds == {e.ckpt : e \in {t \in Rng : Has(t, "ckpt")}}
-TraceMaxCkpt == IF CkptIds = {} THEN 1 ELSE Max(CkptIds)
-TraceMaxInFlight == TraceMaxCkpt + 1   \* the engine does not bound in-flight checkpoints
-
-TraceRecoverable == \A e \in Of("SinkPrepare") : e.family = "recoverable"
-
-\* Fault budgets: what the trace shows happened is what the model may inject.
-TraceMaxWorkerDeaths == Cardinality(Of("WorkerDies"))
-TraceMaxCoordDeaths == Cardinality(Of("CoordRecovers"))
-TraceMaxSnapFails == Cardinality({e \in Of("SubtaskAck") : ~e.ok})
-TraceMaxExpiries == Cardinality({e \in Of("WalkProbes") : e.verdict = "refused"})
-TraceMaxBrokerOutages == Cardinality(Of("WalkRetries")) + Cardinality(Of("WalkExhausted"))
-TraceMaxWalkCancels == Cardinality(Of("WalkCancelled"))
-
 \* The engine's epochs need not start at 1; the model's do.
-Epochs == {e.epoch : e \in Of("Trigger") \cup Of("DeliverBarrier")}
-FirstEpoch == IF Epochs = {} THEN 1 ELSE Min(Epochs)
-ModelEpoch(e) == e - FirstEpoch + 1
+ModelEpoch(e) == e - TraceFirstEpoch + 1
 
 --------------------------------------------------------------------------------
 (* Following the trace. *)
 
-VARIABLE l   \* index of the next event to match
+VARIABLES l,   \* index of the next event to match
+          ev   \* Trace[l], read once per step
 
 \* Register 1 holds the highest event index any path has reached; the
 \* validator runs TLC with one worker, so the register is a single number.
 ASSUME TLCSet(1, 1)
 Reached(i) == TLCSet(1, IF i > TLCGet(1) THEN i ELSE TLCGet(1))
 
-E == Trace[l]
+E == ev
 Is(kind) == E.event = kind
 \* The event names a modelled sink.
 ForSink == Has(E, "sub") /\ E.sub \in Sinks
@@ -235,8 +206,9 @@ StepSinkOpens ==
 StepPlacement == Is("Placement") /\ Skip
 
 TraceStep ==
-    /\ l <= Len(Trace)
+    /\ l <= TraceLen
     /\ l' = l + 1
+    /\ ev' = IF l + 1 <= TraceLen THEN Trace[l + 1] ELSE ev
     /\ \/ StepTrigger \/ StepDeliverBarrier \/ StepSinkPrepare \/ StepSubtaskAck
        \/ StepCoordComplete \/ StepWriteCompleted \/ StepBroadcast
        \/ StepDeliverCommit \/ StepDeliverAbort
@@ -253,21 +225,21 @@ TraceStep ==
 Hidden ==
     /\ \/ CoordDies \/ CoordSuperseded \/ ZombieStops
        \/ TxnExpires \/ BrokerGoesDown \/ BrokerComesBack
-    /\ UNCHANGED l
+    /\ UNCHANGED <<l, ev>>
 
 \* The trace consumed: the run stutters here rather than deadlocking.
-TraceEnd == l > Len(Trace) /\ UNCHANGED <<vars, l>>
+TraceEnd == l > TraceLen /\ UNCHANGED <<vars, l, ev>>
 
 TraceNext == TraceStep \/ Hidden \/ TraceEnd
 
-TraceInit == Init /\ l = 1
+TraceInit == Init /\ l = 1 /\ ev = Trace[1]
 
-TraceSpec == TraceInit /\ [][TraceNext]_<<vars, l>>
+TraceSpec == TraceInit /\ [][TraceNext]_<<vars, l, ev>>
 
 \* POSTCONDITION: TRUE when some path consumed the whole trace.
 TraceAccepted ==
     LET reached == TLCGet(1)
-    IN IF reached > Len(Trace)
+    IN IF reached > TraceLen
        THEN TRUE
        ELSE Print(<<"divergence", reached, Trace[reached]>>, FALSE)
 

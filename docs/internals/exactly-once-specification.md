@@ -209,9 +209,19 @@ own test run leaves (the in-process protocol trace test, every
 multi-process harness test) and the `trace-validation` job model-checks
 them all, so the engine's behaviour under the faults the integration suite
 injects is checked against the model on each commit, not only when a
-fixture is refreshed. That job is advisory for now: it has yet to fit its
-time budget or accept every trace it reaches, so it reports as a warning
-rather than gating the run until both hold.
+fixture is refreshed. That job is advisory for now: it does not yet accept
+every trace it reaches, so it reports as a warning rather than gating the
+run until it does.
+The merge script also writes the model's constants (the sink set, the
+hosts, the fault budgets, the checkpoint range) as a generated module of
+literals, `TraceConstants.tla`, which the trace module extends from TLC's
+library path, and the module reads the current event into a state variable
+once per step. Deriving both from the trace inside TLC re-evaluated the
+whole trace on every reference and made validation quadratic in its length
+(180 events in 6 seconds, 900 in 120, 1,500 in 300); as literals the check
+is linear and a 1,500-event trace takes seconds. `TRACE_JOBS` runs that
+many traces at a time, each with one TLC worker, and prints the reports in
+trace order.
 
 ### What a divergence means
 
