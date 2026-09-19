@@ -496,6 +496,10 @@ std::vector<std::string> read_string_array_field(const std::string& body, const 
 }  // namespace
 
 void Coordinator::recover_persisted_jobs() {
+    {
+        std::lock_guard trace_lock(recovery_trace_mu_);
+        recovery_traced_.clear();  // a new leadership records each job's takeover once
+    }
     if (ha_dir_.empty())
         return;
     // A persisted job is identified by its manifest key: jobs/<id>/manifest.json.
@@ -679,7 +683,15 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                 ckpt.checkpoint_dir.empty()
                     ? 0
                     : latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
+            // The takeover is recorded once per job per leadership: a recovery
+            // parked for capacity comes back through here when a worker
+            // registers, and that is the same takeover continuing, not another.
+            bool first_recovery = false;
             if (protocol_trace::enabled()) {
+                std::lock_guard trace_lock(recovery_trace_mu_);
+                first_recovery = recovery_traced_.insert(job_id).second;
+            }
+            if (first_recovery) {
                 protocol_trace::Event("CoordRecovers")
                     .u("job", job_id)
                     .u("epoch", epoch())
@@ -688,8 +700,7 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                     .emit();
             }
             if (needs_confirmation && !ckpt.checkpoint_dir.empty()) {
-                if (protocol_trace::enabled() &&
-                    completed_on_disk > ckpt.restore_from_checkpoint_id) {
+                if (first_recovery && completed_on_disk > ckpt.restore_from_checkpoint_id) {
                     protocol_trace::Event("RestartProceeds")
                         .u("job", job_id)
                         .b("resolving", true)
@@ -739,21 +750,12 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                 if (next_job_id_ <= job_id)
                     next_job_id_ = job_id;
             }
-            if (protocol_trace::enabled()) {
-                // The id floor submit_job applies: above every durable record.
-                std::uint64_t floor = ckpt.restore_from_checkpoint_id;
-                if (!ckpt.checkpoint_dir.empty()) {
-                    floor =
-                        std::max(floor, latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id));
-                    floor =
-                        std::max(floor, latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id));
-                    floor = std::max(floor, latest_snapshot_id_on_disk(ckpt.checkpoint_dir));
-                }
-                protocol_trace::Event("Redeploy")
-                    .u("job", job_id)
-                    .u("restore", ckpt.restore_from_checkpoint_id)
-                    .u("next", floor + 1)
-                    .emit();
+            // The id floor submit_job applies: above every durable record.
+            std::uint64_t floor = ckpt.restore_from_checkpoint_id;
+            if (protocol_trace::enabled() && !ckpt.checkpoint_dir.empty()) {
+                floor = std::max(floor, latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id));
+                floor = std::max(floor, latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id));
+                floor = std::max(floor, latest_snapshot_id_on_disk(ckpt.checkpoint_dir));
             }
             (void)submit_job(graph,
                              OperatorRegistry::default_instance(),
@@ -761,6 +763,17 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                              ckpt,
                              std::move(bundle),
                              /*notify_client_conn=*/nullptr);
+            // Recorded after the submit, so a recovery parked for capacity (the
+            // submit throws InsufficientSlotsError below) has not redeployed: a
+            // Redeploy for a parked attempt read as a second redeploy from the
+            // running state when the retry then deployed for real.
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("Redeploy")
+                    .u("job", job_id)
+                    .u("restore", ckpt.restore_from_checkpoint_id)
+                    .u("next", floor + 1)
+                    .emit();
+            }
             clink::metrics::orch::ha_recovered_jobs_inc();
             log::info("coordinator.ha",
                       "recovered job_id=" + std::to_string(job_id) +
@@ -7115,14 +7128,8 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
 
 void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     auto msg = decode_subtask_checkpointed(r);
-    if (protocol_trace::enabled()) {
-        protocol_trace::Event("SubtaskAck")
-            .u("job", msg.job_id)
-            .u("sub", msg.subtask_idx)
-            .u("ckpt", msg.checkpoint_id)
-            .b("ok", msg.ok)
-            .emit();
-    }
+    // The SubtaskAck protocol event is recorded by the worker where the ack is
+    // sent (the subtask's own step), not here at the receipt.
     // What a completed checkpoint CONSISTS OF, not just that it happened: the
     // generation whose directories hold it, and the subtask indices that acked it.
     // Recorded in the marker so a checkpoint can be verified across subtasks
@@ -7742,10 +7749,15 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                         "without a recoverable record of it");
                 continue;
             }
-            CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAfterCompletedMarker);
+            // The trace witnesses the durable write before anything can kill the
+            // process "after the marker": a validation run showed a coordinator
+            // exiting at the fault point below with the marker on disk and no
+            // WriteCompleted in its trace, and the recovered leader's restore
+            // point then read as impossible.
             if (protocol_trace::enabled()) {
                 protocol_trace::Event("WriteCompleted").u("job", jid).u("ckpt", ckpt_id).emit();
             }
+            CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAfterCompletedMarker);
         }
         // The checkpoint is durable (or the job keeps no directory, so memory
         // is all there is): advance the restore point now, and only now.

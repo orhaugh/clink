@@ -2318,6 +2318,18 @@ void Worker::run_generic_subtask_(JobId job_id,
                 m.subtask_idx = sub;
                 m.ok = ok;
                 m.error = std::move(error);
+                // The ack is the subtask's own step: recorded here, where it is
+                // sent, so it precedes the subtask's next prepare in the merged
+                // trace. Recorded at the coordinator's receipt it landed after a
+                // final checkpoint's prepare that followed within microseconds.
+                if (protocol_trace::enabled()) {
+                    protocol_trace::Event("SubtaskAck")
+                        .u("job", job_id)
+                        .u("sub", sub)
+                        .u("ckpt", ckpt_id)
+                        .b("ok", ok)
+                        .emit();
+                }
                 send_frame_(encode_frame(MessageKind::SubtaskCheckpointed, m));
             };
             // Cancel token for this subtask: ORed into the runner's stop
@@ -3007,6 +3019,15 @@ void Worker::run_generic_subtask_(JobId job_id,
                     m.subtask_idx = sub;
                     m.ok = ok;
                     m.error = std::move(error);
+                    // Recorded where the ack is sent; see the single-op path.
+                    if (protocol_trace::enabled()) {
+                        protocol_trace::Event("SubtaskAck")
+                            .u("job", job_id)
+                            .u("sub", sub)
+                            .u("ckpt", ckpt_id)
+                            .b("ok", ok)
+                            .emit();
+                    }
                     send_frame_(encode_frame(MessageKind::SubtaskCheckpointed, m));
                 },
             // Checkpoint-retention registration, exactly as the single-op

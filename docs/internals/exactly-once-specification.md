@@ -154,9 +154,9 @@ specification, or a stutter the trace module recognises.
 | `Trigger` | coordinator, trigger loop | `job`, `ckpt`, `epoch` | `Trigger` (or `ZombieTrigger` from a superseded coordinator) |
 | `DeliverBarrier` | worker, on `TriggerCheckpoint` | `job`, `ckpt`, `epoch`, `worker`, `fenced` | `DeliverBarrier` |
 | `SinkPrepare` | the two-phase sink, transaction sealed | `sub`, `ckpt`, `family`, `staged` | `SinkPrepare` or `SinkPrepareFails`; the ack decides which |
-| `SubtaskAck` | coordinator, on `SubtaskCheckpointed` | `job`, `sub`, `ckpt`, `ok` | `SinkAck` (a non-sink subtask's ack is a stutter) |
+| `SubtaskAck` | worker, as `SubtaskCheckpointed` is sent (the subtask's own step, so it precedes the subtask's next prepare in the merged trace) | `job`, `sub`, `ckpt`, `ok` | `SinkAck` (a non-sink subtask's ack is a stutter) |
 | `CoordComplete` | coordinator, last ack in | `job`, `ckpt`, `outcome` = `completed`, `failed`, `discarded` | `CoordComplete` |
-| `WriteCompleted` | coordinator, marker fsync done | `job`, `ckpt` | `WriteCompleted` |
+| `WriteCompleted` | coordinator, marker fsync done, before the `after_completed_marker` fault point | `job`, `ckpt` | `WriteCompleted` |
 | `Broadcast` | coordinator | `job`, `ckpt`, `withheld` | `Broadcast` |
 | `DeliverCommit`, `DeliverAbort` | the sink, on dispatch | `sub`, `ckpt`, `accepted` | `DeliverCommit`, `DeliverAbort` |
 | `SinkCommit` | the sink, external commit executed | `sub`, `ckpt` | `SinkCommit` |

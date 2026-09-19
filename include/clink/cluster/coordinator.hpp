@@ -1634,6 +1634,14 @@ private:
     // failed submit_job consumes its plugin/bundle arguments, so the disk
     // copy is the only ingredient list that survives a refusal.
     std::vector<JobId> pending_recovery_ids_;
+    // Jobs whose recovery this leadership has already recorded (the
+    // CoordRecovers protocol event and the RestartProceeds that may follow
+    // it). A recovery parked for capacity re-runs recover_one_persisted_job_
+    // when a worker registers; the specification takes the takeover once, so
+    // a second CoordRecovers for the same job in the same epoch read as a
+    // second coordinator death and every parked-recovery trace diverged at it.
+    std::mutex recovery_trace_mu_;
+    std::unordered_set<JobId> recovery_traced_;
     std::thread recovery_retry_thread_;
     void recovery_retry_loop_();
     // One job dir's recovery, callable repeatedly (skips ids already in

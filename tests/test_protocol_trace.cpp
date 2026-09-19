@@ -96,9 +96,14 @@ protected:
         ASSERT_TRUE(protocol_trace::enabled());
     }
     void TearDown() override {
-        // Keep the trace where the validator (CI) or a fixture refresh can find it.
+        // Keep the trace where the validator (CI) or a fixture refresh can find
+        // it, but only for a test that ran the protocol from its initial state:
+        // the validator follows a trace from the specification's Init, so a
+        // fragment (a test that toggles the switch and emits a synthetic Trigger
+        // for checkpoint 7, say) can never validate and only ever reads as a
+        // divergence. A complete run opts in with keep_trace_for_validator_.
         if (const char* out = std::getenv("CLINK_PROTOCOL_TRACE_OUT");
-            out != nullptr && *out != '\0') {
+            keep_trace_for_validator_ && out != nullptr && *out != '\0') {
             const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
             const auto dest = std::filesystem::path(out) /
                               (std::string(info->test_suite_name()) + "." + info->name());
@@ -155,9 +160,14 @@ protected:
     }
 
     std::filesystem::path root_;
+
+    // Set by a test whose trace is a complete protocol run, from Init.
+
+    bool keep_trace_for_validator_{false};
 };
 
 TEST_F(ProtocolTraceTest, ACheckpointedRunTellsTheProtocolInTheSpecificationsOrder) {
+    keep_trace_for_validator_ = true;  // a complete run, from the specification's Init
     {
         clink::test::TestCluster cluster(options());
         cluster.execute(job(/*count=*/300), 60s);
