@@ -6,8 +6,11 @@
 # `unobserved <Action>` lines are specification actions the engine cannot
 # observe and so never emits; the trace module lets TLC take them as hidden
 # steps. Every other action in ExactlyOnce.tla's Next must be reached by
-# some event. scripts/check-protocol-trace-events.py holds the three in
-# agreement.
+# some event. `outside <Name>` lines are events that mark a run as outside
+# the specification's scope: the engine emits them, the module never
+# consumes them, and the validator skips a trace that carries one rather
+# than reporting it as a divergence. scripts/check-protocol-trace-events.py
+# holds all of it in agreement.
 #
 # Fields per event (beyond seq, ts, proc): see docs/internals/exactly-once-specification.md.
 event Trigger
@@ -46,3 +49,7 @@ unobserved TxnExpires
 unobserved BrokerGoesDown
 unobserved BrokerComesBack
 unobserved Done
+# A rescale renumbers and re-places the operator's subtasks. The model keys a
+# sink by its subtask index and fixes the set and its hosts for the run, so a
+# rescaled run is outside it until the model covers rescale.
+outside Rescale

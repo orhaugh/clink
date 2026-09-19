@@ -172,6 +172,7 @@ specification, or a stutter the trace module recognises.
 | `WalkSkips`, `WalkReadsReceipt`, `WalkProbes`, `WalkRetries`, `WalkExhausted`, `WalkCancelled`, `WalkDecides`, `WalkFinishes` | the in-doubt walk | `job`, `ckpt`, and `sub`, `verdict`, `confirmed` where they apply | the walk's steps, one each |
 | `SinkOpens` | the sink, `open()` done | `sub`, `family` | `SinkOpens` after a redeploy; the first open is the initial state |
 | `Placement` | worker, task deployed | `job`, `sub`, `worker`, `source` | none: tells the module which worker hosts what |
+| `Rescale` | coordinator, a replan staged or a hot cutover armed | `job`, `op`, `from`, `to`, `mode` | none: a scope marker. The model keys a sink by its subtask index and fixes the set and its hosts for the run; a rescale changes both, so the validator skips the run and counts it, until the model covers rescale |
 
 Everything the engine cannot observe is not in the vocabulary: a
 coordinator dying, a superseded coordinator stopping, the broker expiring
@@ -213,6 +214,9 @@ injects is checked against the model on each commit, not only when a
 fixture is refreshed. That job is advisory for now: it does not yet accept
 every trace it reaches, so it reports as a warning rather than gating the
 run until it does.
+A run that rescaled an operator carries a `Rescale`
+scope marker and is skipped and counted rather than judged: the model keys
+a sink by its subtask index and fixes the set and its hosts for the run.
 The merge script also writes the model's constants (the sink set, the
 hosts, the fault budgets, the checkpoint range) as a generated module of
 literals, `TraceConstants.tla`, which the trace module extends from TLC's

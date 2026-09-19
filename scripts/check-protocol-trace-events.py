@@ -10,7 +10,10 @@ Three things must say the same:
      appears in its Hidden step;
   3. every action in ExactlyOnce.tla's Next relation is either reached by
      the trace module or listed as unobserved (an action nothing in the
-     engine ever emits is a hole in the trace, not a pass).
+     engine ever emits is a hole in the trace, not a pass);
+  4. every `outside X` (an event that marks a run as outside the
+     specification's scope) is emitted by the engine and is NOT consumed by
+     the trace module: the validator skips such a run before TLC sees it.
 Exit 1 with the differences listed, else 0.
 """
 
@@ -27,8 +30,8 @@ SPEC = ROOT / "formal" / "ExactlyOnce.tla"
 SOURCE_DIRS = [ROOT / "src", ROOT / "include", ROOT / "impls"]
 
 
-def manifest() -> tuple[set[str], set[str]]:
-    events, unobserved = set(), set()
+def manifest() -> tuple[set[str], set[str], set[str]]:
+    events, unobserved, outside = set(), set(), set()
     for line in MANIFEST.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -38,9 +41,11 @@ def manifest() -> tuple[set[str], set[str]]:
             events.add(name.strip())
         elif kind == "unobserved":
             unobserved.add(name.strip())
+        elif kind == "outside":
+            outside.add(name.strip())
         else:
             raise SystemExit(f"{MANIFEST}: unknown line: {line}")
-    return events, unobserved
+    return events, unobserved, outside
 
 
 def emitted_in_code() -> dict[str, list[str]]:
@@ -76,14 +81,19 @@ def spec_actions() -> set[str]:
 
 
 def main() -> int:
-    events, unobserved = manifest()
+    events, unobserved, outside = manifest()
     code = emitted_in_code()
     module = MODULE.read_text()
     problems: list[str] = []
 
     for name, where in sorted(code.items()):
-        if name not in events:
+        if name not in events and name not in outside:
             problems.append(f"emitted but not in {MANIFEST.name}: {name} ({where[0]})")
+    for name in sorted(outside):
+        if name not in code:
+            problems.append(f"outside-scope marker in {MANIFEST.name} but nothing emits it: {name}")
+        if f'Is("{name}")' in module:
+            problems.append(f"outside-scope marker in {MANIFEST.name} but {MODULE.name} consumes it: {name}")
     for name in sorted(events):
         if name not in code:
             problems.append(f"in {MANIFEST.name} but nothing emits it: {name}")
@@ -110,7 +120,7 @@ def main() -> int:
             print(f"  {p}", file=sys.stderr)
         return 1
     print(f"check-protocol-trace-events: {len(events)} events, {len(unobserved)} unobserved actions, "
-          f"{len(spec_actions())} spec actions agree.")
+          f"{len(outside)} scope marker(s), {len(spec_actions())} spec actions agree.")
     return 0
 
 

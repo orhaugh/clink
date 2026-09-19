@@ -114,8 +114,8 @@ if [ "$MODE" = trace ]; then
         fi
     done
     [ ${#runs[@]} -gt 0 ] || { echo "formal-check: no traces found under: $*" >&2; exit 2; }
-    # One trace: merge and run TLC. Writes $WORK/result-N (the lines to
-    # print, in order) and $WORK/status-N (accepted | failed). Traces run
+    # One trace: merge, decide scope, run TLC. Writes $WORK/result-N (the lines to
+    # print, in order) and $WORK/status-N (accepted | skipped | failed). Traces run
     # TRACE_JOBS at a time (default 1; the CI job sets it to its core count) and
     # their reports are printed in trace order once all have finished, so the
     # output reads the same at any parallelism.
@@ -132,6 +132,16 @@ if [ "$MODE" = trace ]; then
                 return
             fi
             events=$(wc -l <"$merged" | tr -d ' ')
+            # A run that rescaled an operator is outside the specification's
+            # scope (formal/trace/events.txt, `outside Rescale`): the model keys
+            # a sink by its subtask index and fixes the set and its hosts for
+            # the run, and a rescale changes both. Skipped, and said so; not a
+            # divergence and not a pass.
+            if grep -q '"event":"Rescale"' "$merged"; then
+                echo "formal-check: trace/$name ($events events): SKIPPED, the run rescaled an operator; outside the specification until the model covers rescale"
+                echo skipped >"$WORK/status-$n"
+                return
+            fi
             echo "formal-check: TLC trace/$name ($events events)"
             start=$(date +%s)
             set +e
@@ -186,10 +196,12 @@ if [ "$MODE" = trace ]; then
     wait
     failed=()
     accepted=0
+    skipped=0
     for i in $(seq 1 "$n"); do
         cat "$WORK/result-$i"
         case "$(cat "$WORK/status-$i" 2>/dev/null)" in
             accepted) accepted=$((accepted + 1)) ;;
+            skipped) skipped=$((skipped + 1)) ;;
             *) failed+=("$(basename "${runs[$((i - 1))]}" .ndjson)") ;;
         esac
     done
@@ -198,7 +210,7 @@ if [ "$MODE" = trace ]; then
         echo "formal-check: FAILED: ${failed[*]}" >&2
         exit 1
     fi
-    echo "formal-check: all ${accepted} trace(s) accepted"
+    echo "formal-check: all ${accepted} validated trace(s) accepted; ${skipped} skipped as outside the specification"
     exit 0
 fi
 

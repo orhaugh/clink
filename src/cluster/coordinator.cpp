@@ -2452,6 +2452,18 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
             // last one lands.
             job.pending_op_parallelism[op_id] = new_parallelism;
             job.pre_rescale_op_parallelism[op_id] = old_parallelism;
+            // Marks the run as outside the exactly-once specification's scope:
+            // the model fixes the sink set and its hosts, and a rescale changes
+            // both. The trace validator skips a run that carries this.
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("Rescale")
+                    .u("job", job.id)
+                    .s("op", op_id)
+                    .u("from", old_parallelism)
+                    .u("to", new_parallelism)
+                    .s("mode", "replan")
+                    .emit();
+            }
             // Start of the clink.rescale lifecycle span (mode=replan),
             // recorded when restart_job_locked_ emits the replanned deploys.
             if (clink::metrics::SpanBuffer::global().enabled()) {
@@ -2719,6 +2731,16 @@ bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
     }
 
     job.hot_cutover = std::move(hot);
+    // Outside the specification's scope (see the replan path's marker).
+    if (protocol_trace::enabled()) {
+        protocol_trace::Event("Rescale")
+            .u("job", job.id)
+            .s("op", op_id)
+            .u("from", old_parallelism)
+            .u("to", new_parallelism)
+            .s("mode", "hot")
+            .emit();
+    }
     log::info("coordinator.rescale",
               "hot cutover armed job_id=" + std::to_string(job.id) + " op_id=" + op_id + " " +
                   std::to_string(old_parallelism) + "->" + std::to_string(new_parallelism) +
