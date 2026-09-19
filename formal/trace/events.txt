@@ -24,6 +24,7 @@ event SinkReceipt
 event SinkConfirm
 event WriteConfirmed
 event WorkerDies
+event RestartOnError
 event SubtaskDrained
 event CoordRecovers
 event RestartProceeds

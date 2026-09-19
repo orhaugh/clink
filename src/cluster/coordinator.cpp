@@ -7052,6 +7052,15 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
     const std::string& cause,
     std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>>& cancels) {
     job.awaiting_restart = true;
+    // The specification's RestartOnError: a whole-job restart the coordinator
+    // starts for a subtask error or an unattributed transport failure, with
+    // no worker lost in its view (yet). A loss declared during the drain folds
+    // in afterwards, as its own event. The restart a FAILED checkpoint starts
+    // is not recorded here: the model takes it as part of CoordComplete
+    // (outcome failed), which the coordinator has already emitted.
+    if (protocol_trace::enabled() && reason != "checkpoint failure") {
+        protocol_trace::Event("RestartOnError").u("job", job.id).s("cause", reason).emit();
+    }
     // A real cause is now driving recovery, so any transport failure held
     // pending is absorbed as the symptom it was (item 83). The error text
     // stays in job.errors for diagnosis; it just no longer needs its own

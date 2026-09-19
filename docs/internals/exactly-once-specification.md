@@ -163,7 +163,8 @@ specification, or a stutter the trace module recognises.
 | `SinkReceipt` | the Kafka sink, receipt durable | `sub`, `ckpt` | `SinkReceipt` |
 | `SinkConfirm` | worker, `CommitConfirmed` sent | `job`, `sub`, `ckpt` | `SinkConfirm` (Kafka family; a stutter otherwise) |
 | `WriteConfirmed` | coordinator, `CONFIRMED` marker written | `job`, `ckpt` | `WriteConfirmed` |
-| `WorkerDies` | coordinator, loss detected | `job`, `worker` | `WorkerDies` |
+| `WorkerDies` | coordinator, loss detected | `job`, `worker` | `WorkerDies` (any worker of the job; the model keeps only the source and the sinks, so the dead set may be empty) |
+| `RestartOnError` | coordinator, a whole-job restart begun for a subtask error or an unattributed transport failure | `job`, `cause` | `RestartOnError` (the survivors drain; a loss declared during the drain folds in as its own `WorkerDies`) |
 | `SubtaskDrained` | coordinator, survivor drained | `job`, `sub` | `SinkDrains` (non-sinks stutter) |
 | `CoordRecovers` | the new leader, per recovered job | `job`, `epoch`, `completed`, `confirmed` | `CoordRecovers` (its `CoordDies` is a hidden step) |
 | `RestartProceeds` | coordinator, restart held for resolution | `job`, `resolving`, `completed`, `confirmed` | `RestartProceeds` into `resolving` |

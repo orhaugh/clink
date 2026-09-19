@@ -41,7 +41,7 @@
 (* run that found the defect). The hooks are kept inline so a reader sees,    *)
 (* at the rule, what it is for.                                               *)
 (*****************************************************************************)
-EXTENDS Naturals, FiniteSets, TLC
+EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 CONSTANTS
     Sinks,             \* sink subtasks; each hosts one transactional sink
@@ -57,6 +57,7 @@ CONSTANTS
     MaxSnapFails,      \* snapshot captures that fail (ack ok = FALSE)
     MaxBrokerOutages,  \* broker unreachable episodes
     MaxWalkCancels,    \* resolution walks cancelled by the watchdog deadline
+    MaxErrorRestarts,  \* whole-job restarts begun for a subtask error or a transport failure
     Bug                \* "none" or a mutant name (see Mutants below)
 
 Mutants == {
@@ -137,7 +138,7 @@ VARIABLES
                     \* bumped by init_transactions, which fences every lower one
 
     \* Sink processes (state lost with the process) and control frames.
-    sink,           \* [Sinks -> record]: up, openTxn, ackDue, ackOk, stage, suppress, opening
+    sink,           \* [Sinks -> record]: up, openTxn, ackDue, stage, suppress, opening
     pendingHandles, \* [Sinks -> SUBSET Ckpts]: handles currently in operator state
     barriers,       \* [Sinks -> SUBSET Ckpts]: barriers delivered, not yet processed
     boundEpoch,     \* [Workers -> Nat]: epoch bound at RegisterAck
@@ -155,7 +156,8 @@ VARIABLES
     staleAccepted,  \* TRUE once a worker acted on a frame from a superseded epoch
 
     \* Fault budgets.
-    workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels
+    workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels,
+    errorRestarts
 
 vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
@@ -165,7 +167,7 @@ vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            unresolvedMk, txn, brokerUp, sinkGen, sink, pendingHandles, barriers,
            boundEpoch, msgs, srcPos, frontier, restorePoint, cutOf, published, restoreSound,
            staleAccepted, workerDeaths, coordDeaths, expiries, snapFails,
-           brokerOutages, walkCancels >>
+           brokerOutages, walkCancels, errorRestarts >>
 
 leaderVars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext >>
 coordVars  == << phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
@@ -179,11 +181,17 @@ sinkVars   == << sink, pendingHandles, barriers >>
 jobVars    == << srcPos, frontier, restorePoint, cutOf >>
 ghostVars  == << published, restoreSound, staleAccepted >>
 budgetVars == << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages,
-                 walkCancels >>
+                 walkCancels, errorRestarts >>
 
 NoTxn == [st |-> "none", owner |-> 0, desc |-> FALSE, has |-> FALSE]
 
-DownSink == [up |-> FALSE, openTxn |-> None, ackDue |-> None, ackOk |-> TRUE,
+\* ackDue: the acks the sink still owes the coordinator, oldest first; each
+\* names its checkpoint and whether the capture succeeded. A queue, not a
+\* slot: a barrier arriving right behind another (the source's final
+\* checkpoint follows the previous one within microseconds) is prepared
+\* before the earlier ack is sent, which the snapshot completes asynchronously;
+\* trace validation showed the shape in every run that ended cleanly.
+DownSink == [up |-> FALSE, openTxn |-> None, ackDue |-> << >>,
              stage |-> "idle", suppress |-> 0, opening |-> FALSE]
 
 \* Every id with any durable record: markers, a source snapshot, or a sink
@@ -232,7 +240,7 @@ Init ==
     /\ published = [s \in Sinks |-> [p \in Positions |-> 0]]
     /\ restoreSound = TRUE /\ staleAccepted = FALSE
     /\ workerDeaths = 0 /\ coordDeaths = 0 /\ expiries = 0 /\ snapFails = 0
-    /\ brokerOutages = 0 /\ walkCancels = 0
+    /\ brokerOutages = 0 /\ walkCancels = 0 /\ errorRestarts = 0
 
 --------------------------------------------------------------------------------
 (* CHECKPOINT: trigger, barrier, prepare, ack. *)
@@ -308,7 +316,13 @@ DeliverBarrier ==
 \* swallowed them at emission (their position is at or below the receipted
 \* horizon the sink armed at open).
 CanPrepare(s) ==
-    /\ sink[s].up /\ sink[s].ackDue = None /\ sink[s].stage = "idle"
+    \* The recoverable family prepares the next barrier while an older
+    \* checkpoint's commit is still executing: the commit runs on the worker's
+    \* dispatch thread, the prepare on the task thread, and they touch
+    \* different handles (trace validation showed a prepare landing between a
+    \* commit's delivery and its execution). A Kafka sink has one transaction
+    \* and begins the next only after the commit and its receipt.
+    /\ sink[s].up /\ (Kafka => sink[s].stage = "idle")
     /\ barriers[s] # {}
     /\ Kafka => sink[s].openTxn = None
 
@@ -324,7 +338,7 @@ SinkPrepare(s) ==
           /\ sinkHandles' = [sinkHandles EXCEPT ![s][c] = handles]
           /\ pendingHandles' = [pendingHandles EXCEPT ![s] = handles]
           /\ sink' = [sink EXCEPT ![s].openTxn = IF Kafka THEN c ELSE @,
-                                  ![s].ackDue = c, ![s].ackOk = TRUE]
+                                  ![s].ackDue = Append(@, [c |-> c, ok |-> TRUE])]
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, receipts,
                     unresolvedMk, brokerUp, sinkGen, boundEpoch, msgs, jobVars, ghostVars,
                     budgetVars >>
@@ -342,21 +356,22 @@ SinkPrepareFails(s) ==
                                           desc |-> FALSE, has |-> has]]
           /\ pendingHandles' = [pendingHandles EXCEPT ![s] = @ \cup {c}]
           /\ sink' = [sink EXCEPT ![s].openTxn = IF Kafka THEN c ELSE @,
-                                  ![s].ackDue = c, ![s].ackOk = FALSE]
+                                  ![s].ackDue = Append(@, [c |-> c, ok |-> FALSE])]
     /\ snapFails' = snapFails + 1
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, boundEpoch, msgs, jobVars,
                     ghostVars, workerDeaths, coordDeaths, expiries, brokerOutages,
-                    walkCancels >>
+                    walkCancels, errorRestarts >>
 
 \* SubtaskCheckpointed reaches the coordinator (handle_subtask_checkpointed_).
 \* An ack for an id the coordinator no longer tracks is ignored; an ack to a
 \* dead coordinator is lost with the connection.
 SinkAck(s) ==
-    /\ sink[s].up /\ sink[s].ackDue # None
-    /\ LET c == sink[s].ackDue IN
-       /\ sink' = [sink EXCEPT ![s].ackDue = None]
+    /\ sink[s].up /\ Len(sink[s].ackDue) > 0
+    /\ LET a == Head(sink[s].ackDue)
+           c == a.c IN
+       /\ sink' = [sink EXCEPT ![s].ackDue = Tail(@)]
        /\ IF coordUp /\ c \in inFlight
-          THEN IF sink[s].ackOk
+          THEN IF a.ok
                THEN ackedOk' = [ackedOk EXCEPT ![c] = @ \cup {s}] /\ UNCHANGED ackedFail
                ELSE ackedFail' = [ackedFail EXCEPT ![c] = @ \cup {s}] /\ UNCHANGED ackedOk
           ELSE UNCHANGED << ackedOk, ackedFail >>
@@ -595,10 +610,13 @@ WriteConfirmed ==
 \* into it.
 WorkerDies(w) ==
     /\ workerDeaths < MaxWorkerDeaths
-    \* The worker hosts something of the job: a live sink, or the source (a
-    \* trace validation run showed the source's worker dying with no sink
-    \* beside it, which restarts the job just the same).
-    /\ w = SrcWorker \/ \E s \in Sinks : Host[s] = w /\ sink[s].up
+    \* Any worker of the job may die, whatever it hosts. The model keeps only
+    \* the source and the sinks; the engine restarts the job for the loss of
+    \* any subtask, so a worker carrying only abstracted operators, or only
+    \* sinks that have already drained, restarts it just the same (trace
+    \* validation showed both: a keyed operator's worker killed at the
+    \* restore point, and a survivor lost after its sinks had drained).
+    /\ w \in Workers
     /\ LET dead == {s \in Sinks : Host[s] = w} IN
        /\ sink' = [s \in Sinks |-> IF s \in dead THEN DownSink ELSE sink[s]]
        /\ pendingHandles' = [s \in Sinks |-> IF s \in dead THEN {} ELSE pendingHandles[s]]
@@ -614,11 +632,29 @@ WorkerDies(w) ==
                     toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen, boundEpoch,
                     jobVars, ghostVars, coordDeaths, expiries, snapFails, brokerOutages,
-                    walkCancels >>
+                    walkCancels, errorRestarts >>
 
 \* A cancelled survivor drains: the sink closes. close() aborts only the open
 \* tail; a barrier-sealed prepared transaction is preserved for the resolver
 \* (the cascade fix of 2026-08-18). The mutant restores the old behaviour.
+\* The coordinator restarts the whole job for a subtask error, or for a
+\* transport failure it could not attribute to a worker loss (a departed peer
+\* is a symptom; the cause usually follows as WorkerDies and folds into the
+\* drain). No sink dies in the model's view: the survivors drain and the job
+\* redeploys from its restore point exactly as after a loss. Trace validation
+\* showed the shape: a sink whose prepare failed took its worker down, the
+\* survivors' bridges to it failed first, and the restart began before the
+\* loss was declared.
+RestartOnError ==
+    /\ coordUp /\ phase = "running" /\ errorRestarts < MaxErrorRestarts
+    /\ phase' = "draining" /\ drainSet' = {s \in Sinks : sink[s].up}
+    /\ errorRestarts' = errorRestarts + 1
+    /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
+                    sink, pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars,
+                    workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels >>
+
 SinkDrains(s) ==
     /\ coordUp /\ phase = "draining" /\ s \in drainSet /\ sink[s].up
     /\ drainSet' = drainSet \ {s}
@@ -650,7 +686,7 @@ CoordDies ==
     /\ coordDeaths' = coordDeaths + 1
     /\ UNCHANGED << leaderEpoch, zombie, zombieEpoch, zombieNext, coordVars, diskVars, txn,
                     brokerUp, sinkGen, boundEpoch, jobVars, ghostVars, workerDeaths, expiries,
-                    snapFails, brokerOutages, walkCancels >>
+                    snapFails, brokerOutages, walkCancels, errorRestarts >>
 
 \* The coordinator is superseded without dying: partitioned from the store or
 \* paused past its lease, it keeps its trigger loop. The workers reconnect to
@@ -668,7 +704,7 @@ CoordSuperseded ==
     /\ coordDeaths' = coordDeaths + 1
     /\ UNCHANGED << leaderEpoch, coordVars, diskVars, txn, brokerUp, sinkGen, boundEpoch, jobVars,
                     ghostVars, workerDeaths, expiries, snapFails, brokerOutages,
-                    walkCancels >>
+                    walkCancels, errorRestarts >>
 
 ZombieStops ==
     /\ zombie
@@ -707,14 +743,14 @@ TxnExpires ==
     /\ expiries' = expiries + 1
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
                     jobVars, ghostVars, workerDeaths, coordDeaths, snapFails,
-                    brokerOutages, walkCancels >>
+                    brokerOutages, walkCancels, errorRestarts >>
 
 BrokerGoesDown ==
     /\ Kafka /\ brokerUp /\ brokerOutages < MaxBrokerOutages
     /\ brokerUp' = FALSE /\ brokerOutages' = brokerOutages + 1
     /\ UNCHANGED << leaderVars, coordVars, diskVars, txn, sinkGen, sinkVars, boundEpoch, msgs,
                     jobVars, ghostVars, workerDeaths, coordDeaths, expiries, snapFails,
-                    walkCancels >>
+                    walkCancels, errorRestarts >>
 
 BrokerComesBack ==
     /\ ~brokerUp
@@ -837,7 +873,7 @@ WalkCancelled ==
     /\ Walking /\ Unsettled # {} /\ walkCancels < MaxWalkCancels
     /\ walkCancels' = walkCancels + 1
     /\ EndUnresolved
-    /\ UNCHANGED << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages >>
+    /\ UNCHANGED << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, errorRestarts >>
 
 \* Every handle of the id has a verdict. All committed: CONFIRMED-<id> is
 \* written and the walk moves on. Any refusal: the walk stops and the job
@@ -981,7 +1017,7 @@ SinkOpens(s) ==
                              [p \in Positions |-> IF p \in recovered THEN @[p] + 1 ELSE @[p]]]
           /\ sinkGen' = [sinkGen EXCEPT ![s] = @ + 1]
           /\ sink' = [sink EXCEPT ![s] = [up |-> TRUE,
-                                          openTxn |-> None, ackDue |-> None, ackOk |-> TRUE,
+                                          openTxn |-> None, ackDue |-> << >>,
                                           stage |-> "idle", opening |-> FALSE,
                                           suppress |-> IF Kafka /\ horizon > frontier
                                                        THEN horizon ELSE 0]]
@@ -997,7 +1033,7 @@ Quiescent ==
     /\ nextCkpt > MaxCkpt /\ inFlight = {}
     /\ completeDue = None /\ toBroadcast = None /\ markerDue = None
     /\ msgs = {} /\ broadcastIds = {}
-    /\ \A s \in Sinks : sink[s].up /\ sink[s].ackDue = None /\ sink[s].stage = "idle"
+    /\ \A s \in Sinks : sink[s].up /\ sink[s].ackDue = << >> /\ sink[s].stage = "idle"
                         /\ barriers[s] = {} /\ ~sink[s].opening
                         /\ (Kafka => sink[s].openTxn = None)
 
@@ -1010,6 +1046,7 @@ Next ==
     \/ \E s \in Sinks : SinkCommit(s) \/ SinkReceipt(s) \/ SinkConfirm(s)
     \/ WriteConfirmed
     \/ \E w \in Workers : WorkerDies(w)
+    \/ RestartOnError
     \/ \E s \in Sinks : SinkDrains(s)
     \/ CoordDies \/ CoordSuperseded \/ ZombieStops \/ CoordRecovers
     \/ TxnExpires \/ BrokerGoesDown \/ BrokerComesBack

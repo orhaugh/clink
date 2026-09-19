@@ -88,7 +88,8 @@ StepSinkPrepare ==
 StepSubtaskAck ==
     /\ Is("SubtaskAck")
     /\ IF ForSink
-       THEN /\ sink[E.sub].ackDue = E.ckpt /\ sink[E.sub].ackOk = E.ok
+       THEN /\ Len(sink[E.sub].ackDue) > 0
+            /\ Head(sink[E.sub].ackDue).c = E.ckpt /\ Head(sink[E.sub].ackDue).ok = E.ok
             /\ SinkAck(E.sub)
        ELSE Skip
 
@@ -155,6 +156,12 @@ StepWriteConfirmed ==
 
 StepWorkerDies == Is("WorkerDies") /\ WorkerDies(E.worker)
 
+\* The coordinator restarts the whole job for a subtask error or a transport
+\* failure it could not attribute to a worker loss: the survivors drain, then
+\* the redeploy. No sink dies in the model's view; a worker declared lost
+\* during that drain folds in as WorkerDies does.
+StepRestartOnError == Is("RestartOnError") /\ RestartOnError
+
 StepSubtaskDrained ==
     /\ Is("SubtaskDrained")
     /\ IF ForSink THEN SinkDrains(E.sub) ELSE Skip
@@ -213,7 +220,7 @@ TraceStep ==
        \/ StepCoordComplete \/ StepWriteCompleted \/ StepBroadcast
        \/ StepDeliverCommit \/ StepDeliverAbort
        \/ StepSinkCommit \/ StepSinkReceipt \/ StepSinkConfirm \/ StepWriteConfirmed
-       \/ StepWorkerDies \/ StepSubtaskDrained \/ StepCoordRecovers
+       \/ StepWorkerDies \/ StepRestartOnError \/ StepSubtaskDrained \/ StepCoordRecovers
        \/ StepRestartProceeds \/ StepRedeploy
        \/ StepWalkSkips \/ StepWalkReadsReceipt \/ StepWalkProbes \/ StepWalkRetries
        \/ StepWalkExhausted \/ StepWalkCancelled \/ StepWalkDecides \/ StepWalkFinishes
