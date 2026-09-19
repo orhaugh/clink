@@ -43,7 +43,7 @@ the rigs saw. Neither proves the code.
 | `include/clink/cluster/protocol_trace.hpp` | The emitter: `CLINK_PROTOCOL_TRACE_DIR` turns it on |
 | `scripts/formal-check.sh` | Fetches and verifies the tools, runs TLC, judges models, mutants and traces (`--trace`) |
 | `scripts/protocol-trace-merge.py`, `scripts/check-protocol-trace-events.py` | Merges per-process trace files; holds code, vocabulary and module in agreement |
-| `.github/workflows/ci.yml`, jobs `formal` and `trace-validation` | Models, mutants and the recorded traces on every push; the traces each test run leaves, after the build (advisory until it fits its budget and every trace validates) |
+| `.github/workflows/ci.yml`, jobs `formal` and `trace-validation` | Models, mutants and the recorded traces on every push; the traces each test run leaves, after the build (rescaled runs are skipped and counted, not judged) |
 | `formal/README.md` | The working guide: running, adding a model, adding a mutant, recording a trace |
 
 ## How it works
@@ -211,10 +211,7 @@ own test run leaves (the in-process protocol trace test, every
 multi-process harness test) and the `trace-validation` job model-checks
 them all, so the engine's behaviour under the faults the integration suite
 injects is checked against the model on each commit, not only when a
-fixture is refreshed. That job is advisory for now: it does not yet accept
-every trace it reaches, so it reports as a warning rather than gating the
-run until it does.
-A run that rescaled an operator carries a `Rescale`
+fixture is refreshed. A run that rescaled an operator carries a `Rescale`
 scope marker and is skipped and counted rather than judged: the model keys
 a sink by its subtask index and fixes the set and its hosts for the run.
 The merge script also writes the model's constants (the sink set, the

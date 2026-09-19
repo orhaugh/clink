@@ -107,8 +107,7 @@ trace implies; `scripts/formal-check.sh --trace` merges a run's files, runs
 TLC and names the first event no allowed step produces. The multi-process
 harness traces every node it spawns and keeps the run under
 `CLINK_PROTOCOL_TRACE_OUT`; the build job uploads what its tests left and a
-`trace-validation` job model-checks each one (advisory until it fits its
-budget and every trace validates), while the `formal` job
+`trace-validation` job model-checks each one, while the `formal` job
 validates the recorded set under `formal/traces/`: a checkpointed run of
 the recoverable family and three Kafka runs (a source-worker kill, a kill in
 the receipt window, a coordinator failover), every one a behaviour the
@@ -511,6 +510,29 @@ from a task the operator feeds, and
 sink's ack back for two seconds so an exit lands while C is still open and
 requires the cutover to complete anyway. Mutation-checked: with the pin and
 without the fix, the cut times out and the test fails.
+
+**Trace validation fits its budget and gates again.** The job that model-checks
+every protocol trace a build's tests leave never passed until now. Its time
+went into TLC re-deriving the model's constants from the trace on every
+reference, quadratic in trace length; the merge script now writes them as a
+generated module of literals and the module reads each event once, so a
+1,500-event trace validates in seconds and the recorded set in two. Of the
+divergences it then reported, four shapes were the engine's account of
+itself, not its behaviour, and are corrected: the checkpoint ack is recorded
+where the sink sends it, a takeover once per job per leadership with the
+redeploy only after the submit that deploys, and the completed marker's
+event before the fault point that models a death after it. Four shapes were
+behaviours the specification lacked and now has: any worker of the job may
+die, whatever it hosts; `RestartOnError`, the whole-job restart the
+coordinator begins for a subtask error or an unattributed transport failure;
+a sink with more than one ack outstanding, since a barrier arriving right
+behind another is prepared before the earlier snapshot's ack is sent; and a
+recoverable-family sink preparing while an older checkpoint's commit is
+still executing, which only the Kafka family cannot do.
+Runs that rescale an operator carry a `Rescale` scope marker and are skipped
+and counted rather than judged, since the model fixes the sink set and its
+hosts for the run. Documented under
+[Trace validation](https://orhaugh.github.io/clink/internals/exactly-once-specification/#trace-validation).
 
 ## v0.8.0 (August 2026)
 
