@@ -14155,6 +14155,293 @@ protected:
 
 }  // namespace
 
+namespace {
+
+class SqlParallelSemantics : public ::testing::TestWithParam<std::uint32_t> {
+protected:
+    void SetUp() override {
+        ensure_sql_installed_once();
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        dir_ = std::filesystem::temp_directory_path() /
+               ("clink_sql_parallel_" + std::string(info == nullptr ? "x" : info->name()) + "_p" +
+                std::to_string(GetParam()));
+        std::filesystem::remove_all(dir_);
+        std::filesystem::create_directories(dir_);
+    }
+
+    void TearDown() override { std::filesystem::remove_all(dir_); }
+
+    std::multiset<std::string> run(const std::string& label,
+                                   const std::string& source_ddl,
+                                   const std::string& sink_columns,
+                                   const std::string& insert_sql,
+                                   const Streams& streams,
+                                   const std::vector<std::string>& source_order,
+                                   bool changelog = false) {
+        const auto out = dir_ / (label + ".ndjson");
+        std::filesystem::remove(out);
+        std::string sink =
+            "CREATE TABLE out_t (" + sink_columns + ") WITH (connector='file', format='json', ";
+        if (changelog) {
+            sink += "changelog='true', ";
+        }
+        sink += "path='" + out.string() + "');";
+
+        std::string error;
+        auto rows = run_query(source_ddl + sink,
+                              insert_sql,
+                              streams,
+                              out,
+                              source_order,
+                              changelog,
+                              &error,
+                              "worker-sql-parallel-" + label + "-p" + std::to_string(GetParam()),
+                              GetParam());
+        EXPECT_TRUE(error.empty()) << label << " at parallelism " << GetParam() << ": " << error;
+        return rows;
+    }
+
+    std::filesystem::path dir_;
+};
+
+const std::vector<std::string>& parallel_semantics_rows() {
+    static const std::vector<std::string> rows = {
+        R"({"id":1,"grp":1,"amount":5,"datetime":1000})",
+        R"({"id":2,"grp":1,"amount":40,"datetime":2000})",
+        R"({"id":3,"grp":1,"amount":15,"datetime":3000})",
+        R"({"id":4,"grp":1,"amount":30,"datetime":4000})",
+        R"({"id":5,"grp":2,"amount":25,"datetime":5000})",
+        R"({"id":6,"grp":2,"amount":10,"datetime":6000})",
+        R"({"id":7,"grp":2,"amount":35,"datetime":7000})",
+        R"({"id":8,"grp":2,"amount":21,"datetime":8000})"};
+    return rows;
+}
+
+std::string parallel_semantics_source_ddl() {
+    return "CREATE TABLE t (id BIGINT, grp BIGINT, amount BIGINT, datetime BIGINT) "
+           "WITH (connector='kafka', format='json', brokers='b', topic='t', group_id='g', "
+           "event_time_column='datetime', watermark_lag_ms='0');";
+}
+
+std::string parallelism_name(const ::testing::TestParamInfo<std::uint32_t>& info) {
+    return "P" + std::to_string(info.param);
+}
+
+}  // namespace
+
+TEST_P(SqlParallelSemantics, GlobalAggregateLimitAndTopNMatchExpectedRelation) {
+    Streams streams{dir_ / "rows.ndjson", {}, {}};
+    write_lines(streams.bid, parallel_semantics_rows());
+
+    const auto aggregates =
+        run("global-aggregate",
+            parallel_semantics_source_ddl(),
+            "cnt BIGINT, sumv BIGINT, minv BIGINT, maxv BIGINT, av DOUBLE",
+            "INSERT INTO out_t SELECT COUNT(*) AS cnt, SUM(amount) AS sumv, MIN(amount) AS minv, "
+            "MAX(amount) AS maxv, AVG(amount) AS av FROM t "
+            "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND)",
+            streams,
+            {"bid"});
+    EXPECT_EQ(
+        aggregates,
+        (std::multiset<std::string>{R"({"av":22.625,"cnt":8,"maxv":40,"minv":5,"sumv":181})"}));
+
+    const auto top_n = run("top-n",
+                           parallel_semantics_source_ddl(),
+                           "id BIGINT, amount BIGINT",
+                           "INSERT INTO out_t SELECT id, amount FROM t "
+                           "ORDER BY amount DESC, id ASC LIMIT 3",
+                           streams,
+                           {"bid"});
+    EXPECT_EQ(
+        top_n,
+        (std::multiset<std::string>{
+            R"({"amount":40,"id":2})", R"({"amount":35,"id":7})", R"({"amount":30,"id":4})"}));
+
+    const auto limited = run("limit-offset",
+                             parallel_semantics_source_ddl(),
+                             "id BIGINT, amount BIGINT",
+                             "INSERT INTO out_t SELECT id, amount FROM t LIMIT 3 OFFSET 2",
+                             streams,
+                             {"bid"});
+    EXPECT_EQ(limited.size(), 3u)
+        << "a global LIMIT must apply once; row identity is arrival-order dependent";
+
+    const auto fewer = run("top-n-fewer",
+                           parallel_semantics_source_ddl(),
+                           "id BIGINT, amount BIGINT",
+                           "INSERT INTO out_t SELECT id, amount FROM t "
+                           "ORDER BY amount DESC, id ASC LIMIT 20",
+                           streams,
+                           {"bid"});
+    std::multiset<std::string> all_rows;
+    for (const auto& line : parallel_semantics_rows()) {
+        const auto row = clink::config::parse(line);
+        all_rows.insert(R"({"amount":)" +
+                        std::to_string(static_cast<std::int64_t>(row.at("amount").as_number())) +
+                        R"(,"id":)" +
+                        std::to_string(static_cast<std::int64_t>(row.at("id").as_number())) + "}");
+    }
+    EXPECT_EQ(fewer, all_rows);
+}
+
+TEST_P(SqlParallelSemantics, KeyedRelationalFamiliesMatchExpectedRelation) {
+    Streams rows{dir_ / "rows.ndjson", {}, {}};
+    write_lines(rows.bid, parallel_semantics_rows());
+
+    const auto grouped =
+        run("grouped-window",
+            parallel_semantics_source_ddl(),
+            "grp BIGINT, cnt BIGINT, sumv BIGINT",
+            "INSERT INTO out_t SELECT grp, COUNT(*) AS cnt, SUM(amount) AS sumv FROM t "
+            "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), grp",
+            rows,
+            {"bid"});
+    EXPECT_EQ(grouped,
+              (std::multiset<std::string>{R"({"cnt":4,"grp":1,"sumv":90})",
+                                          R"({"cnt":4,"grp":2,"sumv":91})"}));
+
+    const auto distinct = run("distinct",
+                              parallel_semantics_source_ddl(),
+                              "grp BIGINT",
+                              "INSERT INTO out_t SELECT DISTINCT grp FROM t",
+                              rows,
+                              {"bid"});
+    EXPECT_EQ(distinct, (std::multiset<std::string>{R"({"grp":1})", R"({"grp":2})"}));
+
+    Streams joins{dir_ / "join-left.ndjson", dir_ / "join-right.ndjson", {}};
+    write_lines(joins.bid, {R"({"k":1,"lv":"a"})", R"({"k":1,"lv":"b"})", R"({"k":2,"lv":"c"})"});
+    write_lines(joins.auction,
+                {R"({"k":1,"rv":"x"})", R"({"k":1,"rv":"y"})", R"({"k":3,"rv":"z"})"});
+    const auto joined =
+        run("equi-join",
+            "CREATE TABLE l (k BIGINT, lv VARCHAR) WITH (connector='kafka', format='json', "
+            "brokers='b', topic='l', group_id='l');"
+            "CREATE TABLE r (k BIGINT, rv VARCHAR) WITH (connector='kafka', format='json', "
+            "brokers='b', topic='r', group_id='r');",
+            "k BIGINT, lv VARCHAR, rv VARCHAR",
+            "INSERT INTO out_t SELECT l.k, l.lv, r.rv FROM l JOIN r ON l.k = r.k",
+            joins,
+            {"bid", "auction"});
+    EXPECT_EQ(joined,
+              (std::multiset<std::string>{R"({"k":1,"lv":"a","rv":"x"})",
+                                          R"({"k":1,"lv":"a","rv":"y"})",
+                                          R"({"k":1,"lv":"b","rv":"x"})",
+                                          R"({"k":1,"lv":"b","rv":"y"})"}));
+
+    Streams sets{dir_ / "set-left.ndjson", dir_ / "set-right.ndjson", {}};
+    write_lines(sets.bid, {R"({"v":1})", R"({"v":1})", R"({"v":2})", R"({"v":3})"});
+    write_lines(sets.auction, {R"({"v":1})", R"({"v":2})", R"({"v":2})", R"({"v":4})"});
+    const auto intersected =
+        run("intersect-all",
+            "CREATE TABLE l (v BIGINT) WITH (connector='kafka', format='json', brokers='b', "
+            "topic='l', group_id='l');"
+            "CREATE TABLE r (v BIGINT) WITH (connector='kafka', format='json', brokers='b', "
+            "topic='r', group_id='r');",
+            "v BIGINT",
+            "INSERT INTO out_t SELECT v FROM l INTERSECT ALL SELECT v FROM r",
+            sets,
+            {"bid", "auction"},
+            true);
+    EXPECT_EQ(intersected, (std::multiset<std::string>{R"({"v":1})", R"({"v":2})"}));
+
+    const auto ranked =
+        run("ranking",
+            parallel_semantics_source_ddl(),
+            "id BIGINT, grp BIGINT, amount BIGINT, datetime BIGINT",
+            "INSERT INTO out_t SELECT * FROM (SELECT *, ROW_NUMBER() OVER "
+            "(PARTITION BY grp ORDER BY amount DESC, id ASC) AS rn FROM t) AS ranked "
+            "WHERE rn <= 2",
+            rows,
+            {"bid"},
+            true);
+    EXPECT_EQ(ranked,
+              (std::multiset<std::string>{R"({"amount":40,"datetime":2000,"grp":1,"id":2})",
+                                          R"({"amount":30,"datetime":4000,"grp":1,"id":4})",
+                                          R"({"amount":35,"datetime":7000,"grp":2,"id":7})",
+                                          R"({"amount":25,"datetime":5000,"grp":2,"id":5})"}));
+}
+
+TEST_P(SqlParallelSemantics, ScalarAndNullAwareEdgeCasesMatchExpectedRelation) {
+    Streams scalar{dir_ / "orders.ndjson", dir_ / "refs.ndjson", {}};
+    write_lines(scalar.bid,
+                {R"({"id":1,"amount":5})",
+                 R"({"id":2,"amount":40})",
+                 R"({"id":3,"amount":15})",
+                 R"({"id":4,"amount":30})",
+                 R"({"id":5,"amount":25})"});
+    write_lines(scalar.auction, {R"({"amount":10})", R"({"amount":20})", R"({"amount":30})"});
+    const std::string scalar_ddl =
+        "CREATE TABLE orders (id BIGINT, amount BIGINT) WITH (connector='kafka', "
+        "format='json', brokers='b', topic='orders', group_id='orders');"
+        "CREATE TABLE refs (amount BIGINT) WITH (connector='kafka', format='json', "
+        "brokers='b', topic='refs', group_id='refs');";
+
+    const auto filtered = run("scalar-filter",
+                              scalar_ddl,
+                              "id BIGINT, amount BIGINT",
+                              "INSERT INTO out_t SELECT id, amount FROM orders "
+                              "WHERE amount > (SELECT AVG(amount) FROM refs)",
+                              scalar,
+                              {"bid", "auction"});
+    EXPECT_EQ(
+        filtered,
+        (std::multiset<std::string>{
+            R"({"amount":40,"id":2})", R"({"amount":30,"id":4})", R"({"amount":25,"id":5})"}));
+
+    Streams empty_scalar{scalar.bid, dir_ / "empty-refs.ndjson", {}};
+    write_lines(empty_scalar.auction, {});
+    const auto empty =
+        run("scalar-empty",
+            scalar_ddl,
+            "id BIGINT, m BIGINT",
+            "INSERT INTO out_t SELECT id, (SELECT MAX(amount) FROM refs) AS m FROM orders",
+            empty_scalar,
+            {"bid", "auction"});
+    EXPECT_EQ(empty,
+              (std::multiset<std::string>{R"({"id":1,"m":null})",
+                                          R"({"id":2,"m":null})",
+                                          R"({"id":3,"m":null})",
+                                          R"({"id":4,"m":null})",
+                                          R"({"id":5,"m":null})"}));
+
+    Streams membership{dir_ / "probes.ndjson", dir_ / "members.ndjson", {}};
+    write_lines(membership.bid, {R"({"id":1})", R"({"id":2})", R"({"id":null})"});
+    write_lines(membership.auction, {R"({"id":2})", R"({"id":2})", R"({"id":null})"});
+    const std::string membership_ddl =
+        "CREATE TABLE probes (id BIGINT) WITH (connector='kafka', format='json', brokers='b', "
+        "topic='probes', group_id='probes');"
+        "CREATE TABLE members (id BIGINT) WITH (connector='kafka', format='json', brokers='b', "
+        "topic='members', group_id='members');";
+    const auto in_rows =
+        run("in-null-duplicate",
+            membership_ddl,
+            "id BIGINT",
+            "INSERT INTO out_t SELECT * FROM probes WHERE id IN (SELECT id FROM members)",
+            membership,
+            {"bid", "auction"},
+            true);
+    EXPECT_EQ(in_rows, (std::multiset<std::string>{R"({"id":2})"}));
+
+    Streams empty_membership{membership.bid, dir_ / "empty-members.ndjson", {}};
+    write_lines(empty_membership.auction, {});
+    const auto not_in_rows =
+        run("not-in-empty",
+            membership_ddl,
+            "id BIGINT",
+            "INSERT INTO out_t SELECT * FROM probes WHERE id NOT IN (SELECT id FROM members)",
+            empty_membership,
+            {"bid", "auction"},
+            true);
+    EXPECT_EQ(not_in_rows,
+              (std::multiset<std::string>{R"({"id":1})", R"({"id":2})", R"({"id":null})"}));
+}
+
+INSTANTIATE_TEST_SUITE_P(Parallelism,
+                         SqlParallelSemantics,
+                         ::testing::Values(1u, 2u, 4u, 8u),
+                         parallelism_name);
+
 TEST(SqlRuntime, GlobalSubqueryAndNullAwareSemanticsAreParallelismInvariant) {
     ensure_sql_installed_once();
     const auto dir = std::filesystem::temp_directory_path() / "clink_sql_global_semantics";
