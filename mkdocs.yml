@@ -40,6 +40,11 @@ theme:
     - content.code.copy
     - content.action.edit
 
+# Style overrides on top of the theme. The one rule so far lets the tab bar
+# wrap instead of clipping its last entries; the file says why.
+extra_css:
+  - assets/stylesheets/extra.css
+
 exclude_docs: |
   /*.md
   !/index.md
@@ -108,7 +113,7 @@ nav:
       - qualification/qual-09-infrastructure-faults.md
       - qualification/qual-11-schema-evolution.md
       - qualification/qual-12-security-refusals.md
-  - Cost and environmental footprint: efficiency.md
+  - Efficiency: efficiency.md
   - Internals:
       - internals/README.md
       - internals/architecture.md

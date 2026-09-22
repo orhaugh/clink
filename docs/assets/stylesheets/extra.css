@@ -1,0 +1,17 @@
+/* clink docs: overrides on top of MkDocs Material.
+ *
+ * Top-level navigation tabs. Material lays the tabs out in one row that
+ * scrolls sideways with its scrollbar hidden, so a nav wider than the page
+ * grid clips silently: the last tab shows a single letter and nothing hints
+ * that more exist. Let the row wrap instead. The tab bar is not sticky here
+ * (navigation.tabs.sticky is off), so a taller bar scrolls away with the
+ * page and moves nothing else.
+ */
+.md-tabs__list {
+  flex-wrap: wrap;
+  white-space: normal;
+}
+
+.md-tabs {
+  height: auto;
+}
