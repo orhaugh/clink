@@ -163,9 +163,9 @@ specification, or a stutter the trace module recognises.
 | `SinkReceipt` | the Kafka sink, receipt durable | `sub`, `ckpt` | `SinkReceipt` |
 | `SinkConfirm` | worker, `CommitConfirmed` sent | `job`, `sub`, `ckpt` | `SinkConfirm` (Kafka family; a stutter otherwise) |
 | `WriteConfirmed` | coordinator, `CONFIRMED` marker written | `job`, `ckpt` | `WriteConfirmed` |
-| `WorkerDies` | coordinator, loss detected | `job`, `worker` | `WorkerDies` (any worker of the job; the model keeps only the source and the sinks, so the dead set may be empty) |
+| `WorkerDies` | coordinator, loss detected | `job`, `worker` | `WorkerDies` (any worker of the job; the model keeps only the source and the sinks, so the dead set may be empty). Validation takes the sinks the loss found on that worker from the run's own `Placement` events, not from the model's fixed hosts: a redeploy re-places a subtask, and a sink that has moved off the worker survives its death |
 | `RestartOnError` | coordinator, a whole-job restart begun for a subtask error or an unattributed transport failure | `job`, `cause` | `RestartOnError` (the survivors drain; a loss declared during the drain folds in as its own `WorkerDies`) |
-| `SubtaskDrained` | coordinator, survivor drained | `job`, `sub` | `SinkDrains` (non-sinks stutter) |
+| `SubtaskDrained` | coordinator, survivor drained | `job`, `sub` | `SinkDrains` (non-sinks stutter). A sink the last redeploy placed but that has not finished opening may be among the survivors or not, according to whether its deploy had landed when the loss was declared; the model takes both, since forcing it in removed the shape a mutant's counterexample needs |
 | `CoordRecovers` | the new leader, per recovered job | `job`, `epoch`, `completed`, `confirmed` | `CoordRecovers` (its `CoordDies` is a hidden step) |
 | `RestartProceeds` | coordinator, restart held for resolution | `job`, `resolving`, `completed`, `confirmed` | `RestartProceeds` into `resolving` |
 | `Redeploy` | coordinator, deploying: once per restart, after the deploy frames are built, whatever their number | `job`, `restore`, `next` | `RestartProceeds` (from the drain) or `Redeploy` (after resolution) |

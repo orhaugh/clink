@@ -47,8 +47,9 @@ ModelEpoch(e) == e - TraceFirstEpoch + 1
 --------------------------------------------------------------------------------
 (* Following the trace. *)
 
-VARIABLES l,   \* index of the next event to match
-          ev   \* Trace[l], read once per step
+VARIABLES l,       \* index of the next event to match
+          ev,      \* Trace[l], read once per step
+          placed   \* [Sinks -> Workers]: where each sink is deployed RIGHT NOW
 
 \* Register 1 holds the highest event index any path has reached; the
 \* validator runs TLC with one worker, so the register is a single number.
@@ -154,7 +155,15 @@ StepWriteConfirmed ==
     /\ WriteConfirmed
     /\ E.ckpt \notin broadcastIds'
 
-StepWorkerDies == Is("WorkerDies") /\ WorkerDies(E.worker)
+\* The sinks the loss actually takes: the ones deployed on that worker when it
+\* died, not the ones the model's fixed Host assigns to it. A redeploy
+\* re-places a subtask, and a sink that has moved off the worker survives its
+\* death. Validating against Host instead reported a false divergence: a sink
+\* moved worker-1 -> worker-0 on a redeploy, worker-1 then died, and the model
+\* killed a sink that was no longer there, so its drain had no step.
+StepWorkerDies ==
+    /\ Is("WorkerDies")
+    /\ WorkerDiesKilling(E.worker, {s \in Sinks : placed[s] = E.worker})
 
 \* The coordinator restarts the whole job for a subtask error or a transport
 \* failure it could not attribute to a worker loss: the survivors drain, then
@@ -216,6 +225,11 @@ TraceStep ==
     /\ l <= TraceLen
     /\ l' = l + 1
     /\ ev' = IF l + 1 <= TraceLen THEN Trace[l + 1] ELSE ev
+    \* Followed here rather than in StepPlacement so every step carries it, and
+    \* read unprimed by StepWorkerDies: a death kills where the sinks were.
+    /\ placed' = IF Is("Placement") /\ ForSink
+                 THEN [placed EXCEPT ![E.sub] = E.worker]
+                 ELSE placed
     /\ \/ StepTrigger \/ StepDeliverBarrier \/ StepSinkPrepare \/ StepSubtaskAck
        \/ StepCoordComplete \/ StepWriteCompleted \/ StepBroadcast
        \/ StepDeliverCommit \/ StepDeliverAbort
@@ -232,16 +246,16 @@ TraceStep ==
 Hidden ==
     /\ \/ CoordDies \/ CoordSuperseded \/ ZombieStops
        \/ TxnExpires \/ BrokerGoesDown \/ BrokerComesBack
-    /\ UNCHANGED <<l, ev>>
+    /\ UNCHANGED <<l, ev, placed>>
 
 \* The trace consumed: the run stutters here rather than deadlocking.
-TraceEnd == l > TraceLen /\ UNCHANGED <<vars, l, ev>>
+TraceEnd == l > TraceLen /\ UNCHANGED <<vars, l, ev, placed>>
 
 TraceNext == TraceStep \/ Hidden \/ TraceEnd
 
-TraceInit == Init /\ l = 1 /\ ev = Trace[1]
+TraceInit == Init /\ l = 1 /\ ev = Trace[1] /\ placed = Host
 
-TraceSpec == TraceInit /\ [][TraceNext]_<<vars, l, ev>>
+TraceSpec == TraceInit /\ [][TraceNext]_<<vars, l, ev, placed>>
 
 \* POSTCONDITION: TRUE when some path consumed the whole trace.
 TraceAccepted ==

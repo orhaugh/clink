@@ -608,7 +608,13 @@ WriteConfirmed ==
 \* begins a restart: survivors are cancelled and must drain before anything
 \* redeploys (mark_worker_lost_locked_). A loss during an ongoing drain folds
 \* into it.
-WorkerDies(w) ==
+\* `dead` is the set of sinks the loss takes with it, a parameter rather than
+\* a lookup: the model fixes each sink's host for the run, but the engine
+\* re-places a subtask when the job redeploys, and a sink that has moved off w
+\* does not die with it. Trace validation follows the placements the run
+\* recorded and passes the set they imply; WorkerDies below is the model's own
+\* case, where Host is the whole story.
+WorkerDiesKilling(w, dead) ==
     /\ workerDeaths < MaxWorkerDeaths
     \* Any worker of the job may die, whatever it hosts. The model keeps only
     \* the source and the sinks; the engine restarts the job for the loss of
@@ -617,22 +623,33 @@ WorkerDies(w) ==
     \* validation showed both: a keyed operator's worker killed at the
     \* restore point, and a survivor lost after its sinks had drained).
     /\ w \in Workers
-    /\ LET dead == {s \in Sinks : Host[s] = w} IN
-       /\ sink' = [s \in Sinks |-> IF s \in dead THEN DownSink ELSE sink[s]]
-       /\ pendingHandles' = [s \in Sinks |-> IF s \in dead THEN {} ELSE pendingHandles[s]]
-       /\ barriers' = [s \in Sinks |-> IF s \in dead THEN {} ELSE barriers[s]]
-       /\ msgs' = {m \in msgs : IF m.kind = "barrier" THEN SrcWorker # w ELSE m.s \notin dead}
-       /\ IF coordUp /\ phase = "running"
-          THEN phase' = "draining" /\ drainSet' = {s \in Sinks : sink[s].up /\ s \notin dead}
-          ELSE IF coordUp /\ phase = "draining"
-               THEN drainSet' = drainSet \ dead /\ UNCHANGED phase
-               ELSE UNCHANGED << phase, drainSet >>
+    /\ sink' = [s \in Sinks |-> IF s \in dead THEN DownSink ELSE sink[s]]
+    /\ pendingHandles' = [s \in Sinks |-> IF s \in dead THEN {} ELSE pendingHandles[s]]
+    /\ barriers' = [s \in Sinks |-> IF s \in dead THEN {} ELSE barriers[s]]
+    /\ msgs' = {m \in msgs : IF m.kind = "barrier" THEN SrcWorker # w ELSE m.s \notin dead}
+    /\ IF coordUp /\ phase = "running"
+       THEN /\ phase' = "draining"
+            \* Whether a sink that the last redeploy placed but that has not
+            \* finished opening is among the survivors depends on whether its
+            \* deploy had landed when the loss was declared. The model fixes
+            \* neither, so it takes both: forcing it in removed the shape a
+            \* mutant's counterexample needs, and leaving it out refuses a
+            \* drain real runs record.
+            /\ \E waitOpening \in BOOLEAN :
+                  drainSet' = {s \in Sinks :
+                                  (sink[s].up \/ (waitOpening /\ sink[s].opening))
+                                  /\ s \notin dead}
+       ELSE IF coordUp /\ phase = "draining"
+            THEN drainSet' = drainSet \ dead /\ UNCHANGED phase
+            ELSE UNCHANGED << phase, drainSet >>
     /\ workerDeaths' = workerDeaths + 1
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                     toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen, boundEpoch,
                     jobVars, ghostVars, coordDeaths, expiries, snapFails, brokerOutages,
                     walkCancels, errorRestarts >>
+
+WorkerDies(w) == WorkerDiesKilling(w, {s \in Sinks : Host[s] = w})
 
 \* A cancelled survivor drains: the sink closes. close() aborts only the open
 \* tail; a barrier-sealed prepared transaction is preserved for the resolver
@@ -647,7 +664,9 @@ WorkerDies(w) ==
 \* loss was declared.
 RestartOnError ==
     /\ coordUp /\ phase = "running" /\ errorRestarts < MaxErrorRestarts
-    /\ phase' = "draining" /\ drainSet' = {s \in Sinks : sink[s].up}
+    /\ phase' = "draining"
+    /\ \E waitOpening \in BOOLEAN :   \* as in WorkerDiesKilling
+          drainSet' = {s \in Sinks : sink[s].up \/ (waitOpening /\ sink[s].opening)}
     /\ errorRestarts' = errorRestarts + 1
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                     toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
@@ -655,8 +674,14 @@ RestartOnError ==
                     sink, pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars,
                     workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels >>
 
+\* A sink still opening drains like any other: the redeploy deployed the
+\* subtask, so a loss landing before its open() returned cancels it and waits
+\* for it, and the coordinator records the drain. Requiring `up` here reported
+\* a false divergence on a run whose second loss arrived while the first
+\* restart's sinks were still coming up.
 SinkDrains(s) ==
-    /\ coordUp /\ phase = "draining" /\ s \in drainSet /\ sink[s].up
+    /\ coordUp /\ phase = "draining" /\ s \in drainSet
+    /\ (sink[s].up \/ sink[s].opening)
     /\ drainSet' = drainSet \ {s}
     /\ sink' = [sink EXCEPT ![s] = DownSink]
     /\ pendingHandles' = [pendingHandles EXCEPT ![s] = {}]
