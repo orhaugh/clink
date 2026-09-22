@@ -58,6 +58,7 @@ exclude_docs: |
   !/qualification/
   !/assets/
   consumer-examples/build/
+  consumer-examples/fetchcontent/build/
 
 validation:
   links:
@@ -177,4 +178,5 @@ nav:
       - design/012-machine-checked-exactly-once.md
   - Examples:
       - consumer-examples/README.md
+      - consumer-examples/fetchcontent/README.md
       - consumer-examples/state_as_data/README.md

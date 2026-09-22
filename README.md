@@ -303,7 +303,11 @@ sudo cmake --install build
 Downstream projects consume it with `find_package(clink REQUIRED)` and
 link `clink::clink` (or per-impl targets such as `clink::kafka`);
 [docs/consumer-examples/](docs/consumer-examples/) is a complete
-`find_package`-based project to copy from. The install carries the
+`find_package`-based project to copy from. A project that would rather
+build clink from source pulls it in with CMake's `FetchContent` at a
+pinned tag and links the same targets;
+[docs/consumer-examples/fetchcontent/](docs/consumer-examples/fetchcontent/)
+is that project, and CI builds it from the commit under test. The install carries the
 `clink` CLI and the `clink_node` cluster daemon. Optional connectors and
 backends are `CLINK_WITH_<NAME>` CMake options (default `AUTO`: used
 when the dependency is found); the SQL frontend is `CLINK_BUILD_SQL=ON`

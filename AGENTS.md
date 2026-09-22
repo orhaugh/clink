@@ -35,7 +35,7 @@ the source it cites. Keep these pages current when a subsystem changes.
 
 - Deep per-subsystem references: `docs/internals/` (index: `docs/internals/README.md`).
 - Per-connector references (dependencies, factory names, options, SQL usage): `docs/connectors/`.
-- Runnable API examples: `docs/consumer-examples/`.
+- Runnable API examples: `docs/consumer-examples/` (against an installed clink, `find_package`) and `docs/consumer-examples/fetchcontent/` (clink pulled from GitHub by `FetchContent`; CI builds it from the commit under test).
 - The end-to-end tutorial (Kafka -> clink -> ClickHouse on compose, with a Worker kill): `examples/kafka-to-clickhouse/`, walkthrough in `docs/tutorials/kafka-to-clickhouse.md`. Its `run.sh` is what CI runs against the published runtime image; keep the example, the walkthrough and that script telling the same story.
 
 | Subsystem | Source | Internals page |

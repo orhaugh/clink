@@ -642,6 +642,25 @@ jobs:
           cmake --build /tmp/consumer-examples -j "$(( $(nproc) / 2 ))"
           /tmp/consumer-examples/09_testing_framework
           test -f /tmp/consumer-examples/08_cluster_job_plugin.so
+      - name: Consumer project pulling clink in with FetchContent
+        # The other consumption route: docs/consumer-examples/fetchcontent is
+        # a standalone project whose CMakeLists clones clink from GitHub at a
+        # pinned tag and builds the engine in its own tree. Here FetchContent
+        # is pointed at the checkout instead, so the add_subdirectory
+        # integration (build-tree targets, PUBLIC usage requirements, the
+        # options a consumer sets before the fetch) is tested on the commit
+        # under test rather than on whatever the tag holds. The program is
+        # self-checking and runs through ctest. Release matches the install
+        # build above so ccache serves most of clink's objects again. The
+        # test count guards the not-top-level default: exactly one test
+        # means clink's own suite stayed out of the consumer's tree.
+        run: |
+          cmake -S docs/consumer-examples/fetchcontent -B /tmp/fetchcontent-consumer \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFETCHCONTENT_SOURCE_DIR_CLINK="$GITHUB_WORKSPACE"
+          ctest --test-dir /tmp/fetchcontent-consumer -N | grep -q '^Total Tests: 1$'
+          cmake --build /tmp/fetchcontent-consumer -j "$(( $(nproc) / 2 ))"
+          ctest --test-dir /tmp/fetchcontent-consumer --output-on-failure
       - name: Save compiler cache
         if: always()
         uses: actions/cache/save@v4

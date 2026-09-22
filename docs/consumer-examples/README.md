@@ -37,6 +37,12 @@ cmake --build build --parallel 10
 If clink was installed under a non-standard prefix, set `CMAKE_PREFIX_PATH`
 at configure time: `cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/clink`.
 
+Nothing installed? [`fetchcontent/`](fetchcontent/README.md) is the other
+route: a sister project that pulls clink's source from GitHub at a pinned tag
+with CMake's `FetchContent`, builds the engine in its own build tree and links
+the same `clink::core` target. Copy it when one application wants one build
+with a pinned clink and no install step.
+
 The plugin example (`08_cluster_job_plugin`) builds a .so and is gated:
 
 ```bash

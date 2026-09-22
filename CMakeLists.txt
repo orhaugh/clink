@@ -40,8 +40,12 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
-option(CLINK_BUILD_TESTS    "Build clink tests"    ON)
-option(CLINK_BUILD_EXAMPLES "Build clink examples" ON)
+# Tests and in-tree examples default ON for clink's own build and OFF when clink
+# is pulled into another project's build (FetchContent / add_subdirectory): a
+# consumer wants the engine it links, not a thousand tests and googletest. Pass
+# either explicitly to override in both cases.
+option(CLINK_BUILD_TESTS    "Build clink tests"    ${PROJECT_IS_TOP_LEVEL})
+option(CLINK_BUILD_EXAMPLES "Build clink examples" ${PROJECT_IS_TOP_LEVEL})
 # libFuzzer discovery targets under fuzz/. OFF by default and hard-errors
 # when the toolchain cannot link libFuzzer, rather than skipping quietly -
 # someone who asked for fuzzers and silently got none would believe a
@@ -314,7 +318,10 @@ if(CLINK_USE_FLAT_HASH_MAP)
     # and the consumer disagree on the map layout (a crash, not a link error).
     # Ship the single ankerl header alongside clink's so <ankerl/unordered_dense.h>
     # resolves from the install prefix; the matching define is propagated as a
-    # PUBLIC compile definition on clink_core below.
+    # PUBLIC compile definition on clink_core below, with the fetched include
+    # directory as a BUILD_INTERFACE usage requirement for a consumer that
+    # builds clink inside its own tree (FetchContent / add_subdirectory) and so
+    # never sees the installed copy.
     install(DIRECTORY "${unordered_dense_SOURCE_DIR}/include/ankerl"
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
@@ -549,6 +556,13 @@ set_target_properties(clink_core PROPERTIES EXPORT_NAME core)
 # carries it across the install/export boundary (INTERFACE_COMPILE_DEFINITIONS).
 if(CLINK_USE_FLAT_HASH_MAP)
     target_compile_definitions(clink_core PUBLIC CLINK_USE_FLAT_HASH_MAP=1)
+    # The include_directories() above reaches clink's own TUs only. A consumer
+    # TU outside this directory that includes a header using clink::FlatMap
+    # (any window or keyed-state operator) gets the define through the line
+    # above and must get the header the same way: from the fetched source in
+    # the build tree, from the installed prefix's include dir after install.
+    target_include_directories(clink_core SYSTEM PUBLIC
+        "$<BUILD_INTERFACE:${unordered_dense_SOURCE_DIR}/include>")
 endif()
 
 # PUBLIC, and it must stay PUBLIC: fault_injection.hpp changes what the
