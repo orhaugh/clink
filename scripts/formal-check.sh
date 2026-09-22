@@ -21,8 +21,10 @@
 # the other guard has gone and the record is wrong). Unlisted mutants are
 # expected refuted.
 #
-# Knobs: TLC_WORKERS (default auto), TLC_HEAP (default 2g), TLC_EXTRA (extra
-# TLC flags), CLINK_FORMAL_TOOLS_DIR (jar cache).
+# Knobs: CHECK_JOBS (models/mutants run this many at a time, default 1),
+# TRACE_JOBS (the same for traces), TLC_WORKERS (default auto, or 1 per run
+# when several run side by side), TLC_HEAP (default 2g), TLC_EXTRA (extra TLC
+# flags), CLINK_FORMAL_TOOLS_DIR (jar cache).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -227,65 +229,113 @@ fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/clink-formal.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-failed=()
-for cfg in "${CFGS[@]}"; do
+# One configuration: run TLC and judge it. Writes $WORK/result-N (the lines to
+# print, in order) and $WORK/status-N (ok | failed). Configurations run
+# CHECK_JOBS at a time and their reports are printed in configuration order
+# once all have finished, so the output reads the same at any parallelism.
+check_one() {
+    local n="$1" cfg="$2" name tla log start rc secs states depth expect inv
     name="$(basename "$cfg" .cfg)"
     tla="$DIR/$name.tla"
-    [ -f "$tla" ] || { echo "formal-check: $tla missing for $cfg" >&2; exit 1; }
     log="$WORK/$name.log"
-    echo "formal-check: TLC $MODE/$name"
-    start=$(date +%s)
-    set +e
-    # -DTLA-Library lets the model modules under formal/models find
-    # ExactlyOnce.tla one directory up. Deadlock checking stays ON: a state
-    # with no enabled step that is not the run's quiescent end is a wedge.
-    (cd "$WORK" && java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-2g}" "-DTLA-Library=$ROOT/formal" \
-        -cp "$TLA_JAR${WITH_CM:+:$CM_JAR}" tlc2.TLC \
-        -workers "${TLC_WORKERS:-auto}" -noGenerateSpecTE -metadir "$WORK/$name.states" \
-        -config "$cfg" ${TLC_EXTRA:-} "$tla") >"$log" 2>&1
-    rc=$?
-    set -e
-    secs=$(( $(date +%s) - start ))
-    states="$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -1 || true)"
-    depth="$(grep -oE 'depth of the complete state graph search is [0-9]+' "$log" | tail -1 | awk '{print $NF}' || true)"
-    if [ "$MODE" = models ]; then
-        if [ $rc -eq 0 ]; then
-            echo "formal-check:   ok in ${secs}s (${states:-?}, depth ${depth:-?})"
-        else
-            echo "formal-check:   FAILED (TLC exit $rc) after ${secs}s"
-            sed -n '1,200p' "$log"
-            failed+=("$name")
+    {
+        if [ ! -f "$tla" ]; then
+            echo "formal-check: $tla missing for $cfg"
+            echo failed >"$WORK/status-$n"
+            return
         fi
+        echo "formal-check: TLC $MODE/$name"
+        start=$(date +%s)
+        set +e
+        # -DTLA-Library lets the model modules under formal/models find
+        # ExactlyOnce.tla one directory up. Deadlock checking stays ON: a state
+        # with no enabled step that is not the run's quiescent end is a wedge.
+        (cd "$WORK" && java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-2g}" "-DTLA-Library=$ROOT/formal" \
+            -cp "$TLA_JAR${WITH_CM:+:$CM_JAR}" tlc2.TLC \
+            -workers "$WORKERS" -noGenerateSpecTE -metadir "$WORK/$name.states" \
+            -config "$cfg" ${TLC_EXTRA:-} "$tla") >"$log" 2>&1
+        rc=$?
+        set -e
+        secs=$(( $(date +%s) - start ))
+        states="$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -1 || true)"
+        depth="$(grep -oE 'depth of the complete state graph search is [0-9]+' "$log" | tail -1 | awk '{print $NF}' || true)"
+        if [ "$MODE" = models ]; then
+            if [ $rc -eq 0 ]; then
+                echo "formal-check:   ok in ${secs}s (${states:-?}, depth ${depth:-?})"
+                echo ok >"$WORK/status-$n"
+            else
+                echo "formal-check:   FAILED (TLC exit $rc) after ${secs}s"
+                sed -n '1,200p' "$log"
+                echo failed >"$WORK/status-$n"
+            fi
+        else
+            expect="$(awk -v n="$name" '$1 == n {print $2}' "$ROOT/formal/mutants/expected.txt" 2>/dev/null)"
+            expect="${expect:-refuted}"
+            # TLC exit 12 = invariant violated, 13 = liveness violated, 11 = deadlock.
+            # A deadlock refutes a mutant too: the model's only quiescent state is
+            # the run's clean end, so a stuck state is a protocol that wedged.
+            if [ $rc -eq 12 ] || [ $rc -eq 13 ] || [ $rc -eq 11 ]; then
+                inv="$(grep -oE 'Invariant [A-Za-z]+ is violated|Temporal properties were violated|Deadlock reached' "$log" | head -1 || true)"
+                if [ "$expect" = refuted ]; then
+                    echo "formal-check:   refuted in ${secs}s (${inv:-violation}, ${states:-?})"
+                    echo ok >"$WORK/status-$n"
+                else
+                    echo "formal-check:   REFUTED but expected accepted after ${secs}s (${inv:-violation}): the rule this mutant disables has become load-bearing on its own; update formal/mutants/expected.txt and the published page"
+                    echo failed >"$WORK/status-$n"
+                fi
+            elif [ $rc -eq 0 ]; then
+                if [ "$expect" = accepted ]; then
+                    echo "formal-check:   accepted as recorded in ${secs}s (${states:-?}): guarded by a later rule, see formal/README.md"
+                    echo ok >"$WORK/status-$n"
+                else
+                    echo "formal-check:   NOT REFUTED after ${secs}s (${states:-?}): the model no longer sees this defect"
+                    echo failed >"$WORK/status-$n"
+                fi
+            else
+                echo "formal-check:   ERROR (TLC exit $rc) after ${secs}s"
+                sed -n '1,200p' "$log"
+                echo failed >"$WORK/status-$n"
+            fi
+        fi
+    } >"$WORK/result-$n" 2>&1
+}
+
+jobs_max="${CHECK_JOBS:-1}"
+# One TLC worker per configuration when several run side by side: TLC scales
+# sublinearly across workers, so N independent checks beat one N-way check on
+# the same cores. A TLC_WORKERS set by hand still wins.
+if [ -n "${TLC_WORKERS:-}" ]; then
+    WORKERS="$TLC_WORKERS"
+elif [ "$jobs_max" -gt 1 ]; then
+    WORKERS=1
+else
+    WORKERS=auto
+fi
+
+n=0
+for cfg in "${CFGS[@]}"; do
+    n=$((n + 1))
+    if [ "$jobs_max" -gt 1 ]; then
+        while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$jobs_max" ]; do
+            sleep 1
+        done
+        check_one "$n" "$cfg" &
     else
-        expect="$(awk -v n="$name" '$1 == n {print $2}' "$ROOT/formal/mutants/expected.txt" 2>/dev/null)"
-        expect="${expect:-refuted}"
-        # TLC exit 12 = invariant violated, 13 = liveness violated, 11 = deadlock.
-        # A deadlock refutes a mutant too: the model's only quiescent state is
-        # the run's clean end, so a stuck state is a protocol that wedged.
-        if [ $rc -eq 12 ] || [ $rc -eq 13 ] || [ $rc -eq 11 ]; then
-            inv="$(grep -oE 'Invariant [A-Za-z]+ is violated|Temporal properties were violated|Deadlock reached' "$log" | head -1 || true)"
-            if [ "$expect" = refuted ]; then
-                echo "formal-check:   refuted in ${secs}s (${inv:-violation}, ${states:-?})"
-            else
-                echo "formal-check:   REFUTED but expected accepted after ${secs}s (${inv:-violation}): the rule this mutant disables has become load-bearing on its own; update formal/mutants/expected.txt and the published page"
-                failed+=("$name")
-            fi
-        elif [ $rc -eq 0 ]; then
-            if [ "$expect" = accepted ]; then
-                echo "formal-check:   accepted as recorded in ${secs}s (${states:-?}): guarded by a later rule, see formal/README.md"
-            else
-                echo "formal-check:   NOT REFUTED after ${secs}s (${states:-?}): the model no longer sees this defect"
-                failed+=("$name")
-            fi
-        else
-            echo "formal-check:   ERROR (TLC exit $rc) after ${secs}s"
-            sed -n '1,200p' "$log"
-            failed+=("$name")
-        fi
+        check_one "$n" "$cfg"
+    fi
+done
+wait
+
+failed=()
+for i in $(seq 1 "$n"); do
+    cat "$WORK/result-$i"
+    if [ "$(cat "$WORK/status-$i" 2>/dev/null)" != ok ]; then
+        failed+=("$(basename "${CFGS[$((i - 1))]}" .cfg)")
     fi
 done
 
 if [ ${#failed[@]} -ne 0 ]; then
+    trap - EXIT  # keep the work dir for the TLC logs named above
     echo "formal-check: FAILED: ${failed[*]}" >&2
     exit 1
 fi

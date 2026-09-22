@@ -23,9 +23,16 @@ scripts/formal-check.sh --trace /tmp/run   # a run's per-process trace files
 The script needs a Java 11+ runtime and nothing else. It fetches the TLA+
 tools pinned in `tools.env` (SHA-256 verified, cached under
 `CLINK_FORMAL_TOOLS_DIR`, default `~/.clink-deps/formal-tools`) and runs TLC
-with deadlock checking on. Knobs: `TLC_WORKERS` (default `auto`), `TLC_HEAP`
-(default `2g`), `TLC_EXTRA` for further TLC flags. The `formal` job in
-`.github/workflows/ci.yml` runs both forms on a bare runner.
+with deadlock checking on. Knobs: `CHECK_JOBS` (how many models or mutants run
+at a time, default 1), `TRACE_JOBS` (the same for traces), `TLC_WORKERS`
+(default `auto`, or one worker per run when several run side by side),
+`TLC_HEAP` (default `2g`), `TLC_EXTRA` for further TLC flags. TLC scales
+sublinearly across workers, so N independent checks finish sooner than one
+N-way check on the same cores, but only where no single run dominates. In
+`.github/workflows/ci.yml` the `formal` job therefore runs the models one at
+a time with every worker, since `MC_RecoverableSmall` is most of their cost,
+and the separate `formal-mutants` job runs four mutants at a time with one
+worker each.
 
 A model is green when TLC reports no invariant violation, no deadlock and
 no temporal-property violation. A mutant is judged against
@@ -131,7 +138,7 @@ each and judges the outcome against `mutants/expected.txt`.
 
 | Mutant | Rule it disables | Found by | Result |
 |---|---|---|---|
-| `broadcast_during_drain` | The commit broadcast is withheld while the job drains for a restart | qual01-20260818a | refuted: NoDuplicate (accepted as guarded until the specification admitted a checkpoint triggered before a sink reopens; the counterexample is the campaign's shape) |
+| `broadcast_during_drain` | The commit broadcast is withheld while the job drains for a restart | qual01-20260818a | refuted: NoDuplicate (accepted as guarded until the specification admitted a checkpoint triggered before a sink reopens; the counterexample is the campaign's shape, and it needs a drain that completes while a redeployed sink is still opening, so the drain set takes that sink as possible rather than certain) |
 | `close_aborts_prepared` | A cancelled sink preserves its barrier-sealed prepared transaction | qual01-20260818a | accepted: the walk refuses an aborted transaction and the replay re-emits its interval, receipts suppressing the committed siblings; preserving it saves a replay, not correctness |
 | `no_receipts` | The sink writes a durable commit receipt the instant the broker acknowledges | qual01-20260818b | refuted: NoDuplicate |
 | `stop_at_first_refusal` | The walk probes every handle of a checkpoint even after a refusal | qual01-20260819f | accepted: the marker rule now marks the unprobed handles too, and the sink describes them before fencing |

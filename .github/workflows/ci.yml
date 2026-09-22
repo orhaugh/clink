@@ -415,9 +415,12 @@ jobs:
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04
-    # The models grew by a third when the specification admitted a checkpoint
-    # triggered before a sink reopens; the run takes about an hour on the
-    # four-core runner.
+    # The models take about an hour on the four-core runner, MC_RecoverableSmall
+    # alone most of it. They run one at a time with every worker, not several
+    # at a time with one each: one model dominates, and TLC's workers are worth
+    # more to it than concurrency is to the short ones (measured: a model that
+    # takes 221 s on all workers takes 22 min on one). The mutants are the
+    # opposite case and have their own job.
     timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
@@ -439,14 +442,6 @@ jobs:
         # refused unless their SHA-256 matches formal/tools.env. No C++
         # toolchain: this runs on the bare runner beside the manifest gates.
         run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh
-      - name: Every mutant is refuted
-        # Each configuration under formal/mutants/ switches one rule back to
-        # a pre-fix form a qualification campaign (or the model itself) found
-        # and fixed. TLC must produce a counterexample for each, or the
-        # mutant is recorded in formal/mutants/expected.txt as one a later
-        # rule guards as well and must stay accepted: either drift is a
-        # regression in the model or its record, not a pass.
-        run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh --mutants
       - name: The protocol trace vocabulary agrees with the engine and the trace module
         # Every event the engine emits is in formal/trace/events.txt and
         # consumed by the trace module; every specification action is either
@@ -458,7 +453,36 @@ jobs:
         # event in order; a protocol change that makes a recorded behaviour
         # impossible fails here even where the test that produced it is
         # Docker-gated.
-        run: TLC_WORKERS=auto TLC_HEAP=4g ./scripts/formal-check.sh --trace formal/traces
+        run: TRACE_JOBS=4 TLC_HEAP=2g ./scripts/formal-check.sh --trace formal/traces
+
+  formal-mutants:
+    name: Every mutant of the exactly-once specification is refuted
+    runs-on: ubuntu-24.04
+    # Fifteen independent runs, so four at a time with a single TLC worker each
+    # beats one at a time with all four: TLC scales sublinearly across workers.
+    # Four of them take 24 to 28 minutes on their own worker and dominate the
+    # wall time (about 50 minutes for the set on a developer machine), which is
+    # why this is its own job rather than an hour added to the models'.
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Cache the pinned TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps/formal-tools
+          key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - name: Every mutant is refuted
+        # Each configuration under formal/mutants/ switches one rule back to
+        # a pre-fix form a qualification campaign (or the model itself) found
+        # and fixed. TLC must produce a counterexample for each, or the
+        # mutant is recorded in formal/mutants/expected.txt as one a later
+        # rule guards as well and must stay accepted: either drift is a
+        # regression in the model or its record, not a pass.
+        run: CHECK_JOBS=4 TLC_HEAP=3g ./scripts/formal-check.sh --mutants
 
   trace-validation:
     name: Recorded protocol traces are behaviours of the specification

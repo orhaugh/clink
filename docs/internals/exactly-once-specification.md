@@ -43,7 +43,7 @@ the rigs saw. Neither proves the code.
 | `include/clink/cluster/protocol_trace.hpp` | The emitter: `CLINK_PROTOCOL_TRACE_DIR` turns it on |
 | `scripts/formal-check.sh` | Fetches and verifies the tools, runs TLC, judges models, mutants and traces (`--trace`) |
 | `scripts/protocol-trace-merge.py`, `scripts/check-protocol-trace-events.py` | Merges per-process trace files; holds code, vocabulary and module in agreement |
-| `.github/workflows/ci.yml`, jobs `formal` and `trace-validation` | Models, mutants and the recorded traces on every push; the traces each test run leaves, after the build (rescaled runs are skipped and counted, not judged) |
+| `.github/workflows/ci.yml`, jobs `formal`, `formal-mutants` and `trace-validation` | The models and the recorded traces, the mutants, and the traces each test run leaves, after the build (rescaled runs are skipped and counted, not judged). Models and mutants are separate jobs: one model dominates the models and wants every TLC worker, while the mutants are independent and want concurrency |
 | `formal/README.md` | The working guide: running, adding a model, adding a mutant, recording a trace |
 
 ## How it works
@@ -223,7 +223,9 @@ whole trace on every reference and made validation quadratic in its length
 (180 events in 6 seconds, 900 in 120, 1,500 in 300); as literals the check
 is linear and a 1,500-event trace takes seconds. `TRACE_JOBS` runs that
 many traces at a time, each with one TLC worker, and prints the reports in
-trace order.
+trace order; `CHECK_JOBS` does the same for the models and the mutants,
+which is how the `formal` job fits its budget, since TLC scales sublinearly
+across workers and these runs are independent.
 
 ### What a divergence means
 

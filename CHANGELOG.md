@@ -534,6 +534,29 @@ and counted rather than judged, since the model fixes the sink set and its
 hosts for the run. Documented under
 [Trace validation](https://orhaugh.github.io/clink/internals/exactly-once-specification/#trace-validation).
 
+Its first gating run then found two more, both the model's: a worker's death
+was taken to kill the sinks its fixed hosts assign to it, so a sink that had
+moved to another worker on a redeploy died with a machine it was no longer
+on, and validation now follows the placements the run recorded; and a sink
+the last redeploy had placed but that had not finished opening could not be
+a survivor at all, though a run records exactly that drain. It may now be
+one or not, according to whether its deploy had landed when the loss was
+declared, which is the shape the mutant suite insisted on: made mandatory
+rather than possible, it left `broadcast_during_drain` unrefutable, the
+model having lost the interleaving the defect needs. Forty-six of the
+fifty-eight traces a build leaves are now accepted and twelve skipped as
+rescaled, in under a minute.
+
+The specification's own checks are split in two, the models in one job and
+the mutants in another, because the two want opposite shapes: one model
+dominates the models and TLC's workers are worth more to it than
+concurrency is to the short ones, while the fifteen mutants are independent
+and none dominates. `CHECK_JOBS` runs that many at a time, as `TRACE_JOBS`
+already did for traces. The pinned TLA+ tools are mirrored on this repo's
+own `deps` release: upstream's v1.8.0 is a rolling pre-release whose asset
+is re-cut from master, which broke the checksum and took both jobs down
+without them checking anything.
+
 ## v0.8.0 (August 2026)
 
 The launch release: the qualification programme run across the engine's
