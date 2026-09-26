@@ -149,16 +149,20 @@ build_and_run_tests() {
     test_jobs="$(sysctl -n hw.ncpu)"
   fi
 
-  # Tests that exercise librdkafka's mock cluster trip TSan because
-  # librdkafka itself isn't compiled with -fsanitize=thread; its
-  # internal atomic/futex primitives bypass TSan's interception, and
-  # TSan ends up corrupting librdkafka's state hard enough to crash.
-  # Skipping the Kafka-using tests under TSan only - they're covered
-  # by the normal/asan/ubsan passes. Same applies to PipelineConfig
-  # which transitively uses Kafka.
+  # A test that opens a librdkafka handle (producer, consumer or mock
+  # cluster) cannot run under TSan. librdkafka starts its threads with C11
+  # thrd_create, which glibc routes to its internal pthread_create, and
+  # libtsan does not intercept thrd_create, so TSan never registers those
+  # threads: the first allocation (or other stateful interceptor call) on
+  # one faults inside the TSan runtime ("SEGV on unknown address", then
+  # "nested bug in the same thread"). That is a runtime crash, not a
+  # report, so no suppression reaches it. Such tests are excluded by name
+  # under TSan only, and the normal, ASan and UBSan passes run them; add
+  # any new one here. The KafkaRegistryFormats build-time refusal test
+  # opens no handle and stays in.
   local ctest_exclude=""
   if [[ "$sanitizer" == "tsan" ]]; then
-    ctest_exclude='--exclude-regex (Kafka\.|PipelineConfig\.)'
+    ctest_exclude='--exclude-regex (Kafka\.|PipelineConfig\.|KafkaRegistryFormats\.(AvroRowsRoundTripThroughTheBrokerAndTheRegistry|UndecodableMessagesFailTheSourceOrAreSkippedByPolicy))'
   fi
 
   echo "Running tests..."
