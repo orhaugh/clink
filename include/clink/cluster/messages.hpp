@@ -37,24 +37,31 @@ inline void encode_body(MessageBuilder& b, const RegisterAckMsg& m) {
 // Append a PluginBinary's wire encoding. The bytes blob can be large
 // (multi-megabyte plugins); we use a u32 length prefix which caps us
 // at 4 GB per blob - more than enough for v1.
+//
+// The blob's framing, [u32 length BE][raw bytes], is exactly a string's, so
+// both directions move it in bulk through the string primitives. They used
+// to move it one byte per call, which an unoptimised build pays for in full:
+// a 64 MiB UBSan-built job module took 2.5 to 4 s per pass, and a submit
+// made three passes before its SubmitJobAck (the client's encode, the
+// coordinator's decode, the Deploy encode) - enough to time the ack out.
+// The string primitives rather than new raw-bytes ones because protocol.hpp
+// is on the declared plugin ABI surface, where any edit rotates the
+// fingerprint every compiled plugin is checked against; this header is not.
 inline void encode_plugin_binary(MessageBuilder& b, const PluginBinary& p) {
     b.put_string(p.name);
     b.put_string(p.content_hash);
-    b.put_u32_be(static_cast<std::uint32_t>(p.bytes.size()));
-    for (auto byte : p.bytes) {
-        b.put_u8(static_cast<std::uint8_t>(byte));
-    }
+    b.put_string(std::string(reinterpret_cast<const char*>(p.bytes.data()), p.bytes.size()));
 }
 
 inline PluginBinary decode_plugin_binary(MessageReader& r) {
     PluginBinary p;
     p.name = r.read_string();
     p.content_hash = r.read_string();
-    const std::uint32_t n = r.read_count();
-    p.bytes.reserve(n);
-    for (std::uint32_t i = 0; i < n; ++i) {
-        p.bytes.push_back(static_cast<std::byte>(r.read_u8()));
-    }
+    // read_string refuses a length beyond the bytes left in the frame before
+    // allocating, the same bound read_count puts on an element count.
+    const auto blob = r.read_string();
+    const auto* first = reinterpret_cast<const std::byte*>(blob.data());
+    p.bytes.assign(first, first + blob.size());
     return p;
 }
 

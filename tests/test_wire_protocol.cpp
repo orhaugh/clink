@@ -1230,6 +1230,42 @@ TEST(WireProtocol, PluginBinaryReferenceRoundTripsInsideDeploy) {
     EXPECT_EQ(out.plugins[0].name, "hello");
 }
 
+// The bulk plugin-bytes codec must keep the layout every peer version reads
+// - name, hash, then [u32 length BE][raw bytes] - carry every byte value
+// through, NUL included, and refuse a blob longer than its frame rather than
+// read past it.
+TEST(WireProtocol, PluginBytesKeepTheirLayoutAndRoundTripExactly) {
+    PluginBinary in{.name = "job.so", .content_hash = "0011223344556677", .bytes = {}};
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int v = 0; v < 256; ++v) {
+            in.bytes.push_back(static_cast<std::byte>(v));
+        }
+    }
+    MessageBuilder encoded;
+    encode_plugin_binary(encoded, in);
+    MessageBuilder layout;
+    layout.put_string(in.name);
+    layout.put_string(in.content_hash);
+    layout.put_u32_be(static_cast<std::uint32_t>(in.bytes.size()));
+    for (const auto byte : in.bytes) {
+        layout.put_u8(static_cast<std::uint8_t>(byte));
+    }
+    const auto frame = encoded.finalize();
+    ASSERT_EQ(frame, layout.finalize()) << "the plugin blob's wire layout changed";
+
+    MessageReader r(body_of(frame));
+    const auto out = decode_plugin_binary(r);
+    EXPECT_EQ(out.name, in.name);
+    EXPECT_EQ(out.content_hash, in.content_hash);
+    EXPECT_EQ(out.bytes, in.bytes);
+    EXPECT_TRUE(r.eof());
+
+    auto truncated = body_of(frame);
+    truncated.pop_back();
+    MessageReader short_r(std::move(truncated));
+    EXPECT_THROW((void)decode_plugin_binary(short_r), std::runtime_error);
+}
+
 // The transport_only tail field (item 83). It decides whether the
 // coordinator may act on a subtask error directly or must wait for the
 // cause behind it, so a frame that loses it in transit would turn a symptom
