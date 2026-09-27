@@ -568,6 +568,28 @@ own read of the disk found exactly that checkpoint, and the run is kept
 under `formal/traces/` so the step stays exercised. The engine was correct
 throughout: the test's own exactly-once assertion passed on the same run.
 
+**A savepoint restore into a different subtask layout is refused.** State
+is restored by job-global subtask index, and a submit-time restore (a
+savepoint, an explicit checkpoint id, an HA recovery) deploys every task on
+"restore from my own index". A plan whose index set differs from the one
+that took the checkpoint therefore handed its operators each other's state,
+with a worker's `restore discarded N keyed entries` warning as the only
+trace. Upgrading made it likely: SQL scalar subqueries in `SELECT` and
+null-aware `IN`/`NOT IN` now run as one instance, so a v0.8.0 savepoint of
+such a job at parallelism 2 records 16 subtasks where the job now plans 15,
+and restoring it brought a downstream `GROUP BY` back without any of its
+groups. The coordinator now compares the participant set in the
+checkpoint's `COMPLETED` marker with the new plan before anything deploys
+and refuses a mismatch, naming the checkpoint, both layouts, the plan's
+single-instance operators and the remedy. It blocks only on a definite
+verdict: no identifiable marker, or one older than the participant set,
+proceeds as before. An HA recovery replans the graph as submitted, since a
+rescale does not rewrite the persisted manifest, so a job rescaled and then
+failed over is now refused recovery with the reason logged, where before it
+recovered with misrouted state. Documented under
+[Restore addressing](https://orhaugh.github.io/clink/internals/fault-tolerance-and-rescale/)
+and in the runbook.
+
 **The Kafka connector runs under ThreadSanitizer.** librdkafka starts its
 threads with C11 `thrd_create` and synchronises them with `mtx_*` and
 `cnd_*`, which glibc implements without going through the pthread entry

@@ -28,6 +28,7 @@
 #include <gtest/gtest.h>
 #include <sys/wait.h>
 
+#include "clink/cluster/job_graph.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
@@ -398,6 +399,60 @@ TEST(HttpSubmit, PostJobsRejectsRequestWithoutFile) {
     EXPECT_EQ(resp.status, 400);
     EXPECT_NE(resp.body.find("job_so"), std::string::npos)
         << "expected job_so mention in error body: " << resp.body;
+}
+
+// The HTTP half of the restore layout gate: a spec submitted with a restore whose
+// checkpoint recorded a different subtask set must come back as an error response
+// naming the checkpoint, with no job admitted. The savepoint is a COMPLETED marker
+// only, written the way the coordinator writes one: the refusal comes before
+// anything deploys, so no snapshot is ever read.
+TEST(HttpSubmit, ASpecRestoreIntoADifferentSubtaskLayoutIsRefused) {
+    auto c = start_cluster(/*n_workers=*/1);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    const auto sp = std::filesystem::temp_directory_path() /
+                    ("clink_http_layout_sp_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(sp);
+    std::filesystem::create_directories(sp / "_jobs" / "7");
+    // More participants than a two-operator plan can have.
+    std::ofstream(sp / "_jobs" / "7" / "COMPLETED-5")
+        << "job=7\ncheckpoint=5\ngeneration=1\nsubtasks=0,1,2,3,4,5,6,7\n";
+
+    clink::cluster::JobGraphSpec g;
+    clink::cluster::OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.uid = "http-layout-src";
+    src.out_channel = std::string{clink::cluster::kChannelInt64};
+    src.params = {{"count", "10"}};
+    g.ops.push_back(src);
+    clink::cluster::OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"src"};
+    snk.out_channel = std::string{clink::cluster::kChannelInt64};
+    snk.params = {{"path", (sp / "out.txt").string()}};
+    g.ops.push_back(snk);
+
+    const auto resp = http_post_body(
+        "127.0.0.1",
+        c->coordinator_http_port,
+        "/api/v1/jobs/spec?restore_from_dir=" + sp.string() + "&restore_from_checkpoint_id=5",
+        g.to_json(),
+        "application/json");
+    EXPECT_EQ(resp.status, 500) << resp.body;
+    for (const auto* needle : {"refusing to restore checkpoint 5",
+                               "records 8 participating subtasks (0-7)",
+                               "restored by job-global subtask index"}) {
+        EXPECT_NE(resp.body.find(needle), std::string::npos)
+            << "missing '" << needle << "' in: " << resp.body;
+    }
+    const auto jobs = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs");
+    EXPECT_EQ(jobs.body.find("\"id\":"), std::string::npos)
+        << "the refused restore was admitted as a job: " << jobs.body;
+    EXPECT_FALSE(std::filesystem::exists(sp / "out.txt")) << "the refused job's sink opened";
+    std::filesystem::remove_all(sp);
 }
 
 // The SQL endpoints (compiled into the coordinator when libclink_sql is linked) are not

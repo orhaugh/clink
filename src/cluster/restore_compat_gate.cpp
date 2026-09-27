@@ -5,8 +5,12 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
+#include <string_view>
+#include <system_error>
 
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend.hpp"
@@ -101,6 +105,36 @@ std::string format_fingerprint_reject(const std::vector<clink::StateFingerprintM
            "migration; inspect with `clink check-savepoint --file=<savepoint> --expected="
         << so_path << "`";
     return oss.str();
+}
+
+// "0-15", "0, 3-7": an index set as its runs, for a refusal a person reads. A
+// layout after a hot cutover is not contiguous (the new block is appended), so
+// the runs are what tell two same-sized sets apart.
+std::string describe_indices(const std::set<std::uint32_t>& indices) {
+    constexpr std::size_t kMaxRuns = 8;
+    std::string out;
+    std::size_t runs = 0;
+    for (auto it = indices.begin(); it != indices.end();) {
+        if (runs == kMaxRuns) {
+            out += ", ...";
+            break;
+        }
+        const auto first = *it;
+        auto last = first;
+        for (++it; it != indices.end() && *it == last + 1; ++it) {
+            last = *it;
+        }
+        out += (runs == 0 ? "" : ", ") + std::to_string(first);
+        if (last != first) {
+            out += "-" + std::to_string(last);
+        }
+        ++runs;
+    }
+    return out;
+}
+
+std::string counted(std::size_t n, const char* noun) {
+    return std::to_string(n) + " " + noun + (n == 1 ? "" : "s");
 }
 
 }  // namespace
@@ -209,6 +243,141 @@ std::string check_restore_compatibility_via_plugins(const std::vector<std::strin
         return format_fingerprint_reject(mismatches, so_path);
     }
     return "";  // no .so exported the check -> cannot gate
+}
+
+std::optional<std::set<std::uint32_t>> recorded_restore_participants(
+    const std::string& restore_from_dir, std::uint64_t checkpoint_id) {
+    namespace fs = std::filesystem;
+    if (restore_from_dir.empty() || checkpoint_id == 0) {
+        return std::nullopt;
+    }
+    // A plain path, or a file:// URI naming one. Any other scheme is a state
+    // backend URI (remote-read://, an object store) whose markers, if it has
+    // any, are not a directory this process lists.
+    std::string root = restore_from_dir;
+    if (const auto sep = root.find("://"); sep != std::string::npos) {
+        if (root.compare(0, sep, "file") != 0) {
+            return std::nullopt;
+        }
+        root.erase(0, sep + 3);
+    }
+    // Exactly one job's marker for this id, as the restore requires: a root that
+    // several jobs have written into can hold COMPLETED-<id> for more than one of
+    // them, and picking one would be a guess. Non-throwing iteration throughout,
+    // because a filesystem error here must mean "cannot check", never a failed
+    // submit.
+    const std::string marker_name = "COMPLETED-" + std::to_string(checkpoint_id);
+    std::optional<fs::path> marker;
+    std::error_code ec;
+    fs::directory_iterator it{fs::path{root} / "_jobs", ec};
+    for (; !ec && it != fs::directory_iterator{}; it.increment(ec)) {
+        std::error_code type_ec;
+        if (!it->is_directory(type_ec) || type_ec) {
+            continue;
+        }
+        auto candidate = it->path() / marker_name;
+        std::error_code file_ec;
+        if (!fs::is_regular_file(candidate, file_ec) || file_ec) {
+            continue;
+        }
+        if (marker.has_value()) {
+            return std::nullopt;
+        }
+        marker = std::move(candidate);
+    }
+    if (ec || !marker.has_value()) {
+        return std::nullopt;
+    }
+    std::ifstream in(*marker);
+    if (!in) {
+        return std::nullopt;
+    }
+    // The body the coordinator writes: job=, checkpoint=, generation=, then
+    // subtasks=<comma-separated job-global indices>. Any token that is not a
+    // plain index makes the whole set untrustworthy rather than half-read.
+    constexpr std::string_view kKey = "subtasks=";
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind(kKey, 0) != 0) {
+            continue;
+        }
+        std::set<std::uint32_t> out;
+        std::size_t pos = kKey.size();
+        for (;;) {
+            const auto comma = line.find(',', pos);
+            const auto tok =
+                line.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if (tok.empty() || tok.size() > 10 ||
+                tok.find_first_not_of("0123456789") != std::string::npos) {
+                return std::nullopt;
+            }
+            const auto value = std::stoull(tok);
+            if (value > std::numeric_limits<std::uint32_t>::max()) {
+                return std::nullopt;
+            }
+            out.insert(static_cast<std::uint32_t>(value));
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+        return out;
+    }
+    return std::nullopt;  // a marker predating the participant set
+}
+
+std::string restore_layout_refusal(const std::string& restore_from_dir,
+                                   std::uint64_t checkpoint_id,
+                                   const std::set<std::uint32_t>& recorded,
+                                   const std::set<std::uint32_t>& planned,
+                                   const std::vector<std::string>& single_instance_ops) {
+    if (recorded == planned) {
+        return "";
+    }
+    std::string reason = "refusing to restore checkpoint " + std::to_string(checkpoint_id) +
+                         " from " + restore_from_dir + ": its COMPLETED marker records " +
+                         counted(recorded.size(), "participating subtask") + " (" +
+                         describe_indices(recorded) + ") and this plan deploys " +
+                         std::to_string(planned.size()) + " (" + describe_indices(planned) +
+                         "). State is restored by job-global subtask index, so under a "
+                         "different layout the operators would receive each other's state.";
+    if (!single_instance_ops.empty()) {
+        std::string names;
+        for (const auto& op : single_instance_ops) {
+            names += (names.empty() ? "" : ", ") + op;
+        }
+        reason += single_instance_ops.size() == 1
+                      ? " This plan runs " + names +
+                            " as a single instance whatever the submitted parallelism; a "
+                            "checkpoint taken by an engine version that ran it in parallel has "
+                            "a different layout, which is the likely cause after an upgrade."
+                      : " This plan runs " + std::to_string(single_instance_ops.size()) +
+                            " operators as single instances whatever the submitted parallelism (" +
+                            names +
+                            "); a checkpoint taken by an engine version that ran any of them in "
+                            "parallel has a different layout, which is the likely cause after "
+                            "an upgrade.";
+    }
+    reason +=
+        " Resubmit with the layout the checkpoint was taken with (the same graph and "
+        "parallelism, on the engine version that took it), or submit without the savepoint to "
+        "start from empty state.";
+    return reason;
+}
+
+std::string check_restore_layout(const std::string& restore_from_dir,
+                                 std::uint64_t restore_checkpoint_id,
+                                 const std::set<std::uint32_t>& planned,
+                                 const std::vector<std::string>& single_instance_ops) {
+    if (restore_from_dir.empty() || restore_checkpoint_id == 0) {
+        return "";  // nothing is restored, so there is no layout to match
+    }
+    const auto recorded = recorded_restore_participants(restore_from_dir, restore_checkpoint_id);
+    if (!recorded.has_value()) {
+        return "";  // cannot identify the layout; the deploy proceeds as it always has
+    }
+    return restore_layout_refusal(
+        restore_from_dir, restore_checkpoint_id, *recorded, planned, single_instance_ops);
 }
 
 }  // namespace clink::cluster

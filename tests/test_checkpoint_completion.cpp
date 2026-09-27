@@ -23,6 +23,7 @@
 // concludes from a specific sequence of acks and nothing above the wire
 // can produce that sequence on demand.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -50,6 +51,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/metrics/otlp_export.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/network/connection.hpp"
 
 using namespace clink;
@@ -730,6 +732,125 @@ TEST(CheckpointCompletion, RecoveryRestoresFromTheLastCompletedCheckpoint) {
             << " and the recovery lookup reads <checkpoint_dir>/_jobs/<job_id>/COMPLETED-N; every "
                "completed checkpoint is invisible to recovery and the job restarts from "
                "scratch.";
+
+        w.close();
+        b.stop();
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+// HA recovery replans the graph the job was SUBMITTED with - the manifest is
+// written once, at submit, and a rescale since then does not rewrite it - and
+// every task then restores from its own index in the latest completed
+// checkpoint. A checkpoint taken by a different layout (after a rescale, or by an
+// engine version that planned the graph differently) would give the recovered
+// operators each other's state, so the layout gate refuses the recovery instead:
+// no Deploy goes out, and the coordinator's log names the checkpoint and why.
+//
+// The first leader completes a real checkpoint; its marker is then rewritten to
+// record one participant more than the plan has, which is what a checkpoint taken
+// after scaling an operator up records.
+TEST(CheckpointCompletion, RecoveryIsRefusedWhenTheCheckpointsLayoutDiffersFromThePlan) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_recovery_layout_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(ckpt_dir);
+
+    JobId job_id = 0;
+    std::uint64_t completed = 0;
+    std::uint32_t highest_subtask = 0;
+
+    // --- first leader: run a job and complete a checkpoint ---
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(a.await_registrations(2s));
+
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 100;
+        ckpt.max_restarts_on_worker_loss = 0;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        ASSERT_GT(job_id, 0U);
+
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value());
+        const auto tasks = decode_deploy(*deploy).tasks;
+        ASSERT_FALSE(tasks.empty());
+        std::uint16_t port_seed = 41100;
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+            highest_subtask = std::max(highest_subtask, t.subtask_idx);
+        }
+
+        auto trigger = w.await_frame(MessageKind::TriggerCheckpoint);
+        ASSERT_TRUE(trigger.has_value());
+        completed = decode_trigger_checkpoint(*trigger).checkpoint_id;
+        ASSERT_GT(completed, 0U);
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, completed, t.role, t.subtask_idx, /*ok=*/true));
+        }
+        ASSERT_TRUE(ckpt_await([&] {
+            return std::filesystem::exists(written_marker_path(ckpt_dir, job_id, completed));
+        })) << "the checkpoint never completed, so there is nothing for recovery to find";
+
+        w.close();
+        a.stop();
+    }
+
+    // The checkpoint as a larger layout would have recorded it.
+    {
+        std::string subtasks;
+        for (std::uint32_t i = 0; i <= highest_subtask + 1; ++i) {
+            subtasks += (subtasks.empty() ? "" : ",") + std::to_string(i);
+        }
+        std::ofstream(written_marker_path(ckpt_dir, job_id, completed), std::ios::trunc)
+            << "job=" << job_id << "\ncheckpoint=" << completed
+            << "\ngeneration=1\nsubtasks=" << subtasks << "\n";
+    }
+
+    // --- second leader: recovery must refuse, loudly ---
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(b.await_registrations(2s));
+
+        const auto since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count() -
+                              1;
+        b.recover_persisted_jobs();
+
+        EXPECT_FALSE(w.await_frame(MessageKind::Deploy, 1s).has_value())
+            << "the job was recovered into a layout its checkpoint was not taken with";
+        EXPECT_FALSE(b.snapshot_job(job_id).has_value())
+            << "the refused recovery left a job behind";
+        bool named = false;
+        for (const auto& rec : LogBuffer::global().tail(1000, "warn", since_ms, "coordinator.ha")) {
+            named = named || (rec.message.find("recovery failed for job_id=" +
+                                               std::to_string(job_id)) != std::string::npos &&
+                              rec.message.find("refusing to restore checkpoint " +
+                                               std::to_string(completed)) != std::string::npos);
+        }
+        EXPECT_TRUE(named) << "the refusal must reach the coordinator's log, naming the checkpoint";
 
         w.close();
         b.stop();

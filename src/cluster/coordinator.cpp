@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -3807,6 +3808,34 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
     auto plan = bundle != nullptr
                     ? plan_job(graph, bundle->operator_registry(), bundle->runner_registry())
                     : plan_job(graph, registry);
+
+    // Restore layout gate. Every task this plan deploys restores from its own
+    // job-global index (no directive; that is the rescale paths' translation), so
+    // a checkpoint taken by a different layout would hand the operators each
+    // other's state and the job would carry on. The savepoint submit, an explicit
+    // checkpoint id and HA recovery all arrive here, and HA recovery replans the
+    // SUBMITTED graph, which a rescale since then has not rewritten. Refused
+    // before any slot is waited for or any task deployed; see
+    // check_restore_layout for what counts as a verdict.
+    if (!checkpoint.restore_from_dir.empty() && checkpoint.restore_from_checkpoint_id != 0) {
+        std::set<std::uint32_t> planned;
+        for (const auto& t : plan.tasks) {
+            planned.insert(t.subtask_idx);
+        }
+        std::vector<std::string> single_instance;
+        for (const auto& op : graph.ops) {
+            if (is_forced_singleton(op)) {
+                single_instance.push_back(op.id);
+            }
+        }
+        if (auto reject = check_restore_layout(checkpoint.restore_from_dir,
+                                               checkpoint.restore_from_checkpoint_id,
+                                               planned,
+                                               single_instance);
+            !reject.empty()) {
+            throw std::runtime_error(reject);
+        }
+    }
 
     // Wait for spare slots if configured. This is a coarse-grained
     // policy: we just check `free_slots() >= required` periodically. A

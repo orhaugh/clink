@@ -263,7 +263,11 @@ belong to it, and the records for those keys are gone from its state. Check whet
 the job was rescaled recently and restarted from a PRE-rescale checkpoint - subtask
 directories are addressed by a job-global index, and that index is not stable across
 a topology change. That specific hole is fixed (F63), but the class is worth
-recognising: if state appears in the wrong subtask, suspect index reuse.
+recognising: if state appears in the wrong subtask, suspect index reuse. A restore from
+a savepoint taken at a different subtask layout is the same class; a submit refuses it
+when the checkpoint's marker records its participants (see "refusing to restore
+checkpoint N" below), so seeing this alert after one means the marker was missing or
+ambiguous, or the two layouts happen to share an index set.
 
 ---
 
@@ -289,12 +293,45 @@ participant, and the COMPLETED marker records which subtasks those were.
    mid-checkpoint, or is silently dropping writes.
 3. **The operator is genuinely new.** A stateful operator added to an existing job has
    no prior state. That case is legitimate and is what
-   `CLINK_ALLOW_MISSING_RESTORE_STATE=1` is for.
+   `CLINK_ALLOW_MISSING_RESTORE_STATE=1` is for. If the new operator gave the job a
+   different subtask layout, a submit-time restore is refused before this point
+   (next section), and the override does not bypass that.
 
 **Do not set the override to make a restore start.** It converts the refusal back into
 silent state loss for every subtask, not just the new one. Confirm which subtask is
 missing and why first; if the answer is not case 3, the checkpoint is not safe to
 restore from and an older complete one is the better recovery point.
+
+## A submit is refused with "refusing to restore checkpoint N ... this plan deploys M"
+
+Not an alert - a refusal before anything deploys. The submitter gets it as a failed
+submit (an error response over HTTP); an HA recovery that hits it does not recover the
+job, and the coordinator logs `recovery failed for job_id=...` with the same text.
+The checkpoint's `COMPLETED` marker records which subtask indices took it, and the job
+as submitted plans a different set. State is restored by job-global subtask index, so
+restoring anyway would hand operators each other's state - which is what happened
+before this check, with a worker's `restore discarded N keyed entries` warning
+(`ClinkRestoreDiscardedKeyedState`) as the only trace.
+
+**Look at:** the two counts and index ranges in the message, and the marker it read:
+the `subtasks=` line of `<restore dir>/_jobs/<job>/COMPLETED-<id>`.
+
+**Likely causes, in order:**
+
+1. **An engine upgrade changed the plan.** The message names the plan's
+   single-instance operators. SQL scalar subqueries in `SELECT` and null-aware `IN` /
+   `NOT IN` run as one instance in builds after v0.8.0, so a v0.8.0 savepoint of such a
+   job at a parallelism above 1 has more subtasks than the job now plans.
+2. **A different parallelism or graph.** The job was submitted at another
+   `--parallelism` than the savepoint was taken at, or its graph changed, including a
+   stateful operator added with its own subtask.
+3. **An HA recovery after a rescale.** Recovery plans the graph the job was submitted
+   with, and a checkpoint taken after a rescale records the rescaled layout.
+
+**What to do:** restore with the layout the checkpoint was taken with - the same graph
+and parallelism, on the engine version that took it - or submit without the restore to
+start from empty state. Do not edit the marker to get past the check: the operators
+would still read each other's files.
 
 ## ClinkSubtaskFailures
 

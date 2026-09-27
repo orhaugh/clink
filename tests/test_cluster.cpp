@@ -25,6 +25,7 @@
 #include "clink/cluster/commit_dispatch_gate.hpp"
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_graph.hpp"
+#include "clink/cluster/job_planner.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/runner_registry.hpp"
@@ -3447,4 +3448,163 @@ TEST(Cluster, ASavepointSurvivesTheCheckpointsTakenAfterIt) {
         << "the unpinned checkpoint before the savepoint is still present in " << dirs_with_prev
         << " directories, so retention did not run and this test proves nothing about the pin";
     std::filesystem::remove_all(ckpt_dir);
+}
+
+// A savepoint restore addresses every task's state by its job-global subtask
+// index, and the planner hands those out per chain in graph order, so a plan with
+// a different index set gives its operators each other's state and the job
+// carries on. The v0.8.0 -> v0.9.0 upgrade did exactly that to a GROUP BY
+// downstream of a null-aware NOT IN, which now runs as a single instance: the
+// GROUP BY came back without any of its groups, and the only trace was a worker's
+// "restore discarded N keyed entries" warning.
+//
+// Driven over the wire from a REAL savepoint of a job whose middle operator runs
+// at parallelism 2: restored into the same graph it must be admitted and go on
+// checkpointing; restored into the graph as the newer engine plans it - that
+// operator a forced single instance - it must come back as a failed SubmitJobAck
+// naming the checkpoint, both layouts and the operator, with nothing deployed.
+TEST(Cluster, ARestoreIntoADifferentSubtaskLayoutIsRefusedBeforeAnythingDeploys) {
+    ensure_built_ins_registered();
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_layout_gate_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto sp_dir = root / "savepoint";
+    const auto same_dir = root / "same";
+    const auto moved_dir = root / "moved";
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    cfg.heartbeat_timeout = clink::test_support::scale_slack(cfg.heartbeat_timeout);
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"worker-layout"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 8;
+    wcfg.coordinator_heartbeat_timeout =
+        clink::test_support::scale_slack(wcfg.coordinator_heartbeat_timeout);
+    Worker worker("worker-layout", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(5s));
+
+    // src -> global -> snk. With `single_instance` it is the same job as a newer
+    // engine plans it: global marked a forced singleton, at 1 whatever the
+    // submitted parallelism.
+    const auto layout_graph = [](bool single_instance, const std::filesystem::path& out) {
+        JobGraphSpec g;
+        OperatorSpec src;
+        src.type = "int64_range_source";
+        src.id = "layout_src";
+        src.uid = "layout-gate-src";  // its offset is the state a restore carries
+        src.parallelism = 1;
+        src.out_channel = std::string{kChannelInt64};
+        // Long-lived, not huge (see CancellingAJobReleasesTheWorkersRegistrationsForIt).
+        src.params = {{"count", "2000000"}, {"delay_ms", "1"}};
+        g.ops.push_back(src);
+        OperatorSpec global;
+        global.type = "identity_int64";
+        global.id = "layout_global";
+        global.inputs = {"layout_src"};
+        global.parallelism = single_instance ? 1 : 2;
+        global.out_channel = std::string{kChannelInt64};
+        if (single_instance) {
+            global.params = {{std::string{kForcedSingletonParam}, "true"}};
+        }
+        g.ops.push_back(global);
+        OperatorSpec snk;
+        snk.type = "file_int64_sink";
+        snk.id = "layout_snk";
+        snk.inputs = {"layout_global"};
+        snk.parallelism = 1;
+        snk.out_channel = std::string{kChannelInt64};
+        snk.params = {{"path", out.string()}};
+        g.ops.push_back(snk);
+        return g;
+    };
+    const auto taken = layout_graph(false, root / "taken.txt");
+    const auto moved_out = root / "moved.txt";
+    const auto moved = layout_graph(true, moved_out);
+    // The premise, checked rather than assumed: the two plans differ.
+    const auto taken_tasks = plan_job(taken, OperatorRegistry::default_instance()).tasks.size();
+    const auto moved_tasks = plan_job(moved, OperatorRegistry::default_instance()).tasks.size();
+    ASSERT_NE(taken_tasks, moved_tasks)
+        << "the planner lays both graphs out alike, so nothing below is tested";
+
+    // A real savepoint of the parallel layout.
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = sp_dir.string();
+    ckpt.interval_ms = 200;
+    const auto job_id = coordinator.submit_job(
+        taken, OperatorRegistry::default_instance(), std::vector<PluginBinary>{}, ckpt, nullptr);
+    ASSERT_GT(job_id, 0U);
+    const auto completed_for = [&](JobId id) -> std::uint64_t {
+        const auto snap = coordinator.snapshot_job(id);
+        return snap ? snap->latest_completed_checkpoint_id : 0;
+    };
+    const auto await_completed_above = [&](JobId id, std::uint64_t above) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + clink::test_support::scale_slack(20s);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (completed_for(id) > above) {
+                return true;
+            }
+            std::this_thread::sleep_for(50ms);
+        }
+        return false;
+    };
+    ASSERT_TRUE(await_completed_above(job_id, 0)) << "the job never checkpointed";
+    const auto sp = coordinator.take_savepoint(job_id, 20s);
+    ASSERT_TRUE(sp.ok) << sp.message;
+    (void)coordinator.cancel_job(job_id);
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, clink::test_support::scale_slack(30s)));
+
+    clink::application::JobSubmitter submitter("127.0.0.1", port);
+    const auto restore_options = [&](const std::filesystem::path& own_dir) {
+        clink::application::SubmitOptions opts;
+        opts.wait_for_completion = false;
+        opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
+        opts.checkpoint.checkpoint_dir = own_dir.string();
+        opts.checkpoint.interval_ms = 200;
+        opts.checkpoint.restore_from_dir = sp_dir.string();
+        opts.checkpoint.restore_from_checkpoint_id = sp.checkpoint_id;
+        return opts;
+    };
+
+    // Control: the layout the savepoint was taken with is admitted, and the
+    // restored job goes on to complete a checkpoint of its own.
+    {
+        const auto r = submitter.submit(taken.to_json(), {}, restore_options(same_dir));
+        ASSERT_TRUE(r.ok) << "the savepoint's own layout was refused: " << r.reject_message;
+        EXPECT_TRUE(await_completed_above(r.job_id, sp.checkpoint_id))
+            << "the job restored at the savepoint's own layout never checkpointed";
+        (void)coordinator.cancel_job(r.job_id);
+        ASSERT_TRUE(
+            coordinator.await_job_completion(r.job_id, clink::test_support::scale_slack(30s)));
+    }
+
+    // The newer engine's plan of the same job.
+    const auto jobs_before = coordinator.snapshot_jobs().size();
+    const auto r = submitter.submit(moved.to_json(), {}, restore_options(moved_dir));
+    EXPECT_FALSE(r.ok) << "a restore into a different subtask layout was admitted";
+    for (const auto& needle : {"refusing to restore checkpoint " + std::to_string(sp.checkpoint_id),
+                               "records " + std::to_string(taken_tasks) + " participating subtasks",
+                               "this plan deploys " + std::to_string(moved_tasks),
+                               std::string{"restored by job-global subtask index"},
+                               std::string{"runs layout_global as a single instance"},
+                               std::string{"submit without the savepoint"}}) {
+        EXPECT_NE(r.reject_message.find(needle), std::string::npos)
+            << "missing '" << needle << "' in the refusal: " << r.reject_message;
+    }
+    // Nothing deployed. The coordinator registers a job before it sends any
+    // Deploy, so an unchanged job count is the authoritative witness; the two
+    // paths below are what a deployed task would have created.
+    EXPECT_EQ(coordinator.snapshot_jobs().size(), jobs_before)
+        << "the refused submit was admitted as a job";
+    EXPECT_FALSE(std::filesystem::exists(moved_dir))
+        << "a task of the refused job deployed and created its state directory";
+    EXPECT_FALSE(std::filesystem::exists(moved_out)) << "the refused job's sink opened";
+
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove_all(root);
 }

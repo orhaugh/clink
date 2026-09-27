@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <set>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -224,5 +226,172 @@ TEST(RestoreCompatGate, NonJobPluginIsIgnored) {
     const auto reject = clink::cluster::check_restore_compatibility_via_plugins(
         {"/nonexistent/connector.so", schema_evo_job_path()}, dir.string(), 1);
     EXPECT_FALSE(reject.empty());
+    std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// The restore LAYOUT gate: a submit-time restore addresses every task's state
+// by its job-global subtask index, so the checkpoint's recorded participant set
+// must be the plan's. The verdict is pure; the reader is exercised against
+// directories laid out the way the coordinator writes its markers.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::set<std::uint32_t> layout_gate_range(std::uint32_t first, std::uint32_t last) {
+    std::set<std::uint32_t> out;
+    for (auto i = first; i <= last; ++i) {
+        out.insert(i);
+    }
+    return out;
+}
+
+std::filesystem::path layout_gate_temp_dir(const std::string& tag) {
+    static std::atomic<std::uint64_t> counter{0};
+    auto dir = std::filesystem::temp_directory_path() /
+               ("restore_layout_gate_" + tag + "_" + std::to_string(getpid()) + "_" +
+                std::to_string(counter.fetch_add(1)));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+// <dir>/_jobs/<job>/COMPLETED-<id>, the key the coordinator writes.
+void layout_gate_write_marker(const std::filesystem::path& dir,
+                              std::uint64_t job,
+                              std::uint64_t checkpoint_id,
+                              const std::string& body) {
+    const auto job_dir = dir / "_jobs" / std::to_string(job);
+    std::filesystem::create_directories(job_dir);
+    std::ofstream(job_dir / ("COMPLETED-" + std::to_string(checkpoint_id))) << body;
+}
+
+// Byte for byte the COMPLETED-78 a v0.8.0 coordinator wrote for the null-aware
+// NOT IN + GROUP BY job at parallelism 2: 16 subtasks, where the same SQL now
+// plans 15 because the semi-join runs as a single instance.
+constexpr const char* kLayoutGateV080Marker =
+    "job=3\ncheckpoint=78\ngeneration=1\nsubtasks=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n";
+
+}  // namespace
+
+TEST(RestoreLayoutGate, TheSameLayoutPasses) {
+    EXPECT_EQ(clink::cluster::restore_layout_refusal(
+                  "/sp", 78, layout_gate_range(0, 15), layout_gate_range(0, 15), {"semijoin_7"}),
+              "");
+}
+
+// The upgrade shape: one operator the old version ran at parallelism 2 is now a
+// single instance, so every later block moves down by one and the last index
+// disappears. The refusal has to say which checkpoint, both counts, why that is
+// fatal, which operator is the likely cause, and what to do instead.
+TEST(RestoreLayoutGate, TheUpgradeShapeIsRefusedWithTheCountsTheCauseAndTheRemedy) {
+    const auto reject = clink::cluster::restore_layout_refusal(
+        "/sp/ninagg", 78, layout_gate_range(0, 15), layout_gate_range(0, 14), {"semijoin_7"});
+    ASSERT_FALSE(reject.empty());
+    for (const auto* needle : {"refusing to restore checkpoint 78 from /sp/ninagg",
+                               "records 16 participating subtasks (0-15)",
+                               "this plan deploys 15 (0-14)",
+                               "restored by job-global subtask index",
+                               "receive each other's state",
+                               "runs semijoin_7 as a single instance",
+                               "likely cause after an upgrade",
+                               "Resubmit with the layout the checkpoint was taken with",
+                               "submit without the savepoint"}) {
+        EXPECT_NE(reject.find(needle), std::string::npos)
+            << "missing '" << needle << "' in: " << reject;
+    }
+}
+
+// The same number of subtasks is not the same layout. A hot cutover appends the
+// rescaled operator's new block past the old allocation, so its checkpoints
+// record a set a fresh plan of the rewritten graph never produces.
+TEST(RestoreLayoutGate, ASameSizedSetAtDifferentIndicesIsRefused) {
+    const auto reject = clink::cluster::restore_layout_refusal(
+        "/ckpt", 12, {0, 3, 4, 5, 6, 7}, layout_gate_range(0, 5), {});
+    ASSERT_FALSE(reject.empty());
+    EXPECT_NE(reject.find("records 6 participating subtasks (0, 3-7)"), std::string::npos)
+        << reject;
+    EXPECT_NE(reject.find("this plan deploys 6 (0-5)"), std::string::npos) << reject;
+}
+
+TEST(RestoreLayoutGate, WithNoSingleInstanceOperatorTheUpgradeHintIsLeftOut) {
+    const auto reject = clink::cluster::restore_layout_refusal(
+        "/ckpt", 4, layout_gate_range(0, 3), layout_gate_range(0, 5), {});
+    ASSERT_FALSE(reject.empty());
+    EXPECT_NE(reject.find("records 4 participating subtasks"), std::string::npos) << reject;
+    EXPECT_NE(reject.find("this plan deploys 6"), std::string::npos) << reject;
+    EXPECT_EQ(reject.find("single instance"), std::string::npos)
+        << "no operator in this plan is a single instance, so the upgrade hint is noise: "
+        << reject;
+    EXPECT_NE(reject.find("submit without the savepoint"), std::string::npos) << reject;
+}
+
+TEST(RestoreLayoutGate, EverySingleInstanceOperatorIsNamed) {
+    const auto reject = clink::cluster::restore_layout_refusal(
+        "/sp/sc", 9, layout_gate_range(0, 14), layout_gate_range(0, 13), {"agg_4", "scalarproj_5"});
+    EXPECT_NE(reject.find("2 operators as single instances"), std::string::npos) << reject;
+    EXPECT_NE(reject.find("(agg_4, scalarproj_5)"), std::string::npos) << reject;
+}
+
+// The reader against the real v0.8.0 marker body, among markers for other
+// checkpoints whose names share its digits, then the whole gate on top of it.
+TEST(RestoreLayoutGate, ReadsTheParticipantSetAVersion080MarkerRecords) {
+    const auto dir = layout_gate_temp_dir("v080");
+    layout_gate_write_marker(dir, 3, 78, kLayoutGateV080Marker);
+    layout_gate_write_marker(dir, 3, 7, "job=3\ncheckpoint=7\ngeneration=1\nsubtasks=0,1\n");
+    layout_gate_write_marker(dir, 3, 780, "job=3\ncheckpoint=780\ngeneration=1\nsubtasks=0\n");
+    // Commit receipts share the job's directory; they are not markers.
+    std::filesystem::create_directories(dir / "_jobs" / "3" / "receipts");
+
+    const auto recorded = clink::cluster::recorded_restore_participants(dir.string(), 78);
+    ASSERT_TRUE(recorded.has_value());
+    EXPECT_EQ(*recorded, layout_gate_range(0, 15));
+
+    const auto reject = clink::cluster::check_restore_layout(
+        dir.string(), 78, layout_gate_range(0, 14), {"semijoin_7"});
+    EXPECT_NE(reject.find("records 16 participating subtasks"), std::string::npos) << reject;
+    EXPECT_NE(reject.find("semijoin_7"), std::string::npos) << reject;
+    EXPECT_EQ(clink::cluster::check_restore_layout(
+                  dir.string(), 78, layout_gate_range(0, 15), {"semijoin_7"}),
+              "")
+        << "the layout the checkpoint was taken with must restore";
+    // A file:// URI names the same directory, as it does for the restore.
+    EXPECT_EQ(clink::cluster::recorded_restore_participants("file://" + dir.string(), 78),
+              recorded);
+    std::filesystem::remove_all(dir);
+}
+
+// Everything the gate cannot pin to ONE recorded participant set is "cannot
+// check", never a refusal: the deploy must then proceed exactly as it did before
+// the gate existed.
+TEST(RestoreLayoutGate, AnUnidentifiableLayoutIsNotAVerdict) {
+    const auto planned = layout_gate_range(0, 2);
+    const auto no_verdict = [&](const std::string& dir, std::uint64_t id, const char* why) {
+        EXPECT_FALSE(clink::cluster::recorded_restore_participants(dir, id).has_value()) << why;
+        EXPECT_EQ(clink::cluster::check_restore_layout(dir, id, planned, {"op"}), "") << why;
+    };
+
+    no_verdict("", 5, "no restore directory");
+    EXPECT_EQ(clink::cluster::check_restore_layout("/any", 0, planned, {}), "")
+        << "checkpoint id 0 restores nothing";
+    no_verdict("/nonexistent/restore/layout/gate", 5, "missing directory");
+    no_verdict("remote-read://bucket/prefix", 5, "a state backend URI, not a directory");
+
+    const auto dir = layout_gate_temp_dir("unknown");
+    no_verdict(dir.string(), 5, "no _jobs directory");
+    layout_gate_write_marker(dir, 1, 4, "job=1\ncheckpoint=4\ngeneration=1\nsubtasks=0,1,2,3\n");
+    no_verdict(dir.string(), 5, "no marker for this checkpoint");
+    layout_gate_write_marker(dir, 1, 5, "job=1\ncheckpoint=5\n");
+    no_verdict(dir.string(), 5, "a marker predating the participant set");
+    layout_gate_write_marker(dir, 1, 6, "job=1\ncheckpoint=6\ngeneration=1\nsubtasks=\n");
+    no_verdict(dir.string(), 6, "an empty participant list");
+    layout_gate_write_marker(dir, 1, 7, "job=1\ncheckpoint=7\ngeneration=1\nsubtasks=0,x,2\n");
+    no_verdict(dir.string(), 7, "a token that is not an index");
+
+    // Two jobs have written into this root and both recorded checkpoint 8, with
+    // different layouts: which one the snapshot files belong to is a guess.
+    layout_gate_write_marker(dir, 1, 8, "job=1\ncheckpoint=8\ngeneration=1\nsubtasks=0,1,2,3\n");
+    layout_gate_write_marker(dir, 2, 8, "job=2\ncheckpoint=8\ngeneration=1\nsubtasks=0,1\n");
+    no_verdict(dir.string(), 8, "markers from two jobs for the same checkpoint");
     std::filesystem::remove_all(dir);
 }
