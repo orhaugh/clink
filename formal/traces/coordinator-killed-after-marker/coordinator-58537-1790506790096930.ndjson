@@ -1,0 +1,2 @@
+{"seq":1,"ts":1790506790097020,"proc":"coordinator:58537","event":"Trigger","job":1,"ckpt":1,"epoch":1}
+{"seq":2,"ts":1790506790108716,"proc":"coordinator:58537","event":"CoordComplete","job":1,"ckpt":1,"outcome":"completed"}

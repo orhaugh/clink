@@ -241,11 +241,22 @@ TraceStep ==
        \/ StepSinkOpens \/ StepPlacement
     /\ Reached(l + 1)
 
+\* A COMPLETED marker whose line a kill cut off. The coordinator emits
+\* WriteCompleted after the durable write, so the line never claims a marker
+\* that is not on disk; a kill landing between the two leaves the marker with
+\* no line. The only witness admitted is the next event itself: a takeover
+\* whose own read of the disk found exactly that checkpoint completed.
+LostWriteCompleted ==
+    /\ completeDue # None
+    /\ Is("CoordRecovers") /\ E.completed = completeDue
+    /\ WriteCompleted
+
 \* What the engine cannot observe and so never emits: the model may take
 \* these between events, within the budgets the trace implies.
 Hidden ==
     /\ \/ CoordDies \/ CoordSuperseded \/ ZombieStops
        \/ TxnExpires \/ BrokerGoesDown \/ BrokerComesBack
+       \/ LostWriteCompleted
     /\ UNCHANGED <<l, ev, placed>>
 
 \* The trace consumed: the run stutters here rather than deadlocking.

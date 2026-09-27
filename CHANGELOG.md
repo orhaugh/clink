@@ -557,6 +557,17 @@ own `deps` release: upstream's v1.8.0 is a rolling pre-release whose asset
 is re-cut from master, which broke the checksum and took both jobs down
 without them checking anything.
 
+A later gating run diverged on a trace that was missing a line rather than
+showing a wrong step. The coordinator records `WriteCompleted` after the
+COMPLETED marker's durable write, so the line never claims a marker that is
+not on disk, and a kill landing between the two left the marker without its
+line: the next coordinator recovered from a checkpoint the trace never saw
+written, and its redeploy read as impossible. The trace module now admits
+that marker as a hidden step only when the next event is a takeover whose
+own read of the disk found exactly that checkpoint, and the run is kept
+under `formal/traces/` so the step stays exercised. The engine was correct
+throughout: the test's own exactly-once assertion passed on the same run.
+
 **The Kafka connector runs under ThreadSanitizer.** librdkafka starts its
 threads with C11 `thrd_create` and synchronises them with `mtx_*` and
 `cnd_*`, which glibc implements without going through the pthread entry

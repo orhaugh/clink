@@ -258,6 +258,19 @@ None is an engine defect; each is a behaviour the engine has always had
 that the model had not admitted, and the recorded traces under
 `formal/traces/` now pin all three.
 
+A divergence can also mean the trace is missing a line. The coordinator
+records `WriteCompleted` after the COMPLETED marker's durable write, so the
+line never claims a marker that is not on disk, and a kill landing between
+the two leaves the marker without its line. The next coordinator's
+`CoordRecovers` then reports a completed checkpoint the trace never saw
+written, and its redeploy from that checkpoint looks impossible. The trace
+module takes that marker as a hidden step, `LostWriteCompleted`, admitted
+only when the next event is a takeover whose own read of the disk found
+exactly the checkpoint whose marker was due, so a recovery reporting any
+other checkpoint still diverges. `formal/traces/coordinator-killed-after-marker`
+is the run that showed it (a coordinator and a worker killed together, in
+`FaultRecoveryTest.CoordinatorAndWorkerDyingTogetherStillCommitsExactlyOnce`).
+
 ## The mutants
 
 A model that proves its own invariants shows nothing until it is shown to

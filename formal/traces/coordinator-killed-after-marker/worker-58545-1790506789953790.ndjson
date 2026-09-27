@@ -1,0 +1,3 @@
+{"seq":1,"ts":1790506789953847,"proc":"worker:58545","event":"Placement","job":1,"sub":0,"worker":"worker-0","source":true}
+{"seq":2,"ts":1790506790097243,"proc":"worker:58545","event":"DeliverBarrier","job":1,"ckpt":1,"epoch":1,"worker":"worker-0","fenced":false}
+{"seq":3,"ts":1790506790108020,"proc":"worker:58545","event":"SubtaskAck","job":1,"sub":0,"ckpt":1,"ok":true}

@@ -1,0 +1,4 @@
+{"seq":1,"ts":1790506789918270,"proc":"worker:58546","event":"Placement","job":1,"sub":1,"worker":"worker-1","source":false}
+{"seq":2,"ts":1790506789954788,"proc":"worker:58546","event":"SinkOpens","sub":1,"family":"recoverable"}
+{"seq":3,"ts":1790506790106073,"proc":"worker:58546","event":"SinkPrepare","sub":1,"ckpt":1,"family":"recoverable","staged":true}
+{"seq":4,"ts":1790506790108634,"proc":"worker:58546","event":"SubtaskAck","job":1,"sub":1,"ckpt":1,"ok":true}
