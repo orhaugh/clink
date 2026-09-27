@@ -12,6 +12,14 @@
 # threads, producer queue thread, mock cluster threads). It uses
 # atomic primitives that bypass TSan's instrumentation, which TSan
 # reports as races. The library's own test suite is clean.
+#
+# These rules also hide a race in a clink callback that librdkafka runs,
+# since its stack passes through the library. Narrowing them to
+# called_from_lib:librdkafka.so is not enough: TSan builds route librdkafka's
+# mtx_*/cnd_* through a shim in the executable (impls/kafka/src/
+# tsan_c11_threads.cpp), so a lock on a mutex another librdkafka thread
+# initialised, handed over through the library's own atomics, is reported
+# from the shim (seen in Kafka.ProduceEmitsPartialBatchWithinBatchMaxWait).
 race:librdkafka.so
 race:rdkafka_msg_partitioner
 race:rd_kafka_

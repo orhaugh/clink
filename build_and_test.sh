@@ -149,21 +149,10 @@ build_and_run_tests() {
     test_jobs="$(sysctl -n hw.ncpu)"
   fi
 
-  # A test that opens a librdkafka handle (producer, consumer or mock
-  # cluster) cannot run under TSan. librdkafka starts its threads with C11
-  # thrd_create, which glibc routes to its internal pthread_create, and
-  # libtsan does not intercept thrd_create, so TSan never registers those
-  # threads: the first allocation (or other stateful interceptor call) on
-  # one faults inside the TSan runtime ("SEGV on unknown address", then
-  # "nested bug in the same thread"). That is a runtime crash, not a
-  # report, so no suppression reaches it. Such tests are excluded by name
-  # under TSan only, and the normal, ASan and UBSan passes run them; add
-  # any new one here. The KafkaRegistryFormats build-time refusal test
-  # opens no handle and stays in.
-  local ctest_exclude=""
-  if [[ "$sanitizer" == "tsan" ]]; then
-    ctest_exclude='--exclude-regex (Kafka\.|PipelineConfig\.|KafkaRegistryFormats\.(AvroRowsRoundTripThroughTheBrokerAndTheRegistry|UndecodableMessagesFailTheSourceOrAreSkippedByPolicy))'
-  fi
+  # No test is excluded under TSan. Tests that open a librdkafka handle used
+  # to be, because TSan could not see librdkafka's C11 threads on glibc and
+  # crashed inside its own runtime; TSan builds now compile in a shim that
+  # routes those threads through pthread (impls/kafka/src/tsan_c11_threads.cpp).
 
   echo "Running tests..."
   if [[ "$sanitizer" == "coverage" ]]; then
@@ -179,7 +168,7 @@ build_and_run_tests() {
     # workers don't collide. Sanitizer env (ASAN_OPTIONS, TSAN_OPTIONS,
     # UBSAN_OPTIONS) is propagated through `env` and inherited by each
     # ctest child process.
-    ( cd "$abs_build_dir" && env $test_env ctest -j "$test_jobs" --output-on-failure $ctest_exclude ) \
+    ( cd "$abs_build_dir" && env $test_env ctest -j "$test_jobs" --output-on-failure ) \
       || { echo "▶ Tests failed"; return 1; }
   fi
 

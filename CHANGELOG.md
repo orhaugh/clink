@@ -557,6 +557,24 @@ own `deps` release: upstream's v1.8.0 is a rolling pre-release whose asset
 is re-cut from master, which broke the checksum and took both jobs down
 without them checking anything.
 
+**The Kafka connector runs under ThreadSanitizer.** librdkafka starts its
+threads with C11 `thrd_create` and synchronises them with `mtx_*` and
+`cnd_*`, which glibc implements without going through the pthread entry
+points TSan intercepts. TSan never registered those threads and crashed in
+its own runtime on the first one that allocated, so every test that opened a
+producer, a consumer or a mock cluster had been excluded from the TSan pass
+by name, 22 of them by the end, and the source, sink, transaction and
+registry-format paths had no race checking at all. TSan builds on Linux now
+compile a shim into every target that links `clink::kafka`, forwarding each
+C11 thread, mutex and condition-variable call to the pthread function glibc
+would have used, through the entry point TSan does intercept. The Kafka suite
+runs under TSan with nothing excluded, so clink's own code on either side of
+librdkafka is race-checked; reports whose stacks pass through the
+uninstrumented library itself stay suppressed, as before. Every definition is
+weak, because an executable that also links an object library consuming
+`clink::kafka` compiles the file twice. See the Kafka connector's
+[testing notes](https://orhaugh.github.io/clink/connectors/kafka/#testing).
+
 ## v0.8.0 (August 2026)
 
 The launch release: the qualification programme run across the engine's

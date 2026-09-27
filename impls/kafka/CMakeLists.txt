@@ -103,6 +103,22 @@ if(TARGET clink::schema_registry)
 endif()
 clink_set_warnings(clink_kafka)
 
+# ThreadSanitizer cannot see the C11 threads librdkafka starts on glibc, and
+# faults inside its own runtime on the first one that allocates. Under TSan,
+# every consumer of clink::kafka compiles a shim that routes
+# thrd_*/mtx_*/cnd_*/call_once through the pthread entry points TSan
+# intercepts (src/tsan_c11_threads.cpp). It takes effect where it lands in
+# the executable, or in a shared library loaded at startup; a copy in a
+# dlopen'd module is inert. An INTERFACE source rather than a member of the
+# static library, because nothing in clink references these symbols, so an
+# archive member defining them would never be linked in. Build tree only: an
+# installed clink::kafka carries no shim.
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=thread" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(clink_kafka INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/tsan_c11_threads.cpp>)
+    message(STATUS "clink::kafka - TSan build: C11 threads routed through pthread")
+endif()
+
 # Re-export the underlying rdkafka libs (and mock-header presence) as a
 # CACHE variable so tests/CMakeLists.txt can link them directly into
 # test_kafka.cpp - that test drives the rdkafka_mock broker via the C

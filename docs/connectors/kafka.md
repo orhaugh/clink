@@ -258,6 +258,8 @@ The connector suite (`impls/kafka/tests/test_kafka.cpp`) drives librdkafka's in-
 
 `test_registry_formats.cpp` drives the string factories with `format='avro'` end to end through the same mock broker and an in-process Schema Registry double; `test_registry_formats_live.cpp` repeats the round trip for Avro, Protobuf and JSON Schema against a Redpanda broker with its built-in registry when Docker is available (skipped otherwise).
 
+The whole suite also runs under ThreadSanitizer (`./build_and_test.sh --sanitizer tsan`), mock-broker tests included. librdkafka starts its threads with C11 `thrd_create` and synchronises them with `mtx_*` and `cnd_*`, which glibc implements without going through the pthread symbols TSan intercepts, so TSan would never register those threads and crashes on the first one that allocates. TSan builds on Linux therefore compile `impls/kafka/src/tsan_c11_threads.cpp` into every target that links `clink::kafka`: it forwards each C11 call to the pthread function glibc would have used, through the entry point TSan does intercept, so TSan tracks those threads and their locking and the suite runs instead of crashing. Reports whose stacks pass through librdkafka stay suppressed by `tsan-suppressions.txt`, because the library itself is not instrumented. The shim is part of in-tree and FetchContent builds only; an installed `clink::kafka` carries none.
+
 Run them with the `kafka` ctest label:
 
 ```bash
