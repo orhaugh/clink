@@ -35,8 +35,8 @@ CREATE TABLE readings (
 -- every ten seconds is nothing to batch, and it matters for correctness on
 -- clink 0.8.0, whose ClickHouse sink flushes its buffer on a row-count or
 -- time trigger rather than at the checkpoint barrier: a row still buffered
--- when the Worker dies is only safe if it had already been inserted. Later
--- engines flush at every barrier and the option becomes a plain tuning knob.
+-- when the Worker dies is only safe if it had already been inserted. From
+-- 0.9.0 the sink flushes at every barrier and the option is a plain tuning knob.
 CREATE TABLE sensor_window_stats (
     sensor_id    VARCHAR,
     window_start BIGINT,

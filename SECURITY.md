@@ -3,13 +3,15 @@
 ## Supported versions
 
 clink is pre-1.0 and ships 0.x releases. The latest patch release of the
-newest minor line (currently v0.8.x) is the recommended production
+newest minor line (currently v0.9.x) is the recommended production
 target and the only line that receives security fixes. `main` is active,
 unreleased development: fixes land there first, but it is not a
 supported deployment target. Fixes are not backported to older minor
 lines; upgrading is the supported path, and snapshots carry schema
 versions with a migrate-at-restore path so an upgrade does not
-invalidate checkpoints or savepoints.
+invalidate checkpoints or savepoints, except where a release's notes
+say a job's subtask layout changed (the restore is then refused, not
+silently misapplied).
 
 ## Reporting a vulnerability
 

@@ -320,7 +320,7 @@ the `subtasks=` line of `<restore dir>/_jobs/<job>/COMPLETED-<id>`.
 
 1. **An engine upgrade changed the plan.** The message names the plan's
    single-instance operators. SQL scalar subqueries in `SELECT` and null-aware `IN` /
-   `NOT IN` run as one instance in builds after v0.8.0, so a v0.8.0 savepoint of such a
+   `NOT IN` run as one instance from v0.9.0, so a v0.8.0 savepoint of such a
    job at a parallelism above 1 has more subtasks than the job now plans.
 2. **A different parallelism or graph.** The job was submitted at another
    `--parallelism` than the savepoint was taken at, or its graph changed, including a

@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## v0.9.0 (September 2026)
+
+The exactly-once protocol under a machine-checked specification, Schema
+Registry formats on the Kafka connector, opt-in memory budgets with SQL
+state that spills, and the surfaces the 1.x line will hold stable. Upgrading
+from v0.8.0: compiled job modules must be rebuilt, C callers of the embedded
+ABI recompile against version 2, and a savepoint whose subtask layout the
+new plan no longer matches is refused rather than restored; see the release
+notes for which SQL jobs that affects.
 
 **SQL job parallelism preserves global query semantics.** Scalar subqueries in
 the SELECT list and null-aware `IN` / `NOT IN` joins now retain one global
@@ -607,6 +615,27 @@ uninstrumented library itself stay suppressed, as before. Every definition is
 weak, because an executable that also links an object library consuming
 `clink::kafka` compiles the file twice. See the Kafka connector's
 [testing notes](https://orhaugh.github.io/clink/connectors/kafka/#testing).
+
+**Plugin bytes cross the wire in bulk.** The cluster protocol encoded and
+decoded a job module's bytes one call per byte, three times before a submit
+was acknowledged: the client's encode, the coordinator's decode and the
+Deploy encode. An optimised build barely noticed, but a sanitizer build of a
+64 MiB module spent 2.5 to 4 s on each pass, enough to time out the client's
+10 s acknowledgement on a slow runner, which is what kept the UBSan nightly
+red. The blob's framing is a string's, so it now moves through the string
+primitives in one call each way. The wire bytes are unchanged.
+
+**A project can pull clink in with FetchContent.** A consumer that builds
+clink's source inside its own tree had no example and no test, and two
+things were broken on that route: `clink::FlatMap`'s header was not a usage
+requirement of `clink::core` in the build tree, so any translation unit
+including a window or keyed-state operator failed to find
+`ankerl/unordered_dense.h`, and `CLINK_BUILD_TESTS` and
+`CLINK_BUILD_EXAMPLES` defaulted on as a subproject, building googletest and
+the whole suite. The header is now a build-interface usage requirement and
+both options default to `PROJECT_IS_TOP_LEVEL`, leaving clink's own build
+unchanged. `docs/consumer-examples/fetchcontent` is the example, and CI
+builds it from the commit under test.
 
 ## v0.8.0 (August 2026)
 

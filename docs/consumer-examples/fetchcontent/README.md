@@ -43,7 +43,7 @@ the fetch shape clink's build:
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `CLINK_GIT_REPOSITORY` | `https://github.com/orhaugh/clink.git` | Repository FetchContent clones |
-| `CLINK_GIT_TAG` | `main` | Tag or branch to build. Pin a release tag once one carries build-tree consumption; v0.8.0 predates it. A commit hash works once `GIT_SHALLOW` is dropped from the declaration |
+| `CLINK_GIT_TAG` | `v0.9.0` | Tag or branch to build. v0.9.0 is the first release that supports build-tree consumption; v0.8.0 predates it. A commit hash works once `GIT_SHALLOW` is dropped from the declaration |
 | `CLINK_BUILD_IMPLS` | `OFF` | Connector and backend impls. Set it on and link `clink::kafka` and friends to use one |
 | `CLINK_BUILD_SQL` | `OFF` | The SQL frontend |
 

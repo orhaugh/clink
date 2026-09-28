@@ -5,11 +5,11 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Where clink comes from. Pin a release tag once one carries build-tree
-# consumption: v0.8.0 predates it (its ankerl header is not a usage requirement
-# of clink::core in the build tree, and its tests default on as a subproject),
-# so until the next release this follows main. A commit hash also works, but
-# needs GIT_SHALLOW dropped from the declaration below.
+# Where clink comes from: a release tag. v0.9.0 is the first that supports
+# build-tree consumption (v0.8.0's ankerl header is not a usage requirement of
+# clink::core in the build tree, and its tests default on as a subproject).
+# `main` follows the default branch; a commit hash also works, but needs
+# GIT_SHALLOW dropped from the declaration below.
 #
 # To build this project against a checkout you already have (clink's own CI
 # does this with the commit under test), point FetchContent at it:
@@ -20,7 +20,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # this file changes.
 set(CLINK_GIT_REPOSITORY "https://github.com/orhaugh/clink.git"
     CACHE STRING "Git repository FetchContent clones clink from")
-set(CLINK_GIT_TAG "main"
+set(CLINK_GIT_TAG "v0.9.0"
     CACHE STRING "clink tag or branch to build")
 
 # clink's build options, set before the fetch so its option() calls take
