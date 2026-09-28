@@ -5,60 +5,45 @@
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![changelog](https://img.shields.io/badge/changelog-v0.9.0-lightgrey.svg)](CHANGELOG.md)
 
-`clink` is an embedded-first, Arrow-native stream processing engine in
-modern C++ (C++23): stateful stream processing with engine-grade
-semantics - SQL, event time, keyed state, exactly-once checkpoints -
-that you run like a tool rather than operate like a platform.
+`clink` is a stream processing engine for Kafka pipelines that must stay
+correct when processes die. You write the pipeline in SQL; clink keeps its
+event-time windows and keyed state, checkpoints them, and delivers
+exactly once to Kafka, Postgres, S3 and Parquet. Kill a Worker mid-stream
+and the job resumes from its last checkpoint without losing or
+double-counting a record.
 
-The whole engine lives in one library, and the same pipeline runs two
-ways. In-process: `clink run pipeline.sql` executes it in a single
-process with no daemons and prints its first result about 155 ms after
-process start; `libclink` embeds the engine in any service behind a
-pure-C ABI with results as Arrow C streams; `pyclink` returns them as
-pyarrow tables in a notebook. At scale: the same SQL file, unchanged,
-submits to a distributed Coordinator/Worker cluster with parallelism,
-failover, and rescale.
+It runs like a tool rather than a platform. The same SQL file runs in one
+process on a laptop (`clink run pipeline.sql`, first result in about
+155 ms), embedded in a service through a C ABI or from Python, or on a
+Coordinator/Worker cluster with parallelism, failover and rescale. There is
+no JVM and no separate state store to operate.
 
-Opt-in [memory budgets](docs/internals/memory-management.md) share a byte allowance
-across covered SQL state, local queues, blocking exchanges and checkpoint buffers.
-Blocking exchanges, global top-N candidates and null wildcard entries can spill
-on pressure. Configured SQL aggregate, window, join, OVER and ranking state uses
-entry-level storage to support oversized active keys. Scalar-subquery main inputs
-also spill one row at a time while waiting for the scalar side.
-Buffered model inference accounts retained input rows and flushes early under
-memory pressure.
-`COUNT(DISTINCT)` and
-retractable `MIN`/`MAX` also store each distinct value separately, and exact
-percentiles stream their ordered value cells. `STRING_AGG` and `ARRAY_AGG` retain
-their values as separate cells too, including inside fixed and session windows.
-Individual rows, value cells, materialised results and opaque aggregate
-accumulators must still fit.
-Other covered owners refuse allocations on exhaustion. Accounting coverage is
-partial; this is not an RSS cap.
+Why you can check the claim rather than take it on trust:
 
-Three capabilities follow from that design:
+- **Qualified under faults.** The Kafka exactly-once campaign ran two hours
+  of Worker and Coordinator kills inside commit windows, broker outages and
+  network partitions, and all 755 windows came out byte-exact against an
+  independent oracle. Eleven campaigns are published, each only once green
+  ([Qualification](https://orhaugh.github.io/clink/qualification/)).
+- **A checked protocol.** The exactly-once protocol is a TLA+ specification
+  model-checked on every push, every defect the campaigns found is a mutant
+  it must refute, and the protocol traces of real test runs are validated
+  against it ([Exactly-once specification](https://orhaugh.github.io/clink/internals/exactly-once-specification/)).
+- **Measured cost.** Across the 17-query nexmark suite on a five-node
+  cluster, clink processes an event for 1.9x to 5.3x less CPU (median
+  2.45x) than a JVM stream processor producing identical, correctness-gated
+  output ([Benchmarks](https://orhaugh.github.io/clink/benchmarks/),
+  [cost and footprint](https://orhaugh.github.io/clink/efficiency/)).
 
-- **State is an open dataset.** Snapshots are documented Arrow IPC:
-  checkpoints and savepoints open directly in pyarrow, DuckDB or Polars,
-  export to Parquet and Iceberg, and a running job's live state serves
-  point lookups and Arrow scans over plain HTTP, no sink round-trip.
-  See [state and backends](https://orhaugh.github.io/clink/internals/state-and-backends/).
-- **Incidents replay deterministically.** A flight recorder captures
-  what each operator consumed per checkpoint epoch; `clink replay`
-  re-executes an operator over exactly those records, offline and
-  byte-identically, and can freeze the incident into a permanent
-  regression test. See [replay determinism](https://orhaugh.github.io/clink/internals/replay-determinism/).
-- **Nothing to manage under it.** A single static binary with no managed
-  runtime: cold start in milliseconds, one artefact to ship, and the
-  same behaviour embedded, in CI, and on a cluster.
+State is also an open dataset: checkpoints are documented Arrow IPC that
+open in pyarrow, DuckDB or Polars, and a running job's state answers point
+lookups and scans over HTTP. A flight recorder can replay an incident
+deterministically and freeze it into a regression test.
 
-Measured, not asserted: across the 17-query nexmark suite on a five-node
-cluster, clink processes an event for **1.9x to 5.3x less CPU** (median 2.45x)
-than a JVM stream processor producing identical, correctness-gated output.
-Method, caveats and raw per-run data:
-[Benchmarks](https://orhaugh.github.io/clink/benchmarks/), priced out in
-instances, dollars and modelled CO2e at
-[Cost and environmental footprint](https://orhaugh.github.io/clink/efficiency/).
+clink is young and pre-1.0, written by one maintainer with extensive AI
+assistance. The specification, the qualification campaigns and the
+sanitizer matrix in CI are how its correctness is checked
+([Status and maturity](#status-and-maturity)).
 
 clink is heavily inspired by Apache Flink. Flink's model of typed operator
 DAGs, event-time processing, in-band watermarks and checkpoint barriers, keyed
