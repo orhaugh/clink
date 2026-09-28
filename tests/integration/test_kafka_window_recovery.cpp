@@ -25,6 +25,7 @@
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/connectors/kafka_source.hpp"
+#include "clink/kafka/consume_all.hpp"
 #include "clink/kafka/txn_resume.hpp"
 #include "clink/runtime/network/connection.hpp"
 
@@ -76,6 +77,23 @@ std::uint64_t latest_marker(const std::filesystem::path& root, std::string_view 
     return latest;
 }
 
+// Options for a producer whose records ARE an oracle's expectation. The
+// producer is idempotent because the composites stop and restart the broker
+// mid-feed, and a batch the plain producer retries across that outage is
+// written twice: the engine then counts, correctly, a duplicate the feeder
+// put in its own input, and the oracle calls it a replay. That was the
+// rig-night composite's intermittent "extra event per key" - every wrong
+// window matched a twice-written event_id in the input topic.
+clink::KafkaSink::Options feeder_options(const std::string& brokers, const std::string& topic) {
+    clink::KafkaSink::Options opts;
+    opts.brokers = brokers;
+    opts.topic = topic;
+    opts.metric_prefix.clear();
+    opts.acks = "all";
+    opts.conf["enable.idempotence"] = "true";
+    return opts;
+}
+
 struct SeedRecord {
     std::string payload;
     std::int32_t partition;
@@ -84,10 +102,7 @@ struct SeedRecord {
 void produce_json(const std::string& brokers,
                   const std::string& topic,
                   const std::vector<SeedRecord>& records) {
-    clink::KafkaSink::Options opts;
-    opts.brokers = brokers;
-    opts.topic = topic;
-    opts.metric_prefix.clear();
+    auto opts = feeder_options(brokers, topic);
     clink::KafkaSink sink(std::move(opts));
     sink.open();
     clink::Batch<clink::KafkaMessage> batch;
@@ -205,10 +220,7 @@ void produce_json_sustained(const std::string& brokers,
                             const std::string& topic,
                             const std::vector<SeedRecord>& records,
                             std::atomic<std::size_t>& produced) {
-    clink::KafkaSink::Options opts;
-    opts.brokers = brokers;
-    opts.topic = topic;
-    opts.metric_prefix.clear();
+    auto opts = feeder_options(brokers, topic);
     clink::KafkaSink sink(std::move(opts));
     sink.open();
     constexpr std::size_t kBatchSize = 40;
@@ -249,10 +261,7 @@ std::map<WindowKey, Aggregate> produce_json_advancing(const std::string& brokers
                                                       int keys,
                                                       std::atomic<bool>& stop,
                                                       std::atomic<std::size_t>& produced) {
-    clink::KafkaSink::Options opts;
-    opts.brokers = brokers;
-    opts.topic = topic;
-    opts.metric_prefix.clear();
+    auto opts = feeder_options(brokers, topic);
     // The sent-map below IS the oracle's expectation, so nothing this
     // producer buffers may ever expire: the composite gates hold the broker
     // down for minutes at a time, and records that die in the buffer while
@@ -293,6 +302,34 @@ std::map<WindowKey, Aggregate> produce_json_advancing(const std::string& brokers
     }
     sink.close();
     return sent;
+}
+
+// The event ids that appear more than once in `topic`, with their counts.
+// Every fed record carries a unique event_id, so a duplicate here was written
+// twice by the FEEDER - a producer retry across a broker outage - and a
+// window counting it twice is the engine counting its input faithfully, not a
+// replay. Asked only when the oracle disagrees, to say which side is wrong.
+std::map<std::string, int> input_duplicates(const std::string& brokers, const std::string& topic) {
+    std::map<std::string, int> seen;
+    for (const auto& payload : clink::kafka::consume_all_committed(brokers, topic, 120s)) {
+        constexpr std::string_view kKey = "\"event_id\":\"";
+        const auto at = payload.find(kKey);
+        if (at == std::string::npos) {
+            continue;
+        }
+        const auto from = at + kKey.size();
+        const auto to = payload.find('"', from);
+        if (to != std::string::npos) {
+            ++seen[payload.substr(from, to - from)];
+        }
+    }
+    std::map<std::string, int> dups;
+    for (const auto& [id, n] : seen) {
+        if (n > 1) {
+            dups.emplace(id, n);
+        }
+    }
+    return dups;
 }
 
 // Initialise a transactional producer with `txn_id` and close it again:
@@ -351,10 +388,7 @@ SustainedFeed produce_json_until(const std::string& brokers,
                                  int keys,
                                  std::atomic<bool>& stop,
                                  std::atomic<std::size_t>& produced) {
-    clink::KafkaSink::Options opts;
-    opts.brokers = brokers;
-    opts.topic = topic;
-    opts.metric_prefix.clear();
+    auto opts = feeder_options(brokers, topic);
     clink::KafkaSink sink(std::move(opts));
     sink.open();
     SustainedFeed feed;
@@ -2432,6 +2466,11 @@ TEST_F(KafkaWindowRecoveryTest, TheRigNightCompositeStaysExactlyOnce) {
                 ADD_FAILURE() << "EXTRA k=" << key.first << " ws=" << key.second
                               << " cnt=" << agg.first << " total=" << agg.second;
             }
+        }
+    }
+    if (actual != expected) {
+        for (const auto& [id, n] : input_duplicates(kafka_->brokers(), input_topic_)) {
+            ADD_FAILURE() << "INPUT DUPLICATE event_id=" << id << " written " << n << " times";
         }
     }
     EXPECT_EQ(actual, expected)
