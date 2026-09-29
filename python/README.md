@@ -16,7 +16,7 @@ pip install pyclink-<version>-py3-none-macosx_14_0_arm64.whl
 ```
 
 Release tags publish pyclink to PyPI (`pip install pyclink`) through trusted
-publishing, from the first release after v0.9.0. The wheels are built by
+publishing, from v0.9.1. The wheels are built by
 `.github/workflows/wheels.yml`:
 
 - macOS arm64 (`macosx_14_0_arm64`), without connectors.

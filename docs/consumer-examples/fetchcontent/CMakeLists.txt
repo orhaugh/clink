@@ -20,7 +20,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # this file changes.
 set(CLINK_GIT_REPOSITORY "https://github.com/orhaugh/clink.git"
     CACHE STRING "Git repository FetchContent clones clink from")
-set(CLINK_GIT_TAG "v0.9.0"
+set(CLINK_GIT_TAG "v0.9.1"
     CACHE STRING "clink tag or branch to build")
 
 # clink's build options, set before the fetch so its option() calls take

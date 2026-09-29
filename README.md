@@ -3,7 +3,7 @@
 [![ci](https://github.com/orhaugh/clink/actions/workflows/ci.yml/badge.svg)](https://github.com/orhaugh/clink/actions/workflows/ci.yml)
 [![docs](https://github.com/orhaugh/clink/actions/workflows/docs.yml/badge.svg)](https://orhaugh.github.io/clink/)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
-[![changelog](https://img.shields.io/badge/changelog-v0.9.0-lightgrey.svg)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/changelog-v0.9.1-lightgrey.svg)](CHANGELOG.md)
 
 `clink` is a stream processing engine for Kafka pipelines that must stay
 correct when processes die. You write the pipeline in SQL; clink keeps its

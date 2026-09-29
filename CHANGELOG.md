@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.9.1 (September 2026)
+
+A packaging release: pyclink on PyPI, with Linux wheels that include the
+Kafka connector. There are no engine, SQL, state-format or API changes from
+v0.9.0, so upgrading needs nothing beyond installing it.
 
 **libclink links Arrow statically on Linux, so a manylinux wheel is
 self-contained.** A new `CLINK_STATIC_ARROW` option makes `clink_core` link
