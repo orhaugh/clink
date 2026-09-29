@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include "clink/cluster/job_graph.hpp"
@@ -2441,6 +2442,54 @@ Channel decide_channel(const LogicalPlan& node) {
     return decide_channel(*inputs[0]);
 }
 
+// Post-pass over the built operator graph: an operator that reads a forced
+// singleton without a keyed exchange (no key_by) becomes a forced singleton too,
+// transitively, down to the sink. Fanning it out would put a round-robin edge
+// behind the singleton, and a singleton's output is often a changelog: a row's
+// insert and its later retraction then travel through different subtasks and can
+// reach the sink in either order. A retraction that overtakes its insert deletes
+// nothing, and the insert survives - a null-aware NOT IN returned a row its
+// NULL-bearing subquery had already made UNKNOWN. A keyed consumer keeps its
+// fan-out: the hash exchange sends every change to a key down the same path, so
+// per-key order holds.
+static void propagate_forced_singletons(cluster::JobGraphSpec& spec) {
+    // An input ref may carry a split-branch (".N") or side-output ("::tag") suffix.
+    auto bare = [](const std::string& raw) {
+        if (const auto colons = raw.find("::"); colons != std::string::npos) {
+            return raw.substr(0, colons);
+        }
+        const auto dot = raw.rfind('.');
+        if (dot != std::string::npos && dot + 1 < raw.size() &&
+            raw.find_first_not_of("0123456789", dot + 1) == std::string::npos) {
+            return raw.substr(0, dot);
+        }
+        return raw;
+    };
+    std::unordered_set<std::string> singles;
+    for (const auto& op : spec.ops) {
+        if (cluster::is_forced_singleton(op)) {
+            singles.insert(op.id);
+        }
+    }
+    for (bool changed = !singles.empty(); changed;) {
+        changed = false;
+        for (auto& op : spec.ops) {
+            if (!op.key_by.empty() || singles.contains(op.id)) {
+                continue;
+            }
+            for (const auto& raw : op.inputs) {
+                if (singles.contains(bare(raw))) {
+                    op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+                    op.parallelism = 1;
+                    singles.insert(op.id);
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 // Post-pass over the built operator graph: mark every aggregate_row that feeds a
 // changelog-CONSUMING op (a netting/upsert sink, or a retraction-aware join) so
 // it emits update_before/update_after instead of an append snapshot. Walks back
@@ -2639,6 +2688,7 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     // cannot trace.
     spec.column_lineage = capture_column_lineage(root, sink_id);
     mark_changelog_producers(spec);
+    propagate_forced_singletons(spec);
     enable_columnar_output(spec);
     // Every operator in this spec is planner-emitted engine code: wall-clock
     // and random functions were rejected at bind time, and the operators

@@ -2,9 +2,34 @@
 
 ## v0.9.1 (September 2026)
 
-A packaging release: pyclink on PyPI, with Linux wheels that include the
-Kafka connector. There are no engine, SQL, state-format or API changes from
-v0.9.0, so upgrading needs nothing beyond installing it.
+pyclink on PyPI, with Linux wheels that include the Kafka connector, and a
+SQL correctness fix: a single-instance stage's changes could reach a parallel
+downstream stage out of order. There are no state-format or API changes, and
+the plugin ABI fingerprint is unchanged, but some SQL jobs now plan their
+downstream stages at one instance, so a v0.9.0 savepoint of such a job taken
+above parallelism 1 is refused at submit (see the first entry).
+
+**A single-instance SQL stage no longer feeds its changes to a parallel stage
+out of order.** Scalar subqueries in `SELECT`, null-aware `IN`/`NOT IN`,
+global aggregates, `LIMIT` and top-N run as one instance at any parallelism,
+but the stages after them (the sink binding, and in a real job the sink
+itself) were fanned back out with no key on the edge between. A row's insert
+and its later retraction then took different subtasks and could reach the
+sink in either order; a retraction that overtook its insert deleted nothing,
+and the row survived. The visible case was a null-aware `NOT IN` returning a
+row its NULL-bearing subquery had already made UNKNOWN, intermittently, in
+`SqlRuntime.GlobalSubqueryAndNullAwareSemanticsAreParallelismInvariant`: the
+captured changelog showed `delete (3,5)` written before `insert (3,5)`. The
+planner now marks every stage that reads a single-instance stage without a
+keyed exchange as single-instance too, down to the sink, so the existing
+parallelism, validation and rescale guards keep it at one; a keyed downstream
+stage keeps its fan-out, because a hash exchange sends each key's changes down
+one path. That test passed 400 of 400 runs under the CPU load that reproduced
+the failure, and now prints the raw changelog when its `NOT IN` result is wrong.
+Upgrading: such a job's downstream stages change subtask layout, so its v0.9.0
+savepoint taken above parallelism 1 is refused by the restore layout check
+rather than restored into the wrong subtasks; resubmit it without the
+savepoint.
 
 **libclink links Arrow statically on Linux, so a manylinux wheel is
 self-contained.** A new `CLINK_STATIC_ARROW` option makes `clink_core` link

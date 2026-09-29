@@ -14509,6 +14509,17 @@ TEST(SqlRuntime, GlobalSubqueryAndNullAwareSemanticsAreParallelismInvariant) {
                 "worker-sql-anti-p" + std::to_string(parallelism),
                 parallelism);
             EXPECT_TRUE(error.empty()) << "parallelism " << parallelism << ": " << error;
+            if (got != anti_expected) {
+                // The raw changelog, in the order the sink wrote it: whether the
+                // stray probe was never retracted or retracted and re-inserted is
+                // the first question, and the fold above cannot answer it.
+                std::string log;
+                for (const auto& line : read_lines(out)) {
+                    log += "  " + line + "\n";
+                }
+                ADD_FAILURE() << "anti-join changelog at parallelism " << parallelism << ":\n"
+                              << log;
+            }
             EXPECT_EQ(got, anti_expected) << "null-aware NOT IN at parallelism " << parallelism;
         }
     }
