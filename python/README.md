@@ -15,9 +15,9 @@ build, no `CLINK_LIB`:
 pip install pyclink-<version>-py3-none-macosx_14_0_arm64.whl
 ```
 
-pyclink is not yet published to PyPI. Wheels are produced by
-`.github/workflows/wheels.yml` on every release tag and attached to the run
-as artifacts:
+Release tags publish pyclink to PyPI (`pip install pyclink`) through trusted
+publishing, from the first release after v0.9.0. The wheels are built by
+`.github/workflows/wheels.yml`:
 
 - macOS arm64 (`macosx_14_0_arm64`), without connectors.
 - Linux x86_64 and aarch64 (`manylinux_2_28`), with the Kafka connector.

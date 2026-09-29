@@ -30,7 +30,11 @@ pin), libclink with SQL and Kafka only (`CLINK_WHEEL_KAFKA=1`), auditwheel,
 and a new gate, `scripts/check-wheel-self-contained.py`, that fails the job if
 anything was vendored or libclink needs more than the C and C++ runtime. A
 second job installs each wheel on a stock Ubuntu 22.04 runner and runs the
-smoke test there. pyclink is not yet on PyPI.
+smoke test there, then round-trips Kafka through the wheel against a
+Redpanda broker on the runner, observed from outside by rpk. A release tag
+then publishes all three wheels to PyPI as `pyclink` through trusted
+publishing (the `pypi` environment's OIDC identity, no stored token), after
+checking that each carries the tag's version.
 
 ## v0.9.0 (September 2026)
 
