@@ -365,7 +365,8 @@ jobs:
           if-no-files-found: error
 
   # The same wheels installed where users install them: a stock runner, outside the
-  # build image, with pip and PyPI's pyarrow.
+  # build image, with pip and PyPI's pyarrow; then a live Kafka round trip against a
+  # Redpanda broker on the runner, observed from outside by rpk.
   linux-wheels-verify:
     name: Verify (${{ matrix.name }} on Ubuntu 22.04)
     needs: linux-wheels
@@ -392,6 +393,35 @@ jobs:
           "${RUNNER_TEMP}/v/bin/pip" install wheelhouse/*.whl pyarrow
           unset CLINK_LIB
           ( cd "${RUNNER_TEMP}" && "${RUNNER_TEMP}/v/bin/python" "${{ github.workspace }}/python/tests/wheel_smoke.py" )
+      - name: Start a Redpanda broker
+        # docker run rather than a services: entry, which cannot pass the broker the
+        # arguments it needs to advertise an address the runner can reach. Same image
+        # and flags as the integration tests (tests/integration/docker_kafka.hpp).
+        run: |
+          set -euo pipefail
+          docker run -d --name rp -p 19092:19092 redpandadata/redpanda:v24.2.7 \
+            redpanda start --mode dev-container --smp 1 \
+            --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092 \
+            --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:19092
+          for _ in $(seq 60); do
+            docker exec rp rpk cluster health 2>/dev/null | grep -q 'Healthy:.*true' && break
+            sleep 2
+          done
+          docker exec rp rpk cluster health
+          # dev-container mode does not auto-create topics.
+          docker exec rp rpk topic create wheel-in wheel-out
+          for i in 1 2 3 4 5; do echo "{\"id\":$i,\"v\":\"r$i\"}"; done \
+            | docker exec -i rp rpk topic produce wheel-in -f '%v\n'
+      - name: Live Kafka round trip through the wheel
+        run: |
+          set -euo pipefail
+          unset CLINK_LIB
+          ( cd "${RUNNER_TEMP}" && BROKERS=127.0.0.1:19092 \
+              "${RUNNER_TEMP}/v/bin/python" "${{ github.workspace }}/python/tests/wheel_kafka_live.py" )
+          # The produce side, checked from outside pyclink.
+          got="$(docker exec rp rpk topic consume wheel-out -n 5 -f '%v\n' | wc -l)"
+          echo "rpk read ${got} records from wheel-out"
+          [ "${got}" -eq 5 ]
 
   # Gather every platform wheel that was built into one downloadable artifact.
   # Runs whenever the macOS wheel succeeded, so a failed Linux build does not
