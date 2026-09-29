@@ -214,6 +214,15 @@ libstdc++ and libgcc_s, and auditwheel vendors nothing. The option refuses to
 configure alongside tests or examples, whose job modules would each carry their
 own Arrow copy.
 
+The Linux wheels add the Kafka connector (`CLINK_WHEEL_KAFKA=1`: the impls on,
+every other `CLINK_WITH_*` off by name, against the static librdkafka
+`scripts/build-librdkafka.sh` builds from its pin). The whole Linux build is
+`scripts/build-manylinux-wheel.sh`, run inside `quay.io/pypa/manylinux_2_28_<arch>`:
+Arrow from source with the object stores off, librdkafka, libclink, the wheel,
+auditwheel, then `scripts/check-wheel-self-contained.py`, which fails if anything
+was vendored or libclink needs more than glibc, libstdc++ and libgcc_s, and a
+smoke test with the bundled library.
+
 ### The Flight SQL endpoint
 
 `clink flight-sql` (or `ClinkFlightSqlServer` from

@@ -32,28 +32,29 @@
 #                no TLS, so it serves and fetches plain HTTP only. Local files,
 #                SQL and the embedded engine are unaffected. Build from source
 #                for either capability. Reasons in the macos-wheel job env.
-#   linux        OPT-IN ONLY (workflow_dispatch input build_linux). The pinned
-#                toolchain image is Debian trixie, whose glibc is very new
-#                (2.4x). auditwheel derives the manylinux floor from the glibc
-#                symbol versions the binary actually references, so a wheel built
-#                on this image carries a high floor (>= manylinux_2_34, likely
-#                higher) and installs only on bleeding-edge distros. Rather than
-#                auto-publish an effectively uninstallable wheel on a release tag,
-#                Linux is gated off by default. Producing broadly-installable
-#                Linux wheels needs the toolchain rebuilt on a manylinux_2_28 (or
-#                _2_34) base - a separate piece of work. When you opt in, the
-#                repair step warns loudly if the floor exceeds the portable
-#                target so the artifact is never mistaken for a portable wheel.
+#   linux        Shipped on every tag, x86_64 and aarch64, WITH the Kafka
+#                connector. Built inside quay.io/pypa/manylinux_2_28_<arch> on the
+#                arch's native runner by scripts/build-manylinux-wheel.sh: the pinned
+#                Arrow from source with the object stores off, a static librdkafka,
+#                and libclink with Arrow linked statically (CLINK_STATIC_ARROW), so
+#                it needs only glibc, libstdc++ and libgcc_s and auditwheel vendors
+#                nothing. scripts/check-wheel-self-contained.py fails the job
+#                otherwise (auditwheel alone once passed a wheel that loaded a
+#                second, shared Arrow). Same capability caveats as macOS (no object
+#                stores, no HTTPS), plus: Kafka TLS/SASL use the OpenSSL bundled in
+#                librdkafka; GSSAPI and the Schema Registry formats are left out.
+#                The Arrow + librdkafka prefix is cached on the pins.
 #
-# Shape when Linux is enabled ({macos-arm64, linux-x86_64, linux-aarch64}):
-#   toolchain-image  build + push the pinned image per arch on its NATIVE runner
-#                    (no QEMU), so the aarch64 wheel job can pull an arm64 image.
-#   macos-wheel      native macos-26 (its SDK's libc++ defines std::jthread /
-#                    std::stop_token, which older SDKs do not); cached
-#                    ~/.clink-deps; delocate.
-#   linux-wheels     matrix {x86_64, aarch64}; runs INSIDE the pinned image
-#                    (toolchain at /usr/local, no Arrow rebuild); auditwheel.
-#   collect          gather whatever wheels were built into one artifact.
+# Shape ({macos-arm64, linux-x86_64, linux-aarch64}):
+#   macos-wheel         native macos-26 (its SDK's libc++ defines std::jthread /
+#                       std::stop_token, which older SDKs do not); cached
+#                       ~/.clink-deps; delocate.
+#   linux-wheels        matrix {x86_64, aarch64}; inside the manylinux_2_28 image on
+#                       the native runner; cached /opt/clink-deps; auditwheel +
+#                       the self-contained gate + a smoke test.
+#   linux-wheels-verify install each Linux wheel on a stock Ubuntu 22.04 runner,
+#                       outside the build image, and run the smoke test there.
+#   collect             gather whatever wheels were built into one artifact.
 
 name: wheels
 
@@ -72,19 +73,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      build_linux:
-        description: "Also build Linux wheels. Built on the trixie toolchain image, so the manylinux glibc floor is high and the wheels are NOT broadly installable (see workflow header)."
-        type: boolean
-        default: false
 
 permissions:
   contents: read
-  packages: write
 
 env:
-  # Owner-scoped so a fork builds under its own namespace (mirrors ci.yml).
-  IMAGE: ghcr.io/${{ github.repository_owner }}/clink-build
   # macOS floor. Drives BOTH the libclink minos (passed to cmake by
   # build-libclink-wheel.sh and build-arrow.sh) AND the wheel platform tag
   # (wheel's get_platform reads this env var), so binary and tag agree. Bumping
@@ -101,49 +94,11 @@ env:
   # macos-wheel job), and Arrow is compiled against this same value. Lower it if
   # a macOS 11-13 user ever asks; nothing in clink's own source stands in the way.
   MACOSX_DEPLOYMENT_TARGET: "14.0"
-  # Portable manylinux target. The Linux repair step warns if the wheel's actual
-  # glibc floor exceeds this (see PLATFORM SCOPE). major.minor.
-  MANYLINUX_TARGET: "2.34"
+  # The manylinux policy the Linux wheels are built for and must carry
+  # (scripts/build-manylinux-wheel.sh runs in quay.io/pypa/manylinux_2_28_<arch>).
+  MANYLINUX_TARGET: "2.28"
 
 jobs:
-  # Pinned toolchain image, one per arch, each built on its native runner so the
-  # from-source Arrow/aws-sdk/iceberg layers compile natively (no emulation) and
-  # land in the registry layer cache. Tagged :<sha>-<arch>; the wheel jobs derive
-  # that ref deterministically, so no job output is needed. Only built when Linux
-  # wheels are requested.
-  toolchain-image:
-    name: Toolchain image (${{ matrix.arch }})
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_linux }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build + push pinned image (native, layer-cached)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          push: true
-          platforms: linux/${{ matrix.arch }}
-          tags: ${{ env.IMAGE }}:${{ github.sha }}-${{ matrix.arch }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max
-
-  # macOS arm64 - the locally verified mechanism, run natively on Apple silicon.
-  # Always built; this is the shippable path.
   macos-wheel:
     name: Wheel (macos-arm64)
     # The build host must be new enough that its SDK's libc++ DEFINES the C++20
@@ -365,127 +320,82 @@ jobs:
           path: ${{ runner.temp }}/wheelhouse/*.whl
           if-no-files-found: error
 
-  # Linux x86_64 + aarch64 - inside the pinned image, so the toolchain is already at
-  # /usr/local and there is no Arrow rebuild. Each arch runs on its native runner and
-  # pulls the matching single-arch image. OPT-IN: see PLATFORM SCOPE in the header -
-  # the trixie glibc gives these wheels a high manylinux floor.
+  # Linux x86_64 + aarch64, each inside the manylinux_2_28 image on its native
+  # runner. The whole build is scripts/build-manylinux-wheel.sh; this job only
+  # restores and saves the Arrow + librdkafka prefix it builds.
   linux-wheels:
     name: Wheel (${{ matrix.name }})
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_linux }}
-    needs: toolchain-image
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux-x86_64
-            arch: amd64
             runner: ubuntu-24.04
             plat_arch: x86_64
           - name: linux-aarch64
-            arch: arm64
             runner: ubuntu-24.04-arm
             plat_arch: aarch64
     container:
-      image: ghcr.io/${{ github.repository_owner }}/clink-build:${{ github.sha }}-${{ matrix.arch }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      # root so we can apt-get the wheel-repair tooling; the image's default user is
-      # non-root. The baked toolchain at /usr/local is world-readable.
-      options: --user root
+      image: quay.io/pypa/manylinux_2_28_${{ matrix.plat_arch }}
     env:
-      # Resolve the pinned toolchain baked into the image, not the host path.
-      CLINK_DEPS_PREFIX: /usr/local
+      CLINK_DEPS_PREFIX: /opt/clink-deps
     steps:
       - uses: actions/checkout@v4
-
-      - name: Wheel tooling (python venv + patchelf)
-        # patchelf is auditwheel's runtime dependency; a venv sidesteps Debian's
-        # externally-managed-environment (PEP 668) restriction on system pip.
+      - name: Restore the Arrow + librdkafka prefix
+        uses: actions/cache@v4
+        with:
+          path: /opt/clink-deps
+          key: manylinux-deps-${{ matrix.plat_arch }}-${{ hashFiles('scripts/versions.env', 'scripts/build-arrow.sh', 'scripts/build-librdkafka.sh') }}
+      - name: Build, repair, gate and smoke-test the wheel
         run: |
-          set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends python3 python3-venv python3-pip patchelf
           git config --global --add safe.directory "${{ github.workspace }}"
-          python3 -m venv "${RUNNER_TEMP}/toolvenv"
-          "${RUNNER_TEMP}/toolvenv/bin/pip" install --upgrade pip build "auditwheel>=6"
-
-      - name: Build lean libclink and stage it
-        # Build the heavy library OUTSIDE the wheel build (setup.py then just
-        # copies CLINK_LIB rather than rebuilding clink_shared). The stage path is
-        # passed as an argument so nothing lands in the source tree.
-        run: bash scripts/build-libclink-wheel.sh "${RUNNER_TEMP}/libclink-staged"
-
-      - name: Build wheel
+          scripts/build-manylinux-wheel.sh "${RUNNER_TEMP}/wheelhouse"
+      - name: Gate the manylinux policy
         run: |
           set -euo pipefail
-          export CLINK_LIB="${RUNNER_TEMP}/libclink-staged"
-          "${RUNNER_TEMP}/toolvenv/bin/python" -m build --wheel \
-            --outdir "${RUNNER_TEMP}/dist" \
-            "${{ github.workspace }}/python"
-
-      - name: Repair wheel (auditwheel)
-        # Vendors Arrow's transitive .so deps into the wheel. LD_LIBRARY_PATH points
-        # at the pinned /usr/local/lib so auditwheel can resolve them. No --plat: let
-        # auditwheel derive the lowest manylinux policy the binary's glibc symbols
-        # satisfy. The next step gates that floor against MANYLINUX_TARGET.
-        run: |
-          set -euo pipefail
-          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
-          "${RUNNER_TEMP}/toolvenv/bin/auditwheel" show "${RUNNER_TEMP}"/dist/*.whl || true
-          "${RUNNER_TEMP}/toolvenv/bin/auditwheel" repair \
-            -w "${RUNNER_TEMP}/wheelhouse" \
-            "${RUNNER_TEMP}"/dist/*.whl
-          ls -l "${RUNNER_TEMP}/wheelhouse"
-
-      - name: Gate manylinux floor (warn if not broadly installable)
-        # Parse the glibc floor auditwheel stamped into the wheel name and compare
-        # it to MANYLINUX_TARGET. A floor above the target means the wheel only
-        # installs on very new distros - flag it loudly rather than let it pass for
-        # a portable wheel. Non-fatal: you opted into a trixie-built Linux wheel.
-        run: |
-          set -euo pipefail
-          whl="$(ls "${RUNNER_TEMP}"/wheelhouse/*.whl | head -1)"
-          tag="$(basename "$whl")"
-          target_major="${MANYLINUX_TARGET%%.*}"
-          target_minor="${MANYLINUX_TARGET##*.}"
-          if [[ "$tag" =~ manylinux_([0-9]+)_([0-9]+)_ ]]; then
-            gmaj="${BASH_REMATCH[1]}"; gmin="${BASH_REMATCH[2]}"
-            echo "wheel floor: manylinux_${gmaj}_${gmin}  (target manylinux_${target_major}_${target_minor})"
-            if (( gmaj > target_major || (gmaj == target_major && gmin > target_minor) )); then
-              echo "::warning title=Non-portable Linux wheel::${tag} requires glibc ${gmaj}.${gmin} (manylinux_${gmaj}_${gmin}), above the manylinux_${target_major}_${target_minor} target. It installs only on very new distros. To publish portable Linux wheels, rebuild the toolchain on a manylinux_2_28/_2_34 base. See the wheels.yml header and python/README.md."
-            fi
-          elif [[ "$tag" =~ linux_ ]]; then
-            echo "::warning title=Unrepaired Linux wheel::${tag} kept a bare linux_ tag - auditwheel did not assign a manylinux policy. It is not installable via pip's platform matching."
-          else
-            echo "::warning::could not parse a manylinux tag from ${tag}"
-          fi
-
-      - name: Install + test in a fresh venv (bundled lib)
-        run: |
-          set -euo pipefail
-          python3 -m venv "${RUNNER_TEMP}/testvenv"
-          . "${RUNNER_TEMP}/testvenv/bin/activate"
-          pip install --upgrade pip
-          pip install "${RUNNER_TEMP}"/wheelhouse/*.whl pytest
-          unset CLINK_LIB
-          # Gate: with CLINK_LIB unset, Engine() must load the library bundled in the
-          # wheel and run a real job end to end - the proof the wheel is self-contained.
-          ( cd "${RUNNER_TEMP}" && python "${{ github.workspace }}/python/tests/wheel_smoke.py" )
-          # Functional suite, driven against the wheel's own vendored library.
-          export CLINK_LIB="$(python -c 'import os,pyclink;print(os.path.join(os.path.dirname(pyclink.__file__),"libclink.so"))')"
-          pytest "${{ github.workspace }}/python/tests" -q
-
+          tag="$(basename "$(ls "${RUNNER_TEMP}"/wheelhouse/*.whl | head -1)")"
+          want="manylinux_${MANYLINUX_TARGET/./_}_${{ matrix.plat_arch }}"
+          echo "wheel: ${tag}  (want ${want})"
+          [[ "${tag}" == *"${want}"* ]] || { echo "::error::${tag} is not ${want}"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
           path: ${{ runner.temp }}/wheelhouse/*.whl
           if-no-files-found: error
 
+  # The same wheels installed where users install them: a stock runner, outside the
+  # build image, with pip and PyPI's pyarrow.
+  linux-wheels-verify:
+    name: Verify (${{ matrix.name }} on Ubuntu 22.04)
+    needs: linux-wheels
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+          - name: linux-aarch64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: wheelhouse
+      - name: Install in a fresh venv and smoke-test
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/v"
+          "${RUNNER_TEMP}/v/bin/pip" install --upgrade pip
+          "${RUNNER_TEMP}/v/bin/pip" install wheelhouse/*.whl pyarrow
+          unset CLINK_LIB
+          ( cd "${RUNNER_TEMP}" && "${RUNNER_TEMP}/v/bin/python" "${{ github.workspace }}/python/tests/wheel_smoke.py" )
+
   # Gather every platform wheel that was built into one downloadable artifact.
-  # Runs whenever the macOS wheel succeeded; tolerates Linux being skipped
-  # (opt-in) or failed.
+  # Runs whenever the macOS wheel succeeded, so a failed Linux build does not
+  # hold back the macOS wheel (its failure still fails the run).
   collect:
     name: Gather wheels
     needs: [macos-wheel, linux-wheels]

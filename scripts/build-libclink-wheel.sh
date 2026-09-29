@@ -43,8 +43,38 @@ fi
 # not-found, so clink falls back to Arrow's bundled zstd (build-scope only, which
 # is exactly right for a wheel: nothing downstream find_package()s this build).
 ZSTD_ARG=""
+ZSTD_INC_ARG=""
 if [[ -n "${CLINK_ZSTD_LIBRARY:-}" ]]; then
     ZSTD_ARG="-DCLINK_ZSTD_LIBRARY=${CLINK_ZSTD_LIBRARY}"
+fi
+# Deps prefix, resolved the way CMake resolves it (scripts/versions.env).
+DEPS_PREFIX="${CLINK_DEPS_PREFIX:-${HOME}/.clink-deps}"
+# On Linux there is no system zstd header to fall back on: default to Arrow's own
+# bundled zstd, which scripts/build-arrow.sh installs under <prefix>/zstd-bundled.
+if [[ "$(uname -s)" == "Linux" && -z "${CLINK_ZSTD_LIBRARY:-}" &&
+      -f "${DEPS_PREFIX}/zstd-bundled/lib/libzstd.a" ]]; then
+    ZSTD_ARG="-DCLINK_ZSTD_LIBRARY=${DEPS_PREFIX}/zstd-bundled/lib/libzstd.a"
+    ZSTD_INC_ARG="-DCLINK_ZSTD_INCLUDE_DIR=${DEPS_PREFIX}/zstd-bundled/include"
+fi
+# CLINK_WHEEL_KAFKA=1: the connector impls on, with Kafka the ONLY one, against the
+# static librdkafka scripts/build-librdkafka.sh stages under <prefix>/rdkafka-static.
+# Every other CLINK_WITH_* is switched off by name, read from the build itself so a
+# connector added later cannot join the wheel on AUTO (RocksDB, the always-built
+# state backend, is left as it is).
+IMPL_ARGS=("-DCLINK_BUILD_IMPLS=OFF")
+if [[ "${CLINK_WHEEL_KAFKA:-0}" == "1" ]]; then
+    RDK="${DEPS_PREFIX}/rdkafka-static"
+    if [[ ! -f "${RDK}/lib/librdkafka.a" ]]; then
+        echo "build-libclink-wheel: CLINK_WHEEL_KAFKA=1 needs ${RDK} (run scripts/build-librdkafka.sh)" >&2
+        exit 1
+    fi
+    IMPL_ARGS=("-DCLINK_BUILD_IMPLS=ON" "-DCLINK_WITH_KAFKA=ON"
+               "-DCMAKE_DISABLE_FIND_PACKAGE_RdKafka=ON" "-DCMAKE_PREFIX_PATH=${DEPS_PREFIX};${RDK}")
+    while read -r opt; do
+        case "${opt}" in CLINK_WITH_KAFKA|CLINK_WITH_ROCKSDB) ;; *) IMPL_ARGS+=("-D${opt}=OFF") ;; esac
+    done < <(cd "${ROOT}" && grep -hoE 'CLINK_WITH_[A-Z0-9_]+' CMakeLists.txt impls/*/CMakeLists.txt | sort -u)
+    # The impl's pkg-config tier must not find a shared librdkafka either.
+    export PKG_CONFIG_PATH=""
 fi
 # On Linux the static Arrow must be linked into clink_core itself
 # (CLINK_STATIC_ARROW): GNU ld reads each archive once, so the shared Arrow on
@@ -57,12 +87,13 @@ fi
 cmake -S "${ROOT}" -B "${BUILD}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCLINK_BUILD_SQL=ON \
-    -DCLINK_BUILD_IMPLS=OFF \
+    "${IMPL_ARGS[@]}" \
     -DCLINK_BUILD_TESTS=OFF \
     -DCLINK_BUILD_EXAMPLES=OFF \
     -DCLINK_HTTP_TLS=OFF \
     ${OSX_ARG:+"${OSX_ARG}"} \
     ${ZSTD_ARG:+"${ZSTD_ARG}"} \
+    ${ZSTD_INC_ARG:+"${ZSTD_INC_ARG}"} \
     ${STATIC_ARG:+"${STATIC_ARG}"}
 cmake --build "${BUILD}" --target clink_shared --parallel "${JOBS}"
 

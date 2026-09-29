@@ -217,5 +217,16 @@ cmake -S "${SRC_DIR}/cpp" -B "${BUILD_DIR}" \
 echo "build-arrow: building with ${JOBS} jobs (this is the long pole - bundled aws-sdk etc.)"
 cmake --build "${BUILD_DIR}" --parallel "${JOBS}"
 cmake --install "${BUILD_DIR}"
+# Arrow's bundled zstd, kept where the self-contained libclink build can find it:
+# clink_core needs zstd.h and a zstd library for its compressing log sink, and a
+# manylinux image has neither. Its own directory, not lib/, so no ordinary build's
+# find_library picks it up by accident (scripts/build-libclink-wheel.sh points at it).
+ZSTD_EP="${BUILD_DIR}/zstd_ep-install"
+if [ -f "${ZSTD_EP}/lib/libzstd.a" ]; then
+    rm -rf "${PREFIX}/zstd-bundled"
+    mkdir -p "${PREFIX}/zstd-bundled/lib" "${PREFIX}/zstd-bundled/include"
+    cp "${ZSTD_EP}/lib/libzstd.a" "${PREFIX}/zstd-bundled/lib/"
+    cp "${ZSTD_EP}"/include/zstd*.h "${PREFIX}/zstd-bundled/include/"
+fi
 echo "${stamp_want}" > "${stamp_file}"
 echo "build-arrow: installed Arrow + Parquet ${ARROW_VERSION} (object stores=${ARROW_OBJ_SETTING}) -> ${PREFIX}"

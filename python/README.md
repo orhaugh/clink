@@ -16,12 +16,18 @@ pip install pyclink-<version>-py3-none-macosx_14_0_arm64.whl
 ```
 
 pyclink is not yet published to PyPI. Wheels are produced by
-`.github/workflows/wheels.yml` and attached to CI runs as artifacts: macOS
-arm64 wheels are built and smoke-tested on every release tag. Linux wheels
-are opt-in and currently carry a high glibc floor (built on the project's
-toolchain image), so they are not broadly installable yet; on Linux, and on
-any platform without a wheel, use the build-from-source path below. There is
-no Windows wheel.
+`.github/workflows/wheels.yml` on every release tag and attached to the run
+as artifacts:
+
+- macOS arm64 (`macosx_14_0_arm64`), without connectors.
+- Linux x86_64 and aarch64 (`manylinux_2_28`), with the Kafka connector.
+  They install on any glibc 2.28 or later distribution (AlmaLinux 8,
+  Debian 10+, Ubuntu 20.04+) and need nothing beyond the C and C++ runtime.
+
+None of the wheels has the object-store filesystems or HTTPS, and the Linux
+Kafka connector leaves out GSSAPI and the Schema Registry formats; build
+from source (below) for those, or on a platform without a wheel. There is no
+Windows wheel.
 
 ## Build from source
 

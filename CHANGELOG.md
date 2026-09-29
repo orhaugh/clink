@@ -16,8 +16,21 @@ vendors nothing, and passed its smoke test and a live Kafka round trip on
 AlmaLinux 8, Debian bookworm-slim and Ubuntu 22.04. The option refuses to
 configure alongside tests or examples, whose job modules would each carry their
 own Arrow. `scripts/build-arrow.sh` now also refuses OpenSSL on Linux whenever
-the object stores are off, as it already did on macOS. Publishing Linux wheels
-still needs a CI job on the manylinux image.
+the object stores are off, as it already did on macOS.
+
+**Linux wheels with the Kafka connector, built on every tag.** The wheels
+workflow now builds x86_64 and aarch64 wheels inside
+`quay.io/pypa/manylinux_2_28_<arch>` on each architecture's native runner,
+replacing the opt-in build on the Debian toolchain image whose glibc gave the
+wheels a floor too high to install on mainstream distributions. The build is
+one script, `scripts/build-manylinux-wheel.sh`, so it runs the same way
+locally: the pinned Arrow with the object stores off, the pinned librdkafka as
+static archives (`scripts/build-librdkafka.sh`, a new `LIBRDKAFKA_VERSION`
+pin), libclink with SQL and Kafka only (`CLINK_WHEEL_KAFKA=1`), auditwheel,
+and a new gate, `scripts/check-wheel-self-contained.py`, that fails the job if
+anything was vendored or libclink needs more than the C and C++ runtime. A
+second job installs each wheel on a stock Ubuntu 22.04 runner and runs the
+smoke test there. pyclink is not yet on PyPI.
 
 ## v0.9.0 (September 2026)
 
