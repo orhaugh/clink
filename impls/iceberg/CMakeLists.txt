@@ -80,7 +80,9 @@ foreach(_ice_tgt IN ITEMS iceberg::iceberg_static iceberg::iceberg_data_static
                           iceberg::iceberg_bundle_static)
     if(TARGET ${_ice_tgt})
         get_target_property(_ice_link ${_ice_tgt} INTERFACE_LINK_LIBRARIES)
-        if(_ice_link)
+        # Under CLINK_STATIC_ARROW clink_core itself links the static Arrow, so the
+        # static interface is already the process's one runtime; leave it.
+        if(_ice_link AND NOT CLINK_STATIC_ARROW)
             string(REPLACE "Arrow::arrow_static" "Arrow::arrow_shared" _ice_link "${_ice_link}")
             string(REPLACE "Parquet::parquet_static" "Parquet::parquet_shared" _ice_link
                            "${_ice_link}")

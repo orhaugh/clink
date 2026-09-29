@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+**libclink links Arrow statically on Linux, so a manylinux wheel is
+self-contained.** A new `CLINK_STATIC_ARROW` option makes `clink_core` link
+Arrow, Parquet and the compute kernels statically, and `clink_shared` links
+with `--as-needed`; `scripts/build-libclink-wheel.sh` turns it on for Linux.
+Without it, GNU ld let the shared Arrow on `clink_core`'s interface resolve the
+symbols later members needed, so a Linux libclink loaded `libarrow.so` beside
+its static copy, auditwheel vendored about 43 MB of Arrow into the wheel, and
+the vendored Arrow's `libatomic.so.1` stopped it loading on slim images. With
+the option, a libclink built on `manylinux_2_28` with the Kafka connector needs
+only glibc, libstdc++ and libgcc_s; its wheel tags `manylinux_2_28_aarch64`,
+vendors nothing, and passed its smoke test and a live Kafka round trip on
+AlmaLinux 8, Debian bookworm-slim and Ubuntu 22.04. The option refuses to
+configure alongside tests or examples, whose job modules would each carry their
+own Arrow. `scripts/build-arrow.sh` now also refuses OpenSSL on Linux whenever
+the object stores are off, as it already did on macOS. Publishing Linux wheels
+still needs a CI job on the manylinux image.
+
 ## v0.9.0 (September 2026)
 
 The exactly-once protocol under a machine-checked specification, Schema

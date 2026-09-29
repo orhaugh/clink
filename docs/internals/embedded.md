@@ -201,6 +201,19 @@ wheel build and handed to `setup.py` via `CLINK_LIB`
 (`scripts/build-libclink-wheel.sh`); the wheel then simply copies it. The CI
 that produces the wheels and their platform scope is `.github/workflows/wheels.yml`.
 
+On Linux the script also sets `CLINK_STATIC_ARROW`, which makes `clink_core`
+itself link Arrow, Parquet and the compute kernels statically and links
+`clink_shared` with `--as-needed`. Linking the static archives into
+`clink_shared` alone is not enough there: GNU ld reads each archive once, so the
+shared Arrow on `clink_core`'s interface resolved every symbol a later member
+needed, libclink ended up loading `libarrow.so` beside its static copy, and the
+Arrow libraries brought `libatomic.so.1`, which slim images do not ship. (macOS
+never showed this: ld64 rescans archives and `-dead_strip_dylibs` drops the unused
+dylibs.) With the option, a libclink built on `manylinux_2_28` needs only glibc,
+libstdc++ and libgcc_s, and auditwheel vendors nothing. The option refuses to
+configure alongside tests or examples, whose job modules would each carry their
+own Arrow copy.
+
 ### The Flight SQL endpoint
 
 `clink flight-sql` (or `ClinkFlightSqlServer` from

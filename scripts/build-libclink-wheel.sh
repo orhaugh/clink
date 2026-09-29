@@ -46,6 +46,14 @@ ZSTD_ARG=""
 if [[ -n "${CLINK_ZSTD_LIBRARY:-}" ]]; then
     ZSTD_ARG="-DCLINK_ZSTD_LIBRARY=${CLINK_ZSTD_LIBRARY}"
 fi
+# On Linux the static Arrow must be linked into clink_core itself
+# (CLINK_STATIC_ARROW): GNU ld reads each archive once, so the shared Arrow on
+# clink_core's interface would otherwise win and auditwheel would vendor it,
+# putting two Arrow copies in one process. macOS keeps the dead-strip route.
+STATIC_ARG=""
+if [[ "$(uname -s)" == "Linux" ]]; then
+    STATIC_ARG="-DCLINK_STATIC_ARROW=ON"
+fi
 cmake -S "${ROOT}" -B "${BUILD}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCLINK_BUILD_SQL=ON \
@@ -54,7 +62,8 @@ cmake -S "${ROOT}" -B "${BUILD}" \
     -DCLINK_BUILD_EXAMPLES=OFF \
     -DCLINK_HTTP_TLS=OFF \
     ${OSX_ARG:+"${OSX_ARG}"} \
-    ${ZSTD_ARG:+"${ZSTD_ARG}"}
+    ${ZSTD_ARG:+"${ZSTD_ARG}"} \
+    ${STATIC_ARG:+"${STATIC_ARG}"}
 cmake --build "${BUILD}" --target clink_shared --parallel "${JOBS}"
 
 LIB="$(find "${BUILD}" \( -name libclink.dylib -o -name libclink.so \) -type f | head -1)"

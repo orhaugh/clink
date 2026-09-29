@@ -83,6 +83,13 @@ option(CLINK_BUILD_IMPLS    "Build the connector/backend impls" ON)
 # artifact needs, since the OpenSSL a build finds on macOS is a Homebrew bottle
 # pinned to the build host's OS version. See the httplib block below.
 option(CLINK_HTTP_TLS       "Enable HTTPS in the HTTP subsystem (links OpenSSL)" ON)
+# Link Arrow, Parquet and the compute kernels STATICALLY into clink_core, for a
+# self-contained libclink (the Linux pyclink wheel). The default links the shared
+# libraries, which is what job plugins need: each dlopen'd module then shares the
+# process's one Arrow. With this on, every module linking clink::core would carry its
+# own Arrow copy (two memory pools, two type registries), so it is refused alongside
+# the tests and examples, which build such modules.
+option(CLINK_STATIC_ARROW   "Link Arrow/Parquet/compute statically into clink_core (self-contained libclink only)" OFF)
 option(CLINK_BUILD_BENCH    "Build clink benchmarks (placeholder)" OFF)
 option(CLINK_BUILD_HTTP     "Build the HTTP subsystem (cluster dashboard + JSON API)" ON)
 # SQL frontend: parser (libpg_query), binder, logical/physical planner,
@@ -649,7 +656,25 @@ if(CLINK_PINNED_ARROW_VERSION AND NOT ARROW_VERSION VERSION_EQUAL "${CLINK_PINNE
         "(scripts/build-arrow.sh) and put CLINK_DEPS_PREFIX on the search path, "
         "or update scripts/versions.env if the bump is intentional.")
 endif()
-target_link_libraries(clink_core PUBLIC Arrow::arrow_shared)
+if(CLINK_STATIC_ARROW)
+    if(CLINK_BUILD_TESTS OR CLINK_BUILD_EXAMPLES)
+        message(FATAL_ERROR
+            "CLINK_STATIC_ARROW=ON builds job modules that would each carry their own "
+            "Arrow; turn CLINK_BUILD_TESTS and CLINK_BUILD_EXAMPLES off (it is meant for "
+            "the self-contained libclink, e.g. scripts/build-libclink-wheel.sh).")
+    endif()
+    if(NOT TARGET Arrow::arrow_static)
+        message(FATAL_ERROR "CLINK_STATIC_ARROW=ON but this Arrow has no static library")
+    endif()
+    # Static rather than shared here, not only on clink_shared: GNU ld reads each
+    # archive once, so a shared Arrow anywhere on clink_core's interface wins every
+    # symbol a later member needs, and libclink ends up loading libarrow.so after all
+    # (macOS hid that: ld64 rescans archives and -dead_strip_dylibs drops the unused
+    # dylibs).
+    target_link_libraries(clink_core PUBLIC Arrow::arrow_static)
+else()
+    target_link_libraries(clink_core PUBLIC Arrow::arrow_shared)
+endif()
 target_compile_definitions(clink_core PUBLIC CLINK_HAS_ARROW=1)
 message(STATUS "clink::core - Arrow v${ARROW_VERSION} (pinned ${CLINK_PINNED_ARROW_VERSION})")
 
@@ -676,7 +701,14 @@ find_package(ArrowCompute QUIET)
 set(CLINK_ARROW_COMPUTE_FOUND OFF)
 if(TARGET ArrowCompute::arrow_compute_shared)
     set(CLINK_ARROW_COMPUTE_FOUND ON)
-    target_link_libraries(clink_core PUBLIC ArrowCompute::arrow_compute_shared)
+    if(CLINK_STATIC_ARROW)
+        if(NOT TARGET ArrowCompute::arrow_compute_static)
+            message(FATAL_ERROR "CLINK_STATIC_ARROW=ON but Arrow compute has no static library")
+        endif()
+        target_link_libraries(clink_core PUBLIC ArrowCompute::arrow_compute_static)
+    else()
+        target_link_libraries(clink_core PUBLIC ArrowCompute::arrow_compute_shared)
+    endif()
     target_compile_definitions(clink_core PUBLIC CLINK_HAS_ARROW_COMPUTE=1)
     message(STATUS "clink::core - Arrow compute kernels available (arrow_compute)")
 else()
@@ -687,7 +719,14 @@ endif()
 # (Homebrew, apt, conda). Required by the ParquetSink/Source built-ins
 # and the snapshot/wire layers that share the same batcher seam.
 find_package(Parquet REQUIRED)
-target_link_libraries(clink_core PUBLIC Parquet::parquet_shared)
+if(CLINK_STATIC_ARROW)
+    if(NOT TARGET Parquet::parquet_static)
+        message(FATAL_ERROR "CLINK_STATIC_ARROW=ON but this Parquet has no static library")
+    endif()
+    target_link_libraries(clink_core PUBLIC Parquet::parquet_static)
+else()
+    target_link_libraries(clink_core PUBLIC Parquet::parquet_shared)
+endif()
 target_compile_definitions(clink_core PUBLIC CLINK_HAS_PARQUET=1)
 message(STATUS "clink::core - Parquet enabled")
 
@@ -1262,7 +1301,11 @@ set_target_properties(clink_all PROPERTIES EXPORT_NAME clink)
 # Arrow ships Flight SQL (Homebrew and the Docker image both do).
 if(TARGET clink::embed)
     find_package(ArrowFlightSql QUIET)
-    if(ArrowFlightSql_FOUND AND TARGET ArrowFlightSql::arrow_flight_sql_shared)
+    # Flight SQL is linked shared, so it would bring the shared Arrow back beside a
+    # static one; a self-contained libclink goes without it.
+    if(CLINK_STATIC_ARROW)
+        message(STATUS "clink::flightsql - skipped (CLINK_STATIC_ARROW links Arrow statically)")
+    elseif(ArrowFlightSql_FOUND AND TARGET ArrowFlightSql::arrow_flight_sql_shared)
         add_library(clink_flightsql STATIC src/embed/flight_sql_server.cpp)
         target_link_libraries(clink_flightsql
             PUBLIC clink::embed ArrowFlightSql::arrow_flight_sql_shared)
@@ -1311,6 +1354,12 @@ if(TARGET clink::embed)
         endif()
         if(APPLE)
             target_link_options(clink_shared PRIVATE "LINKER:-dead_strip_dylibs")
+        elseif(CLINK_STATIC_ARROW)
+            # The static Arrow's interface names libatomic (and zlib) whether or not
+            # the objects actually linked reference them. --as-needed drops what
+            # nothing uses, so libclink does not require a libatomic.so.1 that slim
+            # images do not ship.
+            target_link_options(clink_shared PRIVATE "LINKER:--as-needed")
         endif()
         message(STATUS "libclink - self-contained (static Arrow/Parquet)")
     else()

@@ -157,9 +157,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
         #    '/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib' ... newer version 26.0"
         # Nothing in this configuration needs OpenSSL - the object stores are off and
         # Parquet compiles its encryption_internal_nossl variant - so refuse the
-        # find outright. CMake's per-package disable is the narrowest lever that
-        # covers Arrow AND everything it configures beneath it.
-        EXTRA_ARGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON)
+        # find outright (below, on every platform).
     fi
     # Pin the macOS floor when set (CI builds portable wheels): the static Arrow
     # objects linked into a self-contained libclink must not pin minos above the
@@ -167,6 +165,16 @@ if [ "$(uname -s)" = "Darwin" ]; then
     if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
         EXTRA_ARGS+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}")
     fi
+fi
+
+# With the object stores off nothing in Arrow needs OpenSSL (Parquet compiles its
+# encryption_internal_nossl variant), and a system OpenSSL found anyway would be
+# linked through the bundled Thrift into the static Arrow bundle: a Homebrew bottle
+# pins the macOS floor above the wheel's tag, and a manylinux image's OpenSSL is a
+# shared library the self-contained libclink must not need. CMake's per-package
+# disable is the narrowest lever that covers Arrow and everything it configures.
+if [ "${ARROW_OBJ_SETTING}" = "OFF" ]; then
+    EXTRA_ARGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON)
 fi
 
 echo "build-arrow: configuring (BUNDLED data-path deps, SYSTEM aws-sdk, Parquet+Compute, object stores=${ARROW_OBJ_SETTING}) -> ${PREFIX}"
