@@ -58,7 +58,7 @@ Notes:
 
 - The source accepts `base_url`, `path`, `user`, `delegation_token`, `verify_tls`, `connect_timeout_ms` and `rw_timeout_ms`. `permission` applies to the sink only.
 - The sink's `Options` struct also carries a `compression` field defaulting to `parquet::Compression::ZSTD`; this is not parsed from `BuildContext` and so is fixed to the default through the factory path.
-- A sink's `path` is an HDFS directory. Each subtask writes part files named `sub<N>-<run>-<seq>.parquet` into it, so parallel subtasks and successive runs never write the same file (`make_sink` in `register_factories.cpp`). Read them back with the source's `prefix`.
+- A sink's `path` is an HDFS directory. Each subtask writes part files named `sub<N>-<run>-<seq>.parquet` into it, so parallel subtasks and successive runs never write the same file (`make_sink` in `register_factories.cpp`). Read them back with a source on the same `path` (a `path` naming a directory reads every part in it) or with `prefix`. A relative path is taken from the HDFS root.
 
 ## SQL usage
 
@@ -142,7 +142,7 @@ The source reports `is_bounded() == true`: it reads a single Parquet object to i
 
 ## Limitations
 
-- The source reads one Parquet file with `path`, or every matching file under `prefix` (an HDFS directory). With `prefix`, `WebHdfsMultiObjectParquetSource` enumerates the directory via a `LISTSTATUS` call, sorts the files, and shards them round-robin across subtasks (file `i` is read by subtask `i % parallelism`), reading each through the single-object source. Optional param: `suffix` (default `.parquet`). The directory listing is non-recursive (`LISTSTATUS` direct children only) and there is no cross-file replay.
+- The source reads one Parquet file with `path`, or every matching file under `prefix` (an HDFS directory), or under `path` when `path` names a directory (the factory checks with `GETFILESTATUS` when it builds the source). With `prefix`, `WebHdfsMultiObjectParquetSource` enumerates the directory via a `LISTSTATUS` call, sorts the files, and shards them round-robin across subtasks (file `i` is read by subtask `i % parallelism`), reading each through the single-object source. Optional param: `suffix` (default `.parquet`). The directory listing is non-recursive (`LISTSTATUS` direct children only) and there is no cross-file replay.
 - WebHDFS has no incremental upload, so a part is buffered in memory until it closes: one checkpoint interval's output per subtask (a job without checkpointing buffers its whole output).
 - The default sink (`path`, a directory of part files) is at-least-once; the `prefix` 2PC sink is exactly-once (atomic HDFS RENAME on checkpoint commit).
 - Record channels are limited to the registered `int64` and `string` types.

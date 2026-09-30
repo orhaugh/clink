@@ -173,6 +173,14 @@ public:
         commit_receipt_dir_ = std::move(dir);
         restore_from_checkpoint_id_ = restore_from_ckpt;
     }
+    // The checkpoint this run restored from, set on every run whether or not
+    // receipts are on: a sink that keeps output across a restore (a file sink
+    // appending, a rolling Parquet sink keeping its parts) must see a restore as
+    // a restore even without a checkpoint directory (a savepoint restore into a
+    // job that takes no checkpoints of its own). 0 = fresh start.
+    void set_restore_from_checkpoint_id(std::uint64_t restore_from_ckpt) noexcept {
+        restore_from_checkpoint_id_ = restore_from_ckpt;
+    }
     const std::string& commit_receipt_dir() const noexcept { return commit_receipt_dir_; }
     std::uint64_t restore_from_checkpoint_id() const noexcept {
         return restore_from_checkpoint_id_;

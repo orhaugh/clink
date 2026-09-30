@@ -1,7 +1,7 @@
 // Typed S3 Parquet sink helper. The existing `s3_text_sink` /
 // `s3_parquet_int64_sink` / `s3_parquet_string_sink` factories cover
-// the built-in channel types; this free function lets a user wire a
-// `ParquetS3Sink<T>` for ANY registered channel type T by supplying a
+// the built-in channel types; this free function lets a user wire an S3
+// Parquet sink for ANY registered channel type T by supplying a
 // `Codec<T>` (the default Arrow batcher wraps codec bytes into a
 // single `value_bytes:binary` column; users that want a typed Arrow
 // schema can supply their own `ArrowBatcher<T>` instead).
@@ -11,13 +11,17 @@
 //       my_stream,
 //       clink::s3::ParquetSinkOptions{
 //           .bucket = "my-bucket",
-//           .key = "2026/05/17/0001.parquet",
+//           .key = "events/2026/05/17",   // a prefix of part objects
 //           .endpoint_override = "http://minio:9000",
 //       },
 //       my_record_codec());  // Codec<MyRecord>, default binary framing
 //
-// Internally: registers a typed `ParquetS3Sink<T>` factory under a
-// minted op_type via PluginRegistry::register_sink<T>, then appends a
+// Internally: registers a typed sink factory under a minted op_type via
+// PluginRegistry::register_sink<T> (a ParquetRollingSink writing part
+// objects under `key`, or with a bucket_assigner the single-object
+// ParquetS3Sink per assigned key, which finishes each object only at close:
+// after a restore such an object holds only the rows written since), then
+// appends a
 // SinkDescriptor referencing that op_type on the stream's env. Same
 // pattern as the M6 typed Kafka / ClickHouse helpers.
 
@@ -26,11 +30,13 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "clink/api/descriptors.hpp"
 #include "clink/api/pipeline.hpp"
+#include "clink/connectors/parquet_rolling_sink.hpp"
 #include "clink/connectors/parquet_s3_sink.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"
@@ -42,7 +48,8 @@ namespace clink::s3 {
 
 struct ParquetSinkOptions {
     std::string bucket;
-    std::string key;                // e.g. "events/2026/05/17/0001.parquet"
+    std::string key;                // a prefix of part objects, e.g. "events/2026/05/17";
+                                    // with a bucket_assigner, the assigner names each object
     std::string region;             // empty = default chain
     std::string endpoint_override;  // empty = AWS public endpoint
 };
@@ -112,14 +119,37 @@ inline void parquet_sink(clink::api::DataStream<T> stream,
                     }
                     return k + "." + std::to_string(subtask_idx);
                 };
-            } else if (ctx.parallelism > 1) {
-                // Per-subtask key suffix when running parallelism > 1, so
-                // each subtask writes to a distinct object. Mirrors the
-                // `s3_parquet_int64_sink` / `s3_parquet_string_sink`
-                // behaviour at register_factories.cpp.
-                o.key += "." + std::to_string(ctx.subtask_idx) + ".parquet";
+                return std::make_shared<clink::ParquetS3Sink<T>>(std::move(o), batcher);
             }
-            return std::make_shared<clink::ParquetS3Sink<T>>(std::move(o), batcher);
+            // Without an assigner, `key` names a prefix of part objects
+            // (ParquetRollingSink), as the s3_parquet_int64_sink /
+            // s3_parquet_string_sink factories do: one complete object per
+            // subtask per checkpoint interval, kept across a restore.
+            typename clink::ParquetRollingSink<T>::Options ro;
+            ro.dir = opts.bucket + "/" + opts.key;
+            ro.subtask_idx = ctx.subtask_idx;
+            ro.parallelism = ctx.parallelism;
+            auto fs_factory =
+                [region = opts.region,
+                 endpoint = opts.endpoint_override]() -> std::shared_ptr<arrow::fs::FileSystem> {
+                clink::detail::ensure_arrow_s3_initialised();
+                auto s3_opts = arrow::fs::S3Options::Defaults();
+                if (!region.empty()) {
+                    s3_opts.region = region;
+                }
+                if (!endpoint.empty()) {
+                    s3_opts.endpoint_override = endpoint;
+                    s3_opts.scheme = "http";  // localstack/MinIO default, as ParquetS3Sink
+                }
+                auto fs = arrow::fs::S3FileSystem::Make(s3_opts);
+                if (!fs.ok()) {
+                    throw std::runtime_error("s3 typed parquet sink: S3FileSystem::Make: " +
+                                             fs.status().ToString());
+                }
+                return *fs;
+            };
+            return std::make_shared<clink::ParquetRollingSink<T>>(
+                std::move(fs_factory), std::move(ro), batcher, "s3_parquet_typed_sink");
         });
     clink::api::SinkDescriptor desc;
     desc.op_type = op_type;

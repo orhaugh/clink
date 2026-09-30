@@ -1062,3 +1062,68 @@ TEST(EmbeddedEngine, AResumedRunKeepsThePlainParquetSinksEarlierOutput) {
     EXPECT_EQ(rows_on_disk(), 5) << "the resumed run must keep what the first run wrote";
     fs::remove_all(dir);
 }
+
+// A parquet table reads a directory of parts by column name, as it reads one
+// file: a table declaring fewer columns, in another order, reads the parts a
+// wider table wrote.
+TEST(EmbeddedEngine, AParquetDirectoryIsReadByColumnName) {
+    const auto dir = resume_scratch("pqbyname");
+    const auto in_path = dir / "in.ndjson";
+    const auto pq_path = dir / "pq";
+    write_lines(in_path,
+                {R"({"user_id":1,"name":"a","amount":10})",
+                 R"({"user_id":2,"name":"b","amount":20})",
+                 R"({"user_id":3,"name":"c","amount":30})"});
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(engine.execute_script("CREATE TABLE evt (user_id BIGINT, name TEXT, amount BIGINT) "
+                                    "WITH (connector='file', format='json', path='" +
+                                    in_path.string() +
+                                    "');"
+                                    "CREATE TABLE pq_w (user_id BIGINT, name TEXT, amount BIGINT) "
+                                    "WITH (connector='parquet', path='" +
+                                    pq_path.string() +
+                                    "');"
+                                    "INSERT INTO pq_w SELECT user_id, name, amount FROM evt"),
+              0)
+        << err.str();
+    ASSERT_TRUE(engine.await_all()) << err.str();
+    ASSERT_TRUE(fs::is_directory(pq_path));
+
+    ASSERT_EQ(engine.execute_script("CREATE TABLE pq_r (amount BIGINT, user_id BIGINT) "
+                                    "WITH (connector='parquet', path='" +
+                                    pq_path.string() +
+                                    "');"
+                                    "CREATE TABLE got (amount BIGINT, user_id BIGINT) "
+                                    "WITH (connector='collect');"
+                                    "INSERT INTO got SELECT amount, user_id FROM pq_r"),
+              0)
+        << err.str();
+    auto reader = engine.collect_reader("got").ValueOrDie();
+    std::int64_t rows = 0;
+    std::int64_t amount_sum = 0;
+    std::int64_t id_sum = 0;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        ASSERT_TRUE(reader->ReadNext(&batch).ok());
+        if (!batch) {
+            break;
+        }
+        const auto amounts =
+            std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("amount"));
+        const auto ids =
+            std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("user_id"));
+        for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+            amount_sum += amounts->Value(i);
+            id_sum += ids->Value(i);
+        }
+        rows += batch->num_rows();
+    }
+    EXPECT_TRUE(engine.await_all()) << err.str();
+    EXPECT_EQ(rows, 3);
+    EXPECT_EQ(amount_sum, 60);
+    EXPECT_EQ(id_sum, 6);
+    fs::remove_all(dir);
+}

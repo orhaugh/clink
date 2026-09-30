@@ -184,6 +184,10 @@ void LocalExecutor::start() {
             contexts_.back()->set_commit_receipts(config_.commit_receipt_dir,
                                                   config_.restore_from_checkpoint_id);
         }
+        // The restore point reaches every task whether or not receipts are on:
+        // sinks that keep their output across a restore decide on it, and a
+        // savepoint restore can run with no checkpoint directory at all.
+        contexts_.back()->set_restore_from_checkpoint_id(config_.restore_from_checkpoint_id);
         auto* ctx_ptr = contexts_.back().get();
         auto run_fn = runner.run;
         auto op_name = runner.name;

@@ -12485,18 +12485,6 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error("parquet_row_source: 'path' param is required");
             }
             auto cols = parse_row_schema(ctx.param_or("schema_columns"));
-            // A directory (what the rolling parquet_row_sink writes) is read whole:
-            // the multi-file reader requires each file's schema to match the
-            // batcher's, so the projection narrowing below applies to one file
-            // only. The downstream projection still trims the columns.
-            if (auto dir =
-                    make_local_parquet_directory_source<Row>(path,
-                                                             ctx.subtask_idx,
-                                                             ctx.parallelism,
-                                                             make_row_columnar_arrow_batcher(cols),
-                                                             "parquet_row_source")) {
-                return dir;
-            }
             if (const auto csv = ctx.param_or("projected_columns"); !csv.empty()) {
                 std::set<std::string> wanted;
                 std::size_t pos = 0;
@@ -12528,6 +12516,16 @@ void install(clink::plugin::PluginRegistry& reg) {
                         cols = std::move(narrowed);
                     }
                 }
+            }
+            // A directory (what the rolling parquet_row_sink writes) reads every
+            // part, with the same by-name projection as one file.
+            if (auto dir =
+                    make_local_parquet_directory_source<Row>(path,
+                                                             ctx.subtask_idx,
+                                                             ctx.parallelism,
+                                                             make_row_columnar_arrow_batcher(cols),
+                                                             "parquet_row_source")) {
+                return dir;
             }
             return std::make_shared<ParquetSource<Row>>(
                 path, make_row_columnar_arrow_batcher(std::move(cols)), "parquet_row_source");

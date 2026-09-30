@@ -30,18 +30,29 @@
 // this run's parallelism, which no subtask of this run would otherwise clear.
 // Only names matching the part pattern are touched.
 //
-// Where a file is visible under its name while it is being written (a local
-// disk, WebHDFS) a part is written to <name>.inprogress and renamed into place
-// when it is complete, so a kill mid-write never leaves a torn .parquet file;
-// leftover .inprogress files are removed at the next open. An object store
-// publishes an object only when its upload completes, so parts stream to their
-// final key. Either way nothing is buffered beyond what the
-// Parquet writer holds for its current row group.
+// A part appears under its .parquet name only when it is complete, by one of
+// three routes chosen from the filesystem's type:
+//   - S3 streams to the final key: an unfinished multipart upload is never
+//     visible, and Abort() discards it.
+//   - A local disk and WebHDFS show a file under its name while it is being
+//     written, so a part is written to <name>.inprogress and renamed into
+//     place (on a local disk the file and the directory are fsynced first,
+//     unless CLINK_STATE_FSYNC turns durability off, so a part is on stable
+//     storage before the checkpoint that relies on it can complete).
+//   - Every other store (Azure, GCS, anything unknown) writes <name>.inprogress
+//     and copies it to the final key, then deletes the in-progress object:
+//     Azure creates a blob at the key as soon as a stream opens, and a GCS
+//     stream cannot abort, so streaming to the final key would publish an
+//     empty or partial part.
+// A kill therefore leaves at most an .inprogress file, which readers skip (it
+// does not end in .parquet) and the next open removes. Nothing is buffered
+// beyond what the Parquet writer holds for its current row group.
 
 #include <array>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <fcntl.h>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -50,6 +61,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 #include <utility>
 
 #include <arrow/api.h>
@@ -68,6 +80,7 @@
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/runtime_context.hpp"
+#include "clink/state/durable_file_write.hpp"
 
 namespace clink {
 
@@ -107,19 +120,16 @@ public:
     }
 
     // A sink destroyed without close() (a teardown that never reached it)
-    // abandons its unfinished part, as a kill would: an object store's upload is
-    // aborted, so nothing is published, and a local .inprogress file is removed.
-    // Its rows are after the last barrier, so a restore replays them.
+    // abandons its unfinished part, as a kill would: an S3 upload is aborted,
+    // so nothing is published, and an .inprogress file is removed. Its rows are
+    // after the last barrier, so a restore replays them.
     ~ParquetRollingSink() override {
         try {
-            if (writer_) {
-                (void)writer_->Close();
-                writer_.reset();
-            }
+            writer_.reset();
             if (out_) {
                 (void)out_->Abort();
                 out_.reset();
-                if (rename_into_place_ && fs_) {
+                if (publish_ != Publish::StreamToFinal && fs_) {
                     (void)fs_->DeleteFile(final_path_ + ".inprogress");
                 }
             }
@@ -141,25 +151,55 @@ public:
         return "sub" + std::to_string(sub) + "-" + std::string(run) + "-" + digits + ".parquet";
     }
 
-    // The subtask index a file name belongs to, if it is one of this sink's
-    // parts or an in-progress part; nullopt for any other file.
+    // The subtask index a file name belongs to, if it is exactly one of this
+    // sink's part names (sub<N>-<18 hex>-<6+ digits>.parquet, optionally
+    // .inprogress), as part_name writes them; nullopt for any other file, so
+    // clearing a directory never touches a file the sink did not write.
     [[nodiscard]] static std::optional<std::uint32_t> part_subtask(std::string_view basename) {
-        if (basename.rfind("sub", 0) != 0) {
+        std::string_view rest = basename;
+        if (ends_with_(rest, ".inprogress")) {
+            rest.remove_suffix(std::string_view{".inprogress"}.size());
+        }
+        if (!ends_with_(rest, ".parquet") || rest.rfind("sub", 0) != 0) {
             return std::nullopt;
         }
-        const bool finished = ends_with_(basename, ".parquet");
-        const bool in_progress = ends_with_(basename, ".parquet.inprogress");
-        if (!finished && !in_progress) {
-            return std::nullopt;
-        }
-        std::size_t i = 3;
-        std::uint64_t sub = 0;
-        while (i < basename.size() && basename[i] >= '0' && basename[i] <= '9') {
-            sub = (sub * 10) + static_cast<std::uint64_t>(basename[i] - '0');
+        rest.remove_suffix(std::string_view{".parquet"}.size());
+        rest.remove_prefix(3);
+        // <N>: decimal, no leading zero, fits in 32 bits.
+        std::size_t i = 0;
+        while (i < rest.size() && rest[i] >= '0' && rest[i] <= '9') {
             ++i;
         }
-        if (i == 3 || i >= basename.size() || basename[i] != '-' || sub > UINT32_MAX) {
+        if (i == 0 || i > 10 || (i > 1 && rest[0] == '0')) {
             return std::nullopt;
+        }
+        std::uint64_t sub = 0;
+        for (std::size_t k = 0; k < i; ++k) {
+            sub = (sub * 10) + static_cast<std::uint64_t>(rest[k] - '0');
+        }
+        if (sub > UINT32_MAX) {
+            return std::nullopt;
+        }
+        rest.remove_prefix(i);
+        // -<run>: 18 lowercase hex digits.
+        if (rest.size() < 1 + kRunTokenLength || rest[0] != '-') {
+            return std::nullopt;
+        }
+        for (std::size_t k = 1; k <= kRunTokenLength; ++k) {
+            const char c = rest[k];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                return std::nullopt;
+            }
+        }
+        rest.remove_prefix(1 + kRunTokenLength);
+        // -<seq>: at least six decimal digits.
+        if (rest.size() < 7 || rest[0] != '-') {
+            return std::nullopt;
+        }
+        for (std::size_t k = 1; k < rest.size(); ++k) {
+            if (rest[k] < '0' || rest[k] > '9') {
+                return std::nullopt;
+            }
         }
         return static_cast<std::uint32_t>(sub);
     }
@@ -170,9 +210,24 @@ public:
             throw std::runtime_error("ParquetRollingSink: filesystem factory returned null");
         }
         const auto type = fs_->type_name();
-        rename_into_place_ = type == "local" || type == "webhdfs";
+        publish_ = type == "s3"                             ? Publish::StreamToFinal
+                   : (type == "local" || type == "webhdfs") ? Publish::RenameIntoPlace
+                                                            : Publish::CopyIntoPlace;
+        fsync_ = type == "local" && clink::state::detail::fsync_enabled();
+        // An earlier single-file sink wrote a file where this sink writes a
+        // directory. Refuse by name rather than fail on a raw store error, or on
+        // an object store leave the old object to shadow the new parts.
+        if (auto info = fs_->GetFileInfo(opts_.dir);
+            info.ok() && info->type() == arrow::fs::FileType::File) {
+            throw std::runtime_error(
+                "ParquetRollingSink: " + opts_.dir +
+                " is a file, where this sink writes a directory of part files. It was most "
+                "likely written by the single-file Parquet sink of an earlier release; move or "
+                "delete it, or point the sink at another path.");
+        }
         // Object stores treat prefixes as implicit; a directory must exist.
-        if (auto s = fs_->CreateDir(opts_.dir, /*recursive=*/true); !s.ok() && rename_into_place_) {
+        if (auto s = fs_->CreateDir(opts_.dir, /*recursive=*/true);
+            !s.ok() && publish_ == Publish::RenameIntoPlace) {
             throw std::runtime_error("ParquetRollingSink: create " + opts_.dir + ": " +
                                      s.ToString());
         }
@@ -244,9 +299,9 @@ private:
         return token;
     }
 
-    // Removes this subtask's in-progress parts (always) and finished parts (when
-    // the run starts from empty state). Subtask 0 does the same for subtasks at
-    // or above this run's parallelism.
+    // Removes this subtask's in-progress and zero-length parts (always) and its
+    // finished parts (when the run starts from empty state). Subtask 0 does the same for subtasks
+    // at or above this run's parallelism.
     void clear_parts_(bool finished_too) {
         arrow::fs::FileSelector selector;
         selector.base_dir = opts_.dir;
@@ -269,7 +324,10 @@ private:
             const bool mine =
                 *sub == opts_.subtask_idx || (opts_.subtask_idx == 0 && *sub >= opts_.parallelism);
             const bool in_progress = ends_with_(base, ".inprogress");
-            if (mine && (in_progress || finished_too)) {
+            // A zero-length part is never a Parquet file; no route publishes one,
+            // but a reader would fail on it, so it goes even on a restore.
+            const bool empty = info.size() == 0;
+            if (mine && (in_progress || empty || finished_too)) {
                 if (auto s = fs_->DeleteFile(info.path()); !s.ok()) {
                     throw std::runtime_error("ParquetRollingSink: delete " + info.path() + ": " +
                                              s.ToString());
@@ -283,7 +341,7 @@ private:
             return;
         }
         final_path_ = opts_.dir + "/" + part_name(opts_.subtask_idx, run_, next_seq_++);
-        const auto path = rename_into_place_ ? final_path_ + ".inprogress" : final_path_;
+        const auto path = writing_path_();
         auto out = fs_->OpenOutputStream(path);
         if (!out.ok()) {
             throw std::runtime_error("ParquetRollingSink: open " + path + ": " +
@@ -301,8 +359,12 @@ private:
         writer_ = std::move(*writer);
     }
 
+    [[nodiscard]] std::string writing_path_() const {
+        return publish_ == Publish::StreamToFinal ? final_path_ : final_path_ + ".inprogress";
+    }
+
     // Completes the open part, if any: the footer is written and the file
-    // appears under its final name.
+    // appears under its final name, by the route open() chose.
     void finish_part_() {
         if (!writer_) {
             return;
@@ -312,27 +374,65 @@ private:
         if (!closed.ok()) {
             throw std::runtime_error("ParquetRollingSink: close writer: " + closed.ToString());
         }
-        const auto path = rename_into_place_ ? final_path_ + ".inprogress" : final_path_;
+        const auto path = writing_path_();
         auto stream_closed = out_->Close();
         out_.reset();
         if (!stream_closed.ok()) {
             throw std::runtime_error("ParquetRollingSink: close " + path + ": " +
                                      stream_closed.ToString());
         }
-        if (rename_into_place_) {
-            if (auto s = fs_->Move(path, final_path_); !s.ok()) {
-                throw std::runtime_error("ParquetRollingSink: rename " + path + " -> " +
-                                         final_path_ + ": " + s.ToString());
-            }
+        switch (publish_) {
+            case Publish::StreamToFinal:
+                return;
+            case Publish::RenameIntoPlace:
+                if (fsync_) {
+                    fsync_file_(path);
+                }
+                if (auto s = fs_->Move(path, final_path_); !s.ok()) {
+                    throw std::runtime_error("ParquetRollingSink: rename " + path + " -> " +
+                                             final_path_ + ": " + s.ToString());
+                }
+                if (fsync_) {
+                    clink::state::detail::fsync_directory_best_effort(opts_.dir);
+                }
+                return;
+            case Publish::CopyIntoPlace:
+                if (auto s = fs_->CopyFile(path, final_path_); !s.ok()) {
+                    throw std::runtime_error("ParquetRollingSink: copy " + path + " -> " +
+                                             final_path_ + ": " + s.ToString());
+                }
+                // A leftover .inprogress object is harmless (readers skip it and
+                // the next open removes it), so a failed delete does not fail
+                // the checkpoint.
+                (void)fs_->DeleteFile(path);
+                return;
         }
     }
+
+    // The part's bytes must be on stable storage before the rename publishes
+    // it, as write_fsync_rename does for checkpoint files.
+    static void fsync_file_(const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            throw std::runtime_error("ParquetRollingSink: open for fsync " + path);
+        }
+        const int rc = ::fsync(fd);
+        ::close(fd);
+        if (rc != 0) {
+            throw std::runtime_error("ParquetRollingSink: fsync " + path);
+        }
+    }
+
+    enum class Publish : std::uint8_t { StreamToFinal, RenameIntoPlace, CopyIntoPlace };
+    static constexpr std::size_t kRunTokenLength = 18;
 
     FileSystemFactory fs_factory_;
     Options opts_;
     ArrowBatcher<T> batcher_;
     std::string name_;
     std::shared_ptr<arrow::fs::FileSystem> fs_;
-    bool rename_into_place_{false};
+    Publish publish_{Publish::CopyIntoPlace};
+    bool fsync_{false};
     std::string run_;
     std::uint64_t next_seq_{0};
     std::string final_path_;
@@ -374,6 +474,23 @@ std::shared_ptr<Source<T>> make_local_parquet_directory_source(const std::string
     std::error_code ec;
     if (!std::filesystem::is_directory(path, ec)) {
         return nullptr;
+    }
+    // An exactly-once Parquet sink writes <path>/staging and <path>/committed,
+    // with nothing at the top level. Reading <path> would then silently yield
+    // no rows, so say where the committed output is instead.
+    bool has_part = false;
+    for (const auto& e : std::filesystem::directory_iterator(path, ec)) {
+        if (e.is_regular_file(ec) && e.path().extension() == ".parquet") {
+            has_part = true;
+            break;
+        }
+    }
+    if (!has_part && std::filesystem::is_directory(std::filesystem::path(path) / "committed", ec)) {
+        throw std::runtime_error(
+            name + ": " + path +
+            " holds no Parquet parts but has a committed/ directory, the layout of an "
+            "exactly-once Parquet sink; read " +
+            (std::filesystem::path(path) / "committed").string() + " instead");
     }
     typename MultiObjectParquetSource<T>::Options o;
     o.prefix = std::filesystem::absolute(path).lexically_normal().string();

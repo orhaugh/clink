@@ -13,6 +13,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <arrow/filesystem/mockfs.h>
@@ -24,6 +25,10 @@
 #include "clink/connectors/parquet_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/record.hpp"
+#include "clink/operators/source_operator.hpp"
+#include "clink/runtime/dag.hpp"
+#include "clink/runtime/job_config.hpp"
+#include "clink/runtime/local_executor.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
 namespace {
@@ -104,6 +109,9 @@ std::unique_ptr<ParquetRollingSink<std::int64_t>> make_sink(const fs::path& dir,
         clink::local_parquet_filesystem(), std::move(o), clink::int64_arrow_batcher());
 }
 
+// A well-formed run token for names a test writes by hand.
+constexpr std::string_view kDeadRun = "0123456789abcdef01";
+
 CheckpointBarrier barrier(std::uint64_t id) {
     return CheckpointBarrier{CheckpointId{id}};
 }
@@ -164,7 +172,7 @@ TEST(ParquetRollingSink, ARestoredRunKeepsEveryFinishedPart) {
     ASSERT_EQ(parts_in(dir).size(), 2U);
     ASSERT_EQ(files_in(dir).size(), 2U) << "the unfinished part is abandoned, never published";
     // A real kill leaves the .inprogress file behind; the next open removes it.
-    touch(dir / "sub0-deadrun-000009.parquet.inprogress");
+    touch(dir / (ParquetRollingSink<std::int64_t>::part_name(0, kDeadRun, 9) + ".inprogress"));
 
     clink::RuntimeContext ctx(clink::OperatorId{7}, "pq", nullptr, nullptr);
     ctx.set_commit_receipts((dir / "receipts").string(), /*restore_from_ckpt=*/1);
@@ -235,12 +243,23 @@ TEST(ParquetRollingSink, ACloseWithoutEndOfInputKeepsWhatWasWritten) {
 }
 
 TEST(ParquetRollingSink, PartNamesIdentifyTheirSubtaskAndNothingElse) {
-    const auto name = ParquetRollingSink<std::int64_t>::part_name(12, "run", 3);
-    EXPECT_EQ(name, "sub12-run-000003.parquet");
     using S = ParquetRollingSink<std::int64_t>;
+    const auto name = S::part_name(12, kDeadRun, 3);
+    EXPECT_EQ(name, "sub12-" + std::string{kDeadRun} + "-000003.parquet");
     EXPECT_EQ(S::part_subtask(name), 12U);
     EXPECT_EQ(S::part_subtask(name + ".inprogress"), 12U);
-    EXPECT_EQ(S::part_subtask("sub3-x.parquet"), 3U);
+    EXPECT_EQ(S::part_subtask(S::part_name(0, kDeadRun, 1234567)), 0U);
+    // Anything that is not exactly a part name is left alone when clearing.
+    EXPECT_FALSE(S::part_subtask("sub3-x.parquet").has_value()) << "run token too short";
+    EXPECT_FALSE(S::part_subtask("sub3-" + std::string{kDeadRun} + "-12.parquet").has_value())
+        << "sequence under six digits";
+    EXPECT_FALSE(S::part_subtask("sub03-" + std::string{kDeadRun} + "-000001.parquet").has_value())
+        << "leading zero";
+    EXPECT_FALSE(S::part_subtask("sub3-0123456789ABCDEF01-000001.parquet").has_value())
+        << "upper-case hex";
+    EXPECT_FALSE(
+        S::part_subtask("sub99999999999-" + std::string{kDeadRun} + "-000001.parquet").has_value())
+        << "subtask overflows 32 bits";
     EXPECT_FALSE(S::part_subtask("sub-x.parquet").has_value());
     EXPECT_FALSE(S::part_subtask("sub3.parquet").has_value());
     EXPECT_FALSE(S::part_subtask("sub3-x.csv").has_value());
@@ -283,10 +302,10 @@ TEST(ParquetRollingSink, TheDirectorySourceReadsEveryPart) {
     fs::remove_all(dir);
 }
 
-// An object store has no rename, so a part streams to its final key and appears
-// only when its upload completes. The in-memory mock filesystem reports itself
-// as non-local, which takes that path.
-TEST(ParquetRollingSink, OnAnObjectStorePartsAreWrittenUnderTheirFinalKeys) {
+// A store that is neither S3 nor a rename filesystem (Azure, GCS, anything
+// unknown) gets <name>.inprogress copied into place. The in-memory mock
+// filesystem reports its own type, which takes that path.
+TEST(ParquetRollingSink, OnACopyStoreAPartAppearsOnlyWhenComplete) {
     auto mock =
         std::make_shared<arrow::fs::internal::MockFileSystem>(std::chrono::system_clock::now());
     const auto factory = [mock]() -> std::shared_ptr<arrow::fs::FileSystem> { return mock; };
@@ -321,13 +340,16 @@ TEST(ParquetRollingSink, OnAnObjectStorePartsAreWrittenUnderTheirFinalKeys) {
     auto sink = make(0);
     sink->open();
     sink->on_data(values(0, 6));
+    for (const auto& k : keys()) {
+        EXPECT_FALSE(k.ends_with(".parquet")) << k << ": a part being written is not visible";
+    }
     sink->on_barrier(barrier(1));
     sink->on_data(values(6, 9));
     sink->flush();
     sink->close();
     ASSERT_EQ(keys().size(), 2U);
     for (const auto& k : keys()) {
-        EXPECT_TRUE(k.ends_with(".parquet")) << k << ": no in-progress object on a store";
+        EXPECT_TRUE(k.ends_with(".parquet")) << k << ": the in-progress object is deleted";
     }
     EXPECT_EQ(rows(), 9);
 
@@ -339,4 +361,73 @@ TEST(ParquetRollingSink, OnAnObjectStorePartsAreWrittenUnderTheirFinalKeys) {
     fresh->flush();
     fresh->close();
     EXPECT_EQ(rows(), 2);
+}
+
+// The restore point reaches the sink through the executor even when the job has
+// no receipts directory (a savepoint restore into a job without a checkpoint
+// directory of its own). Before, it arrived only with receipts on, so such a
+// restore looked like a fresh start and deleted every earlier part.
+TEST(ParquetRollingSink, ARestoreWithoutACheckpointDirectoryStillKeepsParts) {
+    const auto dir = rolling_tmp_dir("noreceipts");
+    {
+        auto earlier = make_sink(dir);
+        earlier->open();
+        earlier->on_data(values(0, 4));
+        earlier->flush();
+        earlier->close();
+    }
+    ASSERT_EQ(read_all(dir).size(), 4U);
+
+    std::vector<clink::Record<std::int64_t>> recs;
+    for (std::int64_t v = 4; v < 6; ++v) {
+        recs.emplace_back(v);
+    }
+    clink::Dag dag;
+    auto src =
+        dag.add_source<std::int64_t>(std::make_shared<clink::VectorSource<std::int64_t>>(recs));
+    dag.add_sink<std::int64_t>(src, std::shared_ptr<clink::Sink<std::int64_t>>(make_sink(dir)));
+    clink::JobConfig cfg;
+    cfg.restore_from_checkpoint_id = 7;  // and no commit_receipt_dir
+    clink::LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    EXPECT_EQ(read_all(dir), (std::vector<std::int64_t>{0, 1, 2, 3, 4, 5}))
+        << "the restored run must keep the parts written before it";
+    fs::remove_all(dir);
+}
+
+// An exactly-once Parquet sink writes only staging/ and committed/ under its
+// path; reading that path would yield nothing, so the source says where to look.
+TEST(ParquetRollingSink, ReadingAnExactlyOnceSinksDirectoryPointsAtCommitted) {
+    const auto dir = rolling_tmp_dir("committed");
+    fs::create_directories(dir / "committed");
+    fs::create_directories(dir / "staging");
+    try {
+        (void)clink::make_local_parquet_directory_source<std::int64_t>(
+            dir.string(), 0, 1, clink::int64_arrow_batcher(), "pq");
+        ADD_FAILURE() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("committed"), std::string::npos) << e.what();
+    }
+    fs::create_directories(dir / "empty");
+    EXPECT_NE(clink::make_local_parquet_directory_source<std::int64_t>(
+                  (dir / "empty").string(), 0, 1, clink::int64_arrow_batcher(), "pq"),
+              nullptr)
+        << "an empty directory is a legitimate zero-row read";
+    fs::remove_all(dir);
+}
+
+// An earlier release's single-file sink left a file where this sink writes a
+// directory; the sink refuses by name.
+TEST(ParquetRollingSink, APathHoldingAnOldSingleFileIsRefusedByName) {
+    const auto dir = rolling_tmp_dir("oldfile");
+    touch(dir);
+    auto sink = make_sink(dir);
+    try {
+        sink->open();
+        ADD_FAILURE() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("is a file"), std::string::npos) << e.what();
+    }
+    fs::remove(dir);
 }

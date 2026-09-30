@@ -100,9 +100,18 @@ public:
                 std::lock_guard<std::mutex> lk(mu_);
                 if (files_.contains(req.path)) {
                     res.set_content(R"({"FileStatus":{"type":"FILE"}})", "application/json");
-                } else {
-                    res.status = 404;
+                    return;
                 }
+                // A directory is any path some stored file lives under.
+                const std::string child_prefix = req.path + "/";
+                for (const auto& [k, v] : files_) {
+                    if (k.rfind(child_prefix, 0) == 0) {
+                        res.set_content(R"({"FileStatus":{"type":"DIRECTORY"}})",
+                                        "application/json");
+                        return;
+                    }
+                }
+                res.status = 404;
                 return;
             }
             if (op == "LISTSTATUS") {
@@ -579,4 +588,18 @@ TEST(WebHdfsParquetRollingSink, WritesPartsAKilledRunNeverPublishesAndARestoreKe
     fresh->flush();
     fresh->close();
     EXPECT_EQ(read_back(), (std::vector<std::int64_t>{100}));
+}
+
+// The factory reads a source `path` that names a directory as a directory of parts
+// (register_factories.cpp make_source); it decides on this status.
+TEST(WebHdfsFileSystem, ReportsFilesDirectoriesAndMissingPaths) {
+    MockWebHdfs srv;
+    write_int64_object(srv, "/clink/fsinfo/a.parquet", {1});
+    clink::WebHdfsFileSystem::Options fo;
+    fo.base_url = srv.base_url();
+    clink::WebHdfsFileSystem fs(fo);
+    EXPECT_EQ(fs.GetFileInfo("/clink/fsinfo/a.parquet").ValueOrDie().type(),
+              arrow::fs::FileType::File);
+    EXPECT_EQ(fs.GetFileInfo("/clink/fsinfo").ValueOrDie().type(), arrow::fs::FileType::Directory);
+    EXPECT_EQ(fs.GetFileInfo("/clink/nothing").ValueOrDie().type(), arrow::fs::FileType::NotFound);
 }

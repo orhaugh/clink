@@ -15,13 +15,33 @@ GCS, Azure and WebHDFS.
 - A part is closed at every checkpoint barrier and at the end of input, so
   a job's output is readable while it runs, and everything up to the last
   barrier survives a kill.
-- A part appears only when it is complete. An object store publishes it
-  when the upload finishes; on the local disk and WebHDFS it is renamed from
-  `<name>.inprogress`.
+- A part appears under its `.parquet` name only when it is complete, by a
+  route chosen per store. S3 streams to the final key, since an unfinished
+  multipart upload is never visible. The local disk and WebHDFS write
+  `<name>.inprogress` and rename it; on the local disk the part and the
+  directory are fsynced first, so a part is on stable storage before the
+  checkpoint that relies on it completes (unless `CLINK_STATE_FSYNC=0`).
+  Azure and GCS write `<name>.inprogress` and copy it into place: an Azure
+  stream creates its blob as soon as it opens, and a GCS stream cannot
+  abort, so streaming to the final key would publish an empty or partial
+  part. A kill leaves at most an `.inprogress` object, which readers skip
+  and the next run removes.
 - A restored run keeps every part, including parts past the restore point,
   whose rows the sources then replay: at-least-once, as before. A run that
-  starts from empty state replaces the previous run's parts.
-  `delivery_guarantee='exactly_once'` remains the path without duplicates.
+  starts from empty state replaces the previous run's parts, touching only
+  files named exactly as the sink names its parts. A restore is recognised
+  whether or not the job has a checkpoint directory, so a savepoint restore
+  into a job that takes no checkpoints keeps the earlier parts too.
+- A `parquet` source whose `path` is a directory reads every part in it, and
+  resolves columns by name as it does for one file: a table declaring fewer
+  columns, or the same columns in another order, reads the parts, and a
+  query reads only the columns it uses. A WebHDFS source `path` naming a
+  directory is read the same way. A directory holding only an exactly-once
+  sink's `staging/` and `committed/` is refused with a pointer to
+  `committed/`, rather than read as empty.
+- The typed `clink::s3::parquet_sink<T>` helper writes part objects under
+  `key` too; with a `bucket_assigner` it still writes one object per
+  assigned key, finished only at close.
 
 **Exactly-once WebHDFS Parquet tables deploy.** SQL plans
 `delivery_guarantee='exactly_once'` on a `webhdfs_parquet` table to
@@ -30,18 +50,27 @@ failed at deploy. The WebHDFS module now registers
 `webhdfs_parquet_2pc_{int64,string}_sink`, and each object-store module's
 registration test checks the names the planner emits.
 
-**Compatibility.** A plain Parquet sink's `path` (or, on S3, GCS and Azure,
-its `prefix`, with `key` still accepted) now names a directory, not a file.
-Read it back with a `parquet` table on the same `path`, which now reads
-every part in a directory, with the object-store sources' `prefix`, or with
-any dataset reader (`pyarrow.dataset`, DuckDB's `read_parquet('<dir>/*.parquet')`).
-Readers that open the old single file must move to the directory. On S3,
-GCS and Azure, a table that is both written and read (a materialized view's
-backing, for example) must use `prefix`: a source's `key` still reads one
-object. The
-programmatic single-file sink classes (`ParquetSink<T>` and the object-store
-equivalents) are unchanged. The plain sinks no longer read the WebHDFS
-`overwrite` option.
+**Compatibility.**
+
+- A plain Parquet sink's `path` (or, on S3, GCS and Azure, its `prefix`,
+  with `key` still accepted) now names a directory, not a file. Read it
+  back with a `parquet` table on the same `path`, with the object-store
+  sources' `prefix`, or with any dataset reader (`pyarrow.dataset`,
+  DuckDB's `read_parquet('<dir>/*.parquet')`). On S3, GCS and Azure, a
+  table that is both written and read (a materialized view's backing, for
+  example) must use `prefix`: a source's `key` still reads one object.
+- A sink whose path still holds the single file an earlier release wrote
+  refuses to start and names the file; move or delete it.
+- The sink lists and deletes under its path, so its credentials need list
+  and delete permission as well as write (on Azure, a SAS with `sp=rwdl`).
+- The programmatic single-file sink classes (`ParquetSink<T>` and the
+  object-store equivalents) are unchanged. `MultiObjectParquetSource<T>`
+  now reads a file whose columns are a superset of the batcher's, by name,
+  where it refused one before. The plain sinks no longer read the WebHDFS
+  `overwrite` option.
+- `RuntimeContext` gains `set_restore_from_checkpoint_id`, which changes a
+  header on the plugin ABI surface: rebuild job modules against this
+  release.
 
 ## v0.10.0 (September 2026)
 

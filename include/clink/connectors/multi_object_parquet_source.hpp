@@ -20,9 +20,10 @@
 //
 // Lifecycle:
 //   open():     build the filesystem, list + shard the objects, open the first
-//               assigned file's reader. Per-file the schema is validated against
-//               the batcher and a mismatch throws (as the single-object sources
-//               do).
+//               assigned file's reader. Per file, the batcher's columns are
+//               resolved by name (same type) and only those are read, in the
+//               batcher's order, as ParquetSource does; a missing or differently
+//               typed column throws naming it.
 //   produce():  emit the next RecordBatch, transparently advancing to the next
 //               assigned file when the current one is exhausted. Returns false
 //               once every assigned file is drained.
@@ -252,18 +253,57 @@ private:
                                          "): " + s.ToString());
             }
             auto expected = batcher_.schema();
-            if (!file_schema->Equals(*expected, /*check_metadata=*/false)) {
-                throw std::runtime_error("MultiObjectParquetSource: schema mismatch in " + path +
-                                         " - file has " + file_schema->ToString() +
-                                         "; ArrowBatcher expects " + expected->ToString());
+            reorder_.clear();
+            if (file_schema->Equals(*expected, /*check_metadata=*/false)) {
+                auto br_result = reader_->GetRecordBatchReader();
+                if (!br_result.ok()) {
+                    throw std::runtime_error("MultiObjectParquetSource: GetRecordBatchReader(" +
+                                             path + "): " + br_result.status().ToString());
+                }
+                batch_reader_ = std::move(*br_result);
+                return;
             }
-
-            auto br_result = reader_->GetRecordBatchReader();
-            if (!br_result.ok()) {
-                throw std::runtime_error("MultiObjectParquetSource: GetRecordBatchReader(" + path +
-                                         "): " + br_result.status().ToString());
+            // Schema-on-read, as ParquetSource does for one file: the batcher
+            // names columns the file has (by name, with the same type), and only
+            // those are read, in the batcher's order. A declared-narrower or
+            // reordered table therefore reads a wider file, and a narrowed query
+            // skips the unread columns. A missing or differently typed column is
+            // a mismatch naming it.
+            std::vector<int> indices;
+            indices.reserve(static_cast<std::size_t>(expected->num_fields()));
+            for (const auto& field : expected->fields()) {
+                const int idx = file_schema->GetFieldIndex(field->name());
+                if (idx < 0 || !file_schema->field(idx)->type()->Equals(*field->type())) {
+                    throw std::runtime_error(
+                        "MultiObjectParquetSource: schema mismatch in " + path + " - column '" +
+                        field->name() + "' " +
+                        (idx < 0 ? std::string{"is missing"}
+                                 : "is " + file_schema->field(idx)->type()->ToString() +
+                                       ", expected " + field->type()->ToString()) +
+                        " (file has " + file_schema->ToString() + "; ArrowBatcher expects " +
+                        expected->ToString() + ")");
+                }
+                indices.push_back(idx);
             }
-            batch_reader_ = std::move(*br_result);
+            std::vector<int> row_groups;
+            row_groups.reserve(static_cast<std::size_t>(reader_->num_row_groups()));
+            for (int rg = 0; rg < reader_->num_row_groups(); ++rg) {
+                row_groups.push_back(rg);
+            }
+            if (auto s = reader_->GetRecordBatchReader(row_groups, indices, &batch_reader_);
+                !s.ok()) {
+                throw std::runtime_error("MultiObjectParquetSource: projected read of " + path +
+                                         ": " + s.ToString());
+            }
+            // The projected reader yields columns in file order; remap to the
+            // batcher's order when they differ.
+            const auto got = batch_reader_->schema();
+            if (!got->Equals(*expected, /*check_metadata=*/false)) {
+                reorder_.reserve(static_cast<std::size_t>(expected->num_fields()));
+                for (const auto& field : expected->fields()) {
+                    reorder_.push_back(got->GetFieldIndex(field->name()));
+                }
+            }
             return;
         }
         batch_reader_.reset();  // no more files
@@ -277,7 +317,16 @@ private:
                 throw std::runtime_error("MultiObjectParquetSource: ReadNext: " + s.ToString());
             }
             if (rb) {
-                return rb;
+                if (reorder_.empty()) {
+                    return rb;
+                }
+                auto reordered = rb->SelectColumns(reorder_);
+                if (!reordered.ok()) {
+                    throw std::runtime_error("MultiObjectParquetSource: column reorder: " +
+                                             reordered.status().ToString());
+                }
+                return arrow::RecordBatch::Make(
+                    batcher_.schema(), (*reordered)->num_rows(), (*reordered)->columns());
             }
             close_current_();     // current file exhausted
             open_next_reader_();  // advance (sets batch_reader_ or leaves it null)
@@ -296,6 +345,7 @@ private:
     std::shared_ptr<arrow::io::RandomAccessFile> in_;
     std::unique_ptr<parquet::arrow::FileReader> reader_;
     std::shared_ptr<arrow::RecordBatchReader> batch_reader_;
+    std::vector<int> reorder_;           // current file's projected-to-batcher order, if any
     std::uint64_t batches_emitted_ = 0;  // #57 replay cursor (next-batch index)
 };
 

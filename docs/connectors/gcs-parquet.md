@@ -45,7 +45,7 @@ These are the exact names passed to `register_sink` / `register_source` in `impl
 
 ## Configuration
 
-The sink and source share the same auth and endpoint parameters, parsed by `apply_gcs_params` in `impls/gcs/src/register_factories.cpp` onto the `Options` structs in `parquet_gcs_sink.hpp` and `parquet_gcs_source.hpp`.
+The sink and source share the same auth and endpoint parameters: the sources parse them with `apply_gcs_params`, and the sink factories with `gcs_sink_fs_factory` (both in `impls/gcs/src/register_factories.cpp`). A source needs `key` or `prefix`; a sink needs `prefix` (or `key`, taken as the prefix).
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -76,16 +76,18 @@ CREATE TABLE gcs_out (
 ) WITH (
     connector = 'gcs_parquet',
     bucket    = 'my-bucket',
-    key       = 'output/data.parquet',
+    prefix    = 'output/data',       -- parts land at output/data/sub<N>-...parquet
     project_id = 'my-gcp-project'
 );
 ```
+
+Read it back with a table on the same `prefix`.
 
 Other option keys from the table above (`anonymous`, `access_token`, `endpoint_override`, `scheme`, `retry_limit_seconds`) are passed through the same `WITH (...)` properties.
 
 ## Example
 
-Programmatic use of the typed classes with their `Options`, based on `impls/gcs/tests/test_parquet_gcs_live.cpp`. Write a Parquet object, then read it back on the int64 channel.
+Programmatic use of the single-object classes with their `Options`, based on `impls/gcs/tests/test_parquet_gcs_live.cpp`. Write one Parquet object, then read it back on the int64 channel. (The registered sink factories build `ParquetRollingSink<T>` instead; see Delivery semantics.)
 
 ```cpp
 #include "clink/connectors/parquet_gcs_sink.hpp"
@@ -130,7 +132,7 @@ Via the registry, look up the factory by name and channel, for example `gcs_parq
 
 ## Delivery semantics
 
-The factory sink is at-least-once and writes a directory of part objects under `bucket/prefix` through the shared `ParquetRollingSink<T>` (`include/clink/connectors/parquet_rolling_sink.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input, and the store publishes an object only when its upload completes, so a kill never leaves a partial object and everything up to the last barrier is already published. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts under the prefix (only keys named `sub<N>-*.parquet`). Read the directory back with the source on the same `prefix`. The programmatic `ParquetGcsSink<T>` writes a single object and finalises it only in `close()`.
+The factory sink is at-least-once and writes a directory of part objects under `bucket/prefix` through the shared `ParquetRollingSink<T>` (`include/clink/connectors/parquet_rolling_sink.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input. A part is written as `<name>.inprogress` and copied to its final `.parquet` key when complete, then the in-progress object is deleted: a GCS output stream cannot abort (Arrow's `Abort()` completes the upload), so writing to the final key would publish a partial part when a sink is torn down mid-interval. So the prefix never shows a partial `.parquet` object, everything up to the last barrier is already published when a kill lands, and a leftover `.inprogress` object is skipped by readers and removed by the next run. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts under the prefix (only keys named exactly as the sink names its parts). The sink therefore needs list and delete permission as well as write. Read the directory back with the source on the same `prefix`. The programmatic `ParquetGcsSink<T>` writes a single object and finalises it only in `close()`.
 
 For exactly-once, use the 2PC sink: `gcs_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Read the result with the source pointed at `<prefix>/committed`.
 

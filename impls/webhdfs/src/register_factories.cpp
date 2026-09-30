@@ -21,6 +21,15 @@ namespace clink::webhdfs {
 
 namespace {
 
+// WebHDFS paths are absolute; RENAME takes its destination verbatim, so a relative
+// directory would name different files on its two sides.
+std::string absolute_hdfs_path(std::string path) {
+    if (path.empty() || path.front() != '/') {
+        path.insert(path.begin(), '/');
+    }
+    return path;
+}
+
 // Apply the params common to the WebHDFS sink + source (endpoint, path, auth, transport).
 template <typename Opts>
 void apply_common_params(const clink::plugin::BuildContext& ctx, Opts& opts) {
@@ -111,7 +120,7 @@ std::shared_ptr<Sink<T>> make_sink(const clink::plugin::BuildContext& ctx,
         fo.rw_timeout_ms = static_cast<int>(r);
     }
     typename ParquetRollingSink<T>::Options o;
-    o.dir = path;
+    o.dir = absolute_hdfs_path(path);
     o.subtask_idx = ctx.subtask_idx;
     o.parallelism = ctx.parallelism;
     return std::make_shared<ParquetRollingSink<T>>(
@@ -127,14 +136,33 @@ template <typename T>
 std::shared_ptr<Source<T>> make_source(const clink::plugin::BuildContext& ctx,
                                        ArrowBatcher<T> batcher) {
     // A `prefix` reads every matching Parquet object under that HDFS directory (via LISTSTATUS),
-    // sharded across subtasks; a `path` reads one object. They are mutually exclusive.
-    if (const auto prefix = ctx.param_or("prefix", ""); !prefix.empty()) {
+    // sharded across subtasks; a `path` reads one object, or a directory like `prefix`.
+    // A `path` that names an HDFS directory (what the rolling sink writes under `path`) is read
+    // the same way, so one table can be written and read back.
+    std::string dir = ctx.param_or("prefix", "");
+    if (dir.empty() && !ctx.param_or("path", "").empty() && !ctx.param_or("base_url").empty()) {
+        WebHdfsFileSystem::Options fo;
+        fo.base_url = ctx.param_or("base_url");
+        if (const auto u = ctx.param_or("user", ""); !u.empty()) {
+            fo.user = u;
+        }
+        if (const auto d = ctx.param_or("delegation_token", ""); !d.empty()) {
+            fo.delegation_token = d;
+        }
+        fo.verify_tls = ctx.param_or("verify_tls", "true") == "true";
+        const auto path = absolute_hdfs_path(ctx.param_or("path"));
+        auto info = WebHdfsFileSystem(fo).GetFileInfo(path);
+        if (info.ok() && info->type() == arrow::fs::FileType::Directory) {
+            dir = path;
+        }
+    }
+    if (!dir.empty()) {
         if (ctx.param_or("base_url").empty()) {
             throw std::runtime_error("webhdfs_parquet: 'base_url' is required");
         }
         typename WebHdfsMultiObjectParquetSource<T>::Options o;
         o.base_url = ctx.param_or("base_url");
-        o.dir = prefix;
+        o.dir = dir;
         if (const auto u = ctx.param_or("user", ""); !u.empty()) {
             o.user = u;
         }
