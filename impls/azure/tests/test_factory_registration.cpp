@@ -16,4 +16,12 @@ TEST(AzureFactoryRegistration, ParquetSinkAndSourceAreRegistered) {
     EXPECT_NE(rr.find_source("azure_parquet_string_source", "string"), nullptr);
 }
 
+// The SQL planner emits <connector>_2pc_string_sink for delivery_guarantee='exactly_once'
+// (src/sql/physical_plan.cpp); a name it emits that nothing registers fails only at deploy.
+TEST(AzureFactoryRegistration, ExactlyOnceParquetSinksThePlannerNamesAreRegistered) {
+    const auto& rr = clink::cluster::RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("azure_parquet_2pc_int64_sink", "int64"), nullptr);
+    EXPECT_NE(rr.find_sink("azure_parquet_2pc_string_sink", "string"), nullptr);
+}
+
 }  // namespace

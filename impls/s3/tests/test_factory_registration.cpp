@@ -20,4 +20,12 @@ TEST(S3FactoryRegistration, S3ExactlyOnceSinkIsRegistered) {
     EXPECT_NE(rr.find_sink("s3_2pc_string_sink", "string"), nullptr);
 }
 
+// The SQL planner emits <connector>_2pc_string_sink for delivery_guarantee='exactly_once'
+// (src/sql/physical_plan.cpp); a name it emits that nothing registers fails only at deploy.
+TEST(S3FactoryRegistration, ExactlyOnceParquetSinksThePlannerNamesAreRegistered) {
+    const auto& rr = clink::cluster::RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("s3_parquet_2pc_int64_sink", "int64"), nullptr);
+    EXPECT_NE(rr.find_sink("s3_parquet_2pc_string_sink", "string"), nullptr);
+}
+
 }  // namespace

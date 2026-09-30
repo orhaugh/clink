@@ -23,6 +23,13 @@ GCS, Azure and WebHDFS.
   starts from empty state replaces the previous run's parts.
   `delivery_guarantee='exactly_once'` remains the path without duplicates.
 
+**Exactly-once WebHDFS Parquet tables deploy.** SQL plans
+`delivery_guarantee='exactly_once'` on a `webhdfs_parquet` table to
+`webhdfs_parquet_2pc_string_sink`, which nothing registered, so such a job
+failed at deploy. The WebHDFS module now registers
+`webhdfs_parquet_2pc_{int64,string}_sink`, and each object-store module's
+registration test checks the names the planner emits.
+
 **Compatibility.** A plain Parquet sink's `path` (or, on S3, GCS and Azure,
 its `prefix`, with `key` still accepted) now names a directory, not a file.
 Read it back with a `parquet` table on the same `path`, which now reads

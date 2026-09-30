@@ -29,13 +29,14 @@ cmake -S . -B build -DCLINK_WITH_WEBHDFS=ON
 | --- | --- | --- |
 | `webhdfs_parquet_int64_sink` | sink | `int64`; with `path`, the at-least-once sink writing a directory of part files; with `prefix`, the two-phase-commit sink (`WebHdfsParquetSink2PC<T>`, one staged file per checkpoint) |
 | `webhdfs_parquet_string_sink` | sink | `string`; the same `path` / `prefix` selection |
+| `webhdfs_parquet_2pc_int64_sink` / `webhdfs_parquet_2pc_string_sink` | sink | the two-phase-commit sink under `prefix` (or `path` when only that is given); what SQL plans for `delivery_guarantee='exactly_once'` |
 | `webhdfs_parquet_int64_source` | source | `int64` |
 | `webhdfs_parquet_string_source` | source | `string` |
 
-Exact registered names from `impls/webhdfs/src/register_factories.cpp`. Unlike
-the object-store Parquet connectors there is no separate `_2pc_` factory name:
-one sink factory builds either class, chosen by whether `path` or `prefix` is
-given (they are mutually exclusive).
+Exact registered names from `impls/webhdfs/src/register_factories.cpp`. The
+plain sink factory builds either class, chosen by whether `path` or `prefix` is
+given (they are mutually exclusive); the `_2pc_` names always build the
+two-phase-commit sink, as on the object-store Parquet connectors.
 
 ## Configuration
 

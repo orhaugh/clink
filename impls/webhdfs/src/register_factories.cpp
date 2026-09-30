@@ -44,6 +44,38 @@ void apply_common_params(const clink::plugin::BuildContext& ctx, Opts& opts) {
     }
 }
 
+// The exactly-once sink: stages one file per checkpoint interval under <base>/staging and
+// atomically RENAMEs it to <base>/committed on commit (WebHdfsParquetSink2PC).
+template <typename T>
+std::shared_ptr<Sink<T>> make_2pc_sink(const clink::plugin::BuildContext& ctx,
+                                       const std::string& prefix,
+                                       ArrowBatcher<T> batcher) {
+    if (ctx.param_or("base_url").empty()) {
+        throw std::runtime_error("webhdfs_parquet: 'base_url' is required");
+    }
+    typename WebHdfsParquetSink2PC<T>::Options o;
+    o.base_url = ctx.param_or("base_url");
+    o.base = prefix;
+    if (const auto u = ctx.param_or("user", ""); !u.empty()) {
+        o.user = u;
+    }
+    if (const auto d = ctx.param_or("delegation_token", ""); !d.empty()) {
+        o.delegation_token = d;
+    }
+    if (const auto p = ctx.param_or("permission", ""); !p.empty()) {
+        o.permission = p;
+    }
+    o.verify_tls = ctx.param_or("verify_tls", "true") == "true";
+    if (const auto c = ctx.param_int64_or("connect_timeout_ms", 0); c > 0) {
+        o.connect_timeout_ms = static_cast<int>(c);
+    }
+    if (const auto r = ctx.param_int64_or("rw_timeout_ms", 0); r > 0) {
+        o.rw_timeout_ms = static_cast<int>(r);
+    }
+    o.subtask_idx = static_cast<int>(ctx.subtask_idx);
+    return std::make_shared<WebHdfsParquetSink2PC<T>>(std::move(o), std::move(batcher));
+}
+
 template <typename T>
 std::shared_ptr<Sink<T>> make_sink(const clink::plugin::BuildContext& ctx,
                                    ArrowBatcher<T> batcher) {
@@ -51,30 +83,7 @@ std::shared_ptr<Sink<T>> make_sink(const clink::plugin::BuildContext& ctx,
     // RENAMEs to <prefix>/committed on commit); a `path` selects the at-least-once rolling sink
     // (a directory of part files). They are mutually exclusive.
     if (const auto prefix = ctx.param_or("prefix", ""); !prefix.empty()) {
-        if (ctx.param_or("base_url").empty()) {
-            throw std::runtime_error("webhdfs_parquet: 'base_url' is required");
-        }
-        typename WebHdfsParquetSink2PC<T>::Options o;
-        o.base_url = ctx.param_or("base_url");
-        o.base = prefix;
-        if (const auto u = ctx.param_or("user", ""); !u.empty()) {
-            o.user = u;
-        }
-        if (const auto d = ctx.param_or("delegation_token", ""); !d.empty()) {
-            o.delegation_token = d;
-        }
-        if (const auto p = ctx.param_or("permission", ""); !p.empty()) {
-            o.permission = p;
-        }
-        o.verify_tls = ctx.param_or("verify_tls", "true") == "true";
-        if (const auto c = ctx.param_int64_or("connect_timeout_ms", 0); c > 0) {
-            o.connect_timeout_ms = static_cast<int>(c);
-        }
-        if (const auto r = ctx.param_int64_or("rw_timeout_ms", 0); r > 0) {
-            o.rw_timeout_ms = static_cast<int>(r);
-        }
-        o.subtask_idx = static_cast<int>(ctx.subtask_idx);
-        return std::make_shared<WebHdfsParquetSink2PC<T>>(std::move(o), std::move(batcher));
+        return make_2pc_sink<T>(ctx, prefix, std::move(batcher));
     }
 
     // `path` names an HDFS directory of part files, one per subtask per checkpoint interval
@@ -197,6 +206,30 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_sink<std::string>("webhdfs_parquet_string_sink", [](const BuildContext& ctx) {
         return make_sink<std::string>(ctx, string_arrow_batcher());
     });
+
+    // The names the SQL planner emits for delivery_guarantee='exactly_once'. Before these existed
+    // an exactly-once webhdfs_parquet table planned to a factory nothing registered and failed at
+    // deploy; the plain factory reached the 2PC sink only through `prefix`. The base directory is
+    // `prefix`, or `path` when only that is given.
+    const auto two_pc_base = [](const BuildContext& ctx) {
+        auto base = ctx.param_or("prefix", "");
+        if (base.empty()) {
+            base = ctx.param_or("path", "");
+        }
+        if (base.empty()) {
+            throw std::runtime_error(
+                "webhdfs_parquet exactly-once sink: 'prefix' (or 'path') is required");
+        }
+        return base;
+    };
+    reg.register_sink<std::int64_t>(
+        "webhdfs_parquet_2pc_int64_sink", [two_pc_base](const BuildContext& ctx) {
+            return make_2pc_sink<std::int64_t>(ctx, two_pc_base(ctx), int64_arrow_batcher());
+        });
+    reg.register_sink<std::string>(
+        "webhdfs_parquet_2pc_string_sink", [two_pc_base](const BuildContext& ctx) {
+            return make_2pc_sink<std::string>(ctx, two_pc_base(ctx), string_arrow_batcher());
+        });
 
     reg.register_source<std::int64_t>("webhdfs_parquet_int64_source", [](const BuildContext& ctx) {
         return make_source<std::int64_t>(ctx, int64_arrow_batcher());
