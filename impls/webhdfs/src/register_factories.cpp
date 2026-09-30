@@ -8,6 +8,8 @@
 #include <utility>
 
 #include "clink/connectors/capability.hpp"
+#include "clink/connectors/parquet_rolling_sink.hpp"
+#include "clink/connectors/webhdfs_filesystem.hpp"
 #include "clink/connectors/webhdfs_parquet_sink.hpp"
 #include "clink/connectors/webhdfs_parquet_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
@@ -46,8 +48,8 @@ template <typename T>
 std::shared_ptr<Sink<T>> make_sink(const clink::plugin::BuildContext& ctx,
                                    ArrowBatcher<T> batcher) {
     // A `prefix` selects the exactly-once 2PC sink (stages under <prefix>/staging, atomically
-    // RENAMEs to <prefix>/committed on commit); a `path` selects the at-least-once single-object
-    // sink. They are mutually exclusive.
+    // RENAMEs to <prefix>/committed on commit); a `path` selects the at-least-once rolling sink
+    // (a directory of part files). They are mutually exclusive.
     if (const auto prefix = ctx.param_or("prefix", ""); !prefix.empty()) {
         if (ctx.param_or("base_url").empty()) {
             throw std::runtime_error("webhdfs_parquet: 'base_url' is required");
@@ -75,16 +77,41 @@ std::shared_ptr<Sink<T>> make_sink(const clink::plugin::BuildContext& ctx,
         return std::make_shared<WebHdfsParquetSink2PC<T>>(std::move(o), std::move(batcher));
     }
 
-    typename WebHdfsParquetSink<T>::Options opts;
-    apply_common_params(ctx, opts);
-    opts.overwrite = ctx.param_or("overwrite", "true") == "true";
+    // `path` names an HDFS directory of part files, one per subtask per checkpoint interval
+    // (ParquetRollingSink over WebHdfsFileSystem). Read it back with the source's `prefix`.
+    const auto path = ctx.param_or("path");
+    if (ctx.param_or("base_url").empty() || path.empty()) {
+        throw std::runtime_error("webhdfs_parquet: 'base_url' and 'path' are required");
+    }
+    WebHdfsFileSystem::Options fo;
+    fo.base_url = ctx.param_or("base_url");
+    if (const auto u = ctx.param_or("user", ""); !u.empty()) {
+        fo.user = u;
+    }
+    if (const auto d = ctx.param_or("delegation_token", ""); !d.empty()) {
+        fo.delegation_token = d;
+    }
     if (const auto p = ctx.param_or("permission", ""); !p.empty()) {
-        opts.permission = p;
+        fo.permission = p;
     }
-    if (ctx.parallelism > 1) {
-        opts.path += "." + std::to_string(ctx.subtask_idx) + ".parquet";
+    fo.verify_tls = ctx.param_or("verify_tls", "true") == "true";
+    if (const auto c = ctx.param_int64_or("connect_timeout_ms", 0); c > 0) {
+        fo.connect_timeout_ms = static_cast<int>(c);
     }
-    return std::make_shared<WebHdfsParquetSink<T>>(std::move(opts), std::move(batcher));
+    if (const auto r = ctx.param_int64_or("rw_timeout_ms", 0); r > 0) {
+        fo.rw_timeout_ms = static_cast<int>(r);
+    }
+    typename ParquetRollingSink<T>::Options o;
+    o.dir = path;
+    o.subtask_idx = ctx.subtask_idx;
+    o.parallelism = ctx.parallelism;
+    return std::make_shared<ParquetRollingSink<T>>(
+        [fo]() -> std::shared_ptr<arrow::fs::FileSystem> {
+            return std::make_shared<WebHdfsFileSystem>(fo);
+        },
+        std::move(o),
+        std::move(batcher),
+        "webhdfs_parquet_sink");
 }
 
 template <typename T>
@@ -140,7 +167,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .checkpoint_integrated = true,
         // With `prefix` the sink stages one file per checkpoint interval
         // and atomically RENAMEs it to <prefix>/committed on commit; with
-        // `path` it writes a single object, at-least-once.
+        // `path` it writes a directory of part files, at-least-once.
         .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceAtomicPublish,
         .transactional = true,
         .auth_methods = {"none", "kerberos-proxied"},
@@ -149,8 +176,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"path= single-object mode is at-least-once; exactly-once needs prefix=",
-                        "a crash can leave orphaned files under <prefix>/staging"},
+        .limitations =
+            {"path= (a directory of part files) is at-least-once; exactly-once needs prefix=",
+             "a crash can leave orphaned files under <prefix>/staging"},
         .required_options_for_exactly_once = {"prefix"},
     });
 
@@ -158,7 +186,8 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     // ---- Parquet over WebHDFS / HttpFS (sink + source pairs, int64 + string channels) ----
     // Reuses clink's HTTP client (no JVM/libhdfs). base_url = the WebHDFS NameNode or an HttpFS
-    // gateway root; path = the HDFS file path. Auth via user (user.name) or a delegation token.
+    // gateway root; a sink's path = the HDFS directory it writes parts to, a source's path = one
+    // HDFS file (prefix = a directory). Auth via user (user.name) or a delegation token.
     // Two-step REST write/read (CREATE/OPEN -> 307 -> datanode); see webhdfs_parquet_sink.hpp.
 
     reg.register_sink<std::int64_t>("webhdfs_parquet_int64_sink", [](const BuildContext& ctx) {

@@ -17,7 +17,9 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/io/file.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/reader.h>
 
 #include "clink/config/json.hpp"
 #include "clink/embed/embedded_engine.hpp"
@@ -545,8 +547,8 @@ TEST(EmbeddedEngine, ParquetProjectedReadEndToEnd) {
     // survive the round trip.
     const auto in_path = fs::temp_directory_path() / "clink_embed_pq_in.ndjson";
     const auto pq_path = fs::temp_directory_path() / "clink_embed_pq.parquet";
-    fs::remove(in_path);
-    fs::remove(pq_path);
+    fs::remove_all(in_path);
+    fs::remove_all(pq_path);
     write_lines(in_path,
                 {R"({"user_id":1,"name":"a","amount":10})",
                  R"({"user_id":2,"name":"b","amount":20})",
@@ -592,8 +594,8 @@ TEST(EmbeddedEngine, ParquetProjectedReadEndToEnd) {
     EXPECT_EQ(rows, 3);
     EXPECT_EQ(sum, 60);
     EXPECT_TRUE(engine.await_all()) << err.str();
-    fs::remove(in_path);
-    fs::remove(pq_path);
+    fs::remove_all(in_path);
+    fs::remove_all(pq_path);
 }
 
 TEST(EmbeddedEngine, CreateFunctionLanguageSqlRunsEndToEnd) {
@@ -1002,5 +1004,61 @@ TEST(EmbeddedEngine, ARunKilledBeforeItsFirstCheckpointDoesNotResumeTheRunBefore
         false);
     EXPECT_EQ(changed.execute_rc, 0) << changed.err;
     EXPECT_EQ(changed.rows, 5) << "nothing of its own to resume, so no refusal and no old state";
+    fs::remove_all(dir);
+}
+
+// The plain `parquet` sink across a resume. It used to write one file per
+// subtask, which a Parquet writer can only finish at close: a restored run
+// started that file again from empty and dropped every row written before the
+// restore point. It now writes complete parts at each barrier, and a resumed
+// run keeps them.
+TEST(EmbeddedEngine, AResumedRunKeepsThePlainParquetSinksEarlierOutput) {
+    const auto dir = resume_scratch("parquetsink");
+    write_orders(dir / "in.ndjson");
+    const auto out = dir / "out_parquet";
+    const auto run = [&](std::string* err_out) {
+        clink::embed::EngineOptions opts;
+        std::ostringstream err;
+        opts.err = &err;
+        opts.checkpoint_dir = (dir / "ckpt").string();
+        opts.checkpoint_interval_ms = 100;
+        int rc = 0;
+        {
+            clink::embed::EmbeddedEngine engine{std::move(opts)};
+            rc = engine.execute_script(orders_ddl(dir / "in.ndjson") +
+                                       "CREATE TABLE out_pq (user_id BIGINT, amount BIGINT) WITH "
+                                       "(connector='parquet', path='" +
+                                       out.string() +
+                                       "');\n"
+                                       "INSERT INTO out_pq SELECT user_id, amount FROM orders;");
+            if (rc == 0 && !engine.await_all()) {
+                rc = 1;
+            }
+        }
+        *err_out = err.str();
+        return rc;
+    };
+    const auto rows_on_disk = [&] {
+        std::int64_t rows = 0;
+        for (const auto& e : fs::directory_iterator(out)) {
+            if (e.path().extension() != ".parquet") {
+                continue;
+            }
+            auto in = arrow::io::ReadableFile::Open(e.path().string());
+            EXPECT_TRUE(in.ok());
+            auto reader = parquet::arrow::OpenFile(*in, arrow::default_memory_pool());
+            EXPECT_TRUE(reader.ok());
+            rows += (*reader)->parquet_reader()->metadata()->num_rows();
+        }
+        return rows;
+    };
+    std::string err;
+
+    ASSERT_EQ(run(&err), 0) << err;
+    ASSERT_EQ(rows_on_disk(), 5);
+    as_if_killed(dir / "ckpt");
+
+    ASSERT_EQ(run(&err), 0) << err;
+    EXPECT_EQ(rows_on_disk(), 5) << "the resumed run must keep what the first run wrote";
     fs::remove_all(dir);
 }

@@ -142,7 +142,7 @@ TEST(ColumnarParquetFactories, FactoriesBuildWorkingConnectorsViaPathParam) {
             EXPECT_TRUE(trade_eq(got[i], rows[i]));
     }
 
-    std::filesystem::remove(path);
+    std::filesystem::remove_all(path);
 }
 
 TEST(ColumnarParquetFactories, TwoPcFactoryBuildsParquetSink2PC) {

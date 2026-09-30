@@ -13,6 +13,7 @@
 #include "clink/connectors/capability.hpp"
 #include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_fs_2pc_sink.hpp"
+#include "clink/connectors/parquet_rolling_sink.hpp"
 #include "clink/connectors/parquet_s3_sink.hpp"
 #include "clink/connectors/parquet_s3_source.hpp"
 #include "clink/connectors/s3_sink.hpp"
@@ -150,53 +151,9 @@ void install(clink::plugin::PluginRegistry& reg) {
     // S3Sink, so they don't depend on the impls/s3 AWS-SDK glue.
     // Credentials resolve via the standard chain (env vars, instance
     // profile, ~/.aws/credentials). `endpoint_override` is for
-    // localstack / MinIO testing. Path = `bucket` + `/` + `key`.
-    auto parquet_s3_options = [](const BuildContext& ctx, const std::string& op_label) {
-        const auto bucket = ctx.param_or("bucket");
-        const auto key = ctx.param_or("key");
-        if (bucket.empty() || key.empty()) {
-            throw std::runtime_error(op_label + ": 'bucket' and 'key' are required");
-        }
-        return std::make_tuple(
-            bucket, key, ctx.param_or("region", ""), ctx.param_or("endpoint_override", ""));
-    };
-
-    reg.register_sink<std::int64_t>(
-        "s3_parquet_int64_sink",
-        [parquet_s3_options](const BuildContext& ctx) -> std::shared_ptr<Sink<std::int64_t>> {
-            auto [bucket, key, region, endpoint] = parquet_s3_options(ctx, "s3_parquet_int64_sink");
-            ParquetS3Sink<std::int64_t>::Options opts;
-            opts.bucket = bucket;
-            opts.key = key;
-            if (!region.empty())
-                opts.region = region;
-            if (!endpoint.empty())
-                opts.endpoint_override = endpoint;
-            if (ctx.parallelism > 1) {
-                opts.key += "." + std::to_string(ctx.subtask_idx) + ".parquet";
-            }
-            return std::make_shared<ParquetS3Sink<std::int64_t>>(std::move(opts),
-                                                                 int64_arrow_batcher());
-        });
-
-    reg.register_sink<std::string>(
-        "s3_parquet_string_sink",
-        [parquet_s3_options](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
-            auto [bucket, key, region, endpoint] =
-                parquet_s3_options(ctx, "s3_parquet_string_sink");
-            ParquetS3Sink<std::string>::Options opts;
-            opts.bucket = bucket;
-            opts.key = key;
-            if (!region.empty())
-                opts.region = region;
-            if (!endpoint.empty())
-                opts.endpoint_override = endpoint;
-            if (ctx.parallelism > 1) {
-                opts.key += "." + std::to_string(ctx.subtask_idx) + ".parquet";
-            }
-            return std::make_shared<ParquetS3Sink<std::string>>(std::move(opts),
-                                                                string_arrow_batcher());
-        });
+    // localstack / MinIO testing. A sink writes a directory of parts under
+    // `bucket` + `/` + `prefix` (or `key`); a source reads one object (`key`)
+    // or every object under a `prefix`.
 
     // Parquet S3 source. A single `key` reads one object; a `prefix` reads every
     // matching object under it, sharded across subtasks (MultiObjectParquetSource).
@@ -309,6 +266,44 @@ void install(clink::plugin::PluginRegistry& reg) {
                     batcher);
             });
     };
+
+    // At-least-once Parquet sink over S3: one complete object per subtask per checkpoint
+    // interval under <bucket>/<prefix> (ParquetRollingSink). `key` is accepted as the prefix.
+    // Read the result with s3_parquet source on the same prefix.
+    auto register_parquet_rolling_sink = [&reg, make_s3_fs_factory]<typename T>(
+                                             const std::string& factory_name,
+                                             ArrowBatcher<T> batcher) {
+        reg.register_sink<T>(
+            factory_name,
+            [factory_name, make_s3_fs_factory, batcher](
+                const BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+                const auto bucket = ctx.param_or("bucket");
+                auto prefix = ctx.param_or("prefix", "");
+                if (prefix.empty()) {
+                    prefix = ctx.param_or("key", "");
+                }
+                if (bucket.empty() || prefix.empty()) {
+                    throw std::runtime_error(factory_name +
+                                             ": 'bucket' and 'prefix' (or 'key') are required");
+                }
+                typename ParquetRollingSink<T>::Options o;
+                o.dir = bucket + "/" + prefix;
+                o.subtask_idx = ctx.subtask_idx;
+                o.parallelism = ctx.parallelism;
+                return std::make_shared<ParquetRollingSink<T>>(
+                    make_s3_fs_factory(ctx.param_or("region", ""),
+                                       ctx.param_or("endpoint_override", ""),
+                                       ctx.param_or("anonymous", "false") == "true",
+                                       factory_name),
+                    std::move(o),
+                    batcher,
+                    factory_name);
+            });
+    };
+    register_parquet_rolling_sink.template operator()<std::int64_t>("s3_parquet_int64_sink",
+                                                                    int64_arrow_batcher());
+    register_parquet_rolling_sink.template operator()<std::string>("s3_parquet_string_sink",
+                                                                   string_arrow_batcher());
 
     register_parquet_2pc_sink.template operator()<std::int64_t>("s3_parquet_2pc_int64_sink",
                                                                 int64_arrow_batcher());

@@ -34,6 +34,7 @@
 #include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
 #include "clink/connectors/parquet_2pc_sink.hpp"
+#include "clink/connectors/parquet_rolling_sink.hpp"
 #include "clink/connectors/parquet_sink.hpp"
 #include "clink/connectors/parquet_source.hpp"
 #include "clink/core/hash_map.hpp"
@@ -12484,6 +12485,18 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error("parquet_row_source: 'path' param is required");
             }
             auto cols = parse_row_schema(ctx.param_or("schema_columns"));
+            // A directory (what the rolling parquet_row_sink writes) is read whole:
+            // the multi-file reader requires each file's schema to match the
+            // batcher's, so the projection narrowing below applies to one file
+            // only. The downstream projection still trims the columns.
+            if (auto dir =
+                    make_local_parquet_directory_source<Row>(path,
+                                                             ctx.subtask_idx,
+                                                             ctx.parallelism,
+                                                             make_row_columnar_arrow_batcher(cols),
+                                                             "parquet_row_source")) {
+                return dir;
+            }
             if (const auto csv = ctx.param_or("projected_columns"); !csv.empty()) {
                 std::set<std::string> wanted;
                 std::size_t pos = 0;
@@ -12524,17 +12537,15 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   path (required), schema_columns (required for typed columns)
     reg.register_sink<Row>(
         "parquet_row_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
-            auto path = ctx.param_or("path");
+            const auto path = ctx.param_or("path");
             if (path.empty()) {
                 throw std::runtime_error("parquet_row_sink: 'path' param is required");
             }
-            if (ctx.parallelism > 1) {
-                path += "." + std::to_string(ctx.subtask_idx) + ".parquet";
-            }
-            return std::make_shared<ParquetSink<Row>>(
+            return make_local_parquet_rolling_sink<Row>(
                 path,
+                ctx.subtask_idx,
+                ctx.parallelism,
                 make_row_columnar_arrow_batcher(parse_row_schema(ctx.param_or("schema_columns"))),
-                parquet::Compression::ZSTD,
                 "parquet_row_sink");
         });
 

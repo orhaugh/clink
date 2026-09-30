@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+**The plain Parquet sinks keep their output across a restore.** A Parquet
+file cannot be appended to, and its footer is written only when it is
+closed, so the plain `parquet` sinks, which wrote one file per subtask, left
+nothing readable when their process was killed. A restored run, from a
+cluster failover or a resumed `clink run`, started that file again from
+empty and lost every row written before the restore point. The sinks now
+write a directory of complete part files instead, one per subtask per
+checkpoint interval (`ParquetRollingSink`), on the local disk and on S3,
+GCS, Azure and WebHDFS.
+
+- A part is closed at every checkpoint barrier and at the end of input, so
+  a job's output is readable while it runs, and everything up to the last
+  barrier survives a kill.
+- A part appears only when it is complete. An object store publishes it
+  when the upload finishes; on the local disk and WebHDFS it is renamed from
+  `<name>.inprogress`.
+- A restored run keeps every part, including parts past the restore point,
+  whose rows the sources then replay: at-least-once, as before. A run that
+  starts from empty state replaces the previous run's parts.
+  `delivery_guarantee='exactly_once'` remains the path without duplicates.
+
+**Compatibility.** A plain Parquet sink's `path` (or, on S3, GCS and Azure,
+its `prefix`, with `key` still accepted) now names a directory, not a file.
+Read it back with a `parquet` table on the same `path`, which now reads
+every part in a directory, with the object-store sources' `prefix`, or with
+any dataset reader (`pyarrow.dataset`, DuckDB's `read_parquet('<dir>/*.parquet')`).
+Readers that open the old single file must move to the directory. On S3,
+GCS and Azure, a table that is both written and read (a materialized view's
+backing, for example) must use `prefix`: a source's `key` still reads one
+object. The
+programmatic single-file sink classes (`ParquetSink<T>` and the object-store
+equivalents) are unchanged. The plain sinks no longer read the WebHDFS
+`overwrite` option.
+
 ## v0.10.0 (September 2026)
 
 An embedded run now resumes from its own checkpoints after a crash, and

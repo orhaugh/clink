@@ -56,6 +56,7 @@ include/clink/connectors/multi_object_parquet_source.hpp
 include/clink/connectors/openssl_atexit_guard.hpp
 include/clink/connectors/parquet_2pc_sink.hpp
 include/clink/connectors/parquet_fs_2pc_sink.hpp
+include/clink/connectors/parquet_rolling_sink.hpp
 include/clink/connectors/parquet_sink.hpp
 include/clink/connectors/parquet_source.hpp
 include/clink/connectors/polling_source.hpp

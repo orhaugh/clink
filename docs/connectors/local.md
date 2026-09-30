@@ -31,10 +31,10 @@ No client library and no `CLINK_WITH_*` knob: the `file` connector needs nothing
 | `file_json_upsert_sink` | sink | row | nets a changelog by primary key |
 | `partition_file_sink` | sink | row | one file per `partition_by` value (append-only) |
 | `file_2pc_sink_row` / `file_2pc_sink_string` | sink | row / string | exactly-once (stage then atomic rename) |
-| `parquet_string_source` / `parquet_int64_source` | source | string / int64 | `path` (one file) or `prefix` (a directory) |
-| `parquet_row_source` | source | row | typed-columnar (one Arrow column per declared column) |
-| `parquet_string_sink` / `parquet_int64_sink` | sink | string / int64 | one file per subtask |
-| `parquet_row_sink` | sink | row | typed-columnar |
+| `parquet_string_source` / `parquet_int64_source` | source | string / int64 | `path` (one file, or a directory of parts) or `prefix` (a directory tree) |
+| `parquet_row_source` | source | row | typed-columnar (one Arrow column per declared column); `path` may be a directory of parts |
+| `parquet_string_sink` / `parquet_int64_sink` | sink | string / int64 | a directory of part files, one per subtask per checkpoint interval |
+| `parquet_row_sink` | sink | row | typed-columnar, the same directory of part files |
 | `parquet_row_2pc_sink` | sink | row | exactly-once typed-columnar |
 
 In `clink --capabilities` these appear under four connector identities: `file`,
@@ -47,7 +47,7 @@ Options are read from `BuildContext` params in `src/cluster/built_in_factories.c
 
 | Option | Applies to | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `path` | both | one of `path`/`prefix` | (none) | File path. For a parallel sink, `.<subtask_idx>` (text) or `.<subtask_idx>.parquet` is appended so each subtask writes a distinct file. |
+| `path` | both | one of `path`/`prefix` | (none) | For `file`, the file path; a parallel sink appends `.<subtask_idx>` so each subtask writes a distinct file. For a `parquet` sink, the directory its part files are written to. For a `parquet` source, one file, or a directory whose `*.parquet` parts are all read (what a `parquet` sink wrote). |
 | `prefix` | `parquet` source | one of `path`/`prefix` | (none) | A directory to read recursively; every matching Parquet file is read, sharded round-robin across subtasks (file `i` is read by subtask `i % parallelism`). |
 | `recursive` | `parquet` source (`prefix`) | No | `true` | Descend into sub-directories when listing. |
 | `suffix` | `parquet` source (`prefix`) | No | `.parquet` | Only files whose name ends with this are read. |
@@ -78,6 +78,16 @@ CREATE TABLE totals (user_id BIGINT, total BIGINT) WITH (
 INSERT INTO totals SELECT user_id, SUM(amount) AS total FROM events GROUP BY user_id;
 ```
 
+Writing Parquet produces a directory of part files, which a `parquet` table
+reads back whole:
+
+```sql
+CREATE TABLE pq_events (user_id BIGINT, amount BIGINT) WITH (
+  connector = 'parquet', path = '/out/events');  -- /out/events/sub0-...-000000.parquet, ...
+
+INSERT INTO pq_events SELECT user_id, amount FROM events;
+```
+
 Exactly-once to local Parquet, partitioned text output, and upsert:
 
 ```sql
@@ -92,7 +102,10 @@ CREATE TABLE by_region (region STRING, n BIGINT) WITH (
 
 ## Example
 
-Programmatic local Parquet round-trip (single file), plus a multi-object directory read:
+Programmatic local Parquet round-trip with the single-file `ParquetSink<T>`,
+plus a multi-object directory read. The `parquet` connector's factories use
+`ParquetRollingSink<T>` (`clink/connectors/parquet_rolling_sink.hpp`) instead,
+so that a job's output survives a restore.
 
 ```cpp
 #include "clink/connectors/parquet_sink.hpp"
@@ -128,9 +141,9 @@ src.open();
 
 ## Delivery semantics
 
-- **`file` text/JSON sink** (`file_text_sink` / `file_json_sink`): at-least-once. The file is truncated and rewritten on open, so a replay from checkpoint re-writes it.
+- **`file` text/JSON sink** (`file_text_sink` / `file_json_sink`): at-least-once. A run that starts from empty state truncates the file; a run restored from a checkpoint appends to it, so the rows before the restore point stay and the rows after it are written again as the sources replay them.
 - **`file` 2PC sink** (`delivery_guarantee='exactly_once'`, `file_2pc_sink_*`): exactly-once. Each checkpoint interval is staged then atomically renamed into `committed/` on the global commit, with `write_fsync_rename` durability (toggle with `CLINK_STATE_FSYNC`). This is the local reference implementation the object-store 2PC sinks mirror.
-- **`parquet` single-file sink** (`parquet_*_sink`, `parquet_row_sink`): at-least-once; the file is finalised on `close()`.
+- **`parquet` sink** (`parquet_*_sink`, `parquet_row_sink`): at-least-once, a directory of complete part files (`ParquetRollingSink`). Each subtask closes a part at every checkpoint barrier and at the end of input, so its output is readable while the job runs and everything up to the last barrier survives a kill. A part is written to `<name>.inprogress` and renamed when complete, so a reader never sees a torn `.parquet` file. A run restored from a checkpoint keeps every part already written, including those past the restore point, whose rows the sources then replay; a run that starts from empty state replaces the previous run's parts (only files named `sub<N>-*.parquet`). Read the directory with a `parquet` source (`path` or `prefix`), `pyarrow.dataset`, or DuckDB's `read_parquet('<dir>/*.parquet')`.
 - **`parquet` 2PC row sink** (`delivery_guarantee='exactly_once'`, `parquet_row_2pc_sink`): exactly-once, the same staging then atomic-rename protocol with complete, externally-readable Parquet files.
 - **Sources** (`file_*_source`, `parquet_*_source`): bounded, and replay from a checkpoint by re-opening and skipping the record/batch count already emitted (deterministic for a fixed file or a fixed directory listing).
 
@@ -138,5 +151,5 @@ src.open();
 
 - The `parquet` source's multi-object directory read (`prefix`) shards by object across same-parallelism subtasks; cross-parallelism rescale of the assignment is not coordinated.
 - No Hive-partition pruning or column projection on the Parquet read path; the whole file is read.
-- The `file` text sink truncates on open (no append-to-existing), and the partitioning sink is append-only.
+- The `file` text sink truncates on open unless the run restores from a checkpoint, and the partitioning sink is append-only.
 - The typed-columnar `parquet_row_*` factories carry one Arrow column per declared column; the `parquet_string_source`/`_sink` factories carry a single column, so a multi-object `prefix` read on the string channel expects single-column files.

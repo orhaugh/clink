@@ -49,7 +49,8 @@ All four factories share the same parameter parsing (`apply_azure_params` in `re
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `container` | Yes | none | Azure Blob container name. First path segment of `<container>/<blob>`. |
-| `key` | Yes | none | Blob key (object path) within the container. |
+| `prefix` | Sink: one of `prefix`/`key` | none | Sink: the prefix its part blobs are written under (`container/prefix/sub<N>-...parquet`). Source: read every matching blob under it. |
+| `key` | Source: one of `key`/`prefix` | none | Source: the single blob `container/key`. Sink: accepted as the prefix, for configurations written before the sink wrote a directory. |
 | `account_name` | Yes | none | Azure storage account name. |
 | `anonymous` | No | `false` | `true` uses an anonymous credential (public container or emulator). Takes precedence over `account_key` / `sas_token` when set. |
 | `account_key` | No | unset | Shared-key credential. Also how the Azurite emulator authenticates. |
@@ -65,7 +66,7 @@ The sink's `Options` struct (`parquet_azure_sink.hpp`) carries two further field
 - `compression` (`parquet::Compression::type`), default `ZSTD`.
 - `bucket_assigner` (`std::function<std::string(const T&)>`), an optional per-record blob-key assigner for Hive-style partitioning. When set, `key` becomes optional.
 
-When `parallelism > 1`, the sink factory suffixes the configured `key` with `.<subtask_idx>.parquet` so each subtask writes a distinct blob (`register_factories.cpp`). The source factory applies no such suffix.
+Each subtask names its part blobs `sub<N>-<run>-<seq>.parquet`, so parallel subtasks and successive runs never write the same key (`register_factories.cpp`).
 
 ## SQL usage
 
@@ -78,7 +79,7 @@ CREATE TABLE azure_out (
     connector = 'azure_parquet',
     account_name = 'mystorageacct',
     container = 'analytics',
-    key = 'exports/output.parquet',
+    prefix = 'exports/output',
     sas_token = 'sv=2022-11-02&ss=b&srt=co&sp=rwl&...'
 );
 ```
@@ -134,7 +135,7 @@ Through the registry, look the factory up by its registered name (for example `a
 
 ## Delivery semantics
 
-The Parquet blob is finalised only when the sink's `close()` runs, which closes each writer and output stream and flushes Arrow's background write buffer. There is no two-phase commit and no per-checkpoint blob rotation in this connector, so a sink failure or job restart before `close()` can leave a partial or zero-length blob; the writer's `close()` is written to close and release every per-key stream before reporting the first error, so teardown does not strand other keys' streams (`parquet_azure_sink.hpp`). Treat this single-object sink as at-least-once at best.
+The factory sink is at-least-once and writes a directory of part objects under `container/prefix` through the shared `ParquetRollingSink<T>` (`include/clink/connectors/parquet_rolling_sink.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input, and the store publishes an object only when its upload completes, so a kill never leaves a partial object and everything up to the last barrier is already published. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts under the prefix (only keys named `sub<N>-*.parquet`). Read the directory back with the source on the same `prefix`. The programmatic `ParquetAzureSink<T>` writes a single object and finalises it only in `close()`.
 
 For exactly-once, use the 2PC sink: `azure_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet blob per checkpoint interval under `<container>/<prefix>/staging` and promotes it to `<container>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Read the result with the source pointed at `<prefix>/committed`.
 
@@ -142,7 +143,7 @@ The source reads a single Parquet object to its last row group and reports `is_b
 
 ## Limitations
 
-- The default single-object sink commits the whole blob at `close()` (a failure before then can leave a partial blob). For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages and atomically promotes one blob per checkpoint.
+- The factory sink rolls parts at checkpoint barriers only (no size-based rollover) and is at-least-once. For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages and atomically promotes one blob per checkpoint.
 - The source reads one object with `key`, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). Hive-partition pruning and column projection are not performed.
 - Source has no replay or offset tracking; it is a bounded one-shot read.
 - Record channels are limited to `int64` and `string`. Only those four factories are registered.

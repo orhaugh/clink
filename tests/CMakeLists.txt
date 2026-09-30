@@ -52,6 +52,7 @@ add_executable(clink_core_tests
     test_state_fingerprint_gate.cpp
     test_columnar_parquet.cpp
     test_parquet_2pc_sink.cpp
+    test_parquet_rolling_sink.cpp
     test_columnar_parquet_factories.cpp
     test_parquet_connector.cpp
     test_multi_object_parquet_source.cpp

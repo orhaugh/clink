@@ -50,7 +50,8 @@ The sink and source share the same auth and endpoint parameters, parsed by `appl
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `bucket` | Yes | (none) | Target GCS bucket. The factory throws if it is empty. |
-| `key` | Yes | (none) | Object key within the bucket. The object path is `bucket + "/" + key`. The factory throws if it is empty. |
+| `prefix` | Sink: one of `prefix`/`key` | (none) | Sink: the prefix its part objects are written under (`bucket/prefix/sub<N>-...parquet`). Source: read every matching object under it. |
+| `key` | Source: one of `key`/`prefix` | (none) | Source: the single object `bucket + "/" + key`. Sink: accepted as the prefix, for configurations written before the sink wrote a directory. |
 | `anonymous` | No | `false` | When `true`, uses anonymous access (`GcsOptions::Anonymous()`), suitable for the fake-gcs-server emulator or a public bucket. |
 | `access_token` | No | (unset) | An explicit OAuth2 access token. Static, with a 24-hour far-future expiry and no refresh; the caller is responsible for token validity. Prefer `credentials_file`/`credentials_json` or Application Default Credentials for a long-running job. |
 | `credentials_file` / `credentials_json` | No | (unset) | A service-account key, as a file path or inline JSON, mapped to `GcsOptions::FromServiceAccountCredentials`. Auto-refreshing: google-cloud-cpp mints and renews the OAuth token over the filesystem's lifetime. Takes precedence over `access_token`. |
@@ -63,7 +64,7 @@ Authentication and refresh: the credential precedence is `anonymous` > a service
 
 The sink `Options` struct also carries `compression` (defaults to `parquet::Compression::ZSTD`) and an optional `bucket_assigner` for per-record Hive-style object keys. Neither is wired through the factory parameter parsing; they are only reachable via the programmatic API.
 
-When `parallelism > 1`, the sink factory appends `"." + subtask_idx + ".parquet"` to `key` so each subtask writes a distinct object (`register_factories.cpp`).
+Each subtask names its part objects `sub<N>-<run>-<seq>.parquet`, so parallel subtasks and successive runs never write the same key (`register_factories.cpp`).
 
 ## SQL usage
 
@@ -129,7 +130,7 @@ Via the registry, look up the factory by name and channel, for example `gcs_parq
 
 ## Delivery semantics
 
-The Parquet object is finalised in `close()`: the sink keeps a `parquet::arrow::FileWriter` per key, accumulates record batches across `on_data` calls, and only flushes and closes the writer and the output stream at `close()` (`parquet_gcs_sink.hpp`). There is no two-phase commit and no barrier-aligned commit, so the sink is not transactional or exactly-once. A job that fails before `close()` leaves no finalised object for that writer. The `close()` path is hardened to close every writer and stream before rethrowing the first error, so a failure on one key does not strand other keys' streams as partial objects.
+The factory sink is at-least-once and writes a directory of part objects under `bucket/prefix` through the shared `ParquetRollingSink<T>` (`include/clink/connectors/parquet_rolling_sink.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input, and the store publishes an object only when its upload completes, so a kill never leaves a partial object and everything up to the last barrier is already published. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts under the prefix (only keys named `sub<N>-*.parquet`). Read the directory back with the source on the same `prefix`. The programmatic `ParquetGcsSink<T>` writes a single object and finalises it only in `close()`.
 
 For exactly-once, use the 2PC sink: `gcs_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Read the result with the source pointed at `<prefix>/committed`.
 
@@ -139,7 +140,7 @@ The source reads a single Parquet object to its last row group and reports `is_b
 
 - The source reads one object with `key`, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). There is no Hive-partition pruning or column projection on either path.
 - Channels are limited to `int64` and `string`; there are no other typed factories.
-- The default single-object sink holds its writer set open until `close()` and is not transactional. For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages and atomically promotes one file per checkpoint.
+- The factory sink rolls parts at checkpoint barriers only (no size-based rollover) and is at-least-once. For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages and atomically promotes one file per checkpoint.
 - `compression` and the per-record `bucket_assigner` exist on the sink `Options` but are not configurable through the factory parameters or SQL; they require the programmatic API. The compression default is ZSTD.
 - `access_token` is static (fixed 24-hour expiry, no refresh); use `credentials_file`/`credentials_json` (service account) or Application Default Credentials, both of which auto-refresh, for a long-running job.
 - The source requires the on-disk Parquet schema to match the `ArrowBatcher` schema exactly (metadata aside), otherwise `open()` throws.

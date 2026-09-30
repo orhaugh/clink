@@ -27,7 +27,7 @@ cmake -S . -B build -DCLINK_WITH_WEBHDFS=ON
 
 | Factory name | Direction | Record type |
 | --- | --- | --- |
-| `webhdfs_parquet_int64_sink` | sink | `int64`; with `path`, the at-least-once single-object sink; with `prefix`, the two-phase-commit sink (`WebHdfsParquetSink2PC<T>`, one staged file per checkpoint) |
+| `webhdfs_parquet_int64_sink` | sink | `int64`; with `path`, the at-least-once sink writing a directory of part files; with `prefix`, the two-phase-commit sink (`WebHdfsParquetSink2PC<T>`, one staged file per checkpoint) |
 | `webhdfs_parquet_string_sink` | sink | `string`; the same `path` / `prefix` selection |
 | `webhdfs_parquet_int64_source` | source | `int64` |
 | `webhdfs_parquet_string_source` | source | `string` |
@@ -50,14 +50,14 @@ The keys below are parsed from `BuildContext` in `register_factories.cpp` (`appl
 | `verify_tls` | No | `true` | When `false`, skips server-certificate verification for `https://` endpoints. |
 | `connect_timeout_ms` | No | `5000` | HTTP connect timeout in milliseconds. Applied only when supplied and greater than 0. |
 | `rw_timeout_ms` | No | `30000` | HTTP read/write timeout in milliseconds. Applied only when supplied and greater than 0. |
-| `overwrite` | No (sink only) | `true` | Sets the `overwrite` query parameter on `CREATE`. |
+| `overwrite` | No (programmatic sink only) | `true` | Sets the `overwrite` query parameter on `CREATE` for the programmatic `WebHdfsParquetSink<T>`. The factory sink ignores it: its part names are unique, and a run that starts from empty state replaces the previous run's parts. |
 | `permission` | No (sink only) | unset | Sets the `permission` query parameter (octal, e.g. `644`). |
 
 Notes:
 
-- The source accepts `base_url`, `path`, `user`, `delegation_token`, `verify_tls`, `connect_timeout_ms` and `rw_timeout_ms`. `overwrite` and `permission` apply to the sink only.
+- The source accepts `base_url`, `path`, `user`, `delegation_token`, `verify_tls`, `connect_timeout_ms` and `rw_timeout_ms`. `permission` applies to the sink only.
 - The sink's `Options` struct also carries a `compression` field defaulting to `parquet::Compression::ZSTD`; this is not parsed from `BuildContext` and so is fixed to the default through the factory path.
-- When `parallelism > 1`, the sink appends `.<subtask_idx>.parquet` to `path` so each subtask writes a distinct file (`make_sink` in `register_factories.cpp`).
+- A sink's `path` is an HDFS directory. Each subtask writes part files named `sub<N>-<run>-<seq>.parquet` into it, so parallel subtasks and successive runs never write the same file (`make_sink` in `register_factories.cpp`). Read them back with the source's `prefix`.
 
 ## SQL usage
 
@@ -69,9 +69,8 @@ CREATE TABLE hdfs_out (
 ) WITH (
     connector = 'webhdfs_parquet',
     base_url  = 'http://httpfs:14000',
-    path      = '/clink/out.parquet',
-    user      = 'clink',
-    overwrite = 'true'
+    path      = '/clink/out',          -- a directory of part files
+    user      = 'clink'
 );
 ```
 
@@ -134,7 +133,7 @@ In a deployed job the factories are usually looked up by name from the plugin re
 
 ## Delivery semantics
 
-The default single-object sink is at-least-once. The Parquet file is created and finalised in a single upload on `close()`; a failure mid-upload throws and the job replays from the last checkpoint (`webhdfs_parquet_sink.hpp`). There is no two-phase commit and no incremental upload. The two-step write fails loudly if `CREATE` does not return a `307` redirect to a datanode, because `CREATE` carries no body and a non-redirect `2xx` would create an empty file rather than upload the Parquet bytes; a gateway that only does single-request inline writes is not supported.
+The default sink (`path`) is at-least-once and writes a directory of part files through the shared `ParquetRollingSink<T>` over `WebHdfsFileSystem` (`webhdfs_filesystem.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input; a part is uploaded under `<name>.inprogress` and renamed into place when complete, so the directory never shows a partly written part, and everything up to the last barrier survives a kill. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts (only files named `sub<N>-*.parquet`). The programmatic `WebHdfsParquetSink<T>` still writes one file in a single upload on `close()`. The two-step write fails loudly if `CREATE` does not return a `307` redirect to a datanode, because `CREATE` carries no body and a non-redirect `2xx` would create an empty file rather than upload the Parquet bytes; a gateway that only does single-request inline writes is not supported.
 
 For exactly-once, use the 2PC sink: give the `webhdfs_parquet_{int64,string}_sink` factory a `prefix` instead of a `path` (or construct `WebHdfsParquetSink2PC<T>` directly), or set `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `path`. It stages one Parquet file per checkpoint interval under `<prefix>/staging` and commits with an atomic HDFS `RENAME` to `<prefix>/committed` only when the checkpoint completes globally (`MKDIRS` prepares the dirs, abort `DELETE`s staging, and recovery on open re-runs the rename idempotently). This is a true atomic rename rather than a copy. Read the result with the source pointed at `<prefix>/committed`.
 
@@ -143,8 +142,8 @@ The source reports `is_bounded() == true`: it reads a single Parquet object to i
 ## Limitations
 
 - The source reads one Parquet file with `path`, or every matching file under `prefix` (an HDFS directory). With `prefix`, `WebHdfsMultiObjectParquetSource` enumerates the directory via a `LISTSTATUS` call, sorts the files, and shards them round-robin across subtasks (file `i` is read by subtask `i % parallelism`), reading each through the single-object source. Optional param: `suffix` (default `.parquet`). The directory listing is non-recursive (`LISTSTATUS` direct children only) and there is no cross-file replay.
-- The sink buffers the whole Parquet file in memory before upload, since WebHDFS has no incremental Arrow output stream; file size is bounded by available memory.
-- The default single-object sink (`path`) is at-least-once; the `prefix` 2PC sink is exactly-once (atomic HDFS RENAME on checkpoint commit).
+- WebHDFS has no incremental upload, so a part is buffered in memory until it closes: one checkpoint interval's output per subtask (a job without checkpointing buffers its whole output).
+- The default sink (`path`, a directory of part files) is at-least-once; the `prefix` 2PC sink is exactly-once (atomic HDFS RENAME on checkpoint commit).
 - Record channels are limited to the registered `int64` and `string` types.
 - SQL exposes the `string` channel only.
 - Sink `compression` is fixed at ZSTD through the factory path; it is not configurable via the SQL or `BuildContext` keys.

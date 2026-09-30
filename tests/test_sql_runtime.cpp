@@ -10851,7 +10851,7 @@ TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
     const auto pq_path = tmp / "clink_sql_pq_data.parquet";
     const auto out_path = tmp / "clink_sql_pq_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     write_lines(in_path,
                 {
@@ -10884,10 +10884,15 @@ TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
                                << (result.errors.empty() ? "(none)" : result.errors[0]);
     }
 
-    // The Parquet file is externally typed: one Arrow column per SQL column.
-    ASSERT_TRUE(std::filesystem::exists(pq_path)) << pq_path.string();
-    {
-        auto in = arrow::io::ReadableFile::Open(pq_path.string());
+    // The output is a directory of complete Parquet parts, each externally
+    // typed: one Arrow column per SQL column, readable by any Parquet reader.
+    ASSERT_TRUE(std::filesystem::is_directory(pq_path)) << pq_path.string();
+    std::size_t parts = 0;
+    std::int64_t rows_in_parts = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(pq_path)) {
+        ASSERT_EQ(entry.path().extension(), ".parquet") << entry.path();
+        ++parts;
+        auto in = arrow::io::ReadableFile::Open(entry.path().string());
         ASSERT_TRUE(in.ok());
         auto rr = parquet::arrow::OpenFile(*in, arrow::default_memory_pool());
         ASSERT_TRUE(rr.ok());
@@ -10898,7 +10903,10 @@ TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
         EXPECT_EQ(schema->GetFieldByName("name")->type()->id(), arrow::Type::STRING);
         EXPECT_EQ(schema->GetFieldByName("px")->type()->id(), arrow::Type::DOUBLE);
         EXPECT_EQ(schema->GetFieldByName("active")->type()->id(), arrow::Type::BOOL);
+        rows_in_parts += (*rr)->parquet_reader()->metadata()->num_rows();
     }
+    EXPECT_GE(parts, 1U);
+    EXPECT_EQ(rows_in_parts, 3);
 
     // Job 2: read the Parquet back via a parquet source -> NDJSON sink.
     {
@@ -10950,7 +10958,7 @@ TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
     EXPECT_TRUE(got[3].active);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // Columnar keyed aggregation end-to-end: a typed-columnar Parquet source feeds
@@ -10967,7 +10975,7 @@ TEST(SqlRuntime, ColumnarParquetGroupByEndToEnd) {
     const auto pq_path = tmp / "clink_sql_cgb.parquet";
     const auto out_path = tmp / "clink_sql_cgb_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     write_lines(in_path,
                 {
@@ -11041,7 +11049,7 @@ TEST(SqlRuntime, ColumnarParquetGroupByEndToEnd) {
     EXPECT_EQ(final_agg["us"].second, 2);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // WS3 within-batch group-by: a columnar Parquet source feeds a GROUP BY whose
@@ -11061,7 +11069,7 @@ TEST(SqlRuntime, ColumnarParquetGroupByMultiAggregateBatchFold) {
     const auto pq_path = tmp / "clink_sql_ws3.parquet";
     const auto out_path = tmp / "clink_sql_ws3_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     write_lines(in_path,
                 {
@@ -11142,7 +11150,7 @@ TEST(SqlRuntime, ColumnarParquetGroupByMultiAggregateBatchFold) {
     EXPECT_NEAR(fa["us"].av, 50.0, 1e-3);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // The vectorised BIGINT SUM fold must stay integer-exact past the 2^53 double
@@ -11160,7 +11168,7 @@ TEST(SqlRuntime, ColumnarParquetBigintSumExactPastDoubleMantissa) {
     const auto pq_path = tmp / "clink_sql_ws3big.parquet";
     const auto out_path = tmp / "clink_sql_ws3big_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // big: 2^53 + 2 + 1 = 9007199254740995 (exact int; the nearest double is
     // 9007199254740996). sml: 3 + 4 = 7 (a small control group).
@@ -11235,7 +11243,7 @@ TEST(SqlRuntime, ColumnarParquetBigintSumExactPastDoubleMantissa) {
     EXPECT_EQ(fa["sml"], 7);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // WS6 increment 2: a columnar Parquet source feeds a GROUP BY whose aggregates
@@ -11252,7 +11260,7 @@ TEST(SqlRuntime, ColumnarParquetDoubleVarianceBatchFold) {
     const auto pq_path = tmp / "clink_sql_ws6v.parquet";
     const auto out_path = tmp / "clink_sql_ws6v_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // eu: [2.5, 6.5] -> sum 9, avg 4.5, var_pop 4, stddev_pop 2, n 2.
     // us: [10, 10, 10] -> sum 30, avg 10, var_pop 0, stddev_pop 0, n 3.
@@ -11345,7 +11353,7 @@ TEST(SqlRuntime, ColumnarParquetDoubleVarianceBatchFold) {
     EXPECT_EQ(fa["us"].n, 3);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // WS6 increment 3: a columnar Parquet source feeds a GROUP BY with SUM over a
@@ -11362,7 +11370,7 @@ TEST(SqlRuntime, ColumnarParquetDecimalSumExact) {
     const auto pq_path = tmp / "clink_sql_ws6d.parquet";
     const auto out_path = tmp / "clink_sql_ws6d_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // eu: 0.10 + 0.20 -> 0.30 (not 0.300...). us: 10.01 + 0.02 -> 10.03.
     write_lines(in_path,
@@ -11436,7 +11444,7 @@ TEST(SqlRuntime, ColumnarParquetDecimalSumExact) {
     EXPECT_NE(raw["us"].find("\"total\":10.03"), std::string::npos) << raw["us"];
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // Columnar tumbling window end-to-end: a typed-columnar Parquet source feeds a
@@ -11451,7 +11459,7 @@ TEST(SqlRuntime, ColumnarParquetTumbleWindowEndToEnd) {
     const auto pq_path = tmp / "clink_sql_ctw.parquet";
     const auto out_path = tmp / "clink_sql_ctw_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     write_lines(in_path,
                 {
@@ -11529,7 +11537,7 @@ TEST(SqlRuntime, ColumnarParquetTumbleWindowEndToEnd) {
     EXPECT_TRUE(contains(2, 50)) << "user=2 window=[1000,2000) total=50";
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // WS6 window family (end-to-end, with the columnar event-time assigner): a
@@ -11548,7 +11556,7 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
     const auto pq_path = tmp / "clink_sql_chw.parquet";
     const auto out_path = tmp / "clink_sql_chw_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // HOP(ts, size=2000, slide=1000). Panes sit at every multiple of 1000,
     // including the negative ones, so:
@@ -11627,7 +11635,7 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
     EXPECT_EQ(got, want);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // Wave 2: columnar JSON decode FIRES ON THE PRODUCTION (Kafka) PATH end-to-end.
@@ -12061,7 +12069,7 @@ TEST(SqlRuntime, ColumnarParquetWindowMinMaxVectorised) {
     const auto pq_path = tmp / "clink_sql_wmm.parquet";
     const auto out_path = tmp / "clink_sql_wmm_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // user 1, window [0,1000): price 10,30,20 -> max 30, min 10.
     //         window [1000,2000): price 5,50 -> max 50, min 5.
@@ -12129,7 +12137,7 @@ TEST(SqlRuntime, ColumnarParquetWindowMinMaxVectorised) {
     EXPECT_EQ(got, want);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // WS6 regression guard: a windowed COUNT(DISTINCT) over a columnar source must
@@ -12145,7 +12153,7 @@ TEST(SqlRuntime, ColumnarParquetWindowedCountDistinctRowFallback) {
     const auto pq_path = tmp / "clink_sql_wcd.parquet";
     const auto out_path = tmp / "clink_sql_wcd_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // user 1, window [0,1000): bidders {5,5,7} -> distinct 2.
     //         window [1000,2000): bidders {9,9} -> distinct 1.
@@ -12207,7 +12215,7 @@ TEST(SqlRuntime, ColumnarParquetWindowedCountDistinctRowFallback) {
     EXPECT_EQ(got, want);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // WS3 within-batch group-by on the SESSION window: a columnar Parquet source
@@ -12223,7 +12231,7 @@ TEST(SqlRuntime, ColumnarParquetSessionWindowEndToEnd) {
     const auto pq_path = tmp / "clink_sql_csw.parquet";
     const auto out_path = tmp / "clink_sql_csw_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // user=1: {100,200,300} one session + {1000} a separate session (gap > 500).
     // user=2: {400,500} one session.
@@ -12301,7 +12309,7 @@ TEST(SqlRuntime, ColumnarParquetSessionWindowEndToEnd) {
     EXPECT_TRUE(contains(2, 2)) << "user=2 session of 2";
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // WS6 columnar session fold: a Parquet source feeds a SESSION window with
@@ -12319,7 +12327,7 @@ TEST(SqlRuntime, ColumnarParquetSessionSumVectorised) {
     const auto pq_path = tmp / "clink_sql_css.parquet";
     const auto out_path = tmp / "clink_sql_css_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // gap 500. user 1: ts 100(10), 300(20) -> one session [100,300] (gap 200<=500):
     // count 2, sum 30. ts 1500(5) -> 1500-300=1200>500 -> new session: count 1, sum 5.
@@ -12385,7 +12393,7 @@ TEST(SqlRuntime, ColumnarParquetSessionSumVectorised) {
     EXPECT_EQ(got, want);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // WS6 increment 5: vectorised session MIN/MAX across a 3-way merge. An
@@ -12401,7 +12409,7 @@ TEST(SqlRuntime, ColumnarParquetSessionMinMaxMergeVectorised) {
     const auto pq_path = tmp / "clink_sql_smm.parquet";
     const auto out_path = tmp / "clink_sql_smm_out.ndjson";
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // gap 500. Arrivals (in file order): ts 100(price 10), 1000(price 50),
     // 550(price 5). 100 -> session A; 1000 -> session B (gap 900>500); 550 bridges
@@ -12472,7 +12480,7 @@ TEST(SqlRuntime, ColumnarParquetSessionMinMaxMergeVectorised) {
     EXPECT_EQ(last.second, 5);
 
     for (const auto& p : {in_path, pq_path, out_path})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 }
 
 // Multi-way (3-table) INNER equi-join: a JOIN b JOIN c binds to a left-deep

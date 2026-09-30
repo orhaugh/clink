@@ -145,10 +145,11 @@ at-least-once contract; `delivery_guarantee='exactly_once'` is the
 exactly-once file path. A kill in the middle of a write can leave a partial
 last line, which the resumed run appends after. Any restore, a cluster
 restore from a savepoint included, appends to an existing output file rather
-than replacing it. The plain Parquet sink cannot append, and a killed
-run leaves its file without a footer, so after any restore it holds only the
-rows written since. Use the exactly-once Parquet sink where a restore must
-keep earlier output.
+than replacing it. A Parquet file cannot be appended to, so the plain
+`parquet` sink writes a directory of complete part files instead, one per
+subtask per checkpoint interval; a resumed run keeps the parts already
+written and adds its own, on the local disk and on S3, GCS, Azure and
+WebHDFS alike.
 
 ### Await and cancellation
 

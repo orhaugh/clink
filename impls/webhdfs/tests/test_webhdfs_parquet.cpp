@@ -17,6 +17,8 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/connectors/parquet_rolling_sink.hpp"
+#include "clink/connectors/webhdfs_filesystem.hpp"
 #include "clink/connectors/webhdfs_parquet_sink.hpp"
 #include "clink/connectors/webhdfs_parquet_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
@@ -161,6 +163,15 @@ public:
         }
     }
     std::string base_url() const { return "http://127.0.0.1:" + std::to_string(port_); }
+    // The HDFS paths of every stored file, for asserting what a sink left behind.
+    std::vector<std::string> paths() {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<std::string> out;
+        for (const auto& [k, v] : files_) {
+            out.push_back(k.substr(std::string{"/webhdfs/v1"}.size()));
+        }
+        return out;
+    }
 
 private:
     httplib::Server svr_;
@@ -504,4 +515,68 @@ TEST(WebHdfsParquetSink2PC, AbortDeletesStagingAndClearsState) {
     sink->on_abort(9);
     EXPECT_FALSE(state.get(OperatorId{9}, "_2pc_pending_sub0_9").has_value());
     EXPECT_TRUE(read_committed_dir(srv, "/clink/ab/committed").empty());
+}
+
+// The plain webhdfs_parquet sink (`path`): a directory of part files over WebHDFS,
+// each uploaded under a .inprogress name and renamed into place, so the
+// directory never shows a partly written part.
+TEST(WebHdfsParquetRollingSink, WritesPartsAKilledRunNeverPublishesAndARestoreKeeps) {
+    MockWebHdfs srv;
+    clink::WebHdfsFileSystem::Options fo;
+    fo.base_url = srv.base_url();
+    const auto make = [&]() {
+        clink::ParquetRollingSink<std::int64_t>::Options o;
+        o.dir = "/clink/rolling";
+        return std::make_unique<clink::ParquetRollingSink<std::int64_t>>(
+            [fo]() -> std::shared_ptr<arrow::fs::FileSystem> {
+                return std::make_shared<clink::WebHdfsFileSystem>(fo);
+            },
+            std::move(o),
+            int64_arrow_batcher());
+    };
+    const auto batch = [](std::int64_t from, std::int64_t to) {
+        Batch<std::int64_t> b;
+        for (auto v = from; v < to; ++v) {
+            b.emplace(v);
+        }
+        return b;
+    };
+    const auto read_back = [&] {
+        WebHdfsMultiObjectParquetSource<std::int64_t>::Options ro;
+        ro.base_url = srv.base_url();
+        ro.dir = "/clink/rolling";
+        WebHdfsMultiObjectParquetSource<std::int64_t> src(ro, int64_arrow_batcher());
+        auto got = drain_dir_source(src);
+        std::sort(got.begin(), got.end());
+        return got;
+    };
+
+    {
+        auto first = make();
+        first->open();
+        first->on_data(batch(0, 4));
+        first->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        first->on_data(batch(4, 6));  // killed before the next barrier
+    }
+    for (const auto& p : srv.paths()) {
+        EXPECT_TRUE(p.ends_with(".parquet")) << p << ": nothing half-written is left";
+    }
+    EXPECT_EQ(read_back(), (std::vector<std::int64_t>{0, 1, 2, 3}));
+
+    RuntimeContext ctx(OperatorId{3}, "pq", nullptr, nullptr);
+    ctx.set_commit_receipts("unused", /*restore_from_ckpt=*/1);
+    auto resumed = make();
+    resumed->attach_runtime(&ctx);
+    resumed->open();
+    resumed->on_data(batch(4, 6));
+    resumed->flush();
+    resumed->close();
+    EXPECT_EQ(read_back(), (std::vector<std::int64_t>{0, 1, 2, 3, 4, 5}));
+
+    auto fresh = make();
+    fresh->open();  // no restore point: the previous run's parts are replaced
+    fresh->on_data(batch(100, 101));
+    fresh->flush();
+    fresh->close();
+    EXPECT_EQ(read_back(), (std::vector<std::int64_t>{100}));
 }

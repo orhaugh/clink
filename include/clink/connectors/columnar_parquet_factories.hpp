@@ -13,12 +13,13 @@
 //
 // registers, under the channel name "trade":
 //     - register_type<Trade>      (columnar batcher)
-//     - "trade_parquet_sink"      -> ParquetSink<Trade>      (plain, one file/subtask)
-//     - "trade_parquet_source"    -> ParquetSource<Trade>
+//     - "trade_parquet_sink"      -> ParquetRollingSink<Trade> (plain, a directory of parts)
+//     - "trade_parquet_source"    -> ParquetSource<Trade>, or every part of a
+//                                    directory the rolling sink wrote
 //     - "trade_parquet_2pc_sink"  -> ParquetSink2PC<Trade>   (transactional)
 //
 // The factories read the output path from the op-spec params ("path");
-// the plain sink disambiguates per-subtask at parallelism>1, the 2PC
+// the plain sink writes sub<N>-* parts into that directory, and the 2PC
 // sink uses its own sub<N> staging prefix under a shared output dir.
 //
 // The op_type names default off the channel name but are overridable.
@@ -30,6 +31,7 @@
 #include <string>
 
 #include "clink/connectors/columnar_parquet.hpp"  // ParquetSink/Source + make_columnar_* helpers
+#include "clink/connectors/parquet_rolling_sink.hpp"
 #include "clink/core/codec.hpp"
 
 #ifdef CLINK_HAS_PARQUET
@@ -46,18 +48,18 @@ namespace clink::plugin {
 template <clink::HasArrowFields T>
 inline std::function<std::shared_ptr<clink::Sink<T>>(const BuildContext&)>
 columnar_parquet_sink_factory(std::string op_name = "parquet_sink") {
-    return
-        [op_name = std::move(op_name)](const BuildContext& ctx) -> std::shared_ptr<clink::Sink<T>> {
-            auto path = ctx.param_or("path");
-            if (path.empty()) {
-                throw std::runtime_error(op_name + ": 'path' param is required");
-            }
-            if (ctx.parallelism > 1) {
-                path += "." + std::to_string(ctx.subtask_idx) + ".parquet";
-            }
-            return std::make_shared<clink::ParquetSink<T>>(
-                path, clink::make_columnar_arrow_batcher<T>(), parquet::Compression::ZSTD, op_name);
-        };
+    return [op_name =
+                std::move(op_name)](const BuildContext& ctx) -> std::shared_ptr<clink::Sink<T>> {
+        const auto path = ctx.param_or("path");
+        if (path.empty()) {
+            throw std::runtime_error(op_name + ": 'path' param is required");
+        }
+        return clink::make_local_parquet_rolling_sink<T>(path,
+                                                         ctx.subtask_idx,
+                                                         ctx.parallelism,
+                                                         clink::make_columnar_arrow_batcher<T>(),
+                                                         op_name);
+    };
 }
 
 template <clink::HasArrowFields T>
@@ -68,6 +70,14 @@ columnar_parquet_source_factory(std::string op_name = "parquet_source") {
         auto path = ctx.param_or("path");
         if (path.empty()) {
             throw std::runtime_error(op_name + ": 'path' param is required");
+        }
+        if (auto dir = clink::make_local_parquet_directory_source<T>(
+                path,
+                ctx.subtask_idx,
+                ctx.parallelism,
+                clink::make_columnar_arrow_batcher<T>(),
+                op_name)) {
+            return dir;
         }
         return std::make_shared<clink::ParquetSource<T>>(
             path, clink::make_columnar_arrow_batcher<T>(), op_name);

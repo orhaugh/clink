@@ -17,6 +17,7 @@ add_executable(clink_s3_tests
     test_s3_cas_snapshot_store.cpp
     test_s3_remote_pool.cpp
     test_state_parquet_export_s3.cpp
+    test_parquet_rolling_s3.cpp
     test_s3_coordination_store.cpp
     # Custom gtest main that finalises Arrow S3 before static destruction (the AWS CRT
     # background threads must be joined off the static-destruction path); see the file.

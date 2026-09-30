@@ -162,6 +162,7 @@ impls/s3/include/clink/connectors/parquet_s3_source.hpp
 impls/s3/include/clink/connectors/s3_sink.hpp
 impls/s3/include/clink/connectors/s3_sink_2pc.hpp
 impls/s3/include/clink/connectors/s3_source.hpp
+impls/webhdfs/include/clink/connectors/webhdfs_filesystem.hpp
 impls/webhdfs/include/clink/connectors/webhdfs_parquet_sink.hpp
 impls/webhdfs/include/clink/connectors/webhdfs_parquet_source.hpp
 include/clink/application/job_submitter.hpp
@@ -363,6 +364,7 @@ include/clink/connectors/columnar_parquet_factories.hpp
 include/clink/connectors/delta_log.hpp
 include/clink/connectors/openssl_atexit_guard.hpp
 include/clink/connectors/parquet_fs_2pc_sink.hpp
+include/clink/connectors/parquet_rolling_sink.hpp
 include/clink/connectors/state_parquet_export.hpp
 include/clink/connectors/txn_resume_registry.hpp
 include/clink/core/allocator_info.hpp

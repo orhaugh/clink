@@ -21,6 +21,7 @@
 #include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
 #include "clink/connectors/multi_object_parquet_source.hpp"
+#include "clink/connectors/parquet_rolling_sink.hpp"
 #include "clink/connectors/parquet_sink.hpp"
 #include "clink/connectors/parquet_source.hpp"
 #include "clink/connectors/text_format.hpp"
@@ -175,28 +176,28 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
     // ---- Parquet sinks ----
     reg.register_sink<std::int64_t>(
         "parquet_int64_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::int64_t>> {
-            auto path = ctx.param_or("path");
+            const auto path = ctx.param_or("path");
             if (path.empty()) {
                 throw std::runtime_error("parquet_int64_sink: 'path' param is required");
             }
-            if (ctx.parallelism > 1) {
-                path += "." + std::to_string(ctx.subtask_idx) + ".parquet";
-            }
-            return std::make_shared<ParquetSink<std::int64_t>>(
-                path, int64_arrow_batcher(), parquet::Compression::ZSTD, "parquet_int64_sink");
+            return make_local_parquet_rolling_sink<std::int64_t>(path,
+                                                                 ctx.subtask_idx,
+                                                                 ctx.parallelism,
+                                                                 int64_arrow_batcher(),
+                                                                 "parquet_int64_sink");
         });
 
     reg.register_sink<std::string>(
         "parquet_string_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
-            auto path = ctx.param_or("path");
+            const auto path = ctx.param_or("path");
             if (path.empty()) {
                 throw std::runtime_error("parquet_string_sink: 'path' param is required");
             }
-            if (ctx.parallelism > 1) {
-                path += "." + std::to_string(ctx.subtask_idx) + ".parquet";
-            }
-            return std::make_shared<ParquetSink<std::string>>(
-                path, string_arrow_batcher(), parquet::Compression::ZSTD, "parquet_string_sink");
+            return make_local_parquet_rolling_sink<std::string>(path,
+                                                                ctx.subtask_idx,
+                                                                ctx.parallelism,
+                                                                string_arrow_batcher(),
+                                                                "parquet_string_sink");
         });
 
     // ---- Parquet sources ----
@@ -227,6 +228,10 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
                 if (path.empty()) {
                     throw std::runtime_error(factory_name +
                                              ": 'path' or 'prefix' param is required");
+                }
+                if (auto dir = make_local_parquet_directory_source<T>(
+                        path, ctx.subtask_idx, ctx.parallelism, batcher, factory_name)) {
+                    return dir;
                 }
                 return std::make_shared<ParquetSource<T>>(path, batcher, factory_name);
             });

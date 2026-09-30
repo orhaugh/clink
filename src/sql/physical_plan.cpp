@@ -207,7 +207,7 @@ std::string string_sink_factory_for(const TableDef& table) {
         connector == "webhdfs_parquet") {
         // delivery_guarantee='exactly_once' selects the 2PC sink (stages then atomically
         // promotes one file per checkpoint under <prefix>/committed); else the at-least-once
-        // single-object sink.
+        // sink (a directory of part files).
         return table.is_exactly_once() ? connector + "_2pc_string_sink"
                                        : connector + "_string_sink";
     }
@@ -765,7 +765,8 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     if (connector == "parquet") {
         // Typed-columnar Parquet. exactly_once routes to the 2PC variant
-        // (staging/ + atomic commit on checkpoint); else one file/subtask.
+        // (staging/ + atomic commit on checkpoint); else a directory of part
+        // files, one per subtask per checkpoint interval (ParquetRollingSink).
         // upsert is not supported for the Parquet sink (append-only).
         if (upsert) {
             unsupported("connector='parquet' sink does not support mode='upsert'");
@@ -780,7 +781,8 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         // Object-store / WebHDFS Parquet sink. Rows are serialised to JSON strings and written as a
         // single-column Parquet file. exactly_once routes to the 2PC variant (stages one file per
         // checkpoint under <prefix>/staging and atomically promotes it to <prefix>/committed); the
-        // default is the at-least-once single-object sink. upsert is not supported (append-only).
+        // default is the at-least-once sink (a directory of part files). upsert is not
+        // supported (append-only).
         if (upsert) {
             unsupported("connector='" + connector + "' sink does not support mode='upsert'");
         }
