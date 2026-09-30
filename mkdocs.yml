@@ -61,6 +61,7 @@ exclude_docs: |
   !/design/
   !/consumer-examples/
   !/qualification/
+  !/posts/
   !/assets/
   consumer-examples/build/
   consumer-examples/fetchcontent/build/
@@ -90,6 +91,8 @@ nav:
   - Home: index.md
   - Tutorials:
       - Your first real Clink pipeline: tutorials/kafka-to-clickhouse.md
+  - Posts:
+      - "Three checks on exactly-once, and the bug all three missed": posts/checking-exactly-once.md
   - Guides:
       - C++ stream processing engine: guides/cpp-stream-processing.md
       - Streaming SQL in C++: guides/cpp-streaming-sql.md
