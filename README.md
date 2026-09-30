@@ -29,6 +29,8 @@ Why you can check the claim rather than take it on trust:
   model-checked on every push, every defect the campaigns found is a mutant
   it must refute, and the protocol traces of real test runs are validated
   against it ([Exactly-once specification](https://orhaugh.github.io/clink/internals/exactly-once-specification/)).
+  What each check has found, and the duplicate all three missed, is in
+  [Three checks on exactly-once](https://orhaugh.github.io/clink/posts/checking-exactly-once/).
 - **Measured cost.** Across the 17-query nexmark suite on a five-node
   cluster, clink processes an event for 1.9x to 5.3x less CPU (median
   2.45x) than a JVM stream processor producing identical, correctness-gated
