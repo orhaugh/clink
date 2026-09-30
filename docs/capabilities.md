@@ -96,7 +96,7 @@ embedded or submits to a cluster, unchanged.
 
 | Capability | Notes | Reference |
 | --- | --- | --- |
-| Embedded engine | `clink run pipeline.sql`: one process, no daemons; first result in ~155 ms (gated by a Release-build test) | [Embedded execution](internals/embedded.md) |
+| Embedded engine | `clink run pipeline.sql`: one process, no daemons; first result in ~155 ms (gated by a Release-build test); with `--checkpoint-dir`, a rerun after a crash resumes from the last checkpoint | [Embedded execution](internals/embedded.md) |
 | C ABI | `libclink` embeds the engine behind a pure-C ABI with Arrow C stream results | [Embedded execution](internals/embedded.md) |
 | Python | `pyclink` returns results as pyarrow tables | [Embedded execution](internals/embedded.md) |
 | Arrow wire format | Every operator-to-operator data frame is an Arrow IPC stream; columnar schemas for built-in types, binary fallback for user types | [Network stack](internals/network-stack.md) |

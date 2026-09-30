@@ -3817,16 +3817,16 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
     // SUBMITTED graph, which a rescale since then has not rewritten. Refused
     // before any slot is waited for or any task deployed; see
     // check_restore_layout for what counts as a verdict.
+    std::vector<std::string> single_instance;
+    for (const auto& op : graph.ops) {
+        if (is_forced_singleton(op)) {
+            single_instance.push_back(op.id);
+        }
+    }
     if (!checkpoint.restore_from_dir.empty() && checkpoint.restore_from_checkpoint_id != 0) {
         std::set<std::uint32_t> planned;
         for (const auto& t : plan.tasks) {
             planned.insert(t.subtask_idx);
-        }
-        std::vector<std::string> single_instance;
-        for (const auto& op : graph.ops) {
-            if (is_forced_singleton(op)) {
-                single_instance.push_back(op.id);
-            }
         }
         if (auto reject = check_restore_layout(checkpoint.restore_from_dir,
                                                checkpoint.restore_from_checkpoint_id,
@@ -3879,14 +3879,16 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
     // them into the JobState.
     const auto plugins_copy = plugins;
     const auto checkpoint_copy = checkpoint;
-    const auto job_id =
-        deploy_internal_(plan,
-                         notify_client_conn,
-                         std::move(plugins),
-                         std::move(checkpoint),
-                         std::move(bundle),
-                         graph.expected_state_versions.pack(),
-                         graph.udfs.empty() ? std::string{} : pack_udf_specs(graph.udfs));
+    const auto job_id = deploy_internal_(
+        plan,
+        notify_client_conn,
+        std::move(plugins),
+        std::move(checkpoint),
+        std::move(bundle),
+        graph.expected_state_versions.pack(),
+        graph.udfs.empty() ? std::string{} : pack_udf_specs(graph.udfs),
+        checkpoint_copy.checkpoint_dir.empty() ? std::string{} : job_graph_fingerprint(graph),
+        single_instance);
     // Derive commit-group memberships from sink-op params
     // and stash them on JobState so handle_subtask_checkpointed_ can
     // gate CommitCheckpoint broadcasts on the group's collective ack.
@@ -4044,7 +4046,9 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                                     CheckpointConfig checkpoint,
                                     std::unique_ptr<JobBundle> bundle,
                                     std::string expected_state_versions_packed,
-                                    std::string udfs_packed) {
+                                    std::string udfs_packed,
+                                    std::string graph_fingerprint,
+                                    std::vector<std::string> single_instance_ops) {
     // Resolve per-task placement. The grouping contract, and why it exists, is documented on
     // assign_task_placement in coordinator.hpp; it lives there so it can be tested without a
     // cluster. The plan's data_port values are taken as-is: 0 means "the worker will bind
@@ -4099,6 +4103,132 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     const JobId job_id = allocate_job_id_();
     auto job = std::make_shared<JobState>();
     job->id = job_id;
+
+    // Resume from this job's own checkpoints (CheckpointConfig::track_runs): the
+    // embedded engine's rerun of a script after a crash. A fresh process has a
+    // fresh coordinator, so this is a takeover exactly as HA recovery sees one,
+    // and the restore point is chosen the same way. Without it a rerun started
+    // from nothing, re-read its sources from the beginning and re-published
+    // everything its exactly-once sinks had already committed.
+    //
+    // Three records under _jobs/<id>/ decide it, because job ids restart at 1 in
+    // every process and the markers alone say only that SOME job with this id
+    // ran here:
+    //   - graph-fingerprint: which job graph the current run is. A resume whose
+    //     graph differs is refused, never guessed past.
+    //   - run-base: the id the current run numbers above. Checkpoints at or
+    //     below it are an earlier run's; a run that dies before completing a
+    //     checkpoint of its own has nothing to resume, and must not be handed
+    //     the earlier run's state (which, after --fresh with a changed script,
+    //     would be another graph's).
+    //   - FINISHED: the run reached the end of its input cleanly
+    //     (mark_job_finished_). Rerunning a script means running such a job
+    //     again - a bounded load over new input, a full-refresh materialized
+    //     view - so it starts over; resuming would restore its sources at their
+    //     end and publish nothing.
+    const bool track_runs = checkpoint.track_runs && !checkpoint.checkpoint_dir.empty() &&
+                            checkpoint.restore_from_checkpoint_id == 0 &&
+                            checkpoint.restore_from_dir.empty();
+    const std::string fingerprint_key = "_jobs/" + std::to_string(job_id) + "/graph-fingerprint";
+    bool resumed_from_existing = false;
+    if (track_runs && !checkpoint.start_fresh) {
+        const auto store = make_coordination_store(checkpoint.checkpoint_dir);
+        const auto completed = latest_completed_id_on_disk(checkpoint.checkpoint_dir, job_id);
+        std::uint64_t run_base = 0;
+        if (const auto recorded = store->get(run_base_key(job_id)); recorded.has_value()) {
+            try {
+                run_base = std::stoull(*recorded);
+            } catch (const std::exception&) {
+                throw std::runtime_error("refusing to resume job " + std::to_string(job_id) +
+                                         " from " + checkpoint.checkpoint_dir +
+                                         ": its run-base record is unreadable ('" + *recorded +
+                                         "'). Use a new checkpoint directory, or start this job "
+                                         "fresh (clink run --fresh).");
+            }
+        }
+        const auto finished =
+            completed > run_base ? store->get(finished_marker_key(job_id)) : std::nullopt;
+        if (finished.has_value()) {
+            log::info("coordinator.restart",
+                      "job_id=" + std::to_string(job_id) + " finished cleanly in its last run in " +
+                          checkpoint.checkpoint_dir + " (checkpoint " + *finished +
+                          "); starting it from empty state");
+        } else if (completed > run_base) {
+            const auto recorded = store->get(fingerprint_key);
+            if (!recorded.has_value() || *recorded != graph_fingerprint) {
+                throw std::runtime_error(
+                    "refusing to resume job " + std::to_string(job_id) + " from " +
+                    checkpoint.checkpoint_dir + ": its checkpoints (up to " +
+                    std::to_string(completed) + ") were written by " +
+                    (recorded.has_value() ? "a different job graph (fingerprint " + *recorded +
+                                                ", this job is " + graph_fingerprint + ")"
+                                          : "a job that recorded no graph fingerprint") +
+                    ". Restoring them would hand this job another job's state. Use a new "
+                    "checkpoint directory, or start this job fresh (clink run --fresh).");
+            }
+            bool needs_confirmation = false;
+            for (const auto& t : resolved_plan.tasks) {
+                needs_confirmation = needs_confirmation || t.needs_commit_confirmation;
+            }
+            std::uint64_t restore =
+                needs_confirmation ? latest_confirmed_id_on_disk(checkpoint.checkpoint_dir, job_id)
+                                   : completed;
+            // An earlier run's confirmed checkpoint is not this run's to restore.
+            if (restore <= run_base) {
+                restore = 0;
+            }
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("CoordRecovers")
+                    .u("job", job_id)
+                    .u("epoch", epoch())
+                    .u("completed", completed)
+                    .u("confirmed", restore)
+                    .emit();
+            }
+            if (needs_confirmation && completed > std::max(restore, run_base)) {
+                if (protocol_trace::enabled()) {
+                    protocol_trace::Event("RestartProceeds")
+                        .u("job", job_id)
+                        .b("resolving", true)
+                        .u("completed", completed)
+                        .u("confirmed", restore)
+                        .emit();
+                }
+                const auto resolved = resolve_in_doubt_commits(
+                    checkpoint.checkpoint_dir, job_id, std::max(restore, run_base), completed);
+                if (resolved > run_base) {
+                    restore = std::max(restore, resolved);
+                }
+            }
+            if (restore == 0) {
+                // The run completed checkpoints but none of them committed its
+                // sinks' output: nothing of it was published, so it starts over.
+                log::info("coordinator.restart",
+                          "job_id=" + std::to_string(job_id) +
+                              " has no committed checkpoint of its last run in " +
+                              checkpoint.checkpoint_dir + " (newest completed " +
+                              std::to_string(completed) + "); starting it from empty state");
+            } else {
+                checkpoint.restore_from_dir = checkpoint.checkpoint_dir;
+                checkpoint.restore_from_checkpoint_id = restore;
+                // The layout gate above ran before there was a restore point.
+                std::set<std::uint32_t> planned;
+                for (const auto& t : resolved_plan.tasks) {
+                    planned.insert(t.subtask_idx);
+                }
+                if (auto reject = check_restore_layout(
+                        checkpoint.restore_from_dir, restore, planned, single_instance_ops);
+                    !reject.empty()) {
+                    throw std::runtime_error(reject);
+                }
+                resumed_from_existing = true;
+                log::info("coordinator.restart",
+                          "job_id=" + std::to_string(job_id) + " resuming from checkpoint " +
+                              std::to_string(restore) + " in " + checkpoint.checkpoint_dir +
+                              " (newest completed " + std::to_string(completed) + ")");
+            }
+        }
+    }
     // Continue checkpoint numbering ABOVE the checkpoint being restored
     // from, rather than restarting at 1.
     //
@@ -4132,7 +4262,11 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     // wrote, and a further crash inside that window would recover from a
     // checkpoint whose marker and snapshots disagree. Ids are cheap;
     // never reuse one that has a durable record.
-    if (checkpoint.restore_from_checkpoint_id > 0) {
+    // A run of a job that tracks its runs gets the same floor when it starts from
+    // empty state: it has nothing to restore, but a checkpoint numbered 1 would
+    // still overwrite the COMPLETED-1 marker and snapshot files of the run
+    // before it.
+    if (checkpoint.restore_from_checkpoint_id > 0 || track_runs) {
         std::uint64_t id_floor = checkpoint.restore_from_checkpoint_id;
         if (!checkpoint.checkpoint_dir.empty()) {
             id_floor =
@@ -4150,7 +4284,8 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             id_floor = std::max(id_floor, latest_snapshot_id_on_disk(checkpoint.checkpoint_dir));
         }
         job->next_checkpoint_id = id_floor + 1;
-        if (id_floor > checkpoint.restore_from_checkpoint_id) {
+        if (id_floor > checkpoint.restore_from_checkpoint_id &&
+            checkpoint.restore_from_checkpoint_id > 0) {
             log::info("coordinator.restart",
                       "job_id=" + std::to_string(job_id) + " resumes from checkpoint " +
                           std::to_string(checkpoint.restore_from_checkpoint_id) +
@@ -4159,6 +4294,19 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                           std::to_string(id_floor) +
                           " already have durable records in this directory");
         }
+    }
+    if (track_runs) {
+        // Recorded before the deploy, in this order, so that whatever happens to
+        // this run from here - a failed deploy, a kill before its first
+        // checkpoint - the next run resumes only what this one completes: the
+        // base first (an earlier run's checkpoints are out of reach), then the
+        // graph, then the end of the previous run's clean finish.
+        const auto store = make_coordination_store(checkpoint.checkpoint_dir);
+        if (!resumed_from_existing) {
+            store->put(run_base_key(job_id), std::to_string(job->next_checkpoint_id - 1));
+        }
+        store->put(fingerprint_key, graph_fingerprint);
+        store->remove(finished_marker_key(job_id));
     }
     job->notify_client_conn = notify_client_conn;
     // A wire submission's completion push must wait behind the SubmitJobAck
@@ -4413,6 +4561,14 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         if (!conn->conn || !send_frame(*conn->conn, frame)) {
             throw std::runtime_error("Coordinator::deploy: send failed for " + worker_id);
         }
+    }
+    // Recorded after the deploy frames went out, as HA recovery records its own.
+    if (resumed_from_existing && protocol_trace::enabled()) {
+        protocol_trace::Event("Redeploy")
+            .u("job", job_id)
+            .u("restore", checkpoint.restore_from_checkpoint_id)
+            .u("next", job->next_checkpoint_id)
+            .emit();
     }
     return job_id;
 }
@@ -6677,6 +6833,24 @@ void Coordinator::retire_job_manifest_(JobId job_id, const char* status) {
     }
 }
 
+void Coordinator::mark_job_finished_(const JobState& job) {
+    if (!job.checkpoint.track_runs || job.checkpoint.checkpoint_dir.empty()) {
+        return;
+    }
+    try {
+        make_coordination_store(job.checkpoint.checkpoint_dir)
+            ->put(finished_marker_key(job.id), std::to_string(job.latest_completed_checkpoint_id));
+    } catch (const std::exception& e) {
+        // Without the marker the next run resumes a job that had finished: its
+        // sources restore at their end and it emits nothing. Loud, not fatal -
+        // the job's own output is already complete.
+        log::warn("coordinator.complete",
+                  "job_id=" + std::to_string(job.id) + " could not record its clean finish in " +
+                      job.checkpoint.checkpoint_dir + ": " + e.what() +
+                      "; a rerun will resume it at its end");
+    }
+}
+
 void Coordinator::signal_job_completion_locked_(JobState& job) {
     if (job.completion_signalled) {
         return;
@@ -6728,6 +6902,9 @@ void Coordinator::signal_job_completion_locked_(JobState& job) {
         // a job the operator cancelled (item 69 - it re-ran QUAL-05's
         // control arm mid-campaign and competed for the subject's slots).
         retire_job_manifest_(job.id, status);
+        if (job.errors.empty() && !job.cancel_requested) {
+            mark_job_finished_(job);
+        }
         history_.push_back(std::move(rec));
         while (history_.size() > kCoordinatorHistoryCap) {
             history_.pop_front();

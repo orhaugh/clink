@@ -271,6 +271,25 @@ other checkpoint still diverges. `formal/traces/coordinator-killed-after-marker`
 is the run that showed it (a coordinator and a worker killed together, in
 `FaultRecoveryTest.CoordinatorAndWorkerDyingTogetherStillCommitsExactlyOnce`).
 
+A takeover need not advance the epoch. The engine stamps epoch 0 when there
+is no leader election. An HA leader's epoch is always above the one it
+displaced, so it is at least 1. An embedded `clink run` resuming from its own
+checkpoints after a kill records exactly that: a `CoordRecovers` at epoch 0,
+with the previous coordinator gone only because its process died. The trace
+module reads such an event as unfenced (`Unfenced`). It pins no model epoch,
+because the model still advances its own at the recovery, and it admits no
+zombie instead: an epoch-0 `Trigger` or `CoordRecovers` is taken only on a
+path where no coordinator has been superseded. That is tighter than the
+previous reading, which let an epoch-0 `Trigger` match a zombie's.
+`formal/traces/embedded-resume-after-kill` is the run
+(`EmbeddedResumeKafka`, two `clink run` processes, the first SIGKILLed), and
+the same trace with its `Redeploy` rewritten to restore nothing, which is the
+behaviour before resume, diverges there. An embedded run that starts from
+empty state in a directory an earlier run used numbers its checkpoints above
+the earlier run's without a recovery event, and the model's first checkpoint
+is 1, so such a run's trace is not yet validatable. No recorded trace has
+that shape.
+
 ## The mutants
 
 A model that proves its own invariants shows nothing until it is shown to

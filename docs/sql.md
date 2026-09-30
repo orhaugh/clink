@@ -30,7 +30,7 @@ declares a sink table, then issues one `INSERT INTO sink SELECT ... FROM source`
 to start the standing job. `clink run` executes the whole script embedded in a
 single process. Two flags matter for production runs:
 
-- `--checkpoint-dir <dir>` turns on periodic checkpointing so the job can recover.
+- `--checkpoint-dir <dir>` turns on periodic checkpointing. If the process dies, running the same command again resumes the job from its last checkpoint; `--fresh` starts it over.
 - `--capture-dir <dir>` records the run so it can be replayed deterministically.
 
 See [Embedded execution](internals/embedded.md) for the full CLI.

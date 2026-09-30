@@ -58,14 +58,27 @@ Reached(i) == TLCSet(1, IF i > TLCGet(1) THEN i ELSE TLCGet(1))
 
 E == ev
 Is(kind) == E.event = kind
+
+\* Epoch 0 is a coordinator without leader election (an HA leader's epoch is
+\* always above the one it displaced, so at least 1). It stamps no fence
+\* because nothing can supersede it: the previous coordinator of its job is
+\* gone only because its process died, which is what an embedded `clink run`
+\* resuming from its own checkpoints after a kill records. The model still
+\* advances its epoch at the recovery - the fence is abstract there - so an
+\* unfenced event pins no epoch, and instead admits no zombie: a run whose
+\* coordinator could not be superseded has none.
+Unfenced == E.epoch = 0
+
 \* The event names a modelled sink.
 ForSink == Has(E, "sub") /\ E.sub \in Sinks
 Skip == UNCHANGED vars
 
 StepTrigger ==
     /\ Is("Trigger")
-    /\ \/ Trigger /\ nextCkpt = E.ckpt /\ leaderEpoch = ModelEpoch(E.epoch)
-       \/ ZombieTrigger /\ zombieNext = E.ckpt /\ zombieEpoch = ModelEpoch(E.epoch)
+    /\ IF Unfenced
+       THEN Trigger /\ nextCkpt = E.ckpt /\ ~zombie
+       ELSE \/ Trigger /\ nextCkpt = E.ckpt /\ leaderEpoch = ModelEpoch(E.epoch)
+            \/ ZombieTrigger /\ zombieNext = E.ckpt /\ zombieEpoch = ModelEpoch(E.epoch)
 
 \* One barrier per id in the model; a second source subtask's copy is a stutter.
 StepDeliverBarrier ==
@@ -176,10 +189,11 @@ StepSubtaskDrained ==
     /\ IF ForSink THEN SinkDrains(E.sub) ELSE Skip
 
 \* A takeover: the previous coordinator's death is a hidden step before it.
+\* Unfenced, that death was its process's (see Unfenced), never a supersession.
 StepCoordRecovers ==
     /\ Is("CoordRecovers")
     /\ CoordRecovers
-    /\ leaderEpoch' = ModelEpoch(E.epoch)
+    /\ IF Unfenced THEN ~zombie ELSE leaderEpoch' = ModelEpoch(E.epoch)
 
 \* The drain is covered and the job holds for in-doubt resolution.
 StepRestartProceeds ==

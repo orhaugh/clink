@@ -698,6 +698,27 @@ struct CheckpointConfig {
     // wire fields - old peers see EOF and leave capture off.
     std::string capture_dir;
     std::uint64_t capture_records{0};
+
+    // Track this job's runs in checkpoint_dir and resume an unfinished one. Set
+    // by the embedded engine, whose every run is a fresh process with a fresh
+    // coordinator and job ids restarting at 1; in-process only, so it is not
+    // carried on the wire. With it, a submit with no explicit restore point:
+    //   - resumes the job's last run when that run did not finish (killed,
+    //     crashed, cancelled, failed) and completed a checkpoint of its own,
+    //     choosing the restore point the way HA recovery does: the newest
+    //     CONFIRMED checkpoint for a job with a non-recoverable-commit sink,
+    //     after in-doubt resolution, else the newest COMPLETED one;
+    //   - refuses when the recorded job-graph fingerprint differs from this
+    //     job's, so a reused directory never hands one job another's state;
+    //   - otherwise (start_fresh, a clean finish, nothing of the last run's own
+    //     to restore) starts from empty state, recording the id it numbers
+    //     above as the new run's base so a later resume never reaches back into
+    //     an earlier run's checkpoints.
+    // New checkpoints always number above every id on disk.
+    bool track_runs{false};
+    // With track_runs: start from empty state even when the last run did not
+    // finish (clink run --fresh).
+    bool start_fresh{false};
 };
 
 // Resolve max_restarts_on_worker_loss to its effective value (see the field +

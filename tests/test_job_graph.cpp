@@ -492,3 +492,51 @@ TEST(JobGraphSpec, UdfSpecsRoundTripJsonAndPack) {
     EXPECT_TRUE(JobGraphSpec::from_json(bare.to_json()).udfs.empty());
     EXPECT_TRUE(unpack_udf_specs("").empty());
 }
+
+namespace {
+
+JobGraphSpec fingerprint_fixture() {
+    JobGraphSpec spec;
+    OperatorSpec src;
+    src.type = "file_text_source";
+    src.id = "src_0";
+    src.params["path"] = "/tmp/in.ndjson";
+    OperatorSpec sink;
+    sink.type = "collect_sink_row";
+    sink.id = "snk_1";
+    sink.inputs = {"src_0"};
+    sink.params["collect_scope"] = "engine-a";
+    spec.ops = {src, sink};
+    return spec;
+}
+
+}  // namespace
+
+// The identity a resuming submit checks a checkpoint directory against: the same
+// job submitted by a new embedded engine must match (its collect_scope stamp is
+// per engine), and any other change to the graph must not.
+TEST(JobGraphFingerprint, IgnoresTheEngineCollectScopeAndSeesEveryOtherChange) {
+    const auto base = fingerprint_fixture();
+    EXPECT_EQ(job_graph_fingerprint(base), job_graph_fingerprint(fingerprint_fixture()));
+
+    auto other_engine = fingerprint_fixture();
+    other_engine.ops[1].params["collect_scope"] = "engine-b";
+    EXPECT_EQ(job_graph_fingerprint(base), job_graph_fingerprint(other_engine));
+
+    auto other_path = fingerprint_fixture();
+    other_path.ops[0].params["path"] = "/tmp/other.ndjson";
+    EXPECT_NE(job_graph_fingerprint(base), job_graph_fingerprint(other_path));
+
+    auto other_parallelism = fingerprint_fixture();
+    other_parallelism.ops[0].parallelism = 4;
+    EXPECT_NE(job_graph_fingerprint(base), job_graph_fingerprint(other_parallelism));
+
+    auto extra_op = fingerprint_fixture();
+    OperatorSpec proj;
+    proj.type = "project_row";
+    proj.id = "proj_2";
+    proj.inputs = {"src_0"};
+    extra_op.ops.insert(extra_op.ops.begin() + 1, proj);
+    extra_op.ops.back().inputs = {"proj_2"};
+    EXPECT_NE(job_graph_fingerprint(base), job_graph_fingerprint(extra_op));
+}

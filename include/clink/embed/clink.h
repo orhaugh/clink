@@ -148,6 +148,11 @@ typedef struct clink_engine_options {
     int64_t checkpoint_interval_ms;
     /* Persistent catalog directory. NULL keeps a session-only catalog. */
     const char* catalog_dir;
+    /* With checkpoint_dir set: 0 (the default) resumes a job whose last run
+     * there did not finish from its checkpoints, and refuses a directory whose
+     * checkpoints another job wrote; non-zero starts every job from empty
+     * state. A job whose last run finished always starts over. */
+    int32_t fresh;
     /* New options are appended here, never inserted above. */
 } clink_engine_options;
 

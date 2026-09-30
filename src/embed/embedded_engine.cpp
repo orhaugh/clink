@@ -105,6 +105,13 @@ EmbeddedEngine::~EmbeddedEngine() {
     if (collect_hub_) {
         collect_hub_->abort_all();
     }
+    // Cancel before stopping the worker. A stopped worker's subtasks exit
+    // cleanly, and a job that completes cleanly without a cancel reads as one
+    // that reached the end of its input: it would be marked finished, and the
+    // next run would start it over rather than resume it.
+    if (!jobs_.empty()) {
+        cancel_all();
+    }
     if (worker_) {
         worker_->stop();
     }
@@ -120,6 +127,8 @@ int EmbeddedEngine::submit_spec_(const cluster::JobGraphSpec& spec,
         ckpt.interval_ms = opts_.checkpoint_interval_ms;
     }
     ckpt.state_backend_uri = opts_.state_backend_uri;
+    ckpt.track_runs = true;
+    ckpt.start_fresh = opts_.fresh;
     ckpt.capture_dir = opts_.capture_dir;
     ckpt.capture_records = opts_.capture_records;
     // Stamp this engine's scope token onto every collect sink so its

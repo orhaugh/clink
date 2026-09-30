@@ -51,6 +51,15 @@ struct EngineOptions {
     std::string checkpoint_dir;
     // Periodic checkpoint cadence, applied only when checkpoint_dir is set.
     std::int64_t checkpoint_interval_ms = 10'000;
+    // With checkpoint_dir set, a job whose last run did not finish (killed,
+    // crashed, cancelled, failed) RESUMES from its own checkpoints there by
+    // default: rerunning the script continues from the last checkpoint rather
+    // than re-reading its sources and re-publishing what its sinks already
+    // committed. A directory holding a different job's checkpoints is refused.
+    // A job whose last run reached the end of its input starts over. fresh =
+    // true starts every job from empty state (new checkpoints still number
+    // above the old ones).
+    bool fresh = false;
     // Record-capture flight recorder: when non-empty, operator subtasks tee
     // their input records into per-checkpoint-epoch .cap files under this
     // directory (see runtime/record_capture.hpp). Pair with checkpoint_dir

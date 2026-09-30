@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+**An embedded run resumes after a crash.** With `--checkpoint-dir`, running
+the same script again after `clink run` (or a pyclink `Engine`) was killed,
+crashed, failed or was stopped with Ctrl-C continues the job from its last
+checkpoint. Before, the rerun started from nothing: it re-read its sources
+from the beginning and re-published everything its exactly-once sinks had
+already committed. Against a real broker, a run SIGKILLed mid-stream and
+started again committed every window to a transactional Kafka sink once,
+where before the rerun committed the first run's windows a second time. The
+restore point is chosen as HA recovery chooses it, including in-doubt
+resolution, and new checkpoints number above every id already on disk.
+
+- A job that reached the end of its input cleanly starts over on a rerun
+  instead, so a bounded load or a full-refresh materialized view runs again
+  rather than publishing nothing. So does a run that died before completing
+  a checkpoint of its own: it is never handed the run before it.
+- A directory whose checkpoints a different job graph wrote is refused, with
+  both fingerprints named, because job ids restart at 1 in every process.
+- `--fresh` (pyclink `Engine(fresh=True)`, C `clink_engine_options.fresh`)
+  starts from empty state.
+
+**Restored file sinks keep their earlier output.** The plain `file` sink and
+the partitioned file sinks truncated their files whenever they opened, a
+restore included. After a failover, and now after a resumed rerun, the file
+held only the rows written since the restore point. They now append on a
+restore (at-least-once, as documented), and an overwrite sink keeps its
+staging file. The plain Parquet sink cannot append and still keeps only the
+rows written since a restore. The exactly-once Parquet sink is the path that
+keeps them.
+
+Only the embedded engine tracks and resumes its runs; a cluster submit neither resumes nor writes these records.
+
+**Compatibility.** `CheckpointConfig` and the coordinator's deploy path
+changed on the plugin ABI surface, so the plugin ABI fingerprint rotates:
+rebuild job modules against this release. `clink_engine_options` gains
+`fresh` at its end (append-only; `struct_size` covers older callers). A
+checkpoint directory written by an earlier release has no graph fingerprint,
+so resuming from it is refused. Start such a job with `--fresh` or use a new
+directory.
+
 ## v0.9.1 (September 2026)
 
 pyclink on PyPI, with Linux wheels that include the Kafka connector, and a

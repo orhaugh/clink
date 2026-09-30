@@ -9757,11 +9757,15 @@ public:
                 clink::config::JsonValue{clink::sql::to_json_object(q.values)});
             // Write incrementally to a per-partition file handle (opened once,
             // truncating; kept open until flush) rather than buffering all rows -
-            // so memory stays bounded by the number of distinct partitions.
+            // so memory stays bounded by the number of distinct partitions. A
+            // restored run appends instead: its sources replay only what follows
+            // the restore point, so truncating would lose the rows before it
+            // (at-least-once, as FileSink).
             auto [it, inserted] = files_.try_emplace(key);
             if (inserted) {
                 const std::string path = base_path_ + "." + key;
-                it->second.open(path, std::ios::binary | std::ios::trunc);
+                it->second.open(path,
+                                std::ios::binary | (restored_() ? std::ios::app : std::ios::trunc));
                 if (!it->second) {
                     throw std::runtime_error("partition_file_sink: cannot open " + path);
                 }
@@ -9782,6 +9786,9 @@ public:
     std::string name() const override { return "partition_file_sink"; }
 
 private:
+    [[nodiscard]] bool restored_() const {
+        return this->runtime() != nullptr && this->runtime()->restore_from_checkpoint_id() > 0;
+    }
     // Map a partition value to a collision-free, path-safe filename component:
     // percent-encode every byte outside [A-Za-z0-9_-] (so '/' -> %2F can't escape
     // the base dir, '.' -> %2E avoids '.'/'..', and the encoding is reversible so
@@ -9845,7 +9852,16 @@ public:
     void open() override {
         staging_ = dir_ + ".staging";
         std::error_code ec;
-        std::filesystem::remove_all(staging_, ec);  // clear any stale staging
+        // A restored run keeps the staging set it is continuing (recovering it
+        // from the published set when a kill landed after the publish) and
+        // appends to it; only a fresh run starts from an empty one.
+        restored_ = this->runtime() != nullptr && this->runtime()->restore_from_checkpoint_id() > 0;
+        if (!restored_) {
+            std::filesystem::remove_all(staging_, ec);  // clear any stale staging
+        } else if (!std::filesystem::exists(staging_, ec) && std::filesystem::exists(dir_, ec)) {
+            std::filesystem::copy(dir_, staging_, std::filesystem::copy_options::recursive, ec);
+        }
+        ec.clear();
         std::filesystem::create_directories(staging_, ec);
         if (ec) {
             throw std::runtime_error("partition_overwrite_sink: cannot create staging dir " +
@@ -9864,7 +9880,8 @@ public:
             auto [it, inserted] = files_.try_emplace(key);
             if (inserted) {
                 const std::string path = staging_ + "/" + key;
-                it->second.open(path, std::ios::binary | std::ios::trunc);
+                it->second.open(path,
+                                std::ios::binary | (restored_ ? std::ios::app : std::ios::trunc));
                 if (!it->second) {
                     throw std::runtime_error("partition_overwrite_sink: cannot open " + path);
                 }
@@ -9907,6 +9924,7 @@ public:
     std::string name() const override { return "partition_overwrite_sink"; }
 
 private:
+    bool restored_ = false;
     // Path-safe, collision-free key from the partition columns: percent-encode each
     // column value (as PartitionedJsonSink does) and join multi-column keys with '.'
     // (a '.' can never appear in the encoded output, so the join is unambiguous).

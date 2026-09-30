@@ -60,6 +60,7 @@ struct SqlRunArgs {
     std::uint32_t parallelism = 1;
     std::size_t slots = 64;
     bool explain = false;
+    bool fresh = false;
 };
 
 void usage() {
@@ -78,6 +79,13 @@ void usage() {
               << "  --checkpoint-dir=<dir>      Enable checkpointing under this root.\n"
               << "  --checkpoint-interval-ms=<n>  Periodic checkpoint cadence (default 10000;\n"
               << "                              used only with --checkpoint-dir).\n"
+              << "  --fresh                     Start from empty state. By default a job\n"
+              << "                              whose last run did not finish (killed,\n"
+              << "                              crashed, Ctrl-C) resumes from its own\n"
+              << "                              checkpoints in --checkpoint-dir, and a\n"
+              << "                              directory holding a different job's\n"
+              << "                              checkpoints is refused. A job that\n"
+              << "                              reached the end of its input starts over.\n"
               << "  --capture-dir=<dir>         Record-capture flight recorder: tee each\n"
               << "                              operator's input records into per-checkpoint\n"
               << "                              epoch files under this dir (time-travel\n"
@@ -123,6 +131,8 @@ bool parse_args(int argc, char** argv, SqlRunArgs& a) {
             std::exit(0);
         } else if (arg == "--explain") {
             a.explain = true;
+        } else if (arg == "--fresh") {
+            a.fresh = true;
         } else if (arg == "-e") {
             if (i + 1 >= argc) {
                 std::cerr << "error: -e requires a SQL string\n";
@@ -257,6 +267,7 @@ int clink_cmd_run_sql(int argc, char** argv) {
     eopts.state_backend_uri = args.state_backend;
     eopts.checkpoint_dir = args.checkpoint_dir;
     eopts.checkpoint_interval_ms = args.checkpoint_interval_ms;
+    eopts.fresh = args.fresh;
     eopts.capture_dir = args.capture_dir;
     eopts.capture_records = args.capture_records;
     eopts.catalog_dir = args.catalog_dir;

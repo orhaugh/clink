@@ -73,8 +73,15 @@ blocked reader with an error. Collect is append-only in v1 - a retracting
 (changelog) query is rejected at bind time.
 
 `Engine(...)` accepts `parallelism`, `state_backend_uri`, `checkpoint_dir`,
-`checkpoint_interval_ms`, `catalog_dir`, and `lib_path` (which beats the
-`CLINK_LIB` environment variable). `await_all()` polls in slices, so Ctrl-C
+`checkpoint_interval_ms`, `catalog_dir`, `fresh`, and `lib_path` (which beats
+the `CLINK_LIB` environment variable). With `checkpoint_dir` set, a job whose
+last run there did not finish resumes from its checkpoints; `fresh=True`
+starts it from empty state instead. Jobs are matched by their order within a
+session (the first job submitted is job 1 in every session), so an
+interactive session that reuses a checkpoint directory resumes its first
+query from the previous session's first query, if that one was still running
+when the engine closed; a different first query is refused. Give each
+notebook its own directory, or pass `fresh=True`. `await_all()` polls in slices, so Ctrl-C
 cancels the running jobs and drains before re-raising.
 
 See `docs/internals/embedded.md` in the repo for the semantics underneath and

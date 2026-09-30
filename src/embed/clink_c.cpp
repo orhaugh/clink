@@ -127,6 +127,9 @@ clink_engine* clink_engine_open(const clink_engine_options* options) {
         if (CLINK_OPTION_PRESENT(options, catalog_dir) && options->catalog_dir != nullptr) {
             opts.catalog_dir = options->catalog_dir;
         }
+        if (CLINK_OPTION_PRESENT(options, fresh)) {
+            opts.fresh = options->fresh != 0;
+        }
     }
     // Library mode: capture diagnostics instead of writing to stderr; rows
     // sent to a print sink still reach stdout by design.

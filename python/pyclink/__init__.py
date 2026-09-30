@@ -60,6 +60,7 @@ class _EngineOptions(ctypes.Structure):
         ("checkpoint_dir", ctypes.c_char_p),
         ("checkpoint_interval_ms", ctypes.c_int64),
         ("catalog_dir", ctypes.c_char_p),
+        ("fresh", ctypes.c_int32),
     ]
 
 
@@ -161,6 +162,7 @@ class Engine:
         checkpoint_dir: str | None = None,
         checkpoint_interval_ms: int = 0,
         catalog_dir: str | None = None,
+        fresh: bool = False,
         lib_path: str | None = None,
     ):
         self._lib = _bind(_load_library(lib_path))
@@ -174,6 +176,7 @@ class Engine:
             _enc(checkpoint_dir),
             checkpoint_interval_ms,
             _enc(catalog_dir),
+            1 if fresh else 0,
         )
         self._h = self._lib.clink_engine_open(ctypes.byref(opts))
         if not self._h:

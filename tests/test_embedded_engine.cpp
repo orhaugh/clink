@@ -5,6 +5,7 @@
 // stdout output (captured at the fd level, since sink subtasks write from
 // runner threads).
 
+#include <algorithm>
 #include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
@@ -706,4 +707,300 @@ TEST(EmbeddedEngine, ColumnarWindowOutputMatchesRowOutput) {
 
     EXPECT_EQ(columnar, rows)
         << "born-columnar window output must be indistinguishable from the row fire";
+}
+
+namespace {
+
+struct ResumeRun {
+    int execute_rc{0};
+    std::int64_t rows{0};
+    std::string err;
+};
+
+// One engine, one run of `insert` into a collect table over the orders file, with
+// checkpointing into `ckpt`. The engine is destroyed before returning, as a
+// process that exits would be.
+ResumeRun run_orders_into_collect(const fs::path& in_path,
+                                  const fs::path& ckpt,
+                                  const std::string& insert,
+                                  bool fresh) {
+    ResumeRun run;
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    opts.checkpoint_dir = ckpt.string();
+    opts.checkpoint_interval_ms = 100;
+    opts.fresh = fresh;
+    {
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        if (engine.execute_script(orders_ddl(in_path) +
+                                  "CREATE TABLE results (user_id BIGINT, amount BIGINT) "
+                                  "WITH (connector='collect')") != 0) {
+            run.execute_rc = -1;
+            run.err = err.str();
+            return run;
+        }
+        auto reader_r = engine.collect_reader("results");
+        if (!reader_r.ok()) {
+            run.execute_rc = -2;
+            run.err = reader_r.status().ToString();
+            return run;
+        }
+        auto reader = *reader_r;
+        run.execute_rc = engine.execute_script(insert);
+        if (run.execute_rc == 0) {
+            while (true) {
+                std::shared_ptr<arrow::RecordBatch> batch;
+                if (!reader->ReadNext(&batch).ok() || !batch) {
+                    break;
+                }
+                run.rows += batch->num_rows();
+            }
+            (void)engine.await_all();
+        }
+    }
+    run.err = err.str();
+    return run;
+}
+
+std::uint64_t highest_completed_marker(const fs::path& ckpt) {
+    std::uint64_t best = 0;
+    std::error_code ec;
+    for (const auto& e : fs::recursive_directory_iterator(ckpt / "_jobs", ec)) {
+        const auto name = e.path().filename().string();
+        if (name.rfind("COMPLETED-", 0) == 0) {
+            best = std::max<std::uint64_t>(best, std::stoull(name.substr(10)));
+        }
+    }
+    return best;
+}
+
+fs::path resume_scratch(const std::string& name) {
+    const auto dir = fs::temp_directory_path() /
+                     ("clink_embed_resume_" + name + "_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    return dir;
+}
+
+const std::string kResumeInsert = "INSERT INTO results SELECT user_id, amount FROM orders";
+
+// What a kill leaves behind: the run's checkpoints without the FINISHED marker
+// a clean end of input writes. Removing the marker from a finished run gives the
+// in-process tests a killed run's directory deterministically; the real kill is
+// EmbeddedResumeKafka in the integration suite.
+void as_if_killed(const fs::path& ckpt) {
+    std::error_code ec;
+    fs::remove(ckpt / "_jobs" / "1" / "FINISHED", ec);
+}
+
+// Runs `insert` over the orders file into a plain file sink.
+int run_orders_into_file(const fs::path& in_path,
+                         const fs::path& out_path,
+                         const fs::path& ckpt,
+                         std::string* err_out) {
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    opts.checkpoint_dir = ckpt.string();
+    opts.checkpoint_interval_ms = 100;
+    int rc = 0;
+    {
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        rc = engine.execute_script(orders_ddl(in_path) +
+                                   "CREATE TABLE out_file (user_id BIGINT, amount BIGINT) WITH "
+                                   "(connector='file', path='" +
+                                   out_path.string() +
+                                   "', format='json');\n"
+                                   "INSERT INTO out_file SELECT user_id, amount FROM orders;");
+        if (rc == 0 && !engine.await_all()) {
+            rc = 1;
+        }
+    }
+    if (err_out != nullptr) {
+        *err_out = err.str();
+    }
+    return rc;
+}
+
+}  // namespace
+
+// A job whose last run did not finish resumes from its checkpoints: the file
+// source restores its offset at the end of the file, so nothing is read or
+// emitted again. Before resume existed the rerun started from nothing and
+// re-emitted every row, which into an exactly-once sink duplicates everything
+// already committed.
+TEST(EmbeddedEngine, AnUnfinishedJobResumesFromItsCheckpointsInsteadOfReplaying) {
+    const auto dir = resume_scratch("rerun");
+    write_orders(dir / "in.ndjson");
+
+    const auto first =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, false);
+    ASSERT_EQ(first.execute_rc, 0) << first.err;
+    EXPECT_EQ(first.rows, 5);
+    const auto first_marker = highest_completed_marker(dir / "ckpt");
+    ASSERT_GT(first_marker, 0u) << "the first run must leave a completed checkpoint";
+    as_if_killed(dir / "ckpt");
+
+    const auto second =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, false);
+    ASSERT_EQ(second.execute_rc, 0) << second.err;
+    EXPECT_EQ(second.rows, 0) << "a resumed run must not re-emit what the first run read";
+    EXPECT_GT(highest_completed_marker(dir / "ckpt"), first_marker)
+        << "the resumed run numbers its checkpoints above the first run's";
+    fs::remove_all(dir);
+}
+
+// A job that reached the end of its input is run again by a rerun - a bounded
+// load, a full-refresh view - rather than resumed at its end, where it would
+// publish nothing. Its checkpoints still number above the finished run's.
+TEST(EmbeddedEngine, AFinishedJobStartsOverOnARerun) {
+    const auto dir = resume_scratch("finished");
+    write_orders(dir / "in.ndjson");
+
+    const auto first =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, false);
+    ASSERT_EQ(first.execute_rc, 0) << first.err;
+    ASSERT_TRUE(fs::exists(dir / "ckpt" / "_jobs" / "1" / "FINISHED"))
+        << "a clean end of input records the finish";
+    const auto first_marker = highest_completed_marker(dir / "ckpt");
+
+    const auto second =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, false);
+    ASSERT_EQ(second.execute_rc, 0) << second.err;
+    EXPECT_EQ(second.rows, 5) << "a finished job is run again, not resumed at its end";
+    EXPECT_GT(highest_completed_marker(dir / "ckpt"), first_marker);
+
+    // A finished job restores nothing, so a changed script is not refused.
+    const auto changed = run_orders_into_collect(
+        dir / "in.ndjson",
+        dir / "ckpt",
+        "INSERT INTO results SELECT user_id, amount FROM orders WHERE amount > 0",
+        false);
+    EXPECT_EQ(changed.execute_rc, 0) << changed.err;
+    EXPECT_EQ(changed.rows, 5);
+    fs::remove_all(dir);
+}
+
+// Job ids restart at 1 in every process, so the markers alone cannot say which job
+// wrote them. A different script resuming the same directory is refused by name
+// rather than handed the first job's state.
+TEST(EmbeddedEngine, ResumingADifferentScriptOnTheSameCheckpointsIsRefused) {
+    const auto dir = resume_scratch("changed");
+    write_orders(dir / "in.ndjson");
+
+    const auto first =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, false);
+    ASSERT_EQ(first.execute_rc, 0) << first.err;
+    as_if_killed(dir / "ckpt");
+
+    const auto changed = run_orders_into_collect(
+        dir / "in.ndjson",
+        dir / "ckpt",
+        "INSERT INTO results SELECT user_id, amount FROM orders WHERE amount > 0",
+        false);
+    EXPECT_NE(changed.execute_rc, 0);
+    EXPECT_NE(changed.err.find("refusing to resume job 1"), std::string::npos) << changed.err;
+    EXPECT_NE(changed.err.find("different job graph"), std::string::npos) << changed.err;
+    fs::remove_all(dir);
+}
+
+// fresh = true starts an unfinished job from empty state on the same directory,
+// and its checkpoints still number above the old run's, so it overwrites none of
+// that run's markers. A changed script is accepted fresh where a resume refuses it.
+TEST(EmbeddedEngine, AFreshRunStartsOverAboveTheOldCheckpointIds) {
+    const auto dir = resume_scratch("fresh");
+    write_orders(dir / "in.ndjson");
+
+    const auto first =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, false);
+    ASSERT_EQ(first.execute_rc, 0) << first.err;
+    const auto first_marker = highest_completed_marker(dir / "ckpt");
+    as_if_killed(dir / "ckpt");
+
+    const auto fresh =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, true);
+    ASSERT_EQ(fresh.execute_rc, 0) << fresh.err;
+    EXPECT_EQ(fresh.rows, 5) << "a fresh run reads the whole input again";
+    EXPECT_GT(highest_completed_marker(dir / "ckpt"), first_marker);
+    as_if_killed(dir / "ckpt");
+
+    const auto changed_fresh = run_orders_into_collect(
+        dir / "in.ndjson",
+        dir / "ckpt",
+        "INSERT INTO results SELECT user_id, amount FROM orders WHERE amount > 0",
+        true);
+    EXPECT_EQ(changed_fresh.execute_rc, 0) << changed_fresh.err;
+    EXPECT_EQ(changed_fresh.rows, 5);
+    fs::remove_all(dir);
+}
+
+// A resumed run continues a plain file sink's output rather than truncating it:
+// the sources replay only what follows the restore point, so a truncated file
+// would lose every row written before it. (At-least-once: rows after the restore
+// point are written again; here the source restores at its end, so none are.)
+TEST(EmbeddedEngine, AResumedRunKeepsThePlainFileSinksEarlierOutput) {
+    const auto dir = resume_scratch("filesink");
+    write_orders(dir / "in.ndjson");
+    std::string err;
+
+    ASSERT_EQ(run_orders_into_file(dir / "in.ndjson", dir / "out.ndjson", dir / "ckpt", &err), 0)
+        << err;
+    ASSERT_EQ(read_lines(dir / "out.ndjson").size(), 5u);
+    as_if_killed(dir / "ckpt");
+
+    ASSERT_EQ(run_orders_into_file(dir / "in.ndjson", dir / "out.ndjson", dir / "ckpt", &err), 0)
+        << err;
+    EXPECT_EQ(read_lines(dir / "out.ndjson").size(), 5u)
+        << "the resumed run must keep what the first run wrote";
+
+    // A finished job starts over and rewrites its output whole, as before resume.
+    ASSERT_EQ(run_orders_into_file(dir / "in.ndjson", dir / "out.ndjson", dir / "ckpt", &err), 0)
+        << err;
+    EXPECT_EQ(read_lines(dir / "out.ndjson").size(), 5u);
+    fs::remove_all(dir);
+}
+
+// A run that started from empty state and died before completing a checkpoint
+// of its own has nothing to resume. The checkpoints on disk are the run before
+// it, and resuming them would hand this run that run's state: after a clean
+// finish, its sources at their end, so nothing is published; after --fresh with
+// a changed script, another graph's state. The run base each fresh start records
+// keeps them out of reach. The directory is built the way such a kill leaves it:
+// the new run's deploy records its base above the old checkpoints and clears the
+// finish, and nothing more lands before the kill.
+TEST(EmbeddedEngine, ARunKilledBeforeItsFirstCheckpointDoesNotResumeTheRunBeforeIt) {
+    const auto dir = resume_scratch("killedearly");
+    write_orders(dir / "in.ndjson");
+
+    const auto first =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, false);
+    ASSERT_EQ(first.execute_rc, 0) << first.err;
+    const auto first_marker = highest_completed_marker(dir / "ckpt");
+    ASSERT_GT(first_marker, 0u);
+    {
+        std::ofstream(dir / "ckpt" / "_jobs" / "1" / "run-base") << first_marker;
+    }
+    as_if_killed(dir / "ckpt");
+
+    const auto rerun =
+        run_orders_into_collect(dir / "in.ndjson", dir / "ckpt", kResumeInsert, false);
+    ASSERT_EQ(rerun.execute_rc, 0) << rerun.err;
+    EXPECT_EQ(rerun.rows, 5) << "the killed run completed no checkpoint, so it starts over";
+
+    // Same shape after --fresh with a changed script: its fingerprint is the new
+    // graph's, the checkpoints below the base are the old graph's.
+    const auto marker = highest_completed_marker(dir / "ckpt");
+    {
+        std::ofstream(dir / "ckpt" / "_jobs" / "1" / "run-base") << marker;
+    }
+    as_if_killed(dir / "ckpt");
+    const auto changed = run_orders_into_collect(
+        dir / "in.ndjson",
+        dir / "ckpt",
+        "INSERT INTO results SELECT user_id, amount FROM orders WHERE amount > 0",
+        false);
+    EXPECT_EQ(changed.execute_rc, 0) << changed.err;
+    EXPECT_EQ(changed.rows, 5) << "nothing of its own to resume, so no refusal and no old state";
+    fs::remove_all(dir);
 }

@@ -1497,6 +1497,18 @@ private:
     // Best-effort like persist_history_record_: a store hiccup must not
     // turn completion signalling into a throw.
     void retire_job_manifest_(JobId job_id, const char* status);
+    // Record under the job's checkpoint directory that it reached the end of
+    // its input cleanly, so a rerun starts it over instead of resuming it (see
+    // CheckpointConfig::track_runs). No-op unless the job tracks its runs.
+    void mark_job_finished_(const JobState& job);
+    [[nodiscard]] static std::string finished_marker_key(JobId job_id) {
+        return "_jobs/" + std::to_string(job_id) + "/FINISHED";
+    }
+    // The id the job's current run numbers above (CheckpointConfig::track_runs):
+    // checkpoints at or below it belong to earlier runs and are never resumed.
+    [[nodiscard]] static std::string run_base_key(JobId job_id) {
+        return "_jobs/" + std::to_string(job_id) + "/run-base";
+    }
     // After every surviving-worker subtask of `job` has drained on
     // awaiting_restart=true, rebuild tasks_by_worker by round-robin
     // assigning the original task set onto survivor workers, reset
@@ -1562,7 +1574,13 @@ private:
                            CheckpointConfig checkpoint,
                            std::unique_ptr<JobBundle> bundle,
                            std::string expected_state_versions_packed = {},
-                           std::string udfs_packed = {});
+                           std::string udfs_packed = {},
+                           // job_graph_fingerprint of the submitted graph (empty: no
+                           // checkpoint_dir) and its forced-singleton op ids: what a
+                           // CheckpointConfig::track_runs submit checks the
+                           // directory's recorded job and restore layout against.
+                           std::string graph_fingerprint = {},
+                           std::vector<std::string> single_instance_ops = {});
     void handle_subtask_checkpointed_(MessageReader& r);
     // Commit-confirmed restore protocol: a tracked task's commit callbacks
     // for a checkpoint executed without throwing. Drains the checkpoint's

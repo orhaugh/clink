@@ -85,6 +85,13 @@ struct JobGraphSpec;
 // through the other is worse than a plan that is wrong through both.
 void apply_job_parallelism(JobGraphSpec& spec, std::uint32_t parallelism);
 
+// A job graph's identity for resuming from its checkpoints: a hash over the
+// serialised graph with the params that vary between two submissions of the same
+// job left out (the embedded engine's per-engine collect_scope). Two graphs with
+// the same fingerprint restore into each other's operator state, so a resuming
+// submit refuses a checkpoint directory whose recorded fingerprint differs.
+[[nodiscard]] std::string job_graph_fingerprint(const JobGraphSpec& spec);
+
 struct OperatorSpec {
     std::string type;
     std::string id;

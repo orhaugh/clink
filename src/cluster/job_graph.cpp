@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/cluster/plugin_cache.hpp"
 #include "clink/config/json.hpp"
 
 namespace clink::cluster {
@@ -572,6 +574,17 @@ void JobGraphSpec::validate() const {
     if (emitted != ops.size()) {
         throw std::runtime_error("JobGraphSpec::validate: cycle detected in graph");
     }
+}
+
+std::string job_graph_fingerprint(const JobGraphSpec& spec) {
+    JobGraphSpec normalised = spec;
+    for (auto& op : normalised.ops) {
+        // Stamped per engine instance so collect sinks resolve that engine's
+        // queues; the same job submitted by a new process carries a new one.
+        op.params.erase("collect_scope");
+    }
+    const auto json = normalised.to_json();
+    return fnv1a_64_hex(std::as_bytes(std::span{json.data(), json.size()}));
 }
 
 void apply_job_parallelism(JobGraphSpec& spec, std::uint32_t parallelism) {

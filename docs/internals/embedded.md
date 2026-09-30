@@ -87,6 +87,69 @@ must not spawn logging threads it cannot promise to join. A host application
 that initialised `clink::logging` before opening an engine keeps its own
 configuration.
 
+### Resuming after a restart
+
+An embedded run is one process, so a crash or a kill takes its coordinator,
+its worker and every in-flight checkpoint with it. With `--checkpoint-dir`
+set, running the same script again continues the job from its own
+checkpoints instead of starting it from nothing. Without that, a rerun
+re-read its sources from the beginning and re-published everything its
+exactly-once sinks had already committed.
+
+The submit (`CheckpointConfig::resume_existing`, set by the engine unless
+`--fresh`) treats the rerun as a coordinator takeover and chooses the restore
+point the way HA recovery does. For a job with a sink whose commits are not
+recoverable, that is the newest CONFIRMED checkpoint, after in-doubt
+resolution has had its chance to confirm the completed ones above it. For
+any other job it is the newest COMPLETED checkpoint. New checkpoints number
+above every id already on disk, so nothing the earlier run wrote is
+overwritten.
+
+Three rules decide which run resumes and which starts over:
+
+| Last run in this directory | Rerun of the same script | Rerun of a different script |
+|----------------------------|--------------------------|-----------------------------|
+| Did not finish (killed, crashed, cancelled with Ctrl-C, or failed) and completed a checkpoint of its own | Resumes from its checkpoints | Refused |
+| Did not finish, and completed no checkpoint of its own | Starts from empty state | Starts from empty state |
+| Reached the end of its input cleanly | Starts from empty state | Starts from empty state |
+| Any, with `--fresh` | Starts from empty state | Starts from empty state |
+
+Job ids restart at 1 in every process, so the markers under
+`_jobs/<id>/` say only that some job with that id ran there. The
+`graph-fingerprint` file beside them (`job_graph_fingerprint`, a hash of the
+compiled job graph without the engine-local collect scope) says whether it
+was this job. A resume whose fingerprint differs is refused, and the error
+names both fingerprints and the two ways out: a new checkpoint directory,
+or `--fresh`. `clink run` exits 1 on the refusal.
+
+A run that starts from empty state records `_jobs/<id>/run-base`, the id it
+numbers its checkpoints above. Checkpoints at or below it belong to earlier
+runs and are never resumed, so a run killed before its first checkpoint
+completes starts over next time. Without the base it would be handed the run
+before it: after a clean finish, sources at their end; after `--fresh` with a
+changed script, another graph's state. For a job whose sinks need commit
+confirmation, a run whose completed checkpoints never committed also starts
+over, since nothing of it was published.
+
+A clean end of input writes `_jobs/<id>/FINISHED`, and every deploy removes
+it. A rerun of a finished bounded job, such as a load over new input or a
+full-refresh materialized view, therefore runs it again, rather than
+resuming it at its end, where it would publish nothing. A run that dies
+before finishing leaves no marker, so the next run resumes it.
+
+A resumed run's file sinks continue their output rather than truncating
+it. The plain `file` sink and the partitioned sinks append on any restore,
+and an overwrite sink keeps its staging file. Rows after the restore point
+are written again as the sources replay them, which is those sinks'
+at-least-once contract; `delivery_guarantee='exactly_once'` is the
+exactly-once file path. A kill in the middle of a write can leave a partial
+last line, which the resumed run appends after. Any restore, a cluster
+restore from a savepoint included, appends to an existing output file rather
+than replacing it. The plain Parquet sink cannot append, and a killed
+run leaves its file without a footer, so after any restore it holds only the
+rows written since. Use the exactly-once Parquet sink where a restore must
+keep earlier output.
+
 ### Await and cancellation
 
 `await_all` polls every submitted job in 200 ms slices. A caller-supplied
@@ -256,7 +319,14 @@ Worker's slots.
 bare-SELECT print output captured at the fd level, a retracting TOP-N
 printing kind prefixes, cancel-while-running, pure-DDL scripts, the
 collect reader (typed batches, end-of-stream, single-consumer, changelog
-rejection), and the script-runner's synthesis and rejection paths.
+rejection), the script-runner's synthesis and rejection paths, and resume:
+an unfinished job resuming without re-emitting, a finished one starting over,
+a changed script refused, `fresh` numbering above the old checkpoints, and a
+plain file sink keeping its earlier output. The kill itself is
+`EmbeddedResumeKafka` in `tests/integration/test_embedded_resume_kafka.cpp`:
+`clink run` against a real broker, SIGKILLed mid-stream and started again,
+every window committed to the transactional Kafka sink exactly once. Its
+protocol trace is recorded under `formal/traces/embedded-resume-after-kill`.
 `tests/test_clink_c_abi.cpp` drives the C ABI end to end while linking only
 the shared library (the registries live inside libclink, mirroring a real
 embedding), importing the collect stream through Arrow C++ and asserting

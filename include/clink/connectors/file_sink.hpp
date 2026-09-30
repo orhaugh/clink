@@ -28,6 +28,14 @@ namespace clink {
 //
 // Records are written immediately to the stream and flushed on flush() (which the
 // runtime invokes once at end-of-stream).
+//
+// A run restored from a checkpoint (a failover, or an embedded rerun resuming
+// after a kill) continues the file instead of truncating it: the rows written
+// before the restore point stay, and the rows after it are written again as the
+// sources replay them. That is this sink's at-least-once contract; truncating
+// would instead lose every row the restored sources do not replay. An overwrite
+// sink likewise keeps its staging file, recovering it from the published file
+// when a kill landed between the publish and the job's end.
 template <typename T>
 class FileSink final : public Sink<T> {
 public:
@@ -51,12 +59,19 @@ public:
 
     void open() override {
         write_path_ = overwrite_ ? staging_path() : path_;
+        const bool restored =
+            this->runtime() != nullptr && this->runtime()->restore_from_checkpoint_id() > 0;
         if (overwrite_) {
             std::error_code ec;
-            std::filesystem::remove(write_path_, ec);  // clear any stale staging
+            if (!restored) {
+                std::filesystem::remove(write_path_, ec);  // clear any stale staging
+            } else if (!std::filesystem::exists(write_path_, ec) &&
+                       std::filesystem::exists(path_, ec)) {
+                std::filesystem::copy_file(path_, write_path_, ec);
+            }
         }
-        const std::ios::openmode mode =
-            append_ ? (std::ios::out | std::ios::app) : (std::ios::out | std::ios::trunc);
+        const std::ios::openmode mode = (append_ || restored) ? (std::ios::out | std::ios::app)
+                                                              : (std::ios::out | std::ios::trunc);
         stream_.open(write_path_, mode);
         if (!stream_.is_open()) {
             throw std::runtime_error("FileSink: cannot open " + write_path_.string());
