@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.10.0 (September 2026)
+
+An embedded run now resumes from its own checkpoints after a crash, and
+file sinks keep their earlier output across a restore. The plugin ABI
+fingerprint changes, so job modules must be rebuilt; see Compatibility
+below.
 
 **An embedded run resumes after a crash.** With `--checkpoint-dir`, running
 the same script again after `clink run` (or a pyclink `Engine`) was killed,

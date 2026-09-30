@@ -7,7 +7,7 @@ body:
     attributes:
       label: clink version
       description: Output of `clink_node --version`, or the release tag / commit SHA you built.
-      placeholder: "clink 0.9.1 (plugin ABI v1, ...)"
+      placeholder: "clink 0.10.0 (plugin ABI v1, ...)"
     validations:
       required: true
   - type: dropdown
