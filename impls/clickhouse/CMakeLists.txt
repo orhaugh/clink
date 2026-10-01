@@ -1,6 +1,6 @@
-# clink::clickhouse - the ClickHouse source, the HTTP insert sink (TSV or
-# JSONEachRow) and the native-protocol insert sink (src/native/), which builds
-# only against clickhouse-cpp 2.6.2 or later.
+# clink::clickhouse - the ClickHouse source, the text insert sink (TSV or
+# JSONEachRow rows sent as one INSERT statement) and the native-block insert
+# sink (src/native/), which builds only against clickhouse-cpp 2.6.2 or later.
 
 if(CLINK_WITH_CLICKHOUSE STREQUAL "OFF")
     message(STATUS "clink::clickhouse - CLINK_WITH_CLICKHOUSE=OFF; target not defined")

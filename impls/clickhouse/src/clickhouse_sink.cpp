@@ -1,10 +1,18 @@
 #include "clink/connectors/clickhouse_sink.hpp"
 
 #include <chrono>
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
+#include "clink/runtime/runtime_context.hpp"
+
+#include "native/sql_text.hpp"
 
 #ifdef CLINK_HAS_CLICKHOUSE
 #include <clickhouse/client.h>
@@ -12,14 +20,39 @@
 
 namespace clink {
 
-#ifdef CLINK_HAS_CLICKHOUSE
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+constexpr const char* kConnector = "clickhouse";
+
+std::uint64_t nanos_since(Clock::time_point start) {
+    const auto ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    return ns > 0 ? static_cast<std::uint64_t>(ns) : 0;
+}
+
+const char* format_name(ClickHouseSink::Format format) {
+    return format == ClickHouseSink::Format::JSONEachRow ? "JSONEachRow" : "TSV";
+}
+
+}  // namespace
 
 struct ClickHouseSink::Impl {
     Options opts;
-    std::unique_ptr<clickhouse::Client> client;
+#ifdef CLINK_HAS_CLICKHOUSE
+    std::unique_ptr<::clickhouse::Client> client;
+#endif
+    // Drawn at open, so no token of this run can repeat one of an earlier run,
+    // whose batches may already sit in the target's deduplication log.
+    std::optional<clickhouse::native::TokenSource> tokens;
+    bool connected{false};
     std::vector<std::string> buffer;
-    std::chrono::steady_clock::time_point last_flush{std::chrono::steady_clock::now()};
+    std::uint64_t buffered_bytes{0};
+    Clock::time_point last_flush{Clock::now()};
 };
+
+#ifdef CLINK_HAS_CLICKHOUSE
 
 bool ClickHouseSink::is_real_implementation() {
     return true;
@@ -29,112 +62,28 @@ ClickHouseSink::ClickHouseSink(Options opts) : impl_(std::make_unique<Impl>()) {
     impl_->opts = std::move(opts);
 }
 
-ClickHouseSink::~ClickHouseSink() = default;
-
-void ClickHouseSink::open() {
-    clickhouse::ClientOptions co;
-    co.SetHost(impl_->opts.host)
-        .SetPort(impl_->opts.port)
-        .SetDefaultDatabase(impl_->opts.database)
-        .SetUser(impl_->opts.user)
-        .SetPassword(impl_->opts.password);
-    impl_->client = std::make_unique<clickhouse::Client>(co);
+void ClickHouseSink::connect() {
+    const auto& o = impl_->opts;
+    ::clickhouse::ClientOptions co;
+    co.SetHost(o.host)
+        .SetPort(o.port)
+        .SetDefaultDatabase(o.database)
+        .SetUser(o.user)
+        .SetPassword(o.password)
+        .SetConnectionConnectTimeout(o.connect_timeout)
+        .SetConnectionSendTimeout(o.send_timeout)
+        .SetConnectionRecvTimeout(o.receive_timeout);
+    impl_->client = std::make_unique<::clickhouse::Client>(co);
 }
 
-namespace {
-
-void flush_buffer(clickhouse::Client& client,
-                  const std::string& db,
-                  const std::string& table,
-                  ClickHouseSink::Format format,
-                  std::vector<std::string>& buffer) {
-    if (buffer.empty()) {
-        return;
+void ClickHouseSink::send_insert(const std::string& statement) {
+    if (!impl_->client) {
+        throw std::logic_error("clickhouse_sink: no connection to send the INSERT on");
     }
-    // Concatenate the rows into a single payload separated by newlines.
-    std::string body;
-    body.reserve(buffer.size() * 32);
-    for (const auto& r : buffer) {
-        body.append(r);
-        body.push_back('\n');
-    }
-    const std::string fmt = (format == ClickHouseSink::Format::TSV) ? "TSV" : "JSONEachRow";
-    const std::string query = "INSERT INTO " + db + "." + table + " FORMAT " + fmt + "\n" + body;
-    client.Execute(query);
-    buffer.clear();
-}
-
-}  // namespace
-
-void ClickHouseSink::on_data(const Batch<std::string>& batch) {
-    std::uint64_t bytes_written = 0;
-    for (const auto& r : batch) {
-        bytes_written += r.value().size();
-        impl_->buffer.push_back(r.value());
-        if (impl_->buffer.size() >= impl_->opts.batch_rows) {
-            const auto t0 = std::chrono::steady_clock::now();
-            try {
-                flush_buffer(*impl_->client,
-                             impl_->opts.database,
-                             impl_->opts.table,
-                             impl_->opts.format,
-                             impl_->buffer);
-            } catch (...) {
-                clink::metrics::connector::error_inc("clickhouse");
-                throw;
-            }
-            const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now() - t0)
-                                .count();
-            clink::metrics::connector::commit_latency_observe("clickhouse",
-                                                              static_cast<std::uint64_t>(dt));
-            impl_->last_flush = std::chrono::steady_clock::now();
-        }
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (now - impl_->last_flush >= impl_->opts.batch_interval && !impl_->buffer.empty()) {
-        const auto t0 = std::chrono::steady_clock::now();
-        try {
-            flush_buffer(*impl_->client,
-                         impl_->opts.database,
-                         impl_->opts.table,
-                         impl_->opts.format,
-                         impl_->buffer);
-        } catch (...) {
-            clink::metrics::connector::error_inc("clickhouse");
-            throw;
-        }
-        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-        clink::metrics::connector::commit_latency_observe("clickhouse",
-                                                          static_cast<std::uint64_t>(dt));
-        impl_->last_flush = now;
-    }
-    clink::metrics::connector::records_out_inc("clickhouse", batch.size());
-    clink::metrics::connector::bytes_out_inc("clickhouse", bytes_written);
-}
-
-void ClickHouseSink::flush() {
-    if (impl_ && impl_->client) {
-        flush_buffer(*impl_->client,
-                     impl_->opts.database,
-                     impl_->opts.table,
-                     impl_->opts.format,
-                     impl_->buffer);
-    }
-}
-
-void ClickHouseSink::close() {
-    flush();
-    if (impl_) {
-        impl_->client.reset();
-    }
+    impl_->client->Execute(statement);
 }
 
 #else
-
-struct ClickHouseSink::Impl {};
 
 bool ClickHouseSink::is_real_implementation() {
     return false;
@@ -146,12 +95,99 @@ ClickHouseSink::ClickHouseSink(Options /*opts*/) {
         "reconfigure cmake - find_package(clickhouse-cpp) must succeed.");
 }
 
-ClickHouseSink::~ClickHouseSink() = default;
-void ClickHouseSink::open() {}
-void ClickHouseSink::on_data(const Batch<std::string>& /*batch*/) {}
-void ClickHouseSink::flush() {}
-void ClickHouseSink::close() {}
+void ClickHouseSink::connect() {}
+void ClickHouseSink::send_insert(const std::string& /*statement*/) {}
 
 #endif
+
+ClickHouseSink::~ClickHouseSink() = default;
+
+const ClickHouseSink::Options& ClickHouseSink::options() const noexcept {
+    return impl_->opts;
+}
+
+void ClickHouseSink::open() {
+    impl_->connected = false;
+    impl_->tokens.emplace(clickhouse::native::TokenSource::random());
+    if (!impl_->opts.unrecognised_format.empty()) {
+        warn("format '" + impl_->opts.unrecognised_format +
+             "' is not one of tsv, json or jsoneachrow; the rows are sent as TSV");
+    }
+    connect();
+    impl_->connected = true;
+    impl_->last_flush = Clock::now();
+}
+
+void ClickHouseSink::on_data(const Batch<std::string>& batch) {
+    auto& im = *impl_;
+    for (const auto& r : batch) {
+        im.buffered_bytes += r.value().size();
+        im.buffer.push_back(r.value());
+        if (im.buffer.size() >= im.opts.batch_rows) {
+            flush_with_metrics();
+        }
+    }
+    if (!im.buffer.empty() && Clock::now() - im.last_flush >= im.opts.batch_interval) {
+        flush_with_metrics();
+    }
+}
+
+void ClickHouseSink::flush_with_metrics() {
+    auto& im = *impl_;
+    if (im.buffer.empty()) {
+        return;
+    }
+    if (!im.connected) {
+        throw std::logic_error("clickhouse_sink: rows are buffered but open() has not completed");
+    }
+    // A fresh token for every statement, a resend after a failure included. A
+    // resend may carry rows that arrived since the failure, and if the first
+    // attempt did land, the server would drop the whole resend under the old
+    // token as its duplicate, those rows with it.
+    const auto token = im.tokens->next();
+    std::string statement = clickhouse::native::legacy_insert_prefix(
+        im.opts.database, im.opts.table, token, format_name(im.opts.format));
+    statement.reserve(statement.size() + 1 + im.buffered_bytes + im.buffer.size());
+    statement.push_back('\n');
+    for (const auto& row : im.buffer) {
+        statement.append(row);
+        statement.push_back('\n');
+    }
+    const auto start = Clock::now();
+    try {
+        send_insert(statement);
+    } catch (...) {
+        metrics::connector::error_inc(kConnector);
+        throw;
+    }
+    // Counted only now: rows the server has not acknowledged were not written,
+    // and a failed flush keeps them buffered for the next attempt.
+    metrics::connector::commit_latency_observe(kConnector, nanos_since(start));
+    metrics::connector::records_out_inc(kConnector, im.buffer.size());
+    metrics::connector::bytes_out_inc(kConnector, im.buffered_bytes);
+    im.buffer.clear();
+    im.buffered_bytes = 0;
+    im.last_flush = Clock::now();
+}
+
+void ClickHouseSink::flush() {
+    flush_with_metrics();
+}
+
+void ClickHouseSink::close() {
+    flush();
+    impl_->connected = false;
+#ifdef CLINK_HAS_CLICKHOUSE
+    impl_->client.reset();
+#endif
+}
+
+void ClickHouseSink::warn(const std::string& message) const {
+    if (const auto* rt = runtime(); rt != nullptr) {
+        rt->log_warn(message);
+        return;
+    }
+    clink::logging::op_log(nullptr, LogSeverity::Warn, name(), message);
+}
 
 }  // namespace clink

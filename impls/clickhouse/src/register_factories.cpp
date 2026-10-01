@@ -1,11 +1,14 @@
 // ClickHouse factory registration.
 
+#include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include "clink/clickhouse/clickhouse_row_codec.hpp"
@@ -111,6 +114,55 @@ private:
     bool json_{false};
 };
 
+// A clickhouse_sink integer option: the whole value must be the number, from 1
+// to `max`. param_int64_or falls back to the default on garbage, and the casts
+// it fed truncated, so a typo passed unnoticed, batch_rows='0' flushed on every
+// row and port='70000' connected to port 4464.
+std::int64_t sink_integer_param(const clink::plugin::BuildContext& ctx,
+                                const std::string& key,
+                                std::int64_t fallback,
+                                std::int64_t max) {
+    const auto it = ctx.params.find(key);
+    if (it == ctx.params.end()) {
+        return fallback;
+    }
+    const std::string value = clink::plugin::BuildContext::resolve_secret(it->second);
+    const char* first = value.data();
+    const char* last = first + value.size();
+    std::int64_t parsed = 0;
+    const auto [end, ec] = std::from_chars(first, last, parsed);
+    const bool whole = !value.empty() && end == last;
+    const bool too_large = whole && ((ec == std::errc{} && parsed > max) ||
+                                     (ec == std::errc::result_out_of_range && value[0] != '-'));
+    if (too_large) {
+        throw std::runtime_error("clickhouse_sink: " + key + " must be at most " +
+                                 std::to_string(max) + " (got '" + it->second + "')");
+    }
+    if (!whole || ec != std::errc{} || parsed < 1) {
+        throw std::runtime_error("clickhouse_sink: " + key + " must be a positive integer (got '" +
+                                 it->second + "')");
+    }
+    return parsed;
+}
+
+// tsv, json and jsoneachrow, in any case. Any other value keeps the TSV it has
+// always meant: the builder's format() takes any string, and a job that ran
+// must keep running. The sink names the value in a warning at open instead.
+void apply_sink_format(const std::string& value, ClickHouseSink::Options& opts) {
+    std::string lower = value;
+    for (char& c : lower) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (lower == "json" || lower == "jsoneachrow") {
+        opts.format = ClickHouseSink::Format::JSONEachRow;
+        return;
+    }
+    opts.format = ClickHouseSink::Format::TSV;
+    if (lower != "tsv") {
+        opts.unrecognised_format = value;
+    }
+}
+
 // Shared options parser used by every source factory below. Centralised
 // so a "host=..." typo fails the same way no matter which channel
 // flavour the job graph picked.
@@ -146,15 +198,17 @@ void install(clink::plugin::PluginRegistry& reg) {
         .replayable = false,
         .offset_model = clink::connectors::OffsetModel::None,
         .checkpoint_integrated = true,
-        // Batched INSERTs flushed at the barrier, no dedup key: a replay
-        // re-inserts the tail since the last checkpoint.
+        // Batched INSERTs flushed at the barrier. Each carries a deduplication
+        // token of its own, so a replay re-inserts the tail since the last
+        // checkpoint rather than matching what landed before the restart.
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .auth_methods = {"none", "password"},
         .tls = false,
         .backpressure = true,
         .retries = false,
-        .timeout_options = {"batch_interval_ms"},
+        .timeout_options =
+            {"connect_timeout_ms", "send_timeout_ms", "receive_timeout_ms", "batch_interval_ms"},
         .available_in_sql = true,
         .limitations = {"query source re-reads from the start on restart (no offset state)"},
     });
@@ -167,20 +221,23 @@ void install(clink::plugin::PluginRegistry& reg) {
     // joined std::string at the connector boundary.
     reg.register_type<ClickHouseRow>(std::string{kChannelClickHouseRow}, clickhouse_row_codec());
 
-    // clickhouse_sink: inserts string records into a ClickHouse table.
-    // Each record is one row (TSV by default) or one JSON object
-    // (when format="jsoneachrow"). params:
-    //   host (default "localhost"), port (default 9000)
+    // clickhouse_sink: inserts string records into a ClickHouse table, each
+    // record one row. params:
+    //   host (default "localhost"), port (default 9000, 1 to 65535)
     //   database (default "default"), table (required)
     //   user (default "default"), password (default "")
-    //   format ("tsv" or "jsoneachrow"; default "tsv")
-    //   batch_rows (default 1000)
-    //   batch_interval_ms (default 1000)
+    //   format ("tsv", or "json" / "jsoneachrow" for JSONEachRow, in any case;
+    //     default "tsv"; any other value is sent as TSV with a warning at open)
+    //   batch_rows (default 1000, 1 to 2^31-1)
+    //   batch_interval_ms (default 1000, 1 to 3600000)
+    //   connect_timeout_ms (default 5000), send_timeout_ms and
+    //     receive_timeout_ms (default 30000 each), 1 to 600000
+    // Keys it does not know are ignored: the SQL planner puts its own on the op.
     reg.register_sink<std::string>(
         "clickhouse_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
             ClickHouseSink::Options opts;
             opts.host = ctx.param_or("host", "localhost");
-            opts.port = static_cast<std::uint16_t>(ctx.param_int64_or("port", 9000));
+            opts.port = static_cast<std::uint16_t>(sink_integer_param(ctx, "port", 9000, 65535));
             opts.database = ctx.param_or("database", "default");
             opts.table = ctx.param_or("table");
             opts.user = ctx.param_or("user", "default");
@@ -188,15 +245,17 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (opts.table.empty()) {
                 throw std::runtime_error("clickhouse_sink: 'table' is required");
             }
-            const auto fmt = ctx.param_or("format", "tsv");
-            if (fmt == "jsoneachrow" || fmt == "JSONEachRow") {
-                opts.format = ClickHouseSink::Format::JSONEachRow;
-            } else {
-                opts.format = ClickHouseSink::Format::TSV;
-            }
-            opts.batch_rows = static_cast<std::size_t>(ctx.param_int64_or("batch_rows", 1000));
-            opts.batch_interval =
-                std::chrono::milliseconds{ctx.param_int64_or("batch_interval_ms", 1000)};
+            apply_sink_format(ctx.param_or("format", "tsv"), opts);
+            opts.batch_rows =
+                static_cast<std::size_t>(sink_integer_param(ctx, "batch_rows", 1000, 2147483647));
+            opts.batch_interval = std::chrono::milliseconds{
+                sink_integer_param(ctx, "batch_interval_ms", 1000, 3600000)};
+            opts.connect_timeout = std::chrono::milliseconds{
+                sink_integer_param(ctx, "connect_timeout_ms", 5000, 600000)};
+            opts.send_timeout = std::chrono::milliseconds{
+                sink_integer_param(ctx, "send_timeout_ms", 30000, 600000)};
+            opts.receive_timeout = std::chrono::milliseconds{
+                sink_integer_param(ctx, "receive_timeout_ms", 30000, 600000)};
             return std::make_shared<ClickHouseSink>(std::move(opts));
         });
 

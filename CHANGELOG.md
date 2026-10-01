@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+**The text ClickHouse sink is stricter, and says so at deploy.**
+`clickhouse_sink` changes in ways a job can notice:
+- `format='json'` now selects JSONEachRow; it used to write TSV. Values are
+  compared without case, and an unknown value still sends TSV but logs a
+  warning at open.
+- Every INSERT sends `async_insert=0`, `wait_for_async_insert=1` and its own
+  `insert_deduplication_token`, fresh for each batch. Two identical batches no
+  longer deduplicate against each other on a replicated table; a batch
+  replayed after a restart now lands again where content hashing used to
+  absorb it, which at-least-once allows.
+- Database and table names are quoted.
+- New keys `connect_timeout_ms` (5000), `send_timeout_ms` (30000) and
+  `receive_timeout_ms` (30000), each 1 to 600000. A silent server could
+  previously hold a flush, and the checkpoint, indefinitely.
+- `port`, `batch_rows` and `batch_interval_ms` are parsed strictly and refused
+  at deploy when out of range. Garbage used to fall back to the default, and
+  `port=70000` connected to 4464.
+- `records_out` and `bytes_out` count rows only once the server has
+  acknowledged them, and the barrier and close flushes record latency and
+  errors like the others.
+
+`ClickHouseSink::Options` gains the three timeouts and the class gains two
+protected virtual hooks, so a plugin built against the old header must be
+rebuilt, as for any release.
+
 **`insert_format` selects the ClickHouse sink, and only there.** A
 ClickHouse sink table may set `insert_format='native'` or
 `'jsoneachrow'` (the default, today's sink). The value is a closed set, so
