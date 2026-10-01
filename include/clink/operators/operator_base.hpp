@@ -1214,6 +1214,17 @@ public:
     // (see Dag::add_sink). A sink that only writes records and commits on
     // on_commit - the common case - leaves this false and is unaffected.
     [[nodiscard]] virtual bool stages_state_at_barrier() const noexcept { return false; }
+    // True when this sink's on_barrier returns only once everything it received
+    // before the barrier is written outside the job - an at-least-once writer
+    // that flushes at the barrier. Its guarantee rests on the checkpoint's ack
+    // following that hook, which holds only while the sink owns its chain's
+    // checkpoint. A second sink on the chain takes that ownership away and hands
+    // it back to the upstream operator, which acks at its own barrier without
+    // waiting for either sink, so the checkpoint could complete with this sink's
+    // interval unwritten and a restore from it would never replay the rows.
+    // Dag::add_sink therefore refuses a chain holding such a sink beside any
+    // other sink.
+    [[nodiscard]] virtual bool gates_checkpoint_ack() const noexcept { return false; }
     // The number of prepared-but-unfinalised commits this sink is still
     // holding - a CommittingSink's persisted handle count. The sink runner
     // polls this at clean end-of-stream and refuses to close() while it is

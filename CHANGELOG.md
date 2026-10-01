@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**A sink can declare that its barrier gates the checkpoint ack.**
+`Sink::gates_checkpoint_ack()` marks a sink that writes its whole interval out
+inside `on_barrier`, whose at-least-once guarantee rests on the ack following
+that hook. That ordering holds only while the sink owns its chain's
+checkpoint, and a second sink on the chain takes ownership away, so
+`Dag::add_sink` now refuses a chain that holds such a sink beside any other
+sink, in either order. No existing sink declares it, so no existing job is
+affected.
+
 **Labelled histograms render valid Prometheus exposition.** A histogram whose
 name carries labels (`clink_connector_commit_latency_ns{connector=...}`) was
 rendered with the suffix after the label set, `name{...}_bucket{le=...}`,

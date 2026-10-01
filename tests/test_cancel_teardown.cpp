@@ -714,6 +714,59 @@ TEST(CancelTeardown, OneBarrierStagingSinkAlongsidePlainSinksStillBuilds) {
           "are unorderable.";
 }
 
+namespace {
+
+// Stands in for an at-least-once writer that flushes at the barrier; the
+// refusal keys only on the capability.
+class AckGatingSink final : public Sink<int> {
+public:
+    void on_data(const Batch<int>& /*batch*/) override {}
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+    std::string name() const override { return "ack_gating_sink"; }
+};
+
+}  // namespace
+
+// A sink whose barrier hook must precede the ack is correct only while it owns
+// the chain's checkpoint. A second sink on the chain hands ownership back to the
+// operator, which acks without waiting for either sink, so the checkpoint could
+// complete with the gating sink's interval unwritten. Refused in either order.
+TEST(CancelTeardown, AnAckGatingSinkBesideAnotherSinkIsRefused) {
+    {
+        Dag dag;
+        auto h = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+        auto op_h = dag.add_operator<int, int>(
+            h, std::make_shared<MapOperator<int, int>>([](const int& v) { return v; }, "gate_a"));
+        dag.add_sink<int>(op_h, std::make_shared<AckGatingSink>());
+        try {
+            dag.add_sink<int>(op_h, std::make_shared<PlainTeardownSink>());
+            FAIL() << "a plain sink joined a chain whose ack-gating sink then lost ownership";
+        } catch (const std::logic_error& e) {
+            EXPECT_NE(std::string(e.what()).find("ack_gating_sink must be the only sink"),
+                      std::string::npos)
+                << e.what();
+        }
+    }
+    {
+        Dag dag;
+        auto h = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+        auto op_h = dag.add_operator<int, int>(
+            h, std::make_shared<MapOperator<int, int>>([](const int& v) { return v; }, "gate_b"));
+        dag.add_sink<int>(op_h, std::make_shared<PlainTeardownSink>());
+        EXPECT_THROW(dag.add_sink<int>(op_h, std::make_shared<AckGatingSink>()), std::logic_error)
+            << "an ack-gating sink joined a chain that already had a sink, so it never owned "
+               "the checkpoint";
+    }
+}
+
+TEST(CancelTeardown, AnAckGatingSinkAloneOnItsChainBuilds) {
+    Dag dag;
+    auto h = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+    auto op_h = dag.add_operator<int, int>(
+        h, std::make_shared<MapOperator<int, int>>([](const int& v) { return v; }, "gate_alone"));
+    EXPECT_NO_THROW(dag.add_sink<int>(op_h, std::make_shared<AckGatingSink>()));
+}
+
 // --- cancel_requested(): what a blocking operator polls ------------------------
 
 namespace {

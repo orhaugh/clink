@@ -7,6 +7,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -4368,6 +4369,27 @@ public:
             chain_has_barrier_staging_sink_ = true;
         }
 
+        // A sink that gates the ack (an at-least-once writer flushing at the
+        // barrier) is correct only while it owns the chain's checkpoint, and the
+        // fan-out handling below revokes that ownership the moment a second sink
+        // joins. Refuse the combination, whichever of the two arrives first.
+        const bool joins_existing_sink = chain_first_sink_owner_ != nullptr;
+        if (joins_existing_sink && (sink->gates_checkpoint_ack() || chain_ack_gating_sink_)) {
+            const std::string gating =
+                sink->gates_checkpoint_ack() ? sink->name() : *chain_ack_gating_sink_;
+            throw std::logic_error(
+                "Dag::add_sink: " + gating +
+                " must be the only sink on its chain. Its checkpoint barrier returns only once "
+                "the records it received before the barrier are written, and the checkpoint "
+                "acknowledges after that only while it owns the chain's checkpoint. A second "
+                "sink takes that ownership away, so a checkpoint could complete with those "
+                "records unwritten and a restore from it would never replay them. Give the "
+                "other sink its own subtask.");
+        }
+        if (sink->gates_checkpoint_ack()) {
+            chain_ack_gating_sink_ = sink->name();
+        }
+
         if (chain_first_sink_owner_) {
             // A second sink on the same chain. Neither sink can be ordered
             // correctly here: whichever one snapshots would have to do so after
@@ -4994,6 +5016,9 @@ private:
     // (a 2PC / CommittingSink). A second one cannot be ordered against the first,
     // so add_sink refuses rather than building a job that loses a transaction.
     bool chain_has_barrier_staging_sink_{false};
+    // The name of the sink on this chain that gates the checkpoint ack, if any.
+    // Such a sink must be the chain's only sink; see add_sink.
+    std::optional<std::string> chain_ack_gating_sink_;
     std::vector<BarrierInjector> source_injectors_;
     std::vector<OperatorId> source_ids_;
     // Boundedness recorded at registration, parallel to source_ids_ (BATCH-1).
