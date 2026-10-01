@@ -4,8 +4,8 @@
 
 **The ClickHouse client is pinned and built in Release.** clickhouse-cpp is now
 `2.6.2` (`scripts/versions.env`, checksum-pinned), built static with TLS by
-`scripts/build-clickhouse-cpp.sh` into `CLINK_DEPS_PREFIX/clickhouse-cpp` on
-the host and in the image. The image used to build `2.5.1` shared, without
+`scripts/build-clickhouse-cpp.sh`, into `CLINK_DEPS_PREFIX/clickhouse-cpp` on
+the host and into `/usr/local` in the image. The image used to build `2.5.1` shared, without
 TLS, and in Debug, because it followed the toolchain's build type; the
 connector now takes the pinned build first and the configure log names the
 version it took. A new live suite, the server pins

@@ -103,10 +103,12 @@ fi
 
 # -- ClickHouse C++ client --
 # clickhouse-cpp isn't packaged by Debian. The pinned version (scripts/versions.env)
-# is built static, in Release whatever BUILD_TYPE says, with TLS, into
-# ${CLINK_DEPS_PREFIX}/clickhouse-cpp, the same layout as the host. Idempotent.
+# is built static, in Release whatever BUILD_TYPE says, with TLS. In the image it goes
+# straight into /usr/local, on the default search path, so every build in the image
+# finds it whether or not CLINK_DEPS_PREFIX is set (the runtime image's build does not
+# set it). Idempotent.
 apt-get install -y --no-install-recommends liblz4-dev libzstd-dev libabsl-dev libssl-dev
-"${SCRIPT_DIR}/build-clickhouse-cpp.sh"
+CLICKHOUSE_CPP_PREFIX=/usr/local "${SCRIPT_DIR}/build-clickhouse-cpp.sh"
 
 # -- Apache iceberg-cpp (Iceberg table-format sink) --
 # Not packaged by Debian. Built FROM SOURCE at the pinned tag (scripts/versions.env)

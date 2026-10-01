@@ -17,6 +17,26 @@ set(_ch_found FALSE)
 set(_ch_libs)
 set(_ch_include_dir)
 
+# The shared libraries a static client archive needs, as raw paths placed after
+# it. Other targets already link OpenSSL and abseil through their imported
+# targets, and CMake puts a de-duplicated shared library at its first position on
+# the link line, ahead of the archive; GNU ld (with --as-needed, Debian's default)
+# then drops it as unneeded and leaves the archive's TLS and int128 references
+# undefined. A path is a distinct link item, so it lands after the archive.
+function(_clink_clickhouse_shared_deps out)
+    set(_deps)
+    if(OPENSSL_SSL_LIBRARY)
+        list(APPEND _deps "${OPENSSL_SSL_LIBRARY}")
+    endif()
+    if(OPENSSL_CRYPTO_LIBRARY)
+        list(APPEND _deps "${OPENSSL_CRYPTO_LIBRARY}")
+    endif()
+    if(TARGET absl::int128)
+        list(APPEND _deps "$<BUILD_INTERFACE:$<TARGET_LINKER_FILE:absl::int128>>")
+    endif()
+    set(${out} "${_deps}" PARENT_SCOPE)
+endfunction()
+
 # The pinned client first: scripts/build-clickhouse-cpp.sh builds the version
 # scripts/versions.env names, static, in Release, with TLS, into
 # <CLINK_DEPS_PREFIX>/clickhouse-cpp (the image installs it into /usr/local, where
@@ -40,9 +60,10 @@ if(_ch_pinned_dir)
         add_library(_clink_clickhouse_external INTERFACE)
         target_include_directories(_clink_clickhouse_external INTERFACE
             "${_ch_pinned_dir}/include")
+        _clink_clickhouse_shared_deps(_ch_after)
         target_link_libraries(_clink_clickhouse_external INTERFACE
             ${_ch_pinned_lib} ${_ch_pinned_cityhash} ${_ch_pinned_lz4} ${_ch_pinned_zstd}
-            absl::int128 OpenSSL::SSL OpenSSL::Crypto)
+            absl::int128 OpenSSL::SSL OpenSSL::Crypto ${_ch_after})
         set(_ch_libs _clink_clickhouse_external)
         set(_ch_include_dir "${_ch_pinned_dir}/include")
         set(_ch_found TRUE)
@@ -105,6 +126,8 @@ else()
             target_link_libraries(_clink_clickhouse_external INTERFACE
                 OpenSSL::SSL OpenSSL::Crypto)
         endif()
+        _clink_clickhouse_shared_deps(_ch_after)
+        target_link_libraries(_clink_clickhouse_external INTERFACE ${_ch_after})
         set(_ch_libs _clink_clickhouse_external)
         set(_ch_include_dir "${_ch_inc}")
     endif()

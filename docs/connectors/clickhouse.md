@@ -10,7 +10,7 @@ The ClickHouse connector integrates a ClickHouse server through the `clickhouse-
 
 | Component | Provenance | Version |
 | --- | --- | --- |
-| `clickhouse-cpp` | Built from source by `scripts/build-clickhouse-cpp.sh` into `CLINK_DEPS_PREFIX/clickhouse-cpp`: static, Release whatever the build type, with TLS (OpenSSL). Homebrew's or the system's copy is the fallback, and the configure log names the version it took | `2.6.2` (`CLICKHOUSE_CPP_VERSION` in `scripts/versions.env`, checksum-pinned) |
+| `clickhouse-cpp` | Built from source by `scripts/build-clickhouse-cpp.sh`, on the host into `CLINK_DEPS_PREFIX/clickhouse-cpp` and in the image into `/usr/local`: static, Release whatever the build type, with TLS (OpenSSL). Homebrew's or the system's copy is the fallback, and the configure log names the version it took | `2.6.2` (`CLICKHOUSE_CPP_VERSION` in `scripts/versions.env`, checksum-pinned) |
 | cityhash | Bundled with the pinned client | the client's own |
 | lz4, zstd, abseil | System packages, the copies the rest of the binary links | not pinned by clink |
 | OpenSSL | System; linked when found, for the client TLS path | not pinned by clink |

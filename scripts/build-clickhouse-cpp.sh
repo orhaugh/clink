@@ -5,9 +5,11 @@
 # Release whatever the caller's build type: the image builds its toolchain in Debug,
 # and a Debug client is several times slower at encoding blocks, which would make
 # every sink throughput figure a statement about the client's build rather than the
-# sink. Its own directory under the prefix rather than the prefix's lib/, so Homebrew's
-# copy stays where it is and CMake picks this one deliberately (impls/clickhouse looks
-# here first); the image's prefix is /usr/local, so it lands in /usr/local/clickhouse-cpp.
+# sink. On the host it gets its own directory under the prefix rather than the
+# prefix's lib/, so Homebrew's copy stays where it is and CMake picks this one
+# deliberately (impls/clickhouse looks there first). The image passes
+# CLICKHOUSE_CPP_PREFIX=/usr/local, the default search path, where the connector's
+# ordinary probe finds it.
 #
 # abseil, lz4 and zstd come from the system (Homebrew on macOS, Debian's -dev packages
 # in the image), the same copies the rest of the binary links; cityhash is bundled, as
