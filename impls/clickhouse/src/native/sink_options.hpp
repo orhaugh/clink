@@ -46,11 +46,15 @@ struct SinkOptions {
     std::vector<std::string> passed_through;  // tolerated keys seen, for the open report
 };
 
-// Parses BuildContext::params. Resolves env:// on every value with
+// Parses BuildContext::params. Every key must be in one of the two lists
+// below. Resolves env:// on every value the sink reads with
 // BuildContext::resolve_secret (include/clink/plugin/plugin.hpp) before
 // parsing; an env:// naming an unset or empty variable refuses
 // clickhouse.secret_unset, naming the key and the variable, never a value.
-// Throws NativeSinkError.
+// Of the tolerated keys, only mode, delivery_guarantee, changelog and
+// write_mode are read, to refuse a value that would change the guarantee.
+// sql_column_types is checked for presence only: parse_sql_column_types owns
+// its grammar. Throws NativeSinkError.
 [[nodiscard]] SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
                                              std::uint32_t subtask_idx,
                                              std::uint32_t parallelism);
@@ -60,8 +64,9 @@ struct SinkOptions {
 [[nodiscard]] const std::vector<std::string>& own_option_keys();
 [[nodiscard]] const std::vector<std::string>& pass_through_keys();
 
-// One line per option with its effective value (password shown as "set" or
-// "unset"), for the open report.
+// One key=value line per option with its effective value, for the open
+// report, joined by newlines with none at the end. The password is shown only
+// as "set" or "unset", and tolerated keys by name only, as passed_through.
 [[nodiscard]] std::string describe(const SinkOptions&);
 
 }  // namespace clink::clickhouse::native
