@@ -112,3 +112,26 @@ TEST(Histogram, DefaultLatencyBucketsAscending) {
         EXPECT_LT(b[i - 1], b[i]) << "buckets must be strictly ascending at " << i;
     }
 }
+
+TEST(Histogram, LabelledHistogramsRenderValidExposition) {
+    // A histogram whose name carries inlined labels. The suffixes belong on the
+    // base name and `le` joins the label set; appending them to the whole name
+    // gave `name{op_id="7"}_bucket{le=...}`, which no scraper accepts.
+    MetricsRegistry reg;
+    reg.histogram("clink_sink_wait_ns{op_id=\"7\"}", {1000.0}).observe(500);
+    reg.histogram("clink_sink_wait_ns{op_id=\"9\"}", {1000.0}).observe(5000);
+    const auto body = metrics::render_prometheus(reg.snapshot());
+    EXPECT_NE(body.find("clink_sink_wait_ns_bucket{op_id=\"7\",le=\"1000\"} 1\n"),
+              std::string::npos)
+        << body;
+    EXPECT_NE(body.find("clink_sink_wait_ns_bucket{op_id=\"7\",le=\"+Inf\"} 1\n"),
+              std::string::npos);
+    EXPECT_NE(body.find("clink_sink_wait_ns_sum{op_id=\"7\"} 500\n"), std::string::npos);
+    EXPECT_NE(body.find("clink_sink_wait_ns_count{op_id=\"9\"} 1\n"), std::string::npos);
+    EXPECT_EQ(body.find("}_bucket"), std::string::npos) << "a suffix after the label set";
+    // One TYPE line for the base name, not one per label set.
+    const std::string type_line = "# TYPE clink_sink_wait_ns histogram\n";
+    const auto first = body.find(type_line);
+    ASSERT_NE(first, std::string::npos);
+    EXPECT_EQ(body.find(type_line, first + 1), std::string::npos);
+}

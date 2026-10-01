@@ -69,16 +69,30 @@ std::string render_prometheus(const MetricsRegistry::Snapshot& snap) {
     for (const auto& h : histograms) {
         // Prometheus histogram: cumulative _bucket{le} lines (ascending), a
         // closing +Inf bucket equal to the total count, then _sum and _count.
-        out << "# TYPE " << h.name << " histogram\n";
+        // The suffixes go on the base name and `le` joins the inlined label
+        // set: `name{op_id="7"}` renders `name_bucket{op_id="7",le="..."}`,
+        // `name_sum{op_id="7"}` and `name_count{op_id="7"}`. Appending the
+        // suffix to the whole name put it after the labels, which is not valid
+        // exposition, and a scraper dropped every labelled histogram.
+        const std::string base = base_name(h.name);
+        const auto brace = h.name.find('{');
+        const std::string labels = brace == std::string::npos
+                                       ? std::string{}
+                                       : h.name.substr(brace + 1, h.name.size() - brace - 2);
+        const std::string with_labels = labels.empty() ? std::string{} : "{" + labels + "}";
+        const std::string le_prefix = labels.empty() ? std::string{"{"} : "{" + labels + ",";
+        if (typed.insert(base).second) {
+            out << "# TYPE " << base << " histogram\n";
+        }
         std::uint64_t cumulative = 0;
         for (std::size_t i = 0; i < h.data.upper_bounds.size(); ++i) {
             cumulative += (i < h.data.bucket_counts.size()) ? h.data.bucket_counts[i] : 0;
-            out << h.name << "_bucket{le=\"" << format_double(h.data.upper_bounds[i]) << "\"} "
-                << cumulative << '\n';
+            out << base << "_bucket" << le_prefix << "le=\""
+                << format_double(h.data.upper_bounds[i]) << "\"} " << cumulative << '\n';
         }
-        out << h.name << "_bucket{le=\"+Inf\"} " << h.data.count << '\n';
-        out << h.name << "_sum " << format_double(h.data.sum) << '\n';
-        out << h.name << "_count " << h.data.count << '\n';
+        out << base << "_bucket" << le_prefix << "le=\"+Inf\"} " << h.data.count << '\n';
+        out << base << "_sum" << with_labels << ' ' << format_double(h.data.sum) << '\n';
+        out << base << "_count" << with_labels << ' ' << h.data.count << '\n';
     }
     return out.str();
 }

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Labelled histograms render valid Prometheus exposition.** A histogram whose
+name carries labels (`clink_connector_commit_latency_ns{connector=...}`) was
+rendered with the suffix after the label set, `name{...}_bucket{le=...}`,
+which no scraper accepts, so those series were dropped. The suffixes now go on
+the base name and `le` joins the label set.
+
 **Integers past 2^53 survive the Row columnar carriers.** The Row batcher
 read every integer cell through a double, so a BIGINT above 2^53 lost its low
 bits on the wire, in Parquet and Iceberg, and a value outside int64 or int32
