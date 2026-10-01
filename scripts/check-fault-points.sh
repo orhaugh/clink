@@ -13,15 +13,23 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-HEADER="include/clink/fault/fault_injection.hpp"
+# The engine's catalogue, plus any connector that keeps its own (a fault_points.hpp
+# beside its sources).
+HEADERS=("include/clink/fault/fault_injection.hpp")
+while IFS= read -r h; do
+    HEADERS+=("$h")
+done < <(find impls -path '*/src/*' -name fault_points.hpp 2>/dev/null | sort)
 missing=()
 
-while IFS= read -r name; do
-    # A call site is any reference outside the declaring header.
-    if ! grep -rq --include='*.hpp' --include='*.cpp' "points::${name}\b" include src impls tools 2>/dev/null; then
-        missing+=("$name")
-    fi
-done < <(grep -oE 'inline constexpr char (k[A-Za-z0-9_]+)\[\]' "$HEADER" | awk '{print $4}' | sed 's/\[\]//')
+for HEADER in "${HEADERS[@]}"; do
+    while IFS= read -r name; do
+        # A call site is any reference outside the declaring header.
+        if ! grep -rq --include='*.hpp' --include='*.cpp' --exclude="$(basename "$HEADER")" \
+                "points::${name}\b" include src impls tools 2>/dev/null; then
+            missing+=("$name ($HEADER)")
+        fi
+    done < <(grep -oE 'inline constexpr char (k[A-Za-z0-9_]+)\[\]' "$HEADER" | awk '{print $4}' | sed 's/\[\]//')
+done
 
 if [ ${#missing[@]} -ne 0 ]; then
     echo "check-fault-points: these fault points are declared but never placed:" >&2
