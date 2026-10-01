@@ -4,7 +4,6 @@
 #include <charconv>
 #include <cstddef>
 #include <functional>
-#include <limits>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -14,6 +13,7 @@
 #include "clink/plugin/plugin.hpp"
 
 #include "native/errors.hpp"
+#include "native/types.hpp"
 
 namespace clink::clickhouse::native {
 
@@ -24,8 +24,11 @@ constexpr std::string_view kEnvPrefix = "env://";
 constexpr std::size_t kMaxEndpoints = 16;
 constexpr std::uint16_t kDefaultPort = 9000;
 constexpr std::uint16_t kDefaultSecurePort = 9440;
-constexpr std::uint64_t kUnbounded = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kMaxBatchRows = (1ULL << 31) - 1;
+// 1 TiB: far beyond any batch a memory budget would let through, and low
+// enough that twice it, with the writer's queue added, can never wrap a 64-bit
+// sum.
+constexpr std::uint64_t kMaxBatchBytes = 1ULL << 40;
 
 // Of the tolerated keys, these are read: a value that would change the
 // guarantee is refused here as well as in the planner, because Dag-direct
@@ -45,14 +48,24 @@ struct Value {
     [[nodiscard]] bool from_env() const { return raw.starts_with(kEnvPrefix); }
 };
 
-// How a refusal quotes a value. One read from the environment also names its
-// reference, because the job spec shows only the reference.
+// How a refusal quotes a value. One read from the environment is named by its
+// reference alone. env:// exists to keep secrets out of job specs, and a
+// refusal reaches whoever submitted the job, who could otherwise point any key
+// at a worker's variable and read its contents back.
 std::string shown(const Value& v) {
-    std::string out = "'" + v.resolved + "'";
     if (v.from_env()) {
-        out += " (from " + v.raw + ")";
+        return "the value of " + v.raw;
     }
-    return out;
+    return "'" + v.resolved + "'";
+}
+
+// A key with its value, as a refusal names them: mode='upsert', or mode from
+// env://VAR when the value was read from the environment, for the same reason.
+std::string setting(std::string_view key, const Value& v) {
+    if (v.from_env()) {
+        return std::string(key) + " from " + v.raw;
+    }
+    return std::string(key) + "='" + v.resolved + "'";
 }
 
 bool listed(const std::vector<std::string>& keys, std::string_view key) {
@@ -85,11 +98,9 @@ std::uint64_t parse_integer(std::string_view key,
     if (const auto n = to_integer(v.resolved, lo, hi)) {
         return *n;
     }
-    const std::string range = hi == kUnbounded
-                                  ? "of at least " + std::to_string(lo)
-                                  : "from " + std::to_string(lo) + " to " + std::to_string(hi);
     refuse(code::kOptionInvalid,
-           "option '" + std::string(key) + "' must be an integer " + range + "; got " + shown(v));
+           "option '" + std::string(key) + "' must be an integer from " + std::to_string(lo) +
+               " to " + std::to_string(hi) + "; got " + shown(v));
 }
 
 std::chrono::milliseconds parse_millis(std::string_view key,
@@ -159,7 +170,11 @@ std::vector<Endpoint> parse_endpoints(const Value& v) {
             refuse(code::kOptionInvalid,
                    "option 'endpoints' has an empty entry at position " + std::to_string(i + 1));
         }
-        const std::string quoted = "'" + std::string(entry) + "'";
+        // An entry of a value read from the environment is named by its
+        // position, so that its text stays out of the refusal like the rest.
+        const std::string quoted = v.from_env()
+                                       ? "at position " + std::to_string(i + 1) + " of " + shown(v)
+                                       : "'" + std::string(entry) + "'";
         std::string_view host;
         std::string_view port;
         if (entry.front() == '[') {
@@ -204,7 +219,7 @@ void check_guarantee(const std::map<std::string, Value, std::less<>>& values) {
     if (const auto it = values.find("mode");
         it != values.end() && it->second.resolved != "append") {
         refuse(code::kDeliveryUnsupported,
-               "mode=" + shown(it->second) +
+               setting("mode", it->second) +
                    " is not supported; this sink appends rows, so mode must be 'append'");
     }
     if (const auto it = values.find("delivery_guarantee"); it != values.end()) {
@@ -213,26 +228,51 @@ void check_guarantee(const std::map<std::string, Value, std::less<>>& values) {
         const auto requested = connectors::delivery_from_string(it->second.resolved);
         if (!requested) {
             refuse(code::kOptionInvalid,
-                   "delivery_guarantee=" + shown(it->second) + " is not a recognised guarantee");
+                   setting("delivery_guarantee", it->second) + " is not a recognised guarantee");
         }
         if (connectors::strength(*requested) >
             connectors::strength(connectors::DeliveryGuarantee::AtLeastOnce)) {
             refuse(code::kDeliveryUnsupported,
-                   "delivery_guarantee=" + shown(it->second) +
+                   setting("delivery_guarantee", it->second) +
                        " is stronger than this sink provides; it delivers at least once");
         }
     }
     if (const auto it = values.find("changelog"); it != values.end()) {
         if (parse_bool("changelog", it->second)) {
             refuse(code::kDeliveryUnsupported,
-                   "changelog='true' is not supported; this sink writes inserts only");
+                   setting("changelog", it->second) +
+                       " is not supported; this sink writes inserts only");
         }
     }
     if (const auto it = values.find("write_mode");
         it != values.end() && it->second.resolved == "overwrite") {
         refuse(code::kDeliveryUnsupported,
-               "write_mode='overwrite' is not supported; each refresh would append the whole "
-               "result again");
+               setting("write_mode", it->second) +
+                   " is not supported; each refresh would append the whole result again");
+    }
+}
+
+// The grammar belongs to parse_sql_column_types. Running it here moves a
+// malformed value's refusal to deploy, so a Dag-direct job that wrote one by
+// hand is refused before the sink connects. A spelling the parser does not
+// know is not malformed: it parses as unsupported, and the column plan names
+// it at open with the rest.
+void check_column_types(const Value& v) {
+    try {
+        (void)parse_sql_column_types(v.resolved);
+    } catch (const NativeSinkError& e) {
+        if (v.from_env()) {
+            refuse(code::kOptionInvalid,
+                   "option 'sql_column_types' is not a valid column list; got " + shown(v));
+        }
+        // The parser's text already names the key; only its code tag goes, so
+        // that the refusal reads like every other one this factory raises.
+        std::string_view text = e.what();
+        const std::string tag = "[" + e.code() + "] ";
+        if (text.starts_with(tag)) {
+            text.remove_prefix(tag.size());
+        }
+        refuse(code::kOptionInvalid, std::string(text));
     }
 }
 
@@ -362,7 +402,7 @@ SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
     if (const Value* v = get("batch_bytes")) {
         // One block can be as large as 16 MiB, and a batch must hold at least
         // one block, so anything under 1 MiB could never be met.
-        opts.batch_bytes = parse_integer("batch_bytes", *v, 1ULL << 20, kUnbounded);
+        opts.batch_bytes = parse_integer("batch_bytes", *v, 1ULL << 20, kMaxBatchBytes);
     }
     if (const Value* v = get("batch_interval_ms")) {
         opts.batch_interval = parse_millis("batch_interval_ms", *v, 1, 3'600'000);
@@ -416,6 +456,7 @@ SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
         refuse(code::kOptionInvalid,
                "the native sink is built from SQL; a Dag-direct job must pass sql_column_types");
     }
+    check_column_types(*get("sql_column_types"));
 
 #if !defined(CLINK_CLICKHOUSE_NATIVE_TLS)
     if (opts.tls.enabled) {

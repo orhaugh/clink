@@ -4,7 +4,7 @@
 
 ## Overview
 
-The ClickHouse connector integrates a ClickHouse server through the `clickhouse-cpp` native client. The sink batches incoming `std::string` records and issues `INSERT INTO db.table FORMAT ...` statements, where each record is one row encoded as either TSV or JSONEachRow. The source executes a single `SELECT` statement and drains the result blocks; it emits either typed `ClickHouseRow` records (column names plus stringified cell values) or, on the string channel, each row flattened to a delimiter-joined string or to a JSON object keyed by column name. Cell values are kept as text so the source stays schema-agnostic, with downstream operators parsing to concrete types.
+The ClickHouse connector integrates a ClickHouse server through the `clickhouse-cpp` native client. The sink batches incoming `std::string` records and sends each batch as one `INSERT` statement with its rows inline, where each record is one row encoded as either TSV or JSONEachRow. The source executes a single `SELECT` statement and drains the result blocks; it emits either typed `ClickHouseRow` records (column names plus stringified cell values) or, on the string channel, each row flattened to a delimiter-joined string or to a JSON object keyed by column name. Cell values are kept as text so the source stays schema-agnostic, with downstream operators parsing to concrete types.
 
 ## Dependency and version
 
@@ -44,15 +44,30 @@ The connector also registers the `ClickHouseRow` typed channel (`kChannelClickHo
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `table` | yes | (none) | Target table name. Construction fails if empty. |
+| `table` | yes | (none) | Target table name, quoted as an identifier in the INSERT. Construction fails if empty. |
 | `host` | no | `localhost` | ClickHouse server host. |
-| `port` | no | `9000` | Native protocol port. |
-| `database` | no | `default` | Target database. |
+| `port` | no | `9000` | Native protocol port, an integer from 1 to 65535. |
+| `database` | no | `default` | Target database, quoted as an identifier in the INSERT. |
 | `user` | no | `default` | Auth: username. |
 | `password` | no | `` (empty) | Auth: password. |
-| `format` | no | `tsv` | Row encoding: `tsv` or `jsoneachrow` (also accepts `JSONEachRow`). Any other value falls back to TSV. |
-| `batch_rows` | no | `1000` | Buffered rows before a flush is forced. |
-| `batch_interval_ms` | no | `1000` | Time-based flush interval in milliseconds. |
+| `format` | no | `tsv` | Row encoding, matched without regard to case: `tsv` for TSV, `json` or `jsoneachrow` for JSONEachRow. Any other value is sent as TSV, and the sink logs a warning naming it at open. |
+| `batch_rows` | no | `1000` | Buffered rows that force a flush. A positive integer. |
+| `batch_interval_ms` | no | `1000` | A batch that arrives at least this many milliseconds after the last flush triggers one. There is no timer, so rows wait for the next batch, barrier or close. A positive integer. |
+| `connect_timeout_ms` | no | `5000` | Connection timeout in milliseconds, from 1 to 600000. |
+| `send_timeout_ms` | no | `30000` | Socket send timeout in milliseconds, from 1 to 600000. |
+| `receive_timeout_ms` | no | `30000` | Socket receive timeout in milliseconds, from 1 to 600000. A flush waiting on a server that has stopped answering fails after this long instead of holding the checkpoint. |
+
+The integer options are parsed strictly. The whole value must be the number, and a value that is malformed or out of range refuses the job at deploy with a message naming the key; it does not fall back to the default.
+
+Every INSERT names its own settings instead of taking them from the user's profile:
+
+```sql
+INSERT INTO `analytics`.`events`
+SETTINGS async_insert=0, wait_for_async_insert=1, insert_deduplication_token='...'
+FORMAT JSONEachRow
+```
+
+`async_insert=0` and `wait_for_async_insert=1` make the INSERT synchronous, so a flush returns only once its rows are in the table. The deduplication token is fresh for every statement, a resend after a failed flush included, and its random part is drawn again at each open, so a token never repeats one from an earlier run. On a replicated table, two batches with identical rows therefore both land; without a token the server would drop the second as a duplicate of the first. The same token makes a replayed batch land again (see [Delivery semantics](#delivery-semantics)).
 
 ### Sources (`clickhouse_row_source`, `clickhouse_text_source`, `clickhouse_source`)
 
@@ -149,14 +164,19 @@ The source side is reached through the registered factories (`clickhouse_row_sou
 
 ## Delivery semantics
 
-Sink: at-least-once. Records are buffered and flushed by row count (`batch_rows`), by time (`batch_interval_ms`), and at every checkpoint barrier (`on_barrier` flushes before the runner snapshots and acks, so no row consumed before a completed checkpoint can still be sitting in the buffer when the process dies); `close()` flushes the remaining buffer. Before that barrier flush existed (up to and including v0.8.0) a row buffered across a checkpoint was lost if the process died before the next size or time flush, which `batch_rows='1'` avoids on those versions. There is no two-phase commit and no row deduplication, so an INSERT replayed after a failure re-inserts its rows; a `ReplacingMergeTree` keyed by the row's natural key absorbs the duplicates on the ClickHouse side. The SQL planner reflects this: it rejects `exactly_once` and `mode='upsert'`.
+Sink: at-least-once, when it is the only sink on its chain. Records are buffered and flushed by row count (`batch_rows`), by time (`batch_interval_ms`), at every checkpoint barrier, and at `close()`. The barrier flush runs in `on_barrier`, before the runner snapshots and acks, and the INSERT is synchronous, so no row consumed before a completed checkpoint can still be sitting in the buffer when the process dies. A flush that fails at the barrier throws, which fails that checkpoint. Before the barrier flush existed (up to and including v0.8.0) a row buffered across a checkpoint was lost if the process died before the next size or time flush, which `batch_rows='1'` avoids on those versions.
+
+That ordering needs the sink to own its chain's checkpoint, which it does only while it is the only sink on the chain. A second sink on the same chain hands the checkpoint back to the upstream operator, which acks at its own barrier without waiting for either sink. A checkpoint can then complete while this sink still holds rows from before the barrier, and a restore from it never replays them. Nothing refuses that topology for this sink, so keep it alone on its chain.
+
+There is no two-phase commit, and a replay is not deduplicated. After a failure the job resumes from the last completed checkpoint and the rows since then are inserted again. Because every INSERT carries a fresh deduplication token, a replayed batch lands again on a replicated table even when its rows match a batch that landed before the restart; without a token the server's content hashing could absorb such an identical replay. A `ReplacingMergeTree` keyed by the row's natural key absorbs the duplicates on the ClickHouse side. The SQL planner reflects this: it rejects `exactly_once` and `mode='upsert'`.
 
 Source: a `SELECT` materialises a finite (bounded) result set. The source persists a cursor (the row index into the materialised snapshot) and can resume mid result-set after a restart; `open()` clamps a restored cursor to the re-materialised row count. Exactly-once at the source boundary holds only for a deterministically ordered query (an explicit `ORDER BY`) over data unchanged between runs, because row index N is "the same row" only under those conditions. The SQL source binding treats it as a bounded query with no cursor checkpoint.
 
 ## Limitations
 
 - Sink input is a single `std::string` per record, interpreted as one row (TSV or JSONEachRow). It is not a multi-column typed insert at the C++ sink layer; multi-column Rows are serialised to a JSON object string upstream (the SQL path) before the sink sees them.
-- Sink batches are concatenated in memory and inserted with `client.Execute()`; there is no streaming insert, no 2PC, and no upsert/dedup. A failed flush at a barrier throws, which fails that checkpoint rather than completing it over rows ClickHouse never received.
+- Sink batches are concatenated in memory and inserted with `client.Execute()`; there is no streaming insert, no 2PC, no upsert, and no deduplication of a replayed batch. A failed flush at a barrier throws, which fails that checkpoint rather than completing it over rows ClickHouse never received.
+- The sink is at-least-once only as the only sink on its chain; beside a second sink a checkpoint can complete over rows it has not yet written.
 - Source is a one-shot bounded `SELECT`, not a streaming tail or CDC feed. Result-row order is arbitrary without an explicit `ORDER BY`.
 - The `clickhouse_source` (string-channel JSON) requires column names from the server; if they are absent it fails loudly rather than emit positional keys.
 - The connector path is not Arrow-native; records cross the boundary as `std::string` or typed `ClickHouseRow` text values, with type coercion left to downstream operators.

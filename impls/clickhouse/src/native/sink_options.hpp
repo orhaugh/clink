@@ -51,10 +51,12 @@ struct SinkOptions {
 // BuildContext::resolve_secret (include/clink/plugin/plugin.hpp) before
 // parsing; an env:// naming an unset or empty variable refuses
 // clickhouse.secret_unset, naming the key and the variable, never a value.
-// Of the tolerated keys, only mode, delivery_guarantee, changelog and
-// write_mode are read, to refuse a value that would change the guarantee.
-// sql_column_types is checked for presence only: parse_sql_column_types owns
-// its grammar. Throws NativeSinkError.
+// Any other refusal of a value read from the environment names its env://
+// reference and never what it resolved to. Of the tolerated keys, only mode,
+// delivery_guarantee, changelog and write_mode are read, to refuse a value
+// that would change the guarantee. sql_column_types must be present and must
+// pass parse_sql_column_types, which owns its grammar; a failure there is
+// raised again as clickhouse.option_invalid. Throws NativeSinkError.
 [[nodiscard]] SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
                                              std::uint32_t subtask_idx,
                                              std::uint32_t parallelism);

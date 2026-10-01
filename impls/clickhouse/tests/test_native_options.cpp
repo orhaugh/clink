@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -260,13 +262,13 @@ TEST(NativeOptions, InsertFormatAcceptsOnlyNative) {
 struct OptsIntegerRule {
     const char* key;
     unsigned long long lo;
-    unsigned long long hi;  // 0 for no upper bound
+    unsigned long long hi;
 };
 
 const OptsIntegerRule kOptsIntegerRules[] = {
     {"port", 1, 65535},
     {"batch_rows", 1, 2147483647},
-    {"batch_bytes", 1048576, 0},
+    {"batch_bytes", 1048576, 1099511627776},
     {"batch_interval_ms", 1, 3600000},
     {"connect_timeout_ms", 1, 600000},
     {"send_timeout_ms", 1, 600000},
@@ -275,20 +277,18 @@ const OptsIntegerRule kOptsIntegerRules[] = {
 };
 
 std::string opts_integer_refusal(const OptsIntegerRule& rule, const std::string& got) {
-    const std::string range =
-        rule.hi == 0 ? "of at least " + std::to_string(rule.lo)
-                     : "from " + std::to_string(rule.lo) + " to " + std::to_string(rule.hi);
     return opts_message(code::kOptionInvalid,
-                        std::string("option '") + rule.key + "' must be an integer " + range +
-                            "; got '" + got + "'");
+                        std::string("option '") + rule.key + "' must be an integer from " +
+                            std::to_string(rule.lo) + " to " + std::to_string(rule.hi) + "; got '" +
+                            got + "'");
 }
 
 TEST(NativeOptions, EveryIntegerIsAcceptedAtItsBounds) {
     for (const auto& rule : kOptsIntegerRules) {
         EXPECT_NO_THROW((void)opts_parse(opts_with({{rule.key, std::to_string(rule.lo)}})))
             << rule.key;
-        const std::string hi = rule.hi == 0 ? "18446744073709551615" : std::to_string(rule.hi);
-        EXPECT_NO_THROW((void)opts_parse(opts_with({{rule.key, hi}}))) << rule.key;
+        EXPECT_NO_THROW((void)opts_parse(opts_with({{rule.key, std::to_string(rule.hi)}})))
+            << rule.key;
     }
     const SinkOptions o = opts_parse(opts_with({{"port", "65535"},
                                                 {"batch_rows", "2147483647"},
@@ -307,11 +307,30 @@ TEST(NativeOptions, EveryIntegerOutsideItsBoundsIsRefusedWithTheRange) {
         EXPECT_EQ(r.code, code::kOptionInvalid) << rule.key;
         EXPECT_EQ(r.what, opts_integer_refusal(rule, below));
 
-        const std::string above =
-            rule.hi == 0 ? "18446744073709551616" : std::to_string(rule.hi + 1);
+        const std::string above = std::to_string(rule.hi + 1);
         const auto r2 = opts_refusal(opts_with({{rule.key, above}}));
         EXPECT_EQ(r2.code, code::kOptionInvalid) << rule.key;
         EXPECT_EQ(r2.what, opts_integer_refusal(rule, above));
+    }
+}
+
+// Later code closes an INSERT at twice batch_bytes and adds the writer's
+// queue to twice it for the memory cap. Without an upper bound, a value at or
+// above 2^63 wrapped both sums to almost nothing.
+TEST(NativeOptions, TheLargestBatchBytesCanBeDoubledWithoutWrapping) {
+    const SinkOptions o = opts_parse(opts_with({{"batch_bytes", "1099511627776"}}));
+    EXPECT_EQ(o.batch_bytes, 1ULL << 40);
+    EXPECT_LE(o.batch_bytes, std::numeric_limits<std::uint64_t>::max() / 4);
+
+    for (const char* huge :
+         {"1099511627777", "9223372036854775808", "18446744073709551615", "18446744073709551616"}) {
+        const auto r = opts_refusal(opts_with({{"batch_bytes", huge}}));
+        EXPECT_EQ(r.code, code::kOptionInvalid) << huge;
+        EXPECT_EQ(r.what,
+                  opts_message(code::kOptionInvalid,
+                               std::string("option 'batch_bytes' must be an integer from 1048576 "
+                                           "to 1099511627776; got '") +
+                                   huge + "'"));
     }
 }
 
@@ -363,6 +382,31 @@ TEST(NativeOptions, EmptyTableDatabaseOrHostIsRefused) {
                   opts_message(code::kOptionInvalid,
                                std::string("option '") + key + "' must not be empty"));
     }
+}
+
+TEST(NativeOptions, AMalformedSqlColumnTypesIsRefusedAtTheFactory) {
+    const auto r = opts_refusal(opts_with({{"sql_column_types", "no-colon-here;;"}}));
+    EXPECT_EQ(r.code, code::kOptionInvalid);
+    EXPECT_EQ(r.what,
+              opts_message(code::kOptionInvalid,
+                           "option 'sql_column_types' entry 'no-colon-here' is not name:TYPE"));
+
+    // The grammar's own wording belongs to its parser, so these are held only
+    // to the code and to naming the key.
+    const std::string prefix = opts_message(code::kOptionInvalid, "option 'sql_column_types' ");
+    for (const char* bad :
+         {"a:BIGINT;;b:VARCHAR", "a:BIGINT;", ":BIGINT", "a:", "a:BIGINT;a:INTEGER"}) {
+        const auto refused = opts_refusal(opts_with({{"sql_column_types", bad}}));
+        EXPECT_EQ(refused.code, code::kOptionInvalid) << bad;
+        EXPECT_TRUE(refused.what.starts_with(prefix)) << bad << ": " << refused.what;
+    }
+}
+
+TEST(NativeOptions, AnUnknownSqlSpellingIsLeftToTheColumnPlan) {
+    // Not malformed: it parses as an unsupported type, which the column plan
+    // refuses by name at open alongside any other problem.
+    const SinkOptions o = opts_parse(opts_with({{"sql_column_types", "id:BIGINT;g:GEOMETRY"}}));
+    EXPECT_EQ(o.sql_column_types, "id:BIGINT;g:GEOMETRY");
 }
 
 TEST(NativeOptions, AMissingOrEmptySqlColumnTypesSaysTheSinkIsBuiltFromSql) {
@@ -594,14 +638,74 @@ TEST(NativeOptions, NoRefusalShowsThePassword) {
     }
 }
 
-TEST(NativeOptions, AValueFromTheEnvironmentIsMarkedInARefusal) {
-    const OptsScopedEnv rows("CLINK_NATIVE_OPTS_TEST_ROWS", "lots");
-    const auto r = opts_refusal(opts_with({{"batch_rows", "env://CLINK_NATIVE_OPTS_TEST_ROWS"}}));
-    EXPECT_EQ(r.code, code::kOptionInvalid);
-    EXPECT_EQ(r.what,
+// Whoever submits a job sees its refusal, and env:// exists to keep a worker's
+// secrets out of job specs. A key pointed at a variable that holds a secret
+// must not hand the secret back in the message.
+TEST(NativeOptions, ARefusalNamesAnEnvReferenceButNeverItsValue) {
+    const std::string secret = "AKIA-worker-secret-value";
+    const std::string ref = "env://CLINK_NATIVE_OPTS_TEST_SECRET";
+    const OptsScopedEnv env("CLINK_NATIVE_OPTS_TEST_SECRET", secret);
+
+    const std::vector<OptsParams> refused = {
+        opts_with({{"batch_rows", ref}}),
+        opts_with({{"batch_bytes", ref}}),
+        opts_with({{"port", ref}}),
+        opts_with({{"connect_timeout_ms", ref}}),
+        opts_with({{"secure", ref}}),
+        opts_with({{"secure", "true"}, {"tls_verify", ref}}),
+        opts_with({{"compression", ref}}),
+        opts_with({{"insert_format", ref}}),
+        opts_with({{"endpoints", ref}}),
+        opts_with({{"sql_column_types", ref}}),
+        opts_with({{"mode", ref}}),
+        opts_with({{"delivery_guarantee", ref}}),
+        opts_with({{"changelog", ref}}),
+    };
+    for (const auto& p : refused) {
+        const auto r = opts_refusal(p);
+        EXPECT_FALSE(r.code.empty());
+        EXPECT_EQ(r.what.find(secret), std::string::npos) << r.what;
+        EXPECT_NE(r.what.find(ref), std::string::npos) << r.what;
+    }
+
+    EXPECT_EQ(opts_refusal(opts_with({{"batch_rows", ref}})).what,
               opts_message(code::kOptionInvalid,
-                           "option 'batch_rows' must be an integer from 1 to 2147483647; got "
-                           "'lots' (from env://CLINK_NATIVE_OPTS_TEST_ROWS)"));
+                           "option 'batch_rows' must be an integer from 1 to 2147483647; got the "
+                           "value of env://CLINK_NATIVE_OPTS_TEST_SECRET"));
+    EXPECT_EQ(opts_refusal(opts_with({{"compression", ref}})).what,
+              opts_message(code::kOptionInvalid,
+                           "option 'compression' must be 'lz4', 'zstd' or 'none'; got the value "
+                           "of env://CLINK_NATIVE_OPTS_TEST_SECRET"));
+    EXPECT_EQ(opts_refusal(opts_with({{"endpoints", ref}})).what,
+              opts_message(code::kOptionInvalid,
+                           "option 'endpoints' entry at position 1 of the value of "
+                           "env://CLINK_NATIVE_OPTS_TEST_SECRET is not host:port"));
+    EXPECT_EQ(opts_refusal(opts_with({{"sql_column_types", ref}})).what,
+              opts_message(code::kOptionInvalid,
+                           "option 'sql_column_types' is not a valid column list; got the value "
+                           "of env://CLINK_NATIVE_OPTS_TEST_SECRET"));
+    EXPECT_EQ(opts_refusal(opts_with({{"delivery_guarantee", ref}})).what,
+              opts_message(code::kOptionInvalid,
+                           "delivery_guarantee from env://CLINK_NATIVE_OPTS_TEST_SECRET is not a "
+                           "recognised guarantee"));
+}
+
+TEST(NativeOptions, EveryEndpointsRefusalKeepsAnEnvValueOut) {
+    const std::string ref = "env://CLINK_NATIVE_OPTS_TEST_ENDPOINTS";
+    // One value per entry check, each carrying text that must not come back.
+    for (const char* value : {"ok-host:9000,secret-host",
+                              "ok-host:9000,::secret:9000",
+                              "ok-host:9000,:9000",
+                              "ok-host:9000,secret-host:99999",
+                              "ok-host:9000,[secret::1"}) {
+        const OptsScopedEnv env("CLINK_NATIVE_OPTS_TEST_ENDPOINTS", std::string(value));
+        const auto r = opts_refusal(opts_with({{"endpoints", ref}}));
+        EXPECT_EQ(r.code, code::kOptionInvalid) << value;
+        EXPECT_EQ(r.what.find("secret"), std::string::npos) << r.what;
+        EXPECT_EQ(r.what.find("ok-host"), std::string::npos) << r.what;
+        EXPECT_NE(r.what.find("entry at position 2 of the value of " + ref), std::string::npos)
+            << r.what;
+    }
 }
 
 // ---- Unknown keys ----------------------------------------------------------
@@ -796,12 +900,40 @@ TEST(NativeOptions, WriteModeOverwriteIsRefused) {
 
 TEST(NativeOptions, AGuaranteeValueFromTheEnvironmentIsStillChecked) {
     const OptsScopedEnv mode("CLINK_NATIVE_OPTS_TEST_MODE", "upsert");
+    const OptsScopedEnv guarantee("CLINK_NATIVE_OPTS_TEST_GUARANTEE", "exactly_once");
+    const OptsScopedEnv changelog("CLINK_NATIVE_OPTS_TEST_CHANGELOG", "true");
+    const OptsScopedEnv write_mode("CLINK_NATIVE_OPTS_TEST_WRITE_MODE", "overwrite");
+
     const auto r = opts_refusal(opts_with({{"mode", "env://CLINK_NATIVE_OPTS_TEST_MODE"}}));
     EXPECT_EQ(r.code, code::kDeliveryUnsupported);
     EXPECT_EQ(r.what,
               opts_message(code::kDeliveryUnsupported,
-                           "mode='upsert' (from env://CLINK_NATIVE_OPTS_TEST_MODE) is not "
-                           "supported; this sink appends rows, so mode must be 'append'"));
+                           "mode from env://CLINK_NATIVE_OPTS_TEST_MODE is not supported; this "
+                           "sink appends rows, so mode must be 'append'"));
+
+    const auto g =
+        opts_refusal(opts_with({{"delivery_guarantee", "env://CLINK_NATIVE_OPTS_TEST_GUARANTEE"}}));
+    EXPECT_EQ(g.code, code::kDeliveryUnsupported);
+    EXPECT_EQ(g.what,
+              opts_message(code::kDeliveryUnsupported,
+                           "delivery_guarantee from env://CLINK_NATIVE_OPTS_TEST_GUARANTEE is "
+                           "stronger than this sink provides; it delivers at least once"));
+
+    const auto c =
+        opts_refusal(opts_with({{"changelog", "env://CLINK_NATIVE_OPTS_TEST_CHANGELOG"}}));
+    EXPECT_EQ(c.code, code::kDeliveryUnsupported);
+    EXPECT_EQ(c.what,
+              opts_message(code::kDeliveryUnsupported,
+                           "changelog from env://CLINK_NATIVE_OPTS_TEST_CHANGELOG is not "
+                           "supported; this sink writes inserts only"));
+
+    const auto w =
+        opts_refusal(opts_with({{"write_mode", "env://CLINK_NATIVE_OPTS_TEST_WRITE_MODE"}}));
+    EXPECT_EQ(w.code, code::kDeliveryUnsupported);
+    EXPECT_EQ(w.what,
+              opts_message(code::kDeliveryUnsupported,
+                           "write_mode from env://CLINK_NATIVE_OPTS_TEST_WRITE_MODE is not "
+                           "supported; each refresh would append the whole result again"));
 }
 
 // ---- describe --------------------------------------------------------------
