@@ -10,8 +10,9 @@ The ClickHouse connector integrates a ClickHouse server through the `clickhouse-
 
 | Component | Provenance | Version |
 | --- | --- | --- |
-| `clickhouse-cpp` | Debian: built from source (`scripts/install-system-deps.sh`); macOS: system package via brew | `v2.5.1` on Debian; brew version not pinned by clink |
-| cityhash, lz4, zstd | Sibling archives linked alongside `clickhouse-cpp` (system) | not pinned by clink |
+| `clickhouse-cpp` | Built from source by `scripts/build-clickhouse-cpp.sh` into `CLINK_DEPS_PREFIX/clickhouse-cpp`: static, Release whatever the build type, with TLS (OpenSSL). Homebrew's or the system's copy is the fallback, and the configure log names the version it took | `2.6.2` (`CLICKHOUSE_CPP_VERSION` in `scripts/versions.env`, checksum-pinned) |
+| cityhash | Bundled with the pinned client | the client's own |
+| lz4, zstd, abseil | System packages, the copies the rest of the binary links | not pinned by clink |
 | OpenSSL | System; linked when found, for the client TLS path | not pinned by clink |
 
 The sink and source path do not use Arrow; records cross the connector boundary as `std::string` (or typed `ClickHouseRow`), not Arrow batches.
@@ -20,7 +21,7 @@ The sink and source path do not use Arrow; records cross the connector boundary 
 
 Controlled by the `CLINK_WITH_CLICKHOUSE` CMake option (`AUTO` / `ON` / `OFF`, default `AUTO`). Under `AUTO` the `clink::clickhouse` target is defined only if `clickhouse-cpp` is found (via `find_package(clickhouse-cpp CONFIG)` or by locating the headers and `clickhouse-cpp-lib`); with `ON` a missing client is a fatal configure error; `OFF` skips the target entirely. When the target is built, it compiles with `CLINK_HAS_CLICKHOUSE` defined; without the client the sink and source throw on construction.
 
-On Debian the client is built from source by `scripts/install-system-deps.sh` (cloned at tag `v2.5.1`); on macOS it comes from brew.
+The pinned client is built by `scripts/build-clickhouse-cpp.sh` on both the host and the Debian image (`scripts/install-system-deps.sh` calls it). It is built in Release even when the rest of the toolchain is Debug, because the encoding cost of a Debug client would be in every throughput figure.
 
 ```bash
 cmake -S . -B build -DCLINK_WITH_CLICKHOUSE=ON
@@ -163,7 +164,7 @@ Source: a `SELECT` materialises a finite (bounded) result set. The source persis
 
 ## Testing
 
-The in-tree tests are in-process smoke tests, not live-server integration tests. They do not stand up a ClickHouse server and there is no `CLINK_*_TEST_ENDPOINT` gate. Instead they gate on whether the build linked `clickhouse-cpp`:
+The sink and source tests are in-process smoke tests. They do not stand up a ClickHouse server; they gate on whether the build linked `clickhouse-cpp` (the server pins below are the live tests):
 
 - If `clickhouse-cpp` is not linked, `ClickHouseSink::is_real_implementation()` / `ClickHouseSource::is_real_implementation()` return false and the real-impl tests `GTEST_SKIP()`.
 - When linked, the tests exercise the constructor and the lifecycle (`open()` against an unreachable port should throw cleanly; `flush()` / `close()` before `open()` must be safe), plus factory registration and the fluent builder.
@@ -176,4 +177,25 @@ cmake --build build -j --target clink_clickhouse_tests
 ctest --test-dir build -L clickhouse
 ```
 
-To exercise against a real server, point the sink/source options (`host`, `port`, `database`, `table` / `query`, `user`, `password`) at a running ClickHouse instance and run a job manually; there is no automated live test wired into the suite.
+To exercise against a real server, point the sink/source options (`host`, `port`, `database`, `table` / `query`, `user`, `password`) at a running ClickHouse instance and run a job manually.
+
+### Server pins
+
+`impls/clickhouse/tests/test_clickhouse_pins_live.cpp` holds what the native sink's design takes as given about the server, checked against a live server on every supported line. It drives the native protocol directly, with the `BeginInsert` / `SendInsertBlock` / `EndInsert` shape the sink uses, and skips unless `CLINK_CLICKHOUSE_TEST_HOST` (and optionally `CLINK_CLICKHOUSE_TEST_PORT`) names a server. `scripts/clickhouse-pins.sh` starts each line from `docker/integration-services.yml`, pinned by digest and with an embedded Keeper and a one-shard cluster, runs the suite, and tears it down; the `clickhouse-pins` CI job runs it on every push. A failing pin changes the design, not the expectation.
+
+| Pin | What holds on 26.3 and 26.8 |
+|---|---|
+| P1 | SETTINGS written into the `BeginInsert` text take effect (`system.query_log` shows them) |
+| P2 | A token deduplicates its own resend; identical data under a new token lands |
+| P3 | Without a token, two identical, separate blocks deduplicate on ReplicatedMergeTree, so every INSERT needs a token |
+| P4 | A multi-partition INSERT whose first partitions landed, resent whole under its token, lands each partition once |
+| P5 | Several `SendInsertBlock` calls in one INSERT squash into one part, and the INSERT resent under its token lands once |
+| P6 | A table-level `async_insert=1` overrides a query's `async_insert=0`, as does a server-wide `<merge_tree>` default, and behind a Distributed table the shard-local table's setting applies |
+| P7 | With conversion off, a Nullable block is refused for a non-Nullable column; String is accepted into LowCardinality(String) |
+| P8 | FINAL hides a key whose latest version is deleted, without the cleanup setting; merges never collapse a key across partitions |
+| P9 | `max(ver)` is cheap: about 20 ms over ten million rows on a laptop (a measurement, not a pass mark) |
+| P11 | Every setting name the sink sends exists, and `use_strict_insert_block_limits` exists from 26.8 |
+| P12 | `distributed_foreground_insert=1` makes an INSERT into a Distributed table synchronous |
+| P13 | `max_execution_time` with `timeout_overflow_mode='throw'` ends a SELECT with TIMEOUT_EXCEEDED |
+
+P4 reproduces the partial landing by inserting the prefix of the same block's partitions under the token first, because a real failure lands the partitions written before it. P6's Distributed case sets `prefer_localhost_replica=0`: its shard is the same server, and with the default the Distributed table writes the local table in-process, where the shard's own decision never runs.

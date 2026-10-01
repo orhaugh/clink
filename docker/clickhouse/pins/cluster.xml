@@ -1,0 +1,15 @@
+<!-- A one-shard cluster of this server, for the pins that insert through a
+     Distributed table (P6, P12). Current images no longer ship a default
+     cluster. Test use only. -->
+<clickhouse>
+    <remote_servers>
+        <clink_pins_local>
+            <shard>
+                <replica>
+                    <host>localhost</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </clink_pins_local>
+    </remote_servers>
+</clickhouse>

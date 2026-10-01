@@ -1,0 +1,7 @@
+<!-- A server-wide MergeTree default of async_insert=1, for pin P6: the sink
+     must see it as the target's effective setting. Test use only. -->
+<clickhouse>
+    <merge_tree>
+        <async_insert>1</async_insert>
+    </merge_tree>
+</clickhouse>

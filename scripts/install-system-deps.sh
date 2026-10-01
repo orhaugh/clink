@@ -102,26 +102,11 @@ fi
 "${SCRIPT_DIR}/build-arrow.sh"
 
 # -- ClickHouse C++ client --
-# clickhouse-cpp isn't packaged by Debian. It's a small, header-+-cpp
-# library; build from source. Cache by checking if already installed.
-if [ ! -f "/usr/local/lib/libclickhouse-cpp-lib.a" ] && \
-   [ ! -f "/usr/local/lib/libclickhouse-cpp-lib.so" ]; then
-    echo "▶ Building clickhouse-cpp from source..."
-    apt-get install -y --no-install-recommends liblz4-dev libabsl-dev
-    WORK_DIR=$(mktemp -d)
-    git clone --depth 1 --branch v2.5.1 \
-        https://github.com/ClickHouse/clickhouse-cpp.git "$WORK_DIR/clickhouse-cpp"
-    mkdir "$WORK_DIR/clickhouse-cpp/build"
-    cd "$WORK_DIR/clickhouse-cpp/build"
-    cmake -DCMAKE_INSTALL_PREFIX=/usr/local \
-          -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-          -DBUILD_SHARED_LIBS=ON \
-          ..
-    cmake --build . --target install -- -j"${CLINK_BUILD_JOBS:-$(nproc)}"
-    cd /
-    rm -rf "$WORK_DIR"
-    ldconfig
-fi
+# clickhouse-cpp isn't packaged by Debian. The pinned version (scripts/versions.env)
+# is built static, in Release whatever BUILD_TYPE says, with TLS, into
+# ${CLINK_DEPS_PREFIX}/clickhouse-cpp, the same layout as the host. Idempotent.
+apt-get install -y --no-install-recommends liblz4-dev libzstd-dev libabsl-dev libssl-dev
+"${SCRIPT_DIR}/build-clickhouse-cpp.sh"
 
 # -- Apache iceberg-cpp (Iceberg table-format sink) --
 # Not packaged by Debian. Built FROM SOURCE at the pinned tag (scripts/versions.env)

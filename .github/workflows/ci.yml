@@ -354,6 +354,15 @@ jobs:
           path: ${{ runner.temp }}/protocol-traces/**
           if-no-files-found: ignore
           retention-days: 7
+      - name: Upload the ClickHouse pins binary
+        # The clickhouse-pins job runs it against live servers on a plain
+        # runner, inside this same toolchain image for its shared libraries.
+        uses: actions/upload-artifact@v4
+        with:
+          name: clickhouse-pins-binary
+          path: build/impls/clickhouse/tests/clink_clickhouse_tests
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload integration artifacts on failure
         # A multi-process failure with no child logs cannot be diagnosed
         # from a CI transcript. The harness keeps its scratch tree (with
@@ -376,6 +385,42 @@ jobs:
         with:
           path: /root/.ccache
           key: ccache-build-${{ github.run_id }}
+
+  clickhouse-pins:
+    name: ClickHouse server pins (26.3, 26.8)
+    # What the native ClickHouse sink takes as given about the server, checked on
+    # every supported line against servers pinned by digest
+    # (docker/integration-services.yml): SETTINGS in the insert text, token
+    # deduplication, the squash of an INSERT's blocks, the effective async_insert
+    # from the table, the shard and the server default, type strictness, FINAL,
+    # and the bounded metadata reads. A plain runner for the Docker daemon; the
+    # build job's test binary runs inside the toolchain image it was built in,
+    # on the host network, so it reaches the servers' published ports. A failing
+    # pin changes the sink's design, so it blocks like any other gate.
+    needs: [build, toolchain-manifest]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: clickhouse-pins-binary
+          path: build/impls/clickhouse/tests
+      - name: Run the pins against every line
+        env:
+          TOOLCHAIN: ${{ needs.toolchain-manifest.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
+        run: |
+          set -euo pipefail
+          chmod +x build/impls/clickhouse/tests/clink_clickhouse_tests
+          PIN_RUNNER="docker run --rm --network host -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} \
+            -w ${GITHUB_WORKSPACE} -e CLINK_CLICKHOUSE_TEST_HOST -e CLINK_CLICKHOUSE_TEST_PORT \
+            -e CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT ${TOOLCHAIN}" scripts/clickhouse-pins.sh
 
   tutorial-kafka-clickhouse:
     name: Tutorial - Kafka to ClickHouse (published runtime image)

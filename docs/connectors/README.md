@@ -11,7 +11,7 @@ otherwise; set `ON` to require it or `OFF` to exclude it). Most connectors link
 a system client library obtained via apt (Debian) or brew (macOS); a few ride
 the from-source toolchain (Apache Arrow/Parquet `24.0.0`, iceberg-cpp `v0.3.0`,
 aws-sdk-cpp `1.11.795`, Pulsar client `4.2.0`, DataStax cpp-driver `2.17.1`,
-clickhouse-cpp `2.5.1`, Avro C++ `1.12.1`),
+clickhouse-cpp `2.6.2`, Avro C++ `1.12.1`),
 which is compiled at exact versions into `CLINK_DEPS_PREFIX` on both the host
 and the Debian image. Versions are recorded per connector and in
 [`scripts/versions.env`](https://github.com/orhaugh/clink/blob/main/scripts/versions.env).
@@ -50,7 +50,7 @@ is reachable through the programmatic API only.
 | --- | --- | --- | --- | --- |
 | [PostgreSQL](postgres.md) | source + sink | libpq | system pkg | `postgres` |
 | [MySQL / MariaDB](mysql.md) | source + sink | mariadb-connector-c | system pkg | `mysql` |
-| [ClickHouse](clickhouse.md) | source + sink | clickhouse-cpp | `2.5.1` (from source) | `clickhouse` |
+| [ClickHouse](clickhouse.md) | source + sink | clickhouse-cpp | `2.6.2` (from source, Release) | `clickhouse` |
 | [Cassandra / ScyllaDB](cassandra.md) | sink | DataStax cpp-driver | `2.17.1` | `cassandra` |
 | [MongoDB](mongodb.md) | source + sink | mongo-cxx-driver | system pkg | - |
 | [Redis](redis.md) | source + sink | hiredis | system pkg | `redis` |

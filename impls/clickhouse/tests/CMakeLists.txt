@@ -8,6 +8,7 @@ add_executable(clink_clickhouse_tests
     test_clickhouse_source.cpp
     test_builder.cpp
     test_typed_sink.cpp
+    test_clickhouse_pins_live.cpp
 )
 target_link_libraries(clink_clickhouse_tests PRIVATE
     clink::core
@@ -18,5 +19,5 @@ target_compile_definitions(clink_clickhouse_tests PRIVATE CLINK_HAS_CLICKHOUSE)
 clink_set_warnings(clink_clickhouse_tests)
 gtest_discover_tests(clink_clickhouse_tests
     DISCOVERY_MODE PRE_TEST
-    PROPERTIES TIMEOUT 30 LABELS clickhouse
+    PROPERTIES TIMEOUT 120 LABELS clickhouse
 )

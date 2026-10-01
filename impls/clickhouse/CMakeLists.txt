@@ -15,9 +15,50 @@ endif()
 
 set(_ch_found FALSE)
 set(_ch_libs)
+set(_ch_include_dir)
 
-find_package(clickhouse-cpp CONFIG QUIET)
-if(clickhouse-cpp_FOUND)
+# The pinned client first: scripts/build-clickhouse-cpp.sh builds the version
+# scripts/versions.env names, static, in Release, with TLS, into
+# <CLINK_DEPS_PREFIX>/clickhouse-cpp (the image installs it into /usr/local, where
+# the search below finds it). Homebrew's or the system's copy is the fallback, and
+# the configure log says which one was taken and its version.
+set(_ch_pinned_dir)
+if(_clink_deps_prefix AND EXISTS "${_clink_deps_prefix}/clickhouse-cpp/include/clickhouse/client.h")
+    set(_ch_pinned_dir "${_clink_deps_prefix}/clickhouse-cpp")
+endif()
+if(_ch_pinned_dir)
+    find_library(_ch_pinned_lib NAMES clickhouse-cpp-lib
+        PATHS "${_ch_pinned_dir}/lib" NO_DEFAULT_PATH)
+    find_library(_ch_pinned_cityhash NAMES cityhash
+        PATHS "${_ch_pinned_dir}/lib" NO_DEFAULT_PATH)
+    find_library(_ch_pinned_lz4 NAMES lz4 HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
+    find_library(_ch_pinned_zstd NAMES zstd HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
+    find_package(absl CONFIG QUIET)
+    find_package(OpenSSL QUIET)
+    if(_ch_pinned_lib AND _ch_pinned_cityhash AND _ch_pinned_lz4 AND _ch_pinned_zstd
+       AND TARGET absl::int128 AND OpenSSL_FOUND)
+        add_library(_clink_clickhouse_external INTERFACE)
+        target_include_directories(_clink_clickhouse_external INTERFACE
+            "${_ch_pinned_dir}/include")
+        target_link_libraries(_clink_clickhouse_external INTERFACE
+            ${_ch_pinned_lib} ${_ch_pinned_cityhash} ${_ch_pinned_lz4} ${_ch_pinned_zstd}
+            absl::int128 OpenSSL::SSL OpenSSL::Crypto)
+        set(_ch_libs _clink_clickhouse_external)
+        set(_ch_include_dir "${_ch_pinned_dir}/include")
+        set(_ch_found TRUE)
+    else()
+        message(STATUS "clink::clickhouse - the pinned client in ${_ch_pinned_dir} is "
+                       "missing a dependency (lz4, zstd, abseil or OpenSSL); "
+                       "falling back to the system copy")
+    endif()
+endif()
+
+if(NOT _ch_found)
+    find_package(clickhouse-cpp CONFIG QUIET)
+endif()
+if(_ch_found)
+    # The pinned client, above.
+elseif(clickhouse-cpp_FOUND)
     set(_ch_found TRUE)
     set(_ch_libs clickhouse-cpp-lib)
 else()
@@ -52,6 +93,12 @@ else()
         if(_ch_zstd)
             target_link_libraries(_clink_clickhouse_external INTERFACE ${_ch_zstd})
         endif()
+        # A client built against the system abseil leaves absl::int128 to the
+        # final link.
+        find_package(absl CONFIG QUIET)
+        if(TARGET absl::int128)
+            target_link_libraries(_clink_clickhouse_external INTERFACE absl::int128)
+        endif()
         # clickhouse-cpp's client TLS path links against OpenSSL.
         find_package(OpenSSL QUIET)
         if(OpenSSL_FOUND)
@@ -59,7 +106,41 @@ else()
                 OpenSSL::SSL OpenSSL::Crypto)
         endif()
         set(_ch_libs _clink_clickhouse_external)
+        set(_ch_include_dir "${_ch_inc}")
     endif()
+endif()
+
+if(_ch_found AND _ch_include_dir AND EXISTS "${_ch_include_dir}/clickhouse/version.h")
+    file(STRINGS "${_ch_include_dir}/clickhouse/version.h" _ch_version_lines
+        REGEX "^#define CLICKHOUSE_CPP_VERSION_(MAJOR|MINOR|PATCH) ")
+    set(_ch_version "")
+    foreach(_part MAJOR MINOR PATCH)
+        foreach(_l IN LISTS _ch_version_lines)
+            if(_l MATCHES "CLICKHOUSE_CPP_VERSION_${_part} ([0-9]+)")
+                string(APPEND _ch_version "${CMAKE_MATCH_1}.")
+            endif()
+        endforeach()
+    endforeach()
+    string(REGEX REPLACE "\\.$" "" _ch_version "${_ch_version}")
+    file(STRINGS "${CMAKE_SOURCE_DIR}/scripts/versions.env" _ch_pin_line
+        REGEX "^CLICKHOUSE_CPP_VERSION=")
+    string(REGEX REPLACE "^CLICKHOUSE_CPP_VERSION=" "" _ch_pinned_version "${_ch_pin_line}")
+    if(_ch_pinned_dir AND _ch_include_dir STREQUAL "${_ch_pinned_dir}/include")
+        message(STATUS "clink::clickhouse - clickhouse-cpp ${_ch_version} (pinned, Release, TLS)")
+    elseif(_ch_version STREQUAL _ch_pinned_version)
+        message(STATUS "clink::clickhouse - clickhouse-cpp ${_ch_version} from ${_ch_include_dir}")
+    else()
+        message(STATUS "clink::clickhouse - clickhouse-cpp ${_ch_version} from ${_ch_include_dir}, "
+                       "not the pinned ${_ch_pinned_version}: run scripts/build-clickhouse-cpp.sh")
+    endif()
+endif()
+
+# The chosen client's headers ahead of every other include path in this
+# directory: Homebrew's /opt/homebrew/include (which other dependencies put on
+# the path) carries its own clickhouse/ headers, and compiling against those
+# while linking the pinned library mixes two versions of the client.
+if(_ch_found AND _ch_include_dir)
+    include_directories(BEFORE "${_ch_include_dir}")
 endif()
 
 if(NOT _ch_found)

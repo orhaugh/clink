@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**The ClickHouse client is pinned and built in Release.** clickhouse-cpp is now
+`2.6.2` (`scripts/versions.env`, checksum-pinned), built static with TLS by
+`scripts/build-clickhouse-cpp.sh` into `CLINK_DEPS_PREFIX/clickhouse-cpp` on
+the host and in the image. The image used to build `2.5.1` shared, without
+TLS, and in Debug, because it followed the toolchain's build type; the
+connector now takes the pinned build first and the configure log names the
+version it took. A new live suite, the server pins
+(`impls/clickhouse/tests/test_clickhouse_pins_live.cpp`, run by
+`scripts/clickhouse-pins.sh` and the `clickhouse-pins` CI job), checks what the
+coming native sink takes as given about the server on 26.3 and 26.8, pinned by
+digest: insert-text SETTINGS, token deduplication, block squashing, the
+effective `async_insert` from the table, the shard and the server default,
+type strictness, FINAL and bounded metadata reads.
+
 **A cancel that races end of input no longer publishes the tail twice.** At
 the end of a bounded input a source asks the coordinator for one final
 checkpoint, and every way of not getting one fell back to committing the tail

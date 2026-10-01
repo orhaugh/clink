@@ -158,3 +158,5 @@ qualification-results/
 
 # TLC trace-exploration artefacts it drops beside a spec when a check fails
 formal/**/*_TTrace_*
+benchmarks/clickhouse_sink/results/
+benchmarks/clickhouse_sink/data/
