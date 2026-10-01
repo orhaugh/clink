@@ -117,11 +117,11 @@ is fenced.
 
 | Model | Family | Bounds | Result |
 |---|---|---|---|
-| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 23.3M distinct states, depth 78, all invariants hold, no deadlock |
-| `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 42,059 distinct states, depth 67, all invariants hold |
-| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 12.6M distinct states, depth 55, all invariants hold |
-| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | all invariants hold |
-| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 4.5M distinct states |
+| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 26.5M distinct states, depth 78, all invariants hold, no deadlock |
+| `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 46,083 distinct states, depth 67, all invariants hold |
+| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 103.1M distinct states, depth 58, all invariants hold |
+| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | 5.4M distinct states, depth 53, all invariants hold |
+| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 5.3M distinct states |
 
 Within its bounds each run is exhaustive: TLC visits every reachable state.
 The bounds are small so that the push gate finishes in minutes; a larger
