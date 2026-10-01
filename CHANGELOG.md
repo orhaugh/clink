@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A native ClickHouse sink.** A ClickHouse table with
+`insert_format='native'` is written by `clickhouse_native_sink`, which sends
+typed Native blocks over the native protocol from a writer thread of its own,
+instead of JSON text. It is at-least-once: it refuses targets that take inserts
+asynchronously, holds each checkpoint until every INSERT before it is
+acknowledged, retries transient and in-doubt failures inside a ten-minute
+window with deduplication tokens, and refuses at open anything it cannot
+deliver (exactly-once, upsert, changelog, unaligned checkpoints, a second sink
+on its chain). The text sink stays the default. The connector page has the
+options, the type mapping and the guarantees.
+
 **The text ClickHouse sink is stricter, and says so at deploy.**
 `clickhouse_sink` changes in ways a job can notice:
 - `format='json'` now selects JSONEachRow; it used to write TSV. Values are

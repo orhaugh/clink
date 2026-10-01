@@ -5,13 +5,16 @@
 // right facts, does op-type-to-connector resolution pick the right record,
 // and does a job that asks for more than it can have get refused.
 
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
+#include "clink/connectors/capability.hpp"
 
 namespace {
 
@@ -57,6 +60,82 @@ TEST_F(GuaranteeGateTest, LongestPrefixWinsSoTwoPhaseVariantsAreNotMistakenForPl
 
 TEST_F(GuaranteeGateTest, AnUnknownOpTypeResolvesToNothing) {
     EXPECT_TRUE(connector_name_for_op_type("some_third_party_sink").empty());
+}
+
+// Declares records for one test and puts back whatever the registry held
+// under those names before, so the process-wide registry is left as found.
+class GateScopedRecords {
+public:
+    explicit GateScopedRecords(std::vector<connectors::ConnectorCapabilities> records) {
+        auto& registry = connectors::CapabilityRegistry::instance();
+        for (auto& record : records) {
+            const auto* existing = registry.find(record.name);
+            previous_.emplace_back(record.name,
+                                   existing != nullptr
+                                       ? std::optional<connectors::ConnectorCapabilities>(*existing)
+                                       : std::nullopt);
+            registry.declare(std::move(record));
+        }
+    }
+    ~GateScopedRecords() {
+        auto& registry = connectors::CapabilityRegistry::instance();
+        for (auto& [name, record] : previous_) {
+            registry.undeclare(name);
+            if (record) {
+                registry.declare(std::move(*record));
+            }
+        }
+    }
+    GateScopedRecords(const GateScopedRecords&) = delete;
+    GateScopedRecords& operator=(const GateScopedRecords&) = delete;
+
+private:
+    std::vector<std::pair<std::string, std::optional<connectors::ConnectorCapabilities>>> previous_;
+};
+
+// The native ClickHouse sink's factory name starts with both "clickhouse" and
+// "clickhouse_native". Resolving it to the legacy record would report the
+// legacy sink's claims (no retries, no TLS) for the native sink. The core
+// suite links no impl, so the two records the ClickHouse install() declares
+// are stood in for here, with the fields that tell them apart.
+TEST_F(GuaranteeGateTest, TheNativeClickHouseSinkResolvesToItsOwnRecordNotTheLegacyOne) {
+    const GateScopedRecords records({
+        connectors::ConnectorCapabilities{
+            .name = "clickhouse",
+            .is_source = true,
+            .is_sink = true,
+            .checkpoint_integrated = true,
+            .delivery = connectors::DeliveryGuarantee::AtLeastOnce,
+            .tls = false,
+            .retries = false,
+        },
+        connectors::ConnectorCapabilities{
+            .name = "clickhouse_native",
+            .is_source = false,
+            .is_sink = true,
+            .checkpoint_integrated = true,
+            .delivery = connectors::DeliveryGuarantee::AtLeastOnce,
+            .tls = true,
+            .retries = true,
+        },
+    });
+    EXPECT_EQ(connector_name_for_op_type("clickhouse_native_sink"), "clickhouse_native");
+    EXPECT_EQ(connector_name_for_op_type("clickhouse_sink"), "clickhouse");
+    EXPECT_EQ(connector_name_for_op_type("clickhouse_row_source"), "clickhouse");
+
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "src"));
+    g.ops.push_back(op("clickhouse_native_sink", "snk", {"src"}));
+    const auto facts = pipeline_facts_from_graph(g, durable_checkpointing());
+    ASSERT_EQ(facts.connectors.size(), 2U);
+    EXPECT_EQ(facts.connectors[1].connector_name, "clickhouse_native");
+    EXPECT_FALSE(facts.connectors[1].declaration_missing);
+
+    // At-least-once is all it claims, so asking it for exactly-once is refused.
+    g.ops[1].params["delivery_guarantee"] = "exactly_once";
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), nullptr);
+    ASSERT_FALSE(reject.empty());
+    EXPECT_NE(reject.find("clickhouse_native_sink"), std::string::npos) << reject;
 }
 
 // --- graph -> facts ---------------------------------------------------------

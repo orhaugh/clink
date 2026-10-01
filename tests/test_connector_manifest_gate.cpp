@@ -14,6 +14,7 @@
 // (the exempt map below). Both maps are maintained by hand ON PURPOSE - the
 // point of the gate is that a human states the classification.
 
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -24,6 +25,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/guarantee_gate.hpp"
 #include "clink/connectors/capability.hpp"
 #include "clink/plugin/install_defaults.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -69,7 +71,7 @@ const std::map<std::string, std::vector<std::string>> kExpectedRecords = {
     {"kafka", {"kafka", "kafka_2pc"}},
     {"postgres", {"postgres", "postgres_2pc", "postgres_upsert"}},
     {"s3", {"s3", "s3_2pc"}},
-    {"clickhouse", {"clickhouse"}},
+    {"clickhouse", {"clickhouse", "clickhouse_native"}},
     {"aws", {"kinesis", "firehose", "dynamodb"}},
     {"http_connector",
      {"http", "elasticsearch", "opensearch", "influxdb", "prometheus", "splunk_hec", "pubsub"}},
@@ -286,9 +288,10 @@ bool planner_binds(const std::string& connector, bool as_source) {
 // record declares. Three records (mqtt, mongo, generator) once claimed a
 // surface that no `connector='...'` reached, so `clink --capabilities` and
 // the connector pages disagreed about what SQL could do. Variant records
-// (kafka_2pc, postgres_upsert) are reached through their base name plus a
-// WITH option, and two identities also cover a longer SQL vocabulary name
-// their impl registers factories for (s3 -> s3_parquet, http -> http_poll).
+// (kafka_2pc, postgres_upsert, clickhouse_native) are reached through their
+// base name plus a WITH option, and two identities also cover a longer SQL
+// vocabulary name their impl registers factories for (s3 -> s3_parquet,
+// http -> http_poll).
 TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
     clink::plugin::PluginRegistry reg;
     clink::plugin::install_defaults(reg);
@@ -303,7 +306,7 @@ TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
             continue;
         }
         std::string base = cap.name;
-        for (const char* suffix : {"_2pc", "_upsert"}) {
+        for (const char* suffix : {"_2pc", "_upsert", "_native"}) {
             const std::string s = suffix;
             if (base.size() > s.size() && base.compare(base.size() - s.size(), s.size(), s) == 0) {
                 base.resize(base.size() - s.size());
@@ -340,5 +343,51 @@ TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
     }
     EXPECT_TRUE(failures.empty()) << failures.size()
                                   << " SQL surface claim(s) the planner does not honour:" << joined;
+}
+
+// The native ClickHouse record is reached through connector='clickhouse' and
+// insert_format='native'. The planner binds its factory on the Row channel,
+// with no JSON bridge in front, and the delivery gate resolves that factory to
+// the native record, not to the legacy one beside it.
+TEST(ConnectorManifestGate, TheNativeClickHouseRecordIsBoundWithInsertFormatNative) {
+    clink::plugin::PluginRegistry reg;
+    clink::plugin::install_defaults(reg);
+
+    clink::sql::Catalog cat;
+    auto register_table = [&](const std::string& ddl) {
+        auto script = clink::sql::parse(ddl);
+        cat.register_table(std::get<clink::sql::ast::CreateTableStmt>(script.statements[0]));
+    };
+    register_table(
+        "CREATE TABLE src_t (a BIGINT, b TEXT) WITH (connector='file', "
+        "path='/tmp/manifest-gate-probe', format='json')");
+    register_table(
+        "CREATE TABLE dst_t (a BIGINT, b TEXT) WITH (connector='clickhouse', format='json', "
+        "insert_format='native', table='events')");
+    clink::sql::Binder binder(cat);
+    auto plan = binder.bind_insert(std::get<clink::sql::ast::InsertStmt>(
+        clink::sql::parse("INSERT INTO dst_t SELECT a, b FROM src_t").statements[0]));
+    clink::sql::PhysicalPlanner planner;
+    const auto spec = planner.compile(static_cast<const clink::sql::LogicalSink&>(*plan));
+
+    std::vector<std::string> types;
+    std::string listed;
+    for (const auto& op : spec.ops) {
+        types.push_back(op.type);
+        listed += " " + op.type;
+    }
+    const auto has = [&types](const std::string& type) {
+        return std::find(types.begin(), types.end(), type) != types.end();
+    };
+    EXPECT_TRUE(has("clickhouse_native_sink")) << "ops:" << listed;
+    EXPECT_FALSE(has("clickhouse_sink")) << "ops:" << listed;
+    EXPECT_FALSE(has("row_to_json_string")) << "the native sink takes Rows; ops:" << listed;
+
+    const auto enabled = split_csv(kClinkEnabledImpls);
+    if (std::find(enabled.begin(), enabled.end(), "clickhouse") != enabled.end()) {
+        EXPECT_EQ(clink::cluster::connector_name_for_op_type("clickhouse_native_sink"),
+                  "clickhouse_native");
+        EXPECT_EQ(clink::cluster::connector_name_for_op_type("clickhouse_sink"), "clickhouse");
+    }
 }
 #endif  // CLINK_HAS_SQL

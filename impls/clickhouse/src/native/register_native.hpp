@@ -10,8 +10,12 @@ class PluginRegistry;
 
 namespace clink::clickhouse::native {
 
-// Factory `clickhouse_native_sink` on the Row channel, and the
-// `clickhouse_native` capability record. Called from install().
+// Registers the SQL Row channel type (idempotently, so the order of this and
+// the SQL frontend's own install does not matter), the factory
+// `clickhouse_native_sink` on that channel, and the `clickhouse_native`
+// capability record. On a build without the native sink the factory refuses
+// with clickhouse.native_unavailable, and the record still names the
+// connector, with TLS off. Called from install().
 void register_native(clink::plugin::PluginRegistry& registry);
 
 }  // namespace clink::clickhouse::native

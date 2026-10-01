@@ -22,6 +22,8 @@
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
+#include "native/register_native.hpp"
+
 namespace clink::clickhouse {
 
 namespace {
@@ -295,6 +297,11 @@ void install(clink::plugin::PluginRegistry& reg) {
             auto opts = parse_source_options(ctx, "clickhouse_source");
             return std::make_shared<StringClickHouseSource>(std::move(opts), "|", /*json=*/true);
         });
+
+    // clickhouse_native_sink and its clickhouse_native record. A build whose
+    // client is too old for it still registers the factory, which refuses by
+    // name.
+    native::register_native(reg);
 }
 
 }  // namespace clink::clickhouse
