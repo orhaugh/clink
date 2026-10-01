@@ -3447,7 +3447,12 @@ TEST(Cluster, ASavepointSurvivesTheCheckpointsTakenAfterIt) {
     EXPECT_EQ(dirs_with_prev, 0u)
         << "the unpinned checkpoint before the savepoint is still present in " << dirs_with_prev
         << " directories, so retention did not run and this test proves nothing about the pin";
-    std::filesystem::remove_all(ckpt_dir);
+    // The cancel is still winding the subtasks down, and the worker's retention
+    // sweep may be deleting a snapshot while this walks the tree: a throwing
+    // remove_all lost that race under TSan's slower timing ("cannot remove
+    // all: No such file or directory").
+    std::error_code ec;
+    std::filesystem::remove_all(ckpt_dir, ec);
 }
 
 // A savepoint restore addresses every task's state by its job-global subtask
