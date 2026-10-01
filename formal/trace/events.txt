@@ -49,6 +49,7 @@ unobserved TxnExpires
 unobserved BrokerGoesDown
 unobserved BrokerComesBack
 unobserved Done
+unobserved JobFailed
 # A rescale renumbers and re-places the operator's subtasks. The model keys a
 # sink by its subtask index and fixes the set and its hosts for the run, so a
 # rescaled run is outside it until the model covers rescale.

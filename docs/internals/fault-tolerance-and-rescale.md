@@ -65,12 +65,14 @@ Two edge cases are handled explicitly. A second worker lost while the job is alr
 
 `CheckpointConfig::max_restarts_on_worker_loss` defaults to the sentinel `kRestartAuto`. `effective_max_restarts` resolves it at every restart decision:
 
-- `kRestartAuto` with a `checkpoint_dir` set resolves to `kDefaultSelfHealRestarts` (10): the job self-heals up to ten times before failing loudly rather than looping forever.
+- `kRestartAuto` with a `checkpoint_dir` set resolves to `kDefaultSelfHealRestarts` (10): the job self-heals up to ten times in a burst before failing loudly rather than looping forever.
 - `kRestartAuto` with no `checkpoint_dir` resolves to 0: fail fast, because there is no checkpoint to restore from.
 - An explicit `0` forces fail-fast even with checkpointing.
 - An explicit `N` caps the attempts at `N`.
 
 Storing the sentinel rather than the resolved value means the user's intent (auto versus explicit) round-trips through HA recovery.
+
+The budget is a rate, not a lifetime count. A checkpoint that completes at least `Coordinator::Config::restart_budget_reset_after` (default 10 minutes) after the job's last restart forgives the restarts spent so far: a job that recovered and then ran cleanly has proved the recovery. A crash loop never completes a checkpoint, so it still exhausts the budget in bounded time. Deliberate rescales, requested through the API or by the autoscaler, spend no budget. The job history's restart count is the lifetime total. The budget used to be a lifetime count that nothing reset, so a long-running self-healing job failed at its eleventh recovery however far apart its recoveries were. Pinned by `CheckpointCompletion.SeparatedRecoveredFaultsDoNotExhaustTheRestartBudget`.
 
 ### Rescale: changing parallelism on a running job
 
@@ -247,7 +249,8 @@ Scope and honesty: Row-channel operators (the SQL frontend's set - GROUP BY, win
 | `heartbeat_timeout` | `Coordinator::Config` | 2000ms | A worker is declared lost after this much silence |
 | `restart_drain_timeout` | `Coordinator::Config` | 30000ms | Upper bound on the `awaiting_restart` drain; on expiry the watchdog fails the job |
 | `max_restarts` | `Coordinator::Config` | 0 | Per-failing-task retry budget (distinct from worker-level restarts) |
-| `max_restarts_on_worker_loss` | `CheckpointConfig` | `kRestartAuto` | Resolves to 10 (self-heal) with a checkpoint dir, 0 (fail-fast) without; explicit `N` caps attempts |
+| `max_restarts_on_worker_loss` | `CheckpointConfig` | `kRestartAuto` | Resolves to 10 (self-heal) with a checkpoint dir, 0 (fail-fast) without; explicit `N` caps attempts per burst |
+| `restart_budget_reset_after` | `Coordinator::Config` | 10 min | A checkpoint completing this long after the last restart forgives the spent restart budget |
 | `checkpoint_dir` | `CheckpointConfig` | empty | Required for any restart-from-checkpoint, rescale, or savepoint |
 | `interval_ms` | `CheckpointConfig` | 0 | Periodic-checkpoint cadence; operator rescale requires it `> 0` |
 | `restore_from_dir` / `restore_from_checkpoint_id` | `CheckpointConfig` | empty / 0 | Resume a fresh job from a prior completed checkpoint or savepoint |

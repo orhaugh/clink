@@ -58,6 +58,7 @@ CONSTANTS
     MaxBrokerOutages,  \* broker unreachable episodes
     MaxWalkCancels,    \* resolution walks cancelled by the watchdog deadline
     MaxErrorRestarts,  \* whole-job restarts begun for a subtask error or a transport failure
+    MaxJobRestarts,    \* the job's restart budget, as spent by failed-checkpoint rewinds
     Bug                \* "none" or a mutant name (see Mutants below)
 
 Mutants == {
@@ -76,7 +77,8 @@ Mutants == {
     "no_fencing",                     \* a superseded coordinator's frames accepted by workers
     "refusal_wall",                   \* found by this model: the walk left later checkpoints' commits unproven
     "complete_above_failed",          \* found by this model: a checkpoint completed above a FAILED one during the rewind
-    "restore_from_memory"             \* found by this model: the restore point ran ahead of the durable marker
+    "restore_from_memory",            \* found by this model: the restore point ran ahead of the durable marker
+    "sail_on_without_budget"          \* with no restart budget left, a FAILED checkpoint's interval sailed on
 }
 
 ASSUME Host \in [Sinks -> Workers]
@@ -157,7 +159,8 @@ VARIABLES
 
     \* Fault budgets.
     workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels,
-    errorRestarts
+    errorRestarts,
+    ckptRewinds     \* failed-checkpoint rewinds begun: the restart budget they spend
 
 vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
@@ -167,7 +170,7 @@ vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            unresolvedMk, txn, brokerUp, sinkGen, sink, pendingHandles, barriers,
            boundEpoch, msgs, srcPos, frontier, restorePoint, cutOf, published, restoreSound,
            staleAccepted, workerDeaths, coordDeaths, expiries, snapFails,
-           brokerOutages, walkCancels, errorRestarts >>
+           brokerOutages, walkCancels, errorRestarts, ckptRewinds >>
 
 leaderVars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext >>
 coordVars  == << phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
@@ -181,7 +184,7 @@ sinkVars   == << sink, pendingHandles, barriers >>
 jobVars    == << srcPos, frontier, restorePoint, cutOf >>
 ghostVars  == << published, restoreSound, staleAccepted >>
 budgetVars == << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages,
-                 walkCancels, errorRestarts >>
+                 walkCancels, errorRestarts, ckptRewinds >>
 
 NoTxn == [st |-> "none", owner |-> 0, desc |-> FALSE, has |-> FALSE]
 
@@ -240,7 +243,7 @@ Init ==
     /\ published = [s \in Sinks |-> [p \in Positions |-> 0]]
     /\ restoreSound = TRUE /\ staleAccepted = FALSE
     /\ workerDeaths = 0 /\ coordDeaths = 0 /\ expiries = 0 /\ snapFails = 0
-    /\ brokerOutages = 0 /\ walkCancels = 0 /\ errorRestarts = 0
+    /\ brokerOutages = 0 /\ walkCancels = 0 /\ errorRestarts = 0 /\ ckptRewinds = 0
 
 --------------------------------------------------------------------------------
 (* CHECKPOINT: trigger, barrier, prepare, ack. *)
@@ -360,7 +363,7 @@ SinkPrepareFails(s) ==
     /\ snapFails' = snapFails + 1
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, boundEpoch, msgs, jobVars,
                     ghostVars, workerDeaths, coordDeaths, expiries, brokerOutages,
-                    walkCancels, errorRestarts >>
+                    walkCancels, errorRestarts, ckptRewinds >>
 
 \* SubtaskCheckpointed reaches the coordinator (handle_subtask_checkpointed_).
 \* An ack for an id the coordinator no longer tracks is ignored; an ack to a
@@ -406,27 +409,42 @@ AboveRewind(c) == rewindFloor # None /\ c > rewindFloor /\ Bug # "complete_above
 \* every id below c: a lower checkpoint's fate is always known first.
 Decidable == {c \in inFlight : AllAnswered(c)}
 
+\* A FAILED checkpoint rewinds the job so its aborted interval is re-emitted.
+\* The rewind is a whole-job restart and spends the restart budget; a job
+\* already draining or recovering restores below the failure anyway and spends
+\* nothing more. With no budget left the job FAILS: the floor still
+\* covers the failed id, so nothing completes above it, and the recovery point
+\* stays below the gap. It used to sail on, every later checkpoint completing
+\* over the aborted interval.
 CoordComplete ==
     /\ coordUp /\ completeDue = None /\ markerDue = None /\ Decidable # {}
-    /\ LET c == Min(Decidable) IN
+    /\ LET c == Min(Decidable)
+           Floor == IF rewindFloor = None \/ c < rewindFloor THEN c ELSE rewindFloor IN
         /\ inFlight' = inFlight \ {c}
         /\ IF ackedFail[c] = {} /\ ~AboveRewind(c)
            THEN /\ completeDue' = c
-                /\ UNCHANGED << msgs, phase, drainSet, rewindFloor >>
+                /\ UNCHANGED << msgs, phase, drainSet, rewindFloor, ckptRewinds >>
            ELSE /\ msgs' = msgs \cup {[kind |-> "abort", c |-> c, epoch |-> leaderEpoch, s |-> s]
                                       : s \in {t \in Sinks : sink[t].up}}
                 /\ IF ackedFail[c] # {} /\ Bug # "no_rewind_on_failed_checkpoint"
-                   THEN /\ rewindFloor' = IF rewindFloor = None \/ c < rewindFloor THEN c
-                                          ELSE rewindFloor
-                        /\ IF phase = "running"
-                           THEN phase' = "draining" /\ drainSet' = {t \in Sinks : sink[t].up}
-                           ELSE UNCHANGED << phase, drainSet >>
-                   ELSE UNCHANGED << phase, drainSet, rewindFloor >>
+                   THEN IF phase # "running" \/ ckptRewinds < MaxJobRestarts
+                        THEN /\ rewindFloor' = Floor
+                             /\ IF phase = "running"
+                                THEN /\ phase' = "draining"
+                                     /\ drainSet' = {t \in Sinks : sink[t].up}
+                                     /\ ckptRewinds' = ckptRewinds + 1
+                                ELSE UNCHANGED << phase, drainSet, ckptRewinds >>
+                        ELSE IF Bug = "sail_on_without_budget"
+                             THEN UNCHANGED << phase, drainSet, rewindFloor, ckptRewinds >>
+                             ELSE /\ phase' = "failed" /\ rewindFloor' = Floor
+                                  /\ UNCHANGED << drainSet, ckptRewinds >>
+                   ELSE UNCHANGED << phase, drainSet, rewindFloor, ckptRewinds >>
                 /\ UNCHANGED completeDue
     /\ UNCHANGED << leaderVars, nextCkpt, ackedOk, ackedFail, toBroadcast, markerDue,
                     memCompleted, memConfirmed, broadcastIds, unconfirmed, freshLeader,
                     walkVars, diskVars, txn, brokerUp, sinkGen, sinkVars, boundEpoch, jobVars,
-                    ghostVars, budgetVars >>
+                    ghostVars, workerDeaths, coordDeaths, expiries, snapFails, brokerOutages,
+                    walkCancels, errorRestarts >>
 
 \* The COMPLETED-<id> marker, fsync-durable, written before any commit is
 \* broadcast (the marker write in handle_subtask_checkpointed_). Found by this
@@ -647,7 +665,7 @@ WorkerDiesKilling(w, dead) ==
                     toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen, boundEpoch,
                     jobVars, ghostVars, coordDeaths, expiries, snapFails, brokerOutages,
-                    walkCancels, errorRestarts >>
+                    walkCancels, errorRestarts, ckptRewinds >>
 
 WorkerDies(w) == WorkerDiesKilling(w, {s \in Sinks : Host[s] = w})
 
@@ -672,7 +690,7 @@ RestartOnError ==
                     toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
                     sink, pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars,
-                    workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels >>
+                    workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels, ckptRewinds >>
 
 \* A sink still opening drains like any other: the redeploy deployed the
 \* subtask, so a loss landing before its open() returned cancels it and waits
@@ -711,7 +729,7 @@ CoordDies ==
     /\ coordDeaths' = coordDeaths + 1
     /\ UNCHANGED << leaderEpoch, zombie, zombieEpoch, zombieNext, coordVars, diskVars, txn,
                     brokerUp, sinkGen, boundEpoch, jobVars, ghostVars, workerDeaths, expiries,
-                    snapFails, brokerOutages, walkCancels, errorRestarts >>
+                    snapFails, brokerOutages, walkCancels, errorRestarts, ckptRewinds >>
 
 \* The coordinator is superseded without dying: partitioned from the store or
 \* paused past its lease, it keeps its trigger loop. The workers reconnect to
@@ -729,7 +747,7 @@ CoordSuperseded ==
     /\ coordDeaths' = coordDeaths + 1
     /\ UNCHANGED << leaderEpoch, coordVars, diskVars, txn, brokerUp, sinkGen, boundEpoch, jobVars,
                     ghostVars, workerDeaths, expiries, snapFails, brokerOutages,
-                    walkCancels, errorRestarts >>
+                    walkCancels, errorRestarts, ckptRewinds >>
 
 ZombieStops ==
     /\ zombie
@@ -768,14 +786,14 @@ TxnExpires ==
     /\ expiries' = expiries + 1
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
                     jobVars, ghostVars, workerDeaths, coordDeaths, snapFails,
-                    brokerOutages, walkCancels, errorRestarts >>
+                    brokerOutages, walkCancels, errorRestarts, ckptRewinds >>
 
 BrokerGoesDown ==
     /\ Kafka /\ brokerUp /\ brokerOutages < MaxBrokerOutages
     /\ brokerUp' = FALSE /\ brokerOutages' = brokerOutages + 1
     /\ UNCHANGED << leaderVars, coordVars, diskVars, txn, sinkGen, sinkVars, boundEpoch, msgs,
                     jobVars, ghostVars, workerDeaths, coordDeaths, expiries, snapFails,
-                    walkCancels, errorRestarts >>
+                    walkCancels, errorRestarts, ckptRewinds >>
 
 BrokerComesBack ==
     /\ ~brokerUp
@@ -898,7 +916,7 @@ WalkCancelled ==
     /\ Walking /\ Unsettled # {} /\ walkCancels < MaxWalkCancels
     /\ walkCancels' = walkCancels + 1
     /\ EndUnresolved
-    /\ UNCHANGED << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, errorRestarts >>
+    /\ UNCHANGED << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, errorRestarts, ckptRewinds >>
 
 \* Every handle of the id has a verdict. All committed: CONFIRMED-<id> is
 \* written and the walk moves on. Any refusal: the walk stops and the job
@@ -1064,6 +1082,11 @@ Quiescent ==
 
 Done == Quiescent /\ UNCHANGED vars
 
+\* A job that failed (no restart budget left to rewind a FAILED checkpoint)
+\* stays failed: its recovery point is the last checkpoint completed below the
+\* failure, and an operator restore from it is the rewind it could not make.
+JobFailed == phase = "failed" /\ UNCHANGED vars
+
 Next ==
     \/ Trigger \/ ZombieTrigger \/ DeliverBarrier
     \/ \E s \in Sinks : SinkPrepare(s) \/ SinkPrepareFails(s) \/ SinkAck(s)
@@ -1080,7 +1103,7 @@ Next ==
     \/ WalkRetries \/ WalkExhausted \/ WalkCancelled \/ WalkDecides \/ WalkFinishes
     \/ Redeploy
     \/ \E s \in Sinks : SinkOpens(s)
-    \/ Done
+    \/ Done \/ JobFailed
 
 \* Faults are unfair: the model may inject them or not. Everything else is
 \* weakly fair, which is what the liveness property assumes.
@@ -1104,7 +1127,7 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 (* INVARIANTS *)
 
 TypeOK ==
-    /\ phase \in {"running", "draining", "resolving", "deploying"}
+    /\ phase \in {"running", "draining", "resolving", "deploying", "failed"}
     /\ nextCkpt \in 1..(MaxCkpt + 1)
     /\ inFlight \subseteq Ckpts
     /\ completedDisk \subseteq Ckpts /\ confirmedDisk \subseteq Ckpts

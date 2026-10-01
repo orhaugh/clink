@@ -105,6 +105,9 @@ def write_constants(events: list[dict], out: str) -> None:
         f"TraceMaxBrokerOutages == {len(of('WalkRetries')) + len(of('WalkExhausted'))}",
         f"TraceMaxWalkCancels == {len(of('WalkCancelled'))}",
         f"TraceMaxErrorRestarts == {len(of('RestartOnError'))}",
+        # A trace carries no restart budget; size it so a recorded failure always
+        # rewinds, as the run did (a job failing out of budget is not recorded).
+        f"TraceMaxJobRestarts == {sum(1 for e in of('SubtaskAck') if not e.get('ok', True))}",
         f"TraceFirstEpoch == {first_epoch}   \\* the engine's epochs need not start at 1; the model's do",
         "====",
     ]

@@ -83,10 +83,11 @@ struct SubmitCheckpointOptions {
     // "", "aligned", "unaligned" or "adaptive". Empty leaves the default.
     std::string alignment;
     // Worker-loss restart budget. Zero leaves the cluster default, which
-    // resolves to a LIFETIME cap of 10 restarts when checkpointing is on
-    // (kRestartAuto / kDefaultSelfHealRestarts) - the counter is never
-    // reset, so a long-running job under repeated faults exhausts it and
-    // stops. A sustained chaos campaign must raise it deliberately.
+    // resolves to 10 restarts in a burst when checkpointing is on
+    // (kRestartAuto / kDefaultSelfHealRestarts). A checkpoint completing after
+    // a clean run since the last restart (Coordinator::Config::
+    // restart_budget_reset_after) forgives the spent budget, so only a burst of
+    // failures exhausts it.
     std::uint32_t max_restarts_on_worker_loss{0};
 };
 

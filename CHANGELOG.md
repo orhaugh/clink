@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+**The restart budget bounds a burst of failures, not a job's lifetime.** The
+self-heal budget (`max_restarts_on_worker_loss`, 10 under the default) was a
+lifetime count that nothing reset, so a long-running job failed at its
+eleventh recovery however far apart its recoveries were, and once the budget
+was spent every later failure was unrecoverable. A checkpoint that completes
+`restart_budget_reset_after` (default 10 minutes) after the job's last restart
+now forgives the spent restarts; a crash loop never completes a checkpoint, so
+it still exhausts the budget. Deliberate rescales no longer spend it. The job
+history still reports the lifetime restart count.
+
+**A failed checkpoint no longer loses its interval when the restart budget is
+spent.** A checkpoint that fails (a subtask cannot snapshot) aborts every
+exactly-once sink's staged transaction for that interval, and only a rewind
+re-emits it. With restart budget left the job rewinds. With none left it used
+to carry on: the checkpoint above the failed one completed and committed,
+every later one built on it, and the interval's output was lost with every
+gate green. The budget is spent by every recovery a job makes, so a
+long-running job reached this sooner or later. It now fails, naming the
+checkpoint and the cause, with nothing completed above the failure, so a
+restore from its last completed checkpoint re-emits the interval. This
+affects every barrier-sealed exactly-once sink: Kafka, the file, Parquet, S3
+and Postgres two-phase sinks, Iceberg and WebHDFS. The exactly-once
+specification now models the restart budget (`MaxJobRestarts`), with a new
+model in which it is spent and a `sail_on_without_budget` mutant TLC
+refutes.
+
 **The plain Parquet sinks keep their output across a restore.** A Parquet
 file cannot be appended to, and its footer is written only when it is
 closed, so the plain `parquet` sinks, which wrote one file per subtask, left

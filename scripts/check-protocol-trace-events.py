@@ -102,8 +102,8 @@ def main() -> int:
     hidden = re.search(r"^Hidden ==\n(.*?)\n\n", module, re.S | re.M)
     hidden_body = hidden.group(1) if hidden else ""
     for name in sorted(unobserved):
-        if name == "Done":
-            continue  # the run's quiescent stutter; the trace has its own end
+        if name in ("Done", "JobFailed"):
+            continue  # terminal stutters (quiescent, failed); the trace has its own end
         if not re.search(rf"\b{name}\b", hidden_body):
             problems.append(f"unobserved in {MANIFEST.name} but not a hidden step in {MODULE.name}: {name}")
 

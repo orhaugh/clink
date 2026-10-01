@@ -89,7 +89,9 @@ Faults are actions with a budget, so the checker may inject them or not:
 worker death, coordinator death, a superseded coordinator that keeps
 triggering, broker transaction expiry, an unreachable broker, a snapshot
 capture that fails, and a cancelled resolution walk. Everything else is
-weakly fair.
+weakly fair. The job's restart budget is a bound of its own
+(`MaxJobRestarts`): a failed checkpoint rewinds the job while budget is
+left, and fails the job when none is.
 
 ### Fault points are states between steps
 
@@ -120,6 +122,7 @@ go from a step in a counterexample to the code.
 | `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | The push gate for the Kafka family |
 | `MC_KafkaTwoInFlight` | Kafka | as above with 2 checkpoints in flight, no coordinator death or broker fault | The barrier for the next interval overtaking an outstanding commit; a failed checkpoint below a completing one |
 | `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight | Re-commit at open, restore from the newest completed checkpoint |
+| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall` with no restart budget and no error restarts | A failed checkpoint that cannot rewind fails the job rather than completing above itself |
 | `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | Checks `EventuallySettled` as well as the invariants |
 
 Bounds are small on purpose: a push gate has minutes, and within its bounds
@@ -153,12 +156,13 @@ each and judges the outcome against `mutants/expected.txt`.
 | `refusal_wall` | An early stop of the walk marks every unreceipted handle above it | this model | refuted: NoDuplicate |
 | `complete_above_failed` | A checkpoint above a FAILED one is discarded during the rewind | this model | refuted: NoLoss |
 | `restore_from_memory` | The in-memory restore point advances with the durable marker, not before | this model | refuted: FrontierCovered |
+| `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | refuted: NoLoss |
 
 A mutant TLC accepts is recorded in `mutants/expected.txt`, not deleted: it
 means a later rule guards the same defect (defence in depth), and the check
 then holds that record in both directions: the day TLC refutes an
 `accepted` mutant, the other guard has gone and the record is wrong. Two of
-the fifteen are accepted today, both superseded by receipts, in-doubt
+the sixteen are accepted today, both superseded by receipts, in-doubt
 resolution and the marker rule the refusal-wall finding added; the withheld
 broadcast left that set when trace validation widened the specification,
 and the check would have failed had it stayed recorded as accepted. The

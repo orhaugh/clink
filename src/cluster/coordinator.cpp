@@ -5788,7 +5788,13 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     //    for plain restart (same task count); rescale resets it to the
     //    new total. attempt_counts retained - task-level retry budget
     //    is independent of worker-level restart budget.
-    ++job.restart_attempts;
+    // A deliberate rescale (an operator, API or autoscaler request) is not a
+    // failure and spends no restart budget; every other restart does.
+    if (!is_rescale && !is_replan_rescale) {
+        ++job.restart_attempts;
+        ++job.restarts_total;
+        job.last_restart_at = std::chrono::steady_clock::now();
+    }
     job.awaiting_restart = false;
     job.restart_deadline = {};
     job.restart_pending.clear();
@@ -6888,7 +6894,7 @@ void Coordinator::signal_job_completion_locked_(JobState& job) {
         rec.job_id = job.id;
         rec.status = status;
         rec.errors = job.errors;
-        rec.restart_attempts = job.restart_attempts;
+        rec.restart_attempts = job.restarts_total;
         rec.latest_completed_checkpoint_id = job.latest_completed_checkpoint_id;
         rec.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - job.submit_time);
@@ -7530,18 +7536,21 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 // acks is invalid too: the rewind re-emits this interval, and
                 // a later checkpoint completing on top of it would restore
                 // the job past the aborted output (see above_rewind_floor).
-                // Only when a rewind will actually run - one begins below, or
-                // a restart is already pending and will restore below this id.
-                // A job that keeps running with no restart budget keeps its
-                // later checkpoints: discarding them would stop it ever
-                // completing another.
-                const bool rewind_pending =
-                    !job.completion_signalled && !job.cancel_requested &&
-                    !job.checkpoint.checkpoint_dir.empty() &&
-                    (job.awaiting_restart ||
-                     job.restart_attempts < effective_max_restarts(job.checkpoint));
-                if (rewind_pending && (job.rewind_floor_checkpoint_id == 0 ||
-                                       msg.checkpoint_id < job.rewind_floor_checkpoint_id)) {
+                // Only when the job will not run on past this interval: a rewind
+                // begins below, a restart is already pending and will restore
+                // below this id, or the job has no budget left to rewind and so
+                // fails (out_of_budget, below). A checkpoint completing above
+                // the failed one would otherwise make a restore point past the
+                // aborted interval.
+                const bool running_with_checkpoints = !job.completion_signalled &&
+                                                      !job.cancel_requested &&
+                                                      !job.checkpoint.checkpoint_dir.empty();
+                const bool out_of_budget =
+                    running_with_checkpoints && !job.awaiting_restart &&
+                    job.restart_attempts >= effective_max_restarts(job.checkpoint);
+                const bool floor_needed = running_with_checkpoints;
+                if (floor_needed && (job.rewind_floor_checkpoint_id == 0 ||
+                                     msg.checkpoint_id < job.rewind_floor_checkpoint_id)) {
                     job.rewind_floor_checkpoint_id = msg.checkpoint_id;
                 }
                 // At least one subtask failed to take its snapshot, so
@@ -7592,9 +7601,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                 // A failed checkpoint therefore initiates the same
                 // whole-job restart a subtask error does; the replay from
                 // the last completed checkpoint re-produces the aborted
-                // interval. Guarded exactly like the subtask-error path -
-                // a job already restarting, completing, cancelling, or out
-                // of budget keeps today's behaviour.
+                // interval. A job already restarting, completing or
+                // cancelling is left to that path. A job with no restart
+                // budget left FAILS, as the subtask-error path does when out
+                // of budget: carrying on past the aborted interval would lose
+                // it silently, every later checkpoint completing over the gap
+                // (it used to, and the budget is spent by every recovery a job
+                // makes, so a long-running job reached this sooner or later).
                 if (!job.awaiting_restart && !job.completion_signalled && !job.cancel_requested &&
                     !job.checkpoint.checkpoint_dir.empty() &&
                     job.restart_attempts < effective_max_restarts(job.checkpoint)) {
@@ -7665,6 +7678,35 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                                 "of output that only a rewind re-emits",
                             failed_ckpt_cancels);
                     }
+                } else if (out_of_budget) {
+                    log::error("coordinator.checkpoint",
+                               "job_id=" + std::to_string(msg.job_id) + " checkpoint " +
+                                   std::to_string(msg.checkpoint_id) +
+                                   " failed and the job has no restart budget left (" +
+                                   std::to_string(job.restart_attempts) + " of " +
+                                   std::to_string(effective_max_restarts(job.checkpoint)) +
+                                   " used) to rewind and re-emit its aborted interval. Failing "
+                                   "the job rather than continuing past the gap.");
+                    job.errors.push_back(
+                        "checkpoint " + std::to_string(msg.checkpoint_id) +
+                        " failed with no restart budget left to rewind; its aborted sink "
+                        "transactions carried one interval of output that only a rewind "
+                        "re-emits, so the job fails instead of continuing without it. Restore "
+                        "it from checkpoint " +
+                        std::to_string(job.latest_completed_checkpoint_id) +
+                        " once the cause (see the workers' snapshot errors) is fixed.");
+                    if (!job.error_cancel_broadcast) {
+                        job.error_cancel_broadcast = true;
+                        job.terminal_cancel_deadline =
+                            std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+                        for (const auto& [worker_id2, _] : job.tasks_by_worker) {
+                            auto cit = registered_.find(worker_id2);
+                            if (cit != registered_.end() && !cit->second->lost &&
+                                cit->second->conn) {
+                                failed_ckpt_cancels.emplace_back(cit->second->conn, msg.job_id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -7720,6 +7762,19 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             // failure-restarts, and this is where consecutive ends.
             job.consecutive_ckpt_failure_restarts = 0;
             job.first_consecutive_ckpt_failure_at = {};
+            // The same proof, held for long enough, forgives the restart
+            // budget: it bounds a burst of failures, not a job's lifetime.
+            if (job.restart_attempts > 0 &&
+                std::chrono::steady_clock::now() - job.last_restart_at >=
+                    cfg_.restart_budget_reset_after) {
+                log::info("coordinator.restart",
+                          "job_id=" + std::to_string(msg.job_id) + " checkpoint " +
+                              std::to_string(msg.checkpoint_id) +
+                              " completed after a clean run since its last restart; its " +
+                              std::to_string(job.restart_attempts) +
+                              " spent restart(s) no longer count against the budget");
+                job.restart_attempts = 0;
+            }
             // latest_completed_checkpoint_id is NOT advanced here. It used to
             // be, under this lock, with the COMPLETED marker written after the
             // lock was released - and a restart deciding its restore point in

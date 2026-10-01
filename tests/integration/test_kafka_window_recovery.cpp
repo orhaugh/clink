@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -2610,6 +2611,168 @@ TEST_F(KafkaWindowRecoveryTest, AFailedCheckpointRewindsInsteadOfLosingItsInterv
     EXPECT_EQ(actual, expected)
         << "a failed checkpoint lost its aborted interval (missing rows) or the rewind "
            "replayed committed output (duplicates)";
+}
+
+// The same failure once the restart budget is spent (a budget of one, spent by
+// an earlier failure's rewind). The job used to carry on: the checkpoint above
+// the failed one completed and committed, and the windows that closed inside
+// the aborted interval were never published, their output thrown away with
+// the aborted transactions. It now fails, and whatever it did commit is exact.
+TEST_F(KafkaWindowRecoveryTest,
+       AFailedCheckpointWithNoRestartBudgetFailsInsteadOfLosingItsInterval) {
+    constexpr int kKeys = 10;
+    constexpr std::int64_t kBase = 6'000'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    spec.slots_per_worker = 8;
+    spec.ha = true;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    ASSERT_TRUE(cluster.start_ha_coordinators(1));
+    // Two snapshot failures on one worker, so placement cannot put both in
+    // the same checkpoint: the first spends the budget of one on a rewind,
+    // and the second, many checkpoints later, finds none left. One
+    // checkpoint writes a few dozen files per worker, well short of 200.
+    // The helper the fault point sits in also writes the sinks' commit
+    // receipts, at most one per sink subtask in a row, so six consecutive
+    // ordinals are sure to include a snapshot write; a receipt write that
+    // fails only costs a later restore its fast path, and this job never
+    // restores again.
+    std::string faults = "checkpoint.before_write=throw@6";
+    for (int ordinal = 200; ordinal < 206; ++ordinal) {
+        faults += ",checkpoint.before_write=throw@" + std::to_string(ordinal);
+    }
+    ASSERT_TRUE(cluster.start_ha_worker(0, ProcOptions{.fault = faults}));
+    ASSERT_TRUE(cluster.start_ha_worker(1));
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + input_topic_ +
+        "', group_id='ckptfail-nobudget', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + output_topic_ +
+        "', delivery_guarantee='exactly_once', transactional_id='ckptfail-nobudget'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql-ckptfail-nobudget",
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "kafka-ckptfail-nobudget",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "300",
+                              // 0 would mean "the default" to the SQL client.
+                              "--max-restarts-on-worker-loss",
+                              "1",
+                              "--parallelism",
+                              "4"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 2; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+    // Advancing event time: windows close every few dozen milliseconds, so
+    // every checkpoint interval, the aborted one included, carries committed
+    // window output. With one open window the aborted interval would hold
+    // nothing to lose and the data check below would be vacuous.
+    const auto advance_base = kBase + 50'000;
+    std::atomic<bool> stop_feed{false};
+    std::atomic<std::size_t> produced{0};
+    std::map<WindowKey, Aggregate> feed_windows;
+    std::thread feeder([&] {
+        feed_windows = produce_json_advancing(
+            kafka_->brokers(), input_topic_, advance_base, kKeys, stop_feed, produced);
+    });
+    struct FeedGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~FeedGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } feed_guard{stop_feed, feeder};
+
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return cluster.count_in_coordinator_log(" FAILED: subtask(s) ") >= 2; }, 120s))
+        << "the two armed snapshot failures did not both fail a checkpoint";
+    EXPECT_TRUE(clink::itest::await(
+        [&] { return cluster.count_in_coordinator_log("no restart budget left") >= 1; }, 30s))
+        << "a failed checkpoint with no budget to rewind did not fail the job";
+    EXPECT_TRUE(clink::itest::await(
+        [&] { return cluster.count_in_coordinator_log(" failed errors=") >= 1; }, 60s))
+        << "the job did not end FAILED";
+    EXPECT_EQ(cluster.count_in_coordinator_log("checkpoint failure -> whole-job restart"), 1U)
+        << "the first failure spends the budget of one on a rewind, and only that one";
+
+    // Keep feeding, then close every window: a job still running would now
+    // commit windows past the aborted interval, short of its rows.
+    const auto produced_at_failure = produced.load(std::memory_order_acquire);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return produced.load(std::memory_order_acquire) >= produced_at_failure + 400; },
+        30s));
+    stop_feed.store(true, std::memory_order_release);
+    feeder.join();
+    for (const auto& [key, agg] : feed_windows) {
+        expected[key] = agg;
+    }
+    const auto closing = advance_base + 10'000'000;
+    produce_json(kafka_->brokers(), input_topic_, window_records(closing, kKeys));
+
+    // Whatever was committed is exact. A key's windows close in event-time
+    // order, so its committed windows must be the earliest of its expected
+    // ones with no gap: a window that closed inside the aborted interval and
+    // is missing while a later one is present is output the failed checkpoint
+    // threw away. Windows the failed job never reached are simply absent.
+    const auto after = consume_committed(kafka_->brokers(), output_topic_, 1, 20s);
+    const auto actual = parse_output(after);
+    std::map<std::int64_t, std::size_t> committed_per_key;
+    for (const auto& [key, value] : actual) {
+        const auto it = expected.find(key);
+        ASSERT_NE(it, expected.end())
+            << "an unexpected window was committed: k=" << key.first << " ws=" << key.second;
+        EXPECT_EQ(value, it->second) << "window k=" << key.first << " ws=" << key.second
+                                     << " was committed with the wrong aggregate";
+        ++committed_per_key[key.first];
+    }
+    ASSERT_FALSE(actual.empty()) << "the job committed nothing before it failed";
+    for (const auto& [k, count] : committed_per_key) {
+        std::size_t seen = 0;
+        for (auto it = expected.lower_bound({k, std::numeric_limits<std::int64_t>::min()});
+             it != expected.end() && it->first.first == k && seen < count;
+             ++it, ++seen) {
+            EXPECT_TRUE(actual.contains(it->first))
+                << "window k=" << k << " ws=" << it->first.second
+                << " is missing while a later window of the key was committed: the aborted "
+                   "interval's output was lost";
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

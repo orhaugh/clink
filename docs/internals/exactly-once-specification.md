@@ -92,7 +92,10 @@ stay as the broker had them), coordinator death (memory lost, sessions
 ended, reseeded from the durable markers on takeover), a superseded
 coordinator that keeps triggering under a stale epoch, broker transaction
 expiry, an unreachable broker, a snapshot capture that fails, and a
-resolution walk cancelled by the watchdog. The broker is modelled as the
+resolution walk cancelled by the watchdog. The job's restart budget is
+bounded as well (`MaxJobRestarts`): a failed checkpoint rewinds the job while
+budget is left, and once it is spent the job fails, with nothing completed
+above the failed checkpoint. The broker is modelled as the
 transaction coordinator the protocol depends on: a prepared transaction
 that expires or is fenced aborts; a commit's outcome stays describable
 until a successor transaction begins on the same identity or the identity
@@ -117,6 +120,7 @@ is fenced.
 | `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 23.3M distinct states, depth 78, all invariants hold, no deadlock |
 | `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 42,059 distinct states, depth 67, all invariants hold |
 | `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 12.6M distinct states, depth 55, all invariants hold |
+| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | all invariants hold |
 | `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 4.5M distinct states |
 
 Within its bounds each run is exhaustive: TLC visits every reachable state.
@@ -319,8 +323,9 @@ against the bug it guards is decorative.
 | `refusal_wall` | An early stop of the walk marks every unreceipted handle above it | this model | yes, `NoDuplicate` |
 | `complete_above_failed` | A checkpoint above a FAILED one is discarded during the rewind | this model | yes, `NoLoss` |
 | `restore_from_memory` | The in-memory restore point advances with the durable marker, not before | this model | yes, `FrontierCovered` |
+| `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | yes, `NoLoss` |
 
-Thirteen of the fifteen are refuted. The two that are not are recorded in
+Fourteen of the sixteen are refuted. The two that are not are recorded in
 `formal/mutants/expected.txt` rather than deleted, and the check holds that
 record in both directions: each of them disables a rule that a later rule
 now guards as well. The preserved prepared transaction predates commit
@@ -396,7 +401,7 @@ In the honesty categories the qualification pages use:
   reachable interleaving of the modelled protocol steps and faults satisfies
   the invariants, the run never deadlocks, and (in the liveness
   configuration) every run with bounded faults settles with every
-  vouched-for position published exactly once. Thirteen of the fifteen
+  vouched-for position published exactly once. Fourteen of the sixteen
   mutants produce a counterexample; the two that do not are recorded as
   guarded by a later rule, and the check fails the day that stops being
   true.

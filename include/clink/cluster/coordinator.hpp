@@ -326,6 +326,16 @@ public:
         // still terminates in bounded, diagnosable time (~20 paced
         // attempts at the default). Zero = count-only.
         std::chrono::milliseconds checkpoint_failure_restart_window{std::chrono::minutes(10)};
+        // The restart budget (max_restarts_on_worker_loss, 10 under auto) is a
+        // rate, not a lifetime count: once a checkpoint completes at least this
+        // long after the job's last restart, the spent budget is forgiven. A
+        // job that recovered and then ran cleanly has proved the recovery; a
+        // crash loop never completes a checkpoint, so it still exhausts the
+        // budget in bounded time. Without this, ten recoveries over any span
+        // ended a long-running self-healing job, and once spent the budget
+        // left every later failure unrecoverable. Zero = reset on the first
+        // completed checkpoint after a restart.
+        std::chrono::milliseconds restart_budget_reset_after{std::chrono::minutes(10)};
         // Cluster-level default state-backend URI applied to a submitted job
         // that chose none (empty CheckpointConfig.state_backend_uri). Lets an
         // operator point every job at a deferring backend (e.g.
@@ -995,7 +1005,14 @@ private:
         // the sweep will act on transport_pending_cause when it expires.
         std::chrono::steady_clock::time_point transport_error_deadline{};
         std::string transport_pending_cause;
+        // Restarts spent against the budget since it was last forgiven (see
+        // Config::restart_budget_reset_after). Deliberate rescales do not
+        // spend it.
         std::uint32_t restart_attempts{0};
+        std::chrono::steady_clock::time_point last_restart_at{};
+        // Every restart the job made, never forgiven: what the job history
+        // reports as its restart count.
+        std::uint32_t restarts_total{0};
         // Whole-job restarts caused by FAILED CHECKPOINTS since the last
         // checkpoint that COMPLETED. Reset on completion; the job fails
         // with the cause instead of restarting again only when the count

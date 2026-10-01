@@ -609,11 +609,14 @@ TEST(CheckpointCompletion, ACheckpointAboveAFailedOneIsDiscardedDuringTheRewind)
         << "no AbortCheckpoint for the checkpoint discarded above the rewind floor";
 }
 
-TEST(CheckpointCompletion, ACheckpointAboveAFailedOneStillCompletesWithoutARewind) {
-    // The control: with no restart budget the job keeps running, and a
-    // later checkpoint completing after a failed one is what keeps it
-    // recoverable at all. Discarding it here would stop the job ever
-    // completing another checkpoint.
+// With no restart budget left there is no rewind to re-emit the failed
+// checkpoint's aborted interval. The job used to carry on regardless: the
+// checkpoint above the failed one completed and committed, every later one
+// built on it, and the interval's output was gone with every gate green. The
+// budget is spent by every recovery a job makes, so a long-running job got
+// here sooner or later. It now fails, naming the cause, and nothing completes
+// above the gap.
+TEST(CheckpointCompletion, AFailedCheckpointWithNoRestartBudgetFailsTheJobInsteadOfSailingOn) {
     CheckpointFixture fx;
     const auto job_id = fx.bring_up(/*max_restarts=*/0);
     ASSERT_GT(job_id, 0U);
@@ -626,10 +629,18 @@ TEST(CheckpointCompletion, ACheckpointAboveAFailedOneStillCompletesWithoutARewin
     ASSERT_TRUE(fx.ack_all(job_id, *failed, /*ok=*/false));
     ASSERT_TRUE(fx.ack_all(job_id, *above, /*ok=*/true));
 
-    EXPECT_TRUE(ckpt_await([&] {
-        return fx.coordinator->latest_completed_checkpoint(job_id) >= *above;
-    })) << "with no rewind pending, the checkpoint above a failed one must still complete";
-    EXPECT_TRUE(ckpt_await([&] { return fx.marker_exists(job_id, *above); }));
+    EXPECT_TRUE(fx.worker->await_frame(MessageKind::CancelJob, 5s).has_value())
+        << "a failed checkpoint with no budget to rewind must fail the job";
+    EXPECT_FALSE(ckpt_await(
+        [&] { return fx.coordinator->latest_completed_checkpoint(job_id) >= *above; }, 750ms))
+        << "checkpoint " << *above << " completed above failed checkpoint " << *failed
+        << " with no rewind to re-emit the aborted interval: a silent gap in the output";
+    EXPECT_FALSE(fx.marker_exists(job_id, *above));
+    bool named = false;
+    for (const auto& e : fx.coordinator->job_errors(job_id)) {
+        named = named || e.find("no restart budget left to rewind") != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the job's failure does not name the cause";
 }
 
 // --- what recovery restores from ----------------------------------------
@@ -1274,6 +1285,97 @@ TEST(CheckpointCompletion, ReachingTheFailureCountWithinTheWindowIsNotPersistent
     }
     EXPECT_FALSE(coordinator.await_job_completion(job_id, 2s))
         << "the job was terminally failed within seconds of its first failed checkpoint";
+
+    (void)coordinator.cancel_job(job_id);
+    for (const auto& [role, sub] : tasks) {
+        (void)w.send_finished(job_id, role, sub);
+    }
+    (void)coordinator.await_job_completion(job_id, 10s);
+    w.close();
+    coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// The restart budget bounds a burst of failures, not a job's lifetime. It used
+// to be a lifetime count that nothing reset, so a long-running self-healing job
+// failed at its eleventh recovery however far apart they were, and once spent
+// it left every later failure unrecoverable. A checkpoint completing after a
+// clean run since the last restart now forgives it.
+TEST(CheckpointCompletion, SeparatedRecoveredFaultsDoNotExhaustTheRestartBudget) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ckpt_budget_rate_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.checkpoint_failure_restart_limit = 0;  // the breaker is not the subject
+    cfg.restart_budget_reset_after = std::chrono::milliseconds{0};
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"w"});
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();
+    ckpt.interval_ms = 100;
+    ckpt.max_restarts_on_worker_loss = 1;  // one restart per burst
+    const auto job_id = coordinator.submit_job(
+        two_subtask_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+
+    std::vector<std::pair<std::string, std::uint32_t>> tasks;
+    auto learn_deploy = [&]() -> bool {
+        auto deploy = w.await_frame(MessageKind::Deploy, 10s);
+        if (!deploy.has_value()) {
+            return false;
+        }
+        tasks.clear();
+        std::uint16_t fake_port = 47100;
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            tasks.emplace_back(t.role, t.subtask_idx);
+            if (!w.report_listening(job_id, t.role, t.subtask_idx, fake_port++)) {
+                return false;
+            }
+        }
+        return !tasks.empty();
+    };
+    ASSERT_TRUE(learn_deploy());
+
+    // Three bursts of one failure each, every one followed by a completed
+    // checkpoint. A budget of one per lifetime has nothing left for the
+    // second; a budget of one per burst restarts all three.
+    std::uint64_t last_ckpt = 0;
+    for (int cycle = 1; cycle <= 3; ++cycle) {
+        const auto failed = await_trigger_above(w, last_ckpt);
+        ASSERT_TRUE(failed.has_value()) << "no trigger in cycle " << cycle;
+        last_ckpt = *failed;
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, *failed, role, sub, /*ok=*/false));
+        }
+        ASSERT_TRUE(w.await_frame(MessageKind::CancelJob, 10s).has_value());
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.send_finished(job_id, role, sub));
+        }
+        ASSERT_TRUE(learn_deploy()) << "cycle " << cycle
+                                    << ": no redeploy, so the failure exhausted a budget that "
+                                       "the completed checkpoints before it should have reset";
+        const auto good = await_trigger_above(w, last_ckpt);
+        ASSERT_TRUE(good.has_value());
+        last_ckpt = *good;
+        for (const auto& [role, sub] : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, *good, role, sub, /*ok=*/true));
+        }
+        ASSERT_TRUE(ckpt_await([&] {
+            return coordinator.latest_completed_checkpoint(job_id) >= last_ckpt;
+        })) << "cycle "
+            << cycle << ": the healthy checkpoint never completed";
+    }
+    EXPECT_FALSE(coordinator.await_job_completion(job_id, 1s))
+        << "the job ended although every failure was recovered and followed by a clean run";
 
     (void)coordinator.cancel_job(job_id);
     for (const auto& [role, sub] : tasks) {
