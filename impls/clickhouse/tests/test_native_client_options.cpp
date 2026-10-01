@@ -409,12 +409,75 @@ CoClientHello co_handshake(CoPeer& peer) {
 
 const std::string kCoInsert = "INSERT INTO `analytics`.`events` (`id`, `name`) FORMAT Native";
 
+// Waits until `writing` is set and the bytes `transport` has written have
+// grown past `from` and then stood still for `quiet`; false when that has not
+// happened within 5 s. A send with room in the socket buffers returns at once,
+// so a writer whose count stands still that long is blocked in one.
+bool co_writer_blocks(const native::InsertTransport& transport,
+                      const std::atomic<bool>& writing,
+                      std::uint64_t from,
+                      std::chrono::milliseconds quiet) {
+    const auto give_up = CoClock::now() + 5s;
+    while (!writing && CoClock::now() < give_up) {
+        std::this_thread::sleep_for(1ms);
+    }
+    std::uint64_t last = transport.counters().bytes_written;
+    auto since = CoClock::now();
+    while (CoClock::now() < give_up) {
+        std::this_thread::sleep_for(10ms);
+        const std::uint64_t count = transport.counters().bytes_written;
+        if (count != last) {
+            last = count;
+            since = CoClock::now();
+        } else if (count > from && CoClock::now() - since >= quiet) {
+            return true;
+        }
+    }
+    return false;
+}
+
 #if defined(CLINK_CLICKHOUSE_NATIVE_TLS)
+std::string co_temp_path(const std::string& name) {
+    return (std::filesystem::temp_directory_path() /
+            ("clink-native-co-" + std::to_string(::getpid()) + "-" + name))
+        .string();
+}
+
 std::string co_temp_file(const std::string& name, const std::string& contents) {
-    const auto path = std::filesystem::temp_directory_path() /
-                      ("clink-native-co-" + std::to_string(::getpid()) + "-" + name);
+    const std::string path = co_temp_path(name);
     std::ofstream(path) << contents;
-    return path.string();
+    return path;
+}
+
+std::string co_temp_dir(const std::string& name) {
+    const std::string path = co_temp_path(name);
+    std::filesystem::create_directories(path);
+    return path;
+}
+
+// What a secure connect with `tls` refuses, or empty when it refuses nothing.
+// On the way, checks that it opened no socket and left the transport
+// unconnected.
+std::string co_ca_refusal(native::TlsOptions tls) {
+    CoListener listener;
+    SinkOptions o = co_options(listener.port());
+    tls.enabled = true;
+    o.tls = std::move(tls);
+    // Bounds the handshake a connect that wrongly gets that far would wait in.
+    o.receive_timeout = 300ms;
+    const auto transport = make_clickhouse_transport(o);
+    std::string refusal;
+    try {
+        transport->connect(Endpoint{"127.0.0.1", listener.port()});
+    } catch (const NativeSinkError& e) {
+        EXPECT_EQ(e.code(), native::code::kOptionInvalid) << e.what();
+        refusal = e.what();
+    } catch (const std::exception& e) {
+        ADD_FAILURE() << "the connect failed without a refusal: " << e.what();
+    }
+    EXPECT_FALSE(transport->connected());
+    EXPECT_FALSE(listener.has_pending(100ms)) << "the connect opened a socket";
+    return refusal;
 }
 #endif
 
@@ -1051,6 +1114,72 @@ TEST(NativeTransport, AnInterruptWakesASelectBlockedOnTheServerWithin100Ms) {
     EXPECT_EQ(after_query, std::optional<std::string>(""));
 }
 
+// A cancel while the server has stopped reading mid-INSERT: send_block is
+// blocked in send with the socket buffers full, and interrupt() must return
+// it at once, not after the 5 s send timeout.
+TEST(NativeTransport, AnInterruptWakesASendBlockBlockedOnAStalledServerWithin100Ms) {
+    std::atomic<bool> header_out{false};
+    std::atomic<bool> done{false};
+    CoServer server([&](CoServer& s) {
+        CoPeer peer = s.accept();
+        (void)co_handshake(peer);
+        (void)peer.read_until_quiet();
+        peer.send(co_data_packet({{"id", "Int64", ""}}, 0));
+        header_out = true;
+        // Reads nothing more until the test is done with the connection.
+        const auto give_up = CoClock::now() + 10s;
+        while (!done && CoClock::now() < give_up) {
+            std::this_thread::sleep_for(5ms);
+        }
+    });
+    const auto transport = make_clickhouse_transport(co_options(server.port()));
+    transport->connect(server.endpoint());
+    const auto header = transport->begin_insert(kCoInsert);
+    const std::uint64_t before_blocks = transport->counters().bytes_written;
+
+    // 64 KiB of values a block, so that the count moves with every block the
+    // socket takes and stops when it takes no more.
+    ::clickhouse::Block block;
+    block.AppendColumn(
+        "id", std::make_shared<::clickhouse::ColumnInt64>(std::vector<std::int64_t>(8192, 7)));
+    std::atomic<bool> writing{false};
+    std::atomic<bool> returned{false};
+    std::exception_ptr failure;
+    CoClock::time_point woke_at;
+    std::thread writer([&] {
+        writing = true;
+        try {
+            // 256 MiB at most, far more than the buffers of both ends hold.
+            for (int i = 0; i < 4096; ++i) {
+                transport->send_block(block);
+            }
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        woke_at = CoClock::now();
+        returned = true;
+    });
+    const bool blocked = co_writer_blocks(*transport, writing, before_blocks, 200ms);
+    const bool still_writing = !returned;
+    const CoClock::time_point interrupted_at = CoClock::now();
+    transport->interrupt();
+    writer.join();
+    done = true;
+    transport->abandon();
+    server.join();
+
+    ASSERT_EQ(server.error(), "");
+    ASSERT_TRUE(header_out);
+    EXPECT_EQ(header.size(), 1U);
+    EXPECT_TRUE(blocked) << "send_block never blocked in send";
+    EXPECT_TRUE(still_writing) << "send_block finished before the interrupt";
+    ASSERT_TRUE(failure);
+    EXPECT_EQ(co_errno_of(failure), ECONNABORTED);
+    EXPECT_LT(woke_at - interrupted_at, 100ms)
+        << std::chrono::duration_cast<std::chrono::milliseconds>(woke_at - interrupted_at).count()
+        << " ms";
+}
+
 TEST(NativeTransport, SelectReadsTheTextRowsOfEveryBlock) {
     std::string query;
     CoServer server([&](CoServer& s) {
@@ -1107,6 +1236,138 @@ TEST(NativeTransport, AnUnloadableCaFileRefusesOptionInvalidBeforeAnySocket) {
     EXPECT_FALSE(transport->connected());
     EXPECT_FALSE(listener.has_pending(100ms));
     std::filesystem::remove(path);
+}
+
+// OpenSSL accepts any directory when the factory is built, so a typo or an
+// unmounted volume would otherwise reach the handshake and fail there as a
+// verify error naming no key, or be ignored with tls_verify off.
+TEST(NativeTransport, AMissingCaDirectoryRefusesOptionInvalidBeforeAnySocket) {
+    for (const bool verify : {true, false}) {
+        native::TlsOptions tls;
+        tls.ca_dir = "/nonexistent/clink-native-co-ca.d";
+        tls.verify = verify;
+        EXPECT_EQ(co_ca_refusal(tls),
+                  "[clickhouse.option_invalid] clickhouse_native_sink: option 'tls_ca_dir' "
+                  "('/nonexistent/clink-native-co-ca.d') does not exist")
+            << "tls_verify=" << verify;
+    }
+}
+
+TEST(NativeTransport, ACaDirectoryThatIsAFileRefusesOptionInvalidBeforeAnySocket) {
+    const std::string path = co_temp_file("ca-dir-is-a-file", "x\n");
+    native::TlsOptions tls;
+    tls.ca_dir = path;
+    EXPECT_EQ(co_ca_refusal(tls),
+              "[clickhouse.option_invalid] clickhouse_native_sink: option 'tls_ca_dir' ('" + path +
+                  "') is not a directory");
+    std::filesystem::remove(path);
+}
+
+TEST(NativeTransport, AMissingCaFileRefusesOptionInvalidInItsOwnWords) {
+    native::TlsOptions tls;
+    tls.ca_file = "/nonexistent/clink-native-co-ca.pem";
+    EXPECT_EQ(co_ca_refusal(tls),
+              "[clickhouse.option_invalid] clickhouse_native_sink: option 'tls_ca_file' "
+              "('/nonexistent/clink-native-co-ca.pem') does not exist");
+}
+
+TEST(NativeTransport, ACaFileThatIsADirectoryRefusesOptionInvalidBeforeAnySocket) {
+    const std::string path = co_temp_dir("ca-file-is-a-dir");
+    native::TlsOptions tls;
+    tls.ca_file = path;
+    EXPECT_EQ(co_ca_refusal(tls),
+              "[clickhouse.option_invalid] clickhouse_native_sink: option 'tls_ca_file' ('" + path +
+                  "') is a directory; a directory of CA certificates goes in 'tls_ca_dir'");
+    std::filesystem::remove(path);
+}
+
+TEST(NativeTransport, AnUnsearchableCaDirectoryOrUnreadableCaFileRefusesOptionInvalid) {
+    if (::geteuid() == 0) {
+        GTEST_SKIP() << "root reads and searches whatever the mode says";
+    }
+    namespace fs = std::filesystem;
+    const std::string denied = std::system_category().message(EACCES);
+    // Readable but not searchable: OpenSSL could not open a certificate in it.
+    const std::string dir = co_temp_dir("ca-unsearchable.d");
+    fs::permissions(dir, fs::perms::owner_read | fs::perms::owner_write);
+    const std::string file = co_temp_file("ca-unreadable.pem", "x\n");
+    fs::permissions(file, fs::perms::owner_write);
+
+    native::TlsOptions with_dir;
+    with_dir.ca_dir = dir;
+    EXPECT_EQ(co_ca_refusal(with_dir),
+              "[clickhouse.option_invalid] clickhouse_native_sink: option 'tls_ca_dir' ('" + dir +
+                  "') cannot be searched: " + denied);
+    native::TlsOptions with_file;
+    with_file.ca_file = file;
+    EXPECT_EQ(co_ca_refusal(with_file),
+              "[clickhouse.option_invalid] clickhouse_native_sink: option 'tls_ca_file' ('" + file +
+                  "') cannot be read: " + denied);
+
+    fs::permissions(dir, fs::perms::owner_all);
+    fs::permissions(file, fs::perms::owner_read | fs::perms::owner_write);
+    fs::remove(dir);
+    fs::remove(file);
+}
+
+// With both keys set, a directory that is not there is named on its own, and
+// once the paths are sound only the file can fail inside OpenSSL, so that is
+// the one named.
+TEST(NativeTransport, WithBothCaKeysSetTheRefusalNamesTheOneAtFault) {
+    const std::string bad_file = co_temp_file("both-bad-ca.pem", "this is not a certificate\n");
+    const std::string dir = co_temp_dir("both-ca.d");
+
+    native::TlsOptions missing_dir;
+    missing_dir.ca_dir = "/nonexistent/clink-native-co-ca.d";
+    missing_dir.ca_file = bad_file;
+    EXPECT_EQ(co_ca_refusal(missing_dir),
+              "[clickhouse.option_invalid] clickhouse_native_sink: option 'tls_ca_dir' "
+              "('/nonexistent/clink-native-co-ca.d') does not exist");
+
+    native::TlsOptions malformed_file;
+    malformed_file.ca_dir = dir;
+    malformed_file.ca_file = bad_file;
+    const std::string refusal = co_ca_refusal(malformed_file);
+    const std::string expected_start =
+        "[clickhouse.option_invalid] clickhouse_native_sink: option 'tls_ca_file' ('" + bad_file +
+        "') could not be loaded by OpenSSL: ";
+    EXPECT_EQ(refusal.substr(0, expected_start.size()), expected_start) << refusal;
+    EXPECT_GT(refusal.size(), expected_start.size());
+    EXPECT_EQ(refusal.find("tls_ca_dir"), std::string::npos) << refusal;
+
+    std::filesystem::remove(bad_file);
+    std::filesystem::remove(dir);
+}
+
+// The check refuses only what cannot work: a directory that is there, even
+// one holding nothing yet, is left to the handshake, which reaches the server.
+TEST(NativeTransport, AnExistingCaDirectoryIsLeftToTheHandshake) {
+    const std::string dir = co_temp_dir("empty-ca.d");
+    CoServer server([](CoServer& s) {
+        // Hangs up at once, so the handshake fails quickly.
+        (void)s.accept();
+    });
+    SinkOptions o = co_options(server.port());
+    o.tls.enabled = true;
+    o.tls.ca_dir = dir;
+    o.receive_timeout = 1000ms;
+    const auto transport = make_clickhouse_transport(o);
+
+    bool refused = false;
+    bool failed = false;
+    try {
+        transport->connect(server.endpoint());
+    } catch (const NativeSinkError& e) {
+        refused = true;
+        ADD_FAILURE() << e.what();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    server.join();
+    EXPECT_FALSE(refused);
+    EXPECT_TRUE(failed) << "a handshake against a peer that hung up succeeded";
+    EXPECT_EQ(server.error(), "") << "the connect never reached the server";
+    std::filesystem::remove(dir);
 }
 
 #else

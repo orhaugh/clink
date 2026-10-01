@@ -55,10 +55,11 @@ private:
 
 // Wraps NonSecureSocketFactory, or the vendored SSLSocketFactory when `tls`,
 // and returns a socket whose streams count bytes and honour the poison and the
-// deadline. The inner factory is built here, which for TLS loads the CA, so an
-// unreadable or malformed CA throws ::clickhouse::OpenSSLError before any
-// connect. On a build without TLS support, `tls` refuses
-// clickhouse.tls_unavailable.
+// deadline. The inner factory is built here, which for TLS loads the CA files,
+// so an unreadable or malformed one throws ::clickhouse::OpenSSLError before
+// any connect. A CA directory is only recorded here and searched during the
+// handshake, so a missing one passes; the transport checks it beforehand. On
+// a build without TLS support, `tls` refuses clickhouse.tls_unavailable.
 class CountingSocketFactory final : public ::clickhouse::SocketFactory {
 public:
     CountingSocketFactory(const ::clickhouse::ClientOptions& opts,

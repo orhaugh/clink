@@ -46,9 +46,13 @@ constexpr std::array<int, 12> kRetriedByPhase = {
     ch::KEEPER_EXCEPTION,
 };
 
-// Under quorum inserts the server raises these before it writes anything, and
-// they pass once enough replicas are back.
-constexpr std::array<int, 3> kQuorumTransient = {
+// Under quorum inserts these pass once enough replicas are back, so they are
+// retried, but by phase like the codes above. Nothing guarantees the INSERT
+// wrote nothing: some server lines check the quorum again on every chunk the
+// server squashes the INSERT's blocks into, by which time the parts of
+// earlier chunks may be committed, and on every line the commit of a later
+// part can fail on the quorum once an earlier part is in the table.
+constexpr std::array<int, 3> kQuorumRetried = {
     ch::TOO_FEW_LIVE_REPLICAS,
     ch::UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE,
     ch::READONLY,
@@ -152,8 +156,8 @@ FailureClass classify_server(const Failure& f, bool quorum_inserts) {
     if (code == ch::MEMORY_LIMIT_EXCEEDED) {
         return FailureClass::Resource;
     }
-    if (quorum_inserts && contains(kQuorumTransient, code)) {
-        return FailureClass::TransientNotWritten;
+    if (quorum_inserts && contains(kQuorumRetried, code)) {
+        return by_phase(f);
     }
     if (code == ch::READONLY || contains(kPermanentInsert, code) ||
         contains(kPermanentAccess, code)) {

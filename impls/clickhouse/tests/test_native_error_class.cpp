@@ -339,13 +339,34 @@ TEST(NativeErrorClass, AnUnreachableShardAndAnAbortBeforeAndAfterSend) {
     }
 }
 
-TEST(NativeErrorClass, QuorumFailuresAreTransientUnderQuorumInserts) {
+TEST(NativeErrorClass, QuorumFailuresAreRetriedByPhaseUnderQuorumInserts) {
     for (const int code : {285, 286, 164}) {
-        for (const Phase p : kAllPhases) {
-            const Failure f = ec_server(code, p, ec_sent(p));
+        for (const Phase p : kBeforeSendPhases) {
+            const Failure f = ec_server(code, p);
             EXPECT_EQ(classify(f, true), FailureClass::TransientNotWritten) << code;
             EXPECT_EQ(ec_decide(f, true).action, Action::Retry) << code;
         }
+        for (const Phase p : kAfterSendPhases) {
+            const Failure f = ec_server(code, p, true);
+            EXPECT_EQ(classify(f, true), FailureClass::InDoubt) << code;
+            EXPECT_EQ(ec_decide(f, true).action, Action::Retry) << code;
+        }
+    }
+}
+
+// A quorum INSERT whose blocks the server squashes into several chunks can
+// have the first chunk's parts in the table when a later chunk is refused, so
+// a refusal after a send must count as in doubt, the same as any other
+// retried code there, and never as a resend of nothing.
+TEST(NativeErrorClass, AQuorumFailureAfterSendIsInDoubtLikeAnyRetriedCode) {
+    for (const int code : {285, 286, 164}) {
+        const Failure at_end = ec_server(code, Phase::End, true);
+        EXPECT_EQ(classify(at_end, true), FailureClass::InDoubt)
+            << code << " classified as " << to_string(classify(at_end, true));
+        EXPECT_EQ(classify(at_end, true), classify(ec_server(202, Phase::End, true), true)) << code;
+        // after_send alone is enough, whatever phase the caller reports.
+        EXPECT_EQ(classify(ec_server(code, Phase::Begin, true), true), FailureClass::InDoubt)
+            << code;
     }
 }
 

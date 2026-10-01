@@ -54,8 +54,10 @@ public:
     ClickHouseTransport(const ClickHouseTransport&) = delete;
     ClickHouseTransport& operator=(const ClickHouseTransport&) = delete;
 
-    // A CA that OpenSSL cannot load refuses clickhouse.option_invalid, naming
-    // the key, before any socket: it is configuration, not an outage.
+    // A CA file or directory that does not exist, that cannot be read (a
+    // directory: searched), or that OpenSSL cannot load refuses
+    // clickhouse.option_invalid, naming the key and the path, before any
+    // socket: it is configuration, not an outage.
     void connect(const Endpoint& endpoint) override;
     [[nodiscard]] bool connected() const noexcept override;
     // The server of the last successful connect; empty before the first.

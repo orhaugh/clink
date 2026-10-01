@@ -4,6 +4,7 @@
 // layer the transport's guarantees rest on.
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -221,6 +222,32 @@ std::string sf_read_exactly(::clickhouse::InputStream& in, std::size_t n) {
     return out;
 }
 
+// Waits until `writing` is set and the bytes `control` has seen written have
+// grown and then stood still for `quiet`; false when that has not happened
+// within 5 s. A send with room in the socket buffers returns at once, so a
+// writer whose count stands still that long is blocked in one.
+bool sf_writer_blocks(const SocketControl& control,
+                      const std::atomic<bool>& writing,
+                      std::chrono::milliseconds quiet) {
+    const auto give_up = SfClock::now() + 5s;
+    while (!writing && SfClock::now() < give_up) {
+        std::this_thread::sleep_for(1ms);
+    }
+    std::uint64_t last = control.bytes_written();
+    auto since = SfClock::now();
+    while (SfClock::now() < give_up) {
+        std::this_thread::sleep_for(10ms);
+        const std::uint64_t count = control.bytes_written();
+        if (count != last) {
+            last = count;
+            since = SfClock::now();
+        } else if (count > 0 && SfClock::now() - since >= quiet) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The errno a std::system_error from `f` carries; 0 when `f` does not throw.
 template <typename F>
 int sf_system_errno(F&& f) {
@@ -377,6 +404,51 @@ TEST(NativeSocketFactory, APoisonFromAnotherThreadWakesABlockedReadWithin100Ms) 
 
     EXPECT_EQ(err, ECONNABORTED);
     EXPECT_LT(woke_at - poisoned_at, 100ms);
+}
+
+// A server that stops reading mid-INSERT leaves send_block blocked in send
+// with the socket buffers full. Only the shutdown of the write side wakes it;
+// without that the writer would stay there until the send timeout, which is
+// 5 s here.
+TEST(NativeSocketFactory, APoisonFromAnotherThreadWakesABlockedSendWithin100Ms) {
+    SfListener listener;
+    auto control = std::make_shared<SocketControl>();
+    const auto opts = sf_client_options();
+    CountingSocketFactory factory(opts, false, control);
+    const auto socket = factory.connect(opts, listener.endpoint());
+    // Accepted and never read.
+    const SfFd peer = listener.accept_peer();
+    ASSERT_GE(peer.get(), 0);
+    const auto out = socket->makeOutputStream();
+
+    std::atomic<bool> writing{false};
+    std::atomic<bool> returned{false};
+    int err = 0;
+    SfClock::time_point woke_at;
+    std::thread writer([&] {
+        const std::string chunk = sf_pattern(64 * 1024);
+        writing = true;
+        // 256 MiB at most, far more than the buffers of both ends hold.
+        err = sf_system_errno([&] {
+            for (int i = 0; i < 4096; ++i) {
+                sf_write_all(*out, chunk);
+            }
+        });
+        woke_at = SfClock::now();
+        returned = true;
+    });
+    const bool blocked = sf_writer_blocks(*control, writing, 200ms);
+    const bool still_writing = !returned;
+    const SfClock::time_point poisoned_at = SfClock::now();
+    control->poison();
+    writer.join();
+
+    EXPECT_TRUE(blocked) << "the writer never blocked in send";
+    EXPECT_TRUE(still_writing) << "the writer finished before the poison";
+    EXPECT_EQ(err, ECONNABORTED);
+    EXPECT_LT(woke_at - poisoned_at, 100ms)
+        << std::chrono::duration_cast<std::chrono::milliseconds>(woke_at - poisoned_at).count()
+        << " ms";
 }
 
 TEST(NativeSocketFactory, ConnectRefusesAfterAPoisonAndOpensNoConnection) {
@@ -552,6 +624,18 @@ TEST(NativeSocketFactory, AMalformedCaFileThrowsOpenSslErrorWhenTheFactoryIsBuil
     EXPECT_THROW(
         { CountingSocketFactory factory(opts, true, control); }, ::clickhouse::OpenSSLError);
     std::filesystem::remove(path);
+}
+
+// OpenSSL only records a CA directory here and looks inside it during the
+// handshake, so a factory over a directory that does not exist still builds.
+// That is why the transport checks the directory itself before it builds one.
+TEST(NativeSocketFactory, AMissingCaDirectoryStillBuildsAFactory) {
+    auto opts = sf_client_options();
+    opts.SetSSLOptions(::clickhouse::ClientOptions::SSLOptions{}
+                           .SetPathToCADirectory("/nonexistent/clink-native-sf-ca.d")
+                           .SetUseDefaultCALocations(false));
+    auto control = std::make_shared<SocketControl>();
+    EXPECT_NO_THROW({ CountingSocketFactory factory(opts, true, control); });
 }
 
 TEST(NativeSocketFactory, ATlsFactoryOverTheDefaultCaLocationsBuildsWithoutConnecting) {

@@ -2,13 +2,16 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <optional>
 #include <string_view>
 #include <system_error>
+#include <unistd.h>
 #include <utility>
 
 #include <clickhouse/columns/itemview.h>
 #include <clickhouse/exceptions.h>
 #include <clickhouse/types/types.h>
+#include <sys/stat.h>
 
 #include "native/errors.hpp"
 #include "native/socket_factory.hpp"
@@ -59,15 +62,54 @@ void require_timeout(std::chrono::milliseconds value, const char* key) {
     return ::clickhouse::CompressionMethod::LZ4;
 }
 
-// Which key a CA that OpenSSL refused came from. The client loads the
-// directory before the files and its error does not say which failed, so
-// with both set the refusal names both.
+// Why `path` cannot serve as a CA, or nothing when it can. OpenSSL only
+// records a CA directory when the socket factory is built and looks inside it
+// during the handshake, so without this a missing or unsearchable directory
+// would open a socket and fail as a verify error that names no key, or pass
+// unnoticed with tls_verify off. A file is checked the same way, so that its
+// refusal does not depend on what OpenSSL makes of a path it cannot open.
+std::optional<std::string> ca_path_problem(const std::string& path, bool directory) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) {
+        const int err = errno;
+        if (err == ENOENT || err == ENOTDIR) {
+            return std::string("does not exist");
+        }
+        return "cannot be reached: " + std::system_category().message(err);
+    }
+    const bool is_directory = S_ISDIR(st.st_mode);
+    if (directory && !is_directory) {
+        return std::string("is not a directory");
+    }
+    if (!directory && is_directory) {
+        return std::string("is a directory; a directory of CA certificates goes in 'tls_ca_dir'");
+    }
+    // OpenSSL opens the certificates in a directory by their hashed names and
+    // never lists it, so a directory needs search permission, not read.
+    if (::access(path.c_str(), directory ? X_OK : R_OK) != 0) {
+        const int err = errno;
+        return std::string(directory ? "cannot be searched: " : "cannot be read: ") +
+               std::system_category().message(err);
+    }
+    return std::nullopt;
+}
+
+void require_ca_path(const char* key, const std::string& path, bool directory) {
+    if (path.empty()) {
+        return;
+    }
+    if (const std::optional<std::string> problem = ca_path_problem(path, directory)) {
+        refuse(code::kOptionInvalid,
+               "option '" + std::string(key) + "' ('" + path + "') " + *problem);
+    }
+}
+
+// Which key a CA that OpenSSL refused came from. Both paths have passed
+// require_ca_path by then, and OpenSSL loads nothing from a directory until
+// the handshake, so with both keys set the file is the one it refused.
 std::string ca_refusal(const TlsOptions& tls, const std::string& openssl_text) {
     std::string subject;
-    if (!tls.ca_file.empty() && !tls.ca_dir.empty()) {
-        subject =
-            "option 'tls_ca_file' ('" + tls.ca_file + "') or 'tls_ca_dir' ('" + tls.ca_dir + "')";
-    } else if (!tls.ca_file.empty()) {
+    if (!tls.ca_file.empty()) {
         subject = "option 'tls_ca_file' ('" + tls.ca_file + "')";
     } else if (!tls.ca_dir.empty()) {
         subject = "option 'tls_ca_dir' ('" + tls.ca_dir + "')";
@@ -237,6 +279,10 @@ void ClickHouseTransport::connect(const Endpoint& endpoint) {
     }
 
     const ::clickhouse::ClientOptions opts = make_client_options(options_, endpoint);
+    if (options_.tls.enabled) {
+        require_ca_path("tls_ca_dir", options_.tls.ca_dir, true);
+        require_ca_path("tls_ca_file", options_.tls.ca_file, false);
+    }
     auto control = std::make_shared<SocketControl>();
     {
         // Installed under the lock interrupt() takes, and only after a second
