@@ -1,8 +1,10 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,8 +21,11 @@ struct ServerIdentity {
     Endpoint endpoint;
 };
 
-// Every metadata query selects String columns only (statements.hpp casts with
-// toString), so a result is text.
+// Every metadata query selects String columns only (statements.hpp wraps every
+// selected expression in CAST(... AS String)), so a result is text. The real
+// transport still accepts String, LowCardinality(String) and Nullable(String)
+// result columns (a NULL reads as empty text) and throws ProtocolError on any
+// other column type.
 struct ResultSet {
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
@@ -35,7 +40,9 @@ enum class MetaQuery : std::uint8_t {
     MergeTreeSettings,
     ClusterReplicaCount,
     ClusterTables,
-    ClusterMergeTreeSettings
+    ClusterMergeTreeSettings,
+    ReplicatedMergeTreeSettings,
+    ClusterReplicatedMergeTreeSettings
 };
 
 struct TransportCounters {
@@ -67,9 +74,16 @@ public:
     // way the sink ever disposes of a client.
     virtual void abandon() noexcept = 0;
     // Callable from any thread: makes a call blocked on this transport return
-    // promptly (poison and shut down the socket). Destroys nothing; the owning
+    // promptly (poison and shut down the socket). Sticky: every later connect()
+    // throws std::system_error(ECONNABORTED). Destroys nothing; the owning
     // thread then calls abandon().
     virtual void interrupt() noexcept = 0;
+    // Owning thread. Every socket read or write after `deadline` throws
+    // std::system_error(ETIMEDOUT), so a begin_insert or end_insert kept busy
+    // by Progress or ProfileEvents packets still ends. nullopt clears it; the
+    // writer arms it only around those two calls.
+    virtual void set_deadline(
+        std::optional<std::chrono::steady_clock::time_point> deadline) noexcept = 0;
     [[nodiscard]] virtual TransportCounters counters() const noexcept = 0;
 };
 

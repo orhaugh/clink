@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -117,6 +118,8 @@ public:
     void end_insert() override;
     void abandon() noexcept override;
     void interrupt() noexcept override;
+    void set_deadline(
+        std::optional<std::chrono::steady_clock::time_point> deadline) noexcept override;
     [[nodiscard]] TransportCounters counters() const noexcept override;
 
     struct Impl;

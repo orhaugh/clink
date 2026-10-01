@@ -36,6 +36,7 @@ if(_ch_native)
 
     target_sources(clink_clickhouse_tests PRIVATE
         test_native_arrow_to_block.cpp
+        test_native_client_options.cpp
         test_native_column_plan.cpp
         test_native_error_class.cpp
         test_native_errors.cpp

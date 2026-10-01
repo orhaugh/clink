@@ -48,7 +48,8 @@ struct ColumnBinding {
     ChType target;
     Conversion conversion{Conversion::Copy};
     std::vector<ColumnBinding> children;  // List element; Map key, value; Struct elements
-    std::int64_t multiplier{1};  // 10^(S - s) for decimals; 10^(P - unit digits) for timestamps
+    std::int64_t multiplier{1};  // 10^(S - s) for decimals; 10^(P - d) for timestamps when P >= d
+    std::int64_t divisor{1};     // 10^(d - P) for timestamps when P < d; exact or ConversionError
     bool zero_copy{false};
     std::string expected_header_type;  // client_header_spelling(target.spelling)
 };

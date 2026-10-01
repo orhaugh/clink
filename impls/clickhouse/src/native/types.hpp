@@ -34,9 +34,9 @@ enum class SqlKind : std::uint8_t {
 
 struct SqlType {
     SqlKind kind{SqlKind::Unsupported};
-    int precision{0};                      // DECIMAL p; TIMESTAMP p as rendered (0, 3, 6 or 9)
-    int scale{0};                          // DECIMAL s
-    bool with_time_zone{false};            // TIMESTAMP ... WITH TIME ZONE
+    int precision{0};            // DECIMAL p; TIMESTAMP p as rendered (0, 3, 6 or 9), report only
+    int scale{0};                // DECIMAL s
+    bool with_time_zone{false};  // TIMESTAMP ... WITH TIME ZONE
     std::vector<SqlType> children;         // ARRAY: element; MAP: key, value; ROW: fields
     std::vector<std::string> field_names;  // ROW
     std::string spelling;                  // as received, for messages
@@ -53,7 +53,8 @@ struct SqlColumn {
 [[nodiscard]] std::vector<SqlColumn> parse_sql_column_types(const std::string& spec);
 
 // The sink-local Arrow layout of a declared column. nullptr for Time, Bytea
-// and Unsupported.
+// and Unsupported. Every TIMESTAMP(p) is timestamp(ms[, "UTC"]), because the
+// Row value is epoch milliseconds whatever p.
 [[nodiscard]] std::shared_ptr<arrow::DataType> arrow_type_for(const SqlType&);
 
 // A ClickHouse column type, parsed from system.columns.type.

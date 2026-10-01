@@ -84,6 +84,7 @@ void FakeTransport::end_insert() {
 }
 void FakeTransport::abandon() noexcept {}
 void FakeTransport::interrupt() noexcept {}
+void FakeTransport::set_deadline(std::optional<std::chrono::steady_clock::time_point>) noexcept {}
 TransportCounters FakeTransport::counters() const noexcept {
     return {};
 }

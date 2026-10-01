@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <compare>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -14,6 +15,7 @@ struct Endpoint {
     std::string host;
     std::uint16_t port{9000};
     bool operator==(const Endpoint&) const = default;
+    auto operator<=>(const Endpoint&) const = default;
 };
 
 struct TlsOptions {

@@ -20,12 +20,14 @@ private:
 };
 
 // A row the target cannot accept (null into non-Nullable, out of range, bad
-// text for UUID/IPv4/IPv6/Enum, FixedString too long). Always permanent.
+// text for UUID/IPv4/IPv6/Enum, FixedString too long, a timestamp finer than
+// its target), or a cell of the wrong kind for a type the sink converts
+// itself. Always permanent.
 class ConversionError : public NativeSinkError {
 public:
     ConversionError(std::string column, std::int64_t row, const std::string& reason);
     [[nodiscard]] const std::string& column() const noexcept { return column_; }
-    // The row within the chunk being converted.
+    // The row within the chunk, or the Row batch, being converted.
     [[nodiscard]] std::int64_t row() const noexcept { return row_; }
 
 private:
@@ -50,6 +52,7 @@ inline constexpr const char* kTargetAsyncInsert = "clickhouse.target_async_inser
 inline constexpr const char* kTargetUnreadable = "clickhouse.target_unreadable";
 inline constexpr const char* kColumnPlan = "clickhouse.column_plan";
 inline constexpr const char* kMemoryBudgetTooSmall = "clickhouse.memory_budget_too_small";
+inline constexpr const char* kBarrierModeUnsupported = "clickhouse.barrier_mode_unsupported";
 // Runtime, after open:
 inline constexpr const char* kHeaderDrift = "clickhouse.header_drift";
 inline constexpr const char* kConversionFailed = "clickhouse.conversion_failed";
