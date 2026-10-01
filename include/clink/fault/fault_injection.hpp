@@ -284,6 +284,12 @@ inline constexpr char kCoordinatorBeforeMetadataWrite[] = "coordinator.before_me
 inline constexpr char kCoordinatorBeforeCompletedMarker[] = "coordinator.before_completed_marker";
 inline constexpr char kCoordinatorAfterCompletedMarker[] = "coordinator.after_completed_marker";
 inline constexpr char kCoordinatorBeforeCommitBroadcast[] = "coordinator.before_commit_broadcast";
+// A final-checkpoint request from a source at end of input, before it is
+// decided; and a cancel decided but not yet broadcast. Together they hold the
+// race in which a declined source used to commit its tail locally.
+inline constexpr char kCoordinatorBeforeFinalCheckpointRequest[] =
+    "coordinator.before_final_checkpoint_request";
+inline constexpr char kCoordinatorBeforeCancelBroadcast[] = "coordinator.before_cancel_broadcast";
 
 // Sink two-phase commit.
 inline constexpr char kSinkBeforePrepare[] = "sink.before_prepare";

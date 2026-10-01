@@ -1215,6 +1215,7 @@ void Worker::handle_final_checkpoint_assigned_(MessageReader& r) {
         auto it = final_assigned_.find(key);
         if (it != final_assigned_.end()) {
             it->second = msg.final_checkpoint_id;  // 0 = coordinator declined
+            final_declines_[key] = msg.decline;
         }
     }
     final_ckpt_cv_.notify_all();
@@ -2380,10 +2381,25 @@ void Worker::run_generic_subtask_(JobId job_id,
                 req.job_id = job_id;
                 req.role = role;
                 req.subtask_idx = sub;
+                // Only an explicit "this job takes no checkpoints" lets the
+                // source commit its tail locally. Any other way of not getting
+                // an id - the job is stopping, the coordinator is unreachable or
+                // silent - used to fall back to that local commit too, publishing
+                // a tail no checkpoint covers, which a restore then published
+                // again. A stopping job now stops here; a lost request fails the
+                // subtask, so the restart replays the tail under a checkpoint.
                 if (!send_frame_(encode_frame(MessageKind::RequestFinalCheckpoint, req))) {
-                    std::lock_guard lk(final_ckpt_mu_);
-                    final_assigned_.erase(key);
-                    return 0;
+                    {
+                        std::lock_guard lk(final_ckpt_mu_);
+                        final_assigned_.erase(key);
+                    }
+                    if (cancel_token->load(std::memory_order_acquire) ||
+                        stop_.load(std::memory_order_acquire)) {
+                        return 0;
+                    }
+                    throw std::runtime_error(
+                        "the final checkpoint request at end of input could not be sent to "
+                        "the coordinator; failing the subtask so the restart replays the tail");
                 }
                 std::unique_lock lk(final_ckpt_mu_);
                 final_ckpt_cv_.wait_for(lk, std::chrono::seconds(30), [&] {
@@ -2392,8 +2408,41 @@ void Worker::run_generic_subtask_(JobId job_id,
                            stop_.load(std::memory_order_acquire);
                 });
                 const auto v = final_assigned_[key];
+                const auto decline = final_declines_[key];
                 final_assigned_.erase(key);
-                return v.value_or(0);  // 0 on cancel/stop -> source skips the commit
+                final_declines_.erase(key);
+                lk.unlock();
+                if (cancel_token->load(std::memory_order_acquire) ||
+                    stop_.load(std::memory_order_acquire)) {
+                    return 0;  // torn down: the source skips the commit
+                }
+                if (!v.has_value()) {
+                    throw std::runtime_error(
+                        "the coordinator did not answer the final checkpoint request at end of "
+                        "input within 30s; failing the subtask so the restart replays the tail");
+                }
+                if (*v != 0) {
+                    return *v;
+                }
+                if (decline == FinalCheckpointDecline::NoCheckpointDir) {
+                    // No checkpoints to cover it: the tail commits locally, and
+                    // nothing recovers it if this run dies before it does.
+                    log::info("worker.final_checkpoint",
+                              "job_id=" + std::to_string(job_id) + " " + role + ":" +
+                                  std::to_string(sub) +
+                                  " takes no checkpoints; its tail commits locally");
+                    return 0;
+                }
+                // Stopping, unknown job, or a coordinator that does not say: the
+                // job is going away. Stop this task now rather than wait for the
+                // cancel broadcast, so the source exits without committing.
+                cancel_token->store(true, std::memory_order_release);
+                log::info("worker.final_checkpoint",
+                          "job_id=" + std::to_string(job_id) + " " + role + ":" +
+                              std::to_string(sub) +
+                              " was declined a final checkpoint because the job is stopping; "
+                              "its tail is not committed");
+                return 0;
             };
             auto wait_final_committed = [this, job_id, cancel_token](
                                             std::uint64_t id,

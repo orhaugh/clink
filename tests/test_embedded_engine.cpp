@@ -13,6 +13,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -23,6 +24,7 @@
 
 #include "clink/config/json.hpp"
 #include "clink/embed/embedded_engine.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/script_runner.hpp"
 
@@ -852,6 +854,112 @@ TEST(EmbeddedEngine, AnUnfinishedJobResumesFromItsCheckpointsInsteadOfReplaying)
         << "the resumed run numbers its checkpoints above the first run's";
     fs::remove_all(dir);
 }
+
+#ifdef CLINK_FAULT_INJECTION
+namespace {
+
+// Every line committed by the exactly-once file sink under `out`.
+std::vector<std::string> committed_lines(const fs::path& out) {
+    std::vector<std::string> lines;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(out / "committed", ec)) {
+        std::ifstream in(e.path());
+        for (std::string line; std::getline(in, line);) {
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+    }
+    std::sort(lines.begin(), lines.end());
+    return lines;
+}
+
+bool await_hits(std::string_view point, std::uint64_t n) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (clink::fault::Registry::instance().hits(point) < n) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
+int run_orders_into_exactly_once_file(const fs::path& in_path,
+                                      const fs::path& out,
+                                      const fs::path& ckpt,
+                                      bool cancel_at_end_of_input) {
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    opts.checkpoint_dir = ckpt.string();
+    opts.checkpoint_interval_ms = 100;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    const auto rc = engine.execute_script(
+        orders_ddl(in_path) +
+        "CREATE TABLE out_file (user_id BIGINT, amount BIGINT) WITH (connector='file', path='" +
+        out.string() +
+        "', format='json', delivery_guarantee='exactly_once');\n"
+        "INSERT INTO out_file SELECT user_id, amount FROM orders;");
+    if (rc != 0) {
+        ADD_FAILURE() << err.str();
+        return rc;
+    }
+    if (!cancel_at_end_of_input) {
+        return engine.await_all() ? 0 : 1;
+    }
+    auto& faults = clink::fault::Registry::instance();
+    // The source reaches the end of its input and asks for its final checkpoint.
+    EXPECT_TRUE(await_hits(clink::fault::points::kCoordinatorBeforeFinalCheckpointRequest, 1));
+    const auto ids = engine.job_ids();
+    EXPECT_EQ(ids.size(), 1U);
+    // The cancel is decided, and held before its broadcast.
+    std::thread canceller([&] { engine.cancel_job(ids.front()); });
+    EXPECT_TRUE(await_hits(clink::fault::points::kCoordinatorBeforeCancelBroadcast, 1));
+    // The request is answered in the gap: declined, the job is stopping.
+    faults.release(clink::fault::points::kCoordinatorBeforeFinalCheckpointRequest);
+    (void)engine.await_all();
+    faults.release(clink::fault::points::kCoordinatorBeforeCancelBroadcast);
+    canceller.join();
+    return 0;
+}
+
+}  // namespace
+
+// A cancel that races end of input. cancel_job marks the job cancelling, then
+// broadcasts CancelJob; a source that reached the end of its input between the
+// two asked for its final checkpoint, was declined, and committed its tail
+// locally, a commit that no checkpoint covers. The cancelled run leaves no
+// FINISHED marker, so a rerun resumes from the last completed checkpoint and
+// published the tail a second time.
+TEST(EmbeddedEngine, ACancelThatRacesEndOfInputDoesNotPublishATailARerunRepublishes) {
+    auto& faults = clink::fault::Registry::instance();
+    faults.reset();
+    const auto dir = resume_scratch("cancel_race");
+    write_orders(dir / "in.ndjson");
+    faults.arm({.point = clink::fault::points::kCoordinatorBeforeFinalCheckpointRequest,
+                .ordinal = 1,
+                .action = clink::fault::Action::Block});
+    faults.arm({.point = clink::fault::points::kCoordinatorBeforeCancelBroadcast,
+                .ordinal = 1,
+                .action = clink::fault::Action::Block});
+    ASSERT_EQ(run_orders_into_exactly_once_file(dir / "in.ndjson", dir / "out", dir / "ckpt", true),
+              0);
+    faults.reset();
+    ASSERT_EQ(
+        run_orders_into_exactly_once_file(dir / "in.ndjson", dir / "out", dir / "ckpt", false), 0);
+    const std::vector<std::string> expected{
+        R"({"amount":10,"user_id":1})",
+        R"({"amount":20,"user_id":2})",
+        R"({"amount":30,"user_id":1})",
+        R"({"amount":5,"user_id":2})",
+        R"({"amount":7,"user_id":1})",
+    };
+    EXPECT_EQ(committed_lines(dir / "out"), expected)
+        << "the cancelled run published its tail and the rerun published it again";
+    fs::remove_all(dir);
+}
+#endif  // CLINK_FAULT_INJECTION
 
 // A job that reached the end of its input is run again by a rerun - a bounded
 // load, a full-refresh view - rather than resumed at its end, where it would

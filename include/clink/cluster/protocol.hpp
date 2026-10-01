@@ -601,6 +601,17 @@ struct RequestFinalCheckpointMsg {
 // coordinator → worker. Reply to RequestFinalCheckpoint. final_checkpoint_id == 0 means the
 // coordinator declined (job already completing/cancelling, or no checkpoint dir); the
 // source then falls back / returns and the normal restart path takes over.
+// Why a final checkpoint was not assigned (FinalCheckpointAssignedMsg with id 0).
+// The source acts on it: only a job that takes no checkpoints may commit its
+// tail locally, because every other decline means the job is going away and a
+// local commit would publish a tail that no checkpoint covers.
+enum class FinalCheckpointDecline : std::uint8_t {
+    None = 0,             // assigned, or sent by a coordinator that predates the reason
+    Stopping = 1,         // the job is cancelling or has completed
+    NoCheckpointDir = 2,  // the job takes no checkpoints: the tail commits locally
+    UnknownJob = 3,       // this coordinator has no such job
+};
+
 struct FinalCheckpointAssignedMsg {
     JobId job_id{};
     std::string role;
@@ -610,6 +621,7 @@ struct FinalCheckpointAssignedMsg {
     // Zero means an unfenced coordinator and reproduces the pre-fencing
     // behaviour, so a mixed-version cluster keeps working mid-upgrade.
     std::uint64_t coordinator_epoch{0};
+    FinalCheckpointDecline decline{FinalCheckpointDecline::None};
 };
 
 // Sent by the client as the first frame on a control connection so the coordinator

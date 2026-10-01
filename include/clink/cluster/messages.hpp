@@ -491,6 +491,9 @@ inline void encode_body(MessageBuilder& b, const FinalCheckpointAssignedMsg& m) 
     // Fencing epoch, appended last so an older peer that stops
     // reading here still decodes the rest correctly.
     b.put_u64_be(m.coordinator_epoch);
+    // The decline reason rides after the epoch: an older reader stops at the
+    // epoch, and a newer one reads it only when the sender wrote it.
+    b.put_u8(static_cast<std::uint8_t>(m.decline));
 }
 
 // Wrap any typed message: produces the final framed byte buffer ready
@@ -776,6 +779,9 @@ inline FinalCheckpointAssignedMsg decode_final_checkpoint_assigned(MessageReader
     // Fencing epoch. Absent from a pre-fencing peer, which reads
     // as 0 = unfenced and preserves the old behaviour.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    if (!r.eof()) {
+        m.decline = static_cast<FinalCheckpointDecline>(r.read_u8());
+    }
     return m;
 }
 

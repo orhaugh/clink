@@ -398,6 +398,8 @@ private:
     std::mutex final_ckpt_mu_;
     std::condition_variable final_ckpt_cv_;
     std::unordered_map<std::string, std::optional<std::uint64_t>> final_assigned_;
+    // Why a request was declined, beside its 0 in final_assigned_.
+    std::unordered_map<std::string, FinalCheckpointDecline> final_declines_;
     std::unordered_map<JobId, std::uint64_t> final_committed_high_water_;
 
     // Per-task pending state: when Deploy arrives, we register one

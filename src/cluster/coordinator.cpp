@@ -2027,6 +2027,10 @@ CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
         }
     }
     if (ack.ok) {
+        // The job is cancelling but no worker knows yet: a source reaching end
+        // of input in this window is declined its final checkpoint, and must
+        // not commit its tail locally on the strength of that answer.
+        CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCancelBroadcast);
         CancelJobMsg cj;
         cj.job_id = job_id;
         const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
@@ -7174,14 +7178,22 @@ void Coordinator::stop() {
 void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
                                                    network::Connection& reply_conn) {
     auto msg = decode_request_final_checkpoint(r);
-    std::uint64_t final_id = 0;  // 0 == declined (job completing/cancelling/no dir)
+    // Holds a request in the window a cancel can open: decided here, the
+    // CancelJob broadcast still in flight (see cancel_job).
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeFinalCheckpointRequest);
+    std::uint64_t final_id = 0;  // 0 == declined; `decline` says why
+    auto decline = FinalCheckpointDecline::UnknownJob;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(msg.job_id);
         if (it != jobs_.end()) {
             auto& job = *it->second;
-            if (!job.completion_signalled && !job.cancel_requested &&
-                !job.checkpoint.checkpoint_dir.empty()) {
+            if (job.completion_signalled || job.cancel_requested) {
+                decline = FinalCheckpointDecline::Stopping;
+            } else if (job.checkpoint.checkpoint_dir.empty()) {
+                decline = FinalCheckpointDecline::NoCheckpointDir;
+            } else {
+                decline = FinalCheckpointDecline::None;
                 if (!job.final_checkpoint_id.has_value()) {
                     // First source to reach EOS: assign ONE final id for the job,
                     // seed its pending-ack set from the live task set (every
@@ -7250,6 +7262,7 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
     reply.role = msg.role;
     reply.subtask_idx = msg.subtask_idx;
     reply.final_checkpoint_id = final_id;
+    reply.decline = decline;
     send_frame(reply_conn, fenced_frame_(MessageKind::FinalCheckpointAssigned, reply));
 }
 

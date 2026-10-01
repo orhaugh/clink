@@ -4461,7 +4461,13 @@ public:
                         // commit only - no snapshot, no ack (the owner acks).
                         sink->on_barrier(barrier);
                         if (barrier.is_terminal()) {
-                            sink->on_commit(ckpt_id.value());
+                            // As below: a task being torn down does not
+                            // publish its tail.
+                            if (should_stop()) {
+                                sink->on_abort(ckpt_id.value());
+                            } else {
+                                sink->on_commit(ckpt_id.value());
+                            }
                         }
                     } else if (snap_worker && ctx.has_state_backend() && !barrier.is_terminal()) {
                         // Async path: capture on this thread, run the user
@@ -4542,8 +4548,15 @@ public:
                             // commit broadcast - there's no recovery
                             // scenario after end-of-stream. Commit locally
                             // so the sink finalizes its pre-committed
-                            // transaction before the runner exits.
-                            sink->on_commit(ckpt_id.value());
+                            // transaction before the runner exits. Unless the
+                            // task is being torn down: a cancelled job's tail
+                            // is covered by no checkpoint, and a rerun that
+                            // resumes it publishes the tail again.
+                            if (should_stop()) {
+                                sink->on_abort(ckpt_id.value());
+                            } else {
+                                sink->on_commit(ckpt_id.value());
+                            }
                         } else if (const auto& cb = ctx.checkpoint_ack(); cb) {
                             cb(ckpt_id, ok, std::move(err));
                         }

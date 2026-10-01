@@ -491,6 +491,40 @@ TEST(WireProtocol, DeployRoundTripsRescaleDirectivesPerTask) {
     EXPECT_EQ(out.tasks[2].key_group_last, 64);
 }
 
+TEST(WireProtocol, AFinalCheckpointDeclineSaysWhy) {
+    // The source may commit its tail locally only for a job that takes no
+    // checkpoints, so the reason has to survive the wire, after the epoch.
+    FinalCheckpointAssignedMsg in;
+    in.job_id = 3;
+    in.role = "src";
+    in.subtask_idx = 1;
+    in.final_checkpoint_id = 0;
+    in.coordinator_epoch = 12;
+    in.decline = FinalCheckpointDecline::Stopping;
+    auto out =
+        round_trip(MessageKind::FinalCheckpointAssigned, in, decode_final_checkpoint_assigned);
+    EXPECT_EQ(out.decline, FinalCheckpointDecline::Stopping);
+    EXPECT_EQ(out.coordinator_epoch, 12U);
+    in.decline = FinalCheckpointDecline::NoCheckpointDir;
+    out = round_trip(MessageKind::FinalCheckpointAssigned, in, decode_final_checkpoint_assigned);
+    EXPECT_EQ(out.decline, FinalCheckpointDecline::NoCheckpointDir);
+
+    // A reply that ends at the epoch, as an older coordinator sends it, says
+    // nothing about why.
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::FinalCheckpointAssigned));
+    b.put_u64_be(3);
+    b.put_string("src");
+    b.put_u32_be(1);
+    b.put_u64_be(0);
+    b.put_u64_be(12);
+    MessageReader r(body_of(b.finalize()));
+    (void)r.read_u8();
+    const auto legacy = decode_final_checkpoint_assigned(r);
+    EXPECT_EQ(legacy.coordinator_epoch, 12U);
+    EXPECT_EQ(legacy.decline, FinalCheckpointDecline::None);
+}
+
 TEST(WireProtocol, DeployRoundTripsEachTasksSuccession) {
     // The per-operator successor range rides ahead of the fencing epoch; a
     // task left at the default succeeds itself, and the epoch still decodes.

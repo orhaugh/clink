@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**A cancel that races end of input no longer publishes the tail twice.** At
+the end of a bounded input a source asks the coordinator for one final
+checkpoint, and every way of not getting one fell back to committing the tail
+locally, with no checkpoint behind it. A cancel marks the job cancelling
+before it broadcasts `CancelJob`, so a source that reached its end in between
+was declined and committed its tail; the cancelled run left no `FINISHED`
+marker, and a rerun on the same directory resumed from the last completed
+checkpoint and published the tail again. The same fallback ran when the
+request could not be sent or got no answer within 30 seconds. The reply now
+says why it declined: only a job that takes no checkpoints still commits its
+tail locally, a job that is stopping stops the source's task at once, and a
+lost or unanswered request fails the subtask so the restart replays the tail
+under a checkpoint. A sink whose task is already stopping now aborts a
+terminal transaction rather than committing it.
+
 **The S3 two-phase sink waits for a commit still in flight.** When a worker
 dies in the middle of completing a multipart upload, its request can still be
 running at the store when the recovering subtask completes the same upload,
