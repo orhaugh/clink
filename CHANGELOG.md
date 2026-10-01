@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**An HA takeover before a job's first checkpoint keeps the job.** The new
+leader restored each recovered job from its own latest completed checkpoint.
+A job that had completed none yet got the id 0 with its checkpoint directory,
+a pair the deploy lint refuses, so the recovery threw and the job was dropped;
+an operator resubmitting it then lost the savepoint it had been started from.
+A job with no checkpoint of its own now keeps the restore point it was
+submitted with, or starts fresh when it had none, as a restart already did. A
+recovery that still fails is logged at error level, says the job is not
+running, and counts `clink_ha_recovery_failed_total`.
+
 **A rescale no longer loses a completed checkpoint's records in an
 exactly-once sink.** A two-phase-commit sink keeps each prepared
 transaction's handle in operator state under the index of the subtask that

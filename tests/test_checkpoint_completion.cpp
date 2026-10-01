@@ -752,6 +752,97 @@ TEST(CheckpointCompletion, RecoveryRestoresFromTheLastCompletedCheckpoint) {
     std::filesystem::remove_all(root, ec);
 }
 
+// A takeover before the job has completed a checkpoint of its own. The new
+// leader used to take the job's own latest id, 0, as the restore point; the
+// deploy lint refuses a restore directory with id 0, so the recovery threw and
+// the job was dropped (and an operator resubmitting it lost the savepoint it
+// was started from). It must deploy from the restore point the job was
+// submitted with, or fresh when it had none, as a restart does.
+namespace {
+
+DeployMsg recovered_deploy_before_any_checkpoint(const std::string& tag,
+                                                 const std::string& restore_from_dir,
+                                                 std::uint64_t restore_from_checkpoint_id) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_early_recovery_" + tag + "_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(ckpt_dir);
+    DeployMsg out;
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        EXPECT_TRUE(w.valid());
+        EXPECT_TRUE(w.register_and_ack());
+        EXPECT_TRUE(a.await_registrations(2s));
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 100;
+        ckpt.max_restarts_on_worker_loss = 0;
+        ckpt.restore_from_dir = restore_from_dir;
+        ckpt.restore_from_checkpoint_id = restore_from_checkpoint_id;
+        const auto job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        EXPECT_GT(job_id, 0U);
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        EXPECT_TRUE(deploy.has_value());
+        if (deploy.has_value()) {
+            // The premise: the first deploy carried the submitted restore point.
+            EXPECT_EQ(decode_deploy(*deploy).restore_from_checkpoint_id,
+                      restore_from_checkpoint_id);
+        }
+        // No checkpoint is ever acked: the leader dies before the job's first.
+        w.close();
+        a.stop();
+    }
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        EXPECT_TRUE(w.valid());
+        EXPECT_TRUE(w.register_and_ack());
+        EXPECT_TRUE(b.await_registrations(2s));
+        b.recover_persisted_jobs();
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        EXPECT_TRUE(deploy.has_value()) << "the new leader dropped the job instead of deploying it";
+        if (deploy.has_value()) {
+            out = decode_deploy(*deploy);
+        }
+        w.close();
+        b.stop();
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    return out;
+}
+
+}  // namespace
+
+TEST(CheckpointCompletion, RecoveryBeforeTheFirstCheckpointKeepsTheSubmittedRestorePoint) {
+    const auto savepoint = std::filesystem::temp_directory_path() /
+                           ("clink_ckpt_early_recovery_sp_" + std::to_string(::getpid()));
+    std::filesystem::create_directories(savepoint);
+    const auto msg = recovered_deploy_before_any_checkpoint("sp", savepoint.string(), 7);
+    EXPECT_EQ(msg.restore_from_dir, savepoint.string());
+    EXPECT_EQ(msg.restore_from_checkpoint_id, 7U)
+        << "the recovered job did not resume from the savepoint it was submitted with";
+    std::error_code ec;
+    std::filesystem::remove_all(savepoint, ec);
+}
+
+TEST(CheckpointCompletion, RecoveryBeforeTheFirstCheckpointOfAFreshJobStartsItFresh) {
+    const auto msg = recovered_deploy_before_any_checkpoint("fresh", "", 0);
+    EXPECT_TRUE(msg.restore_from_dir.empty());
+    EXPECT_EQ(msg.restore_from_checkpoint_id, 0U);
+}
+
 // HA recovery replans the graph the job was SUBMITTED with - the manifest is
 // written once, at submit, and a rescale since then does not rewrite it - and
 // every task then restores from its own index in the latest completed

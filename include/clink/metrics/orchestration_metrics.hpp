@@ -197,6 +197,12 @@ inline void ha_recovery_skipped_plugin_inc() {
     MetricsRegistry::global().counter("clink_ha_recovery_skipped_plugin_total").increment();
 }
 
+// A persisted job the new leader could not resubmit: it is not running, and
+// every later takeover reads the same manifest, so it needs an operator.
+inline void ha_recovery_failed_inc() {
+    MetricsRegistry::global().counter("clink_ha_recovery_failed_total").increment();
+}
+
 }  // namespace orch
 
 }  // namespace clink::metrics

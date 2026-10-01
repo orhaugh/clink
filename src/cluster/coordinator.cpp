@@ -604,9 +604,14 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         // (legacy resolution via checkpoint_dir) must not be silently rebound
         // to a default configured after it was first submitted.
         pin_recovered_state_backend(ckpt);
-        // For recovery, always restore from this job's checkpoint dir
-        // at the latest COMPLETED-N marker the previous leader managed
-        // to write.
+        // For recovery, restore from this job's checkpoint dir at the latest
+        // COMPLETED-N marker the previous leader managed to write. A job that
+        // has completed no checkpoint of its own yet keeps the restore point it
+        // was submitted with (a savepoint, a predecessor's checkpoint), or
+        // starts fresh when it had none: the same rule a restart applies. It
+        // used to take its own id 0 as the restore point, which the deploy
+        // lint refuses, so the job was dropped at the takeover.
+        std::uint64_t own_restore_point = 0;
         if (!ckpt.checkpoint_dir.empty()) {
             // Commit-confirmed restore protocol: a manifest flagged as
             // carrying a non-recoverable-commit sink restores from the
@@ -618,8 +623,14 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
             const auto latest = needs_confirmation
                                     ? latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id)
                                     : latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
-            ckpt.restore_from_dir = ckpt.checkpoint_dir;
-            ckpt.restore_from_checkpoint_id = latest;
+            own_restore_point = latest;
+            if (latest > 0) {
+                ckpt.restore_from_dir = ckpt.checkpoint_dir;
+                ckpt.restore_from_checkpoint_id = latest;
+            } else if (ckpt.restore_from_dir.empty() || ckpt.restore_from_checkpoint_id == 0) {
+                ckpt.restore_from_dir.clear();
+                ckpt.restore_from_checkpoint_id = 0;
+            }
         }
         // Plugins: scan plugin-*.so keys in this job's prefix, load each
         // into a fresh JobBundle.
@@ -769,9 +780,11 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
             // Redeploy for a parked attempt read as a second redeploy from the
             // running state when the retry then deployed for real.
             if (protocol_trace::enabled()) {
+                // The job's own restore point: a submitted savepoint's id
+                // names another run's checkpoint, which the trace does not.
                 protocol_trace::Event("Redeploy")
                     .u("job", job_id)
-                    .u("restore", ckpt.restore_from_checkpoint_id)
+                    .u("restore", own_restore_point)
                     .u("next", floor + 1)
                     .emit();
             }
@@ -804,8 +817,12 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         } catch (const std::exception& e) {
             recovery_outcome = "failed";
             recovery_ok = false;
-            log::warn("coordinator.ha",
-                      "recovery failed for job_id=" + std::to_string(job_id) + ": " + e.what());
+            // The job is not running and no later takeover will run it either:
+            // its manifest still describes the same refusal.
+            clink::metrics::orch::ha_recovery_failed_inc();
+            log::error("coordinator.ha",
+                       "recovery failed for job_id=" + std::to_string(job_id) +
+                           "; the job is NOT running and needs a resubmit: " + e.what());
         }
         if (recovery_span_start != 0 && clink::metrics::SpanBuffer::global().enabled()) {
             clink::metrics::OtlpSpan span;
