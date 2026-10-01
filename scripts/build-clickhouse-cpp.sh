@@ -18,9 +18,11 @@
 # rebuild of the same version.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# versions.env sits beside this script both in the tree (scripts/) and in the image
+# layer that runs it (/tmp/clink-sys, where the Dockerfile copies the scripts flat).
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=versions.env
-source "${ROOT}/scripts/versions.env"
+. "${HERE}/versions.env"
 V="${CLICKHOUSE_CPP_VERSION}"
 OUT="${CLICKHOUSE_CPP_PREFIX:-${CLINK_DEPS_PREFIX}/clickhouse-cpp}"
 JOBS="${CLINK_BUILD_JOBS:-8}"
