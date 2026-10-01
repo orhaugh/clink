@@ -670,6 +670,178 @@ private:
     std::string& out_;
 };
 
+// Every column as the client writes it: name, type and the column's own
+// serialisation.
+std::string serialised(const ch::Block& block) {
+    std::string out;
+    StringOutput bytes(out);
+    for (std::size_t c = 0; c < block.GetColumnCount(); ++c) {
+        out += block.GetColumnName(c);
+        out += '\0';
+        out += block[c]->Type()->GetName();
+        out += '\0';
+        block[c]->Save(&bytes);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// What the server takes for a column
+
+// The release line of a server, for the one conversion rule that differs
+// between the lines the sink is tested on.
+struct Line {
+    std::uint64_t major{0};
+    std::uint64_t minor{0};
+
+    [[nodiscard]] bool at_least(std::uint64_t at_major, std::uint64_t at_minor) const {
+        return major > at_major || (major == at_major && minor >= at_minor);
+    }
+};
+
+// One column of an open INSERT as the server holds it.
+struct TableType {
+    std::string spelling;  // system.columns.type
+    ChType type;
+};
+
+bool is_enum(ChKind kind) {
+    return kind == ChKind::Enum8 || kind == ChKind::Enum16;
+}
+
+// The server keeps a Decimal in 32, 64, 128 or 256 bits by its precision,
+// and two Decimals of one width are the same type when their scales agree.
+int decimal_bits(int precision) {
+    if (precision <= 9) {
+        return 32;
+    }
+    if (precision <= 18) {
+        return 64;
+    }
+    return precision <= 38 ? 128 : 256;
+}
+
+// An Enum is named by its items in value order, however it was declared.
+std::vector<std::pair<std::int16_t, std::string>> enum_values(const ChType& type) {
+    std::vector<std::pair<std::int16_t, std::string>> out;
+    for (const auto& [name, value] : type.enum_items) {
+        out.emplace_back(value, name);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// The server names the elements of an unnamed Tuple 1, 2, and so on.
+std::vector<std::string> element_names(const ChType& type) {
+    if (!type.element_names.empty()) {
+        return type.element_names;
+    }
+    std::vector<std::string> out;
+    for (std::size_t i = 0; i < type.children.size(); ++i) {
+        out.push_back(std::to_string(i + 1));
+    }
+    return out;
+}
+
+bool server_equal(const ChType& a, const ChType& b);
+
+bool children_equal(const ChType& a, const ChType& b) {
+    if (a.children.size() != b.children.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.children.size(); ++i) {
+        if (!server_equal(a.children[i], b.children[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Type equality as the server decides it. Bool is UInt8 under another name,
+// and a time zone is display metadata, so neither tells two types apart.
+bool server_equal(const ChType& a, const ChType& b) {
+    const auto stored = [](ChKind kind) { return kind == ChKind::Bool ? ChKind::UInt8 : kind; };
+    if (stored(a.kind) != stored(b.kind) || a.nullable != b.nullable ||
+        a.low_cardinality != b.low_cardinality) {
+        return false;
+    }
+    switch (a.kind) {
+        case ChKind::FixedString:
+            return a.fixed_size == b.fixed_size;
+        case ChKind::Enum8:
+        case ChKind::Enum16:
+            return enum_values(a) == enum_values(b);
+        case ChKind::Decimal:
+            return a.scale == b.scale && decimal_bits(a.precision) == decimal_bits(b.precision);
+        case ChKind::DateTime64:
+            return a.precision == b.precision;
+        case ChKind::Tuple:
+            return element_names(a) == element_names(b) && children_equal(a, b);
+        case ChKind::Array:
+        case ChKind::Map:
+            return children_equal(a, b);
+        default:
+            return true;
+    }
+}
+
+ChType without_low_cardinality(ChType type) {
+    type.low_cardinality = false;
+    return type;
+}
+
+// Whether the server takes a column the client sent as `sent` for a column
+// it holds as `table`. Under input_format_native_allow_types_conversion=0,
+// which every sink INSERT sends, it converts only LowCardinality, adding or
+// removing it at any depth of an Array or a Tuple; lines from 26.8 also look
+// inside a Map, and older ones refuse a Map that differs only there. An Enum
+// passes for another Enum of the same width, since only its numbers travel.
+bool server_accepts(const ChType& sent, const ChType& table, Line line) {
+    if (server_equal(sent, table)) {
+        return true;
+    }
+    const bool plain =
+        !sent.nullable && !sent.low_cardinality && !table.nullable && !table.low_cardinality;
+    if (plain && is_enum(table.kind) && sent.kind == table.kind) {
+        return true;
+    }
+    if (sent.low_cardinality && server_equal(without_low_cardinality(sent), table)) {
+        return true;
+    }
+    if (table.low_cardinality && server_equal(sent, without_low_cardinality(table))) {
+        return true;
+    }
+    const bool composite =
+        sent.kind == ChKind::Array || sent.kind == ChKind::Tuple || sent.kind == ChKind::Map;
+    if (!plain || !composite || sent.kind != table.kind ||
+        sent.children.size() != table.children.size()) {
+        return false;
+    }
+    if (sent.kind == ChKind::Map && !line.at_least(26, 8)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < sent.children.size(); ++i) {
+        if (!server_accepts(sent.children[i], table.children[i], line)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Whether the server takes `sent` for INSERT column `table`, whose header
+// the client spelt as `header`.
+bool server_takes(const std::string& sent,
+                  const TableType& table,
+                  const HeaderColumn& header,
+                  Line line) {
+    const ChType parsed = parse_ch_type(sent);
+    if (parsed.kind == ChKind::Unsupported || table.type.kind == ChKind::Unsupported) {
+        // A type the sink's own parser cannot read is matched by its name.
+        return sent == table.spelling || sent == header.type;
+    }
+    return server_accepts(parsed, table.type, line);
+}
+
 // ---------------------------------------------------------------------------
 // The server's state
 
@@ -1208,6 +1380,8 @@ struct OpenInsert {
     std::string database, table;
     std::string token;
     std::vector<HeaderColumn> header;
+    std::vector<TableType> columns;  // the header's columns as the server holds them
+    Line line;
     std::size_t record{0};  // index into TableState::inserts
     std::vector<HeldBlock> blocks;
     // False once the server-side INSERT has failed: nothing more of it can land.
@@ -1231,6 +1405,12 @@ struct FakeTransport::Impl {
     std::uint64_t abandons{0};
     Deadline deadline;
     std::optional<Connection> conn;
+    // The client's own state. BeginInsert marks the client Inserting before
+    // it sends the query and does not undo that when anything then fails.
+    // So this is set when begin_insert starts, and only a successful
+    // end_insert or abandon() clears it. `insert` is the INSERT the server
+    // has open, which a failed begin_insert never opened.
+    bool inserting{false};
     std::optional<OpenInsert> insert;
     ServerIdentity identity;  // owning thread only
 
@@ -1442,7 +1622,14 @@ struct FakeTransport::Impl {
 
 namespace {
 
-std::vector<HeaderColumn> insert_header(FakeServer::Impl& s, const ParsedInsert& in) {
+// What begin_insert finds for the INSERT's column list.
+struct InsertColumns {
+    std::vector<HeaderColumn> header;
+    std::vector<TableType> table;
+    Line line;
+};
+
+InsertColumns insert_columns(FakeServer::Impl& s, const ParsedInsert& in) {
     const std::lock_guard<std::mutex> lock(s.mu);
     const TableState* t = s.find(in.database, in.table);
     if (t == nullptr) {
@@ -1474,60 +1661,61 @@ std::vector<HeaderColumn> insert_header(FakeServer::Impl& s, const ParsedInsert&
             listed.push_back(&*it);
         }
     }
-    std::vector<HeaderColumn> header;
+    InsertColumns out;
+    out.line = Line{s.major, s.minor};
     for (const TargetColumn* c : listed) {
         std::string spelling = client_header_spelling(c->type);
         if (spelling.empty()) {
             // What the client throws when it cannot build a header column.
             throw ch::UnimplementedError("unsupported column type: " + c->type);
         }
-        header.push_back(HeaderColumn{c->name, std::move(spelling)});
+        out.header.push_back(HeaderColumn{c->name, std::move(spelling)});
+        out.table.push_back(TableType{c->type, parse_ch_type(c->type)});
     }
-    return header;
+    return out;
 }
 
-// Serialises and renders one block, and finds where its structure departs
-// from the header, if it does.
+// Serialises and renders one block, and finds where the server would refuse
+// it, if it would.
 struct Captured {
     ReceivedBlock received;
     HeldBlock held;
     std::string mismatch;
 };
 
-Captured capture(const ch::Block& block, const std::vector<HeaderColumn>& header) {
+Captured capture(const ch::Block& block, const OpenInsert& in) {
     Captured out;
     const std::size_t rows = block.GetRowCount();
     out.received.rows = rows;
-    StringOutput bytes(out.received.bytes);
+    out.received.bytes = serialised(block);
     bool consistent = true;
     for (std::size_t c = 0; c < block.GetColumnCount(); ++c) {
-        const ch::ColumnRef column = block[c];
-        const std::string& name = block.GetColumnName(c);
-        const std::string type = column->Type()->GetName();
-        out.received.bytes += name;
-        out.received.bytes += '\0';
-        out.received.bytes += type;
-        out.received.bytes += '\0';
-        column->Save(&bytes);
-        if (column->Size() != rows) {
+        const std::size_t size = block[c]->Size();
+        if (size != rows) {
             consistent = false;
             if (out.mismatch.empty()) {
-                out.mismatch = "column `" + name + "` has " + std::to_string(column->Size()) +
-                               " rows and the block says " + std::to_string(rows);
+                out.mismatch = "column `" + block.GetColumnName(c) + "` has " +
+                               std::to_string(size) + " rows and the block says " +
+                               std::to_string(rows);
             }
         }
     }
     if (out.mismatch.empty()) {
-        if (block.GetColumnCount() != header.size()) {
+        if (block.GetColumnCount() != in.header.size()) {
             out.mismatch = "the block has " + std::to_string(block.GetColumnCount()) +
-                           " columns and the INSERT " + std::to_string(header.size());
+                           " columns and the INSERT " + std::to_string(in.header.size());
         } else {
-            for (std::size_t c = 0; c < header.size(); ++c) {
+            // The server checks a column against the table's own type, not
+            // against the client's spelling of the header: the client reads
+            // a Bool header as UInt8, and the sink sends a LowCardinality
+            // column as its plain type.
+            for (std::size_t c = 0; c < in.header.size(); ++c) {
                 const std::string type = block[c]->Type()->GetName();
-                if (block.GetColumnName(c) != header[c].name || type != header[c].type) {
+                if (block.GetColumnName(c) != in.header[c].name ||
+                    !server_takes(type, in.columns[c], in.header[c], in.line)) {
                     out.mismatch = "column " + std::to_string(c + 1) + " is `" +
                                    block.GetColumnName(c) + "` " + type + " and the INSERT has `" +
-                                   header[c].name + "` " + header[c].type;
+                                   in.header[c].name + "` " + in.columns[c].spelling;
                     break;
                 }
             }
@@ -1590,7 +1778,18 @@ FakeTransport::~FakeTransport() {
     // marker, which commits it, unless the socket can no longer carry it.
     try {
         std::unique_lock<std::mutex> lock(impl_->mu);
+        if (!impl_->inserting) {
+            return;
+        }
         if (!impl_->insert) {
+            // A failed begin_insert left the client inserting, so its
+            // destructor still sends the marker, though the server has no
+            // INSERT open for it to commit.
+            if (impl_->conn) {
+                FakeServer::Impl& s = impl_->conn->server->impl();
+                const std::lock_guard<std::mutex> server_lock(s.mu);
+                ++s.destroyed;
+            }
             return;
         }
         FakeServer::Impl& s = impl_->insert->server->impl();
@@ -1663,7 +1862,7 @@ const ServerIdentity& FakeTransport::server() const {
 ResultSet FakeTransport::select(MetaQuery kind, const std::string& sql) {
     std::unique_lock<std::mutex> lock(impl_->mu);
     impl_->require_connected();
-    if (impl_->insert) {
+    if (impl_->inserting) {
         throw ch::ValidationError("cannot execute query while executing another operation");
     }
     try {
@@ -1688,9 +1887,12 @@ ResultSet FakeTransport::select(MetaQuery kind, const std::string& sql) {
 std::vector<HeaderColumn> FakeTransport::begin_insert(const std::string& sql) {
     std::unique_lock<std::mutex> lock(impl_->mu);
     impl_->require_connected();
-    if (impl_->insert) {
+    if (impl_->inserting) {
         throw ch::ValidationError("cannot execute query while executing another operation");
     }
+    // Set before anything can fail and never undone by a failure: as with
+    // the real client, only abandon() gets out of a failed begin_insert.
+    impl_->inserting = true;
     try {
         impl_->require_live();
         const std::shared_ptr<FakeServer> server = impl_->conn->server;
@@ -1702,13 +1904,16 @@ std::vector<HeaderColumn> FakeTransport::begin_insert(const std::string& sql) {
             impl_->play(lock, *fault, abandons_at_start, true, nullptr);
         }
         const ParsedInsert parsed = parse_insert(sql);
-        std::vector<HeaderColumn> header = insert_header(s, parsed);
+        InsertColumns columns = insert_columns(s, parsed);
+        std::vector<HeaderColumn> header = columns.header;
         OpenInsert in;
         in.server = server;
         in.database = parsed.database;
         in.table = parsed.table;
         in.token = parsed.token;
-        in.header = header;
+        in.header = std::move(columns.header);
+        in.columns = std::move(columns.table);
+        in.line = columns.line;
         {
             const std::lock_guard<std::mutex> server_lock(s.mu);
             TableState* t = s.find(parsed.database, parsed.table);
@@ -1738,11 +1943,18 @@ std::vector<HeaderColumn> FakeTransport::begin_insert(const std::string& sql) {
 void FakeTransport::send_block(const ::clickhouse::Block& block) {
     std::unique_lock<std::mutex> lock(impl_->mu);
     impl_->require_connected();
-    if (!impl_->insert) {
+    if (!impl_->inserting) {
         throw ch::ValidationError("illegal to send insert data without first calling BeginInsert");
     }
     try {
         impl_->require_live();
+        if (!impl_->insert) {
+            // begin_insert failed, yet the client still writes the block.
+            // The server, which answered that INSERT with its error, reads
+            // it only to throw it away.
+            impl_->written.fetch_add(serialised(block).size());
+            return;
+        }
         if (!impl_->insert->pending) {
             throw ch::ProtocolError("fake server: this INSERT has already failed");
         }
@@ -1751,7 +1963,7 @@ void FakeTransport::send_block(const ::clickhouse::Block& block) {
         if (auto fault = s.take(Step::Send)) {
             impl_->play(lock, *fault, abandons_at_start, true, nullptr);
         }
-        Captured captured = capture(block, impl_->insert->header);
+        Captured captured = capture(block, *impl_->insert);
         impl_->written.fetch_add(captured.received.bytes.size());
         OpenInsert& in = *impl_->insert;
         if (in.deferred_error.empty() && !captured.mismatch.empty()) {
@@ -1776,11 +1988,19 @@ void FakeTransport::send_block(const ::clickhouse::Block& block) {
 void FakeTransport::end_insert() {
     std::unique_lock<std::mutex> lock(impl_->mu);
     impl_->require_connected();
-    if (!impl_->insert) {
+    if (!impl_->inserting) {
         return;  // as the client: EndInsert outside an INSERT does nothing
     }
     try {
         impl_->require_live();
+        if (!impl_->insert) {
+            // begin_insert failed. The client sends the marker and waits for
+            // the end of the INSERT, but the server has already answered it
+            // with its error, so the wait runs into the receive timeout.
+            throw_system(ETIMEDOUT,
+                         "fake transport: no reply to end_insert, because the server ended the "
+                         "INSERT when begin_insert failed");
+        }
         if (!impl_->insert->pending) {
             throw ch::ProtocolError("fake server: this INSERT has already failed");
         }
@@ -1808,6 +2028,7 @@ void FakeTransport::end_insert() {
         }
         impl_->land_parts(all, all.size());
         impl_->close_insert(ReceivedInsert::Outcome::Committed);
+        impl_->inserting = false;
     } catch (const std::system_error&) {
         impl_->fail_insert(true);
         throw;
@@ -1820,6 +2041,7 @@ void FakeTransport::end_insert() {
 void FakeTransport::abandon() noexcept {
     const std::lock_guard<std::mutex> lock(impl_->mu);
     ++impl_->abandons;
+    impl_->inserting = false;
     impl_->cv.notify_all();
     if (impl_->insert) {
         FakeServer::Impl& s = impl_->insert->server->impl();

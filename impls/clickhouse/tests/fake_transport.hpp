@@ -199,10 +199,13 @@ public:
     // after a failed one. So an INSERT whose End fails k times and is then
     // dropped counts k.
     [[nodiscard]] std::size_t abandoned_mid_insert() const;
-    // A client destroyed mid-INSERT without abandon(): the real client's
-    // destructor commits here, so the fake commits too and counts it. It
-    // counts even where nothing could commit (a failed INSERT, an interrupted
-    // or broken connection). Every sink test asserts this stays 0.
+    // A client destroyed while inserting without abandon(): mid-INSERT, or
+    // after a begin_insert that failed, which leaves the client inserting.
+    // The real client's destructor then sends the end-of-data marker, which
+    // commits an open INSERT, so the fake commits too and counts it. It
+    // counts even where nothing could commit (a failed begin_insert or
+    // INSERT, an interrupted or broken connection). Every sink test asserts
+    // this stays 0.
     [[nodiscard]] std::size_t destroyed_mid_insert() const;
     // Every connect() routed to this server, the refused ones included, so a
     // failover test can see which endpoints were tried.
@@ -239,9 +242,20 @@ public:
     // The header has the INSERT's column list in its order, each column in
     // client_header_spelling of its table type. A type the client cannot
     // build throws ::clickhouse::UnimplementedError, as inside BeginInsert.
+    // Whatever it throws, the client is left inserting, as BeginInsert
+    // leaves it. Until abandon(), select and begin_insert then throw the
+    // client's ValidationError, send_block lands nothing, and end_insert
+    // lands nothing and throws ETIMEDOUT, the client's receive timeout on a
+    // reply the server will not send.
     std::vector<HeaderColumn> begin_insert(const std::string& sql) override;
-    // A block whose structure differs from the header fails the INSERT with
-    // server code 53 at end_insert, as the server's reply would.
+    // A block the server would refuse fails the INSERT with server code 53
+    // at end_insert, as the server's reply would. Each column is checked
+    // against its table type as the server compares types, not against the
+    // header's spelling: Bool is UInt8 to the server, a time zone does not
+    // make a different type, and under
+    // input_format_native_allow_types_conversion=0, which every sink INSERT
+    // sends, the server adds or removes LowCardinality itself, inside an
+    // Array or a Tuple too, and inside a Map from 26.8.
     void send_block(const ::clickhouse::Block& block) override;
     void end_insert() override;
     void abandon() noexcept override;

@@ -1,7 +1,8 @@
 // The fake server and transport's own semantics, pinned before any sink test
 // relies on them: what lands and when, the deduplication log, the landing
-// modes, the counters a sink test asserts on, interrupt, release, outages,
-// endpoint routing and the deadline.
+// modes, the counters a sink test asserts on, the client's call order, which
+// column types the server takes, interrupt, release, outages, endpoint
+// routing and the deadline.
 
 #include <array>
 #include <atomic>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -24,12 +26,15 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/api.h>
+#include <arrow/json/from_string.h>
 #include <clickhouse/block.h>
 #include <clickhouse/columns/array.h>
 #include <clickhouse/columns/bool.h>
 #include <clickhouse/columns/date.h>
 #include <clickhouse/columns/decimal.h>
 #include <clickhouse/columns/enum.h>
+#include <clickhouse/columns/factory.h>
 #include <clickhouse/columns/ip4.h>
 #include <clickhouse/columns/ip6.h>
 #include <clickhouse/columns/lowcardinality.h>
@@ -44,6 +49,7 @@
 #include <gtest/gtest.h>
 
 #include "fake_transport.hpp"
+#include "native/arrow_to_block.hpp"
 #include "native/column_plan.hpp"
 #include "native/sql_text.hpp"
 #include "native/statements.hpp"
@@ -515,42 +521,160 @@ TEST(NativeFakeTransport, BeginInsertRefusesWhatTheServerOrTheClientWould) {
     table.columns.push_back({"wide", "Int256", DefaultKind::None, 4});
     auto server = ft_server_with(table);
     FakeTransport t(server);
-    t.connect(kFtEp1);
     auto tokens = ft_tokens();
+    // A refused begin leaves the client inserting, so each attempt gets a
+    // new client.
+    const auto fresh = [&]() -> FakeTransport& {
+        t.abandon();
+        t.connect(kFtEp1);
+        return t;
+    };
 
-    auto err = ft_server_error([&] { (void)t.begin_insert(ft_insert_sql(tokens.next(), "nope")); });
+    auto err =
+        ft_server_error([&] { (void)fresh().begin_insert(ft_insert_sql(tokens.next(), "nope")); });
     ASSERT_TRUE(err.has_value());
     EXPECT_EQ(err->code, ch::UNKNOWN_TABLE);
     EXPECT_EQ(err->text, "Table db.nope does not exist");
 
     err = ft_server_error(
-        [&] { (void)t.begin_insert(ft_insert_sql(tokens.next(), "events", "(`id`, `x`)")); });
+        [&] { (void)fresh().begin_insert(ft_insert_sql(tokens.next(), "events", "(`id`, `x`)")); });
     ASSERT_TRUE(err.has_value());
     EXPECT_EQ(err->code, ch::NO_SUCH_COLUMN_IN_TABLE);
     EXPECT_EQ(err->text, "No such column x in table db.events");
 
     err = ft_server_error(
-        [&] { (void)t.begin_insert(ft_insert_sql(tokens.next(), "events", "(`id`, `m`)")); });
+        [&] { (void)fresh().begin_insert(ft_insert_sql(tokens.next(), "events", "(`id`, `m`)")); });
     ASSERT_TRUE(err.has_value());
     EXPECT_EQ(err->code, ch::ILLEGAL_COLUMN);
     EXPECT_EQ(err->text, "Cannot insert column m, because it is MATERIALIZED column");
 
     try {
-        (void)t.begin_insert(ft_insert_sql(tokens.next(), "events", "(`id`, `wide`)"));
+        (void)fresh().begin_insert(ft_insert_sql(tokens.next(), "events", "(`id`, `wide`)"));
         ADD_FAILURE() << "an unbuildable header type must throw";
     } catch (const ch::UnimplementedError& e) {
         EXPECT_STREQ(e.what(), "unsupported column type: Int256");
     }
 
-    err = ft_server_error([&] { (void)t.begin_insert("SELECT 1"); });
+    err = ft_server_error([&] { (void)fresh().begin_insert("SELECT 1"); });
     ASSERT_TRUE(err.has_value());
     EXPECT_EQ(err->code, ch::SYNTAX_ERROR);
 
     // None of those opened an INSERT: abandoning counts nothing, and a new
-    // INSERT can begin.
-    EXPECT_NO_THROW((void)t.begin_insert(ft_insert_sql(tokens.next())));
+    // client can begin one.
+    EXPECT_NO_THROW((void)fresh().begin_insert(ft_insert_sql(tokens.next())));
     t.abandon();
     EXPECT_EQ(server->abandoned_mid_insert(), 1u);
+    EXPECT_EQ(server->inserts("events").size(), 1u);
+    EXPECT_EQ(server->destroyed_mid_insert(), 0u);
+}
+
+// BeginInsert marks the client Inserting before it sends the query and does
+// not undo that when anything fails, so a client whose begin failed runs no
+// other query until it is replaced.
+TEST(NativeFakeTransport, AFailedBeginLeavesTheClientInsertingUntilAbandon) {
+    FakeTable table = ft_events();
+    table.columns.push_back({"wide", "Int256", DefaultKind::None, 3});
+    auto server = ft_server_with(table);
+    auto tokens = ft_tokens();
+    const std::string good = ft_insert_sql(tokens.next());
+    const std::string settings_sql = native::select_server_settings(kFtBudget);
+    const auto begin_fault = [&](Fault::Kind kind, int code) {
+        Fault f;
+        f.step = Step::Begin;
+        f.kind = kind;
+        f.code = code;
+        f.message = "scripted";
+        server->inject(f);
+    };
+    struct Case {
+        std::string what;
+        std::function<void()> arm;
+        std::string sql;
+    };
+    const std::vector<Case> cases = {
+        {"an unknown table", [] {}, ft_insert_sql(tokens.next(), "missing")},
+        {"a header the client cannot build",
+         [] {},
+         ft_insert_sql(tokens.next(), "events", "(`id`, `wide`)")},
+        {"a server error", [&] { begin_fault(Fault::Kind::ServerError, 202); }, good},
+        {"a retryable 279", [&] { begin_fault(Fault::Kind::ServerError, 279); }, good},
+        {"a broken connection", [&] { begin_fault(Fault::Kind::SystemError, 0); }, good},
+        {"a protocol error", [&] { begin_fault(Fault::Kind::ProtocolError, 0); }, good},
+    };
+    FakeTransport t(server);
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.what);
+        t.connect(kFtEp1);
+        c.arm();
+        EXPECT_ANY_THROW((void)t.begin_insert(c.sql));
+        try {
+            (void)t.begin_insert(good);
+            ADD_FAILURE() << "a client whose begin failed must not begin again";
+        } catch (const ch::ValidationError& e) {
+            EXPECT_STREQ(e.what(), "cannot execute query while executing another operation");
+        }
+        EXPECT_THROW((void)t.select(MetaQuery::ServerSettings, settings_sql), ch::ValidationError);
+        t.abandon();
+    }
+    EXPECT_EQ(server->abandoned_mid_insert(), 0u);
+    EXPECT_TRUE(server->inserts("events").empty());
+
+    // A new client begins at once.
+    t.connect(kFtEp1);
+    ft_insert(t, good, {ft_ids(0, 2)});
+    EXPECT_EQ(server->rows("events"), 2u);
+    EXPECT_EQ(server->destroyed_mid_insert(), 0u);
+}
+
+TEST(NativeFakeTransport, AfterAFailedBeginBlocksGoNowhereAndTheEndTimesOut) {
+    auto server = ft_server_with(ft_events(10));
+    auto tokens = ft_tokens();
+    FakeTransport t(server);
+    t.connect(kFtEp1);
+    EXPECT_TRUE(ft_server_error([&] {
+                    (void)t.begin_insert(ft_insert_sql(tokens.next(), "missing"));
+                }).has_value());
+
+    // The client still writes a block; the server, which already answered
+    // that INSERT, throws it away.
+    const auto before = t.counters().bytes_written;
+    EXPECT_NO_THROW(t.send_block(ft_ids(0, 3)));
+    EXPECT_GT(t.counters().bytes_written, before);
+    EXPECT_EQ(ft_errno([&] { t.end_insert(); }), ETIMEDOUT);
+    EXPECT_EQ(server->rows("events"), 0u);
+    EXPECT_TRUE(server->inserts("events").empty());
+    // Still inserting, and the connection is now dead.
+    EXPECT_THROW((void)t.begin_insert(ft_insert_sql(tokens.next())), ch::ValidationError);
+    EXPECT_EQ(ft_errno([&] { t.send_block(ft_ids(0, 1)); }), ECONNRESET);
+    t.abandon();
+    EXPECT_EQ(server->abandoned_mid_insert(), 0u);
+    EXPECT_EQ(server->destroyed_mid_insert(), 0u);
+}
+
+TEST(NativeFakeTransport, AClientDestroyedAfterAFailedBeginIsCounted) {
+    auto server = ft_server_with(ft_events());
+    auto tokens = ft_tokens();
+    {
+        FakeTransport t(server);
+        t.connect(kFtEp1);
+        EXPECT_TRUE(ft_server_error([&] {
+                        (void)t.begin_insert(ft_insert_sql(tokens.next(), "missing"));
+                    }).has_value());
+    }
+    // Nothing could commit, but the destroy broke the rule that a client is
+    // dropped only through abandon().
+    EXPECT_EQ(server->destroyed_mid_insert(), 1u);
+    EXPECT_EQ(server->rows("events"), 0u);
+
+    {
+        FakeTransport t(server);
+        t.connect(kFtEp1);
+        EXPECT_TRUE(ft_server_error([&] {
+                        (void)t.begin_insert(ft_insert_sql(tokens.next(), "missing"));
+                    }).has_value());
+        t.abandon();
+    }
+    EXPECT_EQ(server->destroyed_mid_insert(), 1u);
 }
 
 TEST(NativeFakeTransport, BlocksAreBufferedUntilEndInsertThenLandSquashed) {
@@ -1500,6 +1624,148 @@ TEST(NativeFakeTransport, ABlockThatDoesNotMatchTheHeaderFailsTheInsertAtEnd) {
     EXPECT_EQ(server->rows("events"), 0u);
 }
 
+// What the server makes of a column whose type is not the header's spelling,
+// with type conversion off as the sink sends every INSERT. Empty columns are
+// enough, since only the types are compared.
+TEST(NativeFakeTransport, AColumnIsCheckedAgainstTheTableTypeAsTheServerComparesTypes) {
+    struct Case {
+        std::string table_type;
+        std::string sent;  // a client type name; "Bool" means the client's ColumnBool
+        bool takes;
+        std::uint64_t minor{8};
+    };
+    const std::vector<Case> cases = {
+        // The pinned client reads a Bool header as UInt8; to the server they
+        // are one type.
+        {"Bool", "Bool", true},
+        {"Bool", "UInt8", true},
+        {"UInt8", "Bool", true},
+        // A time zone is display metadata.
+        {"DateTime('UTC')", "DateTime", true},
+        {"DateTime", "DateTime('Europe/London')", true},
+        {"DateTime64(3, 'UTC')", "DateTime64(3)", true},
+        {"DateTime64(3)", "DateTime64(6)", false},
+        // LowCardinality is added or removed by the server itself.
+        {"LowCardinality(String)", "String", true},
+        {"LowCardinality(Nullable(String))", "Nullable(String)", true},
+        {"LowCardinality(FixedString(2))", "FixedString(2)", true},
+        {"String", "LowCardinality(String)", true},
+        {"LowCardinality(Nullable(String))", "String", false},
+        {"LowCardinality(String)", "Nullable(String)", false},
+        {"Array(LowCardinality(String))", "Array(String)", true},
+        {"Tuple(a LowCardinality(String), b Int64)", "Tuple(String, Int64)", true},
+        {"Tuple(a String, b Int64)", "Tuple(String)", false},
+        // Only lines from 26.8 look inside a Map.
+        {"Map(LowCardinality(String), Int64)", "Map(String, Int64)", true, 8},
+        {"Map(LowCardinality(String), Int64)", "Map(String, Int64)", false, 3},
+        {"Map(String, Int64)", "Map(String, Int64)", true, 3},
+        // Only an Enum's numbers travel.
+        {"Enum8('b' = 1, 'c' = 2)", "Enum8('a' = 1)", true},
+        {"Enum8('a' = 1)", "Enum16('a' = 1)", false},
+        // A Decimal is its width and scale.
+        {"Decimal(18, 2)", "Decimal(10,2)", true},
+        {"Decimal(10, 2)", "Decimal(9,2)", false},
+        {"Decimal(10, 2)", "Decimal(10,3)", false},
+        // No other conversion happens.
+        {"Int64", "Int32", false},
+        {"Int64", "Nullable(Int64)", false},
+        {"String", "FixedString(2)", false},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.sent + " into " + c.table_type + " on 26." + std::to_string(c.minor));
+        FakeTable table = ft_events();
+        table.columns = {{"c", c.table_type, DefaultKind::None, 1}};
+        auto server = ft_server_with(table);
+        server->set_version(26, c.minor, 1);
+        FakeTransport t(server);
+        t.connect(kFtEp1);
+        auto tokens = ft_tokens();
+        (void)t.begin_insert(ft_insert_sql(tokens.next(), "events", "(`c`)"));
+        ch::Block block;
+        block.AppendColumn(
+            "c",
+            c.sent == "Bool" ? std::make_shared<ch::ColumnBool>() : ch::CreateColumnByType(c.sent));
+        block.RefreshRowCount();
+        t.send_block(block);
+        const auto err = ft_server_error([&] { t.end_insert(); });
+        EXPECT_EQ(!err.has_value(), c.takes) << (err ? err->text : "taken");
+        if (err) {
+            EXPECT_EQ(err->code, ch::TYPE_MISMATCH);
+            EXPECT_NE(err->text.find("and the INSERT has `c` " + c.table_type), std::string::npos)
+                << err->text;
+            t.abandon();
+        }
+    }
+}
+
+// BlockBuilder's output for the targets the sink sends as another type of
+// column lands, as it does on the server.
+TEST(NativeFakeTransport, WhatTheBlockBuilderSendsLandsForEveryTargetTheServerConverts) {
+    struct Case {
+        std::string declared;
+        std::string target;
+        std::string json;
+        FtRows landed;
+    };
+    const std::vector<Case> cases = {
+        {"BOOLEAN", "Bool", "[true, false]", {{"true"}, {"false"}}},
+        {"BOOLEAN", "UInt8", "[true, false]", {{"1"}, {"0"}}},
+        {"VARCHAR", "LowCardinality(String)", R"(["a", "b"])", {{"a"}, {"b"}}},
+        {"VARCHAR", "LowCardinality(Nullable(String))", R"(["a", null])", {{"a"}, {"NULL"}}},
+        {"VARCHAR",
+         "LowCardinality(FixedString(2))",
+         R"(["ab", "c"])",
+         {{"ab"}, {std::string("c\0", 2)}}},
+        {"VARCHAR ARRAY",
+         "Array(LowCardinality(String))",
+         R"([["a", "b"], []])",
+         {{"['a','b']"}, {"[]"}}},
+        {"MAP<VARCHAR, BIGINT>",
+         "Map(LowCardinality(String), Int64)",
+         R"([[["k", 1]], []])",
+         {{"{'k':1}"}, {"{}"}}},
+        {"TIMESTAMP(3)",
+         "DateTime('UTC')",
+         "[1700000000000, 0]",
+         {{"2023-11-14 22:13:20"}, {"1970-01-01 00:00:00"}}},
+        {"TIMESTAMP(3)",
+         "DateTime64(3, 'UTC')",
+         "[1700000000123, 0]",
+         {{"2023-11-14 22:13:20.123"}, {"1970-01-01 00:00:00.000"}}},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.declared + " into " + c.target);
+        FakeTable table = ft_events();
+        table.columns = {{"c", c.target, DefaultKind::None, 1}};
+        auto server = ft_server_with(table);
+        const std::string spec = "c:" + c.declared;
+        const auto declared = native::parse_sql_column_types(spec);
+        auto planned = native::compile_column_plan(declared, table.columns);
+        ASSERT_TRUE(planned.plan.has_value())
+            << (planned.problems.empty() ? "" : planned.problems.front().message);
+        const auto type = native::arrow_type_for(declared.front().type);
+        ASSERT_NE(type, nullptr);
+        const auto values = arrow::json::ArrayFromJSONString(type, c.json).ValueOrDie();
+        const auto chunk = arrow::RecordBatch::Make(
+            arrow::schema({arrow::field("c", type)}), values->length(), {values});
+        native::BlockBuilder builder(*planned.plan);
+        builder.append(*chunk, 0, chunk->num_rows());
+        const ch::Block block = builder.take();
+
+        FakeTransport t(server);
+        t.connect(kFtEp1);
+        auto tokens = ft_tokens();
+        (void)t.begin_insert(ft_insert_sql(tokens.next(), "events", planned.plan->column_list_sql));
+        t.send_block(block);
+        const auto err = ft_server_error([&] { t.end_insert(); });
+        ASSERT_FALSE(err.has_value())
+            << "sent " << block[0]->Type()->GetName() << ": " << err->text;
+        const auto landed = server->landed("events");
+        ASSERT_EQ(landed.size(), 1u);
+        EXPECT_EQ(landed[0].values, c.landed);
+    }
+}
+
 TEST(NativeFakeTransport, CallOrderMirrorsTheClient) {
     auto server = ft_server_with(ft_events());
     FakeTransport t(server);
@@ -1750,8 +2016,8 @@ TEST(NativeFakeTransport, RendersEveryValueKindTheSinkSends) {
 }
 
 TEST(NativeFakeTransport, RendersTheClientsOwnBoolColumnAsTrueOrFalse) {
-    // The pinned client builds a Bool header as UInt8, so a ColumnBool does
-    // not match it; its rendering still shows in what was received.
+    // The pinned client builds a Bool header as UInt8, but the server takes
+    // a ColumnBool for a Bool column all the same.
     FakeTable table = ft_events();
     table.columns = {{"flag", "Bool", DefaultKind::None, 1}};
     auto server = ft_server_with(table);
@@ -1767,6 +2033,10 @@ TEST(NativeFakeTransport, RendersTheClientsOwnBoolColumnAsTrueOrFalse) {
     block.RefreshRowCount();
     t.send_block(block);
     EXPECT_EQ(server->inserts("events").at(0).blocks.at(0).values, (FtRows{{"true"}, {"false"}}));
+    t.end_insert();
+    const auto landed = server->landed("events");
+    ASSERT_EQ(landed.size(), 1u);
+    EXPECT_EQ(landed[0].values, (FtRows{{"true"}, {"false"}}));
 }
 
 // ---------------------------------------------------------------------------
