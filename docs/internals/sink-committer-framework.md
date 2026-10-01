@@ -33,16 +33,33 @@ flowchart TD
     H -- "committable" --> S["put_operator_state(_xo_pending_sub&lt;N&gt;_&lt;ckpt&gt;, serialize(c))"]
     C["on_commit(ckpt)"] --> L["load handle -&gt; commit() -&gt; erase key"]
     A["on_abort(ckpt)"] --> R["load handle -&gt; abort() -&gt; erase key"]
-    O["open()"] --> OO["on_open()"] --> RA["recover_all_: scan _xo_pending_*, recover() each, erase"]
+    O["open()"] --> OO["on_open()"] --> RA["recover_all_: scan _xo_pending_*, recover() the owned ones, erase"]
 ```
 
 Key points:
 
 - The committable is persisted in **operator state** (not keyed state), keyed by
-  checkpoint id under `_xo_pending_sub<N>_<ckpt>`. Operator state is restored
-  whole per subtask (broadcast/union semantics), so a rescale never drops a
-  pending handle. (The pre-framework 2PC sinks used raw keyed state, which is
-  key-group-filtered on restore - a latent rescale bug the migration fixed.)
+  checkpoint id under `_xo_pending_sub<N>_<ckpt>`, `N` the subtask that
+  prepared it. Operator state is never key-group-filtered on restore. (The
+  pre-framework 2PC sinks used raw keyed state, which a rescale filters by the
+  key's first byte, so a handle followed it to an arbitrary subtask.)
+- Every restored handle has exactly one owner. A rescale gives a new subtask
+  its assigned parents' operator state (`rocksdb://`, `forst://`) or every old
+  subtask's (`file://`), so a handle can sit in several new subtasks' state, or
+  under an index no new subtask has. The coordinator names each new subtask's
+  succession with the parent mapping (`RestoreSuccession`, on the
+  `RuntimeContext`): at a scale-down a subtask succeeds every parent it
+  inherits, at a scale-up only the first child of a parent succeeds it, and
+  without a rescale a subtask succeeds itself. `recover_all_()` finalises the
+  handles whose author it succeeds and erases every other copy, which its
+  owner finalises; `pending_committables()` returns the owned set. A handle
+  left behind under the subtask's own index would also hold the end-of-stream
+  gate open. On in-process paths there is no succession, subtasks may share a
+  backend, and a subtask finalises its own handles and leaves the rest. Before
+  this rule a subtask looked only under its own index, so a rescale on
+  `rocksdb://` or `forst://` left every old subtask's pending handle but the
+  first uncommitted, and a scale-down on `file://` those at or above the new
+  parallelism: a completed checkpoint's records were lost.
 - The barrier snapshot captures the `put` made inside `on_barrier`, so a
   persisted handle survives a crash and is replayed by `recover_all_()` at the
   next `open()`.
@@ -132,11 +149,22 @@ that the SELECT projects it.
 ## Per-connector notes
 
 - **Postgres 2PC**: buffers rows into an open transaction, `PREPARE TRANSACTION`
-  under a deterministic gid `clink_<uid>_sub<N>_<ckpt>` at the barrier,
-  `COMMIT PREPARED` on commit. `on_open` reconciles orphaned prepared
-  transactions (rolls back any of its own gids not in the restored set), so they
-  never accumulate holding locks. Requires the server's
-  `max_prepared_transactions > 0`.
+  under a deterministic gid `clink_<uid>_g<G>_sub<N>_<ckpt>` at the barrier (`G`
+  the topology generation), `COMMIT PREPARED` on commit. `on_open` reconciles
+  orphaned prepared transactions (rolls back those it is responsible for that
+  are not in the restored set), so they never accumulate holding locks. It is
+  responsible for the gids of the subtasks it succeeds from earlier
+  generations, and for its own index in the current one; a rescale gives the
+  new run a new generation, so an owner never touches a transaction a new
+  subtask is already preparing under the same index. Gids from a binary that
+  predates generations (`clink_<uid>_sub<N>_<ckpt>`) are reconciled the same
+  way. Requires the server's `max_prepared_transactions > 0`.
+- **WebHDFS Parquet 2PC** is a `CommittingSink` too: the staged file path is the
+  handle, and the commit is an atomic HDFS `RENAME` under the staged name.
+- **Iceberg** keeps its own handle choreography (one writer, subtask 0), with
+  the same rules: the staged-files handle lives in operator state, subtask 0
+  succeeds the old subtask 0 at every rescale, and handles an older binary kept
+  as raw keyed rows are still finalised.
 - **S3 raw 2PC**: uploads the interval as the parts of an S3 multipart upload at
   the barrier; the object does not exist until `CompleteMultipartUpload` at
   commit. An upload orphaned by a crash before the checkpoint became durable
@@ -152,6 +180,7 @@ that the SELECT projects it.
 - Base: `include/clink/connectors/committing_sink.hpp`
 - Adopters: `include/clink/connectors/{file_2pc_sink,parquet_2pc_sink,parquet_fs_2pc_sink}.hpp`,
   `impls/postgres/.../postgres_json_sink_2pc.hpp` + `postgres_json_upsert_sink.hpp`,
+  `impls/webhdfs/.../webhdfs_parquet_sink.hpp` (`WebHdfsParquetSink2PC`),
   `impls/s3/.../s3_sink_2pc.hpp`, `impls/mysql/.../mysql_json_upsert_sink.hpp`,
   `impls/redis/.../redis_upsert_sink.hpp`,
   `impls/cassandra/.../cassandra_upsert_sink.hpp`

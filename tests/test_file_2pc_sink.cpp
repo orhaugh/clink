@@ -13,6 +13,7 @@
 //      handle pointing at an existing staging file; open() should run
 //      recover_pending_() and promote that file to committed/.
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -22,11 +23,14 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/rescale_dispatch.hpp"
 #include "clink/connectors/file_2pc_sink.hpp"
 #include "clink/connectors/text_format.hpp"
 #include "clink/core/record.hpp"
+#include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/state/state_backend_factory.hpp"
 
 using namespace clink;
 
@@ -233,4 +237,112 @@ TEST(FileSink2PC, RecoveryIsNoOpWhenStagingFileAlreadyCommitted) {
     EXPECT_NO_THROW(sink->open());
     EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_9").has_value())
         << "stale state key should have been cleared during recovery";
+}
+
+// --- Rescale on the file:// backend -------------------------------------------
+//
+// file:// gives every new subtask every old subtask's operator state, so each
+// new subtask holds every pending handle. Each must be committed once, by the
+// successor of the subtask that staged it. Keyed by own index alone, a
+// scale-down left the old subtasks at or above the new parallelism uncommitted.
+
+namespace {
+
+void stage_on_file_backend(const std::string& uri,
+                           const std::filesystem::path& out,
+                           std::uint32_t parallelism) {
+    for (std::uint32_t i = 0; i < parallelism; ++i) {
+        StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = i;
+        auto built = StateBackendFactory::default_instance().build(spec);
+        RuntimeContext rctx(OperatorId{42}, "test_sink", built.backend.get(), nullptr);
+        auto sink = std::make_shared<FileSink2PC<std::string>>(
+            out, string_text_format(), i, "file_2pc_sink_string");
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        sink->on_data(batch_of({"r" + std::to_string(i)}));
+        sink->on_barrier(CheckpointBarrier{CheckpointId{7}});
+        (void)built.backend->snapshot(CheckpointId{7});
+    }
+}
+
+void rescale_on_file_backend(const std::string& from,
+                             const std::string& to,
+                             const std::filesystem::path& out,
+                             std::uint32_t old_p,
+                             std::uint32_t new_p) {
+    for (std::uint32_t i = 0; i < new_p; ++i) {
+        const auto mapping = clink::cluster::rescale_parent_mapping(old_p, new_p, i);
+        ASSERT_TRUE(mapping.ok) << mapping.error;
+        StateBackendSpec spec;
+        spec.uri = to;
+        spec.subtask_idx = i;
+        spec.restore_uri = from;
+        spec.restore_checkpoint_id = 7;
+        spec.restore_from_subtask_idx = mapping.parent_idx;
+        spec.restore_from_parent_count = mapping.parent_count;
+        auto built = StateBackendFactory::default_instance().build(spec);
+        ASSERT_TRUE(built.restore_from.has_value());
+        const auto [first, last] = key_group_range_for_subtask(i, new_p);
+        built.backend->restore(*built.restore_from, KeyGroupRange{first, last});
+        RuntimeContext rctx(OperatorId{42}, "test_sink", built.backend.get(), nullptr);
+        RestoreSuccession succession;
+        succession.first = mapping.succeeds_first;
+        succession.count = mapping.succeeds_count;
+        succession.generation = 2;
+        rctx.set_restore_succession(succession);
+        auto sink = std::make_shared<FileSink2PC<std::string>>(
+            out, string_text_format(), i, "file_2pc_sink_string");
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        std::size_t left = 0;
+        built.backend->scan_operator_state(
+            OperatorId{42}, [&](StateBackend::KeyView k, StateBackend::ValueView) {
+                if (std::string_view{k}.rfind("_xo_pending_", 0) == 0) {
+                    ++left;
+                }
+            });
+        EXPECT_EQ(left, 0U) << "new subtask " << i
+                            << " kept a restored handle it neither finalised nor erased";
+    }
+}
+
+void expect_every_old_subtask_committed(const std::string& tag,
+                                        std::uint32_t old_p,
+                                        std::uint32_t new_p) {
+    const auto root = mktmpdir("rescale_" + tag);
+    const auto out = root / "out";
+    const std::string run1 = "file://" + (root / "run1").string();
+    const std::string run2 = "file://" + (root / "run2").string();
+    stage_on_file_backend(run1, out, old_p);
+    rescale_on_file_backend(run1, run2, out, old_p, new_p);
+    std::vector<std::string> names;
+    for (const auto& e : std::filesystem::directory_iterator(out / "committed")) {
+        names.push_back(e.path().filename().string());
+    }
+    std::sort(names.begin(), names.end());
+    std::vector<std::string> expected;
+    for (std::uint32_t i = 0; i < old_p; ++i) {
+        expected.push_back("sub" + std::to_string(i) + "-7.dat");
+    }
+    EXPECT_EQ(names, expected);
+    for (std::uint32_t i = 0; i < old_p; ++i) {
+        EXPECT_EQ(read_lines(out / "committed" / ("sub" + std::to_string(i) + "-7.dat")),
+                  (std::vector<std::string>{"r" + std::to_string(i)}));
+    }
+    EXPECT_TRUE(std::filesystem::is_empty(out / "staging"));
+    std::filesystem::remove_all(root);
+}
+
+}  // namespace
+
+TEST(FileSink2PC, AScaleDownOnTheFileBackendCommitsEveryOldSubtasksHandle) {
+    expect_every_old_subtask_committed("down", 4, 2);
+}
+
+TEST(FileSink2PC, AScaleUpOnTheFileBackendCommitsEveryOldSubtasksHandle) {
+    expect_every_old_subtask_committed("up", 2, 4);
 }

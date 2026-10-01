@@ -112,6 +112,29 @@ TEST(RescaleParentMapping, EveryChildHasAParentWhenScalingUp) {
     }
 }
 
+TEST(RescaleParentMapping, EveryOldSubtaskHasExactlyOneSuccessor) {
+    // A restored 2PC handle may be finalised by one subtask only: the successor
+    // of the subtask that prepared it. Across every factor, each old index is
+    // succeeded exactly once, and only by a subtask that restored its state.
+    for (const auto [old_p, new_p] : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+             {1, 1}, {3, 3}, {1, 4}, {2, 4}, {2, 8}, {3, 6}, {4, 2}, {4, 1}, {8, 2}, {6, 3}}) {
+        std::vector<int> successors(old_p, 0);
+        for (std::uint32_t i = 0; i < new_p; ++i) {
+            const auto m = rescale_parent_mapping(old_p, new_p, i);
+            ASSERT_TRUE(m.ok) << m.error;
+            for (std::uint32_t j = m.succeeds_first; j < m.succeeds_first + m.succeeds_count; ++j) {
+                ASSERT_LT(j, old_p);
+                EXPECT_GE(j, m.parent_idx) << "a subtask succeeds only parents it restored";
+                EXPECT_LT(j, m.parent_idx + m.parent_count);
+                ++successors[j];
+            }
+        }
+        for (std::uint32_t j = 0; j < old_p; ++j) {
+            EXPECT_EQ(successors[j], 1) << old_p << "->" << new_p << " old subtask " << j;
+        }
+    }
+}
+
 TEST(RescaleParentMapping, UnchangedParallelismRestoresFromSelf) {
     // Not an error. A job where one operator is rescaled replans every
     // operator, and the untouched ones must restore from their own snapshots.
@@ -120,6 +143,8 @@ TEST(RescaleParentMapping, UnchangedParallelismRestoresFromSelf) {
         ASSERT_TRUE(m.ok) << m.error;
         EXPECT_EQ(m.parent_idx, i);
         EXPECT_EQ(m.parent_count, 1u);
+        EXPECT_EQ(m.succeeds_first, i);
+        EXPECT_EQ(m.succeeds_count, 1u);
     }
 }
 

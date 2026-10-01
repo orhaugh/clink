@@ -188,6 +188,11 @@ void LocalExecutor::start() {
         // sinks that keep their output across a restore decide on it, and a
         // savepoint restore can run with no checkpoint directory at all.
         contexts_.back()->set_restore_from_checkpoint_id(config_.restore_from_checkpoint_id);
+        // Which previous subtasks' single-owner state (a 2PC sink's prepared
+        // transactions) this task takes over; unset = only its own.
+        if (config_.restore_succession.has_value()) {
+            contexts_.back()->set_restore_succession(*config_.restore_succession);
+        }
         auto* ctx_ptr = contexts_.back().get();
         auto run_fn = runner.run;
         auto op_name = runner.name;

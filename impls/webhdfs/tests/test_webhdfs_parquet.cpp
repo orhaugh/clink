@@ -473,11 +473,11 @@ TEST(WebHdfsParquetSink2PC, CommitRenamesStagingToCommittedAndIsReadable) {
     b.emplace(20);
     sink->on_data(b);
     sink->on_barrier(CheckpointBarrier{CheckpointId{5}});
-    EXPECT_TRUE(state.get(OperatorId{42}, "_2pc_pending_sub0_5").has_value());
+    EXPECT_TRUE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_5").has_value());
     EXPECT_TRUE(read_committed_dir(srv, "/clink/exactly/committed").empty());  // not committed yet
 
     sink->on_commit(5);
-    EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_5").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_5").has_value());
 
     auto got = read_committed_dir(srv, "/clink/exactly/committed");
     std::sort(got.begin(), got.end());
@@ -504,8 +504,33 @@ TEST(WebHdfsParquetSink2PC, FreshSinkCommitsPendingOnOpen) {
         auto s2 = make_2pc_sink(srv, "/clink/rec", rctx, OperatorId{5});
         s2->open();  // recovery RENAMEs the pending staging file
     }
-    EXPECT_FALSE(state.get(OperatorId{5}, "_2pc_pending_sub0_7").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{5}, "_xo_pending_sub0_7").has_value());
     EXPECT_EQ(read_committed_dir(srv, "/clink/rec/committed"), (std::vector<std::int64_t>{100}));
+}
+
+TEST(WebHdfsParquetSink2PC, AHandleAnEarlierReleaseKeptAsARawKeyIsStillCommitted) {
+    // Before the sink was a CommittingSink it kept the staging path under a raw
+    // keyed "_2pc_pending_sub<N>_<ckpt>" row. A snapshot taken by that release
+    // still holds such rows; opening on it must commit them.
+    MockWebHdfs srv;
+    {
+        InMemoryStateBackend scratch;  // the stage only: its handle is thrown away
+        RuntimeContext rctx(OperatorId{6}, "wh2pc", &scratch, nullptr);
+        auto staged = make_2pc_sink(srv, "/clink/legacy", rctx, OperatorId{6});
+        staged->open();
+        Batch<std::int64_t> b;
+        b.emplace(64);
+        staged->on_data(b);
+        staged->on_barrier(CheckpointBarrier{CheckpointId{3}});
+    }
+    InMemoryStateBackend state;
+    const std::string staging = "/clink/legacy/staging/sub0-3.parquet";
+    state.put(OperatorId{6}, "_2pc_pending_sub0_3", staging);
+    RuntimeContext rctx(OperatorId{6}, "wh2pc", &state, nullptr);
+    auto sink = make_2pc_sink(srv, "/clink/legacy", rctx, OperatorId{6});
+    sink->open();
+    EXPECT_FALSE(state.get(OperatorId{6}, "_2pc_pending_sub0_3").has_value());
+    EXPECT_EQ(read_committed_dir(srv, "/clink/legacy/committed"), (std::vector<std::int64_t>{64}));
 }
 
 TEST(WebHdfsParquetSink2PC, AbortDeletesStagingAndClearsState) {
@@ -519,10 +544,10 @@ TEST(WebHdfsParquetSink2PC, AbortDeletesStagingAndClearsState) {
     b.emplace(1);
     sink->on_data(b);
     sink->on_barrier(CheckpointBarrier{CheckpointId{9}});
-    EXPECT_TRUE(state.get(OperatorId{9}, "_2pc_pending_sub0_9").has_value());
+    EXPECT_TRUE(state.get_operator_state(OperatorId{9}, "_xo_pending_sub0_9").has_value());
 
     sink->on_abort(9);
-    EXPECT_FALSE(state.get(OperatorId{9}, "_2pc_pending_sub0_9").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{9}, "_xo_pending_sub0_9").has_value());
     EXPECT_TRUE(read_committed_dir(srv, "/clink/ab/committed").empty());
 }
 

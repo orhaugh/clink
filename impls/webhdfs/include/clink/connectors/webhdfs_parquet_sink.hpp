@@ -32,6 +32,7 @@
 #include <parquet/properties.h>
 
 #include "clink/config/json.hpp"  // RENAME / MKDIRS boolean responses
+#include "clink/connectors/committing_sink.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/http_connector/http_request.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -286,18 +287,20 @@ private:
 // WebHdfsParquetSink2PC<T> - exactly-once Parquet sink over WebHDFS / HttpFS. The 2PC counterpart
 // to WebHdfsParquetSink, and the WebHDFS analogue of ParquetFsSink2PC. One Parquet file spans one
 // checkpoint interval (accumulated in memory). Unlike the object-store sink, the commit is a true
-// atomic HDFS RENAME rather than a copy:
-//   on_barrier: finalise the buffer and upload it to <base>/staging/sub<N>-<ckpt>.parquet via the
-//               two-step CREATE; record the staging path in operator state.
-//   on_commit:  RENAME staging -> <base>/committed/sub<N>-<ckpt>.parquet (atomic on HDFS), erase
-//               state. Idempotent: a RENAME that returns false but whose committed target already
-//               exists is treated as already committed (recovery re-commit).
-//   on_abort:   DELETE staging, erase state.
-//   open():     MKDIRS staging + committed, then recover any staging still tracked in state.
+// atomic HDFS RENAME rather than a copy. A CommittingSink, so the handle choreography (operator
+// state, recovery at open, one owner per handle across a rescale) is the framework's:
+//   prepare_commit: finalise the buffer and upload it to <base>/staging/sub<N>-<ckpt>.parquet via
+//                   the two-step CREATE; the staging path is the handle.
+//   commit:         RENAME staging -> <base>/committed/ under the staged name (atomic on HDFS).
+//                   Idempotent: a RENAME that returns false but whose committed target already
+//                   exists is treated as already committed (recovery re-commit).
+//   abort:          DELETE staging.
+//   on_open:        MKDIRS staging + committed, and finalise handles an older binary kept under
+//                   a raw key.
 // Exactly-once per the engine's 2PC contract: a committed object exists iff its checkpoint
 // completed globally. Point a reader (webhdfs_parquet source with prefix=<base>/committed) at it.
 template <typename T>
-class WebHdfsParquetSink2PC final : public Sink<T> {
+class WebHdfsParquetSink2PC final : public CommittingSink<T, std::string> {
 public:
     struct Options {
         std::string base_url;  // WebHDFS/HttpFS root
@@ -315,7 +318,10 @@ public:
     WebHdfsParquetSink2PC(Options opts,
                           ArrowBatcher<T> batcher,
                           std::string name = "webhdfs_parquet_2pc_sink")
-        : opts_(std::move(opts)), batcher_(std::move(batcher)), name_(std::move(name)) {
+        : CommittingSink<T, std::string>(static_cast<std::uint32_t>(opts.subtask_idx)),
+          opts_(std::move(opts)),
+          batcher_(std::move(batcher)),
+          name_(std::move(name)) {
         if (opts_.base_url.empty()) {
             throw std::invalid_argument("WebHdfsParquetSink2PC: base_url is required");
         }
@@ -334,13 +340,16 @@ public:
         }
     }
 
-    void open() override {
+    void on_open() override {
         mkdirs_(staging_dir_());
         mkdirs_(committed_dir_());
-        recover_pending_();
+        // Handles an older binary kept under a raw "_2pc_pending_sub<N>_<ckpt>"
+        // key; new ones live in operator state, where a rescale can give each
+        // one owner.
+        this->recover_legacy_handles("_2pc_pending_");
     }
 
-    void on_data(const Batch<T>& batch) override {
+    void write(const Batch<T>& batch) override {
         if (batch.empty()) {
             return;
         }
@@ -350,49 +359,32 @@ public:
             throw std::runtime_error("WebHdfsParquetSink2PC: ArrowBatcher.build returned null");
         }
         if (auto s = writer_->WriteRecordBatch(*record_batch); !s.ok()) {
-            throw std::runtime_error("WebHdfsParquetSink2PC::on_data: WriteRecordBatch: " +
+            throw std::runtime_error("WebHdfsParquetSink2PC::write: WriteRecordBatch: " +
                                      s.ToString());
         }
     }
 
-    void on_barrier(CheckpointBarrier b) override {
-        const auto ckpt = b.id().value();
+    // Seal the interval: finalise the in-memory Parquet file and upload it to
+    // staging/. Every checkpoint stages a file, empty or not.
+    std::optional<std::string> prepare_commit(std::uint64_t checkpoint_id) override {
         ensure_writer_open_();
         auto buffer = finalize_writer_();
-        const std::string staging = staging_key_(ckpt);
+        const std::string staging = staging_key_(checkpoint_id);
         upload_(staging, *buffer);
-        write_pending_state_(ckpt, staging);
+        return staging;
     }
 
-    void on_commit(std::uint64_t checkpoint_id) override {
-        auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
-        }
-        const auto key = state_key_(checkpoint_id);
-        auto stored = state->get(this->id(), key);
-        if (!stored.has_value()) {
-            return;  // already committed (idempotent)
-        }
-        const std::string staging(reinterpret_cast<const char*>(stored->data()), stored->size());
-        commit_one_(staging, committed_key_(checkpoint_id));
-        state->erase(this->id(), key);
+    // Atomic RENAME into committed/ under the staged file's own name, so a
+    // handle another subtask prepared keeps its name when this one finalises it.
+    bool commit(const std::string& staging) override {
+        commit_one_(staging, committed_key_for_(staging));
+        return true;
     }
 
-    void on_abort(std::uint64_t checkpoint_id) override {
-        auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
-        }
-        const auto key = state_key_(checkpoint_id);
-        auto stored = state->get(this->id(), key);
-        if (!stored.has_value()) {
-            return;
-        }
-        const std::string staging(reinterpret_cast<const char*>(stored->data()), stored->size());
-        delete_(staging);
-        state->erase(this->id(), key);
-    }
+    void abort(const std::string& staging) override { delete_(staging); }
+
+    std::string serialize(const std::string& staging) const override { return staging; }
+    std::string deserialize(std::string_view bytes) const override { return std::string(bytes); }
 
     void flush() override { abandon_writer_(); }
     void close() override { abandon_writer_(); }
@@ -406,11 +398,10 @@ private:
     std::string staging_key_(std::uint64_t c) const {
         return staging_dir_() + "/" + sub_prefix_() + "-" + std::to_string(c) + ".parquet";
     }
-    std::string committed_key_(std::uint64_t c) const {
-        return committed_dir_() + "/" + sub_prefix_() + "-" + std::to_string(c) + ".parquet";
-    }
-    std::string state_key_(std::uint64_t c) const {
-        return "_2pc_pending_" + sub_prefix_() + "_" + std::to_string(c);
+    std::string committed_key_for_(const std::string& staging) const {
+        const auto slash = staging.find_last_of('/');
+        return committed_dir_() + "/" +
+               (slash == std::string::npos ? staging : staging.substr(slash + 1));
     }
 
     std::vector<std::pair<std::string, std::string>> auth_params_() const {
@@ -567,44 +558,6 @@ private:
         }
         throw std::runtime_error("WebHdfsParquetSink2PC: RENAME " + staging + " -> " + committed +
                                  " failed: HTTP " + std::to_string(r.status) + ": " + r.body);
-    }
-
-    void write_pending_state_(std::uint64_t ckpt, const std::string& staging) {
-        auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
-        }
-        state->put(this->id(), state_key_(ckpt), std::string_view{staging.data(), staging.size()});
-    }
-
-    void recover_pending_() {
-        auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
-        }
-        const std::string prefix = "_2pc_pending_" + sub_prefix_() + "_";
-        std::vector<std::pair<std::string, std::string>> to_commit;
-        state->scan(this->id(), [&](StateBackend::KeyView k, StateBackend::ValueView v) {
-            const std::string key{k};
-            if (key.rfind(prefix, 0) != 0) {
-                return;
-            }
-            to_commit.emplace_back(key, std::string{v});
-        });
-        for (const auto& [key, staging] : to_commit) {
-            std::uint64_t ckpt = 0;
-            try {
-                ckpt = std::stoull(key.substr(prefix.size()));
-            } catch (...) {
-                continue;
-            }
-            commit_one_(staging, committed_key_(ckpt));
-            state->erase(this->id(), key);
-        }
-    }
-
-    StateBackend* state_backend_() const noexcept {
-        return this->runtime() != nullptr ? this->runtime()->state_backend() : nullptr;
     }
 
     Options opts_;

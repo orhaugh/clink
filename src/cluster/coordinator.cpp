@@ -2946,6 +2946,8 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         d.key_group_last = t.key_group_last;
         d.restore_from_subtask_idx = t.restore_from_subtask_idx;
         d.restore_from_parent_count = t.restore_from_parent_count;
+        d.succeeds_first = t.succeeds_first;
+        d.succeeds_count = t.succeeds_count;
         for (const auto& [pr_role, pr_sub] : t.peer_refs) {
             PeerAddress p;
             p.role = pr_role;
@@ -5893,6 +5895,9 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                     if (mapping.ok) {
                         d.restore_from_subtask_idx = old_block->second.base + mapping.parent_idx;
                         d.restore_from_parent_count = mapping.parent_count;
+                        // In the operator's own indices, not the block's.
+                        d.succeeds_first = mapping.succeeds_first;
+                        d.succeeds_count = mapping.succeeds_count;
                     } else {
                         // Refused earlier by the request validation; reaching
                         // here means the two disagree. Restore nothing rather
@@ -5945,6 +5950,8 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                     if (mapping.ok) {
                         d.restore_from_subtask_idx = stale->second.base + mapping.parent_idx;
                         d.restore_from_parent_count = mapping.parent_count;
+                        d.succeeds_first = mapping.succeeds_first;
+                        d.succeeds_count = mapping.succeeds_count;
                     } else {
                         log::warn("coordinator.restart",
                                   "job_id=" + std::to_string(job.id) + " op_id=" + op_id +
@@ -5972,6 +5979,13 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                     const std::uint32_t k_down = old_p / new_p;
                     d.restore_from_subtask_idx = k.subtask_idx * k_down;
                     d.restore_from_parent_count = k_down;
+                }
+                // A role-level rescale renumbers a single operator, so the role
+                // index is the operator's own.
+                if (const auto succession = rescale_parent_mapping(old_p, new_p, k.subtask_idx);
+                    succession.ok) {
+                    d.succeeds_first = succession.succeeds_first;
+                    d.succeeds_count = succession.succeeds_count;
                 }
                 const auto range = key_group_range_for_subtask(k.subtask_idx, new_p);
                 d.key_group_first = range.first;

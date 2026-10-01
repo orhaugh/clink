@@ -356,3 +356,110 @@ TEST(CommittingSink, CommitGroupIsObservable) {
     EXPECT_TRUE(sink.has_commit_group());
     EXPECT_EQ(sink.commit_group(), "atomic-group");
 }
+
+// --- Rescale: every restored handle has exactly one owner ---------------------
+
+namespace {
+
+// Stage one handle per old subtask, payload "p<N>", into `state` under each old
+// subtask's own key, the way a backend that hands every new subtask every old
+// subtask's operator state restores them.
+void stage_old_handles(World& world, InMemoryStateBackend& state, std::uint32_t old_parallelism) {
+    for (std::uint32_t old = 0; old < old_parallelism; ++old) {
+        RuntimeContext rctx(kOp, "fake", &state, nullptr);
+        auto sink = make_sink(world, rctx, old);
+        sink->on_data(batch_of({"p" + std::to_string(old)}));
+        sink->on_barrier(CheckpointBarrier{CheckpointId{7}});
+    }
+}
+
+std::size_t pending_keys(const InMemoryStateBackend& state) {
+    std::size_t n = 0;
+    state.scan_operator_state(kOp, [&](StateBackend::KeyView k, StateBackend::ValueView) {
+        if (std::string_view{k}.rfind("_xo_pending_", 0) == 0)
+            ++n;
+    });
+    return n;
+}
+
+// Open new subtask `sub` over its own copy of every old handle, succeeding the
+// old subtasks [first, first + count).
+void open_successor(World& world,
+                    std::uint32_t old_parallelism,
+                    std::uint32_t sub,
+                    std::uint32_t first,
+                    std::uint32_t count) {
+    InMemoryStateBackend state;
+    World staging;
+    stage_old_handles(staging, state, old_parallelism);
+    RuntimeContext rctx(kOp, "fake", &state, nullptr);
+    RestoreSuccession succession;
+    succession.first = first;
+    succession.count = count;
+    rctx.set_restore_succession(succession);
+    auto sink = make_sink(world, rctx, sub);
+    sink->open();
+    EXPECT_EQ(pending_keys(state), 0U)
+        << "new subtask " << sub << " kept a handle it neither finalised nor erased";
+}
+
+std::vector<std::string> sorted(std::vector<std::string> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+}  // namespace
+
+TEST(CommittingSink, AScaleDownCommitsEveryOldSubtasksHandleExactlyOnce) {
+    // 4 -> 2: new subtask 0 succeeds old 0 and 1, new subtask 1 old 2 and 3.
+    // Each sees all four handles, yet each handle commits once, by its owner;
+    // keyed by own index alone, old 2 and 3 were never committed and new 1
+    // committed old 1's handle as its own.
+    World world;
+    open_successor(world, 4, 0, 0, 2);
+    open_successor(world, 4, 1, 2, 2);
+    EXPECT_EQ(sorted(world.committed()), (std::vector<std::string>{"p0", "p1", "p2", "p3"}));
+}
+
+TEST(CommittingSink, AScaleUpCommitsEachParentsHandleOnlyThroughItsFirstChild) {
+    // 2 -> 4: children 0 and 1 share parent 0, children 2 and 3 parent 1. Only
+    // the first child of each parent succeeds it.
+    World world;
+    open_successor(world, 2, 0, 0, 1);
+    open_successor(world, 2, 1, 0, 0);
+    open_successor(world, 2, 2, 1, 1);
+    open_successor(world, 2, 3, 1, 0);
+    EXPECT_EQ(sorted(world.committed()), (std::vector<std::string>{"p0", "p1"}));
+}
+
+TEST(CommittingSink, PendingCommittablesAreTheOnesThisSubtaskSucceeds) {
+    // A connector reconciling an external registry at open (Postgres rolls back
+    // what is not in this set) must see the handles it owns, not its own index's.
+    World world;
+    InMemoryStateBackend state;
+    stage_old_handles(world, state, 4);
+    RuntimeContext rctx(kOp, "fake", &state, nullptr);
+    RestoreSuccession succession;
+    succession.first = 2;
+    succession.count = 2;
+    rctx.set_restore_succession(succession);
+    auto sink = make_sink(world, rctx, 1);
+    std::vector<std::string> payloads;
+    for (const auto& c : sink->peek_pending())
+        payloads.push_back(c.payload);
+    EXPECT_EQ(sorted(payloads), (std::vector<std::string>{"p2", "p3"}));
+}
+
+TEST(CommittingSink, WithoutASuccessionASiblingsHandlesAreLeftAlone) {
+    // In-process subtasks may share one backend, so a handle under another
+    // index is a live sibling's, not a restored copy: recovery finalises only
+    // its own and erases nothing else.
+    World world;
+    InMemoryStateBackend state;
+    stage_old_handles(world, state, 2);
+    RuntimeContext rctx(kOp, "fake", &state, nullptr);
+    auto sink = make_sink(world, rctx, 0);
+    sink->open();
+    EXPECT_EQ(world.committed(), (std::vector<std::string>{"p0"}));
+    EXPECT_TRUE(state.get_operator_state(kOp, "_xo_pending_sub1_7").has_value());
+}

@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+**A rescale no longer loses a completed checkpoint's records in an
+exactly-once sink.** A two-phase-commit sink keeps each prepared
+transaction's handle in operator state under the index of the subtask that
+prepared it, and finalises at open whatever its predecessor left pending. Each
+subtask looked only under its own index, so a rescale on `rocksdb://` or
+`forst://`, which restore a subtask's assigned parents only, left every old
+subtask's pending handle but the first uncommitted, and a scale-down on
+`file://` those at or above the new parallelism: a checkpoint that had
+completed, but whose commit had not run when the job stopped, lost its
+records. The coordinator now names each new subtask's succession with the
+parent mapping (every old subtask has exactly one successor: at a scale-down
+the subtask that inherits it, at a scale-up the first of its children), the
+deploy carries it, and `RuntimeContext::restore_succession()` exposes it. The
+successor finalises each handle and every other restored copy is erased. This
+covers the file, Parquet, object-store Parquet, S3 and Postgres two-phase
+sinks. The Postgres sink's transaction ids now carry the topology generation
+(`clink_<uid>_g<G>_sub<N>_<ckpt>`), so the subtask reconciling an old
+subtask's orphans never rolls back a transaction the new run is preparing
+under the same index; ids from earlier releases are still reconciled. The
+WebHDFS Parquet two-phase sink is now a `CommittingSink`, and it and the
+Iceberg sink keep their handles in operator state: as raw keyed rows a
+rescale gave them to whichever subtask owned the key's first byte as a key
+group, so they were lost there too. Handles an earlier release kept as raw
+rows are still finalised. The Iceberg sink now also declares that it stages
+state at the barrier, so a chain with a second such sink is refused as it is
+for the others.
+
 **The restart budget bounds a burst of failures, not a job's lifetime.** The
 self-heal budget (`max_restarts_on_worker_loss`, 10 under the default) was a
 lifetime count that nothing reset, so a long-running job failed at its

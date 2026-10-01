@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -385,8 +387,18 @@ public:
         }
     }
 
+    // The staged-files handle is written into operator state during on_barrier,
+    // so it must be inside the checkpoint that barrier names.
+    [[nodiscard]] bool stages_state_at_barrier() const noexcept override { return true; }
+
     void open() override {
         if (dormant_) {
+            // Only subtask 0 writes, and subtask 0 succeeds the old subtask 0 at
+            // every rescale, so a copy of its handles restored here (a backend
+            // that hands every subtask every old subtask's operator state) is
+            // never this subtask's to finalise. Left behind, it would be
+            // snapshotted forever.
+            erase_foreign_pending_();
             return;
         }
         // Hold mu_ across the whole of open() (incl. recovery) so an early CommitCheckpoint
@@ -547,13 +559,13 @@ public:
         if (state == nullptr || table_ == nullptr || catalog_ == nullptr) {
             return;
         }
-        auto stored = state->get(this->id(), state_key_(checkpoint_id));
+        auto stored = state->get_operator_state(this->id(), state_key_(checkpoint_id));
         if (!stored.has_value()) {
             return;  // nothing staged for this checkpoint (empty interval / already committed)
         }
         auto files = parse_staged_(*stored);
         commit_staged_(checkpoint_id, files, /*delete_data_on_commit_failure=*/false);
-        state->erase(this->id(), state_key_(checkpoint_id));
+        state->erase_operator_state(this->id(), state_key_(checkpoint_id));
     }
 
     // 2PC abort: the checkpoint did NOT complete globally, so drop the staged (unreferenced)
@@ -567,14 +579,14 @@ public:
         if (state == nullptr || file_io_ == nullptr) {
             return;  // closed concurrently
         }
-        auto stored = state->get(this->id(), state_key_(checkpoint_id));
+        auto stored = state->get_operator_state(this->id(), state_key_(checkpoint_id));
         if (!stored.has_value()) {
             return;
         }
         for (const auto& sf : parse_staged_(*stored)) {
             (void)file_io_->DeleteFile(sf.path);  // best-effort orphan cleanup
         }
-        state->erase(this->id(), state_key_(checkpoint_id));
+        state->erase_operator_state(this->id(), state_key_(checkpoint_id));
     }
 
     void close() override {
@@ -642,8 +654,74 @@ private:
 
     // Single-writer table (only subtask 0 active), but keep the subtask in the key so the
     // scheme is uniform with the other 2PC sinks.
+    static constexpr std::string_view kPendingPrefix = "_2pc_pending_sub";
     std::string state_key_(std::uint64_t ckpt) const {
-        return "_2pc_pending_sub" + std::to_string(opts_.subtask_idx) + "_" + std::to_string(ckpt);
+        return std::string(kPendingPrefix) + std::to_string(opts_.subtask_idx) + "_" +
+               std::to_string(ckpt);
+    }
+
+    // The subtask and checkpoint of a pending-handle key "_2pc_pending_sub<N>_<ckpt>".
+    static std::optional<std::pair<std::uint32_t, std::uint64_t>> parse_pending_key_(
+        std::string_view key) {
+        if (key.substr(0, kPendingPrefix.size()) != kPendingPrefix) {
+            return std::nullopt;
+        }
+        key.remove_prefix(kPendingPrefix.size());
+        const auto us = key.find('_');
+        if (us == std::string_view::npos || us == 0 || us + 1 >= key.size()) {
+            return std::nullopt;
+        }
+        try {
+            std::size_t used = 0;
+            const auto sub = std::stoull(std::string(key.substr(0, us)), &used);
+            if (used != us || sub > std::numeric_limits<std::uint32_t>::max()) {
+                return std::nullopt;
+            }
+            const auto rest = std::string(key.substr(us + 1));
+            const auto ckpt = std::stoull(rest, &used);
+            if (used != rest.size()) {
+                return std::nullopt;
+            }
+            return std::make_pair(static_cast<std::uint32_t>(sub), std::uint64_t{ckpt});
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    // Which previous subtasks' handles this subtask finalises: the deploy's
+    // succession, else this subtask alone (in-process paths).
+    [[nodiscard]] RestoreSuccession succession_() const {
+        if (this->runtime() != nullptr && this->runtime()->restore_succession().has_value()) {
+            return *this->runtime()->restore_succession();
+        }
+        RestoreSuccession self;
+        self.first = opts_.subtask_idx;
+        self.count = 1;
+        return self;
+    }
+
+    // Erase every restored handle this subtask does not own; its owner
+    // finalises its own copy. Only when the deploy names the succession, which
+    // is when the state backend is this subtask's alone: in-process subtasks
+    // may share one, and a sibling's handles are not a copy there.
+    void erase_foreign_pending_() {
+        auto* state = state_backend_();
+        if (state == nullptr || this->runtime() == nullptr ||
+            !this->runtime()->restore_succession().has_value()) {
+            return;
+        }
+        const auto owner = succession_();
+        std::vector<std::string> foreign;
+        state->scan_operator_state(
+            this->id(), [&](StateBackend::KeyView k, StateBackend::ValueView) {
+                const auto parsed = parse_pending_key_(k);
+                if (parsed.has_value() && (dormant_ || !owner.succeeds(parsed->first))) {
+                    foreign.emplace_back(k);
+                }
+            });
+        for (const auto& key : foreign) {
+            state->erase_operator_state(this->id(), key);
+        }
     }
 
     // Resolve a list of column names to {name, iceberg source field id, arrow type}. ids in
@@ -984,7 +1062,10 @@ private:
             return;  // empty interval -> nothing to stage, no snapshot
         }
         std::string blob = serialize_staged_(files);
-        state_backend_()->put(
+        // Operator state, not keyed: a rescale restores operator state whole,
+        // where a raw keyed row would follow its first byte's key group to an
+        // arbitrary new subtask.
+        state_backend_()->put_operator_state(
             this->id(), state_key_(ckpt), std::string_view{blob.data(), blob.size()});
     }
 
@@ -1169,24 +1250,48 @@ private:
     // through the idempotent commit, so a file whose checkpoint already snapshotted is skipped
     // (its state key is then cleared). A still-pending key whose checkpoint never completed is
     // left for the engine's abort, or harmlessly re-committed on the next global checkpoint.
+    // Handles live in operator state; each is finalised by the one subtask that succeeds the
+    // subtask that staged it, and every other restored copy is erased. Handles an older binary
+    // kept as raw keyed rows are finalised under this subtask's own index, as they always were.
     void recover_pending_() {
         auto* state = state_backend_();
         if (state == nullptr) {
             return;
         }
-        const std::string prefix = "_2pc_pending_sub" + std::to_string(opts_.subtask_idx) + "_";
-        std::vector<std::pair<std::string, std::vector<std::byte>>> pending;
+        erase_foreign_pending_();
+        const auto owner = succession_();
+        std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> pending;
+        std::vector<std::string> keys;
+        state->scan_operator_state(
+            this->id(), [&](StateBackend::KeyView k, StateBackend::ValueView v) {
+                const auto parsed = parse_pending_key_(k);
+                if (!parsed.has_value() || !owner.succeeds(parsed->first)) {
+                    return;
+                }
+                const auto* p = reinterpret_cast<const std::byte*>(v.data());
+                pending.emplace_back(parsed->second, std::vector<std::byte>{p, p + v.size()});
+                keys.emplace_back(k);
+            });
+        for (std::size_t i = 0; i < pending.size(); ++i) {
+            auto files = parse_staged_(pending[i].second);
+            commit_staged_(pending[i].first, files, /*delete_data_on_commit_failure=*/false);
+            state->erase_operator_state(this->id(), keys[i]);
+        }
+
+        const std::string legacy_prefix =
+            std::string(kPendingPrefix) + std::to_string(opts_.subtask_idx) + "_";
+        std::vector<std::pair<std::string, std::vector<std::byte>>> legacy;
         state->scan(this->id(), [&](StateBackend::KeyView k, StateBackend::ValueView v) {
             const std::string key{k};
-            if (key.rfind(prefix, 0) == 0) {
+            if (key.rfind(legacy_prefix, 0) == 0) {
                 const auto* p = reinterpret_cast<const std::byte*>(v.data());
-                pending.emplace_back(key, std::vector<std::byte>{p, p + v.size()});
+                legacy.emplace_back(key, std::vector<std::byte>{p, p + v.size()});
             }
         });
-        for (const auto& [key, blob] : pending) {
+        for (const auto& [key, blob] : legacy) {
             std::uint64_t ckpt = 0;
             try {
-                ckpt = std::stoull(key.substr(prefix.size()));
+                ckpt = std::stoull(key.substr(legacy_prefix.size()));
             } catch (...) {
                 continue;
             }

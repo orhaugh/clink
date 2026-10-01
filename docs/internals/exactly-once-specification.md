@@ -422,8 +422,15 @@ In the honesty categories the qualification pages use:
   and their values; watermarks and the exactness of replay suppression's
   horizon cut; source partition ownership (the QUAL-01 run C defect lived
   there and this model cannot see it); unaligned-checkpoint in-flight
-  capture; rescale; the HA lock primitive and the metadata compare-and-set;
-  network frame encoding; time. Each has its own evidence elsewhere.
+  capture; rescale, including which new subtask finalises an old subtask's
+  prepared transactions (the model keys a sink by a fixed index; the
+  one-successor rule is held by `RescaleParentMapping.EveryOldSubtaskHasExactlyOneSuccessor`
+  over every factor and by restore tests on the `file://` and `rocksdb://`
+  backends); the HA lock primitive and the metadata compare-and-set; network
+  frame encoding; time. Each has its own evidence elsewhere. A snapshot that
+  fails in an operator rather than a sink is outside trace validation too: the
+  trace module skips acks from subtasks it does not model, so such a run
+  diverges at the failed checkpoint's decision.
 
 What the model proves is the model. What the campaigns prove is one run of
 the code. The two are different evidence for the same guarantee, and this

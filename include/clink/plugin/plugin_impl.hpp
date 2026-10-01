@@ -200,6 +200,8 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     // than the restore point marks an interval that is already published).
     cfg.commit_receipt_dir = rctx.commit_receipt_dir;
     cfg.restore_from_checkpoint_id = rctx.restore_from_checkpoint_id;
+    // Which previous subtasks' prepared transactions this subtask finalises.
+    cfg.restore_succession = rctx.restore_succession;
     // Queryable-state identity: the deployment role + global subtask index
     // external clients address lookups by.
     cfg.runner_role = rctx.runner_role;

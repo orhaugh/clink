@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -203,6 +204,9 @@ struct RunnerContext {
     std::uint32_t restore_from_subtask_idx{kRestoreFromSelf};
     std::uint32_t restore_from_parent_count{1};
     KeyGroupRange restore_key_group_filter{};
+    // The previous run's subtasks (per-operator indices) this subtask
+    // succeeds, with the topology generations; unset on in-process paths.
+    std::optional<RestoreSuccession> restore_succession;
     // Callback the runner invokes after each successful state snapshot
     // (per checkpoint id). The worker uses this to send SubtaskCheckpointed
     // back to the coordinator.

@@ -491,6 +491,37 @@ TEST(WireProtocol, DeployRoundTripsRescaleDirectivesPerTask) {
     EXPECT_EQ(out.tasks[2].key_group_last, 64);
 }
 
+TEST(WireProtocol, DeployRoundTripsEachTasksSuccession) {
+    // The per-operator successor range rides ahead of the fencing epoch; a
+    // task left at the default succeeds itself, and the epoch still decodes.
+    DeployMsg in;
+    in.job_id = 7;
+    in.coordinator_epoch = 41;
+    DeploymentTask first_child;
+    first_child.role = "sink";
+    first_child.subtask_idx = 4;
+    first_child.succeeds_first = 2;
+    first_child.succeeds_count = 1;
+    DeploymentTask later_child;
+    later_child.role = "sink";
+    later_child.subtask_idx = 5;
+    later_child.succeeds_first = 2;
+    later_child.succeeds_count = 0;
+    DeploymentTask plain;
+    plain.role = "sink";
+    plain.subtask_idx = 6;
+    in.tasks = {first_child, later_child, plain};
+    auto out = round_trip(MessageKind::Deploy, in, decode_deploy);
+    ASSERT_EQ(out.tasks.size(), 3u);
+    EXPECT_EQ(out.tasks[0].succeeds_first, 2u);
+    EXPECT_EQ(out.tasks[0].succeeds_count, 1u);
+    EXPECT_EQ(out.tasks[1].succeeds_first, 2u);
+    EXPECT_EQ(out.tasks[1].succeeds_count, 0u);
+    EXPECT_EQ(out.tasks[2].succeeds_first, kRestoreFromSelf);
+    EXPECT_EQ(out.tasks[2].succeeds_count, 1u);
+    EXPECT_EQ(out.coordinator_epoch, 41u);
+}
+
 // Two MessageKinds deliberately share the value 117, and this pins that
 // as a decision rather than an accident.
 //

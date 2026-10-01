@@ -127,6 +127,13 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // deploy-static mode. A peer that stops reading earlier keeps the
     // default false = static stamping, the historical behaviour.
     b.put_u8(m.adaptive_barrier_mode ? 1 : 0);
+    // Per-task succession, in task order. A peer that stops reading earlier
+    // leaves every task succeeding itself, the answer for any deploy that is
+    // not a rescale.
+    for (const auto& t : m.tasks) {
+        b.put_u32_be(t.succeeds_first);
+        b.put_u32_be(t.succeeds_count);
+    }
     // Fencing epoch, appended last so an older peer that stops reading here still
     // decodes the rest correctly. Anything new goes BEFORE this, not after.
     b.put_u64_be(m.coordinator_epoch);
@@ -619,6 +626,14 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     // false = deploy-static barrier stamping.
     if (!r.eof()) {
         m.adaptive_barrier_mode = r.read_u8() != 0;
+    }
+    // Per-task succession. Absent from older coordinator peers -> each task
+    // succeeds itself.
+    if (!r.eof()) {
+        for (auto& t : m.tasks) {
+            t.succeeds_first = r.read_u32_be();
+            t.succeeds_count = r.read_u32_be();
+        }
     }
     // Fencing epoch LAST, matching the encoder. It is deliberately the final field
     // so a peer that stops reading earlier still decodes everything before it.

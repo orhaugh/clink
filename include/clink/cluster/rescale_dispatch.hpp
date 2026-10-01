@@ -115,6 +115,12 @@ struct OpIndexBlock {
 struct RescaleParentMapping {
     std::uint32_t parent_idx{};
     std::uint32_t parent_count{1};
+    // The parents this subtask SUCCEEDS (clink::RestoreSuccession): each old
+    // subtask has exactly one successor, which alone finalises its prepared
+    // transactions. At a scale-down that is every parent; at a scale-up only
+    // the first of a parent's children succeeds it (the others get count 0).
+    std::uint32_t succeeds_first{};
+    std::uint32_t succeeds_count{1};
     bool ok{false};
     std::string error;
 };

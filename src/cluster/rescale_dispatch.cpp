@@ -79,6 +79,8 @@ RescaleParentMapping rescale_parent_mapping(std::uint32_t old_parallelism,
         // is being rescaled restores from its own snapshot.
         out.parent_idx = subtask_idx_in_op;
         out.parent_count = 1;
+        out.succeeds_first = subtask_idx_in_op;
+        out.succeeds_count = 1;
         out.ok = true;
         return out;
     }
@@ -92,6 +94,10 @@ RescaleParentMapping rescale_parent_mapping(std::uint32_t old_parallelism,
         const std::uint32_t k_up = new_parallelism / old_parallelism;
         out.parent_idx = subtask_idx_in_op / k_up;
         out.parent_count = 1;
+        // Every child restores its parent's operator state; only the first
+        // succeeds it, so the parent's prepared transactions have one owner.
+        out.succeeds_first = out.parent_idx;
+        out.succeeds_count = subtask_idx_in_op % k_up == 0 ? 1 : 0;
         out.ok = true;
         return out;
     }
@@ -103,6 +109,8 @@ RescaleParentMapping rescale_parent_mapping(std::uint32_t old_parallelism,
     const std::uint32_t k_down = old_parallelism / new_parallelism;
     out.parent_idx = subtask_idx_in_op * k_down;
     out.parent_count = k_down;
+    out.succeeds_first = out.parent_idx;
+    out.succeeds_count = k_down;
     out.ok = true;
     return out;
 }
@@ -181,6 +189,8 @@ CutoverDeployment plan_operator_cutover(
         }
         d.restore_from_subtask_idx = mapping.parent_idx;
         d.restore_from_parent_count = mapping.parent_count;
+        d.succeeds_first = mapping.succeeds_first;
+        d.succeeds_count = mapping.succeeds_count;
 
         // Greedy placement: scan starting at rr looking for a worker with
         // free capacity. We've already validated total_free >= new_p

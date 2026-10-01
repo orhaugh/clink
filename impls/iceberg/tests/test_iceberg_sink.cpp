@@ -281,6 +281,79 @@ TEST(IcebergSink2PC, RecoveryCommitsPendingStagedData) {
     fs::remove_all(wh);
 }
 
+// A rescale on a backend that hands every new subtask every old subtask's
+// operator state gives the dormant subtasks a copy of the writer's staged handle.
+// It is not theirs: they erase it, and subtask 0, which succeeds the old
+// subtask 0 at every parallelism, commits it once. As a raw keyed row the
+// handle followed its first byte's key group to an arbitrary subtask instead.
+TEST(IcebergSink2PC, ARescaledHandleIsCommittedByTheWriterAndErasedElsewhere) {
+    auto wh = make_2pc_wh("rescale");
+    auto opts = [&](std::uint32_t sub) {
+        IcebergRowSinkOptions o;
+        o.warehouse = wh.string();
+        o.table = "events";
+        o.subtask_idx = sub;
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return o;
+    };
+    InMemoryStateBackend writer_state;
+    {
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &writer_state, /*metrics=*/nullptr);
+        auto sink = make_iceberg_row_sink(opts(0));
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        Batch<Row> b;
+        b.emplace(make_row(1, "a"));
+        sink->on_data(b);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{5}});
+    }
+    ASSERT_TRUE(writer_state.get_operator_state(OperatorId{42}, "_2pc_pending_sub0_5").has_value())
+        << "the staged handle lives in operator state";
+
+    InMemoryStateBackend dormant_state;
+    writer_state.scan_operator_state(
+        OperatorId{42}, [&](clink::StateBackend::KeyView k, clink::StateBackend::ValueView v) {
+            dormant_state.put_operator_state(OperatorId{42}, k, v);
+        });
+    {
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &dormant_state, /*metrics=*/nullptr);
+        clink::RestoreSuccession succession;
+        succession.first = 1;
+        succession.count = 1;
+        succession.generation = 2;
+        rctx.set_restore_succession(succession);
+        auto sink = make_iceberg_row_sink(opts(1));
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        sink->close();
+    }
+    EXPECT_FALSE(
+        dormant_state.get_operator_state(OperatorId{42}, "_2pc_pending_sub0_5").has_value())
+        << "a dormant subtask kept a copy of the writer's handle";
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 0);
+
+    {
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &writer_state, /*metrics=*/nullptr);
+        clink::RestoreSuccession succession;
+        succession.first = 0;
+        succession.count = 2;
+        succession.generation = 2;
+        rctx.set_restore_succession(succession);
+        auto sink = make_iceberg_row_sink(opts(0));
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        EXPECT_EQ(count_paths_containing(wh, "snap-"), 1)
+            << "the writer did not commit the handle it succeeds";
+        sink->close();
+    }
+    EXPECT_FALSE(
+        writer_state.get_operator_state(OperatorId{42}, "_2pc_pending_sub0_5").has_value());
+    fs::remove_all(wh);
+}
+
 // A corrupt staged-commit blob surfaces as a clear error during recovery (not a raw
 // std::stoll exception escaping the recovery scan).
 TEST(IcebergSink2PC, CorruptStagedStateFailsLoudlyOnRecovery) {

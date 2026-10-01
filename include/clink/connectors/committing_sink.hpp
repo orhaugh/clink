@@ -32,11 +32,22 @@
 //                    key means already committed).
 //   on_abort(id)  -> load handle; abort(); erase key. Idempotent.
 //
-// State layout: the handle is persisted via operator state (NOT keyed state) so
-// a rescale restores every subtask's pending set (broadcast/union semantics),
-// under the logical key "_xo_pending_sub<N>_<ckpt>". The barrier snapshot
-// captures the put made inside on_barrier, so a persisted handle survives a
-// crash and is replayed by recover_all_() at the next open().
+// State layout: the handle is persisted via operator state (NOT keyed state),
+// under the logical key "_xo_pending_sub<N>_<ckpt>", N the subtask that
+// prepared it. The barrier snapshot captures the put made inside on_barrier,
+// so a persisted handle survives a crash and is replayed by recover_all_() at
+// the next open().
+//
+// Rescale: a backend restores a subtask's operator state either from the
+// parents it was assigned (rocksdb://, forst://) or from every old subtask
+// (file://), so a restored handle can sit in several new subtasks' state, or
+// under an index no new subtask has. Each handle has exactly one owner, the
+// successor of the subtask that prepared it (RestoreSuccession): the owner
+// finalises it, and every other copy is erased unfinalised. Copies are erased
+// only when the deploy names the succession, which is also when the state
+// backend is this subtask's alone; without one (in-process paths, where
+// subtasks may share a backend) a subtask finalises its own handles and leaves
+// the rest, as it always did.
 //
 // Commit-group and the coordinator round-trip are unchanged: a CommittingSink still
 // participates in set_commit_group() and its on_commit fires from the worker's
@@ -54,6 +65,7 @@
 // thread-safe clients (AWS SDK, librdkafka) need nothing extra.
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -189,8 +201,9 @@ public:
 protected:
     std::uint32_t subtask_idx() const noexcept { return subtask_idx_; }
 
-    // The committables currently persisted (prepared-but-unfinalised) for this
-    // sink, deserialized. Intended for a connector that must reconcile an
+    // The committables currently persisted (prepared-but-unfinalised) that this
+    // subtask owns, deserialized: those of every previous subtask it succeeds
+    // (see succession()). Intended for a connector that must reconcile an
     // external registry at on_open() - e.g. an XA sink that rolls back prepared
     // transactions NOT in this set (their checkpoint never became durable).
     // Safe to call from on_open(): recover_all_() has not yet run, so the full
@@ -200,15 +213,27 @@ protected:
         auto* state = state_backend_();
         if (state == nullptr)
             return out;
-        const std::string prefix = key_prefix_();
+        const auto owner = succession();
         state->scan_operator_state(this->id(),
                                    [&](StateBackend::KeyView k, StateBackend::ValueView v) {
-                                       const std::string key{k};
-                                       if (key.rfind(prefix, 0) != 0)
+                                       const auto sub = pending_key_subtask_(k);
+                                       if (!sub.has_value() || !owner.succeeds(*sub))
                                            return;
                                        out.push_back(deserialize(v));
                                    });
         return out;
+    }
+
+    // The previous run's subtasks whose prepared transactions this subtask
+    // finalises: the deploy's succession when the runtime carries one, else this
+    // subtask alone (in-process paths, a sink driven directly by a test).
+    [[nodiscard]] RestoreSuccession succession() const noexcept {
+        if (this->runtime() != nullptr && this->runtime()->restore_succession().has_value())
+            return *this->runtime()->restore_succession();
+        RestoreSuccession self;
+        self.first = subtask_idx_;
+        self.count = 1;
+        return self;
     }
 
     // One-time upgrade bridge for sinks migrated from the pre-framework 2PC
@@ -243,6 +268,26 @@ protected:
 private:
     static std::string sub_prefix_(std::uint32_t sub) { return "sub" + std::to_string(sub); }
     std::string key_prefix_() const { return "_xo_pending_" + sub_prefix_(subtask_idx_) + "_"; }
+
+    // The subtask that prepared a persisted handle, parsed from its key
+    // "_xo_pending_sub<N>_<ckpt>"; nullopt for any other operator-state key.
+    static std::optional<std::uint32_t> pending_key_subtask_(std::string_view key) {
+        constexpr std::string_view kPrefix = "_xo_pending_sub";
+        if (key.substr(0, kPrefix.size()) != kPrefix)
+            return std::nullopt;
+        key.remove_prefix(kPrefix.size());
+        std::uint64_t sub = 0;
+        std::size_t digits = 0;
+        while (digits < key.size() && key[digits] >= '0' && key[digits] <= '9') {
+            sub = sub * 10 + static_cast<std::uint64_t>(key[digits] - '0');
+            if (sub > std::numeric_limits<std::uint32_t>::max())
+                return std::nullopt;
+            ++digits;
+        }
+        if (digits == 0 || digits + 1 >= key.size() || key[digits] != '_')
+            return std::nullopt;
+        return static_cast<std::uint32_t>(sub);
+    }
     std::string state_key_(std::uint64_t ckpt) const {
         return key_prefix_() + std::to_string(ckpt);
     }
@@ -310,24 +355,39 @@ private:
         state->erase_operator_state(this->id(), key);
     }
 
-    // Walk operator state for "_xo_pending_<sub>_*" handles left prepared by a
-    // previous run and finalise each. Collect first, then finalise + erase (the
-    // scan visitor must not mutate the backend mid-iteration).
+    // Walk operator state for "_xo_pending_sub<N>_*" handles left prepared by a
+    // previous run: finalise each one this subtask owns (N among the subtasks it
+    // succeeds) and, when the deploy names the succession, erase every other
+    // copy, which its owner finalises. Erasing matters: a copy left behind would
+    // be snapshotted forever and, under this subtask's own index, hold the
+    // end-of-stream gate open. Collect first, then finalise + erase (the scan
+    // visitor must not mutate the backend mid-iteration).
     void recover_all_() {
         auto* state = state_backend_();
         if (state == nullptr)
             return;
-        const std::string prefix = key_prefix_();
+        const auto owner = succession();
+        const bool erase_foreign =
+            this->runtime() != nullptr && this->runtime()->restore_succession().has_value();
         std::vector<std::string> keys;
         std::vector<std::string> blobs;
+        std::vector<std::string> foreign;
         state->scan_operator_state(this->id(),
                                    [&](StateBackend::KeyView k, StateBackend::ValueView v) {
-                                       const std::string key{k};
-                                       if (key.rfind(prefix, 0) != 0)
+                                       const auto sub = pending_key_subtask_(k);
+                                       if (!sub.has_value())
                                            return;
-                                       keys.push_back(key);
+                                       if (!owner.succeeds(*sub)) {
+                                           if (erase_foreign)
+                                               foreign.emplace_back(k);
+                                           return;
+                                       }
+                                       keys.emplace_back(k);
                                        blobs.emplace_back(v);
                                    });
+        for (const auto& key : foreign) {
+            state->erase_operator_state(this->id(), key);
+        }
         // The count is the forensic witness for restore-time recovery: a
         // restore that should have re-committed a prepared handle but logs
         // zero here lost the handle BEFORE this sink opened. The sink's
@@ -339,7 +399,8 @@ private:
         clink::log::info("sink.2pc",
                          "recover_all [" + this->name() + "] sub" + std::to_string(subtask_idx_) +
                              ": " + std::to_string(keys.size()) +
-                             " prepared handle(s) to finalise");
+                             " prepared handle(s) to finalise, " + std::to_string(foreign.size()) +
+                             " owned by another subtask");
         for (std::size_t i = 0; i < keys.size(); ++i) {
             clink::log::info("sink.2pc", "recovering prepared handle '" + keys[i] + "'");
             recover(deserialize(blobs[i]));

@@ -20,11 +20,20 @@
 // disables PREPARE TRANSACTION); a PREPARE against a server with it disabled
 // fails the checkpoint loudly.
 //
-// The global id is "clink_<uid>_sub<N>_<ckpt>" (uid sanitised to [A-Za-z0-9_],
-// falling back to the operator id). It is unique per (operator, subtask,
-// checkpoint); reusing the same operator uid across two jobs writing to the same
-// server is a misconfiguration (their gids collide, and reconciliation could
-// roll back the other job's prepared transaction).
+// The global id is "clink_<uid>_g<G>_sub<N>_<ckpt>" (uid sanitised to
+// [A-Za-z0-9_], falling back to the operator id; G the topology generation that
+// prepared it). It is unique per (operator, generation, subtask, checkpoint);
+// reusing the same operator uid across two jobs writing to the same server is a
+// misconfiguration (their gids collide, and reconciliation could roll back the
+// other job's prepared transaction). Ids prepared by an older binary have no
+// generation ("clink_<uid>_sub<N>_<ckpt>") and are still reconciled.
+//
+// Reconciliation covers the subtasks this one succeeds (RestoreSuccession):
+// after a rescale a subtask finalises transactions prepared under other
+// indices, while a new subtask may already be preparing under the same index.
+// The generation keeps the two apart: the new run prepares only in its own
+// generation, and the transactions an owner reconciles were prepared in an
+// earlier one.
 
 #include <chrono>
 #include <cstddef>
@@ -236,10 +245,58 @@ private:
         }
         return s;
     }
-    std::string our_prefix_() const {
-        return "clink_" + ident_() + "_sub" + std::to_string(this->subtask_idx()) + "_";
+    std::string ident_prefix_() const { return "clink_" + ident_() + "_"; }
+    std::string gtxid_(std::uint64_t ckpt) const {
+        return ident_prefix_() + "g" + std::to_string(this->succession().generation) + "_sub" +
+               std::to_string(this->subtask_idx()) + "_" + std::to_string(ckpt);
     }
-    std::string gtxid_(std::uint64_t ckpt) const { return our_prefix_() + std::to_string(ckpt); }
+
+    // Parse what follows "clink_<uid>_": "g<G>_sub<N>_<ckpt>", or the
+    // pre-generation "sub<N>_<ckpt>" (generation nullopt). Anything else is not
+    // one of ours.
+    struct ParsedGid {
+        std::optional<std::uint32_t> generation;
+        std::uint32_t subtask{0};
+    };
+    static std::optional<std::uint64_t> take_number_(std::string_view& s) {
+        std::size_t n = 0;
+        std::uint64_t v = 0;
+        while (n < s.size() && s[n] >= '0' && s[n] <= '9' && n < 19) {
+            v = v * 10 + static_cast<std::uint64_t>(s[n] - '0');
+            ++n;
+        }
+        if (n == 0) {
+            return std::nullopt;
+        }
+        s.remove_prefix(n);
+        return v;
+    }
+    static std::optional<ParsedGid> parse_gid_tail_(std::string_view s) {
+        ParsedGid out;
+        if (!s.empty() && s.front() == 'g') {
+            s.remove_prefix(1);
+            const auto g = take_number_(s);
+            if (!g.has_value() || s.empty() || s.front() != '_') {
+                return std::nullopt;
+            }
+            s.remove_prefix(1);
+            out.generation = static_cast<std::uint32_t>(*g);
+        }
+        if (s.substr(0, 3) != "sub") {
+            return std::nullopt;
+        }
+        s.remove_prefix(3);
+        const auto sub = take_number_(s);
+        if (!sub.has_value() || s.empty() || s.front() != '_') {
+            return std::nullopt;
+        }
+        s.remove_prefix(1);
+        if (!take_number_(s).has_value() || !s.empty()) {
+            return std::nullopt;
+        }
+        out.subtask = static_cast<std::uint32_t>(*sub);
+        return out;
+    }
 
     bool gid_is_prepared_(const std::string& gid) {
         if (!conn_) {
@@ -268,16 +325,31 @@ private:
         return present;
     }
 
-    // Our prepared transactions still on the server (filtered by our exact
-    // prefix so we never touch another subtask's or job's transactions).
+    // The prepared transactions still on the server that this subtask must
+    // reconcile: those prepared under an index it succeeds in an earlier
+    // generation (or by a binary that predates generations), and those under its
+    // own index in this generation (left by an attempt of this topology that
+    // died before its first checkpoint). Never a transaction the live run may be
+    // preparing under another subtask's index.
     std::vector<std::string> our_prepared_gids_() {
         std::vector<std::string> out;
-        const std::string prefix = our_prefix_();
+        const std::string prefix = ident_prefix_();
+        const auto owner = this->succession();
         PGresult* r = PQexec(conn_.get(), "SELECT gid FROM pg_prepared_xacts");
         if (r != nullptr && PQresultStatus(r) == PGRES_TUPLES_OK) {
             for (int i = 0; i < PQntuples(r); ++i) {
                 std::string gid = PQgetvalue(r, i, 0);
-                if (gid.rfind(prefix, 0) == 0) {
+                if (gid.rfind(prefix, 0) != 0) {
+                    continue;
+                }
+                const auto parsed = parse_gid_tail_(std::string_view{gid}.substr(prefix.size()));
+                if (!parsed.has_value()) {
+                    continue;
+                }
+                const bool current = parsed->generation == owner.generation;
+                const bool ours = current ? parsed->subtask == this->subtask_idx()
+                                          : owner.succeeds(parsed->subtask);
+                if (ours) {
                     out.push_back(std::move(gid));
                 }
             }

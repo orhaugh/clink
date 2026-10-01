@@ -55,6 +55,26 @@ namespace clink::cluster {
 
 namespace {
 
+// The previous run's subtasks a deployed subtask succeeds, in its operator's
+// own indices (clink::RestoreSuccession). kRestoreFromSelf is every deploy
+// that is not a rescale: the subtask succeeds only itself.
+clink::RestoreSuccession succession_for(const DeploymentTask& task,
+                                        std::uint32_t subtask_idx_in_op,
+                                        std::uint32_t generation,
+                                        std::uint32_t restore_generation) {
+    clink::RestoreSuccession s;
+    if (task.succeeds_first == kRestoreFromSelf) {
+        s.first = subtask_idx_in_op;
+        s.count = 1;
+    } else {
+        s.first = task.succeeds_first;
+        s.count = task.succeeds_count;
+    }
+    s.generation = generation;
+    s.restore_generation = restore_generation;
+    return s;
+}
+
 std::int64_t steady_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -2614,6 +2634,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .restore_from_subtask_idx = rescale_parent_idx,
                 .restore_from_parent_count = rescale_parent_count,
                 .restore_key_group_filter = kg_filter,
+                .restore_succession = succession_for(
+                    task, chain.subtask_idx_in_op, generation, restore_from_generation),
                 .on_checkpoint_ack = std::move(ack_cb),
                 .request_final_checkpoint = std::move(request_final_ckpt),
                 .wait_final_committed = std::move(wait_final_committed),
@@ -3001,6 +3023,8 @@ void Worker::run_generic_subtask_(JobId job_id,
             .restore_from_parent_count =
                 task.restore_from_parent_count == 0 ? 1 : task.restore_from_parent_count,
             .restore_key_group_filter = {},
+            .restore_succession =
+                succession_for(task, chain.subtask_idx_in_op, generation, restore_from_generation),
             // Wire the checkpoint-ack callback so chained subtasks report
             // SubtaskCheckpointed to the coordinator, keyed by the GLOBAL
             // task.subtask_idx (what the coordinator tracks in task_records). The

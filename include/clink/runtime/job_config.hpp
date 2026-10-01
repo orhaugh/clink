@@ -78,6 +78,12 @@ struct JobConfig {
     std::string commit_receipt_dir;
     std::uint64_t restore_from_checkpoint_id{0};
 
+    // The previous run's subtasks this subtask succeeds (see
+    // RestoreSuccession), copied onto every operator's RuntimeContext. Set by
+    // the cluster path on every deploy; unset in-process, where a subtask
+    // succeeds only itself.
+    std::optional<RestoreSuccession> restore_succession;
+
     // Record-capture flight recorder (time-travel debugging). When non-empty,
     // operator runners whose registration supplied an input codec tee every
     // input record into per-checkpoint-epoch .cap files under

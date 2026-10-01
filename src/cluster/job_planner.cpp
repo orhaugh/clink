@@ -527,6 +527,8 @@ HotCutoverPlan plan_hot_cutover(const JobGraphSpec& graph,
         }
         nt.restore_from_subtask_idx = deployed_op->second.base + mapping.parent_idx;
         nt.restore_from_parent_count = mapping.parent_count;
+        nt.succeeds_first = mapping.succeeds_first;
+        nt.succeeds_count = mapping.succeeds_count;
 
         // Rewrite the chain spec the worker will parse: its own indices,
         // its input edges (feeding tasks keep their deployed indices) and

@@ -294,6 +294,15 @@ struct DeploymentTask {
     std::uint32_t restore_from_parent_count{1};
     std::uint16_t key_group_first{0};
     std::uint16_t key_group_last{0};
+
+    // Succession (clink::RestoreSuccession): the previous run's subtasks this
+    // one succeeds, as per-operator indices [succeeds_first, succeeds_first +
+    // succeeds_count). Unlike restore_from_subtask_idx these are not the
+    // deployed global indices, and at a scale-up the count is 0 for every
+    // subtask but the first of a parent's children. kRestoreFromSelf = this
+    // subtask itself, the answer for every deploy that is not a rescale.
+    std::uint32_t succeeds_first{kRestoreFromSelf};
+    std::uint32_t succeeds_count{1};
 };
 
 // ----- Message bodies -----

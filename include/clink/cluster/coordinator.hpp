@@ -90,6 +90,9 @@ struct PlannedTask {
     // cutover planner sets the parents' deployed global index and count.
     std::uint32_t restore_from_subtask_idx{kRestoreFromSelf};
     std::uint32_t restore_from_parent_count{1};
+    // Succession, as per-operator indices (DeploymentTask::succeeds_first).
+    std::uint32_t succeeds_first{kRestoreFromSelf};
+    std::uint32_t succeeds_count{1};
 };
 
 struct JobPlan {

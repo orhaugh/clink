@@ -186,6 +186,16 @@ public:
         return restore_from_checkpoint_id_;
     }
 
+    // The previous run's subtasks this subtask succeeds (see RestoreSuccession):
+    // set by the cluster's executor on every deploy. Unset on in-process paths,
+    // where a subtask succeeds only itself.
+    void set_restore_succession(RestoreSuccession succession) noexcept {
+        restore_succession_ = succession;
+    }
+    [[nodiscard]] const std::optional<RestoreSuccession>& restore_succession() const noexcept {
+        return restore_succession_;
+    }
+
     // Queryable-state identity: the DeploymentTask role and global subtask
     // index this operator runs as. An operator that exposes a state slot
     // for external lookup binds it under exactly this (role, subtask) pair
@@ -615,6 +625,7 @@ private:
     std::size_t capture_subtask_idx_{0};
     std::string commit_receipt_dir_;
     std::uint64_t restore_from_checkpoint_id_{0};
+    std::optional<RestoreSuccession> restore_succession_;
     std::string runner_role_;
     std::size_t runner_subtask_idx_{0};
     TimerService timer_service_{};

@@ -12,7 +12,12 @@
 // would not even link, since the RocksDBStateBackend symbols are
 // nowhere in the binary.
 #if __has_include("clink/state/rocksdb_state_backend.hpp")
+#include "clink/cluster/rescale_dispatch.hpp"
+#include "clink/connectors/file_2pc_sink.hpp"
+#include "clink/connectors/text_format.hpp"
 #include "clink/rocksdb/install.hpp"
+#include "clink/runtime/key_groups.hpp"
+#include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/rocksdb_state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
@@ -864,6 +869,121 @@ TEST(RocksDBStateBackend, NoExpiryFilterMeansCompactionKeepsEverything) {
         EXPECT_EQ(n, 20U) << "compaction dropped state with no expiry filter installed";
     }
     std::filesystem::remove_all(base_dir);
+}
+
+// A rescale of an exactly-once sink on RocksDB, through the same parent
+// mapping the coordinator uses. Each old subtask stages checkpoint 7 and
+// snapshots it; nothing commits, so every handle is still pending at the
+// restore point. RocksDB gives each new subtask only its assigned parents'
+// operator state, and a subtask that looked only under its own index left
+// every old subtask but 0 uncommitted: their records were lost.
+namespace {
+
+void stage_uncommitted_checkpoint(const std::string& uri,
+                                  const std::filesystem::path& out,
+                                  std::uint32_t parallelism) {
+    for (std::uint32_t i = 0; i < parallelism; ++i) {
+        StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = i;
+        auto built = StateBackendFactory::default_instance().build(spec);
+        RuntimeContext rctx(OperatorId{77}, "sink", built.backend.get(), nullptr);
+        FileSink2PC<std::string> sink(out, string_text_format(), i, "file_2pc_sink_string");
+        sink.set_id(OperatorId{77});
+        sink.attach_runtime(&rctx);
+        sink.open();
+        Batch<std::string> b;
+        b.emplace("r" + std::to_string(i));
+        sink.on_data(b);
+        sink.on_barrier(CheckpointBarrier{CheckpointId{7}});
+        (void)built.backend->snapshot(CheckpointId{7});
+    }
+}
+
+void restore_rescaled(const std::string& from,
+                      const std::string& to,
+                      const std::filesystem::path& out,
+                      std::uint32_t old_p,
+                      std::uint32_t new_p) {
+    for (std::uint32_t i = 0; i < new_p; ++i) {
+        const auto mapping = clink::cluster::rescale_parent_mapping(old_p, new_p, i);
+        ASSERT_TRUE(mapping.ok) << mapping.error;
+        StateBackendSpec spec;
+        spec.uri = to;
+        spec.subtask_idx = i;
+        spec.restore_uri = from;
+        spec.restore_checkpoint_id = 7;
+        spec.restore_from_subtask_idx = mapping.parent_idx;
+        spec.restore_from_parent_count = mapping.parent_count;
+        auto built = StateBackendFactory::default_instance().build(spec);
+        ASSERT_TRUE(built.restore_from.has_value());
+        const auto [first, last] = key_group_range_for_subtask(i, new_p);
+        built.backend->restore(*built.restore_from, KeyGroupRange{first, last});
+        RuntimeContext rctx(OperatorId{77}, "sink", built.backend.get(), nullptr);
+        RestoreSuccession succession;
+        succession.first = mapping.succeeds_first;
+        succession.count = mapping.succeeds_count;
+        succession.generation = 2;
+        rctx.set_restore_succession(succession);
+        FileSink2PC<std::string> sink(out, string_text_format(), i, "file_2pc_sink_string");
+        sink.set_id(OperatorId{77});
+        sink.attach_runtime(&rctx);
+        sink.open();
+        std::size_t left = 0;
+        built.backend->scan_operator_state(
+            OperatorId{77}, [&](StateBackend::KeyView k, StateBackend::ValueView) {
+                if (std::string_view{k}.rfind("_xo_pending_", 0) == 0) {
+                    ++left;
+                }
+            });
+        EXPECT_EQ(left, 0U) << "new subtask " << i
+                            << " kept a restored handle it neither finalised nor erased";
+    }
+}
+
+std::vector<std::string> committed_files(const std::filesystem::path& out) {
+    std::vector<std::string> names;
+    for (const auto& e : std::filesystem::directory_iterator(out / "committed")) {
+        names.push_back(e.path().filename().string());
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+void run_committing_sink_rescale(const std::string& tag, std::uint32_t old_p, std::uint32_t new_p) {
+    clink::rocksdb::install();
+    const auto root = std::filesystem::temp_directory_path() / ("clink_rocks_2pc_" + tag);
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto out = root / "out";
+    const std::string run1 = "rocksdb://" + (root / "run1").string();
+    const std::string run2 = "rocksdb://" + (root / "run2").string();
+    stage_uncommitted_checkpoint(run1, out, old_p);
+    restore_rescaled(run1, run2, out, old_p, new_p);
+    std::vector<std::string> expected;
+    for (std::uint32_t i = 0; i < old_p; ++i) {
+        expected.push_back("sub" + std::to_string(i) + "-7.dat");
+    }
+    EXPECT_EQ(committed_files(out), expected)
+        << "every old subtask's pending checkpoint must be committed, under its own name";
+    EXPECT_TRUE(std::filesystem::is_empty(out / "staging"));
+    std::filesystem::remove_all(root);
+}
+
+}  // namespace
+
+TEST(RocksDBStateBackend, CommittingSinkScaleUpRecoversEveryParentsHandle) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    run_committing_sink_rescale("up", 2, 4);
+}
+
+TEST(RocksDBStateBackend, CommittingSinkScaleDownRecoversEveryParentsHandle) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    run_committing_sink_rescale("down", 4, 2);
 }
 
 #endif  // __has_include rocksdb_state_backend.hpp
