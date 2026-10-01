@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**The S3 two-phase sink waits for a commit still in flight.** When a worker
+dies in the middle of completing a multipart upload, its request can still be
+running at the store when the recovering subtask completes the same upload,
+which then answers `NoSuchUpload` or `InvalidPart` before the object exists.
+The sink took that as a failed commit and restarted the job, spending restart
+budget on every attempt. It now looks for the object for a few seconds before
+calling the commit failed.
+
 **An HA takeover before a job's first checkpoint keeps the job.** The new
 leader restored each recovered job from its own latest completed checkpoint.
 A job that had completed none yet got the id 0 with its checkpoint directory,

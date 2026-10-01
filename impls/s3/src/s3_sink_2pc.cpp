@@ -4,6 +4,7 @@
 #include <chrono>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include "clink/config/json.hpp"
@@ -212,11 +213,26 @@ bool S3Sink2PC::commit(const S3MultipartHandle& handle) {
     if (!out.IsSuccess()) {
         // Idempotency: a retry after a successful complete finds the upload gone.
         // If the object already exists, the previous attempt committed it - no-op.
-        Aws::S3::Model::HeadObjectRequest head;
-        head.SetBucket(bucket);
-        head.SetKey(handle.key);
-        if (impl_->client->HeadObject(head).IsSuccess()) {
-            return true;
+        // A predecessor killed in the middle of its own complete can leave that
+        // request still running at the store when this recovery's complete
+        // arrives: the upload answers NoSuchUpload or InvalidPart (its parts are
+        // being consumed) before the object appears. Those two get a few seconds
+        // of looking again before the commit is called failed.
+        const auto& error = out.GetError();
+        const bool may_be_completing = error.GetErrorType() == Aws::S3::S3Errors::NO_SUCH_UPLOAD ||
+                                       error.GetExceptionName() == "InvalidPart";
+        constexpr int kLooks = 6;
+        for (int look = 0; look < kLooks; ++look) {
+            Aws::S3::Model::HeadObjectRequest head;
+            head.SetBucket(bucket);
+            head.SetKey(handle.key);
+            if (impl_->client->HeadObject(head).IsSuccess()) {
+                return true;
+            }
+            if (!may_be_completing) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250) * (look + 1));
         }
         clink::metrics::connector::error_inc("s3");
         throw std::runtime_error("S3Sink2PC: CompleteMultipartUpload(" + handle.key +
