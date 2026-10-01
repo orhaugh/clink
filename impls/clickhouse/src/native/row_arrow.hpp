@@ -21,7 +21,10 @@ namespace clink::clickhouse::native {
 // shared rule. The rest (SMALLINT, TINYINT, TIMESTAMP, DATE, ARRAY, MAP, ROW,
 // and every element inside a composite, whatever its type) are built here,
 // and a cell of the wrong kind or out of range throws
-// ConversionError(column, row, reason) instead. A JSON null, an absent column
+// ConversionError(column, row, reason) instead. Inside a composite a number
+// with a fraction is refused for every integer type rather than truncated,
+// and a map fails when two of its keys convert to the same value, which
+// would otherwise land as one key held twice. A JSON null, an absent column
 // and an absent ROW field are NULL for every type.
 class RowArrowBuilder {
 public:

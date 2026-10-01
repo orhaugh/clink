@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -558,6 +559,73 @@ TEST(NativeRowArrow, ElementRulesRefuseWhatTheSharedRuleWouldNull) {
             "c", 0, "element 0: expected a decimal number for DECIMAL(5, 2), got text(len 3)"));
 }
 
+// Inside a composite every integer type refuses a number with a fraction, as
+// SMALLINT does at the top level, where the shared rule truncates: 1.9 must
+// never land as 1.
+TEST(NativeRowArrow, FractionalIntegerElementsFailRatherThanTruncate) {
+    const std::vector<std::tuple<std::string, std::string, std::string>> cases = {
+        {"c:BIGINT ARRAY",
+         R"({"c":[1.9,-2.7]})",
+         "element 0: value 1.9 is not a whole number for "
+         "BIGINT"},
+        {"c:BIGINT ARRAY",
+         R"({"c":[1,-2.7]})",
+         "element 1: value -2.7 is not a whole number for "
+         "BIGINT"},
+        {"c:INTEGER ARRAY",
+         R"({"c":[3.99]})",
+         "element 0: value 3.99 is not a whole number for "
+         "INTEGER"},
+        {"c:SMALLINT ARRAY",
+         R"({"c":[0.5]})",
+         "element 0: value 0.5 is not a whole number for "
+         "SMALLINT"},
+        {"c:TINYINT ARRAY",
+         R"({"c":[-0.5]})",
+         "element 0: value -0.5 is not a whole number for "
+         "TINYINT"},
+        {"c:ROW<x BIGINT>",
+         R"({"c":{"x":1.5}})",
+         "field `x`: value 1.5 is not a whole number for "
+         "BIGINT"},
+        {"c:MAP<VARCHAR, INTEGER>",
+         R"({"c":{"k":2.5}})",
+         "entry 0 value: value 2.5 is not a "
+         "whole number for INTEGER"},
+        {"c:INTEGER ARRAY",
+         R"({"c":[-2147483649.0]})",
+         "element 0: value -2147483649 out of "
+         "range for INTEGER"},
+        // Digit text is still the wrong kind: a composite's numbers arrive as
+        // numbers, from a columnar batch too.
+        {"c:BIGINT ARRAY",
+         R"({"c":["5"]})",
+         "element 0: expected a number for BIGINT, got "
+         "text(len 1)"},
+    };
+    for (const auto& [spec, line, reason] : cases) {
+        const RowArrowBuilder builder(ra_columns(spec));
+        EXPECT_EQ(std::string(ra_refusal(builder, ra_rows({line})).what()),
+                  ra_message("c", 0, reason))
+            << spec << " " << line;
+    }
+}
+
+TEST(NativeRowArrow, WholeDoubleIntegerElementsAreKept) {
+    const RowArrowBuilder builder(ra_columns("a:BIGINT ARRAY;i:INTEGER ARRAY"));
+    const auto chunk = ra_build(
+        builder, ra_rows({R"({"a":[7.0,-3.0,1e15],"i":[2147483647.0,-2147483648.0,-0.0]})"}));
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(ra_int64_values(*ra_col<arrow::ListArray>(chunk, 0)->values()),
+              (std::vector<std::int64_t>{7, -3, 1000000000000000}));
+    const auto& i =
+        static_cast<const arrow::Int32Array&>(*ra_col<arrow::ListArray>(chunk, 1)->values());
+    ASSERT_EQ(i.length(), 3);
+    EXPECT_EQ(i.Value(0), std::numeric_limits<std::int32_t>::max());
+    EXPECT_EQ(i.Value(1), std::numeric_limits<std::int32_t>::min());
+    EXPECT_EQ(i.Value(2), 0);
+}
+
 TEST(NativeRowArrow, NestedElementFailureNamesThePath) {
     const RowArrowBuilder builder(ra_columns("n:SMALLINT ARRAY ARRAY"));
     EXPECT_EQ(std::string(ra_refusal(builder, ra_rows({R"({"n":[[1],[40000]]})"})).what()),
@@ -685,6 +753,102 @@ TEST(NativeRowArrow, BadMapKeyFailsNamingItsPositionNotItsText) {
                          "text(len 5)"));
     EXPECT_EQ(std::string(ra_refusal(decimal, ra_rows({R"({"m":{"12345.5":1}})"})).what()),
               ra_message("m", 0, "entry 0 key: key text(len 7) out of range for DECIMAL(5, 2)"));
+}
+
+// Truncating would turn the distinct keys "1", "1.5" and "1.9" into the key
+// 1 three times.
+TEST(NativeRowArrow, FractionalIntegerMapKeysFailNamingThePositionNotTheText) {
+    for (const std::string type : {"BIGINT", "INTEGER", "SMALLINT", "TINYINT"}) {
+        const RowArrowBuilder builder(ra_columns("m:MAP<" + type + ", VARCHAR>"));
+        const auto e = ra_refusal(builder, ra_rows({R"({"m":{"1":"a","1.5":"b","1.9":"c"}})"}));
+        EXPECT_EQ(e.column(), "m");
+        EXPECT_EQ(e.row(), 0);
+        EXPECT_EQ(
+            std::string(e.what()),
+            ra_message("m", 0, "entry 1 key: key text(len 3) is not a whole number for " + type));
+        EXPECT_EQ(std::string(e.what()).find("1.5"), std::string::npos);
+    }
+}
+
+// The object holds each key text once, but two texts can convert to the
+// same key, which ClickHouse would store twice. Entries are in key-text
+// order, so entry 1 is the later text.
+TEST(NativeRowArrow, MapKeysThatConvertToTheSameValueFail) {
+    const auto reason = [](std::size_t length, const std::string& key, const std::string& map) {
+        return "entry 1 key: key text(len " + std::to_string(length) + ") is the same " + key +
+               " as entry 0 key, and each key of " + map + " must be distinct";
+    };
+    const std::vector<std::tuple<std::string, std::string, std::string>> cases = {
+        {"MAP<DATE, BIGINT>",
+         R"({"m":{"19723":1,"2024-01-01":2}})",
+         reason(10, "DATE", "MAP<DATE, BIGINT>")},
+        {"MAP<BIGINT, VARCHAR>",
+         R"({"m":{"1":"a","1.0":"b"}})",
+         reason(3, "BIGINT", "MAP<BIGINT, VARCHAR>")},
+        {"MAP<SMALLINT, VARCHAR>",
+         R"({"m":{"-1":"a","-1e0":"b"}})",
+         reason(4, "SMALLINT", "MAP<SMALLINT, VARCHAR>")},
+        {"MAP<TIMESTAMP(3), BIGINT>",
+         R"({"m":{"01":1,"1":2}})",
+         reason(1, "TIMESTAMP(3)", "MAP<TIMESTAMP(3), BIGINT>")},
+        {"MAP<DECIMAL(5, 2), BIGINT>",
+         R"({"m":{"1.505":1,"1.51":2}})",
+         reason(4, "DECIMAL(5, 2)", "MAP<DECIMAL(5, 2), BIGINT>")},
+        {"MAP<DOUBLE, BIGINT>",
+         R"({"m":{"-0.0":1,"0":2}})",
+         reason(1, "DOUBLE", "MAP<DOUBLE, BIGINT>")},
+        {"MAP<BIGINT ARRAY, VARCHAR>",
+         R"({"m":{"[1, 2]":"a","[1,2.0]":"b"}})",
+         reason(7, "BIGINT ARRAY", "MAP<BIGINT ARRAY, VARCHAR>")},
+    };
+    for (const auto& [type, line, expected] : cases) {
+        const RowArrowBuilder builder(ra_columns("m:" + type));
+        EXPECT_EQ(std::string(ra_refusal(builder, ra_rows({line})).what()),
+                  ra_message("m", 0, expected))
+            << type << " " << line;
+    }
+
+    // A repeat further in names the entry it repeats and the path to the map.
+    // Key texts sort as text, so "1970-01-02" comes before "19723".
+    const RowArrowBuilder nested(ra_columns("w:ROW<m MAP<DATE, BIGINT>>"));
+    EXPECT_EQ(
+        std::string(
+            ra_refusal(nested,
+                       ra_rows({R"({"w":{"m":{"0":1,"19723":2,"1970-01-02":3,"2024-01-01":4}}})"}))
+                .what()),
+        ra_message("w",
+                   0,
+                   "field `m`, entry 3 key: key text(len 10) is the same DATE as entry 2 key, and "
+                   "each key of MAP<DATE, BIGINT> must be distinct"));
+}
+
+// Keys are compared by the values they convert to, recorded so that no two
+// values share a record. The array keys below would read the same if the
+// record dropped an array length or a null marker: 72340172838076673 is
+// eight 0x01 bytes, which is what a run of present markers looks like.
+TEST(NativeRowArrow, DistinctMapKeysAreKeptWhateverTheirType) {
+    const RowArrowBuilder builder(
+        ra_columns("dm:MAP<DATE, BIGINT>;fm:MAP<DOUBLE, BIGINT>;am:MAP<BIGINT ARRAY, BIGINT>;"
+                   "vm:MAP<VARCHAR ARRAY, BIGINT>;bm:MAP<BIGINT, BIGINT>;"
+                   "rm:MAP<ROW<a BIGINT ARRAY, b BIGINT ARRAY>, BIGINT>"));
+    const auto chunk =
+        ra_build(builder,
+                 ra_rows({R"({"dm":{"19723":1,"2024-01-02":2},"fm":{"1":1,"1.5":2,"-0.5":3},)"
+                          R"("am":{"[1,2]":1,"[12]":2,"[1]":3,"[]":4,"[null]":5,)"
+                          R"("[0,null]":6,"[null,0]":7},)"
+                          R"("vm":{"[\"ab\",\"c\"]":1,"[\"a\",\"bc\"]":2,)"
+                          R"("[null,\"x\"]":3,"[\"x\",null]":4},)"
+                          R"("bm":{"1":1,"-1":2,"10":3},)"
+                          R"("rm":{"{\"a\":[72340172838076673],\"b\":[]}":1,)"
+                          R"("{\"a\":[],\"b\":[72340172838076673]}":2}})"}));
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(ra_col<arrow::MapArray>(chunk, 0)->value_length(0), 2);
+    EXPECT_EQ(ra_col<arrow::MapArray>(chunk, 1)->value_length(0), 3);
+    EXPECT_EQ(ra_col<arrow::MapArray>(chunk, 2)->value_length(0), 7);
+    EXPECT_EQ(ra_col<arrow::MapArray>(chunk, 3)->value_length(0), 4);
+    EXPECT_EQ(ra_int64_values(*ra_col<arrow::MapArray>(chunk, 4)->keys()),
+              (std::vector<std::int64_t>{-1, 1, 10}));
+    EXPECT_EQ(ra_col<arrow::MapArray>(chunk, 5)->value_length(0), 2);
 }
 
 TEST(NativeRowArrow, BadMapValueOrNonObjectFails) {

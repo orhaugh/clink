@@ -10,7 +10,10 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
@@ -318,6 +321,20 @@ public:
         throw ConversionError(column_, row_, where() + reason);
     }
 
+    // A map key that converts to the same value as entry `first`'s key, so
+    // the two would land as one key held twice. Named by position and by the
+    // length of its text, as any key failure is.
+    [[noreturn]] void fail_repeated_key(const SqlType& map,
+                                        const std::string& text,
+                                        std::size_t first) const {
+        throw ConversionError(column_,
+                              row_,
+                              where() + "key text(len " + std::to_string(text.size()) +
+                                  ") is the same " + type_name(map.children[0]) + " as entry " +
+                                  std::to_string(first) + " key, and each key of " +
+                                  type_name(map) + " must be distinct");
+    }
+
 private:
     const std::string& column_;
     std::int64_t row_{0};
@@ -355,7 +372,10 @@ private:
 // Appends cells under the sink's own rule: a cell of the wrong kind, or out of
 // range, fails the row rather than becoming NULL. Used for the top-level
 // columns of the types the shared batcher does not cover and for every
-// element inside a composite, the shared types included.
+// element inside a composite, the shared types included. Inside a composite
+// BIGINT and INTEGER take the rule SMALLINT and TINYINT have everywhere: a
+// number with a fraction fails rather than being truncated, so map keys 1.5
+// and 1.9 can never both land as the key 1.
 //
 // A columnar batch carries every type outside the shared set in its text
 // fallback (row_columnar_detail::to_utf8), so once materialised a SMALLINT,
@@ -369,13 +389,70 @@ public:
     void append(arrow::ArrayBuilder& b, const SqlType& t, const JsonValue* v) {
         if (v == nullptr || v->is_null()) {
             arrow_ok(b.AppendNull());
+            record(std::uint8_t{0});
             return;
         }
+        record(std::uint8_t{1});
         append_value(b, t, *v);
     }
 
 private:
     Cursor& cursor_;
+
+    // The converted values of the map keys being built, innermost last. Every
+    // value appended meanwhile is recorded into each of them, so a key's
+    // record is the value it converted to, whatever text it was spelt in.
+    // A record is unambiguous for its type: text and every array or map
+    // carry their length, and every element, value or field its presence.
+    std::vector<std::string*> key_records_;
+
+    // Records into a key's record for the life of a scope.
+    class Recording {
+    public:
+        Recording(CellWriter& writer, std::string& into) : writer_(writer) {
+            writer_.key_records_.push_back(&into);
+        }
+        ~Recording() { writer_.key_records_.pop_back(); }
+        Recording(const Recording&) = delete;
+        Recording& operator=(const Recording&) = delete;
+
+    private:
+        CellWriter& writer_;
+    };
+
+    void record_bytes(const void* data, std::size_t size) {
+        for (std::string* into : key_records_) {
+            into->append(static_cast<const char*>(data), size);
+        }
+    }
+
+    template <typename T>
+    void record(T value) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        record_bytes(&value, sizeof value);
+    }
+
+    // Appends one converted value and records it.
+    template <typename Builder, typename Value>
+    void put(arrow::ArrayBuilder& b, Value value) {
+        arrow_ok(static_cast<Builder&>(b).Append(value));
+        record(value);
+    }
+
+    void put_text(arrow::ArrayBuilder& b, std::string_view text) {
+        arrow_ok(static_cast<arrow::StringBuilder&>(b).Append(text));
+        record(static_cast<std::uint64_t>(text.size()));
+        record_bytes(text.data(), text.size());
+    }
+
+    // -0 and 0 are the same key to anything that compares them.
+    template <typename Float>
+    void put_float(arrow::ArrayBuilder& b, Float value) {
+        using Builder = std::
+            conditional_t<std::is_same_v<Float, float>, arrow::FloatBuilder, arrow::DoubleBuilder>;
+        arrow_ok(static_cast<Builder&>(b).Append(value));
+        record(value == Float{0} ? Float{0} : value);
+    }
 
     [[noreturn]] void fail(Fault fault, const SqlType& t, const JsonValue& v) const {
         cursor_.fail(fault, t, v);
@@ -388,45 +465,49 @@ private:
     void append_value(arrow::ArrayBuilder& b, const SqlType& t, const JsonValue& v) {
         switch (t.kind) {
             case SqlKind::TinyInt:
-                arrow_ok(static_cast<arrow::Int8Builder&>(b).Append(small_int<std::int8_t>(t, v)));
+                put<arrow::Int8Builder>(b, small_int<std::int8_t>(t, v));
                 return;
             case SqlKind::SmallInt:
-                arrow_ok(
-                    static_cast<arrow::Int16Builder&>(b).Append(small_int<std::int16_t>(t, v)));
+                put<arrow::Int16Builder>(b, small_int<std::int16_t>(t, v));
                 return;
             case SqlKind::Integer:
-                append_integer(static_cast<arrow::Int32Builder&>(b), t, v);
+                put<arrow::Int32Builder>(b, element_int<std::int32_t>(t, v));
                 return;
             case SqlKind::BigInt:
-                append_bigint(static_cast<arrow::Int64Builder&>(b), t, v);
+                put<arrow::Int64Builder>(b, element_int<std::int64_t>(t, v));
                 return;
             case SqlKind::Real:
-                append_real(static_cast<arrow::FloatBuilder&>(b), t, v);
+                put_float(b, real(t, v));
                 return;
             case SqlKind::Double:
                 if (!v.is_number()) {
                     fail(Fault::WrongKind, t, v);
                 }
-                arrow_ok(static_cast<arrow::DoubleBuilder&>(b).Append(v.as_number()));
+                put_float(b, v.as_number());
                 return;
             case SqlKind::Boolean:
                 if (!v.is_bool()) {
                     fail(Fault::WrongKind, t, v);
                 }
                 arrow_ok(static_cast<arrow::BooleanBuilder&>(b).Append(v.as_bool()));
+                record(static_cast<std::uint8_t>(v.as_bool()));
                 return;
             case SqlKind::Varchar:
                 // The shared rendering, which accepts every kind.
-                arrow_ok(static_cast<arrow::StringBuilder&>(b).Append(shared::to_utf8(v)));
+                put_text(b, shared::to_utf8(v));
                 return;
-            case SqlKind::Decimal:
-                append_decimal(static_cast<arrow::Decimal128Builder&>(b), t, v);
+            case SqlKind::Decimal: {
+                const arrow::Decimal128 unscaled = decimal(t, v);
+                arrow_ok(static_cast<arrow::Decimal128Builder&>(b).Append(unscaled));
+                record(unscaled.high_bits());
+                record(unscaled.low_bits());
                 return;
+            }
             case SqlKind::Timestamp:
-                arrow_ok(static_cast<arrow::TimestampBuilder&>(b).Append(epoch_ms(t, v)));
+                put<arrow::TimestampBuilder>(b, epoch_ms(t, v));
                 return;
             case SqlKind::Date:
-                arrow_ok(static_cast<arrow::Date32Builder&>(b).Append(date_days(t, v)));
+                put<arrow::Date32Builder>(b, date_days(t, v));
                 return;
             case SqlKind::Array:
                 append_array(static_cast<arrow::ListBuilder&>(b), t, v);
@@ -446,13 +527,11 @@ private:
         throw std::logic_error("clickhouse native sink: no Arrow layout for " + type_name(t));
     }
 
-    // A whole number in [lo, hi]: an integer, a double with no fraction, or
-    // digit text. Text that is not digits raises `text_fault`.
-    std::int64_t whole(const SqlType& t,
-                       const JsonValue& v,
-                       std::int64_t lo,
-                       std::int64_t hi,
-                       Fault text_fault) const {
+    // A whole number in [lo, hi]: an integer, or a double with no fraction.
+    std::int64_t whole_number(const SqlType& t,
+                              const JsonValue& v,
+                              std::int64_t lo,
+                              std::int64_t hi) const {
         std::int64_t out = 0;
         if (v.is_integral_number()) {
             out = v.as_int();
@@ -465,17 +544,33 @@ private:
                 fail(Fault::OutOfRange, t, v);
             }
             out = static_cast<std::int64_t>(d);
-        } else if (is_plain_text(v)) {
-            switch (parse_text_int(v.as_string(), out)) {
-                case TextInt::Ok:
-                    break;
-                case TextInt::OutOfRange:
-                    fail(Fault::OutOfRange, t, v);
-                case TextInt::NotDigits:
-                    fail(text_fault, t, v);
-            }
         } else {
             fail(Fault::WrongKind, t, v);
+        }
+        if (out < lo || out > hi) {
+            fail(Fault::OutOfRange, t, v);
+        }
+        return out;
+    }
+
+    // A whole number in [lo, hi], or digit text. Text that is not digits
+    // raises `text_fault`.
+    std::int64_t whole(const SqlType& t,
+                       const JsonValue& v,
+                       std::int64_t lo,
+                       std::int64_t hi,
+                       Fault text_fault) const {
+        if (!is_plain_text(v)) {
+            return whole_number(t, v, lo, hi);
+        }
+        std::int64_t out = 0;
+        switch (parse_text_int(v.as_string(), out)) {
+            case TextInt::Ok:
+                break;
+            case TextInt::OutOfRange:
+                fail(Fault::OutOfRange, t, v);
+            case TextInt::NotDigits:
+                fail(text_fault, t, v);
         }
         if (out < lo || out > hi) {
             fail(Fault::OutOfRange, t, v);
@@ -491,6 +586,16 @@ private:
                                       std::numeric_limits<Int>::min(),
                                       std::numeric_limits<Int>::max(),
                                       Fault::WrongKind));
+    }
+
+    // BIGINT and INTEGER inside a composite: a whole number in the type's
+    // range. Digit text stays the wrong kind, as it was under the shared
+    // rule: a composite's JSON text is parsed back whole, so its numbers
+    // arrive as numbers even from a columnar batch.
+    template <typename Int>
+    Int element_int(const SqlType& t, const JsonValue& v) const {
+        return static_cast<Int>(
+            whole_number(t, v, std::numeric_limits<Int>::min(), std::numeric_limits<Int>::max()));
     }
 
     // Epoch milliseconds whatever the declared precision, stored as written:
@@ -521,45 +626,9 @@ private:
                                                Fault::DateText));
     }
 
-    // The shared BIGINT rule, failing where it would give NULL: an integer
-    // exactly, a double truncated when an int64 holds it.
-    void append_bigint(arrow::Int64Builder& b, const SqlType& t, const JsonValue& v) const {
-        if (v.is_integral_number()) {
-            arrow_ok(b.Append(v.as_int()));
-        } else if (v.is_number()) {
-            if (!shared::double_fits_int64(v.as_number())) {
-                fail(Fault::OutOfRange, t, v);
-            }
-            arrow_ok(b.Append(static_cast<std::int64_t>(v.as_number())));
-        } else {
-            fail(Fault::WrongKind, t, v);
-        }
-    }
-
-    // The shared INTEGER rule, failing where it would give NULL.
-    void append_integer(arrow::Int32Builder& b, const SqlType& t, const JsonValue& v) const {
-        constexpr auto kLo = std::numeric_limits<std::int32_t>::min();
-        constexpr auto kHi = std::numeric_limits<std::int32_t>::max();
-        if (v.is_integral_number()) {
-            if (v.as_int() < kLo || v.as_int() > kHi) {
-                fail(Fault::OutOfRange, t, v);
-            }
-            arrow_ok(b.Append(static_cast<std::int32_t>(v.as_int())));
-        } else if (v.is_number()) {
-            const double d = v.as_number();
-            if (!std::isfinite(d) || d <= static_cast<double>(kLo) - 1.0 ||
-                d >= static_cast<double>(kHi) + 1.0) {
-                fail(Fault::OutOfRange, t, v);
-            }
-            arrow_ok(b.Append(static_cast<std::int32_t>(d)));
-        } else {
-            fail(Fault::WrongKind, t, v);
-        }
-    }
-
     // A finite double past float's range has no float value; the cast would be
     // undefined, so it fails instead.
-    void append_real(arrow::FloatBuilder& b, const SqlType& t, const JsonValue& v) const {
+    float real(const SqlType& t, const JsonValue& v) const {
         if (!v.is_number()) {
             fail(Fault::WrongKind, t, v);
         }
@@ -568,7 +637,7 @@ private:
             std::fabs(d) > static_cast<double>(std::numeric_limits<float>::max())) {
             fail(Fault::OutOfRange, t, v);
         }
-        arrow_ok(b.Append(static_cast<float>(d)));
+        return static_cast<float>(d);
     }
 
     // A decimal string, an integer read exactly, or a double read through its
@@ -577,7 +646,7 @@ private:
     // decimal inside a composite arrives as a plain number. Rescaled half up,
     // as the shared rule does, and refused when the declared precision cannot
     // hold it.
-    void append_decimal(arrow::Decimal128Builder& b, const SqlType& t, const JsonValue& v) const {
+    arrow::Decimal128 decimal(const SqlType& t, const JsonValue& v) const {
         std::optional<clink::config::Decimal> d;
         if (clink::config::is_dec_string(v)) {
             d = clink::config::dec_parse(v.as_string());
@@ -596,7 +665,7 @@ private:
         if (!scaled || !scaled->unscaled.FitsInPrecision(t.precision)) {
             fail(Fault::OutOfRange, t, v);
         }
-        arrow_ok(b.Append(scaled->unscaled));
+        return scaled->unscaled;
     }
 
     // The value itself, or the value its JSON text encodes, when that is of
@@ -620,12 +689,19 @@ private:
         arrow::ArrayBuilder& values = *b.value_builder();
         const SqlType& element = t.children.front();
         const auto& items = list->as_array();
+        record(static_cast<std::uint64_t>(items.size()));
         for (std::size_t i = 0; i < items.size(); ++i) {
             const Cursor::Scope at(cursor_, {Cursor::Step::Kind::Element, i, nullptr});
             append(values, element, &items[i]);
         }
     }
 
+    // The object holds each key text once, but different texts can convert
+    // to one value: "1" and "1.0" as BIGINT, "19723" and "2024-01-01" as
+    // DATE, "1.505" and "1.51" as DECIMAL(5, 2). A ClickHouse Map does not
+    // make its keys unique, so such a map would land holding one key twice,
+    // and it fails instead. VARCHAR keys are their text verbatim, so they
+    // cannot repeat and are not tracked.
     void append_map(arrow::MapBuilder& b, const SqlType& t, const JsonValue& v) {
         JsonValue parsed;
         const JsonValue* object = composite(v, parsed, /*want_array=*/false);
@@ -635,11 +711,28 @@ private:
         arrow_ok(b.Append());
         arrow::ArrayBuilder& keys = *b.key_builder();
         arrow::ArrayBuilder& items = *b.item_builder();
+        const SqlType& key_type = t.children[0];
+        const auto& entries = object->as_object();
+        record(static_cast<std::uint64_t>(entries.size()));
+        const bool track = key_type.kind != SqlKind::Varchar && entries.size() > 1;
+        std::unordered_map<std::string, std::size_t> seen;
         std::size_t i = 0;
-        for (const auto& [key, value] : object->as_object()) {
+        for (const auto& [key, value] : entries) {
             {
                 const Cursor::Scope at(cursor_, {Cursor::Step::Kind::Key, i, nullptr});
-                append_key(keys, t.children[0], key);
+                if (track) {
+                    std::string converted;
+                    {
+                        const Recording into(*this, converted);
+                        append_key(keys, key_type, key);
+                    }
+                    const auto [first, fresh] = seen.try_emplace(std::move(converted), i);
+                    if (!fresh) {
+                        cursor_.fail_repeated_key(t, key, first->second);
+                    }
+                } else {
+                    append_key(keys, key_type, key);
+                }
             }
             {
                 const Cursor::Scope at(cursor_, {Cursor::Step::Kind::Value, i, nullptr});
@@ -656,7 +749,7 @@ private:
         const Cursor::KeyText redact(cursor_, text);
         switch (t.kind) {
             case SqlKind::Varchar:
-                arrow_ok(static_cast<arrow::StringBuilder&>(b).Append(text));
+                put_text(b, text);
                 return;
             case SqlKind::Timestamp:
             case SqlKind::Date:
