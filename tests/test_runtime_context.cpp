@@ -134,3 +134,19 @@ TEST(RuntimeContext, DrainTargetSignalCanBeCleared) {
     ctx.set_drain_target_signal(nullptr);
     EXPECT_EQ(ctx.drain_target(), 0u);
 }
+
+TEST(RuntimeContext, CancelRequestedIsFalseUntilASignalSaysOtherwise) {
+    RuntimeContext ctx(OperatorId{1}, "op", nullptr, nullptr);
+    EXPECT_FALSE(ctx.cancel_requested()) << "an unset signal means never cancelled";
+    auto executor = std::make_shared<std::atomic<bool>>(false);
+    auto external = std::make_shared<std::atomic<bool>>(false);
+    ctx.set_cancel_signal(CancelSignal{executor, external});
+    EXPECT_FALSE(ctx.cancel_requested());
+    external->store(true);
+    EXPECT_TRUE(ctx.cancel_requested()) << "the external token alone cancels";
+    external->store(false);
+    executor->store(true);
+    EXPECT_TRUE(ctx.cancel_requested()) << "the executor's own flag alone cancels";
+    EXPECT_TRUE(ctx.cancel_signal().requested());
+    EXPECT_FALSE(CancelSignal{}.requested());
+}

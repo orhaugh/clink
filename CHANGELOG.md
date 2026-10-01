@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**Operators can see a cancel.** `RuntimeContext::cancel_requested()` is true
+once the task is being torn down: a CancelJob, the loss of the control
+session, the worker stopping, a final-checkpoint decline, or another operator
+of the executor failing. `cancel_signal()` hands out a copyable view that a
+thread an operator owns may keep after the context is gone. It is separate
+from `stop_requested()`, the stop-with-savepoint signal. A sink that blocks,
+retrying a write, polls it to give up promptly instead of holding a restart's
+drain.
+
 **The ClickHouse client is pinned and built in Release.** clickhouse-cpp is now
 `2.6.2` (`scripts/versions.env`, checksum-pinned), built static with TLS by
 `scripts/build-clickhouse-cpp.sh`, into `CLINK_DEPS_PREFIX/clickhouse-cpp` on

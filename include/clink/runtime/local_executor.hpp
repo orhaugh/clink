@@ -112,7 +112,9 @@ private:
     Dag dag_;
     JobConfig config_;
     std::atomic<bool> running_{false};
-    std::atomic<bool> cancel_{false};
+    // Shared, so the cancel signal an operator's own thread copies stays valid
+    // after the executor's members are gone.
+    std::shared_ptr<std::atomic<bool>> cancel_{std::make_shared<std::atomic<bool>>(false)};
     std::vector<std::jthread> threads_;
     std::vector<std::unique_ptr<RuntimeContext>> contexts_;
     // Default DLQ installed when JobConfig::dead_letter_queue is unset, so bad

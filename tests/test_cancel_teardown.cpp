@@ -713,3 +713,69 @@ TEST(CancelTeardown, OneBarrierStagingSinkAlongsidePlainSinksStillBuilds) {
     }) << "a chain with exactly one transactional sink was refused; only two or more "
           "are unorderable.";
 }
+
+// --- cancel_requested(): what a blocking operator polls ------------------------
+
+namespace {
+
+// Copies the task's cancel signal at open, as a sink with its own writer thread
+// does, so the test can read it from outside and after the executor is gone.
+class CancelSignalProbeSink final : public Sink<int> {
+public:
+    void open() override {
+        signal = this->runtime()->cancel_signal();
+        opened.store(true, std::memory_order_release);
+    }
+    void on_data(const Batch<int>& batch) override {
+        writes.fetch_add(static_cast<int>(batch.size()), std::memory_order_relaxed);
+    }
+    std::string name() const override { return "cancel_teardown.signal_probe"; }
+
+    CancelSignal signal;
+    std::atomic<bool> opened{false};
+    std::atomic<int> writes{0};
+};
+
+}  // namespace
+
+TEST(CancelTeardown, ASinkSeesCancelRequestedAndItsCopyOutlivesTheExecutor) {
+    std::shared_ptr<CancelSignalProbeSink> sink = std::make_shared<CancelSignalProbeSink>();
+    {
+        Dag dag;
+        auto src = std::make_shared<CancelTeardownEndlessSource>();
+        auto h = dag.add_source<int>(src);
+        dag.add_sink<int>(h, sink);
+        LocalExecutor exec(std::move(dag));
+        exec.start();
+        ASSERT_TRUE(await([&] { return sink->writes.load() > 0; }, 5s));
+        ASSERT_TRUE(sink->opened.load(std::memory_order_acquire));
+        EXPECT_FALSE(sink->signal.requested()) << "a running task reported itself cancelled";
+        exec.cancel();
+        EXPECT_TRUE(sink->signal.requested()) << "cancel() did not reach the operator's signal";
+        exec.await_termination();
+    }
+    // The executor and its contexts are gone; a thread that kept the copy must
+    // still read a valid flag, and still see the cancel.
+    EXPECT_TRUE(sink->signal.requested());
+}
+
+TEST(CancelTeardown, TheExternalCancelTokenReachesCancelRequestedAtOnce) {
+    // The worker flips this token on CancelJob and on the loss of the control
+    // session; the signal reads it directly rather than waiting for the
+    // executor's watcher to notice.
+    auto token = std::make_shared<std::atomic<bool>>(false);
+    auto sink = std::make_shared<CancelSignalProbeSink>();
+    Dag dag;
+    auto src = std::make_shared<CancelTeardownEndlessSource>();
+    auto h = dag.add_source<int>(src);
+    dag.add_sink<int>(h, sink);
+    JobConfig cfg;
+    cfg.external_cancel_token = token;
+    LocalExecutor exec(std::move(dag), cfg);
+    exec.start();
+    ASSERT_TRUE(await([&] { return sink->writes.load() > 0; }, 5s));
+    EXPECT_FALSE(sink->signal.requested());
+    token->store(true, std::memory_order_release);
+    EXPECT_TRUE(sink->signal.requested());
+    exec.await_termination();
+}

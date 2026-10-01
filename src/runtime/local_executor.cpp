@@ -159,6 +159,9 @@ void LocalExecutor::start() {
         contexts_.back()->set_drain_target_signal(config_.drain_target);
         contexts_.back()->set_drain_at_checkpoint_signal(config_.drain_at_checkpoint);
         contexts_.back()->set_stop_requested_signal(config_.stop_requested);
+        // Cancellation for operators that block or keep their own threads: the
+        // same flags the runner's stop predicate reads.
+        contexts_.back()->set_cancel_signal(CancelSignal{cancel_, config_.external_cancel_token});
         // Host-owned logger threaded across the plugin boundary by data (see
         // JobConfig::logger). Null in in-process / legacy paths, where the
         // operator log helpers fall back to the process LogBuffer.
@@ -202,7 +205,7 @@ void LocalExecutor::start() {
         // can wind the executor down without a reference to it.
         auto ext_token = config_.external_cancel_token;
         auto stop_predicate = [this, ext_token] {
-            if (cancel_.load(std::memory_order_acquire)) {
+            if (cancel_->load(std::memory_order_acquire)) {
                 return true;
             }
             return ext_token != nullptr && ext_token->load(std::memory_order_acquire);
@@ -288,7 +291,7 @@ void LocalExecutor::await_termination() {
 }
 
 void LocalExecutor::cancel() {
-    cancel_.store(true, std::memory_order_release);
+    cancel_->store(true, std::memory_order_release);
     for (const auto& runner : dag_.runners()) {
         if (runner.cancel) {
             runner.cancel();
@@ -411,7 +414,7 @@ void LocalExecutor::metrics_poll_loop_() {
         probes.push_back(std::move(p));
     }
 
-    while (running_.load(std::memory_order_acquire) && !cancel_.load(std::memory_order_acquire)) {
+    while (running_.load(std::memory_order_acquire) && !cancel_->load(std::memory_order_acquire)) {
         report_memory_metrics_();
         for (auto& p : probes) {
             const std::int64_t d = p.depth ? static_cast<std::int64_t>(p.depth()) : 0;
@@ -434,7 +437,7 @@ void LocalExecutor::metrics_poll_loop_() {
 void LocalExecutor::external_cancel_watch_loop_() {
     using namespace std::chrono_literals;
     const auto& token = config_.external_cancel_token;
-    while (running_.load(std::memory_order_acquire) && !cancel_.load(std::memory_order_acquire)) {
+    while (running_.load(std::memory_order_acquire) && !cancel_->load(std::memory_order_acquire)) {
         if (token && token->load(std::memory_order_acquire)) {
             cancel();
             return;

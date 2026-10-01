@@ -86,6 +86,30 @@ private:
 // Lifetime: the executor owns the RuntimeContext for the entire run; the
 // operator holds a non-owning pointer via Operator::attach_runtime(). Do
 // not stash a copy elsewhere.
+// A copyable view of a task's cancel state. It holds the flags themselves, so a
+// thread an operator owns (a sink's writer) may keep it past the RuntimeContext's
+// lifetime. A default-constructed signal is never cancelled.
+class CancelSignal {
+public:
+    CancelSignal() = default;
+    CancelSignal(std::shared_ptr<const std::atomic<bool>> executor_cancel,
+                 std::shared_ptr<const std::atomic<bool>> external_cancel) noexcept
+        : executor_(std::move(executor_cancel)), external_(std::move(external_cancel)) {}
+
+    // True once the task is being torn down: a CancelJob, the loss of the
+    // control session, the worker stopping, a final-checkpoint decline, or any
+    // operator of the executor failing. The same truth as the runner's own stop
+    // predicate.
+    [[nodiscard]] bool requested() const noexcept {
+        return (executor_ && executor_->load(std::memory_order_acquire)) ||
+               (external_ && external_->load(std::memory_order_acquire));
+    }
+
+private:
+    std::shared_ptr<const std::atomic<bool>> executor_;
+    std::shared_ptr<const std::atomic<bool>> external_;
+};
+
 class RuntimeContext {
 public:
     RuntimeContext(OperatorId op_id,
@@ -343,6 +367,14 @@ public:
     [[nodiscard]] bool stop_requested() const noexcept {
         return stop_requested_ && stop_requested_->load(std::memory_order_acquire);
     }
+
+    // Cancellation, as distinct from a stop: the task is being torn down and
+    // its output will not be checkpointed. An operator that blocks (a sink
+    // retrying a write) polls this to give up promptly; one that keeps its own
+    // thread copies cancel_signal(). Set by the executor; unset means never.
+    void set_cancel_signal(CancelSignal signal) noexcept { cancel_signal_ = std::move(signal); }
+    [[nodiscard]] bool cancel_requested() const noexcept { return cancel_signal_.requested(); }
+    [[nodiscard]] const CancelSignal& cancel_signal() const noexcept { return cancel_signal_; }
 
     // Per-operator alignment mode override. When set, the
     // operator's runner stamps every barrier passing through with
@@ -641,6 +673,7 @@ private:
     std::shared_ptr<std::atomic<std::uint32_t>> drain_target_;
     std::shared_ptr<std::atomic<std::uint64_t>> drain_at_checkpoint_;
     std::shared_ptr<std::atomic<bool>> stop_requested_;
+    CancelSignal cancel_signal_;
 };
 
 }  // namespace clink
