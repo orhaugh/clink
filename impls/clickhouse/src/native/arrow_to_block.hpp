@@ -58,7 +58,8 @@ private:
 
 // One part of a held block divided for a resource split. Column::Slice copies
 // every String value into storage the part owns, so the part no longer needs
-// the chunk, and owned_bytes counts those copies for the memory charge.
+// the chunk, and owned_bytes counts what the copies hold, the growth slack of
+// Array and Map offsets included, for the memory charge.
 struct BlockSlice {
     ::clickhouse::Block block;
     std::size_t rows{0};
@@ -67,8 +68,10 @@ struct BlockSlice {
 };
 
 // Rows [begin, begin + length) of a block that BlockBuilder::take() made, by
-// Column::Slice, with RefreshRowCount() applied. Throws std::out_of_range
-// for an empty or out-of-bounds range, since a 0-row block is never sent.
+// Column::Slice, with RefreshRowCount() applied. Every column of the part has
+// its parent's type, DateTime time zones included at any depth, so the part
+// matches the INSERT's header. Throws std::out_of_range for an empty or
+// out-of-bounds range, since a 0-row block is never sent.
 [[nodiscard]] BlockSlice slice_block(const ::clickhouse::Block& block,
                                      std::size_t begin,
                                      std::size_t length);

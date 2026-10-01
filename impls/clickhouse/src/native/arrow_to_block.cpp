@@ -237,6 +237,31 @@ private:
     std::shared_ptr<ch::ColumnArray> entries_;
 };
 
+// A DateTime column whose slices and empty clones keep its time zone. The
+// client's ColumnDateTime builds both without one, so a split part of a
+// DateTime('UTC') column would go out as plain DateTime, which an INSERT that
+// refuses type conversion need not accept. Nullable, Array, Tuple and Map
+// slice and clone their children through these overrides, so the zone holds
+// at every depth.
+class DateTimeColumn final : public ch::ColumnDateTime {
+public:
+    explicit DateTimeColumn(std::string timezone) : ch::ColumnDateTime(std::move(timezone)) {}
+
+    DateTimeColumn(std::string timezone, std::vector<std::uint32_t>&& values)
+        : ch::ColumnDateTime(std::move(timezone), std::move(values)) {}
+
+    ch::ColumnRef Slice(std::size_t begin, std::size_t len) const override {
+        // The client's slice copies the values into a vector of exactly the
+        // part's size, which the zoned column takes over without a copy.
+        const auto plain = ch::ColumnDateTime::Slice(begin, len)->As<ch::ColumnDateTime>();
+        return std::make_shared<DateTimeColumn>(Timezone(), std::move(plain->GetWritableData()));
+    }
+
+    ch::ColumnRef CloneEmpty() const override {
+        return std::make_shared<DateTimeColumn>(Timezone());
+    }
+};
+
 // Converts one binding's Arrow array into its client column, and owns that
 // column until take(). Every row index is logical: Arrow's accessors add the
 // array's own offset() to both the validity bitmap and the value buffers.
@@ -943,13 +968,12 @@ public:
     using TimestampNode::TimestampNode;
 
 private:
-    std::shared_ptr<ch::ColumnDateTime> values_;
+    std::shared_ptr<DateTimeColumn> values_;
     std::size_t reserved_{0};
 
     ch::ColumnRef fresh() override {
-        values_ = binding_.target.timezone.empty()
-                      ? std::make_shared<ch::ColumnDateTime>()
-                      : std::make_shared<ch::ColumnDateTime>(binding_.target.timezone);
+        // An empty zone spells plain DateTime, as the client's own default.
+        values_ = std::make_shared<DateTimeColumn>(binding_.target.timezone);
         reserved_ = 0;
         return values_;
     }
@@ -1457,9 +1481,11 @@ std::size_t slice_width(const ch::Column& column) {
     }
 }
 
-// What a column made by Column::Slice costs. Slice copies into vectors of
-// exactly the slice's size, and a String slice copies its values into one
-// storage block of exactly their total length.
+// What a column made by Column::Slice costs. Slice copies values and null
+// flags into vectors of exactly the slice's size, and a String slice copies
+// its values into one storage block of exactly their total length. An Array
+// slice appends its offsets one at a time, so their vector can hold up to
+// twice what they need, and its real capacity is what gets counted.
 Tally measure(const ch::Column& column) {
     const std::size_t rows = column.Size();
     if (const auto* nullable = dynamic_cast<const ch::ColumnNullable*>(&column)) {
@@ -1471,7 +1497,7 @@ Tally measure(const ch::Column& column) {
     if (const auto* array = dynamic_cast<const ch::ColumnArray*>(&column)) {
         Tally t = measure(*array->GetData());
         t.payload += rows * kOffsetBytes;
-        t.owned += rows * kOffsetBytes;
+        t.owned += array->GetOffsets()->Capacity() * kOffsetBytes;
         return t;
     }
     if (const auto* map = dynamic_cast<const MapColumn*>(&column)) {

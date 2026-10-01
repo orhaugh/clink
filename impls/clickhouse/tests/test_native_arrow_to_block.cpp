@@ -1149,6 +1149,114 @@ TEST(NativeArrowToBlock, SliceBlockCopiesStringsAndCountsWhatTheCopiesOwn) {
         16U + (2 + 35 + entry) + (16 + 35 + entry) + (16 + 35 + entry + 16) + (16 + 34 + entry));
 }
 
+// A split part goes out under the parent INSERT's header, which refuses type
+// conversion, so every column must keep its parent's type. The client's own
+// DateTime slice drops the time zone, at the top level and inside every
+// composite that slices its children.
+TEST(NativeArrowToBlock, SliceBlockKeepsEveryColumnTypeTimeZonesIncluded) {
+    const std::string spec = std::string("t:TIMESTAMP(3);tn:TIMESTAMP(3);") +
+                             "ta:TIMESTAMP(3) ARRAY;tan:TIMESTAMP(3) ARRAY;" +
+                             "tm:MAP<VARCHAR, TIMESTAMP(3)>;tr:ROW<a TIMESTAMP(3), b BIGINT>;" +
+                             "plain:TIMESTAMP(3);t64:TIMESTAMP(3);" +
+                             "d:DECIMAL(10, 2);e:VARCHAR;f:VARCHAR";
+    const std::vector<std::string> targets = {"DateTime('UTC')",
+                                              "Nullable(DateTime('Europe/London'))",
+                                              "Array(DateTime('UTC'))",
+                                              "Array(Nullable(DateTime('UTC')))",
+                                              "Map(String, DateTime('UTC'))",
+                                              "Tuple(a DateTime('UTC'), b Int64)",
+                                              "DateTime",
+                                              "DateTime64(3, 'UTC')",
+                                              "Decimal(12, 4)",
+                                              "Enum8('a' = 1, 'b' = 2)",
+                                              "FixedString(3)"};
+    const ColumnPlan plan = a2b_plan(spec, targets);
+    const auto chunk = a2b_chunk(
+        spec,
+        {"[1000, 2000, 3000, 4000]",
+         "[1000, null, 3000, 4000]",
+         "[[1000], [2000, 3000], [], [4000]]",
+         "[[null], [2000, null], [3000], []]",
+         R"([[["a", 1000]], [["b", 2000]], [], [["c", 3000], ["d", 4000]]])",
+         R"([{"a": 1000, "b": 1}, {"a": 2000, "b": 2}, {"a": 3000, "b": 3}, {"a": 4000, "b": 4}])",
+         "[1000, 2000, 3000, 4000]",
+         "[1, 2, 3, 4]",
+         R"(["1.00", "2.00", "3.00", "4.00"])",
+         R"(["a", "b", "a", "b"])",
+         R"(["w", "xx", "yyy", ""])"});
+    const ch::Block block = a2b_convert(plan, *chunk, 0, 4);
+    const BlockSlice part = slice_block(block, 1, 2);
+    const std::vector<A2bRows> expected = {{"2", "3"},
+                                           {"NULL", "3"},
+                                           {"[2, 3]", "[]"},
+                                           {"[2, NULL]", "[3]"},
+                                           {"{'b': 2}", "{}"},
+                                           {"(2, 2)", "(3, 3)"},
+                                           {"2", "3"},
+                                           {"2", "3"},
+                                           {"20000", "30000"},
+                                           {"b", "a"},
+                                           {"'xx\\0'", "'yyy'"}};
+    ASSERT_EQ(part.block.GetColumnCount(), targets.size());
+    for (std::size_t k = 0; k < targets.size(); ++k) {
+        SCOPED_TRACE(targets[k]);
+        EXPECT_EQ(block[k]->Type()->GetName(), client_header_spelling(targets[k]));
+        EXPECT_EQ(part.block[k]->Type()->GetName(), block[k]->Type()->GetName());
+        EXPECT_EQ(part.block[k]->CloneEmpty()->Type()->GetName(), block[k]->Type()->GetName());
+        EXPECT_EQ(a2b_rows(part.block[k]), expected[k]);
+    }
+    // A part of a part, as a split of a split half makes, keeps the zone too.
+    const BlockSlice quarter = slice_block(part.block, 1, 1);
+    EXPECT_EQ(quarter.block[0]->Type()->GetName(), "DateTime('UTC')");
+    EXPECT_EQ(a2b_rows(quarter.block[2]), (A2bRows{"[]"}));
+    EXPECT_EQ(quarter.block[2]->Type()->GetName(), "Array(DateTime('UTC'))");
+}
+
+// The memory charge for a split part counts what its copies really hold. An
+// Array slice appends its offsets one value at a time, so the vector grows
+// past the row count, and so does the one under a Map.
+TEST(NativeArrowToBlock, SliceBlockCountsTheGrowthSlackOfArrayAndMapOffsets) {
+    constexpr std::size_t kRows = 600;
+    constexpr std::size_t kHalf = 300;
+    std::string lists = "[";
+    std::string maps = "[";
+    for (std::size_t i = 0; i < kRows; ++i) {
+        lists += i == 0 ? "[1]" : ", [1]";
+        maps += i == 0 ? R"([["k", 1]])" : R"(, [["k", 1]])";
+    }
+    lists += "]";
+    maps += "]";
+    const std::string spec = "tags:BIGINT ARRAY;m:MAP<VARCHAR, BIGINT>";
+    const ColumnPlan plan = a2b_plan(spec, {"Array(Int64)", "Map(String, Int64)"});
+    const auto chunk = a2b_chunk(spec, {lists, maps});
+    const ch::Block block = a2b_convert(plan, *chunk, 0, static_cast<std::int64_t>(kRows));
+
+    ch::Block tags;
+    tags.AppendColumn("tags", block[0]);
+    tags.RefreshRowCount();
+    const BlockSlice tags_part = slice_block(tags, 0, kHalf);
+    const std::size_t capacity =
+        tags_part.block[0]->As<ch::ColumnArray>()->GetOffsets()->Capacity();
+    // Without slack to count, this case would prove nothing.
+    ASSERT_GT(capacity, kHalf);
+    EXPECT_EQ(tags_part.owned_bytes, capacity * 8 + kHalf * 8);
+    EXPECT_EQ(tags_part.payload_bytes, kHalf * 8 + kHalf * 8);
+
+    // The Map's entries are an Array slice of the same rows, grown the same
+    // way: offsets, then a one-byte key of 16 bytes a view plus its text and
+    // one storage-block entry, then the values.
+    ch::Block m;
+    m.AppendColumn("m", block[1]);
+    m.RefreshRowCount();
+    const BlockSlice m_part = slice_block(m, 0, kHalf);
+    const std::size_t entry = 2 * sizeof(std::size_t) + sizeof(char*);
+    EXPECT_EQ(m_part.owned_bytes, capacity * 8 + (kHalf * 16 + kHalf + entry) + kHalf * 8);
+    EXPECT_EQ(m_part.payload_bytes, kHalf * 8 + 2 * kHalf + kHalf * 8);
+
+    // The whole block's part is the sum of its columns'.
+    EXPECT_EQ(slice_block(block, 0, kHalf).owned_bytes, tags_part.owned_bytes + m_part.owned_bytes);
+}
+
 TEST(NativeArrowToBlock, RedactedRowShowsTypesAndOnlyTheOffendingNumber) {
     const std::string spec =
         "id:BIGINT;email:VARCHAR;n:SMALLINT;tags:BIGINT ARRAY;at:TIMESTAMP(3);amount:DECIMAL(10, "
