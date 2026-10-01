@@ -12,19 +12,31 @@
 
 namespace clink::clickhouse::native {
 
-// One typed Arrow column per declared input column, in declared order. The
-// eight types the shared batcher supports go through
+// One typed Arrow column per declared input column, in declared order, typed
+// by arrow_type_for. The scalar types the shared batcher supports (BIGINT,
+// INTEGER, REAL, DOUBLE, BOOLEAN, VARCHAR and DECIMAL) go through
 // clink::sql::row_columnar_detail::append_json_cell, so the Row form and a
-// later columnar form agree by construction; the rest are built here. Never
-// throws for a value: a cell of the wrong JSON kind, or outside its declared
-// type's range, becomes NULL, which is the shared rule.
+// later columnar form agree by construction: at the top level a cell of the
+// wrong JSON kind, or outside the type's range, becomes NULL, which is the
+// shared rule. The rest (SMALLINT, TINYINT, TIMESTAMP, DATE, ARRAY, MAP, ROW,
+// and every element inside a composite, whatever its type) are built here,
+// and a cell of the wrong kind or out of range throws
+// ConversionError(column, row, reason) instead. A JSON null, an absent column
+// and an absent ROW field are NULL for every type.
 class RowArrowBuilder {
 public:
+    // Throws NativeSinkError(column_plan) for a declared type with no Arrow
+    // layout (TIME, BYTEA, an unsupported spelling), which the column plan
+    // refuses at open before a builder is made.
     explicit RowArrowBuilder(std::vector<SqlColumn> columns);
     ~RowArrowBuilder();
     RowArrowBuilder(RowArrowBuilder&&) noexcept;
     RowArrowBuilder& operator=(RowArrowBuilder&&) noexcept;
 
+    // One RecordBatch with one row per record of `batch`. A columnar batch is
+    // read through its row accessors, and so materialised. Throws
+    // ConversionError naming the declared column and the row within `batch`;
+    // a reason never quotes text, only its length.
     [[nodiscard]] std::shared_ptr<arrow::RecordBatch> build(const Batch<sql::Row>& batch) const;
     [[nodiscard]] const std::shared_ptr<arrow::Schema>& schema() const noexcept;
 
