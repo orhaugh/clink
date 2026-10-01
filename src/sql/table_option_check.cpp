@@ -107,6 +107,20 @@ std::vector<TableOptionProblem> check_table_options(
                          "'exactly_once'). An unrecognised value would leave the sink at "
                          "its default guarantee with no warning."});
             }
+            // insert_format chooses between the ClickHouse sinks and nothing
+            // else reads it, so on another connector it would do nothing,
+            // silently.
+            if (key == "insert_format") {
+                const auto c = properties.find("connector");
+                const std::string connector = c == properties.end() ? "" : c->second;
+                if (connector != "clickhouse") {
+                    problems.push_back({key,
+                                        "table '" + table_name +
+                                            "': insert_format applies to connector='clickhouse' "
+                                            "only; this table's connector is '" +
+                                            connector + "'"});
+                }
+            }
             // state_ttl must parse. A mistyped retention that silently
             // became "no retention" would defeat the bounded-state gate,
             // which is exactly what it is there to prevent.

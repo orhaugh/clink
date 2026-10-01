@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**`insert_format` selects the ClickHouse sink, and only there.** A
+ClickHouse sink table may set `insert_format='native'` or
+`'jsoneachrow'` (the default, today's sink). The value is a closed set, so
+a misspelling is refused at `CREATE TABLE`, and so is the key on any other
+connector, where it would otherwise have been ignored without a word.
+
 **A sink can declare that its barrier gates the checkpoint ack.**
 `Sink::gates_checkpoint_ack()` marks a sink that writes its whole interval out
 inside `on_barrier`, whose at-least-once guarantee rests on the ack following

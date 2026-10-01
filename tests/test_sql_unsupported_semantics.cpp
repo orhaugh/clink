@@ -265,6 +265,19 @@ TEST(SqlUnsupportedSemantics, InsertFormatIsAClosedDomain) {
     EXPECT_NE(near_miss.find("insert_format"), std::string::npos) << near_miss;
 }
 
+TEST(SqlUnsupportedSemantics, InsertFormatIsRefusedOffClickHouse) {
+    const auto kafka = register_ddl(
+        "CREATE TABLE t (k BIGINT) WITH (connector='kafka', format='json', topic='t', "
+        "insert_format='native');");
+    ASSERT_FALSE(kafka.empty()) << "insert_format on a Kafka table was silently ignored";
+    EXPECT_NE(kafka.find("applies to connector='clickhouse' only"), std::string::npos) << kafka;
+    EXPECT_NE(kafka.find("'kafka'"), std::string::npos) << kafka;
+
+    EXPECT_EQ(register_ddl("CREATE TABLE t (k BIGINT) WITH (connector='clickhouse', "
+                           "format='json', table='t', insert_format='native');"),
+              "");
+}
+
 TEST(SqlUnsupportedSemantics, EveryLegitimateModeValueIsAccepted) {
     // Guard against the domain list being narrowed by guesswork. The first
     // version of it omitted 'cdc' and rejected every CDC table in the
