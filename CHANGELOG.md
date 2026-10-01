@@ -27,8 +27,9 @@ options, the type mapping and the guarantees.
 - New keys `connect_timeout_ms` (5000), `send_timeout_ms` (30000) and
   `receive_timeout_ms` (30000), each 1 to 600000. A silent server could
   previously hold a flush, and the checkpoint, indefinitely.
-- `port`, `batch_rows` and `batch_interval_ms` are parsed strictly and refused
-  at deploy when out of range. Garbage used to fall back to the default, and
+- `port` (1 to 65535), `batch_rows` and `batch_interval_ms` (positive
+  integers) are parsed strictly and refused at deploy when malformed. Garbage
+  used to fall back to the default, `batch_rows=0` flushed on every row, and
   `port=70000` connected to 4464.
 - `records_out` and `bytes_out` count rows only once the server has
   acknowledged them, and the barrier and close flushes record latency and
@@ -58,6 +59,14 @@ name carries labels (`clink_connector_commit_latency_ns{connector=...}`) was
 rendered with the suffix after the label set, `name{...}_bucket{le=...}`,
 which no scraper accepts, so those series were dropped. The suffixes now go on
 the base name and `le` joins the label set.
+
+**A REAL or DECIMAL cell its type cannot hold is null in the Row carriers.**
+A finite number beyond float's range was written into a REAL column as
+infinity, and a DECIMAL value with more digits than its declared precision
+built an array that fails Arrow validation. Both are now null, the rule the
+carriers already applied to integers, on the wire, in Parquet and in Iceberg.
+An integer read as a decimal is now exact past 2^53, and a double outside
+int64 no longer reaches an undefined cast on the way.
 
 **Integers past 2^53 survive the Row columnar carriers.** The Row batcher
 read every integer cell through a double, so a BIGINT above 2^53 lost its low

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -130,11 +132,19 @@ inline std::optional<Decimal> as_decimal(const JsonValue& v) {
     if (is_dec_string(v)) {
         return dec_parse(v.as_string());
     }
+    if (v.is_integral_number()) {
+        // Exact: going through a double lost the low bits past 2^53.
+        return Decimal{arrow::Decimal128(v.as_int()), 0};
+    }
     if (v.is_number()) {
-        double n = v.as_number();
-        auto as_i64 = static_cast<std::int64_t>(n);
-        if (n == static_cast<double>(as_i64)) {
-            return Decimal{arrow::Decimal128(as_i64), 0};
+        // The cast is undefined for a double outside int64, so range-check
+        // it first; such a value is no integral decimal anyway.
+        const double n = v.as_number();
+        if (std::isfinite(n) && n >= -9223372036854775808.0 && n < 9223372036854775808.0) {
+            const auto as_i64 = static_cast<std::int64_t>(n);
+            if (n == static_cast<double>(as_i64)) {
+                return Decimal{arrow::Decimal128(as_i64), 0};
+            }
         }
     }
     return std::nullopt;

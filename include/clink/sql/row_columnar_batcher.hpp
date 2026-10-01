@@ -124,6 +124,13 @@ inline bool double_fits_int64(double d) noexcept {
     return std::isfinite(d) && d >= -9223372036854775808.0 && d < 9223372036854775808.0;
 }
 
+// True when converting `d` to float is defined: inside float's finite range,
+// or already infinite or NaN, which float holds as such.
+inline bool double_fits_float(double d) noexcept {
+    return !std::isfinite(d) ||
+           std::fabs(d) <= static_cast<double>(std::numeric_limits<float>::max());
+}
+
 // An empty typed builder for one effective column type. Pairs with
 // append_json_cell below: whatever builder this hands back, that function knows
 // how to append to.
@@ -204,8 +211,10 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
             break;
         }
         case arrow::Type::FLOAT: {
+            // A finite double beyond float's range is null: the narrowing
+            // conversion is undefined for it, and in practice gave infinity.
             auto& b = static_cast<arrow::FloatBuilder&>(builder);
-            if (v && v->is_number())
+            if (v && v->is_number() && double_fits_float(v->as_number()))
                 (void)b.Append(static_cast<float>(v->as_number()));
             else
                 (void)b.AppendNull();
@@ -229,7 +238,11 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
                     d = clink::config::dec_rescale(*d, scale);
                 }
             }
-            if (d)
+            // A value with more digits than the declared precision is null,
+            // like any other value its type cannot hold. Appending it built an
+            // array that fails validation and that readers may misread.
+            const int precision = static_cast<const arrow::Decimal128Type&>(eff).precision();
+            if (d && d->unscaled.FitsInPrecision(precision))
                 (void)b.Append(d->unscaled);
             else
                 (void)b.AppendNull();
@@ -241,7 +254,7 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
             if (v != nullptr && v->is_array()) {
                 (void)b.Append();  // open a new list slot
                 for (const auto& e : v->as_array()) {
-                    if (e.is_number())
+                    if (e.is_number() && double_fits_float(e.as_number()))
                         (void)vb->Append(static_cast<float>(e.as_number()));
                     else
                         (void)vb->AppendNull();

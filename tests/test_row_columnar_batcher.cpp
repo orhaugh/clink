@@ -473,6 +473,37 @@ TEST(RowColumnarBatcher, AnInt32CellOutOfRangeIsNull) {
     EXPECT_TRUE(a->IsNull(0));
 }
 
+TEST(RowColumnarBatcher, ARealCellBeyondFloatIsNullNotInfinity) {
+    auto a = one_cell(arrow::float32(), cfg::JsonValue{1e300});
+    EXPECT_TRUE(a->IsNull(0)) << "a finite double beyond float landed as a value";
+    auto ok = std::static_pointer_cast<arrow::FloatArray>(one_cell(
+        arrow::float32(), cfg::JsonValue{static_cast<double>(std::numeric_limits<float>::max())}));
+    ASSERT_FALSE(ok->IsNull(0));
+    EXPECT_EQ(ok->Value(0), std::numeric_limits<float>::max());
+    ok = std::static_pointer_cast<arrow::FloatArray>(
+        one_cell(arrow::float32(), cfg::JsonValue{-2.5}));
+    EXPECT_EQ(ok->Value(0), -2.5F);
+}
+
+TEST(RowColumnarBatcher, ADecimalCellWiderThanItsPrecisionIsNull) {
+    // DECIMAL(5, 2) holds at most 999.99: 1234.5 needs six digits at scale 2.
+    auto a = one_cell(arrow::decimal128(5, 2), cfg::make_dec_value(*cfg::dec_parse("1234.5")));
+    EXPECT_TRUE(a->IsNull(0)) << "an over-precision value built an invalid decimal array";
+    auto fits = one_cell(arrow::decimal128(5, 2), cfg::make_dec_value(*cfg::dec_parse("999.99")));
+    EXPECT_FALSE(fits->IsNull(0));
+    EXPECT_TRUE(fits->ValidateFull().ok());
+    auto integral = std::static_pointer_cast<arrow::Decimal128Array>(
+        one_cell(arrow::decimal128(20, 0), cfg::JsonValue{(std::int64_t{1} << 53) + 1}));
+    ASSERT_FALSE(integral->IsNull(0));
+    EXPECT_EQ(integral->FormatValue(0), "9007199254740993")
+        << "an integer reached the decimal through a double";
+}
+
+TEST(RowColumnarBatcher, ADecimalCellFromADoubleBeyondInt64IsNullNotUndefined) {
+    auto a = one_cell(arrow::decimal128(38, 0), cfg::JsonValue{1e300});
+    EXPECT_TRUE(a->IsNull(0));
+}
+
 TEST(RowColumnarBatcher, NumbersRenderedAsTextAreExact) {
     using clink::sql::row_columnar_detail::to_utf8;
     const std::int64_t big = (std::int64_t{1} << 53) + 1;
