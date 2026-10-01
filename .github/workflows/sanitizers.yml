@@ -136,7 +136,14 @@ jobs:
             -DCMAKE_CXX_FLAGS="-g1 $FLAGS" \
             -DCMAKE_EXE_LINKER_FLAGS="$FLAGS"
       - name: Build
-        run: cmake --build build-san --target clink_core_tests -j "$(( $(nproc) / 2 ))"
+        # clink_clickhouse_tests exists when the image's pinned ClickHouse
+        # client is found; build it when it does.
+        run: |
+          targets=clink_core_tests
+          if cmake --build build-san --target help | grep -q 'clink_clickhouse_tests'; then
+            targets="$targets clink_clickhouse_tests"
+          fi
+          cmake --build build-san --target $targets -j "$(( $(nproc) / 2 ))"
       - name: Test (core subset) [blocking gate]
         # The priority surfaces from the hardening brief: bounded channels,
         # operator threading, network bridges, checkpoint coordination,
@@ -153,6 +160,21 @@ jobs:
           ctest --test-dir build-san --output-on-failure -j 2 --timeout 300 \
             -R 'BoundedChannel|Channel|Network|Checkpoint|StateBackend|InMemoryState|FileBacked|Rescale|KeyGroup|Watermark|Barrier|Operator|Window|FaultInjection|Async|Shutdown|Cancel' \
             -E 'CheckSavepointCli|StateExportCli|HttpModelProvider|PubSub|InlineOpsE2E|TestCluster|Coordinator'
+      - name: Test (native ClickHouse sink) [blocking gate]
+        # The native sink's unit, fake-server and Dag-direct suites: its own
+        # writer and opener threads are where a sanitizer finding would land.
+        # The live suites skip here, having no server.
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:print_stacktrace=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/lsan-suppressions.txt
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          if [ -x build-san/impls/clickhouse/tests/clink_clickhouse_tests ]; then
+            ctest --test-dir build-san --output-on-failure -j 2 --timeout 300 \
+              -L clickhouse -R '^Native'
+          else
+            echo "clink_clickhouse_tests not built (no pinned ClickHouse client); skipping"
+          fi
       - name: Upload sanitizer logs
         if: failure()
         uses: actions/upload-artifact@v4
