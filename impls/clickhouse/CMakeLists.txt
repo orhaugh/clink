@@ -1,12 +1,6 @@
-# clink::clickhouse - ClickHouse insert sink (TSV / JSONEachRow).
-#
-# DRAFT: source files referenced below do not yet exist. Migration plan:
-#   src/connectors/clickhouse_sink.cpp       -> impls/clickhouse/src/clickhouse_sink.cpp
-#   include/clink/connectors/clickhouse_sink.hpp ->
-#       impls/clickhouse/include/clink/connectors/clickhouse_sink.hpp
-# Plus extract the clickhouse_sink factory registration from
-# src/cluster/built_in_factories.cpp into
-# impls/clickhouse/src/register_factories.cpp.
+# clink::clickhouse - the ClickHouse source, the HTTP insert sink (TSV or
+# JSONEachRow) and the native-protocol insert sink (src/native/), which builds
+# only against clickhouse-cpp 2.6.2 or later.
 
 if(CLINK_WITH_CLICKHOUSE STREQUAL "OFF")
     message(STATUS "clink::clickhouse - CLINK_WITH_CLICKHOUSE=OFF; target not defined")
@@ -66,6 +60,8 @@ if(_ch_pinned_dir)
             absl::int128 OpenSSL::SSL OpenSSL::Crypto ${_ch_after})
         set(_ch_libs _clink_clickhouse_external)
         set(_ch_include_dir "${_ch_pinned_dir}/include")
+        set(_ch_check_libs ${_ch_pinned_lib} ${_ch_pinned_cityhash} ${_ch_pinned_lz4}
+            ${_ch_pinned_zstd} absl::int128 OpenSSL::SSL OpenSSL::Crypto)
         set(_ch_found TRUE)
     else()
         message(STATUS "clink::clickhouse - the pinned client in ${_ch_pinned_dir} is "
@@ -82,6 +78,13 @@ if(_ch_found)
 elseif(clickhouse-cpp_FOUND)
     set(_ch_found TRUE)
     set(_ch_libs clickhouse-cpp-lib)
+    set(_ch_check_libs clickhouse-cpp-lib)
+    # The package's target carries the include directory; version.h is read
+    # from it below like on the other paths.
+    get_target_property(_ch_config_inc clickhouse-cpp-lib INTERFACE_INCLUDE_DIRECTORIES)
+    if(_ch_config_inc)
+        list(GET _ch_config_inc 0 _ch_include_dir)
+    endif()
 else()
     find_path(_ch_inc NAMES clickhouse/client.h
         HINTS /opt/homebrew/include /usr/local/include /usr/include)
@@ -102,6 +105,7 @@ else()
         HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
     if(_ch_inc AND _ch_lib)
         set(_ch_found TRUE)
+        set(_ch_check_libs ${_ch_lib} ${_ch_cityhash} ${_ch_lz4} ${_ch_zstd})
         add_library(_clink_clickhouse_external INTERFACE)
         target_include_directories(_clink_clickhouse_external INTERFACE ${_ch_inc})
         target_link_libraries(_clink_clickhouse_external INTERFACE ${_ch_lib})
@@ -119,12 +123,14 @@ else()
         find_package(absl CONFIG QUIET)
         if(TARGET absl::int128)
             target_link_libraries(_clink_clickhouse_external INTERFACE absl::int128)
+            list(APPEND _ch_check_libs absl::int128)
         endif()
         # clickhouse-cpp's client TLS path links against OpenSSL.
         find_package(OpenSSL QUIET)
         if(OpenSSL_FOUND)
             target_link_libraries(_clink_clickhouse_external INTERFACE
                 OpenSSL::SSL OpenSSL::Crypto)
+            list(APPEND _ch_check_libs OpenSSL::SSL OpenSSL::Crypto)
         endif()
         _clink_clickhouse_shared_deps(_ch_after)
         target_link_libraries(_clink_clickhouse_external INTERFACE ${_ch_after})
@@ -174,12 +180,84 @@ if(NOT _ch_found)
     return()
 endif()
 
-add_library(clink_clickhouse STATIC
+# The native sink needs clickhouse-cpp 2.6.2 or later: it relies on that
+# release's client behaviour (rethrown EndInsert errors, the socket factory
+# seam) and on its layout for the vendored TLS header. A version that cannot be
+# read counts as older. Below it, only the registration builds, and its factory
+# refuses with clickhouse.native_unavailable.
+set(_ch_native FALSE)
+if(_ch_version AND NOT _ch_version VERSION_LESS "2.6.2")
+    set(_ch_native TRUE)
+endif()
+
+# TLS on the native sink needs the client's SSLSocketFactory, which only a client
+# built with OpenSSL carries. Finding OpenSSL on this machine is not evidence of
+# that, so compile and link a program that constructs one against the chosen
+# client. Re-run on every configure: the answer belongs to the client found now.
+set(_ch_native_tls FALSE)
+if(_ch_native)
+    include(CheckCXXSourceCompiles)
+    set(_ch_saved_includes "${CMAKE_REQUIRED_INCLUDES}")
+    set(_ch_saved_libraries "${CMAKE_REQUIRED_LIBRARIES}")
+    set(_ch_saved_flags "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_INCLUDES "${_ch_include_dir}")
+    set(CMAKE_REQUIRED_LIBRARIES ${_ch_check_libs})
+    set(CMAKE_REQUIRED_FLAGS "-std=c++20")
+    unset(CLINK_CLICKHOUSE_SSL_FACTORY_LINKS CACHE)
+    check_cxx_source_compiles("
+#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/native/vendor/clickhouse/base/sslsocket.h\"
+#include <clickhouse/client.h>
+int main() {
+    clickhouse::ClientOptions opts;
+    opts.SetSSLOptions(clickhouse::ClientOptions::SSLOptions{});
+    clickhouse::SSLSocketFactory factory(opts);
+    return 0;
+}" CLINK_CLICKHOUSE_SSL_FACTORY_LINKS)
+    set(CMAKE_REQUIRED_INCLUDES "${_ch_saved_includes}")
+    set(CMAKE_REQUIRED_LIBRARIES "${_ch_saved_libraries}")
+    set(CMAKE_REQUIRED_FLAGS "${_ch_saved_flags}")
+    if(CLINK_CLICKHOUSE_SSL_FACTORY_LINKS)
+        set(_ch_native_tls TRUE)
+    endif()
+endif()
+
+set(_ch_sources
     src/clickhouse_sink.cpp
     src/clickhouse_source.cpp
     src/register_factories.cpp
+    # Quoting and tokens, shared with the HTTP sink; no client include.
+    src/native/sql_text.cpp
+    src/native/errors.cpp
+    src/native/register_native.cpp
 )
+if(_ch_native)
+    list(APPEND _ch_sources
+        src/native/arrow_to_block.cpp
+        src/native/clickhouse_transport.cpp
+        src/native/column_plan.cpp
+        src/native/error_class.cpp
+        src/native/insert_transport.cpp
+        src/native/native_sink.cpp
+        src/native/retry.cpp
+        src/native/row_arrow.cpp
+        src/native/sink_options.cpp
+        src/native/socket_factory.cpp
+        src/native/statements.cpp
+        src/native/target_table.cpp
+        src/native/types.cpp
+        src/native/writer.cpp
+    )
+endif()
+
+add_library(clink_clickhouse STATIC ${_ch_sources})
 add_library(clink::clickhouse ALIAS clink_clickhouse)
+target_include_directories(clink_clickhouse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(_ch_native)
+    target_compile_definitions(clink_clickhouse PRIVATE CLINK_CLICKHOUSE_NATIVE=1)
+endif()
+if(_ch_native_tls)
+    target_compile_definitions(clink_clickhouse PRIVATE CLINK_CLICKHOUSE_NATIVE_TLS=1)
+endif()
 
 target_include_directories(clink_clickhouse PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -209,4 +287,15 @@ if(CLINK_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-message(STATUS "clink::clickhouse - enabled")
+if(_ch_native AND _ch_native_tls)
+    message(STATUS "clink::clickhouse - enabled (native sink with TLS)")
+elseif(_ch_native)
+    message(STATUS "clink::clickhouse - enabled (native sink without TLS: the client has no "
+                   "SSLSocketFactory)")
+elseif(_ch_version)
+    message(STATUS "clink::clickhouse - enabled (native sink unavailable: clickhouse-cpp "
+                   "${_ch_version} is older than 2.6.2)")
+else()
+    message(STATUS "clink::clickhouse - enabled (native sink unavailable: the clickhouse-cpp "
+                   "version could not be read)")
+endif()
