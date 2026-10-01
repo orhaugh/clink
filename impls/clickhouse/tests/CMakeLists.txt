@@ -41,6 +41,7 @@ if(_ch_native)
         test_native_error_class.cpp
         test_native_errors.cpp
         test_native_fake_transport.cpp
+        test_native_live.cpp
         test_native_options.cpp
         test_native_retry.cpp
         test_native_row_arrow.cpp

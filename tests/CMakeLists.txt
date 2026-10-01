@@ -440,6 +440,12 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_qual12_pg_transport_live.cpp
         test_helpers/register_linked_impls.cpp
     )
+    # The native ClickHouse sink's kill matrix: a coordinator and two workers
+    # against real ClickHouse servers, with faults at the sink's own points.
+    if(TARGET clink_clickhouse_testing)
+        target_sources(clink_integration_tests PRIVATE
+            integration/test_clickhouse_native_recovery.cpp)
+    endif()
     target_link_libraries(clink_integration_tests PRIVATE
         clink::clink
         GTest::gtest_main
@@ -693,6 +699,31 @@ if(CLINK_BUILD_SQL)
         DISCOVERY_MODE PRE_TEST
         PROPERTIES TIMEOUT 30 LABELS sql
     )
+
+    # The native ClickHouse sink driven through the SQL frontend, against the
+    # in-process fake server: a differential with the collect sink, the keys
+    # the planner puts on the op, and held barriers on the periodic and the
+    # bounded paths. Its own binary, so the SQL suite does not grow and
+    # -L clickhouse reaches it. The final-checkpoint bound is read once per
+    # process, so it is set for the whole binary; every case runs in a
+    # process of its own.
+    if(TARGET clink_clickhouse_testing)
+        add_executable(clink_clickhouse_sql_tests test_clickhouse_native_sql.cpp)
+        target_link_libraries(clink_clickhouse_sql_tests PRIVATE
+            clink::sql
+            clink::embed
+            clink::clickhouse
+            clink_clickhouse_testing
+            GTest::gtest_main
+        )
+        target_compile_definitions(clink_clickhouse_sql_tests PRIVATE CLINK_HAS_CLICKHOUSE)
+        clink_set_warnings(clink_clickhouse_sql_tests)
+        gtest_discover_tests(clink_clickhouse_sql_tests
+            DISCOVERY_MODE PRE_TEST
+            PROPERTIES TIMEOUT 180 LABELS clickhouse
+                       ENVIRONMENT "CLINK_EOS_FINAL_CKPT_TIMEOUT_MS=3000"
+        )
+    endif()
 
     # Differential SQL oracle: the same query and data through clink's
     # EmbeddedEngine and through DuckDB, answers compared as multisets.
