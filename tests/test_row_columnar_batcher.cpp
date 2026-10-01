@@ -8,6 +8,7 @@
 #endif
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -420,4 +421,64 @@ TEST(ColumnarOutputDamper, ReprobesSoGrowingBatchesRecover) {
         recovered = d.active();
     }
     EXPECT_TRUE(recovered) << "a backed-off damper must eventually retry";
+}
+
+// --- exact integer and number cells --------------------------------------------
+
+namespace {
+
+std::shared_ptr<arrow::Array> one_cell(const std::shared_ptr<arrow::DataType>& type,
+                                       const cfg::JsonValue& v) {
+    auto builder = clink::sql::row_columnar_detail::make_cell_builder(type);
+    clink::sql::row_columnar_detail::append_json_cell(*builder, *type, &v);
+    std::shared_ptr<arrow::Array> out;
+    EXPECT_TRUE(builder->Finish(&out).ok());
+    return out;
+}
+
+}  // namespace
+
+TEST(RowColumnarBatcher, Int64CellsPastTwoToTheFiftyThreeAreExact) {
+    // 2^53 + 1 has no double: through as_number() it came back as 2^53.
+    const std::int64_t big = (std::int64_t{1} << 53) + 1;
+    auto a =
+        std::static_pointer_cast<arrow::Int64Array>(one_cell(arrow::int64(), cfg::JsonValue{big}));
+    ASSERT_FALSE(a->IsNull(0));
+    EXPECT_EQ(a->Value(0), big);
+    const auto max = std::numeric_limits<std::int64_t>::max();
+    a = std::static_pointer_cast<arrow::Int64Array>(one_cell(arrow::int64(), cfg::JsonValue{max}));
+    EXPECT_EQ(a->Value(0), max);
+}
+
+TEST(RowColumnarBatcher, AnInt64CellNoInt64HoldsIsNullNotUndefined) {
+    auto a = one_cell(arrow::int64(), cfg::JsonValue{1e300});
+    EXPECT_TRUE(a->IsNull(0));
+    a = one_cell(arrow::int64(), cfg::JsonValue{std::numeric_limits<double>::infinity()});
+    EXPECT_TRUE(a->IsNull(0));
+    auto t =
+        std::static_pointer_cast<arrow::Int64Array>(one_cell(arrow::int64(), cfg::JsonValue{-7.9}));
+    EXPECT_EQ(t->Value(0), -7) << "a double still truncates toward zero";
+}
+
+TEST(RowColumnarBatcher, AnInt32CellOutOfRangeIsNull) {
+    auto a = one_cell(arrow::int32(), cfg::JsonValue{std::int64_t{2147483648}});
+    EXPECT_TRUE(a->IsNull(0)) << "2^31 used to wrap to a negative int32";
+    a = one_cell(arrow::int32(), cfg::JsonValue{std::int64_t{-2147483649}});
+    EXPECT_TRUE(a->IsNull(0));
+    auto ok = std::static_pointer_cast<arrow::Int32Array>(
+        one_cell(arrow::int32(), cfg::JsonValue{std::int64_t{-2147483648}}));
+    ASSERT_FALSE(ok->IsNull(0));
+    EXPECT_EQ(ok->Value(0), std::numeric_limits<std::int32_t>::min());
+    a = one_cell(arrow::int32(), cfg::JsonValue{3e9});
+    EXPECT_TRUE(a->IsNull(0));
+}
+
+TEST(RowColumnarBatcher, NumbersRenderedAsTextAreExact) {
+    using clink::sql::row_columnar_detail::to_utf8;
+    const std::int64_t big = (std::int64_t{1} << 53) + 1;
+    EXPECT_EQ(to_utf8(cfg::JsonValue{big}), "9007199254740993");
+    EXPECT_EQ(to_utf8(cfg::JsonValue{1e-7}), "1e-07") << "six decimals rendered it as 0.000000";
+    EXPECT_EQ(to_utf8(cfg::JsonValue{1.23456789012}), "1.23456789012");
+    EXPECT_EQ(to_utf8(cfg::JsonValue{42.0}), "42");
+    EXPECT_EQ(to_utf8(cfg::JsonValue{std::int64_t{-5}}), "-5");
 }

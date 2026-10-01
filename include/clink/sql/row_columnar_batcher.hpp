@@ -24,7 +24,9 @@
 //   DECIMAL(p,s)    -> decimal128(p,s)  (via the exact dec-string path)
 //   anything else   -> utf8             (stringified fallback)
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -108,14 +110,18 @@ inline std::string to_utf8(const clink::config::JsonValue& v) {
     if (v.is_bool()) {
         return v.as_bool() ? "true" : "false";
     }
-    if (v.is_number()) {
-        const double d = v.as_number();
-        if (d == static_cast<double>(static_cast<std::int64_t>(d))) {
-            return std::to_string(static_cast<std::int64_t>(d));
-        }
-        return std::to_string(d);
-    }
+    // A number renders as the JSON serializer renders it: an integer exactly,
+    // a double in the shortest form that reads back to the same value. This
+    // used std::to_string, which went through a double for integers (lossy past
+    // 2^53, undefined past 2^63) and kept six decimals for the rest (1e-7 came
+    // out as "0.000000").
     return v.serialize(0);
+}
+
+// Whether a double can be cast to int64 without undefined behaviour. 2^63 is
+// exactly representable, so the upper bound is exclusive.
+inline bool double_fits_int64(double d) noexcept {
+    return std::isfinite(d) && d >= -9223372036854775808.0 && d < 9223372036854775808.0;
 }
 
 // An empty typed builder for one effective column type. Pairs with
@@ -160,16 +166,30 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
                              const clink::config::JsonValue* v) {
     switch (eff.id()) {
         case arrow::Type::INT64: {
+            // An integer is read exactly; reading it through a double lost
+            // precision past 2^53. A double is truncated as before, and one
+            // that no int64 holds is null rather than undefined behaviour.
             auto& b = static_cast<arrow::Int64Builder&>(builder);
-            if (v && v->is_number())
+            if (v && v->is_integral_number())
+                (void)b.Append(v->as_int());
+            else if (v && v->is_number() && double_fits_int64(v->as_number()))
                 (void)b.Append(static_cast<std::int64_t>(v->as_number()));
             else
                 (void)b.AppendNull();
             break;
         }
         case arrow::Type::INT32: {
+            // Out of the int32 range is null, where the narrowing cast used to
+            // wrap or be undefined.
             auto& b = static_cast<arrow::Int32Builder&>(builder);
-            if (v && v->is_number())
+            constexpr auto kLo = std::numeric_limits<std::int32_t>::min();
+            constexpr auto kHi = std::numeric_limits<std::int32_t>::max();
+            if (v && v->is_integral_number() && v->as_int() >= kLo && v->as_int() <= kHi)
+                (void)b.Append(static_cast<std::int32_t>(v->as_int()));
+            else if (v && v->is_number() && !v->is_integral_number() &&
+                     std::isfinite(v->as_number()) &&
+                     v->as_number() > static_cast<double>(kLo) - 1.0 &&
+                     v->as_number() < static_cast<double>(kHi) + 1.0)
                 (void)b.Append(static_cast<std::int32_t>(v->as_number()));
             else
                 (void)b.AppendNull();

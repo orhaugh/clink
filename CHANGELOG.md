@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**Integers past 2^53 survive the Row columnar carriers.** The Row batcher
+read every integer cell through a double, so a BIGINT above 2^53 lost its low
+bits on the wire, in Parquet and Iceberg, and a value outside int64 or int32
+was undefined behaviour in the cast. Integer cells are now read exactly, and a
+value the declared type cannot hold is null. A number rendered into a VARCHAR
+column is now written the way the JSON serializer writes it: an integer
+exactly, a double in the shortest form that reads back to the same value
+(`1e-07`, where it used to keep six decimals and print `0.000000`).
+
 **Operators can see a cancel.** `RuntimeContext::cancel_requested()` is true
 once the task is being torn down: a CancelJob, the loss of the control
 session, the worker stopping, a final-checkpoint decline, or another operator
