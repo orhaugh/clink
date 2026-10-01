@@ -7,6 +7,7 @@
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/join_reorder.hpp"
+#include "clink/sql/materialized_view.hpp"
 #include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
@@ -883,6 +884,164 @@ TEST(SqlPhysical, ClickHouseConnectorSinkLowersWithJsonEachRow) {
     EXPECT_EQ(snk->params.at("table"), "events");
     EXPECT_EQ(snk->params.at("format"), "jsoneachrow") << "Row path must force JSONEachRow";
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);  // Row -> JSON bridge
+}
+
+// insert_format='native' binds the native-protocol sink on the Row channel:
+// no JSON bridge, and the declared types ride along as sql_column_types,
+// because schema_columns spells TIMESTAMP and DATE as `str`.
+TEST(SqlPhysical, ClickHouseInsertFormatNativeBindsTheNativeSinkOnTheRowChannel) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT, b VARCHAR, ts TIMESTAMP(3), d DATE) WITH "
+        "(connector='file', format='json', path='/tmp/i.ndjson');"
+        "CREATE TABLE ch_out (a BIGINT, b VARCHAR, ts TIMESTAMP(3), d DATE) WITH "
+        "(connector='clickhouse', format='json', insert_format='native', table='events', "
+        "host='ch');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO ch_out SELECT a, b, ts, d FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "clickhouse_native_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(find_op(spec, "clickhouse_sink"), nullptr);
+    EXPECT_EQ(find_op(spec, "row_to_json_string"), nullptr) << "the native sink takes Rows";
+    EXPECT_EQ(snk->out_channel, "row");
+    EXPECT_EQ(snk->params.at("table"), "events");
+    EXPECT_EQ(snk->params.at("sql_column_types"), "a:BIGINT;b:VARCHAR;ts:TIMESTAMP(3);d:DATE");
+    EXPECT_EQ(snk->params.count("format"), 0u) << "the JSONEachRow override is the legacy path's";
+    // The sink-boundary bind still renames and drops to the declared schema,
+    // which is what the native sink keys its columns on.
+    EXPECT_NE(find_op(spec, "row_bind_columns"), nullptr);
+}
+
+TEST(SqlPhysical, ClickHouseInsertFormatJsonEachRowKeepsTheLegacyBinding) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE ch_out (a BIGINT) WITH (connector='clickhouse', format='json', "
+        "insert_format='jsoneachrow', table='events', host='ch');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO ch_out SELECT a FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "clickhouse_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("format"), "jsoneachrow");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+    EXPECT_EQ(find_op(spec, "clickhouse_native_sink"), nullptr);
+}
+
+namespace {
+
+// The planner's message for a refused ClickHouse sink table, or "" when it
+// compiles. The table is registered as a TableDef, which skips the CREATE
+// TABLE option check, so the planner's own guard is what answers (the path a
+// materialised view's backing table takes).
+std::string clickhouse_sink_refusal(std::map<std::string, std::string> extra) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    TableDef dst;
+    dst.name = "ch_out";
+    dst.columns.push_back(ColumnSpec{"a", arrow::int64()});
+    dst.properties = {{"connector", "clickhouse"}, {"format", "json"}, {"table", "events"}};
+    for (auto& [k, v] : extra) {
+        dst.properties[k] = v;
+    }
+    cat.register_table(std::move(dst));
+    try {
+        auto plan = bind_insert(cat, "INSERT INTO ch_out SELECT a FROM src_t");
+        PhysicalPlanner pp;
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+TEST(SqlPhysical, ClickHouseNativeRefusesWhatItCannotDeliver) {
+    const auto overwrite =
+        clickhouse_sink_refusal({{"insert_format", "native"}, {"write_mode", "overwrite"}});
+    EXPECT_NE(overwrite.find("full-refresh"), std::string::npos) << overwrite;
+
+    const auto changelog =
+        clickhouse_sink_refusal({{"insert_format", "native"}, {"changelog", "true"}});
+    EXPECT_NE(changelog.find("changelog='true'"), std::string::npos) << changelog;
+
+    // The binder's exactly-once allow-list answers before the planner does.
+    const auto eo = clickhouse_sink_refusal(
+        {{"insert_format", "native"}, {"delivery_guarantee", "exactly_once"}});
+    EXPECT_NE(eo.find("got 'clickhouse'"), std::string::npos) << eo;
+
+    EXPECT_EQ(clickhouse_sink_refusal({{"insert_format", "native"}}), "");
+}
+
+TEST(SqlPhysical, AnUnknownClickHouseInsertFormatIsRefusedByThePlanner) {
+    const auto err = clickhouse_sink_refusal({{"insert_format", "Native"}});
+    EXPECT_NE(err.find("is not one of 'native', 'jsoneachrow'"), std::string::npos) << err;
+}
+
+TEST(SqlPhysical, ClickHouseNativeOnASingleTextColumnTableIsRefused) {
+    Catalog cat;
+    register_text(cat, "src_t", "file", "/tmp/in.txt");
+    auto s = parse(
+        "CREATE TABLE ch_out (line TEXT) WITH (connector='clickhouse', insert_format='native', "
+        "table='events', host='ch')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    auto plan = bind_insert(cat, "INSERT INTO ch_out SELECT line FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+        FAIL() << "a string-channel native sink compiled";
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string(e.what()).find("writes typed columns"), std::string::npos)
+            << e.what();
+    }
+}
+
+// A continuous materialised view copies its WITH options onto the backing
+// table, so insert_format='native' reaches the planner arm and binds the
+// native sink; a full-refresh view is refused, as each refresh would append
+// the whole result again.
+TEST(SqlPhysical, AMaterialisedViewBacksOntoTheNativeClickHouseSink) {
+    Catalog cat;
+    register_json(cat, "events", "(user_id BIGINT, amount BIGINT)", "");
+    auto mv = plan_materialized_view(
+        std::move(std::get<ast::CreateMaterializedViewStmt>(
+            parse("CREATE MATERIALIZED VIEW mv WITH (freshness='0', connector='clickhouse', "
+                  "format='json', insert_format='native', mode='append', table='mv', "
+                  "host='ch') AS SELECT user_id, amount FROM events")
+                .statements[0])),
+        cat);
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*mv.maintenance));
+    const auto* snk = find_op(spec, "clickhouse_native_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("sql_column_types"), "user_id:BIGINT;amount:BIGINT");
+
+    Catalog full_cat;
+    register_json(full_cat, "events", "(user_id BIGINT, amount BIGINT)", "");
+    try {
+        auto full = plan_materialized_view(
+            std::move(std::get<ast::CreateMaterializedViewStmt>(
+                parse("CREATE MATERIALIZED VIEW fmv WITH (freshness='1h', connector='clickhouse', "
+                      "format='json', insert_format='native', mode='append', table='fmv', "
+                      "host='ch') AS SELECT user_id, amount FROM events")
+                    .statements[0])),
+            full_cat);
+        PhysicalPlanner fpp;
+        (void)fpp.compile(static_cast<const LogicalSink&>(*full.maintenance));
+        FAIL() << "a full-refresh view bound the native sink";
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string(e.what()).find("full-refresh"), std::string::npos) << e.what();
+    }
 }
 
 // connector='mysql' source lowers to the mysql_source (string channel) bridged

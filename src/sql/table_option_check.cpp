@@ -32,6 +32,7 @@ const std::vector<ClosedDomain>& closed_domains() {
         {"state_ttl_domain", {"event_time", "processing_time"}},
         {"changelog", {"true", "false"}},
         {"columnar_decode", {"true", "false"}},
+        {"insert_format", {"native", "jsoneachrow"}},
     };
     return domains;
 }
@@ -59,6 +60,7 @@ const std::vector<std::string>& interpreted_table_options() {
         "late_records_to_dlq",
         "freshness",
         "bounded",
+        "insert_format",
     };
     return opts;
 }

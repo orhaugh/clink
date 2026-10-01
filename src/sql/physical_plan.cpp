@@ -192,6 +192,16 @@ std::string string_sink_factory_for(const TableDef& table) {
         return "cassandra_sink_string";
     }
     if (connector == "clickhouse") {
+        // The native sink writes typed columns, which a single TEXT column
+        // carrying whole records cannot supply. The source and sink channels
+        // must match, so the planner cannot move the table to the Row channel
+        // behind the user's back; refuse and say what to declare instead.
+        if (const auto it = table.properties.find("insert_format");
+            it != table.properties.end() && it->second == "native") {
+            unsupported(
+                "connector='clickhouse' insert_format='native' writes typed columns: declare the "
+                "table's columns, or format='json'");
+        }
         return "clickhouse_sink";
     }
     if (connector == "s3") {
@@ -412,6 +422,21 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         connector + "')");
 }
 
+// `name:TYPE;name:TYPE` over the table's declared columns, each TYPE spelt by
+// arrow_to_sql_type_string. schema_columns collapses TIMESTAMP, DATE, SMALLINT
+// and the nested types to `str`, so a sink that builds typed columns needs
+// this to tell them apart. Names never contain ':' or ';' (the schema_columns
+// rule), so the join is unambiguous.
+std::string render_sql_column_types(const TableDef& table) {
+    std::string out;
+    for (const auto& c : table.columns) {
+        if (!out.empty())
+            out += ';';
+        out += c.name + ':' + arrow_to_sql_type_string(*c.type);
+    }
+    return out;
+}
+
 RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
     require_kafka_for_registry_format(table, connector);
@@ -540,12 +565,13 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         return RowConnectorBinding{"cassandra_sink_string", kChannelString, "row_to_json_string"};
     }
     if (connector == "clickhouse") {
-        // ClickHouse sink (M1). Each row -> JSON object string -> the sink's
-        // FORMAT JSONEachRow body. At-least-once (INSERT replay re-inserts;
-        // ClickHouse has no row dedup). format=jsoneachrow is FORCED via the
-        // binding because the SQL format='json' channel selector is stripped
-        // before it reaches the sink factory (which would otherwise default to
-        // TSV). exactly_once / upsert are not supported.
+        // ClickHouse sinks, both at-least-once (a replayed INSERT re-inserts).
+        // The default (insert_format='jsoneachrow') turns each row into a JSON
+        // object string for the HTTP sink's FORMAT JSONEachRow body;
+        // format=jsoneachrow is FORCED via the binding because the SQL
+        // format='json' channel selector is stripped before it reaches the
+        // sink factory (which would otherwise default to TSV). exactly_once
+        // and upsert are refused for both.
         if (exactly_once) {
             unsupported(
                 "connector='clickhouse' sink is at-least-once; exactly-once delivery is not "
@@ -553,6 +579,34 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         if (upsert) {
             unsupported("connector='clickhouse' sink does not support mode='upsert'");
+        }
+        // insert_format='native' selects the native-protocol sink, which takes
+        // Rows directly and builds typed blocks against the target's columns.
+        // The value is checked here as well as at CREATE TABLE, because a
+        // materialised view's backing table never passes the catalog check.
+        const auto fmt_it = table.properties.find("insert_format");
+        const std::string fmt = fmt_it == table.properties.end() ? "jsoneachrow" : fmt_it->second;
+        if (fmt == "native") {
+            if (const auto wm = table.properties.find("write_mode");
+                wm != table.properties.end() && wm->second == "overwrite") {
+                unsupported(
+                    "connector='clickhouse' insert_format='native' cannot back a full-refresh "
+                    "materialised view: each refresh would append the whole result again");
+            }
+            if (const auto cl = table.properties.find("changelog");
+                cl != table.properties.end() && cl->second == "true") {
+                unsupported(
+                    "connector='clickhouse' insert_format='native' does not support "
+                    "changelog='true'");
+            }
+            return RowConnectorBinding{"clickhouse_native_sink",
+                                       kChannelRow,
+                                       "",
+                                       {{"sql_column_types", render_sql_column_types(table)}}};
+        }
+        if (fmt != "jsoneachrow") {
+            unsupported("connector='clickhouse': insert_format='" + fmt +
+                        "' is not one of 'native', 'jsoneachrow'");
         }
         return RowConnectorBinding{
             "clickhouse_sink", kChannelString, "row_to_json_string", {{"format", "jsoneachrow"}}};

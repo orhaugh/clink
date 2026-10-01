@@ -51,6 +51,7 @@ TEST(LineageFamily, StripsChannelAndDirectionTokens) {
     EXPECT_EQ(connector_family("file_json_upsert_sink"), "file");
     EXPECT_EQ(connector_family("parquet_row_source"), "parquet");
     EXPECT_EQ(connector_family("clickhouse_sink"), "clickhouse");
+    EXPECT_EQ(connector_family("clickhouse_native_sink"), "clickhouse");
     EXPECT_EQ(connector_family("http_poll_source"), "http");
     EXPECT_EQ(connector_family("partition_file_sink"), "file");
     EXPECT_EQ(connector_family("iceberg_row_sink"), "iceberg");
@@ -106,6 +107,15 @@ TEST(LineageDataset, PostgresFromConnInfo) {
         "string");
     EXPECT_EQ(d.ns, "postgres://db.internal:5432");
     EXPECT_EQ(d.name, "shop.orders");
+}
+
+TEST(LineageDataset, ClickHouseFailoverListNamesTheFirstEndpoint) {
+    const auto d =
+        dataset_for("clickhouse_native_sink",
+                    {{"endpoints", "ch-a:9000,ch-b:9000"}, {"database", "d"}, {"table", "t"}},
+                    "row");
+    EXPECT_EQ(d.ns, "clickhouse://ch-a:9000");
+    EXPECT_EQ(d.name, "d.t");
 }
 
 TEST(LineageDataset, LocalFile) {

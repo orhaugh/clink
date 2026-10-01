@@ -33,7 +33,8 @@ bool is_modifier_token(std::string_view t) {
                                                                     "partition",
                                                                     "double",
                                                                     "bool",
-                                                                    "boolean"};
+                                                                    "boolean",
+                                                                    "native"};
     return kModifiers.count(t) != 0;
 }
 
@@ -114,6 +115,14 @@ ConnInfo parse_conninfo(const std::string& conninfo) {
 std::string host_port(const std::map<std::string, std::string>& params) {
     std::string host = first_of(params, {"host", "hostname"});
     std::string port = first_of(params, {"port"});
+    if (host.empty()) {
+        // A failover list ("h1:p1,h2:p2"): name the first endpoint, the one a
+        // fresh connection tries first.
+        const auto endpoints = first_of(params, {"endpoints"});
+        if (!endpoints.empty()) {
+            return endpoints.substr(0, endpoints.find(','));
+        }
+    }
     if (host.empty()) {
         const auto conninfo = first_of(params, {"conninfo", "connection_string", "dsn"});
         if (!conninfo.empty()) {

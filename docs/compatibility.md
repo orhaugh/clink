@@ -107,8 +107,10 @@ unchanged, with the same results, on every 1.x:
 - The grammar only grows. clink's extensions must not capture text that
   previously parsed as ordinary SQL.
 - A `WITH` option key is never removed or given a new meaning; a renamed key
-  keeps its old spelling as an alias through 1.x. Unknown keys keep failing at
-  compile time.
+  keeps its old spelling as an alias through 1.x. A key within a near-miss
+  distance of an option the SQL frontend interprets is refused at
+  `CREATE TABLE`; any other key passes through to the connector, which may
+  refuse it (the native ClickHouse sink does).
 - A built-in function's result type and semantics never change, and a
   user-defined function shadows a built-in of the same name, so adding a
   built-in can never change what an existing script computes.
@@ -117,8 +119,9 @@ unchanged, with the same results, on every 1.x:
   fixtures.
 
 Kept Evolving until their shapes have had a release to settle: the AI table
-functions (`CREATE MODEL`, `ML_PREDICT`, `VECTOR_SEARCH`) and the WebAssembly
-aggregate form. Not contracts at all: the wording of diagnostics, the text of
+functions (`CREATE MODEL`, `ML_PREDICT`, `VECTOR_SEARCH`), the WebAssembly
+aggregate form, and the native ClickHouse sink's options, `insert_format`
+included. Not contracts at all: the wording of diagnostics, the text of
 `EXPLAIN`, and the output format of `SHOW TABLES`.
 
 The mechanical half is `tests/sql_conformance/`: a corpus of scripts, each

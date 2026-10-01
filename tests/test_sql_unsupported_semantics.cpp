@@ -243,6 +243,28 @@ TEST(SqlUnsupportedSemantics, ValuesOutsideAClosedDomainAreRefused) {
     ASSERT_FALSE(bad_bool.empty()) << "changelog='yes' silently meant false";
 }
 
+TEST(SqlUnsupportedSemantics, InsertFormatIsAClosedDomain) {
+    for (const char* fmt : {"native", "jsoneachrow"}) {
+        EXPECT_EQ(
+            register_ddl(std::string("CREATE TABLE t (k BIGINT) WITH (connector='clickhouse', "
+                                     "format='json', table='t', insert_format='") +
+                         fmt + "');"),
+            "")
+            << "insert_format='" << fmt << "' was refused";
+    }
+    const auto cased = register_ddl(
+        "CREATE TABLE t (k BIGINT) WITH (connector='clickhouse', format='json', table='t', "
+        "insert_format='Native');");
+    ASSERT_FALSE(cased.empty()) << "insert_format='Native' silently kept the JSON sink";
+    EXPECT_NE(cased.find("'native'"), std::string::npos) << cased;
+
+    const auto near_miss = register_ddl(
+        "CREATE TABLE t (k BIGINT) WITH (connector='clickhouse', format='json', table='t', "
+        "insert_formatt='native');");
+    ASSERT_FALSE(near_miss.empty()) << "a misspelt insert_format was accepted";
+    EXPECT_NE(near_miss.find("insert_format"), std::string::npos) << near_miss;
+}
+
 TEST(SqlUnsupportedSemantics, EveryLegitimateModeValueIsAccepted) {
     // Guard against the domain list being narrowed by guesswork. The first
     // version of it omitted 'cdc' and rejected every CDC table in the
