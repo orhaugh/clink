@@ -106,7 +106,8 @@ struct ChType {
 };
 
 // Never throws: an unsupported type comes back as ChKind::Unsupported with a
-// reason. Handles Nullable, LowCardinality, Array, Map, named and unnamed
+// reason, and so does a composite holding one, for that element's reason.
+// Handles Nullable, LowCardinality, Array, Map, named and unnamed
 // Tuple, Decimal(P,S), Decimal32/64/128(S), Decimal256 (refused),
 // DateTime([tz]), DateTime64(P[, tz]), FixedString(N), Enum8/16('a' = 1, ...),
 // and the plain names.

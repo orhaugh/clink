@@ -42,14 +42,18 @@ enum class Conversion : std::uint8_t {
 };
 
 struct ColumnBinding {
+    // A child is named <parent>.element, <parent>.key, <parent>.value or
+    // <parent>.<field>, so a conversion error can say where it failed.
     std::string name;
-    int input_index{0};  // column index in the Arrow chunk
+    int input_index{0};  // column index in the Arrow chunk; a child's position in its parent
     SqlType source;
     ChType target;
     Conversion conversion{Conversion::Copy};
     std::vector<ColumnBinding> children;  // List element; Map key, value; Struct elements
-    std::int64_t multiplier{1};  // 10^(S - s) for decimals; 10^(P - d) for timestamps when P >= d
-    std::int64_t divisor{1};     // 10^(d - P) for timestamps when P < d; exact or ConversionError
+    // 10^(S - s) for decimals, at most 10^18 (the plan refuses a wider
+    // rescale); 10^(P - d) for timestamps when P >= d.
+    std::int64_t multiplier{1};
+    std::int64_t divisor{1};  // 10^(d - P) for timestamps when P < d; exact or ConversionError
     bool zero_copy{false};
     std::string expected_header_type;  // client_header_spelling(target.spelling)
 };
