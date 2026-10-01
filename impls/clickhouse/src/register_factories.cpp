@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -120,6 +121,12 @@ private:
 // to `max`. param_int64_or falls back to the default on garbage, and the casts
 // it fed truncated, so a typo passed unnoticed, batch_rows='0' flushed on every
 // row and port='70000' connected to port 4464.
+// batch_rows and batch_interval_ms take any positive value, because the
+// Stable builder has always passed any value through and a job that ran must
+// keep running. port and the timeouts are bounded: a value past those bounds
+// never worked (a truncated port, an infinite poll).
+constexpr std::int64_t kNoUpperBound = std::numeric_limits<std::int64_t>::max();
+
 std::int64_t sink_integer_param(const clink::plugin::BuildContext& ctx,
                                 const std::string& key,
                                 std::int64_t fallback,
@@ -248,10 +255,10 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error("clickhouse_sink: 'table' is required");
             }
             apply_sink_format(ctx.param_or("format", "tsv"), opts);
-            opts.batch_rows =
-                static_cast<std::size_t>(sink_integer_param(ctx, "batch_rows", 1000, 2147483647));
+            opts.batch_rows = static_cast<std::size_t>(
+                sink_integer_param(ctx, "batch_rows", 1000, kNoUpperBound));
             opts.batch_interval = std::chrono::milliseconds{
-                sink_integer_param(ctx, "batch_interval_ms", 1000, 3600000)};
+                sink_integer_param(ctx, "batch_interval_ms", 1000, kNoUpperBound)};
             opts.connect_timeout = std::chrono::milliseconds{
                 sink_integer_param(ctx, "connect_timeout_ms", 5000, 600000)};
             opts.send_timeout = std::chrono::milliseconds{

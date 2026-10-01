@@ -227,7 +227,7 @@ TEST(ClickHouseSinkFactory, KeysItDoesNotKnowAreIgnored) {
 // param_int64_or fell back to the default on garbage and the result was cast
 // down, so batch_rows='0' flushed on every row and a negative value never
 // flushed by count at all.
-TEST(ClickHouseSinkFactory, BatchRowsMustBeAPositiveIntegerInRange) {
+TEST(ClickHouseSinkFactory, BatchRowsMustBeAPositiveInteger) {
     EXPECT_EQ(legacy_clickhouse_refusal(legacy_clickhouse_params("batch_rows", "0")),
               "clickhouse_sink: batch_rows must be a positive integer (got '0')");
     for (const char* v : {"-1", "-0", "abc", "10x", " 10", "10 ", "+10", "1.5", "1e3", ""}) {
@@ -235,37 +235,40 @@ TEST(ClickHouseSinkFactory, BatchRowsMustBeAPositiveIntegerInRange) {
                   std::string("clickhouse_sink: batch_rows must be a positive integer (got '") + v +
                       "')");
     }
-    for (const char* v : {"2147483648", "99999999999999999999"}) {
-        EXPECT_EQ(legacy_clickhouse_refusal(legacy_clickhouse_params("batch_rows", v)),
-                  std::string("clickhouse_sink: batch_rows must be at most 2147483647 (got '") + v +
-                      "')");
-    }
+    // Past int64 the value cannot be held at all.
+    EXPECT_EQ(
+        legacy_clickhouse_refusal(legacy_clickhouse_params("batch_rows", "99999999999999999999")),
+        "clickhouse_sink: batch_rows must be at most 9223372036854775807 (got "
+        "'99999999999999999999')");
     EXPECT_EQ(
         legacy_clickhouse_refusal(legacy_clickhouse_params("batch_rows", "-99999999999999999999")),
         "clickhouse_sink: batch_rows must be a positive integer (got "
         "'-99999999999999999999')");
     EXPECT_EQ(legacy_clickhouse_options(legacy_clickhouse_params("batch_rows", "1")).batch_rows,
               1U);
+    // The Stable builder has always passed any count through, so a large one
+    // still builds.
     EXPECT_EQ(
-        legacy_clickhouse_options(legacy_clickhouse_params("batch_rows", "2147483647")).batch_rows,
-        2147483647U);
+        legacy_clickhouse_options(legacy_clickhouse_params("batch_rows", "3000000000")).batch_rows,
+        3000000000U);
 }
 
-TEST(ClickHouseSinkFactory, BatchIntervalMustBeFromOneMillisecondToAnHour) {
+TEST(ClickHouseSinkFactory, BatchIntervalMustBeAPositiveInteger) {
     EXPECT_EQ(legacy_clickhouse_refusal(legacy_clickhouse_params("batch_interval_ms", "0")),
               "clickhouse_sink: batch_interval_ms must be a positive integer (got '0')");
     EXPECT_EQ(legacy_clickhouse_refusal(legacy_clickhouse_params("batch_interval_ms", "-5")),
               "clickhouse_sink: batch_interval_ms must be a positive integer (got '-5')");
     EXPECT_EQ(legacy_clickhouse_refusal(legacy_clickhouse_params("batch_interval_ms", "soon")),
               "clickhouse_sink: batch_interval_ms must be a positive integer (got 'soon')");
-    EXPECT_EQ(legacy_clickhouse_refusal(legacy_clickhouse_params("batch_interval_ms", "3600001")),
-              "clickhouse_sink: batch_interval_ms must be at most 3600000 (got '3600001')");
+
     EXPECT_EQ(legacy_clickhouse_options(legacy_clickhouse_params("batch_interval_ms", "1"))
                   .batch_interval,
               std::chrono::milliseconds{1});
-    EXPECT_EQ(legacy_clickhouse_options(legacy_clickhouse_params("batch_interval_ms", "3600000"))
+    // Two hours: the Stable builder accepted it before the parse became
+    // strict, so it still builds.
+    EXPECT_EQ(legacy_clickhouse_options(legacy_clickhouse_params("batch_interval_ms", "7200000"))
                   .batch_interval,
-              std::chrono::milliseconds{3600000});
+              std::chrono::milliseconds{7200000});
 }
 
 // The port went through a truncating cast: 70000 connected to 4464.
