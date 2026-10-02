@@ -11,12 +11,14 @@
 #include "clink/runtime/runtime_context.hpp"
 
 #include "native/retry.hpp"
+#include "test_helpers/sanitizer_slack.hpp"
 
 namespace clink::clickhouse::native {
 namespace {
 
 using std::chrono::milliseconds;
 using Clock = std::chrono::steady_clock;
+using clink::test_support::scale_slack;
 
 // min(cap, initial * 2^n), the ceiling of the nth wait.
 std::int64_t rt_ceiling(std::int64_t initial, std::int64_t cap, unsigned n) {
@@ -282,6 +284,8 @@ TEST(NativeCancellableWait, AnEarlierCancelOrStopReturnsAtOnce) {
         const auto t0 = Clock::now();
         EXPECT_FALSE(cancellable_wait(milliseconds{10'000}, sig, *stop));
         EXPECT_FALSE(cancellable_wait(milliseconds{0}, sig, *stop));
+        // Not scaled for a sanitizer build: this is the 50 ms slice a wait
+        // that looked only after its first one would take.
         EXPECT_LT(Clock::now() - t0, milliseconds{50});
     }
 }
@@ -292,7 +296,7 @@ TEST(NativeCancellableWait, ReturnsWithinAHundredMillisecondsOfAnExecutorCancel)
     bool returned = true;
     const auto took = rt_time_to_notice(flags.signal(), stop, *flags.executor, returned);
     EXPECT_FALSE(returned);
-    EXPECT_LT(took, milliseconds{100});
+    EXPECT_LT(took, scale_slack(milliseconds{100}));
 }
 
 TEST(NativeCancellableWait, ReturnsWithinAHundredMillisecondsOfAnExternalCancel) {
@@ -301,7 +305,7 @@ TEST(NativeCancellableWait, ReturnsWithinAHundredMillisecondsOfAnExternalCancel)
     bool returned = true;
     const auto took = rt_time_to_notice(flags.signal(), stop, *flags.external, returned);
     EXPECT_FALSE(returned);
-    EXPECT_LT(took, milliseconds{100});
+    EXPECT_LT(took, scale_slack(milliseconds{100}));
 }
 
 TEST(NativeCancellableWait, ReturnsWithinAHundredMillisecondsOfAStop) {
@@ -310,7 +314,7 @@ TEST(NativeCancellableWait, ReturnsWithinAHundredMillisecondsOfAStop) {
     bool returned = true;
     const auto took = rt_time_to_notice(flags.signal(), stop, stop, returned);
     EXPECT_FALSE(returned);
-    EXPECT_LT(took, milliseconds{100});
+    EXPECT_LT(took, scale_slack(milliseconds{100}));
 }
 
 TEST(NativeCancellableWait, ACopiedSignalSeesTheCancel) {
@@ -321,7 +325,7 @@ TEST(NativeCancellableWait, ACopiedSignalSeesTheCancel) {
     bool returned = true;
     const auto took = rt_time_to_notice(copy, stop, *flags.executor, returned);
     EXPECT_FALSE(returned);
-    EXPECT_LT(took, milliseconds{100});
+    EXPECT_LT(took, scale_slack(milliseconds{100}));
 }
 
 }  // namespace

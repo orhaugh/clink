@@ -56,6 +56,7 @@
 #include "native/native_sink.hpp"
 #include "native/sink_options.hpp"
 #include "native/writer.hpp"
+#include "test_helpers/sanitizer_slack.hpp"
 
 namespace clink::clickhouse::native {
 namespace {
@@ -64,6 +65,7 @@ using namespace std::chrono_literals;
 namespace fake = clink::clickhouse::native::testing;
 using NsClock = std::chrono::steady_clock;
 using clink::config::JsonValue;
+using clink::test_support::scale_slack;
 
 const std::string kNsTable = "events";
 constexpr std::size_t kNsMiB = 1024 * 1024;
@@ -490,9 +492,10 @@ struct NsDirect {
 
 // --- Helpers --------------------------------------------------------------------
 
+// Waits up to `timeout` for `pred`, scaled for a sanitizer build.
 template <typename Pred>
 bool ns_eventually(Pred pred, std::chrono::milliseconds timeout = 10s) {
-    const auto end = NsClock::now() + timeout;
+    const auto end = NsClock::now() + scale_slack(timeout);
     while (NsClock::now() < end) {
         if (pred()) {
             return true;
@@ -1304,7 +1307,7 @@ TEST(NativeSinkOpen, ARefusalFromTheServerOrThePlanIsCountedByReasonAndNeverRetr
         rig.wait();
         // A retry would have waited out at least one backoff and connected
         // again.
-        EXPECT_LE(NsClock::now() - started, 2s);
+        EXPECT_LE(NsClock::now() - started, scale_slack(2s));
         const auto refused = rig.errors_with(c.code);
         ASSERT_EQ(refused.size(), 1U);
         EXPECT_EQ(rig.server->connects(), 1U);
@@ -1377,7 +1380,7 @@ TEST(NativeSinkOpen, AnUnknownServerCodeIsRetriedThreeTimesAndThenFailsTheOpen) 
     rig.start({ns_data(0, 10)});
     rig.wait();
     // Three backoffs of at most 100, 200 and 400 ms.
-    EXPECT_LE(NsClock::now() - started, 3s);
+    EXPECT_LE(NsClock::now() - started, 100ms + 200ms + 400ms + scale_slack(2300ms));
     ASSERT_EQ(rig.errors_with(code::kInsertFailed).size(), 1U);
     EXPECT_EQ(rig.server->connects(), 4U);
     EXPECT_EQ(
@@ -1537,7 +1540,7 @@ TEST(NativeSinkOutage, AReplicaUnreadableForLongerThanTheWindowExhaustsItRatherT
     // The open gives up once the next backoff would end past the window's
     // deadline, which with full jitter can be well before it, and never
     // later than the window and one attempt.
-    EXPECT_LE(took, 6s);
+    EXPECT_LE(took, 5s + scale_slack(1s));
     EXPECT_EQ(rig.server->rows(kNsTable), 0U);
     EXPECT_EQ(
         ns_count(rig.metrics,
@@ -1617,7 +1620,7 @@ TEST(NativeSinkCancel, ACancelDuringABackoffFailsTheBarrierWithin200msAndLandsNo
     rig.exec->cancel();
     clink::fault::Registry::instance().release(points::kBeforeRetryWait);
     rig.wait();
-    EXPECT_LE(NsClock::now() - cancelled_at, 200ms);
+    EXPECT_LE(NsClock::now() - cancelled_at, scale_slack(200ms));
     // on_barrier threw rather than let the checkpoint complete.
     EXPECT_EQ(rig.errors_with(code::kCancelled).size(), 1U);
     EXPECT_TRUE(rig.acknowledged().empty());
@@ -1644,7 +1647,7 @@ TEST(NativeSinkCancel, ACancelWhileTheServerHangsInEndClosesTheSinkWithin200ms) 
     rig.exec->cancel();
     rig.wait();
     // close_cancelled() returned that fast only through interrupt().
-    EXPECT_LE(NsClock::now() - cancelled_at, 200ms);
+    EXPECT_LE(NsClock::now() - cancelled_at, scale_slack(200ms));
     EXPECT_TRUE(rig.exec->operator_errors().empty());
     EXPECT_EQ(rig.server->abandoned_mid_insert(), 1U);
     EXPECT_EQ(rig.server->rows(kNsTable), 0U);
@@ -1665,7 +1668,7 @@ TEST(NativeSinkCancel, ACancelWhileOpenHangsInConnectFailsTheOpenWithin200ms) {
     const auto cancelled_at = NsClock::now();
     rig.exec->cancel();
     rig.wait();
-    EXPECT_LE(NsClock::now() - cancelled_at, 200ms);
+    EXPECT_LE(NsClock::now() - cancelled_at, scale_slack(200ms));
     EXPECT_EQ(rig.errors_with(code::kCancelled).size(), 1U);
     EXPECT_TRUE(rig.server->inserts(kNsTable).empty());
     EXPECT_EQ(rig.server->rows(kNsTable), 0U);
@@ -1689,7 +1692,7 @@ TEST(NativeSinkCancel, AnOpenStuckWhereNoInterruptReachesIsLeftBehindAndThenStay
     rig.wait();
     const auto took = NsClock::now() - cancelled_at;
     EXPECT_GE(took, 4900ms);
-    EXPECT_LE(took, 5200ms);
+    EXPECT_LE(took, 5s + scale_slack(200ms));
     EXPECT_EQ(rig.errors_with(code::kCancelled).size(), 1U);
 
     ASSERT_FALSE(gone->load()) << "the stuck opener should still hold its transport";
@@ -1717,11 +1720,13 @@ TEST(NativeSinkCancel, ACancelDuringTheOpenersBackoffEndsTheOpenWithoutAnotherCo
     const std::size_t before = d.server->connects();
     const auto cancelled_at = NsClock::now();
     d.cancel->store(true);
-    ASSERT_EQ(opened.wait_for(2s), std::future_status::ready);
+    ASSERT_EQ(opened.wait_for(scale_slack(2s)), std::future_status::ready);
     const auto took = NsClock::now() - cancelled_at;
     const auto error = opened.get();
     ASSERT_TRUE(error);
     EXPECT_EQ(error->code(), code::kCancelled);
+    // Not scaled for a sanitizer build: ten times this would pass the 1.6 s
+    // backoff it tells apart.
     EXPECT_LE(took, 300ms);
     // At most the attempt the cancel raced.
     EXPECT_LE(d.server->connects(), before + 1);
@@ -1752,12 +1757,13 @@ TEST(NativeSinkCancel, ACancelWhileTheProbeHangsJoinsTheOpenerBeforeOpenReturns)
     ASSERT_TRUE(ns_eventually([&hanging] { return hanging->load(); }));
     const auto cancelled_at = NsClock::now();
     d.cancel->store(true);
-    ASSERT_EQ(opened.wait_for(2s), std::future_status::ready);
+    ASSERT_EQ(opened.wait_for(scale_slack(2s)), std::future_status::ready);
     const auto took = NsClock::now() - cancelled_at;
     const auto [error, gone_at_return] = opened.get();
     ASSERT_TRUE(error);
     EXPECT_EQ(error->code(), code::kCancelled);
-    EXPECT_LE(took, 300ms);
+    // The client's 100 ms linger, which the join waits out, and a margin.
+    EXPECT_LE(took, 100ms + scale_slack(200ms));
     EXPECT_TRUE(gone_at_return) << "the opener was left behind instead of joined";
 }
 

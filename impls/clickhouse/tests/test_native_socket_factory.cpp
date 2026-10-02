@@ -33,6 +33,7 @@
 
 #include "native/errors.hpp"
 #include "native/socket_factory.hpp"
+#include "test_helpers/sanitizer_slack.hpp"
 
 namespace {
 
@@ -41,6 +42,7 @@ using clink::clickhouse::native::CountingSocketFactory;
 using clink::clickhouse::native::socket_fd;
 using clink::clickhouse::native::SocketControl;
 using SfClock = std::chrono::steady_clock;
+using clink::test_support::scale_slack;
 
 // An fd closed when it goes out of scope.
 class SfFd {
@@ -107,14 +109,15 @@ public:
     [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
     [[nodiscard]] ::clickhouse::Endpoint endpoint() const { return {"127.0.0.1", port_}; }
 
-    // The next connection, or an empty fd if none arrives in time.
+    // The next connection, or an empty fd if none arrives in time. Both
+    // waits are scaled for a sanitizer build.
     SfFd accept_peer(std::chrono::milliseconds wait = 2000ms) {
-        if (!sf_readable(fd_.get(), wait)) {
+        if (!sf_readable(fd_.get(), scale_slack(wait))) {
             return SfFd{};
         }
         SfFd peer(::accept(fd_.get(), nullptr, nullptr));
         if (peer.get() >= 0) {
-            sf_set_recv_timeout(peer.get(), 5000ms);
+            sf_set_recv_timeout(peer.get(), scale_slack(5000ms));
         }
         return peer;
     }
@@ -166,7 +169,8 @@ void sf_send_all(int fd, std::string_view bytes) {
     }
 }
 
-// Up to `n` bytes; fewer only if the stream ends or stalls for 5 s.
+// Up to `n` bytes; fewer only if the stream ends or stalls for the receive
+// timeout accept_peer() set.
 std::string sf_recv_exactly(int fd, std::size_t n) {
     std::string out;
     char buf[8192];
@@ -181,10 +185,10 @@ std::string sf_recv_exactly(int fd, std::size_t n) {
 }
 
 // What arrives before end of stream, or nullopt if the stream is still open
-// after `wait`.
+// after `wait`, scaled for a sanitizer build.
 std::optional<std::string> sf_recv_until_eof(int fd, std::chrono::milliseconds wait = 1000ms) {
     std::string out;
-    const auto until = SfClock::now() + wait;
+    const auto until = SfClock::now() + scale_slack(wait);
     char buf[4096];
     while (true) {
         const auto left =
@@ -224,12 +228,13 @@ std::string sf_read_exactly(::clickhouse::InputStream& in, std::size_t n) {
 
 // Waits until `writing` is set and the bytes `control` has seen written have
 // grown and then stood still for `quiet`; false when that has not happened
-// within 5 s. A send with room in the socket buffers returns at once, so a
-// writer whose count stands still that long is blocked in one.
+// within 5 s, scaled for a sanitizer build. A send with room in the socket
+// buffers returns at once, so a writer whose count stands still that long is
+// blocked in one.
 bool sf_writer_blocks(const SocketControl& control,
                       const std::atomic<bool>& writing,
                       std::chrono::milliseconds quiet) {
-    const auto give_up = SfClock::now() + 5s;
+    const auto give_up = SfClock::now() + scale_slack(5s);
     while (!writing && SfClock::now() < give_up) {
         std::this_thread::sleep_for(1ms);
     }
@@ -403,7 +408,7 @@ TEST(NativeSocketFactory, APoisonFromAnotherThreadWakesABlockedReadWithin100Ms) 
     poisoner.join();
 
     EXPECT_EQ(err, ECONNABORTED);
-    EXPECT_LT(woke_at - poisoned_at, 100ms);
+    EXPECT_LT(woke_at - poisoned_at, scale_slack(100ms));
 }
 
 // A server that stops reading mid-INSERT leaves send_block blocked in send
@@ -446,7 +451,7 @@ TEST(NativeSocketFactory, APoisonFromAnotherThreadWakesABlockedSendWithin100Ms) 
     EXPECT_TRUE(blocked) << "the writer never blocked in send";
     EXPECT_TRUE(still_writing) << "the writer finished before the poison";
     EXPECT_EQ(err, ECONNABORTED);
-    EXPECT_LT(woke_at - poisoned_at, 100ms)
+    EXPECT_LT(woke_at - poisoned_at, scale_slack(100ms))
         << std::chrono::duration_cast<std::chrono::milliseconds>(woke_at - poisoned_at).count()
         << " ms";
 }

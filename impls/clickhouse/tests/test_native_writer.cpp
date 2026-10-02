@@ -44,6 +44,7 @@
 #include "native/target_table.hpp"
 #include "native/types.hpp"
 #include "native/writer.hpp"
+#include "test_helpers/sanitizer_slack.hpp"
 
 namespace clink::clickhouse::native {
 namespace {
@@ -52,6 +53,7 @@ using namespace std::chrono_literals;
 namespace fake = clink::clickhouse::native::testing;
 using WrClock = std::chrono::steady_clock;
 using WrOutcome = fake::ReceivedInsert::Outcome;
+using clink::test_support::scale_slack;
 
 constexpr std::uint64_t kWrOpId = 7;
 constexpr std::size_t kWrKiB = 1024;
@@ -366,9 +368,10 @@ struct WrRig {
     std::unique_ptr<Writer> writer;
 };
 
+// Waits up to `timeout` for `pred`, scaled for a sanitizer build.
 template <typename Pred>
 bool wr_eventually(Pred pred, std::chrono::milliseconds timeout = 5s) {
-    const auto end = WrClock::now() + timeout;
+    const auto end = WrClock::now() + scale_slack(timeout);
     while (WrClock::now() < end) {
         if (pred()) {
             return true;
@@ -590,7 +593,7 @@ TEST(NativeWriterClose, AQuietStreamLandsWithinTheBatchIntervalWithoutAFlush) {
     // Nothing else can close this INSERT, so it cannot land before the
     // interval has run from its first row.
     EXPECT_GE(landed, 300ms);
-    EXPECT_LE(landed, 500ms);
+    EXPECT_LE(landed, 300ms + scale_slack(200ms));
     EXPECT_EQ(rig.committed().size(), 1U);
     rig.writer->finish();
 }
@@ -700,7 +703,7 @@ TEST(NativeWriterClose, AChunkLargerThanTheQueueCapIsTakenByAnEmptyQueue) {
     ASSERT_GT(big.bytes, kQueueBytes);
     const auto start = WrClock::now();
     rig.writer->submit(std::move(big));
-    EXPECT_LT(WrClock::now() - start, 1s);
+    EXPECT_LT(WrClock::now() - start, scale_slack(1s));
     rig.writer->flush(1);
     EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 17));
     rig.writer->finish();
@@ -812,7 +815,7 @@ TEST(NativeWriterBarrier, FlushReturnsOnlyAfterTheServerAcknowledgedEveryInsert)
     rig.writer->flush(1);
     const auto took = WrClock::now() - start;
     EXPECT_GE(took, 2s);
-    EXPECT_LT(took, 4s);
+    EXPECT_LT(took, 2s + scale_slack(2s));
     const auto all = rig.inserts();
     ASSERT_EQ(all.size(), 3U);
     for (const auto& insert : all) {
@@ -922,7 +925,7 @@ TEST(NativeWriterRetry, AnOutageLongerThanTheWindowFailsTheFlushAndKeepsWhatWasA
     EXPECT_EQ(error->code(), code::kRetryWindowExhausted);
     EXPECT_NE(std::string(error->what()).find("retry_window_ms=500"), std::string::npos)
         << error->what();
-    EXPECT_LT(took, 2s);
+    EXPECT_LT(took, 500ms + scale_slack(1500ms));
     EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 10));
     const WriterStats stats = rig.writer->stats();
     EXPECT_EQ(stats.rows_acknowledged, 10U);
@@ -1016,6 +1019,8 @@ TEST(NativeWriterRetry, AnUnknownServerCodeFailsAfterItsCapNotAtTheEndOfTheWindo
     EXPECT_EQ(error->code(), code::kInsertFailed) << error->what();
     EXPECT_NE(std::string(error->what()).find("a code nobody listed"), std::string::npos)
         << error->what();
+    // Not scaled for a sanitizer build: ten times the margin would pass the
+    // 4 s window this tells apart.
     EXPECT_LT(took, 3s);
     EXPECT_EQ(wr_retries(rig.writer->stats(), FailureClass::Unclassified), 3U);
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
@@ -1336,7 +1341,7 @@ TEST(NativeWriterCancel, ACancelDuringABackoffAbandonsTheInsertAndLandsNothingOf
     const auto cancelled_at = WrClock::now();
     rig.flags.cancel();
     const auto error = flushed.get();
-    EXPECT_LE(WrClock::now() - cancelled_at, 200ms);
+    EXPECT_LE(WrClock::now() - cancelled_at, scale_slack(200ms));
     ASSERT_TRUE(error);
     EXPECT_EQ(error->code(), code::kCancelled);
     // Every attempt was abandoned, the one in flight included, and nothing of
@@ -1360,7 +1365,8 @@ TEST(NativeWriterCancel, AStopThatLandsWhileTheWriterConnectsEndsItWithoutStarti
     ASSERT_TRUE(wr_eventually([&] { return rig.server->connects() >= 2; }));
     const auto stopped_at = WrClock::now();
     rig.writer->abort();
-    EXPECT_LE(WrClock::now() - stopped_at, 200ms);
+    // Scaled, it stays below the 3 s connect delay it tells apart.
+    EXPECT_LE(WrClock::now() - stopped_at, scale_slack(200ms));
     EXPECT_EQ(rig.inserts().size(), 1U);
     std::size_t insert_statements = 0;
     for (const auto& sql : rig.server->statements()) {
@@ -1425,7 +1431,7 @@ TEST(NativeWriterCancel, AWriterStuckWhereNoInterruptReachesIsDetachedAndThenSta
     rig.writer->abort();
     const auto took = WrClock::now() - aborted_at;
     EXPECT_GE(took, 4900ms);
-    EXPECT_LE(took, 5200ms);
+    EXPECT_LE(took, 5s + scale_slack(200ms));
     // The summary is the last the writer says, so it counts the five rows of
     // the INSERT the stuck thread still holds: they were never acknowledged,
     // and the job's restart replays them.
@@ -1664,12 +1670,12 @@ TEST(NativeWriterDeadline, AnEndKeptBusyPastTheWindowTimesOutInDoubtAndExhaustsW
     const auto took = WrClock::now() - start;
     // The first End is cut one window after it began, not 30 s later.
     EXPECT_GE(first_failed, 400ms);
-    EXPECT_LE(first_failed, 600ms);
+    EXPECT_LE(first_failed, 400ms + scale_slack(200ms));
     ASSERT_TRUE(error);
     EXPECT_EQ(error->code(), code::kRetryWindowExhausted);
     EXPECT_NE(std::string(error->what()).find("past the attempt deadline"), std::string::npos)
         << error->what();
-    EXPECT_LE(took, 1000ms);
+    EXPECT_LE(took, 2 * 400ms + scale_slack(200ms));
     EXPECT_GE(rig.writer->stats().in_doubt, 1U);
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
 }
@@ -1734,7 +1740,8 @@ void wr_expect_a_busy_first_begin_is_cut(bool first_block_due) {
         << error->what();
     // The first BeginInsert is cut a window after it began, and the retry at
     // the end of the window its failure started, not after the 20 s the
-    // server would have taken.
+    // server would have taken. Not scaled for a sanitizer build: ten times the
+    // margin would pass those 20 s.
     EXPECT_LT(took, 3s);
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
 }
@@ -1802,7 +1809,7 @@ TEST(NativeWriterQueue, ACancelReleasesASubmitHeldByAFullQueue) {
     std::this_thread::sleep_for(250ms);
     const auto cancelled_at = WrClock::now();
     rig.flags.cancel();
-    const auto status = submitting.wait_for(2s);
+    const auto status = submitting.wait_for(scale_slack(2s));
     const auto released = WrClock::now() - cancelled_at;
     if (status != std::future_status::ready) {
         // Only the abort can free it now; the case fails rather than hangs.
@@ -1813,7 +1820,7 @@ TEST(NativeWriterQueue, ACancelReleasesASubmitHeldByAFullQueue) {
     ASSERT_TRUE(held.error);
     EXPECT_EQ(held.error->code(), code::kCancelled);
     EXPECT_GE(held.took, 100ms) << "the submit that threw was not the one held";
-    EXPECT_LE(released, 200ms);
+    EXPECT_LE(released, scale_slack(200ms));
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
 }
 
@@ -1848,7 +1855,7 @@ TEST(NativeWriterQueue, AnAbortFromAnotherThreadReleasesASubmitHeldByAFullQueue)
     std::this_thread::sleep_for(250ms);
     const auto aborted_at = WrClock::now();
     std::thread aborter([&rig] { rig.writer->abort(); });
-    const auto status = submitting.wait_for(2s);
+    const auto status = submitting.wait_for(scale_slack(2s));
     const auto released = WrClock::now() - aborted_at;
     aborter.join();
     ASSERT_EQ(status, std::future_status::ready) << "the abort did not release the submit";
@@ -1856,7 +1863,7 @@ TEST(NativeWriterQueue, AnAbortFromAnotherThreadReleasesASubmitHeldByAFullQueue)
     ASSERT_TRUE(held.error);
     EXPECT_EQ(held.error->code(), code::kCancelled);
     EXPECT_GE(held.took, 100ms) << "the submit that threw was not the one held";
-    EXPECT_LE(released, 300ms);
+    EXPECT_LE(released, scale_slack(300ms));
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
 }
 
@@ -1876,7 +1883,7 @@ TEST(NativeWriterQueue, ACancelReleasesAFlushQueuedBehindAFullQueue) {
     std::this_thread::sleep_for(100ms);
     const auto cancelled_at = WrClock::now();
     rig.flags.cancel();
-    const auto status = flushed.wait_for(2s);
+    const auto status = flushed.wait_for(scale_slack(2s));
     const auto released = WrClock::now() - cancelled_at;
     if (status != std::future_status::ready) {
         // Only the abort can free it now; the case fails rather than hangs.
@@ -1886,7 +1893,7 @@ TEST(NativeWriterQueue, ACancelReleasesAFlushQueuedBehindAFullQueue) {
     const auto error = flushed.get();
     ASSERT_TRUE(error);
     EXPECT_EQ(error->code(), code::kCancelled);
-    EXPECT_LE(released, 200ms);
+    EXPECT_LE(released, scale_slack(200ms));
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
 }
 
@@ -1948,7 +1955,7 @@ TEST(NativeWriterQueue, AFlushGoesPastAFullQueueAndNeverCountsAgainstItsCaps) {
     auto submitted = std::async(std::launch::async, [&rig] {
         return wr_error([&rig] { rig.writer->submit(rig.chunk(20, 24, 8)); });
     });
-    const auto status = submitted.wait_for(2s);
+    const auto status = submitted.wait_for(scale_slack(2s));
     if (status != std::future_status::ready) {
         // Only the abort can free it now; the case fails rather than hangs.
         rig.writer->abort();
@@ -2095,7 +2102,7 @@ TEST(NativeWriterSplit, RepeatedMemoryLimitsExhaustOneWindowHoweverManyHalvesAre
     const auto took = WrClock::now() - start;
     ASSERT_TRUE(error);
     EXPECT_EQ(error->code(), code::kRetryWindowExhausted);
-    EXPECT_LE(took, 2200ms);
+    EXPECT_LE(took, 2s + scale_slack(200ms));
     std::set<std::size_t> sizes;
     for (const auto& insert : rig.inserts()) {
         sizes.insert(wr_rows_of(insert));
@@ -2137,7 +2144,8 @@ TEST(NativeWriterSplit, AHalfFailsAtItsParentsDeadlineNotAWindowAfterItsOwnStart
     }
     EXPECT_TRUE(sizes.contains(2000U)) << "the INSERT was never split";
     // The first half's End is cut at the deadline the halves share. A half
-    // with a window of its own would have gone on for another one.
+    // with a window of its own would have gone on for another one. Not scaled
+    // for a sanitizer build: the margin has to stay short of that one.
     EXPECT_GE(took, 1900ms);
     EXPECT_LT(took, 2700ms);
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
@@ -2401,7 +2409,7 @@ TEST(NativeWriterMetrics, FrequentSmallInsertsLogThePartRateWarningOncePerQuietP
         rig.writer->flush(static_cast<std::uint64_t>(id) + 1);
         ++id;
     };
-    const auto give_up_at = WrClock::now() + 3s;
+    const auto give_up_at = WrClock::now() + scale_slack(3s);
     while (warnings() == 0 && WrClock::now() < give_up_at) {
         insert_one();
     }

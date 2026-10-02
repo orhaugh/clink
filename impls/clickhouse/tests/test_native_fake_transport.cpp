@@ -54,6 +54,7 @@
 #include "native/sql_text.hpp"
 #include "native/statements.hpp"
 #include "native/types.hpp"
+#include "test_helpers/sanitizer_slack.hpp"
 
 namespace {
 
@@ -77,6 +78,7 @@ using clink::clickhouse::native::testing::Fault;
 using clink::clickhouse::native::testing::LandedBlock;
 using clink::clickhouse::native::testing::ReceivedInsert;
 using clink::clickhouse::native::testing::Step;
+using clink::test_support::scale_slack;
 namespace native = clink::clickhouse::native;
 namespace fake = clink::clickhouse::native::testing;
 using FtClock = std::chrono::steady_clock;
@@ -1309,7 +1311,7 @@ TEST(NativeFakeTransport, InterruptFailsAHangAtOnce) {
     canceller.join();
     EXPECT_EQ(err, ECONNABORTED);
     EXPECT_GE(elapsed, 90ms);
-    EXPECT_LT(elapsed, 600ms);
+    EXPECT_LT(elapsed, 100ms + scale_slack(500ms));
     EXPECT_EQ(server->rows("events"), 0u);
 }
 
@@ -1331,7 +1333,7 @@ TEST(NativeFakeTransport, AnAbandonFromAnotherThreadEndsAHang) {
     const auto elapsed = FtClock::now() - start;
     dropper.join();
     EXPECT_EQ(err, ECONNABORTED);
-    EXPECT_LT(elapsed, 600ms);
+    EXPECT_LT(elapsed, 100ms + scale_slack(500ms));
     EXPECT_FALSE(t.connected());
 }
 
@@ -1454,7 +1456,7 @@ TEST(NativeFakeTransport, ABreakWakesAHungCallWithConnectionReset) {
     const auto elapsed = FtClock::now() - start;
     outage.join();
     EXPECT_EQ(err, ECONNRESET);
-    EXPECT_LT(elapsed, 600ms);
+    EXPECT_LT(elapsed, 100ms + scale_slack(500ms));
     EXPECT_EQ(server->rows("events"), 0u);
 }
 
@@ -1624,6 +1626,8 @@ TEST(NativeFakeTransport, ADelayPastTheDeadlineTimesOutAtTheDeadline) {
     t.set_deadline(std::nullopt);
     EXPECT_EQ(err, ETIMEDOUT);
     EXPECT_GE(elapsed, 140ms);
+    // Not scaled for a sanitizer build: ten times the margin would pass the
+    // 2 s delay this tells apart.
     EXPECT_LT(elapsed, 1000ms);
     EXPECT_EQ(server->rows("events"), 0u);
 }
@@ -1642,7 +1646,7 @@ TEST(NativeFakeTransport, AHangTimesOutAtTheDeadline) {
     const auto elapsed = FtClock::now() - start;
     EXPECT_EQ(err, ETIMEDOUT);
     EXPECT_GE(elapsed, 140ms);
-    EXPECT_LT(elapsed, 1000ms);
+    EXPECT_LT(elapsed, 150ms + scale_slack(850ms));
 }
 
 TEST(NativeFakeTransport, ADelayInsideTheDeadlineSucceedsAfterItsDelay) {
@@ -2234,7 +2238,7 @@ TEST(NativeFaulty, CountsCallsPerStepAndHonoursInterruptAndTheDeadline) {
     });
     start = FtClock::now();
     EXPECT_EQ(ft_errno([&] { (void)t->select(MetaQuery::MergeTreeSettings, sql); }), ECONNABORTED);
-    EXPECT_LT(FtClock::now() - start, 600ms);
+    EXPECT_LT(FtClock::now() - start, 100ms + scale_slack(500ms));
     canceller.join();
     // The interrupt reached the inner transport too, and stays.
     t->abandon();

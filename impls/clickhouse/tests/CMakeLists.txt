@@ -19,6 +19,8 @@ target_compile_definitions(clink_clickhouse_tests PRIVATE CLINK_HAS_CLICKHOUSE)
 # The native sink's headers live beside its sources (src/native/), outside the
 # installed include tree.
 target_include_directories(clink_clickhouse_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# For test_helpers/sanitizer_slack.hpp: wall-clock margins scale under ASan and TSan.
+target_include_directories(clink_clickhouse_tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 clink_set_warnings(clink_clickhouse_tests)
 
 # The native sink's tests, and the fake server they drive it against. The fake
