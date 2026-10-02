@@ -237,8 +237,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   user (default "default"), password (default "")
     //   format ("tsv", or "json" / "jsoneachrow" for JSONEachRow, in any case;
     //     default "tsv"; any other value is sent as TSV with a warning at open)
-    //   batch_rows (default 1000, 1 to 2^31-1)
-    //   batch_interval_ms (default 1000, 1 to 3600000)
+    //   batch_rows (default 1000) and batch_interval_ms (default 1000), any
+    //     positive integer
     //   connect_timeout_ms (default 5000), send_timeout_ms and
     //     receive_timeout_ms (default 30000 each), 1 to 600000
     // Keys it does not know are ignored: the SQL planner puts its own on the op.
