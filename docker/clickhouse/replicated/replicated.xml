@@ -1,0 +1,17 @@
+<!-- One replica of a two-replica shard, for the native sink's failover suite.
+     Both replicas of a line mount this file; the Keeper host and the replica
+     name come from each service's environment, so one file serves both.
+     Replicas fetch parts from each other by host name, which compose sets to
+     the service name. Test use only. -->
+<clickhouse>
+    <zookeeper>
+        <node>
+            <host from_env="CLINK_CLICKHOUSE_KEEPER_HOST"/>
+            <port>9181</port>
+        </node>
+    </zookeeper>
+    <macros>
+        <shard>1</shard>
+        <replica from_env="CLINK_CLICKHOUSE_REPLICA"/>
+    </macros>
+</clickhouse>

@@ -1,0 +1,20 @@
+<!-- The native protocol over TLS on 9440, beside the plain port the
+     healthcheck and the test setup use, for the native sink's TLS suite. The
+     certificate and key are generated per run by scripts/clickhouse-live.sh,
+     signed by a throwaway CA, and mounted read-only at
+     /etc/clickhouse-server/tls. The server asks no client certificate. Test use
+     only. -->
+<clickhouse>
+    <tcp_port_secure>9440</tcp_port_secure>
+    <openSSL>
+        <server>
+            <certificateFile>/etc/clickhouse-server/tls/server.crt</certificateFile>
+            <privateKeyFile>/etc/clickhouse-server/tls/server.key</privateKeyFile>
+            <verificationMode>none</verificationMode>
+            <loadDefaultCAFile>false</loadDefaultCAFile>
+            <cacheSessions>true</cacheSessions>
+            <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1</disableProtocols>
+            <preferServerCiphers>true</preferServerCiphers>
+        </server>
+    </openSSL>
+</clickhouse>

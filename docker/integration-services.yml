@@ -386,3 +386,156 @@ services:
       timeout: 5s
       retries: 60
       start_period: 5s
+
+  # The native sink's live suites (impls/clickhouse/tests/test_native_live.cpp,
+  # run by scripts/clickhouse-live.sh), beyond the services above. 25.3 serves
+  # only the legacy sink's round trip: CLINK_CLICKHOUSE_TEST_PORT=19203.
+  clickhouse-25-3:
+    image: clickhouse/clickhouse-server:25.3@sha256:b627d7a9bc0e0c1bac26cdbe9d2fc6316faa29c5d8a174f28f5abd57d0fa6ba2
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+    ports:
+      - "19203:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+
+  # Two replicas of one shard per line, sharing a standalone Keeper, for the
+  # failover suite and pin P18. Both replicas carry a <replicated_merge_tree>
+  # async_insert=1 default (P18), so the failover target sets async_insert = 0
+  # on the table. Native ports 19133 / 19143 (26.3) and 19138 / 19148 (26.8).
+  clickhouse-keeper-26-3:
+    image: clickhouse/clickhouse-keeper:26.3@sha256:e9ca270ad171e6fc55f2416916d4d581a7d7ad7242504a58fc6dedc1be91ab03
+    volumes:
+      - ./clickhouse/replicated/keeper.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-keeper-client -h localhost -p 9181 -q 'ls /' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 3s
+
+  clickhouse-26-3-r1:
+    image: clickhouse/clickhouse-server:26.3@sha256:d030e8af10d90c42a373919fdffe843248716637d13b1f1331c1b8449b1e9919
+    hostname: clickhouse-26-3-r1
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+      - CLINK_CLICKHOUSE_KEEPER_HOST=clickhouse-keeper-26-3
+      - CLINK_CLICKHOUSE_REPLICA=r1
+    volumes:
+      - ./clickhouse/replicated/replicated.xml:/etc/clickhouse-server/config.d/replicated.xml:ro
+      - ./clickhouse/replicated/replicated-merge-tree-async.xml:/etc/clickhouse-server/config.d/replicated-merge-tree-async.xml:ro
+    depends_on:
+      clickhouse-keeper-26-3:
+        condition: service_healthy
+    ports:
+      - "19133:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+
+  clickhouse-26-3-r2:
+    image: clickhouse/clickhouse-server:26.3@sha256:d030e8af10d90c42a373919fdffe843248716637d13b1f1331c1b8449b1e9919
+    hostname: clickhouse-26-3-r2
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+      - CLINK_CLICKHOUSE_KEEPER_HOST=clickhouse-keeper-26-3
+      - CLINK_CLICKHOUSE_REPLICA=r2
+    volumes:
+      - ./clickhouse/replicated/replicated.xml:/etc/clickhouse-server/config.d/replicated.xml:ro
+      - ./clickhouse/replicated/replicated-merge-tree-async.xml:/etc/clickhouse-server/config.d/replicated-merge-tree-async.xml:ro
+    depends_on:
+      clickhouse-keeper-26-3:
+        condition: service_healthy
+    ports:
+      - "19143:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+
+  clickhouse-keeper-26-8:
+    image: clickhouse/clickhouse-keeper:26.8@sha256:3deb4253a105188c3f5143da4029002ec273f0f6974e18e6cd96be0d48a688c2
+    volumes:
+      - ./clickhouse/replicated/keeper.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-keeper-client -h localhost -p 9181 -q 'ls /' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 3s
+
+  clickhouse-26-8-r1:
+    image: clickhouse/clickhouse-server:26.8@sha256:3043f691ec1a847f38b446ff43708893fcbf9815bd9bd88c0f84bfe064ce852f
+    hostname: clickhouse-26-8-r1
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+      - CLINK_CLICKHOUSE_KEEPER_HOST=clickhouse-keeper-26-8
+      - CLINK_CLICKHOUSE_REPLICA=r1
+    volumes:
+      - ./clickhouse/replicated/replicated.xml:/etc/clickhouse-server/config.d/replicated.xml:ro
+      - ./clickhouse/replicated/replicated-merge-tree-async.xml:/etc/clickhouse-server/config.d/replicated-merge-tree-async.xml:ro
+    depends_on:
+      clickhouse-keeper-26-8:
+        condition: service_healthy
+    ports:
+      - "19138:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+
+  clickhouse-26-8-r2:
+    image: clickhouse/clickhouse-server:26.8@sha256:3043f691ec1a847f38b446ff43708893fcbf9815bd9bd88c0f84bfe064ce852f
+    hostname: clickhouse-26-8-r2
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+      - CLINK_CLICKHOUSE_KEEPER_HOST=clickhouse-keeper-26-8
+      - CLINK_CLICKHOUSE_REPLICA=r2
+    volumes:
+      - ./clickhouse/replicated/replicated.xml:/etc/clickhouse-server/config.d/replicated.xml:ro
+      - ./clickhouse/replicated/replicated-merge-tree-async.xml:/etc/clickhouse-server/config.d/replicated-merge-tree-async.xml:ro
+    depends_on:
+      clickhouse-keeper-26-8:
+        condition: service_healthy
+    ports:
+      - "19148:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+
+  # 26.8 with the native protocol over TLS on 9440 (host 19458), beside the
+  # plain port (host 19158) for setup. The certificate and key come from the
+  # directory CLINK_CLICKHOUSE_TLS_DIR names, which scripts/clickhouse-live.sh
+  # generates per run (a CA, a server certificate for localhost and 127.0.0.1,
+  # and a second CA that did not sign it); without it the TLS port has no
+  # certificate and the server does not start.
+  clickhouse-26-8-tls:
+    image: clickhouse/clickhouse-server:26.8@sha256:3043f691ec1a847f38b446ff43708893fcbf9815bd9bd88c0f84bfe064ce852f
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+    volumes:
+      - ./clickhouse/tls/tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
+      - ${CLINK_CLICKHOUSE_TLS_DIR:-./clickhouse/tls}:/etc/clickhouse-server/tls:ro
+    ports:
+      - "19158:9000"
+      - "19458:9440"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s

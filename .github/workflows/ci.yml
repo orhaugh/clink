@@ -354,13 +354,17 @@ jobs:
           path: ${{ runner.temp }}/protocol-traces/**
           if-no-files-found: ignore
           retention-days: 7
-      - name: Upload the ClickHouse pins binary
-        # The clickhouse-pins job runs it against live servers on a plain
-        # runner, inside this same toolchain image for its shared libraries.
+      - name: Upload the ClickHouse live test binaries
+        # The clickhouse-pins job runs them against live servers on a plain
+        # runner, inside this same toolchain image for their shared libraries:
+        # the impl's own tests (the pins and the native sink's live suites) and
+        # the SQL-linked tests, which carry the SQL-level live cases.
         uses: actions/upload-artifact@v4
         with:
           name: clickhouse-pins-binary
-          path: build/impls/clickhouse/tests/clink_clickhouse_tests
+          path: |
+            build/impls/clickhouse/tests/clink_clickhouse_tests
+            build/tests/clink_clickhouse_sql_tests
           if-no-files-found: error
           retention-days: 1
       - name: Upload integration artifacts on failure
@@ -387,20 +391,27 @@ jobs:
           key: ccache-build-${{ github.run_id }}
 
   clickhouse-pins:
-    name: ClickHouse server pins (26.3, 26.8)
+    name: ClickHouse pins and live suite
     # What the native ClickHouse sink takes as given about the server, checked on
     # every supported line against servers pinned by digest
     # (docker/integration-services.yml): SETTINGS in the insert text, token
     # deduplication, the squash of an INSERT's blocks, the effective async_insert
     # from the table, the shard and the server default, type strictness, FINAL,
-    # and the bounded metadata reads. A plain runner for the Docker daemon; the
-    # build job's test binary runs inside the toolchain image it was built in,
-    # on the host network, so it reaches the servers' published ports. A failing
-    # pin changes the sink's design, so it blocks like any other gate.
+    # and the bounded metadata reads. Then the sink itself against the same
+    # lines (scripts/clickhouse-live.sh): every type pair, the refusals, the
+    # abandoned INSERT, both deduplication hashing regimes, failover between
+    # two replicas, TLS, and the SQL-level round trips, 25.3 included for the
+    # legacy sink. A plain runner for the Docker daemon; the build job's test
+    # binaries run inside the toolchain image they were built in, on the host
+    # network, so they reach the servers' published ports, with the runner's
+    # temporary directory mounted for the TLS material the live script makes. A
+    # failing pin changes the sink's design, so it blocks like any other gate.
     needs: [build, toolchain-manifest]
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      TOOLCHAIN: ${{ needs.toolchain-manifest.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
@@ -411,16 +422,25 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: clickhouse-pins-binary
-          path: build/impls/clickhouse/tests
+          path: build
       - name: Run the pins against every line
-        env:
-          TOOLCHAIN: ${{ needs.toolchain-manifest.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
         run: |
           set -euo pipefail
-          chmod +x build/impls/clickhouse/tests/clink_clickhouse_tests
+          chmod +x build/impls/clickhouse/tests/clink_clickhouse_tests build/tests/clink_clickhouse_sql_tests
           PIN_RUNNER="docker run --rm --network host -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} \
             -w ${GITHUB_WORKSPACE} -e CLINK_CLICKHOUSE_TEST_HOST -e CLINK_CLICKHOUSE_TEST_PORT \
             -e CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT ${TOOLCHAIN}" scripts/clickhouse-pins.sh
+      - name: Run the live suites against every line
+        run: |
+          set -euo pipefail
+          PIN_RUNNER="docker run --rm --network host -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} \
+            -v ${RUNNER_TEMP}:${RUNNER_TEMP} -w ${GITHUB_WORKSPACE} \
+            -e CLINK_CLICKHOUSE_TEST_HOST -e CLINK_CLICKHOUSE_TEST_PORT \
+            -e CLINK_CLICKHOUSE_TEST_LINE -e CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT_PORT \
+            -e CLINK_CLICKHOUSE_TEST_REPLICA_PORTS -e CLINK_CLICKHOUSE_TEST_RMT_ASYNC_DEFAULT \
+            -e CLINK_CLICKHOUSE_TEST_TLS_PORT -e CLINK_CLICKHOUSE_TEST_TLS_CA \
+            -e CLINK_CLICKHOUSE_TEST_TLS_WRONG_CA ${TOOLCHAIN}" \
+            CLICKHOUSE_LIVE_TMPDIR="${RUNNER_TEMP}" scripts/clickhouse-live.sh
 
   tutorial-kafka-clickhouse:
     name: Tutorial - Kafka to ClickHouse (published runtime image)

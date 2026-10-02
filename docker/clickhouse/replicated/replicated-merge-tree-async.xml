@@ -1,0 +1,10 @@
+<!-- A server-wide <replicated_merge_tree> default of async_insert=1, for pin
+     P18: the override reaches Replicated tables only, and the sink must read
+     it from system.replicated_merge_tree_settings. A table on these replicas
+     that should take synchronous inserts says async_insert = 0 itself, which
+     the failover suite does. Test use only. -->
+<clickhouse>
+    <replicated_merge_tree>
+        <async_insert>1</async_insert>
+    </replicated_merge_tree>
+</clickhouse>
