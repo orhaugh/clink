@@ -383,7 +383,7 @@ struct FtCluster {
     }
 };
 
-TEST(NativeFakeServer, ClusterReadsAskEveryReplicaUnderItsDisplayName) {
+TEST(NativeFakeServer, ClusterReadsAskEveryReplicaUnderItsNameAndUuid) {
     FtCluster c;
     FakeTransport t(c.initiator);
     t.connect(kFtEp1);
@@ -398,20 +398,29 @@ TEST(NativeFakeServer, ClusterReadsAskEveryReplicaUnderItsDisplayName) {
               (FtRows{{"0"}}));
 
     // The replica without the table contributes no row.
-    EXPECT_EQ(t.select(MetaQuery::ClusterTables,
-                       native::select_cluster_tables("c", "db", "events_local", kFtBudget))
-                  .rows,
-              (FtRows{{c.r1->display_name(), "MergeTree", c.local.engine_full},
-                      {c.r2->display_name(),
-                       "ReplicatedMergeTree",
-                       "ReplicatedMergeTree('/t', 'r2') ORDER BY id"}}));
+    EXPECT_EQ(
+        t.select(MetaQuery::ClusterTables,
+                 native::select_cluster_tables("c", "db", "events_local", kFtBudget))
+            .rows,
+        (FtRows{
+            {c.r1->display_name() + ":9000", c.r1->server_uuid(), "MergeTree", c.local.engine_full},
+            {c.r2->display_name() + ":9000",
+             c.r2->server_uuid(),
+             "ReplicatedMergeTree",
+             "ReplicatedMergeTree('/t', 'r2') ORDER BY id"}}));
 
     const ResultSet mts = t.select(MetaQuery::ClusterMergeTreeSettings,
                                    native::select_cluster_merge_tree_settings("c", kFtBudget));
     ASSERT_EQ(mts.rows.size(), 9u);
-    EXPECT_EQ(mts.rows[0], (std::vector<std::string>{c.r1->display_name(), "async_insert", "0"}));
-    EXPECT_EQ(mts.rows[3], (std::vector<std::string>{c.r2->display_name(), "async_insert", "1"}));
-    EXPECT_EQ(mts.rows[6], (std::vector<std::string>{c.r3->display_name(), "async_insert", "0"}));
+    EXPECT_EQ(
+        mts.rows[0],
+        (std::vector<std::string>{c.r1->replica_name(), c.r1->server_uuid(), "async_insert", "0"}));
+    EXPECT_EQ(
+        mts.rows[3],
+        (std::vector<std::string>{c.r2->replica_name(), c.r2->server_uuid(), "async_insert", "1"}));
+    EXPECT_EQ(
+        mts.rows[6],
+        (std::vector<std::string>{c.r3->replica_name(), c.r3->server_uuid(), "async_insert", "0"}));
 
     const auto err = ft_server_error([&] {
         (void)t.select(MetaQuery::ClusterTables,
@@ -461,8 +470,10 @@ TEST(NativeFakeServer, ClusterReplicatedSettingsFailWhereAReplicaLacksThatTable)
 
     const ResultSet rs = t.select(MetaQuery::ClusterReplicatedMergeTreeSettings, sql);
     ASSERT_EQ(rs.rows.size(), 9u);
-    EXPECT_EQ(rs.rows[0], (std::vector<std::string>{c.r1->display_name(), "async_insert", "1"}));
-    EXPECT_EQ(rs.columns, (std::vector<std::string>{"host", "name", "value"}));
+    EXPECT_EQ(
+        rs.rows[0],
+        (std::vector<std::string>{c.r1->replica_name(), c.r1->server_uuid(), "async_insert", "1"}));
+    EXPECT_EQ(rs.columns, (std::vector<std::string>{"host", "uuid", "name", "value"}));
 
     c.r3->set_replicated_merge_tree_settings_table(false);
     const auto err = ft_server_error(
@@ -479,7 +490,104 @@ TEST(NativeFakeServer, AClusterThatIncludesTheInitiatorReadsItToo) {
     EXPECT_EQ(t.select(MetaQuery::ClusterTables,
                        native::select_cluster_tables("self", "db", "events", kFtBudget))
                   .rows,
-              (FtRows{{server->display_name(), "MergeTree", ft_events().engine_full}}));
+              (FtRows{{server->replica_name(),
+                       server->server_uuid(),
+                       "MergeTree",
+                       ft_events().engine_full}}));
+}
+
+// Two instances on one machine: hostName() is the same text on both, so only
+// the port and the server UUID tell them apart.
+TEST(NativeFakeServer, ReplicasSharingAHostNameKeepTheirOwnUuid) {
+    FtCluster c;
+    c.r1->set_host_name("box");
+    c.r2->set_host_name("box");
+    c.r2->set_tcp_port(9001);
+    EXPECT_EQ(c.r1->replica_name(), "box:9000");
+    EXPECT_EQ(c.r2->replica_name(), "box:9001");
+    EXPECT_NE(c.r1->server_uuid(), c.r2->server_uuid());
+    EXPECT_EQ(c.r1->server_uuid().size(), 36u);
+    FakeTransport t(c.initiator);
+    t.connect(kFtEp1);
+    const ResultSet rs =
+        t.select(MetaQuery::ClusterTables,
+                 native::select_cluster_tables("c", "db", "events_local", kFtBudget));
+    ASSERT_EQ(rs.rows.size(), 2u);
+    EXPECT_EQ(rs.rows[0][0], "box:9000");
+    EXPECT_EQ(rs.rows[0][1], c.r1->server_uuid());
+    EXPECT_EQ(rs.rows[1][0], "box:9001");
+    EXPECT_EQ(rs.rows[1][1], c.r2->server_uuid());
+    // The display name, which identifies the server in ServerIdentity, is
+    // unchanged.
+    EXPECT_NE(c.r1->display_name(), "box");
+}
+
+TEST(NativeFakeServer, SystemTablesListTheReplicatedSettingsTableWhereItExists) {
+    FtCluster c;
+    c.r2->set_replicated_merge_tree_settings_table(false);
+    FakeTransport t(c.initiator);
+    t.connect(kFtEp1);
+    const ResultSet rs = t.select(
+        MetaQuery::ClusterTables,
+        native::select_cluster_tables("c", "system", "replicated_merge_tree_settings", kFtBudget));
+    ASSERT_EQ(rs.rows.size(), 2u);
+    EXPECT_EQ(rs.rows[0][1], c.r1->server_uuid());
+    EXPECT_EQ(rs.rows[1][1], c.r3->server_uuid());
+}
+
+TEST(NativeFakeServer, TheMacrosReadListsTheServersMacros) {
+    auto server = std::make_shared<FakeServer>();
+    FakeTransport t(server);
+    t.connect(kFtEp1);
+    EXPECT_TRUE(
+        t.select(MetaQuery::ClusterReplicaCount, native::select_macros(kFtBudget)).rows.empty());
+    server->set_macro("cluster", "main");
+    server->set_macro("shard", "01");
+    server->set_macro("cluster", "prod");
+    EXPECT_EQ(t.select(MetaQuery::ClusterReplicaCount, native::select_macros(kFtBudget)).rows,
+              (FtRows{{"cluster", "prod"}, {"shard", "01"}}));
+}
+
+// The server's skip_unavailable_shards decides what an unreachable replica
+// does to a cluster read: with 0 the read fails, with 1 the replica is left
+// out. A statement's own SETTINGS win over the profile.
+TEST(NativeFakeServer, SkipUnavailableShardsLeavesAnUnreachableReplicaOut) {
+    FtCluster c;
+    c.initiator->set_unreadable_replica("c", 0);
+    c.initiator->set_setting("skip_unavailable_shards", "1");
+    FakeTransport t(c.initiator);
+    t.connect(kFtEp1);
+    // The probe's statements without their pin, as they were before it.
+    const auto unpinned = [](std::string sql) {
+        const std::string pin = ", skip_unavailable_shards=0";
+        sql.erase(sql.find(pin), pin.size());
+        return sql;
+    };
+    const std::string tables = native::select_cluster_tables("c", "db", "events_local", kFtBudget);
+    const ResultSet skipped = t.select(MetaQuery::ClusterTables, unpinned(tables));
+    ASSERT_EQ(skipped.rows.size(), 1u);
+    EXPECT_EQ(skipped.rows[0][1], c.r2->server_uuid());
+
+    // Pinned to 0, the replica fails the read.
+    const auto err = ft_server_error([&] { (void)t.select(MetaQuery::ClusterTables, tables); });
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, ch::ALL_CONNECTION_TRIES_FAILED);
+
+    // Under the skip, a replica whose read fails for a missing table is left
+    // out too; pinned to 0, it fails the read.
+    c.initiator->set_unreadable_replica("c", 0, false);
+    c.r3->set_replicated_merge_tree_settings_table(false);
+    const std::string replicated =
+        native::select_cluster_replicated_merge_tree_settings("c", kFtBudget);
+    const ResultSet partial =
+        t.select(MetaQuery::ClusterReplicatedMergeTreeSettings, unpinned(replicated));
+    ASSERT_EQ(partial.rows.size(), 6u);
+    EXPECT_EQ(partial.rows[0][1], c.r1->server_uuid());
+    EXPECT_EQ(partial.rows[5][1], c.r2->server_uuid());
+    const auto missing = ft_server_error(
+        [&] { (void)t.select(MetaQuery::ClusterReplicatedMergeTreeSettings, replicated); });
+    ASSERT_TRUE(missing.has_value());
+    EXPECT_EQ(missing->code, ch::UNKNOWN_TABLE);
 }
 
 // ---------------------------------------------------------------------------

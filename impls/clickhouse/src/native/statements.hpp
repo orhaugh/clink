@@ -48,7 +48,11 @@ struct InsertText {
 [[nodiscard]] std::chrono::seconds metadata_budget(std::chrono::milliseconds receive_timeout);
 
 // Every selected expression is wrapped in CAST(... AS String), and every
-// SELECT ends with bounded_settings(budget).
+// SELECT ends with bounded_settings(budget). A clusterAllReplicas read adds
+// skip_unavailable_shards=0 after it, so that an unreachable replica fails the
+// read rather than dropping out of its result, and its first two columns are
+// the replica each row came from, as host:port for the reports, and that
+// server's UUID, which tells apart two instances on one host.
 [[nodiscard]] std::string select_server_settings(std::chrono::seconds budget);
 [[nodiscard]] std::string select_table(std::string_view db,
                                        std::string_view table,
@@ -60,6 +64,10 @@ struct InsertText {
 [[nodiscard]] std::string select_replicated_merge_tree_settings(std::chrono::seconds budget);
 [[nodiscard]] std::string select_cluster_replica_count(std::string_view cluster,
                                                        std::chrono::seconds budget);
+// The server's macros, to expand a Distributed table's cluster argument such
+// as '{cluster}' as the server does. It is part of finding the cluster whose
+// replicas are counted, so it is sent as MetaQuery::ClusterReplicaCount.
+[[nodiscard]] std::string select_macros(std::chrono::seconds budget);
 [[nodiscard]] std::string select_cluster_tables(std::string_view cluster,
                                                 std::string_view db,
                                                 std::string_view table,

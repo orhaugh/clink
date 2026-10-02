@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <map>
+#include <set>
 #include <utility>
 
 #include <clickhouse/error_codes.h>
@@ -186,11 +187,15 @@ struct SettingLookup {
     std::optional<std::string> value;
 };
 
+// The server prints the storage definition with its SETTINGS clause last, so
+// the last top-level SETTINGS word starts it, and an earlier bare one (in a TTL
+// expression, say) is not the clause. A setting named twice in the clause is
+// applied in order, so its last value is the one the table has.
 SettingLookup lookup_engine_setting(std::string_view engine_full, std::string_view name) {
     constexpr std::string_view kKeyword = "SETTINGS";
     std::optional<std::size_t> clause;
     const bool ok = walk(engine_full, [&](std::size_t i, int depth) {
-        if (clause || depth != 0 || engine_full.substr(i, kKeyword.size()) != kKeyword) {
+        if (depth != 0 || engine_full.substr(i, kKeyword.size()) != kKeyword) {
             return;
         }
         const std::size_t end = i + kKeyword.size();
@@ -220,7 +225,7 @@ SettingLookup lookup_engine_setting(std::string_view engine_full, std::string_vi
         if (key.size() >= 2 && key.front() == '`' && key.back() == '`') {
             key = key.substr(1, key.size() - 2);
         }
-        if (key == name && !found.value) {
+        if (key == name) {
             found.value = std::string(trim(pair.substr(eq + 1)));
         }
     }
@@ -279,11 +284,26 @@ Settings name_values(const ResultSet& rs) {
     return out;
 }
 
-// host -> name -> value, from a clusterAllReplicas settings read.
-std::map<std::string, Settings, std::less<>> per_host(const ResultSet& rs) {
-    std::map<std::string, Settings, std::less<>> out;
+// server UUID -> name -> value, from a clusterAllReplicas settings read, whose
+// rows are (replica, server UUID, name, value). A replica that gives one
+// setting two values in one read is not evidence of either, so it is
+// unreadable rather than decided by whichever row came first.
+using HostSettings = std::map<std::string, Settings, std::less<>>;
+
+HostSettings per_host(const ResultSet& rs,
+                      std::string_view system_table,
+                      const std::string& cluster) {
+    HostSettings out;
     for (const auto& row : rs.rows) {
-        out[cell(row, 0)].emplace(cell(row, 1), cell(row, 2));
+        const auto [it, added] = out[cell(row, 1)].emplace(cell(row, 2), cell(row, 3));
+        if (!added && it->second != cell(row, 3)) {
+            throw NativeSinkError(code::kTargetUnreadable,
+                                  "the read of system." + std::string(system_table) +
+                                      " across cluster " + cluster + " gave replica " +
+                                      cell(row, 0) + " both " + it->first + "=" + it->second +
+                                      " and " + it->first + "=" + cell(row, 3) +
+                                      ", so the native sink cannot tell which applies");
+        }
     }
     return out;
 }
@@ -451,11 +471,20 @@ void refuse_engine(const std::string& qualified,
 
 // --- Effective async_insert and the deduplication window ---------------------
 
-// The MergeTree-level defaults of one server. `replicated` is nullopt on a
-// line without system.replicated_merge_tree_settings.
+// The MergeTree-level defaults of one server. For a Replicated table the
+// <replicated_merge_tree> view is Read from system.replicated_merge_tree_settings;
+// Absent on a line without that table, where merge_tree_settings stands in and
+// the reports say so; or Unreadable, when the server has the table but the
+// read could not reach it, and `unreadable` says why.
 struct ServerDefaults {
     Settings merge_tree;
-    std::optional<Settings> replicated;
+    enum class Replicated : std::uint8_t {
+        Read,
+        Absent,
+        Unreadable
+    } replicated_state{Replicated::Absent};
+    Settings replicated;
+    std::string unreadable;
 };
 
 struct DefaultValue {
@@ -469,8 +498,8 @@ struct DefaultValue {
 // so the replicated section supplied the value only where the two differ.
 DefaultValue server_default(const ServerDefaults& d, bool replicated, std::string_view name) {
     const auto mt = d.merge_tree.find(name);
-    if (replicated && d.replicated) {
-        if (const auto it = d.replicated->find(name); it != d.replicated->end()) {
+    if (replicated && d.replicated_state == ServerDefaults::Replicated::Read) {
+        if (const auto it = d.replicated.find(name); it != d.replicated.end()) {
             const bool differs = mt == d.merge_tree.end() || mt->second != it->second;
             return {it->second, differs};
         }
@@ -510,10 +539,15 @@ std::string alter_fix(const LocalTable& t) {
 
 LocalAssessment assess_local(const LocalTable& t, const ServerDefaults& defaults) {
     const bool replicated = t.family == EngineFamily::ReplicatedMergeTree;
-    const std::string absent_note = replicated && !defaults.replicated
-                                        ? ", " + std::string(kReplicatedTable) + " absent, " +
-                                              std::string(kMergeTreeTable) + " used"
-                                        : "";
+    const bool absent =
+        replicated && defaults.replicated_state == ServerDefaults::Replicated::Absent;
+    // The table's own setting overrides the <replicated_merge_tree> default, so
+    // a default that could not be read matters only where the table sets none.
+    const bool unreadable =
+        replicated && defaults.replicated_state == ServerDefaults::Replicated::Unreadable;
+    const std::string absent_note = absent ? ", " + std::string(kReplicatedTable) + " absent, " +
+                                                 std::string(kMergeTreeTable) + " used"
+                                           : "";
     LocalAssessment out;
 
     // The table's own setting, if any, decides; otherwise the server default.
@@ -540,6 +574,12 @@ LocalAssessment assess_local(const LocalTable& t, const ServerDefaults& defaults
                          alter_fix(t));
         }
         out.async_report = "async_insert=0 (table setting)";
+    } else if (unreadable) {
+        refuse_async(t,
+                     "has table async_insert unset, and the native sink cannot read the "
+                     "<replicated_merge_tree> default it inherits: " +
+                         defaults.unreadable,
+                     alter_fix(t) + ", since a table setting overrides the server default");
     } else {
         const DefaultValue d = server_default(defaults, replicated, "async_insert");
         const std::string section =
@@ -588,6 +628,8 @@ LocalAssessment assess_local(const LocalTable& t, const ServerDefaults& defaults
         out.dedup_report =
             v ? name + "=" + std::to_string(*v) + " (table)"
               : name + "=" + *table_window.value + " (table, unreadable, counted as 0)";
+    } else if (unreadable) {
+        out.dedup_report = name + "=0 (server default unreadable, counted as 0)";
     } else {
         const DefaultValue d = server_default(defaults, replicated, name);
         if (!d.value) {
@@ -612,14 +654,15 @@ bool is_unknown_table(const ch::ServerException& e) noexcept {
     return e.GetCode() == ch::UNKNOWN_TABLE;
 }
 
-// A cluster read. A permission error means the replicas' settings cannot be
-// checked at all, and no retry will change that, so it refuses with the
-// grants the check needs. Every other failure, an unreachable replica above
-// all, goes through unchanged for the caller's retry loop.
+// A read the Distributed probe makes. A permission error means the replicas'
+// settings cannot be checked at all, and no retry will change that, so it
+// refuses with the grants the check needs. Every other failure, an unreachable
+// replica above all, goes through unchanged for the caller's retry loop.
 template <typename Read>
 ResultSet cluster_read(const SinkOptions& opts,
                        const std::string& qualified,
                        const DistributedTarget& d,
+                       bool reads_macros,
                        Read read) {
     try {
         return read();
@@ -636,11 +679,70 @@ ResultSet cluster_read(const SinkOptions& opts,
                 std::to_string(e.GetCode()) + ": " + e.GetException().display_text +
                 "). Grant the sink's user what the check reads: GRANT REMOTE ON *.* TO " + user +
                 "; GRANT SELECT ON system.clusters TO " + user +
+                (reads_macros ? "; GRANT SELECT ON system.macros TO " + user : std::string()) +
                 "; GRANT SELECT ON system.tables TO " + user +
                 "; GRANT SELECT ON system.merge_tree_settings TO " + user +
                 "; GRANT SELECT ON system.replicated_merge_tree_settings TO " + user);
     }
 }
+
+// Expands the macros in a Distributed table's cluster argument the way the
+// server does when it opens the table: each {name} becomes that macro's value
+// from system.macros, and the result is expanded again until no brace is
+// left, for at most ten rounds. The server also knows {server_uuid}, which
+// system.macros does not list; that and any other name it does not list is a
+// macro the probe cannot resolve, and it says so rather than guess a cluster.
+std::string expand_cluster_macros(const std::string& qualified,
+                                  const std::string& written,
+                                  const Settings& macros) {
+    const std::string prefix =
+        qualified + " is a Distributed table whose cluster argument " + quote_string(written);
+    constexpr int kMaxRounds = 10;
+    std::string text = written;
+    for (int round = 0; text.find('{') != std::string::npos; ++round) {
+        if (round == kMaxRounds) {
+            throw NativeSinkError(code::kTargetUnreadable,
+                                  prefix + " nests macros more than " + std::to_string(kMaxRounds) +
+                                      " deep, which the server does not expand either");
+        }
+        std::string out;
+        std::size_t pos = 0;
+        for (std::size_t open = text.find('{'); open != std::string::npos;
+             open = text.find('{', pos)) {
+            const std::size_t close = text.find('}', open + 1);
+            if (close == std::string::npos) {
+                throw NativeSinkError(code::kTargetUnreadable,
+                                      prefix +
+                                          " opens a macro with '{' and does not close it, "
+                                          "so the native sink cannot tell which cluster "
+                                          "it writes to");
+            }
+            const std::string name = text.substr(open + 1, close - open - 1);
+            const auto it = macros.find(name);
+            if (it == macros.end()) {
+                throw NativeSinkError(
+                    code::kTargetUnreadable,
+                    prefix + " uses the macro {" + name +
+                        "}, which system.macros on this server does not define, so the native "
+                        "sink cannot tell which cluster it writes to. Name the cluster in the "
+                        "table definition, or define the macro in the server's <macros> section");
+            }
+            out.append(text, pos, open - pos);
+            out += it->second;
+            pos = close + 1;
+        }
+        out.append(text, pos, std::string::npos);
+        text = std::move(out);
+    }
+    return text;
+}
+
+// One replica's local table, keyed by the server's UUID so that the rows
+// each cluster read returns can be matched to it.
+struct Replica {
+    std::string uuid;
+    LocalTable table;
+};
 
 void probe_distributed(InsertTransport& transport,
                        const SinkOptions& opts,
@@ -648,10 +750,27 @@ void probe_distributed(InsertTransport& transport,
                        const std::string& qualified,
                        DistributedTarget d,
                        TargetInfo& info) {
-    const std::string cluster = quote_identifier(d.cluster);
     const std::string local = qualified_table(d.database, d.table);
+    const std::string written = d.cluster;
+    const bool has_macros = written.find('{') != std::string::npos;
+    const auto guarded = [&](auto read) {
+        return cluster_read(opts, qualified, d, has_macros, read);
+    };
 
-    const ResultSet count = cluster_read(opts, qualified, d, [&] {
+    if (has_macros) {
+        // The server expands the macros when it opens the table and keeps
+        // them unexpanded in the definition, so the probe expands them too,
+        // or system.clusters would not know the name.
+        const Settings macros = name_values(guarded([&] {
+            return transport.select(MetaQuery::ClusterReplicaCount, select_macros(budget));
+        }));
+        d.cluster = expand_cluster_macros(qualified, written, macros);
+    }
+    const std::string cluster = quote_identifier(d.cluster);
+    const std::string cluster_origin =
+        has_macros ? " (" + quote_string(written) + " in its definition)" : "";
+
+    const ResultSet count = guarded([&] {
         return transport.select(MetaQuery::ClusterReplicaCount,
                                 select_cluster_replica_count(d.cluster, budget));
     });
@@ -668,12 +787,13 @@ void probe_distributed(InsertTransport& transport,
     if (replicas == 0) {
         throw NativeSinkError(code::kTargetUnreadable,
                               qualified + " is a Distributed table over cluster " + cluster +
+                                  cluster_origin +
                                   ", which system.clusters on this server does not list, so its "
                                   "replicas cannot be checked");
     }
     d.replicas = static_cast<std::size_t>(replicas);
 
-    const ResultSet tables = cluster_read(opts, qualified, d, [&] {
+    const ResultSet tables = guarded([&] {
         return transport.select(MetaQuery::ClusterTables,
                                 select_cluster_tables(d.cluster, d.database, d.table, budget));
     });
@@ -692,61 +812,135 @@ void probe_distributed(InsertTransport& transport,
                 "; create it on every replica first; the sink does not create tables");
     }
 
-    std::vector<LocalTable> locals;
+    // Two instances can share a host name and a port, but not a UUID; the
+    // reports then add the UUID so that each names one server.
+    std::map<std::string, std::size_t, std::less<>> name_uses;
+    std::set<std::string, std::less<>> seen;
+    for (const auto& row : tables.rows) {
+        if (seen.insert(cell(row, 1)).second) {
+            ++name_uses[cell(row, 0)];
+        }
+    }
+    std::vector<Replica> locals;
     bool any_replicated = false;
     for (const auto& row : tables.rows) {
-        LocalTable t;
+        Replica r;
+        r.uuid = cell(row, 1);
+        LocalTable& t = r.table;
         t.qualified = local;
         t.server = cell(row, 0);
+        if (name_uses[t.server] > 1) {
+            t.server += " (server " + r.uuid + ")";
+        }
         t.where = " on replica " + t.server + " of cluster " + cluster;
-        t.engine_full = cell(row, 2);
-        t.family = engine_family(cell(row, 1));
+        t.engine_full = cell(row, 3);
+        t.family = engine_family(cell(row, 2));
         if (t.family == EngineFamily::SharedMergeTree) {
-            refuse_engine(local, t.where, cell(row, 1), t.family);
+            refuse_engine(local, t.where, cell(row, 2), t.family);
         }
         if (!is_merge_tree_family(t.family)) {
             refuse_async(t,
-                         "uses engine " + cell(row, 1) +
+                         "uses engine " + cell(row, 2) +
                              ", so the native sink cannot check whether it takes inserts "
                              "asynchronously",
                          "Point the Distributed table at MergeTree or ReplicatedMergeTree "
                          "family local tables");
         }
         any_replicated = any_replicated || t.family == EngineFamily::ReplicatedMergeTree;
-        locals.push_back(std::move(t));
+        locals.push_back(std::move(r));
     }
 
-    const auto merge_tree = per_host(cluster_read(opts, qualified, d, [&] {
-        return transport.select(MetaQuery::ClusterMergeTreeSettings,
-                                select_cluster_merge_tree_settings(d.cluster, budget));
-    }));
-    std::optional<std::map<std::string, Settings, std::less<>>> replicated;
+    const HostSettings merge_tree =
+        per_host(guarded([&] {
+                     return transport.select(MetaQuery::ClusterMergeTreeSettings,
+                                             select_cluster_merge_tree_settings(d.cluster, budget));
+                 }),
+                 kMergeTreeTable,
+                 cluster);
+    std::optional<HostSettings> replicated;
+    // After a code 60 on the replicated read: the replicas whose line has no
+    // system.replicated_merge_tree_settings, and why the others cannot be read.
+    std::set<std::string, std::less<>> without_table;
+    std::string unreadable;
     if (any_replicated) {
         try {
-            replicated = per_host(cluster_read(opts, qualified, d, [&] {
-                return transport.select(
-                    MetaQuery::ClusterReplicatedMergeTreeSettings,
-                    select_cluster_replicated_merge_tree_settings(d.cluster, budget));
-            }));
+            replicated =
+                per_host(guarded([&] {
+                             return transport.select(
+                                 MetaQuery::ClusterReplicatedMergeTreeSettings,
+                                 select_cluster_replicated_merge_tree_settings(d.cluster, budget));
+                         }),
+                         kReplicatedTable,
+                         cluster);
         } catch (const ch::ServerException& e) {
-            // A line without the table: fall back to merge_tree_settings, and
-            // the reports say so.
             if (!is_unknown_table(e)) {
                 throw;
             }
+            // One replica without the table fails the read for all of them,
+            // so ask each replica whether it has the table. A replica that
+            // lacks it falls back to merge_tree_settings, as a single server
+            // on that line would. A replica that has it keeps a
+            // <replicated_merge_tree> section no read could see, and is
+            // unreadable rather than assumed to inherit <merge_tree>.
+            const ResultSet having = guarded([&] {
+                return transport.select(
+                    MetaQuery::ClusterTables,
+                    select_cluster_tables(
+                        d.cluster, "system", std::string(kReplicatedTable), budget));
+            });
+            std::set<std::string, std::less<>> with_table;
+            for (const auto& row : having.rows) {
+                with_table.insert(cell(row, 1));
+            }
+            std::vector<std::string> lacking;
+            for (const Replica& r : locals) {
+                if (!with_table.contains(r.uuid) && without_table.insert(r.uuid).second) {
+                    lacking.push_back(r.table.server);
+                }
+            }
+            if (lacking.empty()) {
+                // Every replica has the table, so a missing table is not what
+                // failed the read.
+                throw;
+            }
+            unreadable = "system." + std::string(kReplicatedTable) + " is missing on " +
+                         join(lacking, ", ") + ", so the read of it across cluster " + cluster +
+                         " fails for every replica (code " + std::to_string(e.GetCode()) + ": " +
+                         e.GetException().display_text + ")";
         }
     }
 
+    // A replica the tables read named but a settings read returned nothing
+    // for was never read, which is no evidence that it is synchronous.
+    const auto not_read = [&](const LocalTable& t, std::string_view system_table) {
+        return NativeSinkError(code::kTargetUnreadable,
+                               t.qualified + t.where + " is missing from the read of system." +
+                                   std::string(system_table) +
+                                   " across the cluster, so the native sink cannot check "
+                                   "whether it takes inserts asynchronously");
+    };
     std::vector<std::string> reports;
     std::optional<LocalAssessment> first;
-    for (const LocalTable& t : locals) {
+    for (const Replica& r : locals) {
+        const LocalTable& t = r.table;
         ServerDefaults defaults;
-        if (const auto it = merge_tree.find(t.server); it != merge_tree.end()) {
-            defaults.merge_tree = it->second;
+        const auto mt = merge_tree.find(r.uuid);
+        if (mt == merge_tree.end()) {
+            throw not_read(t, kMergeTreeTable);
         }
-        if (replicated) {
-            const auto it = replicated->find(t.server);
-            defaults.replicated = it != replicated->end() ? it->second : Settings{};
+        defaults.merge_tree = mt->second;
+        if (t.family == EngineFamily::ReplicatedMergeTree) {
+            if (replicated) {
+                const auto it = replicated->find(r.uuid);
+                if (it == replicated->end()) {
+                    throw not_read(t, kReplicatedTable);
+                }
+                defaults.replicated_state = ServerDefaults::Replicated::Read;
+                defaults.replicated = it->second;
+            } else if (!without_table.contains(r.uuid)) {
+                defaults.replicated_state = ServerDefaults::Replicated::Unreadable;
+                defaults.unreadable = unreadable;
+            }
         }
         LocalAssessment a = assess_local(t, defaults);
         reports.push_back(t.server + ": " + a.async_report);
@@ -755,14 +949,14 @@ void probe_distributed(InsertTransport& transport,
         }
     }
 
-    info.async_report =
-        "async_insert=0 on every replica of cluster " + cluster + " (" + join(reports, "; ") + ")";
+    info.async_report = "async_insert=0 on every replica of cluster " + cluster + cluster_origin +
+                        " (" + join(reports, "; ") + ")";
     // The initiator does not deduplicate, and passing the token through to
     // the shards is untested, so a Distributed target counts as keeping no
     // log whatever its local tables keep.
     info.dedup_window = first->window;
     info.keeps_dedup_log = false;
-    info.dedup_report = first->dedup_report + " on " + locals.front().server +
+    info.dedup_report = first->dedup_report + " on " + locals.front().table.server +
                         "'s local table; treated as no log, since the Distributed table does "
                         "not deduplicate";
     info.distributed = std::move(d);
@@ -781,10 +975,13 @@ void probe_local(InsertTransport& transport,
             defaults.replicated =
                 name_values(transport.select(MetaQuery::ReplicatedMergeTreeSettings,
                                              select_replicated_merge_tree_settings(budget)));
+            defaults.replicated_state = ServerDefaults::Replicated::Read;
         } catch (const ch::ServerException& e) {
             if (!is_unknown_table(e)) {
                 throw;
             }
+            // A line without the table: merge_tree_settings stands in, and
+            // the reports say so.
         }
     }
     LocalTable t;

@@ -961,11 +961,41 @@ struct ClusterState {
 
 std::atomic<std::uint64_t> g_next_server{1};
 
+// A server UUID unique in the process, in the server's own text form.
+std::string fake_uuid(std::uint64_t n) {
+    char buf[37];
+    std::snprintf(
+        buf, sizeof buf, "00000000-0000-4000-8000-%012llx", static_cast<unsigned long long>(n));
+    return buf;
+}
+
+// What a clusterAllReplicas statement asks of skip_unavailable_shards: its own
+// SETTINGS when it pins the setting, otherwise the server's profile value.
+bool skips_unavailable(std::string_view sql, const Settings& profile) {
+    if (sql.find("skip_unavailable_shards=0") != std::string_view::npos) {
+        return false;
+    }
+    if (sql.find("skip_unavailable_shards=1") != std::string_view::npos) {
+        return true;
+    }
+    for (const auto& [n, v] : profile) {
+        if (n == "skip_unavailable_shards") {
+            return v == "1" || v == "true";
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 struct FakeServer::Impl {
     mutable std::mutex mu;
-    const std::string display_name{"fake-" + std::to_string(g_next_server.fetch_add(1))};
+    const std::uint64_t number{g_next_server.fetch_add(1)};
+    const std::string display_name{"fake-" + std::to_string(number)};
+    const std::string server_uuid{fake_uuid(number)};
+    std::string host_name{display_name};
+    std::uint16_t tcp_port{9000};
+    Settings macros;
     std::uint64_t major{26}, minor{8}, patch{1};
     Settings settings{default_settings()};
     Settings merge_tree{default_merge_tree_settings()};
@@ -1039,11 +1069,24 @@ struct FakeServer::Impl {
         return id;
     }
 
-    // What a clusterAllReplicas read sees: each replica's display name and a
-    // copy of what `read` takes from it, under that replica's own lock only.
+    // One replica's part of a clusterAllReplicas result: hostName():tcpPort(),
+    // serverUUID() and what the read took from it.
+    template <typename Result>
+    struct ReplicaRows {
+        std::string host;
+        std::string uuid;
+        Result rows;
+    };
+
+    // What a clusterAllReplicas read sees: each replica's identity and a copy
+    // of what `read` takes from it, under that replica's own lock only. Under
+    // skip_unavailable_shards=1 an unreachable replica, or one whose read
+    // fails for a missing table, is left out instead of failing the read, as
+    // the server's default skip_unavailable_shards_mode does.
     template <typename Read>
-    auto across_cluster(const std::string& cluster, Read read) {
+    auto across_cluster(const std::string& cluster, const std::string& sql, Read read) {
         std::vector<FakeServer*> replicas;
+        bool skip = false;
         {
             const std::lock_guard<std::mutex> lock(mu);
             const auto it = clusters.find(cluster);
@@ -1051,7 +1094,14 @@ struct FakeServer::Impl {
                 throw_server(ch::CLUSTER_DOESNT_EXIST,
                              "Requested cluster '" + cluster + "' not found");
             }
-            if (!it->second.unreadable.empty()) {
+            skip = skips_unavailable(sql, settings);
+            if (skip) {
+                for (std::size_t i = 0; i < it->second.replicas.size(); ++i) {
+                    if (!it->second.unreadable.contains(i)) {
+                        replicas.push_back(it->second.replicas[i]);
+                    }
+                }
+            } else if (!it->second.unreadable.empty()) {
                 const std::size_t index = *it->second.unreadable.begin();
                 const std::string host = index < it->second.replicas.size()
                                              ? it->second.replicas[index]->display_name()
@@ -1059,15 +1109,23 @@ struct FakeServer::Impl {
                 throw_server(ch::ALL_CONNECTION_TRIES_FAILED,
                              "All connection tries failed while connecting to " + host +
                                  " of cluster '" + cluster + "'");
+            } else {
+                replicas = it->second.replicas;
             }
-            replicas = it->second.replicas;
         }
         using Result = decltype(read(std::declval<Impl&>()));
-        std::vector<std::pair<std::string, Result>> out;
+        std::vector<ReplicaRows<Result>> out;
         for (FakeServer* replica : replicas) {
             Impl& r = replica->impl();
             const std::lock_guard<std::mutex> lock(r.mu);
-            out.emplace_back(r.display_name, read(r));
+            try {
+                out.push_back(
+                    {r.host_name + ":" + std::to_string(r.tcp_port), r.server_uuid, read(r)});
+            } catch (const ch::ServerException& e) {
+                if (!skip || e.GetCode() != ch::UNKNOWN_TABLE) {
+                    throw;
+                }
+            }
         }
         return out;
     }
@@ -1141,6 +1199,12 @@ ResultSet FakeServer::Impl::answer(MetaQuery kind, const std::string& sql) {
             break;
         }
         case MetaQuery::ClusterReplicaCount: {
+            if (sql.find("FROM system.macros") != std::string::npos) {
+                const std::lock_guard<std::mutex> lock(mu);
+                out.columns = {"macro", "substitution"};
+                out.rows = filtered(macros, std::nullopt);
+                break;
+            }
             const std::string cluster = required_literal(sql, "cluster = ");
             const std::lock_guard<std::mutex> lock(mu);
             const auto it = clusters.find(cluster);
@@ -1153,17 +1217,21 @@ ResultSet FakeServer::Impl::answer(MetaQuery kind, const std::string& sql) {
             const std::string cluster = required_literal(sql, "clusterAllReplicas(");
             const std::string db = required_literal(sql, "database = ");
             const std::string name = required_literal(sql, "AND name = ");
-            out.columns = {"host", "engine", "engine_full"};
-            const auto per_replica = across_cluster(cluster, [&](Impl& r) {
+            out.columns = {"host", "uuid", "engine", "engine_full"};
+            const auto per_replica = across_cluster(cluster, sql, [&](Impl& r) {
                 std::optional<std::pair<std::string, std::string>> row;
                 if (const TableState* t = r.find(db, name)) {
                     row.emplace(t->def.engine, t->def.engine_full);
+                } else if (db == "system" && name == "replicated_merge_tree_settings" &&
+                           r.has_replicated_table) {
+                    row.emplace("SystemReplicatedMergeTreeSettings", "");
                 }
                 return row;
             });
-            for (const auto& [host, row] : per_replica) {
-                if (row) {
-                    out.rows.push_back({host, row->first, row->second});
+            for (const auto& replica : per_replica) {
+                if (replica.rows) {
+                    out.rows.push_back(
+                        {replica.host, replica.uuid, replica.rows->first, replica.rows->second});
                 }
             }
             break;
@@ -1172,8 +1240,8 @@ ResultSet FakeServer::Impl::answer(MetaQuery kind, const std::string& sql) {
         case MetaQuery::ClusterReplicatedMergeTreeSettings: {
             const bool replicated = kind == MetaQuery::ClusterReplicatedMergeTreeSettings;
             const std::string cluster = required_literal(sql, "clusterAllReplicas(");
-            out.columns = {"host", "name", "value"};
-            const auto per_replica = across_cluster(cluster, [&](Impl& r) {
+            out.columns = {"host", "uuid", "name", "value"};
+            const auto per_replica = across_cluster(cluster, sql, [&](Impl& r) {
                 if (replicated && !r.has_replicated_table) {
                     throw_server(ch::UNKNOWN_TABLE,
                                  "Table system.replicated_merge_tree_settings does not exist on " +
@@ -1181,9 +1249,9 @@ ResultSet FakeServer::Impl::answer(MetaQuery kind, const std::string& sql) {
                 }
                 return filtered(replicated ? r.replicated_view() : r.merge_tree, names);
             });
-            for (const auto& [host, rows] : per_replica) {
-                for (const auto& row : rows) {
-                    out.rows.push_back({host, row[0], row[1]});
+            for (const auto& replica : per_replica) {
+                for (const auto& row : replica.rows) {
+                    out.rows.push_back({replica.host, replica.uuid, row[0], row[1]});
                 }
             }
             break;
@@ -1252,6 +1320,21 @@ void FakeServer::add_cluster(const std::string& name, std::vector<FakeServer*> r
     impl_->clusters[name].replicas = std::move(replicas);
 }
 
+void FakeServer::set_host_name(const std::string& name) {
+    const std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->host_name = name;
+}
+
+void FakeServer::set_tcp_port(std::uint16_t port) {
+    const std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->tcp_port = port;
+}
+
+void FakeServer::set_macro(const std::string& name, const std::string& substitution) {
+    const std::lock_guard<std::mutex> lock(impl_->mu);
+    upsert(impl_->macros, name, substitution);
+}
+
 void FakeServer::set_unreadable_replica(const std::string& cluster,
                                         std::size_t replica,
                                         bool unreadable) {
@@ -1313,6 +1396,15 @@ void FakeServer::release() {
 
 const std::string& FakeServer::display_name() const noexcept {
     return impl_->display_name;
+}
+
+std::string FakeServer::replica_name() const {
+    const std::lock_guard<std::mutex> lock(impl_->mu);
+    return impl_->host_name + ":" + std::to_string(impl_->tcp_port);
+}
+
+const std::string& FakeServer::server_uuid() const noexcept {
+    return impl_->server_uuid;
 }
 
 std::vector<LandedBlock> FakeServer::landed(const std::string& table) const {

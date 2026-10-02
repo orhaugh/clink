@@ -59,6 +59,26 @@ std::string bounded(std::string sql, std::chrono::seconds budget) {
     return sql;
 }
 
+// A clusterAllReplicas read with skip_unavailable_shards=0 pinned. A profile
+// that sets it to 1 would have the server leave an unreachable replica out of
+// the result instead of failing the read, so a replica outage would look like
+// a replica without the table or without its settings rows.
+std::string cluster_bounded(std::string sql, std::chrono::seconds budget) {
+    sql = bounded(std::move(sql), budget);
+    sql += ", skip_unavailable_shards=0";
+    return sql;
+}
+
+// The first two columns of every cluster read. hostName() and tcpPort() run on
+// each replica, so the first column names the replica a row came from, for a
+// refusal to cite. Two instances on one machine share a host name and, without
+// a plain TCP port, both report the default port, so rows are matched up across
+// reads by the second column, the server's own UUID, which no two instances
+// share.
+constexpr std::string_view kReplicaColumns =
+    "CAST(concat(hostName(), ':', toString(tcpPort())) AS String), "
+    "CAST(serverUUID() AS String)";
+
 std::string merge_tree_settings_from(std::string_view system_table, std::chrono::seconds budget) {
     return bounded("SELECT CAST(name AS String), CAST(value AS String) FROM " +
                        std::string(system_table) + " WHERE name IN " +
@@ -66,17 +86,15 @@ std::string merge_tree_settings_from(std::string_view system_table, std::chrono:
                    budget);
 }
 
-// hostName() runs on each replica, so every row names the replica it came
-// from and a refusal can say which one is wrong.
 std::string cluster_merge_tree_settings_from(std::string_view cluster,
                                              std::string_view system_table,
                                              std::chrono::seconds budget) {
-    return bounded(
-        "SELECT CAST(hostName() AS String), CAST(name AS String), CAST(value AS String) FROM "
-        "clusterAllReplicas(" +
-            quote_string(cluster) + ", " + std::string(system_table) + ") WHERE name IN " +
-            std::string(kMergeTreeSettingNames),
-        budget);
+    return cluster_bounded("SELECT " + std::string(kReplicaColumns) +
+                               ", CAST(name AS String), CAST(value AS String) FROM "
+                               "clusterAllReplicas(" +
+                               quote_string(cluster) + ", " + std::string(system_table) +
+                               ") WHERE name IN " + std::string(kMergeTreeSettingNames),
+                           budget);
 }
 
 }  // namespace
@@ -193,16 +211,21 @@ std::string select_cluster_replica_count(std::string_view cluster, std::chrono::
                    budget);
 }
 
+std::string select_macros(std::chrono::seconds budget) {
+    return bounded("SELECT CAST(macro AS String), CAST(substitution AS String) FROM system.macros",
+                   budget);
+}
+
 std::string select_cluster_tables(std::string_view cluster,
                                   std::string_view db,
                                   std::string_view table,
                                   std::chrono::seconds budget) {
-    return bounded(
-        "SELECT CAST(hostName() AS String), CAST(engine AS String), CAST(engine_full AS String) "
-        "FROM clusterAllReplicas(" +
-            quote_string(cluster) + ", system.tables) WHERE database = " + quote_string(db) +
-            " AND name = " + quote_string(table),
-        budget);
+    return cluster_bounded("SELECT " + std::string(kReplicaColumns) +
+                               ", CAST(engine AS String), CAST(engine_full AS String) FROM "
+                               "clusterAllReplicas(" +
+                               quote_string(cluster) + ", system.tables) WHERE database = " +
+                               quote_string(db) + " AND name = " + quote_string(table),
+                           budget);
 }
 
 std::string select_cluster_merge_tree_settings(std::string_view cluster,

@@ -143,6 +143,7 @@ std::vector<std::pair<std::string, std::string>> stmt_every_select(seconds budge
         {"merge tree settings", select_merge_tree_settings(budget)},
         {"replicated merge tree settings", select_replicated_merge_tree_settings(budget)},
         {"cluster replica count", select_cluster_replica_count("main", budget)},
+        {"macros", select_macros(budget)},
         {"cluster tables", select_cluster_tables("main", "analytics", "events_local", budget)},
         {"cluster merge tree settings", select_cluster_merge_tree_settings("main", budget)},
         {"cluster replicated merge tree settings",
@@ -498,7 +499,8 @@ TEST(NativeStatements, EverySelectCastsEachExpressionToStringAndEndsBounded) {
     const std::string tail = " SETTINGS max_execution_time=4, timeout_overflow_mode='throw'";
     for (const auto& [what, sql] : stmt_every_select(budget)) {
         SCOPED_TRACE(what + ": " + sql);
-        EXPECT_TRUE(sql.ends_with(tail));
+        const bool cluster = stmt_contains(sql, "clusterAllReplicas(");
+        EXPECT_TRUE(sql.ends_with(cluster ? tail + ", skip_unavailable_shards=0" : tail));
         EXPECT_EQ(stmt_count(sql, "SETTINGS "), 1U);
         const auto items = stmt_select_list(sql);
         ASSERT_FALSE(items.empty());
@@ -667,30 +669,62 @@ TEST(NativeStatements, SelectClusterReplicaCountCountsTheClusterRows) {
               "SETTINGS max_execution_time=10, timeout_overflow_mode='throw'");
 }
 
+TEST(NativeStatements, SelectMacrosListsEveryMacro) {
+    EXPECT_EQ(select_macros(seconds{10}),
+              "SELECT CAST(macro AS String), CAST(substitution AS String) FROM system.macros "
+              "SETTINGS max_execution_time=10, timeout_overflow_mode='throw'");
+}
+
 TEST(NativeStatements, SelectClusterTablesNamesEachReplica) {
     EXPECT_EQ(select_cluster_tables("main", "analytics", "events_local", seconds{10}),
-              "SELECT CAST(hostName() AS String), CAST(engine AS String), CAST(engine_full AS "
+              "SELECT CAST(concat(hostName(), ':', toString(tcpPort())) AS String), "
+              "CAST(serverUUID() AS String), CAST(engine AS String), CAST(engine_full AS "
               "String) FROM clusterAllReplicas('main', system.tables) WHERE database = "
               "'analytics' AND name = 'events_local' SETTINGS max_execution_time=10, "
-              "timeout_overflow_mode='throw'");
+              "timeout_overflow_mode='throw', skip_unavailable_shards=0");
 }
 
 TEST(NativeStatements, SelectClusterMergeTreeSettingsNamesEachReplica) {
     EXPECT_EQ(select_cluster_merge_tree_settings("main", seconds{10}),
-              "SELECT CAST(hostName() AS String), CAST(name AS String), CAST(value AS String) "
+              "SELECT CAST(concat(hostName(), ':', toString(tcpPort())) AS String), "
+              "CAST(serverUUID() AS String), CAST(name AS String), CAST(value AS String) "
               "FROM clusterAllReplicas('main', system.merge_tree_settings) WHERE name IN "
               "('async_insert', 'non_replicated_deduplication_window', "
               "'replicated_deduplication_window') SETTINGS max_execution_time=10, "
-              "timeout_overflow_mode='throw'");
+              "timeout_overflow_mode='throw', skip_unavailable_shards=0");
 }
 
 TEST(NativeStatements, SelectClusterReplicatedMergeTreeSettingsNamesEachReplica) {
     EXPECT_EQ(select_cluster_replicated_merge_tree_settings("main", seconds{10}),
-              "SELECT CAST(hostName() AS String), CAST(name AS String), CAST(value AS String) "
+              "SELECT CAST(concat(hostName(), ':', toString(tcpPort())) AS String), "
+              "CAST(serverUUID() AS String), CAST(name AS String), CAST(value AS String) "
               "FROM clusterAllReplicas('main', system.replicated_merge_tree_settings) WHERE name "
               "IN ('async_insert', 'non_replicated_deduplication_window', "
               "'replicated_deduplication_window') SETTINGS max_execution_time=10, "
-              "timeout_overflow_mode='throw'");
+              "timeout_overflow_mode='throw', skip_unavailable_shards=0");
+}
+
+// A profile with skip_unavailable_shards=1 would have the server drop an
+// unreachable replica from a cluster read instead of failing it, which the
+// probe would then take for a replica without the table or its settings. So
+// every cluster read pins it off, and the reads of the server's own tables,
+// which reach no replica, leave it alone.
+TEST(NativeStatements, EveryClusterReadPinsSkipUnavailableShardsOff) {
+    std::size_t cluster_reads = 0;
+    for (const auto& [what, sql] : stmt_every_select(seconds{2})) {
+        SCOPED_TRACE(what + ": " + sql);
+        if (stmt_contains(sql, "clusterAllReplicas(")) {
+            ++cluster_reads;
+            EXPECT_EQ(stmt_count(sql, "skip_unavailable_shards=0"), 1U);
+            EXPECT_TRUE(
+                sql.starts_with("SELECT CAST(concat(hostName(), ':', "
+                                "toString(tcpPort())) AS String), CAST(serverUUID() AS "
+                                "String), "));
+        } else {
+            EXPECT_FALSE(stmt_contains(sql, "skip_unavailable_shards"));
+        }
+    }
+    EXPECT_EQ(cluster_reads, 3U);
 }
 
 }  // namespace

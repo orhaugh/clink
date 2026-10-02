@@ -26,7 +26,10 @@ enum class EngineFamily : std::uint8_t {
 };
 
 struct DistributedTarget {
-    std::string cluster, database, table;
+    // As the definition gives it from parse_distributed; probe_target expands
+    // any macros in it, such as '{cluster}', as the server does.
+    std::string cluster;
+    std::string database, table;
     std::size_t replicas{0};  // rows system.clusters lists for the cluster
 };
 
@@ -59,19 +62,22 @@ struct TargetInfo {
 // so the writer calls it again on every new client it builds.
 //
 // Throws NativeSinkError for a refusal, and a refusal always rests on a read
-// that succeeded and showed the problem. Lets the client's exceptions
-// through, including a cluster read that fails because a replica is
-// unreachable, so the caller's retry loop can classify them. The one client
-// error it turns into a refusal is a permission error on a cluster read,
-// which no retry can cure.
+// that succeeded and showed the problem, or showed that the check cannot be
+// made: a replica the cluster reads disagree about, or a cluster name whose
+// macros this server does not define. Lets the client's exceptions through,
+// including a cluster read that fails because a replica is unreachable, so the
+// caller's retry loop can classify them. The one client error it turns into a
+// refusal is a permission error on a read of the Distributed probe, which no
+// retry can cure.
 [[nodiscard]] TargetInfo probe_target(InsertTransport& transport, const SinkOptions& opts);
 
 // Pieces, exposed for tests.
 
 // The raw value text of `name` in the top-level SETTINGS clause of
-// engine_full, quotes included ("1", "'0'", "true"). nullopt when there is no
-// such setting, and also when engine_full cannot be scanned (an unclosed
-// quote or bracket).
+// engine_full, quotes included ("1", "'0'", "true"). The clause is the last
+// top-level SETTINGS word, and a setting named twice gives its last value, as
+// the server applies it. nullopt when there is no such setting, and also when
+// engine_full cannot be scanned (an unclosed quote or bracket).
 [[nodiscard]] std::optional<std::string> engine_full_setting(std::string_view engine_full,
                                                              std::string_view name);
 // Distributed(cluster, database, table[, ...]). Each of the first three must

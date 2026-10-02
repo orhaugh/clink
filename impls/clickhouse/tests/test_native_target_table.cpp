@@ -278,6 +278,29 @@ TEST(NativeTargetTablePieces, EngineFullSettingCopesWithASettingsHeavyClause) {
     EXPECT_EQ(native::engine_full_setting(full, "storage_policy"), "'it''s \\'quoted\\''");
 }
 
+// The server applies a setting named twice in order, so the table has the
+// last value.
+TEST(NativeTargetTablePieces, EngineFullSettingTakesTheLastOfARepeatedSetting) {
+    const std::string full =
+        "MergeTree ORDER BY id SETTINGS async_insert = 0, index_granularity = 8192, "
+        "async_insert = 1";
+    EXPECT_EQ(native::engine_full_setting(full, "async_insert"), "1");
+    EXPECT_EQ(native::engine_full_setting(full, "index_granularity"), "8192");
+}
+
+// The storage definition prints SETTINGS last, so a bare SETTINGS word
+// earlier in it, in a TTL expression say, is not the clause.
+TEST(NativeTargetTablePieces, EngineFullSettingReadsTheLastSettingsClause) {
+    EXPECT_EQ(native::engine_full_setting("MergeTree ORDER BY id TTL SETTINGS + toIntervalDay(1) "
+                                          "WHERE x = 1 SETTINGS async_insert = 1",
+                                          "async_insert"),
+              "1");
+    EXPECT_EQ(native::engine_full_setting("MergeTree ORDER BY id TTL SETTINGS + toIntervalDay(1) "
+                                          "SETTINGS index_granularity = 8192",
+                                          "async_insert"),
+              std::nullopt);
+}
+
 TEST(NativeTargetTablePieces, EngineFullSettingGivesNothingForTextItCannotScan) {
     EXPECT_EQ(native::engine_full_setting("MergeTree ORDER BY (id SETTINGS async_insert = 1",
                                           "async_insert"),
@@ -385,7 +408,9 @@ TEST(NativeTargetTable, EveryProbeReadIsBoundedByTheMetadataBudget) {
     const auto statements = c.initiator->statements();
     ASSERT_GE(statements.size(), 7u);
     for (const auto& sql : statements) {
-        EXPECT_TRUE(sql.ends_with("SETTINGS max_execution_time=4, timeout_overflow_mode='throw'"))
+        const std::string tail = "SETTINGS max_execution_time=4, timeout_overflow_mode='throw'";
+        EXPECT_TRUE(sql.ends_with(
+            tt_contains(sql, "clusterAllReplicas(") ? tail + ", skip_unavailable_shards=0" : tail))
             << sql;
         EXPECT_TRUE(sql.starts_with("SELECT CAST(")) << sql;
     }
@@ -783,11 +808,11 @@ TEST(NativeTargetTable, AShardLocalTableSettingRefusesNamingTheReplica) {
     const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
     EXPECT_EQ(r.code, native::code::kTargetAsyncInsert);
     EXPECT_TRUE(tt_contains(r.what,
-                            "`db`.`events_local` on replica " + c.r2->display_name() +
+                            "`db`.`events_local` on replica " + c.r2->replica_name() +
                                 " of cluster `c` takes inserts asynchronously (table setting "
                                 "async_insert=1)"))
         << r.what;
-    EXPECT_TRUE(tt_contains(r.what, "Run on " + c.r2->display_name() + ": ALTER TABLE")) << r.what;
+    EXPECT_TRUE(tt_contains(r.what, "Run on " + c.r2->replica_name() + ": ALTER TABLE")) << r.what;
 }
 
 TEST(NativeTargetTable, AShardLocalServerDefaultRefusesNamingTheReplica) {
@@ -809,16 +834,90 @@ TEST(NativeTargetTable, AShardLocalReplicatedOverrideRefusesNamingTheReplica) {
     EXPECT_TRUE(tt_contains(r.what, "<replicated_merge_tree>")) << r.what;
 }
 
-TEST(NativeTargetTable, AReplicaWithoutReplicatedSettingsFallsBackToMergeTree) {
+TEST(NativeTargetTable, ReplicasWithoutReplicatedSettingsFallBackToMergeTree) {
     TtCluster c;
+    c.r1->set_replicated_merge_tree_settings_table(false);
     c.r2->set_replicated_merge_tree_settings_table(false);
     const TargetInfo info = tt_probe(c.initiator);
-    EXPECT_TRUE(tt_contains(info.async_report, "replicated_merge_tree_settings absent"))
-        << info.async_report;
+    EXPECT_EQ(tt_count_statements(*c.initiator, "replicated_merge_tree_settings"), 2u);
+    EXPECT_EQ(info.async_report,
+              "async_insert=0 on every replica of cluster `c` (" + c.r1->replica_name() +
+                  ": async_insert=0 (table unset, server default 0, "
+                  "replicated_merge_tree_settings absent, merge_tree_settings used); " +
+                  c.r2->replica_name() +
+                  ": async_insert=0 (table unset, server default 0, "
+                  "replicated_merge_tree_settings absent, merge_tree_settings used))");
 
     c.r1->set_merge_tree_setting("async_insert", "1");
     EXPECT_EQ(tt_refusal([&] { (void)tt_probe(c.initiator); }).code,
               native::code::kTargetAsyncInsert);
+}
+
+// One replica on a line without system.replicated_merge_tree_settings fails
+// the read for every replica. The others still have a <replicated_merge_tree>
+// section, which merge_tree_settings does not show, so they cannot be taken
+// to inherit <merge_tree>.
+TEST(NativeTargetTable, AMixedClusterDoesNotReadAReplicatedReplicaFromMergeTree) {
+    for (const char* override_value : {"1", "0"}) {
+        SCOPED_TRACE(override_value);
+        TtCluster c;
+        c.r1->set_replicated_merge_tree_setting("async_insert", override_value);
+        c.r2->set_replicated_merge_tree_settings_table(false);
+        const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
+        EXPECT_EQ(r.code, native::code::kTargetAsyncInsert);
+        EXPECT_TRUE(tt_contains(r.what,
+                                "`db`.`events_local` on replica " + c.r1->replica_name() +
+                                    " of cluster `c` has table async_insert unset, and the "
+                                    "native sink cannot read the <replicated_merge_tree> "
+                                    "default it inherits: system.replicated_merge_tree_settings "
+                                    "is missing on " +
+                                    c.r2->replica_name()))
+            << r.what;
+        EXPECT_TRUE(tt_contains(r.what, "code 60")) << r.what;
+        EXPECT_TRUE(tt_contains(r.what,
+                                "Run on " + c.r1->replica_name() +
+                                    ": ALTER TABLE `db`.`events_local` MODIFY SETTING "
+                                    "async_insert = 0"))
+            << r.what;
+    }
+}
+
+// The table's own setting overrides the server default, so where it is set
+// the default that could not be read does not matter.
+TEST(NativeTargetTable, AMixedClusterAcceptsAReplicaWhoseTableSetsAsyncInsert) {
+    TtCluster c;
+    c.r1->set_replicated_merge_tree_setting("async_insert", "1");
+    TtCluster::set_local(*c.r1, "ReplicatedMergeTree", " SETTINGS async_insert = 0");
+    c.r2->set_replicated_merge_tree_settings_table(false);
+    const TargetInfo info = tt_probe(c.initiator);
+    EXPECT_TRUE(
+        tt_contains(info.async_report, c.r1->replica_name() + ": async_insert=0 (table setting)"))
+        << info.async_report;
+    EXPECT_TRUE(tt_contains(info.async_report,
+                            c.r2->replica_name() +
+                                ": async_insert=0 (table unset, server default 0, "
+                                "replicated_merge_tree_settings absent"))
+        << info.async_report;
+    EXPECT_TRUE(tt_contains(info.dedup_report,
+                            "replicated_deduplication_window=0 (server default unreadable, "
+                            "counted as 0) on " +
+                                c.r1->replica_name()))
+        << info.dedup_report;
+}
+
+TEST(NativeTargetTable, AnUnknownTableErrorNoMissingTableExplainsGoesThrough) {
+    TtCluster c;
+    try {
+        (void)tt_probe_failing(c.initiator,
+                               MetaQuery::ClusterReplicatedMergeTreeSettings,
+                               tt_server_fault(ch::UNKNOWN_TABLE, "something else is missing"));
+        ADD_FAILURE() << "expected the read's error";
+    } catch (const NativeSinkError& e) {
+        ADD_FAILURE() << "a refusal: " << e.what();
+    } catch (const ch::ServerException& e) {
+        EXPECT_EQ(e.GetCode(), ch::UNKNOWN_TABLE);
+        EXPECT_EQ(e.GetException().display_text, "something else is missing");
+    }
 }
 
 TEST(NativeTargetTable, AnUnreadableShardLocalValueRefuses) {
@@ -942,6 +1041,253 @@ TEST(NativeTargetTable, ASharedLocalTableBehindDistributedIsRefused) {
     const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
     EXPECT_EQ(r.code, native::code::kTargetEngineUnsupported);
     EXPECT_TRUE(tt_contains(r.what, "on replica " + c.r1->display_name())) << r.what;
+}
+
+// ---------------------------------------------------------------------------
+// Which replica a row came from
+
+// Two instances on one machine report the same hostName(). Each row carries
+// the server's UUID as well, so one instance's settings are never taken for
+// the other's.
+TEST(NativeTargetTable, InstancesSharingAHostNameAreCheckedApart) {
+    TtCluster c("MergeTree");
+    c.r1->set_host_name("box");
+    c.r2->set_host_name("box");
+    c.r2->set_tcp_port(9001);
+    c.r2->set_merge_tree_setting("async_insert", "1");
+    const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
+    EXPECT_EQ(r.code, native::code::kTargetAsyncInsert);
+    EXPECT_TRUE(tt_contains(r.what, "`db`.`events_local` on replica box:9001 of cluster `c`"))
+        << r.what;
+
+    c.r2->set_merge_tree_setting("async_insert", "0");
+    const TargetInfo info = tt_probe(c.initiator);
+    EXPECT_TRUE(tt_contains(info.async_report, "box:9000: async_insert=0")) << info.async_report;
+    EXPECT_TRUE(tt_contains(info.async_report, "box:9001: async_insert=0")) << info.async_report;
+}
+
+// With the same host name and port, as two TLS-only instances that both
+// report the default tcpPort() give, the reports add the UUID so that each
+// names one server.
+TEST(NativeTargetTable, ReplicasSharingAHostAndPortAreNamedByTheirUuid) {
+    TtCluster c("MergeTree");
+    c.r1->set_host_name("box");
+    c.r2->set_host_name("box");
+    // The second replica's rows come after the first's, so a fold by name
+    // would keep the first replica's 0 for both.
+    c.r2->set_merge_tree_setting("async_insert", "1");
+    const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
+    EXPECT_EQ(r.code, native::code::kTargetAsyncInsert);
+    EXPECT_TRUE(tt_contains(
+        r.what, "on replica box:9000 (server " + c.r2->server_uuid() + ") of cluster `c`"))
+        << r.what;
+}
+
+// The settings read succeeded but has no rows for a replica the tables read
+// named. That replica was never read, which is no evidence that it is
+// synchronous.
+TEST(NativeTargetTable, AReplicaMissingFromASettingsReadIsUnreadable) {
+    for (const MetaQuery kind :
+         {MetaQuery::ClusterMergeTreeSettings, MetaQuery::ClusterReplicatedMergeTreeSettings}) {
+        TtCluster c;
+        c.r2->set_merge_tree_setting("async_insert", "1");
+        const std::string r2_uuid = c.r2->server_uuid();
+        TtHookedTransport t(
+            std::make_unique<FakeTransport>(c.initiator),
+            [&](MetaQuery k, const std::string& sql, InsertTransport& inner) {
+                ResultSet rs = inner.select(k, sql);
+                if (k == kind) {
+                    std::erase_if(rs.rows, [&](const auto& row) { return row.at(1) == r2_uuid; });
+                }
+                return rs;
+            });
+        t.connect(kTtEp);
+        const TtRefusal r = tt_refusal([&] { (void)native::probe_target(t, tt_options()); });
+        EXPECT_EQ(r.code, native::code::kTargetUnreadable);
+        EXPECT_TRUE(tt_contains(
+            r.what,
+            "`db`.`events_local` on replica " + c.r2->replica_name() +
+                " of cluster `c` is missing from the read of system." +
+                (kind == MetaQuery::ClusterMergeTreeSettings ? "merge_tree_settings"
+                                                             : "replicated_merge_tree_settings")))
+            << r.what;
+    }
+}
+
+// One replica giving one setting two values in a read is not evidence of
+// either.
+TEST(NativeTargetTable, TwoValuesForOneReplicasSettingAreUnreadable) {
+    TtCluster c("MergeTree");
+    TtHookedTransport t(std::make_unique<FakeTransport>(c.initiator),
+                        [&](MetaQuery k, const std::string& sql, InsertTransport& inner) {
+                            ResultSet rs = inner.select(k, sql);
+                            if (k == MetaQuery::ClusterMergeTreeSettings) {
+                                std::vector<std::string> extra = rs.rows.front();
+                                extra.at(3) = "1";
+                                rs.rows.push_back(extra);
+                            }
+                            return rs;
+                        });
+    t.connect(kTtEp);
+    const TtRefusal r = tt_refusal([&] { (void)native::probe_target(t, tt_options()); });
+    EXPECT_EQ(r.code, native::code::kTargetUnreadable);
+    EXPECT_TRUE(tt_contains(
+        r.what, "gave replica " + c.r1->replica_name() + " both async_insert=0 and async_insert=1"))
+        << r.what;
+}
+
+// A profile with skip_unavailable_shards=1 would have the server leave an
+// unreachable replica out of the tables read, which would then look like a
+// replica without the local table and refuse for good. The pinned setting
+// keeps it the client's error, which the retry loop waits out.
+TEST(NativeTargetTable, AProfileThatSkipsUnavailableShardsStillFailsTheRead) {
+    TtCluster c;
+    c.initiator->set_setting("skip_unavailable_shards", "1");
+    c.initiator->set_unreadable_replica("c", 1);
+    try {
+        (void)tt_probe(c.initiator);
+        ADD_FAILURE() << "expected the cluster read to fail";
+    } catch (const NativeSinkError& e) {
+        ADD_FAILURE() << "a refusal for an unreachable replica: " << e.what();
+    } catch (const ch::ServerException& e) {
+        EXPECT_EQ(e.GetCode(), ch::ALL_CONNECTION_TRIES_FAILED);
+    }
+    c.initiator->set_unreadable_replica("c", 1, false);
+    EXPECT_EQ(tt_probe(c.initiator).distributed->replicas, 2u);
+}
+
+// ---------------------------------------------------------------------------
+// A cluster argument with macros
+
+// The initiator's Distributed table over `cluster_text`, with replicas
+// r1 and r2 listed as cluster `name`.
+void tt_point_at(TtCluster& c, const std::string& cluster_text, const std::string& name) {
+    c.initiator->add_table(tt_events(
+        "Distributed", "Distributed(" + cluster_text + ", 'db', 'events_local', rand())"));
+    c.initiator->add_cluster(name, {c.r1.get(), c.r2.get()});
+}
+
+TEST(NativeTargetTable, AClusterMacroIsExpandedFromSystemMacros) {
+    TtCluster c;
+    tt_point_at(c, "'{cluster}'", "prod");
+    c.initiator->set_macro("cluster", "prod");
+    const TargetInfo info = tt_probe(c.initiator);
+    ASSERT_TRUE(info.distributed.has_value());
+    EXPECT_EQ(info.distributed->cluster, "prod");
+    EXPECT_EQ(info.distributed->replicas, 2u);
+    EXPECT_TRUE(tt_contains(info.async_report,
+                            "on every replica of cluster `prod` ('{cluster}' in its definition)"))
+        << info.async_report;
+    EXPECT_EQ(tt_count_statements(*c.initiator, "clusterAllReplicas('prod', "), 3u);
+    EXPECT_EQ(tt_count_statements(*c.initiator, "FROM system.macros"), 1u);
+}
+
+// The server expands every macro in the text, and again in what a macro
+// gives, as long as braces are left.
+TEST(NativeTargetTable, NestedAndEmbeddedMacrosAreExpandedAsTheServerDoes) {
+    TtCluster c;
+    tt_point_at(c, "'{env}-{region}_x'", "prod-eu_main_x");
+    c.initiator->set_macro("env", "{tier}");
+    c.initiator->set_macro("tier", "prod");
+    c.initiator->set_macro("region", "eu_{name}");
+    c.initiator->set_macro("name", "main");
+    EXPECT_EQ(tt_probe(c.initiator).distributed->cluster, "prod-eu_main_x");
+}
+
+TEST(NativeTargetTable, AClusterWithoutMacrosDoesNotReadSystemMacros) {
+    TtCluster c;
+    (void)tt_probe(c.initiator);
+    EXPECT_EQ(tt_count_statements(*c.initiator, "system.macros"), 0u);
+}
+
+TEST(NativeTargetTable, AMacroTheServerDoesNotDefineIsSaidPlainly) {
+    for (const char* macro : {"cluster", "server_uuid"}) {
+        TtCluster c;
+        tt_point_at(c, "'{" + std::string(macro) + "}'", "prod");
+        const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
+        EXPECT_EQ(r.code, native::code::kTargetUnreadable);
+        EXPECT_TRUE(tt_contains(r.what,
+                                "`db`.`events` is a Distributed table whose cluster argument '{" +
+                                    std::string(macro) + "}' uses the macro {" + macro +
+                                    "}, which system.macros on this server does not define"))
+            << r.what;
+        EXPECT_FALSE(tt_contains(r.what, "system.clusters")) << r.what;
+    }
+}
+
+TEST(NativeTargetTable, MacrosTheServerCannotExpandEitherAreUnreadable) {
+    {
+        TtCluster c;
+        tt_point_at(c, "'{cluster'", "prod");
+        c.initiator->set_macro("cluster", "prod");
+        const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
+        EXPECT_EQ(r.code, native::code::kTargetUnreadable);
+        EXPECT_TRUE(tt_contains(r.what, "does not close it")) << r.what;
+    }
+    {
+        TtCluster c;
+        tt_point_at(c, "'{loop}'", "prod");
+        c.initiator->set_macro("loop", "{loop}");
+        const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
+        EXPECT_EQ(r.code, native::code::kTargetUnreadable);
+        EXPECT_TRUE(tt_contains(r.what, "nests macros more than 10 deep")) << r.what;
+    }
+    {
+        // Ten rounds are allowed, as on the server.
+        TtCluster c;
+        tt_point_at(c, "'{m0}'", "deep");
+        for (int i = 0; i < 9; ++i) {
+            c.initiator->set_macro("m" + std::to_string(i), "{m" + std::to_string(i + 1) + "}");
+        }
+        c.initiator->set_macro("m9", "deep");
+        EXPECT_EQ(tt_probe(c.initiator).distributed->cluster, "deep");
+    }
+}
+
+TEST(NativeTargetTable, AnExpandedClusterSystemClustersLacksSaysWhereTheNameCameFrom) {
+    TtCluster c;
+    tt_point_at(c, "'{cluster}'", "prod");
+    c.initiator->set_macro("cluster", "staging");
+    const TtRefusal r = tt_refusal([&] { (void)tt_probe(c.initiator); });
+    EXPECT_EQ(r.code, native::code::kTargetUnreadable);
+    EXPECT_TRUE(tt_contains(r.what,
+                            "over cluster `staging` ('{cluster}' in its definition), which "
+                            "system.clusters on this server does not list"))
+        << r.what;
+}
+
+TEST(NativeTargetTable, APermissionErrorOnTheMacrosReadRefusesWithItsGrant) {
+    TtCluster c;
+    tt_point_at(c, "'{cluster}'", "prod");
+    c.initiator->set_macro("cluster", "prod");
+    const TtRefusal r = tt_refusal([&] {
+        (void)tt_probe_failing(c.initiator,
+                               MetaQuery::ClusterReplicaCount,
+                               tt_server_fault(ch::ACCESS_DENIED, "not enough privileges"));
+    });
+    EXPECT_EQ(r.code, native::code::kTargetAsyncInsert);
+    EXPECT_TRUE(tt_contains(r.what, "GRANT SELECT ON system.macros TO `writer`")) << r.what;
+    // A cluster named outright needs no such grant.
+    TtCluster plain;
+    const TtRefusal p = tt_refusal([&] {
+        (void)tt_probe_failing(plain.initiator,
+                               MetaQuery::ClusterReplicaCount,
+                               tt_server_fault(ch::ACCESS_DENIED, "not enough privileges"));
+    });
+    EXPECT_FALSE(tt_contains(p.what, "system.macros")) << p.what;
+}
+
+// ---------------------------------------------------------------------------
+// The table's own settings, as the server applies them
+
+TEST(NativeTargetTable, ARepeatedTableSettingIsReadAsItsLastValue) {
+    auto server = tt_server(
+        tt_events("MergeTree",
+                  "MergeTree ORDER BY id SETTINGS async_insert = 0, index_granularity = 8192, "
+                  "async_insert = 1"));
+    const TtRefusal r = tt_refusal([&] { (void)tt_probe(server); });
+    EXPECT_EQ(r.code, native::code::kTargetAsyncInsert);
+    EXPECT_TRUE(tt_contains(r.what, "table setting async_insert=1")) << r.what;
 }
 
 }  // namespace

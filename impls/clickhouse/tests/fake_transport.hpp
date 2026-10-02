@@ -128,10 +128,12 @@ struct ReceivedInsert {
 // sink reads, with that line's defaults; whose system.merge_tree_settings has
 // async_insert=0, non_replicated_deduplication_window=0 and
 // replicated_deduplication_window=10000; which has
-// system.replicated_merge_tree_settings; and which has no tables and no
-// clusters. Metadata queries are answered by their MetaQuery kind from that
+// system.replicated_merge_tree_settings; which has no tables, no clusters
+// and no macros; and whose host name is its display name, on TCP port 9000.
+// Metadata queries are answered by their MetaQuery kind from that
 // configuration; the names, tables and clusters they ask about are read from
-// the quoted literals of the statement text.
+// the quoted literals of the statement text. A ClusterReplicaCount read of
+// system.macros lists the macros.
 class FakeServer {
 public:
     FakeServer();
@@ -157,11 +159,22 @@ public:
     // landed in it.
     void add_table(FakeTable table);
     // system.clusters on this server. A clusterAllReplicas read asks each
-    // replica in turn, and each row carries the replica's display name as its
-    // hostName().
+    // replica in turn, and each row starts with the replica's
+    // hostName():tcpPort() (replica_name()) and its serverUUID()
+    // (server_uuid()). system.tables on a replica also lists
+    // system.replicated_merge_tree_settings while that table is present.
     void add_cluster(const std::string& name, std::vector<FakeServer*> replicas);
+    // What hostName() and tcpPort() return on this server, for instances that
+    // share a machine.
+    void set_host_name(const std::string& name);
+    void set_tcp_port(std::uint16_t port);
+    // An entry of the server's <macros> section, as system.macros lists it.
+    void set_macro(const std::string& name, const std::string& substitution);
     // While set, every clusterAllReplicas read of `cluster` fails with 279, as a
     // server with skip_unavailable_shards=0 does when it cannot reach a replica.
+    // A read under skip_unavailable_shards=1, from its own SETTINGS or else
+    // from this server's system.settings, leaves the replica out instead, and
+    // also leaves out a replica whose read fails for a missing table.
     void set_unreadable_replica(const std::string& cluster,
                                 std::size_t replica,
                                 bool unreadable = true);
@@ -184,8 +197,13 @@ public:
     // faulty() wrapper in the process.
     void release();
 
-    // "fake-<n>", with n unique in the process; also each cluster row's hostName().
+    // "fake-<n>", with n unique in the process; also hostName() unless
+    // set_host_name changed it.
     [[nodiscard]] const std::string& display_name() const noexcept;
+    // hostName():tcpPort(), as a cluster read's first column names this server.
+    [[nodiscard]] std::string replica_name() const;
+    // serverUUID(), unique in the process.
+    [[nodiscard]] const std::string& server_uuid() const noexcept;
 
     // Observations. A table is named as "database.name" or as just "name";
     // naming one the server does not have throws std::invalid_argument.
