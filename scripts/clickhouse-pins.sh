@@ -46,6 +46,6 @@ for line in ${CLICKHOUSE_LINES}; do
         ${PIN_RUNNER:-} "${BIN}" --gtest_filter='ClickHousePins.P6AServerWide*'; then
         status=1
     fi
-    "${COMPOSE[@]}" rm -sf "${svc}" "${async_svc}" >/dev/null
+    "${COMPOSE[@]}" rm -sfv "${svc}" "${async_svc}" >/dev/null
 done
 exit "${status}"
