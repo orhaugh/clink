@@ -50,7 +50,7 @@ is reachable through the programmatic API only.
 | --- | --- | --- | --- | --- |
 | [PostgreSQL](postgres.md) | source + sink | libpq | system pkg | `postgres` |
 | [MySQL / MariaDB](mysql.md) | source + sink | mariadb-connector-c | system pkg | `mysql` |
-| [ClickHouse](clickhouse.md) | source + sink | clickhouse-cpp | `2.6.2` (from source, Release) | `clickhouse` |
+| [ClickHouse](clickhouse.md) | source + sink (`clickhouse_sink`; `clickhouse_native_sink` via `insert_format='native'`) | clickhouse-cpp | `2.6.2` (from source, Release) | `clickhouse` |
 | [Cassandra / ScyllaDB](cassandra.md) | sink | DataStax cpp-driver | `2.17.1` | `cassandra` |
 | [MongoDB](mongodb.md) | source + sink | mongo-cxx-driver | system pkg | - |
 | [Redis](redis.md) | source + sink | hiredis | system pkg | `redis` |

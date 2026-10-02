@@ -231,6 +231,22 @@ separate atomics on `JobConfig` (`drain_target` and `stop_requested`) for exactl
 that reason, and conflating them would turn "stop at a savepoint" back into
 "stop".
 
+Operators see a cancel through a third signal, `RuntimeContext::cancel_requested()`.
+It turns true once the task is being torn down and its output will not be
+checkpointed: a `CancelJob`, the loss of the control session, the Worker stopping,
+a declined final checkpoint, or the failure of any operator in the same executor.
+It is the same predicate the runner's own loop stops on. It is neither of the
+signals above: `stop_requested()` asks a source to run its end-of-input path and
+take a final checkpoint, and the drain signals end a source for a rescale, while a
+cancel means nothing more will be acknowledged, so an operator that is waiting
+should give up rather than finish. A sink that blocks on the task thread, for
+example while it retries a write, polls `cancel_requested()`. A sink with threads
+of its own copies `cancel_signal()` at `open()`: the `CancelSignal` holds the
+executor's flag and the external cancel token themselves, so it stays valid on a
+thread that outlives the `RuntimeContext`. The native ClickHouse sink's writer and
+opener threads use it to abandon a retry and return within a few seconds of a
+cancel.
+
 What a stop does not do: fire event-time windows. An unbounded source that is
 stopped does not emit a maximum watermark, so open windows stay open and are
 carried in the checkpoint rather than being flushed as though complete. Resuming
