@@ -64,6 +64,10 @@ struct WriterConfig {
     // Empty: the writer keeps the target it has and takes only the new
     // server's identity.
     std::function<TargetInfo(InsertTransport&)> reprobe;
+    // The span and the quiet period of the run-time part-rate warning
+    // (PartRateMonitor). Tests shorten them to reach the warning quickly.
+    std::chrono::milliseconds part_rate_span{std::chrono::seconds{60}};
+    std::chrono::milliseconds part_rate_quiet{std::chrono::minutes{10}};
 };
 
 struct WriterStats {
@@ -101,8 +105,10 @@ public:
     Writer& operator=(Writer&&) = delete;
 
     // Task thread. Blocks while the queue is full. Throws the writer's stored
-    // failure, or NativeSinkError(cancelled), after calling abort(), once the
-    // task is cancelled.
+    // failure, or NativeSinkError(cancelled) once the task is cancelled. On a
+    // cancel it calls abort() first, so the writer is joined and its
+    // cancelled summary logged before the throw, even when the writer saw the
+    // cancel first and the failure it stored is what is thrown.
     void submit(Chunk chunk);
     // Task thread. Returns once every INSERT holding rows submitted before
     // the call has been acknowledged by the server. Throws as submit() does,
@@ -116,8 +122,10 @@ public:
     void finish();
     // Any thread: stop, interrupt the transport, join for up to 5 s, then
     // detach a writer still inside a call that cannot be interrupted. Logs
-    // the cancelled summary once. Idempotent, and a no-op after finish().
-    // Never throws.
+    // the cancelled summary once; for a detached writer it counts the rows of
+    // the INSERT the writer was holding as abandoned first, since the writer
+    // reports nothing more. Idempotent, and a no-op after finish(). Never
+    // throws.
     void abort() noexcept;
 
     [[nodiscard]] WriterStats stats() const;

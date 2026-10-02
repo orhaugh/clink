@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -287,7 +288,10 @@ struct WrRig {
     void start(bool watched = false, bool client_gone = false) {
         std::unique_ptr<InsertTransport> transport = fake::fake_factory(servers)(options);
         transport->connect(options.endpoints.front());
-        const TargetInfo base = wr_base(table);
+        TargetInfo base = wr_base(table);
+        if (target_tweak) {
+            target_tweak(base);
+        }
         WriterConfig config;
         config.options = options;
         config.plan = plan;
@@ -304,6 +308,8 @@ struct WrRig {
             counter->fetch_add(1);
             return wr_probe(t, base);
         };
+        config.part_rate_span = part_rate_span;
+        config.part_rate_quiet = part_rate_quiet;
         if (watched) {
             transport = std::make_unique<WrWatched>(std::move(transport), gone);
         }
@@ -349,8 +355,13 @@ struct WrRig {
     std::shared_ptr<MemoryBudget> budget = std::make_shared<MemoryBudget>(0, "writer-test");
     std::shared_ptr<std::atomic<int>> probes = std::make_shared<std::atomic<int>>(0);
     std::shared_ptr<std::atomic<bool>> gone = std::make_shared<std::atomic<bool>>(false);
-    // Owned by the writer; only interrupt() may be called through it, as the
-    // task thread would.
+    // Applied to what the probe reads from the table, on open and on every
+    // new client, for targets the fake has no table engine for.
+    std::function<void(TargetInfo&)> target_tweak;
+    std::chrono::milliseconds part_rate_span{60s};
+    std::chrono::milliseconds part_rate_quiet{10min};
+    // Owned by the writer. Only interrupt() may be called through it, as the
+    // task thread would, and counters(), whose fields are atomic.
     InsertTransport* handed{nullptr};
     std::unique_ptr<Writer> writer;
 };
@@ -400,6 +411,34 @@ fake::Fault wr_reset_at_end(fake::Fault::Landing landing = fake::Fault::Landing:
     fake::Fault f = wr_fault(fake::Step::End, fake::Fault::Kind::SystemError);
     f.landing = landing;
     return f;
+}
+
+// What the submit that threw said, and how long that one call took.
+struct WrHeld {
+    std::optional<NativeSinkError> error;
+    WrClock::duration took{};
+};
+
+// Submits chunks of four 1 MiB rows, so that four of them fill the queue,
+// until one throws. With batch_rows=4 the first one is the INSERT the writer
+// is busy with, and every one after the fifth has to wait for room.
+WrHeld wr_submit_until_one_throws(WrRig& rig) {
+    WrHeld out;
+    for (std::int64_t from = 0; from < 160 && !out.error; from += 4) {
+        Chunk c = rig.chunk(from, from + 4, kWrMiB);
+        const auto start = WrClock::now();
+        out.error = wr_error([&] { rig.writer->submit(std::move(c)); });
+        out.took = WrClock::now() - start;
+    }
+    return out;
+}
+
+std::vector<std::string> wr_tokens(const fake::FakeServer& s) {
+    std::vector<std::string> out;
+    for (const auto& insert : s.inserts(kWrTable)) {
+        out.push_back(insert.token);
+    }
+    return out;
 }
 
 std::size_t wr_rows_of(const fake::ReceivedInsert& insert) {
@@ -457,6 +496,14 @@ std::multiset<std::int64_t> wr_range(std::int64_t from, std::int64_t to) {
     for (std::int64_t id = from; id < to; ++id) {
         out.insert(id);
     }
+    return out;
+}
+
+// Every id in [from, to) twice: what at least once looks like when a resend
+// was not deduplicated.
+std::multiset<std::int64_t> wr_twice(std::int64_t from, std::int64_t to) {
+    std::multiset<std::int64_t> out = wr_range(from, to);
+    out.merge(wr_range(from, to));
     return out;
 }
 
@@ -707,6 +754,9 @@ TEST(NativeWriterFrozen, AFailedInsertResendsTheBlocksItCutAndLaterRowsGoToTheNe
 TEST(NativeWriterFrozen, AConversionFailureAfterABlockWasSentLandsNothingAndShowsNoText) {
     WrRig rig;
     rig.start();
+    const std::uint64_t written_before = rig.handed->counters().bytes_written;
+    const std::uint64_t bytes_before = wr_connector_counter("bytes_total");
+    const std::uint64_t errors_before = wr_connector_counter("errors_total");
     for (std::int64_t from = 0; from < 40; from += 5) {
         rig.writer->submit(rig.chunk(from, from + 5, 512 * kWrKiB));
     }
@@ -729,7 +779,16 @@ TEST(NativeWriterFrozen, AConversionFailureAfterABlockWasSentLandsNothingAndShow
     EXPECT_EQ(all[0].outcome, WrOutcome::Abandoned);
     EXPECT_EQ(rig.server->abandoned_mid_insert(), 1U);
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
-    EXPECT_EQ(rig.writer->stats().abandoned_rows, 40U);
+    const WriterStats stats = rig.writer->stats();
+    EXPECT_EQ(stats.abandoned_rows, 40U);
+    // The failed INSERT is a failed attempt like any other: the 16 MiB block
+    // it sent counts in wire_bytes and bytes_out, and it counts once as a
+    // connector error. The failure is stored last, so all of it is in place.
+    const std::uint64_t written = rig.handed->counters().bytes_written - written_before;
+    EXPECT_GT(written, all[0].blocks.at(0).bytes.size());
+    EXPECT_EQ(stats.wire_bytes, written);
+    EXPECT_EQ(wr_connector_counter("bytes_total") - bytes_before, written);
+    EXPECT_EQ(wr_connector_counter("errors_total") - errors_before, 1U);
     // The failure stays: every later call on the task thread throws it.
     const auto again = wr_error([&] { rig.writer->submit(rig.chunk(50, 51, 8)); });
     ASSERT_TRUE(again);
@@ -937,6 +996,30 @@ TEST(NativeWriterRetry, AValidationErrorIsRetriedOnceAndThenIsPermanent) {
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
 }
 
+TEST(NativeWriterRetry, AnUnknownServerCodeFailsAfterItsCapNotAtTheEndOfTheWindow) {
+    WrRig rig;
+    rig.options.retry_window = 4s;
+    for (int i = 0; i < 100; ++i) {
+        rig.server->inject(wr_fault(
+            fake::Step::Begin, fake::Fault::Kind::ServerError, 12345, "a code nobody listed"));
+    }
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 5, 8));
+    const auto start = WrClock::now();
+    const auto error = wr_error([&] { rig.writer->flush(1); });
+    const auto took = WrClock::now() - start;
+    ASSERT_TRUE(error);
+    // The writer feeds each INSERT's earlier unknown failures to the policy,
+    // so a permanent code nobody listed fails on its fourth appearance,
+    // after three retries, instead of holding the barrier for the window.
+    EXPECT_EQ(error->code(), code::kInsertFailed) << error->what();
+    EXPECT_NE(std::string(error->what()).find("a code nobody listed"), std::string::npos)
+        << error->what();
+    EXPECT_LT(took, 3s);
+    EXPECT_EQ(wr_retries(rig.writer->stats(), FailureClass::Unclassified), 3U);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
 // --- In-doubt resends -------------------------------------------------------
 
 TEST(NativeWriterInDoubt, ALandedInsertResentToTheSameServerKeepsItsTokenAndLandsOnce) {
@@ -1066,6 +1149,100 @@ TEST(NativeWriterInDoubt, AnExpiredDeduplicationWindowLetsTheResendLandAgain) {
     std::multiset<std::int64_t> twice = wr_range(0, 20);
     twice.merge(wr_range(0, 20));
     EXPECT_EQ(wr_landed_ids(*server), twice);
+    rig.writer->finish();
+}
+
+TEST(NativeWriterInDoubt, TheSameHostRestartedIntoAnotherPatchTakesAFreshToken) {
+    WrRig rig;
+    fake::Fault fault = wr_reset_at_end(fake::Fault::Landing::Everything);
+    const auto server = rig.server;
+    // The connection drops as the server restarts into another patch of the
+    // same tested line, at the same endpoint and under the same name.
+    fault.on_fire = [server] { server->set_version(26, 8, 99); };
+    server->inject(std::move(fault));
+    rig.start();
+    const std::int64_t since = wr_log_mark();
+    rig.writer->submit(rig.chunk(0, 20, 8));
+    rig.writer->flush(1);
+    // Another version may squash or hash the resend differently, so the
+    // token is not kept: the resend lands again, a duplicate and no loss.
+    const auto tokens = wr_tokens(*server);
+    ASSERT_EQ(tokens.size(), 2U);
+    EXPECT_NE(tokens[0], tokens[1]);
+    EXPECT_EQ(wr_landed_ids(*server), wr_twice(0, 20));
+    const WriterStats stats = rig.writer->stats();
+    EXPECT_EQ(stats.rows_maybe_duplicated, 20U);
+    EXPECT_EQ(stats.rows_resent_with_token, 0U);
+    EXPECT_EQ(wr_counter(rig.metrics, wr_name(metric::kRowsMaybeDuplicatedTotal)), 20U);
+    EXPECT_EQ(wr_logs_containing(wr_logs_since(since),
+                                 "now writes to " + server->display_name() + " 26.8.99"),
+              1U);
+    rig.writer->finish();
+}
+
+TEST(NativeWriterInDoubt, AKeptTokenIntoATableWithoutALogCountsAsMaybeDuplicated) {
+    // A plain MergeTree keeps no deduplication log by default, so even the
+    // same token, to the same server, lands again.
+    WrRig rig(wr_table(0));
+    rig.server->inject(wr_reset_at_end(fake::Fault::Landing::Everything));
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 20, 8));
+    rig.writer->flush(1);
+    const auto tokens = wr_tokens(*rig.server);
+    ASSERT_EQ(tokens.size(), 2U);
+    EXPECT_EQ(tokens[0], tokens[1]);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_twice(0, 20));
+    const WriterStats stats = rig.writer->stats();
+    EXPECT_EQ(stats.rows_maybe_duplicated, 20U);
+    EXPECT_EQ(stats.rows_resent_with_token, 0U);
+    rig.writer->finish();
+}
+
+TEST(NativeWriterInDoubt, AKeptTokenIntoDistributedCountsAsMaybeDuplicated) {
+    WrRig rig;
+    // Distributed deduplicates nothing itself, whatever the local tables keep.
+    rig.target_tweak = [](TargetInfo& t) { t.family = EngineFamily::Distributed; };
+    rig.server->inject(wr_reset_at_end(fake::Fault::Landing::Everything));
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 20, 8));
+    rig.writer->flush(1);
+    const auto tokens = wr_tokens(*rig.server);
+    ASSERT_EQ(tokens.size(), 2U);
+    EXPECT_EQ(tokens[0], tokens[1]);
+    const WriterStats stats = rig.writer->stats();
+    EXPECT_EQ(stats.rows_maybe_duplicated, 20U);
+    EXPECT_EQ(stats.rows_resent_with_token, 0U);
+    rig.writer->finish();
+}
+
+TEST(NativeWriterInDoubt, AKeptTokenThenAFreshOneMovesTheRowsFromResentToMaybeDuplicated) {
+    WrRig rig;
+    const auto first = rig.server;
+    const auto second = rig.add_server(kWrEp2);
+    rig.options.endpoints = {kWrEp1, kWrEp2};
+    // In doubt on the first server, which then takes the resend under the
+    // same token; that resend fails in doubt too, as the server goes down.
+    first->inject(wr_reset_at_end(fake::Fault::Landing::Everything));
+    fake::Fault again = wr_reset_at_end();
+    again.on_fire = [first] { first->set_down(true, false); };
+    first->inject(std::move(again));
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 20, 8));
+    rig.writer->flush(1);
+    const auto on_first = wr_tokens(*first);
+    const auto on_second = wr_tokens(*second);
+    ASSERT_EQ(on_first.size(), 2U);
+    ASSERT_EQ(on_second.size(), 1U);
+    EXPECT_EQ(on_first[1], on_first[0]);
+    EXPECT_NE(on_second[0], on_first[0]);
+    EXPECT_EQ(wr_landed_ids(*first), wr_range(0, 20));
+    EXPECT_EQ(wr_landed_ids(*second), wr_range(0, 20));
+    // Counted once, in one of the two: the fresh token on the second server
+    // means the rows may be twice in the cluster.
+    const WriterStats stats = rig.writer->stats();
+    EXPECT_EQ(stats.rows_maybe_duplicated, 20U);
+    EXPECT_EQ(stats.rows_resent_with_token, 0U);
+    EXPECT_EQ(wr_counter(rig.metrics, wr_name(metric::kRowsMaybeDuplicatedTotal)), 20U);
     rig.writer->finish();
 }
 
@@ -1213,11 +1390,17 @@ TEST(NativeWriterCancel, AnInterruptThatLandsInsideTheConnectFailsItAndStartsNoI
         rig.handed->interrupt();
     };
     rig.server->inject(std::move(fault));
+    ASSERT_EQ(rig.handed->counters().connects, 1U) << "the rig's own connect, as the opener's";
     rig.writer->submit(rig.chunk(0, 5, 8));
     ASSERT_TRUE(wr_eventually([&] { return rig.server->connects() >= 2; }));
     const auto error = wr_error([&] { rig.writer->flush(1); });
     ASSERT_TRUE(error);
     EXPECT_EQ(error->code(), code::kCancelled);
+    // The connect itself failed. The cancel alone would also end the writer,
+    // at its check after the connect, so only this count shows that the
+    // interrupt reached a connect already under way: one that was lost would
+    // have let the connect complete on a fresh client.
+    EXPECT_EQ(rig.handed->counters().connects, 1U);
     // No probe read followed the connect, and no INSERT began after the
     // first.
     EXPECT_EQ(rig.probes->load(), 0);
@@ -1236,11 +1419,20 @@ TEST(NativeWriterCancel, AWriterStuckWhereNoInterruptReachesIsDetachedAndThenSta
     rig.writer->submit(rig.chunk(0, 5, 8));
     ASSERT_TRUE(wr_eventually([&] { return rig.server->connects() >= 2; }));
 
+    const std::int64_t aborting = wr_log_mark();
     const auto aborted_at = WrClock::now();
     rig.writer->abort();
     const auto took = WrClock::now() - aborted_at;
     EXPECT_GE(took, 4900ms);
     EXPECT_LE(took, 5200ms);
+    // The summary is the last the writer says, so it counts the five rows of
+    // the INSERT the stuck thread still holds: they were never acknowledged,
+    // and the job's restart replays them.
+    const auto logs = wr_logs_since(aborting);
+    EXPECT_EQ(wr_logs_containing(logs, "clickhouse native sink cancelled:"), 1U);
+    EXPECT_EQ(wr_logs_containing(logs, " abandoned_rows=5 "), 1U);
+    EXPECT_EQ(rig.writer->stats().abandoned_rows, 5U);
+    EXPECT_EQ(wr_counter(rig.metrics, wr_name(metric::kInsertsTotal, "outcome", "abandoned")), 1U);
 
     const auto metrics_before = wr_values(rig.metrics);
     const std::uint64_t bytes_before = wr_connector_counter("bytes_total");
@@ -1258,6 +1450,65 @@ TEST(NativeWriterCancel, AWriterStuckWhereNoInterruptReachesIsDetachedAndThenSta
     EXPECT_EQ(wr_connector_counter("records_total"), records_before);
     EXPECT_TRUE(wr_logs_since(since).empty());
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
+TEST(NativeWriterCancel, ADetachedWritersRowsAreCountedOnceWhenItFinallyLetsGo) {
+    WrRig rig;
+    rig.options.batch_interval = 50ms;
+    rig.options.retry_window = 30s;
+    rig.server->inject(wr_reset_at_end());
+    rig.start(true);
+    rig.server->inject(wr_fault(fake::Step::Connect, fake::Fault::Kind::Uninterruptible));
+    rig.writer->submit(rig.chunk(0, 5, 8));
+    ASSERT_TRUE(wr_eventually([&] { return rig.server->connects() >= 2; }));
+    rig.writer->abort();
+    // Checked without returning early, so the stuck thread is always let go.
+    const auto abandoned = wr_name(metric::kInsertsTotal, "outcome", "abandoned");
+    EXPECT_EQ(rig.writer->stats().abandoned_rows, 5U);
+    EXPECT_EQ(wr_counter(rig.metrics, abandoned), 1U);
+    EXPECT_GT(rig.budget->usage().used, 0U) << "the stuck thread still holds its INSERT";
+
+    // The Writer stays, so its stats can be read after the thread goes. The
+    // thread passes its own count of the INSERT before it lets go of it.
+    rig.server->release();
+    ASSERT_TRUE(wr_eventually([&] { return rig.budget->usage().used == 0; }, 3s))
+        << "the detached thread never let go of its INSERT";
+    EXPECT_EQ(rig.writer->stats().abandoned_rows, 5U);
+    EXPECT_EQ(wr_counter(rig.metrics, abandoned), 1U);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+    rig.writer.reset();
+    EXPECT_TRUE(wr_eventually([&] { return rig.gone->load(); }, 3s));
+}
+
+TEST(NativeWriterCancel, ACancelTheWriterSawFirstIsStillAbortedBeforeTheTaskThreadThrows) {
+    WrRig rig;
+    rig.start();
+    Chunk c = rig.chunk(0, 5, 8);
+    const std::size_t chunk_size = c.bytes;
+    rig.writer->submit(std::move(c));
+    // The INSERT is charged for its rows beside the chunk once they are in the
+    // builder.
+    ASSERT_TRUE(wr_eventually([&] { return rig.budget->usage().used > chunk_size; }));
+    rig.flags.cancel();
+    // The writer sees the cancel at its next slice, stores its own failure and
+    // lets go of the INSERT, all before the task thread calls anything.
+    ASSERT_TRUE(wr_eventually([&] { return rig.budget->usage().used == 0; }));
+
+    const std::int64_t since = wr_log_mark();
+    const auto error = wr_error([&] { rig.writer->flush(1); });
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kCancelled);
+    EXPECT_NE(std::string(error->what()).find("the writer stopped on cancel"), std::string::npos)
+        << error->what();
+    // abort() ran before the throw, as on every cancel: the writer is joined
+    // and its summary is out.
+    const auto logs = wr_logs_since(since);
+    ASSERT_EQ(wr_logs_containing(logs, "clickhouse native sink cancelled:"), 1U);
+    EXPECT_EQ(wr_logs_containing(logs, " abandoned_rows=5 "), 1U);
+    const auto later = wr_error([&] { rig.writer->submit(rig.chunk(5, 6, 8)); });
+    ASSERT_TRUE(later);
+    EXPECT_EQ(later->code(), code::kCancelled);
+    EXPECT_EQ(wr_logs_containing(wr_logs_since(since), "clickhouse native sink cancelled:"), 1U);
 }
 
 TEST(NativeWriterCancel, AbortIsIdempotentLogsOneSummaryAndLeavesTheTaskThreadACancel) {
@@ -1357,6 +1608,49 @@ TEST(NativeWriterDeadline, AnInsertHeldOpenByALongIntervalIsNotCutByTheDeadline)
     rig.writer->finish();
 }
 
+// A BeginInsert the server keeps busy is cut one window after it began, on
+// the first attempt too, wherever that attempt sends it: before the first
+// block when one is due, or when the INSERT closes.
+void wr_expect_a_busy_first_begin_is_cut(bool first_block_due) {
+    WrRig rig;
+    rig.options.retry_window = 400ms;
+    for (int i = 0; i < 10; ++i) {
+        rig.server->inject(wr_delay(fake::Step::Begin, 20s));
+    }
+    rig.start();
+    const auto start = WrClock::now();
+    const auto error = wr_error([&] {
+        if (first_block_due) {
+            // 31 rows fill a block, so its BeginInsert goes out before any
+            // flush.
+            for (std::int64_t from = 0; from < 40; from += 5) {
+                rig.writer->submit(rig.chunk(from, from + 5, 512 * kWrKiB));
+            }
+        } else {
+            rig.writer->submit(rig.chunk(0, 5, 8));
+        }
+        rig.writer->flush(1);
+    });
+    const auto took = WrClock::now() - start;
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kRetryWindowExhausted) << error->what();
+    EXPECT_NE(std::string(error->what()).find("past the attempt deadline"), std::string::npos)
+        << error->what();
+    // The first BeginInsert is cut a window after it began, and the retry at
+    // the end of the window its failure started, not after the 20 s the
+    // server would have taken.
+    EXPECT_LT(took, 3s);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
+TEST(NativeWriterDeadline, AFirstBeginKeptBusyBeforeTheFirstBlockIsCutByTheDeadline) {
+    wr_expect_a_busy_first_begin_is_cut(true);
+}
+
+TEST(NativeWriterDeadline, AFirstBeginKeptBusyWhenTheInsertClosesIsCutByTheDeadline) {
+    wr_expect_a_busy_first_begin_is_cut(false);
+}
+
 // --- Backpressure -------------------------------------------------------------
 
 TEST(NativeWriterQueue, SubmitBlocksWhileTheQueueIsFullAndTheQueueStaysWithinItsCap) {
@@ -1397,6 +1691,180 @@ TEST(NativeWriterQueue, SubmitBlocksWhileTheQueueIsFullAndTheQueueStaysWithinIts
     rig.writer->finish();
 }
 
+// A submit held by a full queue looks at the writer's failure, the task's
+// cancel and the stop flag every slice, so each of them releases it.
+TEST(NativeWriterQueue, ACancelReleasesASubmitHeldByAFullQueue) {
+    WrRig rig;
+    rig.options.batch_rows = 4;
+    // The INSERT ahead of the queue never ends by itself.
+    rig.server->inject(wr_fault(fake::Step::End, fake::Fault::Kind::Hang));
+    rig.start();
+    auto submitting =
+        std::async(std::launch::async, [&rig] { return wr_submit_until_one_throws(rig); });
+    ASSERT_TRUE(wr_eventually([&] { return rig.writer->queue_bytes() >= kQueueBytes; }));
+    // Long enough that the next submit is waiting for room.
+    std::this_thread::sleep_for(250ms);
+    const auto cancelled_at = WrClock::now();
+    rig.flags.cancel();
+    const auto status = submitting.wait_for(2s);
+    const auto released = WrClock::now() - cancelled_at;
+    if (status != std::future_status::ready) {
+        // Only the abort can free it now; the case fails rather than hangs.
+        rig.writer->abort();
+    }
+    ASSERT_EQ(status, std::future_status::ready) << "the cancel did not release the submit";
+    const WrHeld held = submitting.get();
+    ASSERT_TRUE(held.error);
+    EXPECT_EQ(held.error->code(), code::kCancelled);
+    EXPECT_GE(held.took, 100ms) << "the submit that threw was not the one held";
+    EXPECT_LE(released, 200ms);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
+TEST(NativeWriterQueue, APermanentFailureReleasesASubmitHeldByAFullQueueWithThatFailure) {
+    WrRig rig;
+    rig.options.batch_rows = 4;
+    // The INSERT's End answers late, with a failure that is never retried.
+    fake::Fault missing = wr_fault(
+        fake::Step::End, fake::Fault::Kind::ServerError, 60, "Table db.events does not exist");
+    missing.delay = 1500ms;
+    rig.server->inject(std::move(missing));
+    rig.start();
+    const WrHeld held = wr_submit_until_one_throws(rig);
+    ASSERT_TRUE(held.error);
+    EXPECT_EQ(held.error->code(), code::kInsertFailed);
+    EXPECT_NE(std::string(held.error->what()).find("does not exist"), std::string::npos)
+        << held.error->what();
+    // The queue was full well before the End answered, so the submit that
+    // threw had been held until the failure came.
+    EXPECT_GE(held.took, 500ms);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
+TEST(NativeWriterQueue, AnAbortFromAnotherThreadReleasesASubmitHeldByAFullQueue) {
+    WrRig rig;
+    rig.options.batch_rows = 4;
+    rig.server->inject(wr_fault(fake::Step::End, fake::Fault::Kind::Hang));
+    rig.start();
+    auto submitting =
+        std::async(std::launch::async, [&rig] { return wr_submit_until_one_throws(rig); });
+    ASSERT_TRUE(wr_eventually([&] { return rig.writer->queue_bytes() >= kQueueBytes; }));
+    std::this_thread::sleep_for(250ms);
+    const auto aborted_at = WrClock::now();
+    std::thread aborter([&rig] { rig.writer->abort(); });
+    const auto status = submitting.wait_for(2s);
+    const auto released = WrClock::now() - aborted_at;
+    aborter.join();
+    ASSERT_EQ(status, std::future_status::ready) << "the abort did not release the submit";
+    const WrHeld held = submitting.get();
+    ASSERT_TRUE(held.error);
+    EXPECT_EQ(held.error->code(), code::kCancelled);
+    EXPECT_GE(held.took, 100ms) << "the submit that threw was not the one held";
+    EXPECT_LE(released, 300ms);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
+TEST(NativeWriterQueue, ACancelReleasesAFlushQueuedBehindAFullQueue) {
+    WrRig rig;
+    rig.options.batch_rows = 4;
+    rig.server->inject(wr_fault(fake::Step::End, fake::Fault::Kind::Hang));
+    rig.start();
+    // One INSERT hanging in End and four chunks behind it: the queue is full.
+    for (std::int64_t from = 0; from < 20; from += 4) {
+        rig.writer->submit(rig.chunk(from, from + 4, kWrMiB));
+    }
+    ASSERT_GE(rig.writer->queue_bytes(), kQueueBytes);
+    auto flushed = std::async(std::launch::async,
+                              [&rig] { return wr_error([&rig] { rig.writer->flush(1); }); });
+    // Long enough that the flush is waiting.
+    std::this_thread::sleep_for(100ms);
+    const auto cancelled_at = WrClock::now();
+    rig.flags.cancel();
+    const auto status = flushed.wait_for(2s);
+    const auto released = WrClock::now() - cancelled_at;
+    if (status != std::future_status::ready) {
+        // Only the abort can free it now; the case fails rather than hangs.
+        rig.writer->abort();
+    }
+    ASSERT_EQ(status, std::future_status::ready) << "the cancel did not release the flush";
+    const auto error = flushed.get();
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kCancelled);
+    EXPECT_LE(released, 200ms);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
+TEST(NativeWriterQueue, TheQueueHoldsAtMost256ChunksHoweverSmallTheyAre) {
+    WrRig rig;
+    rig.options.batch_rows = 1;
+    rig.server->inject(wr_delay(fake::Step::End, 1500ms));
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 1, 8));
+    // The writer is in that INSERT's End now, so what follows stays queued.
+    ASSERT_TRUE(wr_eventually([&] { return !rig.inserts().empty(); }));
+    const auto waits = [&] {
+        return rig.metrics.histogram(wr_name(metric::kBackpressureBlockedNs)).snapshot().count;
+    };
+    const auto cap = static_cast<std::int64_t>(kQueueChunks);
+    for (std::int64_t id = 1; id <= cap; ++id) {
+        rig.writer->submit(rig.chunk(id, id + 1, 8));
+    }
+    // Far below the byte cap, and not one of them had to wait.
+    EXPECT_LT(rig.writer->queue_bytes(), kQueueBytes / 100);
+    EXPECT_EQ(waits(), 0U);
+    const auto start = WrClock::now();
+    rig.writer->submit(rig.chunk(cap + 1, cap + 2, 8));
+    const auto waited = WrClock::now() - start;
+    // The next one waits for the writer to take one, after the End.
+    EXPECT_EQ(waits(), 1U);
+    EXPECT_GE(waited, 500ms);
+    rig.writer->flush(1);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, cap + 2));
+    rig.writer->finish();
+}
+
+TEST(NativeWriterQueue, AFlushGoesPastAFullQueueAndNeverCountsAgainstItsCaps) {
+    WrRig rig;
+    rig.options.batch_rows = 4;
+    for (int i = 0; i < 5; ++i) {
+        rig.server->inject(wr_delay(fake::Step::End, 300ms));
+    }
+    rig.start();
+    // One INSERT in flight and four chunks behind it: the queue is full.
+    for (std::int64_t from = 0; from < 20; from += 4) {
+        rig.writer->submit(rig.chunk(from, from + 4, kWrMiB));
+    }
+    ASSERT_GE(rig.writer->queue_bytes(), kQueueBytes);
+    // The flush is queued at once, behind the chunks, and returns only once
+    // every one of them has landed.
+    rig.writer->flush(1);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 20));
+    EXPECT_EQ(rig.writer->queue_bytes(), 0U);
+    // Flushes take no room: after more of them than the queue holds chunks,
+    // a submit still goes straight in.
+    for (std::uint64_t id = 2; id < kQueueChunks + 10; ++id) {
+        rig.writer->flush(id);
+    }
+    const auto waits = [&] {
+        return rig.metrics.histogram(wr_name(metric::kBackpressureBlockedNs)).snapshot().count;
+    };
+    const auto waits_before = waits();
+    auto submitted = std::async(std::launch::async, [&rig] {
+        return wr_error([&rig] { rig.writer->submit(rig.chunk(20, 24, 8)); });
+    });
+    const auto status = submitted.wait_for(2s);
+    if (status != std::future_status::ready) {
+        // Only the abort can free it now; the case fails rather than hangs.
+        rig.writer->abort();
+    }
+    ASSERT_EQ(status, std::future_status::ready) << "the flushes took the room of chunks";
+    EXPECT_FALSE(submitted.get());
+    EXPECT_EQ(waits(), waits_before);
+    rig.writer->flush(kQueueChunks + 10);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 24));
+    rig.writer->finish();
+}
+
 // --- The header check ---------------------------------------------------------
 
 TEST(NativeWriterHeader, AColumnRetypedBetweenInsertsFailsTheNextWithTheDifference) {
@@ -1426,6 +1894,26 @@ TEST(NativeWriterHeader, AHeaderTypeTheClientCannotBuildFailsWithTheSameCode) {
     ASSERT_TRUE(error);
     EXPECT_EQ(error->code(), code::kHeaderDrift);
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
+TEST(NativeWriterHeader, DriftFoundOnARetryFailsWithHeaderDriftToo) {
+    WrRig rig;
+    // The connection drops as the column is retyped, so the resend meets the
+    // new header.
+    fake::Fault fault = wr_reset_at_end();
+    const auto server = rig.server;
+    fault.on_fire = [server] { server->alter_column_type(kWrTable, "s", "Nullable(String)"); };
+    server->inject(std::move(fault));
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 5, 8));
+    const auto error = wr_error([&] { rig.writer->flush(1); });
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kHeaderDrift) << error->what();
+    EXPECT_NE(std::string(error->what()).find("column `s`: plan String, server Nullable(String)"),
+              std::string::npos)
+        << error->what();
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+    EXPECT_EQ(rig.writer->stats().abandoned_rows, 5U);
 }
 
 // --- Resource splits ----------------------------------------------------------
@@ -1524,12 +2012,105 @@ TEST(NativeWriterSplit, RepeatedMemoryLimitsExhaustOneWindowHoweverManyHalvesAre
     EXPECT_EQ(rig.writer->stats().abandoned_rows, 4000U);
 }
 
+TEST(NativeWriterSplit, AHalfFailsAtItsParentsDeadlineNotAWindowAfterItsOwnStart) {
+    WrRig rig;
+    rig.options.retry_window = 2s;
+    // The window starts at this failure; the resend's 241 comes back most
+    // of a window later, and every half's End is slower than what is left.
+    rig.server->inject(wr_reset_at_end());
+    fake::Fault late = wr_fault(
+        fake::Step::End, fake::Fault::Kind::ServerError, 241, "Memory limit (total) exceeded");
+    late.delay = 1200ms;
+    rig.server->inject(std::move(late));
+    for (int i = 0; i < 20; ++i) {
+        fake::Fault slow = wr_fault(
+            fake::Step::End, fake::Fault::Kind::ServerError, 241, "Memory limit (total) exceeded");
+        slow.delay = 1500ms;
+        rig.server->inject(std::move(slow));
+    }
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 4000, 8));
+    const auto start = WrClock::now();
+    const auto error = wr_error([&] { rig.writer->flush(1); });
+    const auto took = WrClock::now() - start;
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kRetryWindowExhausted) << error->what();
+    std::set<std::size_t> sizes;
+    for (const auto& insert : rig.inserts()) {
+        sizes.insert(wr_rows_of(insert));
+    }
+    EXPECT_TRUE(sizes.contains(2000U)) << "the INSERT was never split";
+    // The first half's End is cut at the deadline the halves share. A half
+    // with a window of its own would have gone on for another one.
+    EXPECT_GE(took, 1900ms);
+    EXPECT_LT(took, 2700ms);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+}
+
+// The first attempt lands every row and is then in doubt; the resend is split
+// by a 241 before it sends anything. The halves go under fresh tokens, so the
+// first attempt's rows land a second time, and the counts must say so.
+TEST(NativeWriterSplit, ASplitBeforeSendAfterAnInDoubtAttemptCountsItsRowsAsMaybeDuplicated) {
+    WrRig rig;
+    rig.server->inject(wr_reset_at_end(fake::Fault::Landing::Everything));
+    fake::Fault oom = wr_fault(
+        fake::Step::Begin, fake::Fault::Kind::ServerError, 241, "Memory limit (total) exceeded");
+    oom.nth = 2;
+    rig.server->inject(std::move(oom));
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 4000, 8));
+    rig.writer->flush(1);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_twice(0, 4000));
+    const auto tokens = wr_tokens(*rig.server);
+    EXPECT_EQ(std::set<std::string>(tokens.begin(), tokens.end()).size(), 3U);
+    const WriterStats stats = rig.writer->stats();
+    EXPECT_EQ(stats.rows_maybe_duplicated, 4000U);
+    EXPECT_EQ(stats.rows_resent_with_token, 0U);
+    EXPECT_EQ(wr_counter(rig.metrics, wr_name(metric::kRowsMaybeDuplicatedTotal)), 4000U);
+    rig.writer->finish();
+}
+
+TEST(NativeWriterSplit, ASplitByTheReprobeAfterAnInDoubtAttemptCountsItsRowsAsMaybeDuplicated) {
+    WrRig rig;
+    rig.server->inject(wr_reset_at_end(fake::Fault::Landing::Everything));
+    rig.start();
+    // After start, so the opener's own probe does not meet it: the first
+    // read after this is the re-probe of the client rebuilt for the resend.
+    rig.server->inject(wr_fault(
+        fake::Step::Select, fake::Fault::Kind::ServerError, 241, "Memory limit (total) exceeded"));
+    rig.writer->submit(rig.chunk(0, 4000, 8));
+    rig.writer->flush(1);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_twice(0, 4000));
+    const WriterStats stats = rig.writer->stats();
+    EXPECT_EQ(stats.rows_maybe_duplicated, 4000U);
+    EXPECT_EQ(stats.rows_resent_with_token, 0U);
+    rig.writer->finish();
+}
+
+TEST(NativeWriterSplit, ASplitWithNothingInDoubtCountsNoDuplicates) {
+    WrRig rig;
+    // The first attempt fails before it sends anything, so nothing can have
+    // landed under its token.
+    rig.server->inject(wr_fault(fake::Step::Begin, fake::Fault::Kind::SystemError));
+    rig.server->inject(wr_fault(
+        fake::Step::Begin, fake::Fault::Kind::ServerError, 241, "Memory limit (total) exceeded"));
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 4000, 8));
+    rig.writer->flush(1);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 4000));
+    const WriterStats stats = rig.writer->stats();
+    EXPECT_EQ(stats.rows_maybe_duplicated, 0U);
+    EXPECT_EQ(stats.rows_resent_with_token, 0U);
+    rig.writer->finish();
+}
+
 // --- The memory charge ---------------------------------------------------------
 
 TEST(NativeWriterMemory, AChargeTheBudgetRefusesFailsTheInsertAndEveryReservationComesBack) {
     WrRig rig;
     rig.budget = std::make_shared<MemoryBudget>(64 * kWrKiB, "writer-test-small");
     rig.start();
+    const std::uint64_t errors_before = wr_connector_counter("errors_total");
     // The chunk fits the budget; the Native copy of it, with its 16-byte
     // string views and its ids, does not fit beside it.
     rig.writer->submit(rig.chunk(0, 2000, 8));
@@ -1540,6 +2121,9 @@ TEST(NativeWriterMemory, AChargeTheBudgetRefusesFailsTheInsertAndEveryReservatio
         << error->what();
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
     EXPECT_EQ(rig.writer->stats().abandoned_rows, 2000U);
+    // It failed outside any call to the server, and still counts once as a
+    // connector error: it is the failure that ends the task.
+    EXPECT_EQ(wr_connector_counter("errors_total") - errors_before, 1U);
     rig.writer.reset();
     EXPECT_EQ(rig.budget->usage().used, 0U);
     EXPECT_GE(rig.budget->usage().refused, 1U);
@@ -1564,6 +2148,72 @@ TEST(NativeWriterMemory, AChunkWithoutAZeroCopyColumnIsReleasedOnceConverted) {
         << rig.budget->usage().used << " with a chunk of " << chunk_size;
     rig.writer->flush(1);
     EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 10'000));
+    rig.writer->finish();
+}
+
+TEST(NativeWriterMemory, OneLargeChunkOfShortStringsKeepsItsNativeCopiesWithinTheChargeLimit) {
+    WrRig rig;
+    rig.options.batch_bytes = 4 * kWrMiB;
+    rig.start();
+    // Ten bytes of payload a row, so all 400000 rows fit batch_bytes, but
+    // each Native row also owns its id and a 16-byte view: about 10 MB of
+    // copies, against a charge limit of 8 MiB.
+    Chunk c = rig.chunk(0, 400'000, 1);
+    const std::size_t chunk_size = c.bytes;
+    rig.writer->submit(std::move(c));
+    rig.writer->flush(1);
+    // The chunk is charged from the queue until its last row is acknowledged,
+    // and only one INSERT holds copies at a time, so the rest of the peak is
+    // the most any INSERT's copies took. An INSERT may pass the limit by the
+    // chunk it holds, never by the copies of its rows.
+    const std::size_t copies_at_peak = rig.budget->usage().peak - chunk_size;
+    EXPECT_LE(copies_at_peak, 2 * rig.options.batch_bytes);
+    EXPECT_GT(rig.committed().size(), 1U);
+    EXPECT_EQ(rig.server->rows(kWrTable), 400'000U);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 400'000));
+    rig.writer->finish();
+}
+
+TEST(NativeWriterMemory, AChunkLargerThanTheChargeLimitIsStillTakenInInsertsOfManyRows) {
+    WrRig rig;
+    rig.options.batch_bytes = kWrMiB;
+    rig.start();
+    // The chunk alone is over the 2 MiB limit, so every INSERT holding any
+    // of it is too. Each still takes copies up to the limit before it closes,
+    // rather than one row.
+    Chunk c = rig.chunk(0, 400'000, 1);
+    const std::size_t chunk_size = c.bytes;
+    ASSERT_GT(chunk_size, 2 * rig.options.batch_bytes);
+    rig.writer->submit(std::move(c));
+    rig.writer->flush(1);
+    EXPECT_LE(rig.budget->usage().peak - chunk_size, 2 * rig.options.batch_bytes);
+    const auto all = rig.committed();
+    EXPECT_GT(all.size(), 1U);
+    EXPECT_LT(all.size(), 50U);
+    EXPECT_EQ(rig.server->rows(kWrTable), 400'000U);
+    rig.writer->finish();
+}
+
+TEST(NativeWriterMemory, ManySmallChunksOfShortStringsKeepTheChargeWithinTheLimit) {
+    WrRig rig;
+    rig.options.batch_bytes = kWrMiB;
+    rig.start();
+    // Each chunk is small, but the INSERT's block grows its columns by half
+    // again as it fills, and a growth near the limit could carry the charge
+    // past it by half of what the block owns.
+    std::size_t chunk_size = 0;
+    for (std::int64_t from = 0; from < 200'000; from += 1000) {
+        Chunk c = rig.chunk(from, from + 1000, 1);
+        chunk_size = std::max(chunk_size, c.bytes);
+        rig.writer->submit(std::move(c));
+        // One chunk at a time, so at most one waits in the queue.
+        ASSERT_TRUE(wr_eventually([&] { return rig.writer->queue_bytes() == 0; }));
+    }
+    rig.writer->flush(1);
+    // The INSERT's chunks and copies stay within the limit, beside the chunk
+    // in hand and the one queued behind it.
+    EXPECT_LE(rig.budget->usage().peak, 2 * rig.options.batch_bytes + 2 * chunk_size);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 200'000));
     rig.writer->finish();
 }
 
@@ -1615,6 +2265,68 @@ TEST(NativeWriterMetrics, EveryFailedAttemptCountsAsAConnectorError) {
     EXPECT_EQ(wr_connector_counter("errors_total"), errors_before + 2);
     const auto waits = rig.metrics.histogram(wr_name(metric::kRetryWaitNs)).snapshot();
     EXPECT_EQ(waits.count, 2U);
+    rig.writer->finish();
+}
+
+TEST(NativeWriterMetrics, TheQueueBytesGaugeFollowsEveryPushAndPop) {
+    WrRig rig;
+    rig.options.batch_rows = 4;
+    rig.server->inject(wr_delay(fake::Step::End, 1500ms));
+    rig.start();
+    const auto gauge = [&] { return rig.metrics.gauge(wr_name(metric::kQueueBytes)).value(); };
+    // This one closes an INSERT at once, whose End then takes its time.
+    rig.writer->submit(rig.chunk(0, 4, 8));
+    ASSERT_TRUE(wr_eventually([&] { return !rig.inserts().empty(); }));
+    EXPECT_EQ(gauge(), 0) << "the writer has taken the only chunk";
+    Chunk c = rig.chunk(4, 8, 8);
+    const auto queued = static_cast<std::int64_t>(c.bytes);
+    rig.writer->submit(std::move(c));
+    EXPECT_EQ(gauge(), queued) << "a chunk waits behind the INSERT in End";
+    rig.writer->flush(1);
+    EXPECT_EQ(gauge(), 0);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 8));
+    rig.writer->finish();
+}
+
+TEST(NativeWriterMetrics, FrequentSmallInsertsLogThePartRateWarningOncePerQuietPeriod) {
+    WrRig rig;
+    rig.options.parallelism = 4;
+    rig.part_rate_span = 300ms;
+    rig.start();
+    const std::int64_t since = wr_log_mark();
+    const auto warnings = [&] {
+        return wr_logs_containing(wr_logs_since(since), " INSERTs a second over the last ");
+    };
+    // One-row INSERTs as fast as flushes go: far more than one a second for
+    // the job, and far fewer than 10000 rows each.
+    std::int64_t id = 0;
+    const auto insert_one = [&] {
+        rig.writer->submit(rig.chunk(id, id + 1, 8));
+        rig.writer->flush(static_cast<std::uint64_t>(id) + 1);
+        ++id;
+    };
+    const auto give_up_at = WrClock::now() + 3s;
+    while (warnings() == 0 && WrClock::now() < give_up_at) {
+        insert_one();
+    }
+    ASSERT_EQ(warnings(), 1U) << "no warning after " << id << " INSERTs";
+    const auto logs = wr_logs_since(since);
+    const auto warning = std::find_if(logs.begin(), logs.end(), [](const LogRecord& r) {
+        return r.message.find(" INSERTs a second over the last ") != std::string::npos;
+    });
+    EXPECT_EQ(warning->level, "warn");
+    EXPECT_NE(warning->message.find("subtask=0/4 "), std::string::npos) << warning->message;
+    EXPECT_NE(warning->message.find("1 rows each on average"), std::string::npos)
+        << warning->message;
+    EXPECT_NE(warning->message.find("across parallelism 4"), std::string::npos) << warning->message;
+    EXPECT_NE(warning->message.find("Raise batch_interval_ms (now 60000)"), std::string::npos)
+        << warning->message;
+    // Several more spans of the same, inside the quiet period: no repeat.
+    const auto quiet_until = WrClock::now() + 1s;
+    while (WrClock::now() < quiet_until) {
+        insert_one();
+    }
+    EXPECT_EQ(warnings(), 1U);
     rig.writer->finish();
 }
 

@@ -332,6 +332,7 @@ struct Writer::Core {
     void consume(Chunk chunk);
     void open_insert();
     void finish_current();
+    void track_in_flight() noexcept;
     void append(Insert& in,
                 const std::shared_ptr<const Chunk>& chunk,
                 std::int64_t offset,
@@ -343,15 +344,18 @@ struct Writer::Core {
                                              std::int64_t offset,
                                              std::int64_t max_rows,
                                              std::size_t room) const;
+    [[nodiscard]] std::int64_t rows_the_charge_takes(const Insert& in,
+                                                     const Chunk& chunk,
+                                                     std::int64_t max_rows) const;
     [[nodiscard]] std::size_t charged(const Insert& in) const;
-    [[nodiscard]] bool should_close(const Insert& in) const;
+    [[nodiscard]] bool should_close(const Insert& in, bool by_charge) const;
     void cut_and_send();
     void close_current();
     template <class Step>
     bool first_attempt(Step&& step);
     void freeze(Insert& in);
     void deliver(Insert& in, Failure f);
-    void deliver_halves(Insert& parent, bool past_send);
+    void deliver_halves(Insert& parent, bool may_have_landed);
     std::array<std::unique_ptr<Insert>, 2> split(Insert& parent);
     void attempt(Insert& in, Phase& phase);
     void ensure_client(Phase& phase);
@@ -371,6 +375,7 @@ struct Writer::Core {
                                         const arrow::RecordBatch& batch,
                                         const ConversionError& e);
     void fail_quietly(const char* code, const std::string& what) noexcept;
+    void give_up(std::uint64_t rows, Counter* outcome) noexcept;
     void on_stopped() noexcept;
     void store(std::exception_ptr failure);
     void complete_ticket(std::uint64_t ticket);
@@ -398,7 +403,8 @@ struct Writer::Core {
     const std::size_t batch_bytes_;
     // An INSERT also closes at twice batch_bytes of charged memory: the
     // 16-byte string views are invisible to the payload measure, and short,
-    // high-cardinality strings can make them rival it.
+    // high-cardinality strings can make them rival it. Slices are sized
+    // against it too, so one large chunk cannot carry the charge past it.
     const std::size_t charge_limit_;
     const std::chrono::milliseconds batch_interval_;
     const std::chrono::milliseconds retry_window_;
@@ -434,6 +440,10 @@ struct Writer::Core {
     std::exception_ptr failure_;
     std::atomic<std::size_t> queue_bytes_now_{0};
     std::atomic<bool> stop_{false};
+    // The unacknowledged rows of the INSERT in flight, kept by the writer
+    // thread so that abort() can count them when it detaches a writer that
+    // will never get as far as counting them itself.
+    std::atomic<std::uint64_t> in_flight_rows_{0};
 
     // Joining or detaching the thread, once.
     std::mutex life_mu_;
@@ -490,7 +500,9 @@ Writer::Core::Core(WriterConfig config,
       builder_(config_.plan),
       part_rate_(std::max<std::uint32_t>(config_.options.parallelism, 1),
                  config_.options.batch_interval,
-                 started_) {
+                 started_,
+                 config_.part_rate_span,
+                 config_.part_rate_quiet) {
     if (!transport_) {
         throw std::invalid_argument("clickhouse native sink: the writer needs a transport");
     }
@@ -527,6 +539,13 @@ Writer::Core::Gate Writer::Core::gate(bool waiting) const {
 void Writer::Core::raise(Gate why, const std::exception_ptr& failure) {
     switch (why) {
         case Gate::Failed:
+            if (config_.cancel.requested()) {
+                // The writer may have seen the cancel first and stored it as
+                // its failure. The task is cancelled either way, so the writer
+                // is joined and its summary logged before the throw, as on
+                // every cancel.
+                abort_and_join();
+            }
             std::rethrow_exception(failure);
         case Gate::Cancelled:
             // A normal return here would let the runner acknowledge a
@@ -582,9 +601,23 @@ void Writer::Core::abort_and_join() noexcept {
                 // Still inside a call with no fd to shut down. The thread
                 // owns everything it touches through its share of this Core,
                 // and its poisoned socket cannot commit when it goes; from
-                // here on it reports nothing.
+                // here on it reports nothing. So the INSERT it holds, which
+                // the job's restart replays, is counted as abandoned here,
+                // for the summary below, and give_up() on the thread then
+                // finds it counted.
                 {
                     const std::lock_guard<std::mutex> lock(report_mu_);
+                    const std::uint64_t rows =
+                        in_flight_rows_.exchange(0, std::memory_order_acq_rel);
+                    if (rows > 0) {
+                        {
+                            const std::lock_guard<std::mutex> stats(stats_mu_);
+                            stats_.abandoned_rows += rows;
+                        }
+                        if (metrics_.inserts_abandoned != nullptr) {
+                            metrics_.inserts_abandoned->increment();
+                        }
+                    }
                     detached_ = true;
                 }
                 thread_.detach();
@@ -729,11 +762,27 @@ void Writer::Core::consume(Chunk chunk) {
         const std::size_t block_room = kMaxBlockBytes - std::min(block_payload, kMaxBlockBytes);
         const std::size_t insert_room = batch_bytes_ - std::min(insert_payload, batch_bytes_);
         const std::uint64_t row_room = batch_rows_ - std::min(in.rows, batch_rows_);
-        const auto max_rows = static_cast<std::int64_t>(
+        auto max_rows = static_cast<std::int64_t>(
             std::min(static_cast<std::uint64_t>(total - offset), row_room));
         if (max_rows == 0) {
             close_current();
             continue;
+        }
+        // Nothing in a new INSERT says yet what a row costs in Native
+        // copies, so its first row goes in on its own and later slices are
+        // sized from what the rows so far cost. The charge trigger waits for
+        // the slice after that first row, so a chunk that alone takes the
+        // INSERT to the limit still gives it more than one row.
+        const bool first = in.rows == 0;
+        if (first) {
+            max_rows = 1;
+        } else {
+            max_rows = rows_the_charge_takes(in, *shared, max_rows);
+            if (max_rows == 0) {
+                // Its Native copies have taken what the charge allows.
+                close_current();
+                continue;
+            }
         }
         std::int64_t rows =
             rows_that_fit(batch, offset, max_rows, std::min(block_room, insert_room));
@@ -757,7 +806,7 @@ void Writer::Core::consume(Chunk chunk) {
         if (builder_.payload_bytes() >= kMaxBlockBytes) {
             cut_and_send();
         }
-        if (current_ && should_close(*current_)) {
+        if (current_ && should_close(*current_, !first)) {
             close_current();
         }
     }
@@ -768,12 +817,18 @@ void Writer::Core::consume(Chunk chunk) {
 void Writer::Core::open_insert() {
     current_ = std::make_unique<Insert>(tokens_.next(), config_.budget, RetryWindow(retry_window_));
     current_acked_ = 0;
+    track_in_flight();
     backoff_.reset();
 }
 
 void Writer::Core::finish_current() {
     current_.reset();
     current_acked_ = 0;
+    track_in_flight();
+}
+
+void Writer::Core::track_in_flight() noexcept {
+    in_flight_rows_.store(unacknowledged_rows(), std::memory_order_release);
 }
 
 void Writer::Core::append(Insert& in,
@@ -796,6 +851,7 @@ void Writer::Core::append(Insert& in,
         in.first_row = Clock::now();
     }
     in.rows += static_cast<std::uint64_t>(rows);
+    track_in_flight();
     in.charge.resize(in.owned + builder_.owned_bytes());
 }
 
@@ -834,18 +890,54 @@ std::int64_t Writer::Core::rows_that_fit(const arrow::RecordBatch& batch,
     return fits;
 }
 
+// How many of `max_rows` more rows of `chunk` the INSERT can take before its
+// Native copies, with the other chunks it holds, would pass the charge limit.
+// A row is taken to cost what the INSERT's rows have cost so far: exact for
+// flat columns, an estimate for arrays whose rows vary in length. The chunk
+// itself is not counted. It is held whole whatever the INSERT takes of it, so
+// an INSERT may pass the limit by that one chunk, but not by the copies of
+// its rows.
+std::int64_t Writer::Core::rows_the_charge_takes(const Insert& in,
+                                                 const Chunk& chunk,
+                                                 std::int64_t max_rows) const {
+    const std::size_t block_owned = builder_.owned_bytes();
+    const std::size_t owned = in.owned + block_owned;
+    const std::size_t others = in.last_retained == &chunk
+                                   ? in.retained_bytes - std::min(in.retained_bytes, chunk.bytes)
+                                   : in.retained_bytes;
+    const std::size_t held = others + owned;
+    if (held >= charge_limit_) {
+        return 0;
+    }
+    const std::size_t room = charge_limit_ - held;
+    // The builder grows a column by half again when it runs out of room, so
+    // the next slice can add half of what the block owns however few rows it
+    // has.
+    if (block_owned / 2 >= room) {
+        return 0;
+    }
+    if (owned == 0 || in.rows == 0) {
+        return max_rows;
+    }
+    // What the rows so far own includes the builder's growth slack, so it
+    // errs high, which is the safe side.
+    const double per_row = static_cast<double>(owned) / static_cast<double>(in.rows);
+    const double fits = std::floor(static_cast<double>(room) / per_row);
+    return fits >= static_cast<double>(max_rows) ? max_rows : static_cast<std::int64_t>(fits);
+}
+
 std::size_t Writer::Core::charged(const Insert& in) const {
     return in.retained_bytes + in.owned + builder_.owned_bytes();
 }
 
-bool Writer::Core::should_close(const Insert& in) const {
+bool Writer::Core::should_close(const Insert& in, bool by_charge) const {
     if (in.rows >= batch_rows_) {
         return true;
     }
     if (in.payload + builder_.payload_bytes() >= batch_bytes_) {
         return true;
     }
-    if (charged(in) >= charge_limit_) {
+    if (by_charge && charged(in) >= charge_limit_) {
         return true;
     }
     return in.first_row && Clock::now() >= later(*in.first_row, batch_interval_);
@@ -1014,7 +1106,10 @@ void Writer::Core::deliver(Insert& in, Failure f) {
         });
 
         if (splitting) {
-            deliver_halves(in, past_send);
+            // Whether rows sent under the parent's token may have landed:
+            // set by this failure or by any earlier attempt that got past a
+            // send, and cleared only by a fresh token, which counted them.
+            deliver_halves(in, in.doubt.has_value());
             return;
         }
         Phase phase = Phase::Connect;
@@ -1039,10 +1134,10 @@ void Writer::Core::deliver(Insert& in, Failure f) {
     }
 }
 
-void Writer::Core::deliver_halves(Insert& parent, bool past_send) {
-    if (past_send) {
-        // The parent may have landed in part under its own token, and each
-        // half goes under a fresh one.
+void Writer::Core::deliver_halves(Insert& parent, bool may_have_landed) {
+    if (may_have_landed) {
+        // The parent may have landed in part under its own token, on this
+        // attempt or an earlier one, and each half goes under a fresh one.
         count_duplicate(parent);
     }
     std::array<std::unique_ptr<Insert>, 2> halves = split(parent);
@@ -1284,6 +1379,7 @@ void Writer::Core::acknowledged(Insert& in) {
         ++stats_.inserts;
     }
     current_acked_ += rows;
+    track_in_flight();
     const bool retried = in.retried;
     report([&] {
         if (Counter* outcome = retried ? metrics_.inserts_retried_ok : metrics_.inserts_ok) {
@@ -1357,20 +1453,12 @@ void Writer::Core::after_attempt(bool failed) {
     });
 }
 
+// Counts no attempt: deliver() has counted the failed attempt before it gets
+// here, and conversion_failed() and fail_quietly() count theirs first.
 void Writer::Core::fail(const char* code, const std::string& message) {
     transport_->abandon();
     const NativeSinkError error(code, message);
-    const std::uint64_t rows = unacknowledged_rows();
-    const bool in_flight = current_ != nullptr;
-    {
-        const std::lock_guard<std::mutex> lock(stats_mu_);
-        stats_.abandoned_rows += rows;
-    }
-    report([&] {
-        if (in_flight && metrics_.inserts_failed != nullptr) {
-            metrics_.inserts_failed->increment();
-        }
-    });
+    give_up(unacknowledged_rows(), current_ != nullptr ? metrics_.inserts_failed : nullptr);
     log(LogSeverity::Error, error.what());
     // Stored last: the task thread may act on the failure the moment it sees
     // it, and everything reported about it is in place by then.
@@ -1406,6 +1494,9 @@ void Writer::Core::fail_exhausted(Insert& in, const Failure& f, FailureClass cls
 void Writer::Core::conversion_failed(Insert& in,
                                      const arrow::RecordBatch& batch,
                                      const ConversionError& e) {
+    // The INSERT may have sent blocks before this row: the bytes they took
+    // and the failure count as for any failed attempt.
+    after_attempt(true);
     // Row data may be confidential: the sample row shows types, lengths and
     // the offending value only where it is a number or a date.
     fail(code::kConversionFailed,
@@ -1415,6 +1506,9 @@ void Writer::Core::conversion_failed(Insert& in,
 
 void Writer::Core::fail_quietly(const char* code, const std::string& what) noexcept {
     try {
+        // As for a conversion failure: a charge the budget refused, or
+        // anything unexpected, may come after blocks went out.
+        after_attempt(true);
         fail(code,
              (current_ ? insert_label(*current_) + " failed: "
                        : std::string("clickhouse native sink: the writer failed: ")) +
@@ -1424,22 +1518,35 @@ void Writer::Core::fail_quietly(const char* code, const std::string& what) noexc
     }
 }
 
+// Counts the INSERT in flight as given up: `rows` unacknowledged, and one
+// `outcome`. abort() does the same for a writer it detaches, which reports
+// nothing afterwards, so both count under report_mu_ and whichever comes
+// second finds nothing left to count.
+void Writer::Core::give_up(std::uint64_t rows, Counter* outcome) noexcept {
+    try {
+        const std::lock_guard<std::mutex> lock(report_mu_);
+        in_flight_rows_.store(0, std::memory_order_release);
+        if (detached_) {
+            return;
+        }
+        {
+            const std::lock_guard<std::mutex> stats(stats_mu_);
+            stats_.abandoned_rows += rows;
+        }
+        if (outcome != nullptr) {
+            outcome->increment();
+        }
+    } catch (...) {
+        // Only a lock can throw here, and a count is not worth the writer.
+    }
+}
+
 void Writer::Core::on_stopped() noexcept {
     try {
         transport_->abandon();
         after_attempt(false);
         const std::uint64_t rows = unacknowledged_rows();
-        if (rows > 0) {
-            {
-                const std::lock_guard<std::mutex> lock(stats_mu_);
-                stats_.abandoned_rows += rows;
-            }
-            report([this] {
-                if (metrics_.inserts_abandoned != nullptr) {
-                    metrics_.inserts_abandoned->increment();
-                }
-            });
-        }
+        give_up(rows, rows > 0 ? metrics_.inserts_abandoned : nullptr);
         store(std::make_exception_ptr(NativeSinkError(
             code::kCancelled,
             "clickhouse native sink: the writer stopped on cancel" +
