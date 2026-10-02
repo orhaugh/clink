@@ -26,5 +26,11 @@
 #    on - the wait would be for the absence of an event. The 250ms and 10s
 #    sleeps in the same file are poll/sample intervals the checker already
 #    exempts; this is the one deliberate pause.
+#  * test_clickhouse_native_recovery holds a ClickHouse outage open ON
+#    PURPOSE in two kill-matrix cells: the server stays killed for 2s before
+#    it is started again, and the proxy blackholes the connection for 15s, a
+#    span chosen to be shorter than the sink's retry window. The length of
+#    the outage is what each cell tests, so there is no condition to wait on.
+2      tests/integration/test_clickhouse_native_recovery.cpp
 1      tests/integration/test_postgres_pipeline.cpp
 1      tests/integration/test_soak.cpp
