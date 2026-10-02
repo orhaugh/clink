@@ -660,50 +660,14 @@ const std::vector<Column>& differential_columns() {
     return columns;
 }
 
-// TIMESTAMP(0) does not survive the DDL parser: a zero precision reaches it
-// as an empty constant and is refused ("typmod expected integer"). So the DDL
-// spells it with a non-zero precision and pin_timestamp_zero then gives the
-// registered column the type TIMESTAMP(0) declares, a timestamp in seconds.
-constexpr std::string_view kTimestampZeroStandIn = "TIMESTAMP(1)";
-
 std::string column_ddl(const std::vector<Column>& columns = differential_columns()) {
     std::string out = "(";
     bool first = true;
     for (const auto& c : columns) {
-        out += (first ? "" : ", ") + c.name + " " +
-               (c.sql == "TIMESTAMP(0)" ? std::string(kTimestampZeroStandIn) : c.sql);
+        out += (first ? "" : ", ") + c.name + " " + c.sql;
         first = false;
     }
     return out + ")";
-}
-
-// Re-registers every table in `catalog` that has one of `columns`, with those
-// columns typed as TIMESTAMP(0) declares them.
-void pin_timestamp_zero(clink::sql::Catalog& catalog,
-                        const std::vector<std::string>& tables,
-                        const std::set<std::string>& columns) {
-    for (const auto& name : tables) {
-        const auto* found = catalog.get_table(name);
-        if (found == nullptr) {
-            continue;
-        }
-        clink::sql::TableDef def = *found;
-        bool changed = false;
-        for (auto& c : def.columns) {
-            if (columns.contains(c.name)) {
-                c.type = arrow::timestamp(arrow::TimeUnit::SECOND);
-                changed = true;
-            }
-        }
-        if (changed) {
-            catalog.drop_table(name);
-            catalog.register_table(std::move(def));
-        }
-    }
-}
-
-void pin_differential_tables(clink::sql::Catalog& catalog) {
-    pin_timestamp_zero(catalog, {"src", "ch", "out"}, {"t0"});
 }
 
 std::string column_list(const std::string& alias = "",
@@ -1012,7 +976,6 @@ CollectedRows run_into_collect(const std::string& ddl,
                               " WITH (connector='collect');") != 0) {
         throw std::runtime_error("collect DDL: " + err.str());
     }
-    pin_differential_tables(engine.catalog());
     auto reader = engine.collect_reader("out").ValueOrDie();
     if (engine.execute_script(insert) != 0) {
         throw std::runtime_error("collect INSERT: " + err.str());
@@ -1077,7 +1040,6 @@ std::map<std::int64_t, std::map<std::string, std::string>> run_into_native(
                                   kNativeWith + ");") != 0) {
             throw std::runtime_error("native DDL: " + err.str());
         }
-        pin_differential_tables(engine.catalog());
         if (engine.execute_script(insert) != 0) {
             throw std::runtime_error("native INSERT: " + err.str());
         }
@@ -1154,8 +1116,7 @@ TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesForEveryType) {
     const auto plan =
         compile_script(ddl + "CREATE TABLE ch " + column_ddl() + " WITH (" + kNativeWith + ");",
                        "INSERT INTO ch SELECT " + column_list() + " FROM src;",
-                       1,
-                       pin_differential_tables);
+                       1);
     ASSERT_EQ(plan.size(), 1U);
     ASSERT_TRUE(has_op(plan[0], "clickhouse_native_sink"));
 
@@ -1195,8 +1156,7 @@ TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindAColumnarJoin) {
     const auto plan =
         compile_script(ddl + "CREATE TABLE ch " + column_ddl() + " WITH (" + kNativeWith + ");",
                        "INSERT INTO ch " + select,
-                       1,
-                       pin_differential_tables);
+                       1);
     ASSERT_EQ(plan.size(), 1U);
     const auto joins = ops_of_type(plan[0], "equi_join_row");
     ASSERT_EQ(joins.size(), 1U);
@@ -1249,8 +1209,7 @@ TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindTheColumnarDecode) {
     const auto plan = compile_script(
         ddl + "CREATE TABLE ch " + column_ddl(columns) + " WITH (" + kNativeWith + ");",
         "INSERT INTO ch " + select,
-        1,
-        pin_differential_tables);
+        1);
     ASSERT_EQ(plan.size(), 1U);
     ASSERT_TRUE(has_op(plan[0], "json_string_to_row_columnar"));
 
@@ -1597,8 +1556,8 @@ TEST(ClickHouseNativeSql, TheJsonDecodeHandsTimestampsAndDatesOnAsWritten) {
         R"({"id":3,"t0":"0","t3":"0","t6":"0","t9":"0","tz":"1","dd":"1970-01-01"})",
     };
     const std::string table =
-        "(id BIGINT, t0 " + std::string(kTimestampZeroStandIn) +
-        ", t3 TIMESTAMP(3), t6 TIMESTAMP(6), t9 TIMESTAMP(9), tz TIMESTAMPTZ, "
+        "(id BIGINT, t0 TIMESTAMP(0), t3 TIMESTAMP(3), t6 TIMESTAMP(6), t9 TIMESTAMP(9), tz "
+        "TIMESTAMPTZ, "
         "dd DATE)";
     for (const bool row_form : {true, false}) {
         SCOPED_TRACE(row_form ? "json_string_to_row" : "json_string_to_row_columnar");
@@ -1609,11 +1568,8 @@ TEST(ClickHouseNativeSql, TheJsonDecodeHandsTimestampsAndDatesOnAsWritten) {
                                 " WITH (connector='kafka', format='json', topic='" + topic + "'" +
                                 (row_form ? ", columnar_decode='false'" : "") +
                                 "); CREATE TABLE out " + table + " WITH (connector='collect');";
-        const auto pin = [](clink::sql::Catalog& c) {
-            pin_timestamp_zero(c, {"src", "out"}, {"t0"});
-        };
         const std::string insert = "INSERT INTO out SELECT id, t0, t3, t6, t9, tz, dd FROM src;";
-        const auto plan = compile_script(ddl, insert, 1, pin);
+        const auto plan = compile_script(ddl, insert, 1);
         ASSERT_EQ(plan.size(), 1U);
         ASSERT_TRUE(
             has_op(plan[0], row_form ? "json_string_to_row" : "json_string_to_row_columnar"));
@@ -1624,7 +1580,6 @@ TEST(ClickHouseNativeSql, TheJsonDecodeHandsTimestampsAndDatesOnAsWritten) {
         opts.out = &err;
         clink::embed::EmbeddedEngine engine{std::move(opts)};
         ASSERT_EQ(engine.execute_script(ddl), 0) << err.str();
-        pin(engine.catalog());
         auto reader = engine.collect_reader("out").ValueOrDie();
         const auto decoded_before = clink::detail::batch_materialize_counter().load();
         ASSERT_EQ(engine.execute_script(insert), 0) << err.str();

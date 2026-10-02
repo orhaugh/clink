@@ -116,6 +116,40 @@ TEST(SqlCatalog, RegisterAndLookupFromCreateStmt) {
     EXPECT_EQ(def->properties.at("bootstrap"), "localhost:9092");
 }
 
+// A zero type modifier arrives from the parser as an empty integer wrapper,
+// which used to be refused: TIMESTAMP(0), TIMESTAMPTZ(0) and a scale-0
+// DECIMAL could not be declared at all.
+TEST(SqlCatalog, AZeroTypeModifierIsDeclarable) {
+    auto script = parse(
+        "CREATE TABLE t (ts TIMESTAMP(0), tz TIMESTAMPTZ(0), d DECIMAL(10, 0)) "
+        "WITH (connector='kafka', topic='x')");
+    const auto& create = std::get<ast::CreateTableStmt>(script.statements[0]);
+    Catalog cat;
+    cat.register_table(create);
+    const auto* def = cat.get_table("t");
+    ASSERT_NE(def, nullptr);
+    ASSERT_EQ(def->columns.size(), 3u);
+    EXPECT_TRUE(def->columns[0].type->Equals(*arrow::timestamp(arrow::TimeUnit::SECOND)))
+        << def->columns[0].type->ToString();
+    EXPECT_TRUE(def->columns[1].type->Equals(*arrow::timestamp(arrow::TimeUnit::SECOND, "UTC")))
+        << def->columns[1].type->ToString();
+    EXPECT_TRUE(def->columns[2].type->Equals(*arrow::decimal128(10, 0)))
+        << def->columns[2].type->ToString();
+    EXPECT_EQ(arrow_to_sql_type_string(*def->columns[0].type), "TIMESTAMP(0)");
+
+    // A zero now reaches the type's own validation, which is what refuses a
+    // precision of 0.
+    auto zero_precision =
+        parse("CREATE TABLE z (n DECIMAL(0)) WITH (connector='kafka', topic='x')");
+    try {
+        cat.register_table(std::get<ast::CreateTableStmt>(zero_precision.statements[0]));
+        FAIL() << "DECIMAL(0) was accepted";
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string(e.what()).find("precision must be in [1, 38]"), std::string::npos)
+            << e.what();
+    }
+}
+
 TEST(SqlCatalog, RejectsDuplicateRegistration) {
     auto script = parse("CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='x')");
     const auto& create = std::get<ast::CreateTableStmt>(script.statements[0]);

@@ -60,6 +60,11 @@ rendered with the suffix after the label set, `name{...}_bucket{le=...}`,
 which no scraper accepts, so those series were dropped. The suffixes now go on
 the base name and `le` joins the label set.
 
+**TIMESTAMP(0) and scale-0 DECIMAL columns can be declared.** A zero type
+modifier was refused at `CREATE TABLE` with "typmod expected integer", so
+`TIMESTAMP(0)`, `TIMESTAMPTZ(0)` and `DECIMAL(10, 0)` could not be declared
+at all. They now map to a timestamp in seconds and a scale-0 decimal.
+
 **A REAL or DECIMAL cell its type cannot hold is null in the Row carriers.**
 A finite number beyond float's range was written into a REAL column as
 infinity, and a DECIMAL value with more digits than its declared precision

@@ -1070,6 +1070,13 @@ ast::TypeName translate_type_name(const JsonValue& body) {
                     type.typmods.push_back(static_cast<int>(inner.at("ival").as_number()));
                     continue;
                 }
+                // The protobuf JSON leaves out a default-valued field, so a
+                // zero modifier, as in TIMESTAMP(0) or DECIMAL(10, 0),
+                // arrives as an empty ival wrapper.
+                if (!inner.contains("ival")) {
+                    type.typmods.push_back(0);
+                    continue;
+                }
             }
             unsupported("typmod expected integer", type.loc.pos);
         }
