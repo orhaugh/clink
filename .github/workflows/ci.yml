@@ -362,9 +362,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: clickhouse-pins-binary
+          # The SQL-linked binary also needs the fetched wasmtime library, which
+          # its runpath names by this job's container path; the live step points
+          # LD_LIBRARY_PATH at the copy uploaded here.
           path: |
             build/impls/clickhouse/tests/clink_clickhouse_tests
             build/tests/clink_clickhouse_sql_tests
+            build/_deps/wasmtime_capi-src/**/lib/libwasmtime.so
           if-no-files-found: error
           retention-days: 1
       - name: Upload integration artifacts on failure
@@ -433,8 +437,10 @@ jobs:
       - name: Run the live suites against every line
         run: |
           set -euo pipefail
+          wasmtime_lib="$(find "${GITHUB_WORKSPACE}/build/_deps" -name libwasmtime.so -print -quit 2>/dev/null || true)"
+          lib_path="${wasmtime_lib:+$(dirname "${wasmtime_lib}")}"
           PIN_RUNNER="docker run --rm --network host -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} \
-            -v ${RUNNER_TEMP}:${RUNNER_TEMP} -w ${GITHUB_WORKSPACE} \
+            -v ${RUNNER_TEMP}:${RUNNER_TEMP} -w ${GITHUB_WORKSPACE} -e LD_LIBRARY_PATH=${lib_path} \
             -e CLINK_CLICKHOUSE_TEST_HOST -e CLINK_CLICKHOUSE_TEST_PORT \
             -e CLINK_CLICKHOUSE_TEST_LINE -e CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT_PORT \
             -e CLINK_CLICKHOUSE_TEST_REPLICA_PORTS -e CLINK_CLICKHOUSE_TEST_RMT_ASYNC_DEFAULT \
