@@ -780,7 +780,8 @@ TEST(NativeWriterFrozen, AConversionFailureAfterABlockWasSentLandsNothingAndShow
     EXPECT_EQ(rig.server->abandoned_mid_insert(), 1U);
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
     const WriterStats stats = rig.writer->stats();
-    EXPECT_EQ(stats.abandoned_rows, 40U);
+    // The INSERT's 40 rows, and the row that could not be converted.
+    EXPECT_EQ(stats.abandoned_rows, 41U);
     // The failed INSERT is a failed attempt like any other: the 16 MiB block
     // it sent counts in wire_bytes and bytes_out, and it counts once as a
     // connector error. The failure is stored last, so all of it is in place.
@@ -1474,6 +1475,101 @@ TEST(NativeWriterCancel, ADetachedWritersRowsAreCountedOnceWhenItFinallyLetsGo) 
     ASSERT_TRUE(wr_eventually([&] { return rig.budget->usage().used == 0; }, 3s))
         << "the detached thread never let go of its INSERT";
     EXPECT_EQ(rig.writer->stats().abandoned_rows, 5U);
+    EXPECT_EQ(wr_counter(rig.metrics, abandoned), 1U);
+    EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+    rig.writer.reset();
+    EXPECT_TRUE(wr_eventually([&] { return rig.gone->load(); }, 3s));
+}
+
+// The rows the writer never took from its queue, and the rest of the chunk
+// it was taking in, are as unacknowledged as the INSERT it holds, and the
+// job's restart replays them too, so abandoned_rows counts every one. Only
+// the INSERT in flight counts as an abandoned INSERT.
+TEST(NativeWriterCancel, AnAbortCountsTheQueuedRowsAndTheRestOfTheChunkAsAbandoned) {
+    struct Case {
+        std::string label;
+        std::vector<std::pair<std::int64_t, std::int64_t>> chunks;  // [from, to)
+    };
+    const std::vector<Case> cases = {
+        {"chunks waiting in the queue", {{0, 5}, {5, 10}, {10, 15}}},
+        {"the rest of the chunk the writer was taking in", {{0, 15}}},
+        {"both", {{0, 12}, {12, 15}}},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.label);
+        WrRig rig;
+        rig.options.batch_rows = 5;
+        auto hanging = std::make_shared<std::atomic<bool>>(false);
+        fake::Fault hang = wr_fault(fake::Step::End, fake::Fault::Kind::Hang);
+        hang.on_fire = [hanging] { hanging->store(true); };
+        rig.server->inject(std::move(hang));
+        rig.start();
+        rig.writer->submit(rig.chunk(c.chunks.front().first, c.chunks.front().second, 8));
+        ASSERT_TRUE(wr_eventually([&hanging] { return hanging->load(); }));
+        // Held in the first INSERT's End, so these stay in the queue.
+        for (std::size_t i = 1; i < c.chunks.size(); ++i) {
+            rig.writer->submit(rig.chunk(c.chunks[i].first, c.chunks[i].second, 8));
+        }
+        const std::int64_t since = wr_log_mark();
+        rig.writer->abort();
+        EXPECT_EQ(rig.server->rows(kWrTable), 0U);
+        EXPECT_EQ(rig.writer->stats().abandoned_rows, 15U);
+        EXPECT_EQ(wr_logs_containing(wr_logs_since(since), " abandoned_rows=15 "), 1U);
+        EXPECT_EQ(wr_counter(rig.metrics, wr_name(metric::kInsertsTotal, "outcome", "abandoned")),
+                  1U);
+    }
+}
+
+// A writer that fails on its own drops what is queued behind the failed
+// INSERT, and counts it, before the task thread can see it has exited.
+TEST(NativeWriterCancel, AFailureCountsTheRowsItDropsFromTheQueueAsAbandoned) {
+    WrRig rig;
+    rig.options.batch_rows = 5;
+    // The first chunk fills the first INSERT, which fails before the writer
+    // takes anything more from the queue; its End answers late, so the
+    // chunks behind it are queued by then.
+    fake::Fault missing = wr_fault(
+        fake::Step::End, fake::Fault::Kind::ServerError, 60, "Table db.events does not exist");
+    missing.delay = 500ms;
+    rig.server->inject(std::move(missing));
+    rig.start();
+    rig.writer->submit(rig.chunk(0, 5, 8));
+    rig.writer->submit(rig.chunk(5, 10, 8));
+    rig.writer->submit(rig.chunk(10, 15, 8));
+    const auto error = wr_error([&] { rig.writer->flush(1); });
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kInsertFailed);
+    const std::int64_t since = wr_log_mark();
+    rig.writer->abort();
+    EXPECT_EQ(rig.writer->stats().abandoned_rows, 15U);
+    EXPECT_EQ(wr_logs_containing(wr_logs_since(since), " abandoned_rows=15 "), 1U);
+    EXPECT_EQ(wr_counter(rig.metrics, wr_name(metric::kInsertsTotal, "outcome", "failed")), 1U);
+    EXPECT_EQ(wr_counter(rig.metrics, wr_name(metric::kInsertsTotal, "outcome", "abandoned")), 0U);
+}
+
+// A detached writer reports nothing more, so abort() counts what it holds
+// for it: the rest of the chunk it was taking in as well as its INSERT.
+TEST(NativeWriterCancel, ADetachedWriterHoldingPartOfAChunkHasAllOfItCountedAsAbandoned) {
+    WrRig rig;
+    rig.options.batch_rows = 5;
+    rig.options.retry_window = 30s;
+    rig.server->inject(wr_reset_at_end());
+    rig.start(true);
+    rig.server->inject(wr_fault(fake::Step::Connect, fake::Fault::Kind::Uninterruptible));
+    // The first five rows make an INSERT whose End fails; the reconnect for
+    // its resend sticks, with ten rows of the chunk not yet taken in.
+    rig.writer->submit(rig.chunk(0, 15, 8));
+    ASSERT_TRUE(wr_eventually([&] { return rig.server->connects() >= 2; }));
+    const std::int64_t since = wr_log_mark();
+    rig.writer->abort();
+    const auto abandoned = wr_name(metric::kInsertsTotal, "outcome", "abandoned");
+    EXPECT_EQ(rig.writer->stats().abandoned_rows, 15U);
+    EXPECT_EQ(wr_logs_containing(wr_logs_since(since), " abandoned_rows=15 "), 1U);
+    EXPECT_EQ(wr_counter(rig.metrics, abandoned), 1U);
+    // Once it lets go, the thread finds its rows already counted.
+    rig.server->release();
+    ASSERT_TRUE(wr_eventually([&] { return rig.budget->usage().used == 0; }, 3s));
+    EXPECT_EQ(rig.writer->stats().abandoned_rows, 15U);
     EXPECT_EQ(wr_counter(rig.metrics, abandoned), 1U);
     EXPECT_EQ(rig.server->rows(kWrTable), 0U);
     rig.writer.reset();

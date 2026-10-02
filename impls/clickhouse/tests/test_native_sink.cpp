@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
@@ -201,13 +202,18 @@ public:
 };
 
 // Passes every call through, and says when it is destroyed: the moment an
-// opener that was left behind lets go of its state.
+// opener that was left behind lets go of its state. `linger` holds the
+// destructor first, so that a caller that waits for it is told apart from
+// one that does not.
 class NsWatched final : public InsertTransport {
 public:
-    NsWatched(std::unique_ptr<InsertTransport> inner, std::shared_ptr<std::atomic<bool>> gone)
-        : inner_(std::move(inner)), gone_(std::move(gone)) {}
+    NsWatched(std::unique_ptr<InsertTransport> inner,
+              std::shared_ptr<std::atomic<bool>> gone,
+              std::chrono::milliseconds linger = std::chrono::milliseconds::zero())
+        : inner_(std::move(inner)), gone_(std::move(gone)), linger_(linger) {}
     ~NsWatched() override {
         inner_.reset();
+        std::this_thread::sleep_for(linger_);
         gone_->store(true);
     }
     NsWatched(const NsWatched&) = delete;
@@ -239,6 +245,7 @@ public:
 private:
     std::unique_ptr<InsertTransport> inner_;
     std::shared_ptr<std::atomic<bool>> gone_;
+    std::chrono::milliseconds linger_;
 };
 
 // Refuses at connect with the sink's own error, before any socket, as the
@@ -298,6 +305,27 @@ fake::FakeTable ns_table(std::size_t window = 100) {
 
 // --- The rig ------------------------------------------------------------------
 
+// Through the factory, as a job graph reaches it.
+std::shared_ptr<NativeSink> ns_build_sink(const std::map<std::string, std::string>& params,
+                                          std::uint32_t subtask = 0,
+                                          std::uint32_t parallelism = 1) {
+    const auto* factory =
+        cluster::OperatorRegistry::default_instance().find_sink("clickhouse_native_sink", "row");
+    if (factory == nullptr) {
+        throw std::logic_error("clickhouse_native_sink is not registered");
+    }
+    cluster::OperatorBuildContext ctx;
+    ctx.params = params;
+    ctx.subtask_idx = subtask;
+    ctx.parallelism = parallelism;
+    auto built = std::static_pointer_cast<Sink<sql::Row>>(factory->build(ctx));
+    auto typed = std::dynamic_pointer_cast<NativeSink>(built);
+    if (!typed) {
+        throw std::logic_error("clickhouse_native_sink built something other than a NativeSink");
+    }
+    return typed;
+}
+
 using NsConfigure = std::function<void(JobConfig&, OperatorId source, OperatorId sink)>;
 
 // One server, the factory pointed at it, and a job built from a script. The
@@ -344,25 +372,9 @@ struct NsRig {
         return s;
     }
 
-    // Through the factory, as a job graph reaches it.
     [[nodiscard]] std::shared_ptr<NativeSink> build(std::uint32_t subtask = 0,
                                                     std::uint32_t parallelism = 1) const {
-        const auto* factory = cluster::OperatorRegistry::default_instance().find_sink(
-            "clickhouse_native_sink", "row");
-        if (factory == nullptr) {
-            throw std::logic_error("clickhouse_native_sink is not registered");
-        }
-        cluster::OperatorBuildContext ctx;
-        ctx.params = params;
-        ctx.subtask_idx = subtask;
-        ctx.parallelism = parallelism;
-        auto built = std::static_pointer_cast<Sink<sql::Row>>(factory->build(ctx));
-        auto typed = std::dynamic_pointer_cast<NativeSink>(built);
-        if (!typed) {
-            throw std::logic_error(
-                "clickhouse_native_sink built something other than a NativeSink");
-        }
-        return typed;
+        return ns_build_sink(params, subtask, parallelism);
     }
 
     void start(std::vector<NsStep> steps,
@@ -422,6 +434,58 @@ struct NsRig {
     std::shared_ptr<NsSource> source;
     std::shared_ptr<NativeSink> sink;
     std::unique_ptr<LocalExecutor> exec;
+};
+
+// The sink's own calls made from the case's thread, without an executor, for
+// the orders of data, barrier and cancel a running job cannot pin down. The
+// destructor checks what NsRig's does.
+struct NsDirect {
+    static constexpr std::uint64_t kOpId = 4242;
+
+    explicit NsDirect(fake::FakeTable t = ns_table()) {
+        server = std::make_shared<fake::FakeServer>();
+        server->add_table(std::move(t));
+        set_transport_factory_for_testing(fake::fake_factory(server));
+        params = {{"database", "db"},
+                  {"table", kNsTable},
+                  {"sql_column_types", "id:BIGINT;s:VARCHAR"},
+                  {"batch_interval_ms", "3600000"}};
+        ctx = std::make_unique<RuntimeContext>(
+            OperatorId{kOpId}, "clickhouse_native_sink", nullptr, &metrics);
+        ctx->set_cancel_signal(CancelSignal{cancel, nullptr});
+    }
+
+    ~NsDirect() {
+        sink.reset();
+        ctx.reset();
+        EXPECT_EQ(server->destroyed_mid_insert(), 0U) << "a client was destroyed mid-INSERT";
+        set_transport_factory_for_testing(nullptr);
+    }
+
+    NsDirect(const NsDirect&) = delete;
+    NsDirect& operator=(const NsDirect&) = delete;
+    NsDirect(NsDirect&&) = delete;
+    NsDirect& operator=(NsDirect&&) = delete;
+
+    // Builds the sink from `params` and attaches it to the context.
+    NativeSink& build() {
+        sink = ns_build_sink(params);
+        sink->attach_runtime(ctx.get());
+        return *sink;
+    }
+
+    NativeSink& open() {
+        NativeSink& s = build();
+        s.open();
+        return s;
+    }
+
+    std::shared_ptr<fake::FakeServer> server;
+    std::map<std::string, std::string> params;
+    MetricsRegistry metrics;
+    std::shared_ptr<std::atomic<bool>> cancel = std::make_shared<std::atomic<bool>>(false);
+    std::unique_ptr<RuntimeContext> ctx;
+    std::shared_ptr<NativeSink> sink;
 };
 
 // --- Helpers --------------------------------------------------------------------
@@ -551,6 +615,25 @@ bool ns_has(const std::string& text, const std::string& part) {
     return text.find(part) != std::string::npos;
 }
 
+// The number a summary line gives for ` field=`.
+std::uint64_t ns_field(const std::string& line, const std::string& field) {
+    const std::string key = " " + field + "=";
+    const std::size_t at = line.find(key);
+    if (at == std::string::npos) {
+        throw std::invalid_argument("no " + field + " in: " + line);
+    }
+    return std::stoull(line.substr(at + key.size()));
+}
+
+// The one cancelled summary logged since `since`.
+std::string ns_cancelled_summary(std::int64_t since) {
+    const auto lines = ns_logs_with(ns_logs_since(since), "clickhouse native sink cancelled:");
+    if (lines.size() != 1) {
+        throw std::logic_error(std::to_string(lines.size()) + " cancelled summaries, not one");
+    }
+    return lines.front().message;
+}
+
 // --- The factory and the record -----------------------------------------------
 
 TEST(NativeSinkFactory, TheFactoryIsReachableOnTheRowChannelAndBuildsASinkThatGatesTheAck) {
@@ -592,15 +675,33 @@ TEST(NativeSinkFactory, TheRecordClaimsAtLeastOnceWithRetriesAndPassesItsOwnChec
 #else
     EXPECT_FALSE(rec->tls);
 #endif
-    std::string limitations;
-    for (const auto& l : rec->limitations) {
-        limitations += l + "\n";
-    }
-    EXPECT_TRUE(ns_has(limitations, "only sink on its chain")) << limitations;
-    EXPECT_TRUE(ns_has(limitations, "unaligned and adaptive checkpoints are refused"))
-        << limitations;
-    EXPECT_TRUE(ns_has(limitations, "CLINK_EOS_FINAL_CKPT_TIMEOUT_MS")) << limitations;
-    EXPECT_TRUE(ns_has(limitations, "SharedMergeTree")) << limitations;
+    EXPECT_EQ(rec->runtime_dependencies,
+              std::vector<std::string>{"clickhouse server, native protocol (port 9000, or 9440 "
+                                       "with TLS); 26.3 and 26.8 tested"});
+    // Every limitation, word for word: the record is what the manifest and
+    // the capability catalogue print, so a dropped or reworded one shows here.
+    std::vector<std::string> limitations = {
+        "at-least-once: rows after the last completed checkpoint are replayed and may appear "
+        "twice",
+        "a resent INSERT is deduplicated only on targets that keep a deduplication log, on 26.3 "
+        "and 26.8",
+        "exactly-once, mode='upsert' and changelog='true' are refused",
+        "targets whose effective async_insert is not 0 are refused at open, on every replica "
+        "behind a Distributed target",
+        "SharedMergeTree targets are refused: their deduplication is untested",
+        "must be the only sink on its chain: Dag::add_sink refuses another sink beside it",
+        "unaligned and adaptive checkpoints are refused at open until the engine captures "
+        "in-flight rows at a fan-in",
+        "a retry that holds the barrier beyond CLINK_EOS_FINAL_CKPT_TIMEOUT_MS (default 30 s) "
+        "at the end of a bounded job or at a hot cutover spends a restart; nothing is lost",
+        "Row form only: a columnar batch is materialised before conversion",
+    };
+#if !defined(CLINK_CLICKHOUSE_NATIVE)
+    limitations.emplace_back(
+        "not in this build: the clickhouse-cpp it found is older than 2.6.2, or of a version "
+        "it could not read, so the factory refuses clickhouse.native_unavailable");
+#endif
+    EXPECT_EQ(rec->limitations, limitations);
 
     // The legacy sink keeps its own record, so its series and its claims stay
     // apart from these.
@@ -990,6 +1091,38 @@ TEST(NativeSinkMemory, TheCapHoldsForABatchBytesAtTheTopOfItsRange) {
         << opens.front().message;
 }
 
+// The cap is only worth something if the writer closes its INSERTs at it: 24
+// MiB in one interval goes as several INSERTs, none above the capped 8 MiB by
+// more than the one row that would have overrun it.
+TEST(NativeSinkMemory, TheWriterClosesItsInsertsAtTheCappedBatchBytes) {
+    NsRig rig;
+    auto budget = std::make_shared<MemoryBudget>(64 * kNsMiB, "native-sink-test");
+    rig.config.memory_budget = budget;
+    constexpr std::size_t kRowBytes = 64 * 1024;
+    std::vector<NsStep> steps;
+    for (std::int64_t b = 0; b < 24; ++b) {
+        steps.push_back(ns_data(b * 16, b * 16 + 16, kRowBytes));
+    }
+    steps.push_back(ns_barrier(1));
+    rig.start(std::move(steps));
+    rig.wait();
+    EXPECT_TRUE(rig.exec->operator_errors().empty());
+    EXPECT_TRUE(ns_each_landed(*rig.server, 0, 384));
+    EXPECT_EQ(rig.acknowledged(), std::vector<std::uint64_t>{1});
+    const auto inserts = rig.server->inserts(kNsTable);
+    EXPECT_GE(inserts.size(), 3U);
+    for (const auto& insert : inserts) {
+        std::size_t bytes = 0;
+        for (const auto& block : insert.blocks) {
+            bytes += block.bytes.size();
+        }
+        EXPECT_LE(bytes, 8 * kNsMiB + 2 * kRowBytes) << "an INSERT ran past the capped batch_bytes";
+    }
+    rig.exec.reset();
+    rig.sink.reset();
+    EXPECT_EQ(budget->usage().used, 0U);
+}
+
 // --- Barrier modes and the chain rule ---------------------------------------------
 
 TEST(NativeSinkBarrierMode, UnalignedOrAdaptiveCheckpointsAreRefusedAtOpenBeforeAnyConnect) {
@@ -1051,6 +1184,40 @@ TEST(NativeSinkBarrierMode, AnUnalignedBarrierOnAnAlignedJobIsRefusedAndNeverAck
             rig.metrics,
             ns_name(metric::kRefusalsTotal, rig.op_id(), "reason", code::kBarrierModeUnsupported)),
         1U);
+}
+
+// A terminal barrier ends a bounded stream: nothing can arrive after it, so
+// there are no rows in flight for an unaligned one to lose, and it is
+// flushed. Only a barrier with more to come is refused.
+TEST(NativeSinkBarrierMode, ATerminalUnalignedBarrierIsFlushedAndOnlyANonTerminalOneIsRefused) {
+    NsDirect d;
+    NativeSink& sink = d.open();
+    sink.on_data(ns_rows(0, 10));
+    EXPECT_NO_THROW(
+        sink.on_barrier(CheckpointBarrier{CheckpointId{std::numeric_limits<std::uint64_t>::max()},
+                                          true,
+                                          CheckpointBarrier::Mode::Unaligned}));
+    EXPECT_EQ(d.server->rows(kNsTable), 10U);
+
+    const std::int64_t since = ns_log_mark();
+    sink.on_data(ns_rows(10, 20));
+    const auto refused = ns_error([&sink] {
+        sink.on_barrier(CheckpointBarrier{CheckpointId{5}, CheckpointBarrier::Mode::Unaligned});
+    });
+    ASSERT_TRUE(refused);
+    EXPECT_EQ(refused->code(), code::kBarrierModeUnsupported);
+    EXPECT_EQ(d.server->rows(kNsTable), 10U);
+    EXPECT_EQ(
+        ns_count(
+            d.metrics,
+            ns_name(
+                metric::kRefusalsTotal, NsDirect::kOpId, "reason", code::kBarrierModeUnsupported)),
+        1U);
+    // The refusal stopped the writer, so nothing more is taken.
+    EXPECT_THROW(sink.on_data(ns_rows(20, 30)), std::exception);
+    d.sink.reset();
+    EXPECT_TRUE(ns_has(ns_cancelled_summary(since), " abandoned_rows=10 "));
+    EXPECT_EQ(d.server->rows(kNsTable), 10U);
 }
 
 TEST(NativeSinkChain, TheSinkMustBeTheOnlySinkOnItsChainWhicheverIsAddedFirst) {
@@ -1172,6 +1339,56 @@ TEST(NativeSinkOpen, ARefusalFromTheTransportItselfIsNeverRetried) {
         1U);
 }
 
+// A refusal after a failure that was retried: both attempts failed, so both
+// count as connector errors, as the writer counts a refusal a reconnect
+// meets; only the first was retried, after one wait.
+TEST(NativeSinkOpen, ARefusalAfterATransientFailureCountsBothAttemptsAndOneRetry) {
+    NsRig rig;
+    rig.params["retry_window_ms"] = "60000";
+    rig.params["table"] = "absent";
+    rig.server->inject(ns_fault(fake::Step::Connect, fake::Fault::Kind::SystemError));
+    const std::uint64_t errors_before = ns_connector("errors_total");
+    rig.start({ns_data(0, 10)});
+    rig.wait();
+    ASSERT_EQ(rig.errors_with(code::kTargetMissing).size(), 1U);
+    EXPECT_EQ(rig.server->connects(), 2U);
+    EXPECT_EQ(ns_connector("errors_total"), errors_before + 2);
+    EXPECT_EQ(
+        ns_count(rig.metrics, ns_name(metric::kRetriesTotal, rig.op_id(), "class", "transient")),
+        1U);
+    EXPECT_EQ(ns_observations(rig.metrics, ns_name(metric::kRetryWaitNs, rig.op_id())), 1U);
+    EXPECT_EQ(ns_count(rig.metrics, ns_name(metric::kReconnectsTotal, rig.op_id())), 1U);
+    EXPECT_EQ(
+        ns_count(rig.metrics,
+                 ns_name(metric::kRefusalsTotal, rig.op_id(), "reason", code::kTargetMissing)),
+        1U);
+}
+
+// An unknown server code at open is retried three times, as it is at an
+// INSERT, and then fails the open: it neither waits out the whole window nor
+// counts as a refusal.
+TEST(NativeSinkOpen, AnUnknownServerCodeIsRetriedThreeTimesAndThenFailsTheOpen) {
+    NsRig rig;
+    rig.params["retry_window_ms"] = "60000";
+    for (int i = 0; i < 5; ++i) {
+        rig.server->inject(ns_fault(fake::Step::Select, fake::Fault::Kind::ServerError, 99999));
+    }
+    const auto started = NsClock::now();
+    rig.start({ns_data(0, 10)});
+    rig.wait();
+    // Three backoffs of at most 100, 200 and 400 ms.
+    EXPECT_LE(NsClock::now() - started, 3s);
+    ASSERT_EQ(rig.errors_with(code::kInsertFailed).size(), 1U);
+    EXPECT_EQ(rig.server->connects(), 4U);
+    EXPECT_EQ(
+        ns_count(rig.metrics, ns_name(metric::kRetriesTotal, rig.op_id(), "class", "unclassified")),
+        3U);
+    EXPECT_EQ(ns_count(rig.metrics,
+                       ns_name(metric::kRefusalsTotal, rig.op_id(), "reason", code::kInsertFailed)),
+              0U);
+    EXPECT_EQ(rig.server->rows(kNsTable), 0U);
+}
+
 // --- Outages and the retry window -------------------------------------------------
 
 // The outage cases give the window ten times the outage. With full jitter a
@@ -1191,6 +1408,33 @@ TEST(NativeSinkOutage, AnOutageAtOpenShorterThanTheWindowIsWaitedOut) {
     EXPECT_TRUE(ns_each_landed(*rig.server, 0, 50));
     EXPECT_GE(rig.server->connects(), 2U);
     // The client the opener built once the server was back is a reconnect.
+    EXPECT_EQ(ns_count(rig.metrics, ns_name(metric::kReconnectsTotal, rig.op_id())), 1U);
+}
+
+// An outage that holds the open shows in the sink's own retry series while it
+// lasts, as one at an INSERT does, so an alert on them does not wait for the
+// server to come back. Every failed attempt counts once as a connector error.
+TEST(NativeSinkOutage, AnOutageAtOpenMovesTheRetrySeriesWhileItLasts) {
+    NsRig rig;
+    rig.params["retry_window_ms"] = "10000";
+    rig.server->set_down(true);
+    const std::uint64_t errors_before = ns_connector("errors_total");
+    rig.start({ns_data(0, 50)});
+    const std::string transient = ns_name(metric::kRetriesTotal, rig.op_id(), "class", "transient");
+    const std::string waits = ns_name(metric::kRetryWaitNs, rig.op_id());
+    ASSERT_TRUE(ns_eventually([&] {
+        return ns_count(rig.metrics, transient) >= 2 && ns_observations(rig.metrics, waits) >= 1;
+    }));
+    rig.server->set_down(false);
+    rig.wait();
+    EXPECT_TRUE(rig.exec->operator_errors().empty());
+    EXPECT_TRUE(ns_each_landed(*rig.server, 0, 50));
+    // Every attempt but the last failed, and each was retried after one wait.
+    ASSERT_GE(rig.server->connects(), 3U);
+    const std::uint64_t failed = rig.server->connects() - 1;
+    EXPECT_EQ(ns_count(rig.metrics, transient), failed);
+    EXPECT_EQ(ns_observations(rig.metrics, waits), failed);
+    EXPECT_EQ(ns_connector("errors_total"), errors_before + failed);
     EXPECT_EQ(ns_count(rig.metrics, ns_name(metric::kReconnectsTotal, rig.op_id())), 1U);
 }
 
@@ -1324,6 +1568,27 @@ TEST(NativeSinkFailover, ARefusingFirstEndpointIsSkippedAndARebuildStaysOnTheOne
     EXPECT_EQ(down->rows(kNsTable), 0U);
 }
 
+// The open moves on from an endpoint that refuses its connect, and stays on
+// one that answered when a read of its metadata fails.
+TEST(NativeSinkFailover, AMetadataFailureAtOpenStaysOnTheEndpointThatAnswered) {
+    NsRig rig;
+    const Endpoint first{"ch-1", 9000};
+    const Endpoint second{"ch-2", 9000};
+    auto other = rig.add_server();
+    set_transport_factory_for_testing(
+        fake::fake_factory(std::map<Endpoint, std::shared_ptr<fake::FakeServer>>{
+            {first, rig.server}, {second, other}}));
+    rig.params["endpoints"] = "ch-1:9000,ch-2:9000";
+    rig.params["retry_window_ms"] = "60000";
+    rig.server->inject(ns_fault(fake::Step::Select, fake::Fault::Kind::SystemError));
+    rig.start({ns_data(0, 20)});
+    rig.wait();
+    EXPECT_TRUE(rig.exec->operator_errors().empty());
+    EXPECT_TRUE(ns_each_landed(*rig.server, 0, 20));
+    EXPECT_EQ(rig.server->connects(), 2U);
+    EXPECT_EQ(other->connects(), 0U);
+}
+
 // --- Cancel -------------------------------------------------------------------------
 
 TEST(NativeSinkCancel, ACancelDuringABackoffFailsTheBarrierWithin200msAndLandsNothingOfIt) {
@@ -1436,6 +1701,109 @@ TEST(NativeSinkCancel, AnOpenStuckWhereNoInterruptReachesIsLeftBehindAndThenStay
     EXPECT_TRUE(ns_logs_since(since).empty());
     EXPECT_EQ(ns_connector("errors_total"), errors_before);
     EXPECT_EQ(rig.server->rows(kNsTable), 0U);
+}
+
+// The opener waits out its backoffs in slices that look at the cancel. By the
+// fifth attempt a backoff may run to 1.6 s, so a wait that ignored the cancel
+// would show in the time the open takes to end.
+TEST(NativeSinkCancel, ACancelDuringTheOpenersBackoffEndsTheOpenWithoutAnotherConnect) {
+    NsDirect d;
+    d.params["retry_window_ms"] = "60000";
+    d.server->set_down(true);
+    NativeSink& sink = d.build();
+    auto opened =
+        std::async(std::launch::async, [&sink] { return ns_error([&sink] { sink.open(); }); });
+    ASSERT_TRUE(ns_eventually([&d] { return d.server->connects() >= 5; }, 20s));
+    const std::size_t before = d.server->connects();
+    const auto cancelled_at = NsClock::now();
+    d.cancel->store(true);
+    ASSERT_EQ(opened.wait_for(2s), std::future_status::ready);
+    const auto took = NsClock::now() - cancelled_at;
+    const auto error = opened.get();
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kCancelled);
+    EXPECT_LE(took, 300ms);
+    // At most the attempt the cancel raced.
+    EXPECT_LE(d.server->connects(), before + 1);
+}
+
+// A probe blocked in a metadata read has a socket that interrupt() shuts
+// down, so the opener is joined rather than left behind: its client is gone
+// by the time open() returns.
+TEST(NativeSinkCancel, ACancelWhileTheProbeHangsJoinsTheOpenerBeforeOpenReturns) {
+    NsDirect d;
+    auto gone = std::make_shared<std::atomic<bool>>(false);
+    // The client takes 100 ms to go, so an open() that returned without
+    // joining the opener would find it still there.
+    set_transport_factory_for_testing(
+        [inner = fake::fake_factory(d.server), gone](const SinkOptions& options) {
+            return std::unique_ptr<InsertTransport>(
+                std::make_unique<NsWatched>(inner(options), gone, 100ms));
+        });
+    auto hanging = std::make_shared<std::atomic<bool>>(false);
+    fake::Fault hang = ns_fault(fake::Step::Select, fake::Fault::Kind::Hang);
+    hang.on_fire = [hanging] { hanging->store(true); };
+    d.server->inject(std::move(hang));
+    NativeSink& sink = d.build();
+    auto opened = std::async(std::launch::async, [&sink, gone] {
+        auto error = ns_error([&sink] { sink.open(); });
+        return std::make_pair(error, gone->load());
+    });
+    ASSERT_TRUE(ns_eventually([&hanging] { return hanging->load(); }));
+    const auto cancelled_at = NsClock::now();
+    d.cancel->store(true);
+    ASSERT_EQ(opened.wait_for(2s), std::future_status::ready);
+    const auto took = NsClock::now() - cancelled_at;
+    const auto [error, gone_at_return] = opened.get();
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kCancelled);
+    EXPECT_LE(took, 300ms);
+    EXPECT_TRUE(gone_at_return) << "the opener was left behind instead of joined";
+}
+
+// Rows the writer had not yet taken from its queue are as unacknowledged as
+// the INSERT it holds, and the restart replays them too, so the cancelled
+// summary counts them.
+TEST(NativeSinkCancel, TheCancelledSummaryCountsTheQueuedRowsAsAbandonedToo) {
+    NsDirect d;
+    d.params["batch_rows"] = "5";
+    auto hanging = std::make_shared<std::atomic<bool>>(false);
+    fake::Fault hang = ns_fault(fake::Step::End, fake::Fault::Kind::Hang);
+    hang.on_fire = [hanging] { hanging->store(true); };
+    d.server->inject(std::move(hang));
+    const std::int64_t since = ns_log_mark();
+    NativeSink& sink = d.open();
+    sink.on_data(ns_rows(0, 5));
+    ASSERT_TRUE(ns_eventually([&hanging] { return hanging->load(); }));
+    // The writer is held in the first INSERT's End, so these stay queued.
+    sink.on_data(ns_rows(5, 15));
+    sink.close_cancelled();
+    EXPECT_EQ(d.server->rows(kNsTable), 0U);
+    const std::string summary = ns_cancelled_summary(since);
+    EXPECT_TRUE(ns_has(summary, " rows_acknowledged=0 ")) << summary;
+    EXPECT_TRUE(ns_has(summary, " abandoned_rows=15 ")) << summary;
+    // Only the INSERT in flight counts as an abandoned INSERT.
+    EXPECT_EQ(ns_count(d.metrics,
+                       ns_name(metric::kInsertsTotal, NsDirect::kOpId, "outcome", "abandoned")),
+              1U);
+}
+
+// However soon the cancel comes, the summary accounts for every row the sink
+// was given: acknowledged, or abandoned wherever the writer held it, in its
+// queue, in the chunk it was taking in or in an INSERT.
+TEST(NativeSinkCancel, EveryRowIsAcknowledgedOrAbandonedHoweverSoonTheCancelComes) {
+    for (int run = 0; run < 25; ++run) {
+        SCOPED_TRACE(run);
+        NsDirect d;
+        d.params["batch_rows"] = "4";
+        const std::int64_t since = ns_log_mark();
+        NativeSink& sink = d.open();
+        sink.on_data(ns_rows(0, 10));
+        sink.close_cancelled();
+        const std::string summary = ns_cancelled_summary(since);
+        EXPECT_EQ(ns_field(summary, "rows_acknowledged") + ns_field(summary, "abandoned_rows"), 10U)
+            << summary;
+    }
 }
 
 // --- Rows the target cannot take ----------------------------------------------------

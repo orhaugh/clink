@@ -81,8 +81,10 @@ struct WriterStats {
     // a target that keeps a deduplication log: once per INSERT, and never
     // also counted above.
     std::uint64_t rows_resent_with_token{0};
-    // Rows of an INSERT that was in flight when the writer stopped or failed
-    // and that the server had not acknowledged. The job's restart replays them.
+    // Rows submitted to the writer that the server had not acknowledged when
+    // it stopped or failed: those of the INSERT in flight, of the chunk it
+    // was taking in, and of the chunks still queued. The job's restart
+    // replays them.
     std::uint64_t abandoned_rows{0};
     std::uint64_t wire_bytes{0};
     std::array<std::uint64_t, kFailureClasses> retries{};  // by FailureClass
@@ -122,9 +124,9 @@ public:
     void finish();
     // Any thread: stop, interrupt the transport, join for up to 5 s, then
     // detach a writer still inside a call that cannot be interrupted. Logs
-    // the cancelled summary once; for a detached writer it counts the rows of
-    // the INSERT the writer was holding as abandoned first, since the writer
-    // reports nothing more. Idempotent, and a no-op after finish(). Never
+    // the cancelled summary once, with the rows still queued counted as
+    // abandoned; for a detached writer it also counts the rows the writer was
+    // holding, since the writer reports nothing more. Idempotent, and a no-op after finish(). Never
     // throws.
     void abort() noexcept;
 

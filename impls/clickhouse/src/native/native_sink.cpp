@@ -310,7 +310,9 @@ void OpenState::attempts(std::unique_ptr<InsertTransport>& t,
             throw;
         } catch (const NativeSinkError&) {
             // A refusal rests on what a server said or on the options, which
-            // no retry changes.
+            // no retry changes. It is still a failed attempt, which the
+            // writer counts the same way when a reconnect meets one.
+            report([] { mm::connector::error_inc(metric::kConnector); });
             throw;
         } catch (...) {
             failure_seen = to_failure(std::current_exception(), phase, false);
@@ -351,6 +353,18 @@ void OpenState::attempts(std::unique_ptr<InsertTransport>& t,
                     " attempts); the last failed at " + phase_name(phase) + " on " +
                     endpoint_text(ep) + " (" + to_string(cls) + "): " + f.message);
         }
+        // The same series the writer moves for a retried INSERT, so an outage
+        // that holds the open shows in them while it lasts, not only once a
+        // client gets through.
+        report([&] {
+            if (metrics != nullptr) {
+                metrics->counter(tagged(metric::kRetriesTotal, op_id, "class", to_string(cls)))
+                    .increment();
+                if (cls == FailureClass::MergeBackpressure) {
+                    metrics->counter(tagged(metric::kPartsBackoffTotal, op_id)).increment();
+                }
+            }
+        });
         report([&] {
             clink::logging::op_log(
                 logger,
@@ -361,9 +375,22 @@ void OpenState::attempts(std::unique_ptr<InsertTransport>& t,
                     phase_name(phase) + " on " + endpoint_text(ep) + " (" + to_string(cls) +
                     "): " + f.message + "; retrying in " + std::to_string(wait.count()) + " ms");
         });
+        const Clock::time_point wait_start = Clock::now();
         if (!cancellable_wait(wait, cancel, stop)) {
             throw OpenerStopped{};
         }
+        const auto waited =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wait_start).count();
+        report([&] {
+            if (metrics != nullptr) {
+                // The writer's bounds: whichever registers the series first
+                // sets them.
+                metrics
+                    ->histogram(tagged(metric::kRetryWaitNs, op_id),
+                                {metric::kNsBounds.begin(), metric::kNsBounds.end()})
+                    .observe(static_cast<double>(waited));
+            }
+        });
     }
 }
 

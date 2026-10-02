@@ -302,6 +302,17 @@ struct Item {
     std::uint64_t ticket{0};
 };
 
+// The rows of the chunks in `items`, which a stopping writer drops unsent.
+std::uint64_t chunk_rows(const std::deque<Item>& items) {
+    std::uint64_t rows = 0;
+    for (const Item& item : items) {
+        if (item.kind == Item::Kind::Chunk && item.chunk.batch) {
+            rows += static_cast<std::uint64_t>(item.chunk.batch->num_rows());
+        }
+    }
+    return rows;
+}
+
 }  // namespace
 
 struct Writer::Core {
@@ -423,6 +434,10 @@ struct Writer::Core {
     BlockBuilder builder_;
     std::unique_ptr<Insert> current_;
     std::uint64_t current_acked_{0};  // rows of current_ acknowledged through split halves
+    // Rows of the chunk consume() is taking in that no INSERT holds yet. They
+    // have left the queue, so without this a stop mid-chunk would lose them
+    // from the abandoned count.
+    std::uint64_t consuming_{0};
     std::uint64_t written_seen_{0};
     PartRateMonitor part_rate_;
 
@@ -440,9 +455,9 @@ struct Writer::Core {
     std::exception_ptr failure_;
     std::atomic<std::size_t> queue_bytes_now_{0};
     std::atomic<bool> stop_{false};
-    // The unacknowledged rows of the INSERT in flight, kept by the writer
-    // thread so that abort() can count them when it detaches a writer that
-    // will never get as far as counting them itself.
+    // The unacknowledged rows of the INSERT in flight and of the chunk being
+    // taken in, kept by the writer thread so that abort() can count them when
+    // it detaches a writer that will never get as far as counting them itself.
     std::atomic<std::uint64_t> in_flight_rows_{0};
 
     // Joining or detaching the thread, once.
@@ -585,6 +600,14 @@ void Writer::Core::abort_and_join() noexcept {
     }
     work_cv_.notify_all();
     done_cv_.notify_all();
+    // Rows the writer never took from the queue are as unacknowledged as
+    // those it holds, and the restart replays them too: the summary below
+    // counts every submitted row the server did not acknowledge, however far
+    // the writer had got.
+    if (const std::uint64_t rows = chunk_rows(dropped); rows > 0) {
+        const std::lock_guard<std::mutex> stats(stats_mu_);
+        stats_.abandoned_rows += rows;
+    }
     dropped.clear();
     report_queue_bytes();
 
@@ -601,10 +624,11 @@ void Writer::Core::abort_and_join() noexcept {
                 // Still inside a call with no fd to shut down. The thread
                 // owns everything it touches through its share of this Core,
                 // and its poisoned socket cannot commit when it goes; from
-                // here on it reports nothing. So the INSERT it holds, which
-                // the job's restart replays, is counted as abandoned here,
-                // for the summary below, and give_up() on the thread then
-                // finds it counted.
+                // here on it reports nothing. So the INSERT it holds, and
+                // the rest of the chunk it was taking in, which the job's
+                // restart replays, are counted as abandoned here, for the
+                // summary below, and give_up() on the thread then finds them
+                // counted.
                 {
                     const std::lock_guard<std::mutex> lock(report_mu_);
                     const std::uint64_t rows =
@@ -678,6 +702,11 @@ void Writer::Core::run() noexcept {
         exited_ = true;
         closed_ = true;
         dropped.swap(items_);
+        // Counted before abort() can see exited_ and log its summary.
+        if (const std::uint64_t rows = chunk_rows(dropped); rows > 0) {
+            const std::lock_guard<std::mutex> stats(stats_mu_);
+            stats_.abandoned_rows += rows;
+        }
         queued_bytes_ = 0;
         queued_chunks_ = 0;
         queue_bytes_now_.store(0, std::memory_order_relaxed);
@@ -751,6 +780,8 @@ void Writer::Core::consume(Chunk chunk) {
     const arrow::RecordBatch& batch = *shared->batch;
     const std::int64_t total = batch.num_rows();
     std::int64_t offset = 0;
+    consuming_ = static_cast<std::uint64_t>(total);
+    track_in_flight();
     while (offset < total) {
         check_stop();
         if (!current_) {
@@ -828,7 +859,7 @@ void Writer::Core::finish_current() {
 }
 
 void Writer::Core::track_in_flight() noexcept {
-    in_flight_rows_.store(unacknowledged_rows(), std::memory_order_release);
+    in_flight_rows_.store(unacknowledged_rows() + consuming_, std::memory_order_release);
 }
 
 void Writer::Core::append(Insert& in,
@@ -851,6 +882,9 @@ void Writer::Core::append(Insert& in,
         in.first_row = Clock::now();
     }
     in.rows += static_cast<std::uint64_t>(rows);
+    // The rows move from the chunk to the INSERT in one step, so a detaching
+    // abort() never counts them twice.
+    consuming_ -= std::min(consuming_, static_cast<std::uint64_t>(rows));
     track_in_flight();
     in.charge.resize(in.owned + builder_.owned_bytes());
 }
@@ -1458,7 +1492,8 @@ void Writer::Core::after_attempt(bool failed) {
 void Writer::Core::fail(const char* code, const std::string& message) {
     transport_->abandon();
     const NativeSinkError error(code, message);
-    give_up(unacknowledged_rows(), current_ != nullptr ? metrics_.inserts_failed : nullptr);
+    give_up(unacknowledged_rows() + consuming_,
+            current_ != nullptr ? metrics_.inserts_failed : nullptr);
     log(LogSeverity::Error, error.what());
     // Stored last: the task thread may act on the failure the moment it sees
     // it, and everything reported about it is in place by then.
@@ -1545,8 +1580,11 @@ void Writer::Core::on_stopped() noexcept {
     try {
         transport_->abandon();
         after_attempt(false);
-        const std::uint64_t rows = unacknowledged_rows();
-        give_up(rows, rows > 0 ? metrics_.inserts_abandoned : nullptr);
+        // Only an INSERT counts as an abandoned one; the rows of a chunk not
+        // yet in one count as abandoned rows all the same.
+        const std::uint64_t insert_rows = unacknowledged_rows();
+        const std::uint64_t rows = insert_rows + consuming_;
+        give_up(rows, insert_rows > 0 ? metrics_.inserts_abandoned : nullptr);
         store(std::make_exception_ptr(NativeSinkError(
             code::kCancelled,
             "clickhouse native sink: the writer stopped on cancel" +
