@@ -9,6 +9,19 @@
 //     failing it, and on a bounded job costs one restart and loses no rows;
 //   - timestamps and dates leave the JSON decode exactly as written;
 //   - what happens to a script that writes one source to two sinks.
+//
+// Two suites run against a real server instead, and skip unless
+// CLINK_CLICKHOUSE_TEST_HOST names one (native port from
+// CLINK_CLICKHOUSE_TEST_PORT, default 9000; CLINK_CLICKHOUSE_TEST_USER and
+// CLINK_CLICKHOUSE_TEST_PASSWORD when set; CLINK_CLICKHOUSE_TEST_LINE, when
+// set, is the line the server must report). scripts/clickhouse-live.sh starts
+// the servers and runs them:
+//   - ClickHouseNativeSqlLive: the temporal, wide-integer, decimal and nullable
+//     values a script lands through insert_format='native' read back from the
+//     server equal to what the same script hands connector='collect';
+//   - ClickHouseLegacySqlLive: the text sink, configured as the tutorial
+//     configures it, lands every row once, and the server logs every INSERT
+//     with the settings the sink forces, for an ordinary user.
 
 #include <algorithm>
 #include <array>
@@ -17,6 +30,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -38,6 +52,7 @@
 
 #include <arpa/inet.h>
 #include <arrow/api.h>
+#include <clickhouse/client.h>
 #include <gtest/gtest.h>
 #include <sys/socket.h>
 
@@ -58,6 +73,7 @@
 #include "clink/test/test_cluster.hpp"
 
 #include "fake_transport.hpp"
+#include "native/clickhouse_transport.hpp"
 #include "native/column_plan.hpp"
 #include "native/insert_transport.hpp"
 #include "native/native_sink.hpp"
@@ -459,7 +475,11 @@ std::string render(const std::string& sql,
         const std::string element_sql = sql.substr(0, sql.size() - 2);  // "T[]"
         std::string out = "[";
         bool first = true;
-        for (const auto& e : composite_of(cell).as_array()) {
+        // Held in a local: a range-for over a member of a temporary dangles
+        // before the loop body runs, unless the compiler extends the
+        // temporary's life, which some do and others do not.
+        const JsonValue elements = composite_of(cell);
+        for (const auto& e : elements.as_array()) {
             out += (first ? "" : ",") + render(element_sql, *inner, e, true);
             first = false;
         }
@@ -470,7 +490,8 @@ std::string render(const std::string& sql,
         const auto sql_kv = split_args(sql.substr(4, sql.size() - 5));  // "MAP<K, V>"
         std::string out = "{";
         bool first = true;
-        for (const auto& [k, v] : composite_of(cell).as_object()) {
+        const JsonValue entries = composite_of(cell);
+        for (const auto& [k, v] : entries.as_object()) {
             out += (first ? "" : ",") + render(sql_kv[0], kv[0], JsonValue{k}, true) + ":" +
                    render(sql_kv[1], kv[1], v, true);
             first = false;
@@ -1697,6 +1718,546 @@ TEST(ClickHouseNativeSql, TwoInsertsFromOneSourceArePlannedApartOrRefused) {
             << "the script failed for a reason other than the chain rule:\n"
             << errors;
     }
+}
+
+// --- Against a real server ---------------------------------------------------
+
+std::string live_env(const char* name) {
+    const char* v = std::getenv(name);
+    return v == nullptr ? std::string{} : std::string(v);
+}
+
+// A quoted SQL string literal, for values that go into a WITH clause or a
+// ClickHouse statement.
+std::string sql_string(std::string_view text) {
+    std::string out = "'";
+    for (const char c : text) {
+        if (c == '\'' || c == '\\') {
+            out += '\\';
+        }
+        out += c;
+    }
+    return out + "'";
+}
+
+// The server a live case writes to, from the variables the live runner sets.
+// Each case gets a database of its own, dropped afterwards, and a client of
+// its own for the DDL and for reading the target back.
+class LiveSqlServer : public ::testing::Test {
+protected:
+    void SetUp() override {
+        host_ = live_env("CLINK_CLICKHOUSE_TEST_HOST");
+        if (host_.empty()) {
+            GTEST_SKIP() << "set CLINK_CLICKHOUSE_TEST_HOST to run the live SQL cases";
+        }
+        const std::string port = live_env("CLINK_CLICKHOUSE_TEST_PORT");
+        port_ = port.empty() ? 9000 : static_cast<std::uint16_t>(std::stoi(port));
+        user_ = live_env("CLINK_CLICKHOUSE_TEST_USER");
+        password_ = live_env("CLINK_CLICKHOUSE_TEST_PASSWORD");
+        ensure_installed();
+        // A case before this one may have left the fake installed; these
+        // cases go through the real transport.
+        native::set_transport_factory_for_testing(nullptr);
+
+        clickhouse::ClientOptions o;
+        o.SetHost(host_);
+        o.SetPort(port_);
+        if (!user_.empty()) {
+            o.SetUser(user_);
+        }
+        if (!password_.empty()) {
+            o.SetPassword(password_);
+        }
+        o.SetRethrowException(true);
+        client_ = std::make_unique<clickhouse::Client>(o);
+        const auto& info = client_->GetServerInfo();
+        line_ = std::to_string(info.version_major) + "." + std::to_string(info.version_minor);
+        RecordProperty("clickhouse_line", line_);
+        // The runner names the line it started, so a case pointed at the
+        // wrong server says so instead of passing for the wrong line.
+        if (const std::string want = live_env("CLINK_CLICKHOUSE_TEST_LINE"); !want.empty()) {
+            ASSERT_EQ(line_, want) << "the server on port " << port_ << " is not the line named";
+        }
+        std::random_device rd;
+        db_ = "clink_sql_live_" + std::to_string(::getpid()) + "_" +
+              std::to_string(std::mt19937_64(rd())() % 100000000);
+        client_->Execute("CREATE DATABASE " + db_);
+    }
+
+    void TearDown() override {
+        if (client_ == nullptr) {
+            return;
+        }
+        if (!db_.empty()) {
+            client_->Execute("DROP DATABASE IF EXISTS " + db_ + " SYNC");
+        }
+        for (const auto& user : users_) {
+            client_->Execute("DROP USER IF EXISTS " + user);
+        }
+    }
+
+    // Every cell of a SELECT as text: each expression must yield a String
+    // (a NULL in a Nullable(String) reads as empty text).
+    std::vector<std::vector<std::string>> rows(const std::string& sql) {
+        native::ResultSet rs;
+        client_->Select(sql,
+                        [&rs](const clickhouse::Block& b) { native::append_result_block(b, rs); });
+        return rs.rows;
+    }
+
+    std::string scalar(const std::string& sql) {
+        const auto r = rows(sql);
+        return r.empty() || r.front().empty() ? std::string{} : r.front().front();
+    }
+
+    // The WITH options that reach this server as `user` (the configured one
+    // when empty).
+    [[nodiscard]] std::string server_with(const std::string& user = {},
+                                          const std::string& password = {}) const {
+        std::string out = "connector='clickhouse', host=" + sql_string(host_) +
+                          ", port=" + sql_string(std::to_string(port_)) +
+                          ", database=" + sql_string(db_);
+        const std::string& u = user.empty() ? user_ : user;
+        const std::string& p = user.empty() ? password_ : password;
+        if (!u.empty()) {
+            out += ", user=" + sql_string(u);
+        }
+        if (!p.empty()) {
+            out += ", password=" + sql_string(p);
+        }
+        return out;
+    }
+
+    // count(), uniqExact(id) and the duplicates of `table`, as text.
+    void expect_content(const std::string& table, std::size_t produced) {
+        const auto gate = rows(
+            "SELECT toString(count()), toString(uniqExact(id)), "
+            "toString(count() - uniqExact(id)) FROM " +
+            db_ + "." + table);
+        ASSERT_EQ(gate.size(), 1U);
+        EXPECT_EQ(gate[0][0], std::to_string(produced)) << "count() on " << line_;
+        EXPECT_EQ(gate[0][1], std::to_string(produced)) << "uniqExact(id) on " << line_;
+        EXPECT_EQ(gate[0][2], "0") << "duplicates on " << line_;
+    }
+
+    std::string host_;
+    std::uint16_t port_{9000};
+    std::string user_;
+    std::string password_;
+    std::string line_;
+    std::string db_;
+    std::vector<std::string> users_;
+    std::unique_ptr<clickhouse::Client> client_;
+};
+
+class ClickHouseNativeSqlLive : public LiveSqlServer {};
+class ClickHouseLegacySqlLive : public LiveSqlServer {};
+
+// The temporal columns, every precision and both time-zoned spellings, beside
+// an integer past 2^53, two decimals and nullable columns. Each target is the
+// type a user would pick for the declared one.
+const std::vector<Column>& live_columns() {
+    static const std::vector<Column> columns = {
+        {"id", "BIGINT", "Int64"},
+        {"big", "BIGINT", "Int64"},
+        {"n", "BIGINT", "Nullable(Int64)"},
+        {"d", "DATE", "Date32"},
+        {"dd", "DATE", "Date"},
+        {"t0", "TIMESTAMP(0)", "DateTime64(0)"},
+        {"t3", "TIMESTAMP(3)", "DateTime64(3)"},
+        {"t6", "TIMESTAMP(6)", "DateTime64(6, 'UTC')"},
+        {"t9", "TIMESTAMP(9)", "DateTime64(9)"},
+        {"tz", "TIMESTAMPTZ", "DateTime64(6, 'Asia/Tokyo')"},
+        {"tz0", "TIMESTAMPTZ(0)", "DateTime64(0, 'America/New_York')"},
+        {"tz3", "TIMESTAMP(3) WITH TIME ZONE", "Nullable(DateTime64(3, 'Europe/London'))"},
+        {"tdt", "TIMESTAMP(0)", "DateTime"},
+        {"dec", "DECIMAL(10,2)", "Nullable(Decimal(12, 4))"},
+        {"dec0", "DECIMAL(18,0)", "Decimal(18, 0)"},
+    };
+    return columns;
+}
+
+// One generated row: every value inside the range of the column's target,
+// negative epochs and dates before 1970 included, each temporal value in
+// either form the engine's convention allows.
+JsonObject live_row(std::int64_t id, std::mt19937_64& rng) {
+    const auto uniform = [&rng](std::int64_t lo, std::int64_t hi) {
+        return std::uniform_int_distribution<std::int64_t>(lo, hi)(rng);
+    };
+    const auto date_cell = [&](std::int64_t lo, std::int64_t hi) {
+        const std::int64_t days = uniform(lo, hi);
+        return (id % 2 == 0) ? JsonValue{days} : JsonValue{civil_text(days)};
+    };
+    const auto ms_cell = [&](std::int64_t lo, std::int64_t hi, std::int64_t unit) {
+        const std::int64_t ms = uniform(lo / unit, hi / unit) * unit;
+        return (id % 3 == 0) ? JsonValue{std::to_string(ms)} : JsonValue{ms};
+    };
+    const auto max64 = std::numeric_limits<std::int64_t>::max();
+    const auto min64 = std::numeric_limits<std::int64_t>::min();
+    JsonObject row;
+    row["id"] = JsonValue{id};
+    row["big"] = JsonValue{uniform(min64, max64)};
+    row["n"] = id % 5 == 1 ? JsonValue{} : JsonValue{uniform(min64, max64)};
+    row["d"] = date_cell(-25567, 120529);
+    row["dd"] = date_cell(0, 65535);
+    row["t0"] = ms_cell(k1900Ms, k2299Ms, 1000);
+    row["t3"] = ms_cell(k1900Ms, k2299Ms, 1);
+    row["t6"] = ms_cell(k1900Ms, k2299Ms, 1);
+    row["t9"] = ms_cell(k1900Ms, kNanosMaxMs, 1);
+    row["tz"] = ms_cell(k1900Ms, k2299Ms, 1);
+    row["tz0"] = ms_cell(k1900Ms, k2299Ms, 1000);
+    row["tz3"] = id % 7 == 3 ? JsonValue{} : ms_cell(k1900Ms, k2299Ms, 1);
+    row["tdt"] = ms_cell(0, 4294967295000LL, 1000);
+    row["dec"] = id % 6 == 2
+                     ? JsonValue{}
+                     : JsonValue{static_cast<double>(uniform(-9999999999LL, 9999999999LL)) / 100.0};
+    row["dec0"] = JsonValue{uniform(-999999999999999999LL, 999999999999999999LL)};
+    return row;
+}
+
+// The edges, each on a row of its own: a millisecond and a second before the
+// epoch, the first and last instant of every range, 2^53 + 1, and NULLs.
+std::vector<JsonObject> live_edge_rows(std::mt19937_64& rng, std::int64_t& next_id) {
+    std::vector<JsonObject> rows;
+    const auto base = [&] { return live_row(next_id++, rng); };
+    {
+        JsonObject r = base();
+        r["big"] = JsonValue{kTwo53Plus1};
+        r["n"] = JsonValue{-kTwo53Plus1};
+        r["d"] = JsonValue{std::string("1969-12-31")};
+        r["dd"] = JsonValue{static_cast<std::int64_t>(0)};
+        r["t0"] = JsonValue{static_cast<std::int64_t>(-1000)};
+        r["t3"] = JsonValue{static_cast<std::int64_t>(-1)};
+        r["t6"] = JsonValue{static_cast<std::int64_t>(-1)};
+        r["t9"] = JsonValue{static_cast<std::int64_t>(-1)};
+        r["tz"] = JsonValue{std::string("-1")};
+        r["tz0"] = JsonValue{std::string("-1000")};
+        r["tz3"] = JsonValue{static_cast<std::int64_t>(-86400001)};
+        r["tdt"] = JsonValue{static_cast<std::int64_t>(0)};
+        r["dec"] = JsonValue{-0.05};
+        r["dec0"] = JsonValue{kTwo53Plus1};
+        rows.push_back(std::move(r));
+    }
+    {
+        JsonObject r = base();
+        r["big"] = JsonValue{std::numeric_limits<std::int64_t>::max()};
+        r["n"] = JsonValue{std::numeric_limits<std::int64_t>::min()};
+        r["d"] = JsonValue{std::string("1900-01-01")};
+        r["dd"] = JsonValue{std::string("2149-06-06")};
+        r["t0"] = JsonValue{k1900Ms};
+        r["t3"] = JsonValue{k2299Ms};
+        r["t6"] = JsonValue{k1900Ms};
+        r["t9"] = JsonValue{kNanosMaxMs};
+        r["tz"] = JsonValue{k2299Ms};
+        r["tz0"] = JsonValue{std::string("10413791999000")};
+        r["tz3"] = JsonValue{k1900Ms};
+        r["tdt"] = JsonValue{static_cast<std::int64_t>(4294967295000LL)};
+        r["dec"] = JsonValue{99999999.99};
+        r["dec0"] = JsonValue{static_cast<std::int64_t>(-999999999999999999LL)};
+        rows.push_back(std::move(r));
+    }
+    {
+        JsonObject r = base();
+        r["big"] = JsonValue{std::numeric_limits<std::int64_t>::min()};
+        r["n"] = JsonValue{};
+        r["d"] = JsonValue{static_cast<std::int64_t>(120529)};
+        r["dd"] = JsonValue{static_cast<std::int64_t>(65535)};
+        r["t0"] = JsonValue{std::string("10413791999000")};
+        r["t3"] = JsonValue{std::string("-2208988800000")};
+        r["t6"] = JsonValue{k2299Ms};
+        r["t9"] = JsonValue{k1900Ms};
+        r["tz"] = JsonValue{k1900Ms};
+        r["tz0"] = JsonValue{k1900Ms};
+        r["tz3"] = JsonValue{};
+        r["tdt"] = JsonValue{static_cast<std::int64_t>(0)};
+        r["dec"] = JsonValue{};
+        r["dec0"] = JsonValue{static_cast<std::int64_t>(0)};
+        rows.push_back(std::move(r));
+    }
+    {
+        JsonObject r = base();
+        r["d"] = JsonValue{static_cast<std::int64_t>(-25567)};
+        r["t0"] = JsonValue{static_cast<std::int64_t>(-14182940000)};  // 1969-07-20 20:17:40
+        r["t3"] = JsonValue{static_cast<std::int64_t>(-14182939999)};
+        r["t6"] = JsonValue{std::string("-14182940001")};
+        r["t9"] = JsonValue{static_cast<std::int64_t>(-2208988799999)};
+        r["dec"] = JsonValue{-99999999.99};
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+
+constexpr std::size_t kLiveGeneratedRows = 2000;
+constexpr std::size_t kLiveEdgeRows = 4;
+
+std::vector<std::string> live_lines() {
+    std::mt19937_64 rng(20261002);
+    std::int64_t next_id = 1;
+    std::vector<std::string> lines;
+    for (auto& r : live_edge_rows(rng, next_id)) {
+        lines.push_back(line_of(std::move(r), live_columns(), false));
+    }
+    for (std::size_t k = 0; k < kLiveGeneratedRows; ++k) {
+        lines.push_back(line_of(live_row(next_id++, rng), live_columns(), false));
+    }
+    return lines;
+}
+
+// The read-back expression of a column, as text the mapping's rendering can
+// be compared with: an instant in UTC whatever the column's display zone, and
+// a NULL as the word.
+std::string read_back(const Column& c) {
+    std::string type = c.target;
+    const bool nullable = inner_of(type, "Nullable").has_value();
+    if (nullable) {
+        type = *inner_of(type, "Nullable");
+    }
+    const std::string text = type.starts_with("DateTime") ? "toString(" + c.name + ", 'UTC')"
+                                                          : "toString(" + c.name + ")";
+    return nullable ? "ifNull(" + text + ", 'NULL')" : text;
+}
+
+// The server prints a decimal without trailing zeros, and the rendering pads
+// it to the target's scale, so both sides drop them before the comparison.
+std::string decimal_text(std::string text) {
+    if (text.find('.') == std::string::npos) {
+        return text;
+    }
+    while (text.ends_with('0')) {
+        text.pop_back();
+    }
+    if (text.ends_with('.')) {
+        text.pop_back();
+    }
+    return text == "-0" ? "0" : text;
+}
+
+// Through EmbeddedEngine and the real transport, a script lands DATE, every
+// TIMESTAMP precision and both TIMESTAMPTZ spellings, with dates before 1970
+// and negative epochs, plus an integer past 2^53, two decimals and nullable
+// columns, into a real MergeTree with insert_format='native'. Every value
+// read back from the server must be what the same script hands
+// connector='collect', under the sink's type mapping, and the content gates
+// hold. A handful of edge values are also checked against their literal
+// spelling, so that the comparison does not rest on the collect path alone.
+TEST_F(ClickHouseNativeSqlLive, LandsWhatTheCollectSinkSeesForTemporalAndWideValues) {
+    const auto& columns = live_columns();
+    const ScratchDir dir("live_native");
+    const auto lines = live_lines();
+    write_lines(dir.path() / "in.ndjson", lines);
+    std::string target = "CREATE TABLE " + db_ + ".events (";
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+        target += (i == 0 ? "" : ", ") + columns[i].name + " " + columns[i].target;
+    }
+    client_->Execute(target + ") ENGINE = MergeTree ORDER BY id");
+
+    const std::string ddl = "CREATE TABLE src " + column_ddl(columns) +
+                            " WITH (connector='file', format='json', path='" +
+                            (dir.path() / "in.ndjson").string() + "');";
+    const std::string select = "SELECT " + column_list("", columns) + " FROM src;";
+
+    const auto collected = run_into_collect(ddl, "INSERT INTO out " + select, columns);
+    ASSERT_EQ(collected.size(), lines.size());
+    {
+        clink::embed::EngineOptions opts;
+        std::ostringstream err;
+        opts.err = &err;
+        opts.out = &err;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        ASSERT_EQ(
+            engine.execute_script(ddl + "CREATE TABLE ch " + column_ddl(columns) + " WITH (" +
+                                  server_with() + ", insert_format='native', table='events');"),
+            0)
+            << err.str();
+        ASSERT_EQ(engine.execute_script("INSERT INTO ch " + select), 0) << err.str();
+        const bool ok = engine.await_all();
+        std::string errors;
+        for (const auto& e : engine.errors()) {
+            errors += e + "\n";
+        }
+        ASSERT_TRUE(ok) << "the native job failed on " << line_ << ":\n" << errors << err.str();
+    }
+
+    expect_content("events", lines.size());
+
+    std::string exprs;
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+        exprs += (i == 0 ? "" : ", ") + read_back(columns[i]);
+    }
+    std::map<std::int64_t, std::map<std::string, std::string>> landed;
+    for (auto& row : rows("SELECT " + exprs + " FROM " + db_ + ".events")) {
+        std::map<std::string, std::string> cells;
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            cells[columns[i].name] = std::move(row[i]);
+        }
+        const std::int64_t id = std::stoll(cells.at("id"));
+        ASSERT_TRUE(landed.emplace(id, std::move(cells)).second) << "id " << id << " twice";
+    }
+    ASSERT_EQ(landed.size(), lines.size());
+
+    std::size_t mismatches = 0;
+    for (const auto& [id, cells] : collected) {
+        const auto it = landed.find(id);
+        ASSERT_NE(it, landed.end()) << "id " << id << " never landed";
+        for (const auto& c : columns) {
+            const bool decimal = c.target.find("Decimal") != std::string::npos;
+            std::string want = render(mapping_sql(c), c.target, cells.at(c.name), false);
+            std::string got = it->second.at(c.name);
+            if (decimal) {
+                want = decimal_text(want);
+                got = decimal_text(got);
+            }
+            if (got != want && ++mismatches <= 20) {
+                ADD_FAILURE() << line_ << ", id " << id << ", column " << c.name << " (" << c.sql
+                              << " into " << c.target << "): the server holds '" << got
+                              << "', collected " << cells.at(c.name).serialize(0) << " maps to '"
+                              << want << "'";
+            }
+        }
+    }
+    EXPECT_EQ(mismatches, 0U);
+
+    // The edge rows, by what the script wrote rather than by the collect sink.
+    const std::map<std::pair<std::int64_t, std::string>, std::string> literal = {
+        {{1, "big"}, "9007199254740993"},
+        {{1, "n"}, "-9007199254740993"},
+        {{1, "dec0"}, "9007199254740993"},
+        {{1, "d"}, "1969-12-31"},
+        {{1, "t0"}, "1969-12-31 23:59:59"},
+        {{1, "t3"}, "1969-12-31 23:59:59.999"},
+        {{1, "t6"}, "1969-12-31 23:59:59.999000"},
+        {{1, "t9"}, "1969-12-31 23:59:59.999000000"},
+        {{1, "tz"}, "1969-12-31 23:59:59.999000"},
+        {{1, "tz0"}, "1969-12-31 23:59:59"},
+        {{1, "tz3"}, "1969-12-30 23:59:59.999"},
+        {{1, "dec"}, "-0.05"},
+        {{2, "big"}, "9223372036854775807"},
+        {{2, "n"}, "-9223372036854775808"},
+        {{2, "d"}, "1900-01-01"},
+        {{2, "dd"}, "2149-06-06"},
+        {{2, "t0"}, "1900-01-01 00:00:00"},
+        {{2, "t3"}, "2299-12-31 23:59:59.999"},
+        {{2, "t9"}, "2262-04-11 23:47:16.854000000"},
+        {{2, "tdt"}, "2106-02-07 06:28:15"},
+        {{2, "dec"}, "99999999.99"},
+        {{2, "dec0"}, "-999999999999999999"},
+        {{3, "n"}, "NULL"},
+        {{3, "tz3"}, "NULL"},
+        {{3, "dec"}, "NULL"},
+        {{3, "d"}, "2299-12-31"},
+        {{4, "d"}, "1900-01-01"},
+        {{4, "t0"}, "1969-07-20 20:17:40"},
+        {{4, "t3"}, "1969-07-20 20:17:40.001"},
+        {{4, "t6"}, "1969-07-20 20:17:39.999000"},
+        {{4, "t9"}, "1900-01-01 00:00:00.001000000"},
+    };
+    for (const auto& [key, want] : literal) {
+        const auto& [id, column] = key;
+        std::string got = landed.at(id).at(column);
+        if (column.starts_with("dec")) {
+            got = decimal_text(got);
+        }
+        EXPECT_EQ(got, want) << line_ << ", edge row " << id << ", column " << column;
+    }
+}
+
+// The text sink with format='json' and batch_rows='1', as the Kafka to
+// ClickHouse tutorial's pipeline configures it, writing as an ordinary user
+// that holds INSERT on the one table and nothing else. Every row lands once,
+// with its values, and system.query_log shows that every INSERT carried
+// async_insert=0, wait_for_async_insert=1 and a deduplication token of its
+// own: the server accepted the forced settings from that user and ran them.
+TEST_F(ClickHouseLegacySqlLive, TheTutorialsTextSinkLandsEveryRowOnceWithItsForcedSettings) {
+    constexpr std::int64_t kRows = 60;
+    const ScratchDir dir("live_legacy");
+    std::vector<std::string> lines;
+    std::map<std::int64_t, std::vector<std::string>> sent;
+    for (std::int64_t id = 1; id <= kRows; ++id) {
+        const std::string name =
+            unicode_texts()[static_cast<std::size_t>(id) % unicode_texts().size()] + " #" +
+            std::to_string(id);
+        const std::int64_t big = kTwo53Plus1 + id;
+        const double v = static_cast<double>(id) / 4.0;
+        JsonObject row;
+        row["id"] = JsonValue{id};
+        row["name"] = JsonValue{name};
+        row["big"] = JsonValue{big};
+        row["v"] = JsonValue{v};
+        lines.push_back(JsonValue{std::move(row)}.serialize(0));
+        sent[id] = {std::to_string(id), name, std::to_string(big), shortest(v)};
+    }
+    write_lines(dir.path() / "in.ndjson", lines);
+    client_->Execute("CREATE TABLE " + db_ +
+                     ".events (id Int64, name String, big Int64, v Float64) "
+                     "ENGINE = MergeTree ORDER BY id");
+
+    std::random_device rd;
+    const std::string user =
+        "clink_sql_live_writer_" + std::to_string(std::mt19937_64(rd())() % 100000000);
+    const std::string password = "pw-" + std::to_string(std::mt19937_64(rd())());
+    client_->Execute("CREATE USER " + user + " IDENTIFIED WITH sha256_password BY " +
+                     sql_string(password));
+    users_.push_back(user);
+    client_->Execute("GRANT INSERT ON " + db_ + ".events TO " + user);
+
+    const std::string script =
+        "CREATE TABLE src (id BIGINT, name VARCHAR, big BIGINT, v DOUBLE) WITH ("
+        "connector='file', format='json', path='" +
+        (dir.path() / "in.ndjson").string() +
+        "');"
+        "CREATE TABLE out (id BIGINT, name VARCHAR, big BIGINT, v DOUBLE) WITH (" +
+        server_with(user, password) +
+        ", table='events', format='json', batch_rows='1');"
+        "INSERT INTO out SELECT id, name, big, v FROM src;";
+    {
+        clink::embed::EngineOptions opts;
+        std::ostringstream err;
+        opts.err = &err;
+        opts.out = &err;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        ASSERT_EQ(engine.execute_script(script), 0) << err.str();
+        const bool ok = engine.await_all();
+        std::string errors;
+        for (const auto& e : engine.errors()) {
+            errors += e + "\n";
+        }
+        ASSERT_TRUE(ok) << "the text sink's job failed on " << line_ << ":\n"
+                        << errors << err.str();
+    }
+
+    expect_content("events", static_cast<std::size_t>(kRows));
+    const auto landed = rows("SELECT toString(id), name, toString(big), toString(v) FROM " + db_ +
+                             ".events ORDER BY id");
+    ASSERT_EQ(landed.size(), static_cast<std::size_t>(kRows));
+    for (const auto& row : landed) {
+        const std::int64_t id = std::stoll(row[0]);
+        EXPECT_EQ(row, sent.at(id)) << line_ << ", id " << id;
+    }
+
+    client_->Execute("SYSTEM FLUSH LOGS");
+    const std::string mine = " FROM system.query_log WHERE user = " + sql_string(user) +
+                             " AND query_kind = 'Insert' AND has(databases, " + sql_string(db_) +
+                             ")";
+    EXPECT_EQ(scalar("SELECT toString(count())" + mine + " AND type != 'QueryFinish'" +
+                     " AND type != 'QueryStart'"),
+              "0")
+        << "an INSERT failed on " << line_;
+    const auto logged = rows(
+        "SELECT ifNull(Settings['async_insert'], ''), "
+        "ifNull(Settings['wait_for_async_insert'], ''), "
+        "ifNull(Settings['insert_deduplication_token'], ''), query" +
+        mine + " AND type = 'QueryFinish'");
+    // batch_rows='1' flushes after every row, so every row is an INSERT.
+    EXPECT_EQ(logged.size(), static_cast<std::size_t>(kRows)) << "INSERTs logged on " << line_;
+    std::set<std::string> tokens;
+    for (const auto& entry : logged) {
+        SCOPED_TRACE(entry[3]);
+        EXPECT_EQ(entry[0], "0") << "async_insert on " << line_;
+        EXPECT_EQ(entry[1], "1") << "wait_for_async_insert on " << line_;
+        EXPECT_FALSE(entry[2].empty()) << "insert_deduplication_token on " << line_;
+        tokens.insert(entry[2]);
+    }
+    EXPECT_EQ(tokens.size(), logged.size()) << "two INSERTs shared a token on " << line_;
 }
 
 }  // namespace

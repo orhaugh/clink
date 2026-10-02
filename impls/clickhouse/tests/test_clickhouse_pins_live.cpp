@@ -721,7 +721,12 @@ TEST_F(ClickHousePins, P18AReplicatedMergeTreeAsyncInsertDefaultAppliesToReplica
 #if defined(CLINK_CLICKHOUSE_NATIVE)
 // P19: every metadata SELECT the sink sends at open, as its own statement
 // builders write them, returns only String columns on this line, and the real
-// transport reads each one.
+// transport reads each one. The cluster reads lead with the replica each row
+// came from, as host:port, and that server's UUID, both evaluated on the
+// replica: here the one-shard cluster is this server, so both must equal what
+// this server reports for itself. The macros read returns no rows on a server
+// without macros, which these are, so for it only the header's types are
+// checked.
 TEST_F(ClickHousePins, P19EveryProbeSelectReturnsOnlyStringColumns) {
     namespace native = clink::clickhouse::native;
     client_->Execute("CREATE TABLE " + db_ +
@@ -730,22 +735,56 @@ TEST_F(ClickHousePins, P19EveryProbeSelectReturnsOnlyStringColumns) {
                      ".dist (k Int64, p Int64) ENGINE = Distributed(clink_pins_local, " + db_ +
                      ", local)");
     const auto budget = native::metadata_budget(std::chrono::seconds(30));
-    const std::vector<std::pair<native::MetaQuery, std::string>> probes{
-        {native::MetaQuery::ServerSettings, native::select_server_settings(budget)},
-        {native::MetaQuery::Table, native::select_table(db_, "dist", budget)},
-        {native::MetaQuery::Columns, native::select_columns(db_, "dist", budget)},
-        {native::MetaQuery::MergeTreeSettings, native::select_merge_tree_settings(budget)},
-        {native::MetaQuery::ReplicatedMergeTreeSettings,
-         native::select_replicated_merge_tree_settings(budget)},
-        {native::MetaQuery::ClusterReplicaCount,
-         native::select_cluster_replica_count("clink_pins_local", budget)},
-        {native::MetaQuery::ClusterTables,
-         native::select_cluster_tables("clink_pins_local", db_, "local", budget)},
-        {native::MetaQuery::ClusterMergeTreeSettings,
-         native::select_cluster_merge_tree_settings("clink_pins_local", budget)},
-        {native::MetaQuery::ClusterReplicatedMergeTreeSettings,
-         native::select_cluster_replicated_merge_tree_settings("clink_pins_local", budget)},
+    struct Probe {
+        native::MetaQuery kind;
+        std::string sql;
+        bool cluster;  // leads with the replica's host:port and serverUUID()
+        bool may_be_empty;
     };
+    const std::vector<Probe> probes{
+        {native::MetaQuery::ServerSettings, native::select_server_settings(budget), false, false},
+        {native::MetaQuery::Table, native::select_table(db_, "dist", budget), false, false},
+        {native::MetaQuery::Columns, native::select_columns(db_, "dist", budget), false, false},
+        {native::MetaQuery::MergeTreeSettings,
+         native::select_merge_tree_settings(budget),
+         false,
+         false},
+        {native::MetaQuery::ReplicatedMergeTreeSettings,
+         native::select_replicated_merge_tree_settings(budget),
+         false,
+         false},
+        {native::MetaQuery::ClusterReplicaCount,
+         native::select_cluster_replica_count("clink_pins_local", budget),
+         false,
+         false},
+        {native::MetaQuery::ClusterReplicaCount, native::select_macros(budget), false, true},
+        {native::MetaQuery::ClusterTables,
+         native::select_cluster_tables("clink_pins_local", db_, "local", budget),
+         true,
+         false},
+        {native::MetaQuery::ClusterMergeTreeSettings,
+         native::select_cluster_merge_tree_settings("clink_pins_local", budget),
+         true,
+         false},
+        {native::MetaQuery::ClusterReplicatedMergeTreeSettings,
+         native::select_cluster_replicated_merge_tree_settings("clink_pins_local", budget),
+         true,
+         false},
+    };
+    // What this server says of itself, for the cluster reads' leading columns.
+    std::string self_endpoint;
+    std::string self_uuid;
+    client_->Select("SELECT concat(hostName(), ':', toString(tcpPort())), toString(serverUUID())",
+                    [&](const Block& b) {
+                        if (b.GetRowCount() > 0) {
+                            self_endpoint = std::string(b[0]->As<ColumnString>()->At(0));
+                            self_uuid = std::string(b[1]->As<ColumnString>()->At(0));
+                        }
+                    });
+    ASSERT_FALSE(self_endpoint.empty());
+    ASSERT_NE(self_uuid, "00000000-0000-0000-0000-000000000000")
+        << "the server has no UUID on " << line_;
+
     native::SinkOptions opts;
     const auto o = *server_options();
     opts.endpoints = {native::Endpoint{o.host, o.port}};
@@ -758,19 +797,31 @@ TEST_F(ClickHousePins, P19EveryProbeSelectReturnsOnlyStringColumns) {
     opts.compression = native::Compression::None;
     auto transport = native::make_clickhouse_transport(opts);
     transport->connect(opts.endpoints.front());
-    for (const auto& [kind, sql] : probes) {
-        SCOPED_TRACE(sql);
+    for (const auto& probe : probes) {
+        SCOPED_TRACE(probe.sql);
         std::size_t result_rows = 0;
-        client_->Select(sql, [&](const Block& b) {
+        std::size_t typed_columns = 0;
+        client_->Select(probe.sql, [&](const Block& b) {
             result_rows += b.GetRowCount();
+            typed_columns = std::max(typed_columns, b.GetColumnCount());
             for (std::size_t c = 0; c < b.GetColumnCount(); ++c) {
                 EXPECT_EQ(b[c]->Type()->GetName(), "String")
                     << "column " << b.GetColumnName(c) << " on " << line_;
             }
         });
-        EXPECT_GT(result_rows, 0U) << "the probe read nothing on " << line_;
-        const auto rs = transport->select(kind, sql);
+        EXPECT_GT(typed_columns, 0U) << "no block with columns came back on " << line_;
+        if (!probe.may_be_empty) {
+            EXPECT_GT(result_rows, 0U) << "the probe read nothing on " << line_;
+        }
+        const auto rs = transport->select(probe.kind, probe.sql);
         EXPECT_EQ(rs.rows.size(), result_rows);
+        if (probe.cluster) {
+            ASSERT_GT(rs.columns.size(), 2U);
+            for (const auto& row : rs.rows) {
+                EXPECT_EQ(row[0], self_endpoint) << "the replica's host:port on " << line_;
+                EXPECT_EQ(row[1], self_uuid) << "the replica's serverUUID() on " << line_;
+            }
+        }
     }
     transport->abandon();
 }
