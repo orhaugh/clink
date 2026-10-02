@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/frame_io.hpp"
+#include "clink/cluster/in_doubt_resolution.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/operator_registry.hpp"
@@ -221,6 +223,19 @@ public:
         m.had_error = false;
         std::lock_guard lock(send_mu_);
         return send_frame(*conn_, encode_frame(MessageKind::SubtaskFinished, m));
+    }
+
+    // What a bounded source sends at the end of its input: the reply carries
+    // the final checkpoint id it injects.
+    [[nodiscard]] bool request_final_checkpoint(JobId job_id,
+                                                const std::string& role,
+                                                std::uint32_t subtask) {
+        RequestFinalCheckpointMsg m;
+        m.job_id = job_id;
+        m.role = role;
+        m.subtask_idx = subtask;
+        std::lock_guard lock(send_mu_);
+        return send_frame(*conn_, encode_frame(MessageKind::RequestFinalCheckpoint, m));
     }
 
     [[nodiscard]] bool ack_checkpoint(JobId job_id,
@@ -409,6 +424,11 @@ struct CheckpointFixture {
         std::error_code ec;
         return std::filesystem::exists(
             dir / "_jobs" / std::to_string(job_id) / ("COMPLETED-" + std::to_string(ckpt_id)), ec);
+    }
+
+    // The tasks the coordinator deployed, as its Deploy frame named them.
+    [[nodiscard]] const std::vector<std::pair<std::string, std::uint32_t>>& deployed() const {
+        return deployed_;
     }
 
     std::filesystem::path dir;
@@ -643,6 +663,112 @@ TEST(CheckpointCompletion, AFailedCheckpointWithNoRestartBudgetFailsTheJobInstea
     EXPECT_TRUE(named) << "the job's failure does not name the cause";
 }
 
+// --- an id is on record before any frame naming it leaves ---------------
+//
+// A takeover numbers its checkpoints above <checkpoint_dir>/_jobs/<job>/TRIGGERED
+// as well as above the markers and snapshot files, because a barrier whose
+// capture has not landed leaves nothing else a takeover could see. So no
+// TriggerCheckpoint, and no reply carrying an end-of-input final id, may leave
+// the coordinator before its id is on record. A record that cannot be written
+// is a directory where the record goes: its rename fails.
+namespace {
+
+std::filesystem::path triggered_record_path(const std::filesystem::path& checkpoint_dir,
+                                            JobId job_id) {
+    return checkpoint_dir / clink::cluster::triggered_record_key(job_id);
+}
+
+void obstruct_triggered_record(const std::filesystem::path& checkpoint_dir, JobId job_id) {
+    const auto path = triggered_record_path(checkpoint_dir, job_id);
+    std::filesystem::create_directories(path);
+    std::ofstream(path / "obstruction").put('x');
+}
+
+void clear_triggered_record(const std::filesystem::path& checkpoint_dir, JobId job_id) {
+    std::error_code ec;
+    std::filesystem::remove_all(triggered_record_path(checkpoint_dir, job_id), ec);
+}
+
+std::int64_t log_cursor_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+               .count() -
+           1;
+}
+
+}  // namespace
+
+TEST(CheckpointCompletion, APeriodicCheckpointIsNotTriggeredBeforeItsIdIsOnRecord) {
+    CheckpointFixture fx;
+    // A fresh coordinator: the job it is about to be given is job 1.
+    obstruct_triggered_record(fx.dir, 1);
+    const auto since_ms = log_cursor_ms();
+    const auto job_id = fx.bring_up();
+    ASSERT_EQ(job_id, 1U);
+
+    EXPECT_FALSE(fx.worker->await_frame(MessageKind::TriggerCheckpoint, 1500ms).has_value())
+        << "a barrier left before its checkpoint id was on record";
+    const auto detail = fx.coordinator->snapshot_job(job_id);
+    ASSERT_TRUE(detail.has_value());
+    EXPECT_TRUE(detail->pending_checkpoint_ids.empty())
+        << "a round whose id could not be recorded left a checkpoint waiting on acks";
+    std::size_t reported = 0;
+    for (const auto& rec :
+         LogBuffer::global().tail(1000, "error", since_ms, "coordinator.checkpoint")) {
+        reported += rec.message.find("could not record checkpoint id") != std::string::npos ? 1 : 0;
+    }
+    EXPECT_EQ(reported, 1U) << "the failing record must be reported once, not every round";
+
+    // Writable again: the round goes ahead, and the refused rounds consumed no id.
+    clear_triggered_record(fx.dir, job_id);
+    const auto first = fx.await_trigger();
+    ASSERT_TRUE(first.has_value()) << "checkpoints did not resume once the id could be recorded";
+    EXPECT_EQ(*first, 1U);
+    EXPECT_GE(clink::cluster::latest_triggered_id_on_disk(fx.dir.string(), job_id), *first);
+}
+
+TEST(CheckpointCompletion, ASavepointWhoseIdCannotBeRecordedSendsNothing) {
+    CheckpointFixture fx;
+    obstruct_triggered_record(fx.dir, 1);
+    const auto job_id = fx.bring_up();
+    ASSERT_EQ(job_id, 1U);
+
+    const auto ack = fx.coordinator->take_savepoint(job_id, 2s);
+    EXPECT_FALSE(ack.ok);
+    EXPECT_NE(ack.message.find("could not record checkpoint id"), std::string::npos) << ack.message;
+    EXPECT_FALSE(fx.worker->await_frame(MessageKind::TriggerCheckpoint, 500ms).has_value())
+        << "the savepoint's barrier left without its id on record";
+    const auto detail = fx.coordinator->snapshot_job(job_id);
+    ASSERT_TRUE(detail.has_value());
+    EXPECT_TRUE(detail->pending_checkpoint_ids.empty())
+        << "the refused savepoint left a checkpoint waiting on acks";
+}
+
+// The final id's barrier leaves with the reply: the source injects it the
+// moment the reply lands. Unanswered, the source fails its subtask when its
+// bounded wait runs out and the restart replays the tail under a checkpoint.
+TEST(CheckpointCompletion, AFinalCheckpointIdIsAnsweredOnlyOnceItIsOnRecord) {
+    CheckpointFixture fx;
+    obstruct_triggered_record(fx.dir, 1);
+    const auto job_id = fx.bring_up();
+    ASSERT_EQ(job_id, 1U);
+    ASSERT_FALSE(fx.deployed().empty());
+    const auto& [role, subtask] = fx.deployed().front();
+
+    ASSERT_TRUE(fx.worker->request_final_checkpoint(job_id, role, subtask));
+    EXPECT_FALSE(fx.worker->await_frame(MessageKind::FinalCheckpointAssigned, 1s).has_value())
+        << "a final checkpoint id reached a source before it was on record";
+
+    clear_triggered_record(fx.dir, job_id);
+    ASSERT_TRUE(fx.worker->request_final_checkpoint(job_id, role, subtask));
+    auto reply = fx.worker->await_frame(MessageKind::FinalCheckpointAssigned);
+    ASSERT_TRUE(reply.has_value()) << "the request went unanswered once its id could be recorded";
+    const auto assigned = decode_final_checkpoint_assigned(*reply);
+    ASSERT_GT(assigned.final_checkpoint_id, 0U);
+    EXPECT_GE(clink::cluster::latest_triggered_id_on_disk(fx.dir.string(), job_id),
+              assigned.final_checkpoint_id);
+}
+
 // --- what recovery restores from ----------------------------------------
 
 // The marker is written flat at <checkpoint_dir>/COMPLETED-N. The recovery
@@ -841,6 +967,158 @@ TEST(CheckpointCompletion, RecoveryBeforeTheFirstCheckpointOfAFreshJobStartsItFr
     const auto msg = recovered_deploy_before_any_checkpoint("fresh", "", 0);
     EXPECT_TRUE(msg.restore_from_dir.empty());
     EXPECT_EQ(msg.restore_from_checkpoint_id, 0U);
+}
+
+// --- what a takeover numbers its checkpoints from -----------------------
+//
+// The leader dies with a checkpoint's barrier sent and the checkpoint never
+// answered. A worker that outlives it may still be writing that capture, at
+// the path the new run's capture of the same id would take, so the new
+// leader must number above it although nothing on disk names it yet: CI's
+// trace validation caught a takeover reusing such an id. The fake worker
+// writes no snapshot at all, which is that shape exactly, so every id it was
+// sent is visible to the takeover only through the record.
+namespace {
+
+struct TakeoverNumbering {
+    std::uint64_t completed{0};     // the last checkpoint the dead leader completed
+    std::uint64_t highest_sent{0};  // the highest id it sent the worker a barrier for
+    std::uint64_t restore{0};       // the takeover's restore point
+    std::uint64_t first{0};         // the takeover's first checkpoint id
+};
+
+TakeoverNumbering takeover_after_an_unanswered_barrier(
+    const std::string& tag,
+    bool complete_one_first,
+    const std::function<void(const std::filesystem::path&, JobId)>& before_takeover = {}) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_takeover_" + tag + "_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(ckpt_dir);
+    TakeoverNumbering out;
+    JobId job_id = 0;
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        EXPECT_TRUE(w.valid());
+        EXPECT_TRUE(w.register_and_ack());
+        EXPECT_TRUE(a.await_registrations(2s));
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 100;
+        ckpt.max_restarts_on_worker_loss = 0;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        EXPECT_GT(job_id, 0U);
+        std::vector<DeploymentTask> tasks;
+        if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+            tasks = decode_deploy(*deploy).tasks;
+        }
+        EXPECT_FALSE(tasks.empty());
+        std::uint16_t port_seed = 41200;
+        for (const auto& t : tasks) {
+            EXPECT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+        }
+        if (auto trigger = w.await_frame(MessageKind::TriggerCheckpoint); trigger.has_value()) {
+            out.highest_sent = decode_trigger_checkpoint(*trigger).checkpoint_id;
+        }
+        EXPECT_GT(out.highest_sent, 0U);
+        if (complete_one_first && out.highest_sent > 0) {
+            const auto id = out.highest_sent;
+            for (const auto& t : tasks) {
+                EXPECT_TRUE(w.ack_checkpoint(job_id, id, t.role, t.subtask_idx, /*ok=*/true));
+            }
+            EXPECT_TRUE(ckpt_await([&] { return a.latest_completed_checkpoint(job_id) == id; }));
+            out.completed = a.latest_completed_checkpoint(job_id);
+            // The next barrier reaches the worker and is never answered.
+            if (auto next = w.await_frame(MessageKind::TriggerCheckpoint); next.has_value()) {
+                out.highest_sent = decode_trigger_checkpoint(*next).checkpoint_id;
+            }
+        }
+        w.close();
+        a.stop();
+        // Barriers the loop sent while the leader was going down count too.
+        while (auto more = w.await_frame(MessageKind::TriggerCheckpoint, 5ms)) {
+            out.highest_sent =
+                std::max(out.highest_sent, decode_trigger_checkpoint(*more).checkpoint_id);
+        }
+    }
+    if (before_takeover) {
+        before_takeover(ckpt_dir, job_id);
+    }
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        EXPECT_TRUE(w.valid());
+        EXPECT_TRUE(w.register_and_ack());
+        EXPECT_TRUE(b.await_registrations(2s));
+        b.recover_persisted_jobs();
+        if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+            const auto msg = decode_deploy(*deploy);
+            out.restore = msg.restore_from_checkpoint_id;
+            std::uint16_t port_seed = 41300;
+            for (const auto& t : msg.tasks) {
+                EXPECT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+            }
+        } else {
+            ADD_FAILURE() << "the new leader did not redeploy the job";
+        }
+        if (auto trigger = w.await_frame(MessageKind::TriggerCheckpoint); trigger.has_value()) {
+            out.first = decode_trigger_checkpoint(*trigger).checkpoint_id;
+        } else {
+            ADD_FAILURE() << "the recovered job never triggered a checkpoint";
+        }
+        w.close();
+        b.stop();
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    return out;
+}
+
+}  // namespace
+
+TEST(CheckpointCompletion, ATakeoverNumbersAboveABarrierTheDeadLeaderSent) {
+    const auto n = takeover_after_an_unanswered_barrier("sent", /*complete_one_first=*/true);
+    ASSERT_GT(n.completed, 0U);
+    ASSERT_GT(n.highest_sent, n.completed);
+    EXPECT_EQ(n.restore, n.completed);
+    EXPECT_GT(n.first, n.highest_sent)
+        << "the takeover restored from " << n.restore << " and numbered its first checkpoint "
+        << n.first << ", but the dead leader had sent a barrier for " << n.highest_sent
+        << "; a worker still writing that capture would put it beside this run's";
+}
+
+// The takeover has nothing of its own to restore, which used to skip the id
+// floor altogether: the job numbered from 1 again.
+TEST(CheckpointCompletion, ATakeoverBeforeAnyCompletedCheckpointNumbersAboveTheIdsSent) {
+    const auto n = takeover_after_an_unanswered_barrier("fresh", /*complete_one_first=*/false);
+    ASSERT_GT(n.highest_sent, 0U);
+    EXPECT_EQ(n.restore, 0U);
+    EXPECT_GT(n.first, n.highest_sent)
+        << "a takeover with no checkpoint of its own numbered its first checkpoint " << n.first
+        << " although the dead leader had sent a barrier for " << n.highest_sent;
+}
+
+// The record alone sets the floor when it stands above every marker and
+// snapshot: a leader whose triggered checkpoints all died with it.
+TEST(CheckpointCompletion, ATakeoverNumbersAboveTheRecordWhenItIsTheHighestIdOnDisk) {
+    const auto n = takeover_after_an_unanswered_barrier(
+        "record", /*complete_one_first=*/true, [](const std::filesystem::path& dir, JobId job) {
+            std::ofstream(dir / clink::cluster::triggered_record_key(job), std::ios::trunc) << "50";
+        });
+    ASSERT_GT(n.completed, 0U);
+    ASSERT_LT(n.highest_sent, 50U);
+    EXPECT_EQ(n.first, 51U);
 }
 
 // HA recovery replans the graph the job was SUBMITTED with - the manifest is

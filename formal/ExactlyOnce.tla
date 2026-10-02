@@ -197,14 +197,16 @@ NoTxn == [st |-> "none", owner |-> 0, desc |-> FALSE, has |-> FALSE]
 DownSink == [up |-> FALSE, openTxn |-> None, ackDue |-> << >>,
              stage |-> "idle", suppress |-> 0, opening |-> FALSE]
 
-\* Every id with any durable record: markers, a source snapshot, or a sink
-\* snapshot. A recovered job numbers new checkpoints above all of them
-\* (latest_snapshot_id_on_disk and the marker readers in coordinator.cpp).
+\* Every id with a marker. A recovered job numbers new checkpoints above all
+\* of them (the marker readers in coordinator.cpp).
 DurableIds == completedDisk \cup confirmedDisk
 
-\* Ids with a participant snapshot on disk, whether or not they completed:
-\* an interval whose capture began leaves its directory behind, and the
-\* engine's id floor counts those too (latest_snapshot_id_on_disk).
+\* Ids whose capture began, whether or not they completed: the model takes a
+\* capture as durable the moment its barrier is delivered. A recovered job
+\* numbers above these too. The engine cannot see a delivery, and a capture
+\* still being written has no file for latest_snapshot_id_on_disk to find,
+\* so it covers them with its record of every id it triggered (see
+\* RedeployEffects).
 SnapshotIds == {c \in Ckpts : srcCut[c] # 0 \/ \E s \in Sinks : sinkCut[s][c] # 0}
               \cup {c \in Ckpts : srcCut[c] # 0}
               \cup {c \in Ckpts : \E s \in Sinks : sinkCut[s][c] # 0}
@@ -954,16 +956,67 @@ WalkFinishes ==
 \* The redeploy (restart_job_locked_ / recover_one_persisted_job_). The
 \* restore point is the newest confirmed checkpoint for the commit-confirmed
 \* family and the newest completed one otherwise; the source rewinds to its
-\* cut. A recovered coordinator numbers new checkpoints above every id with a
-\* durable record - a marker or a participant snapshot - never merely above the
-\* restore point (qual01-20260817c
-\* reused 246; 20260819g assembled one id from two vintages). The ghost
-\* restoreSound records whether the participant snapshots the restore reads
-\* agree on the cut.
+\* cut. The ghost restoreSound records whether the participant snapshots the
+\* restore reads agree on the cut.
+\*
+\* A recovered coordinator numbers new checkpoints above every id with a
+\* marker or a capture that began, never merely above the restore point
+\* (qual01-20260817c reused 246; 20260819g assembled one id from two
+\* vintages). That bound is FreshFloor. The model cannot show what its
+\* capture half protects: it takes a capture as durable at delivery, while in
+\* the engine a worker that outlives the dead leader can finish the capture
+\* after the new leader has read the directory, at the same
+\* v<generation>/<subtask>/checkpoint-<id>.snap path the new run writes for a
+\* reused id. Nor can the engine see deliveries, so it numbers above every id
+\* it has recorded: an id is written to _jobs/<job>/TRIGGERED before any frame
+\* naming it leaves the coordinator. Trace validation caught the engine
+\* before that record, numbering above the snapshot files it could see and
+\* reusing an id whose barrier had reached the source before its capture
+\* landed.
+\*
+\* The record has no variable here. The periodic trigger records the next id
+\* before allocating it, so a record that cannot be written skips that round
+\* and consumes nothing; the end-of-input, savepoint and hot-cutover triggers
+\* allocate first and record before they reply or send. Where a crash falls
+\* (before a record, between it and the allocation, between that and the
+\* send) decides what the next leader finds, so a fresh leader's next id may
+\* lie anywhere from FreshFloor + 1 to one past the most any dead or
+\* superseded leader can have recorded. Every value in that range is safe:
+\* no id above FreshFloor was delivered, the dead leader's frames died with
+\* it, and the workers fence a zombie's, so no capture of one ever begins. A
+\* record variable with a step between recording and triggering would add an
+\* interleaving point to every trigger and admit nothing the range does not;
+\* trace validation pins the engine's choice to the event's next, and the
+\* lower bound refuses a reuse. That the record precedes every send is the
+\* engine's to keep, and its tests hold it there: an id that cannot be
+\* recorded leaves no frame.
+\*
+\* No mutant comes with the record. The lower bound was already this rule,
+\* and id_reuse refutes weakening it to the restore point; the engine fell
+\* short of the rule, and finding that is what trace validation is for.
+\* Refuting a floor that misses a capture still in flight would need the
+\* source's capture as a durable step of its own, one that can land after
+\* the coordinator has died, and the record as a variable: two more steps in
+\* every checkpoint of every model, for a harm the lower bound already
+\* excludes.
 MemCompletedView == IF Bug = "restore_from_memory" /\ completeDue # None /\ completeDue > memCompleted
                     THEN completeDue ELSE memCompleted
 
 RestoreId == IF Tracked /\ Bug # "restore_from_completed" THEN memConfirmed ELSE MemCompletedView
+
+FreshFloor(r) == Max(DurableIds \cup SnapshotIds \cup {r})
+
+\* The most a leader whose next id is n can have recorded: n itself while it
+\* has an id left to take, since the periodic trigger records before it
+\* allocates. The model takes no id past MaxCkpt, so a leader with none left
+\* has recorded no more than the last it took.
+RecordedBy(n) == IF n <= MaxCkpt THEN n ELSE n - 1
+
+\* The dead leader's record and a superseded one's, whose trigger loop runs
+\* on and records as it goes (zombieNext is 0 until a supersession).
+RecordCeiling == Max({RecordedBy(nextCkpt), RecordedBy(zombieNext)})
+
+FreshIds(r) == (FreshFloor(r) + 1) .. (Max({FreshFloor(r), RecordCeiling}) + 1)
 
 RedeployEffects ==
     /\ LET r == RestoreId
@@ -972,9 +1025,9 @@ RedeployEffects ==
           /\ frontier' = cut /\ srcPos' = cut
           /\ restoreSound' = (restoreSound /\
                 (r = None \/ \A s \in Sinks : sinkCut[s][r] = 0 \/ sinkCut[s][r] = srcCut[r]))
-          /\ nextCkpt' = IF ~freshLeader THEN nextCkpt
-                         ELSE IF Bug = "id_reuse" THEN r + 1
-                         ELSE Max(DurableIds \cup SnapshotIds \cup {r}) + 1
+          /\ nextCkpt' \in IF ~freshLeader THEN {nextCkpt}
+                           ELSE IF Bug = "id_reuse" THEN {r + 1}
+                           ELSE FreshIds(r)
     /\ phase' = "running" /\ freshLeader' = FALSE /\ rewindFloor' = None
     /\ inFlight' = {} /\ completeDue' = None /\ toBroadcast' = None /\ markerDue' = None
     /\ ackedOk' = [c \in Ckpts |-> {}] /\ ackedFail' = [c \in Ckpts |-> {}]

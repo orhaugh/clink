@@ -762,30 +762,36 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                 if (next_job_id_ <= job_id)
                     next_job_id_ = job_id;
             }
-            // The id floor submit_job applies: above every durable record.
-            std::uint64_t floor = ckpt.restore_from_checkpoint_id;
-            if (protocol_trace::enabled() && !ckpt.checkpoint_dir.empty()) {
-                floor = std::max(floor, latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id));
-                floor = std::max(floor, latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id));
-                floor = std::max(floor, latest_snapshot_id_on_disk(ckpt.checkpoint_dir));
-            }
-            (void)submit_job(graph,
-                             OperatorRegistry::default_instance(),
-                             std::move(plugins),
-                             ckpt,
-                             std::move(bundle),
-                             /*notify_client_conn=*/nullptr);
+            // Numbers above every id the job has on record, even with nothing
+            // of its own to restore (submit_job's id floor).
+            ckpt.taken_over = true;
+            const auto deployed = submit_job(graph,
+                                             OperatorRegistry::default_instance(),
+                                             std::move(plugins),
+                                             ckpt,
+                                             std::move(bundle),
+                                             /*notify_client_conn=*/nullptr);
             // Recorded after the submit, so a recovery parked for capacity (the
             // submit throws InsufficientSlotsError below) has not redeployed: a
             // Redeploy for a parked attempt read as a second redeploy from the
             // running state when the retry then deployed for real.
             if (protocol_trace::enabled()) {
+                // The id the deploy numbered from, as the engine chose it: a
+                // floor recomputed here could read a directory that has moved
+                // on since.
+                std::uint64_t next = 0;
+                {
+                    std::lock_guard lock(mu_);
+                    if (const auto it = jobs_.find(deployed); it != jobs_.end()) {
+                        next = it->second->first_checkpoint_id;
+                    }
+                }
                 // The job's own restore point: a submitted savepoint's id
                 // names another run's checkpoint, which the trace does not.
                 protocol_trace::Event("Redeploy")
                     .u("job", job_id)
                     .u("restore", own_restore_point)
-                    .u("next", floor + 1)
+                    .u("next", next)
                     .emit();
             }
             clink::metrics::orch::ha_recovered_jobs_inc();
@@ -2316,6 +2322,11 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
     std::vector<PendingDeploy> hot_frames;
     bool hot_engaged = false;
     std::uint32_t old_parallelism = 0;
+    // The cutover checkpoint a hot cutover reserved, and where it goes on
+    // record before the arm that names it is sent.
+    std::uint64_t hot_cutover_id = 0;
+    std::string hot_record_dir;
+    std::shared_ptr<JobState::TriggeredRecord> hot_record;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -2465,6 +2476,9 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
         if (try_begin_hot_cutover_locked_(
                 job, op_id, new_parallelism, old_parallelism, graph, hot_frames, hot_reason)) {
             hot_engaged = true;
+            hot_cutover_id = job.hot_cutover->cutover_checkpoint;
+            hot_record_dir = job.checkpoint.checkpoint_dir;
+            hot_record = job.triggered_record;
         } else {
             log::info("coordinator.rescale",
                       "hot cutover not taken for job_id=" + std::to_string(job_id) +
@@ -2511,6 +2525,40 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
     }
 
     if (hot_engaged) {
+        // The cutover checkpoint goes on record before any frame naming it
+        // leaves (record_triggered_id_): the arm names it, and its trigger
+        // follows the arm acks. An id that cannot be recorded aborts the
+        // cutover before anything is armed, onto the replan, which needs no
+        // id of its own.
+        try {
+            record_triggered_id_(hot_record_dir, job_id, *hot_record, hot_cutover_id);
+        } catch (const std::exception& e) {
+            std::vector<PendingDeploy> fallback;
+            {
+                std::lock_guard lock(mu_);
+                if (auto it = jobs_.find(job_id); it != jobs_.end()) {
+                    auto& job = *it->second;
+                    // Only the cutover this call armed: a watchdog abort may
+                    // already have moved the job on.
+                    if (job.hot_cutover.has_value() &&
+                        job.hot_cutover->cutover_checkpoint == hot_cutover_id &&
+                        job.hot_cutover->phase == JobState::HotCutover::Phase::Arming) {
+                        abort_hot_cutover_locked_(job,
+                                                  "could not record cutover checkpoint id " +
+                                                      std::to_string(hot_cutover_id) + " (" +
+                                                      e.what() + ")",
+                                                  fallback);
+                    }
+                }
+            }
+            for (auto& f : fallback) {
+                if (f.conn != nullptr) {
+                    send_frame(*f.conn, f.frame);
+                }
+            }
+            return RescaleCoordinator::RequestResult{.ok = true,
+                                                     .accepted_target = new_parallelism};
+        }
         // Arm frames only; the job keeps running.
         for (auto& f : hot_frames) {
             if (f.conn != nullptr) {
@@ -2797,6 +2845,19 @@ void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
     CLINK_FAULT_POINT(clink::fault::points::kHotCutoverBeforeTrigger);
     auto& hot = *job.hot_cutover;
     const auto ckpt_id = hot.cutover_checkpoint;
+    // C went on record before the arm that names it was sent, and the arm's
+    // acks are what bring the cutover here, so its barrier follows the record
+    // (record_triggered_id_). Checked here all the same, at the one barrier
+    // that leaves from another call than the one that recorded it: an arm ack
+    // names no checkpoint, so a late ack from an earlier cutover of the same
+    // operator could arrive first.
+    if (job.triggered_record->durable.load(std::memory_order_acquire) < ckpt_id) {
+        abort_hot_cutover_locked_(
+            job,
+            "cutover checkpoint id " + std::to_string(ckpt_id) + " is not on record yet",
+            out_frames);
+        return;
+    }
     std::unordered_set<std::string> pending;
     for (const auto& [key, _] : job.task_records) {
         pending.insert(key);
@@ -3323,6 +3384,7 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
     std::uint64_t ckpt_id = 0;
     std::uint64_t gen_for_trigger = 0;
     std::vector<std::shared_ptr<network::Connection>> worker_conns;
+    std::shared_ptr<JobState::TriggeredRecord> record;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -3384,6 +3446,31 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
         }
         ack.checkpoint_dir = job.checkpoint.checkpoint_dir;
         gen_for_trigger = job.state_generation;
+        record = job.triggered_record;
+    }
+
+    // On record before the trigger goes out (record_triggered_id_). A
+    // savepoint whose id cannot be recorded fails here with nothing sent, and
+    // takes its bookkeeping with it so no checkpoint is left waiting on acks
+    // that will never come.
+    try {
+        record_triggered_id_(ack.checkpoint_dir, job_id, *record, ckpt_id);
+    } catch (const std::exception& e) {
+        {
+            std::lock_guard lock(mu_);
+            if (auto it = jobs_.find(job_id); it != jobs_.end()) {
+                it->second->pending_checkpoint_acks.erase(ckpt_id);
+                it->second->checkpoint_participants.erase(ckpt_id);
+                it->second->pending_checkpoint_start_times.erase(ckpt_id);
+            }
+        }
+        log::error("coordinator.savepoint",
+                   "job_id=" + std::to_string(job_id) + " could not record checkpoint id " +
+                       std::to_string(ckpt_id) + " (" + e.what() + "); savepoint not taken");
+        ack.ok = false;
+        ack.message = "could not record checkpoint id " + std::to_string(ckpt_id) + " (" +
+                      e.what() + "); nothing was triggered";
+        return ack;
     }
 
     TriggerCheckpointMsg tc;
@@ -4288,8 +4375,9 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     // A run of a job that tracks its runs gets the same floor when it starts from
     // empty state: it has nothing to restore, but a checkpoint numbered 1 would
     // still overwrite the COMPLETED-1 marker and snapshot files of the run
-    // before it.
-    if (checkpoint.restore_from_checkpoint_id > 0 || track_runs) {
+    // before it. So does a job taken over before it completed a checkpoint of
+    // its own: the dead leader may still have triggered some.
+    if (checkpoint.restore_from_checkpoint_id > 0 || track_runs || checkpoint.taken_over) {
         std::uint64_t id_floor = checkpoint.restore_from_checkpoint_id;
         if (!checkpoint.checkpoint_dir.empty()) {
             id_floor =
@@ -4305,19 +4393,31 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             // checkpoint from two vintages (qual01-20260819g re-published
             // ten windows that way). Number above every snapshot file too.
             id_floor = std::max(id_floor, latest_snapshot_id_on_disk(checkpoint.checkpoint_dir));
+            // Nor are the files every capture: one whose barrier reached a
+            // worker but whose snapshot has not landed leaves none, and a
+            // worker that outlives the dead leader can still write it after
+            // this scan, under the very path this run's capture of the same id
+            // writes. Trace validation caught a takeover reusing such an id.
+            // Every id a coordinator sends is on record before its frame leaves
+            // (record_triggered_id_), so number above the record as well.
+            id_floor =
+                std::max(id_floor, latest_triggered_id_on_disk(checkpoint.checkpoint_dir, job_id));
         }
         job->next_checkpoint_id = id_floor + 1;
-        if (id_floor > checkpoint.restore_from_checkpoint_id &&
-            checkpoint.restore_from_checkpoint_id > 0) {
+        if (id_floor > checkpoint.restore_from_checkpoint_id) {
             log::info("coordinator.restart",
-                      "job_id=" + std::to_string(job_id) + " resumes from checkpoint " +
-                          std::to_string(checkpoint.restore_from_checkpoint_id) +
+                      "job_id=" + std::to_string(job_id) +
+                          (checkpoint.restore_from_checkpoint_id > 0
+                               ? " resumes from checkpoint " +
+                                     std::to_string(checkpoint.restore_from_checkpoint_id)
+                               : std::string{" restores nothing of its own"}) +
                           " but numbers new checkpoints from " +
                           std::to_string(job->next_checkpoint_id) + ": ids up to " +
                           std::to_string(id_floor) +
                           " already have durable records in this directory");
         }
     }
+    job->first_checkpoint_id = job->next_checkpoint_id;
     if (track_runs) {
         // Recorded before the deploy, in this order, so that whatever happens to
         // this run from here - a failed deploy, a kill before its first
@@ -4590,7 +4690,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         protocol_trace::Event("Redeploy")
             .u("job", job_id)
             .u("restore", checkpoint.restore_from_checkpoint_id)
-            .u("next", job->next_checkpoint_id)
+            .u("next", job->first_checkpoint_id)
             .emit();
     }
     return job_id;
@@ -7183,6 +7283,8 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
     CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeFinalCheckpointRequest);
     std::uint64_t final_id = 0;  // 0 == declined; `decline` says why
     auto decline = FinalCheckpointDecline::UnknownJob;
+    std::string record_dir;
+    std::shared_ptr<JobState::TriggeredRecord> record;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(msg.job_id);
@@ -7254,7 +7356,29 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
                 }
                 job.sources_requested_final.insert(msg.role + ":" +
                                                    std::to_string(msg.subtask_idx));
+                record_dir = job.checkpoint.checkpoint_dir;
+                record = job.triggered_record;
             }
+        }
+    }
+    // The reply is what sends this barrier: the source injects the id the
+    // moment it lands, so the id goes on record first (record_triggered_id_).
+    // A later source asking for the same id waits here behind the first
+    // one's write. A request whose id cannot be recorded gets no answer, and
+    // the source fails its subtask when its bounded wait runs out, so the
+    // restart replays the tail under a checkpoint; a decline would instead
+    // read as the job going away and leave the tail uncommitted.
+    if (final_id != 0) {
+        try {
+            record_triggered_id_(record_dir, msg.job_id, *record, final_id);
+        } catch (const std::exception& e) {
+            log::error("coordinator.final_checkpoint",
+                       "job_id=" + std::to_string(msg.job_id) +
+                           " could not record final checkpoint id " + std::to_string(final_id) +
+                           " (" + e.what() + "); not answering " + msg.role + ":" +
+                           std::to_string(msg.subtask_idx) +
+                           ", which fails its subtask at the end of its wait");
+            return;
         }
     }
     FinalCheckpointAssignedMsg reply;
@@ -8240,6 +8364,13 @@ void Coordinator::checkpoint_trigger_loop_() {
         std::vector<
             std::tuple<JobId, std::uint64_t, std::uint64_t, std::uint8_t, std::vector<std::string>>>
             to_trigger;
+        // Due jobs whose next id is not yet on record: (job, checkpoint dir,
+        // record, the id to record).
+        std::vector<std::tuple<JobId,
+                               std::string,
+                               std::shared_ptr<JobState::TriggeredRecord>,
+                               std::uint64_t>>
+            to_record;
         {
             std::lock_guard lock(mu_);
             for (auto& [jid, job_ptr] : jobs_) {
@@ -8322,6 +8453,20 @@ void Coordinator::checkpoint_trigger_loop_() {
                         }
                         continue;
                     }
+                }
+                // The id goes on record before its barrier can leave, so a
+                // takeover numbers above it whether or not its capture landed
+                // (record_triggered_id_). Recorded outside the lock and
+                // triggered on the pass straight after; nothing is allocated
+                // until then, so a record that cannot be written costs this
+                // round and leaves no checkpoint half begun.
+                if (job.triggered_record->durable.load(std::memory_order_acquire) <
+                    job.next_checkpoint_id) {
+                    to_record.emplace_back(jid,
+                                           job.checkpoint.checkpoint_dir,
+                                           job.triggered_record,
+                                           job.next_checkpoint_id);
+                    continue;
                 }
                 job.last_checkpoint_trigger_at = now;
                 const auto next_id = job.next_checkpoint_id++;
@@ -8422,8 +8567,56 @@ void Coordinator::checkpoint_trigger_loop_() {
                 }
             }
         }
+        // The records the pass asked for. A job whose record landed is still
+        // due, and triggers on the pass straight after rather than a sleep
+        // later.
+        bool recorded = false;
+        for (const auto& [jid, dir, record, id] : to_record) {
+            try {
+                record_triggered_id_(dir, jid, *record, id);
+                recorded = true;
+                if (record->failing.exchange(false, std::memory_order_relaxed)) {
+                    log::info("coordinator.checkpoint",
+                              "job_id=" + std::to_string(jid) + " checkpoint id " +
+                                  std::to_string(id) +
+                                  " is on record; periodic checkpoints resume");
+                }
+            } catch (const std::exception& e) {
+                // Once per outage: the round is retried at the job's interval
+                // for as long as the store refuses.
+                if (!record->failing.exchange(true, std::memory_order_relaxed)) {
+                    log::error("coordinator.checkpoint",
+                               "job_id=" + std::to_string(jid) +
+                                   " could not record checkpoint id " + std::to_string(id) +
+                                   " in " + dir + " (" + e.what() +
+                                   "); periodic checkpoints are held until it can, because a "
+                                   "barrier must not leave before its id is on record");
+                }
+            }
+        }
+        if (recorded) {
+            continue;
+        }
         std::this_thread::sleep_for(sleep_for);
     }
+}
+
+void Coordinator::record_triggered_id_(const std::string& checkpoint_dir,
+                                       JobId job_id,
+                                       JobState::TriggeredRecord& record,
+                                       std::uint64_t id) {
+    if (checkpoint_dir.empty() || record.durable.load(std::memory_order_acquire) >= id) {
+        return;
+    }
+    // One writer per job at a time, so the store's compare-and-set refuses
+    // only another process's write, and an id two triggers record at once
+    // is written once.
+    std::lock_guard lock(record.write_mu);
+    if (record.durable.load(std::memory_order_relaxed) >= id) {
+        return;
+    }
+    record.durable.store(record_triggered_id(checkpoint_dir, job_id, id),
+                         std::memory_order_release);
 }
 
 bool assign_task_placement(std::vector<PlannedTask>& tasks, std::vector<PlacementWorker>& workers) {

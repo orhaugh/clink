@@ -2267,9 +2267,12 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
                                                ckpt);
 
     // A checkpoint is demonstrably IN FLIGHT (triggered, not yet acked)
-    // before the cancel - the window the Delay holds open.
+    // before the cancel - the window the Delay holds open. The first one waits
+    // out a held write of its own: the coordinator records the id before the
+    // trigger leaves, through the same write path the Delay is armed on.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        const auto deadline =
+            std::chrono::steady_clock::now() + clink::test_support::scale_slack(5s);
         bool in_flight = false;
         while (std::chrono::steady_clock::now() < deadline) {
             const auto d = coordinator.snapshot_job(job_id);
@@ -2286,14 +2289,20 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
     // armed point (the hit is counted before the 1500ms hold begins), so
     // the cancel below demonstrably lands inside the held window. The
     // pending-ids check above only proved the trigger was sent; the first
-    // version of this test asserted hits instantly and was vacuous.
+    // version of this test asserted hits instantly and was vacuous. The
+    // coordinator's record of the id was a hit of its own, so count from the
+    // hits already seen: the next is the worker's snapshot write, or the
+    // record of the next id, which the loop takes while that snapshot write
+    // is still held.
     {
+        const auto seen =
+            clink::fault::Registry::instance().hits(clink::fault::points::kCheckpointBeforeWrite);
         const auto deadline =
             std::chrono::steady_clock::now() + clink::test_support::scale_slack(5s);
         bool reached = false;
         while (std::chrono::steady_clock::now() < deadline) {
             if (clink::fault::Registry::instance().hits(
-                    clink::fault::points::kCheckpointBeforeWrite) > 0) {
+                    clink::fault::points::kCheckpointBeforeWrite) > seen) {
                 reached = true;
                 break;
             }

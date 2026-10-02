@@ -77,7 +77,11 @@ def write_constants(events: list[dict], out: str) -> None:
 
     host = {s: first_placement(lambda e, s=s: e.get("sub") == s) for s in sinks}
     src = first_placement(lambda e: e.get("source")) or (workers[0] if workers else "none")
+    # A redeploy's next id counts as well: the engine records an id before it
+    # allocates it, so a takeover can number one past every id the trace names,
+    # and the model's bound has to admit that id.
     ckpts = [e["ckpt"] for e in events if "ckpt" in e]
+    ckpts += [e["next"] - 1 for e in of("Redeploy") if e.get("next", 0) > 1]
     max_ckpt = max(ckpts) if ckpts else 1
     recoverable = all(e.get("family") == "recoverable" for e in of("SinkPrepare"))
     epochs = [e["epoch"] for e in of("Trigger") + of("DeliverBarrier") if "epoch" in e]

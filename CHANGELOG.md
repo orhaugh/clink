@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**A takeover no longer reuses the id of a checkpoint its dead leader had
+begun.** A recovered job numbered its new checkpoints above the COMPLETED and
+CONFIRMED markers and the snapshot files it could see. A checkpoint whose
+barrier had reached a worker and whose capture had not landed left no file,
+and a worker that outlived the coordinator could still write it after the
+takeover, at the path the new run's checkpoint of the same id writes; a later
+restore could then read one checkpoint from two vintages. CI's trace
+validation caught a takeover reusing such an id. The coordinator now records
+every checkpoint id in `_jobs/<job>/TRIGGERED` in the checkpoint directory
+before any frame naming it leaves, and a takeover numbers above the record as
+well. A job taken over before it completed a checkpoint of its own, which used
+to number from 1 again, gets the same floor. When the record cannot be
+written, a periodic checkpoint is skipped until it can be, a savepoint fails
+with nothing sent, a source's end-of-input request goes unanswered so its
+subtask fails and the restart replays the tail, and a hot cutover falls back to
+the replan. The exactly-once specification's id rule now admits the range of
+ids a takeover can choose, and a worker fault point,
+`worker.after_trigger_delivered`, holds the window open in `HaFailoverTest`.
+
 **A native ClickHouse sink.** A ClickHouse table with
 `insert_format='native'` is written by `clickhouse_native_sink`, which sends
 typed Native blocks over the native protocol from a writer thread of its own,

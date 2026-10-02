@@ -740,6 +740,12 @@ struct CheckpointConfig {
     // With track_runs: start from empty state even when the last run did not
     // finish (clink run --fresh).
     bool start_fresh{false};
+    // Set by HA recovery (recover_persisted_jobs) on the job it takes over from
+    // a leader that died; in-process only, like track_runs. New checkpoints then
+    // number above every id the job has on record even when it has nothing of
+    // its own to restore, because the dead leader may have triggered checkpoints
+    // that never completed and a worker may still be writing one of them.
+    bool taken_over{false};
 };
 
 // Resolve max_restarts_on_worker_loss to its effective value (see the field +

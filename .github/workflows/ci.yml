@@ -486,12 +486,12 @@ jobs:
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04
-    # The models take about an hour on the four-core runner, MC_RecoverableSmall
-    # alone most of it. They run one at a time with every worker, not several
-    # at a time with one each: one model dominates, and TLC's workers are worth
-    # more to it than concurrency is to the short ones (measured: a model that
-    # takes 221 s on all workers takes 22 min on one). The mutants are the
-    # opposite case and have their own job.
+    # The models take about 80 minutes on the four-core runner,
+    # MC_RecoverableSmall alone most of it. They run one at a time with every
+    # worker, not several at a time with one each: one model dominates, and
+    # TLC's workers are worth more to it than concurrency is to the short ones
+    # (measured: a model that takes 221 s on all workers takes 22 min on one).
+    # The mutants are the opposite case and have their own job.
     timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
@@ -529,12 +529,16 @@ jobs:
   formal-mutants:
     name: Every mutant of the exactly-once specification is refuted
     runs-on: ubuntu-24.04
-    # Fifteen independent runs, so four at a time with a single TLC worker each
+    # Sixteen independent runs, so four at a time with a single TLC worker each
     # beats one at a time with all four: TLC scales sublinearly across workers.
-    # Four of them take 24 to 28 minutes on their own worker and dominate the
-    # wall time (about 50 minutes for the set on a developer machine), which is
-    # why this is its own job rather than an hour added to the models'.
-    timeout-minutes: 100
+    # The two accepted mutants enumerate their whole state space and take 45 to
+    # 60 minutes each on their own worker, and the longest refutation takes 50,
+    # which is why this is its own job rather than an hour added to the models'.
+    # The set took 88 minutes until a takeover's next checkpoint id became a
+    # range in the specification (RedeployEffects). Every takeover now branches,
+    # a refutation searches up to two thirds more states before it reaches its
+    # counterexample, and the set should take about 105.
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4

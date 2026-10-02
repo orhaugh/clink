@@ -78,6 +78,7 @@ names, in its comment, the engine site it abstracts.
 | Fault point | State in the model |
 |---|---|
 | `sink.before_prepare` | the barrier delivered, before `SinkPrepare` |
+| `worker.after_trigger_delivered` | the barrier delivered at the source, before `SinkPrepare`: the model has taken the source's capture, which in the engine has not landed yet |
 | `sink.after_prepare` | after `SinkPrepare`, before `SinkAck` |
 | `coordinator.before_completed_marker` | every ack in, before `WriteCompleted` |
 | `coordinator.after_completed_marker`, `coordinator.before_commit_broadcast` | the marker durable, before `Broadcast` |
@@ -117,11 +118,11 @@ is fenced.
 
 | Model | Family | Bounds | Result |
 |---|---|---|---|
-| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 26.5M distinct states, depth 78, all invariants hold, no deadlock |
+| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 29.7M distinct states, depth 78, all invariants hold, no deadlock |
 | `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 46,083 distinct states, depth 67, all invariants hold |
-| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 103.1M distinct states, depth 58, all invariants hold |
-| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | 5.4M distinct states, depth 53, all invariants hold |
-| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 5.3M distinct states |
+| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 105.5M distinct states, depth 58, all invariants hold |
+| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | 5.6M distinct states, depth 53, all invariants hold |
+| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 5.5M distinct states |
 
 Within its bounds each run is exhaustive: TLC visits every reachable state.
 The bounds are small so that the push gate finishes in minutes; a larger
@@ -200,7 +201,8 @@ reordering window the design record states), keeps one job, and runs TLC on
 specification's next-state relation to the recorded events in order. The
 constants are read off the trace: the sinks are the subtasks that prepared
 a transaction, the workers and the source's worker come from `Placement`,
-the checkpoint bound from the highest id seen, the family from the sinks.
+the checkpoint bound from the highest id seen (a redeploy's next id
+included), the family from the sinks.
 The run is accepted when some path through the specification consumes every
 event (hidden steps make the state graph a small tree, and a branch that took
 a hidden step the run did not need dies out without being a verdict); TLC's
@@ -261,6 +263,43 @@ input queue (`Trigger` and `DeliverBarrier` admit a sink that is `opening`).
 None is an engine defect; each is a behaviour the engine has always had
 that the model had not admitted, and the recorded traces under
 `formal/traces/` now pin all three.
+
+Trace validation has since caught an engine defect. A takeover numbered its
+new checkpoints above the markers and the snapshot files it could see, and a
+CI run of `HaFailoverTest.ARecoveredJobParkedForCapacityRunsWhenAWorkerReturns`
+recovered from checkpoint 1 and numbered its next checkpoint 2, although the
+dead leader's barrier for 2 had reached the worker. The trace diverged at the
+`Redeploy`, whose `next` the specification places above every capture that
+began. The gap is real in the engine: a worker that outlives the leader can
+still write that capture after the new leader has read the directory, at the
+path the new run's capture of the same id writes. The coordinator now records
+every id in `_jobs/<job>/TRIGGERED` before any frame naming it leaves, and a
+takeover numbers above the record as well
+([checkpointing](checkpointing.md)). The trace from that run still diverges,
+as it should, and
+`HaFailoverTest.ATakeoverNumbersAboveABarrierTheDeadLeaderDelivered` holds the
+same window open with a worker fault point, `worker.after_trigger_delivered`.
+
+The specification states the rule as a range rather than a value. A fresh
+leader's next id lies anywhere from one above every marker and every capture
+that began to one past the most any dead or superseded leader can have
+recorded: the periodic trigger records an id before it allocates it, the
+other triggers after allocating and before they send, and where a crash
+falls among those steps decides what the next leader finds. Every id in the
+range is safe, since none above the lower bound was delivered (a superseded
+leader's are fenced at the workers). The model keeps no record variable,
+which would add an interleaving point to every trigger and admit nothing the
+range does not; the trace module pins the engine's choice with the event's
+`next`, and the lower bound is what refuses a reuse. The model cannot show
+the harm itself, because it takes a capture as durable once its barrier is
+delivered, so the late writer is below its abstraction; the lower bound
+counts captures that began for that reason. No mutant comes with the
+record: the lower bound was already the specification's rule (`id_reuse`
+refutes weakening it to the restore point), and the defect was the engine
+falling short of it, which is what trace validation is for. Refuting a
+floor that misses a capture still in flight would take the source's capture
+as a durable step of its own that can land after the coordinator has died,
+and the record as a variable, in every checkpoint of every model.
 
 A divergence can also mean the trace is missing a line. The coordinator
 records `WriteCompleted` after the COMPLETED marker's durable write, so the

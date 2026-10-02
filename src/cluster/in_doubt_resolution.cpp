@@ -1,10 +1,14 @@
 #include "clink/cluster/in_doubt_resolution.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -91,6 +95,71 @@ std::uint64_t latest_snapshot_id_on_disk(const std::string& checkpoint_dir) {
         }
     }
     return latest;
+}
+
+std::string triggered_record_key(JobId job_id) {
+    return "_jobs/" + std::to_string(job_id) + "/TRIGGERED";
+}
+
+namespace {
+
+// The record's body is the id in decimal. Anything else reads as no record,
+// and the next raise overwrites it, since the compare-and-set below compares
+// against what parses.
+std::uint64_t triggered_id_of(const std::string& body) {
+    auto end = body.size();
+    while (end > 0 && (body[end - 1] == '\n' || body[end - 1] == '\r' || body[end - 1] == ' ')) {
+        --end;
+    }
+    std::uint64_t id = 0;
+    const auto [last, ec] = std::from_chars(body.data(), body.data() + end, id);
+    if (end == 0 || ec != std::errc{} || last != body.data() + end) {
+        return 0;
+    }
+    return id;
+}
+
+}  // namespace
+
+std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir, JobId job_id) {
+    if (checkpoint_dir.empty()) {
+        return 0;
+    }
+    const auto body = make_coordination_store(checkpoint_dir)->get(triggered_record_key(job_id));
+    return body.has_value() ? triggered_id_of(*body) : 0;
+}
+
+std::uint64_t record_triggered_id(const std::string& checkpoint_dir,
+                                  JobId job_id,
+                                  std::uint64_t id) {
+    const auto store = make_coordination_store(checkpoint_dir);
+    const auto key = triggered_record_key(job_id);
+    const auto held = [&] {
+        const auto body = store->get(key);
+        return body.has_value() ? triggered_id_of(*body) : std::uint64_t{0};
+    };
+    // Read first. An id already covered needs no write, and the
+    // compare-and-set then refuses only a writer that got past this read
+    // first, which is another process: this one serialises its own.
+    if (const auto on_record = held(); on_record >= id) {
+        return on_record;
+    }
+    // The id is its own fencing epoch: the store writes only over a record
+    // holding no more than it.
+    if (store->fenced_put(key,
+                          std::to_string(id),
+                          id,
+                          triggered_id_of,
+                          "(checkpoint-id record: the two numbers are checkpoint ids, and the "
+                          "higher one already on record covers this one)")) {
+        return id;
+    }
+    // Refused, or the write did not land: what the record holds decides.
+    if (const auto on_record = held(); on_record >= id) {
+        return on_record;
+    }
+    throw std::runtime_error("could not record checkpoint id " + std::to_string(id) + " in " +
+                             checkpoint_dir + "/" + key);
 }
 
 namespace {

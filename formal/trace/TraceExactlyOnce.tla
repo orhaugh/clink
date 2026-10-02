@@ -201,7 +201,11 @@ StepRestartProceeds ==
     /\ E.resolving
     /\ RestartProceeds /\ phase' = "resolving"
 
-\* The redeploy: straight from the drain, or after a held resolution.
+\* The redeploy: straight from the drain, or after a held resolution. A fresh
+\* leader's next id is a range in the specification (RedeployEffects); the
+\* event's next picks the engine's choice out of it. A next below the range
+\* (an id whose capture began under the dead leader) diverges here, and so
+\* does one above it (an id no leader can have recorded).
 StepRedeploy ==
     /\ Is("Redeploy")
     /\ IF phase = "draining" THEN RestartProceeds /\ phase' = "running" ELSE Redeploy

@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -445,6 +447,55 @@ TEST_F(ResolutionFixture, TheIdFloorCountsUnmarkedSnapshotFiles) {
     std::ofstream(std::filesystem::path(dir) / "v1" / "0" / "other-12.snap").put('x');
     EXPECT_EQ(clink::cluster::latest_snapshot_id_on_disk(dir), 9u);
     EXPECT_EQ(clink::cluster::latest_snapshot_id_on_disk(""), 0u);
+}
+
+// -- the record of every id a coordinator sent ------------------------------
+//
+// A capture whose barrier has reached a worker has no file until it lands,
+// and a worker outliving the dead leader can land it after the takeover has
+// looked, so the floor also counts the record the coordinator writes before
+// any frame naming an id leaves. The record only rises: a superseded
+// coordinator still triggering must not lower it beneath ids the leader has
+// sent.
+TEST_F(ResolutionFixture, TheTriggeredRecordOnlyRises) {
+    using clink::cluster::latest_triggered_id_on_disk;
+    using clink::cluster::record_triggered_id;
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 0u);
+    EXPECT_EQ(latest_triggered_id_on_disk("", kJob), 0u);
+
+    EXPECT_EQ(record_triggered_id(dir, kJob, 5), 5u);
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 5u);
+    // A lower id is covered by the record and leaves it where it is.
+    EXPECT_EQ(record_triggered_id(dir, kJob, 3), 5u);
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 5u);
+    EXPECT_EQ(record_triggered_id(dir, kJob, 8), 8u);
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 8u);
+    // Job-scoped, beside the markers, and the body is the id in decimal.
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob + 1), 0u);
+    std::ifstream in(completed_marker_dir_for(dir, kJob) / "TRIGGERED");
+    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(body, "8");
+}
+
+TEST_F(ResolutionFixture, AnUnreadableTriggeredRecordReadsAsNoneAndTheNextRaiseRepairsIt) {
+    using clink::cluster::latest_triggered_id_on_disk;
+    const auto path = completed_marker_dir_for(dir, kJob) / "TRIGGERED";
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path) << "not-an-id";
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 0u);
+    EXPECT_EQ(clink::cluster::record_triggered_id(dir, kJob, 2), 2u);
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 2u);
+}
+
+// The caller must not send an id it could not record, so a failed write has
+// to say so rather than return as if the id were covered.
+TEST_F(ResolutionFixture, ATriggeredRecordThatCannotBeWrittenThrows) {
+    // A directory where the record goes: the write's rename fails.
+    const auto path = completed_marker_dir_for(dir, kJob) / "TRIGGERED";
+    std::filesystem::create_directories(path);
+    std::ofstream(path / "obstruction").put('x');
+    EXPECT_THROW((void)clink::cluster::record_triggered_id(dir, kJob, 4), std::runtime_error);
+    EXPECT_EQ(clink::cluster::latest_triggered_id_on_disk(dir, kJob), 0u);
 }
 
 // -- cancellation (the rig-night composite's zombie walk) ------------------

@@ -26,6 +26,7 @@
 // over). It needs a lease-based store - etcd - and is build-gated on it.
 // See docs/history/production-hardening-2026-08.md, W15.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -40,6 +41,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/coordinator.hpp"
+#include "clink/config/json.hpp"
 
 #include "tests/integration/await_port.hpp"
 #include "tests/integration/cluster_harness.hpp"
@@ -132,6 +134,31 @@ OutputVerdict verify_exactly_once(const std::filesystem::path& out_dir, int tota
         v.unexpected.push_back(line + " x" + std::to_string(count));
     }
     return v;
+}
+
+// The protocol events every process of the run recorded (the harness turns
+// the protocol trace on for each process it spawns), one parsed line each.
+std::vector<clink::config::JsonValue> protocol_events(const std::filesystem::path& dir) {
+    std::vector<clink::config::JsonValue> events;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (entry.path().extension() != ".ndjson") {
+            continue;
+        }
+        std::ifstream in(entry.path());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            try {
+                events.push_back(clink::config::parse(line));
+            } catch (const clink::config::ParseError&) {
+                // The tail of a process killed mid-line.
+            }
+        }
+    }
+    return events;
 }
 
 std::string describe(const OutputVerdict& v) {
@@ -511,6 +538,87 @@ TEST_F(HaFailoverTest, ARecoveredJobParkedForCapacityRunsWhenAWorkerReturns) {
     EXPECT_TRUE(v.duplicated.empty()) << describe(v);
     EXPECT_TRUE(v.missing.empty()) << describe(v);
     EXPECT_TRUE(v.unexpected.empty()) << describe(v);
+
+    sub->kill_and_reap();
+}
+
+// The run CI's trace validation caught in the test above, held open on
+// purpose. The leader's checkpoint barrier reached the worker, and the leader
+// died before that checkpoint completed; the new leader recovered from the
+// last completed one and numbered its next checkpoint with the same id. The
+// worker had died too in that run, but a worker that outlives the leader can
+// still finish the capture after the new leader has read the directory, at
+// the path the new run's capture of the reused id writes, and a later
+// restore then reads one checkpoint from two vintages. The snapshot files
+// cannot show such a capture, so the coordinator records every id before its
+// barrier leaves and a takeover numbers above the record.
+//
+// Here the worker dies the moment its second barrier has been handed to the
+// source (worker.after_trigger_delivered): the source thread captures between
+// records, 50ms apart, so that capture never lands. Then the leader dies, and
+// the job is recovered onto a fresh worker.
+TEST_F(HaFailoverTest, ATakeoverNumbersAboveABarrierTheDeadLeaderDelivered) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_ha_coordinators(2));
+    ASSERT_TRUE(c.start_ha_worker(0, {.fault = "worker.after_trigger_delivered=exit:74@2"}));
+    ASSERT_TRUE(c.await_workers_registered(1));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+
+    // Vacuity: the worker died at the fault, with a barrier delivered.
+    ASSERT_TRUE(
+        clink::itest::await([&] { return !c.worker(0).running(); }, std::chrono::seconds(60)))
+        << "the worker never reached worker.after_trigger_delivered";
+    const auto armed_exit = c.worker(0).poll_exit();
+    ASSERT_TRUE(armed_exit.has_value());
+    ASSERT_EQ(*armed_exit, 74) << "the worker exited for a reason other than the injected fault";
+    std::int64_t delivered = 0;
+    for (const auto& e : protocol_events(c.trace_dir())) {
+        if (e.string_or("event", "") == "DeliverBarrier" && !e.bool_or("fenced", false)) {
+            delivered = std::max(delivered, e.int_or("ckpt", 0));
+        }
+    }
+    ASSERT_GT(delivered, 0) << "no barrier delivery was recorded before the worker died";
+
+    ASSERT_TRUE(c.kill_leader_and_await_failover().has_value())
+        << "no standby took over after the leader was killed";
+    ASSERT_TRUE(c.await_coordinator_ready());
+    const auto leader = c.current_leader_index();
+    ASSERT_TRUE(leader.has_value());
+    const auto epoch = c.announced_epoch(*leader);
+    ASSERT_TRUE(epoch.has_value());
+    ASSERT_TRUE(c.restart_worker_ha(0)) << "the worker did not come back";
+    ASSERT_TRUE(c.await_workers_registered(2))
+        << "the restarted worker never registered with the new leader";
+
+    const bool finished = clink::itest::await(
+        [&] { return verify_exactly_once(out_dir_, kTotalRecords).missing.empty(); },
+        std::chrono::seconds(90));
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(finished) << "the recovered job did not finish: " << describe(v) << " ["
+                          << c.describe_coordinator_exits() << "]";
+    EXPECT_TRUE(v.duplicated.empty()) << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << describe(v);
+
+    // The new leader's checkpoints, from its own trace: every one above the
+    // barrier the dead leader delivered.
+    std::int64_t lowest = 0;
+    for (const auto& e : protocol_events(c.trace_dir())) {
+        if (e.string_or("event", "") == "Trigger" &&
+            e.int_or("epoch", 0) == static_cast<std::int64_t>(*epoch)) {
+            const auto id = e.int_or("ckpt", 0);
+            lowest = lowest == 0 ? id : std::min(lowest, id);
+        }
+    }
+    ASSERT_GT(lowest, 0) << "the new leader triggered no checkpoint";
+    EXPECT_GT(lowest, delivered)
+        << "the new leader numbered a checkpoint " << lowest
+        << " although the dead leader's barrier for " << delivered
+        << " had reached the worker; a worker still writing that capture would put it "
+           "beside this run's under the same id";
 
     sub->kill_and_reap();
 }

@@ -1283,6 +1283,24 @@ private:
             pending_checkpoint_start_times;
         std::uint64_t latest_completed_checkpoint_id{0};
         std::uint64_t next_checkpoint_id{1};
+        // The id this incarnation numbered from, fixed at deploy: what the
+        // takeover's Redeploy protocol event reports, read after the trigger
+        // loop may already have moved next_checkpoint_id on.
+        std::uint64_t first_checkpoint_id{1};
+
+        // The job's checkpoint-id record (_jobs/<id>/TRIGGERED, see
+        // record_triggered_id_): the highest id this coordinator knows is on
+        // record, and the lock that keeps this job's writes of it in order.
+        // Shared so a writer outside mu_ keeps it alive if the job is erased
+        // in the meantime.
+        struct TriggeredRecord {
+            std::mutex write_mu;
+            std::atomic<std::uint64_t> durable{0};
+            // Set while the periodic trigger's record keeps failing, so a
+            // store outage logs once rather than every round.
+            std::atomic<bool> failing{false};
+        };
+        std::shared_ptr<TriggeredRecord> triggered_record = std::make_shared<TriggeredRecord>();
 
         // When this job last had a periodic checkpoint TRIGGERED, so the
         // trigger loop can tell whether its interval has elapsed.
@@ -1612,6 +1630,16 @@ private:
     // TriggerCheckpoint, and replies FinalCheckpointAssigned on `reply_conn`.
     void handle_request_final_checkpoint_(MessageReader& r, network::Connection& reply_conn);
     void checkpoint_trigger_loop_();
+    // Put `id` on the job's checkpoint-id record before any frame naming it
+    // leaves this coordinator: a takeover numbers above the record, and a
+    // barrier whose capture has not landed is visible to it nowhere else
+    // (record_triggered_id). Called outside mu_; a no-op for a job without a
+    // checkpoint directory. Throws when the record cannot be written, and the
+    // caller then must not send the id.
+    static void record_triggered_id_(const std::string& checkpoint_dir,
+                                     JobId job_id,
+                                     JobState::TriggeredRecord& record,
+                                     std::uint64_t id);
     // Read every <ha_dir>/history/*.json on startup so the coordinator's
     // in-memory ring picks up where the previous leader left off.
     // Bounded to kCoordinatorHistoryCap entries (oldest dropped). Called

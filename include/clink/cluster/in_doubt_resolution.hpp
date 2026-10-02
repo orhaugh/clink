@@ -74,6 +74,35 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 // that ANY durable artefact names.
 [[nodiscard]] std::uint64_t latest_snapshot_id_on_disk(const std::string& checkpoint_dir);
 
+// <checkpoint_dir>/_jobs/<job_id>/TRIGGERED, in decimal: the highest
+// checkpoint id any coordinator of the job has recorded, and a recovered job
+// numbers above it too. The coordinator records an id here before any frame
+// naming it leaves (a TriggerCheckpoint, the reply carrying an end-of-input
+// final id, a hot cutover's arm), so the record covers every barrier that can
+// have reached a worker. The snapshot files cannot: a capture still being
+// written has no file yet, a worker that outlives the dead coordinator can
+// finish it after the new leader has looked, and with no rescale between them
+// both incarnations write under one generation directory, so a reused id puts
+// that file where the new run's capture of the id goes. Trace validation
+// caught a takeover reusing such an id.
+[[nodiscard]] std::string triggered_record_key(JobId job_id);
+
+// The id the record holds; 0 when there is none or it does not parse.
+[[nodiscard]] std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir,
+                                                        JobId job_id);
+
+// Raise the record to cover `id` and return the id it then holds (at least
+// `id`). It only rises: a write below what it holds is refused by the store's
+// compare-and-set, so a superseded coordinator still triggering under its old
+// epoch cannot lower it beneath ids the leader has sent (a superseded
+// coordinator's own ids are fenced at the workers and need no cover). Throws
+// when the record could not be written, and the caller must then not send the
+// id. Writers in one process serialise per job (the coordinator's per-job
+// record lock); the compare-and-set orders them across processes.
+[[nodiscard]] std::uint64_t record_triggered_id(const std::string& checkpoint_dir,
+                                                JobId job_id,
+                                                std::uint64_t id);
+
 // `cancel` (optional): cooperative cancellation, checked before every wire
 // probe and before every store effect (receipt materialisation, CONFIRMED
 // markers) - and between reading a probe's answer and ACTING on it. The

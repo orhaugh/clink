@@ -1604,6 +1604,7 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
             .b("fenced", false)
             .emit();
     }
+    CLINK_FAULT_POINT(clink::fault::points::kWorkerAfterTriggerDelivered);
 }
 
 void Worker::handle_deploy_(MessageReader& r) {

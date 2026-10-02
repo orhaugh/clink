@@ -335,6 +335,13 @@ inline constexpr char kWorkerTaskTokenRegister[] = "worker.task_token_register";
 // purpose - the storm shape from the rig, where drains took seconds, on a
 // machine where they take milliseconds.
 inline constexpr char kWorkerBeforeSubtaskFinished[] = "worker.before_subtask_finished";
+// A TriggerCheckpoint's barrier has been handed to this worker's sources and
+// recorded as delivered, on the reader thread; the capture runs later on each
+// source's own thread. An exit here is a worker dying between a checkpoint's
+// delivery and its capture landing, which leaves no snapshot file for the id:
+// the window in which a takeover that numbered only above the files it could
+// see reused the id.
+inline constexpr char kWorkerAfterTriggerDelivered[] = "worker.after_trigger_delivered";
 
 // ----- Rescale lifecycle -----
 //

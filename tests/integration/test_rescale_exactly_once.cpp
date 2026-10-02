@@ -1196,3 +1196,86 @@ TEST_F(HotRescaleTest, AWorkerLostMidCutoverFallsBackToTheReplanAndStaysExactlyO
         << "STATE-MISMATCH across the abort + replan. " << describe(v);
     EXPECT_TRUE(v.missing.empty()) << "records LOST across the abort + replan. " << describe(v);
 }
+
+// Every checkpoint id goes on record (<checkpoint_dir>/_jobs/<job>/TRIGGERED)
+// before any frame naming it leaves the coordinator, because a takeover numbers
+// above the record; for a hot cutover that frame is the arm, which names the
+// cutover checkpoint. An id that cannot be recorded aborts the cutover before
+// anything is armed, onto the replan, which needs no id of its own. The record
+// is made unwritable with a directory where it goes, which holds the periodic
+// checkpoints too until it is writable again.
+TEST_F(HotRescaleTest, ACutoverWhoseCheckpointIdCannotBeRecordedFallsBackToTheReplan) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return verify_exactly_once(out_dir_, kTotalRecords).total_lines >= kMinCommittedBefore;
+        },
+        std::chrono::seconds(90)));
+
+    // The job's record, swapped for a directory. The coordinator rewrites it
+    // by rename as it triggers, so the swap is retried until the directory
+    // holds.
+    std::filesystem::path record;
+    {
+        std::error_code ec;
+        for (const auto& job :
+             std::filesystem::directory_iterator(c.checkpoint_dir() / "_jobs", ec)) {
+            if (std::filesystem::exists(job.path() / "TRIGGERED", ec)) {
+                record = job.path() / "TRIGGERED";
+            }
+        }
+    }
+    ASSERT_FALSE(record.empty()) << "the job's checkpoints left no TRIGGERED record";
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            std::error_code ec;
+            if (!std::filesystem::is_directory(record, ec)) {
+                std::filesystem::remove(record, ec);
+                std::filesystem::create_directory(record, ec);
+            }
+            if (!std::filesystem::is_directory(record, ec)) {
+                return false;
+            }
+            std::ofstream(record / "obstruction").put('x');
+            return true;
+        },
+        std::chrono::seconds(10)));
+
+    std::string rescale_out;
+    const int rc = rescale_operator(c, "counter", kMaxParallelism, &rescale_out);
+    ASSERT_EQ(rc, 0) << "the rescale was refused rather than falling back: " << rescale_out;
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return c.coordinator().log_contains("could not record cutover checkpoint id"); },
+        std::chrono::seconds(30)))
+        << "the cutover did not abort on its unrecordable id";
+    ASSERT_TRUE(clink::itest::await([&] { return c.coordinator().log_contains("replanned"); },
+                                    std::chrono::seconds(120)))
+        << "the abort never fell back to the replan";
+    EXPECT_FALSE(c.coordinator().log_contains("hot cutover checkpoint triggered"))
+        << "the cutover checkpoint was triggered although its id was never recorded";
+
+    // Writable again: checkpoints resume and the job runs to completion.
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(record, ec);
+    }
+    const auto exit_code = sub->await_exit(std::chrono::seconds(300));
+    ASSERT_TRUE(exit_code.has_value()) << "submitter never exited after the fallback";
+    EXPECT_EQ(*exit_code, 0) << "the job did not complete after the fallback replan";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records committed MORE than once across the abort + replan. " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty())
+        << "STATE-MISMATCH across the abort + replan. " << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << "records LOST across the abort + replan. " << describe(v);
+}

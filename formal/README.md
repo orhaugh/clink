@@ -104,6 +104,7 @@ them.
 | Fault point | State in the model |
 |---|---|
 | `sink.before_prepare` | barrier in `barriers[s]`, before `SinkPrepare(s)` |
+| `worker.after_trigger_delivered` | after `DeliverBarrier`, before `SinkPrepare(s)`: the model has taken the source's capture, which in the engine has not landed yet |
 | `sink.after_prepare` | after `SinkPrepare(s)`, before `SinkAck(s)` |
 | `coordinator.before_completed_marker` | `completeDue = c`, before `WriteCompleted` |
 | `coordinator.after_completed_marker`, `coordinator.before_commit_broadcast` | `toBroadcast = c`, before `Broadcast` |
@@ -225,6 +226,20 @@ trace test and every multi-process harness test do this themselves when
 `CLINK_PROTOCOL_TRACE_OUT` is set), then validate the directory. To add a
 recorded run to the push gate, copy its files to `traces/<name>/` and
 validate that directory.
+
+Trace validation has caught one engine defect so far. A takeover numbered
+its checkpoints above the markers and the snapshot files it could see, and a
+CI run of the parked-recovery HA test reused the id of a checkpoint whose
+barrier the dead leader had delivered and whose capture had not landed: the
+trace diverged at its `Redeploy`. A worker outliving the leader can finish
+such a capture after the takeover has looked, at the path the new run's
+capture of the reused id writes. The coordinator now records every id in
+`_jobs/<job>/TRIGGERED` before any frame naming it leaves, and a takeover
+numbers above the record. `RedeployEffects` states the rule as a range (from
+one above every capture that began to one past the most a dead leader can
+have recorded) and says why a range rather than a record variable, and why
+no mutant comes with it: the lower bound was already the rule, and the
+engine fell short of it.
 
 ## Conventions
 
