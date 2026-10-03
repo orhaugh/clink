@@ -96,7 +96,15 @@ public:
     }
 
     std::optional<std::string> get(std::string_view key) override {
-        std::ifstream in(resolve_(key), std::ios::binary);
+        // Only a regular file is a record. Anything else at the path (a
+        // directory, say) reads as absent on every platform: libstdc++ opens a
+        // directory and then throws from the read, where libc++ reads nothing.
+        const auto path = resolve_(key);
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec)) {
+            return std::nullopt;
+        }
+        std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) {
             return std::nullopt;
         }
@@ -163,6 +171,12 @@ private:
     static std::function<std::uint64_t(const std::string&)> path_epoch_of_(
         const std::function<std::uint64_t(const std::string&)>& epoch_of) {
         return [&epoch_of](const std::string& existing_path) -> std::uint64_t {
+            // As in get(): only a regular file holds an epoch. The write that
+            // follows then fails over the obstruction on every platform.
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(existing_path, ec)) {
+                return 0;
+            }
             std::ifstream in(existing_path, std::ios::binary);
             if (!in.is_open()) {
                 return 0;  // absent record = epoch 0, extractor not consulted
