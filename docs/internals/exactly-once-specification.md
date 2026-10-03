@@ -43,7 +43,7 @@ the rigs saw. Neither proves the code.
 | `include/clink/cluster/protocol_trace.hpp` | The emitter: `CLINK_PROTOCOL_TRACE_DIR` turns it on |
 | `scripts/formal-check.sh` | Fetches and verifies the tools, runs TLC, judges models, mutants and traces (`--trace`) |
 | `scripts/protocol-trace-merge.py`, `scripts/check-protocol-trace-events.py` | Merges per-process trace files; holds code, vocabulary and module in agreement |
-| `.github/workflows/ci.yml`, jobs `formal`, `formal-mutants`, `formal-mutant-id-reuse` and `trace-validation` | The models and the recorded traces, the mutants, and the traces each test run leaves, after the build (rescaled runs are skipped and counted, not judged). Models and mutants are separate jobs: one model dominates the models and wants every TLC worker, while the mutants are independent and want concurrency, except `M_id_reuse`, whose search dominates the set and runs alone with every worker |
+| `.github/workflows/ci.yml`, jobs `formal`, `formal-recoverable-small`, `formal-mutants`, `formal-mutant-id-reuse` and `trace-validation` | The models and the recorded traces, the mutants, and the traces each test run leaves, after the build (rescaled runs are skipped and counted, not judged). Models and mutants are separate jobs: the models run one at a time with every TLC worker, while the mutants are independent and want concurrency. The largest search of each set runs alone on its own runner with every worker: `MC_RecoverableSmall` and `M_id_reuse` |
 | `formal/README.md` | The working guide: running, adding a model, adding a mutant, recording a trace |
 
 ## How it works

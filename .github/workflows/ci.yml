@@ -486,17 +486,14 @@ jobs:
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04
-    # The models take about 105 minutes on the four-core runner,
-    # MC_RecoverableSmall alone most of it. They run one at a time with every
-    # worker, not several at a time with one each: one model dominates, and
-    # TLC's workers are worth more to it than concurrency is to the short ones
-    # (measured: a model that takes 221 s on all workers takes 22 min on one).
-    # The mutants are the opposite case and have their own job. The models
-    # took 77 minutes until a coordinator whose claim on a checkpoint id is
-    # refused could renumber (Renumber, ZombieRenumber): every supersession
-    # now branches again, and the models with a coordinator death reach up to
-    # half as many states again (MC_RecoverableSmall 103M to 145M).
-    timeout-minutes: 130
+    # Every model but MC_RecoverableSmall, which runs in the job below: about
+    # 42 minutes on the four-core runner, MC_KafkaLiveness and MC_KafkaSmall
+    # some 19 minutes each. They run one at a time with every worker, not
+    # several at a time with one each: TLC's workers are worth more to the
+    # long ones than concurrency is to the short ones (measured: a model that
+    # takes 221 s on all workers takes 22 min on one). The mutants are the
+    # opposite case and have their own job.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -508,7 +505,7 @@ jobs:
         with:
           path: ~/.clink-deps/formal-tools
           key: tla-tools-${{ hashFiles('formal/tools.env') }}
-      - name: Every model configuration proves its invariants
+      - name: Every model but MC_RecoverableSmall proves its invariants
         # formal/ExactlyOnce.tla is the exactly-once protocol as a checkable
         # model (design record 012). TLC enumerates every interleaving of
         # protocol steps and faults within each configuration's bounds and
@@ -516,7 +513,13 @@ jobs:
         # violation. The jars are fetched from the upstream releases and
         # refused unless their SHA-256 matches formal/tools.env. No C++
         # toolchain: this runs on the bare runner beside the manifest gates.
-        run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh
+        # A model added under formal/models/ runs here unless it is excluded
+        # by name like MC_RecoverableSmall.
+        run: |
+          set -euo pipefail
+          models=$(cd formal/models && ls MC_*.cfg | sed 's/\.cfg$//' | grep -vx 'MC_RecoverableSmall')
+          # shellcheck disable=SC2086 # one argument per model, on purpose
+          TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh $models
       - name: The protocol trace vocabulary agrees with the engine and the trace module
         # Every event the engine emits is in formal/trace/events.txt and
         # consumed by the trace module; every specification action is either
@@ -529,6 +532,31 @@ jobs:
         # impossible fails here even where the test that produced it is
         # Docker-gated.
         run: TRACE_JOBS=4 TLC_HEAP=2g ./scripts/formal-check.sh --trace formal/traces
+
+  formal-recoverable-small:
+    name: The recoverable-small model of the exactly-once specification model-checks
+    runs-on: ubuntu-24.04
+    # MC_RecoverableSmall on its own runner with every worker, beside the other
+    # models: its search is the largest of the set, 145.4M states in about 70
+    # minutes. The models took 77 minutes in one job until a coordinator whose
+    # claim on a checkpoint id is refused could renumber (Renumber,
+    # ZombieRenumber): every supersession branches again, MC_RecoverableSmall
+    # grew from 103M to 145M states, and the one job took 112 of its 130
+    # minutes.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Cache the pinned TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps/formal-tools
+          key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - name: MC_RecoverableSmall proves its invariants
+        run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh MC_RecoverableSmall
 
   formal-mutants:
     name: Every mutant of the exactly-once specification is refuted

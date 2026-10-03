@@ -30,11 +30,12 @@ at a time, default 1), `TRACE_JOBS` (the same for traces), `TLC_WORKERS`
 sublinearly across workers, so N independent checks finish sooner than one
 N-way check on the same cores, but only where no single run dominates. In
 `.github/workflows/ci.yml` the `formal` job therefore runs the models one at
-a time with every worker, since `MC_RecoverableSmall` is most of their cost,
-and the separate `formal-mutants` job runs four mutants at a time with one
-worker each. `M_id_reuse` is the exception: its search, which allows two
-coordinator deaths, dominates the set, so the `formal-mutant-id-reuse` job
-runs it alone on its own runner with every worker.
+a time with every worker, and the separate `formal-mutants` job runs four
+mutants at a time with one worker each. One search in each set dominates it
+and runs alone on its own runner with every worker: `MC_RecoverableSmall`
+(about 70 of the models' 112 minutes in one job) in the
+`formal-recoverable-small` job, and `M_id_reuse`, which allows two
+coordinator deaths, in the `formal-mutant-id-reuse` job.
 
 A model is green when TLC reports no invariant violation, no deadlock and
 no temporal-property violation. A mutant is judged against
