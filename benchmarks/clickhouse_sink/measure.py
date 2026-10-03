@@ -33,6 +33,18 @@ B1_MIN_ROWS_PER_S = 500_000
 B1_MIN_RATIO_TO_LEGACY = 3.0
 B1_MAX_SINK_HOP_CPU_S_PER_1E6 = 4.0
 MIN_TRIALS = 3
+# The premise B1 is held to (premise.md); a campaign run off it is not B1.
+B1_PREMISE = {
+    "parallelism": 8,
+    "checkpoint_interval_ms": 10000,
+    "native.batch_rows": 1048449,
+    "native.batch_bytes": 67108864,
+    "native.batch_interval_ms": 1000,
+    "native.compression": "lz4",
+}
+MIN_WINDOW_S = 600             # ten minutes of steady state for a sink rate
+CALIBRATION_HEADROOM = 0.7     # a target above 70% of the ceiling is restated first
+MIN_CLINK_RATE_WINDOW_S = 10   # below this, clink's counters give no rate
 
 
 # --- sampling the job -------------------------------------------------------
@@ -53,7 +65,12 @@ def is_sink(op):
 
 
 def counters(ops):
+    """Rows out of the sources and into the sinks, or None when a sink's
+    figure is stale: the Coordinator reports a stale operator's counters as 0
+    when it could not read the Worker, which is not a value."""
     sinks = [o for o in ops if is_sink(o)]
+    if any(o.get("stale") for o in sinks):
+        return None
     sources = [o for o in ops if int(o.get("records_in") or 0) == 0 and int(o.get("records_out") or 0) > 0
                and not is_sink(o)]
     return (sum(int(o.get("records_out") or 0) for o in sources),
@@ -86,9 +103,11 @@ def cmd_sample(a):
             ops = get_json("{}/api/v1/jobs/{}/operators".format(a.base, job)).get("operators", [])
             st = [j for j in job_list(a.base) if isinstance(j, dict) and int(j.get("id", -1)) == job]
             status = str(st[0].get("status")) if st else status
-            src, snk, sink_types = counters(ops)
-            samples.append([round(now - t0, 3), round(time.time(), 3), src, snk])
-            last_ops = ops
+            got = counters(ops)
+            if got is not None:
+                src, snk, sink_types = got
+                samples.append([round(now - t0, 3), round(time.time(), 3), src, snk])
+                last_ops = ops
         except (urllib.error.URLError, OSError, ValueError):
             pass
         if status in TERMINAL:
@@ -118,15 +137,27 @@ def cmd_sample(a):
 # --- rates --------------------------------------------------------------------
 
 def inserts_sql(table):
-    # One line per acknowledged INSERT into the table, in acknowledgement order:
-    # its finish time, the rows it wrote and the server CPU it used.
+    # One line per INSERT into the table that ended, in the order they ended:
+    # its finish time, the rows it wrote, the server CPU it used, the time the
+    # server held it back for too many parts, and whether it was acknowledged.
     return (
         "SELECT toUnixTimestamp64Micro(event_time_microseconds) AS t_us, written_rows AS rows, "
         "ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds'] AS cpu_us, "
+        "ProfileEvents['DelayedInsertsMilliseconds'] AS delayed_ms, "
         "type = 'QueryFinish' AS ok "
         "FROM system.query_log "
         "WHERE query_kind = 'Insert' AND has(tables, '{t}') AND type != 'QueryStart' "
         "ORDER BY t_us FORMAT JSONEachRow"
+    ).format(t=table)
+
+
+def insert_settings_sql(table):
+    # The settings one acknowledged INSERT actually ran with: each sink sets its
+    # own per statement, so the session defaults do not describe them.
+    return (
+        "SELECT Settings FROM system.query_log "
+        "WHERE query_kind = 'Insert' AND has(tables, '{t}') AND type = 'QueryFinish' "
+        "ORDER BY event_time_microseconds LIMIT 1 FORMAT JSONEachRow"
     ).format(t=table)
 
 
@@ -152,6 +183,7 @@ def server_rate(inserts, warmup, cooldown):
         "rows_acknowledged": sum(r for _, r in pts),
         "mean_rows_per_insert_all": round(sum(r for _, r in pts) / len(pts), 1) if pts else None,
         "server_insert_query_cpu_s": round(sum(int(i["cpu_us"]) for i in ok) / 1e6, 3),
+        "delayed_inserts_ms": sum(int(i.get("delayed_ms") or 0) for i in inserts),
     }
     if len(win) < 2 or win[-1][0] <= win[0][0]:
         res.update({"rows_per_s": None, "window_s": 0.0, "inserts_in_window": len(win),
@@ -183,10 +215,11 @@ def clink_rate(samples, warmup, cooldown):
     t_first = started[0][0]
     t_done = next(t for t, v in rows if v == final)
     win = [p for p in rows if t_first + warmup <= p[0] <= t_done - cooldown]
-    if len(win) < 2 or win[-1][0] <= win[0][0]:
-        return {"source": "clink operators", "rows_per_s": None, "window_s": 0.0, "rows_into_sink": final,
-                "note": "the run is shorter than warm-up plus cool-down"}
-    span = win[-1][0] - win[0][0]
+    span = win[-1][0] - win[0][0] if len(win) >= 2 else 0.0
+    if span < MIN_CLINK_RATE_WINDOW_S:
+        return {"source": "clink operators", "rows_per_s": None, "window_s": round(span, 3),
+                "rows_into_sink": final,
+                "note": "the steady window is under {} s, too short for a rate".format(MIN_CLINK_RATE_WINDOW_S)}
     return {"source": "clink operators", "rows_per_s": round((win[-1][1] - win[0][1]) / span),
             "window_s": round(span, 3), "rows_into_sink": final,
             "first_row_to_last_s": round(t_done - t_first, 3)}
@@ -214,6 +247,7 @@ def cmd_record(a):
         "variant": a.variant,
         "trial": a.trial,
         "rows": a.rows,
+        "image_id": a.image_id,
         "job_status": samples["status"],
         "sink_op_types": samples["sink_op_types"],
         "wall_s": samples["samples"][-1][0] if samples["samples"] else None,
@@ -227,6 +261,8 @@ def cmd_record(a):
     trial["cpu"] = {
         "clink_s": round(clink_s, 3),
         "clink_s_per_1e6_rows": per_million(clink_s, a.rows),
+        # Cores busy on average over the run: a reading that went wrong shows here.
+        "clink_cores_avg": round(clink_s / trial["wall_s"], 2) if trial["wall_s"] else None,
         "server_s": round(server_s, 3),
         "server_s_per_1e6_rows": per_million(server_s, a.rows) if a.variant != "blackhole" else None,
         "from": "cgroup v2 cpu.stat usage_usec, whole run, read before submit and after the job ended",
@@ -249,6 +285,9 @@ def cmd_record(a):
             {"check": "job_completed", "ok": False, "detail": "job ended {}".format(samples["status"])})
     if a.row_bytes:
         trial["mean_row_bytes_uncompressed"] = float(a.row_bytes)
+    if a.insert_settings:
+        got = read_ndjson(a.insert_settings)
+        trial["insert_settings"] = got[0].get("Settings") if got else None
     with open(a.out, "w") as f:
         json.dump(trial, f, indent=2)
     r = trial["rate"]
@@ -281,6 +320,92 @@ def cmd_legacy_batch_rows(a):
     return 0
 
 
+def premise_value(premise, dotted):
+    node = premise
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def measurement_reasons(premise, cells, trials):
+    """Every reason the campaign cannot stand as a B1 measurement; empty when
+    it can. Each is a rule of premise.md or of the plan behind it."""
+    reasons = []
+    if premise.get("local_smoke_run"):
+        reasons.append("local smoke run: the server and clink share one machine")
+    elif not premise.get("rig"):
+        reasons.append("RIG is not stated: the machine types and the network link are part of the premise")
+    if not premise.get("d2_targets_accepted"):
+        reasons.append("D2 not accepted: the targets are still proposals")
+
+    # The fixed premise.
+    for key, want in B1_PREMISE.items():
+        got = premise_value(premise, key)
+        if got != want:
+            reasons.append("{} is {}, the premise fixes {}".format(key, got, want))
+    if "legacy" in cells:
+        if premise_value(premise, "legacy.batch_rows_from") != "native cell mean rows per INSERT":
+            reasons.append("the legacy batch_rows was set by hand, not taken from the native cell")
+        if premise_value(premise, "legacy.batch_interval_ms") != premise_value(premise, "native.batch_interval_ms"):
+            reasons.append("the legacy batch_interval_ms differs from the native one")
+
+    # What is under test.
+    if premise_value(premise, "clickhouse_cpp.build_type") != "Release":
+        reasons.append("the clickhouse-cpp build type is not recorded as Release")
+    build = premise_value(premise, "clink_capabilities.build") or {}
+    if build.get("git_sha") != premise.get("under_test"):
+        reasons.append("the image is commit {}, not the commit under test {}".format(
+            str(build.get("git_sha"))[:12], str(premise.get("under_test"))[:12]))
+    if build.get("git_clean") is not True:
+        reasons.append("the image was built from a tree with uncommitted changes")
+    if build.get("fault_injection"):
+        reasons.append("the image is built with fault injection")
+    if premise_value(premise, "harness.dirty"):
+        reasons.append("the harness has uncommitted changes")
+
+    # Calibration first, and the 70% rule.
+    cal = premise.get("calibration")
+    if not cal:
+        reasons.append("no calibration: the server's ceiling is measured before clink")
+    else:
+        ceiling = cal.get("rows_per_second") or 0
+        cal_premise = cal.get("premise", {})
+        if cal_premise.get("local_smoke_run"):
+            reasons.append("the calibration is a local smoke run")
+        server_version = premise_value(premise, "server.version.version")
+        if server_version and cal_premise.get("server_version") != server_version:
+            reasons.append("the calibration ran against server {}, the campaign against {}".format(
+                cal_premise.get("server_version"), server_version))
+        if CALIBRATION_HEADROOM * ceiling < B1_MIN_ROWS_PER_S:
+            reasons.append("the rate target {} is above 70% of the ceiling {}: restate it before measuring".format(
+                B1_MIN_ROWS_PER_S, ceiling))
+
+    # The trials.
+    for v, c in cells.items():
+        if c["trials_passed"] < MIN_TRIALS:
+            reasons.append("{}: {} passed trial(s), {} needed".format(v, c["trials_passed"], MIN_TRIALS))
+        if c["trials_passed"] < c["trials"]:
+            reasons.append("{}: {} trial(s) failed the gate".format(v, c["trials"] - c["trials_passed"]))
+        # The ten-minute window is the sink rates' rule. The blackhole cell is
+        # there for the CPU subtraction over the same rows and ends sooner.
+        if v != "blackhole" and c["window_s_min"] < MIN_WINDOW_S:
+            reasons.append("{}: steady window {:.0f} s, under {} s".format(v, c["window_s_min"], MIN_WINDOW_S))
+        if c.get("inserts_failed"):
+            reasons.append("{}: {} INSERT(s) failed and were retried".format(v, c["inserts_failed"]))
+        if c.get("delayed_inserts_ms"):
+            reasons.append("{}: the server delayed INSERTs for {} ms (too many parts)".format(
+                v, c["delayed_inserts_ms"]))
+    for v in ("native", "blackhole", "legacy"):
+        if v not in cells:
+            reasons.append("no {} cell".format(v))
+    stamps = {(t.get("image_id"), t.get("rows")) for t in trials}
+    if stamps != {(premise.get("clink_image_id"), premise.get("rows"))}:
+        reasons.append("the trials do not all share the campaign's image and input size")
+    return reasons
+
+
 def cmd_summarise(a):
     premise = read_json(os.path.join(a.campaign, "premise.json"))
     trials = trials_of(a.campaign)
@@ -297,8 +422,11 @@ def cmd_summarise(a):
             "rows_per_s_each": [t["rate"].get("rows_per_s") for t in good],
             "window_s_min": min((t["rate"].get("window_s") or 0.0 for t in good), default=0.0),
             "clink_cpu_s_per_1e6_median": med(t["cpu"]["clink_s_per_1e6_rows"] for t in good),
+            "clink_cpu_s_per_1e6_each": [t["cpu"]["clink_s_per_1e6_rows"] for t in good],
             "server_cpu_s_per_1e6_median": med(t["cpu"]["server_s_per_1e6_rows"] for t in good),
             "mean_rows_per_insert_median": med(t["rate"].get("mean_rows_per_insert_steady") for t in good),
+            "inserts_failed": sum(t["rate"].get("inserts_failed") or 0 for t in good),
+            "delayed_inserts_ms": sum(t["rate"].get("delayed_inserts_ms") or 0 for t in good),
             "batch": ts[0]["batch"],
         }
 
@@ -318,6 +446,7 @@ def cmd_summarise(a):
             (cells["native"]["rows_per_s_median"] or 0) / cells["blackhole"]["rows_per_s_median"], 3)
 
     n = cells.get("native", {})
+    hop_native = derived["native_sink_hop_cpu_s_per_1e6"]
     b1 = {
         "rows_per_s": {"target": ">= {}".format(B1_MIN_ROWS_PER_S), "value": n.get("rows_per_s_median"),
                        "met": (n.get("rows_per_s_median") or 0) >= B1_MIN_ROWS_PER_S},
@@ -325,31 +454,10 @@ def cmd_summarise(a):
                             "value": derived.get("native_to_legacy_rate"),
                             "met": (derived.get("native_to_legacy_rate") or 0) >= B1_MIN_RATIO_TO_LEGACY},
         "sink_hop_cpu_s_per_1e6": {"target": "<= {}".format(B1_MAX_SINK_HOP_CPU_S_PER_1E6),
-                                   "value": derived["native_sink_hop_cpu_s_per_1e6"],
-                                   "met": derived["native_sink_hop_cpu_s_per_1e6"] is not None and
-                                   derived["native_sink_hop_cpu_s_per_1e6"] <= B1_MAX_SINK_HOP_CPU_S_PER_1E6},
+                                   "value": hop_native,
+                                   "met": hop_native is not None and 0 <= hop_native <= B1_MAX_SINK_HOP_CPU_S_PER_1E6},
     }
-
-    # Whether this campaign can stand as a B1 measurement at all, and if not, why.
-    reasons = []
-    if premise.get("local_smoke_run"):
-        reasons.append("local smoke run: the server and clink share one machine")
-    if not premise.get("d2_targets_accepted"):
-        reasons.append("D2 not accepted: the targets are still proposals")
-    if premise.get("clickhouse_cpp", {}).get("build_type") != "Release":
-        reasons.append("the clickhouse-cpp build type is not recorded as Release")
-    for v, c in cells.items():
-        if c["trials_passed"] < MIN_TRIALS:
-            reasons.append("{}: {} passed trial(s), {} needed".format(v, c["trials_passed"], MIN_TRIALS))
-        if c["trials_passed"] < c["trials"]:
-            reasons.append("{}: {} trial(s) failed the gate".format(v, c["trials"] - c["trials_passed"]))
-        # The ten-minute window is the sink rates' rule. The blackhole cell is
-        # there for the CPU subtraction over the same rows and ends sooner.
-        if v != "blackhole" and c["window_s_min"] < premise["min_window_s"]:
-            reasons.append("{}: steady window {:.0f} s, under {} s".format(v, c["window_s_min"], premise["min_window_s"]))
-    for v in ("native", "blackhole", "legacy"):
-        if v not in cells:
-            reasons.append("no {} cell".format(v))
+    reasons = measurement_reasons(premise, cells, trials)
 
     summary = {"campaign": os.path.basename(os.path.normpath(a.campaign)), "cells": cells,
                "derived": derived, "b1": b1, "is_measurement": not reasons, "not_a_measurement_because": reasons}
@@ -370,6 +478,8 @@ def cmd_summarise(a):
         print("\nNot a B1 measurement:")
         for r in reasons:
             print("  - " + r)
+    else:
+        print("\nA B1 measurement under premise.md.")
     print("\nsummary: {}".format(os.path.join(a.campaign, "summary.json")))
     return 0
 
@@ -428,12 +538,16 @@ def main():
 
     q = sub.add_parser("inserts-sql")
     q.add_argument("--table", required=True)
+    qs = sub.add_parser("insert-settings-sql")
+    qs.add_argument("--table", required=True)
 
     r = sub.add_parser("record")
     r.add_argument("--variant", required=True, choices=["native", "blackhole", "legacy"])
     r.add_argument("--trial", type=int, required=True)
     r.add_argument("--rows", type=int, required=True)
+    r.add_argument("--image-id", required=True)
     r.add_argument("--samples", required=True)
+    r.add_argument("--insert-settings")
     r.add_argument("--inserts")
     r.add_argument("--gate")
     r.add_argument("--row-bytes")
@@ -465,6 +579,9 @@ def main():
         return cmd_sample(a)
     if a.cmd == "inserts-sql":
         print(inserts_sql(a.table))
+        return 0
+    if a.cmd == "insert-settings-sql":
+        print(insert_settings_sql(a.table))
         return 0
     if a.cmd == "record":
         return cmd_record(a)

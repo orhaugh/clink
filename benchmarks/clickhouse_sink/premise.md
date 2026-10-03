@@ -23,9 +23,15 @@ run, and its summary says so.
 
 ## Calibration first
 
-`calibrate.sh` measures the server's own insert ceiling from the client host
-at the sink's batch size. A target above 70% of that ceiling is restated
-before clink is measured, never after.
+`calibrate.sh` measures the server's own insert ceiling from the clink host,
+with INSERTs of the sink's size: each client sends a series of INSERTs of
+`INSERT_ROWS` rows, as each subtask closes one INSERT per batch interval. A
+target above 70% of that ceiling is restated before clink is measured, never
+after. `run.sh` takes the calibration as `CALIBRATION`, records it in the
+premise, and sizes the input from it: no sink lands rows faster than the server
+takes them, so `ROWS` must cover ten minutes of steady state at the ceiling,
+plus warm-up and cool-down, with half again in hand, or a rig campaign does not
+start.
 
 ## The rig
 
@@ -43,7 +49,10 @@ one machine is marked `local_smoke_run` and checks the harness only.
   whatever the toolchain's build type; the version comes from the image's
   build stamp. No figure is taken against a Debug client.
 - clink: the runtime image named by `CLINK_IMAGE`, with its image id and its
-  capability record, which carries the commit.
+  capability record. The record's commit must be the commit under test
+  (`UNDER_TEST`, by default the harness's own HEAD), built from a clean tree and
+  without fault injection; the harness's HEAD and whether it has uncommitted
+  changes are recorded too.
 
 ## The table and its settings
 
@@ -51,8 +60,10 @@ one machine is marked `local_smoke_run` and checks the harness only.
 (k, ts)`, every row in one day so one partition is active. The server runs
 its defaults, with `part_log` on; `async_insert` is 0, which the native sink
 checks at open. The table DDL as the server reports it, the fsync and part
-thresholds from `system.merge_tree_settings`, and the insert settings from
-`system.settings` are recorded per campaign.
+thresholds from `system.merge_tree_settings`, and the session defaults from
+`system.settings` are recorded per campaign. Each sink sets its own INSERT
+settings per statement, so each sink trial records the settings one of its
+INSERTs actually ran with, from `query_log`.
 
 ## The workload
 
@@ -91,14 +102,18 @@ thresholds from `system.merge_tree_settings`, and the insert settings from
   INSERT of the steady state, from `system.query_log`. The steady state
   starts `WARMUP_S` after the first acknowledged INSERT and ends `COOLDOWN_S`
   before the last, and must span at least 600 s; a shorter one does not count
-  toward B1.
+  toward B1. An INSERT that failed, or that the server delayed for too many
+  parts, is reported and keeps the campaign from counting: such a figure
+  measures the server's back-pressure, not the sink.
 - **Blackhole rate.** The blackhole sends no INSERT, so its rate is the rows
   reaching the sink operator, from clink's operator counters, over the same
   kind of window. It is reported for B2's ratio to the blackhole; B1 uses
   the blackhole cell only for CPU.
 - **CPU.** cgroup v2 `usage_usec` of the Coordinator and the Worker
   containers, read before the submit and after the job ends, so the whole
-  run is counted. Each cell's CPU is normalised per 10^6 rows first; a
+  run is counted. A reading is refused, and the campaign stops, unless the
+  container is still running and in its own cgroup namespace; a reading that
+  failed is never taken as zero. Each cell's CPU is normalised per 10^6 rows first; a
   sink's hop is its median minus the blackhole cell's median. The server's
   cgroup CPU per 10^6 rows is reported beside it, and the CPU the INSERT
   queries themselves used, from `query_log`.
@@ -107,12 +122,26 @@ thresholds from `system.merge_tree_settings`, and the insert settings from
 
 Every sink run is held to the dataset, not to anything the pipeline reports.
 `verify.py` checks that the table holds exactly the produced number of rows,
-every `k` from 0 to N-1 exactly once, and the same per-column and whole-row
-checksums as `rows.sql` evaluated over the same range by clickhouse-local.
-Duplicates (rows landed minus distinct `k`) are reported and must be 0. A
+no `k` twice (counted in the table's key order, so in bounded memory at any
+size) and every `k` inside 0 to N-1, which together mean every `k` exactly once,
+and the same per-column and whole-row checksums as `rows.sql` evaluated over
+the same range by clickhouse-local. Duplicates are reported and must be 0. A
 blackhole run must deliver every row to the sink operator and end
 `COMPLETED_OK`. A trial that fails its gate has no figure, and the campaign
 exits non-zero.
+
+## When a campaign counts
+
+The summary of every campaign says whether it stands as a B1 measurement and,
+if not, lists each reason: a same-machine run; `RIG` not stated; D2 not
+accepted; any knob off the premise above (parallelism, checkpoint interval,
+the native batch settings, a legacy `batch_rows` set by hand); a client not
+recorded as Release; an image that is not the commit under test, or is dirty
+or fault-injecting; a harness with uncommitted changes; no calibration, a
+same-machine one, one against another server version, or a rate target above
+70% of its ceiling; fewer than three passed trials in a cell, a failed gate, a
+steady window under ten minutes, failed or delayed INSERTs; a missing cell;
+trials that do not share the campaign's image and input.
 
 ## What is not claimed
 

@@ -5,9 +5,14 @@ The landed table is held to the dataset's definition, not to anything the
 pipeline reports about itself. rows.sql over numbers(0, N), evaluated by
 clickhouse-local when run.sh writes the input, gives the expected side: the
 row count and an order-independent checksum of each column and of each whole
-row. The table must hold exactly N rows, every k from 0 to N-1 once, and the
-same checksums. A per-column checksum names the column that went wrong; the
-whole-row checksum catches values that landed in the wrong row.
+row. The table must hold exactly N rows, no k twice and every k inside 0 to
+N-1, which together mean every k exactly once, and the same checksums. A
+per-column checksum names the column that went wrong; the whole-row checksum
+catches values that landed in the wrong row.
+
+Every aggregate is bounded in memory at any N: the duplicate count groups by
+k in the table's order (ORDER BY (k, ts)), so nothing holds the key set, as
+uniqExact over hundreds of millions of keys would.
 
   verify.py checksum-sql --rows N           the expected side, over rows.sql
   verify.py checksum-sql --table DB.TABLE   the landed side
@@ -44,16 +49,21 @@ COLUMNS = [
 ]
 
 
-def checksum_sql(source):
+def checksum_sql(source, landed):
     parts = [
         "count() AS rows",
-        "uniqExact(k) AS distinct_k",
         "min(k) AS min_k",
         "max(k) AS max_k",
         "sum(cityHash64({})) AS h_row".format(", ".join(e for _, e in COLUMNS)),
     ]
     parts += ["sum(cityHash64({})) AS h_{}".format(e, n) for n, e in COLUMNS]
-    return "SELECT\n    {}\nFROM {}\nFORMAT JSONEachRow".format(",\n    ".join(parts), source)
+    settings = ""
+    if landed:
+        # Rows beyond the first for each k, aggregated in the table's key order.
+        parts.insert(1, "(SELECT sum(c - 1) FROM (SELECT count() AS c FROM {} GROUP BY k HAVING c > 1))"
+                        " AS duplicate_rows".format(source))
+        settings = "\nSETTINGS optimize_aggregation_in_order = 1"
+    return "SELECT\n    {}\nFROM {}{}\nFORMAT JSONEachRow".format(",\n    ".join(parts), source, settings)
 
 
 def rows_source(rows):
@@ -85,12 +95,12 @@ def gate(expected, actual, rows):
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
     landed = as_int(actual["rows"])
-    distinct = as_int(actual["distinct_k"])
+    duplicates = as_int(actual["duplicate_rows"] or 0)
+    distinct = landed - duplicates
     check("expected_side_is_the_dataset", as_int(expected["rows"]) == rows,
           "rows.sql over numbers(0, {}) gave {} rows".format(rows, as_int(expected["rows"])))
     check("row_count", landed == rows, "{} landed, {} produced".format(landed, rows))
-    check("every_key_once", distinct == rows,
-          "{} distinct k, {} produced".format(distinct, rows))
+    check("no_key_twice", duplicates == 0, "{} rows repeat a k".format(duplicates))
     check("key_range", as_int(actual["min_k"]) == 0 and as_int(actual["max_k"]) == rows - 1,
           "k in [{}, {}], expected [0, {}]".format(actual["min_k"], actual["max_k"], rows - 1))
     mismatched = [n for n, _ in COLUMNS if str(actual["h_" + n]) != str(expected["h_" + n])]
@@ -102,8 +112,8 @@ def gate(expected, actual, rows):
         "passed": all(c["ok"] for c in checks),
         "rows_produced": rows,
         "rows_landed": landed,
-        "duplicates": landed - distinct,
-        "missing_keys": rows - distinct,
+        "duplicates": duplicates,
+        "missing_keys": max(rows - distinct, 0),
         "mismatched_columns": mismatched,
         "checks": checks,
     }
@@ -124,7 +134,7 @@ def main():
     a = ap.parse_args()
 
     if a.cmd == "checksum-sql":
-        print(checksum_sql(rows_source(a.rows) if a.rows is not None else a.table))
+        print(checksum_sql(rows_source(a.rows), False) if a.rows is not None else checksum_sql(a.table, True))
         return 0
 
     report = gate(load_one(a.expected), load_one(a.actual), a.rows)
