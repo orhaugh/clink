@@ -467,27 +467,76 @@ TEST_F(ResolutionFixture, AnIdIsClaimedOnceAndTheRecordOnlyRises) {
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 0u);
     EXPECT_EQ(latest_triggered_id_on_disk("", kJob), 0u);
 
-    auto claim = record_triggered_id(dir, kJob, 5);
+    auto claim = record_triggered_id(dir, kJob, 5, "leader");
     EXPECT_TRUE(claim.claimed);
     EXPECT_EQ(claim.on_record, 5u);
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 5u);
     // A lower id is held by the record, and the claim says what holds it.
-    claim = record_triggered_id(dir, kJob, 3);
+    claim = record_triggered_id(dir, kJob, 3, "superseded");
     EXPECT_FALSE(claim.claimed);
     EXPECT_EQ(claim.on_record, 5u);
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 5u);
     // So is the same id: whoever claimed it first has it.
-    claim = record_triggered_id(dir, kJob, 5);
+    claim = record_triggered_id(dir, kJob, 5, "superseded");
     EXPECT_FALSE(claim.claimed) << "an id already on record was claimed a second time";
     EXPECT_EQ(claim.on_record, 5u);
-    claim = record_triggered_id(dir, kJob, 8);
+    claim = record_triggered_id(dir, kJob, 8, "superseded");
     EXPECT_TRUE(claim.claimed);
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 8u);
-    // Job-scoped, beside the markers, and the body is the id in decimal.
+    // Job-scoped, beside the markers: the id in decimal, then its claimant.
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob + 1), 0u);
     std::ifstream in(completed_marker_dir_for(dir, kJob) / "TRIGGERED");
     const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    EXPECT_EQ(body, "8");
+    EXPECT_EQ(body, "8\nclaimant=superseded\n");
+}
+
+// A claim whose write landed and whose answer was lost is retried, and the
+// retry finds the id on record: on an object store an ordinary retry of a
+// conditional write that landed is refused, and a network filesystem can report
+// a failure for a rename that landed. The record names its claimant, so the
+// retry takes the id as its own. Read as another coordinator's, it cost the
+// claimant the id, and the coordinator renumbered and warned of two
+// coordinators triggering the job when there was one. Only at exactly the id
+// asked for, and only for the claimant that wrote it.
+TEST_F(ResolutionFixture, AClaimWhoseAnswerWasLostIsKnownForItsOwnOnTheRetry) {
+    using clink::cluster::latest_triggered_id_on_disk;
+    using clink::cluster::record_triggered_id;
+    ASSERT_TRUE(record_triggered_id(dir, kJob, 5, "this-coordinator").claimed);
+    // The retry: the write is on record already.
+    auto claim = record_triggered_id(dir, kJob, 5, "this-coordinator");
+    EXPECT_TRUE(claim.claimed)
+        << "a claim's own write, found by its retry, was read as another coordinator's";
+    EXPECT_EQ(claim.on_record, 5u);
+    // Another coordinator asking for the same id is refused as before.
+    claim = record_triggered_id(dir, kJob, 5, "another-coordinator");
+    EXPECT_FALSE(claim.claimed);
+    EXPECT_EQ(claim.on_record, 5u);
+    // An id below the record is held, its claimant's own earlier ones too.
+    claim = record_triggered_id(dir, kJob, 4, "this-coordinator");
+    EXPECT_FALSE(claim.claimed);
+    EXPECT_EQ(claim.on_record, 5u);
+    // Another coordinator's claim past the id holds every id up to it.
+    ASSERT_TRUE(record_triggered_id(dir, kJob, 9, "another-coordinator").claimed);
+    claim = record_triggered_id(dir, kJob, 6, "this-coordinator");
+    EXPECT_FALSE(claim.claimed);
+    EXPECT_EQ(claim.on_record, 9u);
+    // A claimant of no name is answered by its own write alone.
+    ASSERT_TRUE(record_triggered_id(dir, kJob, 10, "").claimed);
+    claim = record_triggered_id(dir, kJob, 10, "");
+    EXPECT_FALSE(claim.claimed);
+    EXPECT_EQ(claim.on_record, 10u);
+    // A record of the id alone, as it was first written, reads as that id
+    // and names no claimant.
+    {
+        std::ofstream out(completed_marker_dir_for(dir, kJob) / "TRIGGERED", std::ios::trunc);
+        out << "12";
+    }
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 12u);
+    claim = record_triggered_id(dir, kJob, 12, "this-coordinator");
+    EXPECT_FALSE(claim.claimed);
+    EXPECT_EQ(claim.on_record, 12u);
+    EXPECT_TRUE(record_triggered_id(dir, kJob, 13, "this-coordinator").claimed);
+    EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 13u);
 }
 
 // Two coordinators wanting the same id - a leader and a superseded one still
@@ -500,8 +549,9 @@ TEST_F(ResolutionFixture, OfConcurrentClaimsOnOneIdExactlyOneLands) {
         std::vector<std::thread> writers;
         writers.reserve(4);
         for (int i = 0; i < 4; ++i) {
-            writers.emplace_back([&] {
-                if (clink::cluster::record_triggered_id(dir, kJob, id).claimed) {
+            writers.emplace_back([&, i] {
+                const auto claimant = "coordinator-" + std::to_string(i);
+                if (clink::cluster::record_triggered_id(dir, kJob, id, claimant).claimed) {
                     landed.fetch_add(1);
                 }
             });
@@ -521,7 +571,7 @@ TEST_F(ResolutionFixture, AnUnreadableTriggeredRecordReadsAsNoneAndTheNextClaimR
     std::filesystem::create_directories(path.parent_path());
     std::ofstream(path) << "not-an-id";
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 0u);
-    EXPECT_TRUE(clink::cluster::record_triggered_id(dir, kJob, 2).claimed);
+    EXPECT_TRUE(clink::cluster::record_triggered_id(dir, kJob, 2, "leader").claimed);
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 2u);
 }
 
@@ -550,7 +600,8 @@ TEST_F(ResolutionFixture, ATriggeredRecordThatCannotBeWrittenThrowsAndLogsNothin
     std::filesystem::create_directories(path);
     std::ofstream(path / "obstruction").put('x');
     const auto since = triggered_record_log_cursor_ms() - 1;
-    EXPECT_THROW((void)clink::cluster::record_triggered_id(dir, kJob, 4), std::runtime_error);
+    EXPECT_THROW((void)clink::cluster::record_triggered_id(dir, kJob, 4, "leader"),
+                 std::runtime_error);
     EXPECT_EQ(clink::cluster::latest_triggered_id_on_disk(dir, kJob), 0u);
     for (const auto& rec : triggered_record_errors_since(since)) {
         ADD_FAILURE() << "a failed claim logged at the store layer: [" << rec.source << "] "
@@ -561,9 +612,9 @@ TEST_F(ResolutionFixture, ATriggeredRecordThatCannotBeWrittenThrowsAndLogsNothin
 // A claim the record already holds is the ordinary answer when two
 // coordinators run the job, not lost leadership, and is not logged as either.
 TEST_F(ResolutionFixture, AClaimTheRecordAlreadyHoldsIsAnAnswerNotAnError) {
-    ASSERT_TRUE(clink::cluster::record_triggered_id(dir, kJob, 50).claimed);
+    ASSERT_TRUE(clink::cluster::record_triggered_id(dir, kJob, 50, "leader").claimed);
     const auto since = triggered_record_log_cursor_ms() - 1;
-    const auto claim = clink::cluster::record_triggered_id(dir, kJob, 7);
+    const auto claim = clink::cluster::record_triggered_id(dir, kJob, 7, "superseded");
     EXPECT_FALSE(claim.claimed);
     EXPECT_EQ(claim.on_record, 50u);
     for (const auto& rec : triggered_record_errors_since(since)) {

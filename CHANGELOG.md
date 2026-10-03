@@ -16,20 +16,30 @@ and a takeover numbers above the record as well. A claim lands only over a
 record holding less, so each id is claimed once across every coordinator of
 the job, and a coordinator whose claim is refused numbers above the record. A
 superseded coordinator whose trigger loop runs on still reaches the workers
-that have not yet re-registered with the new leader, and the two can no
-longer send the same id. Each job claims its next id in the background as
-soon as the previous one is allocated, so the trigger loop never waits on the
-store and a slow or failing record holds only its own job; a failing claim is
-retried after a delay that doubles up to 2 s, and is reported once. A job
-taken over before it completed a checkpoint of its own, which used to number
-from 1 again, gets the same floor. When an id cannot be claimed, the job's
-periodic checkpoints wait for it, a savepoint fails with nothing sent, a
-source's end-of-input request goes unanswered so its subtask fails and the
-restart replays the tail, and a hot cutover is not begun, so the replan takes
-the request. A hot cutover aborted between its arming and its send no longer
-sends its arm frames. The exactly-once specification's id rule now admits the
+that have not yet re-registered with the new leader, and the two can no longer
+send the same id. Each job claims its next id in the background as soon as the
+previous one is allocated, on one claimer thread that stays parked between
+claims, so the trigger loop never waits on the store and a slow or failing
+record holds only its own job; a failing claim is retried after a delay that
+doubles up to 2 s, and is reported once. The record names the claimant whose
+claim put each id there (the id, then a `claimant=` line), so a claim whose
+write landed and whose answer was lost (an ordinary S3 retry of a conditional
+write that has landed is refused) is taken as claimed when retried, rather
+than as another coordinator's. A job taken over before it completed a
+checkpoint of its own, which used to number from 1 again, gets the same floor.
+When an id cannot be claimed, the job's periodic checkpoints wait for it, a
+savepoint fails with nothing sent, and a hot cutover is not begun, so the
+replan takes the request. A source's end-of-input request whose id is not on
+record yet is held and answered once the claim lands, never claimed for on the
+worker's control connection, whose reader also reads that worker's heartbeats;
+while the id cannot be recorded the request goes unanswered, its subtask
+fails, and the restart replays the tail. A hot cutover's arm frames go out in
+the same coordinator lock hold as the check that the cutover is still being
+armed, so an abort's frames always follow them, and a cutover aborted before
+that check sends none. The exactly-once specification's id rule now admits the
 range of ids a takeover can choose and a renumber past a superseded
-coordinator's claims, and a worker fault point,
+coordinator's claims, trace validation rejects a run in which a leader and a
+superseded coordinator trigger the same id, and a worker fault point,
 `worker.after_trigger_delivered`, holds the window open in `HaFailoverTest`.
 
 **A takeover whose in-doubt resolution confirms the job's own checkpoints

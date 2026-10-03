@@ -156,7 +156,7 @@ specification, or a stutter the trace module recognises.
 
 | Event | Emitted by | Fields | Specification step |
 |---|---|---|---|
-| `Trigger` | coordinator, trigger loop | `job`, `ckpt`, `epoch` | `Trigger` (or `ZombieTrigger` from a superseded coordinator) |
+| `Trigger` | coordinator: the trigger loop, or a source's end-of-input final id (`final`) | `job`, `ckpt`, `epoch` | `Trigger` (or `ZombieTrigger` from a superseded coordinator); diverges when another coordinator that can still reach a worker has triggered the same id |
 | `DeliverBarrier` | worker, on `TriggerCheckpoint` | `job`, `ckpt`, `epoch`, `worker`, `fenced` | `DeliverBarrier` |
 | `SinkPrepare` | the two-phase sink, transaction sealed | `sub`, `ckpt`, `family`, `staged` | `SinkPrepare` or `SinkPrepareFails`; the ack decides which |
 | `SubtaskAck` | worker, as `SubtaskCheckpointed` is sent (the subtask's own step, so it precedes the subtask's next prepare in the merged trace) | `job`, `sub`, `ckpt`, `ok` | `SinkAck` (a non-sink subtask's ack is a stutter) |
@@ -320,10 +320,42 @@ coordinator's own epoch, and the trace module diverges on a renumber past
 every id the other coordinator can have claimed, on one with no superseded
 coordinator to have claimed past it, and on an unfenced one. No mutant comes
 with the renumbering either, since the capture it keeps apart is one the
-model, binding every worker at once, cannot reach. A renumber with no
-superseded coordinator behind it is outside the model: a claim whose write
-landed but whose answer was lost is refused when retried, and the
-coordinator skips that id. No recorded trace has that shape.
+model, binding every worker at once, cannot reach.
+
+What the claims and the renumber exist for, that a leader and a superseded
+coordinator never trigger the same id, the specification does not hold
+itself: its superseded coordinator triggers any id, which is harmless there,
+since the model fences its barriers at the takeover. The trace module checks
+it instead, where it costs the model searches nothing. It keeps a ghost of
+the ids triggered by each coordinator that can still reach a worker, under
+that coordinator's epoch, and a `Trigger` whose id another of them has
+triggered diverges, whichever triggers it second. A leader that dies takes
+its ids out of the ghost, since its barriers die with it: a takeover may
+still number from an id the dead leader triggered and never delivered, which
+the range above admits and which `formal/traces/kafka-coordinator-failover`,
+recorded before the record existed, does. A trace whose leader triggers an
+id the superseded coordinator triggered, before the takeover or after it, or
+whose superseded coordinator triggers an id the leader did, diverges at the
+second `Trigger`.
+
+`Renumber` and `ZombieRenumber` stay in the specification, although no rule
+depends on what they add to the model searches (a gap in a coordinator's ids
+while its checkpoints are in flight) and they enlarge them, `M_id_reuse` the
+most, which is why it runs in a CI job of its own. They are the steps the
+engine records as `Renumber`, and trace validation's claim is that every
+recorded event is a step of the specification the model checks cover: moved
+into the trace module alone, each recorded renumber would be validated
+against a step no model check had explored.
+
+A claim whose write landed and whose answer was lost no longer renumbers:
+the record names the claimant whose claim put each id there, and a retry
+that finds its own claim at exactly the id it asked for takes the id as
+claimed. Two renumbers remain outside the model, and a trace diverges at
+either. A fresh job whose record could not be read at deploy claims from 1,
+and renumbers above whatever an earlier run of the job left on record, with
+no superseded coordinator behind it. And the end-of-input request for a
+final id renumbers while a restart drains as well, where the model renumbers
+only a running job. No recorded trace has either shape.
 
 A divergence can also mean the trace is missing a line. The coordinator
 records `WriteCompleted` after the COMPLETED marker's durable write, so the
@@ -493,8 +525,9 @@ In the honesty categories the qualification pages use:
   worker still bound to a superseded coordinator's epoch after a takeover
   (the model binds every worker at the takeover, so it fences that
   coordinator's frames at once; in the engine the checkpoint-id record keeps
-  the two coordinators' checkpoint ids apart, and nothing keeps the
-  superseded coordinator's other frames from such a worker); network frame
+  the two coordinators' checkpoint ids apart, which trace validation checks
+  of every recorded run, and nothing keeps the superseded coordinator's
+  other frames from such a worker); network frame
   encoding; time. Each has its own evidence elsewhere. A snapshot that
   fails in an operator rather than a sink is outside trace validation too: the
   trace module skips acks from subtasks it does not model, so such a run

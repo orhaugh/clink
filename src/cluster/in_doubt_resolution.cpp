@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -103,12 +104,16 @@ std::string triggered_record_key(JobId job_id) {
 
 namespace {
 
-// The record's body is the id in decimal. Anything else reads as no record,
-// and the next raise overwrites it, since the compare-and-set below compares
-// against what parses.
+// The record's body is the id in decimal on its first line, and the claimant
+// that put it there on the second. A first line that is anything else reads
+// as no record, and the next raise overwrites it, since the compare-and-set
+// below compares against what parses. A body of the id alone, as the record
+// was first written, reads the same and names no claimant.
+constexpr std::string_view kClaimantField = "claimant=";
+
 std::uint64_t triggered_id_of(const std::string& body) {
-    auto end = body.size();
-    while (end > 0 && (body[end - 1] == '\n' || body[end - 1] == '\r' || body[end - 1] == ' ')) {
+    auto end = std::min(body.find('\n'), body.size());
+    while (end > 0 && (body[end - 1] == '\r' || body[end - 1] == ' ')) {
         --end;
     }
     std::uint64_t id = 0;
@@ -117,6 +122,24 @@ std::uint64_t triggered_id_of(const std::string& body) {
         return 0;
     }
     return id;
+}
+
+std::string_view triggered_claimant_of(const std::string& body) {
+    const auto line = body.find('\n');
+    if (line == std::string::npos) {
+        return {};
+    }
+    std::string_view rest(body);
+    rest.remove_prefix(line + 1);
+    if (rest.substr(0, kClaimantField.size()) != kClaimantField) {
+        return {};
+    }
+    rest.remove_prefix(kClaimantField.size());
+    auto end = std::min(rest.find('\n'), rest.size());
+    while (end > 0 && (rest[end - 1] == '\r' || rest[end - 1] == ' ')) {
+        --end;
+    }
+    return rest.substr(0, end);
 }
 
 }  // namespace
@@ -131,22 +154,27 @@ std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir, Job
 
 TriggeredIdClaim record_triggered_id(const std::string& checkpoint_dir,
                                      JobId job_id,
-                                     std::uint64_t id) {
+                                     std::uint64_t id,
+                                     std::string_view claimant) {
     if (id == 0) {
         throw std::invalid_argument("checkpoint ids start at 1; there is no id 0 to record");
     }
     const auto store = make_coordination_store(checkpoint_dir);
     const auto key = triggered_record_key(job_id);
+    std::string body = std::to_string(id);
+    if (!claimant.empty()) {
+        body.append("\n").append(kClaimantField).append(claimant).append("\n");
+    }
     // The store writes over a record holding no more than the writer's epoch,
     // so the writer's epoch is the id below this one: the id lands only over a
     // record that holds less, and of two coordinators claiming one id exactly
     // one succeeds. The fence is the whole check, so there is no read first:
     // a record already at or above the id refuses the write without one.
-    if (store->fenced_put_quietly(key, std::to_string(id), id - 1, triggered_id_of)) {
+    if (store->fenced_put_quietly(key, body, id - 1, triggered_id_of)) {
         return {.claimed = true, .on_record = id};
     }
-    const auto body = store->get(key);
-    const std::uint64_t on_record = body.has_value() ? triggered_id_of(*body) : 0;
+    const auto found = store->get(key);
+    const std::uint64_t on_record = found.has_value() ? triggered_id_of(*found) : 0;
     if (on_record < id) {
         // A fence that refused names a record at or above the id, and the
         // record only rises: one below it means the write did not land and
@@ -154,6 +182,14 @@ TriggeredIdClaim record_triggered_id(const std::string& checkpoint_dir,
         throw std::runtime_error("could not record checkpoint id " + std::to_string(id) + " in " +
                                  checkpoint_dir + "/" + key + " (the record holds " +
                                  std::to_string(on_record) + ")");
+    }
+    // Refused at exactly this id by a record naming this claimant: a claim of
+    // its own whose write landed and whose answer did not, so the id is its
+    // already. A claimant is unique to one coordinator's deploy of the job, so
+    // no other coordinator writes this name. A record past the id, or naming
+    // anyone else, holds the id elsewhere.
+    if (on_record == id && !claimant.empty() && triggered_claimant_of(*found) == claimant) {
+        return {.claimed = true, .on_record = id};
     }
     return {.claimed = false, .on_record = on_record};
 }

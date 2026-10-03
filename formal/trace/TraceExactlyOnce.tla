@@ -31,7 +31,21 @@
    the trace here; TLC re-evaluates a definition on every reference, so every
    step walked the whole trace again and validation was quadratic in trace
    length (180 events in 6 seconds, 900 in 120, 1,500 in 300). The current
-   event is read into a variable once per step for the same reason. *)
+   event is read into a variable once per step for the same reason.
+
+   One property is checked here and not in the specification: no two
+   coordinators that can both still reach a worker trigger the same id. The
+   engine keeps it with the job's checkpoint-id record, on which each id is
+   claimed once across every coordinator of the job, and with the renumber
+   past a refused claim. The specification does not keep it: ZombieTrigger
+   takes any id, which is harmless there, because the model binds every
+   worker to the new epoch at the takeover and so fences the superseded
+   coordinator's barriers. In the engine a worker that has not re-registered
+   with the leader still accepts them, and its capture of a shared id writes
+   the path the leader's capture of that id writes. A ghost of the ids
+   triggered under each epoch costs the model searches nothing here, and a
+   trace whose leader and superseded coordinator both trigger one id diverges
+   at the second Trigger. *)
 EXTENDS ExactlyOnce, Json, IOUtils, TLC, Sequences, TraceConstants
 
 \* The merged trace, named by the environment (the validator sets it).
@@ -47,9 +61,10 @@ ModelEpoch(e) == e - TraceFirstEpoch + 1
 --------------------------------------------------------------------------------
 (* Following the trace. *)
 
-VARIABLES l,       \* index of the next event to match
-          ev,      \* Trace[l], read once per step
-          placed   \* [Sinks -> Workers]: where each sink is deployed RIGHT NOW
+VARIABLES l,         \* index of the next event to match
+          ev,        \* Trace[l], read once per step
+          placed,    \* [Sinks -> Workers]: where each sink is deployed RIGHT NOW
+          triggered  \* <<model epoch, id>> per id triggered (see TriggeredElsewhere)
 
 \* Register 1 holds the highest event index any path has reached; the
 \* validator runs TLC with one worker, so the register is a single number.
@@ -73,8 +88,23 @@ Unfenced == E.epoch = 0
 ForSink == Has(E, "sub") /\ E.sub \in Sinks
 Skip == UNCHANGED vars
 
+\* The model epoch a Trigger event is taken under: the event's own, or the
+\* leader's for an unfenced coordinator, which has no zombie beside it.
+TriggerEpoch == IF Unfenced THEN leaderEpoch ELSE ModelEpoch(E.epoch)
+
+\* The ids triggered by every coordinator that can still reach a worker: the
+\* leader, and a superseded coordinator, whose barriers reach a worker until
+\* that worker re-registers with the leader (see the header). A Trigger whose
+\* id another of them has triggered diverges, whichever triggers it second.
+\* A dead leader's ids are forgotten at its death (Hidden): its barriers died
+\* with it, so a takeover may number from an id it triggered and never
+\* delivered, which the specification's range admits and engines before the
+\* record did (formal/traces/kafka-coordinator-failover).
+TriggeredElsewhere == \E p \in triggered : p[2] = E.ckpt /\ p[1] # TriggerEpoch
+
 StepTrigger ==
     /\ Is("Trigger")
+    /\ ~TriggeredElsewhere
     /\ IF Unfenced
        THEN Trigger /\ nextCkpt = E.ckpt /\ ~zombie
        ELSE \/ Trigger /\ nextCkpt = E.ckpt /\ leaderEpoch = ModelEpoch(E.epoch)
@@ -259,6 +289,9 @@ TraceStep ==
     /\ placed' = IF Is("Placement") /\ ForSink
                  THEN [placed EXCEPT ![E.sub] = E.worker]
                  ELSE placed
+    /\ triggered' = IF Is("Trigger")
+                    THEN triggered \cup {<<TriggerEpoch, E.ckpt>>}
+                    ELSE triggered
     /\ \/ StepTrigger \/ StepDeliverBarrier \/ StepSinkPrepare \/ StepSubtaskAck
        \/ StepCoordComplete \/ StepWriteCompleted \/ StepBroadcast
        \/ StepDeliverCommit \/ StepDeliverAbort
@@ -282,20 +315,24 @@ LostWriteCompleted ==
 
 \* What the engine cannot observe and so never emits: the model may take
 \* these between events, within the budgets the trace implies.
+\* A dying leader takes its ids out of `triggered`; a superseded one keeps them,
+\* under the epoch it goes on triggering with.
 Hidden ==
-    /\ \/ CoordDies \/ CoordSuperseded \/ ZombieStops
-       \/ TxnExpires \/ BrokerGoesDown \/ BrokerComesBack
-       \/ LostWriteCompleted
+    /\ \/ CoordDies /\ triggered' = {p \in triggered : p[1] # leaderEpoch}
+       \/ /\ \/ CoordSuperseded \/ ZombieStops
+             \/ TxnExpires \/ BrokerGoesDown \/ BrokerComesBack
+             \/ LostWriteCompleted
+          /\ UNCHANGED triggered
     /\ UNCHANGED <<l, ev, placed>>
 
 \* The trace consumed: the run stutters here rather than deadlocking.
-TraceEnd == l > TraceLen /\ UNCHANGED <<vars, l, ev, placed>>
+TraceEnd == l > TraceLen /\ UNCHANGED <<vars, l, ev, placed, triggered>>
 
 TraceNext == TraceStep \/ Hidden \/ TraceEnd
 
-TraceInit == Init /\ l = 1 /\ ev = Trace[1] /\ placed = Host
+TraceInit == Init /\ l = 1 /\ ev = Trace[1] /\ placed = Host /\ triggered = {}
 
-TraceSpec == TraceInit /\ [][TraceNext]_<<vars, l, ev, placed>>
+TraceSpec == TraceInit /\ [][TraceNext]_<<vars, l, ev, placed, triggered>>
 
 \* POSTCONDITION: TRUE when some path consumed the whole trace.
 TraceAccepted ==

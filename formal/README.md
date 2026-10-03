@@ -248,7 +248,17 @@ specification admits as `Renumber` and `ZombieRenumber`. The model binds
 every worker to the new epoch at the takeover, so it fences the superseded
 coordinator's barriers there; in the engine a worker binds it only when it
 re-registers, and the claims are what keep a late capture of one of those
-barriers off the leader's ids.
+barriers off the leader's ids. That property is checked in the trace module
+rather than the specification, where it costs the model searches nothing:
+`triggered` is a ghost of the ids each coordinator that can still reach a
+worker has triggered, under its epoch, and a `Trigger` whose id another of
+them has triggered diverges, whichever triggers it second. A leader that
+dies takes its ids out of the ghost, since its barriers die with it, which is
+what lets `traces/kafka-coordinator-failover`, recorded before the record
+existed, number from an id its dead leader triggered and never delivered.
+`Renumber` and `ZombieRenumber` stay in `Next` so that every renumber a trace
+records is a step the model searches have covered, not one the trace module
+alone admits.
 
 ## Conventions
 

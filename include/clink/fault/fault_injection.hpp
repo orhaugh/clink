@@ -376,6 +376,11 @@ inline constexpr char kHotCutoverBeforeComplete[] = "rescale.hot_before_complete
 // it, after which the frames must be dropped rather than arm subtasks for a
 // cutover nobody will finish.
 inline constexpr char kHotCutoverBeforeArm[] = "rescale.hot_before_arm";
+// The cutover is still the one being armed and its arm frames are about to be
+// sent, under the coordinator lock. A Delay here holds the send while the
+// phase deadline passes: the abort that follows must reach every worker after
+// the arm frames, never ahead of them.
+inline constexpr char kHotCutoverArmSend[] = "rescale.hot_arm_send";
 // An ack for the cutover checkpoint C from a task the rescaled operator FEEDS
 // has arrived and is about to be processed, on that worker's connection thread,
 // before the coordinator lock. The fed side acks after every barrier has

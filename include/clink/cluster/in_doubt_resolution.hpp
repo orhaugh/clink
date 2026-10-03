@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace clink::cluster {
 
@@ -74,9 +75,10 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 // that ANY durable artefact names.
 [[nodiscard]] std::uint64_t latest_snapshot_id_on_disk(const std::string& checkpoint_dir);
 
-// <checkpoint_dir>/_jobs/<job_id>/TRIGGERED, in decimal: the highest
-// checkpoint id any coordinator of the job has claimed, and a recovered job
-// numbers above it too. A coordinator claims an id here before any frame
+// <checkpoint_dir>/_jobs/<job_id>/TRIGGERED: the highest checkpoint id any
+// coordinator of the job has claimed, in decimal on the first line, and on the
+// second (`claimant=...`) the claimant whose claim put it there. A recovered
+// job numbers above it too. A coordinator claims an id here before any frame
 // naming it leaves (a TriggerCheckpoint, the reply carrying an end-of-input
 // final id, a hot cutover's arm), so the record covers every barrier that can
 // have reached a worker. The snapshot files cannot: a capture still being
@@ -87,14 +89,17 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 // caught a takeover reusing such an id.
 [[nodiscard]] std::string triggered_record_key(JobId job_id);
 
-// The id the record holds; 0 when there is none or it does not parse.
+// The id the record holds; 0 when there is none or its first line does not
+// parse. A record from before the claimant line (the id alone) reads the same.
 [[nodiscard]] std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir,
                                                         JobId job_id);
 
 // What a claim on one checkpoint id found.
 struct TriggeredIdClaim {
-    // True when this call put the id on record, which makes it the caller's
-    // alone: no coordinator can claim it after.
+    // True when the id is on record as this claimant's, which makes it the
+    // caller's alone: no coordinator can claim it after. Either this call put
+    // it there, or an earlier claim of the same claimant did and its answer
+    // was lost.
     bool claimed{false};
     // What the record holds afterwards: the id itself when claimed, else the
     // id at or above it that refused the claim.
@@ -114,9 +119,21 @@ struct TriggeredIdClaim {
 // either, when the record could not be written, and the caller must not send
 // the id then. Writers in one process serialise per job (the coordinator's
 // per-job record lock); the compare-and-set orders them across processes.
+//
+// `claimant` names the caller's claims, and must be unique to it: a refusal at
+// exactly `id` re-reads the record once, and a record naming this claimant is
+// this claimant's own claim, whose write landed and whose answer was lost (on
+// an object store an ordinary retry of a conditional write that landed is
+// refused, and a network filesystem can report a failure for a rename that
+// landed).
+// Read as held by another coordinator, it cost the caller the id and set off
+// a renumber as if two coordinators were triggering the job. An empty
+// claimant never matches, so each of its claims is answered by its own write
+// alone.
 [[nodiscard]] TriggeredIdClaim record_triggered_id(const std::string& checkpoint_dir,
                                                    JobId job_id,
-                                                   std::uint64_t id);
+                                                   std::uint64_t id,
+                                                   std::string_view claimant);
 
 // `cancel` (optional): cooperative cancellation, checked before every wire
 // probe and before every store effect (receipt materialisation, CONFIRMED

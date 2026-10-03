@@ -709,6 +709,14 @@ public:
         return client_sessions_.size();
     }
 
+    // Checkpoint-id claimer threads started over this coordinator's life: one
+    // per job whose ids it has claimed, however many checkpoints the job
+    // takes. Exposed because a thread per checkpoint is not observable from
+    // outside otherwise, and it was how the claims first ran.
+    [[nodiscard]] std::uint64_t id_claimers_started() const noexcept {
+        return id_claimers_started_.load(std::memory_order_relaxed);
+    }
+
     // Workers still HOLDING a connection, as distinct from workers on record.
     // The gap between the two is the point: a lost worker keeps its record, so
     // "does the coordinator leak a socket per registration" is not observable
@@ -1297,8 +1305,14 @@ private:
             // Fixed at deploy.
             std::string checkpoint_dir;
             JobId job_id{0};
+            // Names this coordinator's claims on the record, unique to this
+            // deploy of the job in this process (record_triggered_id), so a
+            // claim whose write landed and whose answer was lost is known for
+            // its own when the retry finds it there.
+            std::string claimant;
             // Keeps this process's claims for the job in order; held across
-            // the store write.
+            // the store write, and so never taken on a thread that must not
+            // wait on the store.
             std::mutex write_mu;
             // The highest id this coordinator may allocate: the last it
             // claimed, or the record as the job's deploy found it. Ids at or
@@ -1314,15 +1328,18 @@ private:
             // rather than on every retry.
             std::atomic<bool> failing{false};
 
-            // The claimer, guarded by `mu`. It runs while an id is wanted and
+            // The claimer, guarded by `mu`: one thread for the job, started by
+            // the first request for an id. It claims while an id is wanted and
             // not yet owned, retries a failing claim with a growing delay, and
-            // exits once it has caught up; the trigger loop starts it again
-            // for the next id. Retired when the job ends, stopping when the
-            // coordinator does.
+            // otherwise parks on `cv` until a later id is wanted. It leaves
+            // when the job ends (retired) or the coordinator stops (stopping),
+            // and `exited` then tells reap_id_recorders_ it can be joined.
+            // `mu` is never held across the store write.
             std::mutex mu;
             std::condition_variable cv;
             std::uint64_t wanted{0};
-            bool running{false};
+            bool started{false};
+            bool exited{false};
             bool retired{false};
             bool stopping{false};
             std::chrono::steady_clock::time_point retry_at{};
@@ -1365,6 +1382,18 @@ private:
         // EOS re-requests a fresh id seeded from the post-restart task set.
         std::optional<std::uint64_t> final_checkpoint_id;
         std::unordered_set<std::string> sources_requested_final;
+        // Sources whose request arrived while the id the job would assign
+        // next was not on record yet. The request is held rather than claimed
+        // for on the worker's control reader, which must not wait on the
+        // store; the trigger loop answers it once the job's claimer has put
+        // the id on record (answer_final_requests_locked_). Cleared on
+        // restart with the final id, by when the sources asking are gone.
+        struct HeldFinalRequest {
+            std::string role;
+            std::uint32_t subtask_idx{0};
+            std::shared_ptr<network::Connection> reply_conn;
+        };
+        std::vector<HeldFinalRequest> held_final_requests;
         // Test-only (CLINK_TEST_STALL_FIRST_FINAL_CKPT): force the no-crash
         // EOS-timeout path. On the FIRST final checkpoint, the coordinator picks the
         // first subtask that acks it (test_stall_key) and drops EVERY ack for
@@ -1659,18 +1688,36 @@ private:
     // advances latest_confirmed_checkpoint_id.
     void handle_commit_confirmed_(MessageReader& r);
     // A bounded source at clean EOS requested a final coordinated checkpoint.
-    // Assigns (once per job) the final id, seeds its pending ack set, broadcasts
-    // TriggerCheckpoint, and replies FinalCheckpointAssigned on `reply_conn`.
-    void handle_request_final_checkpoint_(MessageReader& r, network::Connection& reply_conn);
+    // Runs on the requesting worker's control reader, which also reads that
+    // worker's heartbeats, so it never waits on the store: an id not yet on
+    // record is asked of the job's claimer and the request is held
+    // (JobState::held_final_requests) until the trigger loop can answer it.
+    void handle_request_final_checkpoint_(MessageReader& r,
+                                          const std::shared_ptr<network::Connection>& reply_conn);
+    // Under mu_: the answer to one source's end-of-input request, assigning the
+    // job's final id (once per job) and seeding its pending ack set, or nothing
+    // while the id the job would assign next is not on record yet. `job` is
+    // null for a job this coordinator does not know.
+    std::optional<FinalCheckpointAssignedMsg> decide_final_request_locked_(
+        JobState* job, JobId job_id, const std::string& role, std::uint32_t subtask_idx);
+    // Under mu_: answer the job's held final-id requests once the id is on
+    // record, staging each reply in `replies` for the caller to send after the
+    // lock. False, leaving them held, while the id is still not on record.
+    bool answer_final_requests_locked_(
+        JobState& job,
+        std::vector<std::pair<std::shared_ptr<network::Connection>, FinalCheckpointAssignedMsg>>&
+            replies);
     void checkpoint_trigger_loop_();
     // Put the job's next checkpoint id on record, so that this coordinator
     // may allocate it: a takeover numbers above the job's checkpoint-id
     // record, and a barrier whose capture has not landed is visible to it
     // nowhere else (record_triggered_id). Called outside mu_, with the id read
-    // under mu_ as the job's next. True when a claim landed or the record
-    // already stands that far for this coordinator; the caller then decides
-    // again under mu_, and allocates only while TriggeredRecord::owned covers
-    // the job's next id at that moment, which is what makes every allocated id
+    // under mu_ as the job's next, and never on a worker's control reader: it
+    // waits on the store, and on TriggeredRecord::write_mu while another claim
+    // for the job is out. True when a claim landed or the record already
+    // stands that far for this coordinator; the caller then decides again
+    // under mu_, and allocates only while TriggeredRecord::owned covers the
+    // job's next id at that moment, which is what makes every allocated id
     // this coordinator's alone even across a renumber in between. False when
     // the record already holds the id or a higher one: another coordinator of
     // the job claimed them, and held_elsewhere says how far. Throws when the
@@ -1684,12 +1731,13 @@ private:
     bool renumber_above_held_ids_locked_(JobState& job);
     // The background claimer (TriggeredRecord). The trigger loop asks it for
     // the job's next id once the previous one is allocated, so the claim has
-    // normally landed by the time the id falls due. Outside mu_: starts the
-    // job's claimer, joining one that has finished, or wakes it.
+    // normally landed by the time the id falls due. Outside mu_, and safe on
+    // any thread: it never waits on the store, only starts the job's claimer
+    // on the first request and wakes it after.
     void request_id_record_(const std::shared_ptr<JobState::TriggeredRecord>& record,
                             std::uint64_t id);
     void id_record_loop_(const std::shared_ptr<JobState::TriggeredRecord>& record);
-    // Join the claimers that have finished; stop() joins the rest.
+    // Join the claimers of jobs that have ended; stop() joins the rest.
     void reap_id_recorders_();
     // Release the trigger loop's sleep: a claim landed, or a refused one
     // means a renumber is due.
@@ -1754,6 +1802,7 @@ private:
     // thread never holds the last reference to its own record.
     std::mutex id_recorders_mu_;
     std::vector<std::shared_ptr<JobState::TriggeredRecord>> id_recorders_;
+    std::atomic<std::uint64_t> id_claimers_started_{0};
 
     // HA recoveries parked for capacity (job ids whose manifest is intact
     // but no worker had registered yet), and the thread that re-runs them
