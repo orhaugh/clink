@@ -75,8 +75,8 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 [[nodiscard]] std::uint64_t latest_snapshot_id_on_disk(const std::string& checkpoint_dir);
 
 // <checkpoint_dir>/_jobs/<job_id>/TRIGGERED, in decimal: the highest
-// checkpoint id any coordinator of the job has recorded, and a recovered job
-// numbers above it too. The coordinator records an id here before any frame
+// checkpoint id any coordinator of the job has claimed, and a recovered job
+// numbers above it too. A coordinator claims an id here before any frame
 // naming it leaves (a TriggerCheckpoint, the reply carrying an end-of-input
 // final id, a hot cutover's arm), so the record covers every barrier that can
 // have reached a worker. The snapshot files cannot: a capture still being
@@ -91,17 +91,32 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 [[nodiscard]] std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir,
                                                         JobId job_id);
 
-// Raise the record to cover `id` and return the id it then holds (at least
-// `id`). It only rises: a write below what it holds is refused by the store's
-// compare-and-set, so a superseded coordinator still triggering under its old
-// epoch cannot lower it beneath ids the leader has sent (a superseded
-// coordinator's own ids are fenced at the workers and need no cover). Throws
-// when the record could not be written, and the caller must then not send the
-// id. Writers in one process serialise per job (the coordinator's per-job
-// record lock); the compare-and-set orders them across processes.
-[[nodiscard]] std::uint64_t record_triggered_id(const std::string& checkpoint_dir,
-                                                JobId job_id,
-                                                std::uint64_t id);
+// What a claim on one checkpoint id found.
+struct TriggeredIdClaim {
+    // True when this call put the id on record, which makes it the caller's
+    // alone: no coordinator can claim it after.
+    bool claimed{false};
+    // What the record holds afterwards: the id itself when claimed, else the
+    // id at or above it that refused the claim.
+    std::uint64_t on_record{0};
+};
+
+// Claim `id` on the record. The claim lands only over a record holding less
+// than the id, so the record only rises and an id is claimed once across every
+// coordinator of the job. That is what keeps a leader off the ids of a
+// superseded coordinator still triggering under its old epoch: workers that
+// have bound the new epoch refuse that coordinator's barriers, but one that
+// has not yet re-registered with the leader still accepts them, and its
+// capture of such an id writes the path the leader's capture of the same id
+// would. A claim refused because the record already holds the id or more is
+// an ordinary answer, not an error, and logs nothing: the caller must not send
+// the id and numbers above what the record holds. Throws, logging nothing
+// either, when the record could not be written, and the caller must not send
+// the id then. Writers in one process serialise per job (the coordinator's
+// per-job record lock); the compare-and-set orders them across processes.
+[[nodiscard]] TriggeredIdClaim record_triggered_id(const std::string& checkpoint_dir,
+                                                   JobId job_id,
+                                                   std::uint64_t id);
 
 // `cancel` (optional): cooperative cancellation, checked before every wire
 // probe and before every store effect (receipt materialisation, CONFIRMED

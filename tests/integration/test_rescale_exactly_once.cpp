@@ -1200,9 +1200,9 @@ TEST_F(HotRescaleTest, AWorkerLostMidCutoverFallsBackToTheReplanAndStaysExactlyO
 // Every checkpoint id goes on record (<checkpoint_dir>/_jobs/<job>/TRIGGERED)
 // before any frame naming it leaves the coordinator, because a takeover numbers
 // above the record; for a hot cutover that frame is the arm, which names the
-// cutover checkpoint. An id that cannot be recorded aborts the cutover before
-// anything is armed, onto the replan, which needs no id of its own. The record
-// is made unwritable with a directory where it goes, which holds the periodic
+// cutover checkpoint. A cutover whose id cannot be recorded is not begun, and
+// the replan, which needs no id of its own, takes the request. The record is
+// made unwritable with a directory where it goes, which holds the periodic
 // checkpoints too until it is writable again.
 TEST_F(HotRescaleTest, ACutoverWhoseCheckpointIdCannotBeRecordedFallsBackToTheReplan) {
     ::setenv("CLINK_RXO_PAR", "2", 1);
@@ -1250,13 +1250,22 @@ TEST_F(HotRescaleTest, ACutoverWhoseCheckpointIdCannotBeRecordedFallsBackToTheRe
         },
         std::chrono::seconds(10)));
 
+    // The job's next id is claimed ahead of its trigger, so it can already be
+    // on record from before the swap. The cutover takes that id, and is only
+    // sure to find it off record once the periodic trigger has used it and the
+    // claim for the one after has failed, which the coordinator reports once.
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return c.coordinator().log_contains("could not record checkpoint id"); },
+        std::chrono::seconds(30)))
+        << "the job's checkpoint ids kept landing on record after the swap";
+
     std::string rescale_out;
     const int rc = rescale_operator(c, "counter", kMaxParallelism, &rescale_out);
     ASSERT_EQ(rc, 0) << "the rescale was refused rather than falling back: " << rescale_out;
     ASSERT_TRUE(clink::itest::await(
         [&] { return c.coordinator().log_contains("could not record cutover checkpoint id"); },
         std::chrono::seconds(30)))
-        << "the cutover did not abort on its unrecordable id";
+        << "the cutover did not fall back on its unrecordable id";
     ASSERT_TRUE(clink::itest::await([&] { return c.coordinator().log_contains("replanned"); },
                                     std::chrono::seconds(120)))
         << "the abort never fell back to the replan";

@@ -14,6 +14,8 @@
 //                     one critical section" guarantee the filesystem store
 //                     gets from flock, expressed as compare-and-swap on
 //                     the object's ETag
+//   fenced_put_quietly -> fenced_put, inherited: it logs nothing of its
+//                     own, refusing with false and failing with a throw
 //   list           -> ListObjectsV2 under "<prefix>/", keys relative to
 //                     the store root
 //   remove         -> DeleteObject (deleting an absent key succeeds)

@@ -486,13 +486,17 @@ jobs:
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04
-    # The models take about 80 minutes on the four-core runner,
+    # The models take about 105 minutes on the four-core runner,
     # MC_RecoverableSmall alone most of it. They run one at a time with every
     # worker, not several at a time with one each: one model dominates, and
     # TLC's workers are worth more to it than concurrency is to the short ones
     # (measured: a model that takes 221 s on all workers takes 22 min on one).
-    # The mutants are the opposite case and have their own job.
-    timeout-minutes: 100
+    # The mutants are the opposite case and have their own job. The models
+    # took 77 minutes until a coordinator whose claim on a checkpoint id is
+    # refused could renumber (Renumber, ZombieRenumber): every supersession
+    # now branches again, and the models with a coordinator death reach up to
+    # half as many states again (MC_RecoverableSmall 103M to 145M).
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -529,16 +533,17 @@ jobs:
   formal-mutants:
     name: Every mutant of the exactly-once specification is refuted
     runs-on: ubuntu-24.04
-    # Sixteen independent runs, so four at a time with a single TLC worker each
+    # Fifteen independent runs, so four at a time with a single TLC worker each
     # beats one at a time with all four: TLC scales sublinearly across workers.
-    # The two accepted mutants enumerate their whole state space and take 45 to
-    # 60 minutes each on their own worker, and the longest refutation takes 50,
-    # which is why this is its own job rather than an hour added to the models'.
-    # The set took 88 minutes until a takeover's next checkpoint id became a
-    # range in the specification (RedeployEffects). Every takeover now branches,
-    # a refutation searches up to two thirds more states before it reaches its
-    # counterexample, and the set should take about 105.
-    timeout-minutes: 130
+    # The two accepted mutants enumerate their whole state space and take well
+    # over an hour each on their own worker, which is why this is its own job
+    # rather than time added to the models'. M_id_reuse runs in the job below:
+    # since a takeover's next checkpoint id became a range (RedeployEffects) and
+    # a coordinator whose claim on an id is refused can renumber (Renumber,
+    # ZombieRenumber), its search, which allows two coordinator deaths, grew
+    # about five times (21.7M to 103.6M states) to some 200 minutes on one
+    # worker, which would have made this job three and a half hours long.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -550,14 +555,38 @@ jobs:
         with:
           path: ~/.clink-deps/formal-tools
           key: tla-tools-${{ hashFiles('formal/tools.env') }}
-      - name: Every mutant is refuted
+      - name: Every mutant but M_id_reuse is refuted
         # Each configuration under formal/mutants/ switches one rule back to
         # a pre-fix form a qualification campaign (or the model itself) found
         # and fixed. TLC must produce a counterexample for each, or the
         # mutant is recorded in formal/mutants/expected.txt as one a later
         # rule guards as well and must stay accepted: either drift is a
         # regression in the model or its record, not a pass.
-        run: CHECK_JOBS=4 TLC_HEAP=3g ./scripts/formal-check.sh --mutants
+        run: |
+          set -euo pipefail
+          mutants=$(cd formal/mutants && ls M_*.cfg | sed 's/\.cfg$//' | grep -vx 'M_id_reuse')
+          # shellcheck disable=SC2086 # one argument per mutant, on purpose
+          CHECK_JOBS=4 TLC_HEAP=3g ./scripts/formal-check.sh --mutants $mutants
+
+  formal-mutant-id-reuse:
+    name: The id-reuse mutant of the exactly-once specification is refuted
+    runs-on: ubuntu-24.04
+    # M_id_reuse on its own runner with every worker, beside the other fifteen:
+    # its refutation is the largest search of the set (about 104M states).
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Cache the pinned TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps/formal-tools
+          key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - name: M_id_reuse is refuted
+        run: TLC_WORKERS=auto TLC_HEAP=10g ./scripts/formal-check.sh --mutants M_id_reuse
 
   trace-validation:
     name: Recorded protocol traces are behaviours of the specification

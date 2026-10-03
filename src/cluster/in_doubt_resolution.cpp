@@ -129,37 +129,33 @@ std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir, Job
     return body.has_value() ? triggered_id_of(*body) : 0;
 }
 
-std::uint64_t record_triggered_id(const std::string& checkpoint_dir,
-                                  JobId job_id,
-                                  std::uint64_t id) {
+TriggeredIdClaim record_triggered_id(const std::string& checkpoint_dir,
+                                     JobId job_id,
+                                     std::uint64_t id) {
+    if (id == 0) {
+        throw std::invalid_argument("checkpoint ids start at 1; there is no id 0 to record");
+    }
     const auto store = make_coordination_store(checkpoint_dir);
     const auto key = triggered_record_key(job_id);
-    const auto held = [&] {
-        const auto body = store->get(key);
-        return body.has_value() ? triggered_id_of(*body) : std::uint64_t{0};
-    };
-    // Read first. An id already covered needs no write, and the
-    // compare-and-set then refuses only a writer that got past this read
-    // first, which is another process: this one serialises its own.
-    if (const auto on_record = held(); on_record >= id) {
-        return on_record;
+    // The store writes over a record holding no more than the writer's epoch,
+    // so the writer's epoch is the id below this one: the id lands only over a
+    // record that holds less, and of two coordinators claiming one id exactly
+    // one succeeds. The fence is the whole check, so there is no read first:
+    // a record already at or above the id refuses the write without one.
+    if (store->fenced_put_quietly(key, std::to_string(id), id - 1, triggered_id_of)) {
+        return {.claimed = true, .on_record = id};
     }
-    // The id is its own fencing epoch: the store writes only over a record
-    // holding no more than it.
-    if (store->fenced_put(key,
-                          std::to_string(id),
-                          id,
-                          triggered_id_of,
-                          "(checkpoint-id record: the two numbers are checkpoint ids, and the "
-                          "higher one already on record covers this one)")) {
-        return id;
+    const auto body = store->get(key);
+    const std::uint64_t on_record = body.has_value() ? triggered_id_of(*body) : 0;
+    if (on_record < id) {
+        // A fence that refused names a record at or above the id, and the
+        // record only rises: one below it means the write did not land and
+        // the refusal was a store that could not tell us why.
+        throw std::runtime_error("could not record checkpoint id " + std::to_string(id) + " in " +
+                                 checkpoint_dir + "/" + key + " (the record holds " +
+                                 std::to_string(on_record) + ")");
     }
-    // Refused, or the write did not land: what the record holds decides.
-    if (const auto on_record = held(); on_record >= id) {
-        return on_record;
-    }
-    throw std::runtime_error("could not record checkpoint id " + std::to_string(id) + " in " +
-                             checkpoint_dir + "/" + key);
+    return {.claimed = false, .on_record = on_record};
 }
 
 namespace {

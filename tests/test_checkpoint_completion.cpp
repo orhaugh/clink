@@ -52,9 +52,15 @@
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/cluster/protocol_trace.hpp"
+#include "clink/config/json.hpp"
+#include "clink/connectors/txn_resume_registry.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/otlp_export.hpp"
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/network/connection.hpp"
+#include "clink/state/state_backend_factory.hpp"
+#include "clink/state_processor/savepoint.hpp"
 
 using namespace clink;
 using namespace clink::cluster;
@@ -96,14 +102,15 @@ std::optional<std::vector<std::byte>> recv_frame(network::Connection& c) {
 // real coordinator.
 class FakeWorker {
 public:
-    FakeWorker(std::uint16_t port, std::string id) : id_(std::move(id)) {
+    FakeWorker(std::uint16_t port, std::string id, std::uint32_t slots = 4)
+        : id_(std::move(id)), slots_(slots) {
         conn_ = network::connect_plain("127.0.0.1", port);
     }
 
     [[nodiscard]] bool valid() const { return conn_ != nullptr; }
 
     [[nodiscard]] bool register_and_ack() {
-        RegisterMsg reg{.worker_id = id_, .data_host = "127.0.0.1", .slot_count = 4};
+        RegisterMsg reg{.worker_id = id_, .data_host = "127.0.0.1", .slot_count = slots_};
         if (!send_frame(*conn_, encode_frame(MessageKind::Register, reg))) {
             return false;
         }
@@ -276,6 +283,7 @@ public:
 
 private:
     std::string id_;
+    std::uint32_t slots_;
     std::unique_ptr<network::Connection> conn_;
     std::thread reader_;
     std::thread heartbeat_;
@@ -338,7 +346,7 @@ struct CheckpointFixture {
     // `max_restarts` is the job's restart budget: 0 keeps a failed
     // checkpoint from starting a rewind, which most tests here want out of
     // the way; the rewind tests pass a budget.
-    JobId bring_up(std::uint32_t max_restarts = 0) {
+    JobId bring_up(std::uint32_t max_restarts = 0, std::int64_t interval_ms = 100) {
         worker = std::make_unique<FakeWorker>(port, "w");
         if (!worker->valid() || !worker->register_and_ack()) {
             return 0;
@@ -350,7 +358,7 @@ struct CheckpointFixture {
         ckpt.checkpoint_dir = dir.string();
         // Periodic triggers drive the test: a real checkpoint id, issued
         // by the real trigger loop, rather than one the test invented.
-        ckpt.interval_ms = 100;
+        ckpt.interval_ms = interval_ms;
         ckpt.max_restarts_on_worker_loss = max_restarts;
         const auto job_id = coordinator->submit_job(
             two_subtask_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
@@ -669,8 +677,10 @@ TEST(CheckpointCompletion, AFailedCheckpointWithNoRestartBudgetFailsTheJobInstea
 // as well as above the markers and snapshot files, because a barrier whose
 // capture has not landed leaves nothing else a takeover could see. So no
 // TriggerCheckpoint, and no reply carrying an end-of-input final id, may leave
-// the coordinator before its id is on record. A record that cannot be written
-// is a directory where the record goes: its rename fails.
+// the coordinator before its id is on record. Each job's ids are claimed by a
+// claimer of its own, the next one as soon as the last is allocated, so the
+// trigger loop never waits on the store. A record that cannot be written is a
+// directory where the record goes: its rename fails.
 namespace {
 
 std::filesystem::path triggered_record_path(const std::filesystem::path& checkpoint_dir,
@@ -696,9 +706,18 @@ std::int64_t log_cursor_ms() {
            1;
 }
 
+// Every claim on the record passes the compare-and-set's critical section,
+// so this point's hits count the claims (no other coordination record is
+// written by a coordinator without an HA directory).
+constexpr const char* kIdClaimPoint = clink::fault::points::kCoordinatorBeforeMetadataWrite;
+
 }  // namespace
 
 TEST(CheckpointCompletion, APeriodicCheckpointIsNotTriggeredBeforeItsIdIsOnRecord) {
+    // Observed only, to count the claims the failing record gets.
+    clink::fault::Registry::instance().reset();
+    clink::fault::ScopedFault observe{
+        clink::fault::Rule{.point = kIdClaimPoint, .action = clink::fault::Action::Observe}};
     CheckpointFixture fx;
     // A fresh coordinator: the job it is about to be given is job 1.
     obstruct_triggered_record(fx.dir, 1);
@@ -718,6 +737,17 @@ TEST(CheckpointCompletion, APeriodicCheckpointIsNotTriggeredBeforeItsIdIsOnRecor
         reported += rec.message.find("could not record checkpoint id") != std::string::npos ? 1 : 0;
     }
     EXPECT_EQ(reported, 1U) << "the failing record must be reported once, not every round";
+    // And by the coordinator alone: the store's own error line on every
+    // retry buried that one report under ten a second.
+    for (const auto& rec :
+         LogBuffer::global().tail(1000, "error", since_ms, "coordinator.metadata")) {
+        ADD_FAILURE() << "the store logged a failed claim itself: " << rec.message;
+    }
+    // Backed off: a claim that keeps failing is retried with a growing delay,
+    // not on every pass of the trigger loop at the job's 100ms interval.
+    const auto attempts = clink::fault::Registry::instance().hits(kIdClaimPoint);
+    EXPECT_GE(attempts, 1U) << "no claim reached the store, so nothing above was tested";
+    EXPECT_LE(attempts, 8U) << attempts << " claims in 1.5s: a failing record is not backed off";
 
     // Writable again: the round goes ahead, and the refused rounds consumed no id.
     clear_triggered_record(fx.dir, job_id);
@@ -725,6 +755,216 @@ TEST(CheckpointCompletion, APeriodicCheckpointIsNotTriggeredBeforeItsIdIsOnRecor
     ASSERT_TRUE(first.has_value()) << "checkpoints did not resume once the id could be recorded";
     EXPECT_EQ(*first, 1U);
     EXPECT_GE(clink::cluster::latest_triggered_id_on_disk(fx.dir.string(), job_id), *first);
+}
+
+// The claim for a job's next id goes out as soon as the previous id is
+// allocated, so the id is on record before it falls due and the trigger does
+// not wait on the store. The trigger loop used to make the write itself when
+// the id fell due, one job after another.
+TEST(CheckpointCompletion, TheNextCheckpointIdIsOnRecordBeforeItFallsDue) {
+    CheckpointFixture fx;
+    // Ten minutes between checkpoints: the first is triggered at once and the
+    // second not within this test.
+    const auto job_id = fx.bring_up(/*max_restarts=*/0, /*interval_ms=*/600'000);
+    ASSERT_GT(job_id, 0U);
+    const auto first = fx.await_trigger();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_TRUE(ckpt_await(
+        [&] {
+            return clink::cluster::latest_triggered_id_on_disk(fx.dir.string(), job_id) ==
+                   *first + 1;
+        },
+        3s))
+        << "the id after checkpoint " << *first
+        << " was not on record ahead of its trigger; the record holds "
+        << clink::cluster::latest_triggered_id_on_disk(fx.dir.string(), job_id);
+    EXPECT_FALSE(fx.worker->await_frame(MessageKind::TriggerCheckpoint, 300ms).has_value())
+        << "claiming the next id ahead of time triggered its checkpoint early";
+}
+
+// Nothing goes on record before the job is up: the record, like everything
+// else in the checkpoint directory, appears once the job is running, which is
+// what the integration harness takes the directory's first entry to mean. A
+// claim made at deploy put it there while the Deploy frames were still going
+// out, and a test that killed a worker on seeing it killed the deploy instead.
+TEST(CheckpointCompletion, NoCheckpointIdIsClaimedBeforeTheJobIsUp) {
+    CheckpointFixture fx;
+    fx.worker = std::make_unique<FakeWorker>(fx.port, "w");
+    ASSERT_TRUE(fx.worker->valid());
+    ASSERT_TRUE(fx.worker->register_and_ack());
+    ASSERT_TRUE(fx.coordinator->await_registrations(2s));
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = fx.dir.string();
+    ckpt.interval_ms = 100;
+    ckpt.max_restarts_on_worker_loss = 0;
+    const auto job_id = fx.coordinator->submit_job(
+        two_subtask_graph(fx.dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    auto deploy = fx.worker->await_frame(MessageKind::Deploy);
+    ASSERT_TRUE(deploy.has_value());
+    const auto tasks = decode_deploy(*deploy).tasks;
+    // Deployed, and not yet reporting its listeners: not up.
+    EXPECT_FALSE(ckpt_await(
+        [&] { return std::filesystem::exists(triggered_record_path(fx.dir, job_id)); }, 500ms))
+        << "a checkpoint id went on record before the job's subtasks were up";
+    std::uint16_t port_seed = 41900;
+    for (const auto& t : tasks) {
+        ASSERT_TRUE(fx.worker->report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+    }
+    EXPECT_TRUE(ckpt_await([&] {
+        return clink::cluster::latest_triggered_id_on_disk(fx.dir.string(), job_id) >= 1;
+    })) << "the job's first checkpoint id never went on record once it was up";
+}
+
+// A claim that does not return holds its own job's checkpoints and nobody
+// else's: the store write runs on the job's claimer, not on the trigger loop,
+// which used to wait on every due job's record in turn, so one slow or
+// failing store stopped every job on the coordinator.
+TEST(CheckpointCompletion, ARecordWriteThatHangsHoldsOnlyItsOwnJob) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ckpt_claim_isolation_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{dir};
+    Coordinator c;
+    const auto port = c.start();
+    c.expect_workers({"w"});
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+    ASSERT_TRUE(c.await_registrations(2s));
+    // The run's first claim is the first job's first id, parked until
+    // released. Armed after the coordinator so that on an early exit it is
+    // reset, releasing the claim, before the coordinator joins its claimer.
+    clink::fault::Registry::instance().reset();
+    clink::fault::ScopedFault park{clink::fault::Rule{
+        .point = kIdClaimPoint, .ordinal = 1, .action = clink::fault::Action::Block}};
+
+    // A job brought up to where its periodic checkpoints are due.
+    const auto submit = [&](const std::string& tag, std::uint16_t port_seed) -> JobId {
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = (dir / tag).string();
+        ckpt.interval_ms = 100;
+        ckpt.max_restarts_on_worker_loss = 0;
+        const auto id = c.submit_job(two_subtask_graph(dir / (tag + ".txt")),
+                                     OperatorRegistry::default_instance(),
+                                     {},
+                                     ckpt);
+        if (id == 0) {
+            return 0;
+        }
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        if (!deploy.has_value()) {
+            return 0;
+        }
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            if (!w.report_listening(id, t.role, t.subtask_idx, port_seed++)) {
+                return 0;
+            }
+        }
+        return id;
+    };
+    const auto held = submit("held", 41500);
+    ASSERT_GT(held, 0U);
+    ASSERT_TRUE(
+        ckpt_await([] { return clink::fault::Registry::instance().hits(kIdClaimPoint) >= 1; }, 3s))
+        << "the first job's claim never reached the store";
+    const auto free_job = submit("free", 41600);
+    ASSERT_GT(free_job, 0U);
+
+    // The other job checkpoints at its interval, the held one not at all.
+    for (int i = 0; i < 4; ++i) {
+        auto trigger = w.await_frame(MessageKind::TriggerCheckpoint, 3s);
+        ASSERT_TRUE(trigger.has_value())
+            << "a record write held on one job stopped the other job's checkpoints";
+        EXPECT_EQ(decode_trigger_checkpoint(*trigger).job_id, free_job)
+            << "the held job's barrier left before its id was on record";
+    }
+
+    // Released: the held job's id lands and its checkpoints begin.
+    EXPECT_EQ(clink::fault::Registry::instance().release(kIdClaimPoint), 1U);
+    bool held_triggered = false;
+    for (int i = 0; i < 100 && !held_triggered; ++i) {
+        auto trigger = w.await_frame(MessageKind::TriggerCheckpoint, 3s);
+        if (!trigger.has_value()) {
+            break;
+        }
+        held_triggered = decode_trigger_checkpoint(*trigger).job_id == held;
+    }
+    EXPECT_TRUE(held_triggered) << "the held job never checkpointed once its claim was released";
+    w.close();
+    c.stop();
+}
+
+// Another coordinator of the job claims ids on the record too: a superseded
+// leader whose trigger loop runs on. A worker that has re-registered with the
+// leader refuses its barriers, but one that has not yet re-registered accepts
+// them, and its late capture of such an id writes the path the leader's
+// capture of the same id would. So the leader must never use an id another
+// coordinator claimed: its own claim is refused, and it numbers above what the
+// record holds. The test claims the ids itself, as that coordinator would.
+TEST(CheckpointCompletion, IdsAnotherCoordinatorClaimedAreSkippedNotReused) {
+    const auto trace_dir = std::filesystem::temp_directory_path() /
+                           ("clink_ckpt_renumber_trace_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(trace_dir);
+    std::filesystem::create_directories(trace_dir);
+    ::setenv("CLINK_PROTOCOL_TRACE_DIR", trace_dir.c_str(), 1);
+    clink::protocol_trace::reset_for_tests();
+    struct TraceOff {
+        std::filesystem::path dir;
+        ~TraceOff() {
+            ::unsetenv("CLINK_PROTOCOL_TRACE_DIR");
+            clink::protocol_trace::reset_for_tests();
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } trace_off{trace_dir};
+
+    CheckpointFixture fx;
+    const auto job_id = fx.bring_up();
+    ASSERT_GT(job_id, 0U);
+    ASSERT_TRUE(fx.await_trigger().has_value());
+    // This coordinator holds at most the ids it has put on record, and can
+    // claim one more before the claim below lands.
+    const auto ours = clink::cluster::latest_triggered_id_on_disk(fx.dir.string(), job_id) + 1;
+    constexpr std::uint64_t kElsewhere = 40;
+    ASSERT_LT(ours, kElsewhere);
+    ASSERT_TRUE(clink::cluster::record_triggered_id(fx.dir.string(), job_id, kElsewhere).claimed);
+
+    std::uint64_t last = 0;
+    for (int i = 0; i < 40 && last <= kElsewhere; ++i) {
+        const auto id = fx.await_trigger();
+        ASSERT_TRUE(id.has_value()) << "checkpoints stopped after another coordinator's claim";
+        last = *id;
+        EXPECT_TRUE(*id <= ours || *id > kElsewhere)
+            << "checkpoint id " << *id
+            << " was sent although another coordinator of the job had claimed every id up to "
+            << kElsewhere;
+    }
+    EXPECT_EQ(last, kElsewhere + 1) << "the job did not number from just above the record";
+
+    // The renumber is a protocol step of its own, which the specification
+    // admits only while a superseded coordinator's claims can stand above
+    // the leader's next id.
+    bool recorded = false;
+    for (const auto& entry : std::filesystem::directory_iterator(trace_dir)) {
+        std::ifstream in(entry.path());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.find("\"event\":\"Renumber\"") != std::string::npos &&
+                line.find("\"job\":" + std::to_string(job_id) + ",") != std::string::npos &&
+                line.find("\"next\":" + std::to_string(kElsewhere + 1)) != std::string::npos) {
+                recorded = true;
+            }
+        }
+    }
+    EXPECT_TRUE(recorded) << "the renumber left no Renumber event in the protocol trace";
 }
 
 TEST(CheckpointCompletion, ASavepointWhoseIdCannotBeRecordedSendsNothing) {
@@ -1119,6 +1359,305 @@ TEST(CheckpointCompletion, ATakeoverNumbersAboveTheRecordWhenItIsTheHighestIdOnD
     ASSERT_GT(n.completed, 0U);
     ASSERT_LT(n.highest_sent, 50U);
     EXPECT_EQ(n.first, 51U);
+}
+
+// --- what a takeover's redeploy restores from, and reports --------------
+//
+// A takeover of a job whose sinks need their commits confirmed resolves the
+// completed but unconfirmed checkpoints before it redeploys, and a walk that
+// proves their commits moves the restore point up to them. The deploy then
+// restores from there, out of the job's own directory, and the protocol event
+// that records the takeover's redeploy names the same point: the
+// specification takes it from the walk's result, and the Kafka takeover
+// traces diverged while the event named the point from before the walk.
+namespace {
+
+constexpr const char* kTakeoverResolver = "ckpt_completion_takeover";
+
+// A sink's resume handle for a transaction that committed before the leader
+// died, staged in the snapshot of participant `subtask` for checkpoint `ckpt`.
+void stage_committed_handle(const std::filesystem::path& ckpt_dir,
+                            std::uint32_t subtask,
+                            std::uint64_t ckpt) {
+    const std::string handle = std::string{"{\"resolver\":\""} + kTakeoverResolver +
+                               "\",\"ckpt\":\"" + std::to_string(ckpt) + "\"}";
+    const std::string key = std::string(clink::connectors::kTxnResumeStateKeyPrefix) + "sub0";
+    auto sp = clink::state_processor::Savepoint::create();
+    sp.backend().put_operator_state(clink::OperatorId{42},
+                                    clink::StateBackend::KeyView{key.data(), key.size()},
+                                    clink::StateBackend::ValueView{handle.data(), handle.size()});
+    const auto sub_dir = std::filesystem::path(clink::state_dir_for(ckpt_dir.string(), 1, subtask));
+    std::filesystem::create_directories(sub_dir);
+    sp.write_to_file(sub_dir / ("checkpoint-" + std::to_string(ckpt) + ".snap"));
+}
+
+struct WalkedTakeover {
+    std::uint64_t completed{0};  // the dead leader's newest completed checkpoint
+    std::filesystem::path checkpoint_dir;
+    std::uint64_t deploy_restore{0};  // what the new leader's deploy restores
+    std::string deploy_restore_dir;   // and from where
+    bool deployed{false};
+    std::int64_t event_restore{-1};  // what its Redeploy event reports, -1 for none
+};
+
+// The dead leader completes two checkpoints of a job; the test then makes it
+// a job whose sinks need their commits confirmed, stages a committed handle
+// in both checkpoints, and marks the first one CONFIRMED when
+// `first_confirmed`. The new leader's takeover walks what is unconfirmed.
+WalkedTakeover takeover_through_the_walk(const std::string& tag, bool first_confirmed) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_walked_takeover_" + tag + "_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto trace_dir = root / "trace";
+    WalkedTakeover out;
+    out.checkpoint_dir = root / "ckpt";
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(trace_dir);
+    std::filesystem::create_directories(out.checkpoint_dir);
+    clink::connectors::TxnResumeRegistry::instance().register_resolver(
+        kTakeoverResolver, [](const std::string&) {
+            return clink::connectors::InDoubtResolution{true, "committed before the leader died"};
+        });
+
+    JobId job_id = 0;
+    std::uint64_t first_completed = 0;
+    std::uint32_t sink_participant = 0;
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        EXPECT_TRUE(w.valid());
+        EXPECT_TRUE(w.register_and_ack());
+        EXPECT_TRUE(a.await_registrations(2s));
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = out.checkpoint_dir.string();
+        ckpt.interval_ms = 100;
+        ckpt.max_restarts_on_worker_loss = 0;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        EXPECT_GT(job_id, 0U);
+        std::vector<DeploymentTask> tasks;
+        if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+            tasks = decode_deploy(*deploy).tasks;
+        }
+        EXPECT_FALSE(tasks.empty());
+        std::uint16_t port_seed = 41700;
+        for (const auto& t : tasks) {
+            EXPECT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+            sink_participant = std::max(sink_participant, t.subtask_idx);
+        }
+        for (int n = 0; n < 2; ++n) {
+            auto trigger = w.await_frame(MessageKind::TriggerCheckpoint);
+            if (!trigger.has_value()) {
+                ADD_FAILURE() << "the leader triggered no checkpoint";
+                break;
+            }
+            const auto id = decode_trigger_checkpoint(*trigger).checkpoint_id;
+            for (const auto& t : tasks) {
+                EXPECT_TRUE(w.ack_checkpoint(job_id, id, t.role, t.subtask_idx, /*ok=*/true));
+            }
+            EXPECT_TRUE(ckpt_await([&] { return a.latest_completed_checkpoint(job_id) == id; }));
+            (n == 0 ? first_completed : out.completed) = id;
+        }
+        w.close();
+        a.stop();
+    }
+
+    // The manifest as it reads for a job whose sinks need their commits
+    // confirmed, a committed handle in each completed checkpoint, and the
+    // first one confirmed if asked.
+    const auto manifest = ha_dir / "jobs" / std::to_string(job_id) / "manifest.json";
+    std::string body;
+    {
+        std::ifstream in(manifest);
+        body.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::string unflagged = "\"requires_commit_confirmation\":false";
+    const auto at = body.find(unflagged);
+    EXPECT_NE(at, std::string::npos) << body;
+    if (at != std::string::npos) {
+        body.replace(at, unflagged.size(), "\"requires_commit_confirmation\":true");
+        std::ofstream(manifest, std::ios::trunc) << body;
+    }
+    stage_committed_handle(out.checkpoint_dir, sink_participant, first_completed);
+    stage_committed_handle(out.checkpoint_dir, sink_participant, out.completed);
+    if (first_confirmed) {
+        std::ofstream(out.checkpoint_dir / "_jobs" / std::to_string(job_id) /
+                      ("CONFIRMED-" + std::to_string(first_completed)))
+            << "job=" << job_id << "\ncheckpoint=" << first_completed << "\n";
+    }
+
+    ::setenv("CLINK_PROTOCOL_TRACE_DIR", trace_dir.c_str(), 1);
+    clink::protocol_trace::reset_for_tests();
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        EXPECT_TRUE(w.valid());
+        EXPECT_TRUE(w.register_and_ack());
+        EXPECT_TRUE(b.await_registrations(2s));
+        b.recover_persisted_jobs();
+        if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+            const auto msg = decode_deploy(*deploy);
+            out.deployed = true;
+            out.deploy_restore = msg.restore_from_checkpoint_id;
+            out.deploy_restore_dir = msg.restore_from_dir;
+        }
+        w.close();
+        b.stop();
+    }
+    ::unsetenv("CLINK_PROTOCOL_TRACE_DIR");
+    clink::protocol_trace::reset_for_tests();
+    for (const auto& entry : std::filesystem::directory_iterator(trace_dir)) {
+        std::ifstream in(entry.path());
+        std::string line;
+        while (std::getline(in, line)) {
+            const auto ev = clink::config::parse(line);
+            if (ev.string_or("event", "") == "Redeploy" &&
+                ev.int_or("job", 0) == static_cast<std::int64_t>(job_id)) {
+                out.event_restore = ev.int_or("restore", -1);
+            }
+        }
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    return out;
+}
+
+}  // namespace
+
+TEST(CheckpointCompletion, ATakeoversRedeployReportsTheRestorePointItsWalkResolved) {
+    const auto t = takeover_through_the_walk("confirmed", /*first_confirmed=*/true);
+    ASSERT_TRUE(t.deployed) << "the new leader did not redeploy the job";
+    ASSERT_GT(t.completed, 0U);
+    EXPECT_EQ(t.deploy_restore, t.completed)
+        << "the walk did not confirm the newest checkpoint, so this tested nothing";
+    EXPECT_EQ(t.event_restore, static_cast<std::int64_t>(t.deploy_restore))
+        << "the takeover's Redeploy reported restore point " << t.event_restore
+        << " while its deploy restored from " << t.deploy_restore;
+}
+
+// With nothing of its own confirmed, the job's restore point comes from the
+// walk alone, and the takeover left no directory to restore it from: the
+// deploy's lint refused an id without one, and the job was dropped.
+TEST(CheckpointCompletion, ATakeoverWhoseWalkConfirmsItsFirstCheckpointsRestoresFromThem) {
+    const auto t = takeover_through_the_walk("unconfirmed", /*first_confirmed=*/false);
+    ASSERT_TRUE(t.deployed) << "the job was dropped at the takeover";
+    EXPECT_EQ(t.deploy_restore, t.completed);
+    EXPECT_EQ(t.deploy_restore_dir, t.checkpoint_dir.string());
+    EXPECT_EQ(t.event_restore, static_cast<std::int64_t>(t.completed));
+}
+
+// --- a hot cutover's arm frames -----------------------------------------
+namespace {
+
+// A job a hot cutover can take: a keyed operator with rescale bounds between
+// a source and a sink, the parallelism mismatched on both of its edges.
+JobGraphSpec hot_cutover_graph(const std::filesystem::path& out) {
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "1000000"}};
+    g.ops.push_back(src);
+    OperatorSpec agg;
+    agg.type = "identity_int64";
+    agg.id = "agg";
+    agg.inputs = {"src"};
+    agg.parallelism = 2;
+    agg.min_parallelism = 1;
+    agg.max_parallelism = 8;
+    agg.out_channel = std::string{kChannelInt64};
+    agg.key_by = "identity";
+    g.ops.push_back(agg);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"agg"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", out.string()}};
+    g.ops.push_back(snk);
+    return g;
+}
+
+}  // namespace
+
+// The cutover is armed under the coordinator lock and its arm frames go out
+// after it. The phase deadline, or a worker loss, can abort the cutover in
+// between, and the abort's CancelJob and replan are then on their way, so the
+// arm frames must be dropped: sent, they would arm subtasks to stop at a
+// cutover checkpoint nobody will trigger.
+TEST(CheckpointCompletion, ACutoverAbortedBeforeItsArmFramesLeaveSendsNone) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ckpt_hot_arm_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{dir};
+    Coordinator::Config cfg;
+    // The watchdog aborts a cutover stuck past this in any phase, Arming
+    // included: well inside the window the fault point below holds open.
+    cfg.hot_cutover_phase_timeout = 100ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    c.expect_workers({"w"});
+    FakeWorker w(port, "w", /*slots=*/8);
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+    ASSERT_TRUE(c.await_registrations(2s));
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = (dir / "ckpt").string();
+    ckpt.interval_ms = 100;
+    ckpt.max_restarts_on_worker_loss = 0;
+    const auto job_id = c.submit_job(
+        hot_cutover_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    auto deploy = w.await_frame(MessageKind::Deploy);
+    ASSERT_TRUE(deploy.has_value());
+    const auto tasks = decode_deploy(*deploy).tasks;
+    std::uint16_t port_seed = 41800;
+    for (const auto& t : tasks) {
+        ASSERT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+    }
+    // A completed checkpoint for the cutover to start from.
+    auto trigger = w.await_frame(MessageKind::TriggerCheckpoint);
+    ASSERT_TRUE(trigger.has_value());
+    const auto completed = decode_trigger_checkpoint(*trigger).checkpoint_id;
+    for (const auto& t : tasks) {
+        ASSERT_TRUE(w.ack_checkpoint(job_id, completed, t.role, t.subtask_idx, /*ok=*/true));
+    }
+    ASSERT_TRUE(ckpt_await([&] { return c.latest_completed_checkpoint(job_id) == completed; }));
+
+    clink::fault::Registry::instance().reset();
+    clink::fault::ScopedFault hold{
+        clink::fault::Rule{.point = clink::fault::points::kHotCutoverBeforeArm,
+                           .ordinal = 1,
+                           .action = clink::fault::Action::Delay,
+                           .arg = 1500}};
+    const auto result = c.request_operator_rescale(job_id, "agg", 4);
+    ASSERT_TRUE(result.ok) << result.reason;
+    ASSERT_EQ(clink::fault::Registry::instance().hits(clink::fault::points::kHotCutoverBeforeArm),
+              1U)
+        << "the rescale did not take the hot path, so there was no window to test";
+    EXPECT_TRUE(w.await_frame(MessageKind::CancelJob, 2s).has_value())
+        << "the phase deadline did not abort the cutover inside the window";
+    EXPECT_FALSE(w.await_frame(MessageKind::BeginRescale, 500ms).has_value())
+        << "the arm frames of a cutover the coordinator had already aborted were sent";
+    w.close();
+    c.stop();
 }
 
 // HA recovery replans the graph the job was SUBMITTED with - the manifest is

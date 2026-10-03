@@ -65,6 +65,22 @@ public:
                             const std::function<std::uint64_t(const std::string&)>& epoch_of,
                             const std::string& caller_context) = 0;
 
+    // fenced_put for a record whose refusal is an ordinary answer rather than
+    // lost leadership (the checkpoint-id record, where a higher id on record
+    // is the normal shape of two coordinators). It logs nothing and answers
+    // through its result alone: true when the body landed, false when the
+    // fence refused it, and an exception when the record could not be read or
+    // written. The default is fenced_put itself, which is exactly that for a
+    // store that logs nothing of its own; the filesystem store, whose
+    // fenced_put logs every refusal and failure, overrides it.
+    virtual bool fenced_put_quietly(
+        std::string_view key,
+        std::string_view body,
+        std::uint64_t writer_epoch,
+        const std::function<std::uint64_t(const std::string&)>& epoch_of) {
+        return fenced_put(key, body, writer_epoch, epoch_of, {});
+    }
+
     [[nodiscard]] virtual std::optional<std::string> get(std::string_view key) = 0;
     [[nodiscard]] virtual bool exists(std::string_view key) = 0;
 

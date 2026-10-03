@@ -2268,8 +2268,9 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
 
     // A checkpoint is demonstrably IN FLIGHT (triggered, not yet acked)
     // before the cancel - the window the Delay holds open. The first one waits
-    // out a held write of its own: the coordinator records the id before the
-    // trigger leaves, through the same write path the Delay is armed on.
+    // out a held write of its own: the coordinator puts the id on record
+    // before the trigger leaves, through the same write path the Delay is
+    // armed on.
     {
         const auto deadline =
             std::chrono::steady_clock::now() + clink::test_support::scale_slack(5s);
@@ -2292,8 +2293,8 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
     // version of this test asserted hits instantly and was vacuous. The
     // coordinator's record of the id was a hit of its own, so count from the
     // hits already seen: the next is the worker's snapshot write, or the
-    // record of the next id, which the loop takes while that snapshot write
-    // is still held.
+    // record of the next id, which the job's claimer takes as soon as the
+    // trigger has gone and holds as long as that snapshot write.
     {
         const auto seen =
             clink::fault::Registry::instance().hits(clink::fault::points::kCheckpointBeforeWrite);

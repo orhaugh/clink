@@ -371,6 +371,11 @@ inline constexpr char kRescaleBeforeFirstCheckpoint[] = "rescale.before_first_ch
 inline constexpr char kHotCutoverBeforeTrigger[] = "rescale.hot_before_trigger";
 inline constexpr char kHotCutoverCuttingOver[] = "rescale.hot_cutting_over";
 inline constexpr char kHotCutoverBeforeComplete[] = "rescale.hot_before_complete";
+// The cutover is armed under the coordinator lock and its arm frames have not
+// gone out: the window in which a worker loss or the phase deadline can abort
+// it, after which the frames must be dropped rather than arm subtasks for a
+// cutover nobody will finish.
+inline constexpr char kHotCutoverBeforeArm[] = "rescale.hot_before_arm";
 // An ack for the cutover checkpoint C from a task the rescaled operator FEEDS
 // has arrived and is about to be processed, on that worker's connection thread,
 // before the coordinator lock. The fed side acks after every barrier has

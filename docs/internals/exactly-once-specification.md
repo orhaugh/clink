@@ -43,7 +43,7 @@ the rigs saw. Neither proves the code.
 | `include/clink/cluster/protocol_trace.hpp` | The emitter: `CLINK_PROTOCOL_TRACE_DIR` turns it on |
 | `scripts/formal-check.sh` | Fetches and verifies the tools, runs TLC, judges models, mutants and traces (`--trace`) |
 | `scripts/protocol-trace-merge.py`, `scripts/check-protocol-trace-events.py` | Merges per-process trace files; holds code, vocabulary and module in agreement |
-| `.github/workflows/ci.yml`, jobs `formal`, `formal-mutants` and `trace-validation` | The models and the recorded traces, the mutants, and the traces each test run leaves, after the build (rescaled runs are skipped and counted, not judged). Models and mutants are separate jobs: one model dominates the models and wants every TLC worker, while the mutants are independent and want concurrency |
+| `.github/workflows/ci.yml`, jobs `formal`, `formal-mutants`, `formal-mutant-id-reuse` and `trace-validation` | The models and the recorded traces, the mutants, and the traces each test run leaves, after the build (rescaled runs are skipped and counted, not judged). Models and mutants are separate jobs: one model dominates the models and wants every TLC worker, while the mutants are independent and want concurrency, except `M_id_reuse`, whose search dominates the set and runs alone with every worker |
 | `formal/README.md` | The working guide: running, adding a model, adding a mutant, recording a trace |
 
 ## How it works
@@ -118,11 +118,11 @@ is fenced.
 
 | Model | Family | Bounds | Result |
 |---|---|---|---|
-| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 29.7M distinct states, depth 78, all invariants hold, no deadlock |
+| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 38.6M distinct states, depth 78, all invariants hold, no deadlock |
 | `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 46,083 distinct states, depth 67, all invariants hold |
-| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 105.5M distinct states, depth 58, all invariants hold |
-| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | 5.6M distinct states, depth 53, all invariants hold |
-| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 5.5M distinct states |
+| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 145.4M distinct states, depth 59, all invariants hold |
+| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | 7.8M distinct states, depth 53, all invariants hold |
+| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 5.7M distinct states |
 
 Within its bounds each run is exhaustive: TLC visits every reachable state.
 The bounds are small so that the push gate finishes in minutes; a larger
@@ -174,6 +174,7 @@ specification, or a stutter the trace module recognises.
 | `CoordRecovers` | the new leader, per recovered job | `job`, `epoch`, `completed`, `confirmed` | `CoordRecovers` (its `CoordDies` is a hidden step) |
 | `RestartProceeds` | coordinator, restart held for resolution | `job`, `resolving`, `completed`, `confirmed` | `RestartProceeds` into `resolving` |
 | `Redeploy` | coordinator, deploying: once per restart, after the deploy frames are built, whatever their number | `job`, `restore`, `next` | `RestartProceeds` (from the drain) or `Redeploy` (after resolution) |
+| `Renumber` | coordinator, a claim on the job's next checkpoint id refused because the record already holds it | `job`, `next`, `epoch` | `Renumber` (the leader, past a superseded coordinator's claims) or `ZombieRenumber` (the superseded coordinator, under its own epoch, past the leader's) |
 | `WalkSkips`, `WalkReadsReceipt`, `WalkProbes`, `WalkRetries`, `WalkExhausted`, `WalkCancelled`, `WalkDecides`, `WalkFinishes` | the in-doubt walk | `job`, `ckpt`, and `sub`, `verdict`, `confirmed` where they apply | the walk's steps, one each |
 | `SinkOpens` | the sink, `open()` done | `sub`, `family` | `SinkOpens` after a redeploy; the first open is the initial state |
 | `Placement` | worker, task deployed | `job`, `sub`, `worker`, `source` | none: tells the module which worker hosts what |
@@ -272,34 +273,57 @@ dead leader's barrier for 2 had reached the worker. The trace diverged at the
 `Redeploy`, whose `next` the specification places above every capture that
 began. The gap is real in the engine: a worker that outlives the leader can
 still write that capture after the new leader has read the directory, at the
-path the new run's capture of the same id writes. The coordinator now records
-every id in `_jobs/<job>/TRIGGERED` before any frame naming it leaves, and a
-takeover numbers above the record as well
-([checkpointing](checkpointing.md)). The trace from that run still diverges,
-as it should, and
+path the new run's capture of the same id writes. The coordinator now claims
+every id in `_jobs/<job>/TRIGGERED` before it allocates it, and a takeover
+numbers above the record as well ([checkpointing](checkpointing.md)). The
+trace from that run still diverges, as it should, and
 `HaFailoverTest.ATakeoverNumbersAboveABarrierTheDeadLeaderDelivered` holds the
 same window open with a worker fault point, `worker.after_trigger_delivered`.
 
 The specification states the rule as a range rather than a value. A fresh
 leader's next id lies anywhere from one above every marker and every capture
 that began to one past the most any dead or superseded leader can have
-recorded: the periodic trigger records an id before it allocates it, the
-other triggers after allocating and before they send, and where a crash
-falls among those steps decides what the next leader finds. Every id in the
-range is safe, since none above the lower bound was delivered (a superseded
-leader's are fenced at the workers). The model keeps no record variable,
-which would add an interleaving point to every trigger and admit nothing the
-range does not; the trace module pins the engine's choice with the event's
-`next`, and the lower bound is what refuses a reuse. The model cannot show
-the harm itself, because it takes a capture as durable once its barrier is
-delivered, so the late writer is below its abstraction; the lower bound
-counts captures that began for that reason. No mutant comes with the
-record: the lower bound was already the specification's rule (`id_reuse`
-refutes weakening it to the restore point), and the defect was the engine
-falling short of it, which is what trace validation is for. Refuting a
-floor that misses a capture still in flight would take the source's capture
-as a durable step of its own that can land after the coordinator has died,
-and the record as a variable, in every checkpoint of every model.
+claimed: each job's claimer puts the next id on record as soon as the
+previous one is allocated, so the record runs at most one id ahead of its
+coordinator's counter, and where a crash falls between a claim, its
+allocation and its send decides what the next leader finds. Every id in the
+range is safe in the model, since none above the lower bound was delivered
+and the model binds every worker to the new epoch at the takeover, so a
+superseded coordinator's barriers are fenced. The model keeps no record
+variable, which would add an interleaving point to every trigger and admit
+nothing the range does not; the trace module pins the engine's choice with
+the event's `next`, and the lower bound is what refuses a reuse. The model
+cannot show the harm itself, because it takes a capture as durable once its
+barrier is delivered, so the late writer is below its abstraction; the
+lower bound counts captures that began for that reason. No mutant comes
+with the record: the lower bound was already the specification's rule
+(`id_reuse` refutes weakening it to the restore point), and the defect was
+the engine falling short of it, which is what trace validation is for.
+Refuting a floor that misses a capture still in flight would take the
+source's capture as a durable step of its own that can land after the
+coordinator has died, and the record as a variable, in every checkpoint of
+every model.
+
+The engine does not bind every worker at the takeover. A worker binds the
+new epoch when it re-registers with the new leader, which recovers its jobs
+once registrations settle, so a worker still on a superseded coordinator's
+connection can accept that coordinator's barriers after the redeploy. The
+record keeps the two coordinators' ids apart: a claim lands only above what
+the record holds, so an id is claimed once, and a coordinator whose claim is
+refused numbers above the record instead and allocates nothing that round.
+The specification admits that as two steps, `Renumber` for the leader,
+bounded by what the superseded coordinator's counter can have claimed, and
+`ZombieRenumber` for the superseded coordinator once a leader of a later
+epoch has redeployed and claimed past it, whether or not that leader is still
+alive; the engine records both as a `Renumber` event under the
+coordinator's own epoch, and the trace module diverges on a renumber past
+every id the other coordinator can have claimed, on one with no superseded
+coordinator to have claimed past it, and on an unfenced one. No mutant comes
+with the renumbering either, since the capture it keeps apart is one the
+model, binding every worker at once, cannot reach. A renumber with no
+superseded coordinator behind it is outside the model: a claim whose write
+landed but whose answer was lost is refused when retried, and the
+coordinator skips that id. No recorded trace has that shape.
 
 A divergence can also mean the trace is missing a line. The coordinator
 records `WriteCompleted` after the COMPLETED marker's durable write, so the
@@ -465,8 +489,13 @@ In the honesty categories the qualification pages use:
   prepared transactions (the model keys a sink by a fixed index; the
   one-successor rule is held by `RescaleParentMapping.EveryOldSubtaskHasExactlyOneSuccessor`
   over every factor and by restore tests on the `file://` and `rocksdb://`
-  backends); the HA lock primitive and the metadata compare-and-set; network
-  frame encoding; time. Each has its own evidence elsewhere. A snapshot that
+  backends); the HA lock primitive and the metadata compare-and-set; a
+  worker still bound to a superseded coordinator's epoch after a takeover
+  (the model binds every worker at the takeover, so it fences that
+  coordinator's frames at once; in the engine the checkpoint-id record keeps
+  the two coordinators' checkpoint ids apart, and nothing keeps the
+  superseded coordinator's other frames from such a worker); network frame
+  encoding; time. Each has its own evidence elsewhere. A snapshot that
   fails in an operator rather than a sink is outside trace validation too: the
   trace module skips acks from subtasks it does not model, so such a run
   diverges at the failed checkpoint's decision.

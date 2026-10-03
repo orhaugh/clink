@@ -760,7 +760,12 @@ ZombieStops ==
 \* A new leader takes over (recover_persisted_jobs). Memory is reseeded from
 \* the durable markers; every worker re-registers and binds the new epoch; the
 \* job is recovered through the same drain-resolve-redeploy path a worker loss
-\* takes, with nothing left to drain.
+\* takes, with nothing left to drain. The model binds every worker in this one
+\* step. The engine recovers a job once registrations have settled, not once
+\* every worker has bound the new epoch, so a worker still bound to the old one
+\* can accept a superseded coordinator's barrier after the redeploy; the
+\* checkpoint-id record keeps that barrier's id out of the leader's numbering
+\* (Renumber), which is what this step leaves out.
 CoordRecovers ==
     /\ ~coordUp
     /\ coordUp' = TRUE /\ leaderEpoch' = leaderEpoch + 1
@@ -968,28 +973,35 @@ WalkFinishes ==
 \* after the new leader has read the directory, at the same
 \* v<generation>/<subtask>/checkpoint-<id>.snap path the new run writes for a
 \* reused id. Nor can the engine see deliveries, so it numbers above every id
-\* it has recorded: an id is written to _jobs/<job>/TRIGGERED before any frame
+\* on record: an id is claimed in _jobs/<job>/TRIGGERED before any frame
 \* naming it leaves the coordinator. Trace validation caught the engine
 \* before that record, numbering above the snapshot files it could see and
 \* reusing an id whose barrier had reached the source before its capture
 \* landed.
 \*
-\* The record has no variable here. The periodic trigger records the next id
-\* before allocating it, so a record that cannot be written skips that round
-\* and consumes nothing; the end-of-input, savepoint and hot-cutover triggers
-\* allocate first and record before they reply or send. Where a crash falls
-\* (before a record, between it and the allocation, between that and the
+\* The record has no variable here. A coordinator claims each id on the
+\* record before it allocates it, on every path that allocates one: the job's
+\* claimer puts the next id there as soon as the previous one is allocated, so
+\* the record is at most one id ahead of the coordinator's counter, and an id
+\* that cannot be claimed is not allocated and leaves no frame. Where a crash
+\* falls (before a claim, between it and the allocation, between that and the
 \* send) decides what the next leader finds, so a fresh leader's next id may
 \* lie anywhere from FreshFloor + 1 to one past the most any dead or
-\* superseded leader can have recorded. Every value in that range is safe:
-\* no id above FreshFloor was delivered, the dead leader's frames died with
-\* it, and the workers fence a zombie's, so no capture of one ever begins. A
-\* record variable with a step between recording and triggering would add an
-\* interleaving point to every trigger and admit nothing the range does not;
-\* trace validation pins the engine's choice to the event's next, and the
-\* lower bound refuses a reuse. That the record precedes every send is the
-\* engine's to keep, and its tests hold it there: an id that cannot be
-\* recorded leaves no frame.
+\* superseded leader can have claimed. Every value in that range is safe
+\* here: no id above FreshFloor was delivered, the dead leader's frames died
+\* with it, and every worker binds the new epoch at the takeover
+\* (CoordRecovers), so a zombie's barriers are fenced. In the engine a worker
+\* binds the new epoch only when it re-registers with the new leader, and a
+\* superseded coordinator's barrier can still reach one that has not. What
+\* keeps the two coordinators' ids apart there is the record itself: a claim
+\* lands only above what the record holds, so an id is claimed once, and a
+\* coordinator whose claim is refused numbers above the record instead of
+\* using the id (Renumber, ZombieRenumber). A record variable with a step
+\* between claiming and triggering would add an interleaving point to every
+\* trigger and admit nothing the range and the renumbering steps do not;
+\* trace validation pins the engine's choice to the events' next, and the
+\* lower bound refuses a reuse. That the claim precedes every allocation is
+\* the engine's to keep, and its tests hold it there.
 \*
 \* No mutant comes with the record. The lower bound was already this rule,
 \* and id_reuse refutes weakening it to the restore point; the engine fell
@@ -998,7 +1010,10 @@ WalkFinishes ==
 \* source's capture as a durable step of its own, one that can land after
 \* the coordinator has died, and the record as a variable: two more steps in
 \* every checkpoint of every model, for a harm the lower bound already
-\* excludes.
+\* excludes. Nor does one come with the renumbering, for the same reason
+\* from the other side: the harm it prevents is a zombie's barrier captured
+\* after the takeover, which the model, binding every worker at once, cannot
+\* reach.
 MemCompletedView == IF Bug = "restore_from_memory" /\ completeDue # None /\ completeDue > memCompleted
                     THEN completeDue ELSE memCompleted
 
@@ -1006,14 +1021,14 @@ RestoreId == IF Tracked /\ Bug # "restore_from_completed" THEN memConfirmed ELSE
 
 FreshFloor(r) == Max(DurableIds \cup SnapshotIds \cup {r})
 
-\* The most a leader whose next id is n can have recorded: n itself while it
-\* has an id left to take, since the periodic trigger records before it
-\* allocates. The model takes no id past MaxCkpt, so a leader with none left
-\* has recorded no more than the last it took.
+\* The most a coordinator whose next id is n can have claimed: n itself while
+\* it has an id left to take, since its claimer puts the next id on record as
+\* soon as the previous one is allocated. The model takes no id past MaxCkpt,
+\* so a coordinator with none left has claimed no more than the last it took.
 RecordedBy(n) == IF n <= MaxCkpt THEN n ELSE n - 1
 
-\* The dead leader's record and a superseded one's, whose trigger loop runs
-\* on and records as it goes (zombieNext is 0 until a supersession).
+\* The dead leader's claims and a superseded one's, whose trigger loop runs
+\* on and claims as it goes (zombieNext is 0 until a supersession).
 RecordCeiling == Max({RecordedBy(nextCkpt), RecordedBy(zombieNext)})
 
 FreshIds(r) == (FreshFloor(r) + 1) .. (Max({FreshFloor(r), RecordCeiling}) + 1)
@@ -1063,6 +1078,35 @@ RestartProceeds ==
             /\ UNCHANGED walkVars
     /\ UNCHANGED << leaderVars, memCompleted, memConfirmed, drainSet, diskVars, txn, brokerUp,
                     sinkGen, boundEpoch, cutOf, published, staleAccepted, budgetVars >>
+
+\* The leader's claim on its next id is refused: the record already holds
+\* that id or a higher one (renumber_above_held_ids_locked_ in
+\* coordinator.cpp). A takeover numbers above the record it reads, so only a
+\* superseded coordinator still triggering under its old epoch can have
+\* claimed past the leader since, at most one id ahead of its own counter. A
+\* worker not yet re-registered with the leader accepts that coordinator's
+\* barriers (see CoordRecovers), so the leader numbers above the record
+\* rather than use the id, and allocates nothing that round.
+Renumber ==
+    /\ coordUp /\ phase = "running"
+    /\ nextCkpt <= RecordedBy(zombieNext)
+    /\ nextCkpt' \in (nextCkpt + 1) .. (RecordedBy(zombieNext) + 1)
+    /\ UNCHANGED << leaderVars, phase, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
+                    markerDue, memCompleted, memConfirmed, broadcastIds, unconfirmed, drainSet,
+                    freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
+                    sinkVars, boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
+
+\* The superseded coordinator runs the same code: once a leader of a later
+\* epoch has redeployed and claimed past it, its own claim is refused and it
+\* numbers above the record. That leader may have died since, and its claims
+\* stay on record.
+ZombieRenumber ==
+    /\ zombie /\ leaderEpoch > zombieEpoch /\ ~freshLeader
+    /\ zombieNext <= RecordedBy(nextCkpt)
+    /\ zombieNext' \in (zombieNext + 1) .. (RecordedBy(nextCkpt) + 1)
+    /\ UNCHANGED << leaderEpoch, coordUp, zombie, zombieEpoch, coordVars, diskVars, txn,
+                    brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars,
+                    budgetVars >>
 
 \* The redeployed sink opens. Kafka family (open() in the 2PC sink): first, an
 \* .unresolved marker for one of its own handles is settled with a read-only
@@ -1155,6 +1199,7 @@ Next ==
     \/ \E s \in Sinks : WalkReadsReceipt(s) \/ WalkProbes(s)
     \/ WalkRetries \/ WalkExhausted \/ WalkCancelled \/ WalkDecides \/ WalkFinishes
     \/ Redeploy
+    \/ Renumber \/ ZombieRenumber
     \/ \E s \in Sinks : SinkOpens(s)
     \/ Done \/ JobFailed
 

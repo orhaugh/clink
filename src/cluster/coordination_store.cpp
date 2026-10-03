@@ -79,25 +79,20 @@ public:
         const auto path = resolve_(key);
         std::error_code ec;
         std::filesystem::create_directories(path.parent_path(), ec);
-        // The store's extractor takes the existing RECORD BODY (an object
-        // store fences on what it read back); fenced_metadata_cas_write's
-        // extractor takes a path and reads the file itself. Adapt - the
-        // contract suite caught the filesystem impl silently fencing
-        // against epoch 0 when the body extractor was handed a path.
         return fenced_metadata_cas_write(
-            path,
-            std::string(body),
-            writer_epoch,
-            [&epoch_of](const std::string& existing_path) -> std::uint64_t {
-                std::ifstream in(existing_path, std::ios::binary);
-                if (!in.is_open()) {
-                    return 0;  // absent record = epoch 0, extractor not consulted
-                }
-                const std::string existing((std::istreambuf_iterator<char>(in)),
-                                           std::istreambuf_iterator<char>());
-                return epoch_of(existing);
-            },
-            caller_context);
+            path, std::string(body), writer_epoch, path_epoch_of_(epoch_of), caller_context);
+    }
+
+    bool fenced_put_quietly(
+        std::string_view key,
+        std::string_view body,
+        std::uint64_t writer_epoch,
+        const std::function<std::uint64_t(const std::string&)>& epoch_of) override {
+        const auto path = resolve_(key);
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        return fenced_metadata_cas_write_quietly(
+            path, std::string(body), writer_epoch, path_epoch_of_(epoch_of));
     }
 
     std::optional<std::string> get(std::string_view key) override {
@@ -158,6 +153,24 @@ public:
 private:
     [[nodiscard]] std::filesystem::path resolve_(std::string_view key) const {
         return root_ / std::filesystem::path(std::string(key));
+    }
+
+    // The store's extractor takes the existing RECORD BODY (an object store
+    // fences on what it read back); fenced_metadata_cas_write's extractor
+    // takes a path and reads the file itself. Adapt - the contract suite
+    // caught the filesystem impl silently fencing against epoch 0 when the
+    // body extractor was handed a path.
+    static std::function<std::uint64_t(const std::string&)> path_epoch_of_(
+        const std::function<std::uint64_t(const std::string&)>& epoch_of) {
+        return [&epoch_of](const std::string& existing_path) -> std::uint64_t {
+            std::ifstream in(existing_path, std::ios::binary);
+            if (!in.is_open()) {
+                return 0;  // absent record = epoch 0, extractor not consulted
+            }
+            const std::string existing((std::istreambuf_iterator<char>(in)),
+                                       std::istreambuf_iterator<char>());
+            return epoch_of(existing);
+        };
     }
 
     std::filesystem::path root_;

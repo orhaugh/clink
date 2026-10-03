@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/coordination_store.hpp"
+#include "clink/runtime/log_buffer.hpp"
 
 namespace clink::test {
 
@@ -114,6 +116,50 @@ TYPED_TEST_P(CoordinationStoreContract, FencedPutRefusesAStaleEpochAndKeepsTheNe
     EXPECT_EQ(this->store->get("jobs/1/manifest.json").value(), "epoch=9\n");
 }
 
+// The quiet form, for a record whose refusal is an ordinary answer rather
+// than lost leadership (the checkpoint-id record): the same fence, answered
+// through the result alone. It logs nothing on a refusal or a landing, since
+// its caller decides what is worth reporting and how often; a store that
+// logged here would put a line on every retry of a failing record.
+TYPED_TEST_P(CoordinationStoreContract, QuietFencedPutAnswersThroughItsResultAndLogsNothing) {
+    const std::string key = "_jobs/7/TRIGGERED";
+    const auto since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count() -
+                          1;
+    EXPECT_TRUE(this->store->fenced_put_quietly(key, "epoch=5\n", 5, contract_epoch_of));
+    EXPECT_FALSE(this->store->fenced_put_quietly(key, "epoch=3\n", 3, contract_epoch_of));
+    EXPECT_EQ(this->store->get(key).value(), "epoch=5\n");
+    EXPECT_TRUE(this->store->fenced_put_quietly(key, "epoch=9\n", 9, contract_epoch_of));
+    EXPECT_EQ(this->store->get(key).value(), "epoch=9\n");
+    for (const auto& rec : clink::LogBuffer::global().tail(1000, "warn", since_ms)) {
+        if (rec.message.find(key) != std::string::npos) {
+            ADD_FAILURE() << "the quiet fenced_put logged: [" << rec.source << "] " << rec.message;
+        }
+    }
+}
+
+// Writers racing to put one value, each fencing one below it, so that a
+// write lands only over a record holding less: the checkpoint-id record's
+// claim, which two coordinators of a job can race for. Exactly one lands.
+TYPED_TEST_P(CoordinationStoreContract, ConcurrentQuietFencedPutsOfOneValueHaveExactlyOneWinner) {
+    std::atomic<int> wins{0};
+    std::vector<std::thread> writers;
+    writers.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        writers.emplace_back([&] {
+            if (this->store->fenced_put_quietly("claimed", "epoch=4\n", 3, contract_epoch_of)) {
+                wins.fetch_add(1);
+            }
+        });
+    }
+    for (auto& t : writers) {
+        t.join();
+    }
+    EXPECT_EQ(wins.load(), 1);
+    EXPECT_EQ(this->store->get("claimed").value(), "epoch=4\n");
+}
+
 TYPED_TEST_P(CoordinationStoreContract, ListIsRecursiveFilesOnlyAndHidesStoreMechanism) {
     this->store->put("_jobs/7/COMPLETED-4", "a");
     this->store->put("_jobs/7/receipts/sub0-4", "wm=100\n");
@@ -146,6 +192,8 @@ REGISTER_TYPED_TEST_SUITE_P(CoordinationStoreContract,
                             PutIfAbsentCreatesOnceAndPreservesTheFirstBody,
                             ConcurrentPutIfAbsentHasExactlyOneWinner,
                             FencedPutRefusesAStaleEpochAndKeepsTheNewerRecord,
+                            QuietFencedPutAnswersThroughItsResultAndLogsNothing,
+                            ConcurrentQuietFencedPutsOfOneValueHaveExactlyOneWinner,
                             ListIsRecursiveFilesOnlyAndHidesStoreMechanism,
                             RemoveIsIdempotent);
 

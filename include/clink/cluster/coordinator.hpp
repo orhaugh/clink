@@ -1289,16 +1289,45 @@ private:
         std::uint64_t first_checkpoint_id{1};
 
         // The job's checkpoint-id record (_jobs/<id>/TRIGGERED, see
-        // record_triggered_id_): the highest id this coordinator knows is on
-        // record, and the lock that keeps this job's writes of it in order.
-        // Shared so a writer outside mu_ keeps it alive if the job is erased
-        // in the meantime.
+        // claim_checkpoint_id_): which ids this coordinator may allocate, and
+        // the background claimer that puts the next one on record before it
+        // falls due (id_record_loop_). Shared so a writer outside mu_ keeps
+        // it alive if the job is erased in the meantime.
         struct TriggeredRecord {
+            // Fixed at deploy.
+            std::string checkpoint_dir;
+            JobId job_id{0};
+            // Keeps this process's claims for the job in order; held across
+            // the store write.
             std::mutex write_mu;
-            std::atomic<std::uint64_t> durable{0};
-            // Set while the periodic trigger's record keeps failing, so a
-            // store outage logs once rather than every round.
+            // The highest id this coordinator may allocate: the last it
+            // claimed, or the record as the job's deploy found it. Ids at or
+            // below the record then are spent for every coordinator of the
+            // job, since a claim lands only above the record, so a fresh job
+            // in a directory an earlier run used may still number from 1.
+            std::atomic<std::uint64_t> owned{0};
+            // The highest id a claim found on record in this coordinator's
+            // place (0 = none): another coordinator holds every id up to it,
+            // and the job renumbers above it (renumber_above_held_ids_locked_).
+            std::atomic<std::uint64_t> held_elsewhere{0};
+            // Set while the claims keep failing, so a store outage logs once
+            // rather than on every retry.
             std::atomic<bool> failing{false};
+
+            // The claimer, guarded by `mu`. It runs while an id is wanted and
+            // not yet owned, retries a failing claim with a growing delay, and
+            // exits once it has caught up; the trigger loop starts it again
+            // for the next id. Retired when the job ends, stopping when the
+            // coordinator does.
+            std::mutex mu;
+            std::condition_variable cv;
+            std::uint64_t wanted{0};
+            bool running{false};
+            bool retired{false};
+            bool stopping{false};
+            std::chrono::steady_clock::time_point retry_at{};
+            std::chrono::milliseconds backoff{0};
+            std::thread thread;
         };
         std::shared_ptr<TriggeredRecord> triggered_record = std::make_shared<TriggeredRecord>();
 
@@ -1470,11 +1499,15 @@ private:
     // apart again.
     void populate_restart_drain_locked_(JobState& job);
 
+    // `id_record_error` is why the caller's claim of the job's next checkpoint
+    // id failed, empty when it did not: the cutover reserves that id only once
+    // it is on record, and otherwise reports this as its reason.
     bool try_begin_hot_cutover_locked_(JobState& job,
                                        const std::string& op_id,
                                        std::uint32_t new_parallelism,
                                        std::uint32_t old_parallelism,
                                        const JobGraphSpec& graph,
+                                       const std::string& id_record_error,
                                        std::vector<PendingDeploy>& out_frames,
                                        std::string& reason);
     // All arm acks arrived and match: trigger the cutover checkpoint.
@@ -1630,16 +1663,37 @@ private:
     // TriggerCheckpoint, and replies FinalCheckpointAssigned on `reply_conn`.
     void handle_request_final_checkpoint_(MessageReader& r, network::Connection& reply_conn);
     void checkpoint_trigger_loop_();
-    // Put `id` on the job's checkpoint-id record before any frame naming it
-    // leaves this coordinator: a takeover numbers above the record, and a
-    // barrier whose capture has not landed is visible to it nowhere else
-    // (record_triggered_id). Called outside mu_; a no-op for a job without a
-    // checkpoint directory. Throws when the record cannot be written, and the
-    // caller then must not send the id.
-    static void record_triggered_id_(const std::string& checkpoint_dir,
-                                     JobId job_id,
-                                     JobState::TriggeredRecord& record,
-                                     std::uint64_t id);
+    // Put the job's next checkpoint id on record, so that this coordinator
+    // may allocate it: a takeover numbers above the job's checkpoint-id
+    // record, and a barrier whose capture has not landed is visible to it
+    // nowhere else (record_triggered_id). Called outside mu_, with the id read
+    // under mu_ as the job's next. True when a claim landed or the record
+    // already stands that far for this coordinator; the caller then decides
+    // again under mu_, and allocates only while TriggeredRecord::owned covers
+    // the job's next id at that moment, which is what makes every allocated id
+    // this coordinator's alone even across a renumber in between. False when
+    // the record already holds the id or a higher one: another coordinator of
+    // the job claimed them, and held_elsewhere says how far. Throws when the
+    // record cannot be written. True without a write for a job without a
+    // checkpoint directory.
+    static bool claim_checkpoint_id_(JobState::TriggeredRecord& record, std::uint64_t id);
+    // Under mu_: number the job above every id another coordinator holds
+    // (TriggeredRecord::held_elsewhere). True when next_checkpoint_id moved,
+    // and the caller then allocates nothing this round: the new next id is
+    // not on record yet.
+    bool renumber_above_held_ids_locked_(JobState& job);
+    // The background claimer (TriggeredRecord). The trigger loop asks it for
+    // the job's next id once the previous one is allocated, so the claim has
+    // normally landed by the time the id falls due. Outside mu_: starts the
+    // job's claimer, joining one that has finished, or wakes it.
+    void request_id_record_(const std::shared_ptr<JobState::TriggeredRecord>& record,
+                            std::uint64_t id);
+    void id_record_loop_(const std::shared_ptr<JobState::TriggeredRecord>& record);
+    // Join the claimers that have finished; stop() joins the rest.
+    void reap_id_recorders_();
+    // Release the trigger loop's sleep: a claim landed, or a refused one
+    // means a renumber is due.
+    void wake_trigger_loop_();
     // Read every <ha_dir>/history/*.json on startup so the coordinator's
     // in-memory ring picks up where the previous leader left off.
     // Bounded to kCoordinatorHistoryCap entries (oldest dropped). Called
@@ -1691,6 +1745,15 @@ private:
     std::chrono::steady_clock::time_point last_watchdog_sweep_{std::chrono::steady_clock::now()};
     std::thread checkpoint_thread_;
     std::atomic<bool> stop_{false};
+    // The trigger loop sleeps here between passes (wake_trigger_loop_).
+    std::mutex trigger_wake_mu_;
+    std::condition_variable trigger_wake_cv_;
+    bool trigger_wake_{false};
+    // Every job's checkpoint-id claimer that has been started and not yet
+    // joined. A record whose thread may still be joinable stays here, so the
+    // thread never holds the last reference to its own record.
+    std::mutex id_recorders_mu_;
+    std::vector<std::shared_ptr<JobState::TriggeredRecord>> id_recorders_;
 
     // HA recoveries parked for capacity (job ids whose manifest is intact
     // but no worker had registered yet), and the thread that re-runs them

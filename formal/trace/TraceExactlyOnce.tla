@@ -212,6 +212,17 @@ StepRedeploy ==
     /\ restorePoint' = E.restore
     /\ nextCkpt' = E.next
 
+\* A claim on the next checkpoint id refused, and the coordinator that made it
+\* numbering above the record: the leader, past a superseded coordinator's
+\* claims, or the superseded one under its own epoch, past the leader's. The
+\* event's next is where it numbers from. An unfenced coordinator has no
+\* superseded one (see Unfenced), so its renumber has no step here.
+StepRenumber ==
+    /\ Is("Renumber")
+    /\ ~Unfenced
+    /\ \/ Renumber /\ leaderEpoch = ModelEpoch(E.epoch) /\ nextCkpt' = E.next
+       \/ ZombieRenumber /\ zombieEpoch = ModelEpoch(E.epoch) /\ zombieNext' = E.next
+
 StepWalkSkips == Is("WalkSkips") /\ walkC = E.ckpt /\ WalkSkips
 StepWalkReadsReceipt ==
     /\ Is("WalkReadsReceipt")
@@ -253,7 +264,7 @@ TraceStep ==
        \/ StepDeliverCommit \/ StepDeliverAbort
        \/ StepSinkCommit \/ StepSinkReceipt \/ StepSinkConfirm \/ StepWriteConfirmed
        \/ StepWorkerDies \/ StepRestartOnError \/ StepSubtaskDrained \/ StepCoordRecovers
-       \/ StepRestartProceeds \/ StepRedeploy
+       \/ StepRestartProceeds \/ StepRedeploy \/ StepRenumber
        \/ StepWalkSkips \/ StepWalkReadsReceipt \/ StepWalkProbes \/ StepWalkRetries
        \/ StepWalkExhausted \/ StepWalkCancelled \/ StepWalkDecides \/ StepWalkFinishes
        \/ StepSinkOpens \/ StepPlacement

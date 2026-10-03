@@ -32,7 +32,9 @@ N-way check on the same cores, but only where no single run dominates. In
 `.github/workflows/ci.yml` the `formal` job therefore runs the models one at
 a time with every worker, since `MC_RecoverableSmall` is most of their cost,
 and the separate `formal-mutants` job runs four mutants at a time with one
-worker each.
+worker each. `M_id_reuse` is the exception: its search, which allows two
+coordinator deaths, dominates the set, so the `formal-mutant-id-reuse` job
+runs it alone on its own runner with every worker.
 
 A model is green when TLC reports no invariant violation, no deadlock and
 no temporal-property violation. A mutant is judged against
@@ -233,13 +235,20 @@ CI run of the parked-recovery HA test reused the id of a checkpoint whose
 barrier the dead leader had delivered and whose capture had not landed: the
 trace diverged at its `Redeploy`. A worker outliving the leader can finish
 such a capture after the takeover has looked, at the path the new run's
-capture of the reused id writes. The coordinator now records every id in
-`_jobs/<job>/TRIGGERED` before any frame naming it leaves, and a takeover
-numbers above the record. `RedeployEffects` states the rule as a range (from
-one above every capture that began to one past the most a dead leader can
-have recorded) and says why a range rather than a record variable, and why
-no mutant comes with it: the lower bound was already the rule, and the
-engine fell short of it.
+capture of the reused id writes. The coordinator now claims every id in
+`_jobs/<job>/TRIGGERED` before it allocates it, and a takeover numbers above
+the record. `RedeployEffects` states the rule as a range (from one above
+every capture that began to one past the most a dead leader can have
+claimed) and says why a range rather than a record variable, and why no
+mutant comes with it: the lower bound was already the rule, and the engine
+fell short of it. A claim lands only above what the record holds, so a
+superseded coordinator still triggering and the leader never share an id; a
+coordinator whose claim is refused renumbers above the record, which the
+specification admits as `Renumber` and `ZombieRenumber`. The model binds
+every worker to the new epoch at the takeover, so it fences the superseded
+coordinator's barriers there; in the engine a worker binds it only when it
+re-registers, and the claims are what keep a late capture of one of those
+barriers off the leader's ids.
 
 ## Conventions
 

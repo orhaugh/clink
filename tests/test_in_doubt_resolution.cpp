@@ -7,6 +7,7 @@
 // that did not commit converts a bounded replay into silent loss.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -14,6 +15,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -21,6 +23,7 @@
 
 #include "clink/cluster/in_doubt_resolution.hpp"
 #include "clink/connectors/txn_resume_registry.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/state/state_backend_factory.hpp"
 #include "clink/state_processor/savepoint.hpp"
 
@@ -453,22 +456,32 @@ TEST_F(ResolutionFixture, TheIdFloorCountsUnmarkedSnapshotFiles) {
 //
 // A capture whose barrier has reached a worker has no file until it lands,
 // and a worker outliving the dead leader can land it after the takeover has
-// looked, so the floor also counts the record the coordinator writes before
-// any frame naming an id leaves. The record only rises: a superseded
-// coordinator still triggering must not lower it beneath ids the leader has
-// sent.
-TEST_F(ResolutionFixture, TheTriggeredRecordOnlyRises) {
+// looked, so the floor also counts the record a coordinator claims each id on
+// before any frame naming it leaves. A claim lands only over a record holding
+// less, so the record only rises and an id is claimed once across every
+// coordinator of the job: a superseded coordinator still triggering can
+// neither lower the record beneath the leader's ids nor share one of them.
+TEST_F(ResolutionFixture, AnIdIsClaimedOnceAndTheRecordOnlyRises) {
     using clink::cluster::latest_triggered_id_on_disk;
     using clink::cluster::record_triggered_id;
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 0u);
     EXPECT_EQ(latest_triggered_id_on_disk("", kJob), 0u);
 
-    EXPECT_EQ(record_triggered_id(dir, kJob, 5), 5u);
+    auto claim = record_triggered_id(dir, kJob, 5);
+    EXPECT_TRUE(claim.claimed);
+    EXPECT_EQ(claim.on_record, 5u);
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 5u);
-    // A lower id is covered by the record and leaves it where it is.
-    EXPECT_EQ(record_triggered_id(dir, kJob, 3), 5u);
+    // A lower id is held by the record, and the claim says what holds it.
+    claim = record_triggered_id(dir, kJob, 3);
+    EXPECT_FALSE(claim.claimed);
+    EXPECT_EQ(claim.on_record, 5u);
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 5u);
-    EXPECT_EQ(record_triggered_id(dir, kJob, 8), 8u);
+    // So is the same id: whoever claimed it first has it.
+    claim = record_triggered_id(dir, kJob, 5);
+    EXPECT_FALSE(claim.claimed) << "an id already on record was claimed a second time";
+    EXPECT_EQ(claim.on_record, 5u);
+    claim = record_triggered_id(dir, kJob, 8);
+    EXPECT_TRUE(claim.claimed);
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 8u);
     // Job-scoped, beside the markers, and the body is the id in decimal.
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob + 1), 0u);
@@ -477,25 +490,86 @@ TEST_F(ResolutionFixture, TheTriggeredRecordOnlyRises) {
     EXPECT_EQ(body, "8");
 }
 
-TEST_F(ResolutionFixture, AnUnreadableTriggeredRecordReadsAsNoneAndTheNextRaiseRepairsIt) {
+// Two coordinators wanting the same id - a leader and a superseded one still
+// triggering - must not both get it, or both send its barrier: a worker that
+// has not yet bound the leader's epoch would capture the superseded one's at
+// the path the leader's capture of the id writes.
+TEST_F(ResolutionFixture, OfConcurrentClaimsOnOneIdExactlyOneLands) {
+    for (std::uint64_t id = 1; id <= 20; ++id) {
+        std::atomic<int> landed{0};
+        std::vector<std::thread> writers;
+        writers.reserve(4);
+        for (int i = 0; i < 4; ++i) {
+            writers.emplace_back([&] {
+                if (clink::cluster::record_triggered_id(dir, kJob, id).claimed) {
+                    landed.fetch_add(1);
+                }
+            });
+        }
+        for (auto& t : writers) {
+            t.join();
+        }
+        ASSERT_EQ(landed.load(), 1)
+            << "checkpoint id " << id << " was claimed " << landed.load() << " times";
+    }
+    EXPECT_EQ(clink::cluster::latest_triggered_id_on_disk(dir, kJob), 20u);
+}
+
+TEST_F(ResolutionFixture, AnUnreadableTriggeredRecordReadsAsNoneAndTheNextClaimRepairsIt) {
     using clink::cluster::latest_triggered_id_on_disk;
     const auto path = completed_marker_dir_for(dir, kJob) / "TRIGGERED";
     std::filesystem::create_directories(path.parent_path());
     std::ofstream(path) << "not-an-id";
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 0u);
-    EXPECT_EQ(clink::cluster::record_triggered_id(dir, kJob, 2), 2u);
+    EXPECT_TRUE(clink::cluster::record_triggered_id(dir, kJob, 2).claimed);
     EXPECT_EQ(latest_triggered_id_on_disk(dir, kJob), 2u);
 }
 
+namespace {
+
+// Error lines logged since `since_ms`, from any component.
+std::vector<clink::LogRecord> triggered_record_errors_since(std::int64_t since_ms) {
+    return clink::LogBuffer::global().tail(1000, "error", since_ms);
+}
+
+std::int64_t triggered_record_log_cursor_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
 // The caller must not send an id it could not record, so a failed write has
-// to say so rather than return as if the id were covered.
-TEST_F(ResolutionFixture, ATriggeredRecordThatCannotBeWrittenThrows) {
+// to say so rather than return as if the id were held. It says so to the
+// caller alone: the coordinator logs a failing record once per outage, and a
+// store line on every retry buried that under a line a second.
+TEST_F(ResolutionFixture, ATriggeredRecordThatCannotBeWrittenThrowsAndLogsNothing) {
     // A directory where the record goes: the write's rename fails.
     const auto path = completed_marker_dir_for(dir, kJob) / "TRIGGERED";
     std::filesystem::create_directories(path);
     std::ofstream(path / "obstruction").put('x');
+    const auto since = triggered_record_log_cursor_ms() - 1;
     EXPECT_THROW((void)clink::cluster::record_triggered_id(dir, kJob, 4), std::runtime_error);
     EXPECT_EQ(clink::cluster::latest_triggered_id_on_disk(dir, kJob), 0u);
+    for (const auto& rec : triggered_record_errors_since(since)) {
+        ADD_FAILURE() << "a failed claim logged at the store layer: [" << rec.source << "] "
+                      << rec.message;
+    }
+}
+
+// A claim the record already holds is the ordinary answer when two
+// coordinators run the job, not lost leadership, and is not logged as either.
+TEST_F(ResolutionFixture, AClaimTheRecordAlreadyHoldsIsAnAnswerNotAnError) {
+    ASSERT_TRUE(clink::cluster::record_triggered_id(dir, kJob, 50).claimed);
+    const auto since = triggered_record_log_cursor_ms() - 1;
+    const auto claim = clink::cluster::record_triggered_id(dir, kJob, 7);
+    EXPECT_FALSE(claim.claimed);
+    EXPECT_EQ(claim.on_record, 50u);
+    for (const auto& rec : triggered_record_errors_since(since)) {
+        ADD_FAILURE() << "a claim the record already held logged an error: [" << rec.source << "] "
+                      << rec.message;
+    }
 }
 
 // -- cancellation (the rig-night composite's zombie walk) ------------------

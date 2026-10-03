@@ -46,4 +46,16 @@ namespace clink::cluster {
     const std::function<std::uint64_t(const std::string&)>& epoch_of,
     const std::string& caller_context = {});
 
+// The same compare-and-set for a record whose refusal is an ordinary answer
+// rather than lost leadership, such as the checkpoint-id record, where a
+// higher id already on record is the normal shape of two coordinators. It
+// logs nothing: true when `body` landed, false when the fence refused it, and
+// a std::runtime_error naming the cause when the lock or the durable write
+// failed. The caller decides what is worth reporting, and how often.
+[[nodiscard]] bool fenced_metadata_cas_write_quietly(
+    const std::filesystem::path& path,
+    const std::string& body,
+    std::uint64_t writer_epoch,
+    const std::function<std::uint64_t(const std::string&)>& epoch_of);
+
 }  // namespace clink::cluster

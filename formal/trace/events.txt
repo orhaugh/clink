@@ -32,6 +32,7 @@ event SubtaskDrained
 event CoordRecovers
 event RestartProceeds
 event Redeploy
+event Renumber
 event WalkSkips
 event WalkReadsReceipt
 event WalkProbes

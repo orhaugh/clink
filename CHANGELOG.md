@@ -3,23 +3,44 @@
 ## Unreleased
 
 **A takeover no longer reuses the id of a checkpoint its dead leader had
-begun.** A recovered job numbered its new checkpoints above the COMPLETED and
-CONFIRMED markers and the snapshot files it could see. A checkpoint whose
-barrier had reached a worker and whose capture had not landed left no file,
-and a worker that outlived the coordinator could still write it after the
-takeover, at the path the new run's checkpoint of the same id writes; a later
-restore could then read one checkpoint from two vintages. CI's trace
-validation caught a takeover reusing such an id. The coordinator now records
-every checkpoint id in `_jobs/<job>/TRIGGERED` in the checkpoint directory
-before any frame naming it leaves, and a takeover numbers above the record as
-well. A job taken over before it completed a checkpoint of its own, which used
-to number from 1 again, gets the same floor. When the record cannot be
-written, a periodic checkpoint is skipped until it can be, a savepoint fails
-with nothing sent, a source's end-of-input request goes unanswered so its
-subtask fails and the restart replays the tail, and a hot cutover falls back to
-the replan. The exactly-once specification's id rule now admits the range of
-ids a takeover can choose, and a worker fault point,
+begun, and a leader no longer shares ids with a superseded coordinator.** A
+recovered job numbered its new checkpoints above the COMPLETED and CONFIRMED
+markers and the snapshot files it could see. A checkpoint whose barrier had
+reached a worker and whose capture had not landed left no file, and a worker
+that outlived the coordinator could still write it after the takeover, at the
+path the new run's checkpoint of the same id writes; a later restore could
+then read one checkpoint from two vintages. CI's trace validation caught a
+takeover reusing such an id. Every checkpoint id is now claimed in
+`_jobs/<job>/TRIGGERED` in the checkpoint directory before it is allocated,
+and a takeover numbers above the record as well. A claim lands only over a
+record holding less, so each id is claimed once across every coordinator of
+the job, and a coordinator whose claim is refused numbers above the record. A
+superseded coordinator whose trigger loop runs on still reaches the workers
+that have not yet re-registered with the new leader, and the two can no
+longer send the same id. Each job claims its next id in the background as
+soon as the previous one is allocated, so the trigger loop never waits on the
+store and a slow or failing record holds only its own job; a failing claim is
+retried after a delay that doubles up to 2 s, and is reported once. A job
+taken over before it completed a checkpoint of its own, which used to number
+from 1 again, gets the same floor. When an id cannot be claimed, the job's
+periodic checkpoints wait for it, a savepoint fails with nothing sent, a
+source's end-of-input request goes unanswered so its subtask fails and the
+restart replays the tail, and a hot cutover is not begun, so the replan takes
+the request. A hot cutover aborted between its arming and its send no longer
+sends its arm frames. The exactly-once specification's id rule now admits the
+range of ids a takeover can choose and a renumber past a superseded
+coordinator's claims, and a worker fault point,
 `worker.after_trigger_delivered`, holds the window open in `HaFailoverTest`.
+
+**A takeover whose in-doubt resolution confirms the job's own checkpoints
+restores from them.** The walk moved the restore point to the newest
+checkpoint it proved, but left the directory to restore it from as it was: a
+job with nothing of its own confirmed had none, and the deploy's lint refused
+the restore, so the job was dropped at the takeover; a job submitted from a
+savepoint kept that savepoint's directory. The takeover now restores the
+resolved checkpoint from the job's own directory, and its `Redeploy` protocol
+event reports that restore point rather than the one from before the walk, on
+which the Kafka takeover traces diverged.
 
 **A native ClickHouse sink.** A ClickHouse table with
 `insert_format='native'` is written by `clickhouse_native_sink`, which sends
