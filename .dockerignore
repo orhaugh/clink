@@ -15,6 +15,10 @@ out/
 compile_commands.json
 compile_flags.txt
 
+# Benchmark inputs and results, generated locally and gigabytes at volume
+benchmarks/clickhouse_sink/data/
+benchmarks/clickhouse_sink/results/
+
 # Test artifacts
 Testing/
 *.gcda
