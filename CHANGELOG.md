@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**A checkpoint no longer stalls when an input's close completes a barrier's
+alignment.** In a union, join, broadcast, co-operator, fan-in sink or
+operator fed by several subtasks, when the other inputs had delivered a
+barrier and the last one finished without it, the aligner released the
+barrier at the close and every runner discarded the release: the barrier
+never left the operator, a fan-in sink never acknowledged it, and the
+checkpoint could only time out, which without restart budget fails the job.
+Each runner now forwards, snapshots or hands on the barrier as its barrier
+path does, ahead of the watermark the close frees.
+
 **A `parquet` source reads files another tool wrote.** The source expected
 clink's own event-time column in every file and refused one without it, so a
 directory pyarrow, DuckDB, Spark or ClickHouse wrote could not be read, though

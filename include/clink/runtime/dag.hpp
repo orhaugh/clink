@@ -1761,7 +1761,12 @@ public:
                     if (align.input_paused(i)) {
                         if (!align.input_closed(i) && channels[i]->closed() &&
                             channels[i]->size() == 0) {
-                            align.on_input_closed(i, channels[i]->close_cancelled());
+                            // A close can complete a pending barrier's alignment:
+                            // forward it, ahead of whatever time the close frees.
+                            if (auto adv = align.on_input_closed(i, channels[i]->close_cancelled());
+                                adv.forward) {
+                                out_channel->push(StreamElement<T>::barrier(adv.barrier));
+                            }
                             if (auto wm_adv = align.refresh_watermark(); wm_adv.forward) {
                                 out_channel->push(StreamElement<T>::watermark(wm_adv.watermark));
                             }
@@ -1774,7 +1779,10 @@ public:
                         // above: a push+close can land between the failed
                         // try_pop and this check.
                         if (channels[i]->closed() && channels[i]->size() == 0) {
-                            align.on_input_closed(i, channels[i]->close_cancelled());
+                            if (auto adv = align.on_input_closed(i, channels[i]->close_cancelled());
+                                adv.forward) {
+                                out_channel->push(StreamElement<T>::barrier(adv.barrier));
+                            }
                             if (auto wm_adv = align.refresh_watermark(); wm_adv.forward) {
                                 out_channel->push(StreamElement<T>::watermark(wm_adv.watermark));
                             }
@@ -2743,7 +2751,12 @@ public:
                         // Closed AND drained (see the co_operator runner): a
                         // push+close between the failed try_pop and this check
                         // must not mark the input closed over queued records.
-                        align.on_input_closed(0, left_ch->close_cancelled());
+                        // A close can complete a pending barrier's alignment:
+                        // forward it, ahead of whatever time the close frees.
+                        if (auto adv = align.on_input_closed(0, left_ch->close_cancelled());
+                            adv.forward) {
+                            out_channel->push(StreamElement<C>::barrier(adv.barrier));
+                        }
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             evict(wm.watermark.timestamp());
                             out_channel->push(StreamElement<C>::watermark(wm.watermark));
@@ -2760,7 +2773,10 @@ public:
                         any_progress = true;
                         handle_right(*m);
                     } else if (right_ch->closed() && right_ch->size() == 0) {
-                        align.on_input_closed(1, right_ch->close_cancelled());
+                        if (auto adv = align.on_input_closed(1, right_ch->close_cancelled());
+                            adv.forward) {
+                            out_channel->push(StreamElement<C>::barrier(adv.barrier));
+                        }
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             evict(wm.watermark.timestamp());
                             out_channel->push(StreamElement<C>::watermark(wm.watermark));
@@ -3066,7 +3082,12 @@ public:
                         handle_main(*m);
                     } else if (main_ch->closed() && main_ch->size() == 0) {
                         // Closed AND drained (see the co_operator runner note).
-                        align.on_input_closed(0, main_ch->close_cancelled());
+                        // A close can complete a pending barrier's alignment:
+                        // forward it, ahead of whatever time the close frees.
+                        if (auto adv = align.on_input_closed(0, main_ch->close_cancelled());
+                            adv.forward) {
+                            out_channel->push(StreamElement<Out>::barrier(adv.barrier));
+                        }
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             out_channel->push(StreamElement<Out>::watermark(wm.watermark));
                         }
@@ -3082,7 +3103,10 @@ public:
                         any_progress = true;
                         handle_brod(*b);
                     } else if (brod_ch->closed() && brod_ch->size() == 0) {
-                        align.on_input_closed(1, brod_ch->close_cancelled());
+                        if (auto adv = align.on_input_closed(1, brod_ch->close_cancelled());
+                            adv.forward) {
+                            out_channel->push(StreamElement<Out>::barrier(adv.barrier));
+                        }
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             out_channel->push(StreamElement<Out>::watermark(wm.watermark));
                         }
@@ -3598,7 +3622,13 @@ public:
                         // align.all_closed() breaks the loop, and the batch is
                         // dropped (observed in CI as an all-zero co-op run
                         // when the other input was empty and closed at start).
-                        align.on_input_closed(0, left_ch->close_cancelled());
+                        // A close can complete a pending barrier's alignment:
+                        // snapshot and forward it as the barrier path does,
+                        // ahead of whatever time the close frees.
+                        if (auto adv = align.on_input_closed(0, left_ch->close_cancelled());
+                            adv.forward) {
+                            snapshot_and_ack(adv.barrier);
+                        }
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             forward_watermark(wm.watermark);
                         }
@@ -3614,7 +3644,10 @@ public:
                         any_progress = true;
                         handle_right(*m);
                     } else if (right_ch->closed() && right_ch->size() == 0) {
-                        align.on_input_closed(1, right_ch->close_cancelled());
+                        if (auto adv = align.on_input_closed(1, right_ch->close_cancelled());
+                            adv.forward) {
+                            snapshot_and_ack(adv.barrier);
+                        }
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             forward_watermark(wm.watermark);
                         }
@@ -4086,7 +4119,13 @@ public:
                             // note): a push+close can land between the failed
                             // try_pop and this check.
                             if (ins[k]->closed() && ins[k]->size() == 0) {
-                                align.on_input_closed(k, ins[k]->close_cancelled());
+                                // A close can complete a pending barrier's
+                                // alignment; the sink must still see it, or it
+                                // never acknowledges the checkpoint.
+                                if (auto adv = align.on_input_closed(k, ins[k]->close_cancelled());
+                                    adv.forward) {
+                                    sink->on_barrier(adv.barrier);
+                                }
                             }
                             continue;
                         }
@@ -4813,7 +4852,13 @@ private:
                             // note): a push+close can land between the failed
                             // try_pop and this check.
                             if (ins[k]->closed() && ins[k]->size() == 0) {
-                                align.on_input_closed(k, ins[k]->close_cancelled());
+                                // A close can complete a pending barrier's
+                                // alignment: hand it to the operator as the
+                                // barrier path does.
+                                if (auto adv = align.on_input_closed(k, ins[k]->close_cancelled());
+                                    adv.forward) {
+                                    op->on_barrier(adv.barrier, out_emitter);
+                                }
                             }
                             continue;
                         }
