@@ -1698,7 +1698,10 @@ TEST(NativeWriterDeadline, AnEndKeptBusyPastTheWindowTimesOutInDoubtAndExhaustsW
 TEST(NativeWriterDeadline, AnInsertHeldOpenByALongIntervalIsNotCutByTheDeadline) {
     WrRig rig;
     rig.options.retry_window = 300ms;
-    rig.options.batch_interval = 1500ms;
+    // Scaled so that, under a sanitizer, the interval cannot run out before
+    // the late submit below and close the INSERT early; the 600 ms hold still
+    // outlasts the 300 ms retry window, which is the point of the test.
+    rig.options.batch_interval = scale_slack(1500ms);
     rig.start();
     // The first block goes out at once, so BeginInsert runs early and the
     // INSERT then stays open for the rest of the interval.
@@ -1711,7 +1714,7 @@ TEST(NativeWriterDeadline, AnInsertHeldOpenByALongIntervalIsNotCutByTheDeadline)
     }));
     std::this_thread::sleep_for(600ms);
     rig.writer->submit(rig.chunk(40, 45, 8));
-    ASSERT_TRUE(wr_eventually([&] { return rig.server->rows(kWrTable) == 45; }, 5s));
+    ASSERT_TRUE(wr_eventually([&] { return rig.server->rows(kWrTable) == 45; }, scale_slack(5s)));
     const auto all = rig.inserts();
     ASSERT_EQ(all.size(), 1U);
     EXPECT_EQ(all[0].outcome, WrOutcome::Committed);
