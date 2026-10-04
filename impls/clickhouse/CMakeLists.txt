@@ -338,6 +338,7 @@ if(_ch_native)
         src/native/insert_transport.cpp
         src/native/intake.cpp
         src/native/native_sink.cpp
+        src/native/native_sink_core.cpp
         src/native/retry.cpp
         src/native/row_arrow.cpp
         src/native/sink_options.cpp

@@ -24,6 +24,10 @@ namespace clink::clickhouse::native {
 // Nothing here touches the RuntimeContext after open(): the cancel signal,
 // the metrics registry, the logger and the memory budget are copied then,
 // because the context goes before the sink does.
+//
+// The open, the writer, the barrier and the closes are a SinkCore's
+// (native_sink_core.hpp); this class adds what is particular to Rows: the
+// columns from sql_column_types, the RowArrowBuilder and the columnar intake.
 class NativeSink final : public Sink<sql::Row> {
 public:
     // Throws NativeSinkError(option_invalid) when sql_column_types does not
