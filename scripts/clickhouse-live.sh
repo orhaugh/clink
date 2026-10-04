@@ -9,7 +9,8 @@
 # services of docker/integration-services.yml:
 #   - the line's plain and async-default servers (the same two the pins use):
 #     ClickHouseNativeLive.*, then the SQL-linked ClickHouseNativeSqlLive.* and
-#     ClickHouseLegacySqlLive.*;
+#     ClickHouseLegacySqlLive.*, which include the typed job module's plugin
+#     route;
 #   - two replicas sharing one Keeper: pin P18 first, then
 #     ClickHouseNativeLiveReplicated.*, whose failover case shuts the first
 #     replica down;
@@ -33,6 +34,8 @@
 #   CLINK_CLICKHOUSE_TEST_TLS_CA              the CA that signed the server
 #   CLINK_CLICKHOUSE_TEST_TLS_WRONG_CA        a CA that did not
 #   CLINK_CLICKHOUSE_TEST_LINE                the line the profile runs ("26.8")
+#   CLINK_CLICKHOUSE_TYPED_JOB                the typed job module (TYPED_JOB),
+#                                             for the SQL-level cases
 # CLINK_CLICKHOUSE_TEST_USER and CLINK_CLICKHOUSE_TEST_PASSWORD pass through
 # when set.
 #
@@ -41,6 +44,11 @@
 #   BIN            clink_clickhouse_tests to run, overriding the one in BUILD_DIR
 #   SQL_BIN        clink_clickhouse_sql_tests, likewise; CLICKHOUSE_LIVE_SQL=0
 #                  skips the SQL-level cases where that binary is not built
+#   TYPED_JOB      clickhouse_typed_job.so, the job module the SQL-level plugin
+#                  case submits, found under BUILD_DIR by default. Passed by
+#                  path, because the one compiled into SQL_BIN names the tree it
+#                  was built in; that case skips when neither exists, and a
+#                  TYPED_JOB set to a missing file fails the run
 #   PIN_RUNNER     a prefix for every test command (CI runs the binaries inside
 #                  the toolchain image with `docker run ... -e <each variable
 #                  above>`, so the variables set on the command reach the
@@ -68,6 +76,19 @@ if [ "${CLICKHOUSE_LIVE_SQL}" = "1" ] && { [ -z "${SQL_BIN}" ] || [ ! -x "${SQL_
     echo "clickhouse-live: clink_clickhouse_sql_tests is not built under ${BUILD_DIR}" \
         "(set SQL_BIN, or CLICKHOUSE_LIVE_SQL=0 to skip the SQL-level cases)" >&2
     exit 1
+fi
+
+# A module needs only to be readable, so it is found without the executable bit
+# an artifact download drops. One named by the caller must exist: the case it
+# serves would otherwise skip, and the plugin route go untested unnoticed.
+if [ -n "${TYPED_JOB:-}" ] && [ ! -f "${TYPED_JOB}" ]; then
+    echo "clickhouse-live: TYPED_JOB=${TYPED_JOB} does not exist" >&2
+    exit 1
+fi
+TYPED_JOB="${TYPED_JOB:-$(find "${BUILD_DIR}" -name clickhouse_typed_job.so -type f 2>/dev/null | head -1)}"
+typed_job_env=()
+if [ -n "${TYPED_JOB}" ]; then
+    typed_job_env=(CLINK_CLICKHOUSE_TYPED_JOB="${TYPED_JOB}")
 fi
 
 started=()
@@ -134,7 +155,8 @@ for line in ${CLICKHOUSE_LINES}; do
         CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT_PORT="${async_port}"
     if [ "${CLICKHOUSE_LIVE_SQL}" = "1" ]; then
         run "${line} SQL-level" "${SQL_BIN}" 'ClickHouseNativeSqlLive.*:ClickHouseLegacySqlLive.*' \
-            CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}"
+            CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}" \
+            ${typed_job_env[@]+"${typed_job_env[@]}"}
     fi
     down "${svc}" "${async_svc}"
 

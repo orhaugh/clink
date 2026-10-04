@@ -21,6 +21,7 @@ That one line yields, with no further code:
 | Byte codec for state values and the row wire | `derived_codec<T>()`, `include/clink/core/derived_codec.hpp` |
 | Registration defaults | `TypeRegistry::register_typed<T>()` / `PluginRegistry::register_type<T>()`: channel name = the declared type name |
 | Shape fingerprint gating restores | `fields_fingerprint_v<T>`, checked where `RuntimeContext::keyed_state` binds |
+| Typed ClickHouse ingest | `make_clickhouse_native_sink<T>()` / `register_clickhouse_native_sink<T>()`, `clink/clickhouse/native_sink.hpp` (Internal): the native sink takes its ClickHouse column types from the batcher's schema ([ClickHouse](../connectors/clickhouse.md#c-typed-structs)) |
 
 The declaration is the **adapter** form: it annotates an existing struct
 rather than defining one, so it works on types the codebase already has.

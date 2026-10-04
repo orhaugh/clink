@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**C++ jobs can write a CLINK_FIELDS struct to ClickHouse over the native
+protocol.** `make_clickhouse_native_sink<T>` builds the native sink for a
+Dag-direct job and `register_clickhouse_native_sink<T>` registers it as the
+factory `clickhouse_native_sink_<channel>` for a job module, both in the
+Internal header `clink/clickhouse/native_sink.hpp`. The sink takes its column
+types from the struct's Arrow schema, so there is no `sql_column_types` and no
+encoder to write; unsigned fields land in unsigned columns, with a per-value
+range check into a narrower one, timestamps of any unit scale exactly, and
+`std::optional` fields land in Nullable ones. Options, refusals, the
+at-least-once guarantee and its conditions are the SQL native sink's. The open
+report labels a typed sink's columns `arrow=` with the Arrow type where a SQL
+sink's show `sql=`, and its options line says `columns=<n> from the batcher
+schema`. Consumer example 12 writes a struct end to end, built with
+`-DCLINK_EXAMPLES_CLICKHOUSE=ON`.
+
+**`find_package(clink COMPONENTS clickhouse)` now resolves the client's own
+dependencies.** The installed package's `clickhouse` component finds the
+OpenSSL and abseil the installed ClickHouse client links, so a consumer
+project can link `clink::clickhouse` from an install prefix; before, the
+exported target named imported targets nothing had defined.
+
 **A multi-input operator or sink no longer holds event time back, or hangs,
 when an input closes.** A fan-in sink and an operator fed by several subtasks
 now forward the watermark an input's close frees as soon as they see the close,

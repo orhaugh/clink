@@ -32,6 +32,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -55,8 +57,10 @@
 #include <arrow/api.h>
 #include <clickhouse/client.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "clink/application/job_submitter.hpp"
 #include "clink/clickhouse/install.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/coordinator.hpp"
@@ -71,6 +75,7 @@
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/dag.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/json_string_to_row_columnar.hpp"
 #include "clink/sql/row_columnar_output.hpp"
@@ -2239,6 +2244,176 @@ TEST(ClickHouseNativeSql, TwoInsertsFromOneSourceArePlannedApartOrRefused) {
     }
 }
 
+// --- The typed helper's plugin route -----------------------------------------
+
+// The job module that registers register_clickhouse_native_sink<Trade>
+// (tests/plugin_examples/clickhouse_typed_job.cpp). CLINK_CLICKHOUSE_TYPED_JOB
+// overrides the path compiled in, which names the build's own tree.
+std::string typed_job_path() {
+    if (const char* p = std::getenv("CLINK_CLICKHOUSE_TYPED_JOB"); p != nullptr && *p != '\0') {
+        return p;
+    }
+#ifdef CLINK_CLICKHOUSE_TYPED_JOB_PATH
+    return CLINK_CLICKHOUSE_TYPED_JOB_PATH;
+#else
+    return {};
+#endif
+}
+
+// Whether CLINK_CLICKHOUSE_TYPED_JOB names the module. A module named that way
+// must exist: a run that names it means the plugin route to be tested, and a
+// skip would hide a module that went missing.
+bool typed_job_named() {
+    const char* p = std::getenv("CLINK_CLICKHOUSE_TYPED_JOB");
+    return p != nullptr && *p != '\0';
+}
+
+// The graph the module's build function makes, read as the submit CLI reads
+// it. The module stays loaded: the graph's bytes are its own.
+std::string typed_job_graph(const std::string& module) {
+    void* handle = ::dlopen(module.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        throw std::runtime_error(std::string("dlopen: ") + ::dlerror());
+    }
+    using JobBuildFn = int (*)(const char**, std::size_t*);
+    void* symbol = ::dlsym(handle, "clink_job_build");
+    if (symbol == nullptr) {
+        throw std::runtime_error(module + " exports no clink_job_build");
+    }
+    JobBuildFn build = nullptr;
+    std::memcpy(&build, &symbol, sizeof(build));
+    const char* data = nullptr;
+    std::size_t size = 0;
+    if (build(&data, &size) != 0) {
+        throw std::runtime_error(module + ": clink_job_build failed");
+    }
+    return std::string(data, size);
+}
+
+// A loopback port nothing listens on: bound, read back and closed.
+std::uint16_t closed_port() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        throw std::runtime_error("socket() failed");
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(addr);
+    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                    ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
+    ::close(fd);
+    if (!ok) {
+        throw std::runtime_error("could not find a free port");
+    }
+    return ntohs(addr.sin_port);
+}
+
+// Where the module's sink writes: its options are env:// references, resolved
+// when a worker builds the sink.
+void point_typed_job_at(const std::string& host,
+                        std::uint16_t port,
+                        const std::string& database,
+                        const std::string& table,
+                        std::chrono::milliseconds retry_window) {
+    ::setenv("CLINK_CLICKHOUSE_TYPED_JOB_HOST", host.c_str(), 1);
+    ::setenv("CLINK_CLICKHOUSE_TYPED_JOB_PORT", std::to_string(port).c_str(), 1);
+    ::setenv("CLINK_CLICKHOUSE_TYPED_JOB_DATABASE", database.c_str(), 1);
+    ::setenv("CLINK_CLICKHOUSE_TYPED_JOB_TABLE", table.c_str(), 1);
+    ::setenv("CLINK_CLICKHOUSE_TYPED_JOB_RETRY_WINDOW_MS",
+             std::to_string(retry_window.count()).c_str(),
+             1);
+}
+
+struct TypedJobRun {
+    clink::application::SubmitResult result;
+    // What the coordinator logged about the job's delivery guarantee.
+    std::vector<std::string> guarantee;
+    // The ClickHouse sink series that appeared in this process's registry,
+    // the one every worker of the cluster hands its operators.
+    std::map<std::string, std::uint64_t> sink_series;
+};
+
+// Submits the module as `clink submit` would, to a TestCluster with durable
+// checkpointing, and waits for the job to end. `max_restarts` overrides the
+// restart budget.
+TypedJobRun run_typed_job(const std::string& module,
+                          const fs::path& dir,
+                          std::optional<std::uint32_t> max_restarts = std::nullopt) {
+    auto checkpointing = checkpointing_cluster(dir / "ckpt", 600'000);
+    if (max_restarts) {
+        checkpointing.checkpoint.max_restarts_on_worker_loss = *max_restarts;
+    }
+    clink::test::TestCluster cluster(checkpointing);
+    std::set<std::string> before;
+    for (const auto& [name, value] : clink::MetricsRegistry::global().snapshot().counters) {
+        before.insert(name);
+    }
+    const std::int64_t since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+    std::this_thread::sleep_for(3ms);
+
+    clink::application::JobSubmitter submitter("127.0.0.1", cluster.coordinator().bound_port());
+    clink::application::SubmitOptions opts;
+    opts.wait_for_completion = true;
+    opts.wait_timeout = 120s;
+    opts.ack_timeout = 30s;
+    opts.checkpoint = checkpointing.checkpoint;
+
+    TypedJobRun run;
+    run.result = submitter.submit(typed_job_graph(module), {module}, opts);
+    for (const auto& r :
+         clink::LogBuffer::global().tail(4096, "", since, "coordinator.guarantee")) {
+        run.guarantee.push_back(r.message);
+    }
+    for (const auto& [name, value] : clink::MetricsRegistry::global().snapshot().counters) {
+        if (name.starts_with("clink_clickhouse_") && !before.contains(name)) {
+            run.sink_series[name] = value;
+        }
+    }
+    return run;
+}
+
+// A worker that loaded the module resolves clickhouse_native_sink_Trade from
+// the module's own registration and builds the sink with the module's code:
+// the coordinator reads the at-least-once record for it by its prefix, and
+// the task fails with the sink's own error for a server that is not there.
+// The host links the ClickHouse impl, as the runtime image does.
+TEST(ClickHouseNativeSql, TheTypedJobModulesSinkIsDeclaredAtLeastOnceAndBuiltByTheWorker) {
+    ensure_installed();
+    const std::string module = typed_job_path();
+    if (module.empty() || !fs::exists(module)) {
+        ASSERT_FALSE(typed_job_named())
+            << "CLINK_CLICKHOUSE_TYPED_JOB names " << module << ", which does not exist";
+        GTEST_SKIP() << "clickhouse_typed_job is not built";
+    }
+    const ScratchDir dir("typed_job_closed");
+    const std::uint16_t port = closed_port();
+    point_typed_job_at("127.0.0.1", port, "db", "trades", 1000ms);
+    // The first failure ends the job: a restart would only meet the same port.
+    const auto run = run_typed_job(module, dir.path(), 0);
+    ASSERT_TRUE(run.result.completed) << run.result.reject_message;
+    EXPECT_FALSE(run.result.ok);
+
+    bool limited = false;
+    for (const auto& line : run.guarantee) {
+        limited = limited || line.find(
+                                 "STATE_EXACTLY_ONCE_OUTPUT_AT_LEAST_ONCE (limited by sink "
+                                 "'clickhouse_native_sink_Trade')") != std::string::npos;
+    }
+    EXPECT_TRUE(limited) << joined(run.guarantee);
+
+    bool refused = false;
+    const std::string endpoint = "on 127.0.0.1:" + std::to_string(port) + " ";
+    for (const auto& e : run.result.errors) {
+        refused = refused || (e.find("[clickhouse.retry_window_exhausted] clickhouse native sink: "
+                                     "could not open `db`.`trades`") != std::string::npos &&
+                              e.find(endpoint) != std::string::npos);
+    }
+    EXPECT_TRUE(refused) << joined(run.result.errors);
+}
+
 // --- Against a real server ---------------------------------------------------
 
 std::string live_env(const char* name) {
@@ -2898,6 +3073,54 @@ TEST_F(ClickHouseNativeSqlLive, TheTutorialsTableTakesTheNativeSink) {
     EXPECT_EQ(scalar("SELECT toString(count()) FROM " + table + " WHERE sensor_id = 'sensor-over'"),
               "0")
         << "the over-range row landed on " << line_;
+}
+
+// The plugin route against a real server: the module's sink, built by a
+// worker of the cluster, lands every row once, unsigned values past the
+// signed range included, and its series are counted in the registry the
+// worker hands its operators, not in a copy of the module's own.
+TEST_F(ClickHouseNativeSqlLive, TheTypedJobModulesSinkLandsEveryRowAndCountsInTheWorkersRegistry) {
+    const std::string module = typed_job_path();
+    if (module.empty() || !fs::exists(module)) {
+        ASSERT_FALSE(typed_job_named())
+            << "CLINK_CLICKHOUSE_TYPED_JOB names " << module << ", which does not exist";
+        GTEST_SKIP() << "clickhouse_typed_job is not built";
+    }
+    if (!user_.empty() || !password_.empty()) {
+        GTEST_SKIP() << "the typed job module connects as the default user";
+    }
+    client_->Execute("CREATE TABLE " + db_ +
+                     ".trades (id Int64, qty UInt32, volume UInt64, px Float64, venue String) "
+                     "ENGINE = MergeTree ORDER BY id");
+    const ScratchDir dir("typed_job_live");
+    point_typed_job_at(host_, port_, db_, "trades", 30000ms);
+    const auto run = run_typed_job(module, dir.path());
+    ASSERT_TRUE(run.result.completed) << run.result.reject_message;
+    ASSERT_TRUE(run.result.ok) << joined(run.result.errors);
+
+    constexpr std::int64_t kRows = 1000;  // the module's source
+    const auto got = rows(
+        "SELECT toString(count()), toString(uniqExact(id)), toString(sum(id)), "
+        "toString(sum(qty)), toString(max(volume)), toString(sum(px)) FROM " +
+        db_ + ".trades");
+    ASSERT_EQ(got.size(), 1U);
+    EXPECT_EQ(got[0][0], std::to_string(kRows)) << "on " << line_;
+    EXPECT_EQ(got[0][1], std::to_string(kRows)) << "on " << line_;
+    EXPECT_EQ(got[0][2], std::to_string(kRows * (kRows - 1) / 2));
+    EXPECT_EQ(got[0][3], std::to_string(3 * kRows * (kRows - 1) / 2));
+    EXPECT_EQ(got[0][4], std::to_string((1ULL << 63) + static_cast<std::uint64_t>(kRows - 1)));
+    EXPECT_EQ(got[0][5], "124875");
+
+    bool counted = false;
+    for (const auto& [name, value] : run.sink_series) {
+        counted = counted || (name.starts_with("clink_clickhouse_rows_total{op_id=") &&
+                              value == static_cast<std::uint64_t>(kRows));
+    }
+    std::string series;
+    for (const auto& [name, value] : run.sink_series) {
+        series += name + "=" + std::to_string(value) + "\n";
+    }
+    EXPECT_TRUE(counted) << "the worker's registry has no rows series for the sink:\n" << series;
 }
 
 // --- The columnar JSON decode into the intake's fast paths ---------------------

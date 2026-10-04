@@ -14,7 +14,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # resolves the dependencies those components need - a machine without,
 # say, the Avro or MongoDB client libraries still builds every example.
 # Request more components (kafka, postgres, ...) as you link them.
-find_package(clink REQUIRED COMPONENTS core test_support)
+#
+# Example 12 links a connector, so it is opt-in: CLINK_EXAMPLES_CLICKHOUSE=ON
+# adds the clickhouse component, whose dependencies (the OpenSSL and abseil the
+# installed client links) must then resolve. It is an option rather than an
+# optional component because a component that is asked for at all has its
+# dependencies resolved under the REQUIRED above, so one missing would stop
+# every other example from configuring.
+option(CLINK_EXAMPLES_CLICKHOUSE
+       "Build example 12, which needs clink installed with the ClickHouse client" OFF)
+set(_clink_components core test_support)
+if(CLINK_EXAMPLES_CLICKHOUSE)
+    list(APPEND _clink_components clickhouse)
+endif()
+find_package(clink REQUIRED COMPONENTS ${_clink_components})
 
 message(STATUS "clink ${clink_VERSION}: impls = ${clink_AVAILABLE_IMPLS}")
 
@@ -60,6 +73,16 @@ add_test(NAME 10_http_surface COMMAND 10_http_surface)
 add_executable(11_declared_types 11_declared_types.cpp)
 target_link_libraries(11_declared_types PRIVATE clink::core)
 add_test(NAME 11_declared_types COMMAND 11_declared_types)
+
+# 12 writes a CLINK_FIELDS struct to ClickHouse with the typed native sink. It
+# is the one example that links a connector, so it is built only with
+# CLINK_EXAMPLES_CLICKHOUSE=ON (see the find_package above). Without
+# CLICKHOUSE_HOST it prints "skipped" and exits 0.
+if(CLINK_EXAMPLES_CLICKHOUSE)
+    add_executable(12_clickhouse_native_typed 12_clickhouse_native_typed.cpp)
+    target_link_libraries(12_clickhouse_native_typed PRIVATE clink::core clink::clickhouse)
+    add_test(NAME 12_clickhouse_native_typed COMMAND 12_clickhouse_native_typed)
+endif()
 
 # 08 is a plugin .so (clink_submit_job loads it). It must be linked as
 # MODULE, not an executable, and it uses clink_add_job_module - the helper

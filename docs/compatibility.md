@@ -121,8 +121,11 @@ unchanged, with the same results, on every 1.x:
 Kept Evolving until their shapes have had a release to settle: the AI table
 functions (`CREATE MODEL`, `ML_PREDICT`, `VECTOR_SEARCH`), the WebAssembly
 aggregate form, and the native ClickHouse sink's options, `insert_format`
-included. Not contracts at all: the wording of diagnostics, the text of
-`EXPLAIN`, and the output format of `SHOW TABLES`.
+included. The native sink's C++ typed helper,
+`clink/clickhouse/native_sink.hpp` (`make_clickhouse_native_sink<T>` and
+`register_clickhouse_native_sink<T>`), is Internal while those options settle.
+Not contracts at all: the wording of diagnostics, the text of `EXPLAIN`, and
+the output format of `SHOW TABLES`.
 
 The mechanical half is `tests/sql_conformance/`: a corpus of scripts, each
 with its inputs and the output the engine produced when the case was frozen,

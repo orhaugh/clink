@@ -64,10 +64,14 @@ struct ColumnBinding {
 };
 
 struct ColumnPlan {
-    std::vector<ColumnBinding> columns;        // INSERT column-list order = input order
-    std::vector<TargetColumn> omitted;         // left to the server
-    bool retains_chunks{false};                // any zero_copy binding, at any depth
-    std::string column_list_sql;               // (`a`, `b`)
+    std::vector<ColumnBinding> columns;  // INSERT column-list order = input order
+    std::vector<TargetColumn> omitted;   // left to the server
+    bool retains_chunks{false};          // any zero_copy binding, at any depth
+    std::string column_list_sql;         // (`a`, `b`)
+    // Where the input columns came from. The report labels each source type
+    // sql= for a declared SQL type and arrow= for a batcher schema's type,
+    // whose spelling is Arrow's.
+    InputKind kind{InputKind::SqlTable};
     [[nodiscard]] std::string report() const;  // the subtask-0 full report
 };
 

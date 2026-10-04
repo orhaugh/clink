@@ -32,6 +32,7 @@ cmake --build build --parallel 10
 ./build/05_interval_join
 ./build/06_file_io
 ./build/07_parquet_io
+CLICKHOUSE_HOST=localhost ./build/12_clickhouse_native_typed   # with -DCLINK_EXAMPLES_CLICKHOUSE=ON
 ```
 
 If clink was installed under a non-standard prefix, set `CMAKE_PREFIX_PATH`
@@ -67,6 +68,7 @@ cmake --build build --target 08_cluster_job_plugin --parallel 10
 | 09 | [`09_testing_framework.cpp`](09_testing_framework.cpp) | Testing a stateful operator with `clink::test_support` (the public testing framework): a `KeyedProcessFunction` driven through `make_keyed_process_function_harness`, per-key state inspected via the production read path, and a snapshot → restore round trip. Links `clink::test_support` and registers with CTest (it exits non-zero on failure). |
 | 10 | [`10_http_surface.cpp`](10_http_surface.cpp) | The embedded HTTP server and client: serve a route from inside an application, then call it. Mainly a link-time guard - the bundled httplib is a `BUILD_INTERFACE` dependency of `clink_core`, so what it needs (OpenSSL, zlib, and the CoreFoundation / Security frameworks on macOS) has to be re-declared as a usage requirement on the exported target. Nothing else here touches that surface. Registers with CTest. |
 | 11 | [`11_declared_types.cpp`](11_declared_types.cpp) | One declaration per type: `CLINK_FIELDS` drives the derived `Codec<T>`, keyed state, a snapshot/restore, and the shape-fingerprint gate refusing an undeclared field reorder. Registers with CTest. |
+| 12 | [`12_clickhouse_native_typed.cpp`](12_clickhouse_native_typed.cpp) | A `CLINK_FIELDS` struct written to ClickHouse over the native protocol by `make_clickhouse_native_sink<T>`, which takes the column types from the struct, unsigned and optional fields included. The one example that links a connector, `clink::clickhouse`: it is built only when configured with `-DCLINK_EXAMPLES_CLICKHOUSE=ON`, which asks `find_package` for the `clickhouse` component and needs clink installed with the ClickHouse client. It needs a server and an existing table (the DDL is in its header comment); without `CLICKHOUSE_HOST` it prints `skipped` and exits 0. Registers with CTest. |
 
 ## Picking targets vs. linking everything
 

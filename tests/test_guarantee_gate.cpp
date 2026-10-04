@@ -122,6 +122,11 @@ TEST_F(GuaranteeGateTest, TheNativeClickHouseSinkResolvesToItsOwnRecordNotTheLeg
     EXPECT_EQ(connector_name_for_op_type("clickhouse_native_sink"), "clickhouse_native");
     EXPECT_EQ(connector_name_for_op_type("clickhouse_sink"), "clickhouse");
     EXPECT_EQ(connector_name_for_op_type("clickhouse_row_source"), "clickhouse");
+    // The typed helper's default op type keeps the prefix first, so a sink
+    // registered for a struct still finds the native record; the reverse
+    // spelling would leave it undeclared.
+    EXPECT_EQ(connector_name_for_op_type("clickhouse_native_sink_Trade"), "clickhouse_native");
+    EXPECT_NE(connector_name_for_op_type("Trade_clickhouse_native_sink"), "clickhouse_native");
 
     JobGraphSpec g;
     g.ops.push_back(op("file_line_source", "src"));

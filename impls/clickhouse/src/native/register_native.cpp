@@ -35,14 +35,6 @@ constexpr bool kNativeTls = true;
 constexpr bool kNativeTls = false;
 #endif
 
-// A refusal at build time comes before any RuntimeContext or op id exists, so
-// it goes to the process registry with the reason alone.
-void count_factory_refusal(const std::string& code) {
-    MetricsRegistry::global()
-        .counter(std::string(metric::kRefusalsTotal) + "{reason=\"" + code + "\"}")
-        .increment();
-}
-
 clink::connectors::ConnectorCapabilities native_record() {
     std::vector<std::string> limitations = {
         "at-least-once: rows after the last completed checkpoint are replayed and may appear "
@@ -100,6 +92,19 @@ clink::connectors::ConnectorCapabilities native_record() {
 
 }  // namespace
 
+void count_factory_refusal(const std::string& code) {
+    MetricsRegistry::global()
+        .counter(std::string(metric::kRefusalsTotal) + "{reason=\"" + code + "\"}")
+        .increment();
+}
+
+std::string native_unavailable_message() {
+    return "clickhouse_native_sink is not available in this build: it needs clickhouse-cpp "
+           "2.6.2 or later, and the client this build found is older or of a version it "
+           "could not read. Rebuild against the pinned client, or use "
+           "insert_format='jsoneachrow'.";
+}
+
 void register_native(clink::plugin::PluginRegistry& registry) {
     // register_sink<Row> needs the Row type registered first. This is the
     // same codec and wire batcher clink::sql::install() registers, and
@@ -128,12 +133,7 @@ void register_native(clink::plugin::PluginRegistry& registry) {
 #else
             (void)ctx;
             count_factory_refusal(code::kNativeUnavailable);
-            throw NativeSinkError(
-                code::kNativeUnavailable,
-                "clickhouse_native_sink is not available in this build: it needs clickhouse-cpp "
-                "2.6.2 or later, and the client this build found is older or of a version it "
-                "could not read. Rebuild against the pinned client, or use "
-                "insert_format='jsoneachrow'.");
+            throw NativeSinkError(code::kNativeUnavailable, native_unavailable_message());
 #endif
         });
 

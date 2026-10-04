@@ -538,7 +538,8 @@ std::string ColumnPlan::report() const {
         " omitted=" + std::to_string(omitted.size()) +
         " retains_chunks=" + (retains_chunks ? "true" : "false");
     for (const auto& b : columns) {
-        out += "\n  " + quote_identifier(b.name) + ": sql=" + b.source.spelling +
+        out += "\n  " + quote_identifier(b.name) +
+               (kind == InputKind::TypedStruct ? ": arrow=" : ": sql=") + b.source.spelling +
                " target=" + b.target.spelling + " conversion=" + describe(b) +
                " zero_copy=" + (any_zero_copy(b) ? "true" : "false");
     }
@@ -554,6 +555,7 @@ PlanResult compile_column_plan(const std::vector<SqlColumn>& input,
     PlanResult result;
     auto& problems = result.problems;
     ColumnPlan plan;
+    plan.kind = kind;
     const Remedies remedies{kind == InputKind::TypedStruct};
 
     if (input.empty()) {

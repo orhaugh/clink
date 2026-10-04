@@ -744,6 +744,18 @@ if(CLINK_BUILD_SQL)
         target_include_directories(clink_clickhouse_sql_tests PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/generated")
         clink_set_warnings(clink_clickhouse_sql_tests)
+        # A job module that carries the typed native sink, for the plugin route:
+        # register_clickhouse_native_sink<Trade> resolved and built by a worker
+        # that loaded it. The live runner points at it through
+        # CLINK_CLICKHOUSE_TYPED_JOB, because the path compiled in here names
+        # the build job's own workspace.
+        clink_add_job_module(clink_clickhouse_typed_job
+            SOURCES plugin_examples/clickhouse_typed_job.cpp
+            OUTPUT_NAME clickhouse_typed_job
+            LINK clink::clickhouse)
+        target_compile_definitions(clink_clickhouse_sql_tests PRIVATE
+            CLINK_CLICKHOUSE_TYPED_JOB_PATH=\"$<TARGET_FILE:clink_clickhouse_typed_job>\")
+        add_dependencies(clink_clickhouse_sql_tests clink_clickhouse_typed_job)
         gtest_discover_tests(clink_clickhouse_sql_tests
             DISCOVERY_MODE PRE_TEST
             PROPERTIES TIMEOUT 180 LABELS clickhouse

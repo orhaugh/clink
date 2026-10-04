@@ -713,6 +713,23 @@ TEST(NativeColumnPlan, UnsignedElementsBindInsideComposites) {
     EXPECT_EQ(r.plan->columns[1].children.at(1).conversion, Conversion::NarrowInt);
 }
 
+// A typed column's source type is Arrow's, so the report labels it arrow=
+// where a declared column shows sql=.
+TEST(NativeColumnPlan, ATypedStructsReportLabelsItsSourceTypesAsArrow) {
+    const PlanResult r = compile_column_plan(
+        plan_typed_columns({arrow::field("id", arrow::uint64()),
+                            arrow::field("ts", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"))}),
+        {plan_target("id", "UInt64"), plan_target("ts", "DateTime64(6, 'UTC')")},
+        InputKind::TypedStruct);
+    ASSERT_TRUE(r.plan.has_value()) << r.problems.at(0).message;
+    EXPECT_EQ(r.plan->kind, InputKind::TypedStruct);
+    EXPECT_EQ(r.plan->report(),
+              "clickhouse native sink column plan: columns=2 omitted=0 retains_chunks=false\n"
+              "  `id`: arrow=uint64 target=UInt64 conversion=copy zero_copy=false\n"
+              "  `ts`: arrow=timestamp[us, tz=UTC] target=DateTime64(6, 'UTC') "
+              "conversion=timestamp_to_datetime64 zero_copy=false");
+}
+
 // Every remedy a typed struct is given names the struct, its fields or its
 // CLINK_FIELDS declaration, never a SELECT or a clink table.
 TEST(NativeColumnPlan, ATypedStructIsToldToChangeTheStructNotTheSelect) {

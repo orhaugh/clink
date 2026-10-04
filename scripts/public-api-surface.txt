@@ -224,6 +224,7 @@ impls/cassandra/include/clink/cassandra/cassandra_sink.hpp
 impls/cassandra/include/clink/cassandra/cassandra_upsert_sink.hpp
 impls/cassandra/include/clink/cassandra/connection_params.hpp
 impls/clickhouse/include/clink/clickhouse/clickhouse_row_codec.hpp
+impls/clickhouse/include/clink/clickhouse/native_sink.hpp
 impls/clickhouse/include/clink/clickhouse/typed_sink.hpp
 impls/etcd/include/clink/etcd/etcd_ha_coordinator.hpp
 impls/forst/include/clink/state/forst_state_backend.hpp

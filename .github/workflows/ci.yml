@@ -358,16 +358,20 @@ jobs:
         # The clickhouse-pins job runs them against live servers on a plain
         # runner, inside this same toolchain image for their shared libraries:
         # the impl's own tests (the pins and the native sink's live suites) and
-        # the SQL-linked tests, which carry the SQL-level live cases.
+        # the SQL-linked tests, which carry the SQL-level live cases, with the
+        # typed job module their plugin-route case submits.
         uses: actions/upload-artifact@v4
         with:
           name: clickhouse-pins-binary
           # The SQL-linked binary also needs the fetched wasmtime library, which
           # its runpath names by this job's container path; the live step points
-          # LD_LIBRARY_PATH at the copy uploaded here.
+          # LD_LIBRARY_PATH at the copy uploaded here. The module path compiled
+          # into that binary names this job's workspace too, so the live script
+          # hands the test the downloaded copy's path instead.
           path: |
             build/impls/clickhouse/tests/clink_clickhouse_tests
             build/tests/clink_clickhouse_sql_tests
+            build/tests/clickhouse_typed_job.so
             build/_deps/wasmtime_capi-src/**/lib/libwasmtime.so
           if-no-files-found: error
           retention-days: 1
@@ -445,8 +449,10 @@ jobs:
             -e CLINK_CLICKHOUSE_TEST_LINE -e CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT_PORT \
             -e CLINK_CLICKHOUSE_TEST_REPLICA_PORTS -e CLINK_CLICKHOUSE_TEST_RMT_ASYNC_DEFAULT \
             -e CLINK_CLICKHOUSE_TEST_TLS_PORT -e CLINK_CLICKHOUSE_TEST_TLS_CA \
-            -e CLINK_CLICKHOUSE_TEST_TLS_WRONG_CA ${TOOLCHAIN}" \
-            CLICKHOUSE_LIVE_TMPDIR="${RUNNER_TEMP}" scripts/clickhouse-live.sh
+            -e CLINK_CLICKHOUSE_TEST_TLS_WRONG_CA -e CLINK_CLICKHOUSE_TYPED_JOB ${TOOLCHAIN}" \
+            CLICKHOUSE_LIVE_TMPDIR="${RUNNER_TEMP}" \
+            TYPED_JOB="${GITHUB_WORKSPACE}/build/tests/clickhouse_typed_job.so" \
+            scripts/clickhouse-live.sh
 
   tutorial-kafka-clickhouse:
     name: Tutorial - Kafka to ClickHouse (published runtime image)
@@ -773,13 +779,25 @@ jobs:
         # a self-checking test of the harnesses from the install prefix.
         # CLINK_BUILD_PLUGIN_EXAMPLE=ON exercises clink_add_job_module from
         # the INSTALLED package: the supported out-of-tree job-module recipe
-        # fails this gate on any packaging mistake.
+        # fails this gate on any packaging mistake. Example 12 is the one that
+        # links a connector, clink::clickhouse, through the clickhouse
+        # component's find_dependency lines; it is opt-in, and the image
+        # builds clink with the ClickHouse client, so the step turns it on and
+        # requires the executable. It runs without a server, where it says
+        # "skipped" and exits 0. The step runs under `sh -e`, without
+        # pipefail, so its output is captured rather than piped into the
+        # check, and a non-zero exit fails the step.
         run: |
           cmake -S docs/consumer-examples -B /tmp/consumer-examples \
-            -DCLINK_BUILD_PLUGIN_EXAMPLE=ON
+            -DCLINK_BUILD_PLUGIN_EXAMPLE=ON -DCLINK_EXAMPLES_CLICKHOUSE=ON
           cmake --build /tmp/consumer-examples -j "$(( $(nproc) / 2 ))"
           /tmp/consumer-examples/09_testing_framework
           test -f /tmp/consumer-examples/08_cluster_job_plugin.so
+          test -x /tmp/consumer-examples/12_clickhouse_native_typed
+          out="$(env -u CLICKHOUSE_HOST /tmp/consumer-examples/12_clickhouse_native_typed)" || {
+            status=$?; printf '%s\n' "${out}"; echo "example 12 exited ${status}" >&2; exit 1; }
+          printf '%s\n' "${out}"
+          printf '%s\n' "${out}" | grep -q '^skipped'
       - name: Consumer project pulling clink in with FetchContent
         # The other consumption route: docs/consumer-examples/fetchcontent is
         # a standalone project whose CMakeLists clones clink from GitHub at a

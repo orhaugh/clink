@@ -46,13 +46,14 @@ By distribution: a host build with the pinned client and the runtime image (buil
 | --- | --- | --- |
 | `clickhouse_sink` | sink | `std::string` |
 | `clickhouse_native_sink` | sink | SQL `Row` (Native blocks; capability record `clickhouse_native`) |
+| `clickhouse_native_sink_<channel>` | sink | a `CLINK_FIELDS` struct, when a job registers it with `register_clickhouse_native_sink<T>` (see [C++: typed structs](#c-typed-structs)) |
 | `clickhouse_row_source` | source | `ClickHouseRow` |
 | `clickhouse_text_source` | source | `std::string` (columns joined by `delim`) |
 | `clickhouse_source` | source | `std::string` (JSON object keyed by column name) |
 
 The connector also registers the `ClickHouseRow` typed channel (`kChannelClickHouseRow`) with its codec so rows can travel end to end across the cluster without flattening.
 
-The native sink is built for SQL: it needs the declared SQL type of every column, which the planner passes as an internal parameter, `sql_column_types`. A Dag-direct or plugin job can reach the factory by name only if it passes that parameter in the planner's spelling; without it the factory refuses `clickhouse.option_invalid` with "the native sink is built from SQL; a Dag-direct job must pass sql_column_types".
+The `clickhouse_native_sink` factory is built for SQL: it needs the declared SQL type of every column, which the planner passes as an internal parameter, `sql_column_types`, and without it the factory refuses `clickhouse.option_invalid` with "the native sink is built from SQL; a Dag-direct job must pass sql_column_types". A C++ job whose records are a struct uses the typed helper instead, which takes the column types from the struct's `CLINK_FIELDS` declaration: see [C++: typed structs](#c-typed-structs).
 
 ## Configuration
 
@@ -487,7 +488,7 @@ clickhouse native sink open: subtask=3/8 factory=clickhouse_native_sink mode=app
 - `batch_bytes` carries `(reduced from N for the memory budget)` when the budget capped it.
 - `eos_bound_ms` is `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` as this worker read it, reported whether or not the job is bounded.
 
-Warnings may follow it: the server is on an untested line; the target keeps no deduplication log (also true of every Null and Distributed target), so an INSERT resent after a failure that left it in doubt may land twice; `batch_rows` is below 10000; `batch_bytes` was reduced for the memory budget. Subtask 0 also logs the column plan, one line per column with its declared type, target type and conversion, and the effective options, with the password shown as `set` or `unset`.
+Warnings may follow it: the server is on an untested line; the target keeps no deduplication log (also true of every Null and Distributed target), so an INSERT resent after a failure that left it in doubt may land twice; `batch_rows` is below 10000; `batch_bytes` was reduced for the memory budget. Subtask 0 also logs the column plan, one line per column with its declared type (`sql=` and the SQL type, or `arrow=` and the Arrow type for a typed struct's field), target type and conversion, and the effective options, with the password shown as `set` or `unset`. A typed sink's open line shows `factory=make_clickhouse_native_sink input=typed`, and its options line `columns=<n> from the batcher schema` where a SQL sink's shows `sql_column_types`.
 
 Each retry logs a Warn line with the attempt, the phase, the class, the error and the wait; a retry at open also names the endpoint. A clean close logs a summary at Info, and a cancelled or failed task logs the same fields at Warn with the prefix `clickhouse native sink cancelled:`:
 
@@ -500,6 +501,58 @@ clickhouse native sink closed: subtask=3/8 rows_acknowledged=10485760 inserts=11
 `columnar_batches` and `row_batches` count the batches the sink queued by how they arrived, as `clink_clickhouse_input_batches_total` does; they are how a `clink run` or pyclink job shows which path its batches took. The first time a subtask hands back batches of a given schema it logs one Info line, `takes columnar batches of this schema through their rows (<reason>)`, with the schema's column names and types.
 
 Setting `CLINK_DISABLE_COLUMNAR=1` in a worker's environment sends every batch through its rows, at the sink as at every columnar operator, which is the A/B for a suspected difference between the two paths: the landed values must be the same, and `row_batches` takes the place of `columnar_batches`. The text sink (`format='json'`) is row-only and stays so: it writes one JSON text per row, so a columnar batch is turned into rows before it, and no columnar path for it is planned.
+
+### C++: typed structs
+
+`clink/clickhouse/native_sink.hpp` writes a C++ struct to ClickHouse through the same native sink, with no SQL. Declare the struct's fields with `CLINK_FIELDS` and the sink takes its column types from the Arrow schema the declaration derives, so there is no `sql_column_types` and no encoder to write. The header is installed with `clink::clickhouse` and is Internal: the helpers and their options may still change between releases.
+
+```cpp
+#include <clink/clickhouse/native_sink.hpp>
+
+struct Trade {
+    std::int64_t id;
+    std::uint32_t qty;
+    std::optional<std::uint64_t> volume;
+    double px;
+    std::string venue;
+};
+CLINK_FIELDS(Trade, id, qty, volume, px, venue);
+
+// A Dag-direct job.
+auto sink = clink::clickhouse::make_clickhouse_native_sink<Trade>(
+    {{"host", "clickhouse.internal"}, {"database", "markets"}, {"table", "trades"}});
+dag.add_sink<Trade>(handle, sink);
+
+// A plugin job: after register_type<Trade>(), the sink is the factory
+// clickhouse_native_sink_Trade, which a SinkDescriptor names with its options.
+clink::clickhouse::register_clickhouse_native_sink<Trade>(pipeline.registry());
+```
+
+- `make_clickhouse_native_sink<T>(options)` builds the sink for a `CLINK_FIELDS` struct through `make_columnar_arrow_batcher<T>()`. `make_clickhouse_native_sink<T>(batcher, options, subtask_idx, parallelism)` takes any `ArrowBatcher<T>` instead, and the subtask for the open report and the INSERT's `log_comment`; a batcher with no schema or no build function is refused with `std::invalid_argument`. Both return a `std::shared_ptr<Sink<T>>`, which is what `Dag::add_sink` takes.
+- `register_clickhouse_native_sink<T>(registry, op_type)` registers the sink as a factory, `clickhouse_native_sink_factory<T>()`, whose sinks take the op's params as their options and its subtask and parallelism. The default `op_type` is `clickhouse_native_sink_<channel>`, where `<channel>` is the name `T` was registered under (the declared type name, for `register_type<T>()`). The delivery-guarantee gate finds the sink's at-least-once record, `clickhouse_native`, by that prefix, so keep it first on any other name: `<channel>_clickhouse_native_sink` would leave the sink undeclared. The helper does not register `T`; call `register_type<T>()` first.
+- The options are the native sink's, with the same parsing, `env://` resolution, tolerated keys and refusals as in [the options table](#native-sink-clickhouse_native_sink), and the typed sink refuses `sql_column_types` with `clickhouse.option_invalid` ("the typed sink takes its column types from the ArrowBatcher schema; remove sql_column_types"). An option is refused when the sink is made, before anything connects, and counted in `clink_clickhouse_refusals_total{reason}` in the process-wide registry of the code that made it. A job module carries its own copy of that registry, so a refusal raised while a worker builds the module's sink fails the task with the coded message but is not counted in the worker's registry.
+- The engine's `event_time` column is dropped: field 0 of the batcher's schema, whenever it is an int64 named `event_time`, is taken for it. The `CLINK_FIELDS` batcher puts the engine's column there, so a struct field of the same name is an ordinary column. A hand-written batcher must put the engine's column first, or give its own field 0 another name: an int64 `event_time` of its own in that place is dropped too, and a target column with a `DEFAULT` takes the default with no error.
+- The guarantee and its conditions are the SQL sink's: at-least-once, aligned checkpoint barriers only, and the only sink on its chain, each enforced as [What it guarantees](#what-it-guarantees) describes. The sink holds no state, so it needs no uid.
+- Batches of `T` are turned into Arrow chunks on the task thread by the batcher. The typed sink takes no columnar batch: typed batches reach it as records. A batcher that returns no chunk fails the task with "clickhouse native sink: the ArrowBatcher could not build a chunk", and one whose build throws fails it with its own error, in both cases after stopping the writer.
+- A job module that uses the helper links `clink::clickhouse`, which carries the sink: the worker builds it with the module's own code and reports its series in the worker's registry. A consumer project asks for the component, `find_package(clink REQUIRED COMPONENTS core clickhouse)`, which also finds the OpenSSL and abseil the installed client links. `docs/consumer-examples/12_clickhouse_native_typed.cpp` is a complete program.
+- On a build without the native sink the helpers still compile and link, and making the sink refuses `clickhouse.native_unavailable`.
+
+Each field maps to a declared kind, which binds to ClickHouse columns as [Type mapping](#type-mapping) and [Column matching](#column-matching) describe for the SQL type named here, and a refusal names a change to the struct or its `CLINK_FIELDS` declaration rather than to a SELECT:
+
+| Struct field | Arrow type | Binds as | ClickHouse targets |
+| --- | --- | --- | --- |
+| `std::int8_t` to `std::int64_t` | int8 to int64 | `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT` | any `Int8` to `Int128` and `UInt8` to `UInt64`; a narrower or unsigned target checks each value |
+| `std::uint8_t` to `std::uint64_t` | uint8 to uint64 | unsigned of that width | the same width unsigned exactly; a wider unsigned, a wider signed or `Int128` widened; a narrower unsigned, or a signed one of the same or a narrower width, checked per value. `Bool`, `Float*` and `String` are refused |
+| `float` | float | `REAL` | `Float32`, `Float64` |
+| `double` | double | `DOUBLE` | `Float64` |
+| `bool` | bool | `BOOLEAN` | `Bool`, `UInt8` |
+| `std::string` | utf8 | `VARCHAR` | `String` (zero-copy), `FixedString(N)`, `Enum8`, `Enum16`, `UUID`, `IPv4`, `IPv6` |
+| `std::optional<E>` | `E`'s type, nullable | as `E` | a `Nullable` target takes the nulls; a null into a non-Nullable column fails the row |
+| `std::vector<E>` | list | `E ARRAY` | `Array(...)` of a target `E` binds to |
+| `std::map<K, V>` | map | `MAP<K, V>` | `Map(...)` of targets `K` and `V` bind to |
+| a nested `CLINK_FIELDS` struct | struct | `ROW` | a `Tuple` with the same number of elements, matched by position; a named Tuple's names must equal the field names |
+
+A field whose `ArrowColumnTraits` specialisation produces `decimal128(p, s)`, `date32` or `timestamp(unit[, tz])` binds as `DECIMAL(p, s)`, `DATE` or `TIMESTAMP` (WITH TIME ZONE when the type carries one). A timestamp is scaled from its own unit, seconds, milliseconds, microseconds or nanoseconds, exactly to the target's, and a value with digits the target cannot hold fails the row rather than being floored. Any other Arrow type, `binary`, `large_utf8`, `date64` and `decimal256` among them, is refused at open in the one `clickhouse.column_plan` message that lists every problem.
 
 ## Example
 
@@ -536,7 +589,7 @@ sink.open();
 // sink.on_data(batch); sink.flush(); sink.close();
 ```
 
-The native sink has no installed header or builder; SQL reaches it through `insert_format='native'`. The source side is reached through the registered factories (`clickhouse_row_source`, `clickhouse_text_source`, `clickhouse_source`), each requiring a `query`.
+SQL reaches the native sink through `insert_format='native'`, and C++ through the typed helper in [C++: typed structs](#c-typed-structs). The source side is reached through the registered factories (`clickhouse_row_source`, `clickhouse_text_source`, `clickhouse_source`), each requiring a `query`.
 
 ## Delivery semantics
 
@@ -561,6 +614,8 @@ Source: a `SELECT` materialises a finite (bounded) result set. The source persis
 - A retry that holds the barrier beyond `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` (default 30 s) at the end of a bounded job or at a hot cutover spends a restart; nothing is lost.
 - The native sink converts a columnar batch from its arrays only when its event-time column is int64 and every value column has a type the Row sidecar carries; any other columnar batch goes through its row accessors, and `clink_clickhouse_columnar_declined_total` says why. The text sink takes rows only.
 - The native sink does not accept `tls_server_name`, does not pin a certificate, and does not create or alter tables. It authenticates by user and password only.
+- The typed helper (`clink/clickhouse/native_sink.hpp`) is Internal, so its signatures and options may change in a minor release. It takes records only, never a columnar batch, and has no option to keep the engine's `event_time` column.
+- A plugin job that registers the typed sink is proven on a cluster whose worker also links the ClickHouse impl, as the runtime image's does. A worker without it is untested.
 - Source is a one-shot bounded `SELECT`, not a streaming tail or CDC feed. Result-row order is arbitrary without an explicit `ORDER BY`.
 - The `clickhouse_source` (string-channel JSON) requires column names from the server; if they are absent it fails loudly rather than emit positional keys.
 - The text sink and the source are not Arrow-native; records cross the boundary as `std::string` or typed `ClickHouseRow` text values, with type coercion left to downstream operators.
@@ -575,8 +630,9 @@ The text sink and source tests are in-process smoke tests. They do not stand up 
 The native sink's tests, built when the client is 2.6.2 or later:
 
 - Unit and in-process suites in `clink_clickhouse_tests` (the `Native*` suites, `--gtest_filter='Native*'`), label `clickhouse`. They cover options, statements, error classes, retry pacing, the type parser and column plan, both converters, the target probe and the writer and sink against an in-process fake server (`impls/clickhouse/tests/fake_transport.hpp`), with no ClickHouse needed.
-- SQL-linked suite, `clink_clickhouse_sql_tests` (`tests/test_clickhouse_native_sql.cpp`), built with the SQL frontend, label `clickhouse`: the sink driven through SQL against the fake server, including a differential against the collect sink, the keys the planner puts on the op, held barriers on the periodic and bounded paths, and two INSERTs from one source. A q0-shaped pipeline, a Kafka JSON table straight into the native sink, proves that no row is built on the way: the process-wide materialisation count stays at 0 while the sink's `columnar` count equals the batches it received, against a collect-sink control that does materialise; a second registration runs it with `CLINK_DISABLE_COLUMNAR=1`. It runs with `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS=3000` set by CTest.
-- Live suites, `impls/clickhouse/tests/test_native_live.cpp` in `clink_clickhouse_tests` (`ClickHouseNativeLive`, `ClickHouseNativeLiveReplicated`, `ClickHouseNativeLiveTls`), and `ClickHouseNativeSqlLive` in `clink_clickhouse_sql_tests`, which writes DATE, every TIMESTAMP precision, TIMESTAMPTZ, a BIGINT past 2^53, a decimal and nullable columns through SQL into a real table and compares what ClickHouse holds with what the collect sink saw. All skip unless `CLINK_CLICKHOUSE_TEST_HOST` names a server.
+- The typed helper's suite, `impls/clickhouse/tests/test_native_typed_sink.cpp` (`NativeTypedSink*`): a `CLINK_FIELDS` struct through `make_clickhouse_native_sink<T>` and through the factory `register_clickhouse_native_sink<T>` registers, against the fake server, with every value checked against the struct, the barrier contract, the chain rule, the barrier modes, the option refusals, the typed open report, and a batcher that builds no chunk or whose build throws. `test_factory_registration.cpp` checks the registration on every build, and on a build without the native sink that making the sink refuses `clickhouse.native_unavailable`.
+- SQL-linked suite, `clink_clickhouse_sql_tests` (`tests/test_clickhouse_native_sql.cpp`), built with the SQL frontend, label `clickhouse`: the sink driven through SQL against the fake server, including a differential against the collect sink, the keys the planner puts on the op, held barriers on the periodic and bounded paths, and two INSERTs from one source. A q0-shaped pipeline, a Kafka JSON table straight into the native sink, proves that no row is built on the way: the process-wide materialisation count stays at 0 while the sink's `columnar` count equals the batches it received, against a collect-sink control that does materialise; a second registration runs it with `CLINK_DISABLE_COLUMNAR=1`. It runs with `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS=3000` set by CTest. The plugin route is here too: a job module, `tests/plugin_examples/clickhouse_typed_job.cpp`, registers the typed sink for its own struct, and a `TestCluster` loads it and runs it against a closed port, where the coordinator reports the at-least-once guarantee for `clickhouse_native_sink_Trade` and the task fails with the sink's own connection error.
+- Live suites, `impls/clickhouse/tests/test_native_live.cpp` in `clink_clickhouse_tests` (`ClickHouseNativeLive`, `ClickHouseNativeLiveReplicated`, `ClickHouseNativeLiveTls`), and `ClickHouseNativeSqlLive` in `clink_clickhouse_sql_tests`, which writes DATE, every TIMESTAMP precision, TIMESTAMPTZ, a BIGINT past 2^53, a decimal and nullable columns through SQL into a real table and compares what ClickHouse holds with what the collect sink saw. `ClickHouseNativeLive.ATypedStructWithEveryLeafRoundTrips` writes a struct with every leaf `CLINK_FIELDS` emits, unsigned values past the signed range included, and each composite through the typed helper, and `ClickHouseNativeSqlLive.TheTypedJobModulesSinkLandsEveryRowAndCountsInTheWorkersRegistry` runs the job module on a `TestCluster` against the server and finds the sink's series in the worker's registry. All skip unless `CLINK_CLICKHOUSE_TEST_HOST` names a server.
 - Kill matrix, `tests/integration/test_clickhouse_native_recovery.cpp` in `clink_integration_tests`: a coordinator and two workers against real servers, with faults at the sink's own points, in the network and in the server. Nine cells, each on both lines and into both a ReplicatedMergeTree and a plain MergeTree, with no loss as the pass mark in every cell.
 
 Run the in-process suites with:
@@ -615,6 +671,7 @@ It sets these for the test binaries, per profile: `CLINK_CLICKHOUSE_TEST_HOST`, 
 | `BIN` | the `clink_clickhouse_tests` binary to run, overriding the one in `BUILD_DIR` |
 | `SQL_BIN` | the `clink_clickhouse_sql_tests` binary, likewise |
 | `CLICKHOUSE_LIVE_SQL=0` | skip the SQL-linked steps, for a build without that binary |
+| `TYPED_JOB` | the typed job module, `clickhouse_typed_job.so`, found under `BUILD_DIR` by default and handed to the SQL-linked binary as `CLINK_CLICKHOUSE_TYPED_JOB`; the plugin-route case skips without it |
 | `PIN_RUNNER` | a prefix for every test command; CI runs the binaries inside the toolchain image this way |
 | `CLICKHOUSE_LIVE_TMPDIR` | where the TLS material is generated, default `TMPDIR` |
 

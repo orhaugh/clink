@@ -16,11 +16,21 @@
 
 #include "clink/api/clickhouse_builders.hpp"
 #include "clink/clickhouse/clickhouse_row_codec.hpp"
+#include "clink/clickhouse/native_sink.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/connectors/capability.hpp"
 #include "clink/connectors/clickhouse_row.hpp"
 #include "clink/connectors/clickhouse_sink.hpp"
+#include "clink/plugin/plugin.hpp"
+
+// A struct for the typed native sink's registration. CLINK_FIELDS specialises
+// a clink template, so it lives at namespace scope.
+struct FrTypedRow {
+    std::int64_t id;
+    std::string s;
+};
+CLINK_FIELDS(FrTypedRow, id, s);
 
 namespace {
 
@@ -320,6 +330,39 @@ TEST(ClickHouseSinkFactory, IntegerKeysResolveEnvironmentReferences) {
               "clickhouse_sink: port must be a positive integer (got "
               "'env://CLINK_TEST_LEGACY_CH_PORT')");
 }
+
+// The typed helper registers whatever the build: its op type keeps the native
+// sink's prefix first, on the channel the struct was registered under.
+TEST(ClickHouseFactoryRegistration, TheTypedNativeSinkRegistersPrefixFirstOnItsStructsChannel) {
+    clink::plugin::PluginRegistry reg;
+    reg.register_type<FrTypedRow>();
+    clink::clickhouse::register_clickhouse_native_sink<FrTypedRow>(reg);
+    EXPECT_NE(RunnerRegistry::default_instance().find_sink("clickhouse_native_sink_FrTypedRow",
+                                                           "FrTypedRow"),
+              nullptr);
+}
+
+#if !defined(CLINK_CLICKHOUSE_NATIVE)
+// Without the native sink the typed helper still compiles and links, and
+// making the sink refuses by name, as the SQL factory does.
+TEST(ClickHouseFactoryRegistration, WithoutTheNativeSinkTheTypedHelperRefusesNativeUnavailable) {
+    try {
+        (void)clink::clickhouse::make_clickhouse_native_sink<FrTypedRow>({{"table", "t"}});
+        ADD_FAILURE() << "a build without the native sink made one";
+    } catch (const std::runtime_error& e) {
+        EXPECT_EQ(std::string(e.what()).rfind("[clickhouse.native_unavailable] ", 0), 0U)
+            << e.what();
+    }
+}
+#else
+// With it, making the sink parses the options and connects to nothing.
+TEST(ClickHouseFactoryRegistration, WithTheNativeSinkTheTypedHelperMakesASinkThatGatesTheAck) {
+    const auto sink = clink::clickhouse::make_clickhouse_native_sink<FrTypedRow>(
+        {{"table", "t"}, {"host", "127.0.0.1"}, {"port", "1"}});
+    EXPECT_EQ(sink->name(), "clickhouse_native_sink");
+    EXPECT_TRUE(sink->gates_checkpoint_ack());
+}
+#endif
 
 TEST(ClickHouseSinkFactory, TheRecordListsTheTimeoutKeysAndKeepsItsFormats) {
     const auto* rec = clink::connectors::CapabilityRegistry::instance().find("clickhouse");

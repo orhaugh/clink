@@ -51,6 +51,7 @@ if(_ch_native)
         test_native_socket_factory.cpp
         test_native_statements.cpp
         test_native_target_table.cpp
+        test_native_typed_sink.cpp
         test_native_types.cpp
         test_native_writer.cpp
     )

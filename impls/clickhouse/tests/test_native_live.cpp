@@ -50,7 +50,9 @@
 #include <gtest/gtest.h>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
+#include "clink/clickhouse/native_sink.hpp"
 #include "clink/config/json.hpp"
+#include "clink/core/columnar_batcher.hpp"
 #include "clink/core/record.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/log_buffer.hpp"
@@ -64,6 +66,51 @@
 #include "native/metrics.hpp"
 #include "native/native_sink.hpp"
 #include "native/sink_options.hpp"
+
+// A struct with every leaf CLINK_FIELDS emits, unsigned included, and each
+// composite, for the typed helper's round trip. CLINK_FIELDS specialises a
+// clink template, so these live at namespace scope.
+struct LiveTypedInner {
+    std::int32_t n;
+    std::string label;
+};
+CLINK_FIELDS(LiveTypedInner, n, label);
+
+struct LiveTypedEvery {
+    std::int64_t id;
+    std::int8_t i8;
+    std::int16_t i16;
+    std::int32_t i32;
+    std::uint8_t u8;
+    std::uint16_t u16;
+    std::uint32_t u32;
+    std::uint64_t u64;
+    float f32;
+    double f64;
+    bool flag;
+    std::string text;
+    std::optional<std::int64_t> maybe;
+    std::vector<std::uint16_t> list;
+    std::map<std::string, std::uint64_t> counts;
+    LiveTypedInner inner;
+};
+CLINK_FIELDS(LiveTypedEvery,
+             id,
+             i8,
+             i16,
+             i32,
+             u8,
+             u16,
+             u32,
+             u64,
+             f32,
+             f64,
+             flag,
+             text,
+             maybe,
+             list,
+             counts,
+             inner);
 
 namespace clink::clickhouse::native {
 namespace {
@@ -1077,6 +1124,135 @@ TEST_F(ClickHouseNativeLive, AResendAfterItsTokenLeftTheWindowLandsAgainAndIsCou
 }
 
 // --- Two replicas sharing a Keeper -------------------------------------------
+
+// --- The typed helper --------------------------------------------------------
+
+// A CLINK_FIELDS struct through make_clickhouse_native_sink, with the column
+// types taken from its batcher's schema: every leaf at its extremes, the
+// unsigned ones past the signed range, a null, empty and filled composites,
+// and a nested struct into a named Tuple. Each value read back as the server
+// renders it.
+TEST_F(ClickHouseNativeLive, ATypedStructWithEveryLeafRoundTrips) {
+    client_->Execute("CREATE TABLE " + q("typed") +
+                     " (id Int64, i8 Int8, i16 Int16, i32 Int32, u8 UInt8, u16 UInt16, "
+                     "u32 UInt32, u64 UInt64, f32 Float32, f64 Float64, flag Bool, text String, "
+                     "maybe Nullable(Int64), list Array(UInt16), counts Map(String, UInt64), "
+                     "inner Tuple(n Int32, label String)) ENGINE = MergeTree ORDER BY id");
+    Batch<LiveTypedEvery> batch;
+    batch.emplace(LiveTypedEvery{0,
+                                 -128,
+                                 -32768,
+                                 -2147483648,
+                                 255,
+                                 65535,
+                                 4294967295U,
+                                 18446744073709551615ULL,
+                                 0.5F,
+                                 -1.25,
+                                 true,
+                                 "plain",
+                                 std::nullopt,
+                                 {1, 65535},
+                                 {{"a", 18446744073709551615ULL}},
+                                 {7, "x"}});
+    batch.emplace(LiveTypedEvery{
+        1, 127, 32767, 2147483647, 0, 0, 0, 0, -2.5F, 1e300, false, "", -9, {}, {}, {-1, ""}});
+    batch.emplace(LiveTypedEvery{2,
+                                 0,
+                                 0,
+                                 0,
+                                 1,
+                                 2,
+                                 3,
+                                 9223372036854775808ULL,
+                                 0.0F,
+                                 0.0,
+                                 true,
+                                 "it's",
+                                 9223372036854775807LL,
+                                 {0},
+                                 {{"b", 1}, {"c", 2}},
+                                 {2147483647, "nested"}});
+
+    auto p = params("typed", "");
+    p.erase("sql_column_types");
+    MetricsRegistry metrics;
+    RuntimeContext ctx(
+        OperatorId{g_live_op_ids.fetch_add(1)}, "clickhouse_native_live_typed", nullptr, &metrics);
+    const auto sink = make_clickhouse_native_sink<LiveTypedEvery>(p);
+    sink->attach_runtime(&ctx);
+    const auto error = live_error([&] {
+        sink->open();
+        sink->on_data(batch);
+        // A barrier returns only once the rows before it are in the table.
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        EXPECT_EQ(rows("typed"), 3U);
+        sink->flush();
+        sink->close();
+    });
+    sink->attach_runtime(nullptr);
+    ASSERT_FALSE(error) << error->what();
+    expect_content(q("typed"), 3, 3);
+
+    const auto got =
+        live_rows(*client_,
+                  "SELECT toString(i8), toString(i16), toString(i32), toString(u8), "
+                  "toString(u16), toString(u32), toString(u64), toString(f32), toString(f64), "
+                  "toString(flag), text, ifNull(toString(maybe), 'NULL'), toString(list), "
+                  "toString(counts), toString(inner) FROM " +
+                      q("typed") + " ORDER BY id");
+    const std::vector<std::vector<std::string>> expected = {
+        {"-128",
+         "-32768",
+         "-2147483648",
+         "255",
+         "65535",
+         "4294967295",
+         "18446744073709551615",
+         "0.5",
+         "-1.25",
+         "true",
+         "plain",
+         "NULL",
+         "[1,65535]",
+         "{'a':18446744073709551615}",
+         "(7,'x')"},
+        {"127",
+         "32767",
+         "2147483647",
+         "0",
+         "0",
+         "0",
+         "0",
+         "-2.5",
+         "1e300",
+         "false",
+         "",
+         "-9",
+         "[]",
+         "{}",
+         "(-1,'')"},
+        {"0",
+         "0",
+         "0",
+         "1",
+         "2",
+         "3",
+         "9223372036854775808",
+         "0",
+         "0",
+         "true",
+         "it's",
+         "9223372036854775807",
+         "[0]",
+         "{'b':1,'c':2}",
+         "(2147483647,'nested')"},
+    };
+    ASSERT_EQ(got.size(), expected.size());
+    for (std::size_t r = 0; r < got.size(); ++r) {
+        EXPECT_EQ(got[r], expected[r]) << "row " << r << " on " << line_;
+    }
+}
 
 class ClickHouseNativeLiveReplicated : public LiveBase {
 protected:

@@ -327,6 +327,9 @@ set(_ch_sources
     src/native/sql_text.cpp
     src/native/errors.cpp
     src/native/register_native.cpp
+    # The typed helper's non-template half (clink/clickhouse/native_sink.hpp),
+    # which refuses clickhouse.native_unavailable without the native sink.
+    src/native/typed_entry.cpp
 )
 if(_ch_native)
     list(APPEND _ch_sources
@@ -374,9 +377,23 @@ clink_set_warnings(clink_clickhouse)
 
 if(TARGET _clink_clickhouse_external)
     install(TARGETS _clink_clickhouse_external EXPORT ${CLINK_EXPORT_NAME})
+    # The exported client target names imported targets on its interface, which
+    # a downstream find_package(clink COMPONENTS clickhouse) must resolve before
+    # it can link clink::clickhouse. Only the ones it really links: the bundled
+    # client carries abseil by path, and a client found without OpenSSL links
+    # none.
+    get_target_property(_ch_iface _clink_clickhouse_external INTERFACE_LINK_LIBRARIES)
+    set(_ch_find_deps)
+    if("OpenSSL::SSL" IN_LIST _ch_iface OR "OpenSSL::Crypto" IN_LIST _ch_iface)
+        list(APPEND _ch_find_deps "find_dependency(OpenSSL)")
+    endif()
+    if("absl::int128" IN_LIST _ch_iface)
+        list(APPEND _ch_find_deps "find_dependency(absl CONFIG)")
+    endif()
     clink_install_impl(
-        TARGET clink_clickhouse
-        NAME   clickhouse)
+        TARGET   clink_clickhouse
+        NAME     clickhouse
+        FIND_DEP ${_ch_find_deps})
 else()
     clink_install_impl(
         TARGET   clink_clickhouse
