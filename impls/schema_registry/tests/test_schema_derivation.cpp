@@ -77,6 +77,32 @@ TEST(SchemaDerivation, JsonSchemaTypesEveryPropertyAsNullable) {
     EXPECT_EQ(type_of("emb"), "array");
 }
 
+// The millisecond timestamp codes a V2 layout writes derive the same string
+// fields their V1 text code does, so no registered subject changes when a
+// carrier switches layout.
+TEST(SchemaDerivation, MillisecondTimestampCodesDeriveStringsLikeText) {
+    constexpr const char* kTimestamps = "a:ts_ms;b:tstz_ms;c:str";
+    const auto avro = clink::config::parse(derive_avro_schema(kTimestamps, "T", ""));
+    for (const auto& f : avro.at("fields").as_array()) {
+        const auto& u = f.at("type").as_array();
+        ASSERT_EQ(u.size(), 2u);
+        EXPECT_EQ(u[1].serialize(), "\"string\"") << f.string_or("name", "");
+    }
+    const auto proto = derive_protobuf_schema(kTimestamps, "T");
+    EXPECT_NE(proto.find("  string a = 1;"), std::string::npos) << proto;
+    EXPECT_NE(proto.find("  string b = 2;"), std::string::npos) << proto;
+    EXPECT_NE(proto.find("  string c = 3;"), std::string::npos) << proto;
+    const auto json = clink::config::parse(derive_json_schema(kTimestamps, "T"));
+    for (const auto& [name, p] : json.at("properties").as_object()) {
+        EXPECT_EQ(p.at("type").as_array().front().as_string(), "string") << name;
+    }
+    // Byte for byte what the text spelling derives.
+    constexpr const char* kText = "a:str;b:str;c:str";
+    EXPECT_EQ(derive_avro_schema(kTimestamps, "T", "ns"), derive_avro_schema(kText, "T", "ns"));
+    EXPECT_EQ(derive_protobuf_schema(kTimestamps, "T"), derive_protobuf_schema(kText, "T"));
+    EXPECT_EQ(derive_json_schema(kTimestamps, "T"), derive_json_schema(kText, "T"));
+}
+
 TEST(SchemaDerivation, SanitiseNameMakesValidIdentifiers) {
     EXPECT_EQ(sanitise_name("orders-value"), "orders");
     EXPECT_EQ(sanitise_name("orders-key"), "orders");

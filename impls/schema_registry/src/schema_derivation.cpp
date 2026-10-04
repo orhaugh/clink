@@ -37,8 +37,18 @@ std::string sanitise_name(const std::string& raw) {
 
 namespace {
 
+// The millisecond timestamp codes of the V2 row layout (ts_ms, tstz_ms; see
+// row_columnar_batcher.hpp) derive exactly what their V1 code `str` derives: a
+// string. A carrier switching layout must not change a registered subject.
+bool is_timestamp_code(const std::string& code) {
+    return code == "ts_ms" || code == "tstz_ms";
+}
+
 JsonValue avro_type_for(const detail::ColumnSpec& c) {
     const auto& code = c.code;
+    if (is_timestamp_code(code)) {
+        return JsonValue{"string"};
+    }
     if (code == "i64") {
         return JsonValue{"long"};
     }
@@ -102,7 +112,9 @@ std::string derive_protobuf_schema(const std::string& columns, const std::string
     int number = 1;
     for (const auto& c : detail::parse_columns(columns)) {
         std::string type = "string";
-        if (c.code == "i64") {
+        if (is_timestamp_code(c.code)) {
+            type = "string";
+        } else if (c.code == "i64") {
             type = "int64";
         } else if (c.code == "i32") {
             type = "int32";
@@ -132,7 +144,9 @@ std::string derive_json_schema(const std::string& columns, const std::string& ti
     for (const auto& c : detail::parse_columns(columns)) {
         JsonObject p;
         JsonArray types;
-        if (c.code == "i64" || c.code == "i32") {
+        if (is_timestamp_code(c.code)) {
+            types.emplace_back("string");
+        } else if (c.code == "i64" || c.code == "i32") {
             types.emplace_back("integer");
         } else if (c.code == "f64" || c.code == "f32" || c.code.rfind("dec_", 0) == 0) {
             types.emplace_back("number");

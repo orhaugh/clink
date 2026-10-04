@@ -365,14 +365,16 @@ TEST(JsonColumnarDecode, MixedSchemaWithFloatAndDecimalStaysColumnarAndEquivalen
     EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
 }
 
-// A declared TIMESTAMP column is not a distinct columnar-capable type: it maps
-// (via effective_type) to utf8. A JSON STRING value round-trips faithfully so
-// the batch fires columnar as a string column; a numeric (epoch) value is not a
-// string and forces the row fallback. Both stay byte-equivalent to the row
-// decode, which is the contract.
+// A declared TIMESTAMP column is not a distinct columnar-capable type: the
+// planner writes it with the V1 code `str`, so the decoder sees utf8. A JSON
+// STRING value round-trips faithfully so the batch fires columnar as a string
+// column; a numeric (epoch) value is not a string and forces the row fallback.
+// Both stay byte-equivalent to the row decode, which is the contract.
 TEST(JsonColumnarDecode, TimestampStringColumnRidesStringPathEquivalent) {
-    const std::vector<RowColumn> schema = {{"a", arrow::int64()},
-                                           {"ts", arrow::timestamp(arrow::TimeUnit::MILLI)}};
+    const std::vector<RowColumn> declared = {{"a", arrow::int64()},
+                                             {"ts", arrow::timestamp(arrow::TimeUnit::MILLI)}};
+    const auto schema = clink::sql::parse_row_schema(
+        clink::sql::serialize_row_schema(declared, clink::sql::RowLayout::V1));
 
     // String timestamp value: utf8 round-trip is faithful -> columnar.
     {

@@ -11,7 +11,8 @@ namespace clink::clickhouse::native {
 namespace {
 
 // The value types rows_from_record_batch reads with read_cell; any other
-// makes it refuse the whole batch.
+// makes it refuse the whole batch. Kept equal to row_record_batch_supported,
+// which a test checks type by type.
 bool carried(const arrow::DataType& type) {
     switch (type.id()) {
         case arrow::Type::INT64:
@@ -24,6 +25,8 @@ bool carried(const arrow::DataType& type) {
             return true;
         case arrow::Type::LIST:
             return clink::sql::row_columnar_detail::is_list_float32(type);
+        case arrow::Type::TIMESTAMP:
+            return clink::sql::row_columnar_detail::is_timestamp_ms(type);
         default:
             return false;
     }
@@ -53,6 +56,10 @@ IntakeReuse reuse_for(const arrow::DataType& type, const SqlType& declared) {
             return declared.kind == SqlKind::Double ? IntakeReuse::Same : IntakeReuse::None;
         case arrow::Type::BOOL:
             return declared.kind == SqlKind::Boolean ? IntakeReuse::Same : IntakeReuse::None;
+        case arrow::Type::TIMESTAMP:
+            // compile_intake has let only timestamp(ms[, tz]) through: the same
+            // epoch milliseconds an int64 column holds, under another zone tag.
+            return declared.kind == SqlKind::Timestamp ? IntakeReuse::Retype : IntakeReuse::None;
         case arrow::Type::STRING:
             return declared.kind == SqlKind::Varchar ? IntakeReuse::Text : IntakeReuse::None;
         case arrow::Type::DECIMAL128: {

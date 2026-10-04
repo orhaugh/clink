@@ -186,6 +186,12 @@ std::string friendly_type(const std::string& code) {
     if (code == "str") {
         return "string";
     }
+    if (code == "ts_ms") {  // TIMESTAMP in the V2 row layout, whatever the precision
+        return "timestamp";
+    }
+    if (code == "tstz_ms") {  // TIMESTAMPTZ in the V2 row layout
+        return "timestamptz";
+    }
     if (code.rfind("dec_", 0) == 0) {  // dec_<precision>_<scale>
         auto rest = code.substr(4);
         if (const auto us = rest.find('_'); us != std::string::npos) {

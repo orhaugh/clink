@@ -321,7 +321,7 @@ Some columns of a columnar batch are taken as they are rather than converted cel
 | Batch array | Declared column | Taken as it is when |
 |---|---|---|
 | int64, int32, float, double, boolean | BIGINT, INTEGER, REAL, DOUBLE, BOOLEAN | always |
-| int64 | TIMESTAMP(p), with or without time zone | always |
+| int64, timestamp(ms) with or without a zone | TIMESTAMP(p), with or without time zone | always |
 | int32 | DATE | always |
 | utf8 | VARCHAR | no value in the batch begins with the byte `\x01`, the engine's decimal marker, which the cell-by-cell path strips |
 | decimal128(p, s) | DECIMAL(p, s), the same precision and scale | every value in the batch fits p digits; the columnar JSON decode stores a value with more digits as written, and the cell-by-cell path lands it as NULL |

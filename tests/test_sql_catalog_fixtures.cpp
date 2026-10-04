@@ -9,6 +9,11 @@
 // CLINK_REGEN_FORMAT_FIXTURES=1 only to ADD a fixture, never to make a
 // failing read pass. Readers ignore unknown keys, so the format grows by
 // adding keys; renaming or removing one is a break.
+//
+// tests/fixtures/job-spec-sql-timestamp-v1.json is a job spec the SQL planner
+// wrote for a table with TIMESTAMP and TIMESTAMPTZ columns, held still so the
+// meaning of its row-schema codes is pinned: `str` is utf8 for good, whatever
+// layouts later builds learn to read.
 
 #include <cstdlib>
 #include <filesystem>
@@ -21,7 +26,13 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "clink/cluster/job_graph.hpp"
+#include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/optimizer.hpp"
+#include "clink/sql/parser.hpp"
+#include "clink/sql/physical_plan.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 
 namespace {
 
@@ -163,6 +174,61 @@ TEST(SqlCatalogFixtures, UnknownKeysAreIgnoredOnLoad) {
         R"({"name":"t","columns":[{"name":"a","type":"BIGINT"}],"properties":{"connector":"file"},"added_in_1_7":true})");
     EXPECT_EQ(table.name, "t");
     ASSERT_EQ(table.columns.size(), 1u);
+}
+
+// A planned job spec whose TIMESTAMP columns carry the V1 code `str`. The new
+// build reads it with V1 meaning: utf8 whether or not the reader is admitted to
+// the V2 layout, re-serialised byte for byte, and stored as text by the
+// schema-driven batcher. A reader that gave `str` another meaning would change
+// how every persisted spec's timestamps are carried.
+TEST(SqlJobSpecFixtures, TimestampColumnsWrittenAsTextKeepTheirV1Meaning) {
+    const auto path = fixture_path("job-spec-sql-timestamp-v1.json");
+    if (regen()) {
+        clink::sql::Catalog cat;
+        const auto ddl = clink::sql::parse(
+            "CREATE TABLE trades (id BIGINT, ts TIMESTAMP(3), ts_tz TIMESTAMPTZ(3), "
+            "amount DECIMAL(10,2)) WITH (connector='kafka', topic='trades', format='json', "
+            "brokers='localhost:9092');"
+            "CREATE TABLE out_t (id BIGINT, ts TIMESTAMP(3), ts_tz TIMESTAMPTZ(3), "
+            "amount DECIMAL(10,2)) WITH (connector='file', format='json', "
+            "path='/tmp/out.ndjson');");
+        for (const auto& stmt : ddl.statements) {
+            cat.register_table(std::get<clink::sql::ast::CreateTableStmt>(stmt));
+        }
+        const clink::sql::Binder binder(cat);
+        const auto insert =
+            clink::sql::parse("INSERT INTO out_t SELECT id, ts, ts_tz, amount FROM trades");
+        auto plan = clink::sql::optimize(
+            binder.bind_insert(std::get<clink::sql::ast::InsertStmt>(insert.statements[0])));
+        clink::sql::PhysicalPlanner pp;
+        const auto spec = pp.compile(static_cast<const clink::sql::LogicalSink&>(*plan));
+        write_text(path, spec.to_json());
+    }
+    const auto spec = clink::cluster::JobGraphSpec::from_json(read_text(path));
+    int carriers = 0;
+    for (const auto& op : spec.ops) {
+        const auto it = op.params.find("schema_columns");
+        if (it == op.params.end()) {
+            continue;
+        }
+        ++carriers;
+        const auto& text = it->second;
+        // The premise: the fixture really does carry its timestamps as `str`.
+        EXPECT_NE(text.find("ts:str;ts_tz:str"), std::string::npos) << op.id << ": " << text;
+        for (const auto layout : {clink::sql::RowLayout::V1, clink::sql::RowLayout::V2}) {
+            const auto cols = clink::sql::parse_row_schema(text, layout);
+            ASSERT_EQ(cols.size(), 4u) << op.id;
+            EXPECT_TRUE(cols[1].type->Equals(*arrow::utf8())) << op.id;
+            EXPECT_TRUE(cols[2].type->Equals(*arrow::utf8())) << op.id;
+            EXPECT_EQ(clink::sql::serialize_row_schema(cols, clink::sql::RowLayout::V1), text);
+            EXPECT_EQ(clink::sql::serialize_row_schema(cols, clink::sql::RowLayout::V2), text);
+            const auto batcher = clink::sql::make_row_columnar_arrow_batcher(cols);
+            EXPECT_EQ(batcher.schema()->GetFieldByName("ts")->type()->id(), arrow::Type::STRING);
+            EXPECT_EQ(batcher.schema()->GetFieldByName("ts_tz")->type()->id(), arrow::Type::STRING);
+        }
+    }
+    // The Kafka source, the columnar bridge and the file sink each carry one.
+    EXPECT_EQ(carriers, 3);
 }
 
 }  // namespace

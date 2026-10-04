@@ -320,6 +320,67 @@ TEST(EmbeddedEngine, CollectReaderDeliversTypedBatchesAndEos) {
     fs::remove(in_path);
 }
 
+// The collect reader's schema is built from the declared columns, the collect
+// sink's batches from the planned `schema_columns`. For every SQL type the two
+// must agree, or a host reading the stream sees batches whose schema is not the
+// one it was promised. Both go through the V1 row layout, so TIMESTAMP and
+// TIMESTAMPTZ are text on both sides whatever the reader learns to carry.
+TEST(EmbeddedEngine, CollectReaderSchemaMatchesTheSinksBatchesForEverySqlType) {
+    const auto in_path = fs::temp_directory_path() /
+                         ("clink_embed_collect_types_" + std::to_string(::getpid()) + ".ndjson");
+    write_lines(in_path,
+                {R"({"b":1,"i":2,"s":3,"o":true,"r":1.5,"f":2.5,"v":"x","t":"y",)"
+                 R"("ts0":1700000000000,"ts3":1700000000123,"ts6":"2023-11-14 22:13:20",)"
+                 R"("ts9":0,"tsd":1,"tz":1700000000123,"d":"2023-11-14","tm":"22:13:20",)"
+                 R"("dec":"12.34","raw":"AQI=","emb":[0.5,1.5],"arr":[1,2],"m":{"k":1},)"
+                 R"("w":{"x":5,"y":"q"}})"});
+    const std::string columns =
+        "(b BIGINT, i INT, s SMALLINT, o BOOLEAN, r REAL, f DOUBLE, v VARCHAR, t TEXT, "
+        "ts0 TIMESTAMP(0), ts3 TIMESTAMP(3), ts6 TIMESTAMP(6), ts9 TIMESTAMP(9), tsd TIMESTAMP, "
+        "tz TIMESTAMP(3) WITH TIME ZONE, d DATE, tm TIME, dec DECIMAL(10, 2), raw BYTEA, "
+        "emb REAL[], arr BIGINT[], m MAP<VARCHAR, BIGINT>, w ROW<x BIGINT, y VARCHAR>)";
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(engine.execute_script("CREATE TABLE src_all " + columns +
+                                    " WITH (connector='file', format='json', path='" +
+                                    in_path.string() + "');" + "CREATE TABLE all_types " + columns +
+                                    " WITH (connector='collect')"),
+              0)
+        << err.str();
+    auto reader_r = engine.collect_reader("all_types");
+    ASSERT_TRUE(reader_r.ok()) << reader_r.status().ToString();
+    auto reader = *reader_r;
+    ASSERT_EQ(reader->schema()->num_fields(), 22);
+    // The text fallback for the types the layout does not carry.
+    for (const char* text :
+         {"s", "ts0", "ts3", "ts6", "ts9", "tsd", "tz", "d", "tm", "raw", "arr"}) {
+        EXPECT_EQ(reader->schema()->GetFieldByName(text)->type()->id(), arrow::Type::STRING)
+            << text;
+    }
+
+    ASSERT_EQ(engine.execute_script("INSERT INTO all_types SELECT * FROM src_all"), 0) << err.str();
+    std::int64_t rows = 0;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        auto st = reader->ReadNext(&batch);
+        ASSERT_TRUE(st.ok()) << st.ToString();
+        if (!batch) {
+            break;
+        }
+        EXPECT_TRUE(batch->schema()->Equals(*reader->schema()))
+            << "batch:\n"
+            << batch->schema()->ToString() << "\nreader:\n"
+            << reader->schema()->ToString();
+        rows += batch->num_rows();
+    }
+    EXPECT_EQ(rows, 1);
+    EXPECT_TRUE(engine.await_all()) << err.str();
+    fs::remove(in_path);
+}
+
 TEST(EmbeddedEngine, CollectChangelogStreamsRowKinds) {
     // connector='collect' with changelog='true' accepts a retracting SELECT
     // and prepends a row_kind utf8 column to the Arrow stream. TOP-1 per

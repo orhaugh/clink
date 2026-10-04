@@ -23,12 +23,20 @@
 //   VARCHAR/CHAR    -> utf8
 //   DECIMAL(p,s)    -> decimal128(p,s)  (via the exact dec-string path)
 //   anything else   -> utf8             (stringified fallback)
+//
+// A column's Arrow type reaches a batcher through its row-schema code (see
+// serialize_row_schema at the end of this file), and the code's layout decides
+// what TIMESTAMP and TIMESTAMPTZ are carried as: text under RowLayout::V1, the
+// layout every producer writes, or epoch milliseconds under RowLayout::V2. The
+// readers below accept a timestamp(ms[, tz]) column already; nothing writes one
+// yet.
 
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -61,7 +69,6 @@ inline constexpr const char* kSourcePartitionColumn = "__source_partition";
 
 namespace row_columnar_detail {
 
-// The Arrow type a column is actually stored as: the declared type when
 // True for a list<float32> column: the columnar form for embeddings (VECTOR_SEARCH),
 // carried as a contiguous Arrow list of float32 instead of a stringified JSON array.
 // Other list value types are not columnar-supported and fall back to utf8.
@@ -70,7 +77,22 @@ inline bool is_list_float32(const arrow::DataType& t) {
            static_cast<const arrow::ListType&>(t).value_type()->id() == arrow::Type::FLOAT;
 }
 
-// it is in the supported set, else utf8 (the stringified fallback).
+// True for a millisecond timestamp, with or without a zone: the one timestamp
+// layout the Row sidecar carries (the V2 codes ts_ms and tstz_ms). The cell is
+// the engine's epoch-millisecond value. Other units are not carried.
+inline bool is_timestamp_ms(const arrow::DataType& t) {
+    return t.id() == arrow::Type::TIMESTAMP &&
+           static_cast<const arrow::TimestampType&>(t).unit() == arrow::TimeUnit::MILLI;
+}
+
+// The Arrow type a column is actually stored as: the type when it is in the
+// supported set, else utf8 (the stringified fallback).
+//
+// A declared SQL type must reach this through its row-schema code, never
+// directly: serialize_row_schema(cols, RowLayout::V1), then parse_row_schema.
+// A declared TIMESTAMP(3) is a timestamp(ms) Arrow type, which passes through
+// here, while its V1 code is text; handing the declared type over directly
+// would give a layout no V1 producer writes.
 inline std::shared_ptr<arrow::DataType> effective_type(const std::shared_ptr<arrow::DataType>& t) {
     if (!t) {
         return arrow::utf8();
@@ -86,6 +108,8 @@ inline std::shared_ptr<arrow::DataType> effective_type(const std::shared_ptr<arr
             return t;
         case arrow::Type::LIST:
             return is_list_float32(*t) ? t : arrow::utf8();
+        case arrow::Type::TIMESTAMP:
+            return is_timestamp_ms(*t) ? t : arrow::utf8();
         default:
             return arrow::utf8();
     }
@@ -153,6 +177,8 @@ inline std::unique_ptr<arrow::ArrayBuilder> make_cell_builder(
         case arrow::Type::LIST:  // list<float32>: an embedding vector
             return std::make_unique<arrow::ListBuilder>(arrow::default_memory_pool(),
                                                         std::make_shared<arrow::FloatBuilder>());
+        case arrow::Type::TIMESTAMP:  // timestamp(ms[, tz]): epoch milliseconds
+            return std::make_unique<arrow::TimestampBuilder>(eff, arrow::default_memory_pool());
         default:  // utf8 (declared STRING or the stringified fallback)
             return std::make_unique<arrow::StringBuilder>();
     }
@@ -225,6 +251,23 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
             auto& b = static_cast<arrow::BooleanBuilder&>(builder);
             if (v && v->is_bool())
                 (void)b.Append(v->as_bool());
+            else
+                (void)b.AppendNull();
+            break;
+        }
+        case arrow::Type::TIMESTAMP: {
+            // timestamp(ms[, tz]), the epoch-millisecond value. An integral
+            // number in int64 range is stored; anything else, a fraction or
+            // text included, is null. That is the projection rule: no producer
+            // that must keep a value as it is (an operator's own output) reaches
+            // here without cell_is_exact first, and a Dag-direct caller that
+            // hands text to a timestamp column gets a null for it.
+            auto& b = static_cast<arrow::TimestampBuilder&>(builder);
+            if (v && v->is_integral_number())
+                (void)b.Append(v->as_int());
+            else if (v && v->is_number() && double_fits_int64(v->as_number()) &&
+                     v->as_number() == std::floor(v->as_number()))
+                (void)b.Append(static_cast<std::int64_t>(v->as_number()));
             else
                 (void)b.AppendNull();
             break;
@@ -310,6 +353,13 @@ inline bool cell_is_exact(const arrow::DataType& layout, const clink::config::Js
                (double_fits_float(d) && static_cast<double>(static_cast<float>(d)) == d);
     };
     switch (layout.id()) {
+        case arrow::Type::TIMESTAMP:
+            // Only timestamp(ms[, tz]) is a timestamp layout (effective_type);
+            // its cell reads back as the int64 it holds, as an INT64 cell does.
+            if (!is_timestamp_ms(layout)) {
+                break;
+            }
+            [[fallthrough]];
         case arrow::Type::INT64:
             // A double holding an integer reads back as that integer, which
             // serialises the same; a fraction would be truncated.
@@ -431,10 +481,28 @@ inline clink::config::JsonValue read_cell(const std::shared_ptr<arrow::DataType>
             }
             return clink::config::JsonValue{std::move(out_arr)};
         }
+        case arrow::Type::TIMESTAMP:
+            // timestamp(ms[, tz]) -> the epoch-millisecond JSON integer the row
+            // path holds for the same value. The array must be milliseconds as
+            // well: ticks of another unit read as epoch ms would be off by a
+            // power of 1000, so any other unit, in the layout or the array, has
+            // no reading here. A zone does not change the ticks.
+            if (is_timestamp_ms(*eff) && is_timestamp_ms(*arr.type())) {
+                return clink::config::JsonValue{
+                    static_cast<const arrow::TimestampArray&>(arr).Value(i)};
+            }
+            break;
         default:
-            return clink::config::JsonValue{
-                static_cast<const arrow::StringArray&>(arr).GetString(i)};
+            break;
     }
+    // utf8: the declared VARCHAR and the text fallback. Checked rather than
+    // cast blind, so an array of a type this function has no reading for is
+    // refused instead of being read through a StringArray it is not.
+    if (arr.type_id() != arrow::Type::STRING) {
+        throw std::logic_error("read_cell: no reading for a " + arr.type()->ToString() +
+                               " array (layout " + eff->ToString() + ")");
+    }
+    return clink::config::JsonValue{static_cast<const arrow::StringArray&>(arr).GetString(i)};
 }
 
 }  // namespace row_columnar_detail
@@ -664,6 +732,10 @@ inline bool row_record_batch_supported(const arrow::RecordBatch& batch) {
                 if (!row_columnar_detail::is_list_float32(ty))
                     return false;
                 break;
+            case arrow::Type::TIMESTAMP:  // milliseconds only
+                if (!row_columnar_detail::is_timestamp_ms(ty))
+                    return false;
+                break;
             default:
                 return false;
         }
@@ -713,6 +785,10 @@ inline std::optional<std::vector<Record<Row>>> rows_from_record_batch(
                 break;
             case arrow::Type::LIST:
                 if (!row_columnar_detail::is_list_float32(*f->type()))
+                    return std::nullopt;
+                break;
+            case arrow::Type::TIMESTAMP:  // milliseconds only
+                if (!row_columnar_detail::is_timestamp_ms(*f->type()))
                     return std::nullopt;
                 break;
             default:
@@ -817,10 +893,23 @@ inline ArrowBatcher<Row> make_row_wire_batcher(clink::Codec<Row> codec) {
 // The SQL planner has the column schema at compile time but the runtime
 // factory only receives string params. These encode the schema as
 // "name:code;name:code;..." (`;` between columns, `:` between name and
-// type code). Codes: i64 i32 f64 f32 bool str dec_<p>_<s>. Assumes plain
-// identifier column names (no ';'/':'), same constraint as decimal_columns.
+// type code). Codes: i64 i32 f64 f32 bool str list_f32 dec_<p>_<s>, plus the
+// V2 codes ts_ms and tstz_ms. Assumes plain identifier column names (no
+// ';'/':'), same constraint as decimal_columns. No code may contain either
+// separator: parse_row_schema splits a column on its last ':'.
+//
+// Layouts. V1 is what every released planner wrote and what every producer
+// writes today: TIMESTAMP and TIMESTAMPTZ are `str`, carried as text. V2 adds
+// ts_ms (timestamp(ms)) for TIMESTAMP and tstz_ms (timestamp(ms, "UTC")) for
+// TIMESTAMPTZ, whatever the declared precision, because the Row value is epoch
+// milliseconds. `str` keeps meaning utf8 for good, so a persisted spec never
+// changes meaning. A reader not admitted to V2 resolves the V2 codes to their
+// V1 type, utf8, as an older reader resolves any unknown code. `i16` is
+// reserved for SMALLINT and not emitted.
+enum class RowLayout { V1, V2 };
 
-inline std::string row_schema_type_code(const std::shared_ptr<arrow::DataType>& t) {
+inline std::string row_schema_type_code(const std::shared_ptr<arrow::DataType>& t,
+                                        RowLayout layout = RowLayout::V1) {
     if (!t)
         return "str";
     switch (t->id()) {
@@ -840,23 +929,37 @@ inline std::string row_schema_type_code(const std::shared_ptr<arrow::DataType>& 
         }
         case arrow::Type::LIST:
             return row_columnar_detail::is_list_float32(*t) ? "list_f32" : "str";
+        case arrow::Type::TIMESTAMP:
+            if (layout == RowLayout::V1) {
+                return "str";
+            }
+            return static_cast<const arrow::TimestampType&>(*t).timezone().empty() ? "ts_ms"
+                                                                                   : "tstz_ms";
         case arrow::Type::STRING:
         default:
             return "str";
     }
 }
 
-inline std::string serialize_row_schema(const std::vector<RowColumn>& columns) {
+// Byte-identical to the pre-layout encoding for V1, for every SQL type.
+inline std::string serialize_row_schema(const std::vector<RowColumn>& columns,
+                                        RowLayout layout = RowLayout::V1) {
     std::string out;
     for (const auto& c : columns) {
         if (!out.empty())
             out += ';';
-        out += c.name + ':' + row_schema_type_code(c.type);
+        out += c.name + ':' + row_schema_type_code(c.type, layout);
     }
     return out;
 }
 
-inline std::shared_ptr<arrow::DataType> row_schema_type_from_code(const std::string& code) {
+inline std::shared_ptr<arrow::DataType> row_schema_type_from_code(
+    const std::string& code, RowLayout admitted = RowLayout::V1) {
+    if (code == "ts_ms")
+        return admitted == RowLayout::V2 ? arrow::timestamp(arrow::TimeUnit::MILLI) : arrow::utf8();
+    if (code == "tstz_ms")
+        return admitted == RowLayout::V2 ? arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")
+                                         : arrow::utf8();
     if (code == "i64")
         return arrow::int64();
     if (code == "i32")
@@ -884,7 +987,10 @@ inline std::shared_ptr<arrow::DataType> row_schema_type_from_code(const std::str
     return arrow::utf8();
 }
 
-inline std::vector<RowColumn> parse_row_schema(const std::string& spec) {
+// `admitted` is the layout the reading deployment may carry. Unless it is V2,
+// the V2 codes resolve to their V1 type (utf8). Unknown codes give utf8.
+inline std::vector<RowColumn> parse_row_schema(const std::string& spec,
+                                               RowLayout admitted = RowLayout::V1) {
     std::vector<RowColumn> cols;
     std::size_t pos = 0;
     while (pos < spec.size()) {
@@ -893,7 +999,7 @@ inline std::vector<RowColumn> parse_row_schema(const std::string& spec) {
         const auto colon = entry.rfind(':');
         if (colon != std::string::npos) {
             cols.push_back(RowColumn{entry.substr(0, colon),
-                                     row_schema_type_from_code(entry.substr(colon + 1))});
+                                     row_schema_type_from_code(entry.substr(colon + 1), admitted)});
         }
         if (semi == std::string::npos)
             break;

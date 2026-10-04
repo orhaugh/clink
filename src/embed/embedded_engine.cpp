@@ -300,10 +300,13 @@ arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> EmbeddedEngine::collect
             "collect_reader: table '", table, "' is not a connector='collect' table");
     }
     // The reader's schema must be byte-identical to what the sink builds:
-    // both come from the same schema-driven batcher over the declared
-    // columns (which maps unsupported column types to their utf8 fallback),
-    // and both strip the batcher's prepended engine event-time column so
-    // the host sees exactly the declared SELECT columns.
+    // both come from the same schema-driven batcher, and both strip the
+    // batcher's prepended engine event-time column so the host sees exactly
+    // the declared SELECT columns. The sink builds its batcher from the
+    // planned `schema_columns`, so the declared types go through the same
+    // V1 row-schema codes here (parse_row_schema(serialize_row_schema(cols,
+    // RowLayout::V1))) rather than straight into the batcher: collect stays
+    // on the V1 layout, where TIMESTAMP and TIMESTAMPTZ are text.
     std::vector<sql::RowColumn> cols;
     cols.reserve(def->columns.size() + 1);
     auto chit = def->properties.find("changelog");
@@ -316,7 +319,10 @@ arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> EmbeddedEngine::collect
     for (const auto& c : def->columns) {
         cols.push_back(sql::RowColumn{c.name, c.type});
     }
-    auto schema_r = sql::make_row_columnar_arrow_batcher(cols).schema()->RemoveField(0);
+    auto schema_r = sql::make_row_columnar_arrow_batcher(
+                        sql::parse_row_schema(sql::serialize_row_schema(cols, sql::RowLayout::V1)))
+                        .schema()
+                        ->RemoveField(0);
     if (!schema_r.ok()) {
         return schema_r.status();
     }

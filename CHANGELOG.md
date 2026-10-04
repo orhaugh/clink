@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**The Row sidecar readers accept millisecond timestamp columns ahead of any
+producer writing them.** The row layout gains `ts_ms` and `tstz_ms` codes,
+read only where a reader admits them and otherwise taken as the text they are
+today; nothing writes them yet, so no frame, file, spec or registered schema
+changes. `read_cell`, the row reader and the native ClickHouse sink's
+columnar intake accept a `timestamp(ms[, tz])` column, and `read_cell` now
+refuses an array it cannot read, including a timestamp of another unit,
+instead of reading it as a string array or its ticks as epoch milliseconds.
+Job modules built against an earlier release must be rebuilt.
+
 **C++ jobs can write a CLINK_FIELDS struct to ClickHouse over the native
 protocol.** `make_clickhouse_native_sink<T>` builds the native sink for a
 Dag-direct job and `register_clickhouse_native_sink<T>` registers it as the

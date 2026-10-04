@@ -38,8 +38,8 @@ enum class IntakeReuse : std::uint8_t {
     // The array itself: int64, int32, float, double and bool into BIGINT,
     // INTEGER, REAL, DOUBLE and BOOLEAN.
     Same,
-    // The array's buffers under the declared column's type: int64 into
-    // TIMESTAMP(p) [WITH TIME ZONE], int32 into DATE.
+    // The array's buffers under the declared column's type: int64 or
+    // timestamp(ms[, tz]) into TIMESTAMP(p) [WITH TIME ZONE], int32 into DATE.
     Retype,
     // The array itself, utf8 into VARCHAR, when no value begins with the
     // decimal sentinel, which the per-cell path strips.

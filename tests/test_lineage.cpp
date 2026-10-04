@@ -88,6 +88,15 @@ TEST(LineageDataset, SchemaFromSchemaColumns) {
     EXPECT_EQ(d.schema[2].type, "decimal(10,2)");
 }
 
+TEST(LineageDataset, MillisecondTimestampCodesHaveFriendlyNames) {
+    const auto d =
+        dataset_for("file_json_source", {{"schema_columns", "a:ts_ms;b:tstz_ms;c:str"}}, "row");
+    ASSERT_EQ(d.schema.size(), 3u);
+    EXPECT_EQ(d.schema[0].type, "timestamp");
+    EXPECT_EQ(d.schema[1].type, "timestamptz");
+    EXPECT_EQ(d.schema[2].type, "string");
+}
+
 TEST(LineageDataset, NoSchemaWhenAbsent) {
     const auto d = dataset_for("kafka_source_string", {{"topic", "t"}}, "string");
     EXPECT_TRUE(d.schema.empty());

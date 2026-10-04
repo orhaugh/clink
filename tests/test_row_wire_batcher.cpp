@@ -15,6 +15,7 @@
 //     equality gate (the columnar schema varies per edge).
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -165,6 +166,100 @@ TEST(RowWireBatcher, NestedArrayMapRowSurviveLossless) {
     ASSERT_EQ(out->size(), 1u);
     EXPECT_EQ(serialize(out->records()[0].value()), serialize(r))
         << "nested ARRAY/MAP/ROW values must survive the wire byte-for-byte";
+}
+
+// Millisecond timestamp columns (the V2 layout's ts_ms and tstz_ms) are accepted
+// on receive before anything sends them: built by the schema-driven batcher,
+// over IPC, through the wire parse, the self-describing reader and read_cell,
+// each value comes back as the JSON integer it went in as, including negative
+// epochs and values no double holds.
+TEST(RowWireBatcher, MillisecondTimestampColumnsSurviveTheWireAsInt64) {
+    const auto schema =
+        clink::sql::parse_row_schema("id:i64;ts:ts_ms;tz:tstz_ms", clink::sql::RowLayout::V2);
+    const std::vector<std::int64_t> values = {
+        -1700000000123,
+        0,
+        (std::int64_t{1} << 53) + 1,
+        std::numeric_limits<std::int64_t>::max(),
+        std::numeric_limits<std::int64_t>::min(),
+    };
+    Batch<Row> in;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{static_cast<std::int64_t>(i)};
+        r.values["ts"] = clink::config::JsonValue{values[i]};
+        r.values["tz"] = clink::config::JsonValue{values[i]};
+        in.emplace(std::move(r), EventTime{static_cast<std::int64_t>(i) + 1});
+    }
+    Row nulls;
+    nulls.values["id"] = clink::config::JsonValue{std::int64_t{99}};
+    in.emplace(std::move(nulls));
+
+    auto sidecar = clink::sql::make_row_columnar_arrow_batcher(schema).build(in);
+    ASSERT_NE(sidecar, nullptr);
+    EXPECT_TRUE(
+        sidecar->schema()->field(2)->type()->Equals(*arrow::timestamp(arrow::TimeUnit::MILLI)))
+        << sidecar->schema()->ToString();
+    EXPECT_TRUE(sidecar->schema()->field(3)->type()->Equals(
+        *arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")))
+        << sidecar->schema()->ToString();
+    Batch<Row> columnar{sidecar, in.size(), clink::sql::row_materialize_fn()};
+
+    auto wire = clink::sql::make_row_wire_batcher(clink::sql::row_json_codec());
+    auto out = wire_roundtrip(wire, columnar);
+    ASSERT_TRUE(out.has_value()) << "a millisecond timestamp frame must parse";
+    ASSERT_TRUE(out->is_columnar());
+    ASSERT_NE(out->arrow(), nullptr);
+    EXPECT_TRUE(clink::sql::row_record_batch_supported(*out->arrow()));
+
+    auto rows = clink::sql::rows_from_record_batch(*out->arrow());
+    ASSERT_TRUE(rows.has_value());
+    ASSERT_EQ(rows->size(), values.size() + 1);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        for (const char* col : {"ts", "tz"}) {
+            const auto& v = (*rows)[i].value().values.at(col);
+            ASSERT_TRUE(v.is_integral_number()) << col << " row " << i << ": " << v.serialize(0);
+            EXPECT_EQ(v.as_int(), values[i]) << col << " row " << i;
+        }
+        EXPECT_EQ((*rows)[i].event_time()->millis(), static_cast<std::int64_t>(i) + 1);
+    }
+    EXPECT_TRUE(rows->back().value().values.at("ts").is_null());
+    EXPECT_TRUE(rows->back().value().values.at("tz").is_null());
+
+    // The batch's own lazy decode agrees with the self-describing reader.
+    std::size_t i = 0;
+    for (const auto& rec : *out) {
+        EXPECT_EQ(serialize(rec.value()), serialize((*rows)[i].value())) << "row " << i;
+        ++i;
+    }
+}
+
+// Only milliseconds joined the carried set: a frame with any other timestamp
+// unit, or a DATE column, is still an unexpected sidecar.
+TEST(RowWireBatcher, OtherTimestampUnitsAndDatesAreStillRefusedAtParse) {
+    auto wire = clink::sql::make_row_wire_batcher(clink::sql::row_json_codec());
+    for (const auto& type : {arrow::timestamp(arrow::TimeUnit::SECOND),
+                             arrow::timestamp(arrow::TimeUnit::MICRO),
+                             arrow::timestamp(arrow::TimeUnit::NANO),
+                             arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"),
+                             arrow::date32()}) {
+        arrow::Int64Builder t;
+        ASSERT_TRUE(t.Append(1).ok());
+        std::shared_ptr<arrow::Array> t_arr;
+        ASSERT_TRUE(t.Finish(&t_arr).ok());
+        auto made = arrow::MakeArrayOfNull(type, 1);
+        ASSERT_TRUE(made.ok());
+        auto rb = arrow::RecordBatch::Make(
+            arrow::schema({arrow::field("event_time", arrow::int64()), arrow::field("c", type)}),
+            1,
+            {t_arr, *made});
+        auto bytes = clink::arrow_batch_to_ipc(*rb);
+        auto back = clink::arrow_batch_from_ipc(bytes.data(), bytes.size());
+        ASSERT_NE(back, nullptr);
+        EXPECT_FALSE(clink::sql::row_record_batch_supported(*back)) << type->ToString();
+        EXPECT_FALSE(clink::sql::rows_from_record_batch(*back).has_value()) << type->ToString();
+        EXPECT_FALSE(wire.parse(*back).has_value()) << type->ToString();
+    }
 }
 
 }  // namespace

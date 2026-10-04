@@ -6,6 +6,7 @@
 
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/parser.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/type.hpp"
 
 #include "arrow/api.h"
@@ -67,6 +68,91 @@ TEST(SqlType, DecimalPrecisionAndScale) {
     const auto& d = static_cast<const arrow::Decimal128Type&>(*t);
     EXPECT_EQ(d.precision(), 18);
     EXPECT_EQ(d.scale(), 4);
+}
+
+// The row-schema code every SQL type serialises to, per layout. The V1 column
+// is the spelling every released planner wrote into `schema_columns` and the
+// born-columnar schemas; it must stay byte-identical, because persisted specs,
+// the resume fingerprint and every reader of those params key on it. V2 differs
+// only for TIMESTAMP and TIMESTAMPTZ, whatever the precision.
+TEST(RowLayout, EverySqlTypeSerialisesToItsCodeInBothLayouts) {
+    auto arr = [](ast::TypeName t, int dims) {
+        t.array_ndims = dims;
+        return t;
+    };
+    auto composite = [](std::string name,
+                        std::vector<ast::TypeName> params,
+                        std::vector<std::string> fields = {}) {
+        ast::TypeName t{"", std::move(name), {}, {}};
+        t.params = std::move(params);
+        t.field_names = std::move(fields);
+        return t;
+    };
+    struct Case {
+        ast::TypeName type;
+        std::string v1;
+        std::string v2;
+    };
+    const std::vector<Case> cases = {
+        {tn("pg_catalog", "int8"), "i64", "i64"},
+        {tn("pg_catalog", "int4"), "i32", "i32"},
+        {tn("pg_catalog", "int2"), "str", "str"},
+        {tn("pg_catalog", "bool"), "bool", "bool"},
+        {tn("pg_catalog", "float4"), "f32", "f32"},
+        {tn("pg_catalog", "float8"), "f64", "f64"},
+        {tn("", "text"), "str", "str"},
+        {tn("pg_catalog", "varchar"), "str", "str"},
+        {tn("pg_catalog", "bpchar"), "str", "str"},
+        {tn("pg_catalog", "timestamp", {0}), "str", "ts_ms"},
+        {tn("pg_catalog", "timestamp", {3}), "str", "ts_ms"},
+        {tn("pg_catalog", "timestamp", {6}), "str", "ts_ms"},
+        {tn("pg_catalog", "timestamp", {9}), "str", "ts_ms"},
+        {tn("pg_catalog", "timestamp"), "str", "ts_ms"},
+        {tn("pg_catalog", "timestamptz", {0}), "str", "tstz_ms"},
+        {tn("pg_catalog", "timestamptz", {3}), "str", "tstz_ms"},
+        {tn("pg_catalog", "timestamptz", {6}), "str", "tstz_ms"},
+        {tn("pg_catalog", "timestamptz", {9}), "str", "tstz_ms"},
+        {tn("pg_catalog", "timestamptz"), "str", "tstz_ms"},
+        {tn("pg_catalog", "date"), "str", "str"},
+        {tn("pg_catalog", "time"), "str", "str"},
+        {tn("pg_catalog", "numeric", {18, 4}), "dec_18_4", "dec_18_4"},
+        {tn("pg_catalog", "numeric"), "dec_38_9", "dec_38_9"},
+        {tn("pg_catalog", "bytea"), "str", "str"},
+        {arr(tn("pg_catalog", "float4"), 1), "list_f32", "list_f32"},
+        {arr(tn("pg_catalog", "float4"), 2), "str", "str"},
+        {arr(tn("pg_catalog", "int8"), 1), "str", "str"},
+        {arr(tn("pg_catalog", "timestamp", {3}), 1), "str", "str"},
+        {composite("map", {tn("", "text"), tn("pg_catalog", "int8")}), "str", "str"},
+        {composite(
+             "row", {tn("pg_catalog", "int8"), tn("pg_catalog", "timestamp", {3})}, {"x", "t"}),
+         "str",
+         "str"},
+        {composite("multiset", {tn("pg_catalog", "int4")}), "str", "str"},
+    };
+    std::vector<RowColumn> all;
+    std::string all_v1;
+    std::string all_v2;
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const auto type = sql_type_to_arrow(cases[i].type);
+        const std::string name = "c" + std::to_string(i);
+        const std::vector<RowColumn> one = {{name, type}};
+        EXPECT_EQ(serialize_row_schema(one), name + ":" + cases[i].v1) << type->ToString();
+        EXPECT_EQ(serialize_row_schema(one, RowLayout::V1), name + ":" + cases[i].v1)
+            << type->ToString();
+        EXPECT_EQ(serialize_row_schema(one, RowLayout::V2), name + ":" + cases[i].v2)
+            << type->ToString();
+        all.push_back(RowColumn{name, type});
+        all_v1 += (i == 0 ? "" : ";") + name + ":" + cases[i].v1;
+        all_v2 += (i == 0 ? "" : ";") + name + ":" + cases[i].v2;
+    }
+    EXPECT_EQ(serialize_row_schema(all), all_v1);
+    EXPECT_EQ(serialize_row_schema(all, RowLayout::V2), all_v2);
+    // A V1 spec read back, admitted or not, holds no timestamp type.
+    for (const auto layout : {RowLayout::V1, RowLayout::V2}) {
+        for (const auto& c : parse_row_schema(all_v1, layout)) {
+            EXPECT_NE(c.type->id(), arrow::Type::TIMESTAMP) << c.name;
+        }
+    }
 }
 
 TEST(SqlType, RejectsUnknownTypeWithTranslationError) {

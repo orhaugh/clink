@@ -10,7 +10,10 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
 #include <arrow/api.h>
@@ -244,12 +247,20 @@ TEST(RowColumnarBatcher, SchemaParamRoundTrips) {
 }
 
 TEST(RowColumnarBatcher, UnsupportedTypeFallsBackToUtf8) {
-    // A timestamp column is not in the v1 native set -> stored as utf8.
-    std::vector<RowColumn> cols = {{"ts", arrow::timestamp(arrow::TimeUnit::MILLI)}};
-    auto batcher = make_row_columnar_arrow_batcher(cols);
+    // A declared TIMESTAMP(3) reaches a batcher through its V1 code, which is
+    // text, so it is stored as utf8. A declared type handed over directly is
+    // outside the carried set unless it is one a row-schema code names: a
+    // microsecond timestamp still falls back.
+    std::vector<RowColumn> declared = {{"ts", arrow::timestamp(arrow::TimeUnit::MILLI)}};
+    auto batcher = make_row_columnar_arrow_batcher(clink::sql::parse_row_schema(
+        clink::sql::serialize_row_schema(declared, clink::sql::RowLayout::V1)));
     auto schema = batcher.schema();
     ASSERT_EQ(schema->num_fields(), 2);
     EXPECT_EQ(schema->field(1)->type()->id(), arrow::Type::STRING);
+
+    auto micros =
+        make_row_columnar_arrow_batcher({{"ts", arrow::timestamp(arrow::TimeUnit::MICRO)}});
+    EXPECT_EQ(micros.schema()->field(1)->type()->id(), arrow::Type::STRING);
 }
 
 // --- Born-columnar operator output (RowColumnarOutput) -----------------------
@@ -512,4 +523,285 @@ TEST(RowColumnarBatcher, NumbersRenderedAsTextAreExact) {
     EXPECT_EQ(to_utf8(cfg::JsonValue{1.23456789012}), "1.23456789012");
     EXPECT_EQ(to_utf8(cfg::JsonValue{42.0}), "42");
     EXPECT_EQ(to_utf8(cfg::JsonValue{std::int64_t{-5}}), "-5");
+}
+
+// --- Row layouts --------------------------------------------------------------
+//
+// V1 is the layout every producer writes: TIMESTAMP and TIMESTAMPTZ travel as
+// text. V2 adds millisecond timestamp codes. Readers learn them first; nothing
+// writes them yet, and a reader that is not admitted to V2 resolves them to
+// their V1 type.
+
+namespace {
+
+namespace rcd = clink::sql::row_columnar_detail;
+using clink::sql::parse_row_schema;
+using clink::sql::RowLayout;
+using clink::sql::serialize_row_schema;
+
+std::vector<RowColumn> timestamp_columns() {
+    return {
+        {"t0", arrow::timestamp(arrow::TimeUnit::SECOND)},
+        {"t3", arrow::timestamp(arrow::TimeUnit::MILLI)},
+        {"t6", arrow::timestamp(arrow::TimeUnit::MICRO)},
+        {"t9", arrow::timestamp(arrow::TimeUnit::NANO)},
+        {"z0", arrow::timestamp(arrow::TimeUnit::SECOND, "UTC")},
+        {"z3", arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")},
+        {"z6", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")},
+        {"z9", arrow::timestamp(arrow::TimeUnit::NANO, "UTC")},
+    };
+}
+
+// Every other type the SQL catalog declares, one column each.
+std::vector<RowColumn> non_timestamp_columns() {
+    return {
+        {"i64", arrow::int64()},
+        {"i32", arrow::int32()},
+        {"i16", arrow::int16()},
+        {"f64", arrow::float64()},
+        {"f32", arrow::float32()},
+        {"b", arrow::boolean()},
+        {"s", arrow::utf8()},
+        {"d", arrow::decimal128(10, 2)},
+        {"dd", arrow::decimal128(38, 9)},
+        {"emb", arrow::list(arrow::float32())},
+        {"arr", arrow::list(arrow::int64())},
+        {"arr2", arrow::list(arrow::list(arrow::float32()))},
+        {"day", arrow::date32()},
+        {"tod", arrow::time64(arrow::TimeUnit::MICRO)},
+        {"raw", arrow::binary()},
+        {"m", arrow::map(arrow::utf8(), arrow::int64())},
+        {"r", arrow::struct_({arrow::field("x", arrow::int64())})},
+    };
+}
+
+std::shared_ptr<arrow::Array> timestamp_array(const std::shared_ptr<arrow::DataType>& type,
+                                              const std::vector<std::optional<std::int64_t>>& v) {
+    arrow::TimestampBuilder b(type, arrow::default_memory_pool());
+    for (const auto& x : v) {
+        if (x) {
+            EXPECT_TRUE(b.Append(*x).ok());
+        } else {
+            EXPECT_TRUE(b.AppendNull().ok());
+        }
+    }
+    std::shared_ptr<arrow::Array> out;
+    EXPECT_TRUE(b.Finish(&out).ok());
+    return out;
+}
+
+}  // namespace
+
+TEST(RowLayout, V1WritesEveryTimestampAsText) {
+    const std::string text = "t0:str;t3:str;t6:str;t9:str;z0:str;z3:str;z6:str;z9:str";
+    EXPECT_EQ(serialize_row_schema(timestamp_columns()), text);
+    EXPECT_EQ(serialize_row_schema(timestamp_columns(), RowLayout::V1), text);
+}
+
+TEST(RowLayout, V1IsTheDefaultAndUnchangedForEveryOtherType) {
+    const auto cols = non_timestamp_columns();
+    // The spelling every released planner wrote; a change here changes every
+    // persisted spec.
+    const std::string text =
+        "i64:i64;i32:i32;i16:str;f64:f64;f32:f32;b:bool;s:str;d:dec_10_2;dd:dec_38_9;"
+        "emb:list_f32;arr:str;arr2:str;day:str;tod:str;raw:str;m:str;r:str";
+    EXPECT_EQ(serialize_row_schema(cols), text);
+    EXPECT_EQ(serialize_row_schema(cols, RowLayout::V1), text);
+}
+
+TEST(RowLayout, V2MapsTimestampAndTimestampTzToMillisecondCodesWhateverThePrecision) {
+    EXPECT_EQ(serialize_row_schema(timestamp_columns(), RowLayout::V2),
+              "t0:ts_ms;t3:ts_ms;t6:ts_ms;t9:ts_ms;z0:tstz_ms;z3:tstz_ms;z6:tstz_ms;z9:tstz_ms");
+}
+
+TEST(RowLayout, V2LeavesEveryOtherTypeOnItsV1Code) {
+    const auto cols = non_timestamp_columns();
+    EXPECT_EQ(serialize_row_schema(cols, RowLayout::V2), serialize_row_schema(cols, RowLayout::V1));
+}
+
+TEST(RowLayout, AnAdmittedParseRoundTripsTheV2Codes) {
+    const std::string spec = "a:ts_ms;b:tstz_ms;c:i64";
+    const auto cols = parse_row_schema(spec, RowLayout::V2);
+    ASSERT_EQ(cols.size(), 3u);
+    EXPECT_TRUE(cols[0].type->Equals(*arrow::timestamp(arrow::TimeUnit::MILLI)))
+        << cols[0].type->ToString();
+    EXPECT_TRUE(cols[1].type->Equals(*arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")))
+        << cols[1].type->ToString();
+    EXPECT_TRUE(cols[2].type->Equals(*arrow::int64()));
+    EXPECT_EQ(serialize_row_schema(cols, RowLayout::V2), spec);
+    // The V1 projection of the same columns is text, as it always was.
+    EXPECT_EQ(serialize_row_schema(cols, RowLayout::V1), "a:str;b:str;c:i64");
+}
+
+TEST(RowLayout, AnUnadmittedParseResolvesV2CodesToTheirV1Types) {
+    for (const auto& cols : {parse_row_schema("a:ts_ms;b:tstz_ms"),
+                             parse_row_schema("a:ts_ms;b:tstz_ms", RowLayout::V1)}) {
+        ASSERT_EQ(cols.size(), 2u);
+        EXPECT_EQ(cols[0].name, "a");
+        EXPECT_TRUE(cols[0].type->Equals(*arrow::utf8())) << cols[0].type->ToString();
+        EXPECT_TRUE(cols[1].type->Equals(*arrow::utf8())) << cols[1].type->ToString();
+    }
+}
+
+TEST(RowLayout, UnknownAndReservedCodesGiveUtf8) {
+    for (const auto layout : {RowLayout::V1, RowLayout::V2}) {
+        // i16 is reserved for SMALLINT and not emitted; until it is, it reads
+        // as any unknown code does.
+        const auto cols = parse_row_schema("a:i16;b:no_such_code;c:;d:dec_x_y;e:ts_us", layout);
+        ASSERT_EQ(cols.size(), 5u);
+        for (const auto& c : cols) {
+            EXPECT_TRUE(c.type->Equals(*arrow::utf8())) << c.name << ": " << c.type->ToString();
+        }
+    }
+}
+
+TEST(RowLayout, NoCodeContainsTheNameOrColumnSeparator) {
+    // parse_row_schema splits columns on ';' and a column on its last ':', so
+    // a code holding either would be misread.
+    auto all = non_timestamp_columns();
+    for (auto& c : timestamp_columns()) {
+        all.push_back(c);
+    }
+    for (const auto layout : {RowLayout::V1, RowLayout::V2}) {
+        for (const auto& c : all) {
+            const auto spec = serialize_row_schema({c}, layout);
+            const auto code = spec.substr(c.name.size() + 1);
+            EXPECT_EQ(code.find(':'), std::string::npos) << code;
+            EXPECT_EQ(code.find(';'), std::string::npos) << code;
+            ASSERT_EQ(parse_row_schema(spec, layout).size(), 1u) << spec;
+        }
+    }
+}
+
+TEST(RowLayoutReceive, EffectiveTypePassesMillisecondTimestampsThrough) {
+    const auto ms = arrow::timestamp(arrow::TimeUnit::MILLI);
+    const auto ms_utc = arrow::timestamp(arrow::TimeUnit::MILLI, "UTC");
+    EXPECT_TRUE(rcd::effective_type(ms)->Equals(*ms));
+    EXPECT_TRUE(rcd::effective_type(ms_utc)->Equals(*ms_utc));
+    for (const auto& other : {arrow::timestamp(arrow::TimeUnit::SECOND),
+                              arrow::timestamp(arrow::TimeUnit::MICRO),
+                              arrow::timestamp(arrow::TimeUnit::NANO, "UTC"),
+                              arrow::date32(),
+                              arrow::int16()}) {
+        EXPECT_TRUE(rcd::effective_type(other)->Equals(*arrow::utf8())) << other->ToString();
+    }
+}
+
+TEST(RowLayoutReceive, ReadCellGivesEpochMillisAsAJsonInteger) {
+    const std::vector<std::optional<std::int64_t>> values = {
+        -1700000000123,
+        0,
+        (std::int64_t{1} << 53) + 1,
+        std::numeric_limits<std::int64_t>::max(),
+        std::numeric_limits<std::int64_t>::min(),
+        std::nullopt,
+    };
+    for (const auto& type : {arrow::timestamp(arrow::TimeUnit::MILLI),
+                             arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")}) {
+        const auto arr = timestamp_array(type, values);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            const auto v = rcd::read_cell(type, *arr, static_cast<std::int64_t>(i));
+            if (!values[i]) {
+                EXPECT_TRUE(v.is_null());
+                continue;
+            }
+            ASSERT_TRUE(v.is_integral_number()) << type->ToString() << " row " << i;
+            EXPECT_EQ(v.as_int(), *values[i]) << type->ToString() << " row " << i;
+        }
+    }
+}
+
+// The refusal read_cell raises for an array it has no reading for: a plain
+// std::logic_error naming the array's type. A subclass (std::length_error
+// from a std::string built over a mis-cast array's garbage offsets, say) is
+// the defect, not the refusal.
+namespace {
+std::string read_cell_refusal(const std::shared_ptr<arrow::DataType>& layout,
+                              const arrow::Array& arr) {
+    try {
+        (void)rcd::read_cell(layout, arr, 0);
+    } catch (const std::logic_error& e) {
+        if (typeid(e) == typeid(std::logic_error)) {
+            return e.what();
+        }
+        return std::string{"wrong exception: "} + typeid(e).name() + ": " + e.what();
+    }
+    return "no exception";
+}
+}  // namespace
+
+TEST(RowLayoutReceive, ReadCellRefusesAnArrayItCannotReadInsteadOfMiscasting) {
+    // A text layout over a non-text array used to be a blind cast to a
+    // StringArray.
+    arrow::Int16Builder b;
+    ASSERT_TRUE(b.Append(7).ok());
+    std::shared_ptr<arrow::Array> shorts;
+    ASSERT_TRUE(b.Finish(&shorts).ok());
+    EXPECT_NE(read_cell_refusal(arrow::utf8(), *shorts).find("int16"), std::string::npos)
+        << read_cell_refusal(arrow::utf8(), *shorts);
+    EXPECT_NE(read_cell_refusal(arrow::int16(), *shorts).find("int16"), std::string::npos)
+        << read_cell_refusal(arrow::int16(), *shorts);
+    // Only milliseconds are read as epoch ms.
+    const auto micros = arrow::timestamp(arrow::TimeUnit::MICRO);
+    const auto us = timestamp_array(micros, {5});
+    EXPECT_NE(read_cell_refusal(micros, *us).find("timestamp[us]"), std::string::npos)
+        << read_cell_refusal(micros, *us);
+    // A millisecond layout over an array of another unit is refused too,
+    // rather than handing its ticks on as epoch milliseconds.
+    const auto millis = arrow::timestamp(arrow::TimeUnit::MILLI);
+    const auto us_value = timestamp_array(micros, {1700000000123000});
+    EXPECT_NE(read_cell_refusal(millis, *us_value).find("timestamp[us]"), std::string::npos)
+        << read_cell_refusal(millis, *us_value);
+    const auto seconds = timestamp_array(arrow::timestamp(arrow::TimeUnit::SECOND, "UTC"), {5});
+    EXPECT_NE(read_cell_refusal(arrow::timestamp(arrow::TimeUnit::MILLI, "UTC"), *seconds)
+                  .find("timestamp[s"),
+              std::string::npos)
+        << read_cell_refusal(arrow::timestamp(arrow::TimeUnit::MILLI, "UTC"), *seconds);
+    // The zone is not part of the check: a zoned millisecond array under an
+    // unzoned millisecond layout holds the same epoch milliseconds.
+    const auto zoned = timestamp_array(arrow::timestamp(arrow::TimeUnit::MILLI, "UTC"), {42});
+    EXPECT_EQ(rcd::read_cell(millis, *zoned, 0).as_int(), 42);
+}
+
+TEST(RowLayoutReceive, ATimestampCellTakesAnIntegralNumberAndOtherwiseIsNull) {
+    const auto type = arrow::timestamp(arrow::TimeUnit::MILLI, "UTC");
+    auto builder = rcd::make_cell_builder(type);
+    ASSERT_TRUE(builder->type()->Equals(*type)) << builder->type()->ToString();
+    const std::vector<cfg::JsonValue> cells = {
+        cfg::JsonValue{std::int64_t{1700000000123}},
+        cfg::JsonValue{std::numeric_limits<std::int64_t>::min()},
+        cfg::JsonValue{5.0},
+        cfg::JsonValue{5.5},
+        cfg::JsonValue{1e300},
+        cfg::JsonValue{std::string{"2023-11-14 22:13:20.123"}},
+        cfg::JsonValue{true},
+    };
+    for (const auto& c : cells) {
+        rcd::append_json_cell(*builder, *type, &c);
+    }
+    rcd::append_json_cell(*builder, *type, nullptr);
+    std::shared_ptr<arrow::Array> out;
+    ASSERT_TRUE(builder->Finish(&out).ok());
+    ASSERT_EQ(out->type_id(), arrow::Type::TIMESTAMP);
+    const auto& ts = static_cast<const arrow::TimestampArray&>(*out);
+    ASSERT_EQ(ts.length(), 8);
+    EXPECT_EQ(ts.Value(0), 1700000000123);
+    EXPECT_EQ(ts.Value(1), std::numeric_limits<std::int64_t>::min());
+    EXPECT_EQ(ts.Value(2), 5);
+    for (std::int64_t i = 3; i < 8; ++i) {
+        EXPECT_TRUE(ts.IsNull(i)) << "row " << i;
+    }
+}
+
+TEST(RowLayoutReceive, CellIsExactForATimestampLayoutTakesIntegersOnly) {
+    const auto type = arrow::timestamp(arrow::TimeUnit::MILLI);
+    const cfg::JsonValue integer{std::int64_t{1700000000123}};
+    const cfg::JsonValue whole{5.0};
+    const cfg::JsonValue fraction{5.5};
+    const cfg::JsonValue text{std::string{"1700000000123"}};
+    EXPECT_TRUE(rcd::cell_is_exact(*type, &integer));
+    EXPECT_TRUE(rcd::cell_is_exact(*type, &whole));
+    EXPECT_FALSE(rcd::cell_is_exact(*type, &fraction));
+    EXPECT_FALSE(rcd::cell_is_exact(*type, &text));
+    EXPECT_TRUE(rcd::cell_is_exact(*type, nullptr));
 }

@@ -223,6 +223,16 @@ CollectHub, and `clink_collect_stream` exports the queue as an
 `ArrowArrayStream` via `arrow::ExportRecordBatchReader` - zero-copy into
 pyarrow, DuckDB, polars, or Arrow C++.
 
+Collect stays on the V1 row layout (see
+[columnar execution](columnar-execution.md#row-sidecar-layouts)): TIMESTAMP
+and TIMESTAMPTZ columns reach the host as utf8 text, whatever the engine
+carries between its own operators. The sink builds its batcher from the
+planned `schema_columns`; the reader builds its schema from the declared
+columns through the same V1 codes
+(`parse_row_schema(serialize_row_schema(cols, RowLayout::V1))`), so the
+reader's schema equals the schema of every batch the sink pushes, for every
+SQL type.
+
 The factory-to-engine binding works by scope stamping: sink factories are
 process-wide, queues are per-engine, so each engine registers its
 CollectHub under a fresh scope token and stamps that token onto every

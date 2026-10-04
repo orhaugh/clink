@@ -26,7 +26,7 @@ plus open, additive facets) so the common adapter is a near-trivial mapping.
 
 | Type | What it is |
 | --- | --- |
-| `LineageDataset` | One external data entity. `ns` is the storage system's address (`kafka://broker:9092`, `postgres://db:5432`, `s3://bucket`, `file`); `name` is the entity within it (a topic, a table, an object key, a path); `facets` is open string metadata (connector family, record format, channel hint, delivery mode); `schema` is the column list (name + friendly type) when the op carries one. |
+| `LineageDataset` | One external data entity. `ns` is the storage system's address (`kafka://broker:9092`, `postgres://db:5432`, `s3://bucket`, `file`); `name` is the entity within it (a topic, a table, an object key, a path); `facets` is open string metadata (connector family, record format, channel hint, delivery mode); `schema` is the column list (name + friendly type) when the op carries one: the friendly type is read off the op's `schema_columns` code (`bigint`, `int`, `double`, `float`, `boolean`, `string`, `decimal(p,s)`, and `timestamp` / `timestamptz` for the V2 layout's `ts_ms` / `tstz_ms`; an unknown code passes through as written). |
 | `LineageVertex` | One connector: a source or a sink. Keyed by the graph-local operator `id`, with the stable `uid` when set. Source vertices also carry `boundedness` (`bounded` / `unbounded` / `unknown`). |
 | `LineageEdge` | A coarse source-vertex to sink-vertex dependency. |
 | `LineageGraph` | `sources`, `sinks`, `edges`. `to_json()` / `from_json()` round-trip it. |

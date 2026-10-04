@@ -444,9 +444,12 @@ TEST(NativeRowArrow, SharedTypesMatchTheBatchersOwnColumnExactly) {
     const auto chunk = ra_build(builder, batch);
     ASSERT_NE(chunk, nullptr);
     for (std::size_t c = 0; c < columns.size(); ++c) {
-        const auto type = arrow_type_for(columns[c].type);
+        // The batcher's layout for a declared type is the one its V1 row-schema
+        // code names.
+        const auto layout = sql::parse_row_schema(sql::serialize_row_schema(
+            {{columns[c].name, arrow_type_for(columns[c].type)}}, sql::RowLayout::V1));
         const auto reference = sql::row_columnar_detail::build_column(
-            columns[c].name, sql::row_columnar_detail::effective_type(type), batch);
+            columns[c].name, sql::row_columnar_detail::effective_type(layout.front().type), batch);
         ASSERT_NE(reference, nullptr);
         EXPECT_TRUE(chunk->column(static_cast<int>(c))->Equals(*reference))
             << columns[c].name << ": " << chunk->column(static_cast<int>(c))->ToString() << " vs "
@@ -956,7 +959,9 @@ TEST(NativeRowArrow, ColumnarBatchMaterialisesToTheSameChunk) {
     for (const auto& c : columns) {
         declared.push_back(sql::RowColumn{c.name, arrow_type_for(c.type)});
     }
-    const auto batcher = sql::make_row_columnar_arrow_batcher(declared);
+    // Through the V1 codes, as the planner writes them.
+    const auto batcher = sql::make_row_columnar_arrow_batcher(
+        sql::parse_row_schema(sql::serialize_row_schema(declared, sql::RowLayout::V1)));
     const auto sidecar = batcher.build(rows);
     ASSERT_NE(sidecar, nullptr);
     const auto columnar = batcher.parse(*sidecar);
@@ -1147,6 +1152,14 @@ TEST(NativeIntake, SharedTypesMatchTheRowPathFromEverySidecarType) {
     const auto narrow =
         ra_json(arrow::decimal128(10, 2),
                 R"(["12.34", null, "-0.01", "99999999.99", "0.00", "1.00", "2.50", "-3.00"])");
+    // timestamp(ms[, tz]), the V2 carriage of TIMESTAMP and TIMESTAMPTZ: read
+    // as the epoch-millisecond integer, so it reaches each declared type as an
+    // int64 cell does.
+    const auto stamps = ra_json(arrow::timestamp(arrow::TimeUnit::MILLI),
+                                "[0, null, -1, 9223372036854775807, -9223372036854775808, "
+                                "2147483648, 1700000000123, 9007199254740993]");
+    const auto zoned_stamps = ra_json(arrow::timestamp(arrow::TimeUnit::MILLI, "UTC"),
+                                      "[1700000000123, null, -1, 2147483647, 0, 7, 8, 9]");
 
     for (const std::string declared : {"BIGINT",
                                        "INTEGER",
@@ -1156,8 +1169,16 @@ TEST(NativeIntake, SharedTypesMatchTheRowPathFromEverySidecarType) {
                                        "VARCHAR",
                                        "DECIMAL(10, 2)",
                                        "DECIMAL(4, 1)"}) {
-        for (const auto& array :
-             {int64s, int32s, doubles, floats, bools, texts, decimals, narrow}) {
+        for (const auto& array : {int64s,
+                                  int32s,
+                                  doubles,
+                                  floats,
+                                  bools,
+                                  texts,
+                                  decimals,
+                                  narrow,
+                                  stamps,
+                                  zoned_stamps}) {
             SCOPED_TRACE(declared + " from " + array->type()->ToString());
             ra_expect_intake_matches(
                 "c:" + declared,
@@ -1372,11 +1393,67 @@ TEST(NativeIntake, ASidecarTheReaderCannotReadIsDeclinedWithItsReason) {
     // Even a column nobody declared: the reader refuses the whole batch.
     check(ra_sidecar({{"a", ints}, {"z", ra_json(arrow::list(arrow::int64()), "[[1]]")}}),
           IntakeDecline::UnsupportedType);
+    // A timestamp of any unit but milliseconds.
+    check(
+        ra_sidecar({{"a", ints}, {"z", ra_json(arrow::timestamp(arrow::TimeUnit::MICRO), "[1]")}}),
+        IntakeDecline::UnsupportedType);
     check(ra_sidecar({{"a", ints}, {"a", ra_json(arrow::utf8(), R"(["x"])")}}),
           IntakeDecline::DuplicateName);
     EXPECT_STREQ(to_string(IntakeDecline::EventTime), "event_time");
     EXPECT_STREQ(to_string(IntakeDecline::UnsupportedType), "unsupported_type");
     EXPECT_STREQ(to_string(IntakeDecline::DuplicateName), "duplicate_name");
+}
+
+// The intake keeps its own copy of the value types the self-describing
+// reader carries. It must decline a sidecar exactly when the reader would
+// refuse it, so a type the reader learns cannot be declined here as
+// unsupported (or the other way about).
+TEST(NativeIntake, DeclinesAnUnsupportedTypeExactlyWhenTheReaderRefusesIt) {
+    const auto columns = ra_columns("a:BIGINT");
+    const std::vector<std::shared_ptr<arrow::DataType>> types = {
+        arrow::int64(),
+        arrow::int32(),
+        arrow::int16(),
+        arrow::int8(),
+        arrow::uint64(),
+        arrow::float64(),
+        arrow::float32(),
+        arrow::boolean(),
+        arrow::decimal128(12, 4),
+        arrow::decimal256(40, 2),
+        arrow::utf8(),
+        arrow::large_utf8(),
+        arrow::binary(),
+        arrow::list(arrow::float32()),
+        arrow::list(arrow::int64()),
+        arrow::large_list(arrow::float32()),
+        arrow::date32(),
+        arrow::date64(),
+        arrow::time64(arrow::TimeUnit::MICRO),
+        arrow::timestamp(arrow::TimeUnit::SECOND),
+        arrow::timestamp(arrow::TimeUnit::MILLI),
+        arrow::timestamp(arrow::TimeUnit::MILLI, "UTC"),
+        arrow::timestamp(arrow::TimeUnit::MILLI, "Europe/London"),
+        arrow::timestamp(arrow::TimeUnit::MICRO),
+        arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"),
+        arrow::timestamp(arrow::TimeUnit::NANO),
+    };
+    for (const auto& type : types) {
+        SCOPED_TRACE(type->ToString());
+        std::unique_ptr<arrow::ArrayBuilder> b = arrow::MakeBuilder(type).ValueOrDie();
+        ASSERT_TRUE(b->AppendNull().ok());
+        const auto sidecar =
+            ra_sidecar({{"a", ra_json(arrow::int64(), "[1]")}, {"z", b->Finish().ValueOrDie()}});
+        const bool supported = sql::row_record_batch_supported(*sidecar);
+        const auto compiled = compile_intake(*sidecar->schema(), columns);
+        const bool declined_as_unsupported =
+            std::holds_alternative<IntakeDecline>(compiled) &&
+            std::get<IntakeDecline>(compiled) == IntakeDecline::UnsupportedType;
+        EXPECT_EQ(declined_as_unsupported, !supported);
+        if (supported) {
+            EXPECT_TRUE(std::holds_alternative<IntakePlan>(compiled));
+        }
+    }
 }
 
 TEST(NativeIntake, AnEmptySidecarGivesAnEmptyChunkWithTheSchema) {
@@ -1487,6 +1564,15 @@ std::shared_ptr<arrow::Array> ra_random_fixed(const std::shared_ptr<arrow::DataT
                         .ok());
                 break;
             }
+            case arrow::Type::TIMESTAMP: {
+                using L = std::numeric_limits<std::int64_t>;
+                const std::int64_t edges[] = {
+                    L::min(), L::max(), 0, -1, 1700000000123, -2208988800000};
+                EXPECT_TRUE(static_cast<arrow::TimestampBuilder&>(*b)
+                                .Append(edge ? edges[pick(6)] : static_cast<std::int64_t>(rng()))
+                                .ok());
+                break;
+            }
             default:
                 EXPECT_TRUE(static_cast<arrow::BooleanBuilder&>(*b).Append(pick(2) == 0).ok());
                 break;
@@ -1503,15 +1589,20 @@ TEST(NativeIntakeReuse, EveryFastPathEqualsTheCellPath) {
         std::shared_ptr<arrow::DataType> type;
         std::string declared;
     };
-    const std::vector<Pair> pairs = {{arrow::int64(), "BIGINT"},
-                                     {arrow::int32(), "INTEGER"},
-                                     {arrow::float32(), "REAL"},
-                                     {arrow::float64(), "DOUBLE"},
-                                     {arrow::boolean(), "BOOLEAN"},
-                                     {arrow::int64(), "TIMESTAMP(3)"},
-                                     {arrow::int64(), "TIMESTAMP(9)"},
-                                     {arrow::int64(), "TIMESTAMP(6) WITH TIME ZONE"},
-                                     {arrow::int32(), "DATE"}};
+    const std::vector<Pair> pairs = {
+        {arrow::int64(), "BIGINT"},
+        {arrow::int32(), "INTEGER"},
+        {arrow::float32(), "REAL"},
+        {arrow::float64(), "DOUBLE"},
+        {arrow::boolean(), "BOOLEAN"},
+        {arrow::int64(), "TIMESTAMP(3)"},
+        {arrow::int64(), "TIMESTAMP(9)"},
+        {arrow::int64(), "TIMESTAMP(6) WITH TIME ZONE"},
+        {arrow::timestamp(arrow::TimeUnit::MILLI), "TIMESTAMP(3)"},
+        {arrow::timestamp(arrow::TimeUnit::MILLI), "TIMESTAMP(9)"},
+        {arrow::timestamp(arrow::TimeUnit::MILLI, "UTC"), "TIMESTAMP(3) WITH TIME ZONE"},
+        {arrow::timestamp(arrow::TimeUnit::MILLI, "UTC"), "TIMESTAMP(0)"},
+        {arrow::int32(), "DATE"}};
     std::mt19937_64 rng(20261005);
     for (const auto& pair : pairs) {
         for (int round = 0; round < 12; ++round) {

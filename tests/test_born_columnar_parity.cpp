@@ -527,7 +527,15 @@ namespace {
 
 using clink::config::JsonValue;
 using clink::sql::row_columnar_detail::cell_is_exact;
-using clink::sql::row_columnar_detail::effective_type;
+
+// The layout a column of declared type `declared` is carried in: the declared
+// type goes through its V1 row-schema code first, as every producer's does, so
+// a TIMESTAMP is text here.
+std::shared_ptr<arrow::DataType> effective_type(const std::shared_ptr<arrow::DataType>& declared) {
+    const auto cols = clink::sql::parse_row_schema(
+        clink::sql::serialize_row_schema({{"c", declared}}, clink::sql::RowLayout::V1));
+    return clink::sql::row_columnar_detail::effective_type(cols.front().type);
+}
 
 // What a row consumer reads back for `v` from a column of declared type
 // `declared`: append_json_cell, then read_cell.

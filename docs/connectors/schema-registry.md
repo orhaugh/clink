@@ -153,6 +153,12 @@ Derived schemas map the declared columns as follows.
 | `DECIMAL(p,s)` | `["null",{"type":"bytes","logicalType":"decimal","precision":p,"scale":s}]` | `string` (proto3 has no exact decimal scalar) | `["number","null"]` |
 | `FLOAT ARRAY` | `["null",{"type":"array","items":"float"}]` | `repeated float` | `["array","null"]` of `number` |
 
+TIMESTAMP and TIMESTAMPTZ columns derive strings under either row layout:
+the millisecond codes of the V2 layout (`ts_ms`, `tstz_ms`; see
+[columnar execution](../internals/columnar-execution.md#row-sidecar-layouts))
+map to string explicitly, exactly as their V1 code `str` does, so a change of
+carrier never changes a registered subject.
+
 A JSON Schema sink with a derived schema re-serialises each row with only
 the declared columns, in schema order, keeping decimal digits exact; with a
 registry-held schema it passes the row through as written.

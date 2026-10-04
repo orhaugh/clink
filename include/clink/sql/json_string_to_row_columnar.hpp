@@ -201,9 +201,17 @@ private:
     // number as a full-precision double and never produced a dec-string, so a
     // columnar float32 truncation or dec-string was a visible difference.
     //
-    // Temporal types are not listed: effective_type maps them to utf8, so they
-    // ride the STRING case (string round-trips) or fall back (a numeric epoch
-    // value).
+    // Temporal types are not listed. The planner hands this operator the
+    // columns its V1 row-schema code names, and the V1 code for TIMESTAMP and
+    // TIMESTAMPTZ is `str`, so they arrive as utf8 and ride the STRING case
+    // (string round-trips) or fall back (a numeric epoch value). A
+    // timestamp(ms[, tz]) column reaches effective_type only from a V2 code
+    // (ts_ms, tstz_ms), and effective_type passes it through; it is not here,
+    // so such a column turns the columnar decode off for the whole schema. A
+    // Dag-direct caller that passes declared types straight in (a TIMESTAMP(3)
+    // column is a timestamp(ms) Arrow type) gets that too: put the columns
+    // through parse_row_schema(serialize_row_schema(cols, RowLayout::V1)) first
+    // to keep the STRING case.
     static bool columnar_capable_type_(arrow::Type::type id) {
         switch (id) {
             case arrow::Type::INT64:
