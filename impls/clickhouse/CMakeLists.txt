@@ -25,7 +25,9 @@ function(_clink_clickhouse_shared_deps out)
     if(OPENSSL_CRYPTO_LIBRARY)
         list(APPEND _deps "${OPENSSL_CRYPTO_LIBRARY}")
     endif()
-    if(TARGET absl::int128)
+    if(_ch_bundled)
+        list(APPEND _deps "${_ch_pinned_int128}")
+    elseif(TARGET absl::int128)
         list(APPEND _deps "$<BUILD_INTERFACE:$<TARGET_LINKER_FILE:absl::int128>>")
     endif()
     set(${out} "${_deps}" PARENT_SCOPE)
@@ -37,10 +39,93 @@ endfunction()
 # the search below finds it). Homebrew's or the system's copy is the fallback, and
 # the configure log says which one was taken and its version.
 set(_ch_pinned_dir)
+set(_ch_bundled FALSE)
 if(_clink_deps_prefix AND EXISTS "${_clink_deps_prefix}/clickhouse-cpp/include/clickhouse/client.h")
     set(_ch_pinned_dir "${_clink_deps_prefix}/clickhouse-cpp")
+    # The script's bundled-deps mode (the self-contained Linux libclink) stamps its
+    # install; the stamp, not whichever files happen to be there, says which layout
+    # this is. A pending marker means an install that stopped part way, which is
+    # neither layout.
+    file(GLOB _ch_pending "${_ch_pinned_dir}/.clink-clickhouse-cpp-pending*")
+    if(_ch_pending)
+        message(FATAL_ERROR "clink::clickhouse - the client install in ${_ch_pinned_dir} "
+                            "did not finish (${_ch_pending}): rerun "
+                            "scripts/build-clickhouse-cpp.sh")
+    endif()
+    file(GLOB _ch_bundled_stamps "${_ch_pinned_dir}/.clink-clickhouse-cpp-*-bundled")
+    if(_ch_bundled_stamps)
+        set(_ch_bundled TRUE)
+    endif()
 endif()
-if(_ch_pinned_dir)
+if(_ch_pinned_dir AND _ch_bundled)
+    # Bundled deps: the client carries its own abseil int128 and cityhash and links
+    # no system library. Its lz4 and zstd were deleted after install, so its
+    # references resolve against the copies Arrow already brings: zstd from
+    # CLINK_ZSTD_LIBRARY when clink_core found one, and lz4 (and zstd otherwise) from
+    # Arrow's bundled-dependencies archive. Every library is a raw path. No
+    # absl::int128 target is created here: a later find_package(absl) (protobuf,
+    # gRPC) would fail on the name already being taken.
+    set(_ch_pinned_int128 "${_ch_pinned_dir}/lib/libabsl_int128.a")
+    foreach(_f "${_ch_pinned_int128}" "${_ch_pinned_dir}/include/absl/numeric/int128.h")
+        if(NOT EXISTS "${_f}")
+            message(FATAL_ERROR "clink::clickhouse - the bundled-deps client in "
+                                "${_ch_pinned_dir} is missing ${_f}: rerun "
+                                "scripts/build-clickhouse-cpp.sh with CLICKHOUSE_CPP_BUNDLED_DEPS=1")
+        endif()
+    endforeach()
+    find_library(_ch_pinned_lib NAMES clickhouse-cpp-lib
+        PATHS "${_ch_pinned_dir}/lib" NO_DEFAULT_PATH)
+    find_library(_ch_pinned_cityhash NAMES cityhash
+        PATHS "${_ch_pinned_dir}/lib" NO_DEFAULT_PATH)
+    set(_ch_arrow_bundled)
+    if(TARGET Arrow::arrow_bundled_dependencies)
+        get_target_property(_ch_arrow_cfgs Arrow::arrow_bundled_dependencies
+            IMPORTED_CONFIGURATIONS)
+        foreach(_cfg IN LISTS _ch_arrow_cfgs)
+            get_target_property(_ch_loc Arrow::arrow_bundled_dependencies
+                IMPORTED_LOCATION_${_cfg})
+            if(_ch_loc AND EXISTS "${_ch_loc}" AND NOT _ch_arrow_bundled)
+                set(_ch_arrow_bundled "${_ch_loc}")
+            endif()
+        endforeach()
+    endif()
+    if(NOT _ch_arrow_bundled)
+        set(_ch_loc "${_clink_deps_prefix}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}arrow_bundled_dependencies${CMAKE_STATIC_LIBRARY_SUFFIX}")
+        if(EXISTS "${_ch_loc}")
+            set(_ch_arrow_bundled "${_ch_loc}")
+        endif()
+    endif()
+    if(NOT _ch_arrow_bundled)
+        message(FATAL_ERROR "clink::clickhouse - the bundled-deps client takes lz4 from "
+                            "Arrow's bundled-dependencies archive, and this Arrow has none "
+                            "(a static Arrow built with ARROW_DEPENDENCY_SOURCE=BUNDLED)")
+    endif()
+    set(_ch_pinned_lz4 "${_ch_arrow_bundled}")
+    if(CLINK_ZSTD_LIBRARY AND EXISTS "${CLINK_ZSTD_LIBRARY}")
+        set(_ch_pinned_zstd "${CLINK_ZSTD_LIBRARY}")
+    else()
+        set(_ch_pinned_zstd "${_ch_arrow_bundled}")
+    endif()
+    find_package(OpenSSL QUIET)
+    if(_ch_pinned_lib AND _ch_pinned_cityhash AND OpenSSL_FOUND)
+        add_library(_clink_clickhouse_external INTERFACE)
+        target_include_directories(_clink_clickhouse_external INTERFACE
+            "${_ch_pinned_dir}/include")
+        _clink_clickhouse_shared_deps(_ch_after)
+        target_link_libraries(_clink_clickhouse_external INTERFACE
+            ${_ch_pinned_lib} ${_ch_pinned_cityhash} ${_ch_pinned_lz4} ${_ch_pinned_zstd}
+            ${_ch_pinned_int128} OpenSSL::SSL OpenSSL::Crypto ${_ch_after})
+        set(_ch_libs _clink_clickhouse_external)
+        set(_ch_include_dir "${_ch_pinned_dir}/include")
+        set(_ch_check_libs ${_ch_pinned_lib} ${_ch_pinned_cityhash} ${_ch_pinned_lz4}
+            ${_ch_pinned_zstd} ${_ch_pinned_int128} OpenSSL::SSL OpenSSL::Crypto)
+        set(_ch_found TRUE)
+    else()
+        message(FATAL_ERROR "clink::clickhouse - the bundled-deps client in ${_ch_pinned_dir} "
+                            "is missing its archives or no OpenSSL was found (the wheel "
+                            "passes OPENSSL_ROOT_DIR=<prefix>/openssl-static)")
+    endif()
+elseif(_ch_pinned_dir)
     find_library(_ch_pinned_lib NAMES clickhouse-cpp-lib
         PATHS "${_ch_pinned_dir}/lib" NO_DEFAULT_PATH)
     find_library(_ch_pinned_cityhash NAMES cityhash
@@ -155,7 +240,11 @@ if(_ch_found AND _ch_include_dir AND EXISTS "${_ch_include_dir}/clickhouse/versi
         REGEX "^CLICKHOUSE_CPP_VERSION=")
     string(REGEX REPLACE "^CLICKHOUSE_CPP_VERSION=" "" _ch_pinned_version "${_ch_pin_line}")
     if(_ch_pinned_dir AND _ch_include_dir STREQUAL "${_ch_pinned_dir}/include")
-        message(STATUS "clink::clickhouse - clickhouse-cpp ${_ch_version} (pinned, Release, TLS)")
+        if(_ch_bundled)
+            message(STATUS "clink::clickhouse - clickhouse-cpp ${_ch_version} (pinned, Release, TLS, bundled deps)")
+        else()
+            message(STATUS "clink::clickhouse - clickhouse-cpp ${_ch_version} (pinned, Release, TLS)")
+        endif()
     elseif(_ch_version STREQUAL _ch_pinned_version)
         message(STATUS "clink::clickhouse - clickhouse-cpp ${_ch_version} from ${_ch_include_dir}")
     else()

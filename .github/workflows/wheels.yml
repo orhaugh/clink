@@ -324,7 +324,7 @@ jobs:
 
   # Linux x86_64 + aarch64, each inside the manylinux_2_28 image on its native
   # runner. The whole build is scripts/build-manylinux-wheel.sh; this job only
-  # restores and saves the Arrow + librdkafka prefix it builds.
+  # restores and saves the Arrow, librdkafka and ClickHouse client prefix it builds.
   linux-wheels:
     name: Wheel (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -344,11 +344,11 @@ jobs:
       CLINK_DEPS_PREFIX: /opt/clink-deps
     steps:
       - uses: actions/checkout@v4
-      - name: Restore the Arrow + librdkafka prefix
+      - name: Restore the Arrow, librdkafka and ClickHouse client prefix
         uses: actions/cache@v4
         with:
           path: /opt/clink-deps
-          key: manylinux-deps-${{ matrix.plat_arch }}-${{ hashFiles('scripts/versions.env', 'scripts/build-arrow.sh', 'scripts/build-librdkafka.sh') }}
+          key: manylinux-deps-${{ matrix.plat_arch }}-${{ hashFiles('scripts/versions.env', 'scripts/build-arrow.sh', 'scripts/build-librdkafka.sh', 'scripts/build-clickhouse-cpp.sh') }}
       - name: Build, repair, gate and smoke-test the wheel
         run: |
           git config --global --add safe.directory "${{ github.workspace }}"
