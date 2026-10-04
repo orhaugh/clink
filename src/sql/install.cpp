@@ -12175,6 +12175,183 @@ private:
     bool done_{false};
 };
 
+namespace {
+
+// row_bind_columns: the sink-boundary schema contract. Binds the SELECT's output
+// columns POSITIONALLY to the sink table's declared columns: reads each field by
+// its planner-side name (select), emits it under the declared name (sink), and
+// drops everything else - a windowed aggregate's unprojected window bounds, a
+// binder-synthesised _colN expression name, any internal field. Without it the
+// JSON sink serialises the row's INTERNAL schema, which is not what the table
+// declared. A field the row does not carry stays absent (the row path's
+// convention for an absent value, distinct from an explicit null). __row_kind
+// survives: it is the changelog tag the upsert/2PC sinks read, not a column.
+//
+// A columnar batch is bound without building rows: the same columns are
+// selected, renamed and dropped on the sidecar, and the result carries the
+// self-describing row_materialize_fn(), never the parent's closure through
+// with_arrow, because the decoder's and the declared batcher's closures resolve
+// their own declared names and would silently drop a renamed column. A sink that
+// takes the sidecar (blackhole) then never sees a row; a row-only sink
+// materialises once, in the sink instead of here.
+class ColumnarRowBindOperator final : public Operator<Row, Row> {
+public:
+    ColumnarRowBindOperator(std::vector<std::string> select, std::vector<std::string> sink)
+        : select_(std::move(select)), sink_(std::move(sink)) {
+        select_names_.reserve(select_.size());
+        sink_names_.reserve(sink_.size());
+        for (std::size_t i = 0; i < select_.size(); ++i) {
+            select_names_.emplace_back(select_[i]);
+            sink_names_.emplace_back(sink_[i]);
+            // A declared column named like an engine field: the self-describing
+            // decode drops __source_partition from the values, and __row_kind
+            // would meet the carried tag. The row path writes both as values, so
+            // such a bind stays on the row path.
+            if (sink_[i] == kSourcePartitionColumn || sink_[i] == kRowKindField) {
+                sink_names_engine_field_ = true;
+            }
+        }
+    }
+
+    [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
+
+    bool process_columnar(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        if (sink_names_engine_field_ || !element.is_data() || !element.as_data().is_columnar()) {
+            return false;
+        }
+        const auto& rb = element.as_data().arrow();
+        if (!rb || rb->num_columns() < 1 ||
+            dynamic_cast<const arrow::Int64Array*>(rb->column(0).get()) == nullptr) {
+            return false;
+        }
+        const std::int64_t n = rb->num_rows();
+        if (n == 0) {
+            return true;  // suppress empty emission, as the columnar projection does
+        }
+        const auto& schema = *rb->schema();
+
+        std::vector<std::shared_ptr<arrow::Field>> fields;
+        std::vector<std::shared_ptr<arrow::Array>> arrays;
+        fields.reserve(select_.size() + 3);
+        arrays.reserve(select_.size() + 3);
+
+        // Event time rides through at position 0, so a materialised row keeps the
+        // event time the row path copies off the record.
+        fields.push_back(schema.field(0));
+        arrays.push_back(rb->column(0));
+
+        for (std::size_t i = 0; i < select_.size(); ++i) {
+            // From index 1, as the row decode reads values: a user column named
+            // event_time resolves to the user column, never to the timestamp.
+            const int idx = clink::operators::expr_detail::value_field_index(schema, select_[i]);
+            // The row decode never exposes the source partition as a value, so a
+            // select name that matches it is absent there too.
+            if (idx < 0 || select_[i] == kSourcePartitionColumn) {
+                continue;  // the row path leaves the field absent
+            }
+            // The row decode keeps the LAST of two same-named value fields and the
+            // lookup above found the first; decline rather than bind the wrong one.
+            if (has_later_field(schema, idx)) {
+                return false;
+            }
+            fields.push_back(arrow::field(sink_[i], schema.field(idx)->type(), /*nullable=*/true));
+            arrays.push_back(rb->column(idx));
+        }
+
+        // The changelog tag, carried as the row path copies it. And the source
+        // partition: metadata the row path keeps on the record, not a Row value
+        // (the self-describing decode drops it from values), so carrying the
+        // column changes nothing a sink reads.
+        static const std::string kCarried[] = {std::string{kRowKindField},
+                                               std::string{kSourcePartitionColumn}};
+        for (const auto& carried : kCarried) {
+            const int idx = clink::operators::expr_detail::value_field_index(schema, carried);
+            if (idx < 0) {
+                continue;
+            }
+            if (has_later_field(schema, idx)) {
+                return false;
+            }
+            fields.push_back(schema.field(idx));
+            arrays.push_back(rb->column(idx));
+        }
+
+        // Fields and arrays are moved into the batch so no local reference outlives
+        // emit_data - see the TSan note in columnar_string_keyed_vector_source.hpp.
+        auto out_rb =
+            arrow::RecordBatch::Make(arrow::schema(std::move(fields)), n, std::move(arrays));
+        // Defensive: row_materialize_fn() decodes only the supported column types,
+        // and would hand a row consumer zero rows for anything else. The parent's
+        // own closure may cope, so leave such a batch to the row path.
+        if (!row_record_batch_supported(*out_rb)) {
+            return false;
+        }
+        out.emit_data(
+            Batch<Row>{std::move(out_rb), static_cast<std::size_t>(n), row_materialize_fn()});
+        return true;
+    }
+
+    void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        if (element.is_data()) {
+            const Batch<Row>& in_batch = element.as_data();
+            Batch<Row> out_batch;
+            for (const auto& record : in_batch) {
+                Record<Row> out_rec =
+                    record.event_time().has_value()
+                        ? Record<Row>(bind_row(record.value()), *record.event_time())
+                        : Record<Row>(bind_row(record.value()));
+                // Engine-only source-split metadata survives the bind, as it
+                // survives every value-mapping hop.
+                if (auto p = record.source_partition(); p.has_value()) {
+                    out_rec.set_source_partition(*p);
+                }
+                out_batch.push(std::move(out_rec));
+            }
+            out.emit_data(std::move(out_batch));
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else {
+            this->on_barrier(element.as_barrier(), out);
+        }
+    }
+
+    std::string name() const override { return "row_bind_columns"; }
+
+private:
+    // True when a value field after `idx` has the same name.
+    static bool has_later_field(const arrow::Schema& schema, int idx) {
+        const auto& name = schema.field(idx)->name();
+        for (int j = idx + 1; j < schema.num_fields(); ++j) {
+            if (schema.field(j)->name() == name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Row bind_row(const Row& r) const {
+        Row out;
+        for (std::size_t i = 0; i < select_names_.size(); ++i) {
+            if (auto it = r.values.find(select_names_[i]); it != r.values.end()) {
+                out.values[sink_names_[i]] = it->second;
+            }
+        }
+        if (auto it = r.values.find(row_kind_name()); it != r.values.end()) {
+            out.values[row_kind_name()] = it->second;
+        }
+        return out;
+    }
+
+    std::vector<std::string> select_;
+    std::vector<std::string> sink_;
+    // Interned once at build: the row path writes these into a Row per record.
+    std::vector<clink::config::InternedName> select_names_;
+    std::vector<clink::config::InternedName> sink_names_;
+    bool sink_names_engine_field_{false};
+};
+
+}  // namespace
+
 // The two retention params, read identically by every operator that can
 // enforce a TTL. One place, so a future third param cannot be wired into
 // three factories and forgotten in the fourth.
@@ -13057,17 +13234,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                                             [](const Row& r) { return r; }, "identity_row");
                                     });
 
-    // row_bind_columns: the sink-boundary schema contract (followups item
-    // 78). Binds the SELECT's output columns POSITIONALLY to the sink
-    // table's declared columns: reads each field by its planner-side name
-    // (select_columns), emits it under the declared name (sink_columns),
-    // and drops everything else - a windowed aggregate's unprojected
-    // window bounds, a binder-synthesised _colN expression name, any
-    // internal field. Without it the JSON sink serialises the row's
-    // INTERNAL schema, which is not what the table declared. A field the
-    // row does not carry stays absent (the row path's convention for an
-    // absent value, distinct from an explicit null). __row_kind survives:
-    // it is the changelog tag the upsert/2PC sinks read, not a column.
+    // row_bind_columns: the sink-boundary schema contract. Params:
+    // select_columns (the SELECT's output names) and sink_columns (the table's
+    // declared names), bound positionally. See ColumnarRowBindOperator.
     reg.register_operator<Row, Row>(
         "row_bind_columns", [](const BuildContext& ctx) -> std::shared_ptr<Operator<Row, Row>> {
             auto from = projection_from_csv(ctx.param_or("select_columns", ""));
@@ -13078,28 +13247,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                     "and the same length (got " +
                     std::to_string(from.size()) + " and " + std::to_string(to.size()) + ")");
             }
-            std::vector<clink::config::InternedName> from_names;
-            std::vector<clink::config::InternedName> to_names;
-            from_names.reserve(from.size());
-            to_names.reserve(to.size());
-            for (std::size_t i = 0; i < from.size(); ++i) {
-                from_names.emplace_back(from[i]);
-                to_names.emplace_back(to[i]);
-            }
-            return std::make_shared<MapOperator<Row, Row>>(
-                [from_names, to_names](const Row& r) -> Row {
-                    Row out;
-                    for (std::size_t i = 0; i < from_names.size(); ++i) {
-                        if (auto it = r.values.find(from_names[i]); it != r.values.end()) {
-                            out.values[to_names[i]] = it->second;
-                        }
-                    }
-                    if (auto it = r.values.find(row_kind_name()); it != r.values.end()) {
-                        out.values[row_kind_name()] = it->second;
-                    }
-                    return out;
-                },
-                "row_bind_columns");
+            return std::make_shared<ColumnarRowBindOperator>(std::move(from), std::move(to));
         });
 
     // SQL-native AI: ml_predict_row. Builds the model provider from the namespaced

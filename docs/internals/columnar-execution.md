@@ -220,7 +220,7 @@ the query's results changes, so it will not show up as a test failure - only as 
 
 Scrape `clink_batch_materializations_total` on a running job. On a pipeline that is
 columnar end to end it stays at zero; a count that tracks the batch count means some
-stage is touching a row accessor. Two real instances, both found this way:
+stage is touching a row accessor. Three real instances:
 
 - A **duplicate factory registration** replaced the counting `BlackholeRowSink` with a
   per-record `FunctionSink`, so nexmark q0 materialised every batch (14,377 of 14,377)
@@ -234,6 +234,31 @@ stage is touching a row accessor. Two real instances, both found this way:
   to row output. That gate must be kept in step with `supports_columnar()` in
   `install.cpp` by hand; there is no compile-time link between them, which is exactly
   why it drifted.
+- The **sink-boundary bind** undid the blackhole fix for six weeks. `997f0e0` (2026-07-26)
+  gave `BlackholeRowSink` the terminal hook. `2dd2e23` (2026-08-24) then put
+  `row_bind_columns` in front of every SQL Row sink, as a `MapOperator` that iterates
+  the batch and so materialised every columnar batch one hop before the sink. nexmark
+  q0 into blackhole paid one materialisation per batch from then on, and q0 blackhole
+  figures taken in that period include it. q12 paid no materialisation at the bind,
+  because its window emits rows in front of it. That is itself a `2dd2e23` effect:
+  before it, the window fed `blackhole_sink_row` directly, which `enable_columnar_output()`
+  counts as a columnar consumer, so the window was promoted to columnar output. The
+  bind is not on that list, so from `2dd2e23` the window emits rows, and q12 blackhole
+  figures across that commit also differ. Nothing failed, because the existing tests
+  ran into row-only sinks, where a materialisation was expected anyway. The bind is now `ColumnarRowBindOperator`, which renames and drops columns
+  on the sidecar; `SqlRuntime.RowBindKeepsQ0ColumnarIntoBlackhole` pins it.
+
+A delta of zero is not proof on its own: a pipeline that never had a sidecar also
+shows zero. Check a hop with three readings:
+
+1. The process-wide delta of `clink::detail::batch_materialize_counter()` (the counter
+   behind `clink_batch_materializations_total`) across a run whose chain ends at a
+   sink that takes the sidecar. It should be zero.
+2. A control: the same chain into a row-only sink, such as a JSON file sink. The delta
+   should be about one per batch, which shows the chain was carrying a sidecar up to
+   the sink. `SqlRuntime.RowBindIntoJsonFileSinkKeepsRowPathBytes` is that control
+   for the bind.
+3. The sink's own count of batches it took as a sidecar, where the sink keeps one.
 
 A related habit worth keeping: an opt-in that cannot be observed will eventually be
 found to have done nothing. `clink_node --version` and the node startup log both report
@@ -316,7 +341,9 @@ flowchart TD
 
 That mattered more than it sounds. The discard sink was a `FunctionSink<Row>` iterating the batch to call a callback with an empty body, so every record became a name-keyed `FlatMap` first. Measured on the q0 chain, materialisation cost **+0.54s on top of a 1.02s decode**. `BlackholeRowSink` now answers the hook and counts via `batch.size()`, which the sidecar answers without decoding.
 
-The hook also unblocks the producer side: `enable_columnar_output()` treats a columnar-capable sink as a columnar consumer, lifting the rule that forbade the operator in front of a sink from emitting born-columnar. Note what this is *not* - a production win. `blackhole` exists to measure the engine without sink cost; a real Kafka or Parquet sink must still serialise per record. The seam is what a Parquet sink would use to write a `RecordBatch` directly.
+In a SQL plan the operator in front of every Row sink is `row_bind_columns`, the sink-boundary bind that maps the SELECT's columns onto the table's declared ones. It takes a columnar batch as it is (`ColumnarRowBindOperator` in `src/sql/install.cpp`): column 0 is kept, each selected column is found by name from index 1, renamed to the declared name with its type kept, and `__row_kind` and `__source_partition` ride along. The result carries `row_materialize_fn()`, never the parent's closure through `with_arrow`, because the decoder's and the declared batcher's closures resolve their own declared names and would drop a renamed column. A select name that matches two value fields, a declared column named `__source_partition` or `__row_kind`, or a column type the self-describing decode cannot read, sends the batch to `process()`. So blackhole takes the sidecar untouched, and a row-only sink materialises once, in the sink rather than in the bind. From `2dd2e23` until it learned to take the sidecar, the bind was a `MapOperator` and materialised every columnar batch, so the blackhole hook did nothing for SQL plans in that period (see "Verifying the path actually fires").
+
+`enable_columnar_output()` lists `blackhole_sink_row` as a columnar consumer, but in a SQL plan the bind sits between any producer and the sink, and the bind is not on that list, so the sink entry does not promote a producer today. Note what the hook is *not* - a production win. `blackhole` exists to measure the engine without sink cost; a real Kafka or Parquet sink must still serialise per record. The seam is what a Parquet sink would use to write a `RecordBatch` directly.
 
 Watermarks and barriers never go through `process_columnar`; the runner routes those to `process()` (or the operator's `on_watermark` / `on_barrier`), so a columnar operator still implements `process()` for control elements and for the row-only fallback.
 

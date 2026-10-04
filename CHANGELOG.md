@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**The column binding in front of every SQL sink no longer turns a columnar
+batch into rows.** `row_bind_columns`, which the planner puts in front of every
+Row sink, materialised every columnar batch that reached it since 2dd2e23,
+which also undid the blackhole sink's columnar path: nexmark q0 blackhole
+figures taken since then include one materialisation per batch at the bind.
+It now renames and selects the batch's columns without building rows, and a
+sink that takes rows builds them itself, once per batch, as the bind did
+before; output is unchanged. q12 is unaffected by this change, because since
+2dd2e23 its window emits rows in front of the bind, so q12 blackhole figures
+from before and after that commit already differ for that reason. A sink
+column declared as `__source_partition` or `__row_kind` keeps the row path.
+
 **A join or window's columnar output no longer changes values on the way to
 the next operator.** A join or window that emitted columnar output carried
 TIMESTAMP, SMALLINT and DATE values held as numbers, and ARRAY, MAP and ROW

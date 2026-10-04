@@ -21,9 +21,12 @@
 // a 1.02s q0 decode.
 //
 // Answering the columnar hook lets the runner hand the batch over untouched and take
-// the row count from the sidecar, and (via enable_columnar_output) lets the operator
-// UPSTREAM emit born-columnar too, which the planner otherwise forbids in front of a
-// sink.
+// the row count from the sidecar. In a SQL plan the hop in front of this sink is
+// always row_bind_columns, the sink-boundary bind, which renames and drops columns
+// on the sidecar without building rows; until it did, the bind materialised every
+// columnar batch and this hook was unreachable from SQL. The planner's
+// enable_columnar_output can also let the operator upstream emit born-columnar,
+// but only when it lists every consumer of that operator as a columnar one.
 
 #include <cstdint>
 #include <string>

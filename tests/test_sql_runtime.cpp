@@ -10,6 +10,7 @@
 #include <any>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -18035,6 +18036,636 @@ TEST(WindowArithmetic, EveryHopPaneContainsTheTimestampAndThereAreSizeOverSlideO
             EXPECT_EQ(starts[i] - starts[i - 1], slide);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// row_bind_columns, the sink-boundary bind the planner puts in front of every
+// Row sink, binds a columnar batch without building rows. Each unit case below
+// builds the op through the registered factory, runs the same input through
+// process() and through process_columnar(), and requires the two to agree on
+// everything a sink can see: the values, the event time, the row kind and the
+// serialised JSON. The materialisation counter must not move while
+// process_columnar() runs; reading the output afterwards is the test decoding,
+// not the operator.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::shared_ptr<Operator<Row, Row>> build_row_bind(const std::string& select_csv,
+                                                   const std::string& sink_csv) {
+    ensure_sql_installed_once();
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "row_bind_columns", std::string{kChannelRow}, std::string{kChannelRow});
+    EXPECT_NE(factory, nullptr) << "row_bind_columns is not registered";
+    if (factory == nullptr) {
+        return nullptr;
+    }
+    cluster::OperatorBuildContext octx;
+    octx.params["select_columns"] = select_csv;
+    octx.params["sink_columns"] = sink_csv;
+    return std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+}
+
+// One sidecar column: a name, an Arrow type and its cells (a JSON null is a null
+// cell). The array is built by the batcher's own cell mapping, so the input is
+// exactly what a columnar producer of that type would emit.
+struct BindInputCol {
+    std::string name;
+    std::shared_ptr<arrow::DataType> type;
+    std::vector<clink::config::JsonValue> cells;
+};
+
+std::shared_ptr<arrow::Array> bind_input_column(const BindInputCol& c) {
+    Batch<Row> rows;
+    for (const auto& v : c.cells) {
+        Row r;
+        if (!v.is_null()) {
+            r.values["c"] = v;
+        }
+        rows.emplace(std::move(r));
+    }
+    return row_columnar_detail::build_column("c", c.type, rows);
+}
+
+std::shared_ptr<arrow::RecordBatch> bind_input(const std::vector<std::optional<std::int64_t>>& ts,
+                                               const std::vector<BindInputCol>& cols,
+                                               std::shared_ptr<arrow::DataType> ts_type = nullptr) {
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    std::vector<std::shared_ptr<arrow::Array>> arrays;
+    if (ts_type == nullptr) {
+        arrow::Int64Builder tb;
+        for (const auto& t : ts) {
+            if (t.has_value()) {
+                EXPECT_TRUE(tb.Append(*t).ok());
+            } else {
+                EXPECT_TRUE(tb.AppendNull().ok());
+            }
+        }
+        std::shared_ptr<arrow::Array> ta;
+        EXPECT_TRUE(tb.Finish(&ta).ok());
+        fields.push_back(arrow::field("event_time", arrow::int64(), /*nullable=*/true));
+        arrays.push_back(std::move(ta));
+    } else {
+        // A column 0 that is not the int64 event-time layout.
+        arrow::Int32Builder tb;
+        for (const auto& t : ts) {
+            EXPECT_TRUE(tb.Append(static_cast<std::int32_t>(t.value_or(0))).ok());
+        }
+        std::shared_ptr<arrow::Array> ta;
+        EXPECT_TRUE(tb.Finish(&ta).ok());
+        fields.push_back(arrow::field("event_time", ts_type, /*nullable=*/true));
+        arrays.push_back(std::move(ta));
+    }
+    for (const auto& c : cols) {
+        EXPECT_EQ(c.cells.size(), ts.size()) << c.name;
+        fields.push_back(arrow::field(c.name, c.type, /*nullable=*/true));
+        arrays.push_back(bind_input_column(c));
+    }
+    return arrow::RecordBatch::Make(
+        arrow::schema(std::move(fields)), static_cast<std::int64_t>(ts.size()), std::move(arrays));
+}
+
+Batch<Row> columnar_input(const std::shared_ptr<arrow::RecordBatch>& rb,
+                          Batch<Row>::MaterializeFn fn = row_materialize_fn()) {
+    return Batch<Row>{rb, static_cast<std::size_t>(rb->num_rows()), std::move(fn)};
+}
+
+struct BindCapture {
+    std::vector<StreamElement<Row>> elems;
+    Emitter<Row> emitter() {
+        return Emitter<Row>([this](StreamElement<Row> e) {
+            elems.push_back(std::move(e));
+            return true;
+        });
+    }
+    std::vector<Record<Row>> records() {
+        std::vector<Record<Row>> out;
+        for (auto& e : elems) {
+            if (e.is_data()) {
+                for (const auto& r : e.as_data()) {
+                    out.push_back(r);
+                }
+            }
+        }
+        return out;
+    }
+};
+
+struct BindOutcome {
+    bool handled{false};
+    std::uint64_t decoded_during_columnar{0};
+    BindCapture row_path;
+    BindCapture columnar_path;
+};
+
+// Run `rb` through process() and through process_columnar() on two separate
+// batches over the same sidecar, so neither run sees rows the other decoded.
+BindOutcome run_bind(const std::string& select_csv,
+                     const std::string& sink_csv,
+                     const std::shared_ptr<arrow::RecordBatch>& rb,
+                     const Batch<Row>::MaterializeFn& input_fn = row_materialize_fn()) {
+    BindOutcome o;
+    auto op = build_row_bind(select_csv, sink_csv);
+    if (op == nullptr) {
+        return o;
+    }
+    EXPECT_TRUE(op->supports_columnar());
+    {
+        auto em = o.row_path.emitter();
+        op->process(StreamElement<Row>::data(columnar_input(rb, input_fn)), em);
+    }
+    auto em = o.columnar_path.emitter();
+    const auto before = clink::detail::batch_materialize_counter().load();
+    o.handled = op->process_columnar(StreamElement<Row>::data(columnar_input(rb, input_fn)), em);
+    o.decoded_during_columnar = clink::detail::batch_materialize_counter().load() - before;
+    return o;
+}
+
+std::string bind_cell_text(const Row& r, std::string_view name) {
+    auto it = r.values.find(name);
+    return it == r.values.end() ? std::string{"<absent>"} : it->second.serialize(0);
+}
+
+// The columnar output, once materialised, is what process() emitted: the same
+// rows in the same order with the same event time, row kind and JSON bytes, both
+// the wire form (decimal tags kept) and the sink's text form.
+void expect_bind_matches_row_path(BindOutcome& o) {
+    ASSERT_TRUE(o.handled) << "process_columnar declined a batch it should bind";
+    EXPECT_EQ(o.decoded_during_columnar, 0u) << "process_columnar built rows";
+    for (const auto& e : o.columnar_path.elems) {
+        ASSERT_TRUE(e.is_data());
+        EXPECT_TRUE(e.as_data().is_columnar()) << "the bind's output should stay columnar";
+    }
+    const auto want = o.row_path.records();
+    const auto got = o.columnar_path.records();
+    ASSERT_EQ(got.size(), want.size());
+    const auto codec = row_json_codec();
+    const auto text = row_json_text_format();
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        SCOPED_TRACE("row " + std::to_string(i));
+        EXPECT_EQ(got[i].event_time(), want[i].event_time());
+        EXPECT_EQ(bind_cell_text(got[i].value(), kRowKindField),
+                  bind_cell_text(want[i].value(), kRowKindField));
+        EXPECT_EQ(got[i].value().values.size(), want[i].value().values.size());
+        for (const auto& [name, value] : want[i].value().values) {
+            EXPECT_EQ(bind_cell_text(got[i].value(), name.str()), value.serialize(0))
+                << "column " << name.str();
+        }
+        EXPECT_EQ(codec.encode(got[i].value()), codec.encode(want[i].value()));
+        EXPECT_EQ(text.encode(got[i].value()), text.encode(want[i].value()));
+    }
+}
+
+std::vector<std::optional<std::int64_t>> bind_ts() {
+    return {1000, std::nullopt, 3000, -5, 0};
+}
+
+using JV = clink::config::JsonValue;
+
+// Every type the sidecar carries, so a rename is checked across all of them.
+std::vector<BindInputCol> bind_all_types() {
+    return {
+        {"i64",
+         arrow::int64(),
+         {JV{std::int64_t{1}},
+          JV{nullptr},
+          JV{std::int64_t{-9007199254740993}},
+          JV{std::int64_t{0}},
+          JV{std::int64_t{42}}}},
+        {"i32",
+         arrow::int32(),
+         {JV{std::int64_t{7}},
+          JV{std::int64_t{-7}},
+          JV{nullptr},
+          JV{std::int64_t{2147483647}},
+          JV{std::int64_t{0}}}},
+        {"f64", arrow::float64(), {JV{1.5}, JV{-0.25}, JV{1e300}, JV{nullptr}, JV{3.0}}},
+        {"f32", arrow::float32(), {JV{0.5}, JV{nullptr}, JV{-2.0}, JV{8.25}, JV{1.0}}},
+        {"b", arrow::boolean(), {JV{true}, JV{false}, JV{nullptr}, JV{true}, JV{false}}},
+        {"s",
+         arrow::utf8(),
+         {JV{std::string{"plain"}},
+          JV{std::string{"quote \" and \\ slash"}},
+          JV{std::string{""}},
+          JV{nullptr},
+          JV{std::string{"caf\xc3\xa9"}}}},
+        {"d",
+         arrow::decimal128(12, 2),
+         {JV{12.5}, JV{nullptr}, JV{-0.01}, JV{std::int64_t{100}}, JV{0.0}}},
+        {"v",
+         arrow::list(arrow::float32()),
+         {JV{clink::config::JsonArray{JV{1.0}, JV{2.5}}},
+          JV{clink::config::JsonArray{}},
+          JV{nullptr},
+          JV{clink::config::JsonArray{JV{-1.0}}},
+          JV{clink::config::JsonArray{JV{0.0}, JV{0.0}, JV{0.0}}}}},
+    };
+}
+
+std::vector<BindInputCol> bind_abc() {
+    return {
+        {"a",
+         arrow::int64(),
+         {JV{std::int64_t{1}},
+          JV{std::int64_t{2}},
+          JV{nullptr},
+          JV{std::int64_t{4}},
+          JV{std::int64_t{5}}}},
+        {"b",
+         arrow::utf8(),
+         {JV{std::string{"x"}},
+          JV{nullptr},
+          JV{std::string{"z"}},
+          JV{std::string{"w"}},
+          JV{std::string{"v"}}}},
+        {"c", arrow::float64(), {JV{0.5}, JV{1.5}, JV{2.5}, JV{nullptr}, JV{4.5}}},
+    };
+}
+
+}  // namespace
+
+TEST(RowBindColumnar, RenamesEveryCarriedType) {
+    auto o = run_bind("i64,i32,f64,f32,b,s,d,v",
+                      "o_i64,o_i32,o_f64,o_f32,o_b,o_s,o_d,o_v",
+                      bind_input(bind_ts(), bind_all_types()));
+    expect_bind_matches_row_path(o);
+    // The type is kept and the column is the input's own array: a rename copies
+    // no data.
+    ASSERT_EQ(o.columnar_path.elems.size(), 1u);
+    const auto& out = o.columnar_path.elems[0].as_data().arrow();
+    ASSERT_NE(out, nullptr);
+    EXPECT_EQ(out->schema()->field(0)->name(), "event_time");
+    EXPECT_EQ(out->schema()->field(7)->name(), "o_d");
+    EXPECT_TRUE(out->schema()->field(7)->type()->Equals(arrow::decimal128(12, 2)));
+}
+
+TEST(RowBindColumnar, DropsColumnsTheSinkDoesNotDeclare) {
+    auto o = run_bind("a,c", "a,c", bind_input(bind_ts(), bind_abc()));
+    expect_bind_matches_row_path(o);
+    ASSERT_EQ(o.columnar_path.elems.size(), 1u);
+    EXPECT_EQ(o.columnar_path.elems[0].as_data().arrow()->num_columns(), 3);
+}
+
+TEST(RowBindColumnar, SwapsNames) {
+    auto o = run_bind("a,b", "b,a", bind_input(bind_ts(), bind_abc()));
+    expect_bind_matches_row_path(o);
+}
+
+TEST(RowBindColumnar, BindsOneSelectNameToTwoSinkColumns) {
+    auto o = run_bind("a,a,c", "p,q,r", bind_input(bind_ts(), bind_abc()));
+    expect_bind_matches_row_path(o);
+}
+
+TEST(RowBindColumnar, LeavesAnAbsentSourceColumnAbsent) {
+    // The row path writes nothing for a select name the row does not carry, so
+    // the field stays absent rather than becoming an explicit null.
+    auto o = run_bind("a,missing,c", "a,m,c", bind_input(bind_ts(), bind_abc()));
+    expect_bind_matches_row_path(o);
+    for (const auto& r : o.columnar_path.records()) {
+        EXPECT_FALSE(r.value().has_column("m"));
+    }
+}
+
+TEST(RowBindColumnar, ResolvesAUserColumnNamedEventTime) {
+    // Column 0 is the engine's event time, which the row path never exposes as a
+    // value; a user column of the same name resolves to the user column.
+    auto cols = bind_abc();
+    cols.push_back({"event_time",
+                    arrow::utf8(),
+                    {JV{std::string{"e1"}},
+                     JV{std::string{"e2"}},
+                     JV{nullptr},
+                     JV{std::string{"e4"}},
+                     JV{std::string{"e5"}}}});
+    auto o = run_bind("event_time,a", "et,a", bind_input(bind_ts(), cols));
+    expect_bind_matches_row_path(o);
+    const auto got = o.columnar_path.records();
+    ASSERT_FALSE(got.empty());
+    EXPECT_EQ(bind_cell_text(got[0].value(), "et"), "\"e1\"");
+}
+
+TEST(RowBindColumnar, CarriesTheRowKind) {
+    auto cols = bind_abc();
+    cols.push_back({std::string{kRowKindField},
+                    arrow::utf8(),
+                    {JV{std::string{kRowKindInsert}},
+                     JV{std::string{kRowKindUpdateBefore}},
+                     JV{std::string{kRowKindUpdateAfter}},
+                     JV{nullptr},
+                     JV{std::string{kRowKindDelete}}}});
+    auto o = run_bind("a,b", "x,y", bind_input(bind_ts(), cols));
+    expect_bind_matches_row_path(o);
+    const auto got = o.columnar_path.records();
+    ASSERT_EQ(got.size(), 5u);
+    EXPECT_EQ(row_kind_of(got[1].value()), kRowKindUpdateBefore);
+    EXPECT_EQ(row_kind_of(got[4].value()), kRowKindDelete);
+}
+
+TEST(RowBindColumnar, CarriesTheSourcePartitionColumn) {
+    // __source_partition is record metadata, never a Row value. The columnar bind
+    // keeps the column so the sidecar still carries what the row path keeps on the
+    // record; the values a sink sees are unchanged.
+    auto rb = bind_input(bind_ts(), bind_abc());
+    arrow::Int32Builder pb;
+    for (int p : {0, 1, 1, 2, 0}) {
+        ASSERT_TRUE(pb.Append(p).ok());
+    }
+    std::shared_ptr<arrow::Array> pa;
+    ASSERT_TRUE(pb.Finish(&pa).ok());
+    auto added =
+        rb->AddColumn(rb->num_columns(), arrow::field(kSourcePartitionColumn, arrow::int32()), pa);
+    ASSERT_TRUE(added.ok());
+    auto o = run_bind("a,b", "x,y", *added);
+    expect_bind_matches_row_path(o);
+    ASSERT_EQ(o.columnar_path.elems.size(), 1u);
+    const auto& out = o.columnar_path.elems[0].as_data().arrow();
+    const int idx = out->schema()->GetFieldIndex(kSourcePartitionColumn);
+    ASSERT_GE(idx, 0) << "the partition column was dropped";
+    // The input's own buffer, not a copy.
+    EXPECT_TRUE(out->column(idx)->Equals(*pa));
+    EXPECT_EQ(out->column(idx)->data()->buffers[1].get(), pa->data()->buffers[1].get());
+    for (const auto& r : o.columnar_path.records()) {
+        EXPECT_FALSE(r.value().has_column(kSourcePartitionColumn));
+    }
+}
+
+TEST(RowBindColumnar, DeclinesASelectNameMatchingTwoValueFields) {
+    // The row decode keeps the last of two same-named fields and a first-match
+    // lookup would bind the first, so the bind declines before emitting and the
+    // runner takes the row path.
+    auto cols = bind_abc();
+    cols.push_back({"a",
+                    arrow::utf8(),
+                    {JV{std::string{"later"}},
+                     JV{nullptr},
+                     JV{std::string{"l3"}},
+                     JV{std::string{"l4"}},
+                     JV{std::string{"l5"}}}});
+    auto o = run_bind("a,c", "a,c", bind_input(bind_ts(), cols));
+    EXPECT_FALSE(o.handled);
+    EXPECT_TRUE(o.columnar_path.elems.empty()) << "declined after emitting";
+    EXPECT_EQ(o.decoded_during_columnar, 0u);
+    // A duplicate the select list does not name is irrelevant to the bind.
+    auto o2 = run_bind("b,c", "b,c", bind_input(bind_ts(), cols));
+    expect_bind_matches_row_path(o2);
+}
+
+TEST(RowBindColumnar, DeclinesASinkColumnNamedLikeAnEngineField) {
+    // The row path writes a declared __source_partition or __row_kind column as a
+    // value. The self-describing decode drops the first and the carried tag meets
+    // the second, so the bind declines before emitting and the runner takes the
+    // row path: the same job writes the same bytes with columnar on or off.
+    for (const std::string engine_field :
+         {std::string{kSourcePartitionColumn}, std::string{kRowKindField}}) {
+        SCOPED_TRACE(engine_field);
+        auto o = run_bind("a,b", engine_field + ",b", bind_input(bind_ts(), bind_abc()));
+        EXPECT_FALSE(o.handled);
+        EXPECT_TRUE(o.columnar_path.elems.empty()) << "declined after emitting";
+        EXPECT_EQ(o.decoded_during_columnar, 0u);
+        const auto want = o.row_path.records();
+        ASSERT_EQ(want.size(), 5u);
+        EXPECT_EQ(bind_cell_text(want[0].value(), engine_field), "1");
+    }
+}
+
+TEST(RowBindColumnar, BindsASlicedBatch) {
+    // A columnar frame can arrive as a slice of a larger batch, with a non-zero
+    // offset into its arrays. The bind reuses the sliced arrays, so the rows it
+    // emits are the slice's, not the parent's first rows.
+    const auto full = bind_input(bind_ts(), bind_all_types());
+    const auto sliced = full->Slice(2, 3);
+    ASSERT_EQ(sliced->column(1)->offset(), 2);
+    auto o = run_bind("i64,i32,f64,f32,b,s,d,v", "o_i64,o_i32,o_f64,o_f32,o_b,o_s,o_d,o_v", sliced);
+    expect_bind_matches_row_path(o);
+    const auto got = o.columnar_path.records();
+    ASSERT_EQ(got.size(), 3u);
+    EXPECT_EQ(got[0].event_time(), std::optional<EventTime>{EventTime::from_millis(3000)});
+    EXPECT_EQ(bind_cell_text(got[0].value(), "o_i64"), "-9007199254740993");
+    EXPECT_EQ(bind_cell_text(got[2].value(), "o_s"), "\"caf\xc3\xa9\"");
+}
+
+TEST(RowBindColumnar, OutputIsDefinedByTheSelfDescribingReader) {
+    // An input batch whose closure resolves only its own declared names, as the
+    // decoder's and the declared batcher's do. The bind's output carries the
+    // self-describing reader, not that closure, so the renamed columns survive a
+    // materialise; reusing the input's closure would drop every one of them.
+    const std::vector<std::string> declared{"a", "b", "c", std::string{kRowKindField}};
+    Batch<Row>::MaterializeFn by_declared_name =
+        [declared](const arrow::RecordBatch& b) -> std::vector<Record<Row>> {
+        auto rows = row_materialize_fn()(b);
+        for (auto& rec : rows) {
+            Row kept;
+            for (const auto& name : declared) {
+                if (auto it = rec.value().values.find(name); it != rec.value().values.end()) {
+                    kept.values[name] = it->second;
+                }
+            }
+            rec.value() = std::move(kept);
+        }
+        return rows;
+    };
+    auto o = run_bind("a,b", "x,y", bind_input(bind_ts(), bind_abc()), by_declared_name);
+    expect_bind_matches_row_path(o);
+    const auto got = o.columnar_path.records();
+    ASSERT_EQ(got.size(), 5u);
+    EXPECT_EQ(bind_cell_text(got[0].value(), "x"), "1");
+    EXPECT_EQ(bind_cell_text(got[0].value(), "y"), "\"x\"");
+}
+
+TEST(RowBindColumnar, DeclinesAColumnZeroThatIsNotInt64) {
+    auto o = run_bind("a", "a", bind_input(bind_ts(), bind_abc(), arrow::int32()));
+    EXPECT_FALSE(o.handled);
+    EXPECT_TRUE(o.columnar_path.elems.empty());
+    EXPECT_EQ(o.decoded_during_columnar, 0u);
+}
+
+TEST(RowBindColumnar, DeclinesARowBatch) {
+    auto op = build_row_bind("a", "a");
+    ASSERT_NE(op, nullptr);
+    BindCapture cap;
+    auto em = cap.emitter();
+    Batch<Row> rows;
+    Row r;
+    r.values["a"] = JV{std::int64_t{1}};
+    rows.emplace(std::move(r));
+    EXPECT_FALSE(op->process_columnar(StreamElement<Row>::data(std::move(rows)), em));
+    EXPECT_TRUE(cap.elems.empty());
+}
+
+TEST(RowBindColumnar, AnEmptyBatchBindsToNoRows) {
+    // Handled as the columnar projection handles one: nothing is emitted. The row
+    // path emits an empty batch, so the rows either path delivers are the same:
+    // none.
+    auto o = run_bind(
+        "a,c", "x,y", bind_input({}, {{"a", arrow::int64(), {}}, {"c", arrow::float64(), {}}}));
+    EXPECT_TRUE(o.handled);
+    EXPECT_TRUE(o.columnar_path.elems.empty());
+    EXPECT_EQ(o.decoded_during_columnar, 0u);
+    EXPECT_TRUE(o.row_path.records().empty());
+    EXPECT_TRUE(o.columnar_path.records().empty());
+}
+
+TEST(RowBindColumnar, RowFormProcessIsUnchanged) {
+    // A row batch takes process(): event time copied, the source partition kept on
+    // the record, the pane not carried, names bound positionally.
+    auto op = build_row_bind("a,b", "y,x");
+    ASSERT_NE(op, nullptr);
+    BindCapture cap;
+    auto em = cap.emitter();
+    Batch<Row> rows;
+    Row r;
+    r.values["a"] = JV{std::int64_t{1}};
+    r.values["b"] = JV{std::string{"s"}};
+    r.values["dropped"] = JV{true};
+    set_row_kind(r, kRowKindUpdateAfter);
+    Record<Row> rec(std::move(r), EventTime::from_millis(77));
+    rec.set_source_partition(3);
+    rows.push(std::move(rec));
+    rows.emplace(Row{});
+    op->process(StreamElement<Row>::data(std::move(rows)), em);
+    const auto got = cap.records();
+    ASSERT_EQ(got.size(), 2u);
+    EXPECT_EQ(got[0].event_time(), std::optional<EventTime>{EventTime::from_millis(77)});
+    EXPECT_EQ(got[0].source_partition(), std::optional<std::int32_t>{3});
+    EXPECT_EQ(row_json_text_format().encode(got[0].value()),
+              R"({"__row_kind":"update_after","x":"s","y":1})");
+    EXPECT_FALSE(got[1].event_time().has_value());
+    EXPECT_TRUE(got[1].value().values.empty());
+}
+
+// The nexmark q0 shape (a stateless pass-through) through the planner-emitted
+// chain: the Kafka source swapped for a file_text_source feeding the same
+// columnar JSON decode, as ColumnarKafkaDecodeFiresOnProductionPath does, then
+// project_row, row_bind_columns and the sink. The sink columns are named apart
+// from the SELECT's so the bind renames.
+namespace {
+
+std::vector<std::string> row_bind_q0_input() {
+    std::vector<std::string> lines;
+    for (int i = 0; i < 40; ++i) {
+        std::string channel =
+            (i % 3 == 0) ? R"("Google")" : (i % 3 == 1 ? R"("a \"q\" \\ b")" : "null");
+        std::string price = (i % 7 == 0) ? "null" : std::to_string(100 + i * 13);
+        lines.push_back(R"({"auction":)" + std::to_string(1000 + i) + R"(,"bidder":)" +
+                        std::to_string(i % 5) + R"(,"price":)" + price + R"(,"channel":)" +
+                        channel + R"(,"url":"https://x/)" + std::to_string(i) + R"(","datetime":)" +
+                        std::to_string(1'700'000'000'000LL + i) + "}");
+    }
+    return lines;
+}
+
+struct RowBindQ0Run {
+    std::uint64_t decoded{0};
+    std::vector<std::string> op_types;
+};
+
+RowBindQ0Run run_row_bind_q0(const std::filesystem::path& in_path,
+                             const std::string& sink_with,
+                             const std::string& worker_id) {
+    ensure_sql_installed_once();
+    RowBindQ0Run run;
+    Catalog cat;
+    auto ddl = parse(
+        "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url "
+        "VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', "
+        "brokers='localhost:9092', topic='nx-bid', group_id='g', "
+        "auto_offset_reset='earliest');"
+        "CREATE TABLE sink_q0 (a_id BIGINT, b_id BIGINT, amount BIGINT, chan VARCHAR, ts "
+        "BIGINT) WITH (" +
+        sink_with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(
+        cat, "INSERT INTO sink_q0 SELECT auction, bidder, price, channel, datetime FROM bid");
+    bool swapped = false;
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = in_path.string();
+            op.params["batch_size"] = "8";
+            swapped = true;
+        }
+        run.op_types.push_back(op.type);
+    }
+    EXPECT_TRUE(swapped) << "no kafka_source_string op to swap";
+
+    const auto before = clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        InProcessCluster cluster(worker_id, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        EXPECT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    run.decoded =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed) - before;
+    return run;
+}
+
+bool row_bind_has(const RowBindQ0Run& run, const std::string& type) {
+    return std::find(run.op_types.begin(), run.op_types.end(), type) != run.op_types.end();
+}
+
+}  // namespace
+
+TEST(SqlRuntime, RowBindKeepsQ0ColumnarIntoBlackhole) {
+    const auto in_path = std::filesystem::temp_directory_path() /
+                         ("clink_sql_rbq0_bh_" + std::to_string(getpid()) + ".ndjson");
+    write_lines(in_path, row_bind_q0_input());
+    const auto run = run_row_bind_q0(in_path, "connector='blackhole'", "worker-rbq0-bh");
+    std::filesystem::remove(in_path);
+
+    for (const char* t :
+         {"json_string_to_row_columnar", "project_row", "row_bind_columns", "blackhole_sink_row"}) {
+        EXPECT_TRUE(row_bind_has(run, t)) << "plan lost " << t;
+    }
+    // Decode, projection, bind and sink all take the sidecar: no row is built
+    // anywhere. RowBindIntoJsonFileSinkKeepsRowPathBytes runs the same chain into a
+    // row-only sink and sees the counter move, so this zero is not a pipeline that
+    // never had a sidecar.
+    EXPECT_EQ(run.decoded, 0u) << "a hop between the decode and the blackhole sink built rows";
+}
+
+TEST(SqlRuntime, RowBindIntoJsonFileSinkKeepsRowPathBytes) {
+    // Registered twice: as discovered, and again with CLINK_DISABLE_COLUMNAR=1,
+    // which the runner reads once per process. Both runs must write these bytes,
+    // which are what the row-form bind wrote before the bind learned the sidecar.
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_rbq0_file_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_rbq0_file_out_" + tag + ".ndjson");
+    std::filesystem::remove(out_path);
+    write_lines(in_path, row_bind_q0_input());
+    const auto run =
+        run_row_bind_q0(in_path,
+                        "connector='file', format='json', path='" + out_path.string() + "'",
+                        "worker-rbq0-file");
+
+    EXPECT_TRUE(row_bind_has(run, "row_bind_columns"));
+    if (const char* off = std::getenv("CLINK_DISABLE_COLUMNAR"); off != nullptr && off[0] == '1') {
+        EXPECT_FALSE(clink::detail::columnar_enabled());
+    } else {
+        // The control for RowBindKeepsQ0ColumnarIntoBlackhole: the same chain into a
+        // row-only sink builds rows, once per batch, at the sink.
+        EXPECT_GT(run.decoded, 0u) << "the decode never handed the chain a sidecar";
+    }
+
+    std::ifstream in(out_path, std::ios::binary);
+    const std::string got{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    std::string want;
+    for (int i = 0; i < 40; ++i) {
+        std::string chan =
+            (i % 3 == 0) ? R"("Google")" : (i % 3 == 1 ? R"("a \"q\" \\ b")" : "null");
+        std::string amount = (i % 7 == 0) ? "null" : std::to_string(100 + i * 13);
+        want += R"({"a_id":)" + std::to_string(1000 + i) + R"(,"amount":)" + amount +
+                R"(,"b_id":)" + std::to_string(i % 5) + R"(,"chan":)" + chan + R"(,"ts":)" +
+                std::to_string(1'700'000'000'000LL + i) + "}\n";
+    }
+    EXPECT_EQ(got, want);
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
 }
 
 }  // namespace clink::sql

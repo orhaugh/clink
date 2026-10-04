@@ -2182,9 +2182,9 @@ std::string compile_node(const LogicalPlan& node,
         if (ch == Channel::Row) {
             auto binding = row_sink_binding_for(table);
             std::string before_sink = std::move(input_id);
-            // The sink-boundary schema contract (followups item 78): what a
-            // sink writes is the TABLE's declared schema, not the row's
-            // internal one. The SELECT's output columns bind POSITIONALLY to
+            // The sink-boundary schema contract: what a sink writes is the
+            // TABLE's declared schema, not the row's internal one. The
+            // SELECT's output columns bind POSITIONALLY to
             // the declared columns - rename a binder-synthesised _colN or a
             // bound-projected window_start to the declared name, and drop
             // every field the declaration does not have (a windowed
@@ -2193,9 +2193,11 @@ std::string compile_node(const LogicalPlan& node,
             // family serialises the bound row verbatim, the file sink too,
             // and the typed batcher sinks pick fields BY NAME from the
             // declared schema, so an unrenamed _colN silently writes null
-            // there. No sink consumes an incoming Arrow sidecar (they all
-            // batch row-by-row from schema_columns), so the extra map hop
-            // costs one rebuild per record at the sink boundary only.
+            // there. The bind takes a columnar batch as it is: it renames and
+            // drops columns on the sidecar without building rows, so a sink
+            // that takes the sidecar (blackhole) sees no row at all, and a
+            // row-only sink materialises once, in the sink, as it would have
+            // without the bind. A row batch costs one rebuild per record here.
             {
                 const auto in_schema = sink.input().schema();
                 std::vector<std::string> select_names;
@@ -2649,8 +2651,12 @@ void enable_columnar_output(cluster::JobGraphSpec& spec) {
         // types that actually build WindowRowOp (which does implement
         // process_columnar) were absent, so every producer in front of a TUMBLING
         // window - the shape nexmark q12 uses - was held back to row output for
-        // nothing. Verified against install.cpp: these eight are exactly the
-        // Row-channel ops and sinks that declare the hook.
+        // nothing. Verified against install.cpp: these ten are exactly the
+        // Row-channel ops and sinks that declare the hook, apart from
+        // row_bind_columns, which is left out on purpose: it always feeds a sink,
+        // and counting it whatever that sink is would promote a producer in
+        // front of a row-only sink, which then pays an Arrow build and a
+        // materialise.
         return t == "filter_row_predicate" || t == "project_row" || t == "row_compute_key" ||
                t == "aggregate_row" || t == "tumbling_window_row" || t == "hopping_window_row" ||
                t == "cumulate_window_row" || t == "session_window_row" ||

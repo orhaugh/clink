@@ -701,6 +701,18 @@ if(CLINK_BUILD_SQL)
         DISCOVERY_MODE PRE_TEST
         PROPERTIES TIMEOUT 30 LABELS sql
     )
+    # The sink-boundary bind's file-sink bytes again with the columnar ingest
+    # off. The runner reads CLINK_DISABLE_COLUMNAR once per process, so the row
+    # path needs a process of its own; both runs must write the same bytes. The
+    # pinned googletest exits 0 when a filter selects nothing, so a renamed test
+    # or a misspelt filter would pass here having run nothing; the fail pattern
+    # turns that into a failure.
+    add_test(NAME SqlRuntime.RowBindIntoJsonFileSinkKeepsRowPathBytes.ColumnarDisabled
+             COMMAND clink_sql_tests
+                     --gtest_filter=SqlRuntime.RowBindIntoJsonFileSinkKeepsRowPathBytes)
+    set_tests_properties(SqlRuntime.RowBindIntoJsonFileSinkKeepsRowPathBytes.ColumnarDisabled
+        PROPERTIES TIMEOUT 30 LABELS sql ENVIRONMENT "CLINK_DISABLE_COLUMNAR=1"
+                   FAIL_REGULAR_EXPRESSION "0 tests from 0 test suites ran")
 
     # The native ClickHouse sink driven through the SQL frontend, against the
     # in-process fake server: a differential with the collect sink, the keys
