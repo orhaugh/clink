@@ -181,6 +181,16 @@ docker compose logs worker | grep -v registry.replace
 means nothing is being read from Kafka, and non-zero everywhere but the sink
 means ClickHouse is refusing the inserts.
 
+`run.sh` also checks that the sink that runs is the one `pipeline.sql` asks
+for: the Coordinator's guarantee line names it, and the native sink logs a
+report each time it opens. A native sink that refused to open says why, with a
+code:
+
+```bash
+docker compose logs coordinator | grep 'job delivery guarantee'
+docker compose logs worker | grep -E 'clickhouse native sink|clickhouse\.[a-z_]+'
+```
+
 One known intermittent: on a freshly created stack the Kafka source can
 assign its partition and then read nothing at all - every `records_out`
 stays 0 with no error anywhere

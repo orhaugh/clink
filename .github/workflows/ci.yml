@@ -466,7 +466,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run the tutorial end to end
-        run: examples/kafka-to-clickhouse/run.sh
+        run: |
+          set -euo pipefail
+          # The check that the sink which runs is the one pipeline.sql asks
+          # for, on synthetic log lines, so it is known to fail when it should.
+          examples/kafka-to-clickhouse/run.sh --self-test
+          examples/kafka-to-clickhouse/run.sh
 
   qualification-status:
     name: Qualification status matches the published pages
