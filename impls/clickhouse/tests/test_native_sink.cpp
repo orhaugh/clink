@@ -27,6 +27,9 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/io/memory.h>
+#include <arrow/ipc/reader.h>
+#include <arrow/ipc/writer.h>
 #include <gtest/gtest.h>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
@@ -59,6 +62,7 @@
 #include "native/sink_options.hpp"
 #include "native/writer.hpp"
 #include "test_helpers/sanitizer_slack.hpp"
+#include "thread_recording_pool.hpp"
 
 namespace clink::clickhouse::native {
 namespace {
@@ -2171,6 +2175,143 @@ TEST(NativeSinkColumnar, AColumnarCellThatCannotConvertFailsTheTaskAsOnDataDoes)
     ASSERT_EQ(lines.size(), 1U);
     EXPECT_EQ(lines.front().level, "error");
     EXPECT_FALSE(ns_has(lines.front().message, "2024")) << lines.front().message;
+}
+
+// --- Shared chunks are freed on the task thread ---------------------------------------
+
+// A sidecar of two builder-made int64 columns, id and v = id * 3, both of which
+// the intake reuses for BIGINT columns, allocated from `pool`.
+std::shared_ptr<arrow::RecordBatch> ns_int_sidecar(
+    std::int64_t from, std::int64_t to, arrow::MemoryPool* pool = arrow::default_memory_pool()) {
+    arrow::Int64Builder times(pool);
+    arrow::Int64Builder ids(pool);
+    arrow::Int64Builder values(pool);
+    for (std::int64_t id = from; id < to; ++id) {
+        EXPECT_TRUE(times.AppendNull().ok());
+        EXPECT_TRUE(ids.Append(id).ok());
+        EXPECT_TRUE(values.Append(id * 3).ok());
+    }
+    return arrow::RecordBatch::Make(
+        arrow::schema({arrow::field("event_time", arrow::int64()),
+                       arrow::field("id", arrow::int64()),
+                       arrow::field("v", arrow::int64())}),
+        to - from,
+        {times.Finish().ValueOrDie(), ids.Finish().ValueOrDie(), values.Finish().ValueOrDie()});
+}
+
+// The writer is held at the fault point with every reused chunk while the task
+// thread, after the sink has taken the batch, reads the batch's columns once
+// more, as a sibling consumer of the same element does, and drops it. The
+// writer's reference is then the last. The sidecar's arrays come from a pool
+// that records which thread frees them, so on every build, with or without a
+// sanitizer, a writer that freed a reused array itself turns this red: every
+// free must run on the task thread, and none of a held chunk's before the
+// writer lets go of it.
+TEST(NativeSinkRelease, AChunkHeldOnTheWriterPastTheInputsDropIsFreedOnTheTaskThread) {
+#if !defined(CLINK_FAULT_INJECTION)
+    GTEST_SKIP() << "needs the fault points compiled in";
+#else
+    // Declared first, so it outlives every array it allocated.
+    fake::ThreadRecordingPool pool;
+    fake::FakeTable table = ns_table();
+    table.columns = {{"id", "Int64", DefaultKind::None, 1}, {"v", "Int64", DefaultKind::None, 2}};
+    NsDirect direct(table);
+    direct.params["sql_column_types"] = "id:BIGINT;v:BIGINT";
+    NativeSink& sink = direct.open();
+    const clink::fault::ScopedFault held(clink::fault::Rule{
+        .point = points::kBeforeSharedChunkRelease,
+        .ordinal = 0,
+        .action = clink::fault::Action::Block,
+    });
+    constexpr std::int64_t kBatches = 12;
+    constexpr std::int64_t kRows = 50;
+    std::int64_t sum = 0;
+    for (std::int64_t b = 0; b < kBatches; ++b) {
+        auto sidecar = ns_int_sidecar(b * kRows, (b + 1) * kRows, &pool);
+        {
+            const Batch<sql::Row> batch{
+                sidecar, static_cast<std::size_t>(kRows), sql::row_materialize_fn()};
+            ASSERT_TRUE(sink.on_data_columnar(batch));
+        }
+        // The writer is parked at the point with the chunk, so the drop below
+        // comes first.
+        ASSERT_TRUE(ns_eventually([b] {
+            return clink::fault::Registry::instance().hits(points::kBeforeSharedChunkRelease) ==
+                   static_cast<std::uint64_t>(b + 1);
+        }));
+        for (int c = 1; c <= 2; ++c) {
+            const auto& column = static_cast<const arrow::Int64Array&>(*sidecar->column(c));
+            for (std::int64_t i = 0; i < column.length(); ++i) {
+                sum += column.Value(i);
+            }
+        }
+        sidecar.reset();
+        // The chunk still holds the two reused columns.
+        EXPECT_GE(pool.bytes_allocated(), 2 * kRows * 8);
+        EXPECT_EQ(pool.frees_elsewhere(), 0U);
+        clink::fault::Registry::instance().release(points::kBeforeSharedChunkRelease);
+    }
+    sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    sink.flush();
+    sink.close();
+    const std::int64_t n = kBatches * kRows;
+    EXPECT_EQ(sum, 4 * (n * (n - 1) / 2));
+    EXPECT_EQ(clink::fault::Registry::instance().hits(points::kBeforeSharedChunkRelease),
+              static_cast<std::uint64_t>(kBatches));
+    EXPECT_EQ(pool.bytes_allocated(), 0);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U) << "a reused array was freed off the task thread";
+    EXPECT_GT(pool.frees_on_owner(), 0U);
+    EXPECT_TRUE(ns_each_landed(*direct.server, 0, n));
+    EXPECT_EQ(direct.server->rows(kNsTable), static_cast<std::size_t>(n));
+#endif
+}
+
+// A chunk built without reuse never reaches the release path, and every chunk
+// that does is let go of exactly once: a row batch, a declined columnar batch
+// and an IPC-decoded one are not held, a builder-made one is.
+TEST(NativeSinkRelease, OnlyAChunkThatReusesTheInputsArraysIsHandedToTheTaskThread) {
+#if !defined(CLINK_FAULT_INJECTION)
+    GTEST_SKIP() << "needs the fault points compiled in";
+#else
+    fake::FakeTable table = ns_table();
+    table.columns = {{"id", "Int64", DefaultKind::None, 1}, {"v", "Int64", DefaultKind::None, 2}};
+    table.columns[1].type = "Nullable(Int64)";
+    NsDirect direct(table);
+    direct.params["sql_column_types"] = "id:BIGINT;v:BIGINT";
+    NativeSink& sink = direct.open();
+    const clink::fault::ScopedFault observed(clink::fault::Rule{
+        .point = points::kBeforeSharedChunkRelease,
+        .ordinal = 0,
+        .action = clink::fault::Action::Observe,
+    });
+    const auto hits = [] {
+        return clink::fault::Registry::instance().hits(points::kBeforeSharedChunkRelease);
+    };
+    // Rows: built cell by cell.
+    sink.on_data(ns_rows(0, 10));
+    // Builder-made: reused.
+    const auto built = ns_int_sidecar(10, 20);
+    ASSERT_TRUE(sink.on_data_columnar(
+        Batch<sql::Row>{built, static_cast<std::size_t>(10), sql::row_materialize_fn()}));
+    // The same rows read back from an IPC frame: cell by cell.
+    auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    auto writer = arrow::ipc::MakeStreamWriter(out, built->schema()).ValueOrDie();
+    ASSERT_TRUE(writer->WriteRecordBatch(*ns_int_sidecar(20, 30)).ok());
+    ASSERT_TRUE(writer->Close().ok());
+    auto reader = arrow::ipc::RecordBatchStreamReader::Open(
+                      std::make_shared<arrow::io::BufferReader>(out->Finish().ValueOrDie()))
+                      .ValueOrDie();
+    std::shared_ptr<arrow::RecordBatch> decoded;
+    ASSERT_TRUE(reader->ReadNext(&decoded).ok());
+    ASSERT_TRUE(sink.on_data_columnar(
+        Batch<sql::Row>{decoded, static_cast<std::size_t>(10), sql::row_materialize_fn()}));
+    sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    EXPECT_EQ(hits(), 1U);
+    sink.flush();
+    sink.close();
+    EXPECT_EQ(hits(), 1U);
+    EXPECT_TRUE(ns_each_landed(*direct.server, 0, 30));
+#endif
 }
 
 // --- The at-least-once contract across a crash ---------------------------------------

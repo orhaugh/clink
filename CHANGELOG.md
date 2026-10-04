@@ -39,7 +39,12 @@ type the Row sidecar does not, or which carries a declared column's name twice,
 takes the row path as before. New metrics
 `clink_clickhouse_input_batches_total{carrier}` and
 `clink_clickhouse_columnar_declined_total{reason}`; the close summary reports
-`columnar_batches` and `row_batches`. `CLINK_DISABLE_COLUMNAR=1` restores the
+`columnar_batches` and `row_batches`. Integer, float,
+boolean, timestamp and date columns are taken without copying when the batch's
+own builders made them; a column read from an Arrow IPC frame or imported
+through the C Data Interface is still converted, and a chunk that shares a
+column with its input stays charged to the memory budget until the task
+thread frees it. `CLINK_DISABLE_COLUMNAR=1` restores the
 row path.
 
 **The column binding in front of every SQL sink no longer turns a columnar

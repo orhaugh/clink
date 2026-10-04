@@ -27,6 +27,7 @@
 #include <clickhouse/block.h>
 #include <gtest/gtest.h>
 
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/log_buffer.hpp"
@@ -37,6 +38,7 @@
 #include "native/arrow_to_block.hpp"
 #include "native/column_plan.hpp"
 #include "native/errors.hpp"
+#include "native/fault_points.hpp"
 #include "native/insert_transport.hpp"
 #include "native/metrics.hpp"
 #include "native/sql_text.hpp"
@@ -45,6 +47,7 @@
 #include "native/types.hpp"
 #include "native/writer.hpp"
 #include "test_helpers/sanitizer_slack.hpp"
+#include "thread_recording_pool.hpp"
 
 namespace clink::clickhouse::native {
 namespace {
@@ -109,9 +112,10 @@ std::shared_ptr<arrow::RecordBatch> wr_batch(const std::vector<std::optional<std
         schema, static_cast<std::int64_t>(ids.size()), {id_array, text_array});
 }
 
-// Rows [from, to) of a chunk laid out as "id:BIGINT".
-std::shared_ptr<arrow::RecordBatch> wr_id_rows(std::int64_t from, std::int64_t to) {
-    arrow::Int64Builder builder;
+// Rows [from, to) of a chunk laid out as "id:BIGINT", allocated from `pool`.
+std::shared_ptr<arrow::RecordBatch> wr_id_rows(
+    std::int64_t from, std::int64_t to, arrow::MemoryPool* pool = arrow::default_memory_pool()) {
+    arrow::Int64Builder builder(pool);
     for (std::int64_t id = from; id < to; ++id) {
         wr_ok(builder.Append(id));
     }
@@ -322,6 +326,17 @@ struct WrRig {
 
     Chunk chunk(std::int64_t from, std::int64_t to, std::size_t length) const {
         return wrap(wr_rows(from, to, length));
+    }
+
+    // A chunk whose batch reuses arrays of the task thread's input.
+    Chunk shared(std::shared_ptr<arrow::RecordBatch> batch) const {
+        Chunk c = wrap(std::move(batch));
+        c.shares_input = true;
+        return c;
+    }
+
+    [[nodiscard]] std::size_t queue_charge() const {
+        return budget->usage().categories[static_cast<std::size_t>(MemoryCategory::Queue)];
     }
 
     Chunk wrap(std::shared_ptr<arrow::RecordBatch> batch) const {
@@ -2496,6 +2511,141 @@ TEST(NativePartRate, LargeOrInfrequentInsertsNeverWarn) {
     for (int s = 2; s <= 600; s += 2) {
         EXPECT_FALSE(slow.on_insert(t0 + std::chrono::seconds{s}, 100)) << s;
     }
+}
+
+// --- Shared chunks ---------------------------------------------------------------
+
+// The arrays of a shares_input chunk come from a pool that records which
+// thread frees them, so each case below goes red on any build, with or without
+// a sanitizer, when the writer, or a thread other than the task thread, frees
+// one.
+
+fake::FakeTable wr_id_table() {
+    fake::FakeTable table = wr_table();
+    table.columns = {{"id", "Int64", DefaultKind::None, 1}};
+    return table;
+}
+
+// The writer hands a shared chunk's batch and its reservation to the release
+// list together, so the chunk stays charged, after the writer has converted
+// and acknowledged it, until drain_released() frees the batch on the calling
+// thread and then returns the charge.
+TEST(NativeWriterRelease, ASharedChunkStaysChargedUntilTheTaskThreadFreesIt) {
+    fake::ThreadRecordingPool pool;
+    WrRig rig(wr_id_table(), "id:BIGINT");
+    ASSERT_FALSE(rig.plan.retains_chunks);
+    rig.start();
+    Chunk c = rig.shared(wr_id_rows(0, 1000, &pool));
+    const std::size_t bytes = c.bytes;
+    rig.writer->submit(std::move(c));
+    rig.writer->flush(1);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 1000));
+    // Converted and acknowledged, so the writer has let go of it, but neither
+    // the batch nor its charge has gone.
+    EXPECT_EQ(rig.queue_charge(), bytes);
+    EXPECT_GE(pool.bytes_allocated(), 1000 * 8);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U);
+    rig.writer->drain_released();
+    EXPECT_EQ(rig.queue_charge(), 0U);
+    EXPECT_EQ(pool.bytes_allocated(), 0);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U);
+    EXPECT_GT(pool.frees_on_owner(), 0U);
+    rig.writer->finish();
+}
+
+// The writer fails with shared chunks still queued: run() drops them, and
+// hands them to the release list rather than freeing them on the writer.
+TEST(NativeWriterRelease, AWriterThatFailsLeavesItsQueuedSharedChunksToTheTaskThread) {
+#if !defined(CLINK_FAULT_INJECTION)
+    GTEST_SKIP() << "needs the fault points compiled in";
+#else
+    fake::ThreadRecordingPool pool;
+    WrRig rig(wr_id_table(), "id:BIGINT");
+    // Each chunk is one whole INSERT, and the second INSERT's header names a
+    // type the client cannot build, which fails the writer at once.
+    rig.options.batch_rows = 100;
+    fake::Fault unbuildable = wr_fault(fake::Step::Begin, fake::Fault::Kind::Unimplemented);
+    unbuildable.nth = 2;
+    rig.server->inject(std::move(unbuildable));
+    // Holds the writer in its release of the first chunk while the rest queue.
+    const clink::fault::ScopedFault held(clink::fault::Rule{
+        .point = points::kBeforeSharedChunkRelease,
+        .ordinal = 1,
+        .action = clink::fault::Action::Block,
+    });
+    rig.start();
+    std::size_t bytes = 0;
+    for (std::int64_t i = 0; i < 4; ++i) {
+        Chunk c = rig.shared(wr_id_rows(i * 100, (i + 1) * 100, &pool));
+        bytes += c.bytes;
+        rig.writer->submit(std::move(c));
+        if (i == 0) {
+            ASSERT_TRUE(wr_eventually([] {
+                return clink::fault::Registry::instance().hits(points::kBeforeSharedChunkRelease) ==
+                       1;
+            }));
+        }
+    }
+    ASSERT_GT(rig.writer->queue_bytes(), 0U);
+    clink::fault::Registry::instance().release(points::kBeforeSharedChunkRelease);
+    // The writer takes the second chunk, fails at its Begin and, on its way
+    // out, drops the two still queued. Once that is done, abort() here finds
+    // nothing left to drop and only joins the thread.
+    ASSERT_TRUE(wr_eventually([&] { return rig.writer->stats().abandoned_rows == 300; }));
+    rig.writer->abort();
+    EXPECT_EQ(pool.frees_elsewhere(), 0U) << "the writer freed a shared chunk";
+    EXPECT_EQ(rig.queue_charge(), bytes);
+    rig.writer->drain_released();
+    EXPECT_EQ(rig.queue_charge(), 0U);
+    EXPECT_EQ(pool.bytes_allocated(), 0);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U);
+    const auto error = wr_error([&] { rig.writer->flush(1); });
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->code(), code::kHeaderDrift);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 100));
+#endif
+}
+
+// abort() may run on a thread other than the task thread. The shared chunks
+// it takes off the queue then wait for the task thread too.
+TEST(NativeWriterRelease, AnAbortOnAnotherThreadLeavesTheQueuedSharedChunksToTheTaskThread) {
+#if !defined(CLINK_FAULT_INJECTION)
+    GTEST_SKIP() << "needs the fault points compiled in";
+#else
+    fake::ThreadRecordingPool pool;
+    WrRig rig(wr_id_table(), "id:BIGINT");
+    const clink::fault::ScopedFault held(clink::fault::Rule{
+        .point = points::kBeforeSharedChunkRelease,
+        .ordinal = 1,
+        .action = clink::fault::Action::Block,
+    });
+    rig.start();
+    std::size_t bytes = 0;
+    for (std::int64_t i = 0; i < 3; ++i) {
+        Chunk c = rig.shared(wr_id_rows(i * 100, (i + 1) * 100, &pool));
+        bytes += c.bytes;
+        rig.writer->submit(std::move(c));
+        if (i == 0) {
+            ASSERT_TRUE(wr_eventually([] {
+                return clink::fault::Registry::instance().hits(points::kBeforeSharedChunkRelease) ==
+                       1;
+            }));
+        }
+    }
+    ASSERT_GT(rig.writer->queue_bytes(), 0U);
+    // The abort takes the two queued chunks while the writer is still parked,
+    // so they are its to drop, and then waits for the writer to stop.
+    std::thread aborter([&rig] { rig.writer->abort(); });
+    ASSERT_TRUE(wr_eventually([&] { return rig.writer->queue_bytes() == 0; }));
+    clink::fault::Registry::instance().release(points::kBeforeSharedChunkRelease);
+    aborter.join();
+    EXPECT_EQ(pool.frees_elsewhere(), 0U) << "a shared chunk was freed off the task thread";
+    EXPECT_EQ(rig.queue_charge(), bytes);
+    rig.writer->drain_released();
+    EXPECT_EQ(rig.queue_charge(), 0U);
+    EXPECT_EQ(pool.bytes_allocated(), 0);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U);
+#endif
 }
 
 }  // namespace

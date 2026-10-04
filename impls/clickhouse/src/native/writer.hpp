@@ -46,6 +46,13 @@ struct Chunk {
     std::size_t bytes{0};  // chunk_bytes(*batch)
     MemoryReservation reservation;
     Carrier carrier{Carrier::Row};
+    // The batch reuses arrays of the task thread's input (build_columnar's
+    // reused count above 0). The writer never drops such a batch itself: it
+    // moves it to a release list that the task thread empties with
+    // Writer::drain_released(), so the last free of memory the task thread
+    // wrote runs there. Its reservation goes with it and is released there
+    // too, after the batch, so the charge covers the batch until it is freed.
+    bool shares_input{false};
 };
 
 struct WriterConfig {
@@ -140,6 +147,12 @@ public:
 
     [[nodiscard]] WriterStats stats() const;
     [[nodiscard]] std::size_t queue_bytes() const noexcept;
+    // Task thread: drops the batches of the shares_input chunks the writer
+    // has let go of since the last call, here rather than on the writer, and
+    // then releases their reservations. submit() also calls it while it waits
+    // for room. A writer detached by abort() keeps those it lets go of
+    // afterwards. Never throws.
+    void drain_released() noexcept;
 
     struct Core;  // shared with the thread, so a detach is safe
 

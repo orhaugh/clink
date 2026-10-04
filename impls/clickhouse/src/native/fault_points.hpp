@@ -11,5 +11,9 @@ inline constexpr char kAfterFirstBlock[] = "clickhouse.after_first_block";
 inline constexpr char kAfterEndInsert[] = "clickhouse.after_end_insert";
 // Inside a retry, before the backoff wait.
 inline constexpr char kBeforeRetryWait[] = "clickhouse.before_retry_wait";
+// The writer is letting go of a chunk that shares arrays with the task
+// thread's input, before it hands the batch to the release list. A delay
+// here holds the chunk past the task thread's drop of its own input.
+inline constexpr char kBeforeSharedChunkRelease[] = "clickhouse.before_shared_chunk_release";
 
 }  // namespace clink::clickhouse::native::points

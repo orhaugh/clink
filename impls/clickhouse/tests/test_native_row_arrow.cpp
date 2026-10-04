@@ -15,7 +15,13 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/c/abi.h>
+#include <arrow/c/bridge.h>
+#include <arrow/io/memory.h>
+#include <arrow/ipc/reader.h>
+#include <arrow/ipc/writer.h>
 #include <arrow/json/from_string.h>
+#include <arrow/util/byte_size.h>
 #include <gtest/gtest.h>
 
 #include "clink/config/decimal.hpp"
@@ -24,6 +30,7 @@
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
+#include "native/arrow_to_block.hpp"
 #include "native/errors.hpp"
 #include "native/intake.hpp"
 #include "native/row_arrow.hpp"
@@ -1382,6 +1389,348 @@ TEST(NativeIntake, AnEmptySidecarGivesAnEmptyChunkWithTheSchema) {
     ASSERT_NE(chunk, nullptr);
     EXPECT_EQ(chunk->num_rows(), 0);
     EXPECT_TRUE(chunk->schema()->Equals(*builder.schema()));
+}
+
+// --- Reuse ----------------------------------------------------------------------
+
+// The intake on `sidecar` as compiled, against the same plan with every fast
+// path off, which is the cell-by-cell path: the same chunk, or the same
+// ConversionError. Returns the reused-column count of the compiled build.
+std::size_t ra_expect_reuse_matches(const std::string& spec,
+                                    const std::shared_ptr<arrow::RecordBatch>& sidecar) {
+    const auto columns = ra_columns(spec);
+    const RowArrowBuilder builder(columns);
+    const auto compiled = compile_intake(*sidecar->schema(), columns);
+    if (!std::holds_alternative<IntakePlan>(compiled)) {
+        ADD_FAILURE() << to_string(std::get<IntakeDecline>(compiled));
+        return 0;
+    }
+    const IntakePlan& plan = std::get<IntakePlan>(compiled);
+    IntakePlan cell_by_cell = plan;
+    cell_by_cell.reuse.clear();
+    std::size_t reused = 0;
+    std::size_t none = 1;
+    const RaOutcome fast =
+        ra_outcome([&] { return builder.build_columnar(*sidecar, plan, &reused); });
+    const RaOutcome slow =
+        ra_outcome([&] { return builder.build_columnar(*sidecar, cell_by_cell, &none); });
+    EXPECT_EQ(fast.error, slow.error);
+    if (fast.chunk && slow.chunk) {
+        EXPECT_EQ(none, 0U);
+        const auto status = fast.chunk->ValidateFull();
+        EXPECT_TRUE(status.ok()) << status.ToString();
+        EXPECT_TRUE(fast.chunk->schema()->Equals(*builder.schema()));
+        EXPECT_TRUE(fast.chunk->Equals(*slow.chunk, arrow::EqualOptions().nans_equal(true)))
+            << fast.chunk->ToString() << "\nvs\n"
+            << slow.chunk->ToString();
+    }
+    return reused;
+}
+
+// One random array of `type` built by an Arrow builder, as the decoder and
+// the born-columnar producers build theirs: edge values, ordinary ones and
+// nulls, or no nulls at all, so no validity bitmap.
+std::shared_ptr<arrow::Array> ra_random_fixed(const std::shared_ptr<arrow::DataType>& type,
+                                              std::mt19937_64& rng,
+                                              int length,
+                                              bool nulls) {
+    std::unique_ptr<arrow::ArrayBuilder> b = arrow::MakeBuilder(type).ValueOrDie();
+    const auto pick = [&rng](std::uint64_t n) { return rng() % n; };
+    for (int i = 0; i < length; ++i) {
+        if (nulls && pick(5) == 0) {
+            EXPECT_TRUE(b->AppendNull().ok());
+            continue;
+        }
+        const bool edge = pick(3) == 0;
+        switch (type->id()) {
+            case arrow::Type::INT64: {
+                using L = std::numeric_limits<std::int64_t>;
+                const std::int64_t edges[] = {L::min(), L::max(), 0, -1, 1, -2208988800000};
+                EXPECT_TRUE(static_cast<arrow::Int64Builder&>(*b)
+                                .Append(edge ? edges[pick(6)] : static_cast<std::int64_t>(rng()))
+                                .ok());
+                break;
+            }
+            case arrow::Type::INT32: {
+                using L = std::numeric_limits<std::int32_t>;
+                const std::int32_t edges[] = {L::min(), L::max(), 0, -1, 19723, -719162};
+                EXPECT_TRUE(static_cast<arrow::Int32Builder&>(*b)
+                                .Append(edge ? edges[pick(6)] : static_cast<std::int32_t>(rng()))
+                                .ok());
+                break;
+            }
+            case arrow::Type::FLOAT: {
+                using L = std::numeric_limits<float>;
+                const float edges[] = {L::quiet_NaN(),
+                                       -0.0F,
+                                       L::infinity(),
+                                       -L::infinity(),
+                                       L::max(),
+                                       L::denorm_min()};
+                EXPECT_TRUE(static_cast<arrow::FloatBuilder&>(*b)
+                                .Append(edge ? edges[pick(6)]
+                                             : static_cast<float>(
+                                                   static_cast<std::int64_t>(pick(2000)) - 1000) /
+                                                   7.0F)
+                                .ok());
+                break;
+            }
+            case arrow::Type::DOUBLE: {
+                using L = std::numeric_limits<double>;
+                const double edges[] = {
+                    L::quiet_NaN(), -0.0, L::infinity(), -L::infinity(), L::max(), L::denorm_min()};
+                EXPECT_TRUE(
+                    static_cast<arrow::DoubleBuilder&>(*b)
+                        .Append(edge ? edges[pick(6)]
+                                     : static_cast<double>(static_cast<std::int64_t>(rng() >> 11)) /
+                                           3.0)
+                        .ok());
+                break;
+            }
+            default:
+                EXPECT_TRUE(static_cast<arrow::BooleanBuilder&>(*b).Append(pick(2) == 0).ok());
+                break;
+        }
+    }
+    return b->Finish().ValueOrDie();
+}
+
+// Every fast path against the cell-by-cell path and the row path on the same
+// input: random arrays with edge values, with and without nulls, as given
+// and sliced at several offsets. Each is reused.
+TEST(NativeIntakeReuse, EveryFastPathEqualsTheCellPath) {
+    struct Pair {
+        std::shared_ptr<arrow::DataType> type;
+        std::string declared;
+    };
+    const std::vector<Pair> pairs = {{arrow::int64(), "BIGINT"},
+                                     {arrow::int32(), "INTEGER"},
+                                     {arrow::float32(), "REAL"},
+                                     {arrow::float64(), "DOUBLE"},
+                                     {arrow::boolean(), "BOOLEAN"},
+                                     {arrow::int64(), "TIMESTAMP(3)"},
+                                     {arrow::int64(), "TIMESTAMP(9)"},
+                                     {arrow::int64(), "TIMESTAMP(6) WITH TIME ZONE"},
+                                     {arrow::int32(), "DATE"}};
+    std::mt19937_64 rng(20261005);
+    for (const auto& pair : pairs) {
+        for (int round = 0; round < 12; ++round) {
+            const bool nulls = round % 3 != 0;
+            const auto array = ra_random_fixed(pair.type, rng, 70, nulls);
+            const auto full = ra_sidecar({{"c", array}});
+            for (const auto& [offset, length] : std::vector<std::pair<std::int64_t, std::int64_t>>{
+                     {0, 70}, {1, 69}, {3, 40}, {9, 61}, {65, 5}, {70, 0}}) {
+                SCOPED_TRACE(pair.declared + " from " + pair.type->ToString() + ", round " +
+                             std::to_string(round) + ", slice " + std::to_string(offset) + "+" +
+                             std::to_string(length));
+                const auto sidecar = full->Slice(offset, length);
+                EXPECT_EQ(ra_expect_reuse_matches("c:" + pair.declared, sidecar), 1U);
+            }
+            ra_expect_intake_matches("c:" + pair.declared, full);
+        }
+    }
+}
+
+// Only the table's pairs are fast paths: an int64 into INTEGER narrows, an
+// int32 into BIGINT or a float into DOUBLE widens, and utf8 carriage of a
+// TIMESTAMP or a DATE parses, so each goes cell by cell. The reused columns
+// take the sidecar's own value buffers.
+TEST(NativeIntakeReuse, BuilderMadeColumnsOfTheTablesPairsAreReusedAndShareTheirBuffers) {
+    const auto int64s = ra_json(arrow::int64(), "[1, null, -3]");
+    const auto int32s = ra_json(arrow::int32(), "[4, 5, null]");
+    const auto floats = ra_json(arrow::float32(), "[1.5, null, -0.0]");
+    const auto doubles = ra_json(arrow::float64(), "[2.5, 3.5, null]");
+    const auto bools = ra_json(arrow::boolean(), "[true, null, false]");
+    const auto texts = ra_json(arrow::utf8(), R"(["19723", null, "0"])");
+    const auto sidecar = ra_sidecar({{"b", int64s},
+                                     {"i", int32s},
+                                     {"r", floats},
+                                     {"d", doubles},
+                                     {"o", bools},
+                                     {"t", int64s},
+                                     {"tz", int64s},
+                                     {"day", int32s},
+                                     {"narrow", int64s},
+                                     {"wide", int32s},
+                                     {"fd", floats},
+                                     {"st", texts},
+                                     {"sd", texts},
+                                     {"v", texts}});
+    const std::string spec =
+        "b:BIGINT;i:INTEGER;r:REAL;d:DOUBLE;o:BOOLEAN;t:TIMESTAMP(3);"
+        "tz:TIMESTAMP(3) WITH TIME ZONE;day:DATE;narrow:INTEGER;wide:BIGINT;fd:DOUBLE;"
+        "st:TIMESTAMP(3);sd:DATE;v:VARCHAR";
+    EXPECT_EQ(ra_expect_reuse_matches(spec, sidecar), 8U);
+    ra_expect_intake_matches(spec, sidecar);
+
+    const auto columns = ra_columns(spec);
+    const RowArrowBuilder builder(columns);
+    const auto compiled = compile_intake(*sidecar->schema(), columns);
+    ASSERT_TRUE(std::holds_alternative<IntakePlan>(compiled));
+    const auto& plan = std::get<IntakePlan>(compiled);
+    EXPECT_EQ(plan.reuse,
+              (std::vector<IntakeReuse>{IntakeReuse::Same,
+                                        IntakeReuse::Same,
+                                        IntakeReuse::Same,
+                                        IntakeReuse::Same,
+                                        IntakeReuse::Same,
+                                        IntakeReuse::Retype,
+                                        IntakeReuse::Retype,
+                                        IntakeReuse::Retype,
+                                        IntakeReuse::None,
+                                        IntakeReuse::None,
+                                        IntakeReuse::None,
+                                        IntakeReuse::None,
+                                        IntakeReuse::None,
+                                        IntakeReuse::None}));
+    const auto chunk = builder.build_columnar(*sidecar, plan);
+    for (int k = 0; k < chunk->num_columns(); ++k) {
+        const auto& from = *sidecar->column_data(plan.source[static_cast<std::size_t>(k)]);
+        const auto& to = *chunk->column_data(k);
+        const bool shared = to.buffers[1] == from.buffers[1];
+        EXPECT_EQ(shared, k < 8) << chunk->schema()->field(k)->name();
+    }
+    EXPECT_TRUE(chunk->column(5)->type()->Equals(arrow::timestamp(arrow::TimeUnit::MILLI)));
+    EXPECT_TRUE(chunk->column(6)->type()->Equals(arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")));
+    EXPECT_TRUE(chunk->column(7)->type()->Equals(arrow::date32()));
+    // The retyped column's own ArrayData is new; the sidecar's keeps its type.
+    EXPECT_TRUE(sidecar->column(6)->type()->Equals(arrow::int64()));
+}
+
+// An array that does not own its buffers goes cell by cell: a buffer with a
+// parent pins memory the chunk's charge does not count, and an immutable one
+// may be an import's. Two real sources of such arrays: an Arrow IPC frame
+// read back, whose buffers are slices of the frame's body, and a batch
+// imported through the C Data Interface, as the Iceberg source builds its
+// batches. Both land the same chunk as the builder-made batch they carry.
+std::shared_ptr<arrow::RecordBatch> ra_ipc_round_trip(const arrow::RecordBatch& batch) {
+    auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    auto writer = arrow::ipc::MakeStreamWriter(sink, batch.schema()).ValueOrDie();
+    EXPECT_TRUE(writer->WriteRecordBatch(batch).ok());
+    EXPECT_TRUE(writer->Close().ok());
+    const auto frame = sink->Finish().ValueOrDie();
+    auto reader =
+        arrow::ipc::RecordBatchStreamReader::Open(std::make_shared<arrow::io::BufferReader>(frame))
+            .ValueOrDie();
+    std::shared_ptr<arrow::RecordBatch> out;
+    EXPECT_TRUE(reader->ReadNext(&out).ok());
+    return out;
+}
+
+std::shared_ptr<arrow::RecordBatch> ra_c_data_round_trip(const arrow::RecordBatch& batch) {
+    struct ArrowArray c_array{};
+    struct ArrowSchema c_schema{};
+    EXPECT_TRUE(arrow::ExportRecordBatch(batch, &c_array, &c_schema).ok());
+    return arrow::ImportRecordBatch(&c_array, &c_schema).ValueOrDie();
+}
+
+TEST(NativeIntakeReuse, IpcDecodedAndCDataImportedColumnsTakeTheCellPath) {
+    const auto int64s = ra_json(arrow::int64(), "[1, null, -3, 9223372036854775807]");
+    const auto int32s = ra_json(arrow::int32(), "[4, 5, null, -2147483648]");
+    const auto floats = ra_json(arrow::float32(), "[1.5, null, -0.0, 7]");
+    const auto doubles = ra_json(arrow::float64(), "[2.5, 3.5, null, -1e300]");
+    const auto bools = ra_json(arrow::boolean(), "[true, null, false, true]");
+    const auto built = ra_sidecar({{"b", int64s},
+                                   {"i", int32s},
+                                   {"r", floats},
+                                   {"d", doubles},
+                                   {"o", bools},
+                                   {"t", int64s},
+                                   {"day", int32s}});
+    const std::string spec = "b:BIGINT;i:INTEGER;r:REAL;d:DOUBLE;o:BOOLEAN;t:TIMESTAMP(3);day:DATE";
+    ASSERT_EQ(ra_expect_reuse_matches(spec, built), 7U);
+
+    const auto columns = ra_columns(spec);
+    const RowArrowBuilder builder(columns);
+    const auto reference = builder.build_columnar(
+        *built, std::get<IntakePlan>(compile_intake(*built->schema(), columns)));
+
+    const auto ipc = ra_ipc_round_trip(*built);
+    const auto imported = ra_c_data_round_trip(*built);
+    // The premises: an IPC column has a buffer with a parent, and an imported
+    // one has no parent but is immutable.
+    for (int k = 1; k < built->num_columns(); ++k) {
+        bool parented = false;
+        for (const auto& buffer : ipc->column_data(k)->buffers) {
+            parented = parented || (buffer && buffer->parent() != nullptr);
+        }
+        EXPECT_TRUE(parented) << "IPC column " << k;
+        for (const auto& buffer : imported->column_data(k)->buffers) {
+            if (buffer) {
+                EXPECT_EQ(buffer->parent(), nullptr) << "imported column " << k;
+                EXPECT_FALSE(buffer->is_mutable()) << "imported column " << k;
+            }
+        }
+        EXPECT_FALSE(owns_its_buffers(*ipc->column_data(k)));
+        EXPECT_FALSE(owns_its_buffers(*imported->column_data(k)));
+        EXPECT_TRUE(owns_its_buffers(*built->column_data(k)));
+    }
+    for (const auto& [name, sidecar] :
+         std::vector<std::pair<std::string, std::shared_ptr<arrow::RecordBatch>>>{
+             {"IPC", ipc}, {"C Data", imported}, {"C Data, sliced", imported->Slice(1)}}) {
+        SCOPED_TRACE(name);
+        EXPECT_EQ(ra_expect_reuse_matches(spec, sidecar), 0U);
+        ra_expect_intake_matches(spec, sidecar);
+    }
+    std::size_t reused = 1;
+    const auto from_ipc = builder.build_columnar(
+        *ipc, std::get<IntakePlan>(compile_intake(*ipc->schema(), columns)), &reused);
+    EXPECT_EQ(reused, 0U);
+    EXPECT_TRUE(from_ipc->Equals(*reference, arrow::EqualOptions().nans_equal(true)));
+    reused = 1;
+    const auto from_import = builder.build_columnar(
+        *imported, std::get<IntakePlan>(compile_intake(*imported->schema(), columns)), &reused);
+    EXPECT_EQ(reused, 0U);
+    EXPECT_TRUE(from_import->Equals(*reference, arrow::EqualOptions().nans_equal(true)));
+}
+
+// An imported batch's every buffer keeps the whole exported batch alive, wide
+// columns the sink does not read included. Its chunk is the intake's own copy,
+// so once the import is dropped the exported memory is gone and the chunk
+// keeps alive only buffers chunk_bytes counts.
+TEST(NativeIntakeReuse, AnImportedBatchsChunkKeepsNothingOfTheExportAlive) {
+    arrow::ProxyMemoryPool exported(arrow::default_memory_pool());
+    arrow::Int64Builder times(&exported);
+    arrow::Int64Builder ids(&exported);
+    arrow::Int64Builder stamps(&exported);
+    arrow::StringBuilder wide(&exported);
+    constexpr int kRows = 64;
+    const std::string filler(16 * 1024, 'w');
+    for (int i = 0; i < kRows; ++i) {
+        ASSERT_TRUE(times.AppendNull().ok());
+        ASSERT_TRUE(ids.Append(i).ok());
+        ASSERT_TRUE(stamps.Append(1700000000000 + i).ok());
+        ASSERT_TRUE(wide.Append(filler).ok());
+    }
+    auto source =
+        arrow::RecordBatch::Make(arrow::schema({arrow::field("event_time", arrow::int64()),
+                                                arrow::field("id", arrow::int64()),
+                                                arrow::field("ts", arrow::int64()),
+                                                arrow::field("wide", arrow::utf8())}),
+                                 kRows,
+                                 {times.Finish().ValueOrDie(),
+                                  ids.Finish().ValueOrDie(),
+                                  stamps.Finish().ValueOrDie(),
+                                  wide.Finish().ValueOrDie()});
+    auto imported = ra_c_data_round_trip(*source);
+    source.reset();
+    const std::int64_t exported_bytes = exported.bytes_allocated();
+    ASSERT_GT(exported_bytes, kRows * static_cast<std::int64_t>(filler.size()));
+
+    const auto columns = ra_columns("id:BIGINT;ts:TIMESTAMP(3)");
+    const RowArrowBuilder builder(columns);
+    std::size_t reused = 1;
+    const auto chunk = builder.build_columnar(
+        *imported, std::get<IntakePlan>(compile_intake(*imported->schema(), columns)), &reused);
+    EXPECT_EQ(reused, 0U);
+    imported.reset();
+    // Reusing the imported columns would have kept all of it alive while
+    // charging a few hundred bytes.
+    EXPECT_EQ(exported.bytes_allocated(), 0);
+    EXPECT_LT(chunk_bytes(*chunk), static_cast<std::size_t>(exported_bytes) / 100);
+    EXPECT_EQ(chunk_bytes(*chunk), static_cast<std::size_t>(arrow::util::TotalBufferSize(*chunk)));
+    EXPECT_EQ(chunk->num_rows(), kRows);
+    EXPECT_EQ(static_cast<const arrow::Int64Array&>(*chunk->column(0)).Value(kRows - 1), kRows - 1);
 }
 
 }  // namespace

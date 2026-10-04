@@ -339,6 +339,11 @@ struct Writer::Core {
 
     void run() noexcept;
     void loop();
+    // Any thread: moves a shares_input chunk's batch, with its reservation,
+    // to released_, so that the task thread, not this one, drops the batch
+    // and the charge goes only once it has.
+    void release_later(Chunk& chunk) noexcept;
+    void release_later(std::deque<Item>& items) noexcept;
     std::optional<Item> next_item();
     void consume(Chunk chunk);
     void open_insert();
@@ -425,6 +430,17 @@ struct Writer::Core {
     const std::uint64_t pinned_rows_;
     const std::uint64_t pinned_bytes_;
     const SinkMetrics metrics_;
+
+    // A shares_input chunk the writer has let go of, waiting for the task
+    // thread's drain_released(). The batch is declared after the reservation,
+    // so it goes first and the charge never falls below what is resident.
+    struct Released {
+        MemoryReservation reservation;
+        std::shared_ptr<arrow::RecordBatch> batch;
+    };
+    // Declared before every member that holds a chunk, so it outlives them.
+    std::mutex release_mu_;
+    std::vector<Released> released_;
 
     // Writer thread only.
     TokenSource tokens_;
@@ -608,6 +624,8 @@ void Writer::Core::abort_and_join() noexcept {
         const std::lock_guard<std::mutex> stats(stats_mu_);
         stats_.abandoned_rows += rows;
     }
+    // abort() may run on any thread, so these too wait for the task thread.
+    release_later(dropped);
     dropped.clear();
     report_queue_bytes();
 
@@ -712,8 +730,35 @@ void Writer::Core::run() noexcept {
         queue_bytes_now_.store(0, std::memory_order_relaxed);
     }
     done_cv_.notify_all();
+    release_later(dropped);
     dropped.clear();
     report_queue_bytes();
+}
+
+void Writer::Core::release_later(Chunk& chunk) noexcept {
+    if (!chunk.shares_input || !chunk.batch) {
+        return;
+    }
+    // CLINK_CLICKHOUSE_TEST_NO_RELEASE_LIST is defined only by a build that
+    // checks the release-list tests fail without the list: there the batch
+    // and its charge go with the chunk, on whichever thread drops it.
+#if !defined(CLINK_CLICKHOUSE_TEST_NO_RELEASE_LIST)
+    try {
+        const std::lock_guard<std::mutex> lock(release_mu_);
+        released_.push_back(Released{std::move(chunk.reservation), std::move(chunk.batch)});
+    } catch (...) {
+        // Out of memory for one entry: the batch and its charge go here
+        // after all, correct, though out of the task thread's sight.
+    }
+#endif
+}
+
+void Writer::Core::release_later(std::deque<Item>& items) noexcept {
+    for (Item& item : items) {
+        if (item.kind == Item::Kind::Chunk) {
+            release_later(item.chunk);
+        }
+    }
 }
 
 void Writer::Core::loop() {
@@ -776,7 +821,22 @@ std::optional<Item> Writer::Core::next_item() {
 }
 
 void Writer::Core::consume(Chunk chunk) {
-    const auto shared = std::make_shared<const Chunk>(std::move(chunk));
+    // Every INSERT that points into the chunk holds `shared`, so whichever
+    // lets go of it last, here once it is converted, or on an
+    // acknowledgement, a split or an abandon, runs this deleter, on the
+    // writer thread.
+    const std::shared_ptr<const Chunk> shared(new Chunk(std::move(chunk)), [this](Chunk* held) {
+        if (held->shares_input) {
+            try {
+                (void)CLINK_FAULT_POINT(points::kBeforeSharedChunkRelease);
+            } catch (...) {
+                // Only a delay or a block belongs here; a thrown fault would
+                // escape a deleter.
+            }
+            release_later(*held);
+        }
+        delete held;
+    });
     const arrow::RecordBatch& batch = *shared->batch;
     const std::int64_t total = batch.num_rows();
     std::int64_t offset = 0;
@@ -842,7 +902,9 @@ void Writer::Core::consume(Chunk chunk) {
         }
     }
     // Without a zero-copy column nothing points into the chunk once it is
-    // converted, so `shared` releases it, and its memory charge, here.
+    // converted, so `shared` releases it, and its memory charge, here; a batch
+    // that shares the task thread's arrays goes, charge and all, to the
+    // release list.
 }
 
 void Writer::Core::open_insert() {
@@ -1680,6 +1742,16 @@ Writer::~Writer() {
     abort();
 }
 
+void Writer::drain_released() noexcept {
+    std::vector<Core::Released> released;
+    {
+        const std::lock_guard<std::mutex> lock(core_->release_mu_);
+        released.swap(core_->released_);
+    }
+    // The last references, and then the charges, go here, on the calling
+    // thread, outside the lock.
+}
+
 void Writer::submit(Chunk chunk) {
     Core& c = *core_;
     if (!chunk.batch) {
@@ -1708,6 +1780,12 @@ void Writer::submit(Chunk chunk) {
             // retries, the task thread stops here once the queue is full.
             waited = true;
             c.done_cv_.wait_for(lock, kSlice);
+            // The writer lets go of chunks while this call waits, so the
+            // task thread frees them, and returns their charge, here too
+            // rather than only at its next call.
+            lock.unlock();
+            drain_released();
+            lock.lock();
         }
         {
             const std::lock_guard<std::mutex> stats(c.stats_mu_);

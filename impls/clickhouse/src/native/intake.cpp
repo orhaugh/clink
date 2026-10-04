@@ -28,6 +28,33 @@ bool carried(const arrow::DataType& type) {
     }
 }
 
+// The fast path for a sidecar array of `type` into a declared column of
+// `declared`: only the pairs whose per-cell conversion hands every value on
+// unchanged. int64 into INTEGER narrows and float into DOUBLE widens, so
+// both stay cell by cell.
+IntakeReuse reuse_for(const arrow::DataType& type, const SqlType& declared) {
+    switch (type.id()) {
+        case arrow::Type::INT64:
+            if (declared.kind == SqlKind::BigInt) {
+                return IntakeReuse::Same;
+            }
+            return declared.kind == SqlKind::Timestamp ? IntakeReuse::Retype : IntakeReuse::None;
+        case arrow::Type::INT32:
+            if (declared.kind == SqlKind::Integer) {
+                return IntakeReuse::Same;
+            }
+            return declared.kind == SqlKind::Date ? IntakeReuse::Retype : IntakeReuse::None;
+        case arrow::Type::FLOAT:
+            return declared.kind == SqlKind::Real ? IntakeReuse::Same : IntakeReuse::None;
+        case arrow::Type::DOUBLE:
+            return declared.kind == SqlKind::Double ? IntakeReuse::Same : IntakeReuse::None;
+        case arrow::Type::BOOL:
+            return declared.kind == SqlKind::Boolean ? IntakeReuse::Same : IntakeReuse::None;
+        default:
+            return IntakeReuse::None;
+    }
+}
+
 }  // namespace
 
 const char* to_string(IntakeDecline reason) noexcept {
@@ -65,17 +92,34 @@ IntakeResult compile_intake(const arrow::Schema& schema, const std::vector<SqlCo
     }
     IntakePlan plan;
     plan.source.reserve(columns.size());
+    plan.reuse.reserve(columns.size());
     for (const auto& c : columns) {
         const auto it = by_name.find(c.name);
         if (it == by_name.end()) {
             plan.source.push_back(-1);
+            plan.reuse.push_back(IntakeReuse::None);
         } else if (it->second < 0) {
             return IntakeDecline::DuplicateName;
         } else {
             plan.source.push_back(it->second);
+            plan.reuse.push_back(reuse_for(*schema.field(it->second)->type(), c.type));
         }
     }
     return plan;
+}
+
+bool owns_its_buffers(const arrow::ArrayData& data) {
+    for (const auto& buffer : data.buffers) {
+        if (buffer && (buffer->parent() != nullptr || !buffer->is_mutable())) {
+            return false;
+        }
+    }
+    for (const auto& child : data.child_data) {
+        if (child && !owns_its_buffers(*child)) {
+            return false;
+        }
+    }
+    return !data.dictionary || owns_its_buffers(*data.dictionary);
 }
 
 }  // namespace clink::clickhouse::native

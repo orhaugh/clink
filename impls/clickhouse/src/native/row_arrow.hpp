@@ -48,8 +48,17 @@ public:
     // build() runs. So it equals build() over the rows `batch` materialises
     // to, by sql::row_materialize_fn(), and throws the same ConversionError
     // for the same cell. `plan` is compile_intake's for `batch`'s schema.
+    //
+    // A column the plan marks for reuse takes the sidecar's array itself, or
+    // its buffers under the declared type, when the array owns its buffers
+    // (owns_its_buffers); the chunk then shares memory with `batch`, and the
+    // count of such columns goes to `reused` when it is given. Whoever drops
+    // a chunk with a reused column last frees memory the task thread wrote,
+    // so the sink keeps that last drop on the task thread.
     [[nodiscard]] std::shared_ptr<arrow::RecordBatch> build_columnar(
-        const arrow::RecordBatch& batch, const IntakePlan& plan) const;
+        const arrow::RecordBatch& batch,
+        const IntakePlan& plan,
+        std::size_t* reused = nullptr) const;
     [[nodiscard]] const std::shared_ptr<arrow::Schema>& schema() const noexcept;
 
     struct Impl;

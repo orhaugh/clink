@@ -895,8 +895,10 @@ std::shared_ptr<arrow::RecordBatch> RowArrowBuilder::build(const Batch<sql::Row>
 }
 
 std::shared_ptr<arrow::RecordBatch> RowArrowBuilder::build_columnar(const arrow::RecordBatch& batch,
-                                                                    const IntakePlan& plan) const {
-    if (plan.source.size() != impl_->columns.size()) {
+                                                                    const IntakePlan& plan,
+                                                                    std::size_t* reused) const {
+    if (plan.source.size() != impl_->columns.size() ||
+        (!plan.reuse.empty() && plan.reuse.size() != impl_->columns.size())) {
         throw std::logic_error("clickhouse native sink: an intake plan for " +
                                std::to_string(plan.source.size()) + " columns, not " +
                                std::to_string(impl_->columns.size()));
@@ -904,8 +906,27 @@ std::shared_ptr<arrow::RecordBatch> RowArrowBuilder::build_columnar(const arrow:
     const std::int64_t rows = batch.num_rows();
     std::vector<std::shared_ptr<arrow::Array>> arrays;
     arrays.reserve(impl_->columns.size());
+    std::size_t taken = 0;
     for (std::size_t k = 0; k < impl_->columns.size(); ++k) {
         const int index = plan.source[k];
+        const IntakeReuse reuse = plan.reuse.empty() ? IntakeReuse::None : plan.reuse[k];
+        if (reuse != IntakeReuse::None && index >= 0 &&
+            owns_its_buffers(*batch.column_data(index))) {
+            // The per-cell path hands every value of these pairs on as it is
+            // and nulls only the null cells, so the array already is the
+            // column it would build; a retype only renames the layout of the
+            // same int64 or int32 values.
+            const std::shared_ptr<arrow::Array>& array = batch.column(index);
+            if (reuse == IntakeReuse::Same) {
+                arrays.push_back(array);
+            } else {
+                std::shared_ptr<arrow::ArrayData> data = array->data()->Copy();
+                data->type = impl_->columns[k].type;
+                arrays.push_back(arrow::MakeArray(std::move(data)));
+            }
+            ++taken;
+            continue;
+        }
         const arrow::Array* array = index < 0 ? nullptr : batch.column(index).get();
         const std::shared_ptr<arrow::DataType> type =
             index < 0 ? nullptr : batch.schema()->field(index)->type();
@@ -920,6 +941,9 @@ std::shared_ptr<arrow::RecordBatch> RowArrowBuilder::build_columnar(const arrow:
                 held = shared::read_cell(type, *array, i);
                 return held.is_null() ? nullptr : &held;
             }));
+    }
+    if (reused != nullptr) {
+        *reused = taken;
     }
     return arrow::RecordBatch::Make(impl_->schema, rows, std::move(arrays));
 }

@@ -482,8 +482,9 @@ struct NativeSink::Impl {
     // counted and, the first time for the schema, logged.
     [[nodiscard]] const IntakePlan* intake_for(const std::shared_ptr<arrow::Schema>& schema);
     // The tail on_data and on_data_columnar share: charge a built chunk to the
-    // budget, queue it and count it under its carrier.
-    void submit(std::shared_ptr<arrow::RecordBatch> rows, Carrier carrier);
+    // budget, queue it and count it under its carrier. `shares_input` when the
+    // chunk reuses arrays of the batch it was built from.
+    void submit(std::shared_ptr<arrow::RecordBatch> rows, Carrier carrier, bool shares_input);
     void conversion_failed(const ConversionError& e) const;
     void count_refusal(const std::string& code) const;
     void log(LogSeverity level, const std::string& message) const;
@@ -871,12 +872,17 @@ const IntakePlan* NativeSink::Impl::intake_for(const std::shared_ptr<arrow::Sche
     return nullptr;
 }
 
-void NativeSink::Impl::submit(std::shared_ptr<arrow::RecordBatch> rows, Carrier carrier) {
+void NativeSink::Impl::submit(std::shared_ptr<arrow::RecordBatch> rows,
+                              Carrier carrier,
+                              bool shares_input) {
     Chunk chunk;
+    // A reused array is counted in full, even when the chunk holds a slice of
+    // it, so the charge is never below what the chunk keeps alive.
     chunk.bytes = chunk_bytes(*rows);
     chunk.reservation = MemoryReservation(budget, MemoryCategory::Queue, chunk.bytes);
     chunk.batch = std::move(rows);
     chunk.carrier = carrier;
+    chunk.shares_input = shares_input;
     writer->submit(std::move(chunk));
     if (Counter* c = carrier == Carrier::Columnar ? columnar_batches : row_batches) {
         c->increment();
@@ -936,6 +942,7 @@ void NativeSink::open() {
 void NativeSink::on_data(const Batch<sql::Row>& batch) {
     Impl& s = *impl_;
     s.require_writer("on_data");
+    s.writer->drain_released();
     if (batch.empty()) {
         return;
     }
@@ -949,7 +956,7 @@ void NativeSink::on_data(const Batch<sql::Row>& batch) {
             s.conversion_failed(e);
             throw;
         }
-        s.submit(std::move(rows), Carrier::Row);
+        s.submit(std::move(rows), Carrier::Row, false);
     } catch (...) {
         // Every call that throws fails the task, and the runner then skips
         // both closes: stop the writer now, which also logs its summary.
@@ -965,6 +972,7 @@ void NativeSink::on_data(Batch<sql::Row>&& batch) {
 bool NativeSink::on_data_columnar(const Batch<sql::Row>& batch) {
     Impl& s = *impl_;
     s.require_writer("on_data_columnar");
+    s.writer->drain_released();
     const std::shared_ptr<arrow::RecordBatch>& sidecar = batch.arrow();
     if (!sidecar) {
         return false;
@@ -984,13 +992,14 @@ bool NativeSink::on_data_columnar(const Batch<sql::Row>& batch) {
             return false;
         }
         std::shared_ptr<arrow::RecordBatch> rows;
+        std::size_t reused = 0;
         try {
-            rows = s.builder->build_columnar(*sidecar, *plan);
+            rows = s.builder->build_columnar(*sidecar, *plan, &reused);
         } catch (const ConversionError& e) {
             s.conversion_failed(e);
             throw;
         }
-        s.submit(std::move(rows), Carrier::Columnar);
+        s.submit(std::move(rows), Carrier::Columnar, reused > 0);
     } catch (...) {
         s.writer->abort();
         throw;
@@ -1001,6 +1010,7 @@ bool NativeSink::on_data_columnar(const Batch<sql::Row>& batch) {
 void NativeSink::on_barrier(CheckpointBarrier barrier) {
     Impl& s = *impl_;
     s.require_writer("on_barrier");
+    s.writer->drain_released();
     try {
         if (barrier.mode() == CheckpointBarrier::Mode::Unaligned && !barrier.is_terminal()) {
             s.refuse_unaligned_barrier(barrier.id().value());
@@ -1010,6 +1020,8 @@ void NativeSink::on_barrier(CheckpointBarrier barrier) {
         s.writer->abort();
         throw;
     }
+    // The flush let go of every chunk acknowledged before the barrier.
+    s.writer->drain_released();
 }
 
 void NativeSink::flush() {
@@ -1017,12 +1029,14 @@ void NativeSink::flush() {
     if (!s.writer) {
         return;
     }
+    s.writer->drain_released();
     try {
         s.writer->flush(0);
     } catch (...) {
         s.writer->abort();
         throw;
     }
+    s.writer->drain_released();
 }
 
 void NativeSink::close() {
@@ -1034,6 +1048,8 @@ void NativeSink::close() {
     // acknowledged, and the job's restart replays them. finish() has then
     // logged the cancelled summary itself.
     s.writer->finish();
+    // The writer has stopped, so nothing more reaches the list.
+    s.writer->drain_released();
     s.log(LogSeverity::Info,
           summary_line(
               "closed",
@@ -1047,6 +1063,9 @@ void NativeSink::close_cancelled() {
     Impl& s = *impl_;
     if (s.writer) {
         s.writer->abort();
+        // A writer that joined has let go of everything; one that abort()
+        // detached keeps what it still holds.
+        s.writer->drain_released();
     }
 }
 
