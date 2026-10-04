@@ -165,6 +165,17 @@ bool append_ondemand(arrow::Type::type type_id,
             return static_cast<arrow::Int32Builder*>(b)->Append(static_cast<std::int32_t>(d)).ok();
         }
         case arrow::Type::DOUBLE: {
+            // An integer token is read as an integer first: the row decode keeps
+            // it exactly, so one past 2^53, which a double would round, has no
+            // faithful cell here. A failed get_int64 leaves the value unconsumed.
+            constexpr std::int64_t kDoubleExactInt = std::int64_t{1} << 53;
+            std::int64_t i{};
+            if (v.get_int64().get(i) == simdjson::SUCCESS) {
+                if (i < -kDoubleExactInt || i > kDoubleExactInt) {
+                    return false;
+                }
+                return static_cast<arrow::DoubleBuilder*>(b)->Append(static_cast<double>(i)).ok();
+            }
             double d{};
             if (v.get_double().get(d) != simdjson::SUCCESS) {
                 return false;

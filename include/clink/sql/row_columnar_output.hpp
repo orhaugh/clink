@@ -16,10 +16,16 @@
 //
 // Two things make it safe to use:
 //
-//   * The per-cell conversion is row_columnar_detail::append_json_cell, the same
-//     function the row-batch converter (build_column) uses. The columnar and row
-//     carriers therefore produce identical Arrow cells by construction, not by a
-//     test noticing they diverged.
+//   * Exact or bail. The sidecar layout (effective_type) keeps a handful of
+//     types as typed columns and stores the rest as text, so not every value
+//     comes back out of it as it went in: a TIMESTAMP, SMALLINT or DATE number,
+//     or an ARRAY, MAP or ROW value, would come back as a string. An operator
+//     therefore appends a row through try_append_row, which checks every cell
+//     with row_columnar_detail::cell_is_exact before appending any, and on false
+//     takes the row path for that emission. What does go in is converted by
+//     append_json_cell, the function the row-batch converter (build_column)
+//     uses, and read back by read_cell, so a row consumer sees the row the
+//     operator would have built.
 //   * The emitted batch carries row_materialize_fn(), so a row consumer
 //     downstream decodes it lazily exactly once and sees the rows it would have
 //     received anyway. Correctness never depends on the consumer being columnar.
@@ -29,6 +35,7 @@
 // use this builder belongs to the planner, which knows the chain, and not to the
 // operator, which does not. See the columnar_output param in physical_plan.cpp.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -43,6 +50,20 @@
 
 #include "clink/config/json.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+
+namespace clink::detail {
+// Process-wide count of born-columnar bails: each increment is one emission an
+// operator began on the columnar carrier and finished in row form, because a
+// row could not ride it (a changelog marker, a cell try_append_row refuses, an
+// absent group value). The materialisation counter cannot tell this apart from
+// a consumer decoding a batch that stayed columnar, since a bail decodes what
+// it had accumulated too. Tests read it to prove an emission never bailed.
+// Incremented only on a bail, so it is not a hot-path cost.
+inline std::atomic<std::uint64_t>& columnar_output_bail_counter() noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    return counter;
+}
+}  // namespace clink::detail
 
 namespace clink::sql {
 
@@ -128,14 +149,39 @@ public:
 
     // Append one cell of the row under construction. `v == nullptr` appends a
     // null, which is how an absent column and a JSON-null column both arrive -
-    // matching the row path exactly.
+    // matching the row path exactly. No exactness check: an operator emitting
+    // its output appends through try_append_row instead.
     void append(std::size_t col, const clink::config::JsonValue* v) {
         row_columnar_detail::append_json_cell(*builders_[col], *eff_[col], v);
     }
 
+    // Append one whole output row, `cells[i]` being column i's value (nullptr
+    // for a null), if every cell comes back out of its column unchanged
+    // (row_columnar_detail::cell_is_exact). Otherwise appends nothing and returns
+    // false, and the caller emits this row, and the rest of its emission, in row
+    // form. Checked before anything is appended because an Arrow builder cannot
+    // take back a partial row.
+    [[nodiscard]] bool try_append_row(const std::vector<const clink::config::JsonValue*>& cells,
+                                      const std::optional<EventTime>& t = std::nullopt) {
+        if (cells.size() != builders_.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            if (!row_columnar_detail::cell_is_exact(*eff_[i], cells[i])) {
+                return false;
+            }
+        }
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            append(i, cells[i]);
+        }
+        end_row(t);
+        return true;
+    }
+
     // Append every cell of one output row from a source Row, reading each
-    // declared column by name. The convenience path for an operator whose output
-    // is a projection of an input row.
+    // declared column by name. Unchecked, like append(): it gives exactly what
+    // build_column gives for the same row, which is what the converter parity
+    // tests compare.
     void append_row_projection(const Row& src, const std::optional<EventTime>& t = std::nullopt) {
         for (std::size_t i = 0; i < columns_.size(); ++i) {
             append(i, row_columnar_detail::field(src, columns_[i].name));
@@ -144,10 +190,10 @@ public:
     }
 
     // Close the current row, with its event time (none by default, which is what
-    // both of today's emission sites produce). Every value column must have had
-    // exactly one append since the previous end_row(): a caller that skipped one
-    // shears the columns apart, which finish() detects by comparing lengths and
-    // reports by returning nullptr rather than emitting a malformed batch.
+    // a join's pair carries; a window pane carries window_end - 1). Every value column must have
+    // had exactly one append since the previous end_row(): a caller that skipped one shears the
+    // columns apart, which finish() detects by comparing lengths and reports by returning nullptr
+    // rather than emitting a malformed batch.
     void end_row(const std::optional<EventTime>& t = std::nullopt) {
         (void)clink::detail::append_event_time(time_builder_, t);
         ++rows_;

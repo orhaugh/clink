@@ -831,6 +831,90 @@ TEST(JsonColumnarDecode, EscapedKeyMidBatchDoesNotCorruptNeighbours) {
     EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
 }
 
+// A BIGINT past 2^53 through the DOM columnar arm. The on-demand arm bails on a
+// duplicate key, and the DOM arm, whose parse keeps one value per key exactly as the row
+// decode does, takes the batch. It must read an integral number exactly: 2^53 + 1 has
+// no double, and reading it through one lands 2^53 in the column while the row decode
+// keeps the integer. The duplicate repeats the same value so which one a reader keeps
+// does not matter.
+TEST(JsonColumnarDecode, DomArmKeepsABigintPastTwoToTheFiftyThree) {
+    const std::vector<RowColumn> schema = {{"a", arrow::int64()}, {"b", arrow::int64()}};
+    const std::vector<std::string> lines = {
+        R"({"a":9007199254740993,"b":-9007199254740993,"b":-9007199254740993})",
+        R"({"a":-9007199254740995,"b":9007199254740995})",
+    };
+
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+    JsonStringToRowColumnarOperator col_op(schema);
+    const auto dom_before = clink::detail::json_columnar_dom_arm_counter().load();
+    auto col_el = run_one(col_op, lines_batch(lines));
+
+    ASSERT_TRUE(col_el.is_data());
+    ASSERT_TRUE(col_el.as_data().is_columnar())
+        << "the DOM columnar arm must take this batch, or the case tests the row path";
+    ASSERT_EQ(clink::detail::json_columnar_dom_arm_counter().load() - dom_before, 1U)
+        << "the on-demand arm took the batch, so the case no longer tests the DOM arm";
+    EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
+    const auto& sidecar = *col_el.as_data().arrow();
+    const auto& a = static_cast<const arrow::Int64Array&>(*sidecar.GetColumnByName("a"));
+    const auto& b = static_cast<const arrow::Int64Array&>(*sidecar.GetColumnByName("b"));
+    EXPECT_EQ(a.Value(0), 9007199254740993);
+    EXPECT_EQ(b.Value(0), -9007199254740993);
+    EXPECT_EQ(a.Value(1), -9007199254740995);
+    EXPECT_EQ(b.Value(1), 9007199254740995);
+}
+
+// A DOUBLE column receiving an integer past 2^53. The row decode keeps the
+// integer token exactly, as for any column type but REAL and DECIMAL, so a
+// double column, which would round it, must not take the batch: both arms send
+// it to the row decode. An integer up to 2^53 has a double, reads back as the
+// same number, and stays columnar. `force_dom` adds a duplicate key, which the
+// on-demand arm declines, so the DOM arm decides instead; the counter says
+// which arm did.
+namespace {
+void expect_double_integer_parity(const std::vector<std::string>& values,
+                                  bool force_dom,
+                                  bool columnar) {
+    const std::vector<RowColumn> schema = {{"x", arrow::float64()}, {"y", arrow::int64()}};
+    std::vector<std::string> lines;
+    lines.reserve(values.size());
+    for (const auto& v : values) {
+        lines.push_back(R"({"x":)" + v + (force_dom ? R"(,"y":1,"y":1})" : R"(,"y":1})"));
+    }
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+    JsonStringToRowColumnarOperator col_op(schema);
+    const auto dom_before = clink::detail::json_columnar_dom_arm_counter().load();
+    auto col_el = run_one(col_op, lines_batch(lines));
+    const auto dom_runs = clink::detail::json_columnar_dom_arm_counter().load() - dom_before;
+
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_EQ(col_el.as_data().is_columnar(), columnar);
+    EXPECT_EQ(dom_runs, (force_dom && columnar) ? 1U : 0U);
+    EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
+}
+}  // namespace
+
+TEST(JsonColumnarDecode, DoubleColumnSendsAnIntegerPastTwoToTheFiftyThreeToRows) {
+    for (const bool force_dom : {false, true}) {
+        SCOPED_TRACE(force_dom ? "DOM arm" : "on-demand arm");
+        expect_double_integer_parity({"1.5", "9007199254740993"}, force_dom, false);
+        expect_double_integer_parity({"-9007199254740993", "2"}, force_dom, false);
+        expect_double_integer_parity({"9223372036854775807"}, force_dom, false);
+    }
+}
+
+TEST(JsonColumnarDecode, DoubleColumnKeepsAnIntegerUpToTwoToTheFiftyThreeColumnar) {
+    for (const bool force_dom : {false, true}) {
+        SCOPED_TRACE(force_dom ? "DOM arm" : "on-demand arm");
+        expect_double_integer_parity(
+            {"9007199254740992", "-9007199254740992", "5", "-0", "0", "1.5", "1e300"},
+            force_dom,
+            true);
+    }
+}
+
 // Reordered fields between two columns of the SAME TYPE. This is the case that can
 // detect a wrong-column error, and until it existed the suite could not: the decoder
 // caches which column each field POSITION matched last time as a first guess, and if

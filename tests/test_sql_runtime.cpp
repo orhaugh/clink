@@ -64,6 +64,7 @@
 #include "clink/sql/physical_plan.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+#include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/sql/table_api.hpp"
 #include "clink/sql/view.hpp"
@@ -1590,6 +1591,143 @@ TEST(SqlRuntime, ColumnarJoinOutputBailsToRowsForMarkedEmissions) {
     EXPECT_EQ(join_live_set(forced.records), expected)
         << "a marked emission must bail to row form with the relation intact";
     EXPECT_EQ(forced.columnar_batches, 0) << "an OUTER join never emits columnar";
+}
+
+namespace {
+
+// The window probe's records as text, each with the event time it carries, so a
+// comparison sees a pane that lost its stamp.
+std::vector<std::string> rows_with_event_time(const std::vector<Record<Row>>& recs) {
+    std::vector<std::string> out;
+    out.reserve(recs.size());
+    for (const auto& rec : recs) {
+        const auto t = rec.event_time();
+        out.push_back(
+            clink::config::JsonValue{clink::sql::to_json_object(rec.value().values)}.serialize(0) +
+            " @ " + (t.has_value() ? std::to_string(t->millis()) : std::string("none")));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Window input keyed on a VARCHAR column: `kt` is (key, ts), the key a JSON
+// value so a test can put a number among the strings.
+std::vector<Record<Row>> varchar_window_rows(
+    const std::vector<std::pair<clink::config::JsonValue, std::int64_t>>& kt) {
+    std::vector<Record<Row>> rows;
+    for (const auto& [k, ts] : kt) {
+        Row r;
+        r.values["k"] = k;
+        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        rows.push_back(Record<Row>{std::move(r), EventTime{ts}});
+    }
+    return rows;
+}
+
+std::string varchar_window_schema() {
+    return clink::sql::serialize_row_schema({{"k", arrow::utf8()},
+                                             {"c", arrow::int64()},
+                                             {"window_start", arrow::int64()},
+                                             {"window_end", arrow::int64()}});
+}
+
+clink::config::JsonValue text_key(const std::string& s) {
+    return clink::config::JsonValue{s};
+}
+
+}  // namespace
+
+// A fired pane carries the event time window_end - 1 on both carriers. The row
+// fire stamps it on each record; a columnar fire writes it into the sidecar's
+// event-time column, which a row consumer reads back. Downstream, replay
+// suppression in an exactly-once sink and every TTL'd operator read that stamp.
+TEST(SqlRuntime, ColumnarWindowFireStampsEachPaneWithItsEventTime) {
+    ensure_sql_installed_once();
+    const auto input = varchar_window_rows({{text_key("a"), 1000},
+                                            {text_key("b"), 2000},
+                                            {text_key("c"), 3000},
+                                            {text_key("a"), 11000},
+                                            {text_key("b"), 12000},
+                                            {text_key("a"), 40000}});
+
+    const auto bails_before = clink::detail::columnar_output_bail_counter().load();
+    const auto row_run = run_tumbling_window_probed(input, "");
+    const auto col_run = run_tumbling_window_probed(input, varchar_window_schema());
+
+    EXPECT_GT(col_run.columnar_batches, 0) << "the fire must ride the sidecar";
+    EXPECT_EQ(clink::detail::columnar_output_bail_counter().load() - bails_before, 0U);
+    EXPECT_EQ(rows_with_event_time(col_run.records), rows_with_event_time(row_run.records))
+        << "a columnar pane must carry the event time the row fire stamps";
+}
+
+// The same with a numeric key among the VARCHAR ones, which bails the fire
+// partway through: the panes appended before the bail are turned back into
+// rows from the sidecar, the rest are built as rows. Both kinds carry the same
+// stamp as the row fire's.
+TEST(SqlRuntime, ColumnarWindowFireThatBailsStampsEveryPaneWithItsEventTime) {
+    ensure_sql_installed_once();
+    std::vector<std::pair<clink::config::JsonValue, std::int64_t>> kt;
+    for (int g = 0; g < 16; ++g) {
+        kt.emplace_back(text_key("k" + std::to_string(g)), 1000 + g);
+    }
+    kt.emplace_back(clink::config::JsonValue{std::int64_t{7}}, 2000);
+    kt.emplace_back(text_key("k0"), 40000);
+    const auto input = varchar_window_rows(kt);
+
+    const auto row_run = run_tumbling_window_probed(input, "");
+    const auto bails_before = clink::detail::columnar_output_bail_counter().load();
+    const auto decoded_before = clink::detail::batch_materialize_counter().load();
+    const auto col_run = run_tumbling_window_probed(input, varchar_window_schema());
+
+    EXPECT_EQ(clink::detail::columnar_output_bail_counter().load() - bails_before, 1U)
+        << "the numeric key must bail the fire it is in";
+    EXPECT_GT(clink::detail::batch_materialize_counter().load() - decoded_before, 0U)
+        << "no pane was appended before the bail, so the case does not test a bail partway "
+           "through a fire";
+    EXPECT_EQ(rows_with_event_time(col_run.records), rows_with_event_time(row_run.records))
+        << "every pane of a fire that bailed must carry the event time the row fire stamps";
+}
+
+// A join that bails partway through an emission keeps that emission's order:
+// the pairs appended before the bail come out of the sidecar first, then the
+// rest as rows, exactly as the row carrier emits them. One left row joins
+// eight right rows on one key, so the pairs come out in the right rows' order
+// whichever side arrives first; the fifth carries a number in a VARCHAR column.
+TEST(SqlRuntime, ColumnarJoinBailPartwayThroughAnEmissionKeepsItsOrder) {
+    ensure_sql_installed_once();
+    std::vector<Record<Row>> left;
+    {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{std::int64_t{1}};
+        r.values["lv"] = clink::config::JsonValue{std::int64_t{10}};
+        left.push_back(Record<Row>{std::move(r)});
+    }
+    std::vector<Record<Row>> right;
+    for (int i = 0; i < 8; ++i) {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{std::int64_t{1}};
+        r.values["rv"] = i == 4 ? clink::config::JsonValue{std::int64_t{i}}
+                                : clink::config::JsonValue{"r" + std::to_string(i)};
+        right.push_back(Record<Row>{std::move(r)});
+    }
+    const auto schema = clink::sql::serialize_row_schema({{"l_id", arrow::int64()},
+                                                          {"l_lv", arrow::int64()},
+                                                          {"r_id", arrow::int64()},
+                                                          {"r_rv", arrow::utf8()}});
+
+    const auto row_run = run_equi_join_probed("inner", left, right, "");
+    const auto bails_before = clink::detail::columnar_output_bail_counter().load();
+    const auto decoded_before = clink::detail::batch_materialize_counter().load();
+    const auto col_run = run_equi_join_probed("inner", left, right, schema);
+
+    ASSERT_EQ(row_run.records.size(), 8U) << "every right row must join the left one";
+    EXPECT_EQ(clink::detail::columnar_output_bail_counter().load() - bails_before, 1U)
+        << "the number in the VARCHAR column must bail the join, once";
+    EXPECT_GT(clink::detail::batch_materialize_counter().load() - decoded_before, 0U)
+        << "no pair was appended before the bail, so the case does not test a bail partway "
+           "through an emission";
+    EXPECT_EQ(serialized_rows(col_run.records), serialized_rows(row_run.records))
+        << "a bail must keep the emission order";
 }
 
 // OUTER joins ride the async/disaggregated path too (extends INNER): a match

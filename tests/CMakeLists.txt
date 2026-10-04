@@ -661,6 +661,7 @@ if(CLINK_BUILD_SQL)
         test_columnar_split.cpp
         test_key_routing_parity.cpp
         test_json_columnar_decode.cpp
+        test_born_columnar_parity.cpp
         test_sql_metrics.cpp
         test_async_function_registry.cpp
         test_table_api.cpp

@@ -69,6 +69,7 @@
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/script_runner.hpp"
 #include "clink/test/test_cluster.hpp"
 
@@ -1150,16 +1151,40 @@ TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesForEveryType) {
     expect_same_values(collected, landed, kGeneratedRows + kEdgeRows);
 }
 
-// An inner join whose output is born columnar, then the projection: the
-// planner promotes the join's columnar output because the projection ingests
-// it, and the sink boundary's row_bind_columns then rebuilds rows from that
-// batch, so the native sink receives rows decoded from Arrow rather than from
-// JSON. The planner always puts row_bind_columns last, so the projection
-// before it is the last columnar producer a SQL plan can have.
-TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindAColumnarJoin) {
-    ensure_installed();
-    const ScratchDir dir("diff_join");
-    const auto lines = differential_lines(kGeneratedRows);
+// The columns whose values the born-columnar layout holds exactly: BIGINT,
+// INTEGER, DOUBLE, BOOLEAN, VARCHAR and DECIMAL. Every other column of the
+// differential (SMALLINT, DATE, TIMESTAMP, arrays, maps and rows) arrives as a
+// number, array or object that the layout would store as text, so a join
+// emitting one takes the row path. REAL is left out too: the file source does
+// not round a REAL to float precision, so the edge rows' 0.1 has no exact
+// float32 cell and its join takes the row path as well.
+const std::vector<Column>& born_columnar_columns() {
+    static const std::vector<Column> columns = [] {
+        std::vector<Column> out;
+        for (const auto& c : differential_columns()) {
+            if (c.sql == "BIGINT" || c.sql == "INTEGER" || c.sql == "DOUBLE" ||
+                c.sql == "BOOLEAN" || c.sql == "VARCHAR" || c.sql.starts_with("DECIMAL")) {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }();
+    return columns;
+}
+
+// What the native run of join_differential did with the join's carrier.
+struct JoinCarrier {
+    std::uint64_t decoded{0};  // columnar batches materialised
+    std::uint64_t bails{0};    // join emissions begun columnar and finished in row form
+};
+
+// An inner join whose output the planner promotes to born columnar, because
+// the projection after it ingests columnar, over `columns`. Returns what the
+// join's carrier did while the native run ran, after checking that the native
+// sink landed what the collect sink saw.
+JoinCarrier join_differential(const std::string& scratch, const std::vector<Column>& columns) {
+    const ScratchDir dir(scratch);
+    const auto lines = differential_lines(kGeneratedRows, columns);
     write_lines(dir.path() / "in.ndjson", lines);
     std::vector<std::string> keys;
     for (std::size_t k = 1; k <= lines.size(); ++k) {
@@ -1167,32 +1192,69 @@ TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindAColumnarJoin) {
     }
     write_lines(dir.path() / "keys.ndjson", keys);
     const std::string ddl =
-        "CREATE TABLE src " + column_ddl() + " WITH (connector='file', format='json', path='" +
-        (dir.path() / "in.ndjson").string() +
+        "CREATE TABLE src " + column_ddl(columns) +
+        " WITH (connector='file', format='json', path='" + (dir.path() / "in.ndjson").string() +
         "'); CREATE TABLE keys (k BIGINT) WITH (connector='file', format='json', "
         "path='" +
         (dir.path() / "keys.ndjson").string() + "');";
     const std::string select =
-        "SELECT " + column_list("a") + " FROM src a JOIN keys b ON a.id = b.k;";
+        "SELECT " + column_list("a", columns) + " FROM src a JOIN keys b ON a.id = b.k;";
 
-    const auto plan =
-        compile_script(ddl + "CREATE TABLE ch " + column_ddl() + " WITH (" + kNativeWith + ");",
-                       "INSERT INTO ch " + select,
-                       1);
-    ASSERT_EQ(plan.size(), 1U);
+    const auto plan = compile_script(
+        ddl + "CREATE TABLE ch " + column_ddl(columns) + " WITH (" + kNativeWith + ");",
+        "INSERT INTO ch " + select,
+        1);
+    EXPECT_EQ(plan.size(), 1U);
+    if (plan.size() != 1U) {
+        return {};
+    }
     const auto joins = ops_of_type(plan[0], "equi_join_row");
-    ASSERT_EQ(joins.size(), 1U);
-    EXPECT_EQ(joins[0]->params.count("columnar_output"), 1U)
-        << "the join no longer emits columnar output, so this case tests the row path";
-    ASSERT_TRUE(has_op(plan[0], "project_row"));
+    EXPECT_EQ(joins.size(), 1U);
+    if (joins.size() == 1U) {
+        EXPECT_EQ(joins[0]->params.count("columnar_output"), 1U)
+            << "the join no longer emits columnar output, so this case tests the row path";
+    }
+    EXPECT_TRUE(has_op(plan[0], "project_row"));
 
-    const auto collected = run_into_collect(ddl, "INSERT INTO out " + select);
-    const FakeServerScope fake(differential_target());
+    const auto collected = run_into_collect(ddl, "INSERT INTO out " + select, columns);
+    const FakeServerScope fake(differential_target(columns));
     const auto decoded_before = clink::detail::batch_materialize_counter().load();
-    const auto landed = run_into_native(fake, ddl, "INSERT INTO ch " + select);
-    EXPECT_GT(clink::detail::batch_materialize_counter().load(), decoded_before)
+    const auto bails_before = clink::detail::columnar_output_bail_counter().load();
+    const auto landed = run_into_native(fake, ddl, "INSERT INTO ch " + select, columns);
+    JoinCarrier carrier;
+    carrier.decoded = clink::detail::batch_materialize_counter().load() - decoded_before;
+    carrier.bails = clink::detail::columnar_output_bail_counter().load() - bails_before;
+    expect_same_values(collected, landed, kGeneratedRows + kEdgeRows, columns);
+    return carrier;
+}
+
+// Every differential column behind a join the planner promotes to born
+// columnar. SMALLINT, DATE, TIMESTAMP, array, map and row values, and a REAL off
+// float precision, have no exact cell in that layout, so the join takes the row path for every pair
+// and the native sink receives rows built by the join, never decoded from a sidecar. The values
+// must still land as the collect sink sees them.
+TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindAJoinOfEveryType) {
+    ensure_installed();
+    const auto carrier = join_differential("diff_join", differential_columns());
+    EXPECT_EQ(carrier.decoded, 0U) << "a join emitting a column the born-columnar layout stores "
+                                      "as text rode the sidecar instead of the row path";
+    EXPECT_GT(carrier.bails, 0U) << "the join never began on the sidecar, so this case no "
+                                    "longer tests the bail";
+}
+
+// The same join over the columns the born-columnar layout holds exactly: the
+// join's output rides the sidecar, and the sink boundary's row_bind_columns
+// rebuilds rows from that batch, so the native sink receives rows decoded from
+// Arrow rather than from JSON. The planner always puts row_bind_columns last,
+// so the projection before it is the last columnar producer a SQL plan can
+// have.
+TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindAColumnarJoin) {
+    ensure_installed();
+    const auto carrier = join_differential("diff_join_shared", born_columnar_columns());
+    EXPECT_GT(carrier.decoded, 0U)
         << "no batch was decoded from its columnar sidecar, so the rows took the row path";
-    expect_same_values(collected, landed, kGeneratedRows + kEdgeRows);
+    EXPECT_EQ(carrier.bails, 0U)
+        << "the join bailed to the row path on a value the born-columnar layout holds exactly";
 }
 
 // The columns the columnar JSON decode carries as Arrow. It decodes a batch

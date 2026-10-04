@@ -30,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef CLINK_HAS_ARROW
@@ -273,6 +274,105 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
             break;
         }
     }
+}
+
+// Whether `v` comes back out of a column of effective type `layout` as the value
+// it went in as: append_json_cell, then read_cell, gives a cell a row consumer
+// cannot tell from `v` (same JSON kind where it matters, same value, same text
+// when serialised).
+//
+// append_json_cell stores whatever it is handed, and for a sink that is the
+// projection it wants: a TIMESTAMP number becomes its digit text. An operator
+// emitting its output columnar (RowColumnarOutput) must not change a value on
+// its way to the next operator, so it checks every cell with this first and
+// takes the row path for a row that has one that is not exact. The rules are the
+// columnar JSON decoder's (json_string_to_row_columnar.hpp, append_cell_), made
+// strict where its row reference coerces at ingestion and a computed output
+// value is not coerced: a REAL must already be at float precision, a DECIMAL
+// must already be a dec-string at the column's scale.
+inline bool cell_is_exact(const arrow::DataType& layout, const clink::config::JsonValue* v) {
+    if (v == nullptr || v->is_null()) {
+        return true;  // a null cell reads back as null, as an absent one does
+    }
+    // 2^53: the largest magnitude below which every integer has a double.
+    constexpr std::int64_t kDoubleExactInt = std::int64_t{1} << 53;
+    // 2^24: the same for a float.
+    constexpr std::int64_t kFloatExactInt = std::int64_t{1} << 24;
+    const auto float_exact = [&](const clink::config::JsonValue& n) {
+        if (n.is_integral_number()) {
+            return n.as_int() >= -kFloatExactInt && n.as_int() <= kFloatExactInt;
+        }
+        if (!n.is_number()) {
+            return false;
+        }
+        const double d = n.as_number();
+        return std::isnan(d) ||
+               (double_fits_float(d) && static_cast<double>(static_cast<float>(d)) == d);
+    };
+    switch (layout.id()) {
+        case arrow::Type::INT64:
+            // A double holding an integer reads back as that integer, which
+            // serialises the same; a fraction would be truncated.
+            if (v->is_integral_number()) {
+                return true;
+            }
+            return v->is_number() && double_fits_int64(v->as_number()) &&
+                   v->as_number() == std::floor(v->as_number());
+        case arrow::Type::INT32: {
+            constexpr auto kLo = std::numeric_limits<std::int32_t>::min();
+            constexpr auto kHi = std::numeric_limits<std::int32_t>::max();
+            if (v->is_integral_number()) {
+                return v->as_int() >= kLo && v->as_int() <= kHi;
+            }
+            if (!v->is_number()) {
+                return false;
+            }
+            const double d = v->as_number();
+            return std::isfinite(d) && d == std::floor(d) && d >= kLo && d <= kHi;
+        }
+        case arrow::Type::DOUBLE:
+            if (v->is_integral_number()) {
+                return v->as_int() >= -kDoubleExactInt && v->as_int() <= kDoubleExactInt;
+            }
+            return v->is_number();
+        case arrow::Type::FLOAT:
+            return float_exact(*v);
+        case arrow::Type::BOOL:
+            return v->is_bool();
+        case arrow::Type::DECIMAL128: {
+            // read_cell hands back a dec-string at the column's scale, so only
+            // a dec-string already at that scale, in its canonical text, and
+            // within the precision comes back unchanged.
+            if (!clink::config::is_dec_string(*v)) {
+                return false;
+            }
+            const auto& dt = static_cast<const arrow::Decimal128Type&>(layout);
+            const auto d = clink::config::dec_parse(v->as_string());
+            return d && d->scale == dt.scale() && d->unscaled.FitsInPrecision(dt.precision()) &&
+                   clink::config::dec_format(*d) == std::string_view(v->as_string()).substr(1);
+        }
+        case arrow::Type::LIST:
+            // Only list<float32> is a list layout (effective_type); anything
+            // else in it is stored as text and is handled below.
+            if (!is_list_float32(layout)) {
+                break;
+            }
+            if (!v->is_array()) {
+                return false;
+            }
+            for (const auto& e : v->as_array()) {
+                if (!float_exact(e)) {
+                    return false;
+                }
+            }
+            return true;
+        default:
+            break;
+    }
+    // utf8: the declared VARCHAR and the text fallback for every other type.
+    // Only a string reads back as itself; a number, bool, array or object comes
+    // back as its text, and a dec-string loses its tag.
+    return v->is_string() && !clink::config::is_dec_string(*v);
 }
 
 inline std::shared_ptr<arrow::Array> build_column(const std::string& name,

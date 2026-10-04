@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,17 @@
 #include "clink/operators/operator_base.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+
+namespace clink::detail {
+// Process-wide count of batches the columnar JSON decode's DOM arm
+// (build_columnar_direct_) decoded, after the on-demand arm declined them. A
+// test of the DOM arm reads it to prove that arm ran, since both arms emit the
+// same columnar batch. Incremented once per such batch, on the slower arm only.
+inline std::atomic<std::uint64_t>& json_columnar_dom_arm_counter() noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    return counter;
+}
+}  // namespace clink::detail
 
 namespace clink::sql {
 
@@ -116,6 +128,8 @@ public:
                     return;
                 }
                 if (auto columnar = build_columnar_direct_(in); columnar.has_value()) {
+                    clink::detail::json_columnar_dom_arm_counter().fetch_add(
+                        1, std::memory_order_relaxed);
                     consecutive_fallbacks_ = 0;
                     out.emit_data(std::move(*columnar));
                     return;
@@ -219,6 +233,11 @@ private:
         }
         switch (eff.id()) {
             case arrow::Type::INT64: {
+                // An integer is read exactly, as the on-demand arm reads it: through
+                // a double, 2^53 + 1 landed as 2^53 while the row decode kept it.
+                if (v.is_integral_number()) {
+                    return static_cast<arrow::Int64Builder*>(b)->Append(v.as_int()).ok();
+                }
                 if (!v.is_number()) {
                     return false;
                 }
@@ -249,6 +268,17 @@ private:
                     .ok();
             }
             case arrow::Type::DOUBLE:
+                // The row decode keeps an integer token exactly, so one past 2^53,
+                // which a double would round, has no faithful cell here.
+                if (v.is_integral_number()) {
+                    constexpr std::int64_t kDoubleExactInt = std::int64_t{1} << 53;
+                    if (v.as_int() < -kDoubleExactInt || v.as_int() > kDoubleExactInt) {
+                        return false;
+                    }
+                    return static_cast<arrow::DoubleBuilder*>(b)
+                        ->Append(static_cast<double>(v.as_int()))
+                        .ok();
+                }
                 if (!v.is_number()) {
                     return false;
                 }

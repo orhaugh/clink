@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**A join or window's columnar output no longer changes values on the way to
+the next operator.** A join or window that emitted columnar output carried
+TIMESTAMP, SMALLINT and DATE values held as numbers, and ARRAY, MAP and ROW
+values, on as text, and a REAL its source had not rounded to float precision on
+as the rounded float, so a JSON sink or a later GROUP BY could see a string or a
+changed number where the row path kept the original value. Such cells now send
+the emission down the row path, and a join stays on the row path from then on;
+the same types carried as text, and nulls, keep the columnar path. A window's
+columnar fire also left its panes without an event time, where the row fire
+stamps `window_end - 1`, so the exactly-once Kafka sink's replay suppression,
+which matches on event time, passed a replayed pane through after a restore
+(logging that it could not match it), and operators downstream saw no event
+time; columnar panes now carry the same stamp. The columnar Kafka JSON decode
+rounded an integer past 2^53 in a DOUBLE column, and in a BIGINT column on its
+fallback parse, where the row decode kept it exact; such a batch now takes the
+row decode. State restored from an affected job may hold groups keyed by the
+text form, which do not merge with new groups keyed by the value. Job modules
+built against an earlier release must be rebuilt.
+
 **The native ClickHouse sink finds the system's trusted CAs where the OpenSSL
 it was built with looks elsewhere, as the Kafka connector already does.** With
 `secure='true'` and no `tls_ca_file` or `tls_ca_dir`, the sink trusts the

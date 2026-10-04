@@ -2696,45 +2696,53 @@ private:
     // output Row is built.
     //
     // Returns false, having appended nothing, when this pane cannot ride the
-    // columnar carrier: the row path OMITS a group column that was absent from
-    // the record, while a fixed column list would emit it as null, and those are
-    // different rows. Rare (a record missing a GROUP BY column) but silent, so it
-    // is checked per pane rather than assumed away.
+    // columnar carrier, and the fire then goes out in row form:
+    //   - the row path OMITS a group column that was absent from the record,
+    //     while a fixed column list would emit it as null, and those are
+    //     different rows. Rare (a record missing a GROUP BY column) but silent,
+    //     so it is checked per pane rather than assumed away;
+    //   - a cell the sidecar would not hand back unchanged (try_append_row): a
+    //     TIMESTAMP, SMALLINT or DATE key, say, which the layout stores as text.
     bool append_pane_columnar_(const WindowBucket& b, std::int64_t win_end) {
         if (b.group_values.values.size() != group_key_outputs_.size()) {
             return false;
         }
-        for (std::size_t i = 0; i < pane_cols_.size(); ++i) {
-            switch (pane_cols_[i].src) {
+        pane_values_.clear();
+        pane_values_.reserve(pane_cols_.size());
+        pane_cells_.clear();
+        pane_cells_.reserve(pane_cols_.size());
+        for (const auto& pc : pane_cols_) {
+            switch (pc.src) {
                 case PaneSrc::Group: {
-                    const auto* v = row_columnar_detail::field(
-                        b.group_values, group_key_outputs_[pane_cols_[i].idx].str());
+                    const auto* v = row_columnar_detail::field(b.group_values,
+                                                               group_key_outputs_[pc.idx].str());
                     if (v == nullptr) {
                         return false;  // as above: an absent group value, not a null one
                     }
-                    columnar_out_->append(i, v);
-                    break;
+                    pane_cells_.push_back(v);
+                    continue;
                 }
-                case PaneSrc::Agg: {
-                    const auto v = finalize_agg(b.agg_states[pane_cols_[i].idx],
-                                                aggregates_[pane_cols_[i].idx]);
-                    columnar_out_->append(i, &v);
+                case PaneSrc::Agg:
+                    pane_values_.push_back(finalize_agg(b.agg_states[pc.idx], aggregates_[pc.idx]));
                     break;
-                }
-                case PaneSrc::WinStart: {
-                    const clink::config::JsonValue v{static_cast<std::int64_t>(b.window_start)};
-                    columnar_out_->append(i, &v);
+                case PaneSrc::WinStart:
+                    pane_values_.emplace_back(static_cast<std::int64_t>(b.window_start));
                     break;
-                }
-                case PaneSrc::WinEnd: {
-                    const clink::config::JsonValue v{static_cast<std::int64_t>(win_end)};
-                    columnar_out_->append(i, &v);
+                case PaneSrc::WinEnd:
+                    pane_values_.emplace_back(static_cast<std::int64_t>(win_end));
                     break;
-                }
+            }
+            // Filled in below, once pane_values_ has stopped moving.
+            pane_cells_.push_back(nullptr);
+        }
+        std::size_t next_value = 0;
+        for (std::size_t i = 0; i < pane_cols_.size(); ++i) {
+            if (pane_cols_[i].src != PaneSrc::Group) {
+                pane_cells_[i] = &pane_values_[next_value++];
             }
         }
-        columnar_out_->end_row();
-        return true;
+        // The same event-time stamp as the row fire: end - 1.
+        return columnar_out_->try_append_row(pane_cells_, EventTime{clink::sat_sub(win_end, 1)});
     }
 
     // Resolve the planner-declared output schema against the fields a fired pane
@@ -2825,6 +2833,7 @@ private:
         Batch<Row> emit_batch;
         auto bail = [&] {
             bailed = true;
+            clink::detail::columnar_output_bail_counter().fetch_add(1, std::memory_order_relaxed);
             if (auto rb = columnar_out_->finish(); rb != nullptr) {
                 for (const auto& rec : columnar_row_batch(rb)) {
                     emit_batch.push(rec);
@@ -2979,6 +2988,10 @@ private:
     std::vector<RowColumn> output_schema_;
     std::optional<RowColumnarOutput> columnar_out_;
     std::vector<PaneCol> pane_cols_;
+    // Scratch for one pane's cells, reused across panes: the finalised
+    // aggregates and window bounds, and a pointer per output column.
+    std::vector<clink::config::JsonValue> pane_values_;
+    std::vector<const clink::config::JsonValue*> pane_cells_;
     ColumnarOutputDamper damper_;
 };
 
@@ -7295,15 +7308,22 @@ private:
         // all. Only for a pair that carries no changelog marker - a marker is a
         // Row field the declared output schema does not have a column for, so a
         // marked row cannot ride this carrier (see bail_columnar_to_rows_).
+        //
+        // A pair with a cell the sidecar would not hand back unchanged (a
+        // TIMESTAMP, SMALLINT or DATE number, an ARRAY, MAP or ROW value, which
+        // the layout stores as text) takes the same way out: try_append_row
+        // appends nothing and the row path takes over from here.
         const bool needs_marker = !kind.empty() || kind_ != EquiJoinKind::Inner;
         if (columnar_out_.has_value() && damper_.active() && !needs_marker) {
-            for (std::size_t i = 0; i < columnar_cols_.size(); ++i) {
-                const auto& oc = sorted_out_cols_[columnar_cols_[i]];
+            columnar_cells_.clear();
+            for (const auto c : columnar_cols_) {
+                const auto& oc = sorted_out_cols_[c];
                 const Row* src = oc.from_left ? &left : &right;
-                columnar_out_->append(i, row_columnar_detail::field(*src, *oc.src));
+                columnar_cells_.push_back(row_columnar_detail::field(*src, *oc.src));
             }
-            columnar_out_->end_row();
-            return;
+            if (columnar_out_->try_append_row(columnar_cells_)) {
+                return;
+            }
         }
         if (columnar_out_.has_value()) {
             bail_columnar_to_rows_(batch);
@@ -7343,12 +7363,14 @@ private:
     }
 
     // Columnar output is planner-enabled for append-only INNER joins, where no
-    // emission carries a changelog marker. If a marked row turns up anyway, this
-    // converts the rows accumulated columnar so far back into `batch` (in order),
-    // drops the columnar carrier for the rest of this operator's life, and lets
-    // the caller continue on the row path. Correctness does not depend on the
-    // planner being right about the gate - only performance does.
+    // emission carries a changelog marker. If a marked row turns up anyway, or a
+    // row with a cell the sidecar cannot hold exactly, this converts the rows
+    // accumulated columnar so far back into `batch` (in order), drops the
+    // columnar carrier for the rest of this operator's life, and lets the caller
+    // continue on the row path. Correctness does not depend on the planner being
+    // right about the gate - only performance does.
     void bail_columnar_to_rows_(Batch<Row>& batch) {
+        clink::detail::columnar_output_bail_counter().fetch_add(1, std::memory_order_relaxed);
         auto rb = columnar_out_->finish();
         columnar_out_.reset();
         if (rb == nullptr) {
@@ -7391,6 +7413,7 @@ private:
         std::vector<RowColumn> cols;
         cols.reserve(sorted_out_cols_.size());
         columnar_cols_.reserve(sorted_out_cols_.size());
+        columnar_cells_.reserve(sorted_out_cols_.size());
         for (std::size_t i = 0; i < sorted_out_cols_.size(); ++i) {
             const auto& name = sorted_out_cols_[i].name;
             auto it = std::find_if(output_schema_.begin(),
@@ -7912,6 +7935,8 @@ private:
     std::vector<RowColumn> output_schema_;
     std::optional<RowColumnarOutput> columnar_out_;
     std::vector<std::size_t> columnar_cols_;
+    // Scratch for one joined pair's cells, reused across pairs.
+    std::vector<const clink::config::JsonValue*> columnar_cells_;
     ColumnarOutputDamper damper_;
 };
 
