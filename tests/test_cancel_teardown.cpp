@@ -801,7 +801,9 @@ TEST(CancelTeardown, ASinkSeesCancelRequestedAndItsCopyOutlivesTheExecutor) {
         LocalExecutor exec(std::move(dag));
         exec.start();
         ASSERT_TRUE(await([&] { return sink->writes.load() > 0; }, 5s));
-        ASSERT_TRUE(sink->opened.load(std::memory_order_acquire));
+        // The acquire on `opened` is what orders this thread's reads of
+        // `signal` after open() assigned it; `writes` is counted relaxed.
+        ASSERT_TRUE(await([&] { return sink->opened.load(std::memory_order_acquire); }, 5s));
         EXPECT_FALSE(sink->signal.requested()) << "a running task reported itself cancelled";
         exec.cancel();
         EXPECT_TRUE(sink->signal.requested()) << "cancel() did not reach the operator's signal";
@@ -827,6 +829,7 @@ TEST(CancelTeardown, TheExternalCancelTokenReachesCancelRequestedAtOnce) {
     LocalExecutor exec(std::move(dag), cfg);
     exec.start();
     ASSERT_TRUE(await([&] { return sink->writes.load() > 0; }, 5s));
+    ASSERT_TRUE(await([&] { return sink->opened.load(std::memory_order_acquire); }, 5s));
     EXPECT_FALSE(sink->signal.requested());
     token->store(true, std::memory_order_release);
     EXPECT_TRUE(sink->signal.requested());
