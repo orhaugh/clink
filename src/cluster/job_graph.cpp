@@ -578,10 +578,29 @@ void JobGraphSpec::validate() const {
 
 std::string job_graph_fingerprint(const JobGraphSpec& spec) {
     JobGraphSpec normalised = spec;
+    // Ops that feed the SQL sink-boundary bind. A release that recorded
+    // fingerprints never let such an op emit columnar output, because it did
+    // not count the bind as a columnar consumer; a later planner writes
+    // columnar_output onto one when the sink behind the bind takes a columnar
+    // batch. That param changes neither the state the op keeps nor how its keys
+    // route, so it stays out of the fingerprint there, and a job interrupted
+    // under the earlier release resumes. Everywhere else columnar_output is
+    // hashed as it always was: dropping it from every op would change the
+    // recorded fingerprint of each job whose window or join already carried
+    // it, and refuse to resume those jobs instead.
+    std::unordered_set<std::string> feeds_the_bind;
+    for (const auto& op : spec.ops) {
+        if (op.type == "row_bind_columns") {
+            feeds_the_bind.insert(op.inputs.begin(), op.inputs.end());
+        }
+    }
     for (auto& op : normalised.ops) {
         // Stamped per engine instance so collect sinks resolve that engine's
         // queues; the same job submitted by a new process carries a new one.
         op.params.erase("collect_scope");
+        if (feeds_the_bind.contains(op.id)) {
+            op.params.erase("columnar_output");
+        }
     }
     const auto json = normalised.to_json();
     return fnv1a_64_hex(std::as_bytes(std::span{json.data(), json.size()}));

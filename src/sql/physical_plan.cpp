@@ -2195,7 +2195,7 @@ std::string compile_node(const LogicalPlan& node,
             // declared schema, so an unrenamed _colN silently writes null
             // there. The bind takes a columnar batch as it is: it renames and
             // drops columns on the sidecar without building rows, so a sink
-            // that takes the sidecar (blackhole) sees no row at all, and a
+            // that takes the sidecar (blackhole, native ClickHouse) sees no row at all, and a
             // row-only sink materialises once, in the sink, as it would have
             // without the bind. A row batch costs one rebuild per record here.
             {
@@ -2616,8 +2616,8 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
 
 }  // namespace
 
-// Born-columnar operator output (D4): promote a producer's stashed output schema
-// to the live `columnar_output` param when, and only when, every consumer of that
+// Born-columnar operator output: promote a producer's stashed output schema to
+// the live `columnar_output` param when, and only when, every consumer of that
 // producer can ingest a columnar batch.
 //
 // The gate is about SPEED, not correctness. An operator emitting columnar always
@@ -2625,6 +2625,13 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
 // just pays the Arrow build and then the materialise, which is strictly worse
 // than having been handed rows. So the decision belongs here, where the whole
 // chain is visible, rather than in an operator that cannot see its consumer.
+//
+// The sink-boundary bind (row_bind_columns) sits in front of every Row-channel
+// sink and passes a columnar batch on as it is, so what it is worth depends on
+// the sink behind it. It counts as a columnar consumer only when every op it
+// feeds is a sink that takes a columnar batch without building rows; in front
+// of any other sink, promoting the producer would buy an Arrow build that the
+// sink then materialises.
 void enable_columnar_output(cluster::JobGraphSpec& spec) {
     // Diagnostic A/B lever, mirroring CLINK_DISABLE_COLUMNAR for the ingest side:
     // =1 keeps every operator's output row-form. It can only make the engine
@@ -2637,39 +2644,51 @@ void enable_columnar_output(cluster::JobGraphSpec& spec) {
         }
         return;
     }
-    // Operators whose process_columnar ingests a sidecar without materialising.
-    // This list must track supports_columnar() in install.cpp: an op wrongly
-    // listed here costs performance (its input materialises anyway), an op
-    // wrongly missing costs an optimisation, and neither changes results.
-    auto ingests_columnar = [](const std::string& t) {
-        // Operators whose process_columnar ingests a sidecar without materialising,
-        // AND sinks that answer the terminal hook (Sink::supports_columnar). Sinks
-        // count because a producer in front of one is otherwise forced back to row
-        // form - the restriction existed only because every sink materialised.
-        // "window_row" is NOT an operator type. It is the param-error prefix the
-        // window factory prints, and it never matched anything here; the three
-        // types that actually build WindowRowOp (which does implement
-        // process_columnar) were absent, so every producer in front of a TUMBLING
-        // window - the shape nexmark q12 uses - was held back to row output for
-        // nothing. Verified against install.cpp: these ten are exactly the
-        // Row-channel ops and sinks that declare the hook, apart from
-        // row_bind_columns, which is left out on purpose: it always feeds a sink,
-        // and counting it whatever that sink is would promote a producer in
-        // front of a row-only sink, which then pays an Arrow build and a
-        // materialise.
-        return t == "filter_row_predicate" || t == "project_row" || t == "row_compute_key" ||
-               t == "aggregate_row" || t == "tumbling_window_row" || t == "hopping_window_row" ||
-               t == "cumulate_window_row" || t == "session_window_row" ||
-               t == "assign_timestamps_row" || t == "blackhole_sink_row";
-    };
-    // id -> the ops taking it as input. An op with no consumer at all feeds the
-    // sink, which is row-form in every connector today.
+    // id -> the ops taking it as input. An op with no consumer at all is the
+    // sink itself, or a dead end, and promotes nothing.
     std::unordered_map<std::string, std::vector<const cluster::OperatorSpec*>> consumers;
     for (const auto& op : spec.ops) {
         for (const auto& in : op.inputs) {
             consumers[in].push_back(&op);
         }
     }
+    // Sinks that answer the terminal hook (Sink::supports_columnar) and take the
+    // batch from its arrays without building a Row. This list must track
+    // supports_columnar() on the Row-channel sinks; the bind counts only in
+    // front of these.
+    auto is_columnar_sink = [](const std::string& t) {
+        return t == "blackhole_sink_row" || t == "clickhouse_native_sink";
+    };
+    // Operators whose process_columnar ingests a sidecar without materialising,
+    // and the columnar sinks. This list must track supports_columnar() in
+    // install.cpp: an op wrongly listed here costs performance (its input
+    // materialises anyway), an op wrongly missing costs an optimisation, and
+    // neither changes results.
+    auto ingests_columnar = [&](const cluster::OperatorSpec& c) {
+        const std::string& t = c.type;
+        // "window_row" is NOT an operator type. It is the param-error prefix the
+        // window factory prints, and it never matched anything here; the three
+        // types that actually build WindowRowOp (which does implement
+        // process_columnar) were absent, so every producer in front of a
+        // TUMBLING window - the shape nexmark q12 uses - was held back to row
+        // output for nothing. row_bind_columns declares the hook as well, and
+        // counts only in front of a columnar sink.
+        if (t == "filter_row_predicate" || t == "project_row" || t == "row_compute_key" ||
+            t == "aggregate_row" || t == "tumbling_window_row" || t == "hopping_window_row" ||
+            t == "cumulate_window_row" || t == "session_window_row" ||
+            t == "assign_timestamps_row" || is_columnar_sink(t)) {
+            return true;
+        }
+        if (t == "row_bind_columns") {
+            const auto it = consumers.find(c.id);
+            return it != consumers.end() && !it->second.empty() &&
+                   std::all_of(
+                       it->second.begin(), it->second.end(), [&](const cluster::OperatorSpec* s) {
+                           return is_columnar_sink(s->type);
+                       });
+        }
+        return false;
+    };
     for (auto& op : spec.ops) {
         auto stashed = op.params.find(kOutputSchemaKey);
         if (stashed == op.params.end()) {
@@ -2690,7 +2709,7 @@ void enable_columnar_output(cluster::JobGraphSpec& spec) {
         }
         const bool all_columnar =
             std::all_of(it->second.begin(), it->second.end(), [&](const cluster::OperatorSpec* c) {
-                return ingests_columnar(c->type);
+                return ingests_columnar(*c);
             });
         if (all_columnar) {
             op.params["columnar_output"] = std::move(schema);

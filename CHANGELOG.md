@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**A windowed aggregate in front of a blackhole or native ClickHouse sink emits
+columnar output.** The planner now counts the column binding in front of every
+SQL sink as a columnar consumer when every sink it feeds takes a columnar batch
+without building rows, which `blackhole` and the native ClickHouse sink
+(`insert_format='native'`) do. A window whose SELECT is its own output, the
+shape nexmark q12 uses, therefore emits columnar batches into either sink; in
+front of any other sink it stays in row form, and results are unchanged. Join
+plans are unchanged: a SQL join always has a projection after it, which already
+counted as a columnar consumer. Nexmark q12 blackhole figures from before this
+change are not comparable. An embedded job interrupted under v0.10.0 still
+resumes: its resume fingerprint leaves `columnar_output` out only on an
+operator that feeds the binding, which v0.10.0 never promoted, so every
+fingerprint v0.10.0 recorded still matches.
+
 **The native ClickHouse sink takes a columnar batch without building rows.** A
 SQL pipeline whose Kafka JSON decode runs columnar, or whose join or window
 emits columnar output, now stays columnar into `insert_format='native'`. The

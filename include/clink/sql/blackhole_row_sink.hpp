@@ -25,8 +25,10 @@
 // always row_bind_columns, the sink-boundary bind, which renames and drops columns
 // on the sidecar without building rows; until it did, the bind materialised every
 // columnar batch and this hook was unreachable from SQL. The planner's
-// enable_columnar_output can also let the operator upstream emit born-columnar,
-// but only when it lists every consumer of that operator as a columnar one.
+// enable_columnar_output also lets the operator in front of the bind, such as a
+// windowed aggregate, emit born-columnar: it counts the bind as a columnar
+// consumer when every sink the bind feeds takes a columnar batch, as this one
+// does.
 
 #include <cstdint>
 #include <string>

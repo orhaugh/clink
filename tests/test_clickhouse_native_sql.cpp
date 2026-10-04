@@ -1567,6 +1567,196 @@ TEST(ClickHouseNativeSql, AQ0ShapedPipelineAtParallelismFourBuildsNoRowAtTheSink
     EXPECT_EQ(landed.row_batches, 0U);
 }
 
+// --- A window straight into the native sink --------------------------------
+
+// The landed rows of one window run, each row its cells in INSERT column
+// order, and how the native sink took its batches.
+struct WindowRun {
+    std::multiset<std::vector<std::string>> rows;
+    std::uint64_t materialised{0};
+    std::uint64_t columnar_batches{0};
+    std::uint64_t row_batches{0};
+};
+
+// The single op consuming `id`'s output, or nullptr unless there is exactly one.
+const clink::cluster::OperatorSpec* sole_consumer_of(const clink::cluster::JobGraphSpec& spec,
+                                                     const std::string& id) {
+    const clink::cluster::OperatorSpec* found = nullptr;
+    for (const auto& op : spec.ops) {
+        if (std::find(op.inputs.begin(), op.inputs.end(), id) != op.inputs.end()) {
+            if (found != nullptr) {
+                return nullptr;
+            }
+            found = &op;
+        }
+    }
+    return found;
+}
+
+// Checks the plan the window cases rest on: the tumbling window feeds the
+// sink-boundary bind and the bind feeds the native sink, with nothing in
+// between, and the window emits columnar output.
+void expect_window_feeds_the_bind_into_native(const std::string& ddl, const std::string& insert) {
+    const auto plan = compile_script(ddl, insert, 1);
+    ASSERT_EQ(plan.size(), 1U);
+    const auto windows = ops_of_type(plan[0], "tumbling_window_row");
+    ASSERT_EQ(windows.size(), 1U);
+    const auto* bind = sole_consumer_of(plan[0], windows[0]->id);
+    ASSERT_NE(bind, nullptr);
+    EXPECT_EQ(bind->type, "row_bind_columns");
+    const auto* sink = sole_consumer_of(plan[0], bind->id);
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->type, "clickhouse_native_sink");
+    EXPECT_EQ(windows[0]->params.count("columnar_output"), 1U)
+        << "the window in front of the bind into the native sink is not planned columnar";
+}
+
+// Runs `ddl` (which declares the native table `ch`) and `insert` in a fresh
+// engine into `fake`, and returns what landed.
+WindowRun window_into_native(const FakeServerScope& fake,
+                             const std::string& ddl,
+                             const std::string& insert) {
+    WindowRun run;
+    const auto materialised = clink::detail::batch_materialize_counter().load();
+    const auto columnar = sink_input_batches("columnar");
+    const auto rows = sink_input_batches("row");
+    {
+        clink::embed::EngineOptions opts;
+        std::ostringstream err;
+        opts.err = &err;
+        opts.out = &err;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        if (engine.execute_script(ddl) != 0 || engine.execute_script(insert) != 0) {
+            throw std::runtime_error("window script: " + err.str());
+        }
+        if (!engine.await_all()) {
+            std::string joined;
+            for (const auto& e : engine.errors()) {
+                joined += e + "\n";
+            }
+            throw std::runtime_error("window job failed:\n" + joined + err.str());
+        }
+    }
+    run.materialised = clink::detail::batch_materialize_counter().load() - materialised;
+    run.columnar_batches = sink_input_batches("columnar") - columnar;
+    run.row_batches = sink_input_batches("row") - rows;
+    for (const auto& block : fake.server().landed("db.events")) {
+        for (const auto& values : block.values) {
+            run.rows.insert(values);
+        }
+    }
+    return run;
+}
+
+// The same script twice, each into a fake of its own: as planned, then with
+// born-columnar output off, so the window hands the bind rows.
+std::pair<WindowRun, WindowRun> window_into_native_both_ways(const fake::FakeTable& target,
+                                                             const std::string& ddl,
+                                                             const std::string& insert) {
+    WindowRun planned;
+    {
+        const FakeServerScope fake(target);
+        planned = window_into_native(fake, ddl, insert);
+    }
+    WindowRun rows;
+    {
+        setenv("CLINK_DISABLE_COLUMNAR_OUTPUT", "1", 1);
+        const FakeServerScope fake(target);
+        try {
+            rows = window_into_native(fake, ddl, insert);
+        } catch (...) {
+            unsetenv("CLINK_DISABLE_COLUMNAR_OUTPUT");
+            throw;
+        }
+        unsetenv("CLINK_DISABLE_COLUMNAR_OUTPUT");
+    }
+    return {std::move(planned), std::move(rows)};
+}
+
+// Event lines over three ten-second windows and a trailing event that fires
+// them. `keys(i)` renders the grouping keys of line i as JSON members.
+std::vector<std::string> window_lines(const std::function<std::string(int)>& keys) {
+    std::vector<std::string> lines;
+    for (int w = 0; w < 3; ++w) {
+        for (int i = 0; i < 40; ++i) {
+            lines.push_back("{" + keys(i) + R"(,"ts":)" + std::to_string((w * 10000) + 1000 + i) +
+                            "}");
+        }
+    }
+    lines.push_back("{" + keys(0) + R"(,"ts":100000})");
+    return lines;
+}
+
+// A tumbling window grouped by BIGINT and VARCHAR keys, its window_start a
+// BIGINT, feeds the bind into the native sink. The planner lets the window
+// emit columnar output because the only sink behind the bind takes a columnar
+// batch, so its panes reach the sink on the sidecar and no Row is built
+// between the window and the sink. What lands equals what the same script
+// lands with the window's output in row form.
+TEST(ClickHouseNativeSql, AWindowIntoTheNativeSinkReachesItColumnarAndLandsTheRowFormValues) {
+    ensure_installed();
+    const ScratchDir dir("window_bigint_varchar");
+    write_lines(dir.path() / "in.ndjson", window_lines([](int i) {
+                    return R"("k":)" + std::to_string(i % 5) + R"(,"name":"n)" +
+                           std::to_string(i % 3) + R"(")";
+                }));
+    const std::string ddl =
+        "CREATE TABLE ev (k BIGINT, name VARCHAR, ts BIGINT) WITH (connector='file', "
+        "format='json', path='" +
+        (dir.path() / "in.ndjson").string() +
+        "', event_time_column='ts', watermark_lag_ms='0');"
+        "CREATE TABLE ch (window_start BIGINT, k BIGINT, name VARCHAR, c BIGINT) WITH (" +
+        kNativeWith + ");";
+    const std::string insert =
+        "INSERT INTO ch SELECT window_start, k, name, COUNT(*) AS c FROM ev "
+        "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k, name;";
+    expect_window_feeds_the_bind_into_native(ddl, insert);
+
+    const auto target = fake_table(
+        "events", {{"window_start", "Int64"}, {"k", "Int64"}, {"name", "String"}, {"c", "Int64"}});
+    const auto [planned, rows] = window_into_native_both_ways(target, ddl, insert);
+    EXPECT_EQ(planned.materialised, 0U) << "a Row was built between the window and the sink";
+    EXPECT_GT(planned.columnar_batches, 0U) << "the native sink took no pane columnar";
+    EXPECT_EQ(planned.row_batches, 0U);
+    EXPECT_GT(rows.row_batches, 0U) << "the row-form run handed the sink no rows";
+    EXPECT_EQ(rows.columnar_batches, 0U);
+    // 3 windows x 15 (k, name) pairs, and the trailing event's own window,
+    // which end of input fires.
+    EXPECT_EQ(planned.rows.size(), 46U);
+    EXPECT_EQ(planned.rows, rows.rows);
+}
+
+// A window grouped by TIMESTAMP(3), SMALLINT and DATE keys into the native
+// sink. The born-columnar layout holds none of these exactly, so the window
+// may finish its panes in row form; whichever carrier reaches the sink, the
+// values that land equal the row-form run's.
+TEST(ClickHouseNativeSql, AWindowGroupedByTemporalAndSmallIntKeysLandsTheRowFormValues) {
+    ensure_installed();
+    const ScratchDir dir("window_temporal");
+    write_lines(dir.path() / "in.ndjson", window_lines([](int i) {
+                    return R"("at":)" + std::to_string(1700000000000 + (i % 4) * 1000) +
+                           R"(,"s":)" + std::to_string((i % 3) - 1) + R"(,"d":")" +
+                           (i % 2 == 0 ? "2024-02-29" : "2001-01-01") + R"(")";
+                }));
+    const std::string ddl =
+        "CREATE TABLE ev (at TIMESTAMP(3), s SMALLINT, d DATE, ts BIGINT) WITH (connector='file', "
+        "format='json', path='" +
+        (dir.path() / "in.ndjson").string() +
+        "', event_time_column='ts', watermark_lag_ms='0');"
+        "CREATE TABLE ch (at TIMESTAMP(3), s SMALLINT, d DATE, c BIGINT) WITH (" +
+        kNativeWith + ");";
+    const std::string insert =
+        "INSERT INTO ch SELECT at, s, d, COUNT(*) AS c FROM ev "
+        "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), at, s, d;";
+    expect_window_feeds_the_bind_into_native(ddl, insert);
+
+    const auto target = fake_table(
+        "events", {{"at", "DateTime64(3)"}, {"s", "Int16"}, {"d", "Date"}, {"c", "Int64"}});
+    const auto [planned, rows] = window_into_native_both_ways(target, ddl, insert);
+    EXPECT_FALSE(planned.rows.empty());
+    EXPECT_EQ(planned.rows, rows.rows);
+}
+
 // --- The keys the planner puts on the op ------------------------------------
 
 struct PlannerCase {

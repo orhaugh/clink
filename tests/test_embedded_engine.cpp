@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include <arrow/api.h>
@@ -1114,6 +1115,137 @@ TEST(EmbeddedEngine, ARunKilledBeforeItsFirstCheckpointDoesNotResumeTheRunBefore
     EXPECT_EQ(changed.execute_rc, 0) << changed.err;
     EXPECT_EQ(changed.rows, 5) << "nothing of its own to resume, so no refusal and no old state";
     fs::remove_all(dir);
+}
+
+namespace {
+
+// Scripts whose job-graph fingerprint the v0.10.0 release recorded, with the
+// fingerprint it recorded, taken by running each script under the v0.10.0
+// runtime image with --checkpoint-dir and reading _jobs/1/graph-fingerprint.
+// The fingerprint hashes every path in the script, so the inputs live at fixed
+// paths, one file per case so concurrently running cases never share one.
+struct ReleasedFingerprint {
+    const char* label;
+    std::vector<std::pair<std::string, std::vector<std::string>>> inputs;  // file -> lines
+    std::string script;
+    const char* recorded;
+};
+
+const char* const kGoldenDir = "/tmp/clink-fingerprint-golden";
+
+std::vector<ReleasedFingerprint> v0100_fingerprints() {
+    const std::string d = kGoldenDir;
+    const std::vector<std::string> windows{
+        R"({"k":1,"ts":1000})", R"({"k":2,"ts":2000})", R"({"k":1,"ts":100000})"};
+    return {
+        // A window straight into the bind in front of a blackhole sink. v0.10.0
+        // planned it in row form; this build plans it columnar.
+        {"window into the bind",
+         {{"window_bind.ndjson", windows}},
+         "CREATE TABLE ev (k BIGINT, ts BIGINT) WITH (connector='file', format='json', path='" + d +
+             "/window_bind.ndjson', event_time_column='ts', watermark_lag_ms='0');"
+             "CREATE TABLE per_window (k BIGINT, c BIGINT) WITH (connector='blackhole');"
+             "INSERT INTO per_window SELECT k, COUNT(*) AS c FROM ev "
+             "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;",
+         "a3a5de713f0e26fb"},
+        // A window into a HAVING filter: v0.10.0 already gave the window
+        // columnar_output, and hashed it.
+        {"window into a filter",
+         {{"window_having.ndjson", windows}},
+         "CREATE TABLE ev (k BIGINT, ts BIGINT) WITH (connector='file', format='json', path='" + d +
+             "/window_having.ndjson', event_time_column='ts', watermark_lag_ms='0');"
+             "CREATE TABLE per_window (k BIGINT, c BIGINT) WITH (connector='blackhole');"
+             "INSERT INTO per_window SELECT k, COUNT(*) AS c FROM ev "
+             "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k HAVING COUNT(*) > 0;",
+         "5bb25bd991bc57c1"},
+        // An inner join into its projection: v0.10.0 already gave the join
+        // columnar_output, and hashed it.
+        {"inner join",
+         {{"join_a.ndjson", {R"({"k":1,"x":10})", R"({"k":2,"x":20})"}},
+          {"join_b.ndjson", {R"({"k":1,"y":5})", R"({"k":3,"y":7})"}}},
+         "CREATE TABLE a (k BIGINT, x BIGINT) WITH (connector='file', format='json', path='" + d +
+             "/join_a.ndjson');"
+             "CREATE TABLE b (k BIGINT, y BIGINT) WITH (connector='file', format='json', path='" +
+             d +
+             "/join_b.ndjson');"
+             "CREATE TABLE joined (k BIGINT, x BIGINT, y BIGINT) WITH (connector='blackhole');"
+             "INSERT INTO joined SELECT a.k, a.x, b.y FROM a JOIN b ON a.k = b.k;",
+         "0639e14a4d089b0d"},
+    };
+}
+
+// One checkpointed run of `script`. Returns execute_script's code; the engine
+// is destroyed before returning, as a process that exits would be.
+int run_checkpointed(const std::string& script, const fs::path& ckpt, std::string* err_out) {
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    opts.checkpoint_dir = ckpt.string();
+    opts.checkpoint_interval_ms = 100;
+    int rc = 0;
+    {
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        rc = engine.execute_script(script);
+        if (rc == 0 && !engine.await_all()) {
+            rc = 1;
+        }
+    }
+    if (err_out != nullptr) {
+        *err_out = err.str();
+    }
+    return rc;
+}
+
+std::string read_file(const fs::path& path) {
+    std::ifstream in(path);
+    std::stringstream buf;
+    buf << in.rdbuf();
+    return buf.str();
+}
+
+}  // namespace
+
+// A job interrupted under v0.10.0 resumes under this build. Each case runs once
+// here and is left as a kill leaves it; its recorded fingerprint is then set to
+// the one v0.10.0 recorded for the same script, so the rerun stands where an
+// upgrade would. The window into the bind is the case this build plans
+// differently (columnar where v0.10.0 planned rows); the filter and join cases
+// carried columnar_output under v0.10.0 already, and their fingerprints must
+// still include it.
+TEST(EmbeddedEngine, AJobInterruptedUnderTheLastReleaseResumes) {
+    std::error_code ec;
+    fs::create_directories(kGoldenDir, ec);
+    for (const auto& c : v0100_fingerprints()) {
+        SCOPED_TRACE(c.label);
+        for (const auto& [file, lines] : c.inputs) {
+            write_lines(fs::path{kGoldenDir} / file, lines);
+        }
+        const auto dir = resume_scratch("release_upgrade");
+        std::string err;
+        ASSERT_EQ(run_checkpointed(c.script, dir / "ckpt", &err), 0) << err;
+        const auto first_marker = highest_completed_marker(dir / "ckpt");
+        ASSERT_GT(first_marker, 0u) << "the first run must leave a completed checkpoint";
+        const auto jobs = dir / "ckpt" / "_jobs" / "1";
+        const auto first_base = read_file(jobs / "run-base");
+        ASSERT_FALSE(first_base.empty()) << "the first run started from empty state and records it";
+        EXPECT_EQ(read_file(jobs / "graph-fingerprint"), c.recorded)
+            << "this build fingerprints the script differently from v0.10.0";
+        as_if_killed(dir / "ckpt");
+        {
+            std::ofstream out(jobs / "graph-fingerprint", std::ios::trunc);
+            out << c.recorded;
+        }
+
+        ASSERT_EQ(run_checkpointed(c.script, dir / "ckpt", &err), 0) << err;
+        EXPECT_EQ(err.find("different job graph"), std::string::npos) << err;
+        EXPECT_EQ(read_file(jobs / "run-base"), first_base)
+            << "the rerun started from empty state instead of resuming the first run";
+        EXPECT_GT(highest_completed_marker(dir / "ckpt"), first_marker);
+        fs::remove_all(dir);
+        for (const auto& [file, lines] : c.inputs) {
+            fs::remove(fs::path{kGoldenDir} / file, ec);
+        }
+    }
 }
 
 // The plain `parquet` sink across a resume. It used to write one file per

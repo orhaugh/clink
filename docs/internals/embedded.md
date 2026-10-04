@@ -122,6 +122,26 @@ was this job. A resume whose fingerprint differs is refused, and the error
 names both fingerprints and the two ways out: a new checkpoint directory,
 or `--fresh`. `clink run` exits 1 on the refusal.
 
+The fingerprint leaves out one param, and only on some operators:
+`columnar_output`, the typed output schema the planner writes onto a window
+or join that may emit columnar batches, is left out on an operator that
+feeds `row_bind_columns`, the bind in front of every SQL sink. Up to v0.10.0
+the planner never wrote it there; after v0.10.0 it does when the sink behind
+the bind takes a columnar batch (blackhole, native ClickHouse), so a
+windowed aggregate whose SELECT is its own output gains it. It changes
+neither what state the job keeps nor how its keys route, so a job of that
+shape interrupted under v0.10.0 resumes rather than being refused. On every
+other operator the param is part of the fingerprint, as it was in v0.10.0:
+a job whose window or join already carried it, such as a join behind its
+projection or a window feeding a `HAVING` filter, keeps the fingerprint it
+recorded. `EmbeddedEngine.AJobInterruptedUnderTheLastReleaseResumes` pins
+all three shapes against the fingerprints the v0.10.0 release recorded.
+
+The check runs in the coordinator, on a job submitted with
+`CheckpointConfig::track_runs`, which only the embedded engine sets. A job
+submitted to a cluster, and one an HA leader takes over, restores from the
+checkpoint it is given and records no fingerprint.
+
 A run that starts from empty state records `_jobs/<id>/run-base`, the id it
 numbers its checkpoints above. Checkpoints at or below it belong to earlier
 runs and are never resumed, so a run killed before its first checkpoint

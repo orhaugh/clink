@@ -12,6 +12,7 @@
 //   - Empty / blank lines do not produce ghost ops.
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 
@@ -539,4 +540,57 @@ TEST(JobGraphFingerprint, IgnoresTheEngineCollectScopeAndSeesEveryOtherChange) {
     extra_op.ops.insert(extra_op.ops.begin() + 1, proj);
     extra_op.ops.back().inputs = {"proj_2"};
     EXPECT_NE(job_graph_fingerprint(base), job_graph_fingerprint(extra_op));
+}
+
+// An upgrade can change how an op carries its batches for the same SQL: a
+// planner that newly lets a window in front of the sink-boundary bind emit
+// columnar output writes columnar_output onto it, which the releases before it
+// never did. That changes neither the state the op keeps nor how its keys
+// route, so a job interrupted under the earlier release must still resume.
+// Every other op's columnar_output is hashed, as those releases hashed it, so
+// their recorded fingerprints still match.
+TEST(JobGraphFingerprint, IgnoresColumnarOutputOnlyInFrontOfTheSinkBind) {
+    // src_0 -> win_1 -> bind_2 -> snk_3
+    auto spec_of = [](const std::map<std::string, std::string>& win_params) {
+        JobGraphSpec spec;
+        OperatorSpec src;
+        src.type = "file_text_source";
+        src.id = "src_0";
+        OperatorSpec win;
+        win.type = "tumbling_window_row";
+        win.id = "win_1";
+        win.inputs = {"src_0"};
+        for (const auto& [k, v] : win_params) {
+            win.params[k] = v;
+        }
+        OperatorSpec bind;
+        bind.type = "row_bind_columns";
+        bind.id = "bind_2";
+        bind.inputs = {"win_1"};
+        OperatorSpec sink;
+        sink.type = "blackhole_sink_row";
+        sink.id = "snk_3";
+        sink.inputs = {"bind_2"};
+        spec.ops = {src, win, bind, sink};
+        return spec;
+    };
+    const auto base = spec_of({});
+    EXPECT_EQ(job_graph_fingerprint(base),
+              job_graph_fingerprint(spec_of({{"columnar_output", "k:i64,c:i64"}})));
+    EXPECT_NE(job_graph_fingerprint(base),
+              job_graph_fingerprint(spec_of({{"columnar_decode", "false"}})));
+
+    // The same param on an op whose consumer is not the bind is part of the
+    // job's identity: a window into a filter carried it under the releases
+    // that recorded fingerprints, and they hashed it.
+    auto into_filter = spec_of({});
+    into_filter.ops[2].type = "filter_row_predicate";
+    auto into_filter_columnar = spec_of({{"columnar_output", "k:i64,c:i64"}});
+    into_filter_columnar.ops[2].type = "filter_row_predicate";
+    EXPECT_NE(job_graph_fingerprint(into_filter), job_graph_fingerprint(into_filter_columnar));
+
+    // Only the op feeding the bind is affected, not the bind or the sink.
+    auto on_the_sink = base;
+    on_the_sink.ops[3].params["columnar_output"] = "k:i64,c:i64";
+    EXPECT_NE(job_graph_fingerprint(base), job_graph_fingerprint(on_the_sink));
 }

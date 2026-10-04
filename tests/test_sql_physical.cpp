@@ -3215,4 +3215,252 @@ TEST(SqlPhysical, ColumnarOutputOnWhenTheConsumerIngestsColumnar) {
     EXPECT_NE(std::find(names.begin(), names.end(), "c"), names.end());
 }
 
+// --- Born-columnar output in front of the sink-boundary bind -----------------
+//
+// Every Row-channel sink has row_bind_columns in front of it, so a window or
+// join whose SELECT needs no projection feeds the bind, never the sink. The
+// bind passes a columnar batch on as it is, so whether the producer should
+// emit one depends on the sink behind the bind: a sink that takes the batch
+// from its arrays (blackhole, native ClickHouse) gains from it, and any other
+// sink would materialise it again after paying for the Arrow build.
+
+namespace {
+
+struct GateSink {
+    const char* label;
+    const char* with;
+    const char* sink_type;
+    bool columnar;
+};
+
+// The four sinks the gate distinguishes, by the DDL options of the
+// destination table.
+const std::vector<GateSink>& gate_sinks() {
+    static const std::vector<GateSink> sinks{
+        {"native ClickHouse",
+         "connector='clickhouse', format='json', insert_format='native', table='events', "
+         "host='ch'",
+         "clickhouse_native_sink",
+         true},
+        {"blackhole", "connector='blackhole'", "blackhole_sink_row", true},
+        {"JSONEachRow ClickHouse",
+         "connector='clickhouse', format='json', table='events', host='ch'",
+         "clickhouse_sink",
+         false},
+        {"file",
+         "connector='file', format='json', path='/tmp/gate_out.ndjson'",
+         "file_json_sink",
+         false},
+    };
+    return sinks;
+}
+
+// Compiles `insert` against the tables `ddl` declares plus `dst` WITH `with`.
+cluster::JobGraphSpec compile_gate_plan(const std::string& ddl,
+                                        const std::string& dst_columns,
+                                        const std::string& with,
+                                        const std::string& insert) {
+    Catalog cat;
+    auto s = parse(ddl + "CREATE TABLE dst " + dst_columns + " WITH (" + with + ");");
+    for (const auto& stmt : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(stmt));
+    }
+    auto plan = optimize(bind_insert(cat, insert.c_str()));
+    PhysicalPlanner pp;
+    return pp.compile(static_cast<const LogicalSink&>(*plan));
+}
+
+// The single op consuming `id`, or nullptr when there is not exactly one.
+const cluster::OperatorSpec* sole_consumer(const cluster::JobGraphSpec& spec,
+                                           const std::string& id) {
+    const cluster::OperatorSpec* found = nullptr;
+    for (const auto& op : spec.ops) {
+        if (std::find(op.inputs.begin(), op.inputs.end(), id) != op.inputs.end()) {
+            if (found != nullptr) {
+                return nullptr;
+            }
+            found = &op;
+        }
+    }
+    return found;
+}
+
+// Checks that `producer_type` feeds the bind, which feeds the sink directly
+// or through the JSON bridge, and returns the producer.
+const cluster::OperatorSpec* producer_in_front_of_the_bind(const cluster::JobGraphSpec& spec,
+                                                           const std::string& producer_type,
+                                                           const GateSink& sink) {
+    const auto* producer = find_op(spec, producer_type);
+    EXPECT_NE(producer, nullptr) << sink.label;
+    if (producer == nullptr) {
+        return nullptr;
+    }
+    const auto* bind = sole_consumer(spec, producer->id);
+    EXPECT_NE(bind, nullptr) << sink.label;
+    if (bind == nullptr) {
+        return nullptr;
+    }
+    EXPECT_EQ(bind->type, "row_bind_columns")
+        << sink.label << ": fixture assumption, the " << producer_type
+        << " must feed the sink-boundary bind with nothing in between";
+    const auto* next = sole_consumer(spec, bind->id);
+    EXPECT_NE(next, nullptr) << sink.label;
+    if (next != nullptr && next->type == "row_to_json_string") {
+        next = sole_consumer(spec, next->id);
+        EXPECT_NE(next, nullptr) << sink.label;
+    }
+    if (next != nullptr) {
+        EXPECT_EQ(next->type, sink.sink_type) << sink.label;
+    }
+    return producer;
+}
+
+}  // namespace
+
+// A tumbling window whose SELECT is its own output feeds the bind directly. It
+// emits columnar output when the sink behind the bind takes a columnar batch
+// without building rows, and stays row form otherwise. The blackhole case is
+// nexmark q12's shape, which lost its born-columnar window when the bind went
+// in front of every sink.
+TEST(SqlPhysical, AWindowInFrontOfTheBindEmitsColumnarOnlyForAColumnarSink) {
+    const std::string ddl =
+        "CREATE TABLE ev (k BIGINT, v BIGINT, ts BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/gate_ev.ndjson', event_time_column='ts');";
+    for (const auto& sink : gate_sinks()) {
+        const auto spec = compile_gate_plan(ddl,
+                                            "(k BIGINT, c BIGINT)",
+                                            sink.with,
+                                            "INSERT INTO dst SELECT k, COUNT(*) AS c FROM ev GROUP "
+                                            "BY TUMBLE(ts, INTERVAL '10' SECOND), k");
+        const auto* win = producer_in_front_of_the_bind(spec, "tumbling_window_row", sink);
+        if (win == nullptr) {
+            continue;
+        }
+        EXPECT_EQ(win->params.count("columnar_output"), sink.columnar ? 1U : 0U) << sink.label;
+        EXPECT_EQ(win->params.count("__output_schema"), 0U) << sink.label;
+    }
+}
+
+// The same four sinks behind an inner join. The binder always puts a
+// projection after a join, even for SELECT *, and project_row counts as a
+// columnar consumer whatever follows it, so through SQL the join emits columnar
+// output in front of every sink, as it did before the bind rule. The rule
+// itself is checked on a join straight into the bind, a shape only a
+// hand-built spec has.
+TEST(SqlPhysical, AJoinBehindItsProjectionEmitsColumnarInFrontOfEverySink) {
+    const std::string ddl =
+        "CREATE TABLE a (k BIGINT, v BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/gate_a.ndjson');"
+        "CREATE TABLE b (k BIGINT, w BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/gate_b.ndjson');";
+    for (const auto& sink : gate_sinks()) {
+        const auto spec = compile_gate_plan(ddl,
+                                            "(a_k BIGINT, a_v BIGINT, b_k BIGINT, b_w BIGINT)",
+                                            sink.with,
+                                            "INSERT INTO dst SELECT * FROM a JOIN b ON a.k = b.k");
+        const auto* join = find_op(spec, "equi_join_row");
+        ASSERT_NE(join, nullptr) << sink.label;
+        const auto* proj = sole_consumer(spec, join->id);
+        ASSERT_NE(proj, nullptr) << sink.label;
+        EXPECT_EQ(proj->type, "project_row") << sink.label;
+        EXPECT_EQ(join->params.count("columnar_output"), 1U) << sink.label;
+    }
+}
+
+namespace {
+
+// An inner join straight into the bind, then `sink`, with the join's output
+// schema stashed as compile_node leaves it for enable_columnar_output.
+cluster::JobGraphSpec join_into_the_bind(const GateSink& sink) {
+    cluster::JobGraphSpec spec;
+    auto add = [&](const std::string& id, const std::string& type, std::vector<std::string> in) {
+        cluster::OperatorSpec op;
+        op.id = id;
+        op.type = type;
+        op.inputs = std::move(in);
+        op.out_channel = "row";
+        spec.ops.push_back(std::move(op));
+        return &spec.ops.back();
+    };
+    add("src_a", "file_json_source", {});
+    add("src_b", "file_json_source", {});
+    add("key_a", "row_compute_key", {"src_a"});
+    add("key_b", "row_compute_key", {"src_b"});
+    auto* join = add("join", "equi_join_row", {"key_a", "key_b"});
+    join->params["join_type"] = "inner";
+    join->params["__output_schema"] = "a_k:i64;a_v:i64;b_k:i64;b_w:i64";
+    add("bind", "row_bind_columns", {"join"});
+    std::string before_sink = "bind";
+    if (std::string{sink.sink_type} == "clickhouse_sink") {
+        add("bridge", "row_to_json_string", {"bind"});
+        before_sink = "bridge";
+    }
+    add("snk", sink.sink_type, {before_sink});
+    return spec;
+}
+
+}  // namespace
+
+TEST(SqlPhysical, AJoinStraightIntoTheBindEmitsColumnarOnlyForAColumnarSink) {
+    for (const auto& sink : gate_sinks()) {
+        auto spec = join_into_the_bind(sink);
+        enable_columnar_output(spec);
+        const auto* join = find_op(spec, "equi_join_row");
+        ASSERT_NE(join, nullptr);
+        EXPECT_EQ(join->params.count("columnar_output"), sink.columnar ? 1U : 0U) << sink.label;
+        EXPECT_EQ(join->params.count("__output_schema"), 0U) << sink.label;
+    }
+    // A bind that feeds a columnar sink and anything else counts as a row
+    // consumer: the other consumer would materialise the batch.
+    auto fan_out = join_into_the_bind(gate_sinks()[1]);
+    cluster::OperatorSpec file_sink;
+    file_sink.id = "snk_file";
+    file_sink.type = "file_json_sink";
+    file_sink.inputs = {"bind"};
+    fan_out.ops.push_back(file_sink);
+    enable_columnar_output(fan_out);
+    EXPECT_EQ(find_op(fan_out, "equi_join_row")->params.count("columnar_output"), 0U);
+}
+
+// An outer join stays row form in front of a columnar sink too, because every
+// row it emits carries a changelog kind the declared output schema has no
+// column for.
+TEST(SqlPhysical, AnOuterJoinStaysRowFormInFrontOfAColumnarSink) {
+    const auto spec = compile_gate_plan(
+        "CREATE TABLE a (k BIGINT, v BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/gate_a.ndjson');"
+        "CREATE TABLE b (k BIGINT, w BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/gate_b.ndjson');",
+        "(a_k BIGINT, a_v BIGINT, b_k BIGINT, b_w BIGINT)",
+        "connector='blackhole'",
+        "INSERT INTO dst SELECT * FROM a LEFT JOIN b ON a.k = b.k");
+    const auto* join = find_op(spec, "equi_join_row");
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->params.count("columnar_output"), 0U);
+}
+
+// The q0 shape into the native sink: the gate adds nothing to a plan with no
+// window or join, so it stays the decode, the projection, the bind and the
+// sink, and no op carries columnar_output.
+TEST(SqlPhysical, AQ0ShapedNativePlanIsUnchangedByTheGate) {
+    const auto spec = compile_gate_plan(
+        "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url "
+        "VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', topic='q0', "
+        "brokers='x:9092');",
+        "(auction BIGINT, bidder BIGINT, price BIGINT, datetime BIGINT)",
+        gate_sinks()[0].with,
+        "INSERT INTO dst SELECT auction, bidder, price, datetime FROM bid");
+    std::vector<std::string> types;
+    for (const auto& op : spec.ops) {
+        types.push_back(op.type);
+        EXPECT_EQ(op.params.count("columnar_output"), 0U) << op.type;
+    }
+    EXPECT_EQ(types,
+              (std::vector<std::string>{"kafka_source_string",
+                                        "json_string_to_row_columnar",
+                                        "project_row",
+                                        "row_bind_columns",
+                                        "clickhouse_native_sink"}));
+}
+
 }  // namespace clink::sql

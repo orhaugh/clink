@@ -65,6 +65,14 @@ private:
     bool allow_unbounded_state_ = false;
 };
 
+// The planner's last pass over a compiled spec, which compile() runs: it
+// promotes each producer's stashed output schema to the producer's
+// `columnar_output` param when every consumer of the producer takes a columnar
+// batch, and erases the stash otherwise. Declared here so a spec shape the
+// binder does not emit, such as an inner join straight into the sink-boundary
+// bind, can be checked against the rule directly.
+void enable_columnar_output(cluster::JobGraphSpec& spec);
+
 // The Row-channel source factory + build params to scan `table` in process (for
 // ANALYZE, via the SourceFactory registry + LocalExecutor). Mirrors the scan
 // source the planner emits for a Row-channel table. Throws TranslationError if
