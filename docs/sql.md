@@ -566,7 +566,8 @@ A wasm UDAF works anywhere a built-in aggregate does, including windowed
 
 `ORDER BY` requires a `LIMIT` at the top level (an unbounded sort has no meaning on
 a stream), and its columns must be in the `SELECT` output. `LIMIT n [OFFSET m]`
-bounds the result.
+bounds the result; `n` and `m` are non-negative integer literals, and `LIMIT 0`
+writes nothing.
 
 ```sql
 SELECT url FROM clicks_a

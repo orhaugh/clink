@@ -1401,6 +1401,12 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
                            av.at("Integer").is_object() && av.at("Integer").contains("ival")) {
                     value = static_cast<std::int64_t>(av.at("Integer").at("ival").as_number());
                     ok = true;
+                } else if (av.is_object() && av.contains("ival") && av.at("ival").is_object() &&
+                           av.at("ival").as_object().empty()) {
+                    // The parser omits a zero field, so LIMIT 0 arrives as an
+                    // empty ival wrapper, as OFFSET 0 does below.
+                    value = 0;
+                    ok = true;
                 }
             }
         }

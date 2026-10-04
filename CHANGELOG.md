@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**`LIMIT 0` is accepted.** It was refused as "LIMIT must be a non-negative
+integer literal": the parser omits a field whose value is zero, and only
+`OFFSET` read the empty value as 0. `LIMIT 0`, with or without `ORDER BY`,
+now completes and writes nothing.
+
 **A takeover no longer reuses the id of a checkpoint its dead leader had
 begun, and a leader no longer shares ids with a superseded coordinator.** A
 recovered job numbered its new checkpoints above the COMPLETED and CONFIRMED

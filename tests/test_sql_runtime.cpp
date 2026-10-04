@@ -4595,6 +4595,44 @@ TEST(SqlRuntime, LimitOffsetSkipsThenForwards) {
     std::filesystem::remove(out_path);
 }
 
+// LIMIT 0 completes and writes nothing, with or without ORDER BY.
+TEST(SqlRuntime, LimitZeroWritesNoRows) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_lim0_in.ndjson";
+    std::filesystem::remove(in_path);
+    write_lines(in_path, {R"({"id":1})", R"({"id":2})", R"({"id":3})"});
+
+    for (const std::string query :
+         {"SELECT id FROM t LIMIT 0", "SELECT id FROM t ORDER BY id LIMIT 0"}) {
+        const auto out_path =
+            std::filesystem::temp_directory_path() / "clink_sql_e2e_lim0_out.ndjson";
+        std::filesystem::remove(out_path);
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE t (id BIGINT) "
+                                     "WITH (connector='file', format='json', path='"} +
+                         in_path.string() +
+                         "');"
+                         "CREATE TABLE out_t (id BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        const std::string insert = "INSERT INTO out_t " + query;
+        auto spec = compile(cat, insert.c_str());
+
+        InProcessCluster cluster("worker-sql-e2e-limit0", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(result.completed) << query << ": " << result.reject_message;
+        EXPECT_TRUE(read_lines(out_path).empty()) << query;
+        std::filesystem::remove(out_path);
+    }
+    std::filesystem::remove(in_path);
+}
+
 // --- IN literal-list e2e -------------------------------
 
 TEST(SqlRuntime, InListFiltersUsers) {

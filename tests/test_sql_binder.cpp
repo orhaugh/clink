@@ -1950,6 +1950,22 @@ TEST(SqlBinder, OrderByLimitOffsetWrapsLogicalTopNWithOffset) {
     EXPECT_EQ(tn.offset(), 2);
 }
 
+// Zero is a count like any other: the parser omits a zero field, and LIMIT 0
+// used to be refused for it while OFFSET 0 was read.
+TEST(SqlBinder, LimitZeroAndOffsetZeroAreCounts) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan = b.bind_select(as_select(parse("SELECT url FROM clicks LIMIT 0")));
+    ASSERT_EQ(plan->kind(), "Limit");
+    EXPECT_EQ(static_cast<const LogicalLimit&>(*plan).count(), 0);
+    plan = b.bind_select(
+        as_select(parse("SELECT user_id FROM clicks ORDER BY user_id LIMIT 0 OFFSET 0")));
+    ASSERT_EQ(plan->kind(), "TopN");
+    EXPECT_EQ(static_cast<const LogicalTopN&>(*plan).count(), 0);
+    EXPECT_EQ(static_cast<const LogicalTopN&>(*plan).offset(), 0);
+}
+
 TEST(SqlBinder, OffsetWithoutLimitRejected) {
     Catalog cat;
     register_clicks(cat);
