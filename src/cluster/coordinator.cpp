@@ -518,8 +518,8 @@ std::vector<std::string> read_string_array_field(const std::string& body, const 
 
 void Coordinator::recover_persisted_jobs() {
     {
-        std::lock_guard trace_lock(recovery_trace_mu_);
-        recovery_traced_.clear();  // a new leadership records each job's takeover once
+        std::lock_guard begun_lock(recovery_begun_mu_);
+        recovery_begun_.clear();  // a new leadership takes each job over once
     }
     if (ha_dir_.empty())
         return;
@@ -631,18 +631,48 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         // starts fresh when it had none: the same rule a restart applies. It
         // used to take its own id 0 as the restore point, which the deploy
         // lint refuses, so the job was dropped at the takeover.
+        //
+        // The markers are read once, here, and everything the takeover reports
+        // and does follows that read: the restore point, CoordRecovers'
+        // completed point, the RestartProceeds gate and the walk's upper
+        // bound. A second read of the COMPLETED markers after plugin loading
+        // saw a superseded coordinator's put that landed in between, and the
+        // takeover reported a completed point it then restored below. The
+        // CONFIRMED marker is read first: a confirmation is written only once
+        // its checkpoint's COMPLETED marker has landed, so the completed point
+        // read after it is never below the confirmed one.
+        //
+        // A recovery parked for capacity, retried when a worker registers,
+        // reads nothing: it deploys what the takeover decided (its record in
+        // recovery_begun_). A superseded coordinator's put landing during the
+        // park moved a fresh read past anything the takeover's lines named.
+        const bool needs_confirmation =
+            body.find("\"requires_commit_confirmation\":true") != std::string::npos;
+        std::optional<TakeoverDecision> decided;
+        {
+            std::lock_guard begun_lock(recovery_begun_mu_);
+            if (const auto it = recovery_begun_.find(job_id);
+                it != recovery_begun_.end() && it->second.decided) {
+                decided = it->second;
+            }
+        }
         std::uint64_t own_restore_point = 0;
-        if (!ckpt.checkpoint_dir.empty()) {
+        std::uint64_t completed_on_disk = 0;
+        if (decided.has_value()) {
+            own_restore_point = decided->own_restore_point;
+            completed_on_disk = decided->completed;
+            ckpt.restore_from_dir = decided->restore_from_dir;
+            ckpt.restore_from_checkpoint_id = decided->restore_from_checkpoint_id;
+        } else if (!ckpt.checkpoint_dir.empty()) {
             // Commit-confirmed restore protocol: a manifest flagged as
             // carrying a non-recoverable-commit sink restores from the
             // newest CONFIRMED checkpoint - a completed-but-unconfirmed one
             // may hold a broker transaction that died with the previous
             // leader's workers, and restoring past it loses that interval.
-            const bool needs_confirmation =
-                body.find("\"requires_commit_confirmation\":true") != std::string::npos;
-            const auto latest = needs_confirmation
-                                    ? latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id)
-                                    : latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
+            const auto confirmed_on_disk =
+                needs_confirmation ? latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id) : 0;
+            completed_on_disk = latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
+            const auto latest = needs_confirmation ? confirmed_on_disk : completed_on_disk;
             own_restore_point = latest;
             if (latest > 0) {
                 ckpt.restore_from_dir = ckpt.checkpoint_dir;
@@ -652,6 +682,7 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                 ckpt.restore_from_checkpoint_id = 0;
             }
         }
+        CLINK_FAULT_POINT(clink::fault::points::kCoordinatorTakeoverAfterMarkerRead);
         // Plugins: scan plugin-*.so keys in this job's prefix, load each
         // into a fresh JobBundle.
         std::vector<PluginBinary> plugins;
@@ -709,30 +740,42 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         // interval instead of replaying it. Any failure leaves the
         // commit-confirmed contract in force.
         {
-            const bool needs_confirmation =
-                body.find("\"requires_commit_confirmation\":true") != std::string::npos;
-            const std::uint64_t completed_on_disk =
-                ckpt.checkpoint_dir.empty()
-                    ? 0
-                    : latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
-            // The takeover is recorded once per job per leadership: a recovery
-            // parked for capacity comes back through here when a worker
-            // registers, and that is the same takeover continuing, not another.
+            // The takeover is recorded, and walks, once per job per leadership:
+            // a recovery parked for capacity comes back through here when a
+            // worker registers, and that is the same takeover continuing, not
+            // another. Its walk has run, and the retry deploys the restore
+            // point the walk left (the decision recorded below); whatever the
+            // walk could not confirm it would only probe again, a second round
+            // of EndTxn calls on handles it refused, under Walk events the
+            // trace has no step for after the takeover's walk finished.
             bool first_recovery = false;
-            if (protocol_trace::enabled()) {
-                std::lock_guard trace_lock(recovery_trace_mu_);
-                first_recovery = recovery_traced_.insert(job_id).second;
+            if (!decided.has_value()) {
+                std::lock_guard begun_lock(recovery_begun_mu_);
+                first_recovery = recovery_begun_.try_emplace(job_id).second;
             }
-            if (first_recovery) {
+            if (first_recovery && protocol_trace::enabled()) {
+                // `confirmed` is the confirmed restore point the takeover
+                // adopts from the job's own directory: for the commit-confirmed
+                // family, the newest CONFIRMED marker as the restore point
+                // read it (own_restore_point), not a second read, which a
+                // superseded coordinator's put landing in between would put
+                // ahead of the restore. It is not the restore point itself
+                // when the job has confirmed nothing of its own yet and keeps
+                // the savepoint it was submitted with, whose id names another
+                // directory: that is 0 here.
                 protocol_trace::Event("CoordRecovers")
                     .u("job", job_id)
                     .u("epoch", epoch())
                     .u("completed", completed_on_disk)
-                    .u("confirmed", ckpt.restore_from_checkpoint_id)
+                    .u("confirmed",
+                       needs_confirmation
+                           ? own_restore_point
+                           : latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id))
                     .emit();
             }
-            if (needs_confirmation && !ckpt.checkpoint_dir.empty()) {
-                if (first_recovery && completed_on_disk > ckpt.restore_from_checkpoint_id) {
+            if (needs_confirmation && !ckpt.checkpoint_dir.empty() && first_recovery) {
+                if (protocol_trace::enabled() &&
+                    completed_on_disk > ckpt.restore_from_checkpoint_id) {
                     protocol_trace::Event("RestartProceeds")
                         .u("job", job_id)
                         .b("resolving", true)
@@ -740,11 +783,17 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                         .u("confirmed", ckpt.restore_from_checkpoint_id)
                         .emit();
                 }
-                const auto resolved = resolve_in_doubt_commits(
-                    ckpt.checkpoint_dir,
-                    job_id,
-                    ckpt.restore_from_checkpoint_id,
-                    latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id));
+                // The walk runs to the completed point the takeover read and
+                // reported (CoordRecovers, RestartProceeds), not to a fresh
+                // read: a stale COMPLETED put (its run redeployed past, or its
+                // coordinator superseded) can land in between, and the walk
+                // then probed checkpoints above the range its own lines named,
+                // or walked with no RestartProceeds at all.
+                CLINK_FAULT_POINT(clink::fault::points::kCoordinatorTakeoverBeforeWalk);
+                const auto resolved = resolve_in_doubt_commits(ckpt.checkpoint_dir,
+                                                               job_id,
+                                                               ckpt.restore_from_checkpoint_id,
+                                                               completed_on_disk);
                 if (resolved > ckpt.restore_from_checkpoint_id) {
                     log::info("coordinator.ha",
                               "job_id=" + std::to_string(job_id) +
@@ -762,6 +811,16 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                     ckpt.restore_from_checkpoint_id = resolved;
                     own_restore_point = resolved;
                 }
+            }
+            if (first_recovery) {
+                std::lock_guard begun_lock(recovery_begun_mu_);
+                recovery_begun_[job_id] = TakeoverDecision{
+                    .decided = true,
+                    .completed = completed_on_disk,
+                    .own_restore_point = own_restore_point,
+                    .restore_from_dir = ckpt.restore_from_dir,
+                    .restore_from_checkpoint_id = ckpt.restore_from_checkpoint_id,
+                };
             }
         }
         // Schema-evolution D: skip recovering a job whose persisted
@@ -792,8 +851,10 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                     next_job_id_ = job_id;
             }
             // Numbers above every id the job has on record, even with nothing
-            // of its own to restore (submit_job's id floor).
+            // of its own to restore (submit_job's id floor), and resumes beside
+            // the completed point the takeover reported.
             ckpt.taken_over = true;
+            ckpt.resumed_completed = completed_on_disk;
             const auto deployed = submit_job(graph,
                                              OperatorRegistry::default_instance(),
                                              std::move(plugins),
@@ -844,7 +905,9 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                     pending_recovery_ids_.end()) {
                     pending_recovery_ids_.push_back(job_id);
                 }
-                if (!recovery_retry_thread_.joinable()) {
+                // Not once stop() has begun, for the reason the in-doubt
+                // resolution thread is not (stage_in_doubt_resolution_locked_).
+                if (!recovery_retry_thread_.joinable() && !stop_.load(std::memory_order_acquire)) {
                     recovery_retry_thread_ = std::thread([this] { recovery_retry_loop_(); });
                 }
             }
@@ -891,7 +954,10 @@ void Coordinator::recovery_retry_loop_() {
         }
         std::size_t free = 0;
         for (const auto& [_, w] : registered_) {
-            if (!w->lost) {
+            // Guarded: a session can be charged past its capacity (a retry
+            // moved onto a successor that was already full), and the unsigned
+            // difference would then read as some four billion free slots.
+            if (!w->lost && w->slots_in_use < w->slot_capacity) {
                 free += (w->slot_capacity - w->slots_in_use);
             }
         }
@@ -919,25 +985,39 @@ bool Coordinator::restart_drain_covered_(const JobState& job) {
     return true;
 }
 
+std::uint64_t Coordinator::completed_point_(const JobState& job) {
+    return std::max(job.latest_completed_checkpoint_id, job.checkpoint.resumed_completed);
+}
+
 bool Coordinator::stage_in_doubt_resolution_locked_(JobState& job) {
     if (job.resolving_in_doubt) {
         return true;  // in flight; the resolution thread fires the restart
+    }
+    if (job.in_doubt_walked) {
+        return false;  // this restart's walk has answered; it waits only to redeploy
     }
     // Only tracked jobs (a non-recoverable-commit sink in the plan), only
     // when a completed-but-unconfirmed gap actually exists, and only with a
     // checkpoint dir to read the staged handles from. Everything else
     // restarts immediately, exactly as before.
-    if (job.confirm_task_keys.empty() || job.checkpoint.checkpoint_dir.empty() ||
-        job.latest_completed_checkpoint_id == 0 ||
-        job.latest_confirmed_checkpoint_id >= job.latest_completed_checkpoint_id) {
+    //
+    // A job that resumed (a takeover, a tracked run's resume) has completed
+    // nothing in memory until its first checkpoint lands, and the completed
+    // point it resumed beside still counts: a gap its takeover's walk left
+    // open is still open, and the specification's restart walks it again.
+    // Without it the restart redeployed straight from the confirmed point.
+    const auto completed = completed_point_(job);
+    if (job.confirm_task_keys.empty() || job.checkpoint.checkpoint_dir.empty() || completed == 0 ||
+        job.latest_confirmed_checkpoint_id >= completed) {
         return false;
     }
     job.resolving_in_doubt = true;
+    job.in_doubt_walk_from = job.latest_confirmed_checkpoint_id;
     if (protocol_trace::enabled()) {
         protocol_trace::Event("RestartProceeds")
             .u("job", job.id)
             .b("resolving", true)
-            .u("completed", job.latest_completed_checkpoint_id)
+            .u("completed", completed)
             .u("confirmed", job.latest_confirmed_checkpoint_id)
             .emit();
     }
@@ -961,15 +1041,20 @@ bool Coordinator::stage_in_doubt_resolution_locked_(JobState& job) {
     // cancel treats a walk that never returned as hung.
     job.restart_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{90};
     pending_in_doubt_resolutions_.push_back(job.id);
-    if (!in_doubt_resolution_thread_.joinable()) {
+    // Never once stop() has begun: it takes the handle under mu_ to join it,
+    // and a handler still in flight on a worker's dispatch thread can stage a
+    // resolution after that. A thread started then would outlive the join and
+    // the Coordinator. stop_ is set before stop() takes mu_, so a stage after
+    // that hold sees it.
+    if (!in_doubt_resolution_thread_.joinable() && !stop_.load(std::memory_order_acquire)) {
         in_doubt_resolution_thread_ = std::thread([this] { in_doubt_resolution_loop_(); });
     }
-    log::info("coordinator.restart",
-              "job_id=" + std::to_string(job.id) +
-                  " restart held for in-doubt resolution (latest_completed=" +
-                  std::to_string(job.latest_completed_checkpoint_id) +
-                  " latest_confirmed=" + std::to_string(job.latest_confirmed_checkpoint_id) +
-                  "); nothing deploys until the broker answers");
+    log::info(
+        "coordinator.restart",
+        "job_id=" + std::to_string(job.id) +
+            " restart held for in-doubt resolution (latest_completed=" + std::to_string(completed) +
+            " latest_confirmed=" + std::to_string(job.latest_confirmed_checkpoint_id) +
+            "); nothing deploys until the broker answers");
     cv_.notify_all();
     return true;
 }
@@ -984,6 +1069,9 @@ void Coordinator::in_doubt_resolution_loop_() {
         auto ids = std::move(pending_in_doubt_resolutions_);
         pending_in_doubt_resolutions_.clear();
         for (const auto id : ids) {
+            lock.unlock();
+            CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeInDoubtWalk);
+            lock.lock();
             std::string dir;
             std::uint64_t confirmed = 0;
             std::uint64_t completed = 0;
@@ -994,8 +1082,10 @@ void Coordinator::in_doubt_resolution_loop_() {
                     continue;  // failed, cancelled, or gone while queued
                 }
                 dir = it->second->checkpoint.checkpoint_dir;
-                confirmed = it->second->latest_confirmed_checkpoint_id;
-                completed = it->second->latest_completed_checkpoint_id;
+                // Where the stage said the walk starts, not where memory is
+                // now (JobState::in_doubt_walk_from).
+                confirmed = it->second->in_doubt_walk_from;
+                completed = completed_point_(*it->second);
                 cancel = it->second->in_doubt_cancel;
             }
             lock.unlock();
@@ -1014,6 +1104,7 @@ void Coordinator::in_doubt_resolution_loop_() {
                 continue;  // the watchdog backstop failed the job meanwhile
             }
             job.resolving_in_doubt = false;
+            job.in_doubt_walked = true;
             // The resolution deadline is spent (soft-cancelled or not); the
             // deferred restart below may enter a capacity wait, which runs
             // on its own deadline.
@@ -1283,9 +1374,9 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
                 "coordinator is at its worker-connection limit (" +
                 std::to_string(cfg_.max_worker_connections) + " already connected); refusing '" +
                 reg.worker_id +
-                "'. Refusing is deliberate - admitting would spawn a reader thread the "
-                "coordinator cannot account for. Raise max_worker_connections if the cluster "
-                "genuinely is this large.";
+                "'. Refusing is deliberate - admitting would spawn two threads (a reader and a "
+                "dispatcher) the coordinator cannot account for. Raise max_worker_connections "
+                "if the cluster genuinely is this large.";
             log::warn("coordinator.register", reason);
             metrics::orch::worker_connection_refused();
             RegisterAckMsg nack{.ok = false, .message = reason, .retryable = true};
@@ -1299,7 +1390,7 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     worker->worker_id = reg.worker_id;
     worker->data_host = reg.data_host;
     worker->conn = std::move(conn);
-    worker->last_seen = std::chrono::steady_clock::now();
+    worker->last_seen.store(std::chrono::steady_clock::now(), std::memory_order_release);
     worker->slot_capacity = reg.slot_count == 0 ? std::uint32_t{1} : reg.slot_count;
     worker->protocol_version = reg.protocol_version;
     worker->http_port = reg.http_port;
@@ -1320,18 +1411,47 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     // restarted process with a stable name) replaces the old WorkerConnection. Its reader
     // thread must be joined before the object can be destroyed - destroying a
     // joinable std::thread is std::terminate - and the join must happen off
-    // this lock AND off the reader thread (the reader takes mu_ in its loop,
-    // and it holds a shared_ptr to its own WorkerConnection, so letting the
+    // this lock AND off the reader thread (the reader joins the connection's
+    // dispatch thread, which takes mu_ for every frame it handles, and the
+    // reader holds a shared_ptr to its own WorkerConnection, so letting the
     // map drop the last reference hands destruction to the exiting reader
-    // itself: self-join, terminate).
+    // itself: self-join, terminate). The join, and the retirement after it,
+    // run on the new session's dispatch thread (retire_replaced_session_),
+    // not here: the old session's dispatcher first handles every frame its
+    // reader read, which can take as long as the store writes those frames
+    // make, and waiting here would hold the accept thread, and leave the new
+    // session's heartbeats unread, for all of it.
     std::shared_ptr<WorkerConnection> replaced;
     bool replaced_was_lost = false;
     {
         std::lock_guard lock(mu_);
         if (auto it = registered_.find(reg.worker_id); it != registered_.end()) {
+            // The session on record is still retiring the one IT replaced: its
+            // dispatch thread waits for that session's frames, and a session
+            // replacing it would wait for both. Each such registration while
+            // the store holds the oldest one's frames used to add two threads
+            // and a full dispatch backlog, outside max_worker_connections, with
+            // no bound on how many. Refused instead, retryably: the worker's
+            // supervisor backs off and registers again, and is admitted once
+            // the retirement ends. Only a worker that registers twice while
+            // one retirement is out is refused, and the retirement ends when
+            // the old session's frames have been handled.
+            if (it->second->retiring_predecessor) {
+                const std::string reason =
+                    "worker '" + reg.worker_id +
+                    "' re-registered while the coordinator is still retiring an earlier session "
+                    "of it (handling the frames that session sent); retry once that is done";
+                log::warn("coordinator.register", reason);
+                metrics::orch::worker_connection_refused();
+                RegisterAckMsg nack{.ok = false, .message = reason, .retryable = true};
+                (void)send_frame(*worker->conn, fenced_frame_(MessageKind::RegisterAck, nack));
+                return;  // conn destructor closes
+            }
             replaced = it->second;
             replaced_was_lost = replaced->lost;
         }
+        worker->session = ++last_worker_session_;
+        worker->retiring_predecessor = replaced != nullptr;
         registered_[reg.worker_id] = worker;
         // Binds the worker to this leader's epoch.
         RegisterAckMsg ack_msg{.ok = true, .message = ""};
@@ -1348,44 +1468,56 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
             return;
         }
     }
-    if (replaced) {
-        if (replaced->conn) {
-            replaced->conn->shutdown_read();  // wake a reader parked in read_frame
+    // From here the replaced session is this thread's to retire until
+    // start_reader_for_ takes it. Anything that throws before then (an
+    // allocation in the logging below) retires it here instead, on the
+    // registering thread: dropped unjoined, its reader would end holding the
+    // last reference to its own WorkerConnection and destroy its own joinable
+    // std::thread, which is std::terminate. The new session never got its
+    // threads, so it is shut down and reported finished; with nothing stamping
+    // it, the watchdog declares it lost.
+    struct RetireUnlessHandedOver {
+        Coordinator& self;
+        WorkerConnection& successor;
+        std::shared_ptr<WorkerConnection>& replaced;
+        const bool& replaced_was_lost;
+        bool handed_over{false};
+        ~RetireUnlessHandedOver() {
+            if (handed_over) {
+                return;
+            }
+            if (successor.conn) {
+                successor.conn->shutdown_read();
+            }
+            successor.reader_finished->store(true, std::memory_order_release);
+            if (replaced) {
+                self.retire_replaced_session_(successor, replaced, replaced_was_lost);
+            }
         }
-        if (replaced->reader.joinable()) {
-            replaced->reader.join();
-        }
-        log::info("coordinator.register",
-                  "worker=" + reg.worker_id + " re-registered; previous session retired");
-        // Retiring the session is not enough: whatever the OLD session had
-        // in flight for a job can never report now, and any restart drain
-        // waiting on those subtasks would wait until its deadline and then
-        // fail the job.
-        //
-        // This is how a replacement session deadlocked recovery. A session ends,
-        // the coordinator starts a restart drain, and the worker registers a
-        // fresh session under the SAME id (which is
-        // correct - the id must be stable for the coordinator to recognise
-        // it), and the drain is now waiting on a subtask whose owning session
-        // can no longer report.
-        // The re-registered worker is alive and heartbeating, so the watchdog
-        // never declares it lost and never folds it in.
-        //
-        // The same treatment a lost worker's subtasks get: drop them from the
-        // expected-drain set and queue them for redeploy. No restart attempt
-        // is consumed - this is still the same restart, now correctly aware
-        // that one of the survivors it was waiting for has been replaced.
-        retire_previous_session_subtasks_(reg.worker_id);
+    } retire_guard{*this, *worker, replaced, replaced_was_lost};
+    if (replaced && replaced->conn) {
+        // Wake a reader parked in read_frame. It stops reading, and the
+        // frames it has already read are handled before it exits.
+        replaced->conn->shutdown_read();
     }
     // A registration IS forward progress for any restart waiting on
     // capacity: reset every waiting job's capacity clock so the deadline
-    // measures 180s with NO worker arriving - genuine starvation - rather
-    // than 180s of a kill/return cadence that keeps almost catching up.
+    // measures restart_capacity_timeout with NO worker arriving - genuine
+    // starvation - rather than that long of a kill/return cadence that keeps
+    // almost catching up.
     // (The rig-night composite expired the clock across episodes whose
     // workers returned within seconds, each time reading a live recovery
     // as a dead cluster.) Under its own mu_ hold: the registration lock
-    // above was deliberately released before joining the replaced session's
-    // reader, and jobs_ is concurrently written by deploys.
+    // above was deliberately released, and jobs_ is concurrently written by
+    // deploys.
+    //
+    // Here, at the registration, and not after a replaced session's
+    // retirement: the new session's slots are free from its RegisterAck, and
+    // a placement made on it while the old session's frames drain is stamped
+    // with the new session, which the retirement does not fold. Waking the
+    // waiters only after the retirement would not have closed that window
+    // anyway: a submit or a watchdog-kicked restart places without being
+    // woken.
     {
         std::lock_guard lock(mu_);
         for (auto& [_, jptr] : jobs_) {
@@ -1396,16 +1528,9 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     }
     cv_.notify_all();
 
-    // Replacing a still-live session keeps the registered-worker and slot
-    // capacity gauges unchanged. A previously-lost session was already
-    // subtracted by worker_lost(), so its replacement must add them back.
-    // Counting every re-registration inflated both gauges on each transient
-    // control-plane reconnect.
-    if (!replaced || replaced_was_lost) {
+    // A replacement's gauges move when its predecessor is retired.
+    if (!replaced) {
         metrics::coordinator::worker_registered(worker->slot_capacity);
-    } else {
-        metrics::coordinator::worker_session_replaced(
-            replaced->slot_capacity, replaced->slots_in_use, worker->slot_capacity);
     }
     log::info("coordinator.register",
               "worker=" + worker->worker_id + " host=" + worker->data_host +
@@ -1417,7 +1542,105 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
                         ",\"slots\":" + std::to_string(worker->slot_capacity) +
                         ",\"http_port\":" + std::to_string(worker->http_port) + "}");
 
-    start_reader_for_(worker);
+    retire_guard.handed_over = true;
+    start_reader_for_(worker, std::move(replaced), replaced_was_lost);
+}
+
+void Coordinator::retire_replaced_session_(WorkerConnection& successor,
+                                           const std::shared_ptr<WorkerConnection>& replaced,
+                                           bool replaced_was_lost) noexcept {
+    try {
+        retire_replaced_session_unguarded_(successor, replaced, replaced_was_lost);
+    } catch (const std::exception& e) {
+        try {
+            log::error("coordinator.register",
+                       "worker=" + successor.worker_id +
+                           ": retiring the previous session failed: " + e.what());
+        } catch (...) {
+            // Only the log line was lost.
+        }
+    } catch (...) {
+        // Not a std::exception; the join below is what matters.
+    }
+    // The join is the retirement's first act; if it was never reached, or
+    // threw, it is attempted again here. join() throws only when it cannot
+    // join at all, and then nothing more can be done.
+    try {
+        if (replaced->reader.joinable()) {
+            replaced->reader.join();
+        }
+    } catch (...) {
+        // Not joinable from here; nothing more can be done.
+    }
+    try {
+        std::lock_guard lock(mu_);
+        successor.retiring_predecessor = false;
+    } catch (...) {
+        // mu_ could not be locked; the flag only gates a retryable refusal.
+    }
+}
+
+void Coordinator::retire_replaced_session_unguarded_(
+    const WorkerConnection& successor,
+    const std::shared_ptr<WorkerConnection>& replaced,
+    bool replaced_was_lost) {
+    // The old session's reader has been woken (handle_register_ shut its read
+    // side) and exits once its dispatcher has handled every frame it read.
+    // Those frames were sent before the re-registration and are handled as
+    // they always were: a SubtaskFinished among them takes its subtask out of
+    // the fold below rather than leaving it to be counted as lost.
+    if (replaced->reader.joinable()) {
+        replaced->reader.join();
+    }
+    if (stop_.load(std::memory_order_acquire)) {
+        return;  // stop() abandons the old session's backlog; nothing to fold
+    }
+    log::info("coordinator.register",
+              "worker=" + successor.worker_id + " re-registered; previous session retired");
+    // Retiring the session is not enough: whatever the OLD session had
+    // in flight for a job can never report now, and any restart drain
+    // waiting on those subtasks would wait until its deadline and then
+    // fail the job.
+    //
+    // This is how a replacement session deadlocked recovery. A session ends,
+    // the coordinator starts a restart drain, and the worker registers a
+    // fresh session under the SAME id (which is
+    // correct - the id must be stable for the coordinator to recognise
+    // it), and the drain is now waiting on a subtask whose owning session
+    // can no longer report.
+    // The re-registered worker is alive and heartbeating, so the watchdog
+    // never declares it lost and never folds it in.
+    //
+    // The same treatment a lost worker's subtasks get: drop them from the
+    // expected-drain set and queue them for redeploy. No restart attempt
+    // is consumed - this is still the same restart, now correctly aware
+    // that one of the survivors it was waiting for has been replaced.
+    //
+    // Only what the old session held. The new session has been schedulable
+    // since its RegisterAck, so a job may already have been placed on it
+    // while the old session's frames drained; the worker id names both
+    // sessions, and the session stamp tells them apart.
+    retire_previous_session_subtasks_(successor.worker_id, successor.session);
+    // Replacing a still-live session keeps the registered-worker and slot
+    // capacity gauges unchanged. A previously-lost session was already
+    // subtracted by worker_lost(), so its replacement must add them back.
+    // Counting every re-registration inflated both gauges on each transient
+    // control-plane reconnect.
+    if (replaced_was_lost) {
+        metrics::coordinator::worker_registered(successor.slot_capacity);
+    } else {
+        // Read and marked in one hold: a slot moved off the replaced session
+        // after this (a deploy re-targeting its successor) must not leave the
+        // gauge a second time.
+        std::uint32_t in_use = 0;
+        {
+            std::lock_guard lock(mu_);
+            in_use = replaced->slots_in_use;
+            replaced->slots_gauge_retired = true;
+        }
+        metrics::coordinator::worker_session_replaced(
+            replaced->slot_capacity, in_use, successor.slot_capacity);
+    }
 }
 
 std::uint64_t Coordinator::latest_completed_checkpoint(JobId job_id) const {
@@ -2674,14 +2897,33 @@ void Coordinator::populate_restart_drain_locked_(JobState& job) {
     // that starts the drain skips workers that are unregistered or lost,
     // so nothing ever asks the others, and waiting for them burns the
     // whole deadline before the watchdog fails the job.
+    //
+    // One exception: a lost session that is still retiring its predecessor
+    // did not hold the predecessor's subtasks (mark_worker_lost_locked_ kept
+    // them pending). The predecessor's queued frames drain them, or its
+    // retirement, which runs once those frames are handled, folds them out
+    // of this set. Redeployed now instead, a SubtaskFinished still queued for
+    // one of them is handled against the new run.
     std::unordered_set<std::string> in_flight;
     for (const auto& [worker_id, pending] : job.pending_per_worker) {
         auto it = registered_.find(worker_id);
-        if (it == registered_.end() || it->second->lost) {
+        if (it == registered_.end()) {
+            continue;
+        }
+        const auto& worker = *it->second;
+        const bool retiring_lost = worker.lost && worker.retiring_predecessor;
+        if (worker.lost && !retiring_lost) {
             continue;
         }
         for (const auto& [role, sub] : pending) {
-            in_flight.insert(role + ":" + std::to_string(sub));
+            const std::string key = role + ":" + std::to_string(sub);
+            if (retiring_lost) {
+                const auto stamp = job.pending_session.find(key);
+                if (stamp == job.pending_session.end() || stamp->second >= worker.session) {
+                    continue;
+                }
+            }
+            in_flight.insert(key);
         }
     }
     job.restart_drain_expected = in_flight;
@@ -3008,11 +3250,7 @@ void Coordinator::hot_cutover_begin_rebind_locked_(JobState& job,
             continue;
         }
         const auto worker_id = rec_it->second.first;
-        if (auto w = registered_.find(worker_id);
-            w != registered_.end() && w->second->slots_in_use > 0) {
-            --w->second->slots_in_use;
-            metrics::coordinator::slots_in_use_delta(-1);
-        }
+        release_task_slot_locked_(job, worker_id, key);
         if (auto tbt = job.tasks_by_worker.find(worker_id); tbt != job.tasks_by_worker.end()) {
             std::erase_if(tbt->second, [&](const DeploymentTask& t) {
                 return t.role == rec_it->second.second.role &&
@@ -3132,9 +3370,10 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
             .op_id = hot.op_id, .subtask_idx_in_op = t.subtask_idx - hot.appended_base};
         job.pending_per_worker[t.worker_id].emplace_back(d.role, d.subtask_idx);
         job.tasks_by_worker[t.worker_id].push_back(d);
+        job.pending_session[key] = 0;
         if (auto w = registered_.find(t.worker_id); w != registered_.end()) {
-            ++w->second->slots_in_use;
-            metrics::coordinator::slots_in_use_delta(1);
+            job.pending_session[key] = w->second->session;
+            charge_slots_locked_(*w->second, 1);
         }
         ++job.expected_completion;
         ++job.expected_listenings;
@@ -3362,11 +3601,7 @@ void Coordinator::abort_hot_cutover_locked_(JobState& job,
     // their slots will not run now, so free them here; the replan re-places the
     // operator, and the drain it stages below covers only what still runs.
     for (const auto& early : job.hot_cutover->early_drains) {
-        if (auto w = registered_.find(early.worker_id);
-            w != registered_.end() && w->second->slots_in_use > 0) {
-            --w->second->slots_in_use;
-            metrics::coordinator::slots_in_use_delta(-1);
-        }
+        release_task_slot_locked_(job, early.worker_id, early.key);
     }
     clear_hot_cut_ack_pin_locked_();
     job.hot_cutover.reset();
@@ -3389,11 +3624,14 @@ void Coordinator::abort_hot_cutover_locked_(JobState& job,
     }
 }
 
-void Coordinator::handle_begin_rescale_ack_(MessageReader& r) {
+void Coordinator::handle_begin_rescale_ack_(MessageReader& r, const WorkerConnection& sender) {
     auto msg = decode_begin_rescale_ack(r);
     std::vector<PendingDeploy> frames;
     {
         std::lock_guard lock(mu_);
+        if (sender.lost) {
+            return;  // the loss fold has already accounted for this session
+        }
         auto it = jobs_.find(msg.job_id);
         if (it == jobs_.end()) {
             return;
@@ -4072,7 +4310,7 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
             }
             std::size_t free = 0;
             for (const auto& [_, worker] : registered_) {
-                if (!worker->lost) {
+                if (!worker->lost && worker->slots_in_use < worker->slot_capacity) {
                     free += (worker->slot_capacity - worker->slots_in_use);
                 }
             }
@@ -4083,7 +4321,7 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
         std::lock_guard lock(mu_);
         std::size_t free = 0;
         for (const auto& [_, worker] : registered_) {
-            if (!worker->lost) {
+            if (!worker->lost && worker->slots_in_use < worker->slot_capacity) {
                 free += (worker->slot_capacity - worker->slots_in_use);
             }
         }
@@ -4274,6 +4512,32 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     // ephemerally and report via SubtaskListening", a non-zero port means "the caller pre-bound
     // this and the address is already known". The legacy in-process API uses the latter.
     JobPlan resolved_plan = plan;
+    // The session each worker's Deploy goes to. The slots, the session stamps
+    // on the job's pending subtasks, and the connection the Deploy is sent on
+    // all name the same session. Picked in the hold that places the tasks and
+    // checked again in the hold that publishes the job (below): the store
+    // reads and writes between the two can outlast a re-registration.
+    std::unordered_map<std::string, std::shared_ptr<WorkerConnection>> targets;
+    std::unordered_map<std::string, std::uint32_t> charged;
+    // Gives back every slot charged here if the job is never published: the
+    // deploy fails, and nothing would release them.
+    struct ReleaseUnlessPublished {
+        Coordinator& self;
+        std::unordered_map<std::string, std::shared_ptr<WorkerConnection>>& targets;
+        std::unordered_map<std::string, std::uint32_t>& charged;
+        bool published{false};
+        ~ReleaseUnlessPublished() {
+            if (published) {
+                return;
+            }
+            std::lock_guard lock(self.mu_);
+            for (const auto& [worker_id, n] : charged) {
+                if (const auto t = targets.find(worker_id); t != targets.end()) {
+                    self.release_slots_locked_(*t->second, n);
+                }
+            }
+        }
+    } release_unless_published{*this, targets, charged};
     {
         std::lock_guard lock(mu_);
         std::vector<PlacementWorker> pool;
@@ -4295,10 +4559,13 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         for (const auto& t : resolved_plan.tasks) {
             auto it = registered_.find(t.worker_id);
             if (it != registered_.end()) {
-                ++it->second->slots_in_use;
+                targets.emplace(t.worker_id, it->second);
+                charge_slots_locked_(*it->second, 1);
+                ++charged[t.worker_id];
             }
         }
     }
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorDeployAfterPlacement);
 
     // Build a (role, subtask) → (worker_id, port) lookup so we can resolve
     // peer references into concrete host:port addresses. Hosts come
@@ -4397,11 +4664,17 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                 restore = 0;
             }
             if (protocol_trace::enabled()) {
+                // The confirmed restore point this run adopts, as a takeover
+                // reports it: the newest CONFIRMED marker, read once above,
+                // and 0 when it belongs to an earlier run (at or below the run
+                // base), which this run neither resumes from nor seeds its
+                // confirmed restore point with. A job outside the
+                // commit-confirmed family confirms nothing.
                 protocol_trace::Event("CoordRecovers")
                     .u("job", job_id)
                     .u("epoch", epoch())
                     .u("completed", completed)
-                    .u("confirmed", restore)
+                    .u("confirmed", needs_confirmation ? restore : 0)
                     .emit();
             }
             if (needs_confirmation && completed > std::max(restore, run_base)) {
@@ -4430,6 +4703,13 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             } else {
                 checkpoint.restore_from_dir = checkpoint.checkpoint_dir;
                 checkpoint.restore_from_checkpoint_id = restore;
+                // Beside the completed point its takeover line reported, as an
+                // HA takeover does: a gap the walk above left open is walked
+                // again by a restart before this run completes a checkpoint.
+                // Only for a resume: a run that starts from empty state above
+                // its base has no gap of its own, and a walk from its zero
+                // confirmed point would reach the earlier runs' checkpoints.
+                checkpoint.resumed_completed = completed;
                 // The layout gate above ran before there was a restore point.
                 std::set<std::uint32_t> planned;
                 for (const auto& t : resolved_plan.tasks) {
@@ -4748,10 +5028,53 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
 
     {
         std::lock_guard lock(mu_);
+        // A worker may have re-registered since its tasks were placed, and the
+        // session they were placed on may already be retired: the retirement
+        // folds only the jobs it finds, and this one is not published yet.
+        // Stamped with that session and deployed on its half-closed socket, the
+        // job would never start and nothing would ever fold it. Its tasks go
+        // to the worker's current session instead, which takes over their
+        // slots if it still has room for them. It has been placeable since its
+        // RegisterAck, so another submit may have filled it meanwhile, and
+        // moving the tasks anyway put more subtasks on the worker than it has
+        // slots. A worker with no live session left, or one whose new session
+        // is full, fails the deploy retryably, as a lack of slots does; the
+        // slots charged here go back with it.
+        for (auto& [worker_id, target] : targets) {
+            const auto current = registered_.find(worker_id);
+            if (current == registered_.end() || current->second->lost) {
+                throw InsufficientSlotsError("Coordinator::deploy: worker '" + worker_id +
+                                             "' was lost after the job's tasks were placed on it");
+            }
+            if (current->second == target) {
+                continue;
+            }
+            const auto n = charged[worker_id];
+            const auto& successor = *current->second;
+            const std::uint32_t room = successor.slots_in_use < successor.slot_capacity
+                                           ? successor.slot_capacity - successor.slots_in_use
+                                           : 0;
+            if (room < n) {
+                throw InsufficientSlotsError(
+                    "Coordinator::deploy: worker '" + worker_id +
+                    "' re-registered after the job's tasks were placed on it, and its new "
+                    "session has " +
+                    std::to_string(room) + " free slot(s) for the job's " + std::to_string(n));
+            }
+            release_slots_locked_(*target, n);
+            charge_slots_locked_(*current->second, n);
+            target = current->second;
+            log::info("coordinator.submit",
+                      "job_id=" + std::to_string(job_id) + " worker=" + worker_id +
+                          " re-registered while the job was being deployed; its " +
+                          std::to_string(n) + " task(s) go to the new session");
+        }
         for (const auto& [worker_id, tasks] : by_worker) {
             const auto deploy_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
                                        .count();
+            const auto target = targets.find(worker_id);
+            const std::uint64_t session = target == targets.end() ? 0 : target->second->session;
             for (const auto& t : tasks) {
                 const std::string key = t.role + ":" + std::to_string(t.subtask_idx);
                 job->task_records[key] = {worker_id, t};
@@ -4761,6 +5084,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                 job->subtask_timing[key].started_ms = deploy_ms;
                 job->subtask_timing[key].finished_ms = 0;  // (re)deploy clears any prior finish
                 job->pending_per_worker[worker_id].emplace_back(t.role, t.subtask_idx);
+                job->pending_session[key] = session;
             }
             job->tasks_by_worker[worker_id] = tasks;
         }
@@ -4772,10 +5096,10 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         job->plugins = plugins;  // copy; each Deploy gets its own copy below
         job->checkpoint = checkpoint;
         jobs_[job_id] = job;
+        release_unless_published.published = true;
     }
 
     metrics::coordinator::job_submitted();
-    metrics::coordinator::slots_in_use_delta(static_cast<std::int64_t>(resolved_plan.tasks.size()));
     log::info("coordinator.submit",
               "job_id=" + std::to_string(job_id) +
                   " tasks=" + std::to_string(resolved_plan.tasks.size()));
@@ -4785,17 +5109,20 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
 
     // Send Deploy to each affected worker.
     for (auto& [worker_id, tasks] : by_worker) {
-        std::shared_ptr<WorkerConnection> conn;
+        // The socket is copied in the hold: reap_finished_workers_ resets
+        // WorkerConnection::conn under mu_, so reading it after the hold
+        // races that reset and can dereference a null pointer.
+        std::shared_ptr<network::Connection> conn;
         std::vector<PluginBinary> worker_plugins;
         {
             std::lock_guard lock(mu_);
-            auto it = registered_.find(worker_id);
-            if (it == registered_.end()) {
+            auto it = targets.find(worker_id);
+            if (it == targets.end()) {
                 throw std::runtime_error("Coordinator::deploy: worker not registered: " +
                                          worker_id);
             }
-            conn = it->second;
-            worker_plugins = plugins_for_worker_locked_(*job, *conn);
+            conn = it->second->conn;
+            worker_plugins = plugins_for_worker_locked_(*job, *it->second);
         }
         DeployMsg deploy_msg;
         deploy_msg.job_id = job_id;
@@ -4820,7 +5147,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.expected_state_versions_packed = job->expected_state_versions_packed;
         deploy_msg.udfs_packed = job->udfs_packed;
         const auto frame = fenced_frame_(MessageKind::Deploy, deploy_msg);
-        if (!conn->conn || !send_frame(*conn->conn, frame)) {
+        if (!conn || !send_frame(*conn, frame)) {
             throw std::runtime_error("Coordinator::deploy: send failed for " + worker_id);
         }
     }
@@ -4835,96 +5162,316 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     return job_id;
 }
 
-void Coordinator::start_reader_for_(std::shared_ptr<WorkerConnection> worker) {
-    worker->reader = std::thread([this, worker] {
-        // Set on EVERY exit path, so a finished reader is distinguishable from a
-        // running one and can be joined. Without it the thread and its socket
-        // were held until stop(). Captured by value so it outlives the
-        // WorkerConnection if that is ever replaced under the same id.
-        auto finished = worker->reader_finished;
-        struct MarkFinished {
-            std::shared_ptr<std::atomic<bool>> flag;
-            ~MarkFinished() { flag->store(true, std::memory_order_release); }
-        } mark{finished};
-        while (!stop_.load(std::memory_order_acquire)) {
-            if (!worker->conn)
-                return;
-            auto frame = read_frame(*worker->conn);
-            if (!frame.has_value()) {
-                return;  // peer closed
-            }
-            bool drop = false;
-            {
-                std::lock_guard lock(mu_);
-                if (worker->lost) {
-                    drop = true;
-                } else {
-                    worker->last_seen = std::chrono::steady_clock::now();
-                }
-            }
-            if (drop) {
-                continue;
-            }
-            MessageReader r(std::move(*frame));
-            // A registered worker sending a malformed frame is either a
-            // version skew or a bug in the worker. Either way it must cost
-            // that worker its connection, not the coordinator its life.
-            try {
-                dispatch_worker_frame_(worker, r);
-            } catch (const std::exception& e) {
-                log::warn("coordinator.worker",
-                          "dropping worker '" + worker->worker_id +
-                              "': frame did not decode: " + e.what());
-                metrics::orch::malformed_frame();
-                return;
-            }
+// The frames one worker connection's reader has read and not answered itself,
+// in the order it read them, waiting for that connection's dispatch thread.
+// Shared by the two threads; mu is a leaf lock, never held across a dispatch
+// or a join.
+struct Coordinator::WorkerDispatchQueue {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::vector<std::byte>> frames;
+    std::size_t bytes{0};
+    // Set by the reader when it exits; the dispatcher handles what is queued
+    // (frames read before a peer EOF are dispatched, as they always were) and
+    // returns.
+    bool closed{false};
+    // Set when the connection has been given up: a frame did not decode or
+    // the backlog overflowed. The backlog is cleared and the reader stops
+    // reading, so last_seen stops moving and the watchdog declares the
+    // worker lost.
+    std::atomic<bool> failed{false};
+    // Joined by the reader on its way out, so a finished reader still means
+    // nothing of this connection is running.
+    std::thread dispatcher;
+};
+
+void Coordinator::start_reader_for_(std::shared_ptr<WorkerConnection> worker,
+                                    std::shared_ptr<WorkerConnection> predecessor,
+                                    bool predecessor_was_lost) {
+    // Shuts a session down whose threads could not all be started: the reader
+    // is reported finished so the reaper releases the connection, and with
+    // nothing stamping last_seen the watchdog declares the worker lost.
+    const auto abandon = [&worker](const char* which, const char* why) noexcept {
+        if (worker->conn) {
+            worker->conn->shutdown_read();
         }
-    });
+        worker->reader_finished->store(true, std::memory_order_release);
+        try {
+            log::error("coordinator.worker",
+                       std::string{"could not start the "} + which + " thread for worker '" +
+                           worker->worker_id + "': " + why + "; dropping its connection");
+        } catch (...) {
+            // Only the log line was lost.
+        }
+    };
+    // Both threads start here, on the registering thread, so a failure to
+    // create one is caught rather than escaping a thread function, which is
+    // std::terminate. Allocating the queue, and std::thread's constructor,
+    // throw std::bad_alloc or std::system_error; either way the session is
+    // shut down, and the predecessor, which no dispatch thread now owns, is
+    // retired here, on the registering thread.
+    std::shared_ptr<WorkerDispatchQueue> queue;
+    try {
+        queue = std::make_shared<WorkerDispatchQueue>();
+        queue->dispatcher =
+            std::thread([this, worker, queue, predecessor, predecessor_was_lost]() mutable {
+                if (predecessor) {
+                    retire_replaced_session_(*worker, predecessor, predecessor_was_lost);
+                    predecessor.reset();  // its socket, not held for this session's life
+                }
+                try {
+                    worker_dispatch_loop_(worker, *queue);
+                } catch (...) {
+                    // Nothing in the loop is meant to throw past it. If
+                    // something does, the connection is given up rather than
+                    // the process: the reader stops at its next frame.
+                    queue->failed.store(true, std::memory_order_release);
+                }
+            });
+    } catch (const std::exception& e) {
+        abandon("dispatch", e.what());
+        if (predecessor) {
+            retire_replaced_session_(*worker, predecessor, predecessor_was_lost);
+        }
+        return;
+    }
+    try {
+        worker->reader = std::thread([this, worker, queue] {
+            // Set on EVERY exit path, so a finished reader is distinguishable from a
+            // running one and can be joined. Without it the thread and its socket
+            // were held until stop(). Captured by value so it outlives the
+            // WorkerConnection if that is ever replaced under the same id.
+            auto finished = worker->reader_finished;
+            struct MarkFinished {
+                std::shared_ptr<std::atomic<bool>> flag;
+                ~MarkFinished() { flag->store(true, std::memory_order_release); }
+            } mark{finished};
+            // Declared after `mark`, so it runs first: the dispatcher has
+            // finished before the reader reports itself finished.
+            struct JoinDispatcher {
+                WorkerDispatchQueue& q;
+                ~JoinDispatcher() {
+                    {
+                        std::lock_guard lock(q.mu);
+                        q.closed = true;
+                    }
+                    q.cv.notify_all();
+                    if (q.dispatcher.joinable()) {
+                        q.dispatcher.join();
+                    }
+                }
+            } join_dispatcher{*queue};
+            // Never throws: it runs on the way out of a catch.
+            const auto give_up = [&](const std::string& why) noexcept {
+                {
+                    std::lock_guard lock(queue->mu);
+                    queue->failed.store(true, std::memory_order_release);
+                    queue->frames.clear();
+                    queue->bytes = 0;
+                }
+                try {
+                    log::warn("coordinator.worker",
+                              "dropping worker '" + worker->worker_id + "': " + why);
+                    metrics::orch::malformed_frame();
+                } catch (...) {
+                    // Only the log line or the count was lost.
+                }
+            };
+            try {
+                while (!stop_.load(std::memory_order_acquire)) {
+                    if (!worker->conn)
+                        return;
+                    auto frame = read_frame(*worker->conn);
+                    if (!frame.has_value()) {
+                        return;  // peer closed
+                    }
+                    // The dispatcher gave up on this connection. Stop reading,
+                    // and so stop stamping: the worker is declared lost as it
+                    // was when the reader itself met the bad frame.
+                    if (queue->failed.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    if (worker->lost.load(std::memory_order_acquire)) {
+                        continue;
+                    }
+                    // Every frame read is proof of life, whatever its dispatch
+                    // is waiting on.
+                    worker->last_seen.store(std::chrono::steady_clock::now(),
+                                            std::memory_order_release);
+                    if (!frame->empty() &&
+                        static_cast<MessageKind>((*frame)[0]) == MessageKind::Heartbeat) {
+                        // Answered here, never queued: a heartbeat carries no
+                        // protocol state, and its answer is what keeps the
+                        // worker's own lease alive while a handler waits on the
+                        // store.
+                        try {
+                            MessageReader r(std::move(*frame));
+                            (void)r.read_u8();
+                            answer_heartbeat_(*worker, r);
+                        } catch (const std::exception& e) {
+                            give_up(std::string{"frame did not decode: "} + e.what());
+                            return;
+                        }
+                        continue;
+                    }
+                    bool overflow = false;
+                    {
+                        std::lock_guard lock(queue->mu);
+                        const auto size = frame->size();
+                        if (!queue->frames.empty() &&
+                            (queue->frames.size() >= cfg_.max_worker_dispatch_backlog_frames ||
+                             queue->bytes + size > cfg_.max_worker_dispatch_backlog_bytes)) {
+                            overflow = true;
+                        } else {
+                            queue->frames.push_back(std::move(*frame));
+                            queue->bytes += size;
+                        }
+                    }
+                    if (overflow) {
+                        give_up("its dispatch backlog exceeded " +
+                                std::to_string(cfg_.max_worker_dispatch_backlog_frames) +
+                                " frames or " +
+                                std::to_string(cfg_.max_worker_dispatch_backlog_bytes) +
+                                " bytes (max_worker_dispatch_backlog_frames / _bytes)");
+                        return;
+                    }
+                    queue->cv.notify_one();
+                }
+            } catch (const std::exception& e) {
+                // An allocation that failed reading or queueing a frame. The
+                // connection is given up, as for a frame that does not decode,
+                // rather than the exception leaving the thread.
+                give_up(std::string{"its reader failed: "} + e.what());
+            } catch (...) {
+                give_up("its reader failed");
+            }
+        });
+    } catch (const std::exception& e) {
+        {
+            std::lock_guard lock(queue->mu);
+            queue->closed = true;
+        }
+        queue->cv.notify_all();
+        // The dispatcher retires the predecessor first, so this also waits for
+        // that; then it finds the queue closed and empty and returns.
+        queue->dispatcher.join();
+        abandon("reader", e.what());
+    }
 }
 
-// Dispatch one decoded worker frame. Extracted from the reader thread so
-// the thread can bound a throw to a single frame.
+// The only consumer of a connection's queue: one frame at a time, in the order
+// the reader read them, so every frame but a heartbeat is handled in the same
+// order, and by the same handler, as when the reader ran the handlers itself.
+//
+// Liveness now means the worker's socket delivers frames, not that its frames
+// are being handled. A dispatcher stalled for ever (a store write that never
+// returns) no longer gets its worker declared lost; and one stalled past
+// restart_drain_timeout during a restart keeps that restart's drain open, since
+// the subtask exits queued behind it are not handled, until the watchdog fails
+// the job as it fails any drain a survivor that still heartbeats does not
+// finish.
+void Coordinator::worker_dispatch_loop_(const std::shared_ptr<WorkerConnection>& worker,
+                                        WorkerDispatchQueue& queue) {
+    while (true) {
+        std::vector<std::byte> frame;
+        {
+            std::unique_lock lock(queue.mu);
+            queue.cv.wait(lock, [&] {
+                return queue.closed || !queue.frames.empty() ||
+                       queue.failed.load(std::memory_order_relaxed);
+            });
+            if (queue.failed.load(std::memory_order_relaxed) || queue.frames.empty()) {
+                return;  // given up, or closed with nothing left to handle
+            }
+            frame = std::move(queue.frames.front());
+            queue.frames.pop_front();
+            queue.bytes -= frame.size();
+        }
+        // stop() abandons a backlog: a frame already being handled finishes,
+        // nothing queued behind it starts.
+        if (stop_.load(std::memory_order_acquire)) {
+            return;
+        }
+        // A lost session's frames are dropped, as the reader drops them. This
+        // check is only a fast path: the loss can be declared between it and
+        // the handler's hold of mu_, so every handler checks again in that
+        // hold, where the loss fold cannot interleave. A superseded session's
+        // are not dropped: the reader read them before the
+        // re-registration woke it, so they happened first, and the retirement
+        // waits for them (retire_replaced_session_). Dropping them turned a
+        // subtask that had reported a clean finish into a lost one.
+        if (worker->lost.load(std::memory_order_acquire)) {
+            continue;
+        }
+        MessageReader r(std::move(frame));
+        // A registered worker sending a malformed frame is either a
+        // version skew or a bug in the worker. Either way it must cost
+        // that worker its connection, not the coordinator its life.
+        try {
+            dispatch_worker_frame_(worker, r);
+        } catch (const std::exception& e) {
+            {
+                std::lock_guard lock(queue.mu);
+                queue.failed.store(true, std::memory_order_release);
+                queue.frames.clear();
+                queue.bytes = 0;
+            }
+            log::warn(
+                "coordinator.worker",
+                "dropping worker '" + worker->worker_id + "': frame did not decode: " + e.what());
+            metrics::orch::malformed_frame();
+            return;
+        }
+    }
+}
+
+void Coordinator::answer_heartbeat_(WorkerConnection& worker, MessageReader& r) {
+    const auto heartbeat = decode_heartbeat(r);
+    if (heartbeat.worker_id != worker.worker_id) {
+        throw std::runtime_error("Heartbeat names worker '" + heartbeat.worker_id +
+                                 "', but this session belongs to '" + worker.worker_id + "'");
+    }
+    // HeartbeatAck is a v2 capability. Sending an unknown frame to a
+    // v1 worker would turn a compatible rolling upgrade into a forced
+    // disconnect, so the registration version gates it explicitly.
+    if (worker.protocol_version >= 2 && worker.conn) {
+        HeartbeatAckMsg ack{.worker_id = worker.worker_id, .sequence = heartbeat.sequence};
+        const auto frame = fenced_frame_(MessageKind::HeartbeatAck, ack);
+        if (!send_frame(*worker.conn, frame)) {
+            worker.conn->close();
+        }
+    }
+}
+
+// Dispatch one decoded worker frame. Extracted from the dispatch loop so
+// the loop can bound a throw to a single frame.
 void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>& worker,
                                          MessageReader& r) {
     const auto kind = static_cast<MessageKind>(r.read_u8());
     switch (kind) {
         case MessageKind::SubtaskFinished:
-            handle_subtask_finished_(r);
+            handle_subtask_finished_(r, *worker);
             break;
         case MessageKind::BeginRescaleAck:
-            handle_begin_rescale_ack_(r);
+            handle_begin_rescale_ack_(r, *worker);
             break;
         case MessageKind::SubtaskListening:
-            handle_subtask_listening_(r);
+            handle_subtask_listening_(r, *worker);
             break;
-        case MessageKind::Heartbeat: {
-            const auto heartbeat = decode_heartbeat(r);
-            if (heartbeat.worker_id != worker->worker_id) {
-                throw std::runtime_error("Heartbeat names worker '" + heartbeat.worker_id +
-                                         "', but this session belongs to '" + worker->worker_id +
-                                         "'");
-            }
-            // HeartbeatAck is a v2 capability. Sending an unknown frame to a
-            // v1 worker would turn a compatible rolling upgrade into a forced
-            // disconnect, so the registration version gates it explicitly.
-            if (worker->protocol_version >= 2 && worker->conn) {
-                HeartbeatAckMsg ack{.worker_id = worker->worker_id, .sequence = heartbeat.sequence};
-                const auto frame = fenced_frame_(MessageKind::HeartbeatAck, ack);
-                if (!send_frame(*worker->conn, frame)) {
-                    worker->conn->close();
-                }
-            }
+        case MessageKind::Heartbeat:
+            // The reader answers heartbeats itself and never queues one, so
+            // this is reached only if that changes.
+            answer_heartbeat_(*worker, r);
             break;
-        }
         case MessageKind::SubtaskCheckpointed:
-            handle_subtask_checkpointed_(r);
+            handle_subtask_checkpointed_(r, *worker);
             break;
         case MessageKind::CommitConfirmed:
-            handle_commit_confirmed_(r);
+            handle_commit_confirmed_(r, *worker);
             break;
         case MessageKind::RequestFinalCheckpoint:
             if (worker->conn) {
-                handle_request_final_checkpoint_(r, worker->conn);
+                handle_request_final_checkpoint_(r, *worker, worker->conn);
             }
             break;
         default:
@@ -4940,13 +5487,16 @@ void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>
     }
 }
 
-void Coordinator::handle_subtask_listening_(MessageReader& r) {
+void Coordinator::handle_subtask_listening_(MessageReader& r, const WorkerConnection& sender) {
     auto msg = decode_subtask_listening(r);
     // Hot-cutover frames staged under the lock (rebind-complete deploys,
     // completion peer updates), sent after it.
     std::vector<PendingDeploy> hot_frames;
     {
         std::lock_guard lock(mu_);
+        if (sender.lost) {
+            return;  // the loss fold has already accounted for this session
+        }
         auto it = jobs_.find(msg.job_id);
         if (it == jobs_.end()) {
             return;  // stale message
@@ -5163,7 +5713,7 @@ void Coordinator::watchdog_loop_() {
                           "judgement one interval");
                 for (auto& [_, worker] : registered_) {
                     if (!worker->lost) {
-                        worker->last_seen = now;
+                        worker->last_seen.store(now, std::memory_order_release);
                     }
                 }
             }
@@ -5172,7 +5722,10 @@ void Coordinator::watchdog_loop_() {
                 if (worker->lost) {
                     continue;
                 }
-                if (now - worker->last_seen > cfg_.heartbeat_timeout) {
+                // A reader stamps without mu_, so a stamp may be later than
+                // `now`; the difference is then negative and never stale.
+                if (now - worker->last_seen.load(std::memory_order_acquire) >
+                    cfg_.heartbeat_timeout) {
                     mark_worker_lost_locked_(*worker);
                     any_lost = true;
                 }
@@ -5460,7 +6013,9 @@ void Coordinator::watchdog_loop_() {
 void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
                                                           const std::string& worker_id,
                                                           const char* log_channel,
-                                                          const std::string& cause) {
+                                                          const std::string& cause,
+                                                          std::uint64_t live_from_session,
+                                                          std::uint64_t dead_from_session) {
     // A worker lost mid-hot-cutover ends the cutover: some phase's messages
     // will never arrive. The abort stages the replan at the requested
     // parallelism (setting awaiting_restart and the drain expectations),
@@ -5477,8 +6032,53 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
     if (it == job.pending_per_worker.end()) {
         return;
     }
+    // A fold takes only what the dying session held, by the session stamps.
+    // A retirement keeps subtasks placed on its successor (stamped with
+    // live_from_session or later): they are alive. A lost session that is
+    // still retiring its predecessor keeps the predecessor's subtasks
+    // (stamped below dead_from_session): that session's frames are still to
+    // be handled, and a SubtaskFinished among them reports a subtask folded
+    // here, maybe redeployed, against the next run. They stay pending until
+    // those frames drain them or the retirement, which runs once they have
+    // been handled, folds them. Either way the kept ones leave the dead list
+    // here and go back into pending at every exit below, and a restart
+    // started here drains them like any survivor.
+    const auto spared_stamp = [&](std::uint64_t stamp) {
+        return (live_from_session != 0 && stamp >= live_from_session) ||
+               (dead_from_session != 0 && stamp < dead_from_session);
+    };
+    std::vector<std::pair<std::string, std::uint32_t>> live;
+    if (live_from_session != 0 || dead_from_session != 0) {
+        std::erase_if(it->second, [&](const std::pair<std::string, std::uint32_t>& p) {
+            const auto stamp = job.pending_session.find(p.first + ":" + std::to_string(p.second));
+            if (stamp == job.pending_session.end() || !spared_stamp(stamp->second)) {
+                return false;
+            }
+            live.push_back(p);
+            return true;
+        });
+    }
     if (protocol_trace::enabled()) {
-        protocol_trace::Event("WorkerDies").u("job", job.id).s("worker", worker_id).emit();
+        // The trace names the worker's subtasks the fold keeps, which live
+        // on, so the validator does not kill a sink the engine goes on to
+        // drain as a survivor.
+        std::vector<std::uint64_t> spared;
+        if (live_from_session != 0 || dead_from_session != 0) {
+            for (const auto& [key, stamp] : job.pending_session) {
+                const auto rec = job.task_records.find(key);
+                if (spared_stamp(stamp) && rec != job.task_records.end() &&
+                    rec->second.first == worker_id) {
+                    spared.push_back(rec->second.second.subtask_idx);
+                }
+            }
+            std::sort(spared.begin(), spared.end());
+        }
+        auto dies = protocol_trace::Event("WorkerDies");
+        dies.u("job", job.id).s("worker", worker_id);
+        if (!spared.empty()) {
+            dies.us("spared", spared);
+        }
+        dies.emit();
     }
     // Deliberately NOT also returning when the list is EMPTY. A worker can be lost
     // with nothing in flight for this job - every subtask of its already reported
@@ -5505,13 +6105,24 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
             job.restart_drained_keys.erase(k);
             job.restart_pending.emplace_back(role, sub);
         }
+        // The kept subtasks drain like any survivor, as they do when this
+        // fold starts the restart. The restart in progress may not have
+        // counted them: a hot cutover aborted at the top of this fold staged
+        // its drain with this worker already lost, and put them up for
+        // redeploy instead.
+        for (const auto& [role, sub] : live) {
+            job.restart_drain_expected.insert(role + ":" + std::to_string(sub));
+            std::erase_if(job.restart_pending, [&](const std::pair<std::string, std::uint32_t>& p) {
+                return p.first == role && p.second == sub;
+            });
+        }
         log::warn(log_channel,
                   "job_id=" + std::to_string(job.id) +
                       " second worker lost during restart drain; folded " +
                       std::to_string(it->second.size()) +
                       " subtask(s) into the pending restart, drain_expected=" +
                       std::to_string(job.restart_drain_expected.size()));
-        it->second.clear();
+        it->second = std::move(live);
         return;
     }
     const bool can_restart = !job.awaiting_restart && !job.completion_signalled &&
@@ -5555,6 +6166,9 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
         // whole job back atomically leaves no survivor holding a stale
         // bridge, so the redeploy converges in one attempt.
         std::unordered_set<std::string> in_flight;
+        for (const auto& [role, sub] : live) {
+            in_flight.insert(role + ":" + std::to_string(sub));
+        }
         for (const auto& [other_worker_id, pending] : job.pending_per_worker) {
             if (other_worker_id == worker_id) {
                 continue;
@@ -5618,19 +6232,57 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
             ++job.completed_count;
         }
     }
-    it->second.clear();
+    it->second = std::move(live);
+}
+
+void Coordinator::charge_slots_locked_(WorkerConnection& worker, std::uint32_t n) {
+    worker.slots_in_use += n;
+    if (!worker.slots_gauge_retired) {
+        metrics::coordinator::slots_in_use_delta(static_cast<std::int64_t>(n));
+    }
+}
+
+void Coordinator::release_slots_locked_(WorkerConnection& worker, std::uint32_t n) {
+    const auto released = std::min(n, worker.slots_in_use);
+    worker.slots_in_use -= released;
+    if (!worker.slots_gauge_retired) {
+        metrics::coordinator::slots_in_use_delta(-static_cast<std::int64_t>(released));
+    }
+}
+
+void Coordinator::release_task_slot_locked_(const JobState& job,
+                                            const std::string& worker_id,
+                                            const std::string& key) {
+    const auto w = registered_.find(worker_id);
+    if (w == registered_.end()) {
+        return;
+    }
+    if (const auto stamp = job.pending_session.find(key);
+        stamp != job.pending_session.end() && stamp->second != w->second->session) {
+        return;  // charged to a superseded session; its retirement accounts for it
+    }
+    release_slots_locked_(*w->second, 1);
 }
 
 void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
     worker.lost = true;
     lost_worker_ids_.push_back(worker.worker_id);
+    // A session still retiring its predecessor did not hold the predecessor's
+    // subtasks; the predecessor's frames and then its retirement account for
+    // them.
+    const std::uint64_t dead_from = worker.retiring_predecessor ? worker.session : 0;
     for (auto& [_, job] : jobs_) {
-        fold_dead_subtasks_into_restart_locked_(
-            *job, worker.worker_id, "coordinator.watchdog", "worker lost (heartbeat timeout)");
+        fold_dead_subtasks_into_restart_locked_(*job,
+                                                worker.worker_id,
+                                                "coordinator.watchdog",
+                                                "worker lost (heartbeat timeout)",
+                                                /*live_from_session=*/0,
+                                                dead_from);
     }
     if (worker.conn) {
         worker.conn->shutdown_read();
     }
+    worker.slots_gauge_retired = true;
     metrics::coordinator::worker_lost(worker.slot_capacity, worker.slots_in_use);
     log::warn("coordinator.watchdog", "worker lost: " + worker.worker_id);
     events::publish("coordinator.worker_lost",
@@ -5648,21 +6300,36 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
 // restart was ever triggered, and the job hung indefinitely with subtasks missing.
 // Not exotic - restarting a crashed process quickly is what an orchestrator does by
 // default. F64 / follow-up 46.
-void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id) {
+void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id,
+                                                    std::uint64_t successor_session) {
     bool touched = false;
     std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> survivor_cancels;
     {
         std::lock_guard lock(mu_);
         for (auto& [job_id, job] : jobs_) {
-            if (job->pending_per_worker.find(worker_id) == job->pending_per_worker.end() ||
-                job->pending_per_worker[worker_id].empty()) {
+            // Only a job that still has a subtask of an earlier session in
+            // flight here. One placed only on the successor (a submit, or a
+            // restart that redeployed while the old session's frames drained)
+            // lost nothing: folding it failed it, or restarted it on top of
+            // the copy the successor is running.
+            const auto pending = job->pending_per_worker.find(worker_id);
+            if (pending == job->pending_per_worker.end() ||
+                std::none_of(pending->second.begin(),
+                             pending->second.end(),
+                             [&](const std::pair<std::string, std::uint32_t>& p) {
+                                 const auto stamp = job->pending_session.find(
+                                     p.first + ":" + std::to_string(p.second));
+                                 return stamp == job->pending_session.end() ||
+                                        stamp->second < successor_session;
+                             })) {
                 continue;
             }
             fold_dead_subtasks_into_restart_locked_(
                 *job,
                 worker_id,
                 "coordinator.register",
-                "worker re-registered; the process holding this subtask is gone");
+                "worker re-registered; the process holding this subtask is gone",
+                successor_session);
             touched = true;
 
             // Starting a whole-job restart is only half of the worker-loss
@@ -5674,8 +6341,14 @@ void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id
             // next sweep runs. Without this register-path broadcast, an
             // unbounded survivor runs forever and the restart expires at its
             // drain deadline.
+            //
+            // The worker's own current session is a survivor too when the
+            // job still has subtasks placed on it.
+            const auto still_pending = job->pending_per_worker.find(worker_id);
+            const bool successor_hosts_job =
+                still_pending != job->pending_per_worker.end() && !still_pending->second.empty();
             for (const auto& [other_worker_id, _] : job->tasks_by_worker) {
-                if (other_worker_id == worker_id) {
+                if (other_worker_id == worker_id && !successor_hosts_job) {
                     continue;
                 }
                 auto it = registered_.find(other_worker_id);
@@ -5958,7 +6631,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         // capacity genuinely never comes back.
         const auto now_tp = std::chrono::steady_clock::now();
         if (job.restart_capacity_deadline == std::chrono::steady_clock::time_point{}) {
-            job.restart_capacity_deadline = now_tp + std::chrono::seconds{180};
+            job.restart_capacity_deadline = now_tp + cfg_.restart_capacity_timeout;
             log::warn("coordinator.restart",
                       "job_id=" + std::to_string(job.id) + " restart waiting for capacity: " +
                           std::to_string(tasks_to_redeploy.size()) + " task(s) need slots, " +
@@ -6057,7 +6730,18 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         ++job.restarts_total;
         job.last_restart_at = std::chrono::steady_clock::now();
     }
+    ++job.redeploys;
+    // The new run tracks only its own checkpoints' confirmations, as the
+    // specification's Redeploy forgets every broadcast checkpoint. A
+    // CommitConfirmed for the old run's checkpoint whose first hold comes
+    // after this finds nothing to drain; left here, it drained the old set,
+    // read the new redeploys, and advanced the new run's confirmed restore
+    // point and traced a WriteConfirmed after the Redeploy. One whose first
+    // hold came before this is caught by the redeploys check after its
+    // marker write (handle_commit_confirmed_).
+    job.pending_confirms.clear();
     job.awaiting_restart = false;
+    job.in_doubt_walked = false;
     job.restart_deadline = {};
     job.restart_pending.clear();
     job.restart_drained_keys.clear();
@@ -6075,6 +6759,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     job.task_records.clear();
     job.tasks_by_worker.clear();
     job.pending_per_worker.clear();
+    job.pending_session.clear();
     job.pending_checkpoint_acks.clear();
     job.rewind_floor_checkpoint_id = 0;
     // Clear the bounded-source final-checkpoint coordination so a replayed EOS
@@ -6260,12 +6945,17 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     }
 
     // 6. Stash the new shape into job state for the rest of the coordinator
-    //    to address: SubtaskListening etc.
+    //    to address: SubtaskListening etc. Stamped with the session the
+    //    Deploy below goes to, resolved in this same hold.
     for (auto& [worker_id, tasks] : by_worker) {
+        const auto worker_it = registered_.find(worker_id);
+        const std::uint64_t session =
+            worker_it == registered_.end() ? 0 : worker_it->second->session;
         for (const auto& t : tasks) {
             const std::string key = t.role + ":" + std::to_string(t.subtask_idx);
             job.task_records[key] = {worker_id, t};
             job.pending_per_worker[worker_id].emplace_back(t.role, t.subtask_idx);
+            job.pending_session[key] = session;
         }
         job.tasks_by_worker[worker_id] = tasks;
     }
@@ -6406,8 +7096,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         auto worker_it = registered_.find(worker_id);
         if (worker_it == registered_.end() || worker_it->second->lost || !worker_it->second->conn)
             continue;
-        worker_it->second->slots_in_use += tasks.size();
-        metrics::coordinator::slots_in_use_delta(static_cast<std::int64_t>(tasks.size()));
+        charge_slots_locked_(*worker_it->second, static_cast<std::uint32_t>(tasks.size()));
         DeployMsg deploy_msg;
         deploy_msg.job_id = job.id;
         deploy_msg.tasks = std::move(tasks);
@@ -6555,12 +7244,21 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         // Old subtasks of THIS op count as in-use right now but are
         // about to be torn down below, so they're effectively
         // available for the new placement. Add them back to the
-        // snapshot the planner sees.
+        // snapshot the planner sees: exactly the ones whose slots the
+        // teardown frees, which is those charged to this worker's current
+        // session (release_task_slot_locked_). One stamped with a superseded
+        // session holds a slot of that session, not of this one, and
+        // counting it let the planner put more on the successor than it has.
         std::uint32_t old_on_this_worker = 0;
         auto it = job.tasks_by_worker.find(worker_id);
         if (it != job.tasks_by_worker.end()) {
             for (const auto& t : it->second) {
-                if (t.role == op_id) {
+                if (t.role != op_id) {
+                    continue;
+                }
+                const auto stamp =
+                    job.pending_session.find(t.role + ":" + std::to_string(t.subtask_idx));
+                if (stamp == job.pending_session.end() || stamp->second == worker->session) {
                     ++old_on_this_worker;
                 }
             }
@@ -6595,11 +7293,7 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
             continue;
         }
         const auto worker_id = rec_it->second.first;
-        auto worker_reg_it = registered_.find(worker_id);
-        if (worker_reg_it != registered_.end() && worker_reg_it->second->slots_in_use > 0) {
-            --worker_reg_it->second->slots_in_use;
-            metrics::coordinator::slots_in_use_delta(-1);
-        }
+        release_task_slot_locked_(job, worker_id, key);
         auto tbt_it = job.tasks_by_worker.find(worker_id);
         if (tbt_it != job.tasks_by_worker.end()) {
             // Match the record's own (role, subtask_idx), not role == op_id:
@@ -6644,6 +7338,9 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         job.task_op_identity[key] =
             TaskOpIdentity{.op_id = op_id, .subtask_idx_in_op = idx_in_op++};
         job.pending_per_worker[worker_id].emplace_back(task.role, task.subtask_idx);
+        // The session the Deploy below goes to, resolved in this same hold.
+        const auto worker_it = registered_.find(worker_id);
+        job.pending_session[key] = worker_it == registered_.end() ? 0 : worker_it->second->session;
         job.tasks_by_worker[worker_id].push_back(task);
         by_worker[worker_id].push_back(std::move(task));
         ++job.expected_completion;
@@ -6665,8 +7362,7 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         if (worker_it == registered_.end() || worker_it->second->lost || !worker_it->second->conn) {
             continue;
         }
-        worker_it->second->slots_in_use += tasks.size();
-        metrics::coordinator::slots_in_use_delta(static_cast<std::int64_t>(tasks.size()));
+        charge_slots_locked_(*worker_it->second, static_cast<std::uint32_t>(tasks.size()));
         DeployMsg deploy_msg;
         deploy_msg.job_id = job.id;
         deploy_msg.tasks = std::move(tasks);
@@ -6691,11 +7387,20 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
     }
 }
 
-void Coordinator::handle_subtask_finished_(MessageReader& r) {
+void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& sender) {
     auto msg = decode_subtask_finished(r);
+    // The slot is the sending session's. A superseded session's frames are
+    // handled after its successor took the worker id, and releasing theirs
+    // against registered_[worker_id] took slots off the successor, which may
+    // already hold new placements: the worker was then over-placed. mu_ held.
+    const auto release_slot_locked = [this, &sender] { release_slots_locked_(sender, 1); };
 
     bool retry = false;
     std::shared_ptr<WorkerConnection> target_conn;
+    // The retry's socket, copied in the hold that picks the target: the
+    // reaper resets WorkerConnection::conn under mu_, so it is never read
+    // after the hold.
+    std::shared_ptr<network::Connection> retry_conn;
     DeploymentTask retry_task;
     JobId job_id = msg.job_id;
     std::shared_ptr<JobState> job_to_signal;
@@ -6703,8 +7408,21 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
     // CancelJob frames to drain still-running subtasks when a subtask error
     // triggers a whole-job restart of a checkpointed job; sent outside mu_.
     std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> error_restart_cancels;
+    // Decoded on the sender's dispatch thread, which checked the session was
+    // not lost before dispatching, and not yet under mu_: the watchdog can
+    // declare the session lost in between.
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeSubtaskFinished);
     {
         std::lock_guard lock(mu_);
+        // A lost session's finish is dropped here, in the hold that would
+        // count it, and not only on the dispatch thread: the loss fold has
+        // already completed, failed or queued for restart every subtask the
+        // session held, and handling the finish after it counted the subtask
+        // a second time (a job completing with a subtask still running
+        // elsewhere), or reported a drain after the loss that killed it.
+        if (sender.lost) {
+            return;
+        }
         auto job_it = jobs_.find(job_id);
         if (job_it == jobs_.end()) {
             return;
@@ -6770,7 +7488,9 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                 // replan staged before C completes drains only what still runs
                 // (the abort releases its slot; the rebind teardown does when
                 // the cut completes).
-                job.hot_cutover->early_drains.push_back({ack.subtask_idx_in_op, msg.worker_id});
+                job.hot_cutover->early_drains.push_back({.subtask_idx_in_op = ack.subtask_idx_in_op,
+                                                         .worker_id = msg.worker_id,
+                                                         .key = key});
                 if (auto pending_it = job.pending_per_worker.find(msg.worker_id);
                     pending_it != job.pending_per_worker.end()) {
                     std::erase_if(pending_it->second, [&](const auto& p) {
@@ -6802,8 +7522,21 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
         if (msg.had_error && !msg.fatal && cfg_.max_restarts > 0 &&
             job.checkpoint.checkpoint_dir.empty()) {
             auto rec_it = job.task_records.find(key);
+            // The retry goes to the worker's current session, and only while
+            // that session is live. A superseded session's error can be
+            // handled after its successor was declared lost: the successor
+            // still holds the worker's registration while it retires its
+            // predecessor, but its loss fold has run, and its retirement folds
+            // only what sessions before it held. A retry moved onto it was
+            // stamped with a session nothing would fold again, and the job
+            // never completed. With no live session the error completes the
+            // subtask, as it does for any subtask on a lost worker.
+            const auto worker_it = rec_it == job.task_records.end()
+                                       ? registered_.end()
+                                       : registered_.find(rec_it->second.first);
+            const bool live_target = worker_it != registered_.end() && !worker_it->second->lost;
             if (rec_it != job.task_records.end() &&
-                rec_it->second.second.role != kGenericSubtaskRole) {
+                rec_it->second.second.role != kGenericSubtaskRole && live_target) {
                 const int attempts = ++job.attempt_counts[key];
                 if (attempts <= cfg_.max_restarts) {
                     retry = true;
@@ -6817,11 +7550,22 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                     // send below: a send that fails is still a retry the
                     // operator needs to see.
                     metrics::orch::subtask_redeployed();
-                    auto worker_it = registered_.find(rec_it->second.first);
-                    if (worker_it != registered_.end()) {
-                        target_conn = worker_it->second;
-                    } else {
-                        retry = false;
+                    target_conn = worker_it->second;
+                    retry_conn = target_conn->conn;
+                    // When the current session is not the one reporting the
+                    // error (a superseded one's frame, handled after its
+                    // successor registered), the subtask moves there: its
+                    // stamp, so the old session's retirement does not fold it
+                    // as lost while it runs again, and its slot, so its finish
+                    // on the successor frees a slot the successor holds. The
+                    // successor may already be full; the retry goes ahead
+                    // regardless, as it does on a session that was never
+                    // replaced, and every free-slot sum treats a session
+                    // charged past its capacity as having none.
+                    if (target_conn.get() != &sender) {
+                        job.pending_session[key] = target_conn->session;
+                        release_slots_locked_(sender, 1);
+                        charge_slots_locked_(*target_conn, 1);
                     }
                 }
             }
@@ -6855,11 +7599,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                     return p.first == msg.role && p.second == msg.subtask_idx;
                 });
             }
-            auto worker_it = registered_.find(msg.worker_id);
-            if (worker_it != registered_.end() && worker_it->second->slots_in_use > 0) {
-                --worker_it->second->slots_in_use;
-                metrics::coordinator::slots_in_use_delta(-1);
-            }
+            release_slot_locked();
             job.restart_drained_keys.insert(key);
             if (protocol_trace::enabled()) {
                 protocol_trace::Event("SubtaskDrained")
@@ -6899,11 +7639,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                     return p.first == msg.role && p.second == msg.subtask_idx;
                 });
             }
-            auto worker_it = registered_.find(msg.worker_id);
-            if (worker_it != registered_.end() && worker_it->second->slots_in_use > 0) {
-                --worker_it->second->slots_in_use;
-                metrics::coordinator::slots_in_use_delta(-1);
-            }
+            release_slot_locked();
             job.errors.push_back(msg.worker_id + "/" + msg.role + "[" +
                                  std::to_string(msg.subtask_idx) + "]: " + msg.error_message);
             if (job.transport_pending_cause.empty()) {
@@ -6942,11 +7678,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                     return p.first == msg.role && p.second == msg.subtask_idx;
                 });
             }
-            auto worker_it = registered_.find(msg.worker_id);
-            if (worker_it != registered_.end() && worker_it->second->slots_in_use > 0) {
-                --worker_it->second->slots_in_use;
-                metrics::coordinator::slots_in_use_delta(-1);
-            }
+            release_slot_locked();
             restart_deploys = initiate_job_restart_locked_(
                 job, "subtask error", msg.error_message, error_restart_cancels);
         } else if (!retry) {
@@ -7029,11 +7761,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                     return p.first == msg.role && p.second == msg.subtask_idx;
                 });
             }
-            auto worker_it = registered_.find(msg.worker_id);
-            if (worker_it != registered_.end() && worker_it->second->slots_in_use > 0) {
-                --worker_it->second->slots_in_use;
-                metrics::coordinator::slots_in_use_delta(-1);
-            }
+            release_slot_locked();
             if (job.completed_count >= job.expected_completion) {
                 signal_job_completion_locked_(job);
                 job_to_signal = job_it->second;
@@ -7058,12 +7786,12 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
         }
     }
 
-    if (retry && target_conn && target_conn->conn) {
+    if (retry && retry_conn) {
         DeployMsg deploy_msg;
         deploy_msg.job_id = job_id;
         deploy_msg.tasks.push_back(std::move(retry_task));
         const auto frame = fenced_frame_(MessageKind::Deploy, deploy_msg);
-        send_frame(*target_conn->conn, frame);
+        send_frame(*retry_conn, frame);
     }
     // Slot freed: wake any submit_job waiting on capacity.
     cv_.notify_all();
@@ -7329,7 +8057,7 @@ std::size_t Coordinator::free_slots() const {
     std::lock_guard lock(mu_);
     std::size_t free = 0;
     for (const auto& [_, worker] : registered_) {
-        if (!worker->lost) {
+        if (!worker->lost && worker->slots_in_use < worker->slot_capacity) {
             free += (worker->slot_capacity - worker->slots_in_use);
         }
     }
@@ -7347,11 +8075,22 @@ void Coordinator::stop() {
     // retry loop, and any submit blocked in its slot wait.
     cv_.notify_all();
     wake_trigger_loop_();
-    if (recovery_retry_thread_.joinable()) {
-        recovery_retry_thread_.join();
+    // Taken under mu_, which every spawn site holds: a dispatch thread or the
+    // watchdog can still be staging a restart while stop() runs, and once
+    // this hold has passed neither thread is started again (both spawns check
+    // stop_ under mu_).
+    std::thread recovery_retry;
+    std::thread in_doubt_resolution;
+    {
+        std::lock_guard lock(mu_);
+        recovery_retry = std::move(recovery_retry_thread_);
+        in_doubt_resolution = std::move(in_doubt_resolution_thread_);
     }
-    if (in_doubt_resolution_thread_.joinable()) {
-        in_doubt_resolution_thread_.join();
+    if (recovery_retry.joinable()) {
+        recovery_retry.join();
+    }
+    if (in_doubt_resolution.joinable()) {
+        in_doubt_resolution.join();
     }
     // Tear down per-job autoscalers before everything else.
     // Their polling threads might be sitting on mu_ trying to call
@@ -7425,10 +8164,10 @@ void Coordinator::stop() {
         worker->conn.reset();  // destructor closes
     }
     // Last, once every thread that starts a checkpoint-id claimer (the
-    // trigger loop, and a worker's reader holding an end-of-input request)
-    // or claims for itself has gone. A claim in flight finishes its store
-    // write first; a parked claimer, or one waiting out a retry delay,
-    // leaves at once.
+    // trigger loop, and a worker's dispatch thread holding an end-of-input
+    // request, joined above with its reader) or claims for itself has gone. A claim in flight
+    // finishes its store write first; a parked claimer, or one waiting out a retry delay, leaves at
+    // once.
     std::vector<std::shared_ptr<JobState::TriggeredRecord>> recorders;
     {
         std::lock_guard lock(id_recorders_mu_);
@@ -7447,17 +8186,21 @@ void Coordinator::stop() {
 }
 
 void Coordinator::handle_request_final_checkpoint_(
-    MessageReader& r, const std::shared_ptr<network::Connection>& reply_conn) {
+    MessageReader& r,
+    const WorkerConnection& sender,
+    const std::shared_ptr<network::Connection>& reply_conn) {
     auto msg = decode_request_final_checkpoint(r);
     // Holds a request in the window a cancel can open: decided here, the
     // CancelJob broadcast still in flight (see cancel_job).
     CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeFinalCheckpointRequest);
-    // This is the requesting worker's control reader, which reads that
-    // worker's heartbeats too, so it never waits on the store. It used to
-    // claim an id not yet on record itself, behind the job's claimer on
-    // TriggeredRecord::write_mu when that claimer's write was out; a slow
-    // object-store write then held the heartbeats past heartbeat_timeout and
-    // got the worker declared lost. Such a request is held instead: the
+    // This runs on the requesting worker's dispatch thread, which handles
+    // that worker's frames one at a time, so it never waits on the store. It
+    // used to claim an id not yet on record itself, behind the job's claimer
+    // on TriggeredRecord::write_mu when that claimer's write was out; a slow
+    // object-store write then held every later frame from that worker (and,
+    // before the dispatch thread existed, its heartbeats past
+    // heartbeat_timeout, which got it declared lost). Such a request is held
+    // instead: the
     // job's claimer is asked for the id, and the trigger loop, which a
     // landing claim wakes, answers it. While the id cannot be recorded the
     // request goes unanswered, and the source fails its subtask when its
@@ -7469,6 +8212,9 @@ void Coordinator::handle_request_final_checkpoint_(
     std::uint64_t want = 0;
     {
         std::lock_guard lock(mu_);
+        if (sender.lost) {
+            return;  // the loss fold has already accounted for this session
+        }
         auto it = jobs_.find(msg.job_id);
         auto* job = it == jobs_.end() ? nullptr : it->second.get();
         reply = decide_final_request_locked_(job, msg.job_id, msg.role, msg.subtask_idx);
@@ -7607,14 +8353,18 @@ bool Coordinator::answer_final_requests_locked_(
     return true;
 }
 
-void Coordinator::handle_commit_confirmed_(MessageReader& r) {
+void Coordinator::handle_commit_confirmed_(MessageReader& r, const WorkerConnection& sender) {
     const auto msg = decode_commit_confirmed(r);
     const std::string key = msg.role + ":" + std::to_string(msg.subtask_idx);
     std::string marker_root;  // checkpoint_dir; empty = nothing to publish
     std::uint64_t confirmed_id = 0;
+    std::uint64_t redeploys = 0;
     JobId jid{};
     {
         std::lock_guard lock(mu_);
+        if (sender.lost) {
+            return;  // the loss fold has already accounted for this session
+        }
         auto job_it = jobs_.find(msg.job_id);
         if (job_it == jobs_.end()) {
             return;  // late confirmation for a finished/evicted job
@@ -7635,34 +8385,81 @@ void Coordinator::handle_commit_confirmed_(MessageReader& r) {
         // confirmed one now.
         job.pending_confirms.erase(job.pending_confirms.begin(),
                                    job.pending_confirms.upper_bound(msg.checkpoint_id));
-        if (msg.checkpoint_id > job.latest_confirmed_checkpoint_id) {
-            job.latest_confirmed_checkpoint_id = msg.checkpoint_id;
-        }
-        marker_root = job.checkpoint.checkpoint_dir;
         confirmed_id = msg.checkpoint_id;
         jid = msg.job_id;
-    }
-    if (!marker_root.empty()) {
-        try {
-            make_coordination_store(marker_root)
-                ->put("_jobs/" + std::to_string(jid) + "/CONFIRMED-" + std::to_string(confirmed_id),
-                      "job=" + std::to_string(jid) +
-                          "\ncheckpoint=" + std::to_string(confirmed_id) + "\n");
-            if (protocol_trace::enabled()) {
-                protocol_trace::Event("WriteConfirmed")
-                    .u("job", jid)
-                    .u("ckpt", confirmed_id)
-                    .emit();
-            }
-        } catch (const std::exception& e) {
-            clink::log::error("coordinator.checkpoint",
-                              "could not durably record commit confirmation of checkpoint " +
-                                  std::to_string(confirmed_id) + ": " + e.what());
+        redeploys = job.redeploys;
+        marker_root = job.checkpoint.checkpoint_dir;
+        if (marker_root.empty()) {
+            // No directory to publish to: memory is all there is.
+            job.latest_confirmed_checkpoint_id =
+                std::max(job.latest_confirmed_checkpoint_id, confirmed_id);
+            return;
         }
-        clink::log::info("coordinator.checkpoint",
-                         "job_id=" + std::to_string(jid) + " checkpoint " +
-                             std::to_string(confirmed_id) + " commit-CONFIRMED");
     }
+    // The state the specification has before WriteConfirmed (the marker
+    // "due"): every tracked task confirmed, the checkpoint out of tracking,
+    // and neither the marker nor latest_confirmed has moved.
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeConfirmedMarker);
+    try {
+        make_coordination_store(marker_root)
+            ->put("_jobs/" + std::to_string(jid) + "/CONFIRMED-" + std::to_string(confirmed_id),
+                  "job=" + std::to_string(jid) + "\ncheckpoint=" + std::to_string(confirmed_id) +
+                      "\n");
+    } catch (const std::exception& e) {
+        clink::log::error("coordinator.checkpoint",
+                          "could not durably record commit confirmation of checkpoint " +
+                              std::to_string(confirmed_id) + ": " + e.what());
+        return;
+    }
+    // The marker is durable: advance the confirmed restore point now, and only
+    // now, as latest_completed advances only once COMPLETED is (the
+    // specification's AdvanceConfirmed, after its WriteConfirmed). Advancing it
+    // before the write held memory ahead of the disk, and a failed write left
+    // memory advanced over no marker at all.
+    //
+    // The WriteConfirmed line is emitted in the same hold as the advance, so it
+    // stands for both steps, and no decision taken under mu_ (a restart's
+    // RestartProceeds, a Redeploy) can fall between the line and the memory it
+    // describes. A restart that redeployed while the write was out has begun a
+    // run this confirmation does not belong to: the specification's Redeploy
+    // leaves the confirmation's put to land with nothing advancing after it,
+    // so neither memory nor the trace moves. The marker stays: it is true, and
+    // what reads it (a takeover, the in-doubt walk) reads it as true. A
+    // takeover that reports it validates through LostWriteConfirmed.
+    //
+    // The line carries the coordinator's epoch. A superseded coordinator does
+    // not know it was superseded and emits it like the leader would; the
+    // specification turned its confirmation stale at the supersession, and
+    // the epoch is what tells the trace validator that this line is that
+    // stale put landing, not the leader's advance.
+    {
+        std::lock_guard lock(mu_);
+        auto job_it = jobs_.find(jid);
+        if (job_it == jobs_.end()) {
+            return;  // finished or evicted while the marker was written
+        }
+        if (job_it->second->redeploys != redeploys) {
+            clink::log::info("coordinator.checkpoint",
+                             "job_id=" + std::to_string(jid) + " checkpoint " +
+                                 std::to_string(confirmed_id) +
+                                 " commit-CONFIRMED on disk; the job restarted while the marker "
+                                 "was written, so its confirmed restore point is unchanged");
+            return;
+        }
+        auto& job = *job_it->second;
+        job.latest_confirmed_checkpoint_id =
+            std::max(job.latest_confirmed_checkpoint_id, confirmed_id);
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("WriteConfirmed")
+                .u("job", jid)
+                .u("ckpt", confirmed_id)
+                .u("epoch", epoch())
+                .emit();
+        }
+    }
+    clink::log::info("coordinator.checkpoint",
+                     "job_id=" + std::to_string(jid) + " checkpoint " +
+                         std::to_string(confirmed_id) + " commit-CONFIRMED");
 }
 
 std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked_(
@@ -7754,7 +8551,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
     return {};
 }
 
-void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
+void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerConnection& sender) {
     auto msg = decode_subtask_checkpointed(r);
     // The SubtaskAck protocol event is recorded by the worker where the ack is
     // sent (the subtask's own step), not here at the receipt.
@@ -7779,6 +8576,11 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         // job restores below it with nothing committed. One decision, one
         // decider.
         bool suppress_commit{false};
+        // The run the checkpoint completed in (JobState::redeploys). Its commit
+        // goes to that run's sinks or nowhere: a restart that both begins and
+        // redeploys while the marker is written has torn them down, and the
+        // new run neither tracks nor commits the old run's checkpoint.
+        std::uint64_t redeploys{0};
     };
     std::vector<CompletedCheckpoint> just_completed;
     std::string completed_marker_dir;
@@ -7799,7 +8601,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     // A hot cutover awaiting its cut, and this is an ack for C from a task the
     // rescaled operator feeds - the ack that closes the cut in practice, since
     // the fed side acks after every barrier has reached it. Reached before the
-    // lock, on this connection's reader thread, so a Delay armed on the point
+    // lock, on this connection's dispatch thread, so a Delay armed on the point
     // holds this ack back while the other connections' frames - the old
     // subtasks' exits at C - are processed. A test aid; one relaxed load.
     if (msg.checkpoint_id != 0 &&
@@ -7816,6 +8618,9 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     }
     {
         std::lock_guard lock(mu_);
+        if (sender.lost) {
+            return;  // the loss fold has already accounted for this session
+        }
         auto job_it = jobs_.find(msg.job_id);
         if (job_it == jobs_.end()) {
             return;
@@ -7974,6 +8779,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                         .u("job", msg.job_id)
                         .u("ckpt", msg.checkpoint_id)
                         .s("outcome", "failed")
+                        .u("epoch", epoch())
                         .emit();
                 }
                 // The abort above discards every sink's staged interval for
@@ -8116,6 +8922,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                     .u("job", msg.job_id)
                     .u("ckpt", msg.checkpoint_id)
                     .s("outcome", "discarded")
+                    .u("epoch", epoch())
                     .emit();
             }
             log::warn("coordinator.checkpoint",
@@ -8139,6 +8946,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                     .u("job", msg.job_id)
                     .u("ckpt", msg.checkpoint_id)
                     .s("outcome", "completed")
+                    .u("epoch", epoch())
                     .emit();
             }
             job.failed_checkpoint_acks.erase(msg.checkpoint_id);
@@ -8187,6 +8995,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                     job.checkpoint_participants.erase(pit);
                 }
                 done.suppress_commit = job.awaiting_restart;
+                done.redeploys = job.redeploys;
                 just_completed.push_back(std::move(done));
             }
             completed_marker_dir = job.checkpoint.checkpoint_dir;
@@ -8348,9 +9157,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             send_frame(*d.conn, d.frame);
         }
     }
-    // Write the COMPLETED marker outside the lock so a slow filesystem
-    // doesn't block reader threads.
-    for (const auto& [jid, ckpt_id, gen, subtasks, suppress_commit] : just_completed) {
+    // Write the COMPLETED marker outside the lock so a slow store does not
+    // hold mu_. This runs on the acking worker's dispatch thread, not its
+    // reader, so the write delays that worker's later frames but never its
+    // heartbeats: a write outlasting heartbeat_timeout no longer gets a live
+    // worker declared lost.
+    for (const auto& [jid, ckpt_id, gen, subtasks, suppress_commit, completed_in_run] :
+         just_completed) {
         // The COMPLETED-N marker is the authoritative record that a
         // checkpoint reached global completion, and the 2PC sinks key their
         // commit-on-restore on finding it. It therefore has to be durable
@@ -8426,35 +9239,61 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                         "without a recoverable record of it");
                 continue;
             }
-            // The trace witnesses the durable write before anything can kill the
-            // process "after the marker": a validation run showed a coordinator
-            // exiting at the fault point below with the marker on disk and no
-            // WriteCompleted in its trace, and the recovered leader's restore
-            // point then read as impossible.
-            if (protocol_trace::enabled()) {
-                protocol_trace::Event("WriteCompleted").u("job", jid).u("ckpt", ckpt_id).emit();
-            }
-            CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAfterCompletedMarker);
         }
         // The checkpoint is durable (or the job keeps no directory, so memory
-        // is all there is): advance the restore point now, and only now.
+        // is all there is): advance the restore point now, and only now, in
+        // the hold that emits WriteCompleted, so memory and the line move
+        // together.
+        //
+        // Only while the run the checkpoint completed in is still the job's.
+        // The put runs outside the lock, and a restart can begin and redeploy
+        // while it is out: the new run restored from a point the checkpoint is
+        // not part of, the specification's Redeploy has forgotten it, and
+        // advancing would hand the new run another run's restore point. The
+        // marker stays on disk, true, as a CONFIRMED marker landing after a
+        // redeploy does.
+        //
+        // Nor while the restart is held for in-doubt resolution, or has been
+        // and waits only to redeploy: the stage fixed the walk's range
+        // (RestartProceeds reports it), the walk runs to the completed point
+        // it read, and memory moving under it took the trace's walk past
+        // where the engine's stopped. The line is still the put landing; the
+        // redeploy restores from the confirmed point, which the walk alone
+        // moves.
         {
             std::lock_guard lock(mu_);
             auto job_it = jobs_.find(jid);
-            if (job_it != jobs_.end()) {
+            if (job_it != jobs_.end() && job_it->second->redeploys == completed_in_run) {
                 auto& job = *job_it->second;
-                job.latest_completed_checkpoint_id =
-                    std::max(job.latest_completed_checkpoint_id, ckpt_id);
-                // The restore point has moved past the last rescale, so every
-                // subtask's own directory now holds state written under the
-                // CURRENT layout and the retained pre-rescale translation is
-                // not only unnecessary but wrong. Drop it.
-                if (!job.stale_layout_blocks.empty() &&
-                    job.latest_completed_checkpoint_id > job.stale_layout_through) {
-                    job.stale_layout_blocks.clear();
-                    job.stale_layout_through = 0;
+                // The trace witnesses the durable write before anything can
+                // kill the process "after the marker": a validation run showed
+                // a coordinator exiting at that fault point with the marker on
+                // disk and no WriteCompleted in its trace, and the recovered
+                // leader's restore point then read as impossible.
+                if (!completed_marker_dir.empty() && protocol_trace::enabled()) {
+                    protocol_trace::Event("WriteCompleted")
+                        .u("job", jid)
+                        .u("ckpt", ckpt_id)
+                        .u("epoch", epoch())
+                        .emit();
+                }
+                if (!job.resolving_in_doubt && !job.in_doubt_walked) {
+                    job.latest_completed_checkpoint_id =
+                        std::max(job.latest_completed_checkpoint_id, ckpt_id);
+                    // The restore point has moved past the last rescale, so
+                    // every subtask's own directory now holds state written
+                    // under the CURRENT layout and the retained pre-rescale
+                    // translation is not only unnecessary but wrong. Drop it.
+                    if (!job.stale_layout_blocks.empty() &&
+                        job.latest_completed_checkpoint_id > job.stale_layout_through) {
+                        job.stale_layout_blocks.clear();
+                        job.stale_layout_through = 0;
+                    }
                 }
             }
+        }
+        if (!completed_marker_dir.empty()) {
+            CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAfterCompletedMarker);
         }
         // A checkpoint that completed while the job was draining for a
         // restart keeps its durable marker but is NOT committed from here:
@@ -8465,11 +9304,19 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         // resolution finalises it as one decision instead.
         if (suppress_commit) {
             if (protocol_trace::enabled()) {
-                protocol_trace::Event("Broadcast")
-                    .u("job", jid)
-                    .u("ckpt", ckpt_id)
-                    .b("withheld", true)
-                    .emit();
+                // Traced only while the run the checkpoint completed in is
+                // still the job's: after its Redeploy the specification has
+                // forgotten the checkpoint, and has no withheld broadcast of it.
+                std::lock_guard lock(mu_);
+                const auto job_it = jobs_.find(jid);
+                if (job_it != jobs_.end() && job_it->second->redeploys == completed_in_run) {
+                    protocol_trace::Event("Broadcast")
+                        .u("job", jid)
+                        .u("ckpt", ckpt_id)
+                        .b("withheld", true)
+                        .u("epoch", epoch())
+                        .emit();
+                }
             }
             log::info("coordinator.checkpoint",
                       "job_id=" + std::to_string(jid) + " checkpoint " + std::to_string(ckpt_id) +
@@ -8483,49 +9330,69 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         // transactions, the marker is durable, so a crash mid-broadcast
         // still lets recovery find COMPLETED-N and commit on restore.
         CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCommitBroadcast);
+        // One hold decides whether the commit goes out, seeds the checkpoint's
+        // confirmation set, picks the connections and emits the Broadcast line.
+        // Split across holds, a restart that began and redeployed between them
+        // seeded the old run's checkpoint into the new run, whose restart had
+        // just cleared pending_confirms, and committed it on the new run's
+        // connections after the Redeploy line.
         std::vector<std::shared_ptr<network::Connection>> worker_conns;
-        {
-            std::lock_guard lock(mu_);
-            auto job_it = jobs_.find(jid);
-            if (job_it != jobs_.end()) {
-                // The suppress decision is RE-TAKEN here, not merely carried
-                // from the ack that completed the checkpoint: the marker
-                // fsync above runs outside the lock (deliberately), and a
-                // restart or cancel beginning inside that window would
-                // otherwise receive the broadcast into a half-torn-down job
-                // - the partial-commit state the captured flag was added to
-                // prevent, re-opened one durable write later. Cancel gets
-                // the same treatment as restart because a cancelled job has
-                // no held resolution behind it: a partial commit there is
-                // permanent.
-                if (job_it->second->awaiting_restart || job_it->second->cancel_requested) {
-                    if (protocol_trace::enabled()) {
-                        protocol_trace::Event("Broadcast")
-                            .u("job", jid)
-                            .u("ckpt", ckpt_id)
-                            .b("withheld", true)
-                            .emit();
-                    }
-                    log::info("coordinator.checkpoint",
-                              "job_id=" + std::to_string(jid) + " checkpoint " +
-                                  std::to_string(ckpt_id) +
-                                  " completed but a restart or cancel began before its commit "
-                                  "broadcast; withheld for in-doubt resolution");
-                    continue;
-                }
-                for (const auto& [worker_id, _] : job_it->second->tasks_by_worker) {
-                    auto worker_it = registered_.find(worker_id);
-                    if (worker_it != registered_.end() && !worker_it->second->lost &&
-                        worker_it->second->conn) {
-                        worker_conns.push_back(worker_it->second->conn);
-                    }
-                }
-            }
-        }
         CommitCheckpointMsg cc;
         cc.job_id = jid;
         cc.checkpoint_id = ckpt_id;
         {
+            std::lock_guard lock(mu_);
+            auto job_it = jobs_.find(jid);
+            if (job_it == jobs_.end()) {
+                continue;
+            }
+            auto& job = *job_it->second;
+            // The run the checkpoint completed in is gone: a restart began and
+            // redeployed while the marker was written. Its sinks were torn
+            // down, the new run's restore point and resolution account for the
+            // checkpoint, and the specification's Redeploy forgets it, so
+            // nothing is sent and nothing traced.
+            if (job.redeploys != completed_in_run) {
+                log::info("coordinator.checkpoint",
+                          "job_id=" + std::to_string(jid) + " checkpoint " +
+                              std::to_string(ckpt_id) +
+                              " completed in a run the job has since redeployed past; no commit "
+                              "broadcast");
+                continue;
+            }
+            // The suppress decision is RE-TAKEN here, not merely carried
+            // from the ack that completed the checkpoint: the marker
+            // fsync above runs outside the lock (deliberately), and a
+            // restart or cancel beginning inside that window would
+            // otherwise receive the broadcast into a half-torn-down job
+            // - the partial-commit state the captured flag was added to
+            // prevent, re-opened one durable write later. Cancel gets
+            // the same treatment as restart because a cancelled job has
+            // no held resolution behind it: a partial commit there is
+            // permanent.
+            if (job.awaiting_restart || job.cancel_requested) {
+                if (protocol_trace::enabled()) {
+                    protocol_trace::Event("Broadcast")
+                        .u("job", jid)
+                        .u("ckpt", ckpt_id)
+                        .b("withheld", true)
+                        .u("epoch", epoch())
+                        .emit();
+                }
+                log::info("coordinator.checkpoint",
+                          "job_id=" + std::to_string(jid) + " checkpoint " +
+                              std::to_string(ckpt_id) +
+                              " completed but a restart or cancel began before its commit "
+                              "broadcast; withheld for in-doubt resolution");
+                continue;
+            }
+            for (const auto& [worker_id, _] : job.tasks_by_worker) {
+                auto worker_it = registered_.find(worker_id);
+                if (worker_it != registered_.end() && !worker_it->second->lost &&
+                    worker_it->second->conn) {
+                    worker_conns.push_back(worker_it->second->conn);
+                }
+            }
             // Commit-confirmed restore protocol. Seed this checkpoint's
             // pending-confirmation set from the tracked tasks, and tell the
             // workers the retention floor: nothing at or above the newest
@@ -8535,10 +9402,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             // confirmation NOTHING may be purged for a tracked job, and a
             // floor of 1 says exactly that; 0 keeps the untracked
             // behaviour byte-identical.
-            std::lock_guard lock(mu_);
-            auto job_it = jobs_.find(jid);
-            if (job_it != jobs_.end() && !job_it->second->confirm_task_keys.empty()) {
-                auto& job = *job_it->second;
+            if (!job.confirm_task_keys.empty()) {
                 job.pending_confirms[ckpt_id] = job.confirm_task_keys;
                 // Bounded: a job whose confirmations stopped arriving must
                 // not grow this map for ever. 64 outstanding checkpoints is
@@ -8551,17 +9415,16 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             // Savepoints ride every commit, whether or not the job runs the
             // confirmed-restore protocol above: a pin that only reached the
             // workers under one protocol would be a pin that sometimes holds.
-            if (job_it != jobs_.end()) {
-                cc.pinned_checkpoint_ids.assign(job_it->second->pinned_checkpoint_ids.begin(),
-                                                job_it->second->pinned_checkpoint_ids.end());
+            cc.pinned_checkpoint_ids.assign(job.pinned_checkpoint_ids.begin(),
+                                            job.pinned_checkpoint_ids.end());
+            if (protocol_trace::enabled()) {
+                protocol_trace::Event("Broadcast")
+                    .u("job", jid)
+                    .u("ckpt", ckpt_id)
+                    .b("withheld", false)
+                    .u("epoch", epoch())
+                    .emit();
             }
-        }
-        if (protocol_trace::enabled()) {
-            protocol_trace::Event("Broadcast")
-                .u("job", jid)
-                .u("ckpt", ckpt_id)
-                .b("withheld", false)
-                .emit();
         }
         const auto frame = fenced_frame_(MessageKind::CommitCheckpoint, cc);
         for (const auto& c : worker_conns)

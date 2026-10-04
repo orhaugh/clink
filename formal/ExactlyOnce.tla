@@ -78,7 +78,8 @@ Mutants == {
     "refusal_wall",                   \* found by this model: the walk left later checkpoints' commits unproven
     "complete_above_failed",          \* found by this model: a checkpoint completed above a FAILED one during the rewind
     "restore_from_memory",            \* found by this model: the restore point ran ahead of the durable marker
-    "sail_on_without_budget"          \* with no restart budget left, a FAILED checkpoint's interval sailed on
+    "sail_on_without_budget",         \* with no restart budget left, a FAILED checkpoint's interval sailed on
+    "advance_before_confirmed_put"    \* found in review: latest_confirmed moved before the CONFIRMED marker was durable
 }
 
 ASSUME Host \in [Sinks -> Workers]
@@ -117,6 +118,16 @@ VARIABLES
     markerDue,      \* (mutant broadcast_before_marker) broadcast sent, marker pending
     memCompleted,   \* latest_completed_checkpoint_id
     memConfirmed,   \* latest_confirmed_checkpoint_id
+    confirming,     \* [Ckpts -> {"none", "due", "written", "stale"}]: a drained
+                    \* confirmation set's CONFIRMED marker on its way to disk and
+                    \* to memory; held by the handler, not the job (see WriteConfirmed)
+    staleCompleted, \* ids whose COMPLETED put is still out for a run the job has
+                    \* redeployed past, or for a superseded coordinator: it lands,
+                    \* and the job's memory does not advance after it, nor does any
+                    \* commit for it reach a sink (WriteStaleCompleted)
+    lateBatch,      \* the stale puts of a superseded coordinator that land in id
+                    \* order, each after the one below it (DecidedLate); empty
+                    \* unless it was superseded with a checkpoint still to decide
     broadcastIds,   \* ids whose confirmation set was seeded and has not drained
     unconfirmed,    \* [Ckpts -> SUBSET Sinks]: pending_confirms
     drainSet,       \* survivors that must report drained before a restart proceeds
@@ -164,7 +175,7 @@ VARIABLES
 
 vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
-           markerDue, memCompleted, memConfirmed, broadcastIds, unconfirmed, drainSet,
+           markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed, drainSet,
            freshLeader, rewindFloor, walkC, walkVerdict, walkRetries,
            completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles, receipts,
            unresolvedMk, txn, brokerUp, sinkGen, sink, pendingHandles, barriers,
@@ -173,10 +184,13 @@ vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            brokerOutages, walkCancels, errorRestarts, ckptRewinds >>
 
 leaderVars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext >>
-coordVars  == << phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
+\* coordMem is the job's memory; confirming and staleCompleted are the handlers'
+\* (see WriteConfirmed and WriteStaleCompleted).
+coordMem   == << phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                  toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
                  unconfirmed, drainSet, freshLeader, rewindFloor, walkC, walkVerdict,
                  walkRetries >>
+coordVars  == << coordMem, confirming, staleCompleted, lateBatch >>
 walkVars   == << walkC, walkVerdict, walkRetries >>
 diskVars   == << completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles,
                  receipts, unresolvedMk >>
@@ -225,6 +239,7 @@ Init ==
     /\ ackedOk = [c \in Ckpts |-> {}] /\ ackedFail = [c \in Ckpts |-> {}]
     /\ completeDue = None /\ toBroadcast = None /\ markerDue = None
     /\ memCompleted = 0 /\ memConfirmed = 0 /\ broadcastIds = {}
+    /\ confirming = [c \in Ckpts |-> "none"] /\ staleCompleted = {} /\ lateBatch = {}
     /\ unconfirmed = [c \in Ckpts |-> {}]
     /\ drainSet = {} /\ freshLeader = FALSE /\ rewindFloor = None
     /\ walkC = None /\ walkVerdict = [s \in Sinks |-> "none"] /\ walkRetries = 0
@@ -267,7 +282,7 @@ Trigger ==
        /\ inFlight' = inFlight \cup {c}
        /\ msgs' = msgs \cup {[kind |-> "barrier", c |-> c, epoch |-> leaderEpoch]}
     /\ UNCHANGED << leaderVars, phase, ackedOk, ackedFail, completeDue, toBroadcast,
-                    markerDue, memCompleted, memConfirmed, broadcastIds, unconfirmed,
+                    markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed,
                     drainSet, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen, sinkVars,
                     boundEpoch, jobVars, ghostVars, budgetVars >>
 
@@ -381,7 +396,7 @@ SinkAck(s) ==
                ELSE ackedFail' = [ackedFail EXCEPT ![c] = @ \cup {s}] /\ UNCHANGED ackedOk
           ELSE UNCHANGED << ackedOk, ackedFail >>
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, completeDue, toBroadcast,
-                    markerDue, memCompleted, memConfirmed, broadcastIds, unconfirmed,
+                    markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed,
                     drainSet, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
                     pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars,
                     budgetVars >>
@@ -443,7 +458,7 @@ CoordComplete ==
                    ELSE UNCHANGED << phase, drainSet, rewindFloor, ckptRewinds >>
                 /\ UNCHANGED completeDue
     /\ UNCHANGED << leaderVars, nextCkpt, ackedOk, ackedFail, toBroadcast, markerDue,
-                    memCompleted, memConfirmed, broadcastIds, unconfirmed, freshLeader,
+                    memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed, freshLeader,
                     walkVars, diskVars, txn, brokerUp, sinkGen, sinkVars, boundEpoch, jobVars,
                     ghostVars, workerDeaths, coordDeaths, expiries, snapFails, brokerOutages,
                     walkCancels, errorRestarts >>
@@ -457,7 +472,18 @@ CoordComplete ==
 \* replayed them. Memory now advances with the durable write. Fault points:
 \* coordinator.before_completed_marker is the state before this step,
 \* coordinator.after_completed_marker the state after it.
-Advance(c) == IF c > memCompleted THEN c ELSE memCompleted
+\*
+\* The put runs outside the lock and the advance in a hold after it, which
+\* takes two gates. A put whose job redeployed while it was out advances
+\* nothing: the Redeploy turned it stale, and it lands as WriteStaleCompleted,
+\* with no advance and no broadcast. A superseded coordinator's put is stale
+\* too (CoordSuperseded), whatever its own handler goes on to do. A put landing while the restart is held for
+\* resolution (resolving, or deploying once the walk has finished) is the
+\* durable write and no advance: the stage fixed the walk's range, and the
+\* walk runs to the completed point it read, so memory moving under it walked
+\* the model past where the engine stops.
+Advance(c) == IF phase \in {"resolving", "deploying"} \/ c <= memCompleted
+              THEN memCompleted ELSE c
 
 WriteCompleted ==
     /\ coordUp
@@ -473,11 +499,60 @@ WriteCompleted ==
              /\ memCompleted' = Advance(c)
              /\ markerDue' = None
              /\ UNCHANGED << completeDue, toBroadcast >>
-    /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, memConfirmed,
+    /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, memConfirmed, confirming, staleCompleted, lateBatch,
                     broadcastIds, unconfirmed, drainSet, freshLeader, rewindFloor, walkVars,
                     confirmedDisk, srcCut, sinkCut, sinkHandles, receipts, unresolvedMk,
                     txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars,
                     budgetVars >>
+
+\* The puts still out once nothing will advance the leader's memory or reach a
+\* sink of the leader's run for them: the job redeployed (the second hold sees
+\* its redeploy count moved and does nothing more), or the coordinator was
+\* superseded. A superseded coordinator's handler runs on unaware: once the put
+\* lands it advances its own memory, which is no longer the job's, and
+\* broadcasts under its own epoch. This step takes every sink down and clears
+\* every frame, and CoordRecovers binds every worker to the new epoch, so no
+\* such commit frame is accepted here (formal/README.md says what that leaves
+\* to the engine).
+CompletedOrphaned == staleCompleted \cup ({completeDue, markerDue} \ {None})
+
+\* The checkpoints a superseded coordinator has still to decide complete when
+\* it is superseded: every participant's ack was sent while it led (SinkAck),
+\* and the last of them waits on its connection's dispatch thread, queued
+\* behind a slow store write on that connection (the stall that cost the
+\* lease). Once the write returns the coordinator decides them, in id order,
+\* and puts their markers, all stale. A decidable checkpoint completes only
+\* when no checkpoint it would decide first fails or is discarded, which
+\* would set the rewind floor below it. The puts land in id order, after the
+\* put the coordinator still had out when it was superseded: the last ack for
+\* a checkpoint waits behind the put for the one before it on the same
+\* connection, so each decision follows the landing below it (lateBatch).
+\* Found by this model: landing them in any order let a later checkpoint's
+\* marker vouch for a cut whose earlier interval no marker covered, and
+\* NoLoss failed on a run the engine cannot produce.
+DecidedLate == {c \in Decidable : \A d \in Decidable :
+                    d <= c => (ackedFail[d] = {} /\ ~AboveRewind(d))}
+
+\* A stale COMPLETED put lands: the marker is durable and true (every
+\* participant acked the checkpoint), and nothing else moves. For a redeployed
+\* run the engine emits no line; a superseded coordinator emits its
+\* WriteCompleted, stamped with its own epoch, and trace validation reads that
+\* line as this step. What reads the disk afterwards sees it: a takeover
+\* reseeds its completed point from the newest marker, and the in-doubt walk
+\* probes the handles of every marker in its range, so a superseded run's
+\* marker can be restored from or walked over. A dead coordinator's own put
+\* landed before its death or never will; the stale ones of a coordinator
+\* that dies are kept, as ConfirmingAfterDeath keeps stale confirmations.
+StaleCompletedLands(c) ==
+    /\ completedDisk' = completedDisk \cup {c}
+    /\ staleCompleted' = staleCompleted \ {c}
+    /\ c \in lateBatch => c = Min(lateBatch)
+    /\ lateBatch' = lateBatch \ {c}
+    /\ UNCHANGED << leaderVars, coordMem, confirming, confirmedDisk, srcCut, sinkCut, sinkHandles,
+                    receipts, unresolvedMk, txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
+                    jobVars, ghostVars, budgetVars >>
+
+WriteStaleCompleted == \E c \in staleCompleted : StaleCompletedLands(c)
 
 \* CommitCheckpoint to every sink of the job, or withheld: a checkpoint that
 \* completed while the job is not running normally (draining for a restart)
@@ -503,7 +578,7 @@ Broadcast ==
                                             ELSE unconfirmed
                /\ broadcastIds' = IF Tracked THEN broadcastIds \cup {c} ELSE broadcastIds
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, memCompleted,
-                    memConfirmed, drainSet, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
+                    memConfirmed, confirming, staleCompleted, lateBatch, drainSet, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
                     sinkVars, boundEpoch, jobVars, ghostVars, budgetVars >>
 
 \* A commit frame reaches a worker (Worker::handle_commit_checkpoint_): fenced
@@ -587,36 +662,99 @@ SinkReceipt(s) ==
 \* The staged handle is erased, the next transaction begins (after which the
 \* broker no longer names the previous commit), and CommitConfirmed goes to the
 \* coordinator (dispatch_commit_checkpoint_). A confirmation reaching a dead
-\* coordinator, or one that no longer tracks the id, is lost.
+\* coordinator, or one that no longer tracks the id, is lost. The one that
+\* drains c's set is handled in the hold that starts c's CONFIRMED marker
+\* (handle_commit_confirmed_): c, and every id below it, leave tracking, and
+\* the marker is due (see WriteConfirmed).
 SinkConfirm(s) ==
     /\ Kafka /\ sink[s].up /\ sink[s].stage = "receipted"
-    /\ LET c == sink[s].openTxn IN
-       /\ txn' = [txn EXCEPT ![s][c].desc = FALSE]
-       /\ pendingHandles' = [pendingHandles EXCEPT ![s] = @ \ {c}]
-       /\ sink' = [sink EXCEPT ![s].stage = "idle", ![s].openTxn = None]
-       /\ unconfirmed' = IF coordUp /\ c \in broadcastIds
-                         THEN [unconfirmed EXCEPT ![c] = @ \ {s}]
-                         ELSE unconfirmed
+    /\ LET c == sink[s].openTxn
+           tracked == coordUp /\ c \in broadcastIds
+           drained == tracked /\ unconfirmed[c] \ {s} = {}
+       IN /\ txn' = [txn EXCEPT ![s][c].desc = FALSE]
+          /\ pendingHandles' = [pendingHandles EXCEPT ![s] = @ \ {c}]
+          /\ sink' = [sink EXCEPT ![s].stage = "idle", ![s].openTxn = None]
+          /\ unconfirmed' = IF tracked
+                            THEN [unconfirmed EXCEPT ![c] = @ \ {s}]
+                            ELSE unconfirmed
+          /\ broadcastIds' = IF drained THEN {d \in broadcastIds : d > c} ELSE broadcastIds
+          /\ confirming' = IF drained THEN [confirming EXCEPT ![c] = "due"] ELSE confirming
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, staleCompleted, lateBatch,
                     drainSet, freshLeader, rewindFloor, walkVars, diskVars, brokerUp, sinkGen, barriers,
                     boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
 
 \* Every tracked sink confirmed c: CONFIRMED-<id>, durable
 \* (handle_commit_confirmed_). Restores of this family select the newest
 \* confirmed checkpoint, never merely the newest completed one.
-WriteConfirmed ==
-    /\ coordUp /\ Tracked
-    /\ \E c \in broadcastIds :
-        /\ unconfirmed[c] = {}
-        /\ broadcastIds' = broadcastIds \ {c}
-        /\ confirmedDisk' = confirmedDisk \cup {c}
-        /\ memConfirmed' = IF c > memConfirmed THEN c ELSE memConfirmed
+\*
+\* The engine takes three steps where COMPLETED takes one, because the put
+\* runs outside the coordinator's lock. The hold that drains c's confirmation
+\* set (SinkConfirm) leaves the marker due. The put (WriteConfirmed) makes it
+\* durable. A second hold (AdvanceConfirmed) then moves latest_confirmed to c,
+\* so memory never runs ahead of the disk, as for COMPLETED. Anything that
+\* takes the lock can fall between the drain and the advance: a Redeploy, a
+\* RestartProceeds that holds the job for resolution, the walk itself. A
+\* takeover can fall there too, and seeds its confirmed restore point from
+\* whatever the put had left on disk (CoordRecovers).
+\*
+\* A Redeploy begins a run the confirmation does not belong to, and the
+\* second hold sees that (the job's redeploy count moved) and leaves memory
+\* alone. A marker still due then turns "stale": its put still lands, and
+\* nothing advances after it. One already written has nothing left to do. The
+\* marker stays on disk either way: it is true, since every sink's commit
+\* executed, and whatever reads it (a takeover, the walk) reads it as true. A
+\* superseded coordinator's handler runs on as well, so its due markers turn
+\* stale at the supersession and may land after the next leader has read the
+\* disk; a dead coordinator's put either landed before the death or never did.
+\* The model does not tell a stale put's writer apart, so a leader's death
+\* keeps the stale ones, which only lets a dead leader's post-redeploy put
+\* land late as well. Fault point: coordinator.before_confirmed_marker is the
+\* state before the put (confirming[c] = "due"): neither confirmedDisk nor
+\* memConfirmed has moved.
+ConfirmedStep(c, write, advance) ==
+    /\ confirmedDisk' = IF write THEN confirmedDisk \cup {c} ELSE confirmedDisk
+    /\ memConfirmed' = IF advance /\ c > memConfirmed THEN c ELSE memConfirmed
+    /\ confirming' = [confirming EXCEPT ![c] = IF advance \/ @ = "stale" THEN "none"
+                                                ELSE "written"]
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, unconfirmed, drainSet,
+                    toBroadcast, markerDue, memCompleted, staleCompleted, lateBatch, broadcastIds, unconfirmed, drainSet,
                     freshLeader, rewindFloor, walkVars, completedDisk, srcCut, sinkCut, sinkHandles,
                     receipts, unresolvedMk, txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
                     jobVars, ghostVars, budgetVars >>
+
+WriteConfirmed ==
+    \E c \in Ckpts :
+        /\ \/ confirming[c] = "due" /\ coordUp
+           \/ confirming[c] = "stale"
+        /\ ConfirmedStep(c, TRUE, FALSE)
+
+AdvanceConfirmed ==
+    \E c \in Ckpts :
+        \/ /\ coordUp /\ confirming[c] = "written"
+           /\ ConfirmedStep(c, FALSE, TRUE)
+        \* Mutant: memory advances in the hold that drains the set, before the
+        \* put (the engine's order before the put moved out of that hold).
+        \/ /\ Bug = "advance_before_confirmed_put"
+           /\ coordUp /\ confirming[c] = "due" /\ c > memConfirmed
+           /\ memConfirmed' = c
+           /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail,
+                           completeDue, toBroadcast, markerDue, memCompleted, confirming, staleCompleted, lateBatch,
+                           broadcastIds, unconfirmed, drainSet, freshLeader, rewindFloor,
+                           walkVars, diskVars, txn, brokerUp, sinkGen, sinkVars, boundEpoch,
+                           msgs, jobVars, ghostVars, budgetVars >>
+
+\* The confirmations in flight once nothing will advance memory for them: the
+\* job redeployed, or its coordinator was superseded (see WriteConfirmed).
+\* Their puts still land.
+ConfirmingOrphaned ==
+    [c \in Ckpts |-> CASE confirming[c] = "due" -> "stale"
+                       [] confirming[c] = "written" -> "none"
+                       [] OTHER -> confirming[c]]
+
+\* The coordinator's process died: its own puts landed or never will.
+ConfirmingAfterDeath ==
+    [c \in Ckpts |-> IF confirming[c] = "stale" THEN "stale" ELSE "none"]
 
 --------------------------------------------------------------------------------
 (* FAULTS: processes die, the broker forgets, the coordinator is superseded. *)
@@ -664,7 +802,7 @@ WorkerDiesKilling(w, dead) ==
             ELSE UNCHANGED << phase, drainSet >>
     /\ workerDeaths' = workerDeaths + 1
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen, boundEpoch,
                     jobVars, ghostVars, coordDeaths, expiries, snapFails, brokerOutages,
                     walkCancels, errorRestarts, ckptRewinds >>
@@ -689,7 +827,7 @@ RestartOnError ==
           drainSet' = {s \in Sinks : sink[s].up \/ (waitOpening /\ sink[s].opening)}
     /\ errorRestarts' = errorRestarts + 1
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
                     sink, pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars,
                     workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels, ckptRewinds >>
@@ -713,7 +851,7 @@ SinkDrains(s) ==
                                                         ELSE txn[s][c]]]
               ELSE txn
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, brokerUp, sinkGen, boundEpoch,
                     jobVars, ghostVars, budgetVars >>
 
@@ -728,8 +866,10 @@ CoordDies ==
     /\ pendingHandles' = [s \in Sinks |-> {}]
     /\ barriers' = [s \in Sinks |-> {}]
     /\ msgs' = {}
+    /\ confirming' = ConfirmingAfterDeath
     /\ coordDeaths' = coordDeaths + 1
-    /\ UNCHANGED << leaderEpoch, zombie, zombieEpoch, zombieNext, coordVars, diskVars, txn,
+    /\ UNCHANGED << leaderEpoch, zombie, zombieEpoch, zombieNext, coordMem, staleCompleted, lateBatch,
+                    diskVars, txn,
                     brokerUp, sinkGen, boundEpoch, jobVars, ghostVars, workerDeaths, expiries,
                     snapFails, brokerOutages, walkCancels, errorRestarts, ckptRewinds >>
 
@@ -746,8 +886,12 @@ CoordSuperseded ==
     /\ pendingHandles' = [s \in Sinks |-> {}]
     /\ barriers' = [s \in Sinks |-> {}]
     /\ msgs' = {}
+    /\ confirming' = ConfirmingOrphaned
+    /\ staleCompleted' = CompletedOrphaned \cup DecidedLate
+    /\ lateBatch' = IF DecidedLate = {} THEN lateBatch
+                    ELSE lateBatch \cup DecidedLate \cup ({completeDue, markerDue} \ {None})
     /\ coordDeaths' = coordDeaths + 1
-    /\ UNCHANGED << leaderEpoch, coordVars, diskVars, txn, brokerUp, sinkGen, boundEpoch, jobVars,
+    /\ UNCHANGED << leaderEpoch, coordMem, diskVars, txn, brokerUp, sinkGen, boundEpoch, jobVars,
                     ghostVars, workerDeaths, expiries, snapFails, brokerOutages,
                     walkCancels, errorRestarts, ckptRewinds >>
 
@@ -774,11 +918,15 @@ CoordRecovers ==
     /\ inFlight' = {} /\ completeDue' = None /\ toBroadcast' = None /\ markerDue' = None
     /\ ackedOk' = [c \in Ckpts |-> {}] /\ ackedFail' = [c \in Ckpts |-> {}]
     /\ memCompleted' = Max(completedDisk)
+    \* Whatever CONFIRMED markers are on disk, wherever their writers got to:
+    \* a put that landed before the previous coordinator's advance counts. A
+    \* superseded coordinator's put still in flight (stale) may land after
+    \* this read, and this leader's memory does not follow it.
     /\ memConfirmed' = Max(confirmedDisk)
     /\ broadcastIds' = {} /\ unconfirmed' = [c \in Ckpts |-> {}]
     /\ freshLeader' = TRUE /\ rewindFloor' = None
     /\ walkC' = None /\ walkVerdict' = [s \in Sinks |-> "none"] /\ walkRetries' = 0
-    /\ UNCHANGED << zombie, zombieEpoch, zombieNext, nextCkpt, diskVars, txn, brokerUp, sinkGen,
+    /\ UNCHANGED << zombie, zombieEpoch, zombieNext, nextCkpt, confirming, staleCompleted, lateBatch, diskVars, txn, brokerUp, sinkGen,
                     sinkVars, msgs, jobVars, ghostVars, budgetVars >>
 
 \* transaction.timeout.ms: a prepared transaction whose producer is gone is
@@ -844,7 +992,7 @@ WalkSkips ==
     /\ WalkAt /\ walkC \notin completedDisk
     /\ NextId
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, drainSet, freshLeader, rewindFloor, diskVars, txn, brokerUp, sinkGen, sinkVars,
                     boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
 
@@ -855,7 +1003,7 @@ WalkReadsReceipt(s) ==
     /\ WalkOpen(s) /\ <<s, walkC>> \in receipts
     /\ walkVerdict' = [walkVerdict EXCEPT ![s] = "committed"]
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, drainSet, freshLeader, rewindFloor, walkC, walkRetries, diskVars, txn,
                     brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
 
@@ -884,7 +1032,7 @@ WalkProbes(s) ==
           ELSE /\ walkVerdict' = [walkVerdict EXCEPT ![s] = "refused"]
                /\ UNCHANGED << txn, published, receipts >>
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, drainSet, freshLeader, rewindFloor, walkC, walkRetries, completedDisk,
                     confirmedDisk, srcCut, sinkCut, sinkHandles, unresolvedMk, brokerUp, sinkGen,
                     sinkVars, boundEpoch, msgs, jobVars, restoreSound, staleAccepted,
@@ -896,7 +1044,7 @@ WalkRetries ==
     /\ Walking /\ ~brokerUp /\ Unsettled # {} /\ walkRetries < 2
     /\ walkRetries' = walkRetries + 1
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, drainSet, freshLeader, rewindFloor, walkC, walkVerdict, diskVars, txn,
                     brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
 
@@ -909,7 +1057,7 @@ EndUnresolved ==
     /\ unresolvedMk' = unresolvedMk \cup {<<s, walkC>> : s \in Unsettled} \cup LaterUnreceipted(walkC)
     /\ phase' = "deploying" /\ walkC' = None
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, drainSet, freshLeader, rewindFloor, walkVerdict, walkRetries,
                     completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles, receipts,
                     txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars >>
@@ -929,14 +1077,17 @@ WalkCancelled ==
 \* written and the walk moves on. Any refusal: the walk stops and the job
 \* restores from the last confirmed id; the committed siblings' intervals will
 \* be replayed and are swallowed by their receipts. A checkpoint staging no
-\* handle at all cannot be proven and stops the walk too.
+\* handle at all cannot be proven and stops the walk too. The confirmed
+\* restore point only moves up: a confirmation's own advance can have taken it
+\* past the walk while the walk ran (the resolution thread applies the walk's
+\* answer only when it is higher).
 WalkDecides ==
     /\ Walking
     /\ \/ \A s \in WalkHandles(walkC) : walkVerdict[s] # "none"
        \/ (Bug = "stop_at_first_refusal" /\ \E t \in Sinks : walkVerdict[t] = "refused")
     /\ IF WalkHandles(walkC) # {} /\ \A s \in WalkHandles(walkC) : walkVerdict[s] = "committed"
        THEN /\ confirmedDisk' = confirmedDisk \cup {walkC}
-            /\ memConfirmed' = walkC
+            /\ memConfirmed' = IF walkC > memConfirmed THEN walkC ELSE memConfirmed
             /\ NextId
             /\ UNCHANGED << phase, unresolvedMk >>
        ELSE /\ phase' = "deploying" /\ walkC' = None
@@ -944,7 +1095,7 @@ WalkDecides ==
                                             \cup LaterUnreceipted(walkC)
             /\ UNCHANGED << confirmedDisk, memConfirmed, walkVerdict, walkRetries >>
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, broadcastIds, unconfirmed,
+                    toBroadcast, markerDue, memCompleted, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed,
                     drainSet, freshLeader, rewindFloor, completedDisk, srcCut, sinkCut, sinkHandles,
                     receipts, txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
                     jobVars, ghostVars, budgetVars >>
@@ -953,7 +1104,7 @@ WalkFinishes ==
     /\ coordUp /\ phase = "resolving" /\ walkC # None /\ walkC > memCompleted
     /\ phase' = "deploying" /\ walkC' = None
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
-                    toBroadcast, markerDue, memCompleted, memConfirmed, broadcastIds,
+                    toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, drainSet, freshLeader, rewindFloor, walkVerdict, walkRetries, diskVars,
                     txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars,
                     budgetVars >>
@@ -1047,6 +1198,12 @@ RedeployEffects ==
     /\ inFlight' = {} /\ completeDue' = None /\ toBroadcast' = None /\ markerDue' = None
     /\ ackedOk' = [c \in Ckpts |-> {}] /\ ackedFail' = [c \in Ckpts |-> {}]
     /\ broadcastIds' = {} /\ unconfirmed' = [c \in Ckpts |-> {}]
+    \* restart_job_locked_ clears pending_confirms and counts the redeploy that
+    \* a confirmation's second hold checks (see WriteConfirmed).
+    /\ confirming' = ConfirmingOrphaned
+    \* A COMPLETED put still out lands for the run before this one.
+    /\ staleCompleted' = CompletedOrphaned
+    /\ UNCHANGED lateBatch
     /\ sink' = [s \in Sinks |-> [DownSink EXCEPT !.opening = TRUE]]
     /\ pendingHandles' = [s \in Sinks |-> {}]
     /\ barriers' = [s \in Sinks |-> {}]
@@ -1064,7 +1221,10 @@ Redeploy ==
 \* The drain is covered. A tracked job with a completed-but-unconfirmed gap
 \* holds its redeploy for in-doubt resolution
 \* (stage_in_doubt_resolution_locked_). Anything else redeploys in the same
-\* lock hold (restart_job_locked_), so no ack can land in between.
+\* lock hold (restart_job_locked_), so no ack can land in between. The walk's
+\* start is fixed here: the stage records it on the job (in_doubt_walk_from),
+\* and the resolution thread walks from it, so a confirmation's advance landing
+\* before the thread takes the job moves memConfirmed and not walkC.
 RestartProceeds ==
     /\ coordUp /\ phase = "draining" /\ drainSet = {}
     /\ IF Tracked /\ MemCompletedView > memConfirmed
@@ -1072,8 +1232,8 @@ RestartProceeds ==
             /\ walkC' = memConfirmed + 1
             /\ walkVerdict' = [s \in Sinks |-> "none"] /\ walkRetries' = 0
             /\ UNCHANGED << nextCkpt, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
-                            markerDue, broadcastIds, unconfirmed, freshLeader, rewindFloor, sinkVars, msgs,
-                            srcPos, frontier, restorePoint, restoreSound >>
+                            markerDue, broadcastIds, unconfirmed, confirming, staleCompleted, lateBatch, freshLeader, rewindFloor,
+                            sinkVars, msgs, srcPos, frontier, restorePoint, restoreSound >>
        ELSE /\ RedeployEffects
             /\ UNCHANGED walkVars
     /\ UNCHANGED << leaderVars, memCompleted, memConfirmed, drainSet, diskVars, txn, brokerUp,
@@ -1092,7 +1252,7 @@ Renumber ==
     /\ nextCkpt <= RecordedBy(zombieNext)
     /\ nextCkpt' \in (nextCkpt + 1) .. (RecordedBy(zombieNext) + 1)
     /\ UNCHANGED << leaderVars, phase, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
-                    markerDue, memCompleted, memConfirmed, broadcastIds, unconfirmed, drainSet,
+                    markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed, drainSet,
                     freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
                     sinkVars, boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
 
@@ -1172,7 +1332,8 @@ Quiescent ==
     /\ coordUp /\ phase = "running" /\ ~zombie /\ brokerUp
     /\ nextCkpt > MaxCkpt /\ inFlight = {}
     /\ completeDue = None /\ toBroadcast = None /\ markerDue = None
-    /\ msgs = {} /\ broadcastIds = {}
+    /\ msgs = {} /\ broadcastIds = {} /\ \A c \in Ckpts : confirming[c] = "none"
+    /\ staleCompleted = {}
     /\ \A s \in Sinks : sink[s].up /\ sink[s].ackDue = << >> /\ sink[s].stage = "idle"
                         /\ barriers[s] = {} /\ ~sink[s].opening
                         /\ (Kafka => sink[s].openTxn = None)
@@ -1187,9 +1348,10 @@ JobFailed == phase = "failed" /\ UNCHANGED vars
 Next ==
     \/ Trigger \/ ZombieTrigger \/ DeliverBarrier
     \/ \E s \in Sinks : SinkPrepare(s) \/ SinkPrepareFails(s) \/ SinkAck(s)
-    \/ CoordComplete \/ WriteCompleted \/ Broadcast \/ DeliverCommit \/ DeliverAbort
+    \/ CoordComplete \/ WriteCompleted \/ WriteStaleCompleted \/ Broadcast
+    \/ DeliverCommit \/ DeliverAbort
     \/ \E s \in Sinks : SinkCommit(s) \/ SinkReceipt(s) \/ SinkConfirm(s)
-    \/ WriteConfirmed
+    \/ WriteConfirmed \/ AdvanceConfirmed
     \/ \E w \in Workers : WorkerDies(w)
     \/ RestartOnError
     \/ \E s \in Sinks : SinkDrains(s)
@@ -1212,8 +1374,10 @@ Fairness ==
                         /\ WF_vars(SinkConfirm(s)) /\ WF_vars(SinkDrains(s))
                         /\ WF_vars(WalkReadsReceipt(s)) /\ WF_vars(WalkProbes(s))
                         /\ WF_vars(SinkOpens(s))
-    /\ WF_vars(CoordComplete) /\ WF_vars(WriteCompleted) /\ WF_vars(Broadcast)
+    /\ WF_vars(CoordComplete) /\ WF_vars(WriteCompleted) /\ WF_vars(WriteStaleCompleted)
+    /\ WF_vars(Broadcast)
     /\ WF_vars(DeliverCommit) /\ WF_vars(DeliverAbort) /\ WF_vars(WriteConfirmed)
+    /\ WF_vars(AdvanceConfirmed)
     /\ WF_vars(CoordRecovers) /\ WF_vars(ZombieStops) /\ WF_vars(BrokerComesBack)
     /\ WF_vars(RestartProceeds) /\ WF_vars(WalkSkips) /\ WF_vars(WalkRetries)
     /\ WF_vars(WalkExhausted) /\ WF_vars(WalkDecides) /\ WF_vars(WalkFinishes)
@@ -1233,6 +1397,9 @@ TypeOK ==
     /\ \A s \in Sinks, c \in Ckpts :
          txn[s][c].st \in {"none", "prepared", "committed", "aborted"}
     /\ \A s \in Sinks : sink[s].stage \in {"idle", "committing", "committed", "receipted"}
+    /\ confirming \in [Ckpts -> {"none", "due", "written", "stale"}]
+    /\ staleCompleted \subseteq Ckpts
+    /\ lateBatch \subseteq staleCompleted
 
 \* No sink publishes any position more than once.
 NoDuplicate ==
@@ -1272,6 +1439,15 @@ Fenced == ~staleAccepted
 ConfirmedMeansCommitted ==
     Tracked => \A c \in confirmedDisk, s \in Sinks :
                  c \in sinkHandles[s][c] => txn[s][c].st = "committed"
+
+\* The confirmed restore point in memory is a CONFIRMED marker on disk. A
+\* commit's retention floor is taken from memory (Worker::handle_commit_
+\* checkpoint_ purges snapshots below it), and a takeover restores from the
+\* disk: memory ahead of the disk let workers purge the snapshots the
+\* takeover's restore point needs. The model does not represent the purge, so
+\* the ordering it relies on is held here.
+ConfirmedMemoryOnDisk ==
+    Tracked => (memConfirmed = 0 \/ memConfirmed \in confirmedDisk)
 
 Safety == NoDuplicate /\ NoLoss /\ FrontierCovered /\ RestoreSound /\ ConfirmedMeansCommitted
 

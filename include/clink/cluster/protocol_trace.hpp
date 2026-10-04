@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace clink::protocol_trace {
 
@@ -51,6 +52,8 @@ public:
     Event& i(std::string_view key, std::int64_t value);
     Event& s(std::string_view key, std::string_view value);
     Event& b(std::string_view key, bool value);
+    // A JSON array of unsigned integers.
+    Event& us(std::string_view key, const std::vector<std::uint64_t>& values);
     void emit();
 
 private:

@@ -284,6 +284,28 @@ inline constexpr char kCoordinatorBeforeMetadataWrite[] = "coordinator.before_me
 inline constexpr char kCoordinatorBeforeCompletedMarker[] = "coordinator.before_completed_marker";
 inline constexpr char kCoordinatorAfterCompletedMarker[] = "coordinator.after_completed_marker";
 inline constexpr char kCoordinatorBeforeCommitBroadcast[] = "coordinator.before_commit_broadcast";
+// Every tracked task has confirmed a checkpoint's commits, and the CONFIRMED
+// marker is not yet written nor latest_confirmed advanced.
+inline constexpr char kCoordinatorBeforeConfirmedMarker[] = "coordinator.before_confirmed_marker";
+// A submit has placed its tasks and charged their workers' slots, and the job
+// is neither published to the coordinator's jobs nor deployed: a worker that
+// re-registers here has its old session retired without seeing the job.
+inline constexpr char kCoordinatorDeployAfterPlacement[] = "coordinator.deploy_after_placement";
+// A worker's SubtaskFinished is decoded on its connection's dispatch thread,
+// after that thread's check that the session is not lost, and its handler has
+// not yet taken the coordinator's lock.
+inline constexpr char kCoordinatorBeforeSubtaskFinished[] = "coordinator.before_subtask_finished";
+// A takeover has read the job's COMPLETED and CONFIRMED markers, the one read
+// its restore point, its CoordRecovers line and its walk all follow, and has
+// not yet loaded the job's plugins.
+inline constexpr char kCoordinatorTakeoverAfterMarkerRead[] =
+    "coordinator.takeover_after_marker_read";
+// A takeover has read the job's markers and recorded them (CoordRecovers, and
+// RestartProceeds when it resolves), and has not yet walked the range.
+inline constexpr char kCoordinatorTakeoverBeforeWalk[] = "coordinator.takeover_before_walk";
+// A restart held for in-doubt resolution is staged (RestartProceeds traced),
+// and the resolution thread has not yet taken the job to walk it.
+inline constexpr char kCoordinatorBeforeInDoubtWalk[] = "coordinator.before_in_doubt_walk";
 // A final-checkpoint request from a source at end of input, before it is
 // decided; and a cancel decided but not yet broadcast. Together they hold the
 // race in which a declined source used to commit its tail locally.

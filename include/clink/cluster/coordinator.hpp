@@ -239,8 +239,9 @@ public:
         // reaching it means something is wrong rather than busy.
         std::size_t max_client_connections{256};
         // Most WORKER connections the coordinator will hold at once. Beyond this
-        // a registration is refused with a reason rather than admitted into a
-        // thread the coordinator cannot account for - the same contract as the
+        // a registration is refused with a reason rather than admitted into
+        // threads the coordinator cannot account for (each worker connection
+        // has two: a reader and a dispatch thread) - the same contract as the
         // client cap above, on the path that had none.
         //
         // The anchor is the engine's own ceiling rather than taste: a keyed
@@ -251,6 +252,21 @@ public:
         // what is derived is the anchor, and the direction - strictly above 128
         // rather than at it.
         std::size_t max_worker_connections{1024};
+        // Most frames, and most bytes, one worker connection may have waiting
+        // for its dispatch thread. Each connection's reader reads every frame
+        // as it arrives, so a heartbeat is never held behind a handler waiting
+        // on the store; the frames it does not answer itself queue for that
+        // connection's dispatch thread. Unread frames used to stay in the
+        // socket buffer and push back on the peer; queued ones are heap, so
+        // the backlog is bounded here instead. Set well above anything a
+        // well-behaved worker sends: it acks only barriers the coordinator
+        // triggered, a stalled checkpoint store stops new barriers at the
+        // trigger, heartbeats are never queued, and the other frames are few
+        // and small. Exceeding either bound costs the worker its connection,
+        // as a malformed frame does. A single frame is always admitted to an
+        // empty backlog, whatever its size.
+        std::size_t max_worker_dispatch_backlog_frames{10000};
+        std::size_t max_worker_dispatch_backlog_bytes{std::size_t{64} * 1024 * 1024};
         // Host advertised to clients/peers in resolved peer addresses
         // when bind_host is a wildcard. Defaults to bind_host. Set to a
         // routable hostname/IP when bind_host = "0.0.0.0".
@@ -274,6 +290,12 @@ public:
         // watch item 63; reproduced locally by the orphaned-commit gate:
         // two sinks blocked on a paused broker, drain expired, job dead).
         std::chrono::milliseconds restart_drain_timeout{120000};
+        // How long a restart whose drain is covered waits for enough free
+        // slots to redeploy before the watchdog fails the job ("capacity
+        // never returned"). The clock measures consecutive starvation: a
+        // worker registering, or a fresh in-doubt resolution hold, restarts
+        // it.
+        std::chrono::milliseconds restart_capacity_timeout{180000};
         // How long a TRANSPORT-only subtask error waits for its cause before
         // it is treated as the cause itself (item 83). A refused send to a
         // departed peer is a symptom: the peer's own exit or its worker's
@@ -799,10 +821,39 @@ private:
         // had no reaper.
         std::shared_ptr<std::atomic<bool>> reader_finished =
             std::make_shared<std::atomic<bool>>(false);
-        std::chrono::steady_clock::time_point last_seen;
-        bool lost{false};
+        // Stamped by the reader for every frame it reads, without mu_, so a
+        // dispatch waiting on the store or on mu_ cannot make a live worker
+        // look silent. The watchdog reads it under mu_.
+        std::atomic<std::chrono::steady_clock::time_point> last_seen{
+            std::chrono::steady_clock::time_point{}};
+        // Written only under mu_ (mark_worker_lost_locked_); atomic because
+        // the reader checks it, lock-free, before stamping last_seen.
+        std::atomic<bool> lost{false};
         std::uint32_t slot_capacity{1};
+        // Slots charged to THIS session. A slot is released against the
+        // session it was charged to, never looked up by worker id alone: a
+        // superseded session's frames are handled after its successor is
+        // registered, and releasing theirs against the successor undercounted
+        // it while it already held new placements. A subtask finishing frees
+        // the sending session's slot; a teardown or an abort frees the one
+        // its session stamp names (release_task_slot_locked_).
         std::uint32_t slots_in_use{0};
+        // True, under mu_, once this session's slots_in_use has been taken off
+        // the slots-in-use gauge: when it is declared lost, or when its
+        // successor retires it. A slot released from it, or moved off it,
+        // after that leaves the gauge alone (release_slots_locked_).
+        bool slots_gauge_retired{false};
+        // This registration's number: unique per coordinator, increasing with
+        // every registration, assigned under mu_ at the registry swap. A
+        // subtask is stamped with the session its Deploy went to
+        // (JobState::pending_session), so retiring a superseded session folds
+        // what that session held and nothing placed on its successor.
+        std::uint64_t session{0};
+        // True, under mu_, from this session's registration until its dispatch
+        // thread has retired the session it replaced. A further same-id
+        // registration is refused, retryably, until then: superseded sessions
+        // wait on one another, and this keeps that chain one session long.
+        bool retiring_predecessor{false};
         // HTTP port the worker is serving its dashboard endpoints on.
         // 0 = worker didn't opt into HTTP; coordinator proxy paths skip it.
         std::uint16_t http_port{0};
@@ -895,6 +946,14 @@ private:
         // a worker is declared lost mid-job).
         std::unordered_map<std::string, std::vector<std::pair<std::string, std::uint32_t>>>
             pending_per_worker;
+        // The session (WorkerConnection::session) each placed subtask's Deploy
+        // went to, keyed like task_records. Stamped wherever a subtask enters
+        // pending_per_worker, in the mu_ hold that also picks the session its
+        // Deploy goes to. Read only when a superseded session is retired: a
+        // worker id names every session of that worker, and only the
+        // subtasks stamped with an earlier session than the successor died
+        // with the one being retired.
+        std::unordered_map<std::string, std::uint64_t> pending_session;
 
         // Port discovery state.
         std::size_t expected_listenings{0};
@@ -1024,6 +1083,11 @@ private:
         // Every restart the job made, never forgiven: what the job history
         // reports as its restart count.
         std::uint32_t restarts_total{0};
+        // Bumped by every restart_job_locked_, rescales included: the run
+        // the job's in-flight bookkeeping belongs to. A CONFIRMED marker
+        // write that outlasts a restart must not advance the new run's
+        // confirmed restore point (handle_commit_confirmed_).
+        std::uint64_t redeploys{0};
         // Whole-job restarts caused by FAILED CHECKPOINTS since the last
         // checkpoint that COMPLETED. Reset on completion; the job fails
         // with the cause instead of restarting again only when the count
@@ -1063,6 +1127,22 @@ private:
         // - and so nothing may fence the orphan - until the broker has
         // answered and latest_confirmed reflects it.
         bool resolving_in_doubt{false};
+        // The confirmed restore point the held resolution walks up from,
+        // fixed in the hold that stages it (and reported there, in the
+        // protocol trace's RestartProceeds). A confirmation's advance can
+        // land between that hold and the resolution thread taking the job;
+        // read then, the walk started above the point the stage reported,
+        // or did not walk at all. The walk's answer is applied as a maximum,
+        // so an advance landing meanwhile is kept.
+        std::uint64_t in_doubt_walk_from{0};
+        // The held resolution for the restart in progress has walked: its
+        // answer is in latest_confirmed_checkpoint_id, and the restart only
+        // waits to redeploy (for capacity, when restart_job_locked_ found
+        // too few free slots). A later kick redeploys without staging the
+        // walk again, which would report a second RestartProceeds for one
+        // restart and reset the capacity deadline on every watchdog tick.
+        // Cleared by the redeploy.
+        bool in_doubt_walked{false};
         // Cooperative cancellation for the in-doubt walk, created at stage
         // time and handed to resolve_in_doubt_commits. The watchdog's SOFT
         // deadline sets it (a slow walk - an outage stretching the wire
@@ -1236,6 +1316,9 @@ private:
             struct EarlyDrain {
                 std::uint32_t subtask_idx_in_op{0};
                 std::string worker_id;
+                // The subtask's task key, whose session stamp names the
+                // session its slot was charged to.
+                std::string key;
             };
             std::vector<EarlyDrain> early_drains;
         };
@@ -1502,8 +1585,14 @@ private:
         std::vector<std::byte> frame;
     };
 
-    void handle_subtask_finished_(MessageReader& r);
-    void handle_begin_rescale_ack_(MessageReader& r);
+    // `sender` is the session whose connection delivered the frame: the
+    // subtask's slot is released against it. Every worker-frame handler takes
+    // it, and drops the frame in its first mu_ hold when that session has been
+    // declared lost: the loss fold has already accounted for whatever the
+    // session held, and the dispatch thread's own lost check runs before that
+    // hold, so it cannot close the window on its own.
+    void handle_subtask_finished_(MessageReader& r, WorkerConnection& sender);
+    void handle_begin_rescale_ack_(MessageReader& r, const WorkerConnection& sender);
 
     // ----- Hot cutover (design record 008) -----
     // Try to run `op_id`'s rescale as an in-place cutover. Returns true when
@@ -1554,30 +1643,92 @@ private:
     void abort_hot_cutover_locked_(JobState& job,
                                    const std::string& reason,
                                    std::vector<PendingDeploy>& out_frames);
-    void handle_subtask_listening_(MessageReader& r);
+    void handle_subtask_listening_(MessageReader& r, const WorkerConnection& sender);
     void handle_rescale_job_(network::Connection& conn, MessageReader& r);
     // Per-operator rescale request dispatch.
     void handle_rescale_operator_(network::Connection& conn, MessageReader& r);
     void handle_savepoint_(network::Connection& conn, MessageReader& r);
     void handle_stop_job_(network::Connection& conn, MessageReader& r);
-    void start_reader_for_(std::shared_ptr<WorkerConnection> worker);
+    // A worker connection runs on two threads. The reader reads every frame,
+    // stamps last_seen and answers heartbeats; every other frame goes, in
+    // the order read, to the connection's dispatch thread, which runs the
+    // handlers one at a time. A handler that waits on the store, or on mu_
+    // held across another's store write, therefore never stops its worker's
+    // heartbeats being read and answered.
+    //
+    // `predecessor` is the session a same-id re-registration replaced. The new
+    // session's reader starts at once, so its heartbeats are answered from the
+    // first; its dispatch thread first retires the predecessor
+    // (retire_replaced_session_) and only then handles a frame, so every frame
+    // the old session sent is handled before the retirement and before
+    // anything the new one sends.
+    struct WorkerDispatchQueue;
+    void start_reader_for_(std::shared_ptr<WorkerConnection> worker,
+                           std::shared_ptr<WorkerConnection> predecessor = nullptr,
+                           bool predecessor_was_lost = false);
+    // Joins the replaced session's reader, which joins its dispatch thread once
+    // that has handled every frame the session read, then folds whatever the
+    // session still had in flight and moves the capacity gauges. Runs on the
+    // successor's dispatch thread, off mu_ and off every thread of the session
+    // it joins. Never throws: the join comes first and is attempted again if
+    // anything after it fails, because a replaced session left unjoined ends
+    // with its reader destroying its own joinable std::thread, which is
+    // std::terminate. Clears the successor's retiring_predecessor last.
+    void retire_replaced_session_(WorkerConnection& successor,
+                                  const std::shared_ptr<WorkerConnection>& replaced,
+                                  bool replaced_was_lost) noexcept;
+    void retire_replaced_session_unguarded_(const WorkerConnection& successor,
+                                            const std::shared_ptr<WorkerConnection>& replaced,
+                                            bool replaced_was_lost);
+    void worker_dispatch_loop_(const std::shared_ptr<WorkerConnection>& worker,
+                               WorkerDispatchQueue& queue);
+    void answer_heartbeat_(WorkerConnection& worker, MessageReader& r);
     void watchdog_loop_();
     void mark_worker_lost_locked_(WorkerConnection& worker);
     // Shared by mark_worker_lost_locked_ and retire_previous_session_subtasks_:
     // a worker's in-flight subtasks are dead either way, and both must fold them
     // into an in-progress restart or start one. See F64.
+    //
+    // With both bounds 0 it folds every subtask pending on `worker_id`. A
+    // non-zero `live_from_session` (a retirement) keeps those stamped with
+    // that session or a later one: they were placed on a live successor. A
+    // non-zero `dead_from_session` (a lost session still retiring its
+    // predecessor) keeps those stamped with an earlier session: the
+    // predecessor's frames, and then its retirement, account for them. Kept
+    // subtasks stay pending as survivors of the restart.
     void fold_dead_subtasks_into_restart_locked_(JobState& job,
                                                  const std::string& worker_id,
                                                  const char* log_channel,
-                                                 const std::string& cause);
+                                                 const std::string& cause,
+                                                 std::uint64_t live_from_session = 0,
+                                                 std::uint64_t dead_from_session = 0);
 
     // Fold a re-registered worker's PREVIOUS session's in-flight subtasks
     // into a restart and cancel the surviving sessions so they drain. The old
     // session is gone, so its subtasks can never report; without the fold or
     // survivor broadcast the drain waits out its deadline and fails a job
-    // that was recovering.
+    // that was recovering. Only subtasks stamped with a session earlier than
+    // `successor_session` are folded: the successor is schedulable from its
+    // RegisterAck, and what was placed on it while the old session's frames
+    // drained is alive.
     // Takes the lock itself (called from the register path, outside it).
-    void retire_previous_session_subtasks_(const std::string& worker_id);
+    void retire_previous_session_subtasks_(const std::string& worker_id,
+                                           std::uint64_t successor_session);
+    // Slot accounting, mu_ held. A charge or release moves `worker`'s
+    // slots_in_use and the slots-in-use gauge together, except that a
+    // session whose slots the gauge has already dropped (slots_gauge_retired)
+    // moves only its own count.
+    void charge_slots_locked_(WorkerConnection& worker, std::uint32_t n);
+    void release_slots_locked_(WorkerConnection& worker, std::uint32_t n);
+    // Releases the slot of the subtask `key` placed on `worker_id`, against
+    // the session it was charged to (JobState::pending_session). When that is
+    // no longer the worker's registered session, nothing is released: the
+    // superseded session is never placed on again, and its retirement takes
+    // its slots off the gauge. Looking the slot up by worker id alone took it
+    // off the successor, which may already hold new placements.
+    void release_task_slot_locked_(const JobState& job,
+                                   const std::string& worker_id,
+                                   const std::string& key);
     void send_peer_updates_locked_(JobState& job);
     // job.plugins with bytes elided for every hash `worker`'s connection
     // already received, recording what this call will ship (item 30).
@@ -1681,18 +1832,19 @@ private:
                            // directory's recorded job and restore layout against.
                            std::string graph_fingerprint = {},
                            std::vector<std::string> single_instance_ops = {});
-    void handle_subtask_checkpointed_(MessageReader& r);
+    void handle_subtask_checkpointed_(MessageReader& r, const WorkerConnection& sender);
     // Commit-confirmed restore protocol: a tracked task's commit callbacks
     // for a checkpoint executed without throwing. Drains the checkpoint's
     // pending-confirmation set; on empty, writes CONFIRMED-<id> and
     // advances latest_confirmed_checkpoint_id.
-    void handle_commit_confirmed_(MessageReader& r);
+    void handle_commit_confirmed_(MessageReader& r, const WorkerConnection& sender);
     // A bounded source at clean EOS requested a final coordinated checkpoint.
     // Runs on the requesting worker's control reader, which also reads that
     // worker's heartbeats, so it never waits on the store: an id not yet on
     // record is asked of the job's claimer and the request is held
     // (JobState::held_final_requests) until the trigger loop can answer it.
     void handle_request_final_checkpoint_(MessageReader& r,
+                                          const WorkerConnection& sender,
                                           const std::shared_ptr<network::Connection>& reply_conn);
     // Under mu_: the answer to one source's end-of-input request, assigning the
     // job's final id (once per job) and seeding its pending ack set, or nothing
@@ -1812,14 +1964,29 @@ private:
     // failed submit_job consumes its plugin/bundle arguments, so the disk
     // copy is the only ingredient list that survives a refusal.
     std::vector<JobId> pending_recovery_ids_;
-    // Jobs whose recovery this leadership has already recorded (the
+    // Jobs this leadership has already taken over: recorded (the
     // CoordRecovers protocol event and the RestartProceeds that may follow
-    // it). A recovery parked for capacity re-runs recover_one_persisted_job_
-    // when a worker registers; the specification takes the takeover once, so
-    // a second CoordRecovers for the same job in the same epoch read as a
-    // second coordinator death and every parked-recovery trace diverged at it.
-    std::mutex recovery_trace_mu_;
-    std::unordered_set<JobId> recovery_traced_;
+    // it) and walked. A recovery parked for capacity re-runs
+    // recover_one_persisted_job_ when a worker registers; the specification
+    // takes the takeover once, so a second CoordRecovers for the same job in
+    // the same epoch read as a second coordinator death and every
+    // parked-recovery trace diverged at it, and a second walk re-probed what
+    // the first had refused, under events with no step after the first walk.
+    //
+    // Each entry keeps what the takeover decided, once its walk has run: the
+    // completed point it read and reported, and the restore point the walk
+    // left. A retry deploys from that record rather than from a new read of
+    // the markers, which a superseded coordinator's put landing during the
+    // park would have moved past anything the takeover's lines named.
+    struct TakeoverDecision {
+        bool decided{false};
+        std::uint64_t completed{0};          // CoordRecovers' completed
+        std::uint64_t own_restore_point{0};  // Redeploy's restore
+        std::string restore_from_dir;        // what the deploy restores from
+        std::uint64_t restore_from_checkpoint_id{0};
+    };
+    std::mutex recovery_begun_mu_;
+    std::unordered_map<JobId, TakeoverDecision> recovery_begun_;
     std::thread recovery_retry_thread_;
     void recovery_retry_loop_();
     // One job dir's recovery, callable repeatedly (skips ids already in
@@ -1850,6 +2017,10 @@ private:
     // mechanism: the survivor's drain ack arrived BEFORE the dead worker's
     // fold, and nothing re-evaluated readiness after the fold).
     [[nodiscard]] static bool restart_drain_covered_(const JobState& job);
+    // The job's completed point as in-doubt resolution reads it: the newest
+    // checkpoint it completed in memory, or, until its first one lands, the
+    // completed point it resumed beside (CheckpointConfig::resumed_completed).
+    [[nodiscard]] static std::uint64_t completed_point_(const JobState& job);
 
     mutable std::mutex mu_;
     // Gate for the rescale.hot_cut_ack fault point: the cutover checkpoint a hot
@@ -1891,6 +2062,8 @@ private:
     // alive across an eviction.
     std::deque<JobId> terminal_job_order_;
     JobId next_job_id_{1};
+    // The last WorkerConnection::session assigned. Under mu_.
+    std::uint64_t last_worker_session_{0};
     // Convenience: the legacy `deploy(plan)`/`await_completion`/`errors`
     // path operates on whichever job was last deployed in-process. -1
     // means none yet.

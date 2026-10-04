@@ -187,6 +187,20 @@ Event& Event::b(std::string_view key, bool value) {
     return *this;
 }
 
+Event& Event::us(std::string_view key, const std::vector<std::uint64_t>& values) {
+    line_.push_back(',');
+    append_json_string(line_, key);
+    line_ += ":[";
+    for (std::size_t k = 0; k < values.size(); ++k) {
+        if (k > 0) {
+            line_.push_back(',');
+        }
+        line_ += std::to_string(values[k]);
+    }
+    line_.push_back(']');
+    return *this;
+}
+
 void Event::emit() {
     if (!enabled()) {
         return;

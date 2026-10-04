@@ -77,6 +77,7 @@ what replay suppression swallowed at emission. The invariants are then:
 | `FrontierCovered` | Every position the source can no longer re-emit is published or held |
 | `RestoreSound` | No restore ever read participant snapshots of mixed vintage |
 | `ConfirmedMeansCommitted` | A CONFIRMED marker never outruns the commits it vouches for |
+| `ConfirmedMemoryOnDisk` | For the Kafka family, the in-memory confirmed restore point is 0 or a CONFIRMED marker on disk: a commit's retention floor comes from memory and a takeover's restore point from the disk, so memory ahead of the disk would let workers purge the snapshots the takeover restores |
 | `Fenced` | No worker acted on a frame from a superseded coordinator |
 | `EventuallySettled` (liveness) | With bounded faults and fair progress the run quiesces with every vouched-for position published once |
 
@@ -96,6 +97,19 @@ weakly fair. The job's restart budget is a bound of its own
 (`MaxJobRestarts`): a failed checkpoint rewinds the job while budget is
 left, and fails the job when none is.
 
+The `CONFIRMED` marker takes three steps where `COMPLETED` takes one, because
+the coordinator puts it outside its lock: the hold that drains the
+confirmation set (inside `SinkConfirm`) leaves the marker due, `WriteConfirmed`
+makes it durable, and `AdvanceConfirmed` moves `memConfirmed` to it. A
+`Redeploy`, a `RestartProceeds` that holds the job for resolution, or a
+takeover can fall between them. A redeploy or a supersession turns a
+confirmation whose put is still out stale: the put lands and nothing advances
+after it, and a takeover seeds `memConfirmed` from whatever is on disk.
+The `COMPLETED` put is outside the lock too, and a `Redeploy` or a
+supersession turns one still out stale (`staleCompleted`):
+`WriteStaleCompleted` lands it with no advance and no broadcast, and a later
+takeover or walk reads it like any other marker.
+
 ### Fault points are states between steps
 
 The atomic steps are chosen so that every named fault point in
@@ -114,6 +128,8 @@ them.
 | `sink.before_commit` | `stage = "committing"`, before `SinkCommit(s)` |
 | `sink.between_commit_and_receipt` | `stage = "committed"`, before `SinkReceipt(s)` |
 | `sink.after_external_commit` | `stage = "receipted"`, before `SinkConfirm(s)` |
+| `coordinator.before_confirmed_marker` | `confirming[c] = "due"` (the confirmation set drained and `c` out of `broadcastIds`), before `WriteConfirmed`; neither `confirmedDisk` nor `memConfirmed` has moved |
+| `coordinator.before_in_doubt_walk` | `phase = "resolving"` with `walkC` fixed by `RestartProceeds`, before the walk's first step; an `AdvanceConfirmed` landing here moves `memConfirmed`, not `walkC` |
 | `checkpoint.before_write` and its siblings | `SinkPrepareFails(s)` (the capture fails, the ack says so) |
 
 Every action's comment names the engine site it abstracts, so a reader can
@@ -161,12 +177,13 @@ each and judges the outcome against `mutants/expected.txt`.
 | `complete_above_failed` | A checkpoint above a FAILED one is discarded during the rewind | this model | refuted: NoLoss |
 | `restore_from_memory` | The in-memory restore point advances with the durable marker, not before | this model | refuted: FrontierCovered |
 | `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | refuted: NoLoss |
+| `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its CONFIRMED marker is durable | review of the per-connection dispatch change | refuted: ConfirmedMemoryOnDisk |
 
 A mutant TLC accepts is recorded in `mutants/expected.txt`, not deleted: it
 means a later rule guards the same defect (defence in depth), and the check
 then holds that record in both directions: the day TLC refutes an
 `accepted` mutant, the other guard has gone and the record is wrong. Two of
-the sixteen are accepted today, both superseded by receipts, in-doubt
+the seventeen are accepted today, both superseded by receipts, in-doubt
 resolution and the marker rule the refusal-wall finding added; the withheld
 broadcast left that set when trace validation widened the specification,
 and the check would have failed had it stayed recorded as accepted. The
@@ -223,6 +240,88 @@ reads the furthest event index any path reached; deadlock checking is off,
 since a hidden-step branch the run did not need dies out harmlessly); a
 shorter reach names the first event no allowed step produced, and
 `formal-check.sh --trace` prints it.
+
+A marker can be on disk without the line that reports it: a kill between the
+`COMPLETED` write and its `WriteCompleted` line, or between the `CONFIRMED`
+put and the hold that emits `WriteConfirmed`, and a `CONFIRMED` put whose job
+redeployed before that hold, or a `COMPLETED` put still out when its job
+redeployed. The hidden steps `LostWriteCompleted` and `LostWriteConfirmed`
+take such a marker, each admitted only when the next event is a takeover that
+read exactly that checkpoint off the disk; a stale `COMPLETED` put is also
+admitted just before a walk event at its checkpoint
+(`LostStaleCompletedAtWalk`), since the walk reads the marker before any event
+but `WalkSkips`. `CoordRecovers` pins the reseeded completed restore point to
+the event's `completed` (`traces/completed-marker-landing-after-redeploy` and
+`traces/completed-marker-walked-after-redeploy`, both synthetic, are accepted
+and diverge without the stale put). A
+`WriteConfirmed` line stands for `WriteConfirmed` and `AdvanceConfirmed` back
+to back, since the engine emits it in the advance's hold, and `CoordRecovers`
+pins the Kafka family's reseeded confirmed restore point to the event's
+`confirmed`, the confirmed restore point the takeover adopts from the job's own
+directory (the `CONFIRMED` marker its restore read, or 0 when that marker
+belongs to a run before the current run's base). The in-doubt walk puts its
+`CONFIRMED` marker before its `WalkDecides` line, and a kill between the two
+leaves the marker without the line; the hidden step `LostWalkDecides` takes
+the walk's success there, on the same terms, when every handle of the walked
+checkpoint was proven committed (`traces/walk-confirmed-then-killed`, a
+synthetic cut of `kafka-kill-after-broker-commit`, is accepted through it and
+diverges without it). A superseded coordinator emits `WriteConfirmed` too,
+unaware of its supersession, and the line carries its epoch: from a
+non-leader epoch it is the stale put landing, or a stutter when the takeover
+already read the marker (`traces/zombie-confirmation-after-takeover`,
+synthetic, is accepted and diverges when the line is read as the leader's).
+Its line can also come before the takeover's, since the takeover reads the
+disk before it emits `CoordRecovers`; the line then reads as the leader's
+epoch, and is taken as the supersession already made and a stutter, the
+confirmation staying stale (`traces/zombie-confirmation-before-takeover-line`,
+synthetic, is accepted and diverges without that branch). The same holds
+for a superseded coordinator's `COMPLETED` put: its handler goes on to advance
+its own memory, emit `WriteCompleted` and broadcast, and `CoordComplete`,
+`WriteCompleted` and `Broadcast` carry the coordinator's epoch. From a
+non-leader epoch, `WriteCompleted` is the stale put landing
+(`StaleCompletedLands`), or a stutter when the takeover already read the
+marker; before the takeover's line it is the supersession already made and a
+stutter, the put staying stale for whatever reads it later
+(`traces/zombie-completion-after-takeover` and
+`traces/zombie-completion-before-takeover-line`, synthetic, are accepted, and
+diverge at the late `WriteCompleted` and at the takeover respectively without
+those branches). A superseded coordinator's `Broadcast` is a stutter. Its
+commit frames are covered in the model by the supersession itself, which
+takes every sink down and clears every frame, and by `CoordRecovers`, which
+binds every worker to the new epoch, so none is accepted there. The engine
+fences them at every worker that has re-registered with the leader; a worker
+that has not yet done so accepts them, the gap described below for the
+superseded coordinator's barriers, and the model does not cover it. A
+superseded coordinator can also decide a checkpoint after the takeover's
+line. Every ack it decides on was sent before the supersession (`SubtaskAck`
+is emitted as the frame is sent, so the model has already taken the
+`SinkAck`), but its connection's dispatch thread held the last of them behind
+a slow store write on the same connection. The supersession turns every
+checkpoint decidable with all acks ok at that moment stale (`DecidedLate`),
+and their puts land in id order after the put still out (`lateBatch`), since
+each decision waits behind the landing below it. A `completed`
+`CoordComplete` from a non-leader epoch for such a checkpoint is a stutter,
+and its `WriteCompleted` the stale put landing
+(`traces/zombie-decision-after-takeover` and
+`traces/zombie-decision-behind-stalled-marker`, synthetic, are accepted and
+diverge at that `CoordComplete` without the branch). Letting those puts land
+in any order made TLC report a `NoLoss` violation on `MC_RecoverableNoBudget`
+that the engine cannot produce: a later marker vouched for a cut whose earlier
+interval no marker covered. A late decision that fails or discards its
+checkpoint still diverges, since the model keeps no record of the superseded
+coordinator's acks past the takeover to check it against, and so does a
+decision on an ack sent after the supersession by a worker not yet
+re-registered, the gap above. A takeover reads the job's markers once, so its
+`CoordRecovers` and its `Redeploy` agree, and a takeover parked for capacity
+redeploys the restore point it decided (`traces/takeover-reads-markers-once`
+and `traces/parked-takeover-keeps-its-restore-point`, synthetic). A restart
+of a taken-over job before its first new checkpoint completes walks the gap
+the takeover's walk left open, as `RestartProceeds` requires
+(`traces/takeover-gap-walked-again`, synthetic). A
+`WorkerDies` kills only the sinks its `spared` list leaves out: a worker that
+re-registers keeps whatever was placed on its new session when the old one is
+retired, and a new session lost while still retiring the old one leaves the
+old session's subtasks to that retirement.
 
 To record a run: set the variable, run the job (the in-process protocol
 trace test and every multi-process harness test do this themselves when

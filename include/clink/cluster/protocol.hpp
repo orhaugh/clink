@@ -746,6 +746,14 @@ struct CheckpointConfig {
     // its own to restore, because the dead leader may have triggered checkpoints
     // that never completed and a worker may still be writing one of them.
     bool taken_over{false};
+    // The newest COMPLETED checkpoint of its own a resuming job read and
+    // reported when it took over (an HA takeover's CoordRecovers, a tracked
+    // run's resume); in-process only. The job starts with no completed
+    // checkpoint in memory, and a restart before its first completion still
+    // holds for in-doubt resolution when this point is above the confirmed
+    // one: the gap the takeover's own walk left (a refusal, a broker outage)
+    // is still open, and the restart walks it again.
+    std::uint64_t resumed_completed{0};
 };
 
 // Resolve max_restarts_on_worker_loss to its effective value (see the field +

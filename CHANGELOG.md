@@ -133,6 +133,72 @@ probes them, and the open line names it (`tls=on (system CAs from <path>)`).
 A named CA is still the only one trusted. The runtime image and host builds
 find OpenSSL's defaults and are unchanged.
 
+**A slow marker write no longer gets a live worker declared lost.** The
+coordinator ran a worker's protocol handlers on the thread that read its
+heartbeats, so the `COMPLETED` or `CONFIRMED` marker write for a checkpoint
+that worker's frame completed held its heartbeats for as long as the store
+took; on an object store slower than the heartbeat timeout the worker was
+declared lost and the completed checkpoint became a restart, and the job's
+completion records, written under the coordinator's lock, held every worker's
+heartbeats at once. Each worker connection now has a reader that stamps
+liveness and answers heartbeats, and a dispatch thread that runs the handlers
+in the order the frames arrived. The dispatch backlog is capped
+(`max_worker_dispatch_backlog_frames`, 10000, and
+`max_worker_dispatch_backlog_bytes`, 64 MiB); a worker that exceeds either
+loses its connection, as for a malformed frame. A frame from a worker declared
+lost after the frame was read is dropped in its handler, so a
+`SubtaskFinished` is never counted on top of the loss that already accounted
+for its subtask. `stop()` no longer races a handler that starts the in-doubt
+resolution thread while the coordinator shuts down.
+
+**A worker that re-registers keeps its slots, its finished subtasks and the
+jobs placed on its new session.** A re-registering worker's new session has
+its heartbeats answered at once; the old session is retired on the new
+session's dispatch thread after every frame it had already sent is handled, so
+a subtask that reported a clean finish just before the re-registration is not
+restarted as lost. Sessions are numbered and every placed subtask records the
+session it went to: the retirement folds only what the old session held, a
+slot is freed from the session it was charged to, a submit whose worker
+re-registers between placing and deploying its tasks deploys on the new
+session (or is refused retryably if that session has filled up), and a subtask
+retried after the old session reported its error moves to the new session,
+slot and all. A worker that registers again while an earlier session of it is
+still being retired is refused retryably until the retirement ends, so
+superseded sessions cannot pile up behind a slow store, and a new session lost
+while still retiring its predecessor leaves the predecessor's subtasks to its
+queued frames, including when the loss aborts a hot cutover. No free-slot count
+wraps round when a session is charged past its capacity.
+
+**The confirmed restore point never runs ahead of its marker or survives a
+restart it does not belong to.** The in-memory confirmed restore point now
+advances only once its `CONFIRMED` marker is durable, as the completed one
+does, and never for a checkpoint of a run the job has since restarted from; a
+checkpoint whose run was redeployed while its `COMPLETED` marker was written is
+committed nowhere and no longer moves the new run's completed restore point,
+and a marker landing while a restart is held for in-doubt resolution leaves
+the walk's range where the hold fixed it, the walk starting from the confirmed
+point the hold reported. The exactly-once specification takes each marker's
+write and the advance as separate steps, so a restart, a takeover or a
+superseded coordinator between them is model-checked, with a new invariant
+that the in-memory confirmed restore point is a marker on disk (and a mutant
+that breaks it). A superseded coordinator's `CoordComplete`, `WriteCompleted`
+and `Broadcast` lines now carry its epoch, and trace validation reads its late
+lines as the stale writes landing and its broadcast as a stutter.
+
+**An HA takeover restores from, walks and reports one reading of the job's
+markers.** A takeover reads the markers once, so the completed point it
+reports is the one it restores from and walks to, and a takeover parked for
+capacity deploys the restore point it decided rather than one read again after
+a superseded coordinator's marker landed, and does not walk again when it
+resumes. A restart of a taken-over or resumed job before its first new
+checkpoint completes walks the completed-but-unconfirmed gap the takeover's
+walk left open, instead of redeploying straight from the confirmed point.
+
+**A restart waiting for slots after its in-doubt walk no longer walks again on
+every watchdog tick, and fails at its capacity deadline.** The deadline is now
+configurable as `Coordinator::Config::restart_capacity_timeout`, 180 s by
+default; the restart used to wait for ever.
+
 **A checkpoint no longer stalls when an input's close completes a barrier's
 alignment.** In a union, join, broadcast, co-operator, fan-in sink or
 operator fed by several subtasks, when the other inputs had delivered a

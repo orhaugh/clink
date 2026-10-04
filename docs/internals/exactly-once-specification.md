@@ -72,7 +72,10 @@ The atomic steps are chosen so that every named fault point in
 `include/clink/fault/fault_injection.hpp` is a distinct state between two
 actions, and a process may die between any two of them. Prepare, ack, marker
 write, broadcast, commit, receipt and confirmation are separate actions;
-so are each stage of in-doubt resolution and of a sink's open. Every action
+so are the `CONFIRMED` marker's put and the advance of the confirmed restore
+point behind it (`WriteConfirmed`, `AdvanceConfirmed`), which the engine runs
+in two holds of its lock with the put between them, and each stage of
+in-doubt resolution and of a sink's open. Every action
 names, in its comment, the engine site it abstracts.
 
 | Fault point | State in the model |
@@ -85,6 +88,10 @@ names, in its comment, the engine site it abstracts.
 | `sink.before_commit` | the commit accepted, before `SinkCommit` |
 | `sink.between_commit_and_receipt` | after `SinkCommit`, before `SinkReceipt` |
 | `sink.after_external_commit` | after `SinkReceipt`, before `SinkConfirm` |
+| `coordinator.before_confirmed_marker` | every tracked sink confirmed and the checkpoint out of tracking (`confirming[c] = "due"`), before `WriteConfirmed`: neither the marker nor the in-memory confirmed restore point has moved |
+| `coordinator.before_in_doubt_walk` | a restart held for resolution, its walk's start fixed by `RestartProceeds`, before the walk's first step: a confirmation's advance landing here moves the in-memory confirmed restore point, not where the walk starts |
+| `coordinator.takeover_after_marker_read` | a takeover's one read of the markers taken, before `CoordRecovers`: a stale `COMPLETED` put landing here is on disk, its superseded coordinator's line may come before the takeover's, and the takeover still reports and restores from the point it read |
+| `coordinator.takeover_before_walk` | a takeover's `CoordRecovers` (and `RestartProceeds` when it resolves) taken, before its walk's first step: a stale `COMPLETED` put landing here is on disk, and the walk still ends at the takeover's `completed` |
 | `checkpoint.before_write` and its siblings | `SinkPrepareFails`: the capture fails and the ack says so |
 
 Faults are actions with a budget, so the checker may inject them or not:
@@ -111,6 +118,7 @@ is fenced.
 | `FrontierCovered` | Every position the source can no longer re-emit is published or held |
 | `RestoreSound` | No restore ever read participant snapshots of mixed vintage |
 | `ConfirmedMeansCommitted` | A `CONFIRMED` marker never outruns the commits it vouches for |
+| `ConfirmedMemoryOnDisk` | For the Kafka family, the in-memory confirmed restore point is 0 or a `CONFIRMED` marker on disk. A commit's retention floor comes from memory and a takeover restores from the disk, so memory ahead of the disk would let workers purge the snapshots the takeover needs; the model does not represent the purge, so the order is held here |
 | `Fenced` | No worker acted on a frame from a superseded coordinator |
 | `EventuallySettled` | With bounded faults and fair progress, the run quiesces with every vouched-for position published once (a temporal property) |
 
@@ -118,11 +126,11 @@ is fenced.
 
 | Model | Family | Bounds | Result |
 |---|---|---|---|
-| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 38.6M distinct states, depth 78, all invariants hold, no deadlock |
-| `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 46,083 distinct states, depth 67, all invariants hold |
+| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 48.9M distinct states, depth 80, all invariants hold, no deadlock |
+| `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 63,889 distinct states, depth 69, all invariants hold |
 | `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 145.4M distinct states, depth 59, all invariants hold |
 | `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | 7.8M distinct states, depth 53, all invariants hold |
-| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 5.7M distinct states |
+| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 6.1M distinct states |
 
 Within its bounds each run is exhaustive: TLC visits every reachable state.
 The bounds are small so that the push gate finishes in minutes; a larger
@@ -160,18 +168,18 @@ specification, or a stutter the trace module recognises.
 | `DeliverBarrier` | worker, on `TriggerCheckpoint` | `job`, `ckpt`, `epoch`, `worker`, `fenced` | `DeliverBarrier` |
 | `SinkPrepare` | the two-phase sink, transaction sealed | `sub`, `ckpt`, `family`, `staged` | `SinkPrepare` or `SinkPrepareFails`; the ack decides which |
 | `SubtaskAck` | worker, as `SubtaskCheckpointed` is sent (the subtask's own step, so it precedes the subtask's next prepare in the merged trace) | `job`, `sub`, `ckpt`, `ok` | `SinkAck` (a non-sink subtask's ack is a stutter) |
-| `CoordComplete` | coordinator, last ack in | `job`, `ckpt`, `outcome` = `completed`, `failed`, `discarded` | `CoordComplete` |
-| `WriteCompleted` | coordinator, marker fsync done, before the `after_completed_marker` fault point | `job`, `ckpt` | `WriteCompleted` |
-| `Broadcast` | coordinator | `job`, `ckpt`, `withheld` | `Broadcast` |
+| `CoordComplete` | coordinator, last ack in | `job`, `ckpt`, `outcome` = `completed`, `failed`, `discarded`, `epoch` | `CoordComplete`. From a superseded coordinator's epoch, a `completed` decision on acks sent before the supersession is a stutter: the supersession turned that checkpoint's put stale (`DecidedLate`). A late `failed` or `discarded` decision diverges, as does one on an ack sent after the supersession by a worker not yet re-registered |
+| `WriteCompleted` | coordinator, in the hold after the marker fsync that advances the completed restore point, before the `after_completed_marker` fault point; not emitted when the job redeployed while the put was out, and the advance is skipped while the restart is held for in-doubt resolution | `job`, `ckpt`, `epoch` | `WriteCompleted` for the leader. From a superseded coordinator's epoch, the stale put landing (`StaleCompletedLands`), or a stutter when the takeover already read the marker; before the takeover's line, a stutter with the put left stale |
+| `Broadcast` | coordinator | `job`, `ckpt`, `withheld`, `epoch` | `Broadcast` for the leader; a stutter from a superseded coordinator |
 | `DeliverCommit`, `DeliverAbort` | the sink, on dispatch | `sub`, `ckpt`, `accepted` | `DeliverCommit`, `DeliverAbort` |
 | `SinkCommit` | the sink, external commit executed | `sub`, `ckpt` | `SinkCommit` |
 | `SinkReceipt` | the Kafka sink, receipt durable | `sub`, `ckpt` | `SinkReceipt` |
 | `SinkConfirm` | worker, `CommitConfirmed` sent | `job`, `sub`, `ckpt` | `SinkConfirm` (Kafka family; a stutter otherwise) |
-| `WriteConfirmed` | coordinator, `CONFIRMED` marker written | `job`, `ckpt` | `WriteConfirmed` |
-| `WorkerDies` | coordinator, loss detected | `job`, `worker` | `WorkerDies` (any worker of the job; the model keeps only the source and the sinks, so the dead set may be empty). Validation takes the sinks the loss found on that worker from the run's own `Placement` events, not from the model's fixed hosts: a redeploy re-places a subtask, and a sink that has moved off the worker survives its death |
+| `WriteConfirmed` | coordinator, in the hold that advances the confirmed restore point, after the `CONFIRMED` marker's put | `job`, `ckpt`, `epoch` | `WriteConfirmed` and `AdvanceConfirmed`, back to back, for the leader. From a superseded coordinator's epoch (it does not know it was superseded, and emits the line as the leader would), the stale put landing, or a stutter when the takeover already read the marker |
+| `WorkerDies` | coordinator, loss detected, or a superseded session retired after its worker re-registered | `job`, `worker`, and `spared` when a retirement leaves some of the worker's subtasks running | `WorkerDies` (any worker of the job; the model keeps only the source and the sinks, so the dead set may be empty). Validation takes the sinks the loss found on that worker from the run's own `Placement` events, not from the model's fixed hosts: a redeploy re-places a subtask, and a sink that has moved off the worker survives its death. A retirement kills only what the superseded session held; `spared` lists the worker's subtasks placed on a later session, which the engine drains as survivors, and validation does not kill them. It also lists the subtasks of an earlier session when the lost session was still retiring it: the predecessor's queued frames drain them, or the retirement's own `WorkerDies` kills them |
 | `RestartOnError` | coordinator, a whole-job restart begun for a subtask error or an unattributed transport failure | `job`, `cause` | `RestartOnError` (the survivors drain; a loss declared during the drain folds in as its own `WorkerDies`) |
 | `SubtaskDrained` | coordinator, survivor drained | `job`, `sub` | `SinkDrains` (non-sinks stutter). A sink the last redeploy placed but that has not finished opening may be among the survivors or not, according to whether its deploy had landed when the loss was declared; the model takes both, since forcing it in removed the shape a mutant's counterexample needs |
-| `CoordRecovers` | the new leader, per recovered job | `job`, `epoch`, `completed`, `confirmed` | `CoordRecovers` (its `CoordDies` is a hidden step) |
+| `CoordRecovers` | the new leader, per recovered job | `job`, `epoch`, `completed`, `confirmed`: the newest `COMPLETED` marker in the job's own checkpoint directory, and the confirmed restore point the takeover adopts from it, read once (the newest `CONFIRMED` marker the restore read; 0 when it belongs to an earlier run than the current run's base, or when the job has confirmed nothing of its own and restores from the savepoint it was submitted with) | `CoordRecovers` (its `CoordDies` is a hidden step); the reseeded completed restore point must equal `completed`, and for the Kafka family the reseeded confirmed restore point must equal `confirmed` |
 | `RestartProceeds` | coordinator, restart held for resolution | `job`, `resolving`, `completed`, `confirmed` | `RestartProceeds` into `resolving` |
 | `Redeploy` | coordinator, deploying: once per restart, after the deploy frames are built, whatever their number | `job`, `restore`, `next` | `RestartProceeds` (from the drain) or `Redeploy` (after resolution) |
 | `Renumber` | coordinator, a claim on the job's next checkpoint id refused because the record already holds it | `job`, `next`, `epoch` | `Renumber` (the leader, past a superseded coordinator's claims) or `ZombieRenumber` (the superseded coordinator, under its own epoch, past the leader's) |
@@ -370,6 +378,100 @@ other checkpoint still diverges. `formal/traces/coordinator-killed-after-marker`
 is the run that showed it (a coordinator and a worker killed together, in
 `FaultRecoveryTest.CoordinatorAndWorkerDyingTogetherStillCommitsExactlyOnce`).
 
+A `COMPLETED` put can also land with no line at all. The put runs outside the
+coordinator's lock, and a restart can redeploy while it is out: the marker
+still lands, but the hold after it sees that the job's run has moved on and
+neither advances the completed restore point nor emits `WriteCompleted`. A
+superseded coordinator's put is stale too, though its handler does not know
+it: it advances its own memory, emits `WriteCompleted` and broadcasts, and
+the lines carry its epoch, so the trace module reads `WriteCompleted` as the
+stale put landing and `Broadcast` as a stutter
+(`formal/traces/zombie-completion-after-takeover` and
+`zombie-completion-before-takeover-line`). It can also decide a checkpoint
+after the takeover: every ack was sent before the supersession, but the last
+one waited on its connection's dispatch thread behind a slow store write on
+the same connection, the stall that cost the lease. The supersession turns
+every checkpoint decidable with all acks ok at that moment stale as well
+(`DecidedLate`), and those puts land in id order after the put the coordinator
+still had out (`lateBatch`), since each decision waits behind the landing below
+it; landing them in any order let TLC find a `NoLoss` violation the engine
+cannot produce. The trace module reads the late `CoordComplete` as a stutter
+and its `WriteCompleted` as the stale put landing
+(`formal/traces/zombie-decision-after-takeover` and
+`zombie-decision-behind-stalled-marker`, synthetic, are accepted and diverge
+at the late `CoordComplete` without that branch). The specification models
+that put: a `Redeploy` or a supersession turns a `COMPLETED` put still out
+stale (`staleCompleted`), and `WriteStaleCompleted` lands it with no advance
+and no broadcast. Whatever reads the disk afterwards sees it, so a takeover
+can restore from a superseded run's checkpoint, and the in-doubt walk can probe
+the handles of one, and TLC checks both against the invariants. The trace
+module takes the landing as a hidden step only when an event witnesses it: a
+takeover whose `completed` names that checkpoint (`LostWriteCompleted`), or a
+walk event other than `WalkSkips` at that checkpoint, since the walk reads the
+marker before it emits any of them (`LostStaleCompletedAtWalk`).
+`CoordRecovers` pins the reseeded completed restore point to the event's
+`completed`, so a marker the model lacks diverges at the takeover.
+`formal/traces/completed-marker-landing-after-redeploy`, a synthetic run in
+which a sink's worker dies with checkpoint 2's put out, the job redeploys from
+1, the put lands and a takeover then restores from 2, is accepted, and
+diverges at the takeover's redeploy without the stale put.
+`formal/traces/completed-marker-walked-after-redeploy` is the Kafka family's
+shape, also synthetic: the new run completes 3 and restarts unconfirmed, and
+its walk probes checkpoint 2's handle, which the reopened sink fenced. It is
+accepted, and diverges at that probe without the stale put or without the
+walk's witness.
+
+The `CONFIRMED` marker can be on disk without its line too, in more ways. The
+coordinator puts it outside its lock and then takes the lock again to advance
+`latest_confirmed_checkpoint_id` and emit `WriteConfirmed`; a kill between the
+two loses the line, and a restart that redeployed while the put was out
+leaves the marker on disk with neither the memory nor the trace moved,
+because the confirmation belongs to the run before the restart. The
+specification takes the three steps the engine takes (the hold that drains
+the confirmation set, inside `SinkConfirm`; the put, `WriteConfirmed`; the
+advance, `AdvanceConfirmed`), so a `Redeploy`, a `RestartProceeds` that holds
+the job for resolution, or a takeover can fall between them, and a takeover
+seeds its confirmed restore point from whatever the put left on disk. A
+redeploy turns a confirmation whose put is still out stale: the put lands,
+and nothing advances after it. A superseded coordinator's puts turn stale
+the same way and may land after the next leader has read the disk. The
+trace module matches a `WriteConfirmed` line against the put and the advance
+back to back, and takes a marker with no line as a hidden step,
+`LostWriteConfirmed`, admitted on the same terms as `LostWriteCompleted`: the
+next event is a takeover whose `confirmed` names exactly that checkpoint.
+`CoordRecovers` pins the reseeded confirmed restore point to the event's
+`confirmed` for the Kafka family, so a marker the model lacks, or one it has
+and the engine did not find, diverges at the takeover rather than at the
+next redeploy. `formal/traces/kafka-coordinator-failover` with the first
+coordinator's `WriteConfirmed` line removed is accepted through
+`LostWriteConfirmed` and diverges without it, and the same trace with its
+takeover reporting a different `confirmed` diverges at the takeover.
+
+The in-doubt walk writes its own `CONFIRMED` marker before its `WalkDecides`
+line, so a kill between the two leaves a marker no line reports and that
+`LostWriteConfirmed` cannot take, since no confirmation set was draining for
+it. The hidden step `LostWalkDecides` takes the walk's success there, on the
+same terms: the next event is a takeover whose `confirmed` is the checkpoint
+being walked, and every handle of that checkpoint was proven committed.
+`formal/traces/walk-confirmed-then-killed`, `kafka-kill-after-broker-commit`
+cut after the walk's last proof with a takeover appended, is accepted through
+it and diverges without it. A superseded coordinator's confirmation handler
+runs on, puts the marker, advances its own memory and emits `WriteConfirmed`;
+the line carries the coordinator's epoch, and from a non-leader epoch the
+trace module takes it as the stale put landing, or as a stutter when the put
+landed before the takeover read the disk.
+`formal/traces/zombie-confirmation-after-takeover`, a synthetic cut of
+`kafka-coordinator-failover` in which the first coordinator's line comes after
+the takeover, is accepted, and diverges when the line is read as the
+leader's. The takeover reads the disk before it emits `CoordRecovers`, so the
+superseded coordinator's put can also land after that read with its line
+written before the takeover's: the trace module takes that line as the
+supersession already made and the stale confirmation's stutter, leaving the
+confirmation stale for a later takeover that reads the marker.
+`formal/traces/zombie-confirmation-before-takeover-line`, the same trace with
+the line moved before the takeover's, is accepted and diverges without that
+branch.
+
 A takeover need not advance the epoch. The engine stamps epoch 0 when there
 is no leader election. An HA leader's epoch is always above the one it
 displaced, so it is at least 1. An embedded `clink run` resuming from its own
@@ -419,8 +521,9 @@ against the bug it guards is decorative.
 | `complete_above_failed` | A checkpoint above a FAILED one is discarded during the rewind | this model | yes, `NoLoss` |
 | `restore_from_memory` | The in-memory restore point advances with the durable marker, not before | this model | yes, `FrontierCovered` |
 | `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | yes, `NoLoss` |
+| `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its `CONFIRMED` marker is durable | review of the per-connection dispatch change | yes, `ConfirmedMemoryOnDisk` |
 
-Fourteen of the sixteen are refuted. The two that are not are recorded in
+Fifteen of the seventeen are refuted. The two that are not are recorded in
 `formal/mutants/expected.txt` rather than deleted, and the check holds that
 record in both directions: each of them disables a rule that a later rule
 now guards as well. The preserved prepared transaction predates commit
@@ -496,7 +599,7 @@ In the honesty categories the qualification pages use:
   reachable interleaving of the modelled protocol steps and faults satisfies
   the invariants, the run never deadlocks, and (in the liveness
   configuration) every run with bounded faults settles with every
-  vouched-for position published exactly once. Fourteen of the sixteen
+  vouched-for position published exactly once. Fifteen of the seventeen
   mutants produce a counterexample; the two that do not are recorded as
   guarded by a later rule, and the check fails the day that stops being
   true.

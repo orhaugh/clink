@@ -1,0 +1,30 @@
+{"seq": 1, "ts": 1000000, "proc": "coordinator:1", "event": "Placement", "job": 1, "sub": 0, "worker": "w0", "source": true}
+{"seq": 2, "ts": 1001000, "proc": "coordinator:1", "event": "Placement", "job": 1, "sub": 1, "worker": "w0", "source": false}
+{"seq": 3, "ts": 1002000, "proc": "coordinator:1", "event": "Placement", "job": 1, "sub": 2, "worker": "w1", "source": false}
+{"seq": 4, "ts": 1003000, "proc": "coordinator:1", "event": "SinkOpens", "sub": 2, "family": "recoverable"}
+{"seq": 5, "ts": 1004000, "proc": "coordinator:1", "event": "Trigger", "job": 1, "ckpt": 1, "epoch": 0}
+{"seq": 6, "ts": 1005000, "proc": "coordinator:1", "event": "DeliverBarrier", "job": 1, "ckpt": 1, "epoch": 0, "worker": "w0", "fenced": false}
+{"seq": 7, "ts": 1006000, "proc": "coordinator:1", "event": "SinkPrepare", "sub": 2, "ckpt": 1, "family": "recoverable", "staged": true}
+{"seq": 8, "ts": 1007000, "proc": "coordinator:1", "event": "SubtaskAck", "job": 1, "sub": 0, "ckpt": 1, "ok": true}
+{"seq": 9, "ts": 1008000, "proc": "coordinator:1", "event": "SubtaskAck", "job": 1, "sub": 1, "ckpt": 1, "ok": true}
+{"seq": 10, "ts": 1009000, "proc": "coordinator:1", "event": "SubtaskAck", "job": 1, "sub": 2, "ckpt": 1, "ok": true}
+{"seq": 11, "ts": 1010000, "proc": "coordinator:1", "event": "CoordComplete", "job": 1, "ckpt": 1, "outcome": "completed"}
+{"seq": 12, "ts": 1011000, "proc": "coordinator:1", "event": "WriteCompleted", "job": 1, "ckpt": 1}
+{"seq": 13, "ts": 1012000, "proc": "coordinator:1", "event": "Broadcast", "job": 1, "ckpt": 1, "withheld": false}
+{"seq": 14, "ts": 1013000, "proc": "coordinator:1", "event": "DeliverCommit", "sub": 2, "ckpt": 1, "accepted": true}
+{"seq": 15, "ts": 1014000, "proc": "coordinator:1", "event": "SinkCommit", "sub": 2, "ckpt": 1}
+{"seq": 16, "ts": 1015000, "proc": "coordinator:1", "event": "Trigger", "job": 1, "ckpt": 2, "epoch": 0}
+{"seq": 17, "ts": 1016000, "proc": "coordinator:1", "event": "DeliverBarrier", "job": 1, "ckpt": 2, "epoch": 0, "worker": "w0", "fenced": false}
+{"seq": 18, "ts": 1017000, "proc": "coordinator:1", "event": "SinkPrepare", "sub": 2, "ckpt": 2, "family": "recoverable", "staged": true}
+{"seq": 19, "ts": 1018000, "proc": "coordinator:1", "event": "SubtaskAck", "job": 1, "sub": 0, "ckpt": 2, "ok": true}
+{"seq": 20, "ts": 1019000, "proc": "coordinator:1", "event": "SubtaskAck", "job": 1, "sub": 1, "ckpt": 2, "ok": true}
+{"seq": 21, "ts": 1020000, "proc": "coordinator:1", "event": "SubtaskAck", "job": 1, "sub": 2, "ckpt": 2, "ok": true}
+{"seq": 22, "ts": 1021000, "proc": "coordinator:1", "event": "CoordComplete", "job": 1, "ckpt": 2, "outcome": "completed"}
+{"seq": 23, "ts": 1022000, "proc": "coordinator:1", "event": "WorkerDies", "job": 1, "worker": "w1"}
+{"seq": 24, "ts": 1023000, "proc": "coordinator:1", "event": "SubtaskDrained", "job": 1, "sub": 0}
+{"seq": 25, "ts": 1024000, "proc": "coordinator:1", "event": "SubtaskDrained", "job": 1, "sub": 1}
+{"seq": 26, "ts": 1025000, "proc": "coordinator:1", "event": "Redeploy", "job": 1, "restore": 1, "next": 3}
+{"seq": 27, "ts": 1026000, "proc": "coordinator:1", "event": "Placement", "job": 1, "sub": 2, "worker": "w0", "source": false}
+{"seq": 28, "ts": 1027000, "proc": "coordinator:1", "event": "SinkOpens", "sub": 2, "family": "recoverable"}
+{"seq": 29, "ts": 1028000, "proc": "coordinator:2", "event": "CoordRecovers", "job": 1, "epoch": 0, "completed": 2, "confirmed": 0}
+{"seq": 30, "ts": 1029000, "proc": "coordinator:2", "event": "Redeploy", "job": 1, "restore": 2, "next": 3}
