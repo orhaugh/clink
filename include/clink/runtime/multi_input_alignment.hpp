@@ -38,6 +38,7 @@ public:
           paused_(input_count, false),
           closed_(input_count, false),
           cancelled_close_(input_count, false),
+          drained_(input_count, false),
           idle_(input_count, false) {}
 
     // Stamp the aligner with the OperatorId.value() of the operator
@@ -162,12 +163,15 @@ public:
     // recompute must not read the wreckage as end-of-time - that fired
     // every open window into a still-live sink during cancel, appending a
     // nondeterministic partial tail (QUAL-07's qcum, 11,532 rows).
+    //
+    // An input that delivered a drain marker first (see on_drain) closes as a
+    // handoff, which counts the same way as a cancel here.
     BarrierAdvance on_input_closed(std::size_t i, bool cancelled = false) {
         if (closed_[i]) {
             return {};
         }
         closed_[i] = true;
-        cancelled_close_[i] = cancelled;
+        cancelled_close_[i] = cancelled || drained_[i];
         input_wm_[i] = Watermark::max();  // closed inputs no longer hold back time
         // A close may complete alignment for a pending barrier; check each.
         for (auto& [id, _] : seen_barriers_) {
@@ -180,6 +184,17 @@ public:
         // we expose it inline here:
         return {};
     }
+
+    // Record that input i delivered a rescale drain marker: its subtask is
+    // handing its key groups to a successor that restores from the cutover
+    // checkpoint and carries on, so the close that follows is not end of
+    // input. That close still frees the survivors' time, but it can never be
+    // what turns an all-closed set into an end-of-time watermark, so no
+    // end-of-time goes downstream and the event-time timers do not all fire
+    // at the handoff. This governs the watermark only: a runner whose inputs
+    // all close Finished still calls flush() at exit, and a window operator's
+    // flush() fires its open windows there.
+    void on_drain(std::size_t i) { drained_[i] = true; }
 
     // Run a watermark recompute (useful after on_input_closed which doesn't
     // emit a watermark advance directly).
@@ -223,6 +238,7 @@ public:
         paused_.push_back(false);
         closed_.push_back(false);
         cancelled_close_.push_back(false);
+        drained_.push_back(false);
         idle_.push_back(false);
         return input_wm_.size() - 1;
     }
@@ -443,6 +459,9 @@ private:
     // all-closed set that includes a cancelled close is teardown, and the
     // recompute must not turn it into an end-of-time watermark (item 79).
     std::vector<bool> cancelled_close_;
+    // Whether each input delivered a drain marker (see on_drain); its close
+    // is then recorded in cancelled_close_ as not end of input.
+    std::vector<bool> drained_;
     std::vector<bool> idle_;
     std::unordered_map<std::uint64_t, std::vector<bool>> seen_barriers_;
     // First-input-delivery time per in-flight checkpoint id. Stamped

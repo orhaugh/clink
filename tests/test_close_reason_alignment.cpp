@@ -65,6 +65,26 @@ TEST(CloseReasonAlignment, ACancelledCloseAmongSurvivorsDoesNotHoldTimeBack) {
         << "the surviving input alone should drive the min";
 }
 
+TEST(CloseReasonAlignment, ADrainedCloseFreesSurvivorsButIsNotEndOfInput) {
+    // A drain is a handoff: the drained subtask's successor restores from
+    // the cutover checkpoint and carries its time on. Its FINISHED close
+    // frees the survivors like any close, but an all-closed set that
+    // includes it is not end of input.
+    MultiInputAlignment align(2);
+    (void)align.on_watermark(0, Watermark{EventTime{100}});
+    (void)align.on_watermark(1, Watermark{EventTime{200}});
+    align.on_drain(0);
+    (void)align.on_input_closed(0, /*cancelled=*/false);
+    const auto freed = align.refresh_watermark();
+    ASSERT_TRUE(freed.forward);
+    EXPECT_EQ(freed.watermark.timestamp(), EventTime{200})
+        << "the drained input must stop holding the survivor back";
+    (void)align.on_input_closed(1, /*cancelled=*/false);
+    EXPECT_FALSE(align.refresh_watermark().forward)
+        << "a drain read as end-of-input fires every open window at a cutover";
+    EXPECT_EQ(align.current_watermark().timestamp(), EventTime{200});
+}
+
 TEST(CloseReasonAlignment, BoundedChannelFirstCloseReasonWins) {
     // The cancel lambda and the runner's exit tail can both close the same
     // channel; whichever lands first decides, so a racing Finished close

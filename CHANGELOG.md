@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**A multi-input operator or sink no longer holds event time back, or hangs,
+when an input closes.** A fan-in sink and an operator fed by several subtasks
+now forward the watermark an input's close frees as soon as they see the close,
+while another input is still open, as the other multi-input runners already
+did; with the remaining inputs idle, time used to stay at the closed input's
+last watermark. Every multi-input runner now also sees a close on an input
+paused at a barrier: the fan-in sink, the N-input operator, the interval join,
+broadcast connect and the co-operator used to miss it, so a later barrier from
+another input could never align and the runner never exited. A drained input
+(a drain marker and then a close, at a rescale or cutover) now counts as a
+handoff rather than an end: once every input has gone, the union, interval
+join, broadcast connect and co-operator no longer move the watermark to end of
+time, so event-time timers do not all fire at the handoff; open windows still
+fire through `flush()` when the runner exits. On their last input's close, the
+fan-in sink and the N-input operator leave end of stream to `flush()`, as the
+single-input runner does.
+
 **The Linux wheels carry the ClickHouse connector.** The Linux pyclink wheels
 (manylinux_2_28, x86_64 and aarch64) carry the ClickHouse connector, including
 the native sink with TLS, built against the same static OpenSSL as the Kafka

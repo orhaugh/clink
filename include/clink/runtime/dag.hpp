@@ -1797,9 +1797,11 @@ public:
                             out_channel->push(StreamElement<T>::watermark(adv.watermark));
                         }
                     } else if (maybe->is_drain()) {
-                        // Rescale drain: forward the wind-down marker as-is (not
-                        // through the aligner, which only tracks watermarks and
-                        // barriers); as_barrier() on a Drain would throw.
+                        // Rescale drain: forward the wind-down marker as-is
+                        // (as_barrier() on a Drain would throw), and tell the
+                        // aligner the close that follows is a handoff, not end
+                        // of input.
+                        align.on_drain(i);
                         out_channel->push(std::move(*maybe));
                     } else {
                         if (auto adv = align.on_barrier(
@@ -2590,6 +2592,8 @@ public:
                         out_channel->push(StreamElement<C>::watermark(adv.watermark));
                     }
                 } else if (el.is_drain()) {
+                    // The close that follows is a handoff, not end of input.
+                    align.on_drain(0);
                     // Rescale wind-down marker: forward downstream (not through
                     // the barrier aligner, which would as_barrier() a Drain).
                     out_channel->push(StreamElement<C>::drain(el.as_drain()));
@@ -2664,6 +2668,8 @@ public:
                         out_channel->push(StreamElement<C>::watermark(adv.watermark));
                     }
                 } else if (el.is_drain()) {
+                    // The close that follows is a handoff, not end of input.
+                    align.on_drain(1);
                     // Rescale wind-down marker: forward downstream (not through
                     // the barrier aligner, which would as_barrier() a Drain).
                     out_channel->push(StreamElement<C>::drain(el.as_drain()));
@@ -2732,6 +2738,19 @@ public:
                 }
             }
 
+            // Input i closed AND drained. The close can complete a pending
+            // barrier's alignment: forward it, ahead of whatever time the
+            // close frees, which is forwarded now because the other input may
+            // stay idle.
+            const auto close_input = [&](std::size_t i, bool cancelled) {
+                if (auto adv = align.on_input_closed(i, cancelled); adv.forward) {
+                    out_channel->push(StreamElement<C>::barrier(adv.barrier));
+                }
+                if (auto wm = align.refresh_watermark(); wm.forward) {
+                    evict(wm.watermark.timestamp());
+                    out_channel->push(StreamElement<C>::watermark(wm.watermark));
+                }
+            };
             while (!should_stop()) {
                 bool any_progress = false;
                 if (!align.input_paused(0)) {
@@ -2751,17 +2770,15 @@ public:
                         // Closed AND drained (see the co_operator runner): a
                         // push+close between the failed try_pop and this check
                         // must not mark the input closed over queued records.
-                        // A close can complete a pending barrier's alignment:
-                        // forward it, ahead of whatever time the close frees.
-                        if (auto adv = align.on_input_closed(0, left_ch->close_cancelled());
-                            adv.forward) {
-                            out_channel->push(StreamElement<C>::barrier(adv.barrier));
-                        }
-                        if (auto wm = align.refresh_watermark(); wm.forward) {
-                            evict(wm.watermark.timestamp());
-                            out_channel->push(StreamElement<C>::watermark(wm.watermark));
-                        }
+                        close_input(0, left_ch->close_cancelled());
                     }
+                } else if (!align.input_closed(0) && pending_left.empty() && left_ch->closed() &&
+                           left_ch->size() == 0) {
+                    // A paused input can close too (see the union runner): left
+                    // unseen, it wedges every later barrier the other input
+                    // delivers and holds its time at this input's last
+                    // watermark. The restore buffer drains first.
+                    close_input(0, left_ch->close_cancelled());
                 }
                 if (!align.input_paused(1)) {
                     if (!pending_right.empty()) {
@@ -2773,15 +2790,11 @@ public:
                         any_progress = true;
                         handle_right(*m);
                     } else if (right_ch->closed() && right_ch->size() == 0) {
-                        if (auto adv = align.on_input_closed(1, right_ch->close_cancelled());
-                            adv.forward) {
-                            out_channel->push(StreamElement<C>::barrier(adv.barrier));
-                        }
-                        if (auto wm = align.refresh_watermark(); wm.forward) {
-                            evict(wm.watermark.timestamp());
-                            out_channel->push(StreamElement<C>::watermark(wm.watermark));
-                        }
+                        close_input(1, right_ch->close_cancelled());
                     }
+                } else if (!align.input_closed(1) && pending_right.empty() && right_ch->closed() &&
+                           right_ch->size() == 0) {
+                    close_input(1, right_ch->close_cancelled());
                 }
                 if (align.all_closed()) {
                     break;
@@ -2996,6 +3009,8 @@ public:
                         out_channel->push(StreamElement<Out>::watermark(adv.watermark));
                     }
                 } else if (el.is_drain()) {
+                    // The close that follows is a handoff, not end of input.
+                    align.on_drain(1);
                     // Rescale wind-down marker: forward (not through the barrier
                     // aligner, which would as_barrier() a Drain).
                     out_channel->push(StreamElement<Out>::drain(el.as_drain()));
@@ -3023,6 +3038,8 @@ public:
                         out_channel->push(StreamElement<Out>::watermark(adv.watermark));
                     }
                 } else if (el.is_drain()) {
+                    // The close that follows is a handoff, not end of input.
+                    align.on_drain(0);
                     // Rescale wind-down marker: forward (not through the barrier
                     // aligner, which would as_barrier() a Drain).
                     out_channel->push(StreamElement<Out>::drain(el.as_drain()));
@@ -3069,6 +3086,18 @@ public:
                 }
             }
 
+            // Input i closed AND drained. The close can complete a pending
+            // barrier's alignment: forward it, ahead of whatever time the
+            // close frees, which is forwarded now because the other input may
+            // stay idle.
+            const auto close_input = [&](std::size_t i, bool cancelled) {
+                if (auto adv = align.on_input_closed(i, cancelled); adv.forward) {
+                    out_channel->push(StreamElement<Out>::barrier(adv.barrier));
+                }
+                if (auto wm = align.refresh_watermark(); wm.forward) {
+                    out_channel->push(StreamElement<Out>::watermark(wm.watermark));
+                }
+            };
             while (!should_stop()) {
                 bool any_progress = false;
                 if (!align.input_paused(0)) {
@@ -3082,16 +3111,15 @@ public:
                         handle_main(*m);
                     } else if (main_ch->closed() && main_ch->size() == 0) {
                         // Closed AND drained (see the co_operator runner note).
-                        // A close can complete a pending barrier's alignment:
-                        // forward it, ahead of whatever time the close frees.
-                        if (auto adv = align.on_input_closed(0, main_ch->close_cancelled());
-                            adv.forward) {
-                            out_channel->push(StreamElement<Out>::barrier(adv.barrier));
-                        }
-                        if (auto wm = align.refresh_watermark(); wm.forward) {
-                            out_channel->push(StreamElement<Out>::watermark(wm.watermark));
-                        }
+                        close_input(0, main_ch->close_cancelled());
                     }
+                } else if (!align.input_closed(0) && pending_main.empty() && main_ch->closed() &&
+                           main_ch->size() == 0) {
+                    // A paused input can close too (see the union runner): left
+                    // unseen, it wedges every later barrier the other input
+                    // delivers and holds its time at this input's last
+                    // watermark. The restore buffer drains first.
+                    close_input(0, main_ch->close_cancelled());
                 }
                 if (!align.input_paused(1)) {
                     if (!pending_brod.empty()) {
@@ -3103,14 +3131,11 @@ public:
                         any_progress = true;
                         handle_brod(*b);
                     } else if (brod_ch->closed() && brod_ch->size() == 0) {
-                        if (auto adv = align.on_input_closed(1, brod_ch->close_cancelled());
-                            adv.forward) {
-                            out_channel->push(StreamElement<Out>::barrier(adv.barrier));
-                        }
-                        if (auto wm = align.refresh_watermark(); wm.forward) {
-                            out_channel->push(StreamElement<Out>::watermark(wm.watermark));
-                        }
+                        close_input(1, brod_ch->close_cancelled());
                     }
+                } else if (!align.input_closed(1) && pending_brod.empty() && brod_ch->closed() &&
+                           brod_ch->size() == 0) {
+                    close_input(1, brod_ch->close_cancelled());
                 }
                 if (align.all_closed()) {
                     break;
@@ -3511,6 +3536,8 @@ public:
                         forward_watermark(adv.watermark);
                     }
                 } else if (el.is_drain()) {
+                    // The close that follows is a handoff, not end of input.
+                    align.on_drain(0);
                     // Rescale wind-down marker: forward downstream (not through
                     // the barrier aligner, which would as_barrier() a Drain).
                     out_emitter.emit_drain(el.as_drain());
@@ -3543,6 +3570,8 @@ public:
                         forward_watermark(adv.watermark);
                     }
                 } else if (el.is_drain()) {
+                    // The close that follows is a handoff, not end of input.
+                    align.on_drain(1);
                     // Rescale wind-down marker: forward downstream (not through
                     // the barrier aligner, which would as_barrier() a Drain).
                     out_emitter.emit_drain(el.as_drain());
@@ -3591,6 +3620,18 @@ public:
                 }
             }
 
+            // Input i closed AND drained. The close can complete a pending
+            // barrier's alignment: snapshot and forward it as the barrier path
+            // does, ahead of whatever time the close frees, which is forwarded
+            // now because the other input may stay idle.
+            const auto close_input = [&](std::size_t i, bool cancelled) {
+                if (auto adv = align.on_input_closed(i, cancelled); adv.forward) {
+                    snapshot_and_ack(adv.barrier);
+                }
+                if (auto wm = align.refresh_watermark(); wm.forward) {
+                    forward_watermark(wm.watermark);
+                }
+            };
             while (!should_stop()) {
                 // Processing-time timers fire through the per-key gate under
                 // async (so a state-touching callback serialises behind an
@@ -3622,17 +3663,15 @@ public:
                         // align.all_closed() breaks the loop, and the batch is
                         // dropped (observed in CI as an all-zero co-op run
                         // when the other input was empty and closed at start).
-                        // A close can complete a pending barrier's alignment:
-                        // snapshot and forward it as the barrier path does,
-                        // ahead of whatever time the close frees.
-                        if (auto adv = align.on_input_closed(0, left_ch->close_cancelled());
-                            adv.forward) {
-                            snapshot_and_ack(adv.barrier);
-                        }
-                        if (auto wm = align.refresh_watermark(); wm.forward) {
-                            forward_watermark(wm.watermark);
-                        }
+                        close_input(0, left_ch->close_cancelled());
                     }
+                } else if (!align.input_closed(0) && pending_left.empty() && left_ch->closed() &&
+                           left_ch->size() == 0) {
+                    // A paused input can close too (see the union runner): left
+                    // unseen, it wedges every later barrier the other input
+                    // delivers and holds its time at this input's last
+                    // watermark. The restore buffer drains first.
+                    close_input(0, left_ch->close_cancelled());
                 }
                 if (!align.input_paused(1)) {
                     if (!pending_right.empty()) {
@@ -3644,14 +3683,11 @@ public:
                         any_progress = true;
                         handle_right(*m);
                     } else if (right_ch->closed() && right_ch->size() == 0) {
-                        if (auto adv = align.on_input_closed(1, right_ch->close_cancelled());
-                            adv.forward) {
-                            snapshot_and_ack(adv.barrier);
-                        }
-                        if (auto wm = align.refresh_watermark(); wm.forward) {
-                            forward_watermark(wm.watermark);
-                        }
+                        close_input(1, right_ch->close_cancelled());
                     }
+                } else if (!align.input_closed(1) && pending_right.empty() && right_ch->closed() &&
+                           right_ch->size() == 0) {
+                    close_input(1, right_ch->close_cancelled());
                 }
                 // A data completion (handle_left/handle_right poll) can drain a
                 // marked watermark's epoch; fire + forward any such markers
@@ -4107,25 +4143,47 @@ public:
                 sink->attach_runtime(&ctx);
                 sink->open();
                 MultiInputAlignment align(ins.size());
+                // Input k is closed AND drained (see the co_operator runner
+                // note: a push+close can land between a failed try_pop and the
+                // check). The close can complete a pending barrier's alignment,
+                // which the sink must still see or it never acknowledges the
+                // checkpoint; and it frees the input's time, which must be
+                // forwarded now because the other inputs may stay idle. Only
+                // while one of them is still open, though: this runner also
+                // serves a forward sink with a single input, and the last
+                // close is end of stream, which is flush()'s business as in
+                // the single-input runner. Recomputing there would turn an
+                // unbounded source's graceful stop, which closes Finished
+                // without an end-of-time watermark, into end-of-time.
+                const auto close_input = [&](std::size_t k) {
+                    if (auto adv = align.on_input_closed(k, ins[k]->close_cancelled());
+                        adv.forward) {
+                        sink->on_barrier(adv.barrier);
+                    }
+                    if (align.all_closed()) {
+                        return;
+                    }
+                    if (auto wm = align.refresh_watermark(); wm.forward) {
+                        sink->on_watermark(wm.watermark);
+                    }
+                };
                 while (!should_stop()) {
                     bool any_progress = false;
                     for (std::size_t k = 0; k < ins.size(); ++k) {
                         if (align.input_paused(k)) {
+                            // A paused input can close too (see the union
+                            // runner): left unseen, it wedges every later
+                            // barrier the other inputs deliver and holds
+                            // their time at its last watermark.
+                            if (!align.input_closed(k) && ins[k]->closed() && ins[k]->size() == 0) {
+                                close_input(k);
+                            }
                             continue;
                         }
                         auto m = ins[k]->try_pop();
                         if (!m.has_value()) {
-                            // Closed AND drained (see the co_operator runner
-                            // note): a push+close can land between the failed
-                            // try_pop and this check.
                             if (ins[k]->closed() && ins[k]->size() == 0) {
-                                // A close can complete a pending barrier's
-                                // alignment; the sink must still see it, or it
-                                // never acknowledges the checkpoint.
-                                if (auto adv = align.on_input_closed(k, ins[k]->close_cancelled());
-                                    adv.forward) {
-                                    sink->on_barrier(adv.barrier);
-                                }
+                                close_input(k);
                             }
                             continue;
                         }
@@ -4140,7 +4198,11 @@ public:
                             }
                         } else if (m->is_drain()) {
                             // A rescale drain is a no-op at a terminal sink
-                            // (ignored, not mis-read as a barrier via as_barrier).
+                            // (ignored, not mis-read as a barrier via
+                            // as_barrier). The aligner need not hear of it:
+                            // this runner never recomputes on the last close
+                            // (see close_input), so a drained close cannot
+                            // become end-of-time here.
                         } else {
                             if (auto adv = align.on_barrier(
                                     k, ctx.apply_barrier_mode_override(m->as_barrier()));
@@ -4840,25 +4902,48 @@ private:
                 op->open();
                 Emitter<Out> out_emitter(stage_emitter.get());
                 MultiInputAlignment align(ins.size());
+                // Input k is closed AND drained (see the co_operator runner
+                // note: a push+close can land between a failed try_pop and the
+                // check). The close can complete a pending barrier's alignment,
+                // handed to the operator as the barrier path does; and it frees
+                // the input's time, which must be forwarded now because the
+                // other inputs may stay idle. Only while one of them is still
+                // open, though: this runner also serves a forward stage with a
+                // single input, and the last close is end of stream, which is
+                // flush()'s business as in the single-input runner.
+                // Recomputing there would turn an unbounded source's graceful
+                // stop, which closes Finished without an end-of-time watermark,
+                // into end-of-time and fire every pending event-time timer
+                // after the stop checkpoint.
+                const auto close_input = [&](std::size_t k) {
+                    if (auto adv = align.on_input_closed(k, ins[k]->close_cancelled());
+                        adv.forward) {
+                        op->on_barrier(adv.barrier, out_emitter);
+                    }
+                    if (align.all_closed()) {
+                        return;
+                    }
+                    if (auto wm = align.refresh_watermark(); wm.forward) {
+                        op->on_watermark(wm.watermark, out_emitter);
+                    }
+                };
                 while (!should_stop()) {
                     bool any_progress = false;
                     for (std::size_t k = 0; k < ins.size(); ++k) {
                         if (align.input_paused(k)) {
+                            // A paused input can close too (see the union
+                            // runner): left unseen, it wedges every later
+                            // barrier the other inputs deliver and holds
+                            // their time at its last watermark.
+                            if (!align.input_closed(k) && ins[k]->closed() && ins[k]->size() == 0) {
+                                close_input(k);
+                            }
                             continue;
                         }
                         auto m = ins[k]->try_pop();
                         if (!m.has_value()) {
-                            // Closed AND drained (see the co_operator runner
-                            // note): a push+close can land between the failed
-                            // try_pop and this check.
                             if (ins[k]->closed() && ins[k]->size() == 0) {
-                                // A close can complete a pending barrier's
-                                // alignment: hand it to the operator as the
-                                // barrier path does.
-                                if (auto adv = align.on_input_closed(k, ins[k]->close_cancelled());
-                                    adv.forward) {
-                                    op->on_barrier(adv.barrier, out_emitter);
-                                }
+                                close_input(k);
                             }
                             continue;
                         }
@@ -4879,7 +4964,10 @@ private:
                         } else if (m->is_drain()) {
                             // Rescale wind-down marker: forward downstream
                             // without handing it to op->process()/as_barrier()
-                            // (which would throw on a Drain).
+                            // (which would throw on a Drain). The aligner need
+                            // not hear of it: this runner never recomputes on
+                            // the last close (see close_input), so a drained
+                            // close cannot become end-of-time here.
                             out_emitter.emit_drain(m->as_drain());
                         } else {
                             if (auto adv = align.on_barrier(
