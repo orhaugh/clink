@@ -1,0 +1,131 @@
+name: clickhouse-recovery
+
+# The native ClickHouse sink's kill matrix, nightly and on demand
+# (tests/integration/test_clickhouse_native_recovery.cpp): every fault cell
+# (a Worker killed before, during and after an INSERT, the server killed,
+# restarted and blackholed, the network cut at the edge) on both server lines
+# and both targets, each cell gated on the landed rows. It stands up its own
+# ClickHouse and Kafka containers and its own Coordinator and Workers, so the
+# build job, which runs in the toolchain container with no Docker daemon,
+# skips it, and the per-push live job runs the suites that need only a server.
+# About 45 minutes for the cells, so it runs here rather than on every push.
+#
+# Plain runner steps that `docker run` the toolchain image, as the live job
+# does: the tests reach the servers on the runner's loopback, which a job
+# container on its own network cannot. The test process drives the runner's
+# Docker daemon through its socket with a pinned static CLI, and the workspace
+# and /tmp are mounted at their own paths, because the servers bind-mount
+# repository files and the harness's scratch tree by host path.
+
+on:
+  schedule:
+    - cron: "15 4 * * *"   # nightly, clear of the 02:30 sanitizers and Monday's 03:45 fuzz
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: clickhouse-recovery
+  cancel-in-progress: false
+
+env:
+  DOCKER_CLI_VERSION: 29.8.2
+  DOCKER_CLI_SHA256: 995d1ef289677f74fd58d8d2c35727b6a4ee389c69db8638a3e42d0487aa5b0f
+
+jobs:
+  kill-matrix:
+    name: The native ClickHouse sink holds its guarantee in every fault cell
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      TOOLCHAIN: ghcr.io/${{ github.repository_owner }}/clink-build:main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report what is under test
+        # A scheduled run tests main's HEAD at the moment it fires.
+        run: |
+          echo "commit under test: $(git rev-parse HEAD)"
+          docker pull -q "${TOOLCHAIN}"
+          df -h /
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-recovery-${{ github.run_id }}
+          restore-keys: ccache-recovery-
+      - name: Build the integration tests and the node binary
+        # Debug without DWARF and stripped, as the build job builds, so the
+        # timing margins the cells were sized against hold here too.
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ccache"
+          docker run --rm --user root \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
+            -v "${RUNNER_TEMP}/ccache:/root/.ccache" \
+            -e CLINK_DEPS_PREFIX=/usr/local -e CCACHE_DIR=/root/.ccache -e CCACHE_MAXSIZE=1500M \
+            -e CMAKE_C_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "${TOOLCHAIN}" bash -c '
+              set -euo pipefail
+              git config --global --add safe.directory "*"
+              apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
+                -DCLINK_INTEGRATION_TESTS=ON -DCMAKE_C_FLAGS_DEBUG=-g0 -DCMAKE_CXX_FLAGS_DEBUG=-g0 \
+                -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
+              cmake --build build --target clink_integration_tests clink_node clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
+              ccache -s | tail -3'
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-recovery-${{ github.run_id }}
+      - name: Fetch the pinned Docker CLI
+        # The toolchain image carries no Docker client; the tests drive the
+        # runner's daemon with this one, verified against its pin.
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/docker.tgz" \
+            "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz"
+          echo "${DOCKER_CLI_SHA256}  ${RUNNER_TEMP}/docker.tgz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/docker.tgz" -C "${RUNNER_TEMP}" docker/docker
+      - name: Run every cell of the kill matrix
+        run: |
+          set -euo pipefail
+          docker run --rm --user root --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${RUNNER_TEMP}/docker/docker:/usr/local/bin/docker:ro" \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
+            -v /tmp:/tmp -v "${RUNNER_TEMP}:${RUNNER_TEMP}" \
+            "${TOOLCHAIN}" build/tests/clink_integration_tests \
+              --gtest_filter='BothLines/ClickHouseNativeRecovery.*' --gtest_brief=1 \
+              --gtest_output="json:${RUNNER_TEMP}/kill-matrix.json"
+      - name: Every cell ran
+        # The cells skip without a Docker daemon, and a skip is not a failure
+        # to gtest: a matrix that ran nothing must not read as green.
+        run: |
+          python3 - "${RUNNER_TEMP}/kill-matrix.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          cases = [t for s in report["testsuites"] for t in s["testsuite"]]
+          skipped = [t["name"] for t in cases if t.get("result") == "SKIPPED"]
+          print(f"{len(cases)} cells, {len(skipped)} skipped, {report['failures']} failed")
+          if skipped or len(cases) < 36:
+              sys.exit("the kill matrix did not run every cell")
+          PY
+      - name: Upload the harness logs on failure
+        # The harness keeps its scratch tree, with every Coordinator and Worker
+        # log, when a cell fails.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clickhouse-recovery-logs
+          path: /tmp/clink_it_*/logs/**
+          if-no-files-found: ignore
+          retention-days: 14

@@ -600,7 +600,7 @@ It sets these for the test binaries, per profile: `CLINK_CLICKHOUSE_TEST_HOST`, 
 
 `scripts/clickhouse-live.sh` and `scripts/clickhouse-pins.sh` use the same host ports, so run one at a time.
 
-The kill matrix needs `-DCLINK_INTEGRATION_TESTS=ON`, Docker, and the build's `clink_node` and `clink_submit_sql` with fault injection, which a test build compiles in by default. It starts its own uniquely named ClickHouse and Keeper containers on free ports, from the images and configuration the compose file pins, so it does not collide with a compose stack, plus a Kafka broker of its own. It skips when Docker or the binaries are missing. A full pass of both lines takes about 45 minutes, so it suits a nightly run rather than every change:
+The kill matrix needs `-DCLINK_INTEGRATION_TESTS=ON`, Docker, and the build's `clink_node` and `clink_submit_sql` with fault injection, which a test build compiles in by default. It starts its own uniquely named ClickHouse and Keeper containers on free ports, from the images and configuration the compose file pins, so it does not collide with a compose stack, plus a Kafka broker of its own. It skips when Docker or the binaries are missing. A full pass of both lines takes about 45 minutes, so CI runs it nightly rather than on every push: `.github/workflows/clickhouse-recovery.yml`, also started by hand from the Actions tab, fails if any cell fails or if the matrix ran fewer than its 36 cells, so a run that skipped for want of Docker cannot read as green. Locally:
 
 ```bash
 cmake -S . -B build -DCLINK_WITH_CLICKHOUSE=ON -DCLINK_BUILD_TESTS=ON -DCLINK_INTEGRATION_TESTS=ON
