@@ -1981,10 +1981,14 @@ TEST(NativeIntakeReuse, AReusedTextOrDecimalChunkKeepsAliveNoMoreThanItIsCharged
             }
             column = decimals.Finish().ValueOrDie();
         }
+        // The type is read before the call: the order in which a call's
+        // arguments are evaluated is unspecified, and GCC on x86-64 moved the
+        // column out of `column` before the schema read its type.
+        const std::shared_ptr<arrow::DataType> column_type = column->type();
         auto sidecar = arrow::RecordBatch::Make(
             arrow::schema({arrow::field("event_time", arrow::int64()),
                            arrow::field("wide", arrow::utf8()),
-                           arrow::field("c", column->type())}),
+                           arrow::field("c", column_type)}),
             rows,
             {times.Finish().ValueOrDie(), wide.Finish().ValueOrDie(), std::move(column)});
         const auto columns = ra_columns(text ? "c:VARCHAR" : "c:DECIMAL(20, 4)");
