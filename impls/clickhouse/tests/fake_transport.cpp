@@ -1676,13 +1676,19 @@ struct FakeTransport::Impl {
     // Under mu: lands parts [parts_landed, upto) of the open INSERT.
     void land_parts(const std::vector<Part>& all, std::size_t upto) {
         OpenInsert& in = *insert;
-        upto = std::min(upto, all.size());
         FakeServer::Impl& s = in.server->impl();
         const std::lock_guard<std::mutex> lock(s.mu);
-        TableState* t = s.find(in.database, in.table);
-        if (t == nullptr) {
-            return;
+        if (TableState* t = s.find(in.database, in.table)) {
+            land_parts_locked(in, *t, all, upto);
         }
+    }
+
+    // Under mu.
+    static void land_parts_locked(OpenInsert& in,
+                                  TableState& t,
+                                  const std::vector<Part>& all,
+                                  std::size_t upto) {
+        upto = std::min(upto, all.size());
         for (std::size_t i = in.parts_landed; i < upto; ++i) {
             LandedBlock block;
             if (!in.token.empty()) {
@@ -1690,9 +1696,25 @@ struct FakeTransport::Impl {
             }
             block.rows = all[i].rows.size();
             block.values = all[i].rows;
-            t->land(std::move(block));
+            t.land(std::move(block));
         }
         in.parts_landed = std::max(in.parts_landed, upto);
+    }
+
+    // Lands every part not yet landed and marks the INSERT committed in one
+    // hold of the server's lock, as a server makes an INSERT's rows visible
+    // when it commits: no observer sees the rows with the INSERT still open.
+    void commit_insert(const std::vector<Part>& all) {
+        OpenInsert& in = *insert;
+        FakeServer::Impl& s = in.server->impl();
+        {
+            const std::lock_guard<std::mutex> lock(s.mu);
+            if (TableState* t = s.find(in.database, in.table)) {
+                land_parts_locked(in, *t, all, all.size());
+                t->inserts.at(in.record).outcome = ReceivedInsert::Outcome::Committed;
+            }
+        }
+        insert.reset();
     }
 
     // Under mu: marks the open INSERT's record and forgets it.
@@ -1892,9 +1914,7 @@ FakeTransport::~FakeTransport() {
         const bool live =
             impl_->conn && !impl_->conn->dead && !impl_->conn->broken() && !impl_->interrupted;
         if (live && impl_->insert->pending && impl_->insert->deferred_error.empty()) {
-            const auto all = impl_->parts();
-            impl_->land_parts(all, all.size());
-            impl_->close_insert(ReceivedInsert::Outcome::Committed);
+            impl_->commit_insert(impl_->parts());
         } else {
             impl_->close_insert(ReceivedInsert::Outcome::Failed);
         }
@@ -2118,8 +2138,7 @@ void FakeTransport::end_insert() {
                 }
             });
         }
-        impl_->land_parts(all, all.size());
-        impl_->close_insert(ReceivedInsert::Outcome::Committed);
+        impl_->commit_insert(all);
         impl_->inserting = false;
     } catch (const std::system_error&) {
         impl_->fail_insert(true);
