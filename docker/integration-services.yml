@@ -519,10 +519,11 @@ services:
 
   # 26.8 with the native protocol over TLS on 9440 (host 19458), beside the
   # plain port (host 19158) for setup. The certificate and key come from the
-  # directory CLINK_CLICKHOUSE_TLS_DIR names, which scripts/clickhouse-live.sh
-  # generates per run (a CA, a server certificate for localhost and 127.0.0.1,
-  # and a second CA that did not sign it); without it the TLS port has no
-  # certificate and the server does not start.
+  # directory CLINK_CLICKHOUSE_TLS_DIR names, which
+  # scripts/make-clickhouse-test-tls.sh generates per run for
+  # scripts/clickhouse-live.sh and the wheels workflow (a CA, a server
+  # certificate for localhost and 127.0.0.1, and a second CA that did not sign
+  # it); without it the TLS port has no certificate and the server does not start.
   clickhouse-26-8-tls:
     image: clickhouse/clickhouse-server:26.8@sha256:3043f691ec1a847f38b446ff43708893fcbf9815bd9bd88c0f84bfe064ce852f
     environment:

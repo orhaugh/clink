@@ -281,11 +281,15 @@ A pyclink wheel bundles one platform `libclink` next to the package
 is ctypes with no CPython extension, the library carries no CPython ABI, and the
 wheel is tagged `py3-none-<arch>` - one wheel serves every Python 3 on a
 platform (`python/setup.py`, `platform_wheel.get_tag`). The build is lean:
-`clink_shared` with `CLINK_BUILD_IMPLS=OFF`, so libclink carries the SQL engine
-and the built-in file / collect / Parquet surfaces but no external-SDK
-connectors, keeping the only shared deps Arrow's own (curl, xml2, aws-sdk,
-openssl, lz4, zstd), which the repair step (delocate on macOS, auditwheel on
-Linux) vendors into the wheel. libclink is built once per platform outside the
+`clink_shared` with `CLINK_BUILD_IMPLS=OFF` by default, so libclink carries the
+SQL engine and the built-in file / collect / Parquet surfaces but no external-SDK
+connectors, and `CLINK_HTTP_TLS=OFF`, so the HTTP subsystem serves and fetches
+plain HTTP only. The macOS wheel is built that way. The Linux wheels add Kafka
+and, from the release after v0.10.0, ClickHouse, each against static archives
+(below), and stay off for the HTTP subsystem's TLS: the connectors' TLS is the static OpenSSL they link, not
+httplib's. Whatever shared libraries remain, the repair step (delocate on macOS,
+auditwheel on Linux) would vendor into the wheel; on both platforms there are
+none beyond the system's. libclink is built once per platform outside the
 wheel build and handed to `setup.py` via `CLINK_LIB`
 (`scripts/build-libclink-wheel.sh`); the wheel then simply copies it. The CI
 that produces the wheels and their platform scope is `.github/workflows/wheels.yml`.
@@ -303,14 +307,36 @@ libstdc++ and libgcc_s, and auditwheel vendors nothing. The option refuses to
 configure alongside tests or examples, whose job modules would each carry their
 own Arrow copy.
 
-The Linux wheels add the Kafka connector (`CLINK_WHEEL_KAFKA=1`: the impls on,
-every other `CLINK_WITH_*` off by name, against the static librdkafka
-`scripts/build-librdkafka.sh` builds from its pin). The whole Linux build is
-`scripts/build-manylinux-wheel.sh`, run inside `quay.io/pypa/manylinux_2_28_<arch>`:
-Arrow from source with the object stores off, librdkafka, libclink, the wheel,
-auditwheel, then `scripts/check-wheel-self-contained.py`, which fails if anything
-was vendored or libclink needs more than glibc, libstdc++ and libgcc_s, and a
-smoke test with the bundled library.
+The Linux wheels add the Kafka connector and, from the release after v0.10.0,
+the ClickHouse connector (v0.10.0 and earlier wheels have Kafka only).
+`CLINK_WHEEL_KAFKA=1` links the static librdkafka `scripts/build-librdkafka.sh` builds from its pin;
+that build also stages the OpenSSL it compiles under `<prefix>/openssl-static`.
+`CLINK_WHEEL_CLICKHOUSE=1` links the pinned ClickHouse client, built by
+`scripts/build-clickhouse-cpp.sh` in bundled-deps mode against that OpenSSL, so
+the library holds one OpenSSL for both connectors; ClickHouse without Kafka is not
+a shipped configuration. With either flag the impls are on and every other
+`CLINK_WITH_*` is off by name. With the ClickHouse flag the script refuses to
+build unless the configure step's `SSLSocketFactory` probe linked and found
+OpenSSL inside `openssl-static`, so a native sink without TLS cannot ship. The
+client's own lz4 and zstd archives are deleted after install, so its references
+resolve against the one copy of each the rest of libclink links. The link map
+shows which: today the lz4 and zstd built into the static librdkafka, which sits
+ahead of Arrow's bundled dependencies on the link line and so also serves
+Arrow's codecs. The gate below holds lz4 to that: frame and block functions
+come from one archive, so from one version. The whole
+Linux build is `scripts/build-manylinux-wheel.sh`, run inside
+`quay.io/pypa/manylinux_2_28_<arch>`: Arrow from source with the object stores
+off, librdkafka, the ClickHouse client, libclink (with a GNU ld link map beside
+it), the wheel, auditwheel, then `scripts/check-wheel-self-contained.py`, and a
+smoke test with the bundled library. The gate fails if anything was vendored, if
+libclink needs more than glibc, libstdc++ and libgcc_s, if it exports a dynamic
+symbol outside `clink_*`, if it carries more than one OpenSSL version string, or
+if the link map shows `LZ4_` or `LZ4F_` definitions taken from more than one
+archive or from a ClickHouse client archive. The wheels workflow then installs each Linux wheel on a stock
+runner and runs live Kafka and ClickHouse round trips through it, the ClickHouse
+one over TLS and again inside `almalinux:8` and `debian:bookworm-slim` with only
+the distribution's CA bundle to trust. A tag publishes no wheel unless every
+one of those runs passes.
 
 ### The Flight SQL endpoint
 

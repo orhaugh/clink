@@ -32,18 +32,25 @@
 #                no TLS, so it serves and fetches plain HTTP only. Local files,
 #                SQL and the embedded engine are unaffected. Build from source
 #                for either capability. Reasons in the macos-wheel job env.
-#   linux        Shipped on every tag, x86_64 and aarch64, WITH the Kafka
-#                connector. Built inside quay.io/pypa/manylinux_2_28_<arch> on the
-#                arch's native runner by scripts/build-manylinux-wheel.sh: the pinned
-#                Arrow from source with the object stores off, a static librdkafka,
-#                and libclink with Arrow linked statically (CLINK_STATIC_ARROW), so
-#                it needs only glibc, libstdc++ and libgcc_s and auditwheel vendors
-#                nothing. scripts/check-wheel-self-contained.py fails the job
-#                otherwise (auditwheel alone once passed a wheel that loaded a
-#                second, shared Arrow). Same capability caveats as macOS (no object
-#                stores, no HTTPS), plus: Kafka TLS/SASL use the OpenSSL bundled in
-#                librdkafka; GSSAPI and the Schema Registry formats are left out.
-#                The Arrow + librdkafka prefix is cached on the pins.
+#   linux        Shipped on every tag, x86_64 and aarch64, WITH the Kafka and
+#                ClickHouse connectors (the native sink with TLS included). Built
+#                inside quay.io/pypa/manylinux_2_28_<arch> on the arch's native
+#                runner by scripts/build-manylinux-wheel.sh: the pinned Arrow from
+#                source with the object stores off, a static librdkafka and the
+#                OpenSSL it builds, the pinned ClickHouse client in bundled-deps
+#                mode against that OpenSSL, and libclink with Arrow linked
+#                statically (CLINK_STATIC_ARROW), so it needs only glibc, libstdc++
+#                and libgcc_s and auditwheel vendors nothing.
+#                scripts/check-wheel-self-contained.py fails the job otherwise
+#                (auditwheel alone once passed a wheel that loaded a second, shared
+#                Arrow), and also if libclink exports anything but clink_*, carries
+#                more than one OpenSSL, or takes lz4 from more than one archive
+#                or from the ClickHouse client.
+#                Same capability caveats as macOS (no object stores; the HTTP
+#                subsystem has no HTTPS), plus: Kafka TLS/SASL and ClickHouse TLS
+#                share the one static OpenSSL; GSSAPI and the Schema Registry
+#                formats are left out. The Arrow, librdkafka and ClickHouse client
+#                prefix is cached on the pins and the scripts that build it.
 #
 # Shape ({macos-arm64, linux-x86_64, linux-aarch64}):
 #   macos-wheel         native macos-26 (its SDK's libc++ defines std::jthread /
@@ -53,7 +60,11 @@
 #                       the native runner; cached /opt/clink-deps; auditwheel +
 #                       the self-contained gate + a smoke test.
 #   linux-wheels-verify install each Linux wheel on a stock Ubuntu 22.04 runner,
-#                       outside the build image, and run the smoke test there.
+#                       outside the build image, and run the smoke test there,
+#                       a live Kafka round trip and a live ClickHouse round trip
+#                       over TLS; then the ClickHouse insert again inside
+#                       almalinux:8 and debian:bookworm-slim, trusting only the
+#                       distribution's CA bundle.
 #   publish             on a release tag only: upload all three wheels to PyPI
 #                       through trusted publishing (the pypi environment).
 #   collect             gather whatever wheels were built into one artifact.
@@ -323,8 +334,9 @@ jobs:
           if-no-files-found: error
 
   # Linux x86_64 + aarch64, each inside the manylinux_2_28 image on its native
-  # runner. The whole build is scripts/build-manylinux-wheel.sh; this job only
-  # restores and saves the Arrow, librdkafka and ClickHouse client prefix it builds.
+  # runner. The whole build, libclink with Kafka and ClickHouse included, is
+  # scripts/build-manylinux-wheel.sh; this job only restores and saves the Arrow,
+  # librdkafka, OpenSSL and ClickHouse client prefix it builds.
   linux-wheels:
     name: Wheel (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -368,7 +380,13 @@ jobs:
 
   # The same wheels installed where users install them: a stock runner, outside the
   # build image, with pip and PyPI's pyarrow; then a live Kafka round trip against a
-  # Redpanda broker on the runner, observed from outside by rpk.
+  # Redpanda broker on the runner, observed from outside by rpk; then live ClickHouse
+  # inserts over TLS against the pinned 26.8 server (a multi-arch digest), counted
+  # from outside by clickhouse-client. The last two runs insert from inside
+  # almalinux:8 and debian:bookworm-slim (no openssl package, so no /usr/lib/ssl)
+  # with the test CA in the distribution's bundle and nothing else naming a CA:
+  # the only end-to-end proof that the native sink finds a CA where the wheel's
+  # static OpenSSL would not look.
   linux-wheels-verify:
     name: Verify (${{ matrix.name }} on Ubuntu 22.04)
     needs: linux-wheels
@@ -424,12 +442,90 @@ jobs:
           got="$(docker exec rp rpk topic consume wheel-out -n 5 -f '%v\n' | wc -l)"
           echo "rpk read ${got} records from wheel-out"
           [ "${got}" -eq 5 ]
+      - name: Start a ClickHouse server with the native protocol over TLS
+        # The live suites' pinned 26.8 service, with certificates from the script
+        # scripts/clickhouse-live.sh uses, so the two cannot drift.
+        run: |
+          set -euo pipefail
+          tls="${RUNNER_TEMP}/clickhouse-tls"
+          mkdir -p "${tls}"
+          scripts/make-clickhouse-test-tls.sh "${tls}"
+          echo "CH_TLS=${tls}" >> "${GITHUB_ENV}"
+          CLINK_CLICKHOUSE_TLS_DIR="${tls}" docker compose -p wheel-ch \
+            -f docker/integration-services.yml up -d --wait clickhouse-26-8-tls
+          for t in tls_ok tls_wrong tls_default; do
+            docker compose -p wheel-ch -f docker/integration-services.yml exec -T \
+              clickhouse-26-8-tls clickhouse-client --query \
+              "CREATE TABLE ${t} (id Int64, v String) ENGINE = MergeTree ORDER BY id"
+          done
+      - name: Live ClickHouse round trip over TLS through the wheel
+        run: |
+          set -euo pipefail
+          unset CLINK_LIB SSL_CERT_FILE SSL_CERT_DIR
+          ( cd "${RUNNER_TEMP}" && ROWS=1000 CLICKHOUSE_TLS_PORT=19458 \
+              CLICKHOUSE_TLS_CA="${CH_TLS}/ca.crt" CLICKHOUSE_TLS_WRONG_CA="${CH_TLS}/wrong-ca.crt" \
+              "${RUNNER_TEMP}/v/bin/python" "${{ github.workspace }}/python/tests/wheel_clickhouse_live.py" \
+              ok wrong default )
+          # Checked from outside pyclink.
+          count() {
+            docker compose -p wheel-ch -f docker/integration-services.yml exec -T \
+              clickhouse-26-8-tls clickhouse-client --query "SELECT count() FROM $1"
+          }
+          ok="$(count tls_ok)"; wrong="$(count tls_wrong)"; dflt="$(count tls_default)"
+          echo "clickhouse-client: tls_ok=${ok} tls_wrong=${wrong} tls_default=${dflt}"
+          [ "${ok}" -eq 1000 ] && [ "${wrong}" -eq 0 ] && [ "${dflt}" -eq 1000 ]
+      - name: ClickHouse over TLS from the distribution's CA bundle (AlmaLinux 8, Debian)
+        # Each run installs the wheel in a stock image, makes sure OpenSSL's own
+        # directory (/usr/lib/ssl, where the wheel's static OpenSSL looks) is absent,
+        # puts the test CA where that distribution keeps its bundle, and inserts with
+        # no tls_ca_file and no SSL_CERT_FILE or SSL_CERT_DIR. Packages are installed
+        # before the bundle is replaced; pip trusts its own certifi.
+        run: |
+          set -euo pipefail
+          count() {
+            docker compose -p wheel-ch -f docker/integration-services.yml exec -T \
+              clickhouse-26-8-tls clickhouse-client --query "$1"
+          }
+          run_in() {
+            local image="$1" py="$2" bundle="$3" setup="$4" prune="$5"
+            count "TRUNCATE TABLE tls_default"
+            docker run --rm --network host \
+              -v "${{ github.workspace }}/wheelhouse:/wheelhouse:ro" \
+              -v "${{ github.workspace }}/python/tests:/tests:ro" \
+              -v "${CH_TLS}/ca.crt:/ca.crt:ro" \
+              "${image}" bash -euo pipefail -c "
+                ${setup}
+                ${py} -m venv /v
+                /v/bin/pip install -q /wheelhouse/*.whl pyarrow
+                ${prune}
+                if [ -e /usr/lib/ssl ]; then echo '/usr/lib/ssl exists' >&2; exit 1; fi
+                mkdir -p \"\$(dirname '${bundle}')\"
+                rm -f '${bundle}' && cp /ca.crt '${bundle}'
+                cd /tmp && env -u SSL_CERT_FILE -u SSL_CERT_DIR -u CLINK_LIB ROWS=1000 \
+                  CLICKHOUSE_TLS_PORT=19458 /v/bin/python /tests/wheel_clickhouse_live.py system"
+            got="$(count "SELECT count() FROM tls_default")"
+            echo "clickhouse-client: tls_default=${got} after ${image}"
+            [ "${got}" -eq 1000 ]
+          }
+          # AlmaLinux 8's python3 is 3.6; pyclink and pyarrow need a newer one.
+          run_in almalinux:8 python3.11 /etc/pki/tls/certs/ca-bundle.crt \
+            "dnf -y -q install python3.11 python3.11-pip >/dev/null" ":"
+          # python3 pulls in ca-certificates and with it openssl, which provides
+          # /usr/lib/ssl; both go once the venv exists, leaving no bundle at all until
+          # the test CA is put at Debian's path.
+          run_in debian:bookworm-slim python3 /etc/ssl/certs/ca-certificates.crt \
+            "apt-get -qq update && DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends python3 python3-venv >/dev/null" \
+            "dpkg --purge --force-depends openssl ca-certificates >/dev/null 2>&1; if dpkg -s openssl >/dev/null 2>&1; then echo 'openssl is installed' >&2; exit 1; fi"
+      - name: Stop the ClickHouse server
+        if: always()
+        run: docker compose -p wheel-ch -f docker/integration-services.yml rm -sfv clickhouse-26-8-tls || true
 
   # Publish to PyPI on a release tag, through PyPI trusted publishing: the pypi
   # environment's OIDC identity is what PyPI trusts (pending publisher: project
   # pyclink, owner orhaugh, repo clink, workflow wheels.yml, environment pypi), so
   # no token is stored anywhere. Runs only after every wheel built and both Linux
-  # wheels passed their stock-runner and live Kafka checks, and refuses unless all
+  # wheels passed their stock-runner, live Kafka and live ClickHouse checks
+  # (including the AlmaLinux and Debian CA-bundle runs), and refuses unless all
   # three platform wheels are present and carry the tag's version.
   publish:
     name: Publish to PyPI

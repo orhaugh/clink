@@ -1,7 +1,8 @@
 <!-- The native protocol over TLS on 9440, beside the plain port the
      healthcheck and the test setup use, for the native sink's TLS suite. The
-     certificate and key are generated per run by scripts/clickhouse-live.sh,
-     signed by a throwaway CA, and mounted read-only at
+     certificate and key are generated per run by
+     scripts/make-clickhouse-test-tls.sh (for scripts/clickhouse-live.sh and the
+     wheels workflow), signed by a throwaway CA, and mounted read-only at
      /etc/clickhouse-server/tls. The server asks no client certificate. Test use
      only. -->
 <clickhouse>

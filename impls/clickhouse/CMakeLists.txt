@@ -2,6 +2,11 @@
 # JSONEachRow rows sent as one INSERT statement) and the native-block insert
 # sink (src/native/), which builds only against clickhouse-cpp 2.6.2 or later.
 
+# The SSL factory probe's cached answer (below) belongs to this configure only:
+# drop it before any path that returns early or skips the probe, so a reconfigure
+# that builds no native sink cannot leave an earlier configure's "linked" behind.
+unset(CLINK_CLICKHOUSE_SSL_FACTORY_LINKS CACHE)
+
 if(CLINK_WITH_CLICKHOUSE STREQUAL "OFF")
     message(STATUS "clink::clickhouse - CLINK_WITH_CLICKHOUSE=OFF; target not defined")
     return()
@@ -60,9 +65,13 @@ endif()
 if(_ch_pinned_dir AND _ch_bundled)
     # Bundled deps: the client carries its own abseil int128 and cityhash and links
     # no system library. Its lz4 and zstd were deleted after install, so its
-    # references resolve against the copies Arrow already brings: zstd from
-    # CLINK_ZSTD_LIBRARY when clink_core found one, and lz4 (and zstd otherwise) from
-    # Arrow's bundled-dependencies archive. Every library is a raw path. No
+    # references resolve against a copy the rest of the link already carries. The
+    # link line offers zstd from CLINK_ZSTD_LIBRARY when clink_core found one, and
+    # lz4 (and zstd otherwise) from Arrow's bundled-dependencies archive, so a
+    # definition always exists; which archive supplies it is whichever comes first
+    # on the final link line. In the Linux wheel that is the static librdkafka,
+    # ahead of Arrow's archive, as the wheel's link map shows. Every library is a
+    # raw path. No
     # absl::int128 target is created here: a later find_package(absl) (protobuf,
     # gRPC) would fail on the name already being taken.
     set(_ch_pinned_int128 "${_ch_pinned_dir}/lib/libabsl_int128.a")
@@ -96,8 +105,9 @@ if(_ch_pinned_dir AND _ch_bundled)
         endif()
     endif()
     if(NOT _ch_arrow_bundled)
-        message(FATAL_ERROR "clink::clickhouse - the bundled-deps client takes lz4 from "
-                            "Arrow's bundled-dependencies archive, and this Arrow has none "
+        message(FATAL_ERROR "clink::clickhouse - the bundled-deps client needs Arrow's "
+                            "bundled-dependencies archive on its link line as the lz4 "
+                            "provider of last resort, and this Arrow has none "
                             "(a static Arrow built with ARROW_DEPENDENCY_SOURCE=BUNDLED)")
     endif()
     set(_ch_pinned_lz4 "${_ch_arrow_bundled}")
@@ -292,7 +302,6 @@ if(_ch_native)
     set(CMAKE_REQUIRED_INCLUDES "${_ch_include_dir}")
     set(CMAKE_REQUIRED_LIBRARIES ${_ch_check_libs})
     set(CMAKE_REQUIRED_FLAGS "-std=c++20")
-    unset(CLINK_CLICKHOUSE_SSL_FACTORY_LINKS CACHE)
     check_cxx_source_compiles("
 #include \"${CMAKE_CURRENT_SOURCE_DIR}/src/native/vendor/clickhouse/base/sslsocket.h\"
 #include <clickhouse/client.h>

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**The Linux wheels carry the ClickHouse connector.** The Linux pyclink wheels
+(manylinux_2_28, x86_64 and aarch64) carry the ClickHouse connector, including
+the native sink with TLS, built against the same static OpenSSL as the Kafka
+client. With `secure='true'` and no CA named, a wheel trusts `SSL_CERT_FILE` or
+`SSL_CERT_DIR`, or, where its OpenSSL's own default locations are missing
+(AlmaLinux 8, or Debian and Ubuntu without the `openssl` package), the
+distribution's CA bundle. The wheels workflow runs a live TLS round trip on
+both architectures, including inside `almalinux:8` and `debian:bookworm-slim`
+with no CA configured, and a tag publishes no wheel unless they pass. The wheel
+gate now also fails on a dynamic export outside `clink_*`, on more than one
+OpenSSL, and on lz4 taken from more than one archive or from the ClickHouse
+client's.
+
 **A windowed aggregate in front of a blackhole or native ClickHouse sink emits
 columnar output.** The planner now counts the column binding in front of every
 SQL sink as a columnar consumer when every sink it feeds takes a columnar batch

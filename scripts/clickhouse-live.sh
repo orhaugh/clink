@@ -15,7 +15,8 @@
 #     replica down;
 #   - on 26.8 only, a server with the native port over TLS, for which this
 #     script generates a CA, a server certificate for localhost and a second,
-#     unrelated CA into a temporary directory: ClickHouseNativeLiveTls.*.
+#     unrelated CA into a temporary directory (scripts/make-clickhouse-test-tls.sh):
+#     ClickHouseNativeLiveTls.*.
 # Then the 25.3 server, for the legacy sink's round trip
 # (ClickHouseLegacySqlLive.* only). A failing case fails the run; every service
 # started is stopped and removed, with its data volume, as soon as its profile
@@ -110,24 +111,11 @@ run() {
 }
 
 # A CA, a server certificate it signs for localhost and 127.0.0.1, and a second
-# CA that signs nothing here. The key is world-readable because the server
-# runs as its own user inside the container; it protects nothing but this run.
+# CA that signs nothing here (scripts/make-clickhouse-test-tls.sh, which the wheels
+# workflow uses too).
 make_tls() {
     tls_dir="$(mktemp -d "${CLICKHOUSE_LIVE_TMPDIR:-${TMPDIR:-/tmp}}/clink-clickhouse-tls.XXXXXX")"
-    (
-        cd "${tls_dir}"
-        openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=clink live test CA" \
-            -keyout ca.key -out ca.crt 2>/dev/null
-        openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=clink unrelated CA" \
-            -keyout wrong-ca.key -out wrong-ca.crt 2>/dev/null
-        openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
-            -keyout server.key -out server.csr 2>/dev/null
-        printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' >server.ext
-        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 \
-            -extfile server.ext -out server.crt 2>/dev/null
-        chmod 0755 .
-        chmod 0644 ./*.crt server.key
-    )
+    "${ROOT}/scripts/make-clickhouse-test-tls.sh" "${tls_dir}"
 }
 
 for line in ${CLICKHOUSE_LINES}; do

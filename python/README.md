@@ -21,13 +21,28 @@ publishing, from v0.9.1. The wheels are built by
 
 - macOS arm64 (`macosx_14_0_arm64`), without connectors.
 - Linux x86_64 and aarch64 (`manylinux_2_28`), with the Kafka connector.
-  They install on any glibc 2.28 or later distribution (AlmaLinux 8,
-  Debian 10+, Ubuntu 20.04+) and need nothing beyond the C and C++ runtime.
+  From the release after v0.10.0 they also carry the ClickHouse connector,
+  its native sink (`insert_format='native'`) and that sink's TLS; v0.10.0
+  and earlier have no ClickHouse connector. They install on any glibc 2.28
+  or later distribution (AlmaLinux 8, Debian 10+, Ubuntu 20.04+) and need
+  nothing beyond the C and C++ runtime.
 
-None of the wheels has the object-store filesystems or HTTPS, and the Linux
-Kafka connector leaves out GSSAPI and the Schema Registry formats; build
-from source (below) for those, or on a platform without a wheel. There is no
-Windows wheel.
+None of the wheels has the object-store filesystems, and none serves or
+fetches HTTPS through clink's HTTP subsystem (the REST and diagnostic
+endpoints). Kafka TLS and SASL and ClickHouse TLS are separate: both use one
+OpenSSL linked into the Linux wheels' library. The Linux Kafka connector leaves
+out GSSAPI and the Schema Registry formats. Build from source (below) for
+those, or on a platform without a wheel. There is no Windows wheel.
+
+In the wheels that carry it, the ClickHouse sink with `secure='true'` and no
+`tls_ca_file` or `tls_ca_dir` trusts `SSL_CERT_FILE` and `SSL_CERT_DIR` when
+they are set, and otherwise the distribution's CA bundle: the wheel's OpenSSL looks in `/usr/lib/ssl`, and
+where that is missing (AlmaLinux 8, or Debian and Ubuntu without the `openssl`
+package) the sink takes the first bundle it finds among the standard locations,
+`/etc/pki/tls/certs/ca-bundle.crt` and `/etc/ssl/certs/ca-certificates.crt`
+among them, and names it in its open log line. A slim image may need the
+`ca-certificates` package for a publicly signed server. See the
+[ClickHouse connector](https://orhaugh.github.io/clink/connectors/clickhouse/#tls-and-failover).
 
 ## Build from source
 
