@@ -1587,14 +1587,9 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
     const auto barrier_mode = msg.barrier_mode_plus1 == 2 ? CheckpointBarrier::Mode::Unaligned
                                                           : CheckpointBarrier::Mode::Aligned;
     CheckpointBarrier barrier(CheckpointId{msg.checkpoint_id}, barrier_mode);
-    for (auto& fn : to_invoke) {
-        try {
-            fn(barrier);
-        } catch (...) {
-            // Best-effort: if a barrier injection fails the coordinator's ack
-            // timeout will surface the missed subtask.
-        }
-    }
+    // Traced before the injection, not after: an injected barrier can reach a
+    // sink and be prepared before this thread runs again, and the trace must
+    // show the delivery ahead of the prepare it causes.
     if (protocol_trace::enabled()) {
         protocol_trace::Event("DeliverBarrier")
             .u("job", msg.job_id)
@@ -1603,6 +1598,14 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
             .s("worker", worker_id_)
             .b("fenced", false)
             .emit();
+    }
+    for (auto& fn : to_invoke) {
+        try {
+            fn(barrier);
+        } catch (...) {
+            // Best-effort: if a barrier injection fails the coordinator's ack
+            // timeout will surface the missed subtask.
+        }
     }
     CLINK_FAULT_POINT(clink::fault::points::kWorkerAfterTriggerDelivered);
 }
@@ -2503,13 +2506,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                         continue;
                     }
                     CheckpointBarrier barrier(CheckpointId{ckpt_id});
-                    for (auto& fn : snapshot) {
-                        try {
-                            fn(barrier);
-                        } catch (...) {
-                            // Best-effort.
-                        }
-                    }
+                    // Traced before the injection, as in handle_trigger_checkpoint_.
                     if (protocol_trace::enabled()) {
                         protocol_trace::Event("DeliverBarrier")
                             .u("job", job_id)
@@ -2518,6 +2515,13 @@ void Worker::run_generic_subtask_(JobId job_id,
                             .s("worker", worker_id_)
                             .b("fenced", false)
                             .emit();
+                    }
+                    for (auto& fn : snapshot) {
+                        try {
+                            fn(barrier);
+                        } catch (...) {
+                            // Best-effort.
+                        }
                     }
                 }
             };
