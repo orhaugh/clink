@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**The native ClickHouse sink finds the system's trusted CAs where the OpenSSL
+it was built with looks elsewhere, as the Kafka connector already does.** With
+`secure='true'` and no `tls_ca_file` or `tls_ca_dir`, the sink trusts the
+default CA locations of its OpenSSL. A static OpenSSL compiled for one layout,
+as the Linux wheels link, can look where another distribution keeps no CAs.
+When OpenSSL's default file and directory are both missing and neither
+`SSL_CERT_FILE` nor `SSL_CERT_DIR` is set, the sink now also trusts the first
+standard CA bundle or directory it finds, in the order the Kafka connector
+probes them, and the open line names it (`tls=on (system CAs from <path>)`).
+A named CA is still the only one trusted. The runtime image and host builds
+find OpenSSL's defaults and are unchanged.
+
 **A checkpoint no longer stalls when an input's close completes a barrier's
 alignment.** In a union, join, broadcast, co-operator, fan-in sink or
 operator fed by several subtasks, when the other inputs had delivered a

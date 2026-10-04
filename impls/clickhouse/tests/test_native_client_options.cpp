@@ -3,9 +3,11 @@
 // native protocol (the Hello exchange, a header block, a result block and
 // EndOfStream) to put a real ::clickhouse::Client mid-INSERT without a server.
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -36,6 +38,7 @@
 #include <sys/socket.h>
 
 #include "native/clickhouse_transport.hpp"
+#include "native/default_ca.hpp"
 #include "native/errors.hpp"
 #include "native/insert_transport.hpp"
 #include "native/sink_options.hpp"
@@ -44,11 +47,15 @@ namespace {
 
 using namespace std::chrono_literals;
 namespace native = clink::clickhouse::native;
+using native::CaEnvironment;
+using native::CaLocation;
 using native::Compression;
 using native::Endpoint;
+using native::fallback_ca_location;
 using native::make_clickhouse_transport;
 using native::make_client_options;
 using native::NativeSinkError;
+using native::PathKind;
 using native::SinkOptions;
 using CoClock = std::chrono::steady_clock;
 
@@ -568,6 +575,135 @@ TEST(NativeClientOptions, MapsEachCompressionToTheClientsMethod) {
               ::clickhouse::CompressionMethod::None);
 }
 
+// --- the CA fallback ---
+
+native::TlsOptions verified_tls() {
+    native::TlsOptions tls;
+    tls.enabled = true;
+    tls.verify = true;
+    return tls;
+}
+
+// OpenSSL compiled to look under /usr/local/ssl, as a static OpenSSL built
+// elsewhere does.
+CaEnvironment foreign_openssl() {
+    CaEnvironment env;
+    env.default_cert_file = "/usr/local/ssl/cert.pem";
+    env.default_cert_dir = "/usr/local/ssl/certs";
+    return env;
+}
+
+// A filesystem holding exactly `present`.
+std::function<PathKind(const std::string&)> filesystem_of(
+    std::vector<std::pair<std::string, PathKind>> present) {
+    return [present = std::move(present)](const std::string& path) {
+        for (const auto& [p, kind] : present) {
+            if (p == path) {
+                return kind;
+            }
+        }
+        return PathKind::Missing;
+    };
+}
+
+TEST(NativeCaFallback, ProbesInTheKafkaClientsOrder) {
+    const auto& locations = native::standard_ca_locations();
+    ASSERT_GE(locations.size(), 11U);
+    EXPECT_EQ(locations.front(), "/etc/pki/tls/certs/ca-bundle.crt");
+    const auto at = [&](const std::string& path) {
+        return std::find(locations.begin(), locations.end(), path) - locations.begin();
+    };
+    // The Debian bundle comes before the Debian directory it is built from.
+    EXPECT_LT(at("/etc/ssl/certs/ca-certificates.crt"), at("/etc/ssl/certs"));
+    EXPECT_LT(at("/etc/ssl/certs"), static_cast<std::ptrdiff_t>(locations.size()));
+}
+
+TEST(NativeCaFallback, TakesTheFirstStandardLocationThatExists) {
+    // AlmaLinux 8: the RHEL bundle, and OpenSSL's own directory is absent.
+    const auto alma = fallback_ca_location(
+        verified_tls(),
+        foreign_openssl(),
+        filesystem_of({{"/etc/pki/tls/certs/ca-bundle.crt", PathKind::File},
+                       {"/etc/ssl/certs/ca-certificates.crt", PathKind::File}}));
+    ASSERT_TRUE(alma.has_value());
+    EXPECT_EQ(alma->path, "/etc/pki/tls/certs/ca-bundle.crt");
+    EXPECT_FALSE(alma->directory);
+
+    // Debian without the openssl package: the bundle ca-certificates writes.
+    const auto debian =
+        fallback_ca_location(verified_tls(),
+                             foreign_openssl(),
+                             filesystem_of({{"/etc/ssl/certs/ca-certificates.crt", PathKind::File},
+                                            {"/etc/ssl/certs", PathKind::Directory}}));
+    ASSERT_TRUE(debian.has_value());
+    EXPECT_EQ(debian->path, "/etc/ssl/certs/ca-certificates.crt");
+    EXPECT_FALSE(debian->directory);
+}
+
+TEST(NativeCaFallback, ReportsADirectoryAsOne) {
+    const auto dir = fallback_ca_location(verified_tls(),
+                                          foreign_openssl(),
+                                          filesystem_of({{"/etc/ssl/certs", PathKind::Directory}}));
+    ASSERT_TRUE(dir.has_value());
+    EXPECT_EQ(dir->path, "/etc/ssl/certs");
+    EXPECT_TRUE(dir->directory);
+}
+
+TEST(NativeCaFallback, NoneWhenNothingExists) {
+    EXPECT_FALSE(
+        fallback_ca_location(verified_tls(), foreign_openssl(), filesystem_of({})).has_value());
+}
+
+TEST(NativeCaFallback, NoneWhenOpenSslsOwnDefaultsExist) {
+    const auto bundle = std::pair{std::string("/etc/pki/tls/certs/ca-bundle.crt"), PathKind::File};
+    EXPECT_FALSE(
+        fallback_ca_location(verified_tls(),
+                             foreign_openssl(),
+                             filesystem_of({{"/usr/local/ssl/cert.pem", PathKind::File}, bundle}))
+            .has_value());
+    EXPECT_FALSE(
+        fallback_ca_location(verified_tls(),
+                             foreign_openssl(),
+                             filesystem_of({{"/usr/local/ssl/certs", PathKind::Directory}, bundle}))
+            .has_value());
+}
+
+TEST(NativeCaFallback, NoneWhenTheEnvironmentNamesTheStore) {
+    const auto fs = filesystem_of({{"/etc/pki/tls/certs/ca-bundle.crt", PathKind::File}});
+    CaEnvironment file_env = foreign_openssl();
+    file_env.cert_file_env = "/opt/ca.pem";
+    EXPECT_FALSE(fallback_ca_location(verified_tls(), file_env, fs).has_value());
+
+    CaEnvironment dir_env = foreign_openssl();
+    dir_env.cert_dir_env = "/opt/ca.d";
+    EXPECT_FALSE(fallback_ca_location(verified_tls(), dir_env, fs).has_value());
+
+    // Set to nothing reads as unset.
+    CaEnvironment empty_env = foreign_openssl();
+    empty_env.cert_file_env = "";
+    empty_env.cert_dir_env = "";
+    EXPECT_TRUE(fallback_ca_location(verified_tls(), empty_env, fs).has_value());
+}
+
+TEST(NativeCaFallback, NoneWhenACaIsNamedOrNothingIsVerified) {
+    const auto fs = filesystem_of({{"/etc/pki/tls/certs/ca-bundle.crt", PathKind::File}});
+    native::TlsOptions file = verified_tls();
+    file.ca_file = "/etc/clink/ca.pem";
+    EXPECT_FALSE(fallback_ca_location(file, foreign_openssl(), fs).has_value());
+
+    native::TlsOptions dir = verified_tls();
+    dir.ca_dir = "/etc/clink/ca.d";
+    EXPECT_FALSE(fallback_ca_location(dir, foreign_openssl(), fs).has_value());
+
+    native::TlsOptions unverified = verified_tls();
+    unverified.verify = false;
+    EXPECT_FALSE(fallback_ca_location(unverified, foreign_openssl(), fs).has_value());
+
+    native::TlsOptions off = verified_tls();
+    off.enabled = false;
+    EXPECT_FALSE(fallback_ca_location(off, foreign_openssl(), fs).has_value());
+}
+
 TEST(NativeClientOptions, LeavesTlsOffUnlessSecure) {
     const auto opts = make_client_options(co_options(), Endpoint{"ch", 9000});
     EXPECT_FALSE(opts.ssl_options.has_value());
@@ -631,6 +767,36 @@ TEST(NativeClientOptions, TurnsOffTheDefaultCaLocationsExactlyWhenACaIsNamed) {
         EXPECT_EQ(opts.ssl_options->use_default_ca_locations, c.defaults)
             << "file='" << c.file << "' dir='" << c.dir << "'";
     }
+}
+
+TEST(NativeClientOptions, AddsTheFallbackCaAndKeepsTheDefaults) {
+    SinkOptions o = co_options();
+    o.tls.enabled = true;
+    const auto file = make_client_options(
+        o, Endpoint{"ch", 9440}, CaLocation{"/etc/pki/tls/certs/ca-bundle.crt", false});
+    ASSERT_TRUE(file.ssl_options.has_value());
+    EXPECT_EQ(file.ssl_options->path_to_ca_files,
+              std::vector<std::string>{"/etc/pki/tls/certs/ca-bundle.crt"});
+    EXPECT_TRUE(file.ssl_options->path_to_ca_directory.empty());
+    EXPECT_TRUE(file.ssl_options->use_default_ca_locations);
+
+    const auto dir =
+        make_client_options(o, Endpoint{"ch", 9440}, CaLocation{"/etc/ssl/certs", true});
+    ASSERT_TRUE(dir.ssl_options.has_value());
+    EXPECT_TRUE(dir.ssl_options->path_to_ca_files.empty());
+    EXPECT_EQ(dir.ssl_options->path_to_ca_directory, "/etc/ssl/certs");
+    EXPECT_TRUE(dir.ssl_options->use_default_ca_locations);
+}
+
+TEST(NativeClientOptions, ANamedCaStillTheOnlyOneTrustedWithAFallbackOffered) {
+    SinkOptions o = co_options();
+    o.tls.enabled = true;
+    o.tls.ca_file = "/etc/clink/ca.pem";
+    const auto opts = make_client_options(
+        o, Endpoint{"ch", 9440}, CaLocation{"/etc/pki/tls/certs/ca-bundle.crt", false});
+    ASSERT_TRUE(opts.ssl_options.has_value());
+    EXPECT_EQ(opts.ssl_options->path_to_ca_files, std::vector<std::string>{"/etc/clink/ca.pem"});
+    EXPECT_FALSE(opts.ssl_options->use_default_ca_locations);
 }
 
 #else

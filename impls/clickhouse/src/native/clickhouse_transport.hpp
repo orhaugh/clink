@@ -12,6 +12,7 @@
 #include <clickhouse/client.h>
 
 #include "native/column_plan.hpp"
+#include "native/default_ca.hpp"
 #include "native/insert_transport.hpp"
 #include "native/sink_options.hpp"
 
@@ -27,8 +28,12 @@ class SocketControl;
 // these and from nothing else; exposed so that tests can check them field by
 // field. Refuses clickhouse.option_invalid for a timeout below 1 ms, and
 // clickhouse.tls_unavailable for secure='true' on a build without TLS.
-[[nodiscard]] ::clickhouse::ClientOptions make_client_options(const SinkOptions& options,
-                                                              const Endpoint& endpoint);
+// `fallback_ca`, from fallback_ca_location(), is trusted on top of the default
+// CA locations, which stay on.
+[[nodiscard]] ::clickhouse::ClientOptions make_client_options(
+    const SinkOptions& options,
+    const Endpoint& endpoint,
+    const std::optional<CaLocation>& fallback_ca = std::nullopt);
 
 // The header BeginInsert returned, in the client's type spelling.
 [[nodiscard]] std::vector<HeaderColumn> header_columns(const ::clickhouse::Block& header);
@@ -77,6 +82,9 @@ private:
     ::clickhouse::Client& client();
 
     const SinkOptions options_;
+    // Looked up once: the environment and the CA stores do not change under
+    // a running sink.
+    const std::optional<CaLocation> fallback_ca_;
     // Owning thread only.
     std::unique_ptr<::clickhouse::Client> client_;
     ServerIdentity server_;

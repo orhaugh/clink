@@ -159,7 +159,8 @@ std::string cell_text(const ::clickhouse::Column& column, std::size_t row) {
 }  // namespace
 
 ::clickhouse::ClientOptions make_client_options(const SinkOptions& options,
-                                                const Endpoint& endpoint) {
+                                                const Endpoint& endpoint,
+                                                const std::optional<CaLocation>& fallback_ca) {
     require_timeout(options.connect_timeout, "connect_timeout_ms");
     require_timeout(options.send_timeout, "send_timeout_ms");
     require_timeout(options.receive_timeout, "receive_timeout_ms");
@@ -195,9 +196,18 @@ std::string cell_text(const ::clickhouse::Column& column, std::size_t row) {
         // A named CA is the only one trusted: the system store would widen it.
         if (!options.tls.ca_file.empty() || !options.tls.ca_dir.empty()) {
             ssl.SetUseDefaultCALocations(false);
+        } else if (fallback_ca) {
+            // The linked OpenSSL looks where this system keeps no CAs (a
+            // static OpenSSL built elsewhere); the defaults stay on as well.
+            if (fallback_ca->directory) {
+                ssl.SetPathToCADirectory(fallback_ca->path);
+            } else {
+                ssl.SetPathToCAFiles({fallback_ca->path});
+            }
         }
         opts.SetSSLOptions(ssl);
 #else
+        (void)fallback_ca;
         refuse_tls_unavailable();
 #endif
     }
@@ -255,7 +265,8 @@ void append_result_block(const ::clickhouse::Block& block, ResultSet& out) {
     }
 }
 
-ClickHouseTransport::ClickHouseTransport(SinkOptions options) : options_(std::move(options)) {
+ClickHouseTransport::ClickHouseTransport(SinkOptions options)
+    : options_(std::move(options)), fallback_ca_(fallback_ca_location(options_.tls)) {
 #if !defined(CLINK_CLICKHOUSE_NATIVE_TLS)
     if (options_.tls.enabled) {
         refuse_tls_unavailable();
@@ -278,7 +289,7 @@ void ClickHouseTransport::connect(const Endpoint& endpoint) {
         }
     }
 
-    const ::clickhouse::ClientOptions opts = make_client_options(options_, endpoint);
+    const ::clickhouse::ClientOptions opts = make_client_options(options_, endpoint, fallback_ca_);
     if (options_.tls.enabled) {
         require_ca_path("tls_ca_dir", options_.tls.ca_dir, true);
         require_ca_path("tls_ca_file", options_.tls.ca_file, false);

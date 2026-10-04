@@ -235,6 +235,7 @@ if(_ch_native)
         src/native/arrow_to_block.cpp
         src/native/clickhouse_transport.cpp
         src/native/column_plan.cpp
+        src/native/default_ca.cpp
         src/native/error_class.cpp
         src/native/insert_transport.cpp
         src/native/native_sink.cpp

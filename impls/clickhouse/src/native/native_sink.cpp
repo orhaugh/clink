@@ -31,6 +31,7 @@
 
 #include "native/arrow_to_block.hpp"
 #include "native/column_plan.hpp"
+#include "native/default_ca.hpp"
 #include "native/error_class.hpp"
 #include "native/errors.hpp"
 #include "native/metrics.hpp"
@@ -683,6 +684,10 @@ void NativeSink::Impl::report_open(const TargetInfo& target, const ColumnPlan& p
     line += " endpoint=" + endpoint_text(target.server.endpoint);
     line += " tls=";
     line += !options.tls.enabled ? "off" : (options.tls.verify ? "on" : "on (verify off)");
+    if (const auto fallback = fallback_ca_location(options.tls)) {
+        // The linked OpenSSL's own CA locations do not exist on this system.
+        line += " (system CAs from " + fallback->path + ")";
+    }
     line += " compression=";
     line += compression_name(options.compression);
     line += " dedup_setting=";
