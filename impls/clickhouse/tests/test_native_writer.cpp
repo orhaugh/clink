@@ -21,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -40,7 +41,9 @@
 #include "native/errors.hpp"
 #include "native/fault_points.hpp"
 #include "native/insert_transport.hpp"
+#include "native/intake.hpp"
 #include "native/metrics.hpp"
+#include "native/row_arrow.hpp"
 #include "native/sql_text.hpp"
 #include "native/statements.hpp"
 #include "native/target_table.hpp"
@@ -123,6 +126,38 @@ std::shared_ptr<arrow::RecordBatch> wr_id_rows(
     wr_ok(builder.Finish(&ids));
     return arrow::RecordBatch::Make(
         arrow::schema({arrow::field("id", arrow::int64())}), to - from, {ids});
+}
+
+// Rows [from, to) as the columnar intake takes them, each text `length` bytes
+// of one letter, allocated from `pool`, and the chunk the intake builds from
+// them for "id:BIGINT;s:VARCHAR", which takes the id and s arrays as they
+// are. `reused` gets the count of arrays it took.
+std::shared_ptr<arrow::RecordBatch> wr_reused_rows(std::int64_t from,
+                                                   std::int64_t to,
+                                                   std::size_t length,
+                                                   arrow::MemoryPool* pool,
+                                                   std::size_t& reused) {
+    arrow::Int64Builder times(pool);
+    arrow::Int64Builder ids(pool);
+    arrow::StringBuilder texts(pool);
+    for (std::int64_t id = from; id < to; ++id) {
+        wr_ok(times.AppendNull());
+        wr_ok(ids.Append(id));
+        wr_ok(texts.Append(std::string(length, static_cast<char>('a' + id % 26))));
+    }
+    const auto sidecar = arrow::RecordBatch::Make(
+        arrow::schema({arrow::field("event_time", arrow::int64()),
+                       arrow::field("id", arrow::int64()),
+                       arrow::field("s", arrow::utf8())}),
+        to - from,
+        {times.Finish().ValueOrDie(), ids.Finish().ValueOrDie(), texts.Finish().ValueOrDie()});
+    const auto columns = parse_sql_column_types("id:BIGINT;s:VARCHAR");
+    const RowArrowBuilder builder(columns);
+    const auto compiled = compile_intake(*sidecar->schema(), columns);
+    if (!std::holds_alternative<IntakePlan>(compiled)) {
+        throw std::runtime_error("the intake declined the test sidecar");
+    }
+    return builder.build_columnar(*sidecar, std::get<IntakePlan>(compiled), &reused);
 }
 
 // Rows [from, to), each text `length` bytes of one letter.
@@ -2339,6 +2374,47 @@ TEST(NativeWriterMemory, ManySmallChunksOfShortStringsKeepTheChargeWithinTheLimi
     rig.writer->finish();
 }
 
+// The same, with chunks whose strings the intake took from its input as they
+// are. Each INSERT retains them and closes at the charge limit as before; once
+// it lets go, they wait on the release list, still charged, until the task
+// thread's next call, so the peak also holds the copies the next INSERT makes
+// meanwhile: of the rest of the chunk in hand and of the one after it.
+TEST(NativeWriterMemory, ManySmallChunksOfReusedStringsCloseEachInsertAtTheChargeLimit) {
+    fake::ThreadRecordingPool pool;
+    WrRig rig;
+    ASSERT_TRUE(rig.plan.retains_chunks);
+    rig.options.batch_bytes = kWrMiB;
+    rig.start();
+    std::size_t chunk_size = 0;
+    for (std::int64_t from = 0; from < 200'000; from += 1000) {
+        std::size_t reused = 0;
+        Chunk c = rig.shared(wr_reused_rows(from, from + 1000, 1, &pool, reused));
+        ASSERT_EQ(reused, 2U);
+        chunk_size = std::max(chunk_size, c.bytes);
+        // As the sink does at each call.
+        rig.writer->drain_released();
+        rig.writer->submit(std::move(c));
+        ASSERT_TRUE(wr_eventually([&] { return rig.writer->queue_bytes() == 0; }));
+    }
+    rig.writer->flush(1);
+    // A chunk's copies own about twice its bytes: an id and a 16-byte view a
+    // row against an id, an offset and one byte of text.
+    EXPECT_LE(rig.budget->usage().peak, 2 * rig.options.batch_bytes + 8 * chunk_size);
+    const auto all = rig.committed();
+    EXPECT_GT(all.size(), 2U);
+    for (const auto& insert : all) {
+        // The payload of 100000 rows would fill batch_bytes; the charge
+        // closes each INSERT long before that.
+        EXPECT_LT(wr_rows_of(insert), 70'000U);
+    }
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 200'000));
+    rig.writer->drain_released();
+    EXPECT_EQ(pool.frees_elsewhere(), 0U) << "a reused array was freed off the task thread";
+    EXPECT_EQ(rig.queue_charge(), 0U);
+    rig.writer->finish();
+    EXPECT_EQ(pool.bytes_allocated(), 0);
+}
+
 // --- What the writer counts ---------------------------------------------------
 
 TEST(NativeWriterMetrics, RowsCountAsOutOnlyOnceTheServerAcknowledgesThem) {
@@ -2649,6 +2725,64 @@ TEST(NativeWriterRelease, AnAbortOnAnotherThreadLeavesTheQueuedSharedChunksToThe
     EXPECT_EQ(pool.bytes_allocated(), 0);
     EXPECT_EQ(pool.frees_elsewhere(), 0U);
 #endif
+}
+
+// A chunk with a String column is retained by every INSERT that points into
+// it, so the writer lets go of it only when the last of them is acknowledged.
+// It then goes to the release list like any other shared chunk.
+TEST(NativeWriterRelease, AChunkItsInsertRetainsIsHandedToTheTaskThreadWhenTheInsertLetsGo) {
+    fake::ThreadRecordingPool pool;
+    WrRig rig;
+    ASSERT_TRUE(rig.plan.retains_chunks);
+    rig.start();
+    std::size_t bytes = 0;
+    for (std::int64_t i = 0; i < 3; ++i) {
+        std::size_t reused = 0;
+        Chunk c = rig.shared(wr_reused_rows(i * 100, (i + 1) * 100, 20, &pool, reused));
+        ASSERT_EQ(reused, 2U);
+        bytes += c.bytes;
+        rig.writer->submit(std::move(c));
+    }
+    rig.writer->flush(1);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 300));
+    // One INSERT held all three; it is acknowledged and gone, and the chunks
+    // with it, but their arrays and their charge are not.
+    EXPECT_EQ(rig.committed().size(), 1U);
+    EXPECT_EQ(rig.queue_charge(), bytes);
+    EXPECT_GE(pool.bytes_allocated(), 300 * 20);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U);
+    rig.writer->drain_released();
+    EXPECT_EQ(rig.queue_charge(), 0U);
+    EXPECT_EQ(pool.bytes_allocated(), 0);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U);
+    EXPECT_GT(pool.frees_on_owner(), 0U);
+    rig.writer->finish();
+}
+
+// A memory-limit split gives each half its share of the parent's rows; the
+// halves, not the parent, then retain the chunk, and the last of them to be
+// acknowledged hands it to the task thread.
+TEST(NativeWriterRelease, ARetainedChunkOutlivesASplitAndIsStillFreedOnTheTaskThread) {
+    fake::ThreadRecordingPool pool;
+    WrRig rig;
+    rig.server->inject(wr_fault(
+        fake::Step::End, fake::Fault::Kind::ServerError, 241, "Memory limit (total) exceeded"));
+    rig.start();
+    std::size_t reused = 0;
+    Chunk c = rig.shared(wr_reused_rows(0, 4000, 8, &pool, reused));
+    ASSERT_EQ(reused, 2U);
+    const std::size_t bytes = c.bytes;
+    rig.writer->submit(std::move(c));
+    rig.writer->flush(1);
+    ASSERT_EQ(rig.inserts().size(), 3U);
+    EXPECT_EQ(wr_landed_ids(*rig.server), wr_range(0, 4000));
+    EXPECT_EQ(rig.queue_charge(), bytes);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U) << "a split half freed the chunk on the writer";
+    rig.writer->drain_released();
+    EXPECT_EQ(rig.queue_charge(), 0U);
+    EXPECT_EQ(pool.bytes_allocated(), 0);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U);
+    rig.writer->finish();
 }
 
 }  // namespace

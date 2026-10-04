@@ -911,13 +911,15 @@ std::shared_ptr<arrow::RecordBatch> RowArrowBuilder::build_columnar(const arrow:
         const int index = plan.source[k];
         const IntakeReuse reuse = plan.reuse.empty() ? IntakeReuse::None : plan.reuse[k];
         if (reuse != IntakeReuse::None && index >= 0 &&
-            owns_its_buffers(*batch.column_data(index))) {
-            // The per-cell path hands every value of these pairs on as it is
-            // and nulls only the null cells, so the array already is the
-            // column it would build; a retype only renames the layout of the
-            // same int64 or int32 values.
+            owns_its_buffers(*batch.column_data(index)) &&
+            passes_as_is(reuse, *batch.column(index))) {
+            // The per-cell path hands every value of these pairs on as it is,
+            // a text or decimal value once passes_as_is has held, and nulls
+            // only the null cells, so the array already is the column it
+            // would build; a retype only renames the layout of the same int64
+            // or int32 values.
             const std::shared_ptr<arrow::Array>& array = batch.column(index);
-            if (reuse == IntakeReuse::Same) {
+            if (reuse != IntakeReuse::Retype) {
                 arrays.push_back(array);
             } else {
                 std::shared_ptr<arrow::ArrayData> data = array->data()->Copy();

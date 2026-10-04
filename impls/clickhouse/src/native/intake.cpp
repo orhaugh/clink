@@ -3,6 +3,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "clink/config/decimal.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
 namespace clink::clickhouse::native {
@@ -30,8 +31,10 @@ bool carried(const arrow::DataType& type) {
 
 // The fast path for a sidecar array of `type` into a declared column of
 // `declared`: only the pairs whose per-cell conversion hands every value on
-// unchanged. int64 into INTEGER narrows and float into DOUBLE widens, so
-// both stay cell by cell.
+// unchanged, or every value that passes passes_as_is. int64 into INTEGER
+// narrows, float into DOUBLE widens and a decimal of another precision or
+// scale is rescaled or checked against another precision, so each stays cell
+// by cell.
 IntakeReuse reuse_for(const arrow::DataType& type, const SqlType& declared) {
     switch (type.id()) {
         case arrow::Type::INT64:
@@ -50,9 +53,48 @@ IntakeReuse reuse_for(const arrow::DataType& type, const SqlType& declared) {
             return declared.kind == SqlKind::Double ? IntakeReuse::Same : IntakeReuse::None;
         case arrow::Type::BOOL:
             return declared.kind == SqlKind::Boolean ? IntakeReuse::Same : IntakeReuse::None;
+        case arrow::Type::STRING:
+            return declared.kind == SqlKind::Varchar ? IntakeReuse::Text : IntakeReuse::None;
+        case arrow::Type::DECIMAL128: {
+            const auto& d = static_cast<const arrow::Decimal128Type&>(type);
+            return declared.kind == SqlKind::Decimal && declared.precision == d.precision() &&
+                           declared.scale == d.scale()
+                       ? IntakeReuse::Decimal
+                       : IntakeReuse::None;
+        }
         default:
             return IntakeReuse::None;
     }
+}
+
+bool no_sentinel_lead(const arrow::StringArray& array) {
+    const std::int64_t length = array.length();
+    if (length == 0) {
+        return true;
+    }
+    // Offsets and values as the slice sees them.
+    const std::int32_t* offsets = array.raw_value_offsets();
+    const std::uint8_t* values = array.raw_data();
+    const bool nulls = array.null_count() > 0;
+    for (std::int64_t i = 0; i < length; ++i) {
+        if (!(nulls && array.IsNull(i)) && offsets[i + 1] > offsets[i] &&
+            values[offsets[i]] == static_cast<std::uint8_t>(clink::config::kDecimalSentinel)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool fits_precision(const arrow::Decimal128Array& array) {
+    const int precision = static_cast<const arrow::Decimal128Type&>(*array.type()).precision();
+    const bool nulls = array.null_count() > 0;
+    for (std::int64_t i = 0; i < array.length(); ++i) {
+        if (!(nulls && array.IsNull(i)) &&
+            !arrow::Decimal128(array.GetValue(i)).FitsInPrecision(precision)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -120,6 +162,23 @@ bool owns_its_buffers(const arrow::ArrayData& data) {
         }
     }
     return !data.dictionary || owns_its_buffers(*data.dictionary);
+}
+
+bool passes_as_is(IntakeReuse reuse, const arrow::Array& array) {
+    switch (reuse) {
+        case IntakeReuse::Text:
+            return array.type_id() == arrow::Type::STRING &&
+                   no_sentinel_lead(static_cast<const arrow::StringArray&>(array));
+        case IntakeReuse::Decimal:
+            return array.type_id() == arrow::Type::DECIMAL128 &&
+                   fits_precision(static_cast<const arrow::Decimal128Array&>(array));
+        case IntakeReuse::Same:
+        case IntakeReuse::Retype:
+            return true;
+        case IntakeReuse::None:
+            break;
+    }
+    return false;
 }
 
 }  // namespace clink::clickhouse::native

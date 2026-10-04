@@ -44,7 +44,12 @@ boolean, timestamp and date columns are taken without copying when the batch's
 own builders made them; a column read from an Arrow IPC frame or imported
 through the C Data Interface is still converted, and a chunk that shares a
 column with its input stays charged to the memory budget until the task
-thread frees it. `CLINK_DISABLE_COLUMNAR=1` restores the
+thread frees it. Text columns into VARCHAR, and decimal columns into
+a DECIMAL of the same precision and scale, are taken without copying too: a
+text column when none of its values in the batch begins with the engine's
+decimal marker byte (`\x01`), a decimal column when every value fits its
+precision. A column that fails its condition is converted cell by cell for
+that batch, so the landed values are unchanged. `CLINK_DISABLE_COLUMNAR=1` restores the
 row path.
 
 **The column binding in front of every SQL sink no longer turns a columnar

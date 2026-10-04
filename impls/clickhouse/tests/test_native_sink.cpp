@@ -2314,6 +2314,169 @@ TEST(NativeSinkRelease, OnlyAChunkThatReusesTheInputsArraysIsHandedToTheTaskThre
 #endif
 }
 
+// A sidecar of id (int64), s (utf8, "t<id>") and d (decimal128(9, 2),
+// id + 0.25) rows [from, to), allocated from `pool`. With `unfit`, row `from`
+// has an s that begins with the decimal sentinel and a d of ten digits, so
+// neither column can be taken as it is.
+std::shared_ptr<arrow::RecordBatch> ns_text_sidecar(std::int64_t from,
+                                                    std::int64_t to,
+                                                    arrow::MemoryPool* pool,
+                                                    bool unfit = false) {
+    arrow::Int64Builder times(pool);
+    arrow::Int64Builder ids(pool);
+    arrow::StringBuilder texts(pool);
+    arrow::Decimal128Builder decimals(arrow::decimal128(9, 2), pool);
+    for (std::int64_t id = from; id < to; ++id) {
+        const bool odd = unfit && id == from;
+        EXPECT_TRUE(times.AppendNull().ok());
+        EXPECT_TRUE(ids.Append(id).ok());
+        EXPECT_TRUE(
+            texts.Append((odd ? std::string(1, '\x01') : std::string()) + "t" + std::to_string(id))
+                .ok());
+        EXPECT_TRUE(decimals.Append(arrow::Decimal128(odd ? 1'234'567'890 : id * 100 + 25)).ok());
+    }
+    return arrow::RecordBatch::Make(arrow::schema({arrow::field("event_time", arrow::int64()),
+                                                   arrow::field("id", arrow::int64()),
+                                                   arrow::field("s", arrow::utf8()),
+                                                   arrow::field("d", arrow::decimal128(9, 2))}),
+                                    to - from,
+                                    {times.Finish().ValueOrDie(),
+                                     ids.Finish().ValueOrDie(),
+                                     texts.Finish().ValueOrDie(),
+                                     decimals.Finish().ValueOrDie()});
+}
+
+fake::FakeTable ns_text_table() {
+    fake::FakeTable table = ns_table();
+    table.columns = {{"id", "Int64", DefaultKind::None, 1},
+                     {"s", "String", DefaultKind::None, 2},
+                     {"d", "Nullable(Decimal(9, 2))", DefaultKind::None, 3}};
+    return table;
+}
+
+// The same, for a chunk whose text and decimal columns are reused: the
+// INSERT retains it, since its String column points into the chunk, and lets
+// go of it once acknowledged. One INSERT a batch, so the writer lets go of
+// each chunk while the next batch is still to come.
+TEST(NativeSinkRelease, AChunkThatReusesTextAndDecimalsIsRetainedAndStillFreedOnTheTaskThread) {
+#if !defined(CLINK_FAULT_INJECTION)
+    GTEST_SKIP() << "needs the fault points compiled in";
+#else
+    fake::ThreadRecordingPool pool;
+    NsDirect direct(ns_text_table());
+    constexpr std::int64_t kBatches = 8;
+    constexpr std::int64_t kRows = 40;
+    direct.params["sql_column_types"] = "id:BIGINT;s:VARCHAR;d:DECIMAL(9, 2)";
+    direct.params["batch_rows"] = std::to_string(kRows);
+    NativeSink& sink = direct.open();
+    const clink::fault::ScopedFault held(clink::fault::Rule{
+        .point = points::kBeforeSharedChunkRelease,
+        .ordinal = 0,
+        .action = clink::fault::Action::Block,
+    });
+    std::size_t text_bytes = 0;
+    for (std::int64_t b = 0; b < kBatches; ++b) {
+        auto sidecar = ns_text_sidecar(b * kRows, (b + 1) * kRows, &pool);
+        {
+            const Batch<sql::Row> batch{
+                sidecar, static_cast<std::size_t>(kRows), sql::row_materialize_fn()};
+            ASSERT_TRUE(sink.on_data_columnar(batch));
+        }
+        // The INSERT has been acknowledged and the writer is parked at the
+        // point with the chunk, so the drop below comes first.
+        ASSERT_TRUE(ns_eventually([b] {
+            return clink::fault::Registry::instance().hits(points::kBeforeSharedChunkRelease) ==
+                   static_cast<std::uint64_t>(b + 1);
+        }));
+        const auto& texts = static_cast<const arrow::StringArray&>(*sidecar->column(2));
+        text_bytes += static_cast<std::size_t>(texts.total_values_length());
+        // The sidecar has no nulls, so these are the only buffers the three
+        // reused columns keep: the id values, the text offsets and values,
+        // and the decimal values.
+        const auto capacity = [&](int column, int buffer) {
+            return sidecar->column(column)->data()->buffers[buffer]->capacity();
+        };
+        for (int column = 1; column <= 3; ++column) {
+            ASSERT_EQ(sidecar->column(column)->data()->buffers[0], nullptr);
+        }
+        const std::int64_t reused =
+            capacity(1, 1) + capacity(2, 1) + capacity(2, 2) + capacity(3, 1);
+        sidecar.reset();
+        // The chunk still holds the three reused columns: without the text,
+        // the pool would hold only the id and decimal buffers.
+        EXPECT_GE(pool.bytes_allocated(), reused);
+        EXPECT_EQ(pool.frees_elsewhere(), 0U);
+        clink::fault::Registry::instance().release(points::kBeforeSharedChunkRelease);
+    }
+    sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    sink.flush();
+    sink.close();
+    const std::int64_t n = kBatches * kRows;
+    EXPECT_GT(text_bytes, 0U);
+    EXPECT_EQ(pool.bytes_allocated(), 0);
+    EXPECT_EQ(pool.frees_elsewhere(), 0U) << "a reused array was freed off the task thread";
+    EXPECT_GT(pool.frees_on_owner(), 0U);
+    EXPECT_TRUE(ns_each_landed(*direct.server, 0, n));
+    EXPECT_EQ(direct.server->inserts(kNsTable).size(), static_cast<std::size_t>(kBatches));
+    for (const auto& block : direct.server->landed(kNsTable)) {
+        for (const auto& row : block.values) {
+            EXPECT_EQ(row.at(1), "t" + row.at(0));
+            EXPECT_EQ(row.at(2), row.at(0) + ".25");
+        }
+    }
+#endif
+}
+
+// A batch whose text holds a value that begins with the decimal sentinel, and
+// whose decimal holds one past its precision, is converted cell by cell like
+// any batch the intake does not reuse: the sentinel is stripped, the decimal
+// is NULL, and the chunk shares nothing with the input, so it never reaches
+// the release path. Its neighbour, without either value, does.
+TEST(NativeSinkRelease, ATextOrDecimalThatCannotPassAsItIsIsCopiedAndNotHandedOver) {
+#if !defined(CLINK_FAULT_INJECTION)
+    GTEST_SKIP() << "needs the fault points compiled in";
+#else
+    fake::FakeTable table = ns_text_table();
+    table.columns = {{"s", "String", DefaultKind::None, 1},
+                     {"d", "Nullable(Decimal(9, 2))", DefaultKind::None, 2}};
+    NsDirect direct(table);
+    direct.params["sql_column_types"] = "s:VARCHAR;d:DECIMAL(9, 2)";
+    NativeSink& sink = direct.open();
+    const clink::fault::ScopedFault observed(clink::fault::Rule{
+        .point = points::kBeforeSharedChunkRelease,
+        .ordinal = 0,
+        .action = clink::fault::Action::Observe,
+    });
+    const auto hits = [] {
+        return clink::fault::Registry::instance().hits(points::kBeforeSharedChunkRelease);
+    };
+    const auto unfit = ns_text_sidecar(0, 10, arrow::default_memory_pool(), true);
+    ASSERT_TRUE(sink.on_data_columnar(
+        Batch<sql::Row>{unfit, static_cast<std::size_t>(10), sql::row_materialize_fn()}));
+    sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    EXPECT_EQ(hits(), 0U);
+    const auto fit = ns_text_sidecar(10, 20, arrow::default_memory_pool());
+    ASSERT_TRUE(sink.on_data_columnar(
+        Batch<sql::Row>{fit, static_cast<std::size_t>(10), sql::row_materialize_fn()}));
+    sink.on_barrier(CheckpointBarrier{CheckpointId{2}});
+    EXPECT_EQ(hits(), 1U);
+    sink.flush();
+    sink.close();
+    EXPECT_EQ(hits(), 1U);
+    std::map<std::string, std::string> landed;
+    for (const auto& block : direct.server->landed(kNsTable)) {
+        for (const auto& row : block.values) {
+            landed[row.at(0)] = row.at(1);
+        }
+    }
+    ASSERT_EQ(landed.size(), 20U);
+    EXPECT_EQ(landed.at("t0"), "NULL");
+    EXPECT_EQ(landed.at("t1"), "1.25");
+    EXPECT_EQ(landed.at("t10"), "10.25");
+    EXPECT_EQ(landed.at("t19"), "19.25");
+#endif
+}
+
 // --- The at-least-once contract across a crash ---------------------------------------
 
 // Drives the Sink calls directly, as a restarted subtask would see them: data,

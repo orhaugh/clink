@@ -30,7 +30,8 @@ enum class IntakeDecline : std::uint8_t {
 // How a declared column may take its sidecar array without converting it
 // cell by cell. Each yields the chunk the per-cell path builds from the same
 // array, and is taken only for an array whose buffers are all owned pool
-// allocations (owns_its_buffers); any other array goes cell by cell.
+// allocations (owns_its_buffers) and whose values pass its condition
+// (passes_as_is); any other array goes cell by cell.
 enum class IntakeReuse : std::uint8_t {
     // Cell by cell.
     None,
@@ -40,6 +41,13 @@ enum class IntakeReuse : std::uint8_t {
     // The array's buffers under the declared column's type: int64 into
     // TIMESTAMP(p) [WITH TIME ZONE], int32 into DATE.
     Retype,
+    // The array itself, utf8 into VARCHAR, when no value begins with the
+    // decimal sentinel, which the per-cell path strips.
+    Text,
+    // The array itself, decimal128(p, s) into DECIMAL(p, s), when every value
+    // fits p digits; the per-cell path nulls one that does not, and the
+    // columnar JSON decode stores such values unchecked.
+    Decimal,
 };
 
 // Where each declared column's cells come from in one sidecar schema.
@@ -70,5 +78,12 @@ using IntakeResult = std::variant<IntakePlan, IntakeDecline>;
 // imported through the C Data Interface has none but keeps the whole exported
 // structure alive, and is immutable. Neither is reused.
 [[nodiscard]] bool owns_its_buffers(const arrow::ArrayData& data);
+
+// True when the per-cell path would hand on every value of `array`, which
+// the plan marks `reuse`, unchanged: always for Same and Retype; for Text,
+// when no non-null value begins with the decimal sentinel; for Decimal, when
+// every non-null value fits the array's precision. Reads only the array's own
+// slice, one byte or one value a row; a null cell's slot is not read.
+[[nodiscard]] bool passes_as_is(IntakeReuse reuse, const arrow::Array& array);
 
 }  // namespace clink::clickhouse::native

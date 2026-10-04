@@ -69,8 +69,10 @@
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/json_string_to_row_columnar.hpp"
 #include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/script_runner.hpp"
 #include "clink/test/test_cluster.hpp"
@@ -79,8 +81,11 @@
 #include "native/clickhouse_transport.hpp"
 #include "native/column_plan.hpp"
 #include "native/insert_transport.hpp"
+#include "native/intake.hpp"
 #include "native/native_sink.hpp"
+#include "native/row_arrow.hpp"
 #include "native/sink_options.hpp"
+#include "native/types.hpp"
 #include "tutorial_clickhouse_init.hpp"
 
 namespace {
@@ -2893,6 +2898,116 @@ TEST_F(ClickHouseNativeSqlLive, TheTutorialsTableTakesTheNativeSink) {
     EXPECT_EQ(scalar("SELECT toString(count()) FROM " + table + " WHERE sensor_id = 'sensor-over'"),
               "0")
         << "the over-range row landed on " << line_;
+}
+
+// --- The columnar JSON decode into the intake's fast paths ---------------------
+
+// One batch of `lines` through the columnar JSON decode, the Kafka default.
+clink::StreamElement<clink::sql::Row> decode_columnar(
+    const std::vector<clink::sql::RowColumn>& schema, const std::vector<std::string>& lines) {
+    clink::sql::JsonStringToRowColumnarOperator op(schema);
+    clink::Batch<std::string> in;
+    for (const auto& line : lines) {
+        in.emplace(std::string(line));
+    }
+    clink::BoundedChannel<clink::StreamElement<clink::sql::Row>> channel(4);
+    clink::Emitter<clink::sql::Row> out(&channel);
+    op.process(clink::StreamElement<std::string>::data(std::move(in)), out);
+    auto element = channel.try_pop();
+    if (!element || !element->is_data()) {
+        throw std::runtime_error("the columnar decode emitted no batch");
+    }
+    return std::move(*element);
+}
+
+// Whether every non-null value of a decimal128 array fits its precision.
+bool decimals_fit(const arrow::Array& array) {
+    const auto& d = static_cast<const arrow::Decimal128Array&>(array);
+    const int precision = static_cast<const arrow::Decimal128Type&>(*array.type()).precision();
+    for (std::int64_t i = 0; i < array.length(); ++i) {
+        if (!array.IsNull(i) && !arrow::Decimal128(d.GetValue(i)).FitsInPrecision(precision)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The columnar decode stores a decimal at the declared scale without checking
+// its precision, so a value with too many digits, or one that rounding at the
+// scale carries past them, reaches the sink as it was written; the cell rule
+// nulls it. The intake takes the decode's text and decimal columns as they are
+// exactly when no value would be changed, and lands the same chunk as the cell
+// path and as the rows the batch materialises to, across random batches, nulls
+// and slices.
+TEST(ClickHouseNativeSql, TheColumnarDecodesTextAndDecimalsAreReusedOnlyWhenEveryValuePasses) {
+    const std::vector<clink::sql::RowColumn> schema = {
+        {"s", arrow::utf8()}, {"d", arrow::decimal128(5, 2)}, {"e", arrow::decimal128(12, 4)}};
+    const auto declared =
+        native::parse_sql_column_types("s:VARCHAR;d:DECIMAL(5, 2);e:DECIMAL(12, 4)");
+    const native::RowArrowBuilder builder(declared);
+    const std::vector<std::string> texts = {
+        "", "plain", "été", "with \"quotes\"", "x\u0001y", "12.50", std::string(200, 'w')};
+    // Fit DECIMAL(5, 2), or not: too many digits, or carried past them by the
+    // half-up rounding at scale 2.
+    const std::vector<std::string> fitting = {"0", "999.99", "-999.99", "12.5", "0.004", "1"};
+    const std::vector<std::string> over = {"123456.78", "999.995", "-1000", "99999999999"};
+    std::mt19937_64 rng(20261007);
+    const auto pick = [&rng](std::size_t n) { return static_cast<std::size_t>(rng() % n); };
+    std::size_t over_batches = 0;
+    std::size_t reused_decimals = 0;
+    for (int round = 0; round < 30; ++round) {
+        const bool failing = round % 2 == 1;
+        std::vector<std::string> lines;
+        for (int i = 0; i < 64; ++i) {
+            // Written as text, so each numeral reaches the decode as the token
+            // shown here.
+            const std::string text =
+                pick(6) == 0 ? "null" : JsonValue{texts[pick(texts.size())]}.serialize(0);
+            std::string decimal = "null";
+            if (pick(6) != 0) {
+                decimal = failing && pick(10) == 0 ? over[pick(over.size())]
+                                                   : fitting[pick(fitting.size())];
+            }
+            const std::string wide = pick(6) == 0 ? "null"
+                                                  : std::to_string(pick(2'000'000)) + "." +
+                                                        std::to_string(100 + pick(900));
+            lines.push_back(R"({"s":)" + text + R"(,"d":)" + decimal + R"(,"e":)" + wide + "}");
+        }
+        const auto element = decode_columnar(schema, lines);
+        const auto& decoded = element.as_data();
+        ASSERT_TRUE(decoded.is_columnar()) << "round " << round << " fell back to rows";
+        const auto& full = decoded.arrow();
+        const auto compiled = native::compile_intake(*full->schema(), declared);
+        ASSERT_TRUE(std::holds_alternative<native::IntakePlan>(compiled));
+        const auto& plan = std::get<native::IntakePlan>(compiled);
+        native::IntakePlan cell_by_cell = plan;
+        cell_by_cell.reuse.clear();
+        for (const auto& [offset, length] : std::vector<std::pair<std::int64_t, std::int64_t>>{
+                 {0, 64}, {1, 63}, {5, 30}, {40, 24}}) {
+            SCOPED_TRACE("round " + std::to_string(round) + ", slice " + std::to_string(offset) +
+                         "+" + std::to_string(length));
+            const auto sidecar = full->Slice(offset, length);
+            const int d = sidecar->schema()->GetFieldIndex("d");
+            ASSERT_GE(d, 0);
+            const bool fits = decimals_fit(*sidecar->column(d));
+            over_batches += fits ? 0 : 1;
+            reused_decimals += fits ? 1 : 0;
+            std::size_t reused = 0;
+            const auto fast = builder.build_columnar(*sidecar, plan, &reused);
+            const auto slow = builder.build_columnar(*sidecar, cell_by_cell);
+            const clink::Batch<clink::sql::Row> rows{
+                sidecar, static_cast<std::size_t>(length), clink::sql::row_materialize_fn()};
+            const auto from_rows = builder.build(rows);
+            EXPECT_EQ(reused, fits ? 3U : 2U);
+            ASSERT_TRUE(fast->ValidateFull().ok());
+            EXPECT_TRUE(fast->Equals(*slow)) << fast->ToString() << "\nvs\n" << slow->ToString();
+            EXPECT_TRUE(fast->Equals(*from_rows)) << fast->ToString() << "\nvs\n"
+                                                  << from_rows->ToString();
+        }
+    }
+    // Both outcomes were exercised.
+    EXPECT_GT(over_batches, 10U);
+    EXPECT_GT(reused_decimals, 30U);
 }
 
 }  // namespace

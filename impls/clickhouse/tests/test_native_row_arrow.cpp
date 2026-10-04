@@ -1533,8 +1533,8 @@ TEST(NativeIntakeReuse, EveryFastPathEqualsTheCellPath) {
 
 // Only the table's pairs are fast paths: an int64 into INTEGER narrows, an
 // int32 into BIGINT or a float into DOUBLE widens, and utf8 carriage of a
-// TIMESTAMP or a DATE parses, so each goes cell by cell. The reused columns
-// take the sidecar's own value buffers.
+// TIMESTAMP or a DATE parses, so each goes cell by cell. The reused columns,
+// utf8 text into VARCHAR among them, take the sidecar's own value buffers.
 TEST(NativeIntakeReuse, BuilderMadeColumnsOfTheTablesPairsAreReusedAndShareTheirBuffers) {
     const auto int64s = ra_json(arrow::int64(), "[1, null, -3]");
     const auto int32s = ra_json(arrow::int32(), "[4, 5, null]");
@@ -1560,7 +1560,7 @@ TEST(NativeIntakeReuse, BuilderMadeColumnsOfTheTablesPairsAreReusedAndShareTheir
         "b:BIGINT;i:INTEGER;r:REAL;d:DOUBLE;o:BOOLEAN;t:TIMESTAMP(3);"
         "tz:TIMESTAMP(3) WITH TIME ZONE;day:DATE;narrow:INTEGER;wide:BIGINT;fd:DOUBLE;"
         "st:TIMESTAMP(3);sd:DATE;v:VARCHAR";
-    EXPECT_EQ(ra_expect_reuse_matches(spec, sidecar), 8U);
+    EXPECT_EQ(ra_expect_reuse_matches(spec, sidecar), 9U);
     ra_expect_intake_matches(spec, sidecar);
 
     const auto columns = ra_columns(spec);
@@ -1582,13 +1582,13 @@ TEST(NativeIntakeReuse, BuilderMadeColumnsOfTheTablesPairsAreReusedAndShareTheir
                                         IntakeReuse::None,
                                         IntakeReuse::None,
                                         IntakeReuse::None,
-                                        IntakeReuse::None}));
+                                        IntakeReuse::Text}));
     const auto chunk = builder.build_columnar(*sidecar, plan);
     for (int k = 0; k < chunk->num_columns(); ++k) {
         const auto& from = *sidecar->column_data(plan.source[static_cast<std::size_t>(k)]);
         const auto& to = *chunk->column_data(k);
         const bool shared = to.buffers[1] == from.buffers[1];
-        EXPECT_EQ(shared, k < 8) << chunk->schema()->field(k)->name();
+        EXPECT_EQ(shared, k < 8 || k == 13) << chunk->schema()->field(k)->name();
     }
     EXPECT_TRUE(chunk->column(5)->type()->Equals(arrow::timestamp(arrow::TimeUnit::MILLI)));
     EXPECT_TRUE(chunk->column(6)->type()->Equals(arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")));
@@ -1731,6 +1731,281 @@ TEST(NativeIntakeReuse, AnImportedBatchsChunkKeepsNothingOfTheExportAlive) {
     EXPECT_EQ(chunk_bytes(*chunk), static_cast<std::size_t>(arrow::util::TotalBufferSize(*chunk)));
     EXPECT_EQ(chunk->num_rows(), kRows);
     EXPECT_EQ(static_cast<const arrow::Int64Array&>(*chunk->column(0)).Value(kRows - 1), kRows - 1);
+}
+
+// --- utf8 and decimal: reused when every value passes as it is ------------------
+
+// One decimal128(p, s) array built by an Arrow builder: values that fit p
+// digits, nulls, and, when `over` holds, values of p + 1 to 39 digits, which
+// the builder stores unchecked as the columnar JSON decode does.
+std::shared_ptr<arrow::Array> ra_random_decimal(
+    int precision, int scale, std::mt19937_64& rng, int length, bool nulls, bool over) {
+    arrow::Decimal128Builder b(arrow::decimal128(precision, scale));
+    const auto pick = [&rng](std::uint64_t n) { return rng() % n; };
+    const arrow::Decimal128 limit = arrow::Decimal128::GetScaleMultiplier(precision);
+    for (int i = 0; i < length; ++i) {
+        if (nulls && pick(5) == 0) {
+            EXPECT_TRUE(b.AppendNull().ok());
+            continue;
+        }
+        arrow::Decimal128 v;
+        if (over && pick(6) == 0) {
+            // At least one digit past the precision, and at most 39, the
+            // most a decimal128 holds.
+            const int digits =
+                precision + 1 + static_cast<int>(pick(static_cast<std::uint64_t>(39 - precision)));
+            v = arrow::Decimal128::GetScaleMultiplier(digits - 1) +
+                arrow::Decimal128(static_cast<std::int64_t>(pick(1000)));
+        } else {
+            switch (pick(4)) {
+                case 0:
+                    v = limit - arrow::Decimal128(1);  // the largest that fits
+                    break;
+                case 1:
+                    v = arrow::Decimal128(0);
+                    break;
+                default:
+                    v = arrow::Decimal128(static_cast<std::int64_t>(rng() >> 1)) %
+                        limit;  // any number of digits up to the precision
+                    break;
+            }
+        }
+        if (pick(2) == 0) {
+            v.Negate();
+        }
+        EXPECT_TRUE(b.Append(v).ok());
+    }
+    return b.Finish().ValueOrDie();
+}
+
+// One utf8 array built by an Arrow builder, with nulls, empty strings,
+// strings that hold the decimal sentinel anywhere but first, and, when
+// `sentinel` holds, strings that begin with it.
+std::shared_ptr<arrow::Array> ra_random_text(std::mt19937_64& rng,
+                                             int length,
+                                             bool nulls,
+                                             bool sentinel) {
+    arrow::StringBuilder b;
+    const auto pick = [&rng](std::uint64_t n) { return rng() % n; };
+    const std::vector<std::string> plain = {"",
+                                            "a",
+                                            "12.50",
+                                            "x\x01y",
+                                            " \x01",
+                                            std::string(300, 'w'),
+                                            "{\"k\":1}",
+                                            "\xc3\xa9t\xc3\xa9"};
+    const std::vector<std::string> led = {"\x01",
+                                          "\x01"
+                                          "12.50",
+                                          "\x01"
+                                          "x",
+                                          "\x01\x01"};
+    for (int i = 0; i < length; ++i) {
+        if (nulls && pick(5) == 0) {
+            EXPECT_TRUE(b.AppendNull().ok());
+        } else if (sentinel && pick(8) == 0) {
+            EXPECT_TRUE(b.Append(led[pick(led.size())]).ok());
+        } else {
+            EXPECT_TRUE(b.Append(plain[pick(plain.size())]).ok());
+        }
+    }
+    return b.Finish().ValueOrDie();
+}
+
+// Whether the cell path hands every value of `array` on unchanged: no
+// non-null utf8 value begins with the sentinel, and every non-null decimal
+// fits the array's precision. Read through the public accessors, so it is
+// independent of the intake's own scan.
+bool ra_passes_as_is(const arrow::Array& array) {
+    for (std::int64_t i = 0; i < array.length(); ++i) {
+        if (array.IsNull(i)) {
+            continue;
+        }
+        if (array.type_id() == arrow::Type::STRING) {
+            const auto v = static_cast<const arrow::StringArray&>(array).GetView(i);
+            if (!v.empty() && v.front() == clink::config::kDecimalSentinel) {
+                return false;
+            }
+        } else {
+            const auto& d = static_cast<const arrow::Decimal128Array&>(array);
+            const auto& t = static_cast<const arrow::Decimal128Type&>(*array.type());
+            if (!arrow::Decimal128(d.GetValue(i)).FitsInPrecision(t.precision())) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// A builder-made utf8 column into VARCHAR and an in-precision decimal128
+// column into a DECIMAL of the same precision and scale are taken as they
+// are, buffers and all. A sentinel inside a value, not first, is text like any
+// other.
+TEST(NativeIntakeReuse, AUtf8ColumnAndAnInPrecisionDecimalColumnAreReused) {
+    const auto texts = ra_json(arrow::utf8(), R"(["a", null, "", "x\u0001y", "12.50"])");
+    const auto decimals =
+        ra_json(arrow::decimal128(9, 2), R"(["1234567.89", null, "-9999999.99", "0.00", "0.01"])");
+    EXPECT_EQ(ra_expect_reuse_matches("v:VARCHAR", ra_sidecar({{"v", texts}})), 1U);
+    EXPECT_EQ(ra_expect_reuse_matches("d:DECIMAL(9, 2)", ra_sidecar({{"d", decimals}})), 1U);
+
+    const auto sidecar = ra_sidecar({{"v", texts}, {"d", decimals}});
+    const std::string spec = "v:VARCHAR;d:DECIMAL(9, 2)";
+    EXPECT_EQ(ra_expect_reuse_matches(spec, sidecar), 2U);
+    ra_expect_intake_matches(spec, sidecar);
+    const auto columns = ra_columns(spec);
+    const RowArrowBuilder builder(columns);
+    const IntakePlan plan = std::get<IntakePlan>(compile_intake(*sidecar->schema(), columns));
+    EXPECT_EQ(plan.reuse, (std::vector<IntakeReuse>{IntakeReuse::Text, IntakeReuse::Decimal}));
+    const auto chunk = builder.build_columnar(*sidecar, plan);
+    EXPECT_EQ(chunk->column(0), sidecar->column(1));
+    EXPECT_EQ(chunk->column(1), sidecar->column(2));
+}
+
+// The cell path strips a leading sentinel from text and nulls a decimal past
+// its precision, so a column holding one such value goes cell by cell, whole;
+// a slice that leaves the value out is reused. A decimal of another precision
+// or scale is never a fast path.
+TEST(NativeIntakeReuse, ASentinelLedValueOrAnOverPrecisionDecimalSendsItsColumnCellByCell) {
+    const auto texts = ra_json(arrow::utf8(), R"(["a", null, "\u000112.50", "b"])");
+    arrow::Decimal128Builder over(arrow::decimal128(5, 2));
+    ASSERT_TRUE(over.Append(arrow::Decimal128(12345)).ok());
+    ASSERT_TRUE(over.AppendNull().ok());
+    ASSERT_TRUE(over.Append(arrow::Decimal128(-123456)).ok());
+    ASSERT_TRUE(over.Append(arrow::Decimal128(-99999)).ok());
+    const std::shared_ptr<arrow::Array> decimals = over.Finish().ValueOrDie();
+
+    const auto sidecar = ra_sidecar({{"v", texts}, {"d", decimals}});
+    EXPECT_EQ(ra_expect_reuse_matches("v:VARCHAR", sidecar), 0U);
+    EXPECT_EQ(ra_expect_reuse_matches("d:DECIMAL(5, 2)", sidecar), 0U);
+    EXPECT_EQ(ra_expect_reuse_matches("v:VARCHAR;d:DECIMAL(5, 2)", sidecar), 0U);
+    ra_expect_intake_matches("v:VARCHAR;d:DECIMAL(5, 2)", sidecar);
+
+    const auto columns = ra_columns("v:VARCHAR;d:DECIMAL(5, 2)");
+    const RowArrowBuilder builder(columns);
+    const auto chunk = builder.build_columnar(
+        *sidecar, std::get<IntakePlan>(compile_intake(*sidecar->schema(), columns)));
+    EXPECT_EQ(static_cast<const arrow::StringArray&>(*chunk->column(0)).GetString(2), "12.50");
+    EXPECT_TRUE(chunk->column(1)->IsNull(2));
+    EXPECT_FALSE(chunk->column(1)->IsNull(3));
+
+    // Rows 0 and 1 hold neither value.
+    EXPECT_EQ(ra_expect_reuse_matches("v:VARCHAR;d:DECIMAL(5, 2)", sidecar->Slice(0, 2)), 2U);
+    EXPECT_EQ(ra_expect_reuse_matches("v:VARCHAR;d:DECIMAL(5, 2)", sidecar->Slice(3)), 2U);
+    // Each column is decided alone.
+    EXPECT_EQ(
+        ra_expect_reuse_matches("v:VARCHAR;w:VARCHAR",
+                                ra_sidecar({{"v", texts->Slice(2, 2)}, {"w", texts->Slice(0, 2)}})),
+        1U);
+
+    const auto in_precision = ra_json(arrow::decimal128(9, 2), R"(["1.00", null, "-2.50"])");
+    for (const std::string declared : {"DECIMAL(10, 2)", "DECIMAL(9, 3)", "DECIMAL(9, 1)"}) {
+        EXPECT_EQ(ra_expect_reuse_matches("d:" + declared, ra_sidecar({{"d", in_precision}})), 0U)
+            << declared;
+    }
+}
+
+// The two fast paths against the cell path and the row path: random columns
+// with and without values that fail their condition, with and without nulls,
+// as given and sliced. A column is reused exactly when every value of the
+// slice passes.
+TEST(NativeIntakeReuse, Utf8AndDecimalFastPathsEqualTheCellPath) {
+    struct Shape {
+        int precision;
+        int scale;
+    };
+    const std::vector<Shape> shapes = {{9, 2}, {18, 0}, {38, 10}, {5, 5}, {1, 0}, {37, 3}};
+    const std::vector<std::pair<std::int64_t, std::int64_t>> slices = {
+        {0, 70}, {1, 69}, {3, 40}, {9, 61}, {65, 5}, {70, 0}};
+    std::mt19937_64 rng(20261006);
+    std::size_t reused_columns = 0;
+    std::size_t refused_columns = 0;
+    for (int round = 0; round < 24; ++round) {
+        const bool nulls = round % 3 != 0;
+        const bool failing = round % 2 == 0;
+        const auto text = ra_random_text(rng, 70, nulls, failing);
+        const Shape shape = shapes[static_cast<std::size_t>(round) % shapes.size()];
+        const auto decimal =
+            ra_random_decimal(shape.precision, shape.scale, rng, 70, nulls, failing);
+        const std::string decimal_spec =
+            "DECIMAL(" + std::to_string(shape.precision) + ", " + std::to_string(shape.scale) + ")";
+        const auto full = ra_sidecar({{"v", text}, {"d", decimal}});
+        const std::string spec = "v:VARCHAR;d:" + decimal_spec;
+        for (const auto& [offset, length] : slices) {
+            SCOPED_TRACE("round " + std::to_string(round) + ", " + decimal_spec + ", slice " +
+                         std::to_string(offset) + "+" + std::to_string(length));
+            const auto sidecar = full->Slice(offset, length);
+            const std::size_t expected =
+                static_cast<std::size_t>(ra_passes_as_is(*sidecar->column(1))) +
+                static_cast<std::size_t>(ra_passes_as_is(*sidecar->column(2)));
+            EXPECT_EQ(ra_expect_reuse_matches(spec, sidecar), expected);
+            reused_columns += expected;
+            refused_columns += 2 - expected;
+        }
+        ra_expect_intake_matches(spec, full);
+    }
+    // Both outcomes were exercised.
+    EXPECT_GT(reused_columns, 50U);
+    EXPECT_GT(refused_columns, 20U);
+}
+
+// A chunk that takes a sidecar's text and decimal arrays keeps those buffers
+// alive and nothing else of the sidecar, and is charged at least that: once
+// the sidecar is gone, what is left in its pool is no more than chunk_bytes.
+// Arrow rounds every allocation up to 64 bytes and chunk_bytes counts buffer
+// sizes, as for the cell path's own copies, so the sizes here are whole
+// 64-byte units: 63 strings of 64 bytes (offsets 256 bytes, values 4032) and
+// 64 decimals (1024 bytes), no nulls. A slice is charged its arrays in full.
+TEST(NativeIntakeReuse, AReusedTextOrDecimalChunkKeepsAliveNoMoreThanItIsCharged) {
+    for (const bool text : {true, false}) {
+        SCOPED_TRACE(text ? "VARCHAR" : "DECIMAL");
+        arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+        const std::int64_t rows = text ? 63 : 64;
+        arrow::Int64Builder times(&pool);
+        arrow::StringBuilder wide(&pool);
+        for (std::int64_t i = 0; i < rows; ++i) {
+            ASSERT_TRUE(times.Append(i).ok());
+            ASSERT_TRUE(wide.Append(std::string(4096, 'w')).ok());
+        }
+        std::shared_ptr<arrow::Array> column;
+        if (text) {
+            arrow::StringBuilder texts(&pool);
+            for (std::int64_t i = 0; i < rows; ++i) {
+                ASSERT_TRUE(texts.Append(std::string(64, static_cast<char>('a' + i % 26))).ok());
+            }
+            column = texts.Finish().ValueOrDie();
+        } else {
+            arrow::Decimal128Builder decimals(arrow::decimal128(20, 4), &pool);
+            for (std::int64_t i = 0; i < rows; ++i) {
+                ASSERT_TRUE(decimals.Append(arrow::Decimal128(i * 1000003)).ok());
+            }
+            column = decimals.Finish().ValueOrDie();
+        }
+        auto sidecar = arrow::RecordBatch::Make(
+            arrow::schema({arrow::field("event_time", arrow::int64()),
+                           arrow::field("wide", arrow::utf8()),
+                           arrow::field("c", column->type())}),
+            rows,
+            {times.Finish().ValueOrDie(), wide.Finish().ValueOrDie(), std::move(column)});
+        const auto columns = ra_columns(text ? "c:VARCHAR" : "c:DECIMAL(20, 4)");
+        const RowArrowBuilder builder(columns);
+        const IntakePlan plan = std::get<IntakePlan>(compile_intake(*sidecar->schema(), columns));
+        std::size_t reused = 0;
+        const auto chunk = builder.build_columnar(*sidecar, plan, &reused);
+        std::size_t sliced_reused = 0;
+        const auto sliced = builder.build_columnar(*sidecar->Slice(7, 20), plan, &sliced_reused);
+        ASSERT_EQ(reused, 1U);
+        ASSERT_EQ(sliced_reused, 1U);
+        const std::int64_t before = pool.bytes_allocated();
+        sidecar.reset();
+        const std::int64_t pinned = pool.bytes_allocated();
+        // The wide column and the event times are gone; the reused buffers
+        // are not.
+        EXPECT_LT(pinned, before / 10);
+        EXPECT_GT(pinned, 0);
+        EXPECT_GE(static_cast<std::int64_t>(chunk_bytes(*chunk)), pinned);
+        EXPECT_GE(static_cast<std::int64_t>(chunk_bytes(*sliced)), pinned);
+    }
 }
 
 }  // namespace

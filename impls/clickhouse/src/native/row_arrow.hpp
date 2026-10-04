@@ -51,7 +51,8 @@ public:
     //
     // A column the plan marks for reuse takes the sidecar's array itself, or
     // its buffers under the declared type, when the array owns its buffers
-    // (owns_its_buffers); the chunk then shares memory with `batch`, and the
+    // (owns_its_buffers) and its values pass the pair's condition
+    // (passes_as_is); the chunk then shares memory with `batch`, and the
     // count of such columns goes to `reused` when it is given. Whoever drops
     // a chunk with a reused column last frees memory the task thread wrote,
     // so the sink keeps that last drop on the task thread.
