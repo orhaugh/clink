@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**The native ClickHouse sink takes a columnar batch without building rows.** A
+SQL pipeline whose Kafka JSON decode runs columnar, or whose join or window
+emits columnar output, now stays columnar into `insert_format='native'`. The
+sink converts the batch from its arrays, cell for cell by the same rules as the
+rows it would turn into, so the landed values and any conversion failure are
+unchanged. A batch whose event-time column is not int64, which carries a value
+type the Row sidecar does not, or which carries a declared column's name twice,
+takes the row path as before. New metrics
+`clink_clickhouse_input_batches_total{carrier}` and
+`clink_clickhouse_columnar_declined_total{reason}`; the close summary reports
+`columnar_batches` and `row_batches`. `CLINK_DISABLE_COLUMNAR=1` restores the
+row path.
+
 **The column binding in front of every SQL sink no longer turns a columnar
 batch into rows.** `row_bind_columns`, which the planner puts in front of every
 Row sink, materialised every columnar batch that reached it since 2dd2e23,

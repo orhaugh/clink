@@ -26,6 +26,16 @@ inline constexpr char kPartsBackoffTotal[] = "clink_clickhouse_parts_backoff_tot
 inline constexpr char kRefusalsTotal[] = "clink_clickhouse_refusals_total";  // reason
 inline constexpr char kReconnectsTotal[] = "clink_clickhouse_reconnects_total";
 inline constexpr char kRowsMaybeDuplicatedTotal[] = "clink_clickhouse_rows_maybe_duplicated_total";
+// Non-empty batches the sink took, by `carrier`: columnar for a sidecar read
+// without building rows, row for a batch read through its row accessors.
+inline constexpr char kInputBatchesTotal[] = "clink_clickhouse_input_batches_total";  // carrier
+// Columnar batches the sink handed back to the row path, by `reason`
+// (to_string(IntakeDecline)).
+inline constexpr char kColumnarDeclinedTotal[] = "clink_clickhouse_columnar_declined_total";
+
+// Values of the `carrier` tag on kInputBatchesTotal.
+inline constexpr char kCarrierColumnar[] = "columnar";
+inline constexpr char kCarrierRow[] = "row";
 
 // Values of the `outcome` tag on kInsertsTotal.
 inline constexpr char kOutcomeOk[] = "ok";

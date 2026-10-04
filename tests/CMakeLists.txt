@@ -749,6 +749,19 @@ if(CLINK_BUILD_SQL)
             PROPERTIES TIMEOUT 180 LABELS clickhouse
                        ENVIRONMENT "CLINK_EOS_FINAL_CKPT_TIMEOUT_MS=3000"
         )
+        # The q0-shaped pipeline again with the columnar path off: every
+        # batch reaches the native sink through its rows, and the same rows
+        # land. The runner reads CLINK_DISABLE_COLUMNAR once per process, so
+        # this run needs its own; the fail pattern turns a filter that selects
+        # nothing into a failure.
+        add_test(NAME ClickHouseNativeSql.AQ0ShapedPipelineBuildsNoRowAtTheSinkHop.ColumnarDisabled
+                 COMMAND clink_clickhouse_sql_tests
+                         --gtest_filter=ClickHouseNativeSql.AQ0ShapedPipelineBuildsNoRowAtTheSinkHop)
+        set_tests_properties(
+            ClickHouseNativeSql.AQ0ShapedPipelineBuildsNoRowAtTheSinkHop.ColumnarDisabled
+            PROPERTIES TIMEOUT 180 LABELS clickhouse
+                       ENVIRONMENT "CLINK_EOS_FINAL_CKPT_TIMEOUT_MS=3000;CLINK_DISABLE_COLUMNAR=1"
+                       FAIL_REGULAR_EXPRESSION "0 tests from 0 test suites ran")
     endif()
 
     # Differential SQL oracle: the same query and data through clink's

@@ -313,6 +313,8 @@ The sink converts in two steps, and the rules differ by step.
 
 The declared types are the table's SQL column types as the planner renders them. `TIMESTAMP(0)`, `TIMESTAMPTZ(0)` and scale-0 decimals such as `DECIMAL(10, 0)` can be declared; a `TIMESTAMP` precision is rendered as 0, 3, 6 or 9, the next of those at or above the one declared, and `TIMESTAMP` alone as `TIMESTAMP(6)`. `TINYINT` has no DDL spelling, so a SQL table cannot declare it; it is listed below for completeness.
 
+A batch can reach the sink as rows or as a columnar batch, an Arrow sidecar that a columnar operator passed on: in a SQL plan, after the columnar Kafka JSON decode or a join or window that emits columnar output. The sink converts a columnar batch from its arrays without building a row, cell by cell through the same rules as the rows that batch would turn into, so either form lands the same values and fails on the same cell with the same error. It takes the batch through its rows instead, and counts why in `clink_clickhouse_columnar_declined_total`, when the batch's event-time column is not int64 (`event_time`), when a value column has a type the Row sidecar does not carry (`unsupported_type`), or when two value columns carry one declared column's name (`duplicate_name`). The rules below are written for Row values, which is what each cell of either form is read as.
+
 From the Row value to the declared type. A JSON null, or an absent field of a ROW, is NULL for every type. For the types the engine's own Row batcher handles, a top-level cell of the wrong JSON kind, or out of range for its type, becomes NULL, exactly as it does on every other columnar path: it then lands as NULL in a Nullable target and fails the row in a non-Nullable one. Every other type, and every element inside an ARRAY, MAP or ROW, fails the row instead.
 
 | Declared type | Accepted Row values | Otherwise |
@@ -454,6 +456,8 @@ The sink's own series are tagged with its `op_id`:
 | `clink_clickhouse_refusals_total` | counter | `reason` = the refusal code | refusals at deploy, open and run time. A deploy refusal comes before any operator id exists, so it carries `reason` only |
 | `clink_clickhouse_reconnects_total` | counter | | clients built after a failure, at open or by the writer |
 | `clink_clickhouse_rows_maybe_duplicated_total` | counter | | rows resent after they were sent, other than under their own token to a target that keeps a log |
+| `clink_clickhouse_input_batches_total` | counter | `carrier` = `columnar`, `row` | non-empty batches taken, `columnar` for a batch converted from its arrays, `row` for one read through its rows |
+| `clink_clickhouse_columnar_declined_total` | counter | `reason` = `event_time`, `unsupported_type`, `duplicate_name` | columnar batches handed back to the row path, before anything of them was queued |
 
 The `_ns` histograms have buckets from 1e5 to 1.2e11 ns, and `block_rows` from 1 to 2e6 rows.
 
@@ -476,10 +480,14 @@ Warnings may follow it: the server is on an untested line; the target keeps no d
 Each retry logs a Warn line with the attempt, the phase, the class, the error and the wait; a retry at open also names the endpoint. A clean close logs a summary at Info, and a cancelled or failed task logs the same fields at Warn with the prefix `clickhouse native sink cancelled:`:
 
 ```
-clickhouse native sink closed: subtask=3/8 rows_acknowledged=10485760 inserts=11 retries=transient:2,in_doubt:1,merge_backpressure:0,resource:0,client_defect:0,unclassified:0 in_doubt=1 rows_resent_with_token=953211 rows_maybe_duplicated=0 abandoned_rows=0 wire_bytes=391002113 elapsed_ms=61210
+clickhouse native sink closed: subtask=3/8 rows_acknowledged=10485760 inserts=11 retries=transient:2,in_doubt:1,merge_backpressure:0,resource:0,client_defect:0,unclassified:0 in_doubt=1 rows_resent_with_token=953211 rows_maybe_duplicated=0 abandoned_rows=0 wire_bytes=391002113 elapsed_ms=61210 columnar_batches=160 row_batches=0
 ```
 
 `inserts` counts the INSERTs the server acknowledged, both halves of a split included. `abandoned_rows` counts every submitted row the server had not acknowledged when the sink stopped: the INSERT in flight, the rest of a chunk the writer was part-way through, and the rows still waiting in its queue. With `rows_acknowledged` it accounts for every row the sink took. Either way they were after the last completed checkpoint, so the restart replays them; an abandoned INSERT larger than the server's squash threshold may already have written some parts, so duplicates are possible and loss is not.
+
+`columnar_batches` and `row_batches` count the batches the sink queued by how they arrived, as `clink_clickhouse_input_batches_total` does; they are how a `clink run` or pyclink job shows which path its batches took. The first time a subtask hands back batches of a given schema it logs one Info line, `takes columnar batches of this schema through their rows (<reason>)`, with the schema's column names and types.
+
+Setting `CLINK_DISABLE_COLUMNAR=1` in a worker's environment sends every batch through its rows, at the sink as at every columnar operator, which is the A/B for a suspected difference between the two paths: the landed values must be the same, and `row_batches` takes the place of `columnar_batches`. The text sink (`format='json'`) is row-only and stays so: it writes one JSON text per row, so a columnar batch is turned into rows before it, and no columnar path for it is planned.
 
 ## Example
 
@@ -539,7 +547,7 @@ Source: a `SELECT` materialises a finite (bounded) result set. The source persis
 - The native sink refuses SharedMergeTree targets, asynchronous-insert targets, and unaligned and adaptive checkpoints, and must be the only sink on its chain.
 - A resent INSERT is deduplicated only on targets that keep a deduplication log, and only on 26.3 and 26.8.
 - A retry that holds the barrier beyond `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` (default 30 s) at the end of a bounded job or at a hot cutover spends a restart; nothing is lost.
-- The native sink takes Rows only: a columnar batch that reaches it is materialised through its row accessors before conversion.
+- The native sink converts a columnar batch from its arrays only when its event-time column is int64 and every value column has a type the Row sidecar carries; any other columnar batch goes through its row accessors, and `clink_clickhouse_columnar_declined_total` says why. The text sink takes rows only.
 - The native sink does not accept `tls_server_name`, does not pin a certificate, and does not create or alter tables. It authenticates by user and password only.
 - Source is a one-shot bounded `SELECT`, not a streaming tail or CDC feed. Result-row order is arbitrary without an explicit `ORDER BY`.
 - The `clickhouse_source` (string-channel JSON) requires column names from the server; if they are absent it fails loudly rather than emit positional keys.
@@ -555,7 +563,7 @@ The text sink and source tests are in-process smoke tests. They do not stand up 
 The native sink's tests, built when the client is 2.6.2 or later:
 
 - Unit and in-process suites in `clink_clickhouse_tests` (the `Native*` suites, `--gtest_filter='Native*'`), label `clickhouse`. They cover options, statements, error classes, retry pacing, the type parser and column plan, both converters, the target probe and the writer and sink against an in-process fake server (`impls/clickhouse/tests/fake_transport.hpp`), with no ClickHouse needed.
-- SQL-linked suite, `clink_clickhouse_sql_tests` (`tests/test_clickhouse_native_sql.cpp`), built with the SQL frontend, label `clickhouse`: the sink driven through SQL against the fake server, including a differential against the collect sink, the keys the planner puts on the op, held barriers on the periodic and bounded paths, and two INSERTs from one source. It runs with `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS=3000` set by CTest.
+- SQL-linked suite, `clink_clickhouse_sql_tests` (`tests/test_clickhouse_native_sql.cpp`), built with the SQL frontend, label `clickhouse`: the sink driven through SQL against the fake server, including a differential against the collect sink, the keys the planner puts on the op, held barriers on the periodic and bounded paths, and two INSERTs from one source. A q0-shaped pipeline, a Kafka JSON table straight into the native sink, proves that no row is built on the way: the process-wide materialisation count stays at 0 while the sink's `columnar` count equals the batches it received, against a collect-sink control that does materialise; a second registration runs it with `CLINK_DISABLE_COLUMNAR=1`. It runs with `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS=3000` set by CTest.
 - Live suites, `impls/clickhouse/tests/test_native_live.cpp` in `clink_clickhouse_tests` (`ClickHouseNativeLive`, `ClickHouseNativeLiveReplicated`, `ClickHouseNativeLiveTls`), and `ClickHouseNativeSqlLive` in `clink_clickhouse_sql_tests`, which writes DATE, every TIMESTAMP precision, TIMESTAMPTZ, a BIGINT past 2^53, a decimal and nullable columns through SQL into a real table and compares what ClickHouse holds with what the collect sink saw. All skip unless `CLINK_CLICKHOUSE_TEST_HOST` names a server.
 - Kill matrix, `tests/integration/test_clickhouse_native_recovery.cpp` in `clink_integration_tests`: a coordinator and two workers against real servers, with faults at the sink's own points, in the network and in the server. Nine cells, each on both lines and into both a ReplicatedMergeTree and a plain MergeTree, with no loss as the pass mark in every cell.
 

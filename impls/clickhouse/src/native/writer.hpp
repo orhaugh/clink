@@ -37,10 +37,15 @@ namespace clink::clickhouse::native {
 inline constexpr std::size_t kQueueBytes = 16ULL << 20;
 inline constexpr std::size_t kQueueChunks = 256;
 
+// How the batch a chunk was built from reached the sink: as rows, or as a
+// columnar sidecar read without building any.
+enum class Carrier : std::uint8_t { Row, Columnar };
+
 struct Chunk {
     std::shared_ptr<arrow::RecordBatch> batch;
     std::size_t bytes{0};  // chunk_bytes(*batch)
     MemoryReservation reservation;
+    Carrier carrier{Carrier::Row};
 };
 
 struct WriterConfig {
@@ -88,6 +93,9 @@ struct WriterStats {
     std::uint64_t abandoned_rows{0};
     std::uint64_t wire_bytes{0};
     std::array<std::uint64_t, kFailureClasses> retries{};  // by FailureClass
+    // Chunks submitted, by the carrier of the batch each was built from.
+    std::uint64_t columnar_batches{0};
+    std::uint64_t row_batches{0};
 };
 
 // The insert thread of one sink subtask. It owns the transport, the block
@@ -139,7 +147,8 @@ private:
     std::shared_ptr<Core> core_;
 };
 
-// "clickhouse native sink <outcome>: subtask=K/P rows_acknowledged=... elapsed_ms=E",
+// "clickhouse native sink <outcome>: subtask=K/P rows_acknowledged=... elapsed_ms=E
+// columnar_batches=C row_batches=R",
 // the fields both exit summaries carry. The writer logs the cancelled one;
 // the sink logs the closed one with the same fields.
 [[nodiscard]] std::string summary_line(std::string_view outcome,

@@ -2,24 +2,30 @@
 // scalar types, and the per-cell refusal for every type the sink converts
 // itself.
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/json/from_string.h>
 #include <gtest/gtest.h>
 
 #include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
+#include "clink/core/record.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
 #include "native/errors.hpp"
+#include "native/intake.hpp"
 #include "native/row_arrow.hpp"
 #include "native/types.hpp"
 
@@ -1001,6 +1007,381 @@ TEST(NativeRowArrow, MovedBuilderKeepsItsSchemaAndBuilds) {
     const auto chunk = ra_build(moved, ra_rows({R"({"s":5})"}));
     ASSERT_NE(chunk, nullptr);
     EXPECT_EQ(ra_col<arrow::Int16Array>(chunk, 0)->Value(0), 5);
+}
+
+// --- The columnar intake --------------------------------------------------------
+
+// A sidecar in the layout columnar Row producers emit: an event-time column,
+// then one value column per (name, array).
+std::shared_ptr<arrow::RecordBatch> ra_sidecar(
+    const std::vector<std::pair<std::string, std::shared_ptr<arrow::Array>>>& columns,
+    std::shared_ptr<arrow::DataType> time_type = arrow::int64()) {
+    const std::int64_t rows = columns.empty() ? 0 : columns.front().second->length();
+    std::unique_ptr<arrow::ArrayBuilder> times = arrow::MakeBuilder(time_type).ValueOrDie();
+    for (std::int64_t i = 0; i < rows; ++i) {
+        EXPECT_TRUE(times->AppendNull().ok());
+    }
+    arrow::FieldVector fields = {arrow::field("event_time", time_type)};
+    std::vector<std::shared_ptr<arrow::Array>> arrays = {times->Finish().ValueOrDie()};
+    for (const auto& [name, array] : columns) {
+        fields.push_back(arrow::field(name, array->type()));
+        arrays.push_back(array);
+    }
+    return arrow::RecordBatch::Make(arrow::schema(fields), rows, std::move(arrays));
+}
+
+std::shared_ptr<arrow::Array> ra_json(const std::shared_ptr<arrow::DataType>& type,
+                                      const std::string& json) {
+    auto made = arrow::json::ArrayFromJSONString(type, json);
+    EXPECT_TRUE(made.ok()) << type->ToString() << " " << json << ": " << made.status().ToString();
+    return made.ValueOrDie();
+}
+
+// What a build gave: a chunk, or the full text of the ConversionError.
+struct RaOutcome {
+    std::shared_ptr<arrow::RecordBatch> chunk;
+    std::optional<std::string> error;
+};
+
+template <typename F>
+RaOutcome ra_outcome(F&& build) {
+    RaOutcome out;
+    try {
+        out.chunk = build();
+    } catch (const ConversionError& e) {
+        out.error = e.what();
+    }
+    return out;
+}
+
+// The intake on `sidecar` against build() over the rows the same sidecar
+// materialises to through the self-describing reader: the same chunk, or the
+// same ConversionError, and no Row built by the intake. Checked on the
+// sidecar as given and on a slice of it at a non-zero offset.
+void ra_expect_intake_matches(const std::string& spec,
+                              const std::shared_ptr<arrow::RecordBatch>& full) {
+    const auto columns = ra_columns(spec);
+    const RowArrowBuilder builder(columns);
+    for (const std::int64_t offset : {std::int64_t{0}, std::int64_t{1}}) {
+        if (offset > full->num_rows()) {
+            continue;
+        }
+        SCOPED_TRACE(spec + ", offset " + std::to_string(offset));
+        const auto sidecar = full->Slice(offset);
+        const auto compiled = compile_intake(*sidecar->schema(), columns);
+        ASSERT_TRUE(std::holds_alternative<IntakePlan>(compiled))
+            << to_string(std::get<IntakeDecline>(compiled));
+        const auto& plan = std::get<IntakePlan>(compiled);
+
+        const auto before = clink::detail::batch_materialize_counter().load();
+        const RaOutcome columnar =
+            ra_outcome([&] { return builder.build_columnar(*sidecar, plan); });
+        EXPECT_EQ(clink::detail::batch_materialize_counter().load(), before)
+            << "the intake built rows";
+        const Batch<sql::Row> rows{
+            sidecar, static_cast<std::size_t>(sidecar->num_rows()), sql::row_materialize_fn()};
+        const RaOutcome row = ra_outcome([&] { return builder.build(rows); });
+
+        EXPECT_EQ(columnar.error, row.error);
+        if (columnar.chunk && row.chunk) {
+            const auto status = columnar.chunk->ValidateFull();
+            EXPECT_TRUE(status.ok()) << status.ToString();
+            EXPECT_TRUE(columnar.chunk->schema()->Equals(*builder.schema()));
+            EXPECT_TRUE(columnar.chunk->Equals(*row.chunk, arrow::EqualOptions().nans_equal(true)))
+                << columnar.chunk->ToString() << "\nvs\n"
+                << row.chunk->ToString();
+        }
+    }
+}
+
+// The shared types from every sidecar type the reader carries, including the
+// ones the shared rule nulls: a value of the wrong kind, an int64 out of the
+// INTEGER range, a double past a float, a decimal past its precision.
+TEST(NativeIntake, SharedTypesMatchTheRowPathFromEverySidecarType) {
+    const auto int64s = ra_json(arrow::int64(),
+                                "[0, null, -1, 9223372036854775807, -9223372036854775808, "
+                                "2147483648, -2147483649, 9007199254740993]");
+    const auto int32s = ra_json(arrow::int32(), "[0, null, -1, 2147483647, -2147483648, 7, 8, 9]");
+    arrow::DoubleBuilder doubles_builder;
+    ASSERT_TRUE(doubles_builder
+                    .AppendValues({0.5,
+                                   -0.0,
+                                   std::numeric_limits<double>::quiet_NaN(),
+                                   std::numeric_limits<double>::infinity(),
+                                   1e300,
+                                   -2.5e9,
+                                   3.4e38,
+                                   9.3e18})
+                    .ok());
+    ASSERT_TRUE(doubles_builder.AppendNull().ok());
+    std::shared_ptr<arrow::Array> doubles;
+    ASSERT_TRUE(doubles_builder.Finish(&doubles).ok());
+    arrow::FloatBuilder floats_builder;
+    ASSERT_TRUE(floats_builder
+                    .AppendValues({0.1F,
+                                   -0.0F,
+                                   std::numeric_limits<float>::quiet_NaN(),
+                                   -std::numeric_limits<float>::infinity(),
+                                   3.0F,
+                                   1e10F,
+                                   2.5F,
+                                   -7.0F})
+                    .ok());
+    ASSERT_TRUE(floats_builder.AppendNull().ok());
+    std::shared_ptr<arrow::Array> floats;
+    ASSERT_TRUE(floats_builder.Finish(&floats).ok());
+    const auto bools =
+        ra_json(arrow::boolean(), "[true, false, null, true, false, true, false, true]");
+    const auto texts = ra_json(
+        arrow::utf8(), R"(["12", null, "", "abc", "\u0001xy", "\u000112.50", "1e3", "-0"])");
+    const auto decimals = ra_json(
+        arrow::decimal128(12, 4),
+        R"(["12.3400", null, "-0.0001", "99999999.9999", "12345678.9999", "0.0050", "1.0000", "-5.5000"])");
+    const auto narrow =
+        ra_json(arrow::decimal128(10, 2),
+                R"(["12.34", null, "-0.01", "99999999.99", "0.00", "1.00", "2.50", "-3.00"])");
+
+    for (const std::string declared : {"BIGINT",
+                                       "INTEGER",
+                                       "REAL",
+                                       "DOUBLE",
+                                       "BOOLEAN",
+                                       "VARCHAR",
+                                       "DECIMAL(10, 2)",
+                                       "DECIMAL(4, 1)"}) {
+        for (const auto& array :
+             {int64s, int32s, doubles, floats, bools, texts, decimals, narrow}) {
+            SCOPED_TRACE(declared + " from " + array->type()->ToString());
+            ra_expect_intake_matches(
+                "c:" + declared,
+                ra_sidecar({{"c", array->Slice(0, std::min<std::int64_t>(array->length(), 9))}}));
+        }
+    }
+}
+
+// A decimal128 array holds whatever was stored in it: a value past the
+// array's own precision, as the decoder stores one unchecked, is nulled by
+// both paths alike.
+TEST(NativeIntake, ADecimalPastItsArraysPrecisionMatchesTheRowPath) {
+    arrow::Decimal128Builder b(arrow::decimal128(5, 2));
+    ASSERT_TRUE(b.Append(arrow::Decimal128(12345)).ok());
+    ASSERT_TRUE(b.Append(arrow::Decimal128(123456789)).ok());
+    ASSERT_TRUE(b.AppendNull().ok());
+    ASSERT_TRUE(b.Append(arrow::Decimal128(-99999)).ok());
+    std::shared_ptr<arrow::Array> array;
+    ASSERT_TRUE(b.Finish(&array).ok());
+    for (const std::string declared :
+         {"DECIMAL(5, 2)", "DECIMAL(12, 2)", "DECIMAL(10, 4)", "VARCHAR", "DOUBLE"}) {
+        ra_expect_intake_matches("d:" + declared, ra_sidecar({{"d", array}}));
+    }
+}
+
+// The sink-owned types read the text forms the sidecar stores them in, and the
+// integer forms a computed column holds; a cell neither form fits fails with
+// the same ConversionError on both paths.
+TEST(NativeIntake, SinkOwnedTypesMatchTheRowPathIncludingTheirRefusals) {
+    struct Case {
+        std::string declared;
+        std::shared_ptr<arrow::Array> array;
+    };
+    const std::vector<Case> cases = {
+        {"TIMESTAMP(3)",
+         ra_json(arrow::utf8(), R"(["1700000000123", null, "-1", "-2208988800000", "0"])")},
+        {"TIMESTAMP(9)",
+         ra_json(arrow::int64(), "[1700000000123, null, -1, -2208988800000, 9223372036854]")},
+        {"TIMESTAMP(3) WITH TIME ZONE", ra_json(arrow::int64(), "[0, null, -86400000]")},
+        {"TIMESTAMP(6)", ra_json(arrow::utf8(), R"(["1", "2024-01-01T00:00:00Z"])")},
+        {"TIMESTAMP(0)", ra_json(arrow::int32(), "[0, -1, 2147483647]")},
+        {"TIMESTAMP(3)", ra_json(arrow::utf8(), R"(["99999999999999999999"])")},
+        {"TIMESTAMP(3)", ra_json(arrow::float64(), "[1.5]")},
+        {"DATE", ra_json(arrow::utf8(), R"(["19675", "1969-07-20", null, "-1", "2299-12-31"])")},
+        {"DATE", ra_json(arrow::int32(), "[19675, null, -165, 0]")},
+        {"DATE", ra_json(arrow::int64(), "[19675, -165]")},
+        {"DATE", ra_json(arrow::utf8(), R"(["2024-02-30"])")},
+        {"DATE", ra_json(arrow::utf8(), R"(["24-1-1"])")},
+        {"DATE", ra_json(arrow::int64(), "[9223372036854775807]")},
+        {"SMALLINT", ra_json(arrow::utf8(), R"(["-123", null, "32767", "0"])")},
+        {"SMALLINT", ra_json(arrow::utf8(), R"(["12a"])")},
+        {"SMALLINT", ra_json(arrow::utf8(), R"(["40000"])")},
+        {"SMALLINT", ra_json(arrow::int64(), "[1, -32768, 32768]")},
+        {"SMALLINT", ra_json(arrow::int32(), "[5, null, -5]")},
+        {"TINYINT", ra_json(arrow::utf8(), R"(["7", "-128", null])")},
+        {"TINYINT", ra_json(arrow::int32(), "[127, 128]")},
+        {"BIGINT ARRAY",
+         ra_json(arrow::utf8(), R"(["[1,null,3]", "[]", null, "[9007199254740993]"])")},
+        {"BIGINT ARRAY", ra_json(arrow::utf8(), R"(["[1,\"x\"]"])")},
+        {"BIGINT ARRAY", ra_json(arrow::utf8(), R"(["not json"])")},
+        {"REAL ARRAY", ra_json(arrow::list(arrow::float32()), "[[1.5, null, -0.0], [], null]")},
+        {"BIGINT ARRAY", ra_json(arrow::list(arrow::float32()), "[[1, 2], [1.5]]")},
+        {"MAP<VARCHAR, BIGINT>", ra_json(arrow::utf8(), R"(["{\"k\":1,\"j\":null}", "{}", null])")},
+        {"MAP<BIGINT, VARCHAR>", ra_json(arrow::utf8(), R"(["{\"1\":\"a\",\"01\":\"b\"}"])")},
+        {"ROW<x BIGINT, y VARCHAR>",
+         ra_json(arrow::utf8(), R"(["{\"x\":5,\"y\":\"q\"}", "{}", null, "{\"x\":\"no\"}"])")},
+        {"ROW<x BIGINT, y VARCHAR>", ra_json(arrow::int64(), "[1]")},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.declared + " from " + c.array->ToString());
+        ra_expect_intake_matches("c:" + c.declared, ra_sidecar({{"c", c.array}}));
+    }
+}
+
+// Random columns of every carried type into every declared type, nulls
+// included, several columns to a batch so a failure's column order matters.
+TEST(NativeIntake, RandomSidecarsMatchTheRowPath) {
+    std::mt19937_64 rng(20261004);
+    const auto pick = [&rng](std::uint64_t n) { return rng() % n; };
+    const auto random_array =
+        [&](const std::shared_ptr<arrow::DataType>& type) -> std::shared_ptr<arrow::Array> {
+        std::unique_ptr<arrow::ArrayBuilder> b = arrow::MakeBuilder(type).ValueOrDie();
+        for (int i = 0; i < 40; ++i) {
+            if (pick(8) == 0) {
+                EXPECT_TRUE(b->AppendNull().ok());
+                continue;
+            }
+            const std::int64_t small = static_cast<std::int64_t>(pick(200)) - 100;
+            switch (type->id()) {
+                case arrow::Type::INT64:
+                    EXPECT_TRUE(static_cast<arrow::Int64Builder&>(*b)
+                                    .Append(pick(4) == 0 ? static_cast<std::int64_t>(rng()) : small)
+                                    .ok());
+                    break;
+                case arrow::Type::INT32:
+                    EXPECT_TRUE(static_cast<arrow::Int32Builder&>(*b)
+                                    .Append(static_cast<std::int32_t>(pick(4) == 0 ? rng() : small))
+                                    .ok());
+                    break;
+                case arrow::Type::DOUBLE:
+                    EXPECT_TRUE(static_cast<arrow::DoubleBuilder&>(*b)
+                                    .Append(static_cast<double>(small) / 4.0)
+                                    .ok());
+                    break;
+                case arrow::Type::FLOAT:
+                    EXPECT_TRUE(static_cast<arrow::FloatBuilder&>(*b)
+                                    .Append(static_cast<float>(small) / 8.0F)
+                                    .ok());
+                    break;
+                case arrow::Type::BOOL:
+                    EXPECT_TRUE(static_cast<arrow::BooleanBuilder&>(*b).Append(pick(2) == 0).ok());
+                    break;
+                case arrow::Type::DECIMAL128:
+                    EXPECT_TRUE(static_cast<arrow::Decimal128Builder&>(*b)
+                                    .Append(arrow::Decimal128(small * 1000 + 7))
+                                    .ok());
+                    break;
+                default: {
+                    const std::vector<std::string> texts = {std::to_string(small),
+                                                            "1969-07-20",
+                                                            "[1,2]",
+                                                            "{\"x\":1}",
+                                                            "\x01"
+                                                            "5.5",
+                                                            "text"};
+                    EXPECT_TRUE(static_cast<arrow::StringBuilder&>(*b)
+                                    .Append(texts[pick(pick(3) == 0 ? texts.size() : 1)])
+                                    .ok());
+                    break;
+                }
+            }
+        }
+        return b->Finish().ValueOrDie();
+    };
+    const std::vector<std::shared_ptr<arrow::DataType>> types = {arrow::int64(),
+                                                                 arrow::int32(),
+                                                                 arrow::float64(),
+                                                                 arrow::float32(),
+                                                                 arrow::boolean(),
+                                                                 arrow::decimal128(9, 3),
+                                                                 arrow::utf8()};
+    const std::vector<std::string> declared = {"BIGINT",
+                                               "INTEGER",
+                                               "REAL",
+                                               "DOUBLE",
+                                               "BOOLEAN",
+                                               "VARCHAR",
+                                               "DECIMAL(9, 3)",
+                                               "DECIMAL(6, 1)",
+                                               "SMALLINT",
+                                               "DATE",
+                                               "TIMESTAMP(3)",
+                                               "BIGINT ARRAY",
+                                               "ROW<x BIGINT>"};
+    for (int round = 0; round < 60; ++round) {
+        std::string spec;
+        std::vector<std::pair<std::string, std::shared_ptr<arrow::Array>>> columns;
+        for (int c = 0; c < 3; ++c) {
+            const std::string name = "c" + std::to_string(c);
+            spec += (spec.empty() ? "" : ";") + name + ":" + declared[pick(declared.size())];
+            columns.emplace_back(name, random_array(types[pick(types.size())]));
+        }
+        SCOPED_TRACE("round " + std::to_string(round));
+        ra_expect_intake_matches(spec, ra_sidecar(columns));
+    }
+}
+
+// Names resolve as the self-describing reader resolves them: value columns
+// from index 1, so a value column may share the event-time column's name;
+// __source_partition is dropped; __key and __row_kind are ordinary names; a
+// declared column the sidecar lacks is NULL; and an undeclared name may
+// repeat.
+TEST(NativeIntake, NamesResolveAsTheReaderResolvesThem) {
+    const auto ints = ra_json(arrow::int64(), "[1, 2]");
+    const auto texts = ra_json(arrow::utf8(), R"(["a", "b"])");
+    const auto parts = ra_json(arrow::int32(), "[0, 1]");
+    const auto sidecar = ra_sidecar({{"__source_partition", parts},
+                                     {"event_time", ints},
+                                     {"__row_kind", texts},
+                                     {"__key", texts},
+                                     {"extra", ints},
+                                     {"extra", texts}});
+    const auto columns = ra_columns(
+        "event_time:BIGINT;__row_kind:VARCHAR;__key:VARCHAR;missing:BIGINT;__source_partition:"
+        "INTEGER");
+    const auto compiled = compile_intake(*sidecar->schema(), columns);
+    ASSERT_TRUE(std::holds_alternative<IntakePlan>(compiled));
+    EXPECT_EQ(std::get<IntakePlan>(compiled).source, (std::vector<int>{2, 3, 4, -1, -1}));
+    ra_expect_intake_matches(
+        "event_time:BIGINT;__row_kind:VARCHAR;__key:VARCHAR;missing:BIGINT;__source_partition:"
+        "INTEGER",
+        sidecar);
+}
+
+// A sidecar the reader would not read as the intake does is declined, with
+// its reason, before anything is built.
+TEST(NativeIntake, ASidecarTheReaderCannotReadIsDeclinedWithItsReason) {
+    const auto columns = ra_columns("a:BIGINT;b:DATE");
+    const auto ints = ra_json(arrow::int64(), "[1]");
+    const auto check = [&columns](const std::shared_ptr<arrow::RecordBatch>& sidecar,
+                                  IntakeDecline want) {
+        const auto compiled = compile_intake(*sidecar->schema(), columns);
+        ASSERT_TRUE(std::holds_alternative<IntakeDecline>(compiled)) << sidecar->ToString();
+        EXPECT_EQ(std::get<IntakeDecline>(compiled), want);
+    };
+    check(ra_sidecar({{"a", ints}}, arrow::int32()), IntakeDecline::EventTime);
+    check(arrow::RecordBatch::Make(
+              arrow::schema(arrow::FieldVector{}), 1, std::vector<std::shared_ptr<arrow::Array>>{}),
+          IntakeDecline::EventTime);
+    check(ra_sidecar({{"a", ints}, {"b", ra_json(arrow::date32(), "[1]")}}),
+          IntakeDecline::UnsupportedType);
+    // Even a column nobody declared: the reader refuses the whole batch.
+    check(ra_sidecar({{"a", ints}, {"z", ra_json(arrow::list(arrow::int64()), "[[1]]")}}),
+          IntakeDecline::UnsupportedType);
+    check(ra_sidecar({{"a", ints}, {"a", ra_json(arrow::utf8(), R"(["x"])")}}),
+          IntakeDecline::DuplicateName);
+    EXPECT_STREQ(to_string(IntakeDecline::EventTime), "event_time");
+    EXPECT_STREQ(to_string(IntakeDecline::UnsupportedType), "unsupported_type");
+    EXPECT_STREQ(to_string(IntakeDecline::DuplicateName), "duplicate_name");
+}
+
+TEST(NativeIntake, AnEmptySidecarGivesAnEmptyChunkWithTheSchema) {
+    const auto columns = ra_columns("b:BIGINT;ts:TIMESTAMP(3);a:SMALLINT ARRAY");
+    const RowArrowBuilder builder(columns);
+    const auto sidecar = ra_sidecar({{"b", ra_json(arrow::int64(), "[]")}});
+    const auto compiled = compile_intake(*sidecar->schema(), columns);
+    ASSERT_TRUE(std::holds_alternative<IntakePlan>(compiled));
+    const auto chunk = builder.build_columnar(*sidecar, std::get<IntakePlan>(compiled));
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(chunk->num_rows(), 0);
+    EXPECT_TRUE(chunk->schema()->Equals(*builder.schema()));
 }
 
 }  // namespace

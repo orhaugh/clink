@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/api.h>
 #include <gtest/gtest.h>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
@@ -47,6 +48,7 @@
 #include "clink/runtime/memory_budget.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 
 #include "fake_transport.hpp"
 #include "native/errors.hpp"
@@ -398,6 +400,25 @@ struct NsRig {
         exec->start();
     }
 
+    // One bounded source per script, every one of them into a single sink
+    // subtask, so the sink runs on the fan-in runner rather than the chain's.
+    void start_fan_in(std::vector<std::vector<NsStep>> scripts) {
+        sink = build();
+        Dag dag;
+        auto sources = std::make_shared<std::vector<std::vector<NsStep>>>(std::move(scripts));
+        auto h = dag.add_parallel_source<sql::Row>(
+            [sources](std::size_t subtask) -> std::shared_ptr<Source<sql::Row>> {
+                return std::make_shared<NsSource>(sources->at(subtask), true);
+            },
+            sources->size());
+        dag.add_parallel_sink<sql::Row>(
+            h,
+            [s = sink](std::size_t /*subtask*/) -> std::shared_ptr<Sink<sql::Row>> { return s; },
+            1);
+        exec = std::make_unique<LocalExecutor>(std::move(dag), config);
+        exec->start();
+    }
+
     void wait() const { exec->await_termination(); }
 
     // Each operator error that carries `code`.
@@ -646,7 +667,7 @@ TEST(NativeSinkFactory, TheFactoryIsReachableOnTheRowChannelAndBuildsASinkThatGa
         nullptr);
     const auto sink = rig.build();
     EXPECT_TRUE(sink->gates_checkpoint_ack());
-    EXPECT_FALSE(sink->supports_columnar());
+    EXPECT_TRUE(sink->supports_columnar());
     EXPECT_EQ(sink->name(), "clickhouse_native_sink");
 }
 
@@ -697,7 +718,9 @@ TEST(NativeSinkFactory, TheRecordClaimsAtLeastOnceWithRetriesAndPassesItsOwnChec
         "in-flight rows at a fan-in",
         "a retry that holds the barrier beyond CLINK_EOS_FINAL_CKPT_TIMEOUT_MS (default 30 s) "
         "at the end of a bounded job or at a hot cutover spends a restart; nothing is lost",
-        "Row form only: a columnar batch is materialised before conversion",
+        "a columnar batch is taken without building rows when its event-time column is int64 "
+        "and every value column has a type the Row sidecar carries; otherwise it goes through "
+        "its row accessors, and clink_clickhouse_columnar_declined_total says why",
     };
 #if !defined(CLINK_CLICKHOUSE_NATIVE)
     limitations.emplace_back(
@@ -857,7 +880,9 @@ TEST(NativeSinkLogs, TheOpenReportAndTheClosedSummaryCarryEveryField) {
           " rows_maybe_duplicated=0 ",
           " abandoned_rows=0 ",
           " wire_bytes=",
-          " elapsed_ms="}) {
+          " elapsed_ms=",
+          " columnar_batches=0 ",
+          " row_batches=2"}) {
         EXPECT_TRUE(ns_has(summary, field)) << "missing '" << field << "' in: " << summary;
     }
     EXPECT_TRUE(ns_logs_with(logs, "clickhouse native sink cancelled:").empty());
@@ -1865,6 +1890,287 @@ TEST(NativeSinkConversion, AWrongKindCellFailsTheTaskInsteadOfLandingAsNull) {
             EXPECT_FALSE(ns_has(lines.front().message, c.hidden)) << lines.front().message;
         }
     }
+}
+
+// --- The columnar intake ------------------------------------------------------------
+
+// The rows ns_rows(from, to, length) holds, as the sidecar a columnar Row
+// producer emits: a null event time, then id and s.
+std::shared_ptr<arrow::RecordBatch> ns_sidecar(std::int64_t from,
+                                               std::int64_t to,
+                                               std::size_t length = 8) {
+    arrow::Int64Builder times;
+    arrow::Int64Builder ids;
+    arrow::StringBuilder texts;
+    for (std::int64_t id = from; id < to; ++id) {
+        EXPECT_TRUE(times.AppendNull().ok());
+        EXPECT_TRUE(ids.Append(id).ok());
+        EXPECT_TRUE(texts.Append(std::string(length, static_cast<char>('a' + id % 26))).ok());
+    }
+    std::shared_ptr<arrow::Array> t;
+    std::shared_ptr<arrow::Array> i;
+    std::shared_ptr<arrow::Array> s;
+    EXPECT_TRUE(times.Finish(&t).ok());
+    EXPECT_TRUE(ids.Finish(&i).ok());
+    EXPECT_TRUE(texts.Finish(&s).ok());
+    return arrow::RecordBatch::Make(arrow::schema({arrow::field("event_time", arrow::int64()),
+                                                   arrow::field("id", arrow::int64()),
+                                                   arrow::field("s", arrow::utf8())}),
+                                    to - from,
+                                    {t, i, s});
+}
+
+// A columnar batch whose closure counts its calls: any call is a Row built
+// from the sidecar. It still answers with the rows, so a sink that calls it
+// lands the right values and only the count tells.
+Batch<sql::Row> ns_counted(std::shared_ptr<arrow::RecordBatch> sidecar,
+                           std::shared_ptr<std::atomic<int>> calls) {
+    const auto rows = static_cast<std::size_t>(sidecar->num_rows());
+    return Batch<sql::Row>{
+        std::move(sidecar), rows, [calls = std::move(calls)](const arrow::RecordBatch& b) {
+            calls->fetch_add(1);
+            auto out = sql::rows_from_record_batch(b);
+            return out ? std::move(*out) : std::vector<Record<sql::Row>>{};
+        }};
+}
+
+NsStep ns_columnar(std::int64_t from, std::int64_t to, std::shared_ptr<std::atomic<int>> calls) {
+    NsStep s;
+    s.rows = [from, to, calls = std::move(calls)] {
+        return ns_counted(ns_sidecar(from, to), calls);
+    };
+    return s;
+}
+
+// Every block the table received, in order: the bytes of each column as the
+// client wrote them, then its rows.
+std::vector<std::pair<std::string, std::vector<std::vector<std::string>>>> ns_received(
+    const fake::FakeServer& s) {
+    std::vector<std::pair<std::string, std::vector<std::vector<std::string>>>> out;
+    for (const auto& insert : s.inserts(kNsTable)) {
+        for (const auto& block : insert.blocks) {
+            out.emplace_back(block.bytes, block.values);
+        }
+    }
+    return out;
+}
+
+std::vector<std::vector<std::string>> ns_sorted_rows(const fake::FakeServer& s) {
+    std::vector<std::vector<std::string>> out;
+    for (const auto& block : s.landed(kNsTable)) {
+        out.insert(out.end(), block.values.begin(), block.values.end());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// The sink on its chain, behind a source that emits columnar batches: no Row
+// is built for them anywhere on the hop, and the server receives the same
+// blocks, byte for byte, as from row batches holding the same rows.
+TEST(NativeSinkColumnar, AChainSinkTakesAColumnarBatchWithoutCallingItsClosure) {
+    const auto calls = std::make_shared<std::atomic<int>>(0);
+    std::vector<std::pair<std::string, std::vector<std::vector<std::string>>>> columnar;
+    {
+        NsRig rig;
+        rig.start({ns_columnar(0, 100, calls), ns_barrier(1), ns_columnar(100, 250, calls)});
+        rig.wait();
+        EXPECT_TRUE(rig.exec->operator_errors().empty());
+        EXPECT_TRUE(ns_each_landed(*rig.server, 0, 250));
+        columnar = ns_received(*rig.server);
+    }
+    EXPECT_EQ(calls->load(), 0) << "a Row was built from the sidecar on the sink's hop";
+    NsRig rig;
+    rig.start({ns_data(0, 100), ns_barrier(1), ns_data(100, 250)});
+    rig.wait();
+    EXPECT_TRUE(rig.exec->operator_errors().empty());
+    const auto rows = ns_received(*rig.server);
+    ASSERT_EQ(columnar.size(), 2U);
+    EXPECT_EQ(columnar, rows);
+}
+
+// The same through the fan-in runner, a single sink subtask reading two
+// upstream subtasks.
+TEST(NativeSinkColumnar, AFanInSinkTakesAColumnarBatchWithoutCallingItsClosure) {
+    const auto calls = std::make_shared<std::atomic<int>>(0);
+    std::vector<std::vector<std::string>> columnar;
+    {
+        NsRig rig;
+        rig.start_fan_in({{ns_columnar(0, 60, calls), ns_columnar(60, 100, calls)},
+                          {ns_columnar(100, 180, calls)}});
+        rig.wait();
+        EXPECT_TRUE(rig.exec->operator_errors().empty());
+        EXPECT_TRUE(ns_each_landed(*rig.server, 0, 180));
+        columnar = ns_sorted_rows(*rig.server);
+    }
+    EXPECT_EQ(calls->load(), 0) << "a Row was built from the sidecar on the sink's hop";
+    NsRig rig;
+    rig.start_fan_in({{ns_data(0, 60), ns_data(60, 100)}, {ns_data(100, 180)}});
+    rig.wait();
+    EXPECT_TRUE(rig.exec->operator_errors().empty());
+    ASSERT_EQ(columnar.size(), 180U);
+    EXPECT_EQ(columnar, ns_sorted_rows(*rig.server));
+}
+
+// A sidecar the self-describing reader cannot read as the intake would is
+// handed back before anything is reserved or sent, its reason is counted, and
+// on_data then lands the batch through its rows. The closure here is not the
+// reader, so each batch still has rows to give.
+TEST(NativeSinkColumnar, ADeclinedBatchReservesAndSendsNothingAndOnDataLandsIt) {
+    struct Case {
+        std::string label;
+        std::shared_ptr<arrow::RecordBatch> sidecar;
+        const char* reason;
+    };
+    const auto base = ns_sidecar(0, 4);
+    std::shared_ptr<arrow::Array> int32_times;
+    {
+        arrow::Int32Builder b;
+        ASSERT_TRUE(b.AppendNulls(4).ok());
+        ASSERT_TRUE(b.Finish(&int32_times).ok());
+    }
+    std::shared_ptr<arrow::Array> dates;
+    {
+        arrow::Date32Builder b;
+        ASSERT_TRUE(b.AppendValues({1, 2, 3, 4}).ok());
+        ASSERT_TRUE(b.Finish(&dates).ok());
+    }
+    const std::vector<Case> cases = {
+        {"an int32 event-time column",
+         arrow::RecordBatch::Make(arrow::schema({arrow::field("event_time", arrow::int32()),
+                                                 arrow::field("id", arrow::int64()),
+                                                 arrow::field("s", arrow::utf8())}),
+                                  4,
+                                  {int32_times, base->column(1), base->column(2)}),
+         "event_time"},
+        {"a date32 value column",
+         base->AddColumn(3, arrow::field("d", arrow::date32()), dates).ValueOrDie(),
+         "unsupported_type"},
+        {"a declared name carried twice",
+         base->AddColumn(3, arrow::field("id", arrow::int64()), base->column(1)).ValueOrDie(),
+         "duplicate_name"},
+    };
+    std::int64_t next = 0;
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.label);
+        NsDirect direct;
+        NativeSink& sink = direct.open();
+        const std::int64_t since = ns_log_mark();
+        const std::int64_t from = next;
+        next += 4;
+        const auto rows = ns_rows(from, from + 4);
+        const Batch<sql::Row> batch{
+            c.sidecar, 4, [&rows](const arrow::RecordBatch&) { return rows.records(); }};
+        // The same schema twice: both are counted, one is logged.
+        EXPECT_FALSE(sink.on_data_columnar(batch));
+        EXPECT_FALSE(sink.on_data_columnar(batch));
+        EXPECT_EQ(direct.metrics.gauge(ns_name(metric::kQueueBytes, NsDirect::kOpId)).value(), 0);
+        sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+        EXPECT_TRUE(direct.server->inserts(kNsTable).empty())
+            << "a declined batch reached the writer";
+        EXPECT_EQ(ns_count(direct.metrics,
+                           ns_name(metric::kColumnarDeclinedTotal,
+                                   NsDirect::kOpId,
+                                   "reason",
+                                   std::string(c.reason))),
+                  2U);
+        const auto logged = ns_logs_with(ns_logs_since(since),
+                                         "takes columnar batches of this schema through their "
+                                         "rows (" +
+                                             std::string(c.reason) + ")");
+        ASSERT_EQ(logged.size(), 1U);
+        EXPECT_EQ(logged.front().level, "info");
+
+        sink.on_data(batch);
+        sink.on_barrier(CheckpointBarrier{CheckpointId{2}});
+        EXPECT_TRUE(ns_each_landed(*direct.server, from, from + 4));
+        EXPECT_EQ(direct.server->rows(kNsTable), 4U);
+        EXPECT_EQ(
+            ns_count(
+                direct.metrics,
+                ns_name(
+                    metric::kInputBatchesTotal, NsDirect::kOpId, "carrier", metric::kCarrierRow)),
+            1U);
+        EXPECT_EQ(ns_count(direct.metrics,
+                           ns_name(metric::kInputBatchesTotal,
+                                   NsDirect::kOpId,
+                                   "carrier",
+                                   metric::kCarrierColumnar)),
+                  0U);
+        sink.flush();
+        sink.close();
+    }
+}
+
+// What the sink counts and reports for each carrier: the batches it took
+// columnar and through their rows, in the metric and in the closed summary.
+TEST(NativeSinkColumnar, EachCarrierIsCountedAndTheSummaryReportsBoth) {
+    NsDirect direct;
+    NativeSink& sink = direct.open();
+    const std::int64_t since = ns_log_mark();
+    const auto calls = std::make_shared<std::atomic<int>>(0);
+    EXPECT_TRUE(sink.on_data_columnar(ns_counted(ns_sidecar(0, 10), calls)));
+    EXPECT_TRUE(sink.on_data_columnar(ns_counted(ns_sidecar(10, 30), calls)));
+    // An empty columnar batch is taken, and is no batch to count.
+    EXPECT_TRUE(sink.on_data_columnar(ns_counted(ns_sidecar(30, 30), calls)));
+    sink.on_data(ns_rows(30, 40));
+    // A row batch has no sidecar to take.
+    EXPECT_FALSE(sink.on_data_columnar(ns_rows(40, 41)));
+    sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    sink.flush();
+    sink.close();
+    EXPECT_EQ(calls->load(), 0);
+    EXPECT_TRUE(ns_each_landed(*direct.server, 0, 40));
+    EXPECT_EQ(direct.server->rows(kNsTable), 40U);
+    EXPECT_EQ(ns_count(direct.metrics,
+                       ns_name(metric::kInputBatchesTotal, NsDirect::kOpId, "carrier", "columnar")),
+              2U);
+    EXPECT_EQ(ns_count(direct.metrics,
+                       ns_name(metric::kInputBatchesTotal, NsDirect::kOpId, "carrier", "row")),
+              1U);
+    const auto closed = ns_logs_with(ns_logs_since(since), "clickhouse native sink closed:");
+    ASSERT_EQ(closed.size(), 1U);
+    EXPECT_TRUE(ns_has(closed.front().message, " elapsed_ms=")) << closed.front().message;
+    EXPECT_TRUE(closed.front().message.ends_with(" columnar_batches=2 row_batches=1"))
+        << closed.front().message;
+}
+
+// A cell the intake cannot convert fails the task as on_data does, with the
+// same line, and sends nothing of its batch.
+TEST(NativeSinkColumnar, AColumnarCellThatCannotConvertFailsTheTaskAsOnDataDoes) {
+    fake::FakeTable table = ns_table();
+    table.columns = {{"id", "Int64", DefaultKind::None, 1},
+                     {"ts", "Nullable(DateTime64(3))", DefaultKind::None, 2}};
+    NsDirect direct(table);
+    direct.params["sql_column_types"] = "id:BIGINT;ts:TIMESTAMP(3)";
+    NativeSink& sink = direct.open();
+    const std::int64_t since = ns_log_mark();
+    arrow::Int64Builder times;
+    arrow::Int64Builder ids;
+    arrow::StringBuilder stamps;
+    ASSERT_TRUE(times.AppendNulls(2).ok());
+    ASSERT_TRUE(ids.AppendValues({1, 2}).ok());
+    ASSERT_TRUE(stamps.AppendValues({"1700000000000", "2024-01-01T00:00:00Z"}).ok());
+    const auto sidecar = arrow::RecordBatch::Make(
+        arrow::schema({arrow::field("event_time", arrow::int64()),
+                       arrow::field("id", arrow::int64()),
+                       arrow::field("ts", arrow::utf8())}),
+        2,
+        {times.Finish().ValueOrDie(), ids.Finish().ValueOrDie(), stamps.Finish().ValueOrDie()});
+    const auto calls = std::make_shared<std::atomic<int>>(0);
+    try {
+        (void)sink.on_data_columnar(ns_counted(sidecar, calls));
+        ADD_FAILURE() << "the batch was taken";
+    } catch (const ConversionError& e) {
+        EXPECT_EQ(e.column(), "ts");
+        EXPECT_EQ(e.row(), 1);
+    }
+    EXPECT_EQ(calls->load(), 0);
+    sink.close_cancelled();
+    EXPECT_TRUE(direct.server->inserts(kNsTable).empty());
+    const auto lines = ns_logs_with(ns_logs_since(since), "cannot write a row of this batch");
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines.front().level, "error");
+    EXPECT_FALSE(ns_has(lines.front().message, "2024")) << lines.front().message;
 }
 
 // --- The at-least-once contract across a crash ---------------------------------------

@@ -829,6 +829,48 @@ RowArrowBuilder::~RowArrowBuilder() = default;
 RowArrowBuilder::RowArrowBuilder(RowArrowBuilder&&) noexcept = default;
 RowArrowBuilder& RowArrowBuilder::operator=(RowArrowBuilder&&) noexcept = default;
 
+namespace {
+
+// The one per-column loop both build() and build_columnar() run, so the row
+// and the columnar intake cannot drift. `cell(i)` gives row i's cell of the
+// column, or nullptr for a null or absent one; the pointer is used before the
+// next call. A shared type goes through the batcher's own builder, reserve
+// rule and cell rule, exactly as row_columnar_detail::build_column applies
+// them; the rest through CellWriter.
+template <typename CellAt>
+std::shared_ptr<arrow::Array> build_one(const RowArrowBuilder::Impl::Column& c,
+                                        std::int64_t rows,
+                                        CellAt&& cell) {
+    std::shared_ptr<arrow::Array> array;
+    if (c.shared) {
+        std::unique_ptr<arrow::ArrayBuilder> builder = shared::make_cell_builder(c.type);
+        // The list builder's capacity is its child's, so build_column reserves
+        // nothing for it.
+        if (c.type->id() != arrow::Type::LIST) {
+            arrow_ok(builder->Reserve(rows));
+        }
+        for (std::int64_t i = 0; i < rows; ++i) {
+            shared::append_json_cell(*builder, *c.type, cell(i));
+        }
+        arrow_ok(builder->Finish(&array));
+        return array;
+    }
+    auto made = arrow::MakeBuilder(c.type, arrow::default_memory_pool());
+    arrow_ok(made.status());
+    std::unique_ptr<arrow::ArrayBuilder> builder = std::move(made).ValueUnsafe();
+    arrow_ok(builder->Reserve(rows));
+    Cursor cursor(c.declared.name);
+    CellWriter writer(cursor);
+    for (std::int64_t i = 0; i < rows; ++i) {
+        cursor.at_row(i);
+        writer.append(*builder, c.declared.type, cell(i));
+    }
+    arrow_ok(builder->Finish(&array));
+    return array;
+}
+
+}  // namespace
+
 std::shared_ptr<arrow::RecordBatch> RowArrowBuilder::build(const Batch<sql::Row>& batch) const {
     // Materialises a columnar batch. A sidecar whose decoder cannot read its
     // schema yields no rows, and building from that would drop them in
@@ -845,31 +887,39 @@ std::shared_ptr<arrow::RecordBatch> RowArrowBuilder::build(const Batch<sql::Row>
     arrays.reserve(impl_->columns.size());
     for (const auto& c : impl_->columns) {
         const std::string& name = c.declared.name;
-        std::shared_ptr<arrow::Array> array;
-        if (c.shared) {
-            // The batcher's own column builder, cell rule and lookup.
-            array = shared::build_column(name, c.type, batch);
-            if (!array) {
-                throw std::runtime_error(
-                    "clickhouse native sink: building the Arrow chunk failed for column `" + name +
-                    "`");
-            }
-        } else {
-            auto made = arrow::MakeBuilder(c.type, arrow::default_memory_pool());
-            arrow_ok(made.status());
-            std::unique_ptr<arrow::ArrayBuilder> builder = std::move(made).ValueUnsafe();
-            arrow_ok(builder->Reserve(rows));
-            Cursor cursor(name);
-            CellWriter writer(cursor);
-            for (std::int64_t i = 0; i < rows; ++i) {
-                cursor.at_row(i);
-                writer.append(*builder,
-                              c.declared.type,
-                              shared::field(records[static_cast<std::size_t>(i)].value(), name));
-            }
-            arrow_ok(builder->Finish(&array));
-        }
-        arrays.push_back(std::move(array));
+        arrays.push_back(build_one(c, rows, [&records, &name](std::int64_t i) {
+            return shared::field(records[static_cast<std::size_t>(i)].value(), name);
+        }));
+    }
+    return arrow::RecordBatch::Make(impl_->schema, rows, std::move(arrays));
+}
+
+std::shared_ptr<arrow::RecordBatch> RowArrowBuilder::build_columnar(const arrow::RecordBatch& batch,
+                                                                    const IntakePlan& plan) const {
+    if (plan.source.size() != impl_->columns.size()) {
+        throw std::logic_error("clickhouse native sink: an intake plan for " +
+                               std::to_string(plan.source.size()) + " columns, not " +
+                               std::to_string(impl_->columns.size()));
+    }
+    const std::int64_t rows = batch.num_rows();
+    std::vector<std::shared_ptr<arrow::Array>> arrays;
+    arrays.reserve(impl_->columns.size());
+    for (std::size_t k = 0; k < impl_->columns.size(); ++k) {
+        const int index = plan.source[k];
+        const arrow::Array* array = index < 0 ? nullptr : batch.column(index).get();
+        const std::shared_ptr<arrow::DataType> type =
+            index < 0 ? nullptr : batch.schema()->field(index)->type();
+        // The cell as the self-describing reader reads it into a Row value,
+        // and as shared::field then hands it on: a null cell is no cell.
+        JsonValue held;
+        arrays.push_back(
+            build_one(impl_->columns[k], rows, [&](std::int64_t i) -> const JsonValue* {
+                if (array == nullptr || array->IsNull(i)) {
+                    return nullptr;
+                }
+                held = shared::read_cell(type, *array, i);
+                return held.is_null() ? nullptr : &held;
+            }));
     }
     return arrow::RecordBatch::Make(impl_->schema, rows, std::move(arrays));
 }

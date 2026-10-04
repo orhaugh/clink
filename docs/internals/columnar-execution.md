@@ -24,6 +24,7 @@ The path is strictly opt-in and degrades cleanly. The default for every operator
 | SQL Row columnar | `include/clink/sql/row_columnar_batcher.hpp`, `src/sql/install.cpp` | `make_row_columnar_arrow_batcher`, `make_row_wire_batcher`, columnar SQL operators |
 | Born-columnar output | `include/clink/sql/row_columnar_output.hpp`, `enable_columnar_output()` in `src/sql/physical_plan.cpp` | `RowColumnarOutput` builds an operator's output as typed Arrow columns; the planner decides when that pays |
 | Parquet source | `include/clink/connectors/parquet_source.hpp` | Produces columnar batches via the batcher's `parse` |
+| Native ClickHouse sink intake | `impls/clickhouse/src/native/intake.{hpp,cpp}`, `RowArrowBuilder::build_columnar()` in `impls/clickhouse/src/native/row_arrow.cpp` | Converts a SQL Row sidecar to the sink's typed chunk with no Row built, cell for cell as the row path would |
 
 ## How it works
 
@@ -258,7 +259,13 @@ shows zero. Check a hop with three readings:
    should be about one per batch, which shows the chain was carrying a sidecar up to
    the sink. `SqlRuntime.RowBindIntoJsonFileSinkKeepsRowPathBytes` is that control
    for the bind.
-3. The sink's own count of batches it took as a sidecar, where the sink keeps one.
+3. The sink's own count of batches it took as a sidecar, where the sink keeps one. The
+   native ClickHouse sink keeps `clink_clickhouse_input_batches_total{carrier}` and
+   reports `columnar_batches` and `row_batches` in its close summary.
+
+`ClickHouseNativeSql.AQ0ShapedPipelineBuildsNoRowAtTheSinkHop` takes all three readings
+for a Kafka JSON table straight into the native sink: a delta of 0, a collect-sink
+control above 0, and a `columnar` count equal to the batches the sink received.
 
 A related habit worth keeping: an opt-in that cannot be observed will eventually be
 found to have done nothing. `clink_node --version` and the node startup log both report
@@ -343,7 +350,9 @@ That mattered more than it sounds. The discard sink was a `FunctionSink<Row>` it
 
 In a SQL plan the operator in front of every Row sink is `row_bind_columns`, the sink-boundary bind that maps the SELECT's columns onto the table's declared ones. It takes a columnar batch as it is (`ColumnarRowBindOperator` in `src/sql/install.cpp`): column 0 is kept, each selected column is found by name from index 1, renamed to the declared name with its type kept, and `__row_kind` and `__source_partition` ride along. The result carries `row_materialize_fn()`, never the parent's closure through `with_arrow`, because the decoder's and the declared batcher's closures resolve their own declared names and would drop a renamed column. A select name that matches two value fields, a declared column named `__source_partition` or `__row_kind`, or a column type the self-describing decode cannot read, sends the batch to `process()`. So blackhole takes the sidecar untouched, and a row-only sink materialises once, in the sink rather than in the bind. From `2dd2e23` until it learned to take the sidecar, the bind was a `MapOperator` and materialised every columnar batch, so the blackhole hook did nothing for SQL plans in that period (see "Verifying the path actually fires").
 
-`enable_columnar_output()` lists `blackhole_sink_row` as a columnar consumer, but in a SQL plan the bind sits between any producer and the sink, and the bind is not on that list, so the sink entry does not promote a producer today. Note what the hook is *not* - a production win. `blackhole` exists to measure the engine without sink cost; a real Kafka or Parquet sink must still serialise per record. The seam is what a Parquet sink would use to write a `RecordBatch` directly.
+The bind taking the sidecar is what lets any SQL sink use the hook. The native ClickHouse sink (`clickhouse_native_sink`) is the first production sink to answer it. Its intake resolves the declared columns against the sidecar's own schema by the self-describing reader's rules, reads each cell with `row_columnar_detail::read_cell`, and appends it through the same per-column loop `RowArrowBuilder::build()` runs for rows, so a columnar batch lands exactly what its rows would and fails on the same cell. It declines a batch whose column 0 is not int64, that carries a value type the reader cannot read, or that carries a declared name twice, before reserving or sending anything; the runner then calls `on_data`. A Dag-direct caller that hands it a batch with another closure gets the sidecar's own column names as the truth.
+
+`enable_columnar_output()` lists `blackhole_sink_row` as a columnar consumer, but in a SQL plan the bind sits between any producer and the sink, and the bind is not on that list, so the sink entry does not promote a producer today. `blackhole` exists to measure the engine without sink cost. A sink that writes per record still serialises per record behind the hook; the seam is what a Parquet sink would use to write a `RecordBatch` directly.
 
 Watermarks and barriers never go through `process_columnar`; the runner routes those to `process()` (or the operator's `on_watermark` / `on_barrier`), so a columnar operator still implements `process()` for control elements and for the row-only fallback.
 
@@ -395,7 +404,7 @@ Everything above is about *ingest*: a producer attaches a sidecar and a capable 
 - Exact or bail. The sidecar layout (`effective_type`) keeps int64, int32, double, float, bool, utf8, decimal128 and list<float32> as typed columns and stores every other type as text, so not every value comes back out of it as it went in: a TIMESTAMP, SMALLINT or DATE number, or an ARRAY, MAP or ROW value, would come back as a JSON string, and a REAL the source never rounded to float precision would come back rounded. An operator therefore appends a row through `RowColumnarOutput::try_append_row`, which checks every cell with `row_columnar_detail::cell_is_exact` before appending any of them. A row with an inexact cell sends its emission down the row path. The cells that do go in are converted by `append_json_cell`, the function the row-batch converter (`build_column`) uses, and read back by `read_cell`, so a row consumer sees the row the operator would have built, with the event time the row path stamps on it. `tests/test_born_columnar_parity.cpp` runs joins and windows over those types against `CLINK_DISABLE_COLUMNAR_OUTPUT=1` and compares the output files; `clink::detail::columnar_output_bail_counter()` counts the emissions that began columnar and finished in row form, so a test can tell a carrier that held from one that bailed.
 - The emitted batch carries `row_materialize_fn()`, so a row consumer downstream decodes it lazily exactly once and sees the rows it would have received anyway. Correctness never depends on the consumer being columnar.
 
-Whether emitting columnar is *faster* does depend on the consumer, because a row consumer pays the Arrow build and then the materialise. So the decision belongs to the planner, which can see the chain, and not to the operator, which cannot. `enable_columnar_output()` in `src/sql/physical_plan.cpp` promotes a producer's stashed typed output schema to a live `columnar_output` param only when every consumer of that producer ingests columnar; a producer feeding a sink directly is left row form, since no sink connector reads Arrow batches today.
+Whether emitting columnar is *faster* does depend on the consumer, because a row consumer pays the Arrow build and then the materialise. So the decision belongs to the planner, which can see the chain, and not to the operator, which cannot. `enable_columnar_output()` in `src/sql/physical_plan.cpp` promotes a producer's stashed typed output schema to a live `columnar_output` param only when every consumer of that producer ingests columnar; a producer feeding a sink directly is left row form. In a SQL plan that producer feeds the sink-boundary bind, which the planner does not count as a columnar consumer, so a sink that reads the sidecar (blackhole, the native ClickHouse sink) receives one only when an earlier operator, such as the projection or the source decode, already made it.
 
 Two operators emit born-columnar output:
 

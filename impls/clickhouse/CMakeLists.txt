@@ -327,6 +327,7 @@ if(_ch_native)
         src/native/default_ca.cpp
         src/native/error_class.cpp
         src/native/insert_transport.cpp
+        src/native/intake.cpp
         src/native/native_sink.cpp
         src/native/retry.cpp
         src/native/row_arrow.cpp

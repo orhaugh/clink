@@ -16,7 +16,9 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -34,6 +36,7 @@
 #include "native/default_ca.hpp"
 #include "native/error_class.hpp"
 #include "native/errors.hpp"
+#include "native/intake.hpp"
 #include "native/metrics.hpp"
 #include "native/retry.hpp"
 #include "native/row_arrow.hpp"
@@ -475,6 +478,13 @@ struct NativeSink::Impl {
     void open_failed(const NativeSinkError& e) const;
     [[noreturn]] void refuse_unaligned_barrier(std::uint64_t checkpoint) const;
     void require_writer(const char* call) const;
+    // The plan for a sidecar of this schema, or nullptr once the decline is
+    // counted and, the first time for the schema, logged.
+    [[nodiscard]] const IntakePlan* intake_for(const std::shared_ptr<arrow::Schema>& schema);
+    // The tail on_data and on_data_columnar share: charge a built chunk to the
+    // budget, queue it and count it under its carrier.
+    void submit(std::shared_ptr<arrow::RecordBatch> rows, Carrier carrier);
+    void conversion_failed(const ConversionError& e) const;
     void count_refusal(const std::string& code) const;
     void log(LogSeverity level, const std::string& message) const;
     [[nodiscard]] std::string subtask() const { return subtask_text(options); }
@@ -497,6 +507,18 @@ struct NativeSink::Impl {
     std::optional<std::uint64_t> reduced_from;
     Clock::time_point opened_at{};
     std::unique_ptr<RowArrowBuilder> builder;
+
+    // The last sidecar schema on_data_columnar saw and what compile_intake
+    // made of it: a stream keeps one schema, so it compiles once.
+    std::shared_ptr<arrow::Schema> intake_schema;
+    IntakeResult intake{IntakeDecline::EventTime};
+    std::unordered_set<std::string> declines_logged;
+    // Registered at open, so every series shows from the start. Null without
+    // a context.
+    Counter* columnar_batches{nullptr};
+    Counter* row_batches{nullptr};
+    std::array<Counter*, 3> declined{};  // by IntakeDecline
+
     // Declared last, so it goes first: its destructor aborts a writer that
     // was never closed.
     std::unique_ptr<Writer> writer;
@@ -518,6 +540,18 @@ void NativeSink::Impl::cache(const RuntimeContext* ctx,
     // The same id the INSERTs carry in log_comment, so the open report and
     // system.query_log can be matched.
     sink_id = sanitise_sink_id(ctx->operator_name());
+    if (metrics != nullptr) {
+        columnar_batches = &metrics->counter(
+            tagged(metric::kInputBatchesTotal, op_id, "carrier", metric::kCarrierColumnar));
+        row_batches = &metrics->counter(
+            tagged(metric::kInputBatchesTotal, op_id, "carrier", metric::kCarrierRow));
+        for (const IntakeDecline reason : {IntakeDecline::EventTime,
+                                           IntakeDecline::UnsupportedType,
+                                           IntakeDecline::DuplicateName}) {
+            declined.at(static_cast<std::size_t>(reason)) = &metrics->counter(
+                tagged(metric::kColumnarDeclinedTotal, op_id, "reason", to_string(reason)));
+        }
+    }
 }
 
 void NativeSink::Impl::check_barrier_mode(const RuntimeContext* ctx) const {
@@ -811,6 +845,52 @@ void NativeSink::Impl::require_writer(const char* call) const {
     }
 }
 
+const IntakePlan* NativeSink::Impl::intake_for(const std::shared_ptr<arrow::Schema>& schema) {
+    if (!intake_schema || (intake_schema != schema && !intake_schema->Equals(*schema))) {
+        intake = compile_intake(*schema, columns);
+        intake_schema = schema;
+        if (const auto* reason = std::get_if<IntakeDecline>(&intake)) {
+            std::string fields;
+            for (const auto& f : schema->fields()) {
+                fields += (fields.empty() ? "" : ", ") + f->name() + ": " + f->type()->ToString();
+            }
+            if (declines_logged.insert(fields).second) {
+                log(LogSeverity::Info,
+                    "clickhouse native sink: subtask=" + subtask() +
+                        " takes columnar batches of this schema through their rows (" +
+                        to_string(*reason) + "): " + fields);
+            }
+        }
+    }
+    if (const auto* plan = std::get_if<IntakePlan>(&intake)) {
+        return plan;
+    }
+    if (Counter* c = declined.at(static_cast<std::size_t>(std::get<IntakeDecline>(intake)))) {
+        c->increment();
+    }
+    return nullptr;
+}
+
+void NativeSink::Impl::submit(std::shared_ptr<arrow::RecordBatch> rows, Carrier carrier) {
+    Chunk chunk;
+    chunk.bytes = chunk_bytes(*rows);
+    chunk.reservation = MemoryReservation(budget, MemoryCategory::Queue, chunk.bytes);
+    chunk.batch = std::move(rows);
+    chunk.carrier = carrier;
+    writer->submit(std::move(chunk));
+    if (Counter* c = carrier == Carrier::Columnar ? columnar_batches : row_batches) {
+        c->increment();
+    }
+}
+
+void NativeSink::Impl::conversion_failed(const ConversionError& e) const {
+    // The reason names the column, the row of the batch, the declared type
+    // and the kind of the cell, and never its text.
+    log(LogSeverity::Error,
+        "clickhouse native sink: subtask=" + subtask() + " cannot write a row of this batch to " +
+            qualified + ": " + e.what());
+}
+
 void NativeSink::Impl::count_refusal(const std::string& code) const {
     if (metrics != nullptr) {
         metrics->counter(tagged(metric::kRefusalsTotal, op_id, "reason", code)).increment();
@@ -866,18 +946,10 @@ void NativeSink::on_data(const Batch<sql::Row>& batch) {
             // the writer's network I/O.
             rows = s.builder->build(batch);
         } catch (const ConversionError& e) {
-            // The reason names the column, the row of the batch, the declared
-            // type and the kind of the cell, and never its text.
-            s.log(LogSeverity::Error,
-                  "clickhouse native sink: subtask=" + s.subtask() +
-                      " cannot write a row of this batch to " + s.qualified + ": " + e.what());
+            s.conversion_failed(e);
             throw;
         }
-        Chunk chunk;
-        chunk.bytes = chunk_bytes(*rows);
-        chunk.reservation = MemoryReservation(s.budget, MemoryCategory::Queue, chunk.bytes);
-        chunk.batch = std::move(rows);
-        s.writer->submit(std::move(chunk));
+        s.submit(std::move(rows), Carrier::Row);
     } catch (...) {
         // Every call that throws fails the task, and the runner then skips
         // both closes: stop the writer now, which also logs its summary.
@@ -888,6 +960,42 @@ void NativeSink::on_data(const Batch<sql::Row>& batch) {
 
 void NativeSink::on_data(Batch<sql::Row>&& batch) {
     on_data(static_cast<const Batch<sql::Row>&>(batch));
+}
+
+bool NativeSink::on_data_columnar(const Batch<sql::Row>& batch) {
+    Impl& s = *impl_;
+    s.require_writer("on_data_columnar");
+    const std::shared_ptr<arrow::RecordBatch>& sidecar = batch.arrow();
+    if (!sidecar) {
+        return false;
+    }
+    if (batch.empty()) {
+        return true;
+    }
+    if (sidecar->num_rows() != static_cast<std::int64_t>(batch.size())) {
+        // A count the sidecar does not bear out is no layout this intake
+        // reads; on_data checks the rows it materialises against it.
+        return false;
+    }
+    try {
+        const IntakePlan* plan = s.intake_for(sidecar->schema());
+        if (plan == nullptr) {
+            // Nothing is reserved or sent yet, so the row path can take it.
+            return false;
+        }
+        std::shared_ptr<arrow::RecordBatch> rows;
+        try {
+            rows = s.builder->build_columnar(*sidecar, *plan);
+        } catch (const ConversionError& e) {
+            s.conversion_failed(e);
+            throw;
+        }
+        s.submit(std::move(rows), Carrier::Columnar);
+    } catch (...) {
+        s.writer->abort();
+        throw;
+    }
+    return true;
 }
 
 void NativeSink::on_barrier(CheckpointBarrier barrier) {

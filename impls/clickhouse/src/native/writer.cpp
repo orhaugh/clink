@@ -1709,6 +1709,11 @@ void Writer::submit(Chunk chunk) {
             waited = true;
             c.done_cv_.wait_for(lock, kSlice);
         }
+        {
+            const std::lock_guard<std::mutex> stats(c.stats_mu_);
+            ++(chunk.carrier == Carrier::Columnar ? c.stats_.columnar_batches
+                                                  : c.stats_.row_batches);
+        }
         c.queued_bytes_ += chunk.bytes;
         ++c.queued_chunks_;
         c.queue_bytes_now_.store(c.queued_bytes_, std::memory_order_relaxed);
@@ -1860,6 +1865,8 @@ std::string summary_line(std::string_view outcome,
     out += " abandoned_rows=" + std::to_string(stats.abandoned_rows);
     out += " wire_bytes=" + std::to_string(stats.wire_bytes);
     out += " elapsed_ms=" + std::to_string(std::max<std::int64_t>(elapsed.count(), 0));
+    out += " columnar_batches=" + std::to_string(stats.columnar_batches);
+    out += " row_batches=" + std::to_string(stats.row_batches);
     return out;
 }
 

@@ -2452,7 +2452,8 @@ TEST(NativeWriterSummary, TheSummaryLineCarriesEveryFieldInOrder) {
               "clickhouse native sink closed: subtask=3/8 rows_acknowledged=10485760 inserts=11 "
               "retries=transient:2,in_doubt:1,merge_backpressure:0,resource:0,client_defect:0,"
               "unclassified:0 in_doubt=1 rows_resent_with_token=953211 rows_maybe_duplicated=0 "
-              "abandoned_rows=0 wire_bytes=391002113 elapsed_ms=61210");
+              "abandoned_rows=0 wire_bytes=391002113 elapsed_ms=61210 columnar_batches=0 "
+              "row_batches=0");
 }
 
 TEST(NativePartRate, FrequentSmallInsertsWarnAtMostOncePerQuietPeriod) {

@@ -8,6 +8,7 @@
 #include "clink/core/record.hpp"
 #include "clink/sql/row.hpp"
 
+#include "native/intake.hpp"
 #include "native/types.hpp"
 
 namespace clink::clickhouse::native {
@@ -41,6 +42,14 @@ public:
     // ConversionError naming the declared column and the row within `batch`;
     // a reason never quotes text, only its length.
     [[nodiscard]] std::shared_ptr<arrow::RecordBatch> build(const Batch<sql::Row>& batch) const;
+    // The same chunk from a columnar batch's sidecar, with no Row built: each
+    // cell is read as the self-describing reader reads it into a Row value
+    // (row_columnar_detail::read_cell) and goes through the per-column loop
+    // build() runs. So it equals build() over the rows `batch` materialises
+    // to, by sql::row_materialize_fn(), and throws the same ConversionError
+    // for the same cell. `plan` is compile_intake's for `batch`'s schema.
+    [[nodiscard]] std::shared_ptr<arrow::RecordBatch> build_columnar(
+        const arrow::RecordBatch& batch, const IntakePlan& plan) const;
     [[nodiscard]] const std::shared_ptr<arrow::Schema>& schema() const noexcept;
 
     struct Impl;

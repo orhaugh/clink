@@ -58,7 +58,9 @@ clink::connectors::ConnectorCapabilities native_record() {
         "in-flight rows at a fan-in",
         "a retry that holds the barrier beyond CLINK_EOS_FINAL_CKPT_TIMEOUT_MS (default 30 s) "
         "at the end of a bounded job or at a hot cutover spends a restart; nothing is lost",
-        "Row form only: a columnar batch is materialised before conversion",
+        "a columnar batch is taken without building rows when its event-time column is int64 "
+        "and every value column has a type the Row sidecar carries; otherwise it goes through "
+        "its row accessors, and clink_clickhouse_columnar_declined_total says why",
     };
 #if !defined(CLINK_CLICKHOUSE_NATIVE)
     limitations.emplace_back(

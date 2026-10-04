@@ -41,6 +41,13 @@ public:
     void open() override;
     void on_data(const Batch<sql::Row>& batch) override;
     void on_data(Batch<sql::Row>&& batch) override;
+    // A columnar batch whose sidecar the self-describing reader can read is
+    // converted from its arrays with no Row built, to the same chunk on_data
+    // would build. Otherwise it returns false before anything is reserved or
+    // sent, counts the reason in clink_clickhouse_columnar_declined_total, and
+    // the runner hands the batch to on_data. Throws as on_data does.
+    [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
+    bool on_data_columnar(const Batch<sql::Row>& batch) override;
     // Throws rather than returns when the rows cannot be acknowledged (a
     // permanent failure, an exhausted retry window, a cancel), because a
     // normal return lets the checkpoint complete over rows that never reached
@@ -52,8 +59,6 @@ public:
     void close() override;
     // Never throws.
     void close_cancelled() override;
-    // supports_columnar() keeps the default false: a columnar batch is read
-    // through its row accessors.
     // The at-least-once guarantee rests on on_barrier preceding the
     // checkpoint's ack, which holds only while this sink owns its chain's
     // checkpoint, so Dag::add_sink keeps it the only sink on its chain.

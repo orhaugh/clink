@@ -2,7 +2,8 @@
 // in-process fake server rather than a real one:
 //   - the values a script lands through insert_format='native' equal what the
 //     same script hands connector='collect', under the sink's type mapping,
-//     on a row plan and on plans whose rows were rebuilt from a columnar batch;
+//     on a row plan and on plans that hand the sink a columnar batch;
+//   - a q0-shaped pipeline builds no Row on its way into the native sink;
 //   - every key the planner puts on a native sink op is one the sink owns or
 //     tolerates, and the factory accepts the op;
 //   - a barrier held by a slow INSERT stalls the periodic checkpoint without
@@ -65,6 +66,7 @@
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
 #include "clink/embed/embedded_engine.hpp"
+#include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
@@ -1095,6 +1097,21 @@ std::map<std::int64_t, std::map<std::string, std::string>> run_into_native(
     return rows;
 }
 
+// clink_clickhouse_input_batches_total for one carrier, summed over every
+// sink subtask in the process. The embedded engine's worker hands its
+// operators the process registry.
+std::uint64_t sink_input_batches(const std::string& carrier) {
+    const std::string prefix = "clink_clickhouse_input_batches_total{";
+    const std::string tag = "carrier=\"" + carrier + "\"";
+    std::uint64_t total = 0;
+    for (const auto& [name, value] : clink::MetricsRegistry::global().snapshot().counters) {
+        if (name.starts_with(prefix) && name.find(tag) != std::string::npos) {
+            total += value;
+        }
+    }
+    return total;
+}
+
 // The differential itself: the same rows, each column's landed text against
 // the mapping applied to what the collect sink saw.
 void expect_same_values(const CollectedRows& collected,
@@ -1174,8 +1191,10 @@ const std::vector<Column>& born_columnar_columns() {
 
 // What the native run of join_differential did with the join's carrier.
 struct JoinCarrier {
-    std::uint64_t decoded{0};  // columnar batches materialised
-    std::uint64_t bails{0};    // join emissions begun columnar and finished in row form
+    std::uint64_t decoded{0};           // columnar batches materialised
+    std::uint64_t bails{0};             // join emissions begun columnar and finished in row form
+    std::uint64_t columnar_batches{0};  // batches the native sink took columnar
+    std::uint64_t row_batches{0};       // and through their rows
 };
 
 // An inner join whose output the planner promotes to born columnar, because
@@ -1220,10 +1239,14 @@ JoinCarrier join_differential(const std::string& scratch, const std::vector<Colu
     const FakeServerScope fake(differential_target(columns));
     const auto decoded_before = clink::detail::batch_materialize_counter().load();
     const auto bails_before = clink::detail::columnar_output_bail_counter().load();
+    const auto columnar_before = sink_input_batches("columnar");
+    const auto rows_before = sink_input_batches("row");
     const auto landed = run_into_native(fake, ddl, "INSERT INTO ch " + select, columns);
     JoinCarrier carrier;
     carrier.decoded = clink::detail::batch_materialize_counter().load() - decoded_before;
     carrier.bails = clink::detail::columnar_output_bail_counter().load() - bails_before;
+    carrier.columnar_batches = sink_input_batches("columnar") - columnar_before;
+    carrier.row_batches = sink_input_batches("row") - rows_before;
     expect_same_values(collected, landed, kGeneratedRows + kEdgeRows, columns);
     return carrier;
 }
@@ -1231,28 +1254,37 @@ JoinCarrier join_differential(const std::string& scratch, const std::vector<Colu
 // Every differential column behind a join the planner promotes to born
 // columnar. SMALLINT, DATE, TIMESTAMP, array, map and row values, and a REAL off
 // float precision, have no exact cell in that layout, so the join takes the row path for every pair
-// and the native sink receives rows built by the join, never decoded from a sidecar. The values
-// must still land as the collect sink sees them.
+// and the native sink receives rows built by the join, never a sidecar. The values must still
+// land as the collect sink sees them.
+//
+// The sink's carrier counts are the proof of the row path. The materialise
+// counter alone is not: the native sink converts a sidecar without building a
+// Row, so a join batch that stayed columnar all the way to the sink would also
+// leave it unmoved. It stays as a secondary reading, that nothing between the
+// join and the sink decoded a sidecar.
 TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindAJoinOfEveryType) {
     ensure_installed();
     const auto carrier = join_differential("diff_join", differential_columns());
-    EXPECT_EQ(carrier.decoded, 0U) << "a join emitting a column the born-columnar layout stores "
-                                      "as text rode the sidecar instead of the row path";
+    EXPECT_EQ(carrier.columnar_batches, 0U)
+        << "a join batch carrying a type the layout stores as text reached the sink on the sidecar";
+    EXPECT_GT(carrier.row_batches, 0U) << "the native sink took no batch through its rows";
+    EXPECT_EQ(carrier.decoded, 0U) << "a sidecar was turned into rows between the join and the "
+                                      "native sink";
     EXPECT_GT(carrier.bails, 0U) << "the join never began on the sidecar, so this case no "
                                     "longer tests the bail";
 }
 
 // The same join over the columns the born-columnar layout holds exactly: the
-// join's output rides the sidecar, and the sink boundary's row_bind_columns
-// rebuilds rows from that batch, so the native sink receives rows decoded from
-// Arrow rather than from JSON. The planner always puts row_bind_columns last,
-// so the projection before it is the last columnar producer a SQL plan can
-// have.
+// join's output rides the sidecar through the projection and the sink
+// boundary's row_bind_columns, and the native sink converts that batch from
+// its arrays, with no Row built on the way.
 TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindAColumnarJoin) {
     ensure_installed();
     const auto carrier = join_differential("diff_join_shared", born_columnar_columns());
-    EXPECT_GT(carrier.decoded, 0U)
-        << "no batch was decoded from its columnar sidecar, so the rows took the row path";
+    EXPECT_EQ(carrier.decoded, 0U) << "a batch was turned into rows on the way to the native sink";
+    EXPECT_GT(carrier.columnar_batches, 0U)
+        << "the native sink took no batch columnar, so the rows took the row path";
+    EXPECT_EQ(carrier.row_batches, 0U);
     EXPECT_EQ(carrier.bails, 0U)
         << "the join bailed to the row path on a value the born-columnar layout holds exactly";
 }
@@ -1279,8 +1311,8 @@ const std::vector<Column>& columnar_decode_columns() {
 }
 
 // The columnar JSON decode, the default for a Kafka table: the bridge builds
-// an Arrow sidecar at decode and the projection passes it on, so here too the
-// sink's rows come out of a columnar batch. DATE and TIMESTAMP values are
+// an Arrow sidecar at decode, the projection and the bind pass it on, and the
+// native sink converts it from its arrays. DATE and TIMESTAMP values are
 // written as text, the form that keeps the batch columnar.
 TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindTheColumnarDecode) {
     ensure_installed();
@@ -1300,10 +1332,239 @@ TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindTheColumnarDecode) {
     const auto collected = run_into_collect(ddl, "INSERT INTO out " + select, columns);
     const FakeServerScope fake(differential_target(columns));
     const auto decoded_before = clink::detail::batch_materialize_counter().load();
+    const auto columnar_before = sink_input_batches("columnar");
+    const auto rows_before = sink_input_batches("row");
     const auto landed = run_into_native(fake, ddl, "INSERT INTO ch " + select, columns);
-    EXPECT_GT(clink::detail::batch_materialize_counter().load(), decoded_before)
-        << "no batch was decoded from its columnar sidecar, so the rows took the row path";
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(), decoded_before)
+        << "a batch was turned into rows on the way to the native sink";
+    EXPECT_GT(sink_input_batches("columnar"), columnar_before)
+        << "the native sink took no batch columnar, so the rows took the row path";
+    EXPECT_EQ(sink_input_batches("row"), rows_before);
     expect_same_values(collected, landed, kGeneratedRows + kEdgeRows, columns);
+}
+
+// --- The q0 shape: a Kafka JSON table straight into the native sink ------------
+
+// The batches the columnar decode emits: the feed hands the source 64 lines
+// at a time, and every one of these lines decodes columnar.
+constexpr std::size_t kQ0Batches = 8;
+
+// Bid lines as the nexmark generator writes them: integers and plain text,
+// nothing else, so the columnar decode takes every batch.
+std::vector<std::string> q0_lines() {
+    std::vector<std::string> lines;
+    for (std::size_t k = 0; k < kQ0Batches * 64; ++k) {
+        const auto n = static_cast<std::int64_t>(k);
+        JsonObject bid;
+        bid["auction"] = JsonValue{1000 + n};
+        bid["bidder"] = JsonValue{2000 + (n * 7) % 113};
+        bid["price"] = JsonValue{(n * 7919) % 100000};
+        bid["channel"] = JsonValue{std::string(n % 3 == 0 ? "Google" : "Apple")};
+        bid["url"] = JsonValue{"https://www.nexmark.com/item.htm?query=" + std::to_string(n)};
+        bid["datetime"] = JsonValue{std::int64_t{1700000000000} + n * 13};
+        lines.push_back(JsonValue{std::move(bid)}.serialize(0));
+    }
+    return lines;
+}
+
+const std::string kQ0Columns = "(auction BIGINT, bidder BIGINT, price BIGINT, datetime BIGINT)";
+const std::string kQ0Select = "SELECT auction, bidder, price, datetime FROM bid;";
+
+std::string q0_source_ddl(const std::string& topic) {
+    return "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url "
+           "VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', topic='" +
+           topic + "');";
+}
+
+fake::FakeTable q0_target() {
+    return fake_table(
+        "events",
+        {{"auction", "Int64"}, {"bidder", "Int64"}, {"price", "Int64"}, {"datetime", "Int64"}});
+}
+
+using Q0Rows = std::multiset<std::vector<std::int64_t>>;
+
+// What one run did: the rows that arrived, and how the native sink took its
+// batches.
+struct Q0Run {
+    Q0Rows rows;
+    std::uint64_t materialised{0};  // columnar batches turned into rows, process-wide
+    std::uint64_t columnar_batches{0};
+    std::uint64_t row_batches{0};
+};
+
+// Runs `ddl` in a fresh engine, then `read`, which submits the INSERT and
+// returns what a reader saw.
+Q0Run q0_run(const std::string& ddl,
+             std::uint32_t parallelism,
+             const std::function<Q0Rows(clink::embed::EmbeddedEngine&)>& read) {
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    opts.out = &err;
+    opts.parallelism = parallelism;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    if (engine.execute_script(ddl) != 0) {
+        throw std::runtime_error("q0 DDL: " + err.str());
+    }
+    Q0Run run;
+    const auto materialised = clink::detail::batch_materialize_counter().load();
+    const auto columnar = sink_input_batches("columnar");
+    const auto rows = sink_input_batches("row");
+    run.rows = read(engine);
+    if (!engine.await_all()) {
+        std::string joined;
+        for (const auto& e : engine.errors()) {
+            joined += e + "\n";
+        }
+        throw std::runtime_error("q0 job failed:\n" + joined + err.str());
+    }
+    run.materialised = clink::detail::batch_materialize_counter().load() - materialised;
+    run.columnar_batches = sink_input_batches("columnar") - columnar;
+    run.row_batches = sink_input_batches("row") - rows;
+    return run;
+}
+
+// The q0 chain into the collect sink, which is row-only.
+Q0Run q0_into_collect(const std::string& topic, std::uint32_t parallelism) {
+    const std::string insert = "INSERT INTO out " + kQ0Select;
+    return q0_run(
+        q0_source_ddl(topic) + "CREATE TABLE out " + kQ0Columns + " WITH (connector='collect');",
+        parallelism,
+        [&insert](clink::embed::EmbeddedEngine& engine) {
+            auto reader = engine.collect_reader("out").ValueOrDie();
+            if (engine.execute_script(insert) != 0) {
+                throw std::runtime_error("q0 collect INSERT failed");
+            }
+            Q0Rows rows;
+            while (true) {
+                std::shared_ptr<arrow::RecordBatch> batch;
+                if (!reader->ReadNext(&batch).ok()) {
+                    throw std::runtime_error("q0 collect read failed");
+                }
+                if (!batch) {
+                    break;
+                }
+                for (std::int64_t r = 0; r < batch->num_rows(); ++r) {
+                    std::vector<std::int64_t> row;
+                    for (const char* name : {"auction", "bidder", "price", "datetime"}) {
+                        row.push_back(collected_cell(*batch->GetColumnByName(name), r).as_int());
+                    }
+                    rows.insert(std::move(row));
+                }
+            }
+            return rows;
+        });
+}
+
+// The same chain into the native sink on `fake`.
+Q0Run q0_into_native(const FakeServerScope& fake,
+                     const std::string& topic,
+                     std::uint32_t parallelism) {
+    const std::string insert = "INSERT INTO ch " + kQ0Select;
+    Q0Run run = q0_run(
+        q0_source_ddl(topic) + "CREATE TABLE ch " + kQ0Columns + " WITH (" + kNativeWith + ");",
+        parallelism,
+        [&insert](clink::embed::EmbeddedEngine& engine) {
+            if (engine.execute_script(insert) != 0) {
+                throw std::runtime_error("q0 native INSERT failed");
+            }
+            return Q0Rows{};
+        });
+    const auto inserts = fake.server().inserts("db.events");
+    if (inserts.empty()) {
+        throw std::runtime_error("the native sink sent no INSERT");
+    }
+    const auto names = insert_columns(inserts.front().sql);
+    for (const auto& block : fake.server().landed("db.events")) {
+        for (const auto& values : block.values) {
+            std::map<std::string, std::int64_t> cells;
+            for (std::size_t c = 0; c < names.size() && c < values.size(); ++c) {
+                cells[names[c]] = std::stoll(values[c]);
+            }
+            run.rows.insert(
+                {cells.at("auction"), cells.at("bidder"), cells.at("price"), cells.at("datetime")});
+        }
+    }
+    return run;
+}
+
+bool q0_columnar_disabled() {
+    const char* e = std::getenv("CLINK_DISABLE_COLUMNAR");
+    return e != nullptr && e[0] == '1';
+}
+
+// The plan itself: nothing between the decode and the sink but the projection
+// and the sink-boundary bind, each of which passes a columnar batch on.
+TEST(ClickHouseNativeSql, AQ0ShapedInsertPlansTheDecodeTheProjectionTheBindAndTheSinkOnly) {
+    ensure_installed();
+    const auto plan = compile_script(
+        q0_source_ddl("q0_plan") + "CREATE TABLE ch " + kQ0Columns + " WITH (" + kNativeWith + ");",
+        "INSERT INTO ch " + kQ0Select,
+        1);
+    ASSERT_EQ(plan.size(), 1U);
+    std::vector<std::string> types;
+    for (const auto& op : plan[0].ops) {
+        types.push_back(op.type);
+    }
+    EXPECT_EQ(types,
+              (std::vector<std::string>{"kafka_source_string",
+                                        "json_string_to_row_columnar",
+                                        "project_row",
+                                        "row_bind_columns",
+                                        "clickhouse_native_sink"}));
+}
+
+// A Kafka JSON table straight into the native sink, nexmark q0's shape, builds
+// no Row anywhere: the decode, the projection and the bind pass the columnar
+// batch on, and the sink takes it as it is. The collect sink is the control:
+// it is row-only, so the same chain into it materialises at the sink hop, the
+// only hop left that can. A process-wide delta of 0 alone would prove
+// nothing, because a decode that fell back to rows shows 0 too, so the sink's
+// own carrier count is part of the proof. Registered a second time with
+// CLINK_DISABLE_COLUMNAR=1, where every batch takes the row path and the
+// landed rows are the same.
+TEST(ClickHouseNativeSql, AQ0ShapedPipelineBuildsNoRowAtTheSinkHop) {
+    ensure_installed();
+    set_feed("q0_collect", q0_lines(), true);
+    set_feed("q0_native", q0_lines(), true);
+    const Q0Run collected = q0_into_collect("q0_collect", 1);
+    EXPECT_GT(collected.materialised, 0U) << "the collect sink took the batches without rows";
+    ASSERT_EQ(collected.rows.size(), kQ0Batches * 64);
+
+    const FakeServerScope fake(q0_target());
+    const Q0Run landed = q0_into_native(fake, "q0_native", 1);
+    EXPECT_EQ(landed.rows, collected.rows);
+    if (q0_columnar_disabled()) {
+        EXPECT_GT(landed.materialised, 0U);
+        EXPECT_GT(landed.row_batches, 0U);
+        EXPECT_EQ(landed.columnar_batches, 0U);
+        return;
+    }
+    EXPECT_EQ(landed.materialised, 0U) << "a Row was built on the way to the native sink";
+    EXPECT_EQ(landed.columnar_batches, kQ0Batches)
+        << "the native sink did not take every batch columnar";
+    EXPECT_EQ(landed.row_batches, 0U);
+}
+
+// The same at parallelism 4. Every source subtask builds its own FeedSource
+// from the whole feed, so each line arrives once per subtask, four times in
+// all, on both sides alike, and the sink subtasks receive four times the
+// batches.
+TEST(ClickHouseNativeSql, AQ0ShapedPipelineAtParallelismFourBuildsNoRowAtTheSinkHop) {
+    ensure_installed();
+    set_feed("q0_collect_p4", q0_lines(), true);
+    set_feed("q0_native_p4", q0_lines(), true);
+    const Q0Run collected = q0_into_collect("q0_collect_p4", 4);
+    EXPECT_GT(collected.materialised, 0U);
+    ASSERT_EQ(collected.rows.size(), 4 * kQ0Batches * 64);
+
+    const FakeServerScope fake(q0_target());
+    const Q0Run landed = q0_into_native(fake, "q0_native_p4", 4);
+    EXPECT_EQ(landed.rows, collected.rows);
+    EXPECT_EQ(landed.materialised, 0U) << "a Row was built on the way to the native sink";
+    EXPECT_EQ(landed.columnar_batches, 4 * kQ0Batches);
+    EXPECT_EQ(landed.row_batches, 0U);
 }
 
 // --- The keys the planner puts on the op ------------------------------------
