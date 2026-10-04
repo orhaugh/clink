@@ -9,6 +9,11 @@
 
 namespace clink::clickhouse::native {
 
+// Where the sink's column list came from: the planner's declared SQL types, or
+// the schema of a typed struct's batcher. It changes what the open report says
+// about the input and how a refusal words its remedy.
+enum class InputKind : std::uint8_t { SqlTable, TypedStruct };
+
 enum class DefaultKind : std::uint8_t { None, Default, Materialized, Alias, Ephemeral };
 
 struct TargetColumn {
@@ -72,19 +77,24 @@ struct PlanProblem {
 };
 
 // Pairs the declared input columns with the target's columns and the type
-// rules. Collects every problem rather than stopping at the first.
+// rules. Collects every problem rather than stopping at the first. `kind`
+// picks the remedy a problem names: a change to the SELECT or the clink table
+// for SqlTable, to the struct or its CLINK_FIELDS declaration for TypedStruct.
+// The rules are the same for both.
 struct PlanResult {
     std::optional<ColumnPlan> plan;
     std::vector<PlanProblem> problems;
 };
 [[nodiscard]] PlanResult compile_column_plan(const std::vector<SqlColumn>& input,
-                                             const std::vector<TargetColumn>& target);
+                                             const std::vector<TargetColumn>& target,
+                                             InputKind kind = InputKind::SqlTable);
 
 // compile_column_plan, or throw NativeSinkError(column_plan) whose message
 // lists every problem, one per line, with the remediation for each.
 [[nodiscard]] ColumnPlan compile_or_refuse(const std::vector<SqlColumn>& input,
                                            const std::vector<TargetColumn>& target,
-                                           const std::string& qualified_table);
+                                           const std::string& qualified_table,
+                                           InputKind kind = InputKind::SqlTable);
 
 struct HeaderColumn {
     std::string name;

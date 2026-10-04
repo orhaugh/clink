@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/api.h>
 #include <gtest/gtest.h>
 
 #include "native/column_plan.hpp"
@@ -639,6 +640,249 @@ TEST(NativeColumnPlan, BoolDoesNotDriftAgainstTheClientsUInt8) {
     const ColumnPlan plan = compile_or_refuse(
         parse_sql_column_types("flag:BOOLEAN"), {plan_target("flag", "Bool")}, "`db`.`t`");
     EXPECT_TRUE(header_drift(plan, {{"flag", "UInt8"}}).empty());
+}
+
+// --- Typed struct inputs ----------------------------------------------------------
+
+// The columns of a typed struct whose batcher schema is `fields`.
+std::vector<SqlColumn> plan_typed_columns(const arrow::FieldVector& fields) {
+    return columns_from_arrow_schema(*arrow::schema(fields));
+}
+
+// One typed column `c` of Arrow type `type`, stored as `ch`.
+PlanResult plan_typed_one(const std::shared_ptr<arrow::DataType>& type, const std::string& ch) {
+    return compile_column_plan(plan_typed_columns({arrow::field("c", type)}),
+                               {plan_target("c", ch)},
+                               InputKind::TypedStruct);
+}
+
+// Every unsigned source against every integer, Bool, Float and String target:
+// the same width is a copy, a wider unsigned or signed target widens, and a
+// narrower unsigned or a signed target of the same or a narrower width is
+// checked per value.
+TEST(NativeColumnPlan, EveryUnsignedSourceIsAcceptedOrRefused) {
+    const std::vector<std::pair<std::shared_ptr<arrow::DataType>, int>> sources = {
+        {arrow::uint8(), 1}, {arrow::uint16(), 2}, {arrow::uint32(), 4}, {arrow::uint64(), 8}};
+    const std::vector<std::pair<std::string, int>> signed_targets = {
+        {"Int8", 1}, {"Int16", 2}, {"Int32", 4}, {"Int64", 8}, {"Int128", 16}};
+    const std::vector<std::pair<std::string, int>> unsigned_targets = {
+        {"UInt8", 1}, {"UInt16", 2}, {"UInt32", 4}, {"UInt64", 8}};
+    for (const auto& [type, from] : sources) {
+        const std::string spelling = type->ToString();
+        for (const auto& [ch, to] : signed_targets) {
+            const PlanResult r = plan_typed_one(type, ch);
+            ASSERT_TRUE(r.plan.has_value()) << spelling << " into " << ch;
+            const Conversion want = to > from ? Conversion::WidenInt : Conversion::NarrowInt;
+            EXPECT_EQ(r.plan->columns.at(0).conversion, want) << spelling << " into " << ch;
+        }
+        for (const auto& [ch, to] : unsigned_targets) {
+            const PlanResult r = plan_typed_one(type, ch);
+            ASSERT_TRUE(r.plan.has_value()) << spelling << " into " << ch;
+            const Conversion want =
+                to == from ? Conversion::Copy
+                           : (to > from ? Conversion::WidenInt : Conversion::NarrowInt);
+            EXPECT_EQ(r.plan->columns.at(0).conversion, want) << spelling << " into " << ch;
+            EXPECT_FALSE(r.plan->retains_chunks);
+        }
+        for (const std::string ch : {"Bool",
+                                     "Float32",
+                                     "Float64",
+                                     "String",
+                                     "UInt128",
+                                     "Decimal(20, 0)",
+                                     "DateTime64(3)"}) {
+            const PlanResult r = plan_typed_one(type, ch);
+            EXPECT_FALSE(r.plan.has_value()) << spelling << " into " << ch;
+            ASSERT_EQ(r.problems.size(), 1U) << spelling << " into " << ch;
+            EXPECT_EQ(r.problems[0].message,
+                      "column `c`: " + spelling + " into " + ch +
+                          " is not supported; change the struct field's type or the target "
+                          "column");
+        }
+    }
+}
+
+TEST(NativeColumnPlan, UnsignedElementsBindInsideComposites) {
+    const PlanResult r = compile_column_plan(
+        plan_typed_columns({arrow::field("tags", arrow::list(arrow::uint16())),
+                            arrow::field("counts", arrow::map(arrow::utf8(), arrow::uint64()))}),
+        {plan_target("tags", "Array(UInt8)"), plan_target("counts", "Map(String, Int64)")},
+        InputKind::TypedStruct);
+    ASSERT_TRUE(r.plan.has_value()) << r.problems.at(0).message;
+    EXPECT_EQ(r.plan->columns[0].children.at(0).conversion, Conversion::NarrowInt);
+    EXPECT_EQ(r.plan->columns[1].children.at(1).conversion, Conversion::NarrowInt);
+}
+
+// Every remedy a typed struct is given names the struct, its fields or its
+// CLINK_FIELDS declaration, never a SELECT or a clink table.
+TEST(NativeColumnPlan, ATypedStructIsToldToChangeTheStructNotTheSelect) {
+    const auto input = plan_typed_columns({
+        arrow::field("amount", arrow::decimal128(18, 2)),
+        arrow::field("score", arrow::float64()),
+        arrow::field("total", arrow::int64()),
+        arrow::field("extra", arrow::int64()),
+        arrow::field("label", arrow::boolean()),
+        arrow::field("price", arrow::decimal128(10, 4)),
+        arrow::field("fine", arrow::decimal128(2, 0)),
+    });
+    const std::vector<TargetColumn> target = {
+        plan_target("tenant", "String"),
+        plan_target("amount", "Decimal(18, 4)"),
+        plan_target("score", "Float32"),
+        plan_target("total", "Int64", DefaultKind::Materialized),
+        plan_target("label", "String"),
+        plan_target("price", "Decimal(10, 2)"),
+        plan_target("fine", "Decimal(38, 20)"),
+    };
+    try {
+        (void)compile_or_refuse(input, target, "`analytics`.`events`", InputKind::TypedStruct);
+        FAIL() << "no refusal";
+    } catch (const NativeSinkError& e) {
+        EXPECT_EQ(e.code(), code::kColumnPlan);
+        EXPECT_STREQ(e.what(),
+                     "[clickhouse.column_plan] `analytics`.`events` cannot take this struct's "
+                     "rows:\n"
+                     "  - target column `tenant` has no default and the struct has no field for "
+                     "it\n"
+                     "  - column `amount`: decimal128(18, 2) into Decimal(18, 4) leaves 14 "
+                     "integer digits for 16; widen the target or give the struct field "
+                     "decimal128(16, 2)\n"
+                     "  - column `score`: double into Float32 narrows; change the struct field's "
+                     "type or the target column\n"
+                     "  - `total` is MATERIALIZED; the server computes it; remove the field from "
+                     "the CLINK_FIELDS declaration\n"
+                     "  - column `extra` is not in the target table; remove the field from the "
+                     "CLINK_FIELDS declaration or add the column to the table\n"
+                     "  - column `label`: bool into String is not supported; change the struct "
+                     "field's type or the target column\n"
+                     "  - column `price`: decimal128(10, 4) into Decimal(10, 2) drops 2 "
+                     "fractional digits; raise the target's scale to 4 or change the struct "
+                     "field's type\n"
+                     "  - column `fine`: decimal128(2, 0) into Decimal(38, 20) rescales by 20 "
+                     "digits, more than the 18 the native sink supports; give the struct field "
+                     "a scale of at least 2");
+    }
+}
+
+TEST(NativeColumnPlan, ATypedStructsNestedStructAndSchemaProblemsAreWordedForTheStruct) {
+    const auto inner =
+        arrow::struct_({arrow::field("a", arrow::int64()), arrow::field("b", arrow::utf8())});
+    const PlanResult named = plan_typed_one(inner, "Tuple(a Int64, c String)");
+    ASSERT_EQ(named.problems.size(), 1U);
+    EXPECT_EQ(named.problems[0].message,
+              "column `c`: field 2 is `b` in the nested struct and `c` in Tuple(a Int64, c "
+              "String); rename one so that they match");
+    const PlanResult arity = plan_typed_one(inner, "Tuple(Int64)");
+    ASSERT_EQ(arity.problems.size(), 1U);
+    EXPECT_EQ(arity.problems[0].message,
+              "column `c`: " + inner->ToString() +
+                  " has 2 fields and Tuple(Int64) has 1; the nested struct and the Tuple must "
+                  "have the same fields");
+
+    const PlanResult empty = compile_column_plan({}, {}, InputKind::TypedStruct);
+    ASSERT_EQ(empty.problems.size(), 1U);
+    EXPECT_EQ(empty.problems[0].message, "the batcher's schema has no columns besides event_time");
+
+    std::vector<SqlColumn> twice = plan_typed_columns({arrow::field("a", arrow::int64())});
+    twice.push_back(twice.front());
+    const PlanResult dup =
+        compile_column_plan(twice, {plan_target("a", "Int64")}, InputKind::TypedStruct);
+    ASSERT_EQ(dup.problems.size(), 1U);
+    EXPECT_EQ(dup.problems[0].message, "column `a` appears twice in the batcher's schema");
+
+    // Unsupported Arrow types are listed together, each under its own
+    // spelling, before any INSERT.
+    const PlanResult unsupported =
+        compile_column_plan(plan_typed_columns({arrow::field("raw", arrow::binary()),
+                                                arrow::field("big", arrow::large_utf8()),
+                                                arrow::field("day", arrow::date64()),
+                                                arrow::field("wide", arrow::decimal256(40, 2))}),
+                            {plan_target("raw", "String"),
+                             plan_target("big", "String"),
+                             plan_target("day", "Date32"),
+                             plan_target("wide", "Decimal(40, 2)")},
+                            InputKind::TypedStruct);
+    ASSERT_FALSE(unsupported.plan.has_value());
+    ASSERT_EQ(unsupported.problems.size(), 4U);
+    EXPECT_EQ(unsupported.problems[0].message,
+              "column `raw`: the clink type binary is not supported by the native sink");
+    EXPECT_EQ(unsupported.problems[1].message,
+              "column `big`: the clink type large_string is not supported by the native sink");
+    EXPECT_EQ(unsupported.problems[2].message,
+              "column `day`: the clink type date64[ms] is not supported by the native sink");
+    EXPECT_EQ(unsupported.problems[3].message,
+              "column `wide`: the clink type decimal256(40, 2) is not supported by the native "
+              "sink");
+}
+
+// The same problems through a SQL table keep the wording they always had,
+// whether the kind is named or left to its default.
+TEST(NativeColumnPlan, ASqlTableKeepsItsWordingWhenTheKindIsNamed) {
+    const auto input = parse_sql_column_types("amount:DECIMAL(18, 2);score:DOUBLE;extra:BIGINT");
+    const std::vector<TargetColumn> target = {plan_target("tenant", "String"),
+                                              plan_target("amount", "Decimal(18, 4)"),
+                                              plan_target("score", "Float32")};
+    std::string by_default;
+    std::string named;
+    try {
+        (void)compile_or_refuse(input, target, "`db`.`t`");
+    } catch (const NativeSinkError& e) {
+        by_default = e.what();
+    }
+    try {
+        (void)compile_or_refuse(input, target, "`db`.`t`", InputKind::SqlTable);
+    } catch (const NativeSinkError& e) {
+        named = e.what();
+    }
+    EXPECT_EQ(named, by_default);
+    EXPECT_EQ(named,
+              "[clickhouse.column_plan] `db`.`t` cannot take this table's rows:\n"
+              "  - target column `tenant` has no default and the query does not produce it\n"
+              "  - column `amount`: DECIMAL(18, 2) into Decimal(18, 4) leaves 14 integer digits "
+              "for 16; widen the target or declare the clink column DECIMAL(16, 2)\n"
+              "  - column `score`: DOUBLE into Float32 narrows; use REAL in the clink table or "
+              "CAST in the SELECT\n"
+              "  - column `extra` is not in the target table; drop it from the SELECT or add it "
+              "to the table");
+}
+
+// A batcher schema's timestamp says its unit, and the figures follow it; a
+// declared TIMESTAMP(p) is always milliseconds.
+TEST(NativeColumnPlan, TheSourceUnitSetsTheTimestampMultiplierAndDivisor) {
+    const std::vector<std::pair<arrow::TimeUnit::type, int>> units = {{arrow::TimeUnit::SECOND, 0},
+                                                                      {arrow::TimeUnit::MILLI, 3},
+                                                                      {arrow::TimeUnit::MICRO, 6},
+                                                                      {arrow::TimeUnit::NANO, 9}};
+    const auto pow10 = [](int n) {
+        std::int64_t v = 1;
+        for (int i = 0; i < n; ++i) {
+            v *= 10;
+        }
+        return v;
+    };
+    for (const auto& [unit, d] : units) {
+        for (const std::string tz : {"", "UTC"}) {
+            const auto type = arrow::timestamp(unit, tz);
+            const std::string spelling = type->ToString();
+
+            const PlanResult dt = plan_typed_one(type, "DateTime");
+            ASSERT_TRUE(dt.plan.has_value()) << spelling;
+            const ColumnBinding& whole = dt.plan->columns.at(0);
+            EXPECT_EQ(whole.conversion, Conversion::TimestampToDateTime) << spelling;
+            EXPECT_EQ(whole.multiplier, 1) << spelling;
+            EXPECT_EQ(whole.divisor, pow10(d)) << spelling;
+
+            for (const int p : {0, 3, 6, 9}) {
+                const std::string ch = "DateTime64(" + std::to_string(p) + ")";
+                const PlanResult r = plan_typed_one(type, ch);
+                ASSERT_TRUE(r.plan.has_value()) << spelling << " into " << ch;
+                const ColumnBinding& b = r.plan->columns.at(0);
+                EXPECT_EQ(b.conversion, Conversion::TimestampToDateTime64);
+                EXPECT_EQ(b.multiplier, p >= d ? pow10(p - d) : 1) << spelling << " into " << ch;
+                EXPECT_EQ(b.divisor, p >= d ? 1 : pow10(d - p)) << spelling << " into " << ch;
+            }
+        }
+    }
 }
 
 }  // namespace

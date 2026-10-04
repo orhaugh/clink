@@ -19,6 +19,8 @@
 #include <clickhouse/types/type_parser.h>
 #pragma GCC diagnostic pop
 
+#include "clink/core/arrow_batcher.hpp"
+
 #include "native/errors.hpp"
 
 namespace clink::clickhouse::native {
@@ -988,12 +990,135 @@ std::shared_ptr<arrow::DataType> arrow_type_for(const SqlType& type) {
             }
             return arrow::struct_(std::move(fields));
         }
+        // Only a batcher schema carries these, and its chunks arrive built.
+        case SqlKind::UTinyInt:
+        case SqlKind::USmallInt:
+        case SqlKind::UInteger:
+        case SqlKind::UBigInt:
         case SqlKind::Time:
         case SqlKind::Bytea:
         case SqlKind::Unsupported:
             return nullptr;
     }
     return nullptr;
+}
+
+namespace {
+
+int timestamp_unit_digits(arrow::TimeUnit::type unit) {
+    switch (unit) {
+        case arrow::TimeUnit::SECOND:
+            return 0;
+        case arrow::TimeUnit::MILLI:
+            return 3;
+        case arrow::TimeUnit::MICRO:
+            return 6;
+        case arrow::TimeUnit::NANO:
+            return 9;
+    }
+    return 3;
+}
+
+SqlType sql_type_of(const arrow::DataType& type, int depth) {
+    SqlType t;
+    t.spelling = type.ToString();
+    if (depth > kMaxNesting) {
+        return t;
+    }
+    switch (type.id()) {
+        case arrow::Type::INT8:
+            t.kind = SqlKind::TinyInt;
+            break;
+        case arrow::Type::INT16:
+            t.kind = SqlKind::SmallInt;
+            break;
+        case arrow::Type::INT32:
+            t.kind = SqlKind::Integer;
+            break;
+        case arrow::Type::INT64:
+            t.kind = SqlKind::BigInt;
+            break;
+        case arrow::Type::UINT8:
+            t.kind = SqlKind::UTinyInt;
+            break;
+        case arrow::Type::UINT16:
+            t.kind = SqlKind::USmallInt;
+            break;
+        case arrow::Type::UINT32:
+            t.kind = SqlKind::UInteger;
+            break;
+        case arrow::Type::UINT64:
+            t.kind = SqlKind::UBigInt;
+            break;
+        case arrow::Type::FLOAT:
+            t.kind = SqlKind::Real;
+            break;
+        case arrow::Type::DOUBLE:
+            t.kind = SqlKind::Double;
+            break;
+        case arrow::Type::BOOL:
+            t.kind = SqlKind::Boolean;
+            break;
+        case arrow::Type::STRING:
+            t.kind = SqlKind::Varchar;
+            break;
+        case arrow::Type::DECIMAL128: {
+            const auto& d = static_cast<const arrow::Decimal128Type&>(type);
+            t.kind = SqlKind::Decimal;
+            t.precision = d.precision();
+            t.scale = d.scale();
+            break;
+        }
+        case arrow::Type::DATE32:
+            t.kind = SqlKind::Date;
+            break;
+        case arrow::Type::TIMESTAMP: {
+            const auto& ts = static_cast<const arrow::TimestampType&>(type);
+            t.kind = SqlKind::Timestamp;
+            t.unit_digits = timestamp_unit_digits(ts.unit());
+            t.precision = t.unit_digits;
+            t.with_time_zone = !ts.timezone().empty();
+            break;
+        }
+        case arrow::Type::LIST: {
+            const auto& list = static_cast<const arrow::ListType&>(type);
+            t.kind = SqlKind::Array;
+            t.children.push_back(sql_type_of(*list.value_type(), depth + 1));
+            break;
+        }
+        case arrow::Type::MAP: {
+            const auto& map = static_cast<const arrow::MapType&>(type);
+            t.kind = SqlKind::Map;
+            t.children.push_back(sql_type_of(*map.key_type(), depth + 1));
+            t.children.push_back(sql_type_of(*map.item_type(), depth + 1));
+            break;
+        }
+        case arrow::Type::STRUCT:
+            t.kind = SqlKind::Row;
+            for (const auto& field : type.fields()) {
+                t.children.push_back(sql_type_of(*field->type(), depth + 1));
+                t.field_names.push_back(field->name());
+            }
+            break;
+        default:
+            break;
+    }
+    return t;
+}
+
+}  // namespace
+
+std::vector<SqlColumn> columns_from_arrow_schema(const arrow::Schema& schema) {
+    std::vector<SqlColumn> columns;
+    const int n = schema.num_fields();
+    for (int i = 0; i < n; ++i) {
+        const arrow::Field& field = *schema.field(i);
+        if (i == 0 && clink::detail::is_event_time_field(field)) {
+            continue;
+        }
+        columns.push_back(SqlColumn{field.name(), sql_type_of(*field.type(), 0)});
+    }
+    return columns;
 }
 
 ChType parse_ch_type(const std::string& spelling) {

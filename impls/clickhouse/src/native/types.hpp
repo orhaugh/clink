@@ -10,13 +10,20 @@
 
 namespace clink::clickhouse::native {
 
-// Declared SQL type of one input column, parsed from the sql_column_types
-// spelling that clink::sql::arrow_to_sql_type_string renders.
+// Declared type of one input column: parsed from the sql_column_types
+// spelling that clink::sql::arrow_to_sql_type_string renders, or read from a
+// typed struct's batcher schema by columns_from_arrow_schema. The unsigned
+// kinds come only from a batcher schema; parse_sql_column_types never
+// produces them.
 enum class SqlKind : std::uint8_t {
     TinyInt,
     SmallInt,
     Integer,
     BigInt,
+    UTinyInt,
+    USmallInt,
+    UInteger,
+    UBigInt,
     Real,
     Double,
     Boolean,
@@ -40,6 +47,10 @@ struct SqlType {
     std::vector<SqlType> children;         // ARRAY: element; MAP: key, value; ROW: fields
     std::vector<std::string> field_names;  // ROW
     std::string spelling;                  // as received, for messages
+    // TIMESTAMP: the decimal digits of the value's unit (0 for s, 3 for ms, 6
+    // for us, 9 for ns). A Row carries epoch milliseconds whatever p, so a
+    // declared column keeps 3; a batcher schema's column takes its Arrow unit.
+    int unit_digits{3};
 };
 
 struct SqlColumn {
@@ -52,9 +63,20 @@ struct SqlColumn {
 // column plan refuses with the rest.
 [[nodiscard]] std::vector<SqlColumn> parse_sql_column_types(const std::string& spec);
 
+// The input columns of a typed struct, from its batcher's schema. Field 0 is
+// skipped exactly when it is the engine's event_time column
+// (clink::detail::is_event_time_field). int8 to int64, uint8 to uint64,
+// float, double, bool, utf8, decimal128(p, s), date32, timestamp(unit[, tz]),
+// list, map and struct each map to their kind; a timestamp takes its precision
+// and unit_digits from the unit, and a time zone makes it WITH TIME ZONE.
+// Every spelling is the Arrow type's ToString(). Anything else is Unsupported,
+// which the column plan refuses with every other problem. Never throws.
+[[nodiscard]] std::vector<SqlColumn> columns_from_arrow_schema(const arrow::Schema& schema);
+
 // The sink-local Arrow layout of a declared column. nullptr for Time, Bytea
-// and Unsupported. Every TIMESTAMP(p) is timestamp(ms[, "UTC"]), because the
-// Row value is epoch milliseconds whatever p.
+// and Unsupported, and for the unsigned kinds, which no SQL table declares.
+// Every TIMESTAMP(p) is timestamp(ms[, "UTC"]), because the Row value is
+// epoch milliseconds whatever p.
 [[nodiscard]] std::shared_ptr<arrow::DataType> arrow_type_for(const SqlType&);
 
 // A ClickHouse column type, parsed from system.columns.type.

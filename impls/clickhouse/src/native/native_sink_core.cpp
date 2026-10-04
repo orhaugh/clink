@@ -161,6 +161,7 @@ struct OpenState {
     SinkOptions options;
     TransportFactory factory;
     std::vector<SqlColumn> columns;
+    InputKind kind{InputKind::SqlTable};
     std::string qualified;
     CancelSignal cancel;
     spdlog::logger* logger{nullptr};
@@ -286,7 +287,7 @@ void OpenState::attempts(std::unique_ptr<InsertTransport>& t,
             }
             phase = Phase::Metadata;
             TargetInfo info = probe_target(*t, options);
-            ColumnPlan p = compile_or_refuse(columns, info.columns, qualified);
+            ColumnPlan p = compile_or_refuse(columns, info.columns, qualified, kind);
             found = std::move(info);
             planned = std::move(p);
             return;
@@ -592,6 +593,7 @@ Opened SinkCore::Impl::open_target() {
     state->options = options;
     state->factory = factory;
     state->columns = columns;
+    state->kind = kind;
     state->qualified = qualified;
     state->cancel = cancel;
     state->logger = logger;

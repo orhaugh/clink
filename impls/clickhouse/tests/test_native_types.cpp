@@ -1,7 +1,11 @@
-// Declared SQL types from sql_column_types, ClickHouse types from
-// system.columns.type, and the header spelling the pinned client gives each.
+// Declared SQL types from sql_column_types, the input columns of a typed
+// struct from its batcher's schema, ClickHouse types from system.columns.type,
+// and the header spelling the pinned client gives each.
 
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -9,8 +13,63 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "clink/core/arrow_batcher.hpp"
+#include "clink/core/columnar_batcher.hpp"
+
 #include "native/errors.hpp"
 #include "native/types.hpp"
+
+// Typed structs whose batcher schemas the mapping reads. CLINK_FIELDS
+// specialises a clink template, so these live at namespace scope.
+struct NtTypesInner {
+    std::int32_t n;
+    std::string label;
+};
+CLINK_FIELDS(NtTypesInner, n, label);
+
+// Every leaf CLINK_FIELDS emits, and each composite.
+struct NtTypesEvery {
+    std::int8_t i8;
+    std::int16_t i16;
+    std::int32_t i32;
+    std::int64_t i64;
+    std::uint8_t u8;
+    std::uint16_t u16;
+    std::uint32_t u32;
+    std::uint64_t u64;
+    float f32;
+    double f64;
+    bool flag;
+    std::string text;
+    std::optional<std::int64_t> maybe;
+    std::vector<std::uint16_t> list;
+    std::map<std::string, std::uint64_t> counts;
+    NtTypesInner inner;
+};
+CLINK_FIELDS(NtTypesEvery,
+             i8,
+             i16,
+             i32,
+             i64,
+             u8,
+             u16,
+             u32,
+             u64,
+             f32,
+             f64,
+             flag,
+             text,
+             maybe,
+             list,
+             counts,
+             inner);
+
+// A struct with a field of its own called event_time.
+struct NtTypesClock {
+    std::int64_t event_time;
+    std::string name;
+};
+CLINK_FIELDS(NtTypesClock, event_time, name);
 
 namespace clink::clickhouse::native {
 namespace {
@@ -656,6 +715,161 @@ TEST(NativeClientHeader, EmptyWhenTheClientCannotBuildTheType) {
         std::string header;
         ASSERT_NO_THROW(header = client_header_spelling(spelling)) << spelling;
         EXPECT_EQ(header, "") << spelling;
+    }
+}
+
+// --- The input columns of a typed struct --------------------------------------
+
+std::shared_ptr<arrow::Schema> types_schema(const arrow::FieldVector& fields) {
+    return arrow::schema(fields);
+}
+
+TEST(NativeArrowSchemaColumns, EveryLeafAndCompositeOfAClinkFieldsStructMaps) {
+    const auto schema = clink::make_columnar_arrow_batcher<NtTypesEvery>().schema();
+    ASSERT_EQ(schema->num_fields(), 17);
+    ASSERT_TRUE(clink::detail::is_event_time_field(*schema->field(0)));
+
+    const std::vector<SqlColumn> columns = columns_from_arrow_schema(*schema);
+    ASSERT_EQ(columns.size(), 16U);
+    const std::vector<std::pair<std::string, SqlKind>> want = {
+        {"i8", SqlKind::TinyInt},
+        {"i16", SqlKind::SmallInt},
+        {"i32", SqlKind::Integer},
+        {"i64", SqlKind::BigInt},
+        {"u8", SqlKind::UTinyInt},
+        {"u16", SqlKind::USmallInt},
+        {"u32", SqlKind::UInteger},
+        {"u64", SqlKind::UBigInt},
+        {"f32", SqlKind::Real},
+        {"f64", SqlKind::Double},
+        {"flag", SqlKind::Boolean},
+        {"text", SqlKind::Varchar},
+        {"maybe", SqlKind::BigInt},
+        {"list", SqlKind::Array},
+        {"counts", SqlKind::Map},
+        {"inner", SqlKind::Row},
+    };
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        const auto& c = columns[i];
+        EXPECT_EQ(c.name, want[i].first);
+        EXPECT_EQ(c.type.kind, want[i].second) << c.name;
+        // Every spelling is the Arrow type's own, field 0 being event_time.
+        EXPECT_EQ(c.type.spelling, schema->field(static_cast<int>(i) + 1)->type()->ToString())
+            << c.name;
+    }
+    EXPECT_EQ(columns[4].type.spelling, "uint8");
+    EXPECT_EQ(columns[7].type.spelling, "uint64");
+
+    const SqlType& list = columns[13].type;
+    ASSERT_EQ(list.children.size(), 1U);
+    EXPECT_EQ(list.children[0].kind, SqlKind::USmallInt);
+    EXPECT_EQ(list.children[0].spelling, "uint16");
+
+    const SqlType& counts = columns[14].type;
+    ASSERT_EQ(counts.children.size(), 2U);
+    EXPECT_EQ(counts.children[0].kind, SqlKind::Varchar);
+    EXPECT_EQ(counts.children[1].kind, SqlKind::UBigInt);
+
+    const SqlType& inner = columns[15].type;
+    ASSERT_EQ(inner.children.size(), 2U);
+    EXPECT_EQ(inner.field_names, (std::vector<std::string>{"n", "label"}));
+    EXPECT_EQ(inner.children[0].kind, SqlKind::Integer);
+    EXPECT_EQ(inner.children[1].kind, SqlKind::Varchar);
+}
+
+TEST(NativeArrowSchemaColumns, TimestampsTakeTheirUnitAndZoneDecimalsAndDatesTheirParts) {
+    const auto schema = types_schema({
+        arrow::field("s", arrow::timestamp(arrow::TimeUnit::SECOND)),
+        arrow::field("ms", arrow::timestamp(arrow::TimeUnit::MILLI)),
+        arrow::field("us", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")),
+        arrow::field("ns", arrow::timestamp(arrow::TimeUnit::NANO, "Asia/Tokyo")),
+        arrow::field("amount", arrow::decimal128(18, 4)),
+        arrow::field("day", arrow::date32()),
+    });
+    const std::vector<SqlColumn> columns = columns_from_arrow_schema(*schema);
+    ASSERT_EQ(columns.size(), 6U);
+    const int digits[] = {0, 3, 6, 9};
+    for (int i = 0; i < 4; ++i) {
+        const SqlType& t = columns[static_cast<std::size_t>(i)].type;
+        EXPECT_EQ(t.kind, SqlKind::Timestamp) << i;
+        EXPECT_EQ(t.unit_digits, digits[i]) << i;
+        EXPECT_EQ(t.precision, digits[i]) << i;
+        EXPECT_EQ(t.with_time_zone, i >= 2) << i;
+        EXPECT_EQ(t.spelling, schema->field(i)->type()->ToString());
+    }
+    EXPECT_EQ(columns[4].type.kind, SqlKind::Decimal);
+    EXPECT_EQ(columns[4].type.precision, 18);
+    EXPECT_EQ(columns[4].type.scale, 4);
+    EXPECT_EQ(columns[4].type.spelling, "decimal128(18, 4)");
+    EXPECT_EQ(columns[5].type.kind, SqlKind::Date);
+}
+
+TEST(NativeSqlTypes, ADeclaredTimestampKeepsTheRowsMilliseconds) {
+    for (int p = 0; p <= 9; ++p) {
+        const SqlType t = types_parse_one("TIMESTAMP(" + std::to_string(p) + ")");
+        EXPECT_EQ(t.unit_digits, 3) << p;
+    }
+    EXPECT_EQ(SqlType{}.unit_digits, 3);
+}
+
+TEST(NativeArrowSchemaColumns, OnlyALeadingInt64EventTimeIsTheEngineColumn) {
+    // The batcher's own event_time comes first; the struct's field of the same
+    // name is a column like any other.
+    const auto clock = clink::make_columnar_arrow_batcher<NtTypesClock>().schema();
+    ASSERT_EQ(clock->num_fields(), 3);
+    const std::vector<SqlColumn> columns = columns_from_arrow_schema(*clock);
+    ASSERT_EQ(columns.size(), 2U);
+    EXPECT_EQ(columns[0].name, "event_time");
+    EXPECT_EQ(columns[0].type.kind, SqlKind::BigInt);
+    EXPECT_EQ(columns[1].name, "name");
+
+    // A first field named event_time that is not int64 is not the engine's.
+    const auto text = columns_from_arrow_schema(*types_schema(
+        {arrow::field("event_time", arrow::utf8()), arrow::field("id", arrow::int64())}));
+    ASSERT_EQ(text.size(), 2U);
+    EXPECT_EQ(text[0].name, "event_time");
+    EXPECT_EQ(text[0].type.kind, SqlKind::Varchar);
+
+    // Nor is an int64 event_time anywhere but first.
+    const auto later = columns_from_arrow_schema(*types_schema(
+        {arrow::field("id", arrow::int64()), arrow::field("event_time", arrow::int64())}));
+    ASSERT_EQ(later.size(), 2U);
+    EXPECT_EQ(later[1].name, "event_time");
+}
+
+TEST(NativeArrowSchemaColumns, AnyOtherArrowTypeIsUnsupportedUnderItsOwnSpelling) {
+    const std::vector<std::shared_ptr<arrow::DataType>> others = {
+        arrow::binary(),
+        arrow::large_utf8(),
+        arrow::date64(),
+        arrow::decimal256(40, 2),
+        arrow::float16(),
+        arrow::large_list(arrow::int64()),
+        arrow::time32(arrow::TimeUnit::MILLI),
+        arrow::dictionary(arrow::int32(), arrow::utf8()),
+    };
+    for (const auto& type : others) {
+        const auto columns = columns_from_arrow_schema(*types_schema({arrow::field("c", type)}));
+        ASSERT_EQ(columns.size(), 1U);
+        EXPECT_EQ(columns[0].type.kind, SqlKind::Unsupported) << type->ToString();
+        EXPECT_EQ(columns[0].type.spelling, type->ToString());
+    }
+    // Inside a composite only the element is unsupported, so a refusal can
+    // name it.
+    const auto nested =
+        columns_from_arrow_schema(*types_schema({arrow::field("c", arrow::list(arrow::binary()))}));
+    ASSERT_EQ(nested.size(), 1U);
+    ASSERT_EQ(nested[0].type.kind, SqlKind::Array);
+    EXPECT_EQ(nested[0].type.children.at(0).kind, SqlKind::Unsupported);
+    EXPECT_EQ(nested[0].type.children.at(0).spelling, "binary");
+}
+
+TEST(NativeArrowSchemaColumns, NoSqlTableDeclaresAnUnsignedKindSoItHasNoRowLayout) {
+    for (const SqlKind kind :
+         {SqlKind::UTinyInt, SqlKind::USmallInt, SqlKind::UInteger, SqlKind::UBigInt}) {
+        SqlType t;
+        t.kind = kind;
+        EXPECT_EQ(arrow_type_for(t), nullptr);
     }
 }
 

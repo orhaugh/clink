@@ -146,6 +146,14 @@ arrow::Type::type arrow_layout(SqlKind kind) {
             return arrow::Type::INT32;
         case SqlKind::BigInt:
             return arrow::Type::INT64;
+        case SqlKind::UTinyInt:
+            return arrow::Type::UINT8;
+        case SqlKind::USmallInt:
+            return arrow::Type::UINT16;
+        case SqlKind::UInteger:
+            return arrow::Type::UINT32;
+        case SqlKind::UBigInt:
+            return arrow::Type::UINT64;
         case SqlKind::Real:
             return arrow::Type::FLOAT;
         case SqlKind::Double:
@@ -174,8 +182,9 @@ arrow::Type::type arrow_layout(SqlKind kind) {
     return arrow::Type::NA;
 }
 
-// A chunk built by anything but RowArrowBuilder (or V2's columnar path) for
-// this plan is a defect upstream of the sink, not a bad row.
+// A chunk laid out otherwise than its plan's input columns (RowArrowBuilder's,
+// or a typed struct's batcher schema) is a defect upstream of the sink, not a
+// bad row.
 [[noreturn]] void layout_mismatch(const ColumnBinding& b, const arrow::Array& array) {
     throw std::invalid_argument("clickhouse native sink: column " + ticked(b.name) +
                                 " arrives as " + array.type()->ToString() +
@@ -866,8 +875,9 @@ private:
     }
 };
 
-// Timestamps carry their unit in the Arrow type: milliseconds in V1, any unit
-// from the columnar path. The conversion is exact or refused, never floored.
+// Timestamps carry their unit in the Arrow type: milliseconds from a Row, any
+// unit from a typed struct's batcher. The conversion is exact or refused, never
+// floored.
 class TimestampNode : public Node {
 public:
     using Node::Node;
@@ -1262,6 +1272,14 @@ std::unique_ptr<Node> number_node(const ColumnBinding& b, Tally& tally) {
             return integer_node<arrow::Int32Type>(b, tally);
         case SqlKind::BigInt:
             return integer_node<arrow::Int64Type>(b, tally);
+        case SqlKind::UTinyInt:
+            return integer_node<arrow::UInt8Type>(b, tally);
+        case SqlKind::USmallInt:
+            return integer_node<arrow::UInt16Type>(b, tally);
+        case SqlKind::UInteger:
+            return integer_node<arrow::UInt32Type>(b, tally);
+        case SqlKind::UBigInt:
+            return integer_node<arrow::UInt64Type>(b, tally);
         case SqlKind::Real:
             if (b.target.kind == ChKind::Float32) {
                 return std::make_unique<NumberNode<arrow::FloatType, float>>(b, tally);
@@ -1570,6 +1588,14 @@ std::string describe_cell(const ColumnBinding& b, const arrow::Array& array, std
             return std::to_string(static_cast<const arrow::Int32Array&>(array).Value(row));
         case SqlKind::BigInt:
             return std::to_string(static_cast<const arrow::Int64Array&>(array).Value(row));
+        case SqlKind::UTinyInt:
+            return std::to_string(static_cast<const arrow::UInt8Array&>(array).Value(row));
+        case SqlKind::USmallInt:
+            return std::to_string(static_cast<const arrow::UInt16Array&>(array).Value(row));
+        case SqlKind::UInteger:
+            return std::to_string(static_cast<const arrow::UInt32Array&>(array).Value(row));
+        case SqlKind::UBigInt:
+            return std::to_string(static_cast<const arrow::UInt64Array&>(array).Value(row));
         case SqlKind::Real:
             return shortest(
                 static_cast<double>(static_cast<const arrow::FloatArray&>(array).Value(row)));

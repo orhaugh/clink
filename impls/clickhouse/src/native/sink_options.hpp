@@ -61,6 +61,14 @@ struct SinkOptions {
                                              std::uint32_t subtask_idx,
                                              std::uint32_t parallelism);
 
+// parse_sink_options for a typed struct's sink, whose column types come from
+// its batcher's schema: sql_column_types is refused clickhouse.option_invalid
+// rather than required, and is left empty. Every other key, value and refusal
+// is parse_sink_options's own.
+[[nodiscard]] SinkOptions parse_typed_sink_options(const std::map<std::string, std::string>& params,
+                                                   std::uint32_t subtask_idx,
+                                                   std::uint32_t parallelism);
+
 // The sink's own keys, and the keys it tolerates because the planner, the
 // materialised-view code or the binder put them on the op.
 [[nodiscard]] const std::vector<std::string>& own_option_keys();

@@ -31,7 +31,8 @@ class RowArrowBuilder {
 public:
     // Throws NativeSinkError(column_plan) for a declared type with no Arrow
     // layout (TIME, BYTEA, an unsupported spelling), which the column plan
-    // refuses at open before a builder is made.
+    // refuses at open before a builder is made, and for an unsigned kind,
+    // which only a typed struct's batcher schema carries.
     explicit RowArrowBuilder(std::vector<SqlColumn> columns);
     ~RowArrowBuilder();
     RowArrowBuilder(RowArrowBuilder&&) noexcept;

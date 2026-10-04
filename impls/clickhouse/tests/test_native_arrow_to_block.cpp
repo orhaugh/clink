@@ -5,7 +5,9 @@
 #include <array>
 #include <charconv>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -32,10 +34,32 @@
 #include <clickhouse/columns/uuid.h>
 #include <gtest/gtest.h>
 
+#include "clink/core/arrow_batcher.hpp"
+#include "clink/core/columnar_batcher.hpp"
+#include "clink/core/record.hpp"
+
 #include "native/arrow_to_block.hpp"
 #include "native/column_plan.hpp"
 #include "native/errors.hpp"
 #include "native/types.hpp"
+
+// A typed struct whose batcher builds the chunk. CLINK_FIELDS specialises a
+// clink template, so these live at namespace scope.
+struct A2bTypedLeg {
+    std::string venue;
+    double px;
+};
+CLINK_FIELDS(A2bTypedLeg, venue, px);
+
+struct A2bTypedTrade {
+    std::int64_t id;
+    std::uint32_t qty;
+    std::optional<std::uint64_t> volume;
+    std::vector<std::uint8_t> flags;
+    std::map<std::string, std::uint16_t> counts;
+    A2bTypedLeg leg;
+};
+CLINK_FIELDS(A2bTypedTrade, id, qty, volume, flags, counts, leg);
 
 namespace clink::clickhouse::native {
 namespace {
@@ -1338,6 +1362,139 @@ TEST(NativeArrowToBlock, RedactedRowShowsTypesAndOnlyTheOffendingNumber) {
         EXPECT_EQ(logged.find("10.0.0.300"), std::string::npos);
         EXPECT_NE(logged.find("n=Int8(200)"), std::string::npos);
     }
+}
+
+// --- Typed struct inputs ----------------------------------------------------------
+
+// The plan for one typed column `c` of Arrow type `type` into `target`.
+ColumnPlan a2b_typed_plan(const std::shared_ptr<arrow::DataType>& type, const std::string& target) {
+    PlanResult r =
+        compile_column_plan(columns_from_arrow_schema(*arrow::schema({arrow::field("c", type)})),
+                            {TargetColumn{"c", target, DefaultKind::None, 1}},
+                            InputKind::TypedStruct);
+    if (!r.plan) {
+        throw std::runtime_error("the column plan refused " + type->ToString() + " into " + target +
+                                 ": " + r.problems.at(0).message);
+    }
+    return std::move(*r.plan);
+}
+
+std::vector<std::string> a2b_typed_accepts(const std::shared_ptr<arrow::DataType>& type,
+                                           const std::string& target,
+                                           const std::string& json) {
+    const ColumnPlan plan = a2b_typed_plan(type, target);
+    const auto chunk = a2b_single(arrow::json::ArrayFromJSONString(type, json).ValueOrDie());
+    return a2b_rows(a2b_convert(plan, *chunk, 0, chunk->num_rows())[0]);
+}
+
+// The ConversionError a typed single-column conversion throws, checked for
+// the column and the row it names.
+std::string a2b_typed_refusal(const std::shared_ptr<arrow::DataType>& type,
+                              const std::string& target,
+                              const std::string& json,
+                              std::int64_t row) {
+    const ColumnPlan plan = a2b_typed_plan(type, target);
+    const auto chunk = a2b_single(arrow::json::ArrayFromJSONString(type, json).ValueOrDie());
+    BlockBuilder builder(plan);
+    try {
+        builder.append(*chunk, 0, chunk->num_rows());
+    } catch (const ConversionError& e) {
+        EXPECT_EQ(e.code(), code::kConversionFailed);
+        EXPECT_EQ(e.column(), "c");
+        EXPECT_EQ(e.row(), row);
+        return e.what();
+    }
+    ADD_FAILURE() << type->ToString() << " into " << target << " accepted " << json;
+    return {};
+}
+
+TEST(NativeArrowToBlock, UnsignedNarrowingIsCheckedPerValue) {
+    EXPECT_EQ(a2b_typed_refusal(arrow::uint64(), "Int64", "[1, 9223372036854775808]", 1),
+              "[clickhouse.conversion_failed] column `c`, row 1: value out of range for Int64");
+    EXPECT_EQ(a2b_typed_refusal(arrow::uint16(), "UInt8", "[255, 300]", 1),
+              "[clickhouse.conversion_failed] column `c`, row 1: value out of range for UInt8");
+    EXPECT_EQ(a2b_typed_refusal(arrow::uint8(), "Int8", "[128]", 0),
+              "[clickhouse.conversion_failed] column `c`, row 0: value out of range for Int8");
+    EXPECT_EQ(a2b_typed_refusal(arrow::uint32(), "Int32", "[2147483648]", 0),
+              "[clickhouse.conversion_failed] column `c`, row 0: value out of range for Int32");
+    EXPECT_EQ(a2b_typed_accepts(arrow::uint64(), "Int64", "[0, 9223372036854775807]"),
+              (A2bRows{"0", "9223372036854775807"}));
+    EXPECT_EQ(a2b_typed_accepts(arrow::uint16(), "UInt8", "[0, 255]"), (A2bRows{"0", "255"}));
+    EXPECT_EQ(a2b_typed_accepts(arrow::uint8(), "Int8", "[0, 127]"), (A2bRows{"0", "127"}));
+}
+
+TEST(NativeArrowToBlock, UnsignedWideningAndCopiesAreExact) {
+    EXPECT_EQ(a2b_typed_accepts(arrow::uint32(), "Int64", "[4294967295, 0]"),
+              (A2bRows{"4294967295", "0"}));
+    EXPECT_EQ(a2b_typed_accepts(arrow::uint64(), "Int128", "[18446744073709551615, 0]"),
+              (A2bRows{"18446744073709551615", "0"}));
+    EXPECT_EQ(a2b_typed_accepts(arrow::uint64(), "UInt64", "[18446744073709551615, 1]"),
+              (A2bRows{"18446744073709551615", "1"}));
+    EXPECT_EQ(a2b_typed_accepts(arrow::uint8(), "UInt64", "[255, 0]"), (A2bRows{"255", "0"}));
+    EXPECT_EQ(a2b_typed_accepts(arrow::uint16(), "Nullable(Int32)", "[65535, null]"),
+              (A2bRows{"65535", "NULL"}));
+}
+
+TEST(NativeArrowToBlock, AMicrosecondFieldIsExactInDateTime64Of6AndRefusedNotFlooredIn3) {
+    const auto micros = arrow::timestamp(arrow::TimeUnit::MICRO);
+    EXPECT_EQ(a2b_typed_accepts(micros, "DateTime64(6)", "[1700000000123456, -1, 0]"),
+              (A2bRows{"1700000000123456", "-1", "0"}));
+    EXPECT_EQ(a2b_typed_accepts(micros, "DateTime64(3)", "[1700000000123000, -2000]"),
+              (A2bRows{"1700000000123", "-2"}));
+    EXPECT_EQ(a2b_typed_refusal(micros, "DateTime64(3)", "[1700000000123000, 1700000000123456]", 1),
+              "[clickhouse.conversion_failed] column `c`, row 1: 1700000000123456 us has "
+              "sub-second digits DateTime64(3) cannot hold; target DateTime64(6) or write whole "
+              "seconds");
+    // A negative value is never floored to the millisecond below.
+    EXPECT_EQ(a2b_typed_refusal(micros, "DateTime64(3)", "[-1500]", 0),
+              "[clickhouse.conversion_failed] column `c`, row 0: -1500 us has sub-second digits "
+              "DateTime64(3) cannot hold; target DateTime64(6) or write whole seconds");
+    const auto seconds = arrow::timestamp(arrow::TimeUnit::SECOND, "UTC");
+    EXPECT_EQ(a2b_typed_accepts(seconds, "DateTime", "[1700000000]"), (A2bRows{"1700000000"}));
+}
+
+TEST(NativeArrowToBlock, AnUnsignedCellIsShownInTheRedactedRow) {
+    const ColumnPlan plan = a2b_typed_plan(arrow::uint64(), "Int64");
+    const auto chunk = a2b_single(
+        arrow::json::ArrayFromJSONString(arrow::uint64(), "[18446744073709551615]").ValueOrDie());
+    EXPECT_EQ(redacted_row(plan, *chunk, 0, "c"), "c=Int64(18446744073709551615)");
+}
+
+// The chunk a typed struct's batcher builds, less its event_time column, is
+// the plan's input as it stands.
+TEST(NativeArrowToBlock, ATypedStructsBatchConvertsOnceItsEventTimeIsDropped) {
+    const auto batcher = clink::make_columnar_arrow_batcher<A2bTypedTrade>();
+    Batch<A2bTypedTrade> batch;
+    batch.emplace(A2bTypedTrade{
+        7, 4000000000U, 18446744073709551615ULL, {1, 255}, {{"a", 65535}}, {"XLON", 0.25}});
+    batch.emplace(A2bTypedTrade{-1, 0, std::nullopt, {}, {}, {"", -2.5}});
+    const auto built = batcher.build(batch);
+    ASSERT_NE(built, nullptr);
+    const auto chunk = built->RemoveColumn(0).ValueOrDie();
+
+    const auto columns = columns_from_arrow_schema(*built->schema());
+    const std::vector<std::string> targets = {"Int64",
+                                              "UInt32",
+                                              "Nullable(UInt64)",
+                                              "Array(UInt8)",
+                                              "Map(String, UInt16)",
+                                              "Tuple(venue String, px Float64)"};
+    ASSERT_EQ(columns.size(), targets.size());
+    std::vector<TargetColumn> table;
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+        table.push_back(TargetColumn{
+            columns[i].name, targets[i], DefaultKind::None, static_cast<std::uint32_t>(i + 1)});
+    }
+    PlanResult r = compile_column_plan(columns, table, InputKind::TypedStruct);
+    ASSERT_TRUE(r.plan.has_value()) << r.problems.at(0).message;
+    const ch::Block block = a2b_convert(*r.plan, *chunk, 0, chunk->num_rows());
+    ASSERT_EQ(block.GetColumnCount(), 6U);
+    EXPECT_EQ(a2b_rows(block[0]), (A2bRows{"7", "-1"}));
+    EXPECT_EQ(a2b_rows(block[1]), (A2bRows{"4000000000", "0"}));
+    EXPECT_EQ(a2b_rows(block[2]), (A2bRows{"18446744073709551615", "NULL"}));
+    EXPECT_EQ(a2b_rows(block[3]), (A2bRows{"[1, 255]", "[]"}));
+    EXPECT_EQ(a2b_rows(block[4]), (A2bRows{"{'a': 65535}", "{}"}));
+    EXPECT_EQ(a2b_rows(block[5]), (A2bRows{"('XLON', 0.25)", "('', -2.5)"}));
 }
 
 }  // namespace

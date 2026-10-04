@@ -19,9 +19,6 @@ namespace {
 // holds.
 constexpr int kMaxRescaleDigits = 18;
 
-// Every TIMESTAMP(p) reaches the converter as epoch milliseconds.
-constexpr int kTimestampSourceDigits = 3;
-
 std::int64_t pow10(int n) {
     std::int64_t v = 1;
     for (int i = 0; i < n; ++i) {
@@ -114,20 +111,98 @@ bool is_unsigned_up_to_64(ChKind k) {
     return k == ChKind::UInt8 || k == ChKind::UInt16 || k == ChKind::UInt32 || k == ChKind::UInt64;
 }
 
-int sql_int_width(SqlKind k) {
+// The width in bytes of an unsigned target up to 64 bits, or 0.
+int unsigned_width(ChKind k) {
     switch (k) {
-        case SqlKind::TinyInt:
+        case ChKind::UInt8:
             return 1;
-        case SqlKind::SmallInt:
+        case ChKind::UInt16:
             return 2;
-        case SqlKind::Integer:
+        case ChKind::UInt32:
             return 4;
-        case SqlKind::BigInt:
+        case ChKind::UInt64:
             return 8;
         default:
             return 0;
     }
 }
+
+int sql_int_width(SqlKind k) {
+    switch (k) {
+        case SqlKind::TinyInt:
+        case SqlKind::UTinyInt:
+            return 1;
+        case SqlKind::SmallInt:
+        case SqlKind::USmallInt:
+            return 2;
+        case SqlKind::Integer:
+        case SqlKind::UInteger:
+            return 4;
+        case SqlKind::BigInt:
+        case SqlKind::UBigInt:
+            return 8;
+        default:
+            return 0;
+    }
+}
+
+// The remedies a problem names. A SQL table is changed in its SELECT or its
+// declaration; a typed struct in its fields or its CLINK_FIELDS declaration.
+// The SQL texts are the ones the sink has always printed.
+struct Remedies {
+    bool typed{false};
+
+    [[nodiscard]] const char* change_source() const {
+        return typed ? "change the struct field's type or the target column" : "CAST in the SELECT";
+    }
+    [[nodiscard]] const char* narrow_float() const {
+        return typed ? "change the struct field's type or the target column"
+                     : "use REAL in the clink table or CAST in the SELECT";
+    }
+    [[nodiscard]] const char* or_change_source() const {
+        return typed ? "or change the struct field's type" : "or CAST in the SELECT";
+    }
+    [[nodiscard]] std::string declare_decimal(int precision, int scale) const {
+        return typed ? "or give the struct field decimal128(" + std::to_string(precision) + ", " +
+                           std::to_string(scale) + ")"
+                     : "or declare the clink column DECIMAL(" + std::to_string(precision) + ", " +
+                           std::to_string(scale) + ")";
+    }
+    [[nodiscard]] const char* declare_scale() const {
+        return typed ? "give the struct field a scale of at least "
+                     : "declare the clink column with a scale of at least ";
+    }
+    [[nodiscard]] const char* source_side() const {
+        return typed ? "the nested struct" : "the clink table";
+    }
+    [[nodiscard]] const char* same_fields() const {
+        return typed ? "the nested struct and the Tuple must have the same fields"
+                     : "the clink ROW and the Tuple must have the same fields";
+    }
+    [[nodiscard]] const char* no_columns() const {
+        return typed ? "the batcher's schema has no columns besides event_time"
+                     : "the clink table declares no columns";
+    }
+    [[nodiscard]] const char* not_produced() const {
+        return typed ? "has no default and the struct has no field for it"
+                     : "has no default and the query does not produce it";
+    }
+    [[nodiscard]] const char* appears_twice() const {
+        return typed ? "appears twice in the batcher's schema" : "appears twice in the clink table";
+    }
+    [[nodiscard]] const char* drop_or_add() const {
+        return typed ? "remove the field from the CLINK_FIELDS declaration or add the column to "
+                       "the table"
+                     : "drop it from the SELECT or add it to the table";
+    }
+    [[nodiscard]] const char* drop_computed() const {
+        return typed ? "remove the field from the CLINK_FIELDS declaration"
+                     : "drop it from the SELECT";
+    }
+    [[nodiscard]] const char* whose_rows() const {
+        return typed ? " cannot take this struct's rows:" : " cannot take this table's rows:";
+    }
+};
 
 bool any_zero_copy(const ColumnBinding& b) {
     return b.zero_copy || std::any_of(b.children.begin(), b.children.end(), any_zero_copy);
@@ -167,8 +242,8 @@ std::string ascii_lower(std::string_view s) {
 // the spot for the message ("column `a`", "column `a`, element").
 class Binder {
 public:
-    Binder(std::vector<PlanProblem>& problems, std::string column)
-        : problems_(problems), column_(std::move(column)) {}
+    Binder(std::vector<PlanProblem>& problems, std::string column, Remedies remedies)
+        : problems_(problems), column_(std::move(column)), remedies_(remedies) {}
 
     std::optional<ColumnBinding> bind(const SqlType& src,
                                       const ChType& dst,
@@ -214,6 +289,22 @@ public:
                 }
                 break;
             }
+            case SqlKind::UTinyInt:
+            case SqlKind::USmallInt:
+            case SqlKind::UInteger:
+            case SqlKind::UBigInt: {
+                // Every value of a wider type holds the source's, so only a
+                // narrower or a same-width signed target is checked per value.
+                const int from = sql_int_width(src.kind);
+                if (const int to = unsigned_width(dst.kind); to != 0) {
+                    conversion = to == from
+                                     ? Conversion::Copy
+                                     : (to > from ? Conversion::WidenInt : Conversion::NarrowInt);
+                } else if (const int to_signed = signed_width(dst.kind); to_signed != 0) {
+                    conversion = to_signed > from ? Conversion::WidenInt : Conversion::NarrowInt;
+                }
+                break;
+            }
             case SqlKind::Real:
                 if (dst.kind == ChKind::Float32) {
                     conversion = Conversion::Copy;
@@ -226,9 +317,8 @@ public:
                     conversion = Conversion::Copy;
                 } else if (dst.kind == ChKind::Float32) {
                     return refuse(where,
-                                  src.spelling + " into " + dst.spelling +
-                                      " narrows; use REAL in the clink table or CAST in the "
-                                      "SELECT");
+                                  src.spelling + " into " + dst.spelling + " narrows; " +
+                                      remedies_.narrow_float());
                 }
                 break;
             case SqlKind::Boolean:
@@ -253,20 +343,21 @@ public:
                 }
                 break;
             case SqlKind::Timestamp:
-                // The declared precision says nothing about the value, so any
-                // TIMESTAMP(p) goes into any target unit. A value finer than
-                // the target is refused per value by the converter, never
-                // floored.
+                // The value's unit, not the declared precision, sets the
+                // figures: a Row carries every TIMESTAMP(p) as milliseconds,
+                // and a batcher schema says its unit. Any source goes into any
+                // target unit. A value finer than the target is refused per
+                // value by the converter, never floored.
                 if (dst.kind == ChKind::DateTime64) {
                     conversion = Conversion::TimestampToDateTime64;
-                    if (dst.precision >= kTimestampSourceDigits) {
-                        b.multiplier = pow10(dst.precision - kTimestampSourceDigits);
+                    if (dst.precision >= src.unit_digits) {
+                        b.multiplier = pow10(dst.precision - src.unit_digits);
                     } else {
-                        b.divisor = pow10(kTimestampSourceDigits - dst.precision);
+                        b.divisor = pow10(src.unit_digits - dst.precision);
                     }
                 } else if (dst.kind == ChKind::DateTime) {
                     conversion = Conversion::TimestampToDateTime;
-                    b.divisor = pow10(kTimestampSourceDigits);
+                    b.divisor = pow10(src.unit_digits);
                 }
                 break;
             case SqlKind::Date:
@@ -321,9 +412,9 @@ public:
                 break;
         }
         if (!conversion) {
-            return refuse(
-                where,
-                src.spelling + " into " + dst.spelling + " is not supported; CAST in the SELECT");
+            return refuse(where,
+                          src.spelling + " into " + dst.spelling + " is not supported; " +
+                              remedies_.change_source());
         }
         b.conversion = *conversion;
         return b;
@@ -332,6 +423,7 @@ public:
 private:
     std::vector<PlanProblem>& problems_;
     std::string column_;
+    Remedies remedies_;
 
     std::nullopt_t refuse(const std::string& where, const std::string& message) {
         problems_.push_back(PlanProblem{column_, where + ": " + message});
@@ -369,7 +461,7 @@ private:
             refuse(where,
                    pair + " drops " + std::to_string(src.scale - dst.scale) +
                        " fractional digits; raise the target's scale to " +
-                       std::to_string(src.scale) + " or CAST in the SELECT");
+                       std::to_string(src.scale) + " " + remedies_.or_change_source());
             return false;
         }
         const int target_integer_digits = dst.precision - dst.scale;
@@ -378,8 +470,7 @@ private:
             const int fitting = target_integer_digits + src.scale;
             std::string remedy = "widen the target";
             if (fitting >= 1) {
-                remedy += " or declare the clink column DECIMAL(" + std::to_string(fitting) + ", " +
-                          std::to_string(src.scale) + ")";
+                remedy += " " + remedies_.declare_decimal(fitting, src.scale);
             }
             refuse(where,
                    pair + " leaves " + std::to_string(target_integer_digits) +
@@ -391,8 +482,7 @@ private:
             refuse(where,
                    pair + " rescales by " + std::to_string(dst.scale - src.scale) +
                        " digits, more than the " + std::to_string(kMaxRescaleDigits) +
-                       " the native sink supports; declare the clink column with a scale of at "
-                       "least " +
+                       " the native sink supports; " + remedies_.declare_scale() +
                        std::to_string(dst.scale - kMaxRescaleDigits));
             return false;
         }
@@ -409,8 +499,8 @@ private:
         if (src.children.size() != dst.children.size()) {
             refuse(where,
                    src.spelling + " has " + std::to_string(src.children.size()) + " fields and " +
-                       dst.spelling + " has " + std::to_string(dst.children.size()) +
-                       "; the clink ROW and the Tuple must have the same fields");
+                       dst.spelling + " has " + std::to_string(dst.children.size()) + "; " +
+                       remedies_.same_fields());
             return false;
         }
         bool ok = true;
@@ -419,8 +509,9 @@ private:
             if (!dst.element_names.empty() && dst.element_names[i] != field) {
                 refuse(where,
                        "field " + std::to_string(i + 1) + " is " + quote_identifier(field) +
-                           " in the clink table and " + quote_identifier(dst.element_names[i]) +
-                           " in " + dst.spelling + "; rename one so that they match");
+                           " in " + remedies_.source_side() + " and " +
+                           quote_identifier(dst.element_names[i]) + " in " + dst.spelling +
+                           "; rename one so that they match");
                 ok = false;
                 continue;
             }
@@ -458,13 +549,15 @@ std::string ColumnPlan::report() const {
 }
 
 PlanResult compile_column_plan(const std::vector<SqlColumn>& input,
-                               const std::vector<TargetColumn>& target) {
+                               const std::vector<TargetColumn>& target,
+                               InputKind kind) {
     PlanResult result;
     auto& problems = result.problems;
     ColumnPlan plan;
+    const Remedies remedies{kind == InputKind::TypedStruct};
 
     if (input.empty()) {
-        problems.push_back(PlanProblem{"", "the clink table declares no columns"});
+        problems.push_back(PlanProblem{"", remedies.no_columns()});
     }
 
     std::unordered_map<std::string, const TargetColumn*> by_name;
@@ -484,10 +577,9 @@ PlanResult compile_column_plan(const std::vector<SqlColumn>& input,
             continue;
         }
         if (t.default_kind == DefaultKind::None) {
-            problems.push_back(PlanProblem{t.name,
-                                           "target column " + quote_identifier(t.name) +
-                                               " has no default and the query does not produce "
-                                               "it"});
+            problems.push_back(PlanProblem{
+                t.name,
+                "target column " + quote_identifier(t.name) + " " + remedies.not_produced()});
         } else {
             plan.omitted.push_back(t);
         }
@@ -499,7 +591,7 @@ PlanResult compile_column_plan(const std::vector<SqlColumn>& input,
         const std::string quoted = quote_identifier(in.name);
         const std::string where = "column " + quoted;
         if (!seen.insert(in.name).second) {
-            problems.push_back(PlanProblem{in.name, where + " appears twice in the clink table"});
+            problems.push_back(PlanProblem{in.name, where + " " + remedies.appears_twice()});
             continue;
         }
         const auto it = by_name.find(in.name);
@@ -519,7 +611,7 @@ PlanResult compile_column_plan(const std::vector<SqlColumn>& input,
                 message += "the target has " + quote_identifier(near->name) +
                            ", which differs only in case, and ClickHouse names are case-sensitive";
             } else {
-                message += "drop it from the SELECT or add it to the table";
+                message += remedies.drop_or_add();
             }
             problems.push_back(PlanProblem{in.name, std::move(message)});
             continue;
@@ -528,11 +620,11 @@ PlanResult compile_column_plan(const std::vector<SqlColumn>& input,
         if (t.default_kind == DefaultKind::Materialized || t.default_kind == DefaultKind::Alias) {
             problems.push_back(PlanProblem{in.name,
                                            quoted + " is " + default_kind_name(t.default_kind) +
-                                               "; the server computes it; drop it from the "
-                                               "SELECT"});
+                                               "; the server computes it; " +
+                                               remedies.drop_computed()});
             continue;
         }
-        Binder binder(problems, in.name);
+        Binder binder(problems, in.name, remedies);
         auto binding =
             binder.bind(in.type, parse_ch_type(t.type), in.name, static_cast<int>(i), where);
         if (!binding) {
@@ -566,12 +658,13 @@ PlanResult compile_column_plan(const std::vector<SqlColumn>& input,
 
 ColumnPlan compile_or_refuse(const std::vector<SqlColumn>& input,
                              const std::vector<TargetColumn>& target,
-                             const std::string& qualified_table) {
-    PlanResult result = compile_column_plan(input, target);
+                             const std::string& qualified_table,
+                             InputKind kind) {
+    PlanResult result = compile_column_plan(input, target, kind);
     if (result.plan) {
         return std::move(*result.plan);
     }
-    std::string message = qualified_table + " cannot take this table's rows:";
+    std::string message = qualified_table + Remedies{kind == InputKind::TypedStruct}.whose_rows();
     for (const auto& p : result.problems) {
         message += "\n  - " + p.message;
     }

@@ -1013,5 +1013,84 @@ TEST(NativeOptions, DescribeNeverRendersAPasswordFromTheEnvironment) {
     EXPECT_EQ(text.find("CLINK_NATIVE_OPTS_TEST_PW"), std::string::npos) << text;
 }
 
+// ---- The typed sink's options ---------------------------------------------------
+
+// The refusal parse_typed_sink_options raises.
+OptsRefusal opts_typed_refusal(const OptsParams& p) {
+    try {
+        (void)parse_typed_sink_options(p, 0, 1);
+    } catch (const NativeSinkError& e) {
+        return {e.code(), e.what()};
+    }
+    ADD_FAILURE() << "parse_typed_sink_options accepted the options";
+    return {};
+}
+
+TEST(NativeTypedOptions, TheTableAloneIsEnoughAndTheColumnTypesStayEmpty) {
+    const SinkOptions typed = parse_typed_sink_options({{"table", "events"}}, 1, 2);
+    EXPECT_EQ(typed.table, "events");
+    EXPECT_TRUE(typed.sql_column_types.empty());
+    EXPECT_EQ(typed.subtask_idx, 1U);
+    EXPECT_EQ(typed.parallelism, 2U);
+}
+
+TEST(NativeTypedOptions, SqlColumnTypesIsRefusedAsTheSchemaCarriesTheTypes) {
+    const std::string expected =
+        opts_message(code::kOptionInvalid,
+                     "the typed sink takes its column types from the ArrowBatcher schema; remove "
+                     "sql_column_types");
+    for (const std::string& value : {std::string(kOptsColumnTypes), std::string()}) {
+        const auto r = opts_typed_refusal({{"table", "events"}, {"sql_column_types", value}});
+        EXPECT_EQ(r.code, code::kOptionInvalid) << value;
+        EXPECT_EQ(r.what, expected) << value;
+    }
+    // Refused for being there, so a reference is never resolved.
+    const OptsScopedEnv unset("CLINK_NATIVE_OPTS_TEST_UNSET", std::nullopt);
+    const auto from_env = opts_typed_refusal(
+        {{"table", "events"}, {"sql_column_types", "env://CLINK_NATIVE_OPTS_TEST_UNSET"}});
+    EXPECT_EQ(from_env.code, code::kOptionInvalid);
+    EXPECT_EQ(from_env.what, expected);
+}
+
+TEST(NativeTypedOptions, EveryOtherKeyIsParsedAndRefusedAsTheSqlSinkDoes) {
+    const OptsParams shared = {{"table", "events"},
+                               {"database", "db"},
+                               {"endpoints", "ch-1:9000,ch-2:9001"},
+                               {"user", "writer"},
+                               {"batch_rows", "1000"},
+                               {"compression", "zstd"},
+                               {"retry_window_ms", "5000"},
+                               {"bounded", "true"}};
+    OptsParams with_types = shared;
+    with_types["sql_column_types"] = kOptsColumnTypes;
+    SinkOptions typed = parse_typed_sink_options(shared, 0, 1);
+    SinkOptions sql = parse_sink_options(with_types, 0, 1);
+    sql.sql_column_types.clear();
+    EXPECT_EQ(describe(typed), describe(sql));
+
+    // Each refusal reads exactly as the SQL sink's.
+    const std::vector<std::pair<std::string, std::string>> refused = {
+        {"tls_server_name", "ch-1"},
+        {"mode", "upsert"},
+        {"delivery_guarantee", "exactly_once"},
+        {"changelog", "true"},
+        {"batch_rows", "0"},
+    };
+    for (const auto& [key, value] : refused) {
+        OptsParams t = {{"table", "events"}, {key, value}};
+        OptsParams q = t;
+        q["sql_column_types"] = kOptsColumnTypes;
+        const auto typed_refusal = opts_typed_refusal(t);
+        const auto sql_refusal = opts_refusal(q);
+        EXPECT_EQ(typed_refusal.code, sql_refusal.code) << key;
+        EXPECT_EQ(typed_refusal.what, sql_refusal.what) << key;
+    }
+    EXPECT_EQ(opts_typed_refusal({{"table", "events"}, {"tls_server_name", "ch-1"}}).code,
+              code::kUnknownOption);
+    EXPECT_EQ(opts_typed_refusal({{"table", "events"}, {"mode", "upsert"}}).code,
+              code::kDeliveryUnsupported);
+    EXPECT_EQ(opts_typed_refusal({{"database", "db"}}).code, code::kOptionInvalid);
+}
+
 }  // namespace
 }  // namespace clink::clickhouse::native

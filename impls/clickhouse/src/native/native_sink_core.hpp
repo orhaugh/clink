@@ -13,6 +13,7 @@
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
+#include "native/column_plan.hpp"
 #include "native/errors.hpp"
 #include "native/insert_transport.hpp"
 #include "native/sink_options.hpp"
@@ -20,11 +21,6 @@
 #include "native/writer.hpp"
 
 namespace clink::clickhouse::native {
-
-// Where the sink's column list came from: the planner's declared SQL types, or
-// the schema of a typed struct's batcher. It changes only what the open report
-// says about the input.
-enum class InputKind : std::uint8_t { SqlTable, TypedStruct };
 
 // The part of the native sink that does not depend on what the rows arrive as:
 // the open (barrier mode, memory cap, the opener thread and its retries, the

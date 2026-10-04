@@ -69,6 +69,15 @@ std::string type_name(const SqlType& t) {
             return "INTEGER";
         case SqlKind::BigInt:
             return "BIGINT";
+        // A batcher schema's kinds, which no SQL table declares.
+        case SqlKind::UTinyInt:
+            return "uint8";
+        case SqlKind::USmallInt:
+            return "uint16";
+        case SqlKind::UInteger:
+            return "uint32";
+        case SqlKind::UBigInt:
+            return "uint64";
         case SqlKind::Real:
             return "REAL";
         case SqlKind::Double:
@@ -518,6 +527,10 @@ private:
             case SqlKind::Row:
                 append_row(static_cast<arrow::StructBuilder&>(b), t, v);
                 return;
+            case SqlKind::UTinyInt:
+            case SqlKind::USmallInt:
+            case SqlKind::UInteger:
+            case SqlKind::UBigInt:
             case SqlKind::Time:
             case SqlKind::Bytea:
             case SqlKind::Unsupported:

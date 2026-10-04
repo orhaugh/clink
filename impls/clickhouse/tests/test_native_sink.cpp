@@ -59,6 +59,7 @@
 #include "native/insert_transport.hpp"
 #include "native/metrics.hpp"
 #include "native/native_sink.hpp"
+#include "native/native_sink_core.hpp"
 #include "native/sink_options.hpp"
 #include "native/writer.hpp"
 #include "test_helpers/sanitizer_slack.hpp"
@@ -1350,6 +1351,41 @@ TEST(NativeSinkOpen, ARefusalFromTheServerOrThePlanIsCountedByReasonAndNeverRetr
         EXPECT_EQ(lines.front().level, "error");
         EXPECT_TRUE(ns_logs_with(ns_logs_since(since), "clickhouse native sink open:").empty());
     }
+}
+
+// The opener compiles the plan with the core's input kind, so a typed struct's
+// refusal names the struct's remedies and a SQL table's keeps its own.
+TEST(NativeSinkOpen, APlanRefusalAtOpenIsWordedForTheInputKind) {
+    auto server = std::make_shared<fake::FakeServer>();
+    server->add_table(ns_table());
+    const auto schema = arrow::schema({arrow::field("id", arrow::uint64()),
+                                       arrow::field("s", arrow::utf8()),
+                                       arrow::field("extra", arrow::int64())});
+    const std::map<std::string, std::string> params = {{"database", "db"}, {"table", kNsTable}};
+    const auto refusal = [&](InputKind kind) {
+        SinkCore core(parse_typed_sink_options(params, 0, 1),
+                      columns_from_arrow_schema(*schema),
+                      kind,
+                      fake::fake_factory(server));
+        try {
+            core.open(nullptr, OperatorId{4243}, "clickhouse_native_sink");
+        } catch (const NativeSinkError& e) {
+            EXPECT_EQ(e.code(), code::kColumnPlan);
+            return std::string(e.what());
+        }
+        ADD_FAILURE() << "the plan was accepted";
+        return std::string();
+    };
+    EXPECT_EQ(refusal(InputKind::TypedStruct),
+              "[clickhouse.column_plan] `db`.`events` cannot take this struct's rows:\n"
+              "  - column `extra` is not in the target table; remove the field from the "
+              "CLINK_FIELDS declaration or add the column to the table");
+    EXPECT_EQ(refusal(InputKind::SqlTable),
+              "[clickhouse.column_plan] `db`.`events` cannot take this table's rows:\n"
+              "  - column `extra` is not in the target table; drop it from the SELECT or add it "
+              "to the table");
+    EXPECT_TRUE(server->inserts(kNsTable).empty());
+    EXPECT_EQ(server->destroyed_mid_insert(), 0U);
 }
 
 TEST(NativeSinkOpen, ARefusalFromTheTransportItselfIsNeverRetried) {

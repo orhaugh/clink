@@ -293,11 +293,14 @@ std::string_view compression_name(Compression c) {
     return "unknown";
 }
 
-}  // namespace
+// Where the column list comes from: sql_column_types, which the planner
+// supplies, or a typed struct's batcher schema, which leaves no place for it.
+enum class ColumnSource : std::uint8_t { SqlColumnTypes, BatcherSchema };
 
-SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
-                               std::uint32_t subtask_idx,
-                               std::uint32_t parallelism) {
+SinkOptions parse_options(const std::map<std::string, std::string>& params,
+                          std::uint32_t subtask_idx,
+                          std::uint32_t parallelism,
+                          ColumnSource source) {
     const auto& own = own_option_keys();
     const auto& tolerated = pass_through_keys();
 
@@ -318,6 +321,11 @@ SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
         }
         refuse(code::kUnknownOption,
                "unknown option '" + key + "'. Accepted options: " + accepted + ".");
+    }
+    if (source == ColumnSource::BatcherSchema && params.contains("sql_column_types")) {
+        refuse(code::kOptionInvalid,
+               "the typed sink takes its column types from the ArrowBatcher schema; remove "
+               "sql_column_types");
     }
 
     SinkOptions opts;
@@ -452,11 +460,14 @@ SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
     if (get("table") == nullptr) {
         refuse(code::kOptionInvalid, "option 'table' is required");
     }
-    if (opts.sql_column_types.empty()) {
-        refuse(code::kOptionInvalid,
-               "the native sink is built from SQL; a Dag-direct job must pass sql_column_types");
+    if (source == ColumnSource::SqlColumnTypes) {
+        if (opts.sql_column_types.empty()) {
+            refuse(code::kOptionInvalid,
+                   "the native sink is built from SQL; a Dag-direct job must pass "
+                   "sql_column_types");
+        }
+        check_column_types(*get("sql_column_types"));
     }
-    check_column_types(*get("sql_column_types"));
 
 #if !defined(CLINK_CLICKHOUSE_NATIVE_TLS)
     if (opts.tls.enabled) {
@@ -466,6 +477,20 @@ SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
     }
 #endif
     return opts;
+}
+
+}  // namespace
+
+SinkOptions parse_sink_options(const std::map<std::string, std::string>& params,
+                               std::uint32_t subtask_idx,
+                               std::uint32_t parallelism) {
+    return parse_options(params, subtask_idx, parallelism, ColumnSource::SqlColumnTypes);
+}
+
+SinkOptions parse_typed_sink_options(const std::map<std::string, std::string>& params,
+                                     std::uint32_t subtask_idx,
+                                     std::uint32_t parallelism) {
+    return parse_options(params, subtask_idx, parallelism, ColumnSource::BatcherSchema);
 }
 
 const std::vector<std::string>& own_option_keys() {
