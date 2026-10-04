@@ -13,7 +13,9 @@
 #include <vector>
 
 #include <arrow/filesystem/localfs.h>
+#include <arrow/io/file.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/writer.h>
 
 #include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_sink.hpp"
@@ -44,6 +46,27 @@ void write_int64_file(const std::filesystem::path& path, const std::vector<std::
     }
     sink.on_data(b);
     sink.close();
+}
+
+// Write a Parquet file the way another tool would: plain Arrow columns, with
+// none of clink's own (no event_time).
+void write_foreign_file(const std::filesystem::path& path,
+                        const std::shared_ptr<arrow::Table>& table) {
+    auto out = arrow::io::FileOutputStream::Open(path.string()).ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1024).ok());
+    ASSERT_TRUE(out->Close().ok());
+}
+
+std::shared_ptr<arrow::Array> int64_array(const std::vector<std::int64_t>& vals) {
+    arrow::Int64Builder b;
+    EXPECT_TRUE(b.AppendValues(vals).ok());
+    return b.Finish().ValueOrDie();
+}
+
+std::shared_ptr<arrow::Array> utf8_array(const std::vector<std::string>& vals) {
+    arrow::StringBuilder b;
+    EXPECT_TRUE(b.AppendValues(vals).ok());
+    return b.Finish().ValueOrDie();
 }
 
 auto local_fs_factory() {
@@ -216,4 +239,77 @@ TEST(MultiObjectParquetSource, ReplayResumesAcrossFilesWithoutLossOrDuplication)
     all.insert(all.end(), second.begin(), second.end());
     std::sort(all.begin(), all.end());
     EXPECT_EQ(all, (std::vector<std::int64_t>{0, 100, 200, 300, 400, 500}));
+}
+
+// A file another tool wrote has no event_time column. Its rows read in full,
+// each with no event time, rather than the file being refused for the missing
+// engine column.
+TEST(MultiObjectParquetSource, AFileAnotherToolWroteReadsWithNoEventTime) {
+    auto dir = make_temp_dir("foreign");
+    const auto schema = arrow::schema({arrow::field("value", arrow::int64(), false)});
+    write_foreign_file(dir / "a.parquet", arrow::Table::Make(schema, {int64_array({1, 2, 3})}));
+    write_foreign_file(dir / "b.parquet", arrow::Table::Make(schema, {int64_array({4, 5})}));
+
+    std::vector<std::int64_t> values;
+    std::size_t with_time = 0;
+    for (int sub = 0; sub < 2; ++sub) {
+        MultiObjectParquetSource<std::int64_t> src(
+            local_fs_factory(), dir_opts(dir, sub, 2), int64_arrow_batcher());
+        src.open();
+        Emitter<std::int64_t> em([&](StreamElement<std::int64_t> e) {
+            if (e.is_data()) {
+                for (const auto& r : e.as_data()) {
+                    values.push_back(r.value());
+                    with_time += r.event_time().has_value() ? 1 : 0;
+                }
+            }
+            return true;
+        });
+        while (src.produce(em)) {
+        }
+        src.close();
+    }
+    std::sort(values.begin(), values.end());
+    EXPECT_EQ(values, (std::vector<std::int64_t>{1, 2, 3, 4, 5}));
+    EXPECT_EQ(with_time, 0u);
+    std::filesystem::remove_all(dir);
+}
+
+// Only the engine's own column may be absent: an event_time of another type is
+// a user's column, still refused, and a missing declared column still names it.
+TEST(MultiObjectParquetSource, OnlyTheEngineEventTimeColumnMayBeAbsent) {
+    auto dir = make_temp_dir("foreign_bad");
+    write_foreign_file(
+        dir / "typed.parquet",
+        arrow::Table::Make(arrow::schema({arrow::field("event_time", arrow::utf8()),
+                                          arrow::field("value", arrow::int64(), false)}),
+                           {utf8_array({"x"}), int64_array({1})}));
+    {
+        MultiObjectParquetSource<std::int64_t> src(
+            local_fs_factory(), dir_opts(dir, 0, 1), int64_arrow_batcher());
+        try {
+            src.open();
+            FAIL() << "an event_time column of another type must be refused";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("'event_time'"), std::string::npos) << e.what();
+        }
+        src.close();
+    }
+    std::filesystem::remove_all(dir);
+
+    dir = make_temp_dir("foreign_missing");
+    write_foreign_file(
+        dir / "other.parquet",
+        arrow::Table::Make(arrow::schema({arrow::field("other", arrow::int64(), false)}),
+                           {int64_array({1})}));
+    MultiObjectParquetSource<std::int64_t> src(
+        local_fs_factory(), dir_opts(dir, 0, 1), int64_arrow_batcher());
+    try {
+        src.open();
+        FAIL() << "a missing declared column must be refused";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("'value'"), std::string::npos) << e.what();
+    }
+    src.close();
+    std::filesystem::remove_all(dir);
 }

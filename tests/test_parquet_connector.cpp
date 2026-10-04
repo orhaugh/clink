@@ -19,6 +19,7 @@
 #include <arrow/io/file.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/reader.h>
+#include <parquet/arrow/writer.h>
 
 #include "clink/connectors/parquet_sink.hpp"
 #include "clink/connectors/parquet_source.hpp"
@@ -352,5 +353,39 @@ TEST(ParquetConnector, ProjectedReadSkipsAndReordersColumns) {
         EXPECT_NE(std::string(e.what()).find("nope"), std::string::npos) << e.what();
     }
 
+    std::filesystem::remove(path);
+}
+
+// A single file another tool wrote has no event_time column; its rows read in
+// full, in the batcher's column order, each with no event time.
+TEST(ParquetConnector, AFileAnotherToolWroteReadsWithNoEventTime) {
+    const auto path = tmp_parquet("foreign");
+    {
+        arrow::Int64Builder vb;
+        ASSERT_TRUE(vb.AppendValues({7, 8, 9}).ok());
+        auto table =
+            arrow::Table::Make(arrow::schema({arrow::field("value", arrow::int64(), false)}),
+                               {vb.Finish().ValueOrDie()});
+        auto out = arrow::io::FileOutputStream::Open(path.string()).ValueOrDie();
+        ASSERT_TRUE(
+            parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1024).ok());
+        ASSERT_TRUE(out->Close().ok());
+    }
+    ParquetSource<std::int64_t> source(path, int64_arrow_batcher());
+    source.open();
+    CapturedBatches<std::int64_t> captured;
+    auto emitter = make_capturing_emitter(captured);
+    while (source.produce(emitter)) {
+    }
+    source.close();
+
+    std::vector<std::int64_t> values;
+    for (const auto& batch : captured.batches) {
+        for (const auto& rec : batch) {
+            values.push_back(rec.value());
+            EXPECT_FALSE(rec.event_time().has_value());
+        }
+    }
+    EXPECT_EQ(values, (std::vector<std::int64_t>{7, 8, 9}));
     std::filesystem::remove(path);
 }

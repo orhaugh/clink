@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A `parquet` source reads files another tool wrote.** The source expected
+clink's own event-time column in every file and refused one without it, so a
+directory pyarrow, DuckDB, Spark or ClickHouse wrote could not be read, though
+the connector page reads such a directory in its first example. A missing
+event-time column now reads as no event time for every row, in one file and
+in a directory, on every filesystem the source reads. Any other declared column
+the file lacks, or an `event_time` column of another type, is still refused,
+naming it. A table of more than one column also reads a directory tree through
+`prefix`, as the page's example does; only the single-column sources took
+`prefix` before, and the example failed at deploy.
+
 **`LIMIT 0` is accepted.** It was refused as "LIMIT must be a non-negative
 integer literal": the parser omits a field whose value is zero, and only
 `OFFSET` read the empty value as 0. `LIMIT 0`, with or without `ORDER BY`,

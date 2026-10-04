@@ -72,6 +72,35 @@ inline std::shared_ptr<arrow::Field> arrow_event_time_field() {
 
 namespace detail {
 
+// Whether a declared column is the engine's event-time column, the one
+// arrow_event_time_field() describes. A file another tool wrote does not
+// carry it, and a reader takes its absence as "no event time" for every row
+// rather than as a missing column.
+inline bool is_event_time_field(const arrow::Field& f) {
+    return f.name() == "event_time" && f.type()->id() == arrow::Type::INT64;
+}
+
+// A projected batch in a schema's column order: order[i] is the column of
+// `rb` that becomes column i, or -1 for an event-time column the file did not
+// carry, which reads as all null.
+inline arrow::Result<std::shared_ptr<arrow::RecordBatch>> batch_in_schema_order(
+    const arrow::RecordBatch& rb,
+    const std::vector<int>& order,
+    const std::shared_ptr<arrow::Schema>& schema) {
+    std::vector<std::shared_ptr<arrow::Array>> columns;
+    columns.reserve(order.size());
+    for (const int idx : order) {
+        if (idx < 0) {
+            ARROW_ASSIGN_OR_RAISE(auto nulls,
+                                  arrow::MakeArrayOfNull(arrow::int64(), rb.num_rows()));
+            columns.push_back(std::move(nulls));
+        } else {
+            columns.push_back(rb.column(idx));
+        }
+    }
+    return arrow::RecordBatch::Make(schema, rb.num_rows(), std::move(columns));
+}
+
 // Build (event-time array, value array(s)) helpers. These are factored
 // out so every built-in batcher gets identical event-time handling.
 inline arrow::Status append_event_time(arrow::Int64Builder& b, const std::optional<EventTime>& t) {

@@ -56,7 +56,7 @@ Options are read from `BuildContext` params in `src/cluster/built_in_factories.c
 | `mode` | `file` sink | No | append | `mode='upsert'` nets a changelog by the table's PRIMARY KEY. |
 | `delivery_guarantee` | `file` / `parquet` sink | No | at-least-once | `delivery_guarantee='exactly_once'` selects the 2PC sink. |
 
-The `parquet` row source derives its Arrow schema from the table's declared columns (`schema_columns`), so no separate schema option is needed.
+The `parquet` row source derives its Arrow schema from the table's declared columns (`schema_columns`), so no separate schema option is needed. It resolves those columns by name, with the same type, in any file: one clink wrote, or one another tool wrote (pyarrow, DuckDB, Spark, ClickHouse). A file from another tool carries none of clink's own columns, and its rows read with no event time; a declared column the file lacks, or holds as another type, is refused at open, naming it.
 
 ## SQL usage
 

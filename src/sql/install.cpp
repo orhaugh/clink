@@ -12481,8 +12481,10 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_source<Row>(
         "parquet_row_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<Row>> {
             auto path = ctx.param_or("path");
-            if (path.empty()) {
-                throw std::runtime_error("parquet_row_source: 'path' param is required");
+            const auto prefix = ctx.param_or("prefix", "");
+            if (path.empty() && prefix.empty()) {
+                throw std::runtime_error(
+                    "parquet_row_source: 'path' or 'prefix' param is required");
             }
             auto cols = parse_row_schema(ctx.param_or("schema_columns"));
             if (const auto csv = ctx.param_or("projected_columns"); !csv.empty()) {
@@ -12516,6 +12518,24 @@ void install(clink::plugin::PluginRegistry& reg) {
                         cols = std::move(narrowed);
                     }
                 }
+            }
+            // A prefix reads every matching file beneath a directory tree,
+            // sharded round-robin across subtasks, as the int64 and string
+            // Parquet sources do.
+            if (!prefix.empty()) {
+                MultiObjectParquetSource<Row>::Options o;
+                o.prefix = prefix;
+                o.subtask_idx = static_cast<int>(ctx.subtask_idx);
+                o.parallelism = static_cast<int>(ctx.parallelism);
+                o.recursive = ctx.param_or("recursive", "true") == "true";
+                o.suffix = ctx.param_or("suffix", ".parquet");
+                return std::make_shared<MultiObjectParquetSource<Row>>(
+                    []() -> std::shared_ptr<arrow::fs::FileSystem> {
+                        return std::make_shared<arrow::fs::LocalFileSystem>();
+                    },
+                    std::move(o),
+                    make_row_columnar_arrow_batcher(std::move(cols)),
+                    "parquet_row_source");
             }
             // A directory (what the rolling parquet_row_sink writes) reads every
             // part, with the same by-name projection as one file.

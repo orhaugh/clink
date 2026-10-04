@@ -268,11 +268,18 @@ private:
             // those are read, in the batcher's order. A declared-narrower or
             // reordered table therefore reads a wider file, and a narrowed query
             // skips the unread columns. A missing or differently typed column is
-            // a mismatch naming it.
+            // a mismatch naming it, except a missing engine event-time column: a
+            // file another tool wrote has none, and its rows read as having no
+            // event time.
             std::vector<int> indices;
             indices.reserve(static_cast<std::size_t>(expected->num_fields()));
+            bool event_time_absent = false;
             for (const auto& field : expected->fields()) {
                 const int idx = file_schema->GetFieldIndex(field->name());
+                if (idx < 0 && detail::is_event_time_field(*field)) {
+                    event_time_absent = true;
+                    continue;
+                }
                 if (idx < 0 || !file_schema->field(idx)->type()->Equals(*field->type())) {
                     throw std::runtime_error(
                         "MultiObjectParquetSource: schema mismatch in " + path + " - column '" +
@@ -296,9 +303,10 @@ private:
                                          ": " + s.ToString());
             }
             // The projected reader yields columns in file order; remap to the
-            // batcher's order when they differ.
+            // batcher's order when they differ (-1 marks the absent event-time
+            // column, filled with nulls).
             const auto got = batch_reader_->schema();
-            if (!got->Equals(*expected, /*check_metadata=*/false)) {
+            if (event_time_absent || !got->Equals(*expected, /*check_metadata=*/false)) {
                 reorder_.reserve(static_cast<std::size_t>(expected->num_fields()));
                 for (const auto& field : expected->fields()) {
                     reorder_.push_back(got->GetFieldIndex(field->name()));
@@ -320,13 +328,12 @@ private:
                 if (reorder_.empty()) {
                     return rb;
                 }
-                auto reordered = rb->SelectColumns(reorder_);
+                auto reordered = detail::batch_in_schema_order(*rb, reorder_, batcher_.schema());
                 if (!reordered.ok()) {
                     throw std::runtime_error("MultiObjectParquetSource: column reorder: " +
                                              reordered.status().ToString());
                 }
-                return arrow::RecordBatch::Make(
-                    batcher_.schema(), (*reordered)->num_rows(), (*reordered)->columns());
+                return std::move(*reordered);
             }
             close_current_();     // current file exhausted
             open_next_reader_();  // advance (sets batch_reader_ or leaves it null)

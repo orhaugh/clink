@@ -95,11 +95,18 @@ public:
             // must match exactly) and read ONLY those columns. This is what
             // makes a narrowed query skip unread Parquet columns entirely,
             // and what lets a declared-narrower table read a wider file. A
-            // batcher column absent from the file is an error naming it.
+            // batcher column absent from the file is an error naming it,
+            // except the engine's event-time column: a file another tool
+            // wrote has none, and its rows read as having no event time.
             std::vector<int> indices;
             indices.reserve(static_cast<std::size_t>(expected->num_fields()));
+            bool event_time_absent = false;
             for (const auto& field : expected->fields()) {
                 const int idx = file_schema->GetFieldIndex(field->name());
+                if (idx < 0 && detail::is_event_time_field(*field)) {
+                    event_time_absent = true;
+                    continue;
+                }
                 if (idx < 0) {
                     throw std::runtime_error("ParquetSource: file " + path_.string() +
                                              " has no column '" + field->name() +
@@ -124,12 +131,17 @@ public:
                                          s.ToString());
             }
             // The projected reader yields columns in file order; remap to the
-            // batcher's order when they differ so parse() sees its schema.
+            // batcher's order when they differ so parse() sees its schema
+            // (-1 marks the absent event-time column, filled with nulls).
             const auto got = batch_reader_->schema();
-            if (!got->Equals(*expected, /*check_metadata=*/false)) {
+            if (event_time_absent || !got->Equals(*expected, /*check_metadata=*/false)) {
                 reorder_.reserve(static_cast<std::size_t>(expected->num_fields()));
                 for (const auto& field : expected->fields()) {
                     const int idx = got->GetFieldIndex(field->name());
+                    if (idx < 0 && event_time_absent && detail::is_event_time_field(*field)) {
+                        reorder_.push_back(-1);
+                        continue;
+                    }
                     if (idx < 0) {
                         throw std::runtime_error("ParquetSource: projected read lost column '" +
                                                  field->name() + "'");
@@ -166,13 +178,12 @@ public:
         }
         ++batches_emitted_;  // #57: count emitted batches for replay
         if (!reorder_.empty()) {
-            auto reordered = rb->SelectColumns(reorder_);
+            auto reordered = detail::batch_in_schema_order(*rb, reorder_, batcher_.schema());
             if (!reordered.ok()) {
                 throw std::runtime_error("ParquetSource: column reorder: " +
                                          reordered.status().ToString());
             }
-            rb = arrow::RecordBatch::Make(
-                batcher_.schema(), (*reordered)->num_rows(), (*reordered)->columns());
+            rb = std::move(*reordered);
         }
         auto parsed = batcher_.parse(*rb);
         if (!parsed.has_value()) {

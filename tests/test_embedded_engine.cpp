@@ -21,6 +21,7 @@
 #include <arrow/io/file.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/reader.h>
+#include <parquet/arrow/writer.h>
 
 #include "clink/config/json.hpp"
 #include "clink/embed/embedded_engine.hpp"
@@ -1168,6 +1169,71 @@ TEST(EmbeddedEngine, AResumedRunKeepsThePlainParquetSinksEarlierOutput) {
 
     ASSERT_EQ(run(&err), 0) << err;
     EXPECT_EQ(rows_on_disk(), 5) << "the resumed run must keep what the first run wrote";
+    fs::remove_all(dir);
+}
+
+// The connector page's example over files another tool wrote: plain Parquet
+// with none of clink's own columns (no event_time), read through `prefix`.
+TEST(EmbeddedEngine, AParquetDirectoryAnotherToolWroteIsReadBySql) {
+    const auto dir = resume_scratch("pqforeign");
+    const auto events = dir / "events";
+    fs::create_directories(events);
+    const auto schema = arrow::schema({arrow::field("user_id", arrow::int64(), false),
+                                       arrow::field("amount", arrow::int64(), false)});
+    for (int part = 0; part < 2; ++part) {
+        arrow::Int64Builder ids;
+        arrow::Int64Builder amounts;
+        for (std::int64_t i = 0; i < 3; ++i) {
+            ASSERT_TRUE(ids.Append(part * 3 + i + 1).ok());
+            ASSERT_TRUE(amounts.Append((part * 3 + i + 1) * 10).ok());
+        }
+        auto table =
+            arrow::Table::Make(schema, {ids.Finish().ValueOrDie(), amounts.Finish().ValueOrDie()});
+        auto out = arrow::io::FileOutputStream::Open(
+                       (events / ("part-" + std::to_string(part) + ".parquet")).string())
+                       .ValueOrDie();
+        ASSERT_TRUE(
+            parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1024).ok());
+        ASSERT_TRUE(out->Close().ok());
+    }
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(engine.execute_script("CREATE TABLE events (user_id BIGINT, amount BIGINT) "
+                                    "WITH (connector='parquet', prefix='" +
+                                    events.string() +
+                                    "');"
+                                    "CREATE TABLE got (user_id BIGINT, amount BIGINT) "
+                                    "WITH (connector='collect');"
+                                    "INSERT INTO got SELECT user_id, amount FROM events"),
+              0)
+        << err.str();
+    auto reader = engine.collect_reader("got").ValueOrDie();
+    std::int64_t rows = 0;
+    std::int64_t amount_sum = 0;
+    std::int64_t id_sum = 0;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        ASSERT_TRUE(reader->ReadNext(&batch).ok());
+        if (!batch) {
+            break;
+        }
+        const auto got_amounts =
+            std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("amount"));
+        const auto got_ids =
+            std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("user_id"));
+        for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+            amount_sum += got_amounts->Value(i);
+            id_sum += got_ids->Value(i);
+        }
+        rows += batch->num_rows();
+    }
+    EXPECT_TRUE(engine.await_all()) << err.str();
+    EXPECT_EQ(rows, 6);
+    EXPECT_EQ(id_sum, 21);
+    EXPECT_EQ(amount_sum, 210);
     fs::remove_all(dir);
 }
 
