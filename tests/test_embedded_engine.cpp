@@ -1172,6 +1172,42 @@ TEST(EmbeddedEngine, AResumedRunKeepsThePlainParquetSinksEarlierOutput) {
     fs::remove_all(dir);
 }
 
+// A collect stream ends when the job writing it ends, and a job that failed
+// ends it with the failure: the reader neither waits for producers that will
+// never close nor hands back a short result as if it were complete.
+TEST(EmbeddedEngine, ACollectStreamEndsWithItsJobsFailure) {
+    const auto dir = resume_scratch("collectfail");
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(
+        engine.execute_script("CREATE TABLE src (a BIGINT, b BIGINT) "
+                              "WITH (connector='parquet', path='" +
+                              (dir / "missing.parquet").string() +
+                              "');"
+                              "CREATE TABLE got (a BIGINT, b BIGINT) WITH (connector='collect');"
+                              "INSERT INTO got SELECT a, b FROM src"),
+        0)
+        << err.str();
+    auto reader = engine.collect_reader("got").ValueOrDie();
+    arrow::Status st;
+    std::int64_t rows = 0;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        st = reader->ReadNext(&batch);
+        if (!st.ok() || !batch) {
+            break;
+        }
+        rows += batch->num_rows();
+    }
+    EXPECT_EQ(rows, 0);
+    ASSERT_FALSE(st.ok()) << "a failed job must end its collect stream with the failure";
+    EXPECT_NE(st.ToString().find("failed"), std::string::npos) << st.ToString();
+    EXPECT_FALSE(engine.await_all());
+    fs::remove_all(dir);
+}
+
 // The connector page's example over files another tool wrote: plain Parquet
 // with none of clink's own columns (no event_time), read through `prefix`.
 TEST(EmbeddedEngine, AParquetDirectoryAnotherToolWroteIsReadBySql) {

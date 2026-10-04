@@ -47,27 +47,55 @@ void ensure_factories_installed_once() {
 std::atomic<int> g_engine_seq{0};
 
 // A RecordBatchReader over one collect table's queue: ReadNext blocks
-// until a batch, nullptr at end-of-stream, Cancelled after abort. Holds
-// the queue alive so draining stays safe after the engine is destroyed.
+// until a batch, returns nullptr at end-of-stream, the job's failure when
+// the job writing the table failed, and Cancelled after abort. Holds the
+// queue and the hub alive so draining stays safe after the engine is
+// destroyed.
 class CollectReader final : public arrow::RecordBatchReader {
 public:
-    CollectReader(std::shared_ptr<arrow::Schema> schema, std::shared_ptr<CollectQueue> queue)
-        : schema_(std::move(schema)), queue_(std::move(queue)) {}
+    CollectReader(std::shared_ptr<arrow::Schema> schema,
+                  std::shared_ptr<CollectQueue> queue,
+                  std::shared_ptr<CollectHub> hub)
+        : schema_(std::move(schema)), queue_(std::move(queue)), hub_(std::move(hub)) {}
 
     [[nodiscard]] std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
 
     arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch>* out) override {
-        auto r = queue_->next();
-        if (!r.ok()) {
-            return r.status();
+        // Wait in slices; between them a quiet queue (nothing queued, no
+        // producer open) asks whether the jobs writing it have ended. Only
+        // then is the stream over: producers also go quiet between one
+        // subtask closing and another opening, during a restart, and for
+        // good when the job fails before its sink opens.
+        constexpr auto kSlice = std::chrono::milliseconds{100};
+        while (true) {
+            auto r = queue_->next_for(kSlice);
+            if (!r.ok()) {
+                return r.status();
+            }
+            if (*r) {
+                *out = std::move(*r);
+                return arrow::Status::OK();
+            }
+            if (!queue_->quiet()) {
+                continue;
+            }
+            const auto state = hub_->feed_state(queue_->feeds());
+            // A batch can land between the two looks; it is read first.
+            if (!state.ended || !queue_->quiet()) {
+                continue;
+            }
+            if (!state.status.ok()) {
+                return state.status;
+            }
+            *out = nullptr;
+            return arrow::Status::OK();
         }
-        *out = *r;
-        return arrow::Status::OK();
     }
 
 private:
     std::shared_ptr<arrow::Schema> schema_;
     std::shared_ptr<CollectQueue> queue_;
+    std::shared_ptr<CollectHub> hub_;
 };
 
 }  // namespace
@@ -84,6 +112,13 @@ EmbeddedEngine::EmbeddedEngine(EngineOptions opts) : opts_(std::move(opts)) {
         catalog_.set_persistence_dir(opts_.catalog_dir);
     }
     collect_hub_ = std::make_shared<CollectHub>();
+    // Whether a job writing a collect table has ended, and what it reported:
+    // the collect stream ends on this, not on its producers alone.
+    collect_hub_->set_job_queries(
+        [this](std::uint64_t id) {
+            return coordinator_.await_job_completion(id, std::chrono::milliseconds{0});
+        },
+        [this](std::uint64_t id) { return coordinator_.job_errors(id); });
     collect_scope_ = CollectScopeRegistry::instance().register_hub(collect_hub_);
     const std::string worker_id = "embedded-worker-" + std::to_string(g_engine_seq.fetch_add(1));
     coordinator_port_ = coordinator_.start();  // ephemeral loopback port
@@ -104,6 +139,9 @@ EmbeddedEngine::~EmbeddedEngine() {
     CollectScopeRegistry::instance().unregister(collect_scope_);
     if (collect_hub_) {
         collect_hub_->abort_all();
+        // A reader still holding the hub must not ask this engine, about to
+        // go, whether its jobs have ended.
+        collect_hub_->detach();
     }
     // Cancel before stopping the worker. A stopped worker's subtasks exit
     // cleanly, and a job that completes cleanly without a cancel reads as one
@@ -144,6 +182,14 @@ int EmbeddedEngine::submit_spec_(const cluster::JobGraphSpec& spec,
         const auto id = coordinator_.submit_job(
             stamped, cluster::OperatorRegistry::default_instance(), {}, std::move(ckpt), nullptr);
         jobs_.push_back(JobEntry{id, name.empty() ? ("job_" + std::to_string(id)) : name});
+        // The collect tables this job writes end their streams when it ends.
+        for (const auto& op : stamped.ops) {
+            if (op.type == "collect_sink_row") {
+                if (const auto t = op.params.find("collect_table"); t != op.params.end()) {
+                    collect_hub_->queue(t->second)->add_feed(id);
+                }
+            }
+        }
     } catch (const std::exception& e) {
         err << "error: submit failed: " << e.what() << "\n";
         return 1;
@@ -227,6 +273,9 @@ bool EmbeddedEngine::await_job(cluster::JobId id, std::chrono::milliseconds time
 }
 
 void EmbeddedEngine::cancel_job(cluster::JobId id) {
+    if (collect_hub_) {
+        collect_hub_->note_user_cancel(id);
+    }
     try {
         coordinator_.cancel_job(id);
     } catch (const std::exception& e) {
@@ -278,12 +327,15 @@ arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> EmbeddedEngine::collect
             "collect_reader: table '", table, "' already has a consumer (one reader per table)");
     }
     return std::static_pointer_cast<arrow::RecordBatchReader>(
-        std::make_shared<CollectReader>(std::move(schema), std::move(queue)));
+        std::make_shared<CollectReader>(std::move(schema), std::move(queue), collect_hub_));
 }
 
 void EmbeddedEngine::cancel_all() {
     user_cancelled_ = true;
     for (const auto& j : jobs_) {
+        if (collect_hub_) {
+            collect_hub_->note_user_cancel(j.id);
+        }
         try {
             coordinator_.cancel_job(j.id);
         } catch (const std::exception& e) {

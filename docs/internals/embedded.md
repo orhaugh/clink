@@ -212,11 +212,16 @@ cluster submit carries no scope (and cluster Workers have no factory),
 so it fails loudly rather than silently writing nowhere.
 
 Stream semantics: one consumer per table; `get_next` blocks until a batch
-arrives; end-of-stream fires when the producing job's sink subtasks have
-all closed (completion, failure and cancellation all close, so a reader
-never waits on a dead job); closing the engine wakes blocked readers with a
-cancelled status, and an exported stream stays safe to drain and release
-after the engine is gone (it keeps its queue alive).
+arrives; the stream ends once every batch is read, no sink subtask is open,
+and every job writing the table has ended. The sink subtasks alone cannot say
+so: they open and close at different moments, all close during a restart, and
+none opens when a job fails before its sink does. The engine records at submit
+which jobs write each collect table, and the reader asks it whether they have
+ended. A job that failed ends its stream with the failure, after every row it
+delivered, so a short result never reads as complete; a job the user cancelled
+ends it normally. Closing the engine wakes blocked readers with a cancelled
+status, and an exported stream stays safe to drain and release after the
+engine is gone (it keeps its queue alive).
 
 Changelog semantics: a plain collect table is append-only - a retracting
 (changelog) SELECT is rejected at bind so retractions are never silently

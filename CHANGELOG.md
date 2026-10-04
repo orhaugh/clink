@@ -13,6 +13,16 @@ naming it. A table of more than one column also reads a directory tree through
 `prefix`, as the page's example does; only the single-column sources took
 `prefix` before, and the example failed at deploy.
 
+**A collect stream ends when the job writing it ends, and reports its
+failure.** The stream ended when its sink subtasks had all closed, so a job
+that failed before its sink opened left the reader waiting forever, and a
+reader could see the end early, between one subtask closing and another
+opening or across a restart. It now ends once every batch is read, no sink
+subtask is open and every job writing the table has ended. A job that failed
+ends the stream with its failure, after the rows it delivered, so pyclink's
+`read_all()` raises instead of returning a short result as if it were
+complete; a job the user cancelled still ends it normally.
+
 **`LIMIT 0` is accepted.** It was refused as "LIMIT must be a non-negative
 integer literal": the parser omits a field whose value is zero, and only
 `OFFSET` read the empty value as 0. `LIMIT 0`, with or without `ORDER BY`,

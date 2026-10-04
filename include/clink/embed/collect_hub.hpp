@@ -19,19 +19,27 @@
 // therefore embedded-only by design: a cluster Worker has no scope
 // (and no factory) for it.
 //
-// End-of-stream: the queue counts open producers. Once at least one
-// producer has opened and the count returns to zero (the job's sink
-// subtasks closed - completion, cancellation, or failure all close), the
-// stream ends. abort() (engine close) wakes blocked readers with a
-// Cancelled status instead.
+// End-of-stream: the stream ends when the queue is drained, no producer is
+// open, and every job writing the table has ended. Producers alone cannot
+// say so: subtasks open and close at different moments, all close during a
+// restart, and none opens at all when the job fails at deploy. The engine
+// records which jobs write a table (CollectQueue::add_feed) and answers
+// whether they have ended (CollectHub::set_feed_state). A job that ended
+// failing ends its stream with that failure, after every row it delivered,
+// unless the user cancelled it. abort() (engine close) wakes blocked
+// readers with a Cancelled status instead.
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <vector>
 
 #include <arrow/api.h>
 
@@ -47,9 +55,17 @@ public:
     void producer_close();
     void push(std::shared_ptr<arrow::RecordBatch> batch);
 
-    // Blocks until a batch is available, the stream ended (returns nullptr),
-    // or abort() was called (returns Cancelled).
-    arrow::Result<std::shared_ptr<arrow::RecordBatch>> next();
+    // The next queued batch, waiting at most `timeout`: a batch, Cancelled
+    // after abort(), or nullptr when none arrived. Whether the stream has
+    // ended is the reader's question, answered with the jobs' state.
+    arrow::Result<std::shared_ptr<arrow::RecordBatch>> next_for(std::chrono::milliseconds timeout);
+
+    // No batch queued and no producer open.
+    bool quiet();
+
+    // The jobs writing this table, recorded as the engine submits them.
+    void add_feed(std::uint64_t job_id);
+    std::vector<std::uint64_t> feeds();
 
     // Wake every blocked reader with Cancelled and refuse further pushes.
     // Idempotent; called when the owning engine closes.
@@ -62,10 +78,17 @@ private:
     std::mutex m_;
     std::condition_variable cv_;
     std::deque<std::shared_ptr<arrow::RecordBatch>> q_;
+    std::vector<std::uint64_t> feeds_;
     int open_producers_ = 0;
-    bool saw_producer_ = false;
     bool aborted_ = false;
     bool consumer_claimed_ = false;
+};
+
+// Whether the jobs writing a collect table have all ended, and if so with
+// what: OK, or the failure that ends the stream.
+struct FeedState {
+    bool ended = false;
+    arrow::Status status;
 };
 
 // Per-engine table -> queue map.
@@ -74,9 +97,24 @@ public:
     std::shared_ptr<CollectQueue> queue(const std::string& table);
     void abort_all();
 
+    // The engine's answers about a job: has it ended, and what errors did it
+    // record. Set once by the engine; detach() (engine close) clears them,
+    // after which every stream reads as ended by the close.
+    void set_job_queries(std::function<bool(std::uint64_t)> ended,
+                         std::function<std::vector<std::string>(std::uint64_t)> errors);
+    void detach();
+    FeedState feed_state(const std::vector<std::uint64_t>& jobs);
+
+    // A job the user cancelled ends its streams normally: the errors its
+    // teardown records are not a failure of the job.
+    void note_user_cancel(std::uint64_t job_id);
+
 private:
     std::mutex m_;
     std::map<std::string, std::shared_ptr<CollectQueue>> queues_;
+    std::function<bool(std::uint64_t)> job_ended_;
+    std::function<std::vector<std::string>(std::uint64_t)> job_errors_;
+    std::set<std::uint64_t> cancelled_;
 };
 
 // Process-wide scope token -> hub registry (weak: the engine owns the hub).
