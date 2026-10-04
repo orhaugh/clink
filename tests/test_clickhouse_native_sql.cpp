@@ -78,6 +78,7 @@
 #include "native/insert_transport.hpp"
 #include "native/native_sink.hpp"
 #include "native/sink_options.hpp"
+#include "tutorial_clickhouse_init.hpp"
 
 namespace {
 
@@ -2258,6 +2259,127 @@ TEST_F(ClickHouseLegacySqlLive, TheTutorialsTextSinkLandsEveryRowOnceWithItsForc
         tokens.insert(entry[2]);
     }
     EXPECT_EQ(tokens.size(), logged.size()) << "two INSERTs shared a token on " << line_;
+}
+
+// The Kafka to ClickHouse tutorial's own table, created by the init script the
+// tutorial's ClickHouse runs, takes the native sink from the tutorial's sink
+// DDL with insert_format='native' and no batch_rows: every row lands with its
+// values, the server fills inserted_at and computes window_start_ts, and a
+// reading count past UInt32 fails the job rather than wrapping.
+TEST_F(ClickHouseNativeSqlLive, TheTutorialsTableTakesTheNativeSink) {
+    std::string init = kTutorialClickHouseInit;
+    const std::string bare = "CREATE TABLE IF NOT EXISTS sensor_window_stats";
+    const auto at = init.find(bare);
+    ASSERT_NE(at, std::string::npos)
+        << "the tutorial's init script no longer creates sensor_window_stats this way:\n"
+        << init;
+    init.replace(at, bare.size(), "CREATE TABLE IF NOT EXISTS " + db_ + ".sensor_window_stats");
+    client_->Execute(init);
+
+    const std::string columns =
+        "(sensor_id VARCHAR, window_start BIGINT, window_end BIGINT, readings BIGINT, "
+        "avg_temp_c DOUBLE, min_temp_c DOUBLE, max_temp_c DOUBLE)";
+    const std::string sink = "CREATE TABLE sensor_window_stats " + columns + " WITH (" +
+                             server_with() +
+                             ", format='json', table='sensor_window_stats', "
+                             "insert_format='native');";
+    const auto run = [&](const fs::path& input) {
+        clink::embed::EngineOptions opts;
+        std::ostringstream err;
+        opts.err = &err;
+        opts.out = &err;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        std::string errors;
+        const int rc = engine.execute_script(
+            "CREATE TABLE windows " + columns + " WITH (connector='file', format='json', path='" +
+            input.string() + "');" + sink +
+            "INSERT INTO sensor_window_stats SELECT sensor_id, window_start, window_end, "
+            "readings, avg_temp_c, min_temp_c, max_temp_c FROM windows;");
+        const bool ok = rc == 0 && engine.await_all();
+        for (const auto& e : engine.errors()) {
+            errors += e + "\n";
+        }
+        return std::pair{ok, errors + err.str()};
+    };
+
+    // Twelve sensors, five one-minute windows each, from 2026-01-01 00:00 UTC.
+    constexpr std::int64_t kStart = 1767225600000;
+    const ScratchDir dir("live_tutorial");
+    std::vector<std::string> lines;
+    std::map<std::pair<std::string, std::int64_t>, std::vector<std::string>> sent;
+    for (int sensor = 0; sensor < 12; ++sensor) {
+        for (std::int64_t w = 0; w < 5; ++w) {
+            const std::string id = "sensor-" + std::to_string(sensor);
+            const std::int64_t start = kStart + w * 60'000;
+            const std::int64_t readings = 4 + sensor + w;
+            const double lo = 15.0 + sensor / 4.0;
+            const double hi = lo + static_cast<double>(w) / 2.0 + 0.25;
+            const double avg = (lo + hi) / 2.0;
+            JsonObject row;
+            row["sensor_id"] = JsonValue{id};
+            row["window_start"] = JsonValue{start};
+            row["window_end"] = JsonValue{start + 60'000};
+            row["readings"] = JsonValue{readings};
+            row["avg_temp_c"] = JsonValue{avg};
+            row["min_temp_c"] = JsonValue{lo};
+            row["max_temp_c"] = JsonValue{hi};
+            lines.push_back(JsonValue{std::move(row)}.serialize(0));
+            sent[{id, start}] = {id,
+                                 std::to_string(start),
+                                 std::to_string(start + 60'000),
+                                 std::to_string(readings),
+                                 shortest(avg),
+                                 shortest(lo),
+                                 shortest(hi)};
+        }
+    }
+    write_lines(dir.path() / "windows.ndjson", lines);
+    {
+        const auto [ok, errors] = run(dir.path() / "windows.ndjson");
+        ASSERT_TRUE(ok) << "the native job failed on " << line_ << ":\n" << errors;
+    }
+
+    const std::string table = db_ + ".sensor_window_stats";
+    const auto landed = rows(
+        "SELECT sensor_id, toString(window_start), toString(window_end), toString(readings), "
+        "toString(avg_temp_c), toString(min_temp_c), toString(max_temp_c) FROM " +
+        table + " ORDER BY sensor_id, window_start");
+    ASSERT_EQ(landed.size(), sent.size()) << "rows on " << line_;
+    for (const auto& row : landed) {
+        const auto it = sent.find({row[0], std::stoll(row[1])});
+        ASSERT_NE(it, sent.end()) << line_ << ": a row nobody sent, " << row[0] << " " << row[1];
+        EXPECT_EQ(row, it->second) << line_;
+    }
+    // Columns the sink does not write: a DEFAULT the server fills and a
+    // MATERIALIZED column it computes.
+    EXPECT_EQ(scalar("SELECT toString(countIf(inserted_at > toDateTime64('2020-01-01', 3))) FROM " +
+                     table),
+              std::to_string(sent.size()))
+        << "inserted_at on " << line_;
+    EXPECT_EQ(scalar("SELECT toString(min(window_start_ts), 'UTC') FROM " + table),
+              "2026-01-01 00:00:00.000")
+        << "window_start_ts on " << line_;
+
+    // One more than UInt32 holds: the sink refuses the value instead of
+    // sending a count that wraps to 0.
+    JsonObject over;
+    over["sensor_id"] = JsonValue{std::string("sensor-over")};
+    over["window_start"] = JsonValue{kStart};
+    over["window_end"] = JsonValue{kStart + 60'000};
+    over["readings"] = JsonValue{std::int64_t{4294967296}};
+    over["avg_temp_c"] = JsonValue{20.0};
+    over["min_temp_c"] = JsonValue{20.0};
+    over["max_temp_c"] = JsonValue{20.0};
+    write_lines(dir.path() / "over.ndjson", {JsonValue{std::move(over)}.serialize(0)});
+    {
+        const auto [ok, errors] = run(dir.path() / "over.ndjson");
+        EXPECT_FALSE(ok) << "a reading count past UInt32 was accepted on " << line_;
+        EXPECT_NE(errors.find("clickhouse.conversion_failed"), std::string::npos) << errors;
+        EXPECT_NE(errors.find("readings"), std::string::npos) << errors;
+    }
+    EXPECT_EQ(scalar("SELECT toString(count()) FROM " + table + " WHERE sensor_id = 'sensor-over'"),
+              "0")
+        << "the over-range row landed on " << line_;
 }
 
 }  // namespace

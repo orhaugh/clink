@@ -718,6 +718,18 @@ if(CLINK_BUILD_SQL)
             GTest::gtest_main
         )
         target_compile_definitions(clink_clickhouse_sql_tests PRIVATE CLINK_HAS_CLICKHOUSE)
+        # The tutorial's ClickHouse init script, embedded so that the live
+        # case creates the tutorial's own table wherever the binary runs; an
+        # edit to the script reconfigures and re-embeds it.
+        set(_tutorial_ch_init
+            "${CMAKE_SOURCE_DIR}/examples/kafka-to-clickhouse/clickhouse-init.sql")
+        file(READ "${_tutorial_ch_init}" CLINK_TUTORIAL_CLICKHOUSE_INIT)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_tutorial_ch_init}")
+        configure_file(tutorial_clickhouse_init.hpp.in
+                       "${CMAKE_CURRENT_BINARY_DIR}/generated/tutorial_clickhouse_init.hpp"
+                       @ONLY)
+        target_include_directories(clink_clickhouse_sql_tests PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/generated")
         clink_set_warnings(clink_clickhouse_sql_tests)
         gtest_discover_tests(clink_clickhouse_sql_tests
             DISCOVERY_MODE PRE_TEST
