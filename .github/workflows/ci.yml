@@ -459,7 +459,8 @@ jobs:
     # container: it needs the runner's Docker daemon. Against the published
     # image this catches rot in the example and its dependencies; the
     # runtime-image workflow runs the same script against each newly built
-    # image before tagging it, which is where an engine regression shows.
+    # image under its sha- tag, before it moves :latest or :main onto it,
+    # which is where an engine regression shows.
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:

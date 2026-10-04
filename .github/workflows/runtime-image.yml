@@ -258,29 +258,37 @@ jobs:
             echo "refs:${refs}"
             exit 1
           fi
-          # Split the tag list through an EXPANSION. `IFS=, ; for t in <literal>`
-          # does NOT split: IFS governs expansions, not literal words in the
-          # source, so all three tags arrived as one argument and `-t a,b,c`
-          # was refused as an invalid reference format. v0.8.0's tag run died
-          # exactly here, with both architectures already built and pushed.
-          targs=""
-          for t in $(echo '${{ steps.tags.outputs.tags }}' | tr ',' ' '); do
-            targs="${targs} -t ${t}"
-          done
-          echo "Merging${refs} into${targs}"
-          docker buildx imagetools create ${targs} ${refs}
+          # Only the immutable sha- tag here. The moving tags (:latest,
+          # :<version>, :main) are applied by the last step, once every check
+          # below has passed against this manifest: a failed check then leaves
+          # them on the previous image instead of on one that did not pass.
           first="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          echo "Merging${refs} into ${first}"
+          docker buildx imagetools create -t "${first}" ${refs}
           docker buildx imagetools inspect "$first"
 
       - name: Smoke the published image
         # Cheap proof that what was pushed actually runs, rather than merely
-        # having compiled: both binaries must respond on their own.
+        # having compiled: both binaries must respond on their own. And the
+        # native ClickHouse sink must be in it: a build against a client
+        # older than the pin still compiles, and its record then says "not in
+        # this build" (impls/clickhouse/src/native/register_native.cpp).
         run: |
           set -euo pipefail
           ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
           echo "Smoking ${ref}"
           docker run --rm --entrypoint clink_node "${ref}" --help
           docker run --rm --entrypoint clink "${ref}" --help
+          docker run --rm "${ref}" clink --capabilities-json | python3 -c '
+          import json, sys
+          caps = json.load(sys.stdin)
+          rec = [c for c in caps.get("connectors", []) if c.get("name") == "clickhouse_native"]
+          if not rec:
+              sys.exit("the image has no clickhouse_native connector")
+          if "not in this build" in json.dumps(rec[0]):
+              sys.exit("the image lists clickhouse_native as not in this build")
+          print("clickhouse_native present:", ", ".join(rec[0].get("build_dependencies", [])))
+          '
 
       - name: The manifest really covers both architectures
         # The failure this guards is silent: if one arch's build dropped out,
@@ -336,4 +344,20 @@ jobs:
               echo "::error::the example printed engine logs over its results on ${platform}"
               exit 1
             fi
+          done
+
+      - name: Apply the moving tags
+        # Last, so :latest, :<version> and :main move only once the smoke,
+        # architecture, tutorial and one-command checks above have passed
+        # against the sha- tag. They point at the manifest those checks ran.
+        run: |
+          set -euo pipefail
+          first="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          # Split through an EXPANSION: `IFS=, ; for t in <literal>` does not
+          # split (IFS governs expansions, not literal words), which is how
+          # v0.8.0's tag run once died with both architectures pushed.
+          for t in $(echo '${{ steps.tags.outputs.tags }}' | tr ',' ' ' | cut -d' ' -f2-); do
+            [ "${t}" = "${first}" ] && continue
+            echo "Tagging ${t} -> ${first}"
+            docker buildx imagetools create -t "${t}" "${first}"
           done
