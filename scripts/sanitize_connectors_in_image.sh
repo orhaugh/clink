@@ -62,8 +62,8 @@ run_one() {
                  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
                  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address")
               E="ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 LSAN_OPTIONS=suppressions=$SRC/lsan-suppressions.txt" ;;
-        ubsan) F=(-DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer"
-                  -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer"
+        ubsan) F=(-DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -DCLINK_UBSAN_BUILD=1"
+                  -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -DCLINK_UBSAN_BUILD=1"
                   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined")
               E="UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:suppressions=$SRC/ubsan-suppressions.txt" ;;
         tsan) F=(-DCMAKE_CXX_FLAGS="-fsanitize=thread"

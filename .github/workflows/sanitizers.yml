@@ -127,7 +127,9 @@ jobs:
         run: |
           FLAGS="-fsanitize=address -fno-omit-frame-pointer"
           if [ "${{ matrix.mode }}" = "ubsan" ]; then
-            FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+            # CLINK_UBSAN_BUILD tells tests/test_helpers/sanitizer_slack.hpp,
+            # as GCC has no macro of its own for UBSan.
+            FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -DCLINK_UBSAN_BUILD=1"
           fi
           cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug \
             -DCLINK_BUILD_TESTS=ON \

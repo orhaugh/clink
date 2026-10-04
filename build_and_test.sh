@@ -53,8 +53,10 @@ build_and_run_tests() {
     ubsan)
       build_dir="build-ubsan"
       cmake_extra_flags=(
-        "-DCMAKE_CXX_FLAGS=-fsanitize=undefined -fno-omit-frame-pointer"
-        "-DCMAKE_C_FLAGS=-fsanitize=undefined -fno-omit-frame-pointer"
+        # CLINK_UBSAN_BUILD tells tests/test_helpers/sanitizer_slack.hpp, as
+        # GCC has no macro of its own for UBSan.
+        "-DCMAKE_CXX_FLAGS=-fsanitize=undefined -fno-omit-frame-pointer -DCLINK_UBSAN_BUILD=1"
+        "-DCMAKE_C_FLAGS=-fsanitize=undefined -fno-omit-frame-pointer -DCLINK_UBSAN_BUILD=1"
         "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=undefined"
         # SQL off, pinned rather than inherited, matching the sanitizers CI
         # job. The SQL runtime tests hang under ASan and time out under a
