@@ -319,6 +319,38 @@ inline constexpr char kCoordinatorBeforeCancelBroadcast[] = "coordinator.before_
 // accept() on it.
 inline constexpr char kCoordinatorAcceptBeforeWait[] = "coordinator.accept_before_wait";
 inline constexpr char kCoordinatorStopAfterAcceptWake[] = "coordinator.stop_after_accept_wake";
+// The accept thread, about to accept a connection the listener has reported.
+// Error here (arg: the errno, EMFILE when zero) stands in for accept() failing
+// with the connection left pending, as it does when the process is out of
+// descriptors.
+inline constexpr char kCoordinatorAcceptOne[] = "coordinator.accept_one";
+// The accept thread, after accept() failed for want of a descriptor or of
+// memory, about to wait before it tries again.
+inline constexpr char kCoordinatorAcceptBackoff[] = "coordinator.accept_backoff";
+// An admission thread: the connection's handshake is done and it is about to
+// read the first frame. Reached, the coordinator is committed to that read,
+// which is what a test of the admission deadline or of stop() during it
+// needs to know before it acts.
+inline constexpr char kCoordinatorAdmissionBeforeFirstFrame[] =
+    "coordinator.admission_before_first_frame";
+// The accept thread, holding a socket it has just accepted, about to track its
+// admission (join finished admission threads, read the peer's address).
+// Throw here stands in for anything in that bookkeeping throwing before the
+// socket is handed on.
+inline constexpr char kCoordinatorAdmissionBeforeTrack[] = "coordinator.admission_before_track";
+// The accept thread, about to start a connection's admission thread, with its
+// pending entry published. Throw here stands in for a thread that cannot be
+// started.
+inline constexpr char kCoordinatorAdmissionBeforeThreadStart[] =
+    "coordinator.admission_before_thread_start";
+// An admission thread: the whole first frame has arrived and the connection
+// is Queued, about to wait its turn to be handled. Reached, it counts against
+// max_pending_connections and can no longer be evicted.
+inline constexpr char kCoordinatorAdmissionQueued[] = "coordinator.admission_queued";
+// An admission thread holding the first-frame lock, about to handle the
+// frame. Blocked here, every other first frame waits behind it, as behind a
+// registration that is slow to take the coordinator's lock.
+inline constexpr char kCoordinatorAdmissionBeforeHandle[] = "coordinator.admission_before_handle";
 
 // Sink two-phase commit.
 inline constexpr char kSinkBeforePrepare[] = "sink.before_prepare";
@@ -349,6 +381,15 @@ inline constexpr char kNetworkChannelBeforeAccept[] = "network_channel.before_ac
 // Parked here, a teardown wakes a thread that already holds a connection
 // teardown cannot yet see.
 inline constexpr char kNetworkChannelAfterAccept[] = "network_channel.after_accept";
+// TLS server accept: the TCP connection is accepted and the handshake is
+// about to start. Reached, the accept thread is committed to that client's
+// handshake, which is what a test of the handshake deadline or the stop wake
+// needs to know before it acts.
+inline constexpr char kTlsAcceptBeforeHandshake[] = "tls.accept_before_handshake";
+// TLS server accept: one step of the handshake (an SSL_accept call, which is
+// where its CPU is spent) about to run, holding one of the server context's
+// handshake slots. Blocked here, the slot stays held.
+inline constexpr char kTlsHandshakeStep[] = "tls.handshake_step";
 
 // Worker control-plane dispatch. Fires at the top of Deploy handling, on
 // the reader thread - where the plugin bytes are written to cache and

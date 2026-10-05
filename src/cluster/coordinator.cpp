@@ -8,15 +8,22 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <random>
 #include <set>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include "clink/cluster/admission_policy.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/config_lint.hpp"
 #include "clink/cluster/connector_availability.hpp"
@@ -162,22 +169,77 @@ std::string js_quote(const std::string& s) {
 
 namespace {
 
-// Default plain-TCP accept factory: accept the connection accept_loop_
-// has already waited for and wrap it in a PlainTcpConnection. The
-// listener is non-blocking by then, so a connection that has gone yields
-// nullptr rather than a parked accept. TLS callers replace this via
-// set_accept_factory.
-std::unique_ptr<network::Connection> default_accept_factory(int listener_fd) {
-    const int fd = network::NetworkSocket::accept_one(listener_fd);
-    if (fd < 0)
-        return nullptr;
-    return network::make_plain_connection(fd);
+// Default plain-TCP accept factory: wrap the socket accept_loop_ has
+// accepted in a PlainTcpConnection. TLS callers replace this via
+// set_accept_factory. Plain TCP has no handshake, so there is nothing for
+// the deadline or the wake to bound.
+std::unique_ptr<network::Connection> default_accept_factory(
+    const Coordinator::AcceptRequest& request) {
+    return network::make_plain_connection(request.fd);
+}
+
+// The eviction policy's source for an accepted connection (see
+// admission_policy.hpp): the peer's address, an IPv4-mapped peer as IPv4, an
+// IPv6 peer by its /64, since one host is commonly given a whole /64. Empty
+// when the address cannot be read.
+std::string admission_source_key(int fd) {
+    sockaddr_storage ss{};
+    socklen_t len = sizeof(ss);
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&ss), &len) != 0) {
+        return {};
+    }
+    std::array<char, INET6_ADDRSTRLEN> buf{};
+    if (ss.ss_family == AF_INET) {
+        sockaddr_in in{};
+        std::memcpy(&in, &ss, sizeof(in));
+        return ::inet_ntop(AF_INET, &in.sin_addr, buf.data(), buf.size()) != nullptr
+                   ? std::string{buf.data()}
+                   : std::string{};
+    }
+    if (ss.ss_family == AF_INET6) {
+        sockaddr_in6 in6{};
+        std::memcpy(&in6, &ss, sizeof(in6));
+        if (IN6_IS_ADDR_V4MAPPED(&in6.sin6_addr)) {
+            in_addr v4{};
+            std::memcpy(&v4, &in6.sin6_addr.s6_addr[12], sizeof(v4));
+            return ::inet_ntop(AF_INET, &v4, buf.data(), buf.size()) != nullptr
+                       ? std::string{buf.data()}
+                       : std::string{};
+        }
+        std::memset(&in6.sin6_addr.s6_addr[8], 0, 8);
+        return ::inet_ntop(AF_INET6, &in6.sin6_addr, buf.data(), buf.size()) != nullptr
+                   ? std::string{buf.data()} + "/64"
+                   : std::string{};
+    }
+    return {};
+}
+
+// An accepted socket, closed on the way out unless released: the accept
+// thread owns each one until the connection's admission thread has taken it,
+// so nothing that throws in between can leak it.
+class OwnedFd {
+public:
+    explicit OwnedFd(int fd) noexcept : fd_(fd) {}
+    OwnedFd(const OwnedFd&) = delete;
+    OwnedFd& operator=(const OwnedFd&) = delete;
+    ~OwnedFd() { network::NetworkSocket::close(fd_); }
+    void release() noexcept { fd_ = -1; }
+
+private:
+    int fd_;
+};
+
+// Five lines in full per ten seconds, then a summary: enough to see what a
+// flood is and where it comes from, at a rate no connect loop can raise.
+std::unique_ptr<AdmissionLogLimiter> make_admission_log_limiter() {
+    return std::make_unique<AdmissionLogLimiter>(5, std::chrono::seconds{10});
 }
 
 }  // namespace
 
 Coordinator::Coordinator() {
     accept_factory_ = default_accept_factory;
+    admission_log_ = make_admission_log_limiter();
 }
 
 Coordinator::Coordinator(Config cfg) : cfg_(cfg) {
@@ -185,6 +247,7 @@ Coordinator::Coordinator(Config cfg) : cfg_(cfg) {
         cfg_.advertise_host = cfg_.bind_host;
     }
     accept_factory_ = default_accept_factory;
+    admission_log_ = make_admission_log_limiter();
 }
 
 namespace {
@@ -210,7 +273,13 @@ RowLayoutAdmission admission_on(const Registry& registered, const TasksByWorker&
 }  // namespace
 
 void Coordinator::set_accept_factory(AcceptFactory f) {
+    listener_accept_factory_ = std::move(f);
+}
+
+void Coordinator::set_accept_factory(BoundedAcceptFactory f) {
     accept_factory_ = std::move(f);
+    accept_factory_handshakes_ = true;
+    listener_accept_factory_ = nullptr;
 }
 
 void Coordinator::set_autoscaler_sample_fn(AutoscalerSampleFn fn) {
@@ -1230,15 +1299,41 @@ std::uint16_t Coordinator::start(std::uint16_t port) {
 void Coordinator::accept_loop_() {
     while (!stop_.load(std::memory_order_acquire)) {
         CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAcceptBeforeWait);
+        // Close any admission past its deadline, and wake in time for the
+        // next one: this thread is the admission deadlines' clock.
+        const auto next_deadline = police_admissions_();
+        if (std::chrono::steady_clock::now() < accept_retry_at_) {
+            // accept() failed for want of a descriptor or of memory, and left
+            // the connection pending: the listener stays readable, so waiting
+            // on it would return at once and accept() would fail again, a
+            // spin on this core until a descriptor frees. Wait on the stop
+            // wake alone; the connection keeps its place in the backlog.
+            CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAcceptBackoff);
+            const auto until = std::min(next_deadline, accept_retry_at_);
+            if (network::NetworkSocket::wait_for_wake(*accept_wake_, until)) {
+                return;
+            }
+            if (std::chrono::steady_clock::now() < until) {
+                // The wait could not be had (poll() failed, or the wake is
+                // unusable) and returned early: end the backoff, so the wait
+                // on the listener below reports it rather than this spinning.
+                accept_retry_at_ = {};
+            }
+            continue;
+        }
         // Wait here, where stop() can wake us, and never in a blocking
         // accept(): stop() joins this thread before it closes the listener
         // (see stop()). The wait leaves the listener non-blocking, so the
-        // factory's accept returns at once even if the connection it saw has
-        // gone, and the loop comes back here.
-        if (!network::NetworkSocket::wait_for_connection(listener_fd_, *accept_wake_)) {
+        // accept that follows returns at once even if the connection it saw
+        // has gone, and the loop comes back here.
+        if (!network::NetworkSocket::wait_for_connection(
+                listener_fd_, *accept_wake_, next_deadline)) {
             const int err = errno;
             if (stop_.load(std::memory_order_acquire) || err == ECANCELED) {
                 return;
+            }
+            if (err == ETIMEDOUT) {
+                continue;  // an admission deadline is due
             }
             // poll() itself failing (ENOMEM, say) is not something a retry
             // here can outlast, and spinning on it helps nobody.
@@ -1250,80 +1345,555 @@ void Coordinator::accept_loop_() {
         if (stop_.load(std::memory_order_acquire)) {
             return;
         }
-        // Factory does accept_one + any TLS handshake; nullptr when the
-        // connection went before it was accepted. On a TLS handshake
-        // failure, the factory throws; catch so one bad client can't kill
-        // the accept loop.
-        std::unique_ptr<network::Connection> conn;
-        try {
-            conn = accept_factory_(listener_fd_);
-        } catch (const std::exception& e) {
-            if (stop_.load(std::memory_order_acquire)) {
-                return;  // stop() woke us between the wait and the accept
+        if (listener_accept_factory_) {
+            // A factory in its listener form does the accept, and any
+            // handshake, here on this thread (see set_accept_factory); nullptr
+            // when the connection went before it was accepted. On a handshake
+            // failure it throws; catch so one bad client can't kill the loop.
+            std::unique_ptr<network::Connection> conn;
+            try {
+                conn = listener_accept_factory_(listener_fd_);
+            } catch (const std::exception& e) {
+                if (stop_.load(std::memory_order_acquire)) {
+                    return;  // stop() woke us between the wait and the accept
+                }
+                // The factory throws for an accept() that failed as well as
+                // for a handshake that did, and errno after the throw is not
+                // to be relied on. Out of descriptors is the failure that
+                // would spin (the connection stays in the backlog, so the
+                // listener stays readable), so look for a free one: none
+                // means back off as for the accept below.
+                if (const int probe = ::fcntl(listener_fd_, F_DUPFD_CLOEXEC, 0); probe >= 0) {
+                    network::NetworkSocket::close(probe);
+                } else if (const int err = errno; err == EMFILE || err == ENFILE) {
+                    note_accept_exhausted_(err);
+                    continue;
+                }
+                // One count per connection, and a line unless a flood is
+                // being summarised: the factory has closed it.
+                metrics::orch::coordinator_handshake_failed();
+                log_admission_drop_({}, std::string{"connection rejected: "} + e.what());
+                continue;
             }
-            log::warn("coordinator.accept", std::string{"connection rejected: "} + e.what());
+            if (!conn) {
+                continue;  // transient: the peer disappeared before the accept
+            }
+            note_accept_resumed_();
+            (void)begin_admission_guarded_(-1, std::move(conn));
             continue;
         }
-        if (!conn) {
-            if (stop_.load(std::memory_order_acquire))
-                return;
-            continue;  // transient: malformed handshake, peer disappeared
+        // Accept here and nothing more: everything a connection does before
+        // it is admitted (its handshake, its first frame) runs on a thread of
+        // its own, so a client that stalls any of it holds up no other.
+        int fd = -1;
+        if (const auto injected = CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAcceptOne);
+            injected.fired && injected.action == clink::fault::Action::Error) {
+            errno = injected.arg != 0 ? static_cast<int>(injected.arg) : EMFILE;
+        } else {
+            fd = network::NetworkSocket::accept_one(listener_fd_);
         }
-        // stop() woke us after the factory's accept (on Darwin the wake
-        // leaves the listener alone, so that accept can still succeed).
-        // Drop the connection rather than make stop()'s join wait out its
-        // first-frame read.
-        if (stop_.load(std::memory_order_acquire)) {
-            return;
-        }
-        // A decoder throwing must not take the coordinator with it.
-        //
-        // MessageReader throws BY DESIGN on a truncated or malformed
-        // payload - there is a test for it - and nothing caught it. The
-        // throw propagated out of this thread function, which is
-        // std::terminate: one malformed frame from anything that could
-        // reach the control port killed the whole control plane, before
-        // any authentication. Dropping the connection is the correct
-        // response; the peer's framing cannot be trusted after this.
-        try {
-            if (!handle_first_frame_(std::move(conn))) {
-                continue;  // connection ended (rejected client / bad frame)
+        if (fd < 0) {
+            const int err = errno;
+            if (err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM) {
+                note_accept_exhausted_(err);
             }
-        } catch (const std::exception& e) {
-            log::warn(
-                "coordinator.accept",
-                std::string{"dropping a connection whose first frame did not decode: "} + e.what());
-            metrics::orch::malformed_frame();
+            // Otherwise the connection went before the accept (EAGAIN), or a
+            // failure the next accept can get past.
             continue;
+        }
+        if (const int err = begin_admission_guarded_(fd, nullptr); err != 0) {
+            // accept() had a descriptor for the connection but none was left
+            // for its interrupt duplicate, so it is closed rather than left
+            // in the backlog: back off as for accept() itself, and keep the
+            // episode the accepts before it began.
+            note_accept_exhausted_(err);
+            continue;
+        }
+        note_accept_resumed_();
+    }
+}
+
+void Coordinator::note_accept_resumed_() noexcept {
+    if (accept_exhausted_failures_ == 0) {
+        return;
+    }
+    try {
+        log::info("coordinator.accept",
+                  "accepting connections again after " +
+                      std::to_string(accept_exhausted_failures_) +
+                      " accept() failures for want of descriptors or memory");
+    } catch (...) {
+        // Logging failed: accepting has resumed all the same.
+    }
+    accept_exhausted_failures_ = 0;
+    accept_backoff_ = std::chrono::milliseconds{0};
+    accept_retry_at_ = {};
+}
+
+void Coordinator::note_accept_exhausted_(int err) noexcept {
+    // From 10 ms, doubling, to a second: a descriptor freed by an admission
+    // ending is picked up quickly, and a process that stays out of them costs
+    // this thread one accept() a second.
+    constexpr std::chrono::milliseconds kFirst{10};
+    constexpr std::chrono::milliseconds kMost{1000};
+    accept_backoff_ = accept_backoff_.count() == 0 ? kFirst : std::min(accept_backoff_ * 2, kMost);
+    accept_retry_at_ = network::NetworkSocket::deadline_after(accept_backoff_);
+    if (accept_exhausted_failures_++ == 0) {
+        // Once per episode; the line when accepting resumes gives the count.
+        try {
+            log::error("coordinator.accept",
+                       std::string{"cannot accept connections: "} + std::strerror(err) +
+                           "; they wait in the listen backlog, and accept() is retried with a "
+                           "backoff of up to a second until it succeeds. Each connection being "
+                           "admitted holds two descriptors, so raise the descriptor limit "
+                           "(ulimit -n) or lower max_pending_connections, "
+                           "max_worker_connections or max_client_connections");
+        } catch (...) {
+            // Logging failed (out of memory, say): the backoff still stands.
         }
     }
 }
 
-bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn) {
-    // Bound the first read. This runs on the ACCEPT THREAD, so without a deadline
-    // one connection that opens a socket and sends nothing parks the only thread
-    // that admits anything: no client connects, no worker registers, and
-    // max_client_connections becomes unreachable - a connection limit defeated by
-    // a single connection carrying no bytes.
+int Coordinator::begin_admission_guarded_(int fd, std::unique_ptr<network::Connection> conn) {
+    // An allocation failing while one connection is tracked must not end the
+    // accept thread, and with it every later registration: begin_admission_
+    // has closed what it had not handed on, so drop this one and carry on.
+    try {
+        return begin_admission_(fd, std::move(conn));
+    } catch (const std::exception& e) {
+        log_admission_drop_(
+            {}, std::string{"connection rejected: cannot track its admission: "} + e.what());
+    }
+    return 0;
+}
+
+void Coordinator::log_admission_drop_(const std::string& source, std::string message) noexcept {
+    try {
+        auto verdict = admission_log_->note(std::chrono::steady_clock::now(), source);
+        if (!verdict.summary.empty()) {
+            log::warn("coordinator.accept", std::move(verdict.summary));
+        }
+        if (verdict.log) {
+            log::warn("coordinator.accept", std::move(message));
+        }
+    } catch (...) {
+        // Logging failed (out of memory, say): the drop still stands.
+    }
+}
+
+void Coordinator::interrupt_admission_locked_(PendingAdmission& pending,
+                                              std::string why,
+                                              bool queued_too) {
+    // Once Queued, its first frame is in and handle_first_frame_ decides what
+    // becomes of it: the deadline and eviction leave it alone. stop() does
+    // not, since a reply handle_first_frame_ sends to a peer that never reads
+    // would otherwise keep stop() waiting to join its thread.
+    if (!pending.interrupted.empty() ||
+        (pending.progress == AdmissionProgress::Queued && !queued_too)) {
+        return;
+    }
+    pending.interrupted = std::move(why);
+    // Fails whatever the admission thread is waiting in. Neither frees
+    // anything, so both are safe while that thread is inside its read.
+    if (pending.interrupt_fd >= 0) {
+        network::NetworkSocket::shutdown_read(pending.interrupt_fd);
+        network::NetworkSocket::shutdown_write(pending.interrupt_fd);
+        // Its one use is spent (an admission is interrupted once), so it
+        // need not stay open for as long as the thread takes to notice.
+        network::NetworkSocket::close(pending.interrupt_fd);
+        pending.interrupt_fd = -1;
+    } else if (pending.conn != nullptr) {
+        pending.conn->shutdown_read();
+    }
+}
+
+std::chrono::steady_clock::time_point Coordinator::police_admissions_() {
+    // Join what has finished, so the list is bounded by the connections in
+    // flight rather than by every connection ever accepted.
+    std::erase_if(admission_threads_, [](AdmissionThread& t) {
+        if (!t.finished->load(std::memory_order_acquire)) {
+            return false;
+        }
+        t.thread.join();
+        return true;
+    });
+    const auto now = std::chrono::steady_clock::now();
+    // A flood that has stopped still gets its summary line (see
+    // AdmissionLogLimiter): this thread is the clock that gives it.
+    if (auto summary = admission_log_->flush(now); !summary.empty()) {
+        log::warn("coordinator.accept", std::move(summary));
+    }
+    auto earliest = admission_log_->flush_due();
+    std::lock_guard lock(admission_mu_);
+    for (auto& [_, pending] : pending_admissions_) {
+        if (!pending.interrupted.empty() || pending.progress == AdmissionProgress::Queued) {
+            continue;  // on its way out, or its first frame is in
+        }
+        if (now >= pending.deadline) {
+            interrupt_admission_locked_(pending, "not admitted within its admission deadline");
+        } else {
+            earliest = std::min(earliest, pending.deadline);
+        }
+    }
+    return earliest;
+}
+
+int Coordinator::begin_admission_(int fd, std::unique_ptr<network::Connection> conn) {
+    // This function's until the admission thread starts: every throw before
+    // that (joining finished threads, building the source key, the
+    // bookkeeping) closes it on the way out. conn, for a listener-form
+    // connection, is owned the same way.
+    OwnedFd owned{fd};
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAdmissionBeforeTrack);
+    (void)police_admissions_();
+    // From the accept: the handshake's own bound, then heartbeat_timeout for
+    // the first frame, which is the coordinator's own definition of a live
+    // peer (see handle_first_frame_). Saturating, so a timeout meant as "no
+    // limit" is no deadline rather than an overflow into the past.
+    auto deadline = std::chrono::steady_clock::time_point::max();
+    if (cfg_.heartbeat_timeout.count() > 0) {
+        const auto handshake = std::max(cfg_.handshake_timeout, std::chrono::milliseconds{0});
+        const auto total = handshake >= std::chrono::milliseconds::max() - cfg_.heartbeat_timeout
+                               ? std::chrono::milliseconds::max()
+                               : handshake + cfg_.heartbeat_timeout;
+        deadline = network::NetworkSocket::deadline_after(total);
+    }
+    PendingAdmission pending{
+        .conn = conn.get(),
+        .deadline = deadline,
+        .source = fd >= 0 ? admission_source_key(fd) : std::string{},
+        // A listener-form factory has done its handshake already.
+        .progress = fd >= 0 ? AdmissionProgress::Accepted : AdmissionProgress::Handshaken};
+    if (fd >= 0) {
+        // A duplicate, so the socket can be shut down from another thread
+        // however the factory has dealt with its own descriptor.
+        pending.interrupt_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (pending.interrupt_fd < 0) {
+            const int err = errno;
+            log_admission_drop_(pending.source,
+                                std::string{"connection rejected: cannot track its admission: "} +
+                                    std::strerror(err));
+            // owned closes fd
+            return err == EMFILE || err == ENFILE ? err : 0;
+        }
+    }
+    // Owns the connection, if any, until its thread has taken it: if the
+    // thread cannot start, the pending entry (which a listener-form
+    // connection is reachable from) goes before the connection does.
+    // Allocated before the entry is published, so nothing between publishing
+    // it and starting the thread can fail but the start itself.
+    std::shared_ptr<std::unique_ptr<network::Connection>> handoff;
+    std::shared_ptr<std::atomic<bool>> finished;
+    std::uint64_t id = 0;
+    std::string refused;
+    // For the admission thread's log lines; pending.source moves into the
+    // entry.
+    std::string source;
+    try {
+        handoff = std::make_shared<std::unique_ptr<network::Connection>>(std::move(conn));
+        finished = std::make_shared<std::atomic<bool>>(false);
+        source = pending.source;
+        std::lock_guard lock(admission_mu_);
+        // stop() interrupts every admission under this lock after it sets
+        // stop_, so one that starts after that would be missed: refuse it.
+        if (stop_.load(std::memory_order_acquire)) {
+            network::NetworkSocket::close(pending.interrupt_fd);
+            return 0;  // owned closes fd; conn, if any, closes on the way out
+        }
+        // Every admission still tracked, interrupted ones included: an
+        // interrupted admission is on its way out, but its thread and its
+        // socket stay until that thread notices, and one whose first frame is
+        // in holds its thread and its frame until handle_first_frame_ has
+        // taken it. decide_admission bounds them all (admission_policy.hpp).
+        const std::size_t cap = std::max<std::size_t>(cfg_.max_pending_connections, 1);
+        std::vector<AdmissionCandidate> tracked;
+        tracked.reserve(pending_admissions_.size());
+        for (const auto& [pid, p] : pending_admissions_) {
+            tracked.push_back(AdmissionCandidate{.id = pid,
+                                                 .source = p.source,
+                                                 .progress = p.progress,
+                                                 .interrupted = !p.interrupted.empty()});
+        }
+        const auto decision = decide_admission(tracked, pending.source, cap, pending.progress);
+        const std::string limit =
+            " (max_pending_connections=" + std::to_string(cfg_.max_pending_connections) + ")";
+        switch (decision.kind) {
+            case AdmissionDecision::Kind::Admit:
+                break;
+            case AdmissionDecision::Kind::Evict:
+                // One eviction per new connection: a full set stays full, and
+                // each newcomer either takes a slot or is turned away.
+                interrupt_admission_locked_(pending_admissions_.at(decision.victim),
+                                            "evicted to admit a newer connection" + limit);
+                break;
+            case AdmissionDecision::Kind::Refuse:
+                if (!decision.at_ceiling) {
+                    refused =
+                        "no admission can make way for it: none is from a busier address, every "
+                        "one from an address as busy as its own is further along, and its own "
+                        "address has a connection still waiting on its peer" +
+                        limit;
+                } else if (tracked.size() >= admission_hard_limit(cap)) {
+                    refused =
+                        "three times max_pending_connections are still being admitted or "
+                        "letting go after being interrupted" +
+                        limit;
+                } else {
+                    refused =
+                        "twice max_pending_connections are still being admitted or letting go "
+                        "after being interrupted, and this address already holds its share of "
+                        "them" +
+                        limit;
+                }
+                break;
+        }
+        if (refused.empty()) {
+            id = next_admission_id_++;
+            pending_admissions_.emplace(id, std::move(pending));
+        }
+    } catch (...) {
+        // Nothing published (emplace is all or nothing): the descriptors are
+        // still this function's to close (owned closes fd). The accept loop
+        // logs it.
+        network::NetworkSocket::close(pending.interrupt_fd);
+        throw;
+    }
+    if (!refused.empty()) {
+        network::NetworkSocket::close(pending.interrupt_fd);
+        metrics::orch::coordinator_handshake_failed();
+        log_admission_drop_(source, "connection refused: " + refused);
+        return 0;  // owned closes fd; conn, if any, closes on the way out
+    }
+    std::thread thread;
+    try {
+        // Room first: a push_back that failed after the thread started would
+        // destroy a joinable std::thread.
+        admission_threads_.reserve(admission_threads_.size() + 1);
+        CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAdmissionBeforeThreadStart);
+        thread = std::thread([this, id, fd, finished, handoff, source]() {
+            admit_connection_(id, fd, std::move(*handoff), source);
+            // Last act: police_admissions_ reads this to join the thread
+            // without blocking on one still at work.
+            finished->store(true, std::memory_order_release);
+        });
+        owned.release();  // the admission thread's now
+    } catch (const std::exception& e) {
+        // Out of threads, typically. The entry first, then the connection
+        // (owned closes fd on the way out).
+        (void)end_admission_(id);
+        handoff->reset();
+        log_admission_drop_(
+            source, std::string{"connection rejected: cannot start its admission: "} + e.what());
+        return 0;
+    }
+    admission_threads_.push_back(
+        AdmissionThread{.thread = std::move(thread), .finished = finished});
+    return 0;
+}
+
+std::string Coordinator::end_admission_(std::uint64_t id) {
+    std::lock_guard lock(admission_mu_);
+    const auto it = pending_admissions_.find(id);
+    if (it == pending_admissions_.end()) {
+        return {};
+    }
+    std::string why = std::move(it->second.interrupted);
+    network::NetworkSocket::close(it->second.interrupt_fd);
+    pending_admissions_.erase(it);
+    return why;
+}
+
+std::string Coordinator::advance_admission_(std::uint64_t id, AdmissionProgress progress) {
+    std::lock_guard lock(admission_mu_);
+    const auto it = pending_admissions_.find(id);
+    if (it == pending_admissions_.end()) {
+        return "no longer tracked";
+    }
+    auto& pending = it->second;
+    if (!pending.interrupted.empty()) {
+        return pending.interrupted;
+    }
+    pending.progress = progress;
+    if (progress == AdmissionProgress::Queued) {
+        // Out of reach of the deadline and eviction from here, though not of
+        // stop() (see interrupt_admission_locked_), which shuts the socket
+        // down through interrupt_fd: that stays until end_admission_. A
+        // listener-form connection may be handed by handle_first_frame_ to a
+        // session that outlives this entry, so it is no longer reachable
+        // from here; its replies are bounded by send_admission_reply_.
+        pending.conn = nullptr;
+    }
+    return {};
+}
+
+bool Coordinator::send_admission_reply_(network::Connection& conn,
+                                        const std::vector<std::byte>& frame) {
+    // Each reply here is small (no peer-supplied string in it is longer than
+    // kMaxRegisterStringBytes), and a peer waiting for it reads all it is
+    // sent, so it goes into the socket's send buffer in one send() at once.
+    // A peer that does not read can fill that buffer all the same: over TLS,
+    // OpenSSL writes from inside the reads of the first frame (an alert for
+    // each renegotiation it refuses, a reply to a TLS 1.3 KeyUpdate), so a
+    // client can fill it before it sends its Register. The caller holds the
+    // first-frame lock, and mu_ for the RegisterAck, so the bound is short
+    // and fixed rather than heartbeat_timeout: it is how long such a peer
+    // holds them, each time.
+    const auto bound = cfg_.heartbeat_timeout.count() > 0
+                           ? std::min(cfg_.heartbeat_timeout, kAdmissionReplySendBound)
+                           : kAdmissionReplySendBound;
+    const bool bounded = conn.set_send_timeout(bound);
+    const bool sent = send_frame(conn, frame);
+    if (bounded) {
+        (void)conn.set_send_timeout(std::chrono::milliseconds{0});
+    }
+    return sent;
+}
+
+void Coordinator::admit_connection_(std::uint64_t id,
+                                    int fd,
+                                    std::unique_ptr<network::Connection> conn,
+                                    const std::string& source) {
+    // Nothing may leave this thread function: an exception escaping it is
+    // std::terminate, which would take the whole control plane down for one
+    // connection, before any authentication. The accept loop used to read
+    // first frames inside a catch for this reason; a std::bad_alloc while a
+    // frame grows, or a throw from a custom Connection, now lands here.
+    try {
+        admit_connection_unguarded_(id, fd, conn, source);
+    } catch (const std::exception& e) {
+        const auto why = end_admission_(id);
+        metrics::orch::malformed_frame();
+        try {
+            log_admission_drop_(source,
+                                std::string{"dropping a connection whose admission failed: "} +
+                                    (why.empty() ? e.what() : why));
+        } catch (...) {
+            // Building the line failed too (out of memory, say): the drop
+            // still stands.
+        }
+    } catch (...) {
+        (void)end_admission_(id);
+        metrics::orch::malformed_frame();
+        log_admission_drop_(source,
+                            "dropping a connection whose admission failed: unknown exception");
+    }
+    // Every path out: the entry goes before the connection (a listener-form
+    // connection is reachable from it until then). Idempotent.
+    (void)end_admission_(id);
+    conn.reset();
+}
+
+void Coordinator::admit_connection_unguarded_(std::uint64_t id,
+                                              int fd,
+                                              std::unique_ptr<network::Connection>& conn,
+                                              const std::string& source) {
+    if (conn == nullptr) {
+        // The handshake, bounded three ways: by handshake_timeout inside the
+        // factory, by the admission deadline and eviction (both shut the
+        // socket down under it), and by stop(), which does too.
+        try {
+            conn = accept_factory_(AcceptRequest{
+                .fd = fd, .wake = accept_wake_.get(), .handshake_timeout = cfg_.handshake_timeout});
+        } catch (const std::exception& e) {
+            const auto why = end_admission_(id);
+            if (stop_.load(std::memory_order_acquire)) {
+                return;  // stop() ended it
+            }
+            // One count per connection, and a line unless a flood is being
+            // summarised: the factory has closed it.
+            metrics::orch::coordinator_handshake_failed();
+            log_admission_drop_(
+                source, std::string{"connection rejected: "} + (why.empty() ? e.what() : why));
+            return;
+        }
+        if (conn == nullptr) {
+            return;
+        }
+        if (accept_factory_handshakes_) {
+            (void)advance_admission_(id, AdmissionProgress::Handshaken);
+        }
+    }
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAdmissionBeforeFirstFrame);
+    // Bound each read as well as the whole admission: a peer that sends
+    // nothing is dropped at heartbeat_timeout without waiting for the
+    // admission deadline. The deadline is what stops a peer that sends a
+    // byte at a time, each inside this bound.
     //
-    // The bound is heartbeat_timeout, reused rather than given its own knob. The
-    // coordinator already declares that a peer silent for that long is dead
-    // (mark_worker_lost_locked_ uses it on ESTABLISHED peers); a peer that cannot
-    // get its first frame out inside that window is, by the coordinator's own
-    // definition of liveness, not live. No new number to justify.
+    // Under kMaxFirstFrameBytes, not the 256 MiB a plugin-carrying frame may
+    // need later: nothing in a first frame is large, and nothing has been
+    // authenticated yet.
     (void)conn->set_recv_timeout(cfg_.heartbeat_timeout);
-    auto frame = read_frame(*conn);
+    std::optional<std::vector<std::byte>> frame;
+    if (const auto len = read_frame_length(*conn); len.has_value()) {
+        if (*len <= kMaxFirstFrameBytes) {
+            (void)advance_admission_(id, AdmissionProgress::FrameStarted);
+        }
+        frame = read_frame_body(*conn, *len, kMaxFirstFrameBytes);
+    }
     // Cleared before the connection is handed to a thread of its own, where a
     // blocking read is correct: a client holds an idle connection open between
     // commands, and a worker between heartbeats.
     (void)conn->set_recv_timeout(std::chrono::milliseconds{0});
     if (!frame.has_value()) {
-        return false;  // conn destructor closes
+        const auto why = end_admission_(id);
+        if (!why.empty() && !stop_.load(std::memory_order_acquire)) {
+            log_admission_drop_(source, "dropping a connection before its first frame: " + why);
+        }
+        return;  // conn destructor closes
     }
-    MessageReader r(std::move(*frame));
+    // Out of reach of the deadline, eviction and stop() from here, but still
+    // counted against max_pending_connections until handle_first_frame_ has
+    // taken it, so the threads waiting below are bounded too.
+    if (const auto why = advance_admission_(id, AdmissionProgress::Queued); !why.empty()) {
+        (void)end_admission_(id);
+        if (!stop_.load(std::memory_order_acquire)) {
+            log_admission_drop_(source, "dropping a connection before its first frame: " + why);
+        }
+        return;  // interrupted, so not to be trusted even if the frame did arrive
+    }
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAdmissionQueued);
+    // One at a time. Not in accept order: handle_register_ refuses a
+    // registration older than the one on record for its worker instead.
+    std::lock_guard lock(first_frame_mu_);
+    // stop() is tearing down what an admission would join.
+    if (stop_.load(std::memory_order_acquire)) {
+        return;
+    }
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAdmissionBeforeHandle);
+    // A decoder throwing must not take the coordinator with it.
+    //
+    // MessageReader throws BY DESIGN on a truncated or malformed
+    // payload - there is a test for it - and nothing caught it. The
+    // throw propagated out of the accept thread function, which is
+    // std::terminate: one malformed frame from anything that could
+    // reach the control port killed the whole control plane, before
+    // any authentication. Dropping the connection is the correct
+    // response; the peer's framing cannot be trusted after this.
+    try {
+        (void)handle_first_frame_(std::move(conn), std::move(*frame), id);
+    } catch (const std::exception& e) {
+        metrics::orch::malformed_frame();
+        log_admission_drop_(
+            source,
+            std::string{"dropping a connection whose first frame did not decode: "} + e.what());
+    }
+}
+
+bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn,
+                                      std::vector<std::byte> frame,
+                                      std::uint64_t admission) {
+    // The first frame was read on the connection's admission thread, under
+    // the admission deadline (admit_connection_). That deadline is
+    // handshake_timeout + heartbeat_timeout, reusing heartbeat_timeout rather
+    // than giving the first frame its own knob: the coordinator already
+    // declares that a peer silent for that long is dead
+    // (mark_worker_lost_locked_ uses it on ESTABLISHED peers), so a peer that
+    // cannot get its first frame out inside that window is, by the
+    // coordinator's own definition of liveness, not live.
+    MessageReader r(std::move(frame));
     const auto kind = static_cast<MessageKind>(r.read_u8());
     if (kind == MessageKind::Register) {
-        handle_register_(std::move(conn), r);
+        handle_register_(std::move(conn), r, admission);
         return true;
     }
     if (kind == MessageKind::HelloClient) {
@@ -1338,7 +1908,7 @@ bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn)
             const auto frame =
                 encode_frame(MessageKind::SubmitJobAck,
                              SubmitJobAckMsg{.job_id = 0, .ok = false, .message = compat.reason});
-            (void)send_frame(*conn, frame);
+            (void)send_admission_reply_(*conn, frame);
             return false;  // conn destructor closes
         }
         // Reap before admitting. A client that connected and went away
@@ -1361,7 +1931,7 @@ bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn)
                                 .message = "coordinator is at its client-connection limit (" +
                                            std::to_string(cfg_.max_client_connections) +
                                            "); retry, or raise max_client_connections"});
-            (void)send_frame(*conn, frame);
+            (void)send_admission_reply_(*conn, frame);
             return false;  // conn destructor closes
         }
 
@@ -1388,7 +1958,9 @@ bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn)
     return false;
 }
 
-void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, MessageReader& r) {
+void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn,
+                                   MessageReader& r,
+                                   std::uint64_t admission) {
     auto reg = decode_register(r);
 
     // Protocol negotiation, before anything else is done with this worker.
@@ -1407,7 +1979,7 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
         metrics::orch::protocol_mismatch();
         RegisterAckMsg nack{.ok = false, .message = compat.reason};
         const auto frame = fenced_frame_(MessageKind::RegisterAck, nack);
-        (void)send_frame(*conn, frame);
+        (void)send_admission_reply_(*conn, frame);
         return;  // conn destructor closes
     }
 
@@ -1440,7 +2012,7 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
             metrics::orch::worker_connection_refused();
             RegisterAckMsg nack{.ok = false, .message = reason, .retryable = true};
             const auto frame = fenced_frame_(MessageKind::RegisterAck, nack);
-            (void)send_frame(*conn, frame);
+            (void)send_admission_reply_(*conn, frame);
             return;  // conn destructor closes
         }
     }
@@ -1453,6 +2025,7 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     worker->slot_capacity = reg.slot_count == 0 ? std::uint32_t{1} : reg.slot_count;
     worker->protocol_version = reg.protocol_version;
     worker->http_port = reg.http_port;
+    worker->admission = admission;
 
     // Install the registration and send RegisterAck under ONE mu_ hold, in
     // that order. The ack is the worker's schedulability linearisation point:
@@ -1482,50 +2055,73 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     // session's heartbeats unread, for all of it.
     std::shared_ptr<WorkerConnection> replaced;
     bool replaced_was_lost = false;
+    // Why this registration is refused, decided under mu_ and sent after it
+    // is released: a refusal is a reply to a peer that may never read, and
+    // mu_ is what every dispatcher, the watchdog and stop() need.
+    std::string refusal;
     {
         std::lock_guard lock(mu_);
         if (auto it = registered_.find(reg.worker_id); it != registered_.end()) {
-            // The session on record is still retiring the one IT replaced: its
-            // dispatch thread waits for that session's frames, and a session
-            // replacing it would wait for both. Each such registration while
-            // the store holds the oldest one's frames used to add two threads
-            // and a full dispatch backlog, outside max_worker_connections, with
-            // no bound on how many. Refused instead, retryably: the worker's
-            // supervisor backs off and registers again, and is admitted once
-            // the retirement ends. Only a worker that registers twice while
-            // one retirement is out is refused, and the retirement ends when
-            // the old session's frames have been handled.
-            if (it->second->retiring_predecessor) {
-                const std::string reason =
-                    "worker '" + reg.worker_id +
-                    "' re-registered while the coordinator is still retiring an earlier session "
-                    "of it (handling the frames that session sent); retry once that is done";
-                log::warn("coordinator.register", reason);
-                metrics::orch::worker_connection_refused();
-                RegisterAckMsg nack{.ok = false, .message = reason, .retryable = true};
-                (void)send_frame(*worker->conn, fenced_frame_(MessageKind::RegisterAck, nack));
-                return;  // conn destructor closes
-            }
-            replaced = it->second;
-            replaced_was_lost = replaced->lost;
-        }
-        worker->session = ++last_worker_session_;
-        worker->retiring_predecessor = replaced != nullptr;
-        registered_[reg.worker_id] = worker;
-        // Binds the worker to this leader's epoch.
-        RegisterAckMsg ack_msg{.ok = true, .message = ""};
-        const auto ack = fenced_frame_(MessageKind::RegisterAck, ack_msg);
-        if (!send_frame(*worker->conn, ack)) {
-            // Handshake failed (the client vanished mid-register). Restore
-            // the previous session: a failed re-registration must not retire
-            // a live worker.
-            if (replaced) {
-                registered_[reg.worker_id] = replaced;
+            if (it->second->admission > admission) {
+                // A registration from an OLDER connection than the session on
+                // record. First frames are handled one at a time but not in
+                // accept order, so a worker whose first attempt timed out
+                // waiting for its RegisterAck, and which reconnected and
+                // registered again, can have that abandoned attempt handled
+                // after the live one. Replacing would tear down the live
+                // session for one whose worker has already hung up on it.
+                refusal = "worker '" + reg.worker_id +
+                          "' registered from a connection accepted before the one its current "
+                          "session registered on; dropping the older registration";
+            } else if (it->second->retiring_predecessor) {
+                // The session on record is still retiring the one IT
+                // replaced: its dispatch thread waits for that session's
+                // frames, and a session replacing it would wait for both.
+                // Each such registration while the store holds the oldest
+                // one's frames used to add two threads and a full dispatch
+                // backlog, outside max_worker_connections, with no bound on
+                // how many. Refused instead, retryably: the worker's
+                // supervisor backs off and registers again, and is admitted
+                // once the retirement ends. Only a worker that registers twice
+                // while one retirement is out is refused, and the retirement
+                // ends when the old session's frames have been handled.
+                refusal = "worker '" + reg.worker_id +
+                          "' re-registered while the coordinator is still retiring an earlier "
+                          "session of it (handling the frames that session sent); retry once that "
+                          "is done";
             } else {
-                registered_.erase(reg.worker_id);
+                replaced = it->second;
+                replaced_was_lost = replaced->lost;
             }
-            return;
         }
+        if (refusal.empty()) {
+            worker->session = ++last_worker_session_;
+            worker->retiring_predecessor = replaced != nullptr;
+            registered_[reg.worker_id] = worker;
+            // Binds the worker to this leader's epoch. Small and the first
+            // frame on a fresh connection, so it goes in one send() at once;
+            // send_admission_reply_ bounds it all the same, since mu_ is held.
+            RegisterAckMsg ack_msg{.ok = true, .message = ""};
+            const auto ack = fenced_frame_(MessageKind::RegisterAck, ack_msg);
+            if (!send_admission_reply_(*worker->conn, ack)) {
+                // Handshake failed (the client vanished mid-register, or never
+                // read). Restore the previous session: a failed
+                // re-registration must not retire a live worker.
+                if (replaced) {
+                    registered_[reg.worker_id] = replaced;
+                } else {
+                    registered_.erase(reg.worker_id);
+                }
+                return;
+            }
+        }
+    }
+    if (!refusal.empty()) {
+        log::warn("coordinator.register", refusal);
+        metrics::orch::worker_connection_refused();
+        RegisterAckMsg nack{.ok = false, .message = refusal, .retryable = true};
+        (void)send_admission_reply_(*worker->conn, fenced_frame_(MessageKind::RegisterAck, nack));
+        return;  // conn destructor closes
     }
     // From here the replaced session is this thread's to retire until
     // start_reader_for_ takes it. Anything that throws before then (an
@@ -8276,10 +8872,32 @@ void Coordinator::stop() {
     if (accept_wake_ != nullptr) {
         accept_wake_->wake();
     }
+    // And every connection still being admitted: shut down under it, so its
+    // thread leaves its handshake, its first frame, or a reply it is sending
+    // from handle_first_frame_ to a peer that does not read, at once. No
+    // admission starts after this (begin_admission_ checks stop_ under the
+    // same lock). One whose first frame is in and that is waiting for the
+    // first-frame lock checks stop_ once it has it.
+    {
+        std::lock_guard lock(admission_mu_);
+        for (auto& [_, pending] : pending_admissions_) {
+            interrupt_admission_locked_(
+                pending, "the coordinator is stopping", /*queued_too=*/true);
+        }
+    }
     CLINK_FAULT_POINT(clink::fault::points::kCoordinatorStopAfterAcceptWake);
     if (accept_thread_.joinable()) {
         accept_thread_.join();
     }
+    // Before the listener closes (on Linux the wake an admission thread's
+    // handshake waits on is the listener's descriptor), and before anything
+    // an admission could hand a connection to is torn down.
+    for (auto& t : admission_threads_) {
+        if (t.thread.joinable()) {
+            t.thread.join();
+        }
+    }
+    admission_threads_.clear();
     // The wake goes before the listener: on Linux it acts on the
     // listener's descriptor, which must not outlive the close.
     accept_wake_.reset();

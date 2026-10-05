@@ -67,6 +67,19 @@ public:
         return ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
     }
 
+    bool set_send_timeout(std::chrono::milliseconds timeout) override {
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd < 0) {
+            return false;
+        }
+        // Zero clears it. NetworkSocket::send_all reports a send that times
+        // out (EAGAIN) as a failure.
+        struct timeval tv{};
+        tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout.count() / 1000);
+        tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout.count() % 1000) * 1000);
+        return ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+    }
+
     void shutdown_write() override {
         const int fd = fd_.load(std::memory_order_acquire);
         if (fd >= 0)

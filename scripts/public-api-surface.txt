@@ -316,6 +316,7 @@ include/clink/async/pid_controller.hpp
 include/clink/cep/cep_operator.hpp
 include/clink/checkpoint/adaptive_mode_policy.hpp
 include/clink/checkpoint/checkpoint_coordinator.hpp
+include/clink/cluster/admission_policy.hpp
 include/clink/cluster/autoscaler.hpp
 include/clink/cluster/built_in_factories.hpp
 include/clink/cluster/checkpoint_retention.hpp

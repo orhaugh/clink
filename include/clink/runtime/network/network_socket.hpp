@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -83,6 +84,48 @@ public:
     // mode, so the accept_one(listener_fd) that follows returns EAGAIN
     // rather than parking if the connection has gone in the meantime.
     static bool wait_for_connection(int listener_fd, const AcceptWake& wake);
+    // As above, and false with errno ETIMEDOUT once `deadline` passes with
+    // nothing pending, for a caller that has other work due by then (the
+    // coordinator's admission deadlines). time_point::max() waits without one.
+    static bool wait_for_connection(int listener_fd,
+                                    const AcceptWake& wake,
+                                    std::chrono::steady_clock::time_point deadline);
+
+    // now() + timeout, saturating: a timeout too large to add to the clock
+    // (milliseconds::max(), say, as "no limit") gives time_point::max(),
+    // which every wait here reads as no deadline, rather than overflowing
+    // into a deadline in the past. Zero or less gives now().
+    static std::chrono::steady_clock::time_point deadline_after(std::chrono::milliseconds timeout);
+
+    // What wait_ready saw.
+    enum class WaitResult : std::uint8_t {
+        Ready,     // fd is readable (or writable), or has an error or hangup to report
+        Woken,     // `wake` was woken; checked first, so it wins over Ready
+        TimedOut,  // `deadline` passed first
+        Failed,    // poll() failed, errno preserved
+    };
+
+    // Wait until `fd` is ready to read (or, with want_write, to write), until
+    // `wake` is woken, or until `deadline`, whichever comes first. For a
+    // thread that must do bounded I/O on an accepted connection before it
+    // can go back to its listener, such as a non-blocking TLS handshake on
+    // an accept thread: the deadline stops one peer from holding the thread,
+    // and the wake lets the owner stop it at once. `wake` may be null (no
+    // wake) and `deadline` may be time_point::max() (no deadline). A wake
+    // that came before the call returns Woken at once.
+    static WaitResult wait_ready(int fd,
+                                 bool want_write,
+                                 const AcceptWake* wake,
+                                 std::chrono::steady_clock::time_point deadline);
+
+    // Wait until `wake` is woken or `deadline` passes, and nothing else: a
+    // pending connection on the wake's listener does not end it. True once
+    // woken. For an accept thread that must not call accept() for a while
+    // (it failed for want of a descriptor, and the connection is still
+    // pending, so waiting on the listener would return at once) but must
+    // still stop when told to.
+    static bool wait_for_wake(const AcceptWake& wake,
+                              std::chrono::steady_clock::time_point deadline);
 
     // Send all `len` bytes of `buf`. Returns true on success.
     static bool send_all(int fd, const std::byte* buf, std::size_t len);
@@ -139,7 +182,12 @@ public:
     [[nodiscard]] int fd() const noexcept { return read_fd_; }
 
 private:
-    // Read only by the Linux wake.
+    // wait_ready waits on the wake alongside another descriptor.
+    friend class NetworkSocket;
+
+    // Read only on Linux: by the wake, and by wait_ready, which polls it
+    // with no events requested, so a pending connection does not register
+    // and only the shutdown that is the wake does (as POLLHUP).
     [[maybe_unused]] int listener_fd_;
     std::atomic<bool> woken_{false};
     int read_fd_{-1};

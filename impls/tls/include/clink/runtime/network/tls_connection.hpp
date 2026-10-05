@@ -18,10 +18,27 @@
 namespace clink::network {
 
 // Accept a TLS connection on the given listener fd. Performs the TCP
-// accept + TLS handshake; throws std::runtime_error on handshake
-// failure. Returns the Connection owning the accepted socket.
+// accept + TLS handshake, bounded by `opts` (see TlsAcceptOptions); throws
+// std::runtime_error on a failed, timed-out or abandoned handshake. Returns
+// the Connection owning the accepted socket, or nullptr when a non-blocking
+// listener had nothing left to accept.
+std::unique_ptr<Connection> accept_tls_connection(int listener_fd,
+                                                  std::shared_ptr<TlsServerContext> ctx,
+                                                  const TlsAcceptOptions& opts);
+
+// As above with no handshake deadline and no wake. Only for a caller that
+// owns the client too: a server that accepts from a network passes options.
 std::unique_ptr<Connection> accept_tls_connection(int listener_fd,
                                                   std::shared_ptr<TlsServerContext> ctx);
+
+// The handshake half of accept_tls_connection, on a socket the caller has
+// already accepted, which this takes ownership of: the form for a server
+// that accepts on one thread and handshakes on others, as the coordinator
+// does. Throws, with the socket closed, on a failed, timed-out or abandoned
+// handshake.
+std::unique_ptr<Connection> handshake_accepted_tls_connection(int fd,
+                                                              std::shared_ptr<TlsServerContext> ctx,
+                                                              const TlsAcceptOptions& opts);
 
 // Connect to host:port over TLS, verifying against the CAs in `ctx`.
 // Returns nullptr on TCP failure; throws on TLS handshake failure.

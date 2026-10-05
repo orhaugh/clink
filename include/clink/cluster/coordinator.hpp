@@ -37,6 +37,11 @@ namespace clink::cluster {
 struct JobGraphSpec;
 class OperatorRegistry;
 class JobBundle;
+// How far a connection has got in being admitted (admission_policy.hpp).
+enum class AdmissionProgress : std::uint8_t;
+// Bounds the log lines admission refusals and drops produce
+// (admission_policy.hpp).
+class AdmissionLogLimiter;
 
 // One task in the user-supplied job plan. peer_refs are resolved against
 // the rest of the plan at deployment time to compute the actual host:port
@@ -223,6 +228,14 @@ void pin_recovered_state_backend(CheckpointConfig& checkpoint);
 
 class Coordinator {
 public:
+    // The most a reply to a peer not yet admitted (a refusal, or the
+    // RegisterAck, which goes out under the coordinator's lock) may wait in
+    // one send(), or heartbeat_timeout when that is shorter. A send waits
+    // only while the socket's send buffer is full, which a peer waiting for
+    // the reply never brings about, so this is the time a peer that does not
+    // read can hold the lock (see send_admission_reply_).
+    static constexpr std::chrono::milliseconds kAdmissionReplySendBound{250};
+
     struct Config {
         // How often the watchdog thread re-evaluates worker liveness.
         std::chrono::milliseconds watchdog_interval{100};
@@ -242,6 +255,98 @@ public:
         // default - a CLI is short-lived and a dashboard holds one - so
         // reaching it means something is wrong rather than busy.
         std::size_t max_client_connections{256};
+        // The most the transport handshake of one accepted connection may
+        // take - the TLS handshake when TLS is on - from the accept to its
+        // end. A client that connects and never finishes it (a port scanner,
+        // a plain-TCP client on a TLS port, a ClientHello sent a byte at a
+        // time) is closed past it, logged once and counted
+        // (clink_coordinator_handshake_failures_total). A legitimate
+        // handshake takes milliseconds, even across a WAN; the default leaves
+        // room for a loaded host. Zero or less leaves the handshake bounded
+        // only by the admission deadline below. Passed to a factory installed
+        // in its AcceptRequest form (see set_accept_factory).
+        //
+        // The admission deadline: a connection that has not finished its
+        // handshake and sent its whole first frame within handshake_timeout +
+        // heartbeat_timeout of being accepted is closed. It bounds the whole
+        // of admission, not each read, so a peer that sends a byte at a time,
+        // each well inside any per-read bound, cannot stretch it. With
+        // heartbeat_timeout zero or less there is none. stop() never waits on
+        // a connection that is still being admitted, whatever either is.
+        // Values too large to add to the clock saturate to no deadline.
+        std::chrono::milliseconds handshake_timeout{5000};
+        // Most connections being admitted at once: accepted, and not yet
+        // handled (registered as a worker, or taken on as a client). Each is
+        // admitted on a thread of its own, so one that stalls holds up no
+        // other. Counted from the accept until handle_first_frame_ has taken
+        // it, so this covers the threads whose first frame has arrived and is
+        // waiting for registration too.
+        //
+        // A connection beyond the cap evicts one, or is refused: the peer
+        // address holding the most admissions gives way first, and within it
+        // the connection that has got least far (a completed TLS handshake,
+        // or a first frame begun, is never evicted for a connection that has
+        // done neither), the oldest of those first. A connection whose first
+        // frame has arrived is never evicted. So a flood from one host evicts
+        // its own connections, and a worker from another host is evicted only
+        // when every host holds at most one admission and it is among the
+        // least advanced. When nothing can be evicted, a connection from an
+        // address with no admission at all is still admitted, beyond the cap,
+        // and so is one from an address all of whose admissions have their
+        // whole first frame in. See admission_policy.hpp. Zero is treated as
+        // one.
+        //
+        // Several workers starting at once from one address (one host, or
+        // peers behind one NAT) are therefore admitted while their first
+        // frames wait for registration, up to twice this many, past which
+        // that address is held to its share (below). What the cap still
+        // limits is how many from one address may be mid-handshake, or
+        // mid-first-frame, at once: past it the oldest of those is evicted,
+        // and a newer one refused when they are all further along. A
+        // WorkerSupervisor retries either; a direct call to
+        // Worker::connect_to_coordinator does not. So set this above the
+        // number of workers that start together behind one address: a TLS
+        // handshake takes long enough for a whole simultaneous start to be
+        // under way at once.
+        //
+        // Each connection being admitted holds two descriptors (its socket
+        // and a duplicate used to interrupt it) until it is handled or let
+        // go, so up to six times this many on top of the worker and client
+        // connections (max_worker_connections, max_client_connections). Size
+        // the process's descriptor limit for all of them. When accept() fails
+        // for want of descriptors, connections wait in the listen backlog and
+        // accept() is retried with a backoff of up to a second, logged once.
+        // One that accept() takes with no descriptor left for its duplicate
+        // is closed, and a WorkerSupervisor retries it.
+        //
+        // An evicted connection's thread and socket stay until that thread
+        // notices (at once for a read or a wait on the socket; within a few
+        // milliseconds for a TLS handshake waiting for a handshake slot), so
+        // they are bounded separately, counting interrupted admissions too,
+        // each towards its own address. At twice this many tracked, a new
+        // connection is admitted only from an address holding less than its
+        // fair share of them (or none), so one host whose evicted
+        // connections are slow to let go cannot turn away a worker from
+        // another; at three times this many, every new connection is
+        // refused. That hard limit, not this cap, is the bound on admission
+        // threads and their descriptors. Refusals and drops are logged in
+        // full up to five per ten seconds, then summarised; the counters are
+        // the precise record.
+        //
+        // A factory installed in its listener form hands over connections
+        // already accepted, so their addresses are unknown and they all count
+        // as one: among them a newcomer evicts the oldest that has got no
+        // further than its handshake, so without mTLS one client can evict
+        // workers there.
+        //
+        // Isolation between hosts holds only while the coordinator sees each
+        // peer's own address. Behind a hop that rewrites it (an L4 load
+        // balancer or HA virtual IP that SNATs, a NAT gateway), every peer
+        // behind it shares one address, and a connection that has sent
+        // nothing can evict a worker from that address whose TLS handshake is
+        // still under way. Keep SNAT out of the path to the control port, or
+        // require mTLS, under which a worker past its handshake is protected.
+        std::size_t max_pending_connections{64};
         // Most WORKER connections the coordinator will hold at once. Beyond this
         // a registration is refused with a reason rather than admitted into
         // threads the coordinator cannot account for (each worker connection
@@ -678,7 +783,8 @@ public:
     // Connection. Default = plain-TCP; clink_node installs a TLS
     // factory when --tls-cert is given. Must be called before start().
     //
-    // The factory accepts the connection itself, on these terms:
+    // In this listener form the factory accepts the connection itself, on
+    // these terms:
     //   * It is called only once the accept loop has seen a connection
     //     pending on the listener, so it never waits for one.
     //   * The listener it is handed is NON-BLOCKING (the loop waits in
@@ -693,9 +799,45 @@ public:
     //     NetworkSocket::accept_one(listener_fd), which returns a blocking
     //     socket (or -1 with errno EAGAIN when nothing is left to accept),
     //     or clear O_NONBLOCK on the accepted socket before using it.
-    //   * Throw on a failed handshake; the loop logs it and carries on.
+    //   * Throw on a failed handshake; the loop logs it, counts it in
+    //     clink_coordinator_handshake_failures_total, and carries on.
+    //   * It runs on the accept thread itself, because it does the accept,
+    //     so any handshake it does must be bounded: a factory that waits on
+    //     its client without a deadline lets one client that never finishes
+    //     the handshake stop every later worker registering, and stop()
+    //     returning. Only the first frame that follows runs on the
+    //     connection's own admission thread, under the admission deadline
+    //     (see Config::handshake_timeout). Prefer the AcceptRequest form
+    //     below, where the handshake runs there too.
     using AcceptFactory = std::function<std::unique_ptr<network::Connection>(int listener_fd)>;
     void set_accept_factory(AcceptFactory f);
+
+    // What the coordinator hands a factory installed in the form below.
+    struct AcceptRequest {
+        // The accepted connection's socket, blocking, and the factory's to
+        // own: wrap it in the Connection returned, or close it and throw (or
+        // return nullptr) on a failed handshake.
+        int fd{-1};
+        // Woken by stop(). A handshake that waits on its client should give
+        // up as soon as this is woken (NetworkSocket::wait_ready waits on a
+        // socket and the wake together). Valid for the duration of the call.
+        const network::AcceptWake* wake{nullptr};
+        // Config::handshake_timeout: the most the whole handshake may take,
+        // from the accept to its end. Past it, close the connection and throw.
+        std::chrono::milliseconds handshake_timeout{0};
+    };
+    // A factory handed a connection the coordinator has already accepted,
+    // with the handshake deadline and the stop wake. It runs on that
+    // connection's own admission thread, so a handshake that stalls holds up
+    // no other connection, and calls can overlap: it must be safe to call
+    // from several threads at once. The coordinator may shut the socket down
+    // from another thread while the factory works on it (at the admission
+    // deadline, to evict it at max_pending_connections, or on stop()); the
+    // handshake then fails, and the factory throws as for any other failed
+    // handshake. clink_node installs its TLS factory this way.
+    using BoundedAcceptFactory =
+        std::function<std::unique_ptr<network::Connection>(const AcceptRequest& request)>;
+    void set_accept_factory(BoundedAcceptFactory f);
 
     // Enable HA mode: every submitted job is persisted under <dir>/jobs/
     // (manifest.json + plugin-<hash>.so bytes). On standby->leader
@@ -875,6 +1017,12 @@ private:
         // registration is refused, retryably, until then: superseded sessions
         // wait on one another, and this keeps that chain one session long.
         bool retiring_predecessor{false};
+        // The admission this registration arrived on (begin_admission_'s id,
+        // rising in accept order). First frames are handled in whatever order
+        // their admission threads get to them, so a registration from an
+        // older connection can arrive after a newer one by the same worker
+        // has registered: it is refused rather than allowed to replace it.
+        std::uint64_t admission{0};
         // HTTP port the worker is serving its dashboard endpoints on.
         // 0 = worker didn't opt into HTTP; coordinator proxy paths skip it.
         std::uint16_t http_port{0};
@@ -1597,11 +1745,80 @@ private:
     };
 
     void accept_loop_();
+    // Start admitting one accepted connection on a thread of its own: the
+    // socket `fd` for the AcceptRequest-form factory to wrap, or the
+    // connection `conn` a listener-form factory has already made (fd -1).
+    // Accept thread only. Returns EMFILE or ENFILE when the connection was
+    // closed for want of a descriptor for its interrupt duplicate, else 0.
+    [[nodiscard]] int begin_admission_(int fd, std::unique_ptr<network::Connection> conn);
+    // begin_admission_, logging rather than throwing what it throws.
+    [[nodiscard]] int begin_admission_guarded_(int fd, std::unique_ptr<network::Connection> conn);
+    // accept() failed with `err`, one of EMFILE, ENFILE, ENOBUFS or ENOMEM
+    // (or had no descriptor left to track what it accepted): back off before
+    // the next (accept_backoff_), logging the first of a run. Accept thread
+    // only.
+    void note_accept_exhausted_(int err) noexcept;
+    // A connection was accepted and tracked: ends a run of
+    // note_accept_exhausted_, logging how long it was. Accept thread only.
+    void note_accept_resumed_() noexcept;
+    // The admission thread: the handshake (when the factory has not done it
+    // already), the first frame, then handle_first_frame_. Nothing it throws
+    // leaves it, and its pending entry is gone before the connection is.
+    // `source` is the peer's address key, for the log.
+    void admit_connection_(std::uint64_t id,
+                           int fd,
+                           std::unique_ptr<network::Connection> conn,
+                           const std::string& source);
+    // admit_connection_ without the catch. `conn` is moved out once it is
+    // handed on.
+    void admit_connection_unguarded_(std::uint64_t id,
+                                     int fd,
+                                     std::unique_ptr<network::Connection>& conn,
+                                     const std::string& source);
+    // Log one connection refused or dropped while being admitted, from
+    // `source` (empty when not known), unless a flood of them is being
+    // summarised instead (admission_log_). Never throws.
+    void log_admission_drop_(const std::string& source, std::string message) noexcept;
+    // Record that admission `id` has got as far as `progress`, unless it has
+    // been interrupted. Returns why it was interrupted, or an empty string.
+    // Reaching AdmissionProgress::Queued also takes it out of reach of the
+    // deadline and eviction (stop() still reaches it), which is why that step
+    // must check.
+    std::string advance_admission_(std::uint64_t id, AdmissionProgress progress);
+    // Send `frame` to a peer that has not been admitted yet (a refusal, or
+    // the RegisterAck that admits it), with each send() bounded by
+    // heartbeat_timeout, cleared again before it returns. A peer that never
+    // reads cannot then hold this thread, nor whatever lock it holds, in
+    // send(). Returns whether the frame went.
+    bool send_admission_reply_(network::Connection& conn, const std::vector<std::byte>& frame);
+    // After accept() fails for want of a descriptor or of memory, the
+    // connection stays pending and the listener readable, so the accept
+    // thread waits this long (doubling, to a second) before it tries again,
+    // until accept_retry_at_, and counts the failures for the line it logs
+    // when accepting resumes. Zero while accepting normally. Accept thread
+    // only.
+    std::chrono::milliseconds accept_backoff_{0};
+    std::chrono::steady_clock::time_point accept_retry_at_{};
+    std::uint64_t accept_exhausted_failures_{0};
+    // Close every admission past its deadline and join every admission
+    // thread that has finished. Returns the earliest deadline still pending,
+    // or time_point::max(). Accept thread only.
+    std::chrono::steady_clock::time_point police_admissions_();
+    // Remove admission `id`, releasing its interrupt descriptor. Returns why
+    // it was interrupted, or an empty string if it was not.
+    std::string end_admission_(std::uint64_t id);
     // Returns true if the connection was handed off to a long-lived
     // reader; false if it was a one-shot client conversation that has
-    // already ended (the connection is closed/dropped).
-    bool handle_first_frame_(std::unique_ptr<network::Connection> conn);
-    void handle_register_(std::unique_ptr<network::Connection> conn, MessageReader& r);
+    // already ended (the connection is closed/dropped). `frame` is the
+    // connection's first frame, already read.
+    // `admission` is the connection's admission id (see
+    // WorkerConnection::admission).
+    bool handle_first_frame_(std::unique_ptr<network::Connection> conn,
+                             std::vector<std::byte> frame,
+                             std::uint64_t admission);
+    void handle_register_(std::unique_ptr<network::Connection> conn,
+                          MessageReader& r,
+                          std::uint64_t admission);
     void handle_client_loop_(std::shared_ptr<network::Connection> conn);
     // Dispatch one decoded client frame; false means close the connection.
     // Separate from the loop so the loop can bound a throw to one frame.
@@ -2142,10 +2359,80 @@ private:
     // restart and drain semantics. What is released is the thread and the socket.
     std::size_t reap_finished_workers_();
 
-    // Wraps an accepted listener fd into a Connection. Default plain
-    // TCP via make_plain_connection. TLS callers replace via
-    // set_accept_factory before start().
-    AcceptFactory accept_factory_;
+    // Wraps an accepted socket into a Connection. Default plain TCP via
+    // make_plain_connection. TLS callers replace via set_accept_factory
+    // before start(). Unused while listener_accept_factory_ is set.
+    BoundedAcceptFactory accept_factory_;
+    // A factory installed in its listener form, which does the accept and
+    // its handshake on the accept thread; empty otherwise.
+    AcceptFactory listener_accept_factory_;
+    // True once a factory other than the plain-TCP default is installed in
+    // the AcceptRequest form: its return marks a completed handshake, which
+    // the eviction policy protects (AdmissionProgress::Handshaken). The
+    // default has no handshake to complete.
+    bool accept_factory_handshakes_{false};
+
+    // A connection being admitted: accepted, and not yet handled by
+    // handle_first_frame_. Each is admitted on its own thread
+    // (admit_connection_) and tracked here, so the admission deadline,
+    // eviction at max_pending_connections and stop() can end it from the
+    // accept thread or stop()'s, and so the cap counts it until
+    // handle_first_frame_ has taken it.
+    struct PendingAdmission {
+        // A duplicate of the accepted socket. shutdown() on it fails whatever
+        // the admission thread is waiting in (the handshake, the first
+        // frame, a reply in handle_first_frame_), and it stays valid whatever
+        // the factory does with its own descriptor, until the interrupt or
+        // end_admission_ closes it under admission_mu_. Kept once Queued, so
+        // stop() can still end a reply to a peer that does not read. -1 for
+        // a connection a listener-form factory made, and once closed.
+        int interrupt_fd{-1};
+        // That listener-form connection, interrupted with shutdown_read();
+        // null otherwise, and from the step to Queued, after which
+        // handle_first_frame_ may hand it to a session that outlives this
+        // entry (its replies are bounded by send_admission_reply_ instead).
+        // Owned by the admission thread until then, which removes this entry
+        // before it lets the connection go.
+        network::Connection* conn{nullptr};
+        std::chrono::steady_clock::time_point deadline{
+            std::chrono::steady_clock::time_point::max()};
+        // The peer's address key, for the eviction policy.
+        std::string source;
+        // Value-initialised: AdmissionProgress::Accepted.
+        AdmissionProgress progress{};
+        // Why it was interrupted, once it has been; empty until then.
+        std::string interrupted;
+    };
+    struct AdmissionThread {
+        std::thread thread;
+        // Set as the thread's last act, so the accept thread can join it
+        // without blocking (see ClientSession::finished).
+        std::shared_ptr<std::atomic<bool>> finished;
+    };
+    // Interrupt one pending admission, once. Under admission_mu_. One whose
+    // first frame is in (AdmissionProgress::Queued) is interrupted only when
+    // `queued_too` is set, which is stop()'s call: the deadline and eviction
+    // leave it to handle_first_frame_.
+    static void interrupt_admission_locked_(PendingAdmission& pending,
+                                            std::string why,
+                                            bool queued_too = false);
+    // Guards pending_admissions_ and next_admission_id_.
+    std::mutex admission_mu_;
+    // Keyed by an id that rises in accept order, so begin() is the oldest.
+    std::map<std::uint64_t, PendingAdmission> pending_admissions_;
+    // Starts at 1: 0 is a WorkerConnection that arrived on no admission.
+    std::uint64_t next_admission_id_{1};
+    // Touched only by the accept thread, and by stop() once it has joined
+    // that thread.
+    std::vector<AdmissionThread> admission_threads_;
+    // Rate-limits the log lines of connections refused or dropped while
+    // being admitted (see log_admission_drop_). Set by both constructors.
+    std::unique_ptr<AdmissionLogLimiter> admission_log_;
+    // Serialises handle_first_frame_ across admission threads, so
+    // registrations are handled one at a time. Not in accept order: a
+    // registration from an older connection than the one on record for its
+    // worker is refused instead (see WorkerConnection::admission).
+    std::mutex first_frame_mu_;
 };
 
 }  // namespace clink::cluster

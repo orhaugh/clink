@@ -49,15 +49,22 @@ inline constexpr std::size_t kMaxFrameBytes = std::size_t{256} * 1024 * 1024;
 // actually arrived.
 inline constexpr std::size_t kFrameReadChunkBytes = std::size_t{64} * 1024;
 
-// Read one length-prefixed frame, returning the payload without the
-// 4-byte header.
+// The most a connection's FIRST frame may claim, before the peer has
+// identified itself as a worker or a client.
 //
-// nullopt means the connection ended, the peer sent a length above
-// `max_bytes`, or the body did not arrive. All three are terminal for the
-// connection: after an over-long length there is no way to know where the
-// next frame starts, so the caller must close rather than resynchronise.
-[[nodiscard]] inline std::optional<std::vector<std::byte>> read_frame(
-    network::Connection& conn, std::size_t max_bytes = kMaxFrameBytes) {
+// A first frame is a Register or a HelloClient: two strings and a few
+// integers, well under a kilobyte. The plugin-carrying frames that need
+// kMaxFrameBytes only ever come later, on an established client
+// connection. Reading the first frame under the full cap let an
+// unauthenticated peer (plain TCP, or TLS without client certificates)
+// claim 256 MiB and stream it, and with each new connection admitted on a
+// thread of its own, max_pending_connections of those at once.
+inline constexpr std::size_t kMaxFirstFrameBytes = std::size_t{64} * 1024;
+
+// Read a frame's 4-byte length prefix. nullopt means the connection ended
+// before it arrived. read_frame is this followed by read_frame_body, for a
+// caller that needs to know the frame has begun.
+[[nodiscard]] inline std::optional<std::uint32_t> read_frame_length(network::Connection& conn) {
     std::array<std::byte, 4> hdr{};
     if (!conn.recv_all(hdr.data(), hdr.size())) {
         return std::nullopt;
@@ -66,6 +73,14 @@ inline constexpr std::size_t kFrameReadChunkBytes = std::size_t{64} * 1024;
     for (const auto b : hdr) {
         len = (len << 8) | static_cast<unsigned char>(b);
     }
+    return len;
+}
+
+// Read the `len`-byte body of a frame whose length prefix has been read.
+// nullopt when `len` is above `max_bytes`, without reading any of it, or when
+// the body did not arrive.
+[[nodiscard]] inline std::optional<std::vector<std::byte>> read_frame_body(
+    network::Connection& conn, std::uint32_t len, std::size_t max_bytes = kMaxFrameBytes) {
     if (len == 0) {
         return std::vector<std::byte>{};
     }
@@ -88,6 +103,22 @@ inline constexpr std::size_t kFrameReadChunkBytes = std::size_t{64} * 1024;
         got += want;
     }
     return body;
+}
+
+// Read one length-prefixed frame, returning the payload without the
+// 4-byte header.
+//
+// nullopt means the connection ended, the peer sent a length above
+// `max_bytes`, or the body did not arrive. All three are terminal for the
+// connection: after an over-long length there is no way to know where the
+// next frame starts, so the caller must close rather than resynchronise.
+[[nodiscard]] inline std::optional<std::vector<std::byte>> read_frame(
+    network::Connection& conn, std::size_t max_bytes = kMaxFrameBytes) {
+    const auto len = read_frame_length(conn);
+    if (!len.has_value()) {
+        return std::nullopt;
+    }
+    return read_frame_body(conn, *len, max_bytes);
 }
 
 [[nodiscard]] inline bool send_frame(network::Connection& conn,

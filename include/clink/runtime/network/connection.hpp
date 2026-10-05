@@ -52,18 +52,31 @@ public:
 
     // Bound how long a single recv() on this connection may block.
     //
-    // Exists because the coordinator reads a new peer's FIRST frame on the
-    // ACCEPT THREAD. Without a deadline, one connection that opens a socket and
-    // sends nothing parks that thread forever: no client can connect, no worker
-    // can register, and max_client_connections becomes unreachable - a cap
-    // defeated by a single connection that sends no bytes at all.
+    // The coordinator sets it while it reads a new peer's FIRST frame, so a
+    // peer that opens a socket and sends nothing is dropped at the first read
+    // that times out.
     //
-    // Returns false when the transport cannot set one, in which case the caller
-    // is no worse off than before. Bounds each recv(), not a whole recv_all: a
-    // peer dribbling one byte per window can still stretch a transfer. That
-    // converts an unbounded PARK into a bounded STALL, which is what unwedges
-    // admission; a total-transfer deadline is a separate, larger change.
+    // Returns false when the transport cannot set one. Bounds each recv(), not
+    // a whole recv_all: a peer dribbling one byte per window can still stretch
+    // a transfer. The coordinator's admission deadline is what bounds the
+    // whole first frame (Coordinator::Config::handshake_timeout); it ends the
+    // read with shutdown_read, so a transport that cannot set this is still
+    // bounded.
     virtual bool set_recv_timeout(std::chrono::milliseconds /*timeout*/) { return false; }
+
+    // Bound how long a single send() on this connection may block; zero
+    // clears it. A send that times out fails, and the connection is not to be
+    // used again (part of a frame may have gone).
+    //
+    // The coordinator sets it while it replies to a peer it has not yet
+    // admitted: a peer that never reads would otherwise hold the thread
+    // replying to it, and whatever that thread holds, in send() for as long
+    // as it keeps the connection open. Returns false when the transport
+    // cannot set one. Like set_recv_timeout, it bounds each send(), not a
+    // whole send_all; the coordinator's replies to an unadmitted peer are
+    // small enough to fit a fresh socket's send buffer, so one send() is the
+    // whole of each.
+    virtual bool set_send_timeout(std::chrono::milliseconds /*timeout*/) { return false; }
 };
 
 // Wrap an already-accepted int fd as a plain-TCP Connection. Takes

@@ -478,6 +478,18 @@ void Worker::connect_to_coordinator(const std::string& coordinator_host,
     coordinator_host_ = coordinator_host;
     coordinator_port_ = coordinator_port;
     metrics::worker::slot_capacity_set(cfg_.slot_count);
+    // The coordinator refuses these unread, by closing the connection, so say
+    // why here rather than let it read as a coordinator that hung up. Not
+    // retryable: the next attempt would carry the same strings.
+    if (worker_id_.size() > kMaxRegisterStringBytes ||
+        data_host_.size() > kMaxRegisterStringBytes) {
+        throw WorkerConnectionError(
+            WorkerConnectionError::Kind::FatalHandshake,
+            "Worker::connect_to_coordinator: the worker id and the data host may each be at most " +
+                std::to_string(kMaxRegisterStringBytes) + " bytes (they are " +
+                std::to_string(worker_id_.size()) + " and " + std::to_string(data_host_.size()) +
+                ")");
+    }
     try {
         conn_ = connect_factory_(coordinator_host, coordinator_port);
     } catch (const std::exception& e) {

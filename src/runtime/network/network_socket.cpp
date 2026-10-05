@@ -1,6 +1,8 @@
 #include "clink/runtime/network/network_socket.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
@@ -172,6 +174,12 @@ int NetworkSocket::accept_one(int listener_fd) {
 }
 
 bool NetworkSocket::wait_for_connection(int listener_fd, const AcceptWake& wake) {
+    return wait_for_connection(listener_fd, wake, std::chrono::steady_clock::time_point::max());
+}
+
+bool NetworkSocket::wait_for_connection(int listener_fd,
+                                        const AcceptWake& wake,
+                                        std::chrono::steady_clock::time_point deadline) {
     // poll() skips a negative fd, which would turn a missing listener into a
     // wait only a wake can end; fail it the way accept() would.
     if (listener_fd < 0) {
@@ -185,10 +193,24 @@ bool NetworkSocket::wait_for_connection(int listener_fd, const AcceptWake& wake)
     if (const int flags = ::fcntl(listener_fd, F_GETFL); flags >= 0 && (flags & O_NONBLOCK) == 0) {
         ::fcntl(listener_fd, F_SETFL, flags | O_NONBLOCK);
     }
+    const bool bounded = deadline != std::chrono::steady_clock::time_point::max();
     for (;;) {
+        int timeout_ms = -1;
+        if (bounded) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                errno = ETIMEDOUT;
+                return false;
+            }
+            // Rounded up, as in wait_ready, so the wait never ends just short
+            // of the deadline and spins on a zero timeout.
+            const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+            timeout_ms = static_cast<int>(std::min<long long>(left, 24LL * 60 * 60 * 1000));
+        }
         pollfd fds[2] = {{listener_fd, POLLIN, 0}, {wake.fd(), POLLIN, 0}};
         const nfds_t nfds = wake.fd() >= 0 ? 2 : 1;
-        if (::poll(fds, nfds, -1) < 0) {
+        const int rc = ::poll(fds, nfds, timeout_ms);
+        if (rc < 0) {
             if (errno == EINTR) {
                 continue;
             }
@@ -210,6 +232,7 @@ bool NetworkSocket::wait_for_connection(int listener_fd, const AcceptWake& wake)
             errno = (fds[0].revents & POLLNVAL) != 0 ? EBADF : EINVAL;
             return false;
         }
+        // rc == 0: the deadline, checked at the top.
     }
 }
 
@@ -238,6 +261,124 @@ int NetworkSocket::accept_one(int listener_fd, const AcceptWake& wake) {
             errno = ECANCELED;
         }
         return -1;
+    }
+}
+
+std::chrono::steady_clock::time_point NetworkSocket::deadline_after(
+    std::chrono::milliseconds timeout) {
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    if (timeout.count() <= 0) {
+        return now;
+    }
+    // Compared in the clock's own unit, so neither the conversion of
+    // `timeout` nor the addition can overflow.
+    const auto headroom = clock::time_point::max() - now;
+    if (timeout >= std::chrono::duration_cast<std::chrono::milliseconds>(headroom)) {
+        return clock::time_point::max();
+    }
+    return now + std::chrono::duration_cast<clock::duration>(timeout);
+}
+
+NetworkSocket::WaitResult NetworkSocket::wait_ready(
+    int fd,
+    bool want_write,
+    const AcceptWake* wake,
+    std::chrono::steady_clock::time_point deadline) {
+    if (fd < 0) {
+        errno = EBADF;
+        return WaitResult::Failed;
+    }
+    const bool bounded = deadline != std::chrono::steady_clock::time_point::max();
+    for (;;) {
+        if (wake != nullptr && wake->woken()) {
+            return WaitResult::Woken;
+        }
+        int timeout_ms = -1;
+        if (bounded) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return WaitResult::TimedOut;
+            }
+            // Rounded up, so a wait never ends just short of the deadline and
+            // spins on a zero timeout.
+            const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+            timeout_ms = static_cast<int>(std::min<long long>(left, 24LL * 60 * 60 * 1000));
+        }
+        pollfd fds[2] = {{fd, static_cast<short>(want_write ? POLLOUT : POLLIN), 0}, {-1, 0, 0}};
+        nfds_t nfds = 1;
+        if (wake != nullptr) {
+#if defined(__linux__)
+            // The wake shuts the listener down, which poll() reports as
+            // POLLHUP whatever is asked for. Asking for nothing keeps a
+            // pending connection, which is POLLIN, from waking this wait.
+            fds[1] = {wake->listener_fd_, 0, 0};
+#else
+            fds[1] = {wake->read_fd_, POLLIN, 0};
+#endif
+            nfds = 2;
+        }
+        const int rc = ::poll(fds, nfds, timeout_ms);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return WaitResult::Failed;
+        }
+        if (wake != nullptr && wake->woken()) {
+            return WaitResult::Woken;
+        }
+        // An error or hangup counts as ready: the I/O call the caller makes
+        // next is what reports it.
+        if (fds[0].revents != 0) {
+            return WaitResult::Ready;
+        }
+        // The wake's descriptor is ready but nobody woke it: it is not usable
+        // (the listener was closed under us, say). Waiting again would spin.
+        if (nfds == 2 && fds[1].revents != 0) {
+            errno = (fds[1].revents & POLLNVAL) != 0 ? EBADF : EINVAL;
+            return WaitResult::Failed;
+        }
+        // rc == 0: the deadline, checked at the top.
+    }
+}
+
+bool NetworkSocket::wait_for_wake(const AcceptWake& wake,
+                                  std::chrono::steady_clock::time_point deadline) {
+    const bool bounded = deadline != std::chrono::steady_clock::time_point::max();
+    for (;;) {
+        if (wake.woken()) {
+            return true;
+        }
+        int timeout_ms = -1;
+        if (bounded) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return false;
+            }
+            // Rounded up, as in wait_ready.
+            const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+            timeout_ms = static_cast<int>(std::min<long long>(left, 24LL * 60 * 60 * 1000));
+        }
+#if defined(__linux__)
+        // The wake shuts the listener down, which poll() reports as POLLHUP
+        // whatever is asked for; asking for nothing keeps a pending
+        // connection (POLLIN) from ending the wait.
+        pollfd p{wake.listener_fd_, 0, 0};
+#else
+        pollfd p{wake.read_fd_, POLLIN, 0};
+#endif
+        const int rc = ::poll(&p, 1, timeout_ms);
+        if (rc < 0 && errno != EINTR) {
+            // poll() itself failing: report the wake's state, and let the
+            // caller's next wait (on the listener) see the failure.
+            return wake.woken();
+        }
+        if (rc > 0 && !wake.woken()) {
+            // Ready but nobody woke it: not usable (the listener closed under
+            // us, say). Waiting again would spin.
+            return false;
+        }
     }
 }
 

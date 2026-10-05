@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+**A connection that stalls its TLS handshake or its first frame no longer
+holds up every other connection to the coordinator.** The coordinator's accept
+thread ran each connection's TLS handshake and read its first frame itself, one
+connection at a time, so a peer that connected to the control port and sent
+nothing, or sent a byte at a time, kept every worker and client from
+registering for as long as it kept going. Each accepted connection is now
+admitted on a thread of its own. The TLS handshake runs non-blocking, bounded by
+the new `Config::handshake_timeout` (default 5000 ms, `--handshake-timeout-ms`),
+and each step of it takes one of a limited number of handshake slots, so a
+flood of handshakes cannot take every core; the whole of admission, handshake
+and first frame, must finish within `handshake_timeout + heartbeat_timeout`.
+At most `max_pending_connections` (default 64, `--max-pending-connections`) are
+admitted at once. Past that, the peer address holding the most admissions gives
+way first, and within it the connection that has got least far, so a flood from
+one host evicts its own connections rather than another host's workers, and a
+worker past its handshake never gives way to a connection that has sent nothing;
+admissions interrupted but not yet gone count towards a hard limit of three
+times the cap. Registrations are still handled in accept order, so a worker's
+abandoned earlier attempt cannot replace its live one. The first frame is
+capped at 64 KiB, a `Register`'s worker id and data host at 255 bytes, and a
+reply to a peer not yet admitted waits at most 250 ms in a send, so a peer that
+never reads holds the coordinator's lock no longer than that. Both TLS contexts now refuse
+renegotiation. When `accept()` runs out of descriptors the accept thread backs
+off, up to a second, instead of spinning on a core. Connections refused,
+evicted or failing their handshake count in
+`clink_coordinator_handshake_failures_total`, and are logged in full up to five
+per ten seconds, then summarised.
+
 **Numbers in a Kafka or WebSocket JSON table compute the same on the columnar
 and row paths.** The columnar JSON decode, and joins and windows emitting
 born-columnar output, took a numeral with a decimal point or an exponent but an

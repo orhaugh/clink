@@ -512,6 +512,18 @@ inline RegisterMsg decode_register(MessageReader& r) {
     RegisterMsg m;
     m.worker_id = r.read_string();
     m.data_host = r.read_string();
+    // Refused here, before anything echoes them (see kMaxRegisterStringBytes).
+    // The message names neither string.
+    if (m.worker_id.size() > kMaxRegisterStringBytes) {
+        throw std::runtime_error("Register: worker_id is " + std::to_string(m.worker_id.size()) +
+                                 " bytes, more than the " +
+                                 std::to_string(kMaxRegisterStringBytes) + " allowed");
+    }
+    if (m.data_host.size() > kMaxRegisterStringBytes) {
+        throw std::runtime_error("Register: data_host is " + std::to_string(m.data_host.size()) +
+                                 " bytes, more than the " +
+                                 std::to_string(kMaxRegisterStringBytes) + " allowed");
+    }
     m.slot_count = r.eof() ? std::uint32_t{1} : r.read_u32_be();
     m.http_port = r.eof() ? std::uint16_t{0} : r.read_u16_be();
     // Protocol version declaration. Absent from a pre-versioning peer,

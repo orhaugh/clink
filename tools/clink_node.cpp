@@ -210,6 +210,10 @@ using namespace clink;
 using namespace clink::cluster;
 using namespace std::chrono_literals;
 
+// The longest --handshake-timeout-ms accepted: one day. A TLS handshake
+// takes milliseconds; anything near this is a mistake, not a deadline.
+constexpr long long kMaxHandshakeTimeoutMs = 24LL * 60 * 60 * 1000;
+
 // Process-wide "shutdown requested" flag the role mainloops poll. A
 // SIGTERM / SIGINT handler sets it; the loop wakes within at most one
 // poll interval (200ms) and calls coordinator::stop() / worker::stop() so the
@@ -541,6 +545,9 @@ void write_coordinator_config(clink::http::JsonWriter& w,
     // what that limit currently is.
     w.kv("max_client_connections", static_cast<std::int64_t>(c.max_client_connections));
     w.kv("max_worker_connections", static_cast<std::int64_t>(c.max_worker_connections));
+    w.kv("handshake_timeout_ms",
+         std::chrono::duration_cast<std::chrono::milliseconds>(c.handshake_timeout).count());
+    w.kv("max_pending_connections", static_cast<std::int64_t>(c.max_pending_connections));
     w.end_object();
 }
 
@@ -2004,6 +2011,16 @@ int run_coordinator(int argc, char** argv) {
         argc, argv, "max-client-connections", std::to_string(kCfgDefaults.max_client_connections));
     const auto max_worker_conns_str = get_arg(
         argc, argv, "max-worker-connections", std::to_string(kCfgDefaults.max_worker_connections));
+    // Deadline for each accepted connection's TLS handshake, run on that
+    // connection's own admission thread (Coordinator::Config::handshake_timeout).
+    const auto handshake_timeout_str = get_arg(
+        argc, argv, "handshake-timeout-ms", std::to_string(kCfgDefaults.handshake_timeout.count()));
+    // Most connections admitted at once (Coordinator::Config::max_pending_connections).
+    const auto max_pending_conns_str =
+        get_arg(argc,
+                argv,
+                "max-pending-connections",
+                std::to_string(kCfgDefaults.max_pending_connections));
     // Cluster-level default state backend for jobs that submit without their
     // own --state-backend. Empty (default) keeps the legacy resolution
     // (memory / file-from-checkpoint-dir). Set it to a deferring backend to
@@ -2029,6 +2046,27 @@ int run_coordinator(int argc, char** argv) {
     cfg.watchdog_interval = std::chrono::milliseconds{std::stoll(watchdog_interval_str)};
     cfg.max_client_connections = static_cast<std::size_t>(std::stoull(max_client_conns_str));
     cfg.max_worker_connections = static_cast<std::size_t>(std::stoull(max_worker_conns_str));
+    // Parsed signed and range-checked: std::stoull("-1") is ULLONG_MAX, which
+    // would silently lift the pending cap, and a handshake timeout of years is
+    // a typo for something, not a deadline.
+    {
+        const long long handshake_ms = std::stoll(handshake_timeout_str);
+        if (handshake_ms < 0 || handshake_ms > kMaxHandshakeTimeoutMs) {
+            std::cerr << "coordinator: --handshake-timeout-ms=" << handshake_timeout_str
+                      << " is out of range: give 0 to " << kMaxHandshakeTimeoutMs
+                      << " (one day); 0 leaves the handshake bounded only by the admission "
+                         "deadline\n";
+            return 2;
+        }
+        cfg.handshake_timeout = std::chrono::milliseconds{handshake_ms};
+        const long long max_pending = std::stoll(max_pending_conns_str);
+        if (max_pending < 0) {
+            std::cerr << "coordinator: --max-pending-connections=" << max_pending_conns_str
+                      << " is out of range: give 0 or more (0 is treated as 1)\n";
+            return 2;
+        }
+        cfg.max_pending_connections = static_cast<std::size_t>(max_pending);
+    }
     cfg.restart_drain_timeout = std::chrono::milliseconds{std::stoll(restart_drain_timeout_str)};
     cfg.default_state_backend_uri = default_state_backend;
     if (!ha_dir.empty()) {
@@ -2125,9 +2163,17 @@ int run_coordinator(int argc, char** argv) {
         if (!tls_client_ca.empty()) {
             server_ctx->set_client_ca_path(tls_client_ca);
         }
-        coordinator.set_accept_factory([server_ctx](int listener_fd) {
-            return clink::network::accept_tls_connection(listener_fd, server_ctx);
-        });
+        // The handshake runs on the connection's own admission thread,
+        // bounded by handshake_timeout and abandoned when stop() wakes the
+        // coordinator, so a client that stalls it holds up no other.
+        coordinator.set_accept_factory(
+            [server_ctx](const clink::cluster::Coordinator::AcceptRequest& req) {
+                return clink::network::handshake_accepted_tls_connection(
+                    req.fd,
+                    server_ctx,
+                    clink::network::TlsAcceptOptions{.handshake_timeout = req.handshake_timeout,
+                                                     .wake = req.wake});
+            });
         std::cout << "coordinator TLS enabled (cert=" << tls_cert
                   << (tls_client_ca.empty() ? "" : ", mTLS=on") << ")\n";
     }
@@ -3275,6 +3321,15 @@ int main(int argc, char** argv) {
                 << "  --watchdog-interval-ms=<n>   worker-liveness poll cadence (default 200).\n"
                 << "  --max-client-connections=<n> concurrent client connections (default 256).\n"
                 << "  --max-worker-connections=<n> concurrent worker connections (default 1024).\n"
+                << "  --handshake-timeout-ms=<n>   deadline for each connection's TLS handshake,\n"
+                   "                               0 to 86400000 (default 5000); 0 leaves it\n"
+                   "                               bounded only by the admission deadline\n"
+                   "                               (handshake + heartbeat timeout).\n"
+                << "  --max-pending-connections=<n> connections being admitted at once, 0 or\n"
+                   "                               more (default 64; 0 is treated as 1). Beyond\n"
+                   "                               it the least advanced connection from the\n"
+                   "                               busiest peer address is evicted, or the new\n"
+                   "                               one refused.\n"
                 << "  --ha-allow-unsafe-locks      Stand for leadership even when --ha-dir is on "
                    "a\n"
                    "                               filesystem that does not honour the leader "

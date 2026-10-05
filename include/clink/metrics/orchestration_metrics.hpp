@@ -18,6 +18,7 @@
 //   - clink_protocol_mismatches_total
 //   - clink_malformed_frames_total
 //   - clink_client_connections_refused_total
+//   - clink_coordinator_handshake_failures_total
 //
 // The metrics surface here is sized for dashboards and alert rules
 // rather than per-operator inner loops. Costs are bounded by the
@@ -93,6 +94,16 @@ inline constexpr const char* kProtocolMismatches = "clink_protocol_mismatches_to
 // produce a well-formed frame is either badly version-skewed or hostile;
 // either way this counts it rather than letting it pass unnoticed.
 inline constexpr const char* kMalformedFrames = "clink_malformed_frames_total";
+// Connections the coordinator dropped during their handshake, before admitting
+// them: a TLS handshake that failed, that did not finish within
+// Coordinator::Config::handshake_timeout or the admission deadline (or could
+// not get a handshake slot within it), that was evicted at
+// max_pending_connections, or that was refused there because every slot was
+// held by a connection further along or because twice that many admissions,
+// evicted ones not yet gone included, were still tracked. A steady rise is a client that cannot
+// handshake (wrong CA, plain TCP on a TLS port) or something probing the port.
+inline constexpr const char* kCoordinatorHandshakeFailures =
+    "clink_coordinator_handshake_failures_total";
 // Clients turned away because the coordinator was already at its
 // connection limit. Non-zero means either a client leak somewhere or a
 // limit set too low - both worth knowing before it becomes an outage.
@@ -177,6 +188,9 @@ inline void client_connection_refused() {
 // not join the cluster.
 inline void worker_connection_refused() {
     MetricsRegistry::global().counter(kWorkerConnectionsRefused).increment();
+}
+inline void coordinator_handshake_failed() {
+    MetricsRegistry::global().counter(kCoordinatorHandshakeFailures).increment();
 }
 inline void malformed_frame() {
     MetricsRegistry::global().counter(kMalformedFrames).increment();

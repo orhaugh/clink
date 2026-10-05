@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -339,6 +340,15 @@ struct PluginBinary {
         return bytes.empty() && !content_hash.empty();
     }
 };
+
+// The longest worker_id, and the longest data_host, a Register may carry.
+// A Register is the first frame of a connection nothing has authenticated
+// yet, and the coordinator names the worker in its replies and its log lines:
+// an id as long as the first frame allows (kMaxFirstFrameBytes) made each
+// reply tens of kilobytes, enough for a peer that never read to block the
+// coordinator in send() while it held what registration needs. 255 bytes is
+// a DNS name's length with room to spare, which is what both usually are.
+inline constexpr std::size_t kMaxRegisterStringBytes = 255;
 
 struct RegisterMsg {
     std::string worker_id;
