@@ -1007,8 +1007,12 @@ TEST(FrameRobustness, DeadlineAfterSaturatesRatherThanOverflowing) {
     const auto in_a_second = network::NetworkSocket::deadline_after(1s);
     EXPECT_GE(in_a_second, before + 1s);
     EXPECT_LE(in_a_second, clock::now() + 1s);
-    EXPECT_LE(network::NetworkSocket::deadline_after(0ms), clock::now());
-    EXPECT_LE(network::NetworkSocket::deadline_after(-5ms), clock::now());
+    // Each deadline is taken before the clock it is compared with: within one
+    // EXPECT the compiler may read the clock first, and GCC on x86-64 does.
+    const auto at_once = network::NetworkSocket::deadline_after(0ms);
+    EXPECT_LE(at_once, clock::now());
+    const auto in_the_past = network::NetworkSocket::deadline_after(-5ms);
+    EXPECT_LE(in_the_past, clock::now());
 }
 
 // --- Who gives way when the admission set is full -------------------------
