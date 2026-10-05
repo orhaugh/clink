@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**A worker's TLS connect to the coordinator, and the Kafka resume's TLS
+connect to a broker, no longer wait for ever.** The TLS client connect was a
+blocking TCP connect followed by a blocking `SSL_connect` with no deadline, so
+a server whose TCP connection completed but that never answered the
+ClientHello (a frozen coordinator, one whose accept thread was stuck, a
+stalled middlebox) held the caller indefinitely: a worker in that state
+neither retried nor honoured shutdown, and a restore waiting on the
+transactional-resume dialer waited with it. The TCP connect and the handshake
+now run non-blocking under one deadline, `TlsConnectOptions::connect_timeout`,
+which starts once the host has resolved and defaults to 5000 ms even for
+callers that pass no options. A connect that misses it fails with a message
+naming the stage, and the worker retries it with backoff. Workers take
+`--handshake-timeout-ms` (1 to 86400000, default 5000); the Kafka resume
+dialer bounds its connects at 5000 ms.
+
 **A connection that stalls its TLS handshake or its first frame no longer
 holds up every other connection to the coordinator.** The coordinator's accept
 thread ran each connection's TLS handshake and read its first frame itself, one

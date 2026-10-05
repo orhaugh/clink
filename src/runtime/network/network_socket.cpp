@@ -31,29 +31,44 @@ struct SigpipeIgnorer {
 };
 [[maybe_unused]] SigpipeIgnorer kSigpipeIgnorer;
 
-}  // namespace
-
-int NetworkSocket::connect_to(const std::string& host, std::uint16_t port) {
-    // Resolve host via getaddrinfo so we accept both numeric IPs and
-    // DNS names. The earlier inet_pton-only path silently failed for
-    // hostnames (e.g. docker-compose service names), which made
-    // cross-process testing on anything but 127.0.0.1 break.
+// Resolve host via getaddrinfo so we accept both numeric IPs and DNS names.
+// The earlier inet_pton-only path silently failed for hostnames (e.g.
+// docker-compose service names), which made cross-process testing on
+// anything but 127.0.0.1 break. Null when the host does not resolve.
+addrinfo* resolve_ipv4(const std::string& host, std::uint16_t port) {
     addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
     const std::string port_str = std::to_string(port);
-    if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || res == nullptr) {
+    if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) {
+        return nullptr;
+    }
+    return res;
+}
+
+int new_tcp_socket(const addrinfo& ai) {
+    const int fd = ::socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol);
+    if (fd >= 0) {
+        int one = 1;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+    return fd;
+}
+
+}  // namespace
+
+int NetworkSocket::connect_to(const std::string& host, std::uint16_t port) {
+    addrinfo* res = resolve_ipv4(host, port);
+    if (res == nullptr) {
         return -1;
     }
 
-    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int fd = new_tcp_socket(*res);
     if (fd < 0) {
         ::freeaddrinfo(res);
         return -1;
     }
-    int one = 1;
-    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     if (::connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
         // A blocking connect interrupted by a signal (EINTR) continues in
@@ -63,12 +78,10 @@ int NetworkSocket::connect_to(const std::string& host, std::uint16_t port) {
         int attempts = 0;
         while (errno == EINTR && attempts < 3) {
             ::close(fd);
-            fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+            fd = new_tcp_socket(*res);
             if (fd < 0) {
                 break;
             }
-            int nd = 1;
-            ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
             if (::connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
                 ::freeaddrinfo(res);
                 return fd;
@@ -83,6 +96,74 @@ int NetworkSocket::connect_to(const std::string& host, std::uint16_t port) {
     }
     ::freeaddrinfo(res);
     return fd;
+}
+
+NetworkSocket::ConnectAttempt NetworkSocket::connect_within(const std::string& host,
+                                                            std::uint16_t port,
+                                                            std::chrono::milliseconds timeout) {
+    ConnectAttempt out;
+    addrinfo* res = resolve_ipv4(host, port);
+    if (res == nullptr) {
+        out.unresolved = true;
+        return out;
+    }
+    // From here, not from the call (see the header).
+    if (timeout.count() > 0) {
+        out.deadline = deadline_after(timeout);
+    }
+    const int fd = new_tcp_socket(*res);
+    // Closes fd and records why.
+    const auto fail = [&out, fd](int err) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        out.error = err;
+        return out;
+    };
+    if (fd < 0) {
+        const int err = errno;
+        ::freeaddrinfo(res);
+        return fail(err);
+    }
+    const int flags = ::fcntl(fd, F_GETFL);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        const int err = errno;
+        ::freeaddrinfo(res);
+        return fail(err);
+    }
+    const int rc = ::connect(fd, res->ai_addr, res->ai_addrlen);
+    const int connect_errno = errno;
+    ::freeaddrinfo(res);
+    // A connect interrupted by a signal (EINTR) carries on in the background
+    // like one in progress, and completes or fails the same way.
+    if (rc != 0 && connect_errno != EINPROGRESS && connect_errno != EINTR) {
+        return fail(connect_errno);
+    }
+    if (rc != 0) {
+        switch (wait_ready(fd, /*want_write=*/true, nullptr, out.deadline)) {
+            case WaitResult::Ready:
+                break;
+            case WaitResult::TimedOut:
+                return fail(ETIMEDOUT);
+            case WaitResult::Woken:  // no wake was given
+            case WaitResult::Failed:
+                return fail(errno);
+        }
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
+            return fail(errno);
+        }
+        if (err != 0) {
+            return fail(err);
+        }
+    }
+    // Every reader of the socket from here on expects a blocking one.
+    if (::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+        return fail(errno);
+    }
+    out.fd = fd;
+    return out;
 }
 
 int NetworkSocket::listen_on(std::uint16_t& port, std::string_view bind_host) {

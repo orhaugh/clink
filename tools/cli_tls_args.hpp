@@ -28,10 +28,57 @@
 // because that operator asked for nothing and gets nothing, which is not
 // a downgrade.
 
+#include <charconv>
+#include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <system_error>
 
 namespace clink::cli {
+
+// The longest --handshake-timeout-ms accepted, for either role: one day. A
+// TLS handshake takes milliseconds; anything near this is a mistake, not a
+// deadline.
+inline constexpr long long kMaxHandshakeTimeoutMs = 24LL * 60 * 60 * 1000;
+
+// The worker's --handshake-timeout-ms when none is given: the TLS client's own
+// default (network::kDefaultTlsConnectTimeout), which clink_node pins it to.
+inline constexpr long long kDefaultWorkerHandshakeTimeoutMs = 5000;
+
+enum class HandshakeRole : std::uint8_t { Coordinator, Worker };
+
+// --handshake-timeout-ms, for either role: a whole number of milliseconds and
+// nothing else, so neither "-1" nor "5s" (read as 5 ms by a lenient parse)
+// slips through. The coordinator takes 0 to one day, 0 leaving its side of
+// the handshake bounded by the admission deadline alone; a worker takes 1 to
+// one day, since nothing else bounds its connect to the coordinator. Returns
+// the refusal message, or nullopt with `out` set.
+inline std::optional<std::string> parse_handshake_timeout_ms(HandshakeRole role,
+                                                             const std::string& text,
+                                                             std::chrono::milliseconds& out) {
+    const bool coordinator = role == HandshakeRole::Coordinator;
+    const std::string prefix =
+        std::string{coordinator ? "coordinator" : "worker"} + ": --handshake-timeout-ms=" + text;
+    const long long min = coordinator ? 0 : 1;
+    const std::string range =
+        "give " + std::to_string(min) + " to " + std::to_string(kMaxHandshakeTimeoutMs) +
+        " (one day)" +
+        (coordinator ? "; 0 leaves the handshake bounded only by the admission deadline"
+                     : "; nothing else bounds a worker's connect to the coordinator");
+    long long ms = 0;
+    const char* last = text.data() + text.size();
+    const auto [end, ec] = std::from_chars(text.data(), last, ms);
+    if (end != last || text.empty() ||
+        (ec != std::errc{} && ec != std::errc::result_out_of_range)) {
+        return prefix + " is not a whole number of milliseconds: " + range;
+    }
+    if (ec == std::errc::result_out_of_range || ms < min || ms > kMaxHandshakeTimeoutMs) {
+        return prefix + " is out of range: " + range;
+    }
+    out = std::chrono::milliseconds{ms};
+    return std::nullopt;
+}
 
 // `linked` reports whether the binary actually carries TLS support.
 inline std::optional<std::string> validate_coordinator_tls_args(const std::string& cert,

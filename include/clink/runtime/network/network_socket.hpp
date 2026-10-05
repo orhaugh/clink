@@ -33,8 +33,38 @@ class AcceptWake;
 // <sys/socket.h>.
 class NetworkSocket {
 public:
-    // Connect to host:port over TCP; returns the connected fd or -1.
+    // Connect to host:port over TCP; returns the connected fd or -1. Bounded
+    // only by the kernel's own connect timeout (about two minutes with
+    // Linux's default SYN retries).
     static int connect_to(const std::string& host, std::uint16_t port);
+
+    // What connect_within came to.
+    struct ConnectAttempt {
+        // The connected socket, blocking, as connect_to returns it; -1 when
+        // the connect failed.
+        int fd{-1};
+        // When fd is -1 and the host resolved: the connect's error, and
+        // ETIMEDOUT when `deadline` passed with the connect still under way.
+        int error{0};
+        // The host did not resolve; nothing was attempted.
+        bool unresolved{false};
+        // The deadline the connect ran under, for a caller that holds what
+        // follows it (a handshake) to the same one; time_point::max() when
+        // there was none.
+        std::chrono::steady_clock::time_point deadline{
+            std::chrono::steady_clock::time_point::max()};
+    };
+
+    // As connect_to, within `timeout` of the host resolving (zero or less:
+    // no deadline). The connect runs non-blocking and its completion is
+    // waited for in poll(), then read from SO_ERROR. The deadline starts
+    // after name resolution, which has resolver timeouts of its own (five
+    // seconds a nameserver under glibc's defaults) that nothing here can cut
+    // short, and which would otherwise spend the whole bound before a packet
+    // was sent.
+    static ConnectAttempt connect_within(const std::string& host,
+                                         std::uint16_t port,
+                                         std::chrono::milliseconds timeout);
 
     // Bind to bind_host:port and listen. If port == 0, the OS picks one
     // and writes it back via the out-param.

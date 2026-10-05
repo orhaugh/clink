@@ -126,12 +126,19 @@ std::unique_ptr<Connection> handshake_accepted_tls_connection(int fd,
 
 std::unique_ptr<Connection> connect_tls_connection(const std::string& host,
                                                    std::uint16_t port,
-                                                   std::shared_ptr<TlsClientContext> ctx) {
+                                                   std::shared_ptr<TlsClientContext> ctx,
+                                                   const TlsConnectOptions& opts) {
     if (!ctx) {
         throw std::runtime_error("connect_tls_connection: null TlsClientContext");
     }
-    TlsSocket sock = TlsSocket::connect(host, port, *ctx);
+    TlsSocket sock = TlsSocket::connect(host, port, *ctx, opts);
     return std::make_unique<TlsConnectionImpl>(std::move(sock), std::move(ctx));
+}
+
+std::unique_ptr<Connection> connect_tls_connection(const std::string& host,
+                                                   std::uint16_t port,
+                                                   std::shared_ptr<TlsClientContext> ctx) {
+    return connect_tls_connection(host, port, std::move(ctx), TlsConnectOptions{});
 }
 
 }  // namespace clink::network

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -20,15 +21,14 @@
 #include "clink/connectors/txn_resume_registry.hpp"
 #include "clink/kafka/txn_resume.hpp"
 #include "clink/runtime/network/connection.hpp"
+#include "clink/runtime/network/network_socket.hpp"
 
 #ifdef CLINK_KAFKA_RESUME_TLS
 #include <cstdlib>
 #include <filesystem>
-#include <memory>
 #include <mutex>
 
 #include "clink/kafka/scram.hpp"
-#include "clink/runtime/network/network_socket.hpp"
 #include "clink/runtime/network/tls_connection.hpp"
 #include "clink/runtime/network/tls_socket.hpp"
 #endif
@@ -357,15 +357,19 @@ public:
         socklen_t len = sizeof(addr);
         (void)::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
         port_ = ntohs(addr.sin_port);
+        wake_ = std::make_unique<clink::network::AcceptWake>(listen_fd_);
         accept_thread_ = std::thread([this] { accept_loop_(); });
     }
 
+    // Wake, join, then close: closing the listener under a thread in accept()
+    // does not wake it on Linux and can leave both stuck on Darwin.
     ~FakeBroker() {
-        ::shutdown(listen_fd_, SHUT_RDWR);
-        ::close(listen_fd_);
+        wake_->wake();
         if (accept_thread_.joinable()) {
             accept_thread_.join();
         }
+        wake_.reset();
+        ::close(listen_fd_);
         for (auto& t : serve_threads_) {
             if (t.joinable()) {
                 t.join();
@@ -396,9 +400,9 @@ public:
 private:
     void accept_loop_() {
         while (true) {
-            const int fd = ::accept(listen_fd_, nullptr, nullptr);
+            const int fd = clink::network::NetworkSocket::accept_one(listen_fd_, *wake_);
             if (fd < 0) {
-                return;  // listener closed
+                return;  // woken, or the listener failed
             }
             // One thread per connection: a real broker serves the bootstrap
             // and coordinator connections concurrently, and so must this.
@@ -502,6 +506,9 @@ private:
     FakeSasl sasl_;
     int listen_fd_{-1};
     std::uint16_t port_{0};
+    // Created before the accept thread starts, released after it is joined
+    // and before the listener is closed.
+    std::unique_ptr<clink::network::AcceptWake> wake_;
     std::thread accept_thread_;
     std::vector<std::thread> serve_threads_;
     mutable std::mutex mu_;
@@ -997,20 +1004,26 @@ public:
         std::uint16_t bound = 0;
         listen_fd_ = clink::network::NetworkSocket::listen_on(bound, "127.0.0.1");
         port_ = bound;
+        wake_ = std::make_unique<clink::network::AcceptWake>(listen_fd_);
         accept_thread_ = std::thread([this] { accept_loop_(); });
     }
 
+    // Wake, join, then close: closing the listener under a thread in accept()
+    // does not wake it on Linux and can leave both stuck on Darwin.
     ~TlsResumeBroker() {
-        // Order matters: the flag first, so the accept loop can tell the
-        // listener teardown (accept_tls_connection THROWS on a dead
-        // listener, same as on a failed client handshake) from a client
-        // it should keep serving past.
-        stopping_.store(true, std::memory_order_release);
-        clink::network::NetworkSocket::shutdown_read(listen_fd_);
-        clink::network::NetworkSocket::close(listen_fd_);
+        {
+            std::lock_guard lock(mu_);
+            stopping_ = true;
+            if (serving_ != nullptr) {
+                serving_->close();  // ends a read the client never answers
+            }
+        }
+        wake_->wake();
         if (accept_thread_.joinable()) {
             accept_thread_.join();
         }
+        wake_.reset();
+        clink::network::NetworkSocket::close(listen_fd_);
     }
 
     TlsResumeBroker(const TlsResumeBroker&) = delete;
@@ -1026,17 +1039,32 @@ public:
 
 private:
     void accept_loop_() {
-        while (!stopping_.load(std::memory_order_acquire)) {
+        for (;;) {
+            // -1 once woken, or if the listener fails.
+            const int fd = clink::network::NetworkSocket::accept_one(listen_fd_, *wake_);
+            if (fd < 0) {
+                return;
+            }
             std::unique_ptr<clink::network::Connection> conn;
             try {
-                conn = clink::network::accept_tls_connection(listen_fd_, ctx_);
+                conn = clink::network::handshake_accepted_tls_connection(
+                    fd,
+                    ctx_,
+                    clink::network::TlsAcceptOptions{.handshake_timeout = std::chrono::seconds{10},
+                                                     .wake = wake_.get()});
             } catch (const std::exception&) {
                 continue;  // a failed handshake ends that client, not the broker
             }
-            if (conn == nullptr) {
-                return;
+            {
+                std::lock_guard lock(mu_);
+                if (stopping_) {
+                    return;
+                }
+                serving_ = conn.get();
             }
             serve_(*conn);
+            std::lock_guard lock(mu_);
+            serving_ = nullptr;
         }
     }
 
@@ -1101,9 +1129,13 @@ private:
     std::shared_ptr<clink::network::TlsServerContext> ctx_;
     int listen_fd_{-1};
     std::uint16_t port_{0};
+    // Created before the accept thread starts, released after it is joined
+    // and before the listener is closed.
+    std::unique_ptr<clink::network::AcceptWake> wake_;
     std::thread accept_thread_;
-    std::atomic<bool> stopping_{false};
     mutable std::mutex mu_;
+    bool stopping_{false};                          // guarded by mu_
+    clink::network::Connection* serving_{nullptr};  // guarded by mu_
     std::size_t end_txn_count_{0};
 };
 

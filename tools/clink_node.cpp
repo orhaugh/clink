@@ -210,10 +210,6 @@ using namespace clink;
 using namespace clink::cluster;
 using namespace std::chrono_literals;
 
-// The longest --handshake-timeout-ms accepted: one day. A TLS handshake
-// takes milliseconds; anything near this is a mistake, not a deadline.
-constexpr long long kMaxHandshakeTimeoutMs = 24LL * 60 * 60 * 1000;
-
 // Process-wide "shutdown requested" flag the role mainloops poll. A
 // SIGTERM / SIGINT handler sets it; the loop wakes within at most one
 // poll interval (200ms) and calls coordinator::stop() / worker::stop() so the
@@ -2050,15 +2046,14 @@ int run_coordinator(int argc, char** argv) {
     // would silently lift the pending cap, and a handshake timeout of years is
     // a typo for something, not a deadline.
     {
-        const long long handshake_ms = std::stoll(handshake_timeout_str);
-        if (handshake_ms < 0 || handshake_ms > kMaxHandshakeTimeoutMs) {
-            std::cerr << "coordinator: --handshake-timeout-ms=" << handshake_timeout_str
-                      << " is out of range: give 0 to " << kMaxHandshakeTimeoutMs
-                      << " (one day); 0 leaves the handshake bounded only by the admission "
-                         "deadline\n";
+        if (const auto err =
+                clink::cli::parse_handshake_timeout_ms(clink::cli::HandshakeRole::Coordinator,
+                                                       handshake_timeout_str,
+                                                       cfg.handshake_timeout);
+            err.has_value()) {
+            std::cerr << *err << "\n";
             return 2;
         }
-        cfg.handshake_timeout = std::chrono::milliseconds{handshake_ms};
         const long long max_pending = std::stoll(max_pending_conns_str);
         if (max_pending < 0) {
             std::cerr << "coordinator: --max-pending-connections=" << max_pending_conns_str
@@ -2890,6 +2885,17 @@ int run_worker(int argc, char** argv) {
     const auto tls_ca = get_arg(argc, argv, "tls-ca", "");
     const auto tls_client_cert = get_arg(argc, argv, "tls-client-cert", "");
     const auto tls_client_key = get_arg(argc, argv, "tls-client-key", "");
+    // Deadline for each TLS connect to the coordinator, the TCP connect and the
+    // handshake together. A coordinator whose TCP connection completes and
+    // that never answers the ClientHello (frozen, or with its accept thread
+    // stuck: the kernel completes the connection into the backlog regardless)
+    // would otherwise hold the attempt for ever, and the supervisor would
+    // never retry or honour shutdown.
+    const auto handshake_timeout_str =
+        get_arg(argc,
+                argv,
+                "handshake-timeout-ms",
+                std::to_string(clink::cli::kDefaultWorkerHandshakeTimeoutMs));
     // HA: when set, every control-session attempt looks up the current leader
     // endpoint. Static mode reconnects to the configured address instead.
     const auto ha_dir = get_arg(argc, argv, "ha-dir", "");
@@ -3002,17 +3008,31 @@ int run_worker(int argc, char** argv) {
         std::cerr << "worker: " << *tls_err << "\n";
         return 2;
     }
+    // Checked with or without TLS, as the coordinator's is.
+    std::chrono::milliseconds handshake_timeout{clink::cli::kDefaultWorkerHandshakeTimeoutMs};
+    if (const auto err = clink::cli::parse_handshake_timeout_ms(
+            clink::cli::HandshakeRole::Worker, handshake_timeout_str, handshake_timeout);
+        err.has_value()) {
+        std::cerr << *err << "\n";
+        return 2;
+    }
 #ifdef CLINK_LINKED_TLS
+    static_assert(std::chrono::milliseconds{clink::cli::kDefaultWorkerHandshakeTimeoutMs} ==
+                      clink::network::kDefaultTlsConnectTimeout,
+                  "the worker's --handshake-timeout-ms default is the TLS client's default");
     if (!tls_ca.empty()) {
         auto client_ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
         if (!tls_client_cert.empty() && !tls_client_key.empty()) {
             client_ctx->set_client_cert(tls_client_cert, tls_client_key);
         }
-        supervisor.set_connect_factory([client_ctx](const std::string& host, std::uint16_t port) {
-            return clink::network::connect_tls_connection(host, port, client_ctx);
-        });
+        const clink::network::TlsConnectOptions connect_opts{.connect_timeout = handshake_timeout};
+        supervisor.set_connect_factory(
+            [client_ctx, connect_opts](const std::string& host, std::uint16_t port) {
+                return clink::network::connect_tls_connection(host, port, client_ctx, connect_opts);
+            });
         std::cout << "worker TLS enabled (ca=" << tls_ca
-                  << (tls_client_cert.empty() ? "" : ", mTLS=on") << ")\n";
+                  << (tls_client_cert.empty() ? "" : ", mTLS=on")
+                  << ", handshake_timeout_ms=" << handshake_timeout.count() << ")\n";
     }
 #endif
 
@@ -3345,6 +3365,13 @@ int main(int argc, char** argv) {
                    "1000).\n"
                 << "  --reconnect-initial-backoff-ms=<n>     first retry cap (default 100).\n"
                 << "  --reconnect-max-backoff-ms=<n>         retry cap (default 5000).\n"
+                << "\n"
+                << "Worker TLS flags:\n"
+                << "  --handshake-timeout-ms=<n>   deadline for each TLS connect to the\n"
+                   "                               coordinator (--tls-ca), the TCP connect\n"
+                   "                               and the handshake together, 1 to 86400000\n"
+                   "                               (default 5000); a connect that misses it\n"
+                   "                               is retried with backoff.\n"
                 << "\n"
                 << "Logging flags:\n"
                 << "  --log-level=<lvl>            trace|debug|info|warn|error|off "

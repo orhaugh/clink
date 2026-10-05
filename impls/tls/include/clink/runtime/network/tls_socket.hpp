@@ -105,6 +105,24 @@ struct TlsAcceptOptions {
     const AcceptWake* wake{nullptr};
 };
 
+// How long a TLS client connect may take unless its caller says otherwise.
+inline constexpr std::chrono::milliseconds kDefaultTlsConnectTimeout{5000};
+
+// Bounds on the client side of a connect. Unlike TlsAcceptOptions, the
+// default is bounded: a server whose TCP connection completes and that never
+// answers the ClientHello would otherwise hold the connecting thread for ever.
+// The kernel completes the connection into the listen backlog whatever the
+// process is doing, so a frozen server, or one whose accepting thread is
+// stuck, looks exactly like that; so does a stalled middlebox, or a server not
+// speaking TLS that waits for more than the ClientHello.
+struct TlsConnectOptions {
+    // Deadline for the whole connect, from the host resolving: the TCP
+    // connect and the handshake share it. Zero or less means none, which only
+    // a caller that owns the server too should choose. Name resolution is not
+    // covered (see NetworkSocket::connect_within).
+    std::chrono::milliseconds connect_timeout{kDefaultTlsConnectTimeout};
+};
+
 // A TLS-wrapped TCP socket. Send/recv go through OpenSSL's record layer.
 // Owns the underlying fd and tears it down on destruct.
 class TlsSocket {
@@ -128,6 +146,17 @@ public:
     static TlsSocket handshake_accepted(int fd,
                                         const TlsServerContext& ctx,
                                         const TlsAcceptOptions& opts);
+    // Connect to host:port and run the client handshake, verifying the server
+    // against the CAs in `ctx`, all within opts.connect_timeout. Throws
+    // std::runtime_error, naming the stage, when the host does not resolve,
+    // the TCP connect fails, the handshake fails, or the deadline passes
+    // first; the connection is closed either way. The returned socket is
+    // blocking.
+    static TlsSocket connect(const std::string& host,
+                             std::uint16_t port,
+                             const TlsClientContext& ctx,
+                             const TlsConnectOptions& opts);
+    // With the default deadline, kDefaultTlsConnectTimeout.
     static TlsSocket connect(const std::string& host,
                              std::uint16_t port,
                              const TlsClientContext& ctx);

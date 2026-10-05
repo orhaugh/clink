@@ -444,27 +444,92 @@ TlsSocket TlsSocket::handshake_accepted(int fd,
 TlsSocket TlsSocket::connect(const std::string& host,
                              std::uint16_t port,
                              const TlsClientContext& ctx) {
-    const int fd = NetworkSocket::connect_to(host, port);
-    if (fd < 0) {
-        throw std::runtime_error("TlsSocket::connect: TCP connect failed");
+    return connect(host, port, ctx, TlsConnectOptions{});
+}
+
+TlsSocket TlsSocket::connect(const std::string& host,
+                             std::uint16_t port,
+                             const TlsClientContext& ctx,
+                             const TlsConnectOptions& opts) {
+    // One deadline for the TCP connect and the handshake together, from the
+    // host resolving (see NetworkSocket::connect_within), saturating as
+    // accept's does.
+    const bool bounded = opts.connect_timeout.count() > 0;
+    const std::string peer = host + ":" + std::to_string(port);
+    const std::string within =
+        " not completed within " + std::to_string(opts.connect_timeout.count()) + " ms";
+    const auto attempt = NetworkSocket::connect_within(host, port, opts.connect_timeout);
+    if (attempt.unresolved) {
+        throw std::runtime_error("TlsSocket::connect: cannot resolve " + host);
     }
+    if (attempt.fd < 0) {
+        if (attempt.error == ETIMEDOUT && bounded &&
+            std::chrono::steady_clock::now() >= attempt.deadline) {
+            throw std::runtime_error("TlsSocket::connect: TCP connect to " + peer + within);
+        }
+        throw std::runtime_error("TlsSocket::connect: TCP connect to " + peer +
+                                 " failed: " + std::strerror(attempt.error));
+    }
+    const int fd = attempt.fd;
+    const auto deadline = attempt.deadline;
+    // Owned from here: every throw below closes the connection on the way out.
     TlsSocket out;
     out.impl_ = std::make_unique<Impl>();
     out.impl_->fd = fd;
     out.impl_->ssl =
         SSL_new(static_cast<SSL_CTX*>(const_cast<TlsClientContext&>(ctx).native_handle()));
     if (out.impl_->ssl == nullptr) {
-        NetworkSocket::close(fd);
         throw std::runtime_error("TlsSocket::connect: SSL_new failed");
     }
     SSL_set_fd(out.impl_->ssl, fd);
     SSL_set_tlsext_host_name(out.impl_->ssl, host.c_str());
-    if (SSL_connect(out.impl_->ssl) != 1) {
-        const auto err = ossl_last_error();
-        SSL_free(out.impl_->ssl);
-        NetworkSocket::close(fd);
-        out.impl_.reset();
-        throw std::runtime_error("TlsSocket::connect: handshake failed: " + err);
+
+    // Non-blocking, so every wait for the server happens in wait_ready below,
+    // where the deadline reaches it. A blocking SSL_connect waits in recv()
+    // for as long as the server cares to send nothing.
+    if (!set_nonblocking(fd, true)) {
+        throw std::runtime_error(std::string{"TlsSocket::connect: cannot make the socket "
+                                             "non-blocking: "} +
+                                 std::strerror(errno));
+    }
+    for (;;) {
+        ERR_clear_error();
+        errno = 0;
+        const int rc = SSL_connect(out.impl_->ssl);
+        if (rc == 1) {
+            break;
+        }
+        const int ssl_error = SSL_get_error(out.impl_->ssl, rc);
+        if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+            throw std::runtime_error("TlsSocket::connect: TLS handshake with " + peer +
+                                     " failed: " + handshake_error(ssl_error));
+        }
+        switch (NetworkSocket::wait_ready(
+            fd, ssl_error == SSL_ERROR_WANT_WRITE, /*wake=*/nullptr, deadline)) {
+            case NetworkSocket::WaitResult::Ready:
+                continue;
+            case NetworkSocket::WaitResult::TimedOut: {
+                // Still waiting for the ServerHello: the TCP connection
+                // completed and the server has said nothing since.
+                const bool unanswered = SSL_get_state(out.impl_->ssl) == TLS_ST_CW_CLNT_HELLO;
+                throw std::runtime_error(
+                    "TlsSocket::connect: TLS handshake with " + peer + within +
+                    (unanswered ? ": the server sent nothing in reply to the ClientHello "
+                                  "(is it stalled, or not serving TLS on this port?)"
+                                : ""));
+            }
+            case NetworkSocket::WaitResult::Woken:  // no wake was given
+            case NetworkSocket::WaitResult::Failed:
+                throw std::runtime_error(
+                    std::string{"TlsSocket::connect: waiting for the handshake failed: "} +
+                    std::strerror(errno));
+        }
+    }
+    // Every reader of the connection from here on expects a blocking socket.
+    if (!set_nonblocking(fd, false)) {
+        throw std::runtime_error(std::string{"TlsSocket::connect: cannot make the socket "
+                                             "blocking again: "} +
+                                 std::strerror(errno));
     }
     return out;
 }
@@ -615,6 +680,12 @@ bool TlsSocket::set_send_timeout(std::chrono::milliseconds) {
 }
 void TlsServerContext::set_max_concurrent_handshake_steps(std::size_t) {}
 TlsSocket TlsSocket::connect(const std::string&, std::uint16_t, const TlsClientContext&) {
+    return {};
+}
+TlsSocket TlsSocket::connect(const std::string&,
+                             std::uint16_t,
+                             const TlsClientContext&,
+                             const TlsConnectOptions&) {
     return {};
 }
 bool TlsSocket::send_all(const std::byte*, std::size_t) {

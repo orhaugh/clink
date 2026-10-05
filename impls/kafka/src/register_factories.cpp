@@ -390,8 +390,14 @@ ResumeDialer build_resume_dialer() {
             }
             d.connect = [ctx](const std::string& host,
                               std::uint16_t port) -> std::unique_ptr<clink::network::Connection> {
+                // The same bound as each read of the resume (5 s): a restore
+                // waits on this, and a broker whose TCP connection completes
+                // and that never answers the ClientHello (frozen, or behind a
+                // stalled middlebox) would otherwise hold it for ever.
+                constexpr clink::network::TlsConnectOptions kResumeConnect{
+                    .connect_timeout = std::chrono::milliseconds{5000}};
                 try {
-                    return clink::network::connect_tls_connection(host, port, ctx);
+                    return clink::network::connect_tls_connection(host, port, ctx, kResumeConnect);
                 } catch (const std::exception&) {
                     // A failed handshake is a transport failure: bounded
                     // retries and the honest transport fallback, the same

@@ -1,23 +1,32 @@
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <poll.h>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <sys/socket.h>
 
 #include "clink/fault/fault_injection.hpp"
 #include "clink/runtime/network/network_socket.hpp"
+#include "clink/runtime/network/tls_connection.hpp"
 #include "clink/runtime/network/tls_socket.hpp"
 
 using namespace clink;
@@ -402,5 +411,335 @@ TEST(TlsSocket, AWriteToAPeerThatNeverReadsFailsWithinTheSendTimeout) {
     }
     cv.notify_all();
     client.join();
+    std::filesystem::remove_all(cert_dir);
+}
+
+// --- The client connect's deadline --------------------------------------------
+//
+// A TLS client connect used to be a blocking TCP connect and then a blocking
+// SSL_connect with no bound. A server whose TCP connection completed and that
+// never answered the ClientHello held the caller indefinitely: a worker could
+// neither retry nor stop, and a restore waiting on the Kafka resume dialer
+// waited with it. The kernel completes a connection into the listen backlog
+// whatever the server process is doing, so a frozen coordinator, or an older
+// one whose accept thread a stalled peer was holding, did exactly that.
+
+namespace {
+
+using namespace std::chrono_literals;
+
+// Long enough that a pass is never a slow machine and a fail is never a fast
+// one: every bounded path here finishes well inside it, and the unbounded one
+// never finishes on its own.
+constexpr auto kConnectFailureBound = 10s;
+
+// A TCP server that accepts one connection and sends nothing, as a frozen or
+// stuck server does.
+class SilentTcpServer {
+public:
+    SilentTcpServer() {
+        listener_ = NetworkSocket::listen_on(port_, "127.0.0.1");
+        wake_ = std::make_unique<AcceptWake>(listener_);
+        thread_ = std::thread([this] {
+            const int fd = NetworkSocket::accept_one(listener_, *wake_);
+            std::lock_guard lock(mu_);
+            accepted_ = fd;
+            cv_.notify_all();
+        });
+    }
+    ~SilentTcpServer() {
+        wake_->wake();
+        thread_.join();
+        wake_.reset();
+        NetworkSocket::close(accepted_);
+        NetworkSocket::close(listener_);
+    }
+    SilentTcpServer(const SilentTcpServer&) = delete;
+    SilentTcpServer& operator=(const SilentTcpServer&) = delete;
+    SilentTcpServer(SilentTcpServer&&) = delete;
+    SilentTcpServer& operator=(SilentTcpServer&&) = delete;
+
+    [[nodiscard]] bool listening() const { return listener_ >= 0; }
+    [[nodiscard]] std::uint16_t port() const { return port_; }
+
+    // Ends the connection, so a client still waiting on it fails rather than
+    // holding the test.
+    void hang_up() {
+        std::unique_lock lock(mu_);
+        cv_.wait_for(lock, kConnectFailureBound, [&] { return accepted_ >= 0; });
+        if (accepted_ >= 0) {
+            NetworkSocket::shutdown_read(accepted_);
+            NetworkSocket::shutdown_write(accepted_);
+        }
+    }
+
+private:
+    std::uint16_t port_{0};
+    int listener_{-1};
+    std::unique_ptr<AcceptWake> wake_;
+    std::thread thread_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    int accepted_{-1};
+};
+
+// The message a connect threw, or empty if it returned.
+template <typename Connect>
+std::string connect_error(const Connect& connect) {
+    try {
+        connect();
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return {};
+}
+
+}  // namespace
+
+TEST(TlsSocketConnect, AServerThatNeverAnswersTheClientHelloFailsTheConnectAtItsDeadline) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto cert_dir = generate_self_signed_cert();
+    if (cert_dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    auto client_ctx = std::make_shared<TlsClientContext>((cert_dir / "cert.pem").string());
+    SilentTcpServer server;
+    ASSERT_TRUE(server.listening());
+
+    const auto started = std::chrono::steady_clock::now();
+    auto connecting = std::async(std::launch::async, [&] {
+        return connect_error([&] {
+            (void)connect_tls_connection("127.0.0.1",
+                                         server.port(),
+                                         client_ctx,
+                                         TlsConnectOptions{.connect_timeout = 300ms});
+        });
+    });
+    if (connecting.wait_for(kConnectFailureBound) != std::future_status::ready) {
+        ADD_FAILURE() << "a TLS connect to a server that never answers its ClientHello was still "
+                         "waiting after "
+                      << kConnectFailureBound.count() << "s: the handshake has no deadline";
+        server.hang_up();  // fails the held handshake, so the test can finish
+    }
+    const std::string error = connecting.get();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_NE(error.find("TLS handshake with 127.0.0.1:" + std::to_string(server.port()) +
+                         " not completed within 300 ms"),
+              std::string::npos)
+        << error;
+    EXPECT_NE(error.find("nothing in reply to the ClientHello"), std::string::npos) << error;
+    EXPECT_GE(elapsed, 250ms) << "the connect failed before its deadline: " << error;
+    EXPECT_LT(elapsed, 5s) << "the connect outlasted its deadline by seconds";
+    std::filesystem::remove_all(cert_dir);
+}
+
+// A caller that passes no options gets kDefaultTlsConnectTimeout, not the
+// unbounded wait.
+TEST(TlsSocketConnect, TheConnectWithoutOptionsIsBoundedByTheDefault) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    static_assert(TlsConnectOptions{}.connect_timeout == kDefaultTlsConnectTimeout);
+    static_assert(kDefaultTlsConnectTimeout > 0ms &&
+                  kDefaultTlsConnectTimeout < kConnectFailureBound);
+    const auto cert_dir = generate_self_signed_cert();
+    if (cert_dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    TlsClientContext client_ctx((cert_dir / "cert.pem").string());
+    SilentTcpServer server;
+    ASSERT_TRUE(server.listening());
+
+    auto connecting = std::async(std::launch::async, [&] {
+        return connect_error(
+            [&] { (void)TlsSocket::connect("127.0.0.1", server.port(), client_ctx); });
+    });
+    if (connecting.wait_for(kConnectFailureBound) != std::future_status::ready) {
+        ADD_FAILURE() << "a TLS connect without options to a server that never answers was "
+                         "still waiting after "
+                      << kConnectFailureBound.count() << "s";
+        server.hang_up();
+    }
+    const std::string error = connecting.get();
+    EXPECT_NE(error.find("not completed within " +
+                         std::to_string(kDefaultTlsConnectTimeout.count()) + " ms"),
+              std::string::npos)
+        << error;
+    std::filesystem::remove_all(cert_dir);
+}
+
+// The deadline covers the TCP connect too. A listener whose accept queue is
+// full and that never accepts leaves a connect to it under way until the client
+// gives up, which without a deadline is the kernel's own connect timeout: about
+// eight seconds measured on Darwin's loopback, about two minutes with Linux's
+// default SYN retries.
+TEST(TlsSocketConnect, ATcpConnectThatCannotCompleteFailsAtTheSameDeadline) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto cert_dir = generate_self_signed_cert();
+    if (cert_dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    TlsClientContext client_ctx((cert_dir / "cert.pem").string());
+
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(listener, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(::listen(listener, 1), 0);
+    socklen_t len = sizeof(addr);
+    ASSERT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+    const std::uint16_t port = ntohs(addr.sin_port);
+
+    // Fill the accept queue one connection at a time until one stays under
+    // way: how many a backlog of one holds differs by platform (two on Linux,
+    // one on Darwin). A loopback connect with room in the queue completes in
+    // the kernel at once, so one still connecting after 200 ms found it full.
+    std::vector<int> fillers;
+    const auto close_all = [&] {
+        for (const int fd : fillers) {
+            ::close(fd);
+        }
+        ::close(listener);
+        std::filesystem::remove_all(cert_dir);
+    };
+    bool full = false;
+    for (int i = 0; i < 64 && !full; ++i) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(fd, 0);
+        fillers.push_back(fd);
+        ASSERT_EQ(::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK), 0);
+        const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        ASSERT_TRUE(rc == 0 || errno == EINPROGRESS) << std::strerror(errno);
+        pollfd p{fd, POLLOUT, 0};
+        full = ::poll(&p, 1, 200) == 0;
+    }
+    if (!full) {
+        close_all();
+        GTEST_SKIP() << "64 connections did not fill a listen queue of one on this platform";
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    auto connecting = std::async(std::launch::async, [&] {
+        return connect_error([&] {
+            (void)TlsSocket::connect(
+                "127.0.0.1", port, client_ctx, TlsConnectOptions{.connect_timeout = 300ms});
+        });
+    });
+    if (connecting.wait_for(kConnectFailureBound) != std::future_status::ready) {
+        ADD_FAILURE() << "a TCP connect to a full listen queue was still under way after "
+                      << kConnectFailureBound.count() << "s: the TCP connect has no deadline";
+        // Refused from here: the client's next SYN is answered with a reset,
+        // so the test can finish.
+        ::close(listener);
+        connecting.wait();
+        for (const int fd : fillers) {
+            ::close(fd);
+        }
+        std::filesystem::remove_all(cert_dir);
+        return;
+    }
+    const std::string error = connecting.get();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_NE(error.find("TCP connect to 127.0.0.1:" + std::to_string(port) +
+                         " not completed within 300 ms"),
+              std::string::npos)
+        << error;
+    EXPECT_GE(elapsed, 250ms) << "the connect failed before its deadline: " << error;
+    EXPECT_LT(elapsed, 5s) << "the connect outlasted its deadline by seconds";
+    close_all();
+}
+
+// The handshake runs non-blocking, and every reader of the connection
+// afterwards expects a blocking socket. One left non-blocking fails a read with
+// nothing yet to read at once, and a write that fills the send buffer, which
+// recv_all and send_all both report as a dead connection.
+TEST(TlsSocketConnect, TheSocketIsBlockingAgainOnceTheHandshakeIsDone) {
+    if (!TlsServerContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto cert_dir = generate_self_signed_cert();
+    if (cert_dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    TlsServerContext server_ctx((cert_dir / "cert.pem").string(), (cert_dir / "key.pem").string());
+    TlsClientContext client_ctx((cert_dir / "cert.pem").string());
+    std::uint16_t port = 0;
+    const int listener = NetworkSocket::listen_on(port, "127.0.0.1");
+    ASSERT_GE(listener, 0);
+
+    // Far more than the two sockets' buffers hold, each way.
+    constexpr std::size_t kBytes = std::size_t{16} * 1024 * 1024;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    bool server_echoed = false;
+    // Lets the client's side end the server's accept or handshake, so a
+    // client that fails before it connects fails the test rather than
+    // leaving the join below waiting.
+    auto wake = std::make_unique<AcceptWake>(listener);
+    std::thread server([&] {
+        try {
+            const int fd = NetworkSocket::accept_one(listener, *wake);
+            if (fd < 0) {
+                return;
+            }
+            TlsSocket conn = TlsSocket::handshake_accepted(
+                fd, server_ctx, TlsAcceptOptions{.handshake_timeout = 10s, .wake = wake.get()});
+            std::vector<std::byte> buf(kBytes);
+            server_echoed =
+                conn.recv_all(buf.data(), buf.size()) && conn.send_all(buf.data(), buf.size());
+            // Then sends nothing until the client is done, or a bound well past
+            // the test, so a broken build fails rather than hangs.
+            std::unique_lock lock(mu);
+            cv.wait_for(lock, 20s, [&] { return done; });
+        } catch (const std::exception&) {
+            // The client's assertions say what went wrong.
+        }
+    });
+
+    std::string error;
+    try {
+        TlsSocket conn = TlsSocket::connect(
+            "127.0.0.1", port, client_ctx, TlsConnectOptions{.connect_timeout = 5s});
+        std::vector<std::byte> out(kBytes);
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            out[i] = static_cast<std::byte>((i * 31 + 7) & 0xff);
+        }
+        EXPECT_TRUE(conn.send_all(out.data(), out.size()))
+            << "a large write after the handshake failed";
+        std::vector<std::byte> back(kBytes);
+        EXPECT_TRUE(conn.recv_all(back.data(), back.size()))
+            << "a large read after the handshake failed";
+        EXPECT_TRUE(back == out);
+
+        // Nothing more is coming, so a blocking read waits out its timeout,
+        // where a non-blocking one fails at once.
+        EXPECT_TRUE(conn.set_recv_timeout(300ms));
+        std::byte b{};
+        const auto started = std::chrono::steady_clock::now();
+        EXPECT_FALSE(conn.recv_all(&b, 1));
+        EXPECT_GE(std::chrono::steady_clock::now() - started, 200ms)
+            << "a read with nothing to read failed at once: the socket is still non-blocking";
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    EXPECT_EQ(error, "");
+
+    {
+        std::lock_guard lock(mu);
+        done = true;
+    }
+    cv.notify_all();
+    wake->wake();
+    server.join();
+    wake.reset();
+    EXPECT_TRUE(server_echoed);
+    NetworkSocket::close(listener);
     std::filesystem::remove_all(cert_dir);
 }

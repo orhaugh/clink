@@ -12,6 +12,9 @@
 // for nothing and got nothing has not been downgraded, and a check that
 // refuses that would be a check nobody can run.
 
+#include <chrono>
+#include <string>
+
 #include <gtest/gtest.h>
 
 #include "../tools/cli_tls_args.hpp"
@@ -121,5 +124,73 @@ TEST(CliTlsArgs, EveryRefusalExplainsWhatWouldHaveHappened) {
             msg.find("not protected") != std::string::npos ||
             msg.find("without the client certificate") != std::string::npos;
         EXPECT_TRUE(names_consequence) << "refusal does not say what it prevented: " << msg;
+    }
+}
+
+// --- --handshake-timeout-ms ----------------------------------------------------
+//
+// Both roles take the flag, parsed by the one function, so a value one refuses
+// the other refuses too, bar the range: the coordinator's 0 leaves its side of
+// the handshake to the admission deadline, while a worker's connect to the
+// coordinator has no other bound, so a worker refuses 0.
+
+using clink::cli::HandshakeRole;
+using clink::cli::kMaxHandshakeTimeoutMs;
+using clink::cli::parse_handshake_timeout_ms;
+
+TEST(CliTlsArgs, AHandshakeTimeoutInRangeIsTakenByEitherRole) {
+    for (const auto role : {HandshakeRole::Coordinator, HandshakeRole::Worker}) {
+        std::chrono::milliseconds out{0};
+        EXPECT_FALSE(parse_handshake_timeout_ms(role, "5000", out).has_value());
+        EXPECT_EQ(out, std::chrono::milliseconds{5000});
+        EXPECT_FALSE(parse_handshake_timeout_ms(role, "1", out).has_value());
+        EXPECT_EQ(out, std::chrono::milliseconds{1});
+        EXPECT_FALSE(parse_handshake_timeout_ms(role, std::to_string(kMaxHandshakeTimeoutMs), out)
+                         .has_value());
+        EXPECT_EQ(out, std::chrono::milliseconds{kMaxHandshakeTimeoutMs});
+    }
+}
+
+TEST(CliTlsArgs, ZeroIsTheCoordinatorsAdmissionDeadlineButNoBoundForAWorker) {
+    std::chrono::milliseconds out{7};
+    EXPECT_FALSE(parse_handshake_timeout_ms(HandshakeRole::Coordinator, "0", out).has_value());
+    EXPECT_EQ(out, std::chrono::milliseconds{0});
+    out = std::chrono::milliseconds{7};
+    const auto err = parse_handshake_timeout_ms(HandshakeRole::Worker, "0", out);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("worker: --handshake-timeout-ms=0 is out of range: give 1 to"),
+              std::string::npos)
+        << *err;
+    EXPECT_EQ(out, std::chrono::milliseconds{7}) << "a refused value must not be applied";
+}
+
+TEST(CliTlsArgs, ABadHandshakeTimeoutIsRefusedByEitherRole) {
+    // "5s" and "5000ms" were read as 5 and 5000 by the lenient parse the
+    // coordinator used, and "" or "abc" threw out of it.
+    const std::string not_numbers[] = {"", "abc", "5s", "5000ms", " 5000", "5000 ", "+5000", "1e3"};
+    const std::string out_of_range[] = {
+        "-1", "86400001", "99999999999999999999", "-99999999999999999999"};
+    for (const auto role : {HandshakeRole::Coordinator, HandshakeRole::Worker}) {
+        const std::string who = role == HandshakeRole::Coordinator ? "coordinator" : "worker";
+        for (const auto& v : not_numbers) {
+            std::chrono::milliseconds out{7};
+            const auto err = parse_handshake_timeout_ms(role, v, out);
+            ASSERT_TRUE(err.has_value()) << who << " took --handshake-timeout-ms=" << v;
+            EXPECT_NE(err->find(who + ": --handshake-timeout-ms=" + v +
+                                " is not a whole number of milliseconds"),
+                      std::string::npos)
+                << *err;
+            EXPECT_EQ(out, std::chrono::milliseconds{7});
+        }
+        for (const auto& v : out_of_range) {
+            std::chrono::milliseconds out{7};
+            const auto err = parse_handshake_timeout_ms(role, v, out);
+            ASSERT_TRUE(err.has_value()) << who << " took --handshake-timeout-ms=" << v;
+            EXPECT_NE(err->find(" is out of range: "), std::string::npos) << *err;
+            EXPECT_NE(err->find(std::to_string(kMaxHandshakeTimeoutMs) + " (one day)"),
+                      std::string::npos)
+                << *err;
+            EXPECT_EQ(out, std::chrono::milliseconds{7});
+        }
     }
 }
