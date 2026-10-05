@@ -607,7 +607,7 @@ jobs:
         # ones run in formal-mutants-accepted, read from the same record.
         run: |
           set -euo pipefail
-          accepted=$(awk '$2 == "accepted" { print $1 }' formal/mutants/expected.txt)
+          accepted=$(awk '!/^#/ && $2 == "accepted" { print $1 }' formal/mutants/expected.txt)
           mutants=$(cd formal/mutants && ls M_*.cfg | sed 's/\.cfg$//' | grep -vx 'M_id_reuse' \
             | grep -vxF -f <(printf '%s\n' $accepted))
           # shellcheck disable=SC2086 # one argument per mutant, on purpose
@@ -634,7 +634,7 @@ jobs:
       - name: Every accepted mutant stays accepted
         run: |
           set -euo pipefail
-          accepted=$(awk '$2 == "accepted" { print $1 }' formal/mutants/expected.txt)
+          accepted=$(awk '!/^#/ && $2 == "accepted" { print $1 }' formal/mutants/expected.txt)
           if [ -z "${accepted}" ]; then
             echo "formal/mutants/expected.txt records no accepted mutant; nothing to run"
             exit 0
