@@ -531,6 +531,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/cluster/runner_registry.cpp
     src/cluster/rescale_coordinator.cpp
     src/cluster/rescale_dispatch.cpp
+    src/cluster/row_layout_admission.cpp
     src/cluster/autoscaler.cpp
     src/cluster/refresh_scheduler.cpp
     src/cluster/dag_builder_registry.cpp

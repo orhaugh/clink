@@ -598,6 +598,13 @@ std::string job_graph_fingerprint(const JobGraphSpec& spec) {
         // Stamped per engine instance so collect sinks resolve that engine's
         // queues; the same job submitted by a new process carries a new one.
         op.params.erase("collect_scope");
+        // The Row sidecar layout the coordinator admitted for one deployment
+        // (row_layout_admission.hpp). It is stamped onto Deploy frames and
+        // never into a submitted spec, and no released planner ever wrote
+        // it, so erasing it from every op changes no recorded fingerprint; it
+        // is erased as a guard, because admission depends on which workers
+        // host a run and the same job must resume whichever they are.
+        op.params.erase("row_layout");
         if (feeds_the_bind.contains(op.id)) {
             op.params.erase("columnar_output");
         }

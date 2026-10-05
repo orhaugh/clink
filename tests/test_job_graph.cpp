@@ -594,3 +594,19 @@ TEST(JobGraphFingerprint, IgnoresColumnarOutputOnlyInFrontOfTheSinkBind) {
     on_the_sink.ops[3].params["columnar_output"] = "k:i64,c:i64";
     EXPECT_NE(job_graph_fingerprint(base), job_graph_fingerprint(on_the_sink));
 }
+
+// The Row sidecar layout a coordinator admitted for one deployment is stamped
+// onto Deploy frames, never into a submitted spec, and no released planner
+// wrote it. It is erased from every op as a guard: admission depends on which
+// workers host a run, and the same job must resume whichever they are.
+TEST(JobGraphFingerprint, IgnoresTheAdmittedRowLayoutOnEveryOp) {
+    const auto base = fingerprint_fixture();
+    auto stamped = fingerprint_fixture();
+    stamped.ops[0].params["row_layout"] = "2";
+    stamped.ops[1].params["row_layout"] = "2";
+    EXPECT_EQ(job_graph_fingerprint(base), job_graph_fingerprint(stamped));
+
+    auto first = fingerprint_fixture();
+    first.ops[1].params["row_layout"] = "1";
+    EXPECT_EQ(job_graph_fingerprint(base), job_graph_fingerprint(first));
+}

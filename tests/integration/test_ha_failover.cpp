@@ -36,6 +36,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -535,6 +536,68 @@ TEST_F(HaFailoverTest, ARecoveredJobParkedForCapacityRunsWhenAWorkerReturns) {
     EXPECT_TRUE(finished) << "the parked recovery never ran once capacity registered: "
                           << describe(v) << " [" << c.describe_coordinator_exits()
                           << ", worker-0=" << (c.worker(0).running() ? "running" : "gone") << "]";
+    EXPECT_TRUE(v.duplicated.empty()) << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << describe(v);
+
+    sub->kill_and_reap();
+}
+
+// A takeover is a whole-job deploy, so it decides the Row sidecar layout
+// again for the workers it recovers onto rather than inheriting the previous
+// leader's decision, and logs it. Here the worker and then the leader die,
+// and the worker returns, after the new leader has parked the recovery,
+// registered at protocol v2 (the test-only CLINK_TEST_REGISTER_PROTOCOL_VERSION
+// hook). The job has no layout-bearing operator, so both decisions are the
+// first layout for that reason; the recovered job must run on the v2 worker,
+// and still exactly once. Recovery onto workers that change the answer for a
+// job with a layout-bearing operator is pinned at frame level in
+// test_row_layout_admission.cpp.
+TEST_F(HaFailoverTest, ATakeoverDecidesTheRowLayoutAgainForTheWorkersItRecoversOnto) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_ha_coordinators(2, {.extra_args = {"--submit-wait-for-slots-ms=1500"}}));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.await_workers_registered(1));
+
+    constexpr std::string_view kDecision =
+        "job_id=1 row_layout=1 (no layout-bearing operator) stamped_ops=0";
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return verify_exactly_once(out_dir_, kTotalRecords).total_lines > 0; },
+        std::chrono::seconds(45)))
+        << "nothing was committed before the failover; the run would prove nothing";
+    const auto decided_before = c.count_in_coordinator_log(kDecision);
+    ASSERT_GT(decided_before, 0U) << "the premise: the first leader logged its layout decision";
+    ASSERT_EQ(c.count_in_coordinator_log("row_layout=2"), 0U);
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    ASSERT_TRUE(c.kill_leader_and_await_failover().has_value())
+        << "no standby took over after the leader was killed";
+    ASSERT_TRUE(c.await_coordinator_ready());
+    ASSERT_TRUE(
+        clink::itest::await([&] { return c.count_in_coordinator_log("parked for capacity") > 0; },
+                            std::chrono::seconds(30)))
+        << "the recovery never parked, so the worker could not return at another version first ["
+        << c.describe_coordinator_exits() << "]";
+
+    clink::itest::ProcOptions v2;
+    v2.env = {{"CLINK_TEST_REGISTER_PROTOCOL_VERSION", "2"}};
+    ASSERT_TRUE(c.restart_worker_ha(0, v2)) << "the worker did not come back";
+    ASSERT_TRUE(c.await_workers_registered(2))
+        << "the restarted worker never registered with the new leader";
+    ASSERT_TRUE(
+        clink::itest::await([&] { return c.count_in_coordinator_log(kDecision) > decided_before; },
+                            std::chrono::seconds(30)))
+        << "the takeover did not decide the layout again for the worker it recovered onto";
+
+    const bool finished = clink::itest::await(
+        [&] { return verify_exactly_once(out_dir_, kTotalRecords).missing.empty(); },
+        std::chrono::seconds(90));
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(finished) << "the recovered job never finished on the v2 worker: " << describe(v);
     EXPECT_TRUE(v.duplicated.empty()) << describe(v);
     EXPECT_TRUE(v.missing.empty()) << describe(v);
     EXPECT_TRUE(v.unexpected.empty()) << describe(v);

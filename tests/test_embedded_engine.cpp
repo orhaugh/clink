@@ -6,6 +6,7 @@
 // runner threads).
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
@@ -27,6 +28,7 @@
 #include "clink/config/json.hpp"
 #include "clink/embed/embedded_engine.hpp"
 #include "clink/fault/fault_injection.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/script_runner.hpp"
 
@@ -1306,6 +1308,53 @@ TEST(EmbeddedEngine, AJobInterruptedUnderTheLastReleaseResumes) {
         for (const auto& [file, lines] : c.inputs) {
             fs::remove(fs::path{kGoldenDir} / file, ec);
         }
+    }
+}
+
+// The embedded engine admits the Row sidecar's second layout through its own
+// deploy: its in-process worker registers at this build's protocol version, so
+// the coordinator stamps the layout-bearing operators in the Deploy frames. The
+// stamp never reaches the submitted spec, so the fingerprint a resume checks is
+// the one v0.10.0 recorded for the same script.
+TEST(EmbeddedEngine, AdmittingTheSecondRowLayoutLeavesTheResumeFingerprintAlone) {
+    std::error_code ec;
+    fs::create_directories(kGoldenDir, ec);
+    const auto cases = v0100_fingerprints();
+    const auto& c = cases.front();  // the window into the bind: one stamped window
+    ASSERT_EQ(std::string{c.label}, "window into the bind");
+    for (const auto& [file, lines] : c.inputs) {
+        write_lines(fs::path{kGoldenDir} / file, lines);
+    }
+    const auto dir = resume_scratch("admitted_layout");
+    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count() -
+                       1;
+    std::string err;
+    ASSERT_EQ(run_checkpointed(c.script, dir / "ckpt", &err), 0) << err;
+
+    bool admitted = false;
+    std::string seen;
+    for (const auto& r : clink::LogBuffer::global().tail(1024, "info", since, "coordinator")) {
+        if (r.message.find("row_layout=") == std::string::npos) {
+            continue;
+        }
+        seen += r.message + "\n";
+        const std::string key = "row_layout=2 stamped_ops=";
+        if (const auto at = r.message.find(key); at != std::string::npos &&
+                                                 at + key.size() < r.message.size() &&
+                                                 r.message[at + key.size()] != '0') {
+            admitted = true;
+        }
+    }
+    EXPECT_TRUE(admitted) << "the embedded deploy did not admit and stamp the second layout; "
+                             "coordinator said:\n"
+                          << seen;
+    EXPECT_EQ(read_file(dir / "ckpt" / "_jobs" / "1" / "graph-fingerprint"), c.recorded)
+        << "admission moved the resume fingerprint";
+    fs::remove_all(dir, ec);
+    for (const auto& [file, lines] : c.inputs) {
+        fs::remove(fs::path{kGoldenDir} / file, ec);
     }
 }
 

@@ -34,7 +34,7 @@ SQL statements a 1.x release holds stable) is the published
 
 | Domain | Current | Minimum compatible | Where enforced |
 |---|---|---|---|
-| Cluster control protocol | 2 | 1 | `include/clink/cluster/protocol.hpp` (`kClusterProtocolVersion`), three handshake sites |
+| Cluster control protocol | 3 | 1 | `include/clink/cluster/protocol.hpp` (`kClusterProtocolVersion`), three handshake sites |
 | Data plane (operator wire frames) | unversioned by design | n/a | `include/clink/runtime/network/wire.hpp` |
 | Checkpoint metadata sidecar | 1 | 1 | `include/clink/state/checkpoint_integrity.hpp` (`kCheckpointMetaVersion`) |
 | State snapshots and savepoints | 1 (`clink.format_version`) | 1 (absence reads as 1) | `docs/internals/state-snapshot-format.md` |
@@ -51,7 +51,7 @@ SQL statements a 1.x release holds stable) is the published
 
 ## Cluster control protocol
 
-`kClusterProtocolVersion = 2`, `kMinCompatibleClusterProtocolVersion = 1`
+`kClusterProtocolVersion = 3`, `kMinCompatibleClusterProtocolVersion = 1`
 (`include/clink/cluster/protocol.hpp`). Peers exchange both numbers in the
 handshake messages and are compatible when the ranges overlap, so versions
 may differ as long as each side can speak something the other accepts.
@@ -72,6 +72,11 @@ may differ as long as each side can speak something the other accepts.
   not produce TCP EOF. The new frame is sent only when the registered worker
   declares v2; a v2 worker paired with a v1 coordinator falls back to EOF, so
   the minimum remains v1 for rolling upgrades.
+- **Version 3 capability:** a v3 worker reads the Row sidecar's second
+  layout (the typed timestamp codes `ts_ms` and `tstz_ms`, below). Nothing
+  changes on the control wire; the version is the gate the coordinator uses
+  to admit that layout per deployment. v1 and v2 peers remain compatible and
+  never receive it.
 - **Known limitation:** client enforcement is one-directional. The
   coordinator sends no hello ack on success, so a CLI never learns the
   coordinator's version.
@@ -97,8 +102,33 @@ and never talks to a peer of unknown vintage.
   at both read sites before allocation; `ArrowBatch` payloads are
   self-describing Arrow IPC validated with `ValidateFull` before use, and
   the receiver checks the embedded schema against its registered batcher.
+- **Row sidecar layout, admitted per deployment.** A Row frame's Arrow
+  sidecar is described by row-schema codes. The first layout is every code
+  a worker has always read; the second adds `ts_ms` and `tstz_ms`, which a
+  worker from before protocol v3 reads as utf8, so a typed column sent to it
+  would fail the channel ("batch parse failed"). The coordinator admits the
+  second layout for a deployment only when it has a layout-bearing operator
+  and every worker hosting it registered at v3 or later (`admit_row_layout`,
+  `include/clink/cluster/row_layout_admission.hpp`), and decides again on
+  every whole-job deploy: submit, restart, the replan rescale and HA
+  recovery. A deployment with no layout-bearing operator can never send a
+  typed column, so it runs the first layout on any workers and is never
+  held to the second layout's placement rules. It says so by adding `row_layout=2` to the params of the
+  operators whose factory parses a layout-bearing schema
+  (`json_string_to_row_columnar`, the three window types, `equi_join_row`),
+  in the Deploy frames only; a factory without the stamp resolves
+  second-layout codes to their first-layout types. A hot cutover never
+  changes a job's layout (see
+  [fault tolerance and rescale](fault-tolerance-and-rescale.md)). Every
+  upgrade order is safe: an older coordinator never stamps, an older worker
+  is never admitted, and a downgrade silently runs the first layout.
 - **Tests:** `tests/test_network_channel.cpp` (oversized frames),
-  `fuzz/fuzz_data_frame.cpp` with the decode-reencode round-trip property.
+  `fuzz/fuzz_data_frame.cpp` with the decode-reencode round-trip property;
+  `tests/test_row_layout_admission.cpp` (admission, the stamp, and the
+  coordinator's Deploy frames on submit, restart, the replan rescale and a
+  hot cutover) and the admission cases in
+  `tests/integration/test_rescale_exactly_once.cpp` and
+  `tests/integration/test_ha_failover.cpp`.
 
 ## Checkpoint metadata sidecar
 
@@ -143,6 +173,13 @@ OLD build wrote. `name`, `column_lineage`, `expected_state_versions` and
 `determinism_coverage` are the precedents - each defaults sanely when
 absent. `from_json` validates structure and refuses malformed specs before
 admission. Pinned by `tests/fixtures/job-spec-v1.json`.
+
+A row-schema code keeps its meaning for good: `str` means utf8 in every spec
+an old build persisted, and the typed timestamp layout uses new codes rather
+than changing an old one. The `row_layout` stamp a coordinator adds at deploy
+is never written into the spec: the submitted, retained and persisted spec is
+the one the client sent, and `job_graph_fingerprint` erases `row_layout` as a
+guard.
 
 ## Connector offsets and committables
 

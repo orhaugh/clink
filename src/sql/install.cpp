@@ -27,6 +27,7 @@
 #include "clink/cep/cep_operator.hpp"
 #include "clink/cep/pattern.hpp"
 #include "clink/cluster/job_planner.hpp"
+#include "clink/cluster/row_layout_admission.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/capability.hpp"
 #include "clink/connectors/directory_file_source.hpp"
@@ -11734,6 +11735,16 @@ std::int64_t hash_json_value(const clink::config::JsonValue& v) {
 
 constexpr const char* kRowKeyField = "__key";
 
+// The Row sidecar layout the coordinator admitted for this deployment. It
+// stamps `row_layout=2` onto the factories that parse a layout-bearing schema
+// only when every worker hosting the job reads the second layout; without the
+// stamp (an older coordinator, a mixed cluster, a Dag-direct caller) its codes
+// resolve to their first-layout types. See row_layout_admission.hpp.
+inline RowLayout admitted_row_layout(const BuildContext& ctx) {
+    return ctx.param_or(std::string{cluster::kRowLayoutParam}, "1") == "2" ? RowLayout::V2
+                                                                           : RowLayout::V1;
+}
+
 // Comma-separated column list -> names, skipping empties. The projected_columns idiom was
 // already open-coded in file_json_source and parquet_row_source; the columnar JSON bridge
 // is the third caller, so it lives here once.
@@ -13171,7 +13182,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             // the operator's constructor comment for why narrowing the schema instead
             // would disable the columnar path rather than speed it up.
             return std::make_shared<JsonStringToRowColumnarOperator>(
-                parse_row_schema(ctx.param_or("schema_columns")),
+                parse_row_schema(ctx.param_or("schema_columns"), admitted_row_layout(ctx)),
                 projection_from_csv(ctx.param_or("projected_columns", "")));
         });
 
@@ -13900,20 +13911,19 @@ void install(clink::plugin::PluginRegistry& reg) {
             decode_agg_extras(entry, spec);
             aggregates.push_back(std::move(spec));
         }
-        auto op =
-            std::make_shared<WindowRowOp>(kind,
-                                          std::move(time_column),
-                                          size_ms,
-                                          slide_ms,
-                                          std::move(group_keys),
-                                          std::move(aggregates),
-                                          std::move(group_key_outputs),
-                                          std::move(window_start_output),
-                                          std::move(window_end_output),
-                                          // Born-columnar output: set by the
-                                          // planner only when the consumer
-                                          // can ingest columnar.
-                                          parse_row_schema(ctx.param_or("columnar_output", "")));
+        auto op = std::make_shared<WindowRowOp>(
+            kind,
+            std::move(time_column),
+            size_ms,
+            slide_ms,
+            std::move(group_keys),
+            std::move(aggregates),
+            std::move(group_key_outputs),
+            std::move(window_start_output),
+            std::move(window_end_output),
+            // Born-columnar output: set by the planner only when the consumer can
+            // ingest columnar.
+            parse_row_schema(ctx.param_or("columnar_output", ""), admitted_row_layout(ctx)));
         op->set_allowed_lateness_ms(ctx.param_int64_or("allowed_lateness_ms", 0));
         op->set_report_late(ctx.param_or("late_records_to_dlq", "") == "true");
         return op;
@@ -14157,7 +14167,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 // the planner only when the
                 // consumer can ingest columnar
                 // (see physical_plan.cpp).
-                parse_row_schema(ctx.param_or("columnar_output", "")),
+                parse_row_schema(ctx.param_or("columnar_output", ""), admitted_row_layout(ctx)),
                 read_ttl_params(ctx).ms,
                 read_ttl_params(ctx).event_time);
         });

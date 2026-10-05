@@ -36,6 +36,7 @@
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/refresh_scheduler.hpp"
+#include "clink/cluster/row_layout_admission.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/config/json.hpp"
 #include "clink/operators/agg_function_registry.hpp"
@@ -1366,8 +1367,12 @@ public:
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             ++batches_;
-            if (element.as_data().is_columnar())
+            if (element.as_data().is_columnar()) {
                 ++columnar_batches_;
+                if (first_schema_.empty()) {
+                    first_schema_ = element.as_data().arrow()->schema()->ToString();
+                }
+            }
         }
         out.emit(element);
     }
@@ -1375,10 +1380,14 @@ public:
 
     [[nodiscard]] int batches() const { return batches_; }
     [[nodiscard]] int columnar_batches() const { return columnar_batches_; }
+    // The first sidecar's Arrow schema, "name: type" per field; empty when no
+    // batch carried one.
+    [[nodiscard]] const std::string& first_schema() const { return first_schema_; }
 
 private:
     int batches_ = 0;
     int columnar_batches_ = 0;
+    std::string first_schema_;
 };
 
 // run_equi_join, plus the born-columnar output schema param and a probe between
@@ -1387,12 +1396,16 @@ struct JoinRun {
     std::vector<Record<Row>> records;
     int batches = 0;
     int columnar_batches = 0;
+    std::string first_schema;
 };
 
+// `row_layout` empty = no stamp, as a worker builds the op when the coordinator
+// did not admit the second layout; otherwise the stamp's value.
 JoinRun run_equi_join_probed(const std::string& join_type,
                              const std::vector<Record<Row>>& left,
                              const std::vector<Record<Row>>& right,
-                             const std::string& columnar_output) {
+                             const std::string& columnar_output,
+                             const std::string& row_layout = "") {
     const auto* builder = cluster::DagBuilderRegistry::default_instance().find("equi_join_row");
     Dag dag;
     auto hl = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(left));
@@ -1408,6 +1421,9 @@ JoinRun run_equi_join_probed(const std::string& join_type,
     if (!columnar_output.empty()) {
         ctx.params["columnar_output"] = columnar_output;
     }
+    if (!row_layout.empty()) {
+        ctx.params["row_layout"] = row_layout;
+    }
     std::vector<std::any> upstream = {std::any{hl}, std::any{hr}};
     auto out = (*builder)(dag, upstream, ctx);
     auto h_join = std::any_cast<StageHandle<Row>>(out.main_handle);
@@ -1419,14 +1435,18 @@ JoinRun run_equi_join_probed(const std::string& join_type,
     cfg.state_backend = std::make_shared<InMemoryStateBackend>();
     LocalExecutor exec(std::move(dag), std::move(cfg));
     exec.run();
-    return JoinRun{sink->collected_records(), probe->batches(), probe->columnar_batches()};
+    return JoinRun{sink->collected_records(),
+                   probe->batches(),
+                   probe->columnar_batches(),
+                   probe->first_schema()};
 }
 
 // Drive a tumbling window (COUNT(*) per key per 10s) through the registry with a
 // probe between it and the sink, so a test can see whether the fire emitted a
 // sidecar. `columnar_output` empty = the row-form default.
 JoinRun run_tumbling_window_probed(const std::vector<Record<Row>>& input,
-                                   const std::string& columnar_output) {
+                                   const std::string& columnar_output,
+                                   const std::string& row_layout = "") {
     const auto* builder =
         cluster::DagBuilderRegistry::default_instance().find("tumbling_window_row");
     Dag dag;
@@ -1439,6 +1459,9 @@ JoinRun run_tumbling_window_probed(const std::vector<Record<Row>>& input,
     if (!columnar_output.empty()) {
         ctx.params["columnar_output"] = columnar_output;
     }
+    if (!row_layout.empty()) {
+        ctx.params["row_layout"] = row_layout;
+    }
     std::vector<std::any> upstream = {std::any{h}};
     auto out = (*builder)(dag, upstream, ctx);
     auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
@@ -1450,7 +1473,44 @@ JoinRun run_tumbling_window_probed(const std::vector<Record<Row>>& input,
     cfg.state_backend = std::make_shared<InMemoryStateBackend>();
     LocalExecutor exec(std::move(dag), std::move(cfg));
     exec.run();
-    return JoinRun{sink->collected_records(), probe->batches(), probe->columnar_batches()};
+    return JoinRun{sink->collected_records(),
+                   probe->batches(),
+                   probe->columnar_batches(),
+                   probe->first_schema()};
+}
+
+// The columnar Kafka JSON decode, built through the registry as a worker builds
+// it, over `lines`, with a probe behind it.
+JoinRun run_json_columnar_decode_probed(const std::vector<std::string>& lines,
+                                        const std::string& schema_columns,
+                                        const std::string& row_layout = "") {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("json_string_to_row_columnar");
+    Dag dag;
+    std::vector<Record<std::string>> input;
+    input.reserve(lines.size());
+    for (const auto& l : lines) {
+        input.push_back(Record<std::string>{l});
+    }
+    auto h = dag.add_source<std::string>(std::make_shared<VectorSource<std::string>>(input));
+    clink::plugin::BuildContext ctx;
+    ctx.params["schema_columns"] = schema_columns;
+    if (!row_layout.empty()) {
+        ctx.params["row_layout"] = row_layout;
+    }
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_dec = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto probe = std::make_shared<ColumnarProbeOp>();
+    auto h_probe = dag.add_operator<Row, Row>(h_dec, probe);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_probe, sink);
+    LocalExecutor exec(std::move(dag), JobConfig{});
+    exec.run();
+    return JoinRun{sink->collected_records(),
+                   probe->batches(),
+                   probe->columnar_batches(),
+                   probe->first_schema()};
 }
 
 // Records with an event time, so the watermark advances and windows fire.
@@ -1729,6 +1789,90 @@ TEST(SqlRuntime, ColumnarJoinBailPartwayThroughAnEmissionKeepsItsOrder) {
            "through an emission";
     EXPECT_EQ(serialized_rows(col_run.records), serialized_rows(row_run.records))
         << "a bail must keep the emission order";
+}
+
+// ----- The admitted Row sidecar layout (row_layout_admission.hpp) -----
+//
+// The coordinator stamps row_layout=2 onto exactly these factories when every
+// worker hosting a deployment reads the second layout. The list lives on the
+// cluster side, which cannot see the SQL factories, so this pins that each
+// name is a registered factory.
+TEST(SqlRuntime, EveryOpTypeTheCoordinatorStampsIsARegisteredFactory) {
+    ensure_sql_installed_once();
+    for (const auto type : cluster::layout_bearing_op_types()) {
+        EXPECT_NE(cluster::DagBuilderRegistry::default_instance().find(std::string{type}), nullptr)
+            << type << " is stamped by the coordinator but no factory of that name exists";
+    }
+}
+
+// A worker given a spec carrying second-layout codes without the stamp (an
+// older coordinator, or a deployment that also runs on a v2 worker) builds
+// first-layout batchers: ts_ms is utf8, so an epoch value in it cannot ride the
+// born-columnar output, which bails to rows exactly as a VARCHAR column given a
+// number does. With the stamp the column is timestamp(ms) and the fire is born
+// columnar. The emitted rows are the same either way.
+TEST(SqlRuntime, AnUnstampedWindowBuildsTheFirstLayoutAndAStampedOneTheSecond) {
+    ensure_sql_installed_once();
+    const auto input = window_rows({{1, 1000}, {1, 2000}, {2, 3000}, {1, 40000}});
+    const std::string schema = "k:i64;c:i64;window_start:ts_ms;window_end:ts_ms";
+
+    const auto row_run = run_tumbling_window_probed(input, "");
+    const auto unstamped = run_tumbling_window_probed(input, schema);
+    const auto stamped = run_tumbling_window_probed(input, schema, "2");
+
+    EXPECT_GT(unstamped.batches, 0);
+    EXPECT_EQ(unstamped.columnar_batches, 0)
+        << "without the stamp ts_ms is utf8, and an epoch value cannot ride a utf8 column: "
+        << unstamped.first_schema;
+    EXPECT_GT(stamped.columnar_batches, 0) << "with the stamp the fire is born columnar";
+    EXPECT_NE(stamped.first_schema.find("window_start: timestamp[ms]"), std::string::npos)
+        << stamped.first_schema;
+    EXPECT_EQ(serialized_rows(stamped.records), serialized_rows(row_run.records));
+    EXPECT_EQ(serialized_rows(unstamped.records), serialized_rows(row_run.records));
+
+    const auto explicit_first = run_tumbling_window_probed(input, schema, "1");
+    EXPECT_EQ(explicit_first.columnar_batches, 0) << "row_layout=1 is the first layout";
+}
+
+TEST(SqlRuntime, AnUnstampedJoinBuildsTheFirstLayoutAndAStampedOneTheSecond) {
+    ensure_sql_installed_once();
+    const auto left = outer_join_rows({{1, 10}, {2, 20}}, "lv");
+    const auto right = outer_join_rows({{1, 100}, {2, 200}}, "rv");
+    const std::string schema = "l_id:i64;l_lv:ts_ms;r_id:i64;r_rv:i64";
+
+    const auto row_run = run_equi_join_probed("inner", left, right, "");
+    const auto unstamped = run_equi_join_probed("inner", left, right, schema);
+    const auto stamped = run_equi_join_probed("inner", left, right, schema, "2");
+
+    EXPECT_GT(unstamped.batches, 0);
+    EXPECT_EQ(unstamped.columnar_batches, 0) << unstamped.first_schema;
+    EXPECT_GT(stamped.columnar_batches, 0);
+    EXPECT_NE(stamped.first_schema.find("l_lv: timestamp[ms]"), std::string::npos)
+        << stamped.first_schema;
+    EXPECT_EQ(serialized_rows(stamped.records), serialized_rows(row_run.records));
+    EXPECT_EQ(serialized_rows(unstamped.records), serialized_rows(row_run.records));
+}
+
+// The columnar Kafka JSON decode: unstamped, a ts_ms column is utf8 and text
+// timestamps ride columnar as text, which is what every released build did. The
+// stamp makes it timestamp(ms), which this build's decoder does not yet take,
+// so the decode stays row form; either way the rows are the row decode's.
+TEST(SqlRuntime, AnUnstampedColumnarJsonDecodeBuildsTheFirstLayout) {
+    ensure_sql_installed_once();
+    const std::vector<std::string> lines{R"({"k":1,"ts":"2026-10-05 10:00:00"})",
+                                         R"({"k":2,"ts":"2026-10-05 10:00:01"})"};
+    const std::string schema = "k:i64;ts:ts_ms";
+
+    const auto unstamped = run_json_columnar_decode_probed(lines, schema);
+    EXPECT_GT(unstamped.columnar_batches, 0) << "first-layout text timestamps ride columnar";
+    EXPECT_NE(unstamped.first_schema.find("ts: string"), std::string::npos)
+        << unstamped.first_schema;
+
+    const auto stamped = run_json_columnar_decode_probed(lines, schema, "2");
+    EXPECT_GT(stamped.batches, 0);
+    EXPECT_EQ(stamped.columnar_batches, 0)
+        << "the stamp resolved ts_ms to timestamp(ms): " << stamped.first_schema;
+    EXPECT_EQ(serialized_rows(stamped.records), serialized_rows(unstamped.records));
 }
 
 // OUTER joins ride the async/disaggregated path too (extends INNER): a match

@@ -492,9 +492,21 @@ void Worker::connect_to_coordinator(const std::string& coordinator_host,
                                         coordinator_host + ":" + std::to_string(coordinator_port));
     }
 
-    const auto reg_frame =
-        encode_frame(MessageKind::Register,
-                     RegisterMsg{worker_id_, data_host_, cfg_.slot_count, cfg_.http_port});
+    RegisterMsg reg{worker_id_, data_host_, cfg_.slot_count, cfg_.http_port};
+    // Test-only: declare an older protocol version than this build speaks,
+    // so a cluster test can stand up a mixed-version cluster from one build.
+    // Only versions this build can still talk to are honoured; anything else
+    // is ignored and the worker declares its own.
+    if (const char* v = std::getenv("CLINK_TEST_REGISTER_PROTOCOL_VERSION");
+        v != nullptr && *v != '\0') {
+        char* end = nullptr;
+        const auto declared = std::strtoul(v, &end, 10);
+        if (end != nullptr && *end == '\0' && declared >= kMinCompatibleClusterProtocolVersion &&
+            declared <= kClusterProtocolVersion) {
+            reg.protocol_version = static_cast<std::uint32_t>(declared);
+        }
+    }
+    const auto reg_frame = encode_frame(MessageKind::Register, reg);
     if (!send_frame_(reg_frame)) {
         throw WorkerConnectionError(WorkerConnectionError::Kind::Transient,
                                     "Worker::connect_to_coordinator: Register send failed");

@@ -344,6 +344,7 @@ include/clink/cluster/replay_driver_registry.hpp
 include/clink/cluster/rescale_coordinator.hpp
 include/clink/cluster/rescale_dispatch.hpp
 include/clink/cluster/restore_compat_gate.hpp
+include/clink/cluster/row_layout_admission.hpp
 include/clink/cluster/runner_helpers.hpp
 include/clink/cluster/runner_registry.hpp
 include/clink/cluster/service_discovery.hpp

@@ -33,6 +33,7 @@
 #include "clink/cluster/protocol_trace.hpp"
 #include "clink/cluster/rescale_dispatch.hpp"
 #include "clink/cluster/restore_compat_gate.hpp"
+#include "clink/cluster/row_layout_admission.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/checkpoint_metrics.hpp"
 #include "clink/metrics/orchestration_metrics.hpp"
@@ -181,6 +182,28 @@ Coordinator::Coordinator(Config cfg) : cfg_(cfg) {
     }
     accept_factory_ = default_accept_factory;
 }
+
+namespace {
+
+// The Row sidecar layout a whole-job deployment may use, `by_worker` being
+// its tasks by the worker they are placed on: layout 1 when no task names a
+// layout-bearing operator, otherwise from the protocol versions those workers
+// registered at. A worker that is no longer registered cannot host anything
+// and is skipped.
+template <typename Registry, typename TasksByWorker>
+RowLayoutAdmission admission_on(const Registry& registered, const TasksByWorker& by_worker) {
+    std::vector<HostingWorker> hosts;
+    std::size_t layout_bearing_ops = 0;
+    for (const auto& [id, tasks] : by_worker) {
+        layout_bearing_ops += count_layout_bearing_ops(tasks);
+        if (const auto it = registered.find(id); it != registered.end()) {
+            hosts.push_back(HostingWorker{id, it->second->protocol_version});
+        }
+    }
+    return admit_row_layout(hosts, layout_bearing_ops);
+}
+
+}  // namespace
 
 void Coordinator::set_accept_factory(AcceptFactory f) {
     accept_factory_ = std::move(f);
@@ -3043,6 +3066,51 @@ bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
         return false;
     }
 
+    // A cutover never changes the job's Row sidecar layout: every feeder of
+    // the new subtasks keeps the one it was deployed with. So while that is
+    // the second layout, the new subtasks may go only to workers that read
+    // it, as the deploy places them. The pool is foreseen here as the deploy
+    // will see it: today's free slots plus those the operator's old subtasks
+    // give back at the teardown. The request is refused only when the
+    // workers that read the layout cannot seat the plan and an older worker
+    // has the room it needs; a plain lack of room is the deploy's to report
+    // (it aborts to the replan). The deploy repeats the restriction against
+    // the workers registered by then.
+    if (job.row_layout == kRowLayoutV2) {
+        std::vector<CutoverCandidate> candidates;
+        for (const auto& [worker_id, worker] : registered_) {
+            if (worker->lost || !worker->conn) {
+                continue;
+            }
+            std::uint32_t free = worker->slot_capacity > worker->slots_in_use
+                                     ? worker->slot_capacity - worker->slots_in_use
+                                     : 0;
+            for (const auto& [key, ident] : job.task_op_identity) {
+                if (ident.op_id != op_id) {
+                    continue;
+                }
+                const auto rec = job.task_records.find(key);
+                if (rec == job.task_records.end() || rec->second.first != worker_id) {
+                    continue;
+                }
+                const auto stamp = job.pending_session.find(key);
+                if (stamp == job.pending_session.end() || stamp->second == worker->session) {
+                    ++free;
+                }
+            }
+            candidates.push_back(CutoverCandidate{worker_id, worker->protocol_version, free});
+        }
+        if (const auto blocker = layout_two_cutover_blocker(plan.tasks, candidates);
+            blocker.has_value()) {
+            reason = "the job runs row layout 2 and the new subtasks of '" + op_id +
+                     "' need the free slots of worker '" + blocker->worker_id +
+                     "', which registered at protocol v" +
+                     std::to_string(blocker->protocol_version) + "; layout 2 needs v" +
+                     std::to_string(kRowLayoutV2ProtocolVersion);
+            return false;
+        }
+    }
+
     // The cutover checkpoint is the job's next id, and it must be on record
     // before the arm that names it leaves (claim_checkpoint_id_). The caller
     // claimed it before taking the lock; a periodic trigger can still have
@@ -3320,10 +3388,17 @@ void Coordinator::hot_cutover_begin_rebind_locked_(JobState& job,
 void Coordinator::hot_cutover_deploy_locked_(JobState& job,
                                              std::vector<PendingDeploy>& out_frames) {
     auto& hot = *job.hot_cutover;
-    // Place the validated plan onto free slots.
+    // Place the validated plan onto free slots. While the job runs the Row
+    // sidecar's second layout, only on workers that read it: eligibility
+    // checked the placement it foresaw, and a worker that registered since
+    // must not take a new subtask the feeders will send typed columns to.
     std::vector<PlacementWorker> workers;
     for (const auto& [worker_id, worker] : registered_) {
         if (worker->lost || !worker->conn) {
+            continue;
+        }
+        if (job.row_layout == kRowLayoutV2 &&
+            effective_protocol_version(worker->protocol_version) < kRowLayoutV2ProtocolVersion) {
             continue;
         }
         const std::uint32_t free = worker->slot_capacity > worker->slots_in_use
@@ -3335,7 +3410,12 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
     }
     auto tasks = hot.planned_tasks;
     if (!assign_task_placement(tasks, workers)) {
-        abort_hot_cutover_locked_(job, "no free slots for the post-cutover subtasks", out_frames);
+        abort_hot_cutover_locked_(job,
+                                  job.row_layout == kRowLayoutV2
+                                      ? "no free slots for the post-cutover subtasks on workers "
+                                        "that read the job's row layout 2"
+                                      : "no free slots for the post-cutover subtasks",
+                                  out_frames);
         return;
     }
 
@@ -3382,6 +3462,7 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
     ++job.topology_version;
     clink::metrics::orch::rescale_cutover_deploy();
 
+    std::size_t stamped_ops = 0;
     for (auto& [worker_id, wtasks] : by_worker) {
         auto it = registered_.find(worker_id);
         if (it == registered_.end() || it->second->lost || !it->second->conn) {
@@ -3408,6 +3489,10 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         dm.adaptive_barrier_mode = job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         dm.expected_state_versions_packed = job.expected_state_versions_packed;
         dm.udfs_packed = job.udfs_packed;
+        // The new subtasks join running feeders and consumers, which keep the
+        // layout they were deployed with: the job's current one, never a
+        // recomputed one.
+        stamped_ops += stamp_row_layout(dm.tasks, job.row_layout);
         out_frames.push_back({it->second->conn, fenced_frame_(MessageKind::Deploy, dm)});
     }
     hot.phase = JobState::HotCutover::Phase::Deploying;
@@ -3415,7 +3500,8 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
     log::info("coordinator.rescale",
               "hot cutover deploy job_id=" + std::to_string(job.id) + " op_id=" + hot.op_id +
                   " new_parallelism=" + std::to_string(hot.target_parallelism) +
-                  " cutover_checkpoint=" + std::to_string(hot.cutover_checkpoint));
+                  " cutover_checkpoint=" + std::to_string(hot.cutover_checkpoint) + " row_layout=" +
+                  std::to_string(job.row_layout) + " stamped_ops=" + std::to_string(stamped_ops));
 }
 
 void Coordinator::hot_cutover_complete_locked_(JobState& job,
@@ -5026,6 +5112,8 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             JobState::TaskOpIdentity{.op_id = t.op_id, .subtask_idx_in_op = t.subtask_idx_in_op};
     }
 
+    std::uint32_t row_layout = kRowLayoutV1;
+    std::string row_layout_note;
     {
         std::lock_guard lock(mu_);
         // A worker may have re-registered since its tasks were placed, and the
@@ -5069,6 +5157,16 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                           " re-registered while the job was being deployed; its " +
                           std::to_string(n) + " task(s) go to the new session");
         }
+        // The Row sidecar layout this deployment may use, from its operators
+        // and the sessions it is about to be sent on. Submit, HA recovery and
+        // the embedded engine all deploy through here, so each decides it
+        // afresh.
+        {
+            const auto admission = admission_on(registered_, by_worker);
+            job->row_layout = admission.layout;
+            row_layout_note = admission.describe();
+        }
+        row_layout = job->row_layout;
         for (const auto& [worker_id, tasks] : by_worker) {
             const auto deploy_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
@@ -5108,6 +5206,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                         ",\"tasks\":" + std::to_string(resolved_plan.tasks.size()) + "}");
 
     // Send Deploy to each affected worker.
+    std::size_t stamped_ops = 0;
     for (auto& [worker_id, tasks] : by_worker) {
         // The socket is copied in the hold: reap_finished_workers_ resets
         // WorkerConnection::conn under mu_, so reading it after the hold
@@ -5146,11 +5245,15 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.adaptive_barrier_mode = checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job->expected_state_versions_packed;
         deploy_msg.udfs_packed = job->udfs_packed;
+        stamped_ops += stamp_row_layout(deploy_msg.tasks, row_layout);
         const auto frame = fenced_frame_(MessageKind::Deploy, deploy_msg);
         if (!conn || !send_frame(*conn, frame)) {
             throw std::runtime_error("Coordinator::deploy: send failed for " + worker_id);
         }
     }
+    log::info("coordinator.submit",
+              "job_id=" + std::to_string(job_id) + " " + row_layout_note +
+                  " stamped_ops=" + std::to_string(stamped_ops));
     // Recorded after the deploy frames went out, as HA recovery records its own.
     if (resumed_from_existing && protocol_trace::enabled()) {
         protocol_trace::Event("Redeploy")
@@ -7091,6 +7194,17 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                   " (latest_completed=" + std::to_string(job.latest_completed_checkpoint_id) +
                   " latest_confirmed=" + std::to_string(job.latest_confirmed_checkpoint_id) +
                   " tracked=" + std::to_string(job.confirm_task_keys.size()) + ")");
+    // A restart redeploys the whole task set, a plain restart and both
+    // rescale flavours alike, so the Row sidecar layout is decided again from
+    // the workers this placement uses: a worker that joined or left since the
+    // last deploy changes the answer, in either direction.
+    std::string row_layout_note;
+    {
+        const auto admission = admission_on(registered_, by_worker);
+        job.row_layout = admission.layout;
+        row_layout_note = admission.describe();
+    }
+    std::size_t stamped_ops = 0;
     std::vector<PendingDeploy> out;
     for (auto& [worker_id, tasks] : by_worker) {
         auto worker_it = registered_.find(worker_id);
@@ -7130,8 +7244,12 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
             job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
+        stamped_ops += stamp_row_layout(deploy_msg.tasks, job.row_layout);
         out.push_back({worker_it->second->conn, fenced_frame_(MessageKind::Deploy, deploy_msg)});
     }
+    log::info(is_rescale || is_replan_rescale ? "coordinator.rescale" : "coordinator.restart",
+              "job_id=" + std::to_string(job.id) + " " + row_layout_note +
+                  " stamped_ops=" + std::to_string(stamped_ops));
     // One restart, one Redeploy event, whatever the number of deploy frames.
     // The specification takes the step once (deploying -> running), so an
     // event per frame read as a second redeploy from the running state and
@@ -7232,10 +7350,17 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         return;
     }
 
-    // Free-slot snapshot. Skip lost workers and any without an open conn.
+    // Free-slot snapshot. Skip lost workers and any without an open conn, and,
+    // while the job runs the Row sidecar's second layout, any worker that
+    // cannot read it: the running subtasks keep that layout, and the new ones
+    // join them on it.
     std::vector<std::pair<std::string, std::uint32_t>> worker_free_slots;
     for (const auto& [worker_id, worker] : registered_) {
         if (worker->lost || !worker->conn) {
+            continue;
+        }
+        if (job.row_layout == kRowLayoutV2 &&
+            effective_protocol_version(worker->protocol_version) < kRowLayoutV2ProtocolVersion) {
             continue;
         }
         const std::uint32_t free_slots = worker->slot_capacity > worker->slots_in_use
@@ -7383,6 +7508,8 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
             job.checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
+        // A partial deploy: the job's current layout, never a recomputed one.
+        stamp_row_layout(deploy_msg.tasks, job.row_layout);
         out.push_back({worker_it->second->conn, fenced_frame_(MessageKind::Deploy, deploy_msg)});
     }
 }

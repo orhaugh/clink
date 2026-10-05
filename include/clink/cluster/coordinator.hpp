@@ -927,6 +927,16 @@ private:
         // registers the functions before running subtasks. Empty when the
         // job uses none.
         std::string udfs_packed;
+        // The Row sidecar layout admitted for the current deployment
+        // (row_layout_admission.hpp): 2 only when it has a layout-bearing
+        // operator and every worker hosting it registered at protocol v3 or
+        // later. Decided afresh on every
+        // whole-job deploy (submit, restart, replan rescale, HA recovery);
+        // a partial deploy (a hot cutover's new subtasks) carries it as it
+        // is, because the running subtasks keep their deploy-time layout.
+        // Stamped onto the Deploy frames only; task_records keep the
+        // unstamped extra_config, so a redeploy decides it again.
+        std::uint32_t row_layout{1};
         // Per-task records keyed by "role:subtask_idx" so a retry can
         // re-send the original Deploy entry to the original worker.
         std::unordered_map<std::string, std::pair<std::string, DeploymentTask>> task_records;

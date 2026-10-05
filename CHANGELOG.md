@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**Cluster protocol version 3 admits the Row sidecar's millisecond timestamp
+layout per deployment.** A deployment runs the second layout only when it has
+a layout-bearing operator (the columnar Kafka JSON decode, a window or a join)
+and every worker hosting it registered at protocol v3 or later, decided again
+at every submit, restart, replan rescale and HA takeover; a job with none stays
+on the first layout and a rolling upgrade costs it nothing. A hot rescale of a
+job running the new layout places its new subtasks only on v3 workers, and
+falls back to the stop-and-replan only when they need a pre-v3 worker's free
+slots. A coordinator from an earlier release never admits it, and a downgrade
+silently runs the first layout. Nothing writes the new layout yet. Job modules
+(`CLINK_REGISTER_JOB`) built against an earlier release must be rebuilt: the
+plugin ABI fingerprint changed.
+
 **The Row sidecar readers accept millisecond timestamp columns ahead of any
 producer writing them.** The row layout gains `ts_ms` and `tstz_ms` codes,
 read only where a reader admits them and otherwise taken as the text they are

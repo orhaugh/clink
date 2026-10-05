@@ -137,6 +137,16 @@ projection or a window feeding a `HAVING` filter, keeps the fingerprint it
 recorded. `EmbeddedEngine.AJobInterruptedUnderTheLastReleaseResumes` pins
 all three shapes against the fingerprints the v0.10.0 release recorded.
 
+`row_layout` is left out on every operator. It is the Row sidecar layout the
+coordinator admitted for one deployment, and the coordinator adds it to the
+Deploy frames it sends, never to the submitted spec the fingerprint is taken
+from; no released planner ever wrote it, so leaving it out changes no
+recorded fingerprint. The embedded engine admits the second layout through
+its own deploy (its in-process worker registers at this build's protocol
+version), and
+`EmbeddedEngine.AdmittingTheSecondRowLayoutLeavesTheResumeFingerprintAlone`
+pins that the admitted run records the v0.10.0 fingerprint.
+
 The check runs in the coordinator, on a job submitted with
 `CheckpointConfig::track_runs`, which only the embedded engine sets. A job
 submitted to a cluster, and one an HA leader takes over, restores from the

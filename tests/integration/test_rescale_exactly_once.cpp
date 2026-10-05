@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -981,7 +982,12 @@ class HotRescaleTest : public RescaleExactlyOnceTest {
 protected:
     // Submit, wait for meaningful committed output, rescale `counter` to
     // `target`, and assert the full hot-cutover contract.
-    void run_hot_and_assert(Cluster& c, int target, const std::string& label) {
+    // `before_rescale`, when set, runs once the committed output is there and
+    // before the request: a test joins a worker to the cluster there.
+    void run_hot_and_assert(Cluster& c,
+                            int target,
+                            const std::string& label,
+                            const std::function<void()>& before_rescale = {}) {
         auto sub = submit(c);
         ASSERT_NE(sub, nullptr);
 
@@ -993,6 +999,12 @@ protected:
             std::chrono::seconds(90)))
             << label
             << ": too little committed output before the rescale for a bad cutover to show up";
+        if (before_rescale) {
+            before_rescale();
+            if (::testing::Test::HasFatalFailure()) {
+                return;
+            }
+        }
 
         std::string rescale_out;
         const int rc = rescale_operator(c, "counter", target, &rescale_out);
@@ -1287,4 +1299,134 @@ TEST_F(HotRescaleTest, ACutoverWhoseCheckpointIdCannotBeRecordedFallsBackToTheRe
     EXPECT_TRUE(v.unexpected.empty())
         << "STATE-MISMATCH across the abort + replan. " << describe(v);
     EXPECT_TRUE(v.missing.empty()) << "records LOST across the abort + replan. " << describe(v);
+}
+
+// ===== Row sidecar layout admission (protocol v3) ===========================
+//
+// A deployment carries the Row sidecar's second layout (typed timestamp
+// columns) only when it has a layout-bearing operator and every worker
+// hosting it registered at protocol v3 or later; the coordinator decides on
+// every whole-job deploy and logs the decision as "job_id=<id> row_layout=<n>
+// ...". A worker is made to register at v2 with
+// CLINK_TEST_REGISTER_PROTOCOL_VERSION, a test-only hook in the worker's
+// registration: a mixed-version cluster from one build.
+//
+// This job has no layout-bearing operator, so it runs the first layout on any
+// workers and the second layout's placement rules never apply to it: these
+// cases pin that a rolling upgrade costs such a job nothing, on a real
+// cluster. The stamped case (a job with a layout-bearing operator: its
+// Deploy frames on submit, restart, the replan rescale and a hot cutover, and
+// a cutover that would need a v2 worker) is pinned at frame level in
+// test_row_layout_admission.cpp, and the factories honouring the stamp in
+// test_sql_runtime.cpp.
+
+namespace {
+
+clink::itest::ProcOptions at_protocol_v2() {
+    return clink::itest::ProcOptions{.env = {{"CLINK_TEST_REGISTER_PROTOCOL_VERSION", "2"}}};
+}
+
+// Two slots a worker, so the starting job (source, counter at 2, sink: four
+// tasks) fills the first two workers and a third has room only for new
+// subtasks.
+ClusterSpec admission_spec() {
+    ClusterSpec s;
+    s.node_binary = node_binary();
+    s.workers = 2;
+    s.slots_per_worker = 2;
+    return s;
+}
+
+}  // namespace
+
+TEST_F(RescaleExactlyOnceTest, AClusterWithAWorkerAtProtocolTwoRunsTheJobExactlyOnce) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);
+    Cluster c(admission_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1, at_protocol_v2()));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return c.coordinator().log_contains(
+                "job_id=1 row_layout=1 (no layout-bearing operator) stamped_ops=0");
+        },
+        std::chrono::seconds(30)))
+        << "the deployment's layout decision was not logged";
+    EXPECT_FALSE(c.coordinator().log_contains("row_layout=2"));
+
+    const auto exit_code = sub->await_exit(std::chrono::seconds(180));
+    ASSERT_TRUE(exit_code.has_value()) << "submitter never exited";
+    EXPECT_EQ(*exit_code, 0) << "the job did not complete on the mixed-version cluster";
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty() && v.missing.empty() && v.unexpected.empty()) << describe(v);
+}
+
+TEST_F(RescaleExactlyOnceTest, AJobWithNoLayoutBearingOperatorStaysOnTheFirstLayoutOnV3Workers) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);
+    Cluster c(admission_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return c.coordinator().log_contains(
+                "job_id=1 row_layout=1 (no layout-bearing operator) stamped_ops=0");
+        },
+        std::chrono::seconds(30)))
+        << "a job that can never send a typed column was admitted to the second layout";
+
+    const auto exit_code = sub->await_exit(std::chrono::seconds(180));
+    ASSERT_TRUE(exit_code.has_value()) << "submitter never exited";
+    EXPECT_EQ(*exit_code, 0);
+    EXPECT_FALSE(c.coordinator().log_contains("row_layout=2"));
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty() && v.missing.empty() && v.unexpected.empty()) << describe(v);
+}
+
+// The rolling-upgrade case a layout decision must not cost: the job runs on
+// two v3 workers, then a third worker joins at protocol v2 with the only free
+// slots, so the cutover's new subtasks of `counter` land on it. The job has
+// no layout-bearing operator, so nothing it sends can carry a typed column,
+// and the cutover is taken hot onto the v2 worker rather than refused to the
+// stop-and-replan.
+TEST_F(HotRescaleTest, AJobWithNoLayoutBearingOperatorCutsOverHotOntoAWorkerAtProtocolTwo) {
+    ::setenv("CLINK_RXO_PAR", "2", 1);
+    Cluster c(admission_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    run_hot_and_assert(c, kMaxParallelism, "hot onto a joined v2 worker", [&] {
+        ASSERT_TRUE(c.coordinator().log_contains(
+            "job_id=1 row_layout=1 (no layout-bearing operator) stamped_ops=0"))
+            << "the premise: the job runs the first layout, decided for its operators";
+        ASSERT_TRUE(c.start_worker(2, at_protocol_v2()));
+        ASSERT_TRUE(c.await_workers_registered(3));
+    });
+    EXPECT_FALSE(c.coordinator().log_contains("hot cutover not taken"))
+        << "the cutover was held to the second layout's placement rules";
+    {
+        const auto log = c.coordinator().read_log();
+        const auto at = log.find("hot cutover deploy job_id=1 op_id=counter new_parallelism=4");
+        ASSERT_NE(at, std::string::npos) << "no hot cutover deploy line";
+        const auto line = log.substr(at, log.find('\n', at) - at);
+        EXPECT_NE(line.find(" row_layout=1 stamped_ops=0"), std::string::npos)
+            << "the cutover's new subtasks were not deployed on the job's first layout: " << line;
+    }
+    // A new subtask ran on the joined v2 worker, so the case exercised the
+    // placement rather than one that avoided it.
+    EXPECT_TRUE(c.worker(2).log_contains("job_id=1 __clink_subtask["))
+        << "no subtask of the job ran on the joined worker";
 }

@@ -50,8 +50,19 @@ namespace clink::cluster {
 // where TCP has not reported EOF. v1 peers remain wire-compatible: a v2
 // coordinator sends the new frame only to a worker that registered as v2, and
 // a v2 worker connected to a v1 coordinator falls back to EOF detection.
-inline constexpr std::uint32_t kClusterProtocolVersion = 2;
+//
+// v3 changes what a Row frame may contain under an unchanged encoding: a v3
+// worker reads the typed timestamp codes of the Row sidecar's second layout
+// (`ts_ms`, `tstz_ms`), which an earlier worker reads as utf8, so a typed
+// column sent to it fails the channel. The coordinator admits that layout for
+// a deployment only when every worker hosting it registered at v3 or later
+// (row_layout_admission.hpp). Every other frame is as v2 left it, so v1 and v2
+// peers remain wire-compatible and simply never receive the second layout.
+inline constexpr std::uint32_t kClusterProtocolVersion = 3;
 inline constexpr std::uint32_t kMinCompatibleClusterProtocolVersion = 1;
+
+// The first version whose workers read the Row sidecar's second layout.
+inline constexpr std::uint32_t kRowLayoutV2ProtocolVersion = 3;
 
 // What a peer that predates versioning looks like on the wire: the field
 // is absent, so it decodes as 0. Treated as version 1 rather than as an
