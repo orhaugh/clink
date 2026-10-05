@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+**A listener is never closed under a thread that may be accepting on it.**
+The coordinator, the data-plane receiver and the HTTP server woke their accept
+thread by closing its listening socket. On macOS a close racing the thread's
+entry into `accept()` could wedge both until a connection arrived, which hung
+`Coordinator::stop()` under load (the occasional `ShutdownLeaks` timeouts); on
+Linux the closed descriptor could be reissued to another listener in the same
+process before the thread reached it. Accept threads now wait in `poll()` and
+are woken, joined, and only then is the listener closed: the wake is a listener
+shutdown on Linux and a self-pipe on macOS. A receiver no longer keeps a peer
+it accepted as teardown began, and a failed accept on its listener that is not
+a shutdown wake now fails the task with `CLINK_NETWORK_CHANNEL_ACCEPT_FAILED`
+instead of ending its input cleanly. `Coordinator::set_accept_factory`
+(Evolving): the factory is now called only once a connection is pending, with
+a non-blocking listener; one that calls `::accept()` itself must handle EAGAIN
+and, on macOS and the BSDs, clear `O_NONBLOCK` on the accepted socket before a
+blocking handshake, or use `NetworkSocket::accept_one`, which does both.
+
+**The HTTP server and client work with descriptors numbered 1024 or above.**
+httplib waited on sockets with `select()`, so on a long-running node with a
+raised `RLIMIT_NOFILE` any descriptor at or above `FD_SETSIZE` made the server
+answer 500, the client fail to read its response, and the listen loop fall
+back into a blocking `accept()`. It is now built with `CPPHTTPLIB_USE_POLL`.
+On macOS `HttpServer::stop()` can take up to 20 ms, because `close()` does not
+wake `poll()` there.
+
 **Cluster protocol version 3 admits the Row sidecar's millisecond timestamp
 layout per deployment.** A deployment runs the second layout only when it has
 a layout-bearing operator (the columnar Kafka JSON decode, a window or a join)

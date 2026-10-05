@@ -1069,6 +1069,18 @@ if(CLINK_BUILD_HTTP)
     # the header.
     set(HTTPLIB_COMPILE OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(httplib)
+    # Wait on sockets with poll(), not httplib's default select(). select()
+    # cannot take a descriptor at or above FD_SETSIZE (1024), and httplib
+    # then gives up rather than wait: a server answers 500 to a connection
+    # whose descriptor is that high, a client fails to read its response,
+    # and the server's listen loop falls through to a blocking accept(),
+    # which brings back the stop() race HttpServer::start avoids with a
+    # bounded wait (see src/http/http_server.cpp). Long-running nodes
+    # raise RLIMIT_NOFILE and hold many sockets, so descriptors that high are
+    # ordinary there. Set on the INTERFACE of the target (the alias cannot
+    # take it) so every translation unit that includes httplib.h compiles
+    # the same inline functions.
+    target_compile_definitions(httplib INTERFACE CPPHTTPLIB_USE_POLL)
 
     # When httplib resolves OpenSSL (CLINK_HTTP_TLS=ON and OpenSSL present),
     # clink_core's http_server / http_client objects reference OpenSSL

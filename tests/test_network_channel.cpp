@@ -1,17 +1,24 @@
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <fcntl.h>
+#include <functional>
 #include <pthread.h>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/core/stream_element.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/network/local_data_plane.hpp"
@@ -721,6 +728,243 @@ TEST(NetworkSocketAccept, ASignalInterruptedAcceptStillDeliversTheConnection) {
     NetworkSocket::close(client_fd);
     NetworkSocket::close(listener_fd);
     ::sigaction(SIGUSR1, &prev, nullptr);
+}
+
+namespace {
+
+// True while `fd` is still the listener bound to `port`: open, and not
+// reissued to another socket. A woken listener counts (on Linux the wake
+// shuts it down, which leaves it open and bound); a closed one does not.
+bool accept_wake_test_is_listening_on(int fd, std::uint16_t port) {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+        addr.sin_family != AF_INET || ntohs(addr.sin_port) != port) {
+        return false;
+    }
+    // Not SO_ACCEPTCONN, which Darwin does not answer. A socket bound to
+    // the port with no peer is the listener: an accepted socket shares the
+    // local port but has a peer.
+    sockaddr_in peer{};
+    socklen_t peer_len = sizeof(peer);
+    return ::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_len) != 0 &&
+           errno == ENOTCONN;
+}
+
+// The descriptor this process holds listening on `port`, or -1. Probes a
+// bounded descriptor range rather than listing /dev/fd, which is enough for a
+// test process.
+int accept_wake_test_listener_for(std::uint16_t port) {
+    for (int fd = 0; fd < 4096; ++fd) {
+        if (accept_wake_test_is_listening_on(fd, port)) {
+            return fd;
+        }
+    }
+    return -1;
+}
+
+bool accept_wake_test_await(const std::function<bool()>& cond) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!cond()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
+}  // namespace
+
+// A wake that lands before the wait starts is not lost, and it ends the wait
+// without closing the listener: the owner closes that, after joining.
+TEST(NetworkSocketAccept, AWakeEndsTheWaitEvenWhenItCameFirst) {
+    std::uint16_t port = 0;
+    const int listener_fd = NetworkSocket::listen_on(port, "127.0.0.1");
+    ASSERT_GE(listener_fd, 0);
+    AcceptWake wake(listener_fd);
+#if defined(__linux__)
+    // On Linux the wake is a shutdown of the listener itself, so a receiver
+    // waiting for a peer costs no descriptors beyond its listener.
+    EXPECT_EQ(wake.fd(), -1) << "the Linux wake allocated a descriptor";
+#endif
+    wake.wake();
+    wake.wake();  // idempotent
+
+    std::atomic<int> result{-2};
+    std::atomic<int> err{0};
+    std::thread acceptor([&] {
+        result.store(NetworkSocket::accept_one(listener_fd, wake));
+        err.store(errno);
+    });
+    acceptor.join();
+    EXPECT_EQ(result.load(), -1);
+    EXPECT_EQ(err.load(), ECANCELED);
+    EXPECT_TRUE(accept_wake_test_is_listening_on(listener_fd, port))
+        << "the wait ended by closing the listener";
+    NetworkSocket::close(listener_fd);
+}
+
+// The waiting accept puts the listener in non-blocking mode, and an accepted
+// socket inherits that on Darwin and the BSDs (not on Linux). Every reader of
+// an accepted fd - recv_all, the TLS handshake - expects a blocking one.
+TEST(NetworkSocketAccept, AWaitingAcceptDeliversABlockingSocket) {
+    std::uint16_t port = 0;
+    const int listener_fd = NetworkSocket::listen_on(port, "127.0.0.1");
+    ASSERT_GE(listener_fd, 0);
+    AcceptWake wake(listener_fd);
+    std::atomic<int> accepted{-2};
+    std::thread acceptor([&] { accepted.store(NetworkSocket::accept_one(listener_fd, wake)); });
+    const int client_fd = NetworkSocket::connect_to("127.0.0.1", port);
+    ASSERT_GE(client_fd, 0);
+    acceptor.join();
+    ASSERT_GE(accepted.load(), 0);
+    EXPECT_NE(::fcntl(listener_fd, F_GETFL) & O_NONBLOCK, 0) << "the listener was left blocking";
+    EXPECT_EQ(::fcntl(accepted.load(), F_GETFL) & O_NONBLOCK, 0)
+        << "the accepted socket inherited the listener's O_NONBLOCK";
+    NetworkSocket::close(accepted.load());
+    NetworkSocket::close(client_fd);
+    NetworkSocket::close(listener_fd);
+}
+
+// A receiver's teardown must not close its listener while the recv thread
+// can still accept() on it. On Darwin, a close() that lands while that thread
+// is entering accept() can miss it, and then both block until a connection
+// arrives - which for the colocated case, where no peer ever connects, is
+// never. On Linux, close() does not wake accept() at all, and a descriptor
+// closed under the thread can be reissued to another receiver's listener in
+// the same worker before the thread gets to it.
+//
+// The recv thread is parked just before it waits; shutdown_recv() must leave
+// the listener open, and once the thread is let go it closes the listener
+// itself, so the port is still given back without waiting for the destructor.
+TEST(NetworkChannel, TeardownNeverClosesTheListenerUnderTheRecvThread) {
+    namespace fault = clink::fault;
+    // Before the fault guard, so an early exit resets the registry (releasing
+    // the parked recv thread) before the destructor joins it.
+    NetworkChannelSource<std::int64_t> source(/*port*/ 0, int64_codec());
+    fault::Registry::instance().reset();
+    fault::ScopedFault park{fault::Rule{.point = fault::points::kNetworkChannelBeforeAccept,
+                                        .ordinal = 1,
+                                        .action = fault::Action::Block}};
+    const std::uint16_t port = source.listen();
+    source.accept();
+    ASSERT_TRUE(accept_wake_test_await([] {
+        return fault::Registry::instance().hits(fault::points::kNetworkChannelBeforeAccept) >= 1;
+    })) << "the recv thread never started";
+    const int listener = accept_wake_test_listener_for(port);
+    ASSERT_GE(listener, 0) << "no descriptor in this process is listening on " << port;
+
+    source.shutdown_recv();
+    const bool open_while_thread_waits = accept_wake_test_is_listening_on(listener, port);
+    // Not asserting the count: the thread can be counted as a hit before it
+    // has parked. The release still reaches it (reach() captures the epoch).
+    fault::Registry::instance().release(fault::points::kNetworkChannelBeforeAccept);
+
+    EXPECT_TRUE(open_while_thread_waits)
+        << "shutdown_recv() closed the listener while the recv thread could still accept() on it";
+    EXPECT_TRUE(accept_wake_test_await([&] {
+        return !accept_wake_test_is_listening_on(listener, port);
+    })) << "the woken recv thread did not give the listener back";
+    EXPECT_FALSE(source.pop().has_value());
+}
+
+// A peer that connects as teardown begins must not strand the recv thread.
+// Teardown wakes the thread and shuts down any peer it can see; a connection
+// the thread accepted but had not yet published is one it cannot see, so the
+// thread must refuse it once woken. Kept instead, the thread would sit in
+// recv_all on a peer nothing will ever shut down, and the destructor's join
+// would wait for that peer to hang up.
+//
+// The recv thread is parked just after it accepts the test's connection;
+// shutdown_recv() runs there, and once let go the thread must close the
+// connection rather than serve it.
+TEST(NetworkChannel, APeerAcceptedDuringTeardownIsRefused) {
+    namespace fault = clink::fault;
+    NetworkChannelSource<std::int64_t> source(/*port*/ 0, int64_codec());
+    // After the source, so it closes first: a kept connection then ends at
+    // the client's close instead of hanging the destructor's join.
+    struct ClientFd {
+        int fd{-1};
+        ~ClientFd() {
+            if (fd >= 0) {
+                NetworkSocket::close(fd);
+            }
+        }
+    } client;
+    fault::Registry::instance().reset();
+    fault::ScopedFault park{fault::Rule{.point = fault::points::kNetworkChannelAfterAccept,
+                                        .ordinal = 1,
+                                        .action = fault::Action::Block}};
+    const std::uint16_t port = source.listen();
+    source.accept();
+    client.fd = NetworkSocket::connect_to("127.0.0.1", port);
+    ASSERT_GE(client.fd, 0);
+    ASSERT_TRUE(accept_wake_test_await([] {
+        return fault::Registry::instance().hits(fault::points::kNetworkChannelAfterAccept) >= 1;
+    })) << "the recv thread never accepted the connection";
+
+    source.shutdown_recv();
+    // Not asserting the count: the thread can be counted as a hit before it
+    // has parked. The release still reaches it (reach() captures the epoch).
+    fault::Registry::instance().release(fault::points::kNetworkChannelAfterAccept);
+
+    // Refused: the client sees the connection end. Served: it receives the
+    // source's initial credit instead, or nothing until the bound.
+    timeval bound{.tv_sec = 10, .tv_usec = 0};
+    ASSERT_EQ(::setsockopt(client.fd, SOL_SOCKET, SO_RCVTIMEO, &bound, sizeof(bound)), 0);
+    std::byte b{};
+    const auto n = ::recv(client.fd, &b, 1, 0);
+    const int err = errno;
+    EXPECT_TRUE(n == 0 || (n < 0 && err != EAGAIN && err != EWOULDBLOCK))
+        << "the recv thread kept a peer it accepted after teardown woke it (recv returned " << n
+        << ", errno " << err << ")";
+    EXPECT_FALSE(source.pop().has_value());
+}
+
+// Only a wake is an orderly end of the wait for a peer. The owner never closes
+// or shuts down the listener to stop the recv thread any more, so an accept
+// that fails EINVAL or EBADF means something else broke the listener, and
+// ending the stream quietly would hand the task a clean end of input with
+// nothing in it: the silent clean end-of-stream that turns into a whole-job
+// restart once the upstream hits the dead connection. It must fail the stream
+// instead, as any other accept failure does.
+//
+// The recv thread is parked before it waits, and the listener's descriptor
+// number is swapped for a socket that is readable but not listening (one end
+// of a socketpair, shut down for reading), so the thread's accept fails
+// EINVAL. Swapped with dup2, so the number stays the source's to close and the
+// listener is closed while no thread is using it.
+TEST(NetworkChannel, AnAcceptFailureThatIsNotAWakeFailsTheStream) {
+    namespace fault = clink::fault;
+    NetworkChannelSource<std::int64_t> source(/*port*/ 0, int64_codec());
+    fault::Registry::instance().reset();
+    fault::ScopedFault park{fault::Rule{.point = fault::points::kNetworkChannelBeforeAccept,
+                                        .ordinal = 1,
+                                        .action = fault::Action::Block}};
+    const std::uint16_t port = source.listen();
+    source.accept();
+    ASSERT_TRUE(accept_wake_test_await([] {
+        return fault::Registry::instance().hits(fault::points::kNetworkChannelBeforeAccept) >= 1;
+    })) << "the recv thread never started";
+    const int listener = accept_wake_test_listener_for(port);
+    ASSERT_GE(listener, 0) << "no descriptor in this process is listening on " << port;
+
+    int pair[2] = {-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+    ASSERT_EQ(::shutdown(pair[0], SHUT_RD), 0);
+    ASSERT_EQ(::dup2(pair[0], listener), listener);
+    ::close(pair[0]);
+    ::close(pair[1]);
+    // Not asserting the count: the thread can be counted as a hit before it
+    // has parked. The release still reaches it (reach() captures the epoch).
+    fault::Registry::instance().release(fault::points::kNetworkChannelBeforeAccept);
+
+    EXPECT_FALSE(source.pop().has_value());
+    ASSERT_NE(source.failure_reason(), nullptr)
+        << "an accept on a broken listener ended the stream as if it were a clean end of input";
+    EXPECT_NE(std::string{source.failure_reason()}.find("accept failed"), std::string::npos)
+        << source.failure_reason();
 }
 
 // The SINK-side data-loss detector, which had no test at all.

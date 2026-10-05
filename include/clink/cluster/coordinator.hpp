@@ -28,6 +28,10 @@
 #include "clink/lineage/lineage_graph.hpp"
 #include "clink/runtime/network/connection.hpp"
 
+namespace clink::network {
+class AcceptWake;
+}  // namespace clink::network
+
 namespace clink::cluster {
 
 struct JobGraphSpec;
@@ -673,6 +677,23 @@ public:
     // Override the factory used to wrap each accepted int fd into a
     // Connection. Default = plain-TCP; clink_node installs a TLS
     // factory when --tls-cert is given. Must be called before start().
+    //
+    // The factory accepts the connection itself, on these terms:
+    //   * It is called only once the accept loop has seen a connection
+    //     pending on the listener, so it never waits for one.
+    //   * The listener it is handed is NON-BLOCKING (the loop waits in
+    //     poll() so stop() can wake it, never in a blocking accept()). A
+    //     pending connection can still be gone by the time the factory
+    //     accepts (reset by its peer), and accept() then fails EAGAIN or
+    //     EWOULDBLOCK: return nullptr and the loop goes back to waiting (a
+    //     throw is survived too, but is logged as a rejected connection).
+    //   * On Darwin and the BSDs an accepted socket inherits O_NONBLOCK from
+    //     the listener, so a blocking handshake or read on it fails at once
+    //     with EAGAIN or SSL_ERROR_WANT_READ. Accept with
+    //     NetworkSocket::accept_one(listener_fd), which returns a blocking
+    //     socket (or -1 with errno EAGAIN when nothing is left to accept),
+    //     or clear O_NONBLOCK on the accepted socket before using it.
+    //   * Throw on a failed handshake; the loop logs it and carries on.
     using AcceptFactory = std::function<std::unique_ptr<network::Connection>(int listener_fd)>;
     void set_accept_factory(AcceptFactory f);
 
@@ -1945,6 +1966,10 @@ private:
         return encode_frame(kind, m);
     }
     int listener_fd_{-1};
+    // Wakes accept_loop_ for stop(), which joins it before closing
+    // listener_fd_; closing the listener under it can wedge both (see
+    // NetworkSocket::accept_one). Created by start().
+    std::unique_ptr<network::AcceptWake> accept_wake_;
     std::uint16_t bound_port_{0};
     std::thread accept_thread_;
     std::thread watchdog_thread_;

@@ -312,6 +312,13 @@ inline constexpr char kCoordinatorBeforeInDoubtWalk[] = "coordinator.before_in_d
 inline constexpr char kCoordinatorBeforeFinalCheckpointRequest[] =
     "coordinator.before_final_checkpoint_request";
 inline constexpr char kCoordinatorBeforeCancelBroadcast[] = "coordinator.before_cancel_broadcast";
+// The accept thread at the top of each pass, before it waits for a
+// connection; and stop() once it has woken that thread, before joining it.
+// Parking the first while observing the second holds stop() in the window
+// where it used to close the listener under a thread that was about to
+// accept() on it.
+inline constexpr char kCoordinatorAcceptBeforeWait[] = "coordinator.accept_before_wait";
+inline constexpr char kCoordinatorStopAfterAcceptWake[] = "coordinator.stop_after_accept_wake";
 
 // Sink two-phase commit.
 inline constexpr char kSinkBeforePrepare[] = "sink.before_prepare";
@@ -334,6 +341,14 @@ inline constexpr char kShardedStageDeathBeforeDelivery[] = "sharded_stage.death_
 
 // State backend + restore.
 inline constexpr char kStateBeforeRestore[] = "state.before_restore";
+
+// Data-plane receiver: the recv thread before it waits for its peer. Parked
+// here, a teardown races a thread about to accept() on the listener.
+inline constexpr char kNetworkChannelBeforeAccept[] = "network_channel.before_accept";
+// The recv thread once it has accepted its peer, before publishing it.
+// Parked here, a teardown wakes a thread that already holds a connection
+// teardown cannot yet see.
+inline constexpr char kNetworkChannelAfterAccept[] = "network_channel.after_accept";
 
 // Worker control-plane dispatch. Fires at the top of Deploy handling, on
 // the reader thread - where the plugin bytes are written to cache and

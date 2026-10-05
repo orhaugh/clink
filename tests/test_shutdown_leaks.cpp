@@ -18,20 +18,26 @@
 // number of cycles; a fixture does not. The assertions are on the delta
 // across the last cycles for that reason.
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <dirent.h>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
 
 #include "clink/cluster/coordinator.hpp"
+#include "clink/fault/fault_injection.hpp"
 
 namespace {
 
@@ -105,7 +111,108 @@ std::size_t settled_thread_count(std::size_t want, std::chrono::milliseconds bou
     return n;
 }
 
+// True while `fd` is still the listener bound to `port`: open, and not
+// reissued to another socket. A woken listener counts (on Linux the wake
+// shuts it down, which leaves it open and bound); a closed one does not.
+bool is_listening_on(int fd, std::uint16_t port) {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+        addr.sin_family != AF_INET || ntohs(addr.sin_port) != port) {
+        return false;
+    }
+    // Not SO_ACCEPTCONN, which Darwin does not answer. A socket bound to
+    // the port with no peer is the listener: an accepted socket shares the
+    // local port but has a peer.
+    sockaddr_in peer{};
+    socklen_t peer_len = sizeof(peer);
+    return ::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_len) != 0 &&
+           errno == ENOTCONN;
+}
+
+// The descriptor this process holds listening on `port`, or -1.
+int listening_fd_for_port(std::uint16_t port) {
+    DIR* d = ::opendir("/dev/fd");
+    if (d == nullptr) {
+        return -1;
+    }
+    int found = -1;
+    while (const auto* e = ::readdir(d)) {
+        const int fd = std::atoi(e->d_name);
+        if (e->d_name[0] != '.' && is_listening_on(fd, port)) {
+            found = fd;
+            break;
+        }
+    }
+    ::closedir(d);
+    return found;
+}
+
+bool await_condition(const std::function<bool()>& cond, std::chrono::milliseconds bound = 10s) {
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+    while (!cond()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    return true;
+}
+
 }  // namespace
+
+// stop() must not close the listener while its accept thread can still be
+// using it: it wakes the thread, joins it, and only then closes.
+//
+// Closing the listener to wake the thread is what it used to do, and on
+// Darwin it wedged under load: a close() that lands while the other thread is
+// entering accept() can miss it, and then both wait - accept() asleep, and
+// close(), uninterruptibly, for accept() to let go of the descriptor - until
+// a connection happens to arrive, which on an idle test coordinator is never.
+// That was the occasional timeout of the two cycling tests below. On Linux,
+// close() does not wake accept() at all, and a descriptor closed under a
+// thread about to use it can be reissued to another listener in the process
+// before the thread gets there.
+//
+// The kernel race itself is too narrow to hit on demand, so this pins the
+// rule that rules it out: the accept thread is parked just before it waits,
+// stop() is let run up to the point where it has woken that thread, and the
+// listener must still be open and listening there.
+TEST(ShutdownLeaks, StopJoinsTheAcceptThreadBeforeClosingItsListener) {
+    namespace fault = clink::fault;
+    // Before the fault guard, so an early exit resets the registry (releasing
+    // the parked accept thread) before the coordinator's destructor joins it.
+    Coordinator c;
+    fault::Registry::instance().reset();
+    fault::ScopedFault park{fault::Rule{.point = fault::points::kCoordinatorAcceptBeforeWait,
+                                        .ordinal = 1,
+                                        .action = fault::Action::Block}};
+    fault::Registry::instance().arm({.point = fault::points::kCoordinatorStopAfterAcceptWake,
+                                     .action = fault::Action::Observe});
+
+    const auto port = c.start();
+    ASSERT_TRUE(await_condition([] {
+        return fault::Registry::instance().hits(fault::points::kCoordinatorAcceptBeforeWait) >= 1;
+    })) << "the accept thread never started its first pass";
+    const int listener = listening_fd_for_port(port);
+    ASSERT_GE(listener, 0) << "no descriptor in this process is listening on " << port;
+
+    std::thread stopper([&] { c.stop(); });
+    const bool woke = await_condition([] {
+        return fault::Registry::instance().hits(fault::points::kCoordinatorStopAfterAcceptWake) >=
+               1;
+    });
+    const bool open_while_thread_lives = is_listening_on(listener, port);
+    // Not asserting the count: the thread can be counted as a hit before it
+    // has parked. The release still reaches it (reach() captures the epoch).
+    fault::Registry::instance().release(fault::points::kCoordinatorAcceptBeforeWait);
+    stopper.join();
+
+    ASSERT_TRUE(woke) << "stop() never reached the point after waking the accept thread";
+    EXPECT_TRUE(open_while_thread_lives)
+        << "stop() closed the listener while the accept thread could still accept() on it";
+    EXPECT_FALSE(is_listening_on(listener, port)) << "stop() returned with its listener open";
+}
 
 TEST(ShutdownLeaks, StartingAndStoppingACoordinatorReleasesItsDescriptors) {
     // One cycle first, to let anything lazily created on the first start

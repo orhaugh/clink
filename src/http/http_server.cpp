@@ -300,6 +300,24 @@ std::uint16_t HttpServer::start(const std::string& host, std::uint16_t port) {
     }
     bound_port_ = static_cast<std::uint16_t>(actually_bound);
     running_.store(true, std::memory_order_release);
+    // Wait in a bounded poll() and accept only what is pending, never in a
+    // blocking accept(). httplib's stop() wakes the listen thread by closing
+    // its socket, and on Darwin a close() that lands while that thread is
+    // entering accept() can miss it: both then block - accept() asleep, and
+    // close() uninterruptibly waiting for it - until a connection arrives.
+    // A start/stop hammer with a random gap wedged that way within seconds;
+    // with the bounded wait it ran clean. (httplib's POSIX default is no idle
+    // interval, which means a bare blocking accept.) The wait is poll() only
+    // because the build defines CPPHTTPLIB_USE_POLL (CMakeLists.txt): with
+    // httplib's select() a listener at or above FD_SETSIZE skips the wait
+    // and goes straight to the blocking accept().
+    //
+    // The interval is also how long stop() can take on Darwin, where close()
+    // wakes a select() on the socket but not a poll(): the listen thread
+    // only sees the stop when its wait times out. On Linux httplib's
+    // shutdown() wakes the poll() at once. 20ms keeps stop() quick there
+    // and costs an idle server 50 wake-ups a second.
+    impl_->server.set_idle_interval(0, 20'000);
     // listen_after_bind blocks; spawn it so start() returns.
     impl_->listen_thread = std::thread([this] { impl_->server.listen_after_bind(); });
     return bound_port_;

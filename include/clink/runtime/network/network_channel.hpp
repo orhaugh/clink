@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -19,6 +20,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
 #include "clink/core/stream_element.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/network_metrics.hpp"
 #include "clink/metrics/operator_metrics.hpp"
 #include "clink/runtime/bounded_channel.hpp"
@@ -511,33 +513,32 @@ public:
         // Wake any blocked socket thread and join it before tearing
         // down the fds. The recv-thread parses frames into
         // local_channel_; closing the channel here also wakes any
-        // thread blocked in pop(). To unblock the recv-thread out of
-        // accept_one or recv_all we shutdown + close the underlying fds.
+        // thread blocked in pop(). shutdown_read on the peer wakes a
+        // recv_all; the accept wake wakes a recv-thread still waiting for
+        // its peer, which is the common colocated case (the sink used the
+        // LocalDataPlane fast path and no TCP peer ever connects).
         local_channel_->close();
         if (recv_thread_.joinable()) {
+            // Wake first, then look for a peer: see wake_accept_.
+            wake_accept_();
             if (peer_fd_ >= 0) {
                 NetworkSocket::shutdown_read(peer_fd_);
-            }
-            if (listener_fd_ >= 0) {
-                int fd = listener_fd_;
-                listener_fd_ = -1;
-                // shutdown_read wakes a blocked accept() on Linux; close alone
-                // does NOT (close only wakes accept on macOS/BSD). BOTH are
-                // needed. Without the shutdown, recv_loop_'s accept_one never
-                // returns on Linux when no TCP peer ever connected (the common
-                // colocated case, where the sink used the LocalDataPlane
-                // fast path), so this join() - and the whole subtask teardown,
-                // and thus the job's SubtaskFinished / JobCompleted - hangs.
-                NetworkSocket::shutdown_read(fd);
-                NetworkSocket::close(fd);
             }
             recv_thread_.join();
         }
         if (peer_fd_ >= 0) {
             NetworkSocket::close(peer_fd_);
         }
-        if (listener_fd_ >= 0) {
-            NetworkSocket::close(listener_fd_);
+        // Only now, with no thread left that can be waiting on it (see
+        // NetworkSocket::accept_one for why closing it under one is unsafe),
+        // and with the wake released first, since on Linux it acts on the
+        // listener's descriptor.
+        {
+            std::lock_guard lock(accept_wake_mu_);
+            accept_wake_.reset();
+        }
+        if (const int fd = listener_fd_.exchange(-1); fd >= 0) {
+            NetworkSocket::close(fd);
         }
         LocalDataPlane::instance().unregister_endpoint(bind_host_, bound_port_);
     }
@@ -579,6 +580,13 @@ public:
     // here forever. If a socket peer never connects, the recv-thread
     // sits in accept_one until shutdown_recv() / destructor wakes it.
     void accept() {
+        {
+            std::lock_guard lock(accept_wake_mu_);
+            accept_wake_ = std::make_unique<AcceptWake>(listener_fd_.load());
+            if (accept_woken_) {
+                accept_wake_->wake();  // shutdown_recv() came first
+            }
+        }
         recv_thread_ = std::thread([this] { recv_loop_(); });
     }
 
@@ -640,23 +648,32 @@ public:
     // reason).
     void shutdown_recv() {
         local_channel_->close(ChannelCloseReason::Cancelled);
+        // Wake the recv-thread if it is still waiting for its peer; it
+        // closes the listener itself on the way out. Never close the
+        // listener from here: the recv-thread may be in accept on it (see
+        // NetworkSocket::accept_one). Wake first, then look for a peer:
+        // see wake_accept_.
+        wake_accept_();
         if (peer_fd_ >= 0) {
             NetworkSocket::shutdown_read(peer_fd_);
-        }
-        if (listener_fd_ >= 0) {
-            // Wake the recv-thread's blocked accept_one. shutdown_read wakes
-            // accept() on Linux; close wakes it on macOS/BSD (where shutdown on
-            // a listening socket is a no-op). BOTH are needed for portability -
-            // close alone leaves accept() blocked on Linux when no TCP peer
-            // ever connected (the colocated LocalDataPlane fast path).
-            int fd = listener_fd_;
-            listener_fd_ = -1;
-            NetworkSocket::shutdown_read(fd);
-            NetworkSocket::close(fd);
         }
     }
 
 private:
+    // The recv-thread publishes peer_fd_ under accept_wake_mu_ and refuses a
+    // connection it accepted once accept_woken_ is set. So a caller that
+    // wakes through here and only THEN reads peer_fd_ either sees the peer
+    // (and can shut it down) or knows the thread will drop it: a peer that
+    // connects during teardown can never leave the thread in recv_all with
+    // nothing left to wake it.
+    void wake_accept_() {
+        std::lock_guard lock(accept_wake_mu_);
+        accept_woken_ = true;
+        if (accept_wake_ != nullptr) {
+            accept_wake_->wake();
+        }
+    }
+
     // Single-threaded socket recv loop. Lives for the lifetime of the
     // source: parses one frame at a time, pushes each StreamElement
     // into local_channel_, and exits on EOF / Close / parse failure.
@@ -681,23 +698,52 @@ private:
             ~CloseOnExit() { ch->close(*reason); }
         };
         CloseOnExit guard{local_channel_, &recv_close_reason_};
-        peer_fd_ = NetworkSocket::accept_one(listener_fd_);
+        CLINK_FAULT_POINT(clink::fault::points::kNetworkChannelBeforeAccept);
+        // accept_wake_ is set before this thread starts and only this thread
+        // releases it, so it is read here without the lock.
+        int accepted = NetworkSocket::accept_one(listener_fd_, *accept_wake_);
+        int accept_err = errno;
+        CLINK_FAULT_POINT(clink::fault::points::kNetworkChannelAfterAccept);
+        // The listener and the wake are done with either way: this thread is
+        // the only one that waits on them, so it is the one that closes them.
+        // Closing the listener now also refuses any later connect at once
+        // rather than queueing it for a thread that is gone. The wake is
+        // released first: on Linux it acts on the listener's descriptor, so
+        // no wake may land after the close.
+        {
+            std::lock_guard lock(accept_wake_mu_);
+            accept_wake_.reset();
+            // A peer accepted as teardown woke us is refused, and the peer
+            // is published under this lock (see wake_accept_).
+            if (accepted >= 0 && accept_woken_) {
+                NetworkSocket::close(accepted);
+                accepted = -1;
+                accept_err = ECANCELED;
+            }
+            peer_fd_ = accepted;
+        }
+        if (const int fd = listener_fd_.exchange(-1); fd >= 0) {
+            NetworkSocket::close(fd);
+        }
         if (peer_fd_ < 0) {
-            const int err = errno;
-            // EBADF/EINVAL are the owner waking us for shutdown (the
-            // destructor closes or shuts down the listener while we block
-            // here): an orderly end. CloseOnExit closes the channel; any
-            // local sink pushes still in the channel drain before pop()
-            // returns nullopt. accept_one already retried the transient
-            // errnos (EINTR/ECONNABORTED), so anything ELSE here - file
-            // descriptor exhaustion above all - is a real failure, and
+            const int err = accept_err;
+            // ECANCELED is the owner waking us for shutdown (shutdown_recv or
+            // the destructor) while we wait here: an orderly end, and the
+            // only one. CloseOnExit closes the channel; any local sink pushes
+            // still in the channel drain before pop() returns nullopt. The
+            // owner never closes or shuts down the listener to wake us (a
+            // Linux wake that does reaches us as ECANCELED, see accept_one),
+            // so EBADF or EINVAL here means something else broke it.
+            // accept_one already retried the transient errnos
+            // (EINTR/ECONNABORTED), so anything ELSE here - file descriptor
+            // exhaustion above all - is a real failure, and
             // returning silently would convert it into a clean
             // end-of-stream: the task completes "ok" holding nothing, its
             // upstream hits the dead connection as "peer gone", and the
             // origin of the cascade never appears in any log (item 72's
             // silent half). Fail loudly instead; the bridge source turns
             // failure_reason() into a task failure.
-            if (err != EBADF && err != EINVAL) {
+            if (err != ECANCELED) {
                 std::fprintf(stderr,
                              "CLINK_NETWORK_CHANNEL_ACCEPT_FAILED port=%u errno=%d\n",
                              static_cast<unsigned>(bound_port_.load()),
@@ -708,8 +754,6 @@ private:
             }
             return;
         }
-        NetworkSocket::close(listener_fd_);
-        listener_fd_ = -1;
         send_credit_(kInitialNetworkCredit);
 
         while (true) {
@@ -907,6 +951,15 @@ private:
     // place regardless of how the records got in.
     std::shared_ptr<LocalEndpointChannel<T>> local_channel_;
     std::thread recv_thread_;
+    // Wakes the recv-thread while it waits for its peer, so teardown can join
+    // it before closing the listener. Created by accept() and released by the
+    // recv-thread once it stops waiting. It costs no descriptors on Linux; on
+    // Darwin and the BSDs it holds a pipe, so a colocated source, whose
+    // recv-thread waits for its whole life, holds two more there.
+    // accept_woken_ carries a wake that came before accept().
+    std::mutex accept_wake_mu_;
+    std::unique_ptr<AcceptWake> accept_wake_;
+    bool accept_woken_{false};
     // Per-operator bytes attribution (set by the bridge before accept()).
     MetricsRegistry* op_reg_{nullptr};
     std::uint64_t op_id_for_bytes_{0};

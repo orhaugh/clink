@@ -3,7 +3,10 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
+#include <stdexcept>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -147,18 +150,142 @@ int NetworkSocket::accept_one(int listener_fd) {
         // upstream then hit the reset backlog connection as "peer gone"
         // and a whole-job restart followed (QUAL-06, followups item 72:
         // intermittent at ~292 deployed tasks, deterministic at ~1,160).
-        // Anything else - including EBADF/EINVAL from the owner closing
-        // the listener to wake us for shutdown - stays terminal, with
-        // errno preserved for the caller to classify.
+        // Anything else stays terminal, with errno preserved for the
+        // caller to classify. EBADF/EINVAL are among those: the listener
+        // was closed or is no longer listening. The waiting overload below
+        // reports its own wake as ECANCELED, so a caller stopped that way
+        // never has to read them as shutdown.
         if (errno == EINTR || errno == ECONNABORTED) {
             continue;
         }
         return -1;
     }
+    // An accepted socket inherits O_NONBLOCK from a non-blocking listener on
+    // Darwin and the BSDs (not on Linux), and every reader of an accepted fd
+    // - recv_all, the TLS handshake - expects a blocking one.
+    if (const int flags = ::fcntl(fd, F_GETFL); flags >= 0 && (flags & O_NONBLOCK) != 0) {
+        ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return fd;
 }
+
+bool NetworkSocket::wait_for_connection(int listener_fd, const AcceptWake& wake) {
+    // poll() skips a negative fd, which would turn a missing listener into a
+    // wait only a wake can end; fail it the way accept() would.
+    if (listener_fd < 0) {
+        errno = EBADF;
+        return false;
+    }
+    // Non-blocking, so the accept that follows can never park: readiness can
+    // be stale by the time accept() runs (the pending connection was reset
+    // and dropped from the queue), and a blocking accept() would then sleep
+    // where only a new connection could wake it.
+    if (const int flags = ::fcntl(listener_fd, F_GETFL); flags >= 0 && (flags & O_NONBLOCK) == 0) {
+        ::fcntl(listener_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    for (;;) {
+        pollfd fds[2] = {{listener_fd, POLLIN, 0}, {wake.fd(), POLLIN, 0}};
+        const nfds_t nfds = wake.fd() >= 0 ? 2 : 1;
+        if (::poll(fds, nfds, -1) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        // Woken wins over a pending connection: the owner is stopping and
+        // will close the listener, which resets anything still queued.
+        if (wake.woken()) {
+            errno = ECANCELED;
+            return false;
+        }
+        if ((fds[0].revents & POLLIN) != 0) {
+            return true;
+        }
+        // Ready without a connection and without a wake: the descriptor is
+        // not a usable listener (closed, or shut down by someone else).
+        // Waiting again would spin, so fail it as accept() would.
+        if (fds[0].revents != 0) {
+            errno = (fds[0].revents & POLLNVAL) != 0 ? EBADF : EINVAL;
+            return false;
+        }
+    }
+}
+
+int NetworkSocket::accept_one(int listener_fd, const AcceptWake& wake) {
+    for (;;) {
+        if (!wait_for_connection(listener_fd, wake)) {
+            return -1;
+        }
+        const int fd = accept_one(listener_fd);
+        if (fd >= 0) {
+            // Woken wins here too: on Darwin the wake leaves the listener
+            // alone, so a connection can still be accepted after it.
+            if (wake.woken()) {
+                NetworkSocket::close(fd);
+                errno = ECANCELED;
+                return -1;
+            }
+            return fd;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            continue;
+        }
+        // A wake between the wait and the accept (on Linux it shuts the
+        // listener down, so accept() fails EINVAL) is still a wake.
+        if (wake.woken()) {
+            errno = ECANCELED;
+        }
+        return -1;
+    }
+}
+
+#if defined(__linux__)
+
+// Linux: shutdown() on the listener is the wake (see the header). No pipe.
+AcceptWake::AcceptWake(int listener_fd) : listener_fd_(listener_fd) {}
+
+AcceptWake::~AcceptWake() = default;
+
+void AcceptWake::wake() noexcept {
+    if (!woken_.exchange(true, std::memory_order_acq_rel) && listener_fd_ >= 0) {
+        ::shutdown(listener_fd_, SHUT_RD);
+    }
+}
+
+#else
+
+AcceptWake::AcceptWake(int listener_fd) : listener_fd_(listener_fd) {
+    int fds[2] = {-1, -1};
+    if (::pipe(fds) != 0) {
+        throw std::runtime_error(std::string{"AcceptWake: pipe failed: "} + std::strerror(errno));
+    }
+    read_fd_ = fds[0];
+    write_fd_ = fds[1];
+    // Not inherited by a spawned child, and a wake can never block its
+    // caller: once the pipe is full it is readable anyway.
+    for (const int fd : fds) {
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    ::fcntl(write_fd_, F_SETFL, ::fcntl(write_fd_, F_GETFL) | O_NONBLOCK);
+}
+
+AcceptWake::~AcceptWake() {
+    ::close(read_fd_);
+    ::close(write_fd_);
+}
+
+void AcceptWake::wake() noexcept {
+    // Flag first: a waiter that sees the pipe ready reads it as a wake.
+    woken_.store(true, std::memory_order_release);
+    const char byte = 1;
+    // EAGAIN means the pipe is already full, which is already a wake.
+    while (::write(write_fd_, &byte, 1) < 0 && errno == EINTR) {
+    }
+}
+
+#endif
 
 bool NetworkSocket::send_all(int fd, const std::byte* buf, std::size_t len) {
     while (len > 0) {

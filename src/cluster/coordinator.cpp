@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -160,9 +162,11 @@ std::string js_quote(const std::string& s) {
 
 namespace {
 
-// Default plain-TCP accept factory: block on accept_one, wrap the
-// accepted client fd in a PlainTcpConnection. TLS callers replace
-// this via set_accept_factory.
+// Default plain-TCP accept factory: accept the connection accept_loop_
+// has already waited for and wrap it in a PlainTcpConnection. The
+// listener is non-blocking by then, so a connection that has gone yields
+// nullptr rather than a parked accept. TLS callers replace this via
+// set_accept_factory.
 std::unique_ptr<network::Connection> default_accept_factory(int listener_fd) {
     const int fd = network::NetworkSocket::accept_one(listener_fd);
     if (fd < 0)
@@ -1216,6 +1220,7 @@ std::uint16_t Coordinator::start(std::uint16_t port) {
     if (cfg_.advertise_host.empty()) {
         cfg_.advertise_host = cfg_.bind_host;
     }
+    accept_wake_ = std::make_unique<network::AcceptWake>(listener_fd_);
     accept_thread_ = std::thread([this] { accept_loop_(); });
     watchdog_thread_ = std::thread([this] { watchdog_loop_(); });
     checkpoint_thread_ = std::thread([this] { checkpoint_trigger_loop_(); });
@@ -1224,14 +1229,38 @@ std::uint16_t Coordinator::start(std::uint16_t port) {
 
 void Coordinator::accept_loop_() {
     while (!stop_.load(std::memory_order_acquire)) {
-        // Factory does accept_one + any TLS handshake. On listener
-        // shutdown, accept_one returns -1 → factory returns nullptr →
-        // we exit. On a TLS handshake failure, the factory throws;
-        // catch so one bad client can't kill the accept loop.
+        CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAcceptBeforeWait);
+        // Wait here, where stop() can wake us, and never in a blocking
+        // accept(): stop() joins this thread before it closes the listener
+        // (see stop()). The wait leaves the listener non-blocking, so the
+        // factory's accept returns at once even if the connection it saw has
+        // gone, and the loop comes back here.
+        if (!network::NetworkSocket::wait_for_connection(listener_fd_, *accept_wake_)) {
+            const int err = errno;
+            if (stop_.load(std::memory_order_acquire) || err == ECANCELED) {
+                return;
+            }
+            // poll() itself failing (ENOMEM, say) is not something a retry
+            // here can outlast, and spinning on it helps nobody.
+            log::error("coordinator.accept",
+                       std::string{"no longer accepting connections: waiting for one failed: "} +
+                           std::strerror(err));
+            return;
+        }
+        if (stop_.load(std::memory_order_acquire)) {
+            return;
+        }
+        // Factory does accept_one + any TLS handshake; nullptr when the
+        // connection went before it was accepted. On a TLS handshake
+        // failure, the factory throws; catch so one bad client can't kill
+        // the accept loop.
         std::unique_ptr<network::Connection> conn;
         try {
             conn = accept_factory_(listener_fd_);
         } catch (const std::exception& e) {
+            if (stop_.load(std::memory_order_acquire)) {
+                return;  // stop() woke us between the wait and the accept
+            }
             log::warn("coordinator.accept", std::string{"connection rejected: "} + e.what());
             continue;
         }
@@ -1239,6 +1268,13 @@ void Coordinator::accept_loop_() {
             if (stop_.load(std::memory_order_acquire))
                 return;
             continue;  // transient: malformed handshake, peer disappeared
+        }
+        // stop() woke us after the factory's accept (on Darwin the wake
+        // leaves the listener alone, so that accept can still succeed).
+        // Drop the connection rather than make stop()'s join wait out its
+        // first-frame read.
+        if (stop_.load(std::memory_order_acquire)) {
+            return;
         }
         // A decoder throwing must not take the coordinator with it.
         //
@@ -8225,23 +8261,30 @@ void Coordinator::stop() {
     // destroy-outside-the-lock pattern) lets the rest of stop()
     // proceed without contending with autoscaler callbacks.
     stop_autoscalers_();
-    // shutdown_read on the listener wakes accept() on Linux but is a
-    // no-op on macOS / BSDs. Close the listener fd to portably wake
-    // accept_one. Closing while accept is blocked is safe here: the
-    // accept thread can only be in accept() (no other use of the fd),
-    // and we join it before doing anything else with the descriptor.
+    // Wake the accept thread, join it, and only then close the listener.
+    // Closing the listener to wake it is what this used to do, and it is
+    // not safe: on Darwin a close() that lands while the accept thread is
+    // entering accept() can miss it, and then both wait for ever - accept()
+    // asleep, and close(), uninterruptibly, for accept() to let go of the
+    // descriptor - until a connection happens to arrive. On Linux close()
+    // does not wake accept() at all (the shutdown_read that went with it
+    // did), and a descriptor closed under a thread about to use it can be
+    // reissued to another listener in this process before it gets there.
     //
-    // Write listener_fd_ = -1 only AFTER joining the accept thread.
-    // Joining establishes the happens-before edge the accept thread
-    // needs to safely retire its reads of listener_fd_ - without it
-    // TSan (correctly) flags the unsynchronised write against the
-    // accept_loop_'s read in accept_one(listener_fd_).
-    if (listener_fd_ >= 0) {
-        network::NetworkSocket::shutdown_read(listener_fd_);
-        network::NetworkSocket::close(listener_fd_);
+    // Write listener_fd_ = -1 only AFTER joining the accept thread, which
+    // is the happens-before edge for its reads of listener_fd_.
+    if (accept_wake_ != nullptr) {
+        accept_wake_->wake();
     }
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorStopAfterAcceptWake);
     if (accept_thread_.joinable()) {
         accept_thread_.join();
+    }
+    // The wake goes before the listener: on Linux it acts on the
+    // listener's descriptor, which must not outlive the close.
+    accept_wake_.reset();
+    if (listener_fd_ >= 0) {
+        network::NetworkSocket::close(listener_fd_);
     }
     listener_fd_ = -1;
     if (watchdog_thread_.joinable()) {
