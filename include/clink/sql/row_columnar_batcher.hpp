@@ -331,21 +331,17 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
 // takes the row path for a row that has one that is not exact. The rules are the
 // columnar JSON decoder's (json_string_to_row_columnar.hpp, append_cell_), made
 // strict where its row reference coerces at ingestion and a computed output
-// value is not coerced: a REAL must already be at float precision, a DECIMAL
-// must already be a dec-string at the column's scale.
+// value is not coerced: a DOUBLE must already be a double, a REAL a double at
+// float precision, a DECIMAL a dec-string at the column's scale.
 inline bool cell_is_exact(const arrow::DataType& layout, const clink::config::JsonValue* v) {
     if (v == nullptr || v->is_null()) {
         return true;  // a null cell reads back as null, as an absent one does
     }
-    // 2^53: the largest magnitude below which every integer has a double.
-    constexpr std::int64_t kDoubleExactInt = std::int64_t{1} << 53;
-    // 2^24: the same for a float.
-    constexpr std::int64_t kFloatExactInt = std::int64_t{1} << 24;
+    // A double or float cell reads back as a double, so an integer, which
+    // prints the same, would come back taking double arithmetic where it took
+    // integer arithmetic. Only a double goes in.
     const auto float_exact = [&](const clink::config::JsonValue& n) {
-        if (n.is_integral_number()) {
-            return n.as_int() >= -kFloatExactInt && n.as_int() <= kFloatExactInt;
-        }
-        if (!n.is_number()) {
+        if (!n.is_number() || n.is_integral_number()) {
             return false;
         }
         const double d = n.as_number();
@@ -354,39 +350,26 @@ inline bool cell_is_exact(const arrow::DataType& layout, const clink::config::Js
     };
     switch (layout.id()) {
         case arrow::Type::TIMESTAMP:
-            // Only timestamp(ms[, tz]) is a timestamp layout (effective_type).
-            // Its cell reads back as the int64 it holds, so only an integer comes
-            // back as it went in: an integral double would come back an integer,
-            // and the evaluator's arithmetic follows the value's kind.
+            // Only timestamp(ms[, tz]) is a timestamp layout (effective_type);
+            // its cell reads back as the int64 it holds, as an INT64 cell does.
             if (!is_timestamp_ms(layout)) {
                 break;
             }
-            return v->is_integral_number();
+            [[fallthrough]];
         case arrow::Type::INT64:
-            // A double holding an integer reads back as that integer, which
-            // serialises the same; a fraction would be truncated.
-            if (v->is_integral_number()) {
-                return true;
-            }
-            return v->is_number() && double_fits_int64(v->as_number()) &&
-                   v->as_number() == std::floor(v->as_number());
-        case arrow::Type::INT32: {
-            constexpr auto kLo = std::numeric_limits<std::int32_t>::min();
-            constexpr auto kHi = std::numeric_limits<std::int32_t>::max();
-            if (v->is_integral_number()) {
-                return v->as_int() >= kLo && v->as_int() <= kHi;
-            }
-            if (!v->is_number()) {
-                return false;
-            }
-            const double d = v->as_number();
-            return std::isfinite(d) && d == std::floor(d) && d >= kLo && d <= kHi;
-        }
+            // The cell reads back as an integer, so only an integer comes back
+            // as it went in: an integral double such as 5.0 would come back as 5,
+            // which prints the same but takes integer arithmetic where the double
+            // took double arithmetic, and the evaluator follows the value's kind.
+            return v->is_integral_number();
+        case arrow::Type::INT32:
+            // The same, within int32.
+            return v->is_integral_number() &&
+                   v->as_int() >= std::numeric_limits<std::int32_t>::min() &&
+                   v->as_int() <= std::numeric_limits<std::int32_t>::max();
         case arrow::Type::DOUBLE:
-            if (v->is_integral_number()) {
-                return v->as_int() >= -kDoubleExactInt && v->as_int() <= kDoubleExactInt;
-            }
-            return v->is_number();
+            // A double only, for the reason float_exact gives.
+            return v->is_number() && !v->is_integral_number();
         case arrow::Type::FLOAT:
             return float_exact(*v);
         case arrow::Type::BOOL:
@@ -509,10 +492,12 @@ inline clink::config::JsonValue read_cell(const std::shared_ptr<arrow::DataType>
 
 }  // namespace row_columnar_detail
 
-// The schema-aware NDJSON decoder for a declared column list: the DECIMAL scales
-// and FLOAT columns are read off the declared types, so a caller only has to hold
-// the schema it already has. Types are taken through effective_type, matching what
-// the columnar carriers actually store.
+// The schema-aware NDJSON decoder for a declared column list: the DECIMAL scales,
+// FLOAT columns and DOUBLE columns are read off the declared types, so a caller
+// only has to hold the schema it already has. Types are taken through
+// effective_type, matching what the columnar carriers actually store. A DOUBLE
+// column's integer tokens become doubles (coerce_row_doubles), as the columnar
+// decoder's DoubleBuilder holds them.
 //
 // Both JSON-source bridges build their decoder from this - the plain
 // json_string_to_row and the columnar decoder's row fallback - so the two agree
@@ -521,15 +506,33 @@ inline clink::TextFormat<Row> row_json_text_format_for_columns(
     const std::vector<RowColumn>& columns) {
     std::map<std::string, int> decimal_scales;
     std::vector<std::string> float_columns;
+    std::vector<std::string> double_columns;
     for (const auto& c : columns) {
         const auto eff = row_columnar_detail::effective_type(c.type);
         if (eff->id() == arrow::Type::DECIMAL128) {
             decimal_scales[c.name] = static_cast<const arrow::Decimal128Type&>(*eff).scale();
         } else if (eff->id() == arrow::Type::FLOAT) {
             float_columns.push_back(c.name);
+        } else if (eff->id() == arrow::Type::DOUBLE) {
+            double_columns.push_back(c.name);
         }
     }
-    return row_json_text_format_typed(std::move(decimal_scales), std::move(float_columns));
+    auto typed = row_json_text_format_typed(std::move(decimal_scales), std::move(float_columns));
+    if (double_columns.empty()) {
+        return typed;
+    }
+    return clink::TextFormat<Row>{
+        .decode = [typed, doubles = std::move(double_columns)](
+                      std::string_view line) -> std::optional<Row> {
+            auto r = typed.decode(line);
+            if (r.has_value()) {
+                coerce_row_doubles(*r, doubles);
+            }
+            return r;
+        },
+        // A coerced value serialises as the integer did, so encode is unchanged.
+        .encode = typed.encode,
+    };
 }
 
 // row_json_text_format_for_columns, restricted to a keep-list of column names.

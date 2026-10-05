@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -201,6 +202,12 @@ private:
     // number as a full-precision double and never produced a dec-string, so a
     // columnar float32 truncation or dec-string was a visible difference.
     //
+    // It coerces a declared DOUBLE column's integer tokens to double, as the
+    // double cell holds them. It does not coerce BIGINT or INTEGER: it keeps an
+    // integer token as an exact int64 and any other numeral, 5.0 and 5e0
+    // included, as a double. An int64 or int32 column therefore takes only an
+    // integer token in its range, and the rest fall back.
+    //
     // TIMESTAMP and TIMESTAMPTZ are here as timestamp(ms[, tz]), the type their
     // second Row layout codes (ts_ms, tstz_ms) name, and only where the
     // deployment is admitted to that layout: otherwise parse_row_schema resolves
@@ -210,9 +217,9 @@ private:
     // epoch-millisecond value read back as that integer, and the row reference
     // keeps a timestamp value as written: an integral numeral such as 5.0 stays a
     // double there, and the evaluator's arithmetic follows the value's kind, so
-    // it falls back, as a string, ISO or digit text alike, does. effective_type passes only the
-    // millisecond unit through, so no other timestamp reaches here. DATE is not
-    // listed: its codes are `str` in both layouts.
+    // it falls back, as a string, ISO or digit text alike, does. effective_type
+    // passes only the millisecond unit through, so no other timestamp reaches
+    // here. DATE is not listed: its codes are `str` in both layouts.
     static bool columnar_capable_type_(arrow::Type::type id) {
         switch (id) {
             case arrow::Type::INT64:
@@ -242,26 +249,15 @@ private:
             return b->AppendNull().ok();
         }
         switch (eff.id()) {
-            case arrow::Type::INT64: {
-                // An integer is read exactly, as the on-demand arm reads it: through
-                // a double, 2^53 + 1 landed as 2^53 while the row decode kept it.
-                if (v.is_integral_number()) {
-                    return static_cast<arrow::Int64Builder*>(b)->Append(v.as_int()).ok();
-                }
-                if (!v.is_number()) {
-                    return false;
-                }
-                const double d = v.as_number();
-                if (!std::isfinite(d) || d != std::floor(d)) {
-                    return false;  // non-integer would be truncated
-                }
-                if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) {
-                    return false;  // outside int64 -> lossy / UB cast
-                }
-                return static_cast<arrow::Int64Builder*>(b)
-                    ->Append(static_cast<std::int64_t>(d))
-                    .ok();
-            }
+            case arrow::Type::INT64:
+                // An integer token only, read exactly. The row decode keeps a
+                // numeral with a decimal point or an exponent, such as 5.0 or 5e0,
+                // as the double simdjson parsed, and the evaluator chooses integer
+                // or double arithmetic by the value's kind, so an integer cell
+                // would change what `v / 2` computes though it prints the same. A
+                // token past int64 is a double there too.
+                return v.is_integral_number() &&
+                       static_cast<arrow::Int64Builder*>(b)->Append(v.as_int()).ok();
             case arrow::Type::TIMESTAMP:
                 // timestamp(ms[, tz]): the epoch milliseconds, from an integer token
                 // only. The row decode keeps a numeral such as 5.0 as a double, and
@@ -271,23 +267,23 @@ private:
                 return v.is_integral_number() &&
                        static_cast<arrow::TimestampBuilder*>(b)->Append(v.as_int()).ok();
             case arrow::Type::INT32: {
-                if (!v.is_number()) {
+                // An integer token in int32 range, for the reason INT64 gives.
+                if (!v.is_integral_number()) {
                     return false;
                 }
-                const double d = v.as_number();
-                if (!std::isfinite(d) || d != std::floor(d)) {
-                    return false;
-                }
-                if (d < -2147483648.0 || d > 2147483647.0) {
+                const std::int64_t x = v.as_int();
+                if (x < std::numeric_limits<std::int32_t>::min() ||
+                    x > std::numeric_limits<std::int32_t>::max()) {
                     return false;
                 }
                 return static_cast<arrow::Int32Builder*>(b)
-                    ->Append(static_cast<std::int32_t>(d))
+                    ->Append(static_cast<std::int32_t>(x))
                     .ok();
             }
             case arrow::Type::DOUBLE:
-                // The row decode keeps an integer token exactly, so one past 2^53,
-                // which a double would round, has no faithful cell here.
+                // The row reference coerces an integer token to double
+                // (coerce_row_doubles), as this cell holds it. One past 2^53, which
+                // has no exact double, is left to the row decode.
                 if (v.is_integral_number()) {
                     constexpr std::int64_t kDoubleExactInt = std::int64_t{1} << 53;
                     if (v.as_int() < -kDoubleExactInt || v.as_int() > kDoubleExactInt) {

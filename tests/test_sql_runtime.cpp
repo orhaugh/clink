@@ -1347,13 +1347,14 @@ std::vector<std::string> join_live_set(const std::vector<Record<Row>>& emissions
     return live;
 }
 
+// Join input with JSON integer values, as a JSON decode gives an integer token.
 std::vector<Record<Row>> outer_join_rows(
     const std::vector<std::pair<std::int64_t, std::int64_t>>& kv, const char* col) {
     std::vector<Record<Row>> rows;
     for (const auto& [id, v] : kv) {
         Row r;
-        r.values["id"] = clink::config::JsonValue{static_cast<double>(id)};
-        r.values[col] = clink::config::JsonValue{static_cast<double>(v)};
+        r.values["id"] = clink::config::JsonValue{id};
+        r.values[col] = clink::config::JsonValue{v};
         rows.push_back(Record<Row>{std::move(r)});
     }
     return rows;
@@ -1514,13 +1515,15 @@ JoinRun run_json_columnar_decode_probed(const std::vector<std::string>& lines,
                    probe->first_schema()};
 }
 
-// Records with an event time, so the watermark advances and windows fire.
+// Records with an event time, so the watermark advances and windows fire. The
+// values are JSON integers, as a JSON decode gives an integer token: a BIGINT
+// cell holds only an integer exactly, so a double key would bail the fire.
 std::vector<Record<Row>> window_rows(const std::vector<std::pair<std::int64_t, std::int64_t>>& kt) {
     std::vector<Record<Row>> rows;
     for (const auto& [k, ts] : kt) {
         Row r;
-        r.values["k"] = clink::config::JsonValue{static_cast<double>(k)};
-        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["k"] = clink::config::JsonValue{k};
+        r.values["ts"] = clink::config::JsonValue{ts};
         rows.push_back(Record<Row>{std::move(r), EventTime{ts}});
     }
     return rows;
@@ -1838,20 +1841,9 @@ TEST(SqlRuntime, AnUnstampedWindowBuildsTheFirstLayoutAndAStampedOneTheSecond) {
 TEST(SqlRuntime, AnUnstampedJoinBuildsTheFirstLayoutAndAStampedOneTheSecond) {
     ensure_sql_installed_once();
     // The joined values as JSON integers, the form a timestamp(ms) cell holds
-    // exactly. (outer_join_rows makes doubles, which no timestamp cell holds.)
-    const auto integers = [](const std::vector<std::pair<std::int64_t, std::int64_t>>& kv,
-                             const char* col) {
-        std::vector<Record<Row>> rows;
-        for (const auto& [id, v] : kv) {
-            Row r;
-            r.values["id"] = clink::config::JsonValue{id};
-            r.values[col] = clink::config::JsonValue{v};
-            rows.push_back(Record<Row>{std::move(r)});
-        }
-        return rows;
-    };
-    const auto left = integers({{1, 10}, {2, 20}}, "lv");
-    const auto right = integers({{1, 100}, {2, 200}}, "rv");
+    // exactly.
+    const auto left = outer_join_rows({{1, 10}, {2, 20}}, "lv");
+    const auto right = outer_join_rows({{1, 100}, {2, 200}}, "rv");
     const std::string schema = "l_id:i64;l_lv:ts_ms;r_id:i64;r_rv:i64";
 
     const auto row_run = run_equi_join_probed("inner", left, right, "");
@@ -1870,7 +1862,14 @@ TEST(SqlRuntime, AnUnstampedJoinBuildsTheFirstLayoutAndAStampedOneTheSecond) {
     // out of the timestamp(ms) column as an integer, which takes integer
     // arithmetic where the double took double arithmetic: the stamped join
     // bails it to rows.
-    const auto doubles = outer_join_rows({{1, 10}, {2, 20}}, "lv");
+    std::vector<Record<Row>> doubles;
+    for (const auto& [id, v] :
+         std::vector<std::pair<std::int64_t, std::int64_t>>{{1, 10}, {2, 20}}) {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{id};
+        r.values["lv"] = clink::config::JsonValue{static_cast<double>(v)};
+        doubles.push_back(Record<Row>{std::move(r)});
+    }
     const auto double_rows = run_equi_join_probed("inner", doubles, right, "");
     const auto stamped_doubles = run_equi_join_probed("inner", doubles, right, schema, "2");
     EXPECT_GT(stamped_doubles.batches, 0);
@@ -12595,6 +12594,188 @@ TEST(SqlRuntime, EpochMillisIntegralDoubleTimestampsComputeAsTheRowPathDoes) {
     };
     EXPECT_EQ(row_form, want);
     EXPECT_EQ(columnar, row_form);
+    std::filesystem::remove(in_path);
+}
+
+// Arithmetic on BIGINT and INTEGER columns fed integral numerals (7.0, 5e0,
+// 1.1E1, the forms a JSON encoder gives for a float) beside plain integers in
+// the same batch. The row decode keeps each numeral a double, and the evaluator
+// divides a double as a double and an integer as an integer, so `n / 2` gives
+// 3.5 for 7.0 and 3 for 7. The columnar decode must not hand the numeral on as
+// an integer, which would print the same but compute differently: through a
+// projection, and through a window whose SUM and MIN feed a division in the
+// query over it, the run must write what the row bridge writes. The same columns fed
+// integers only must still reach the sink on the sidecar. Registered a second
+// time with CLINK_DISABLE_COLUMNAR=1.
+TEST(SqlRuntime, IntegralDoubleIntegersComputeAsTheRowPathDoes) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_int_double_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_int_double_out_" + tag + ".ndjson");
+    const std::string cols = "k BIGINT, n BIGINT, i INTEGER, ts BIGINT";
+    write_lines(in_path,
+                {
+                    R"({"k":1,"n":7,"i":9,"ts":1000})",
+                    R"({"k":2,"n":7.0,"i":9.0,"ts":2000})",
+                    R"({"k":1,"n":5e0,"i":3,"ts":3000})",
+                    R"({"k":2,"n":11,"i":1.1E1,"ts":4000})",
+                    R"({"k":1,"n":1,"i":1,"ts":100000})",
+                });
+    {
+        SCOPED_TRACE("projection");
+        const std::string q = "INSERT INTO out_t SELECT k, n / 2 AS nh, i / 2 AS ih FROM t";
+        const std::string out_cols = "k BIGINT, nh DOUBLE, ih DOUBLE";
+        const auto columnar = run_kafka_parity_case(cols, "", out_cols, q, in_path, out_path);
+        const auto row_form =
+            run_kafka_parity_case(cols, "columnar_decode='false'", out_cols, q, in_path, out_path);
+        const std::multiset<std::string> want = {
+            R"({"ih":4,"k":1,"nh":3})",
+            R"({"ih":4.5,"k":2,"nh":3.5})",
+            R"({"ih":1,"k":1,"nh":2.5})",
+            R"({"ih":5.5,"k":2,"nh":5})",
+            R"({"ih":0,"k":1,"nh":0})",
+        };
+        EXPECT_EQ(row_form, want);
+        EXPECT_EQ(columnar, row_form);
+    }
+    {
+        SCOPED_TRACE("window");
+        const std::string q =
+            "INSERT INTO out_t SELECT k, sn / 8 AS sq, mi / 2 AS mh, c FROM ("
+            "SELECT k, SUM(n) AS sn, MIN(i) AS mi, COUNT(*) AS c FROM t "
+            "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k) w";
+        const std::string out_cols = "k BIGINT, sq DOUBLE, mh DOUBLE, c BIGINT";
+        const std::string with = "event_time_column='ts', watermark_lag_ms='0'";
+        // The window sits behind a keyed exchange, and the row wire codec
+        // writes 7.0 as 7, so on this shape the window folds integers on either
+        // carrier; what is pinned is that the two carriers agree through it.
+        const auto columnar = run_kafka_parity_case(
+            cols, with, out_cols, q, in_path, out_path, "tumbling_window_row", 2);
+        const auto row_form = run_kafka_parity_case(cols,
+                                                    with + ", columnar_decode='false'",
+                                                    out_cols,
+                                                    q,
+                                                    in_path,
+                                                    out_path,
+                                                    "tumbling_window_row",
+                                                    2);
+        EXPECT_EQ(row_form.size(), 3U);
+        EXPECT_EQ(columnar, row_form);
+    }
+    {
+        SCOPED_TRACE("integers only");
+        write_lines(in_path,
+                    {
+                        R"({"k":1,"n":7,"i":9,"ts":1000})",
+                        R"({"k":2,"n":-8,"i":-2147483648,"ts":2000})",
+                        R"({"k":3,"n":9223372036854775807,"i":2147483647,"ts":3000})",
+                    });
+        const std::string q = "INSERT INTO out_t SELECT k, n / 2 AS nh, i / 2 AS ih FROM t";
+        const std::string out_cols = "k BIGINT, nh BIGINT, ih BIGINT";
+        const auto before = clink::detail::batch_materialize_counter().load();
+        const auto columnar = run_kafka_parity_case(cols, "", out_cols, q, in_path, out_path);
+        const auto columnar_decoded = clink::detail::batch_materialize_counter().load() - before;
+        const auto row_form =
+            run_kafka_parity_case(cols, "columnar_decode='false'", out_cols, q, in_path, out_path);
+        const std::multiset<std::string> want = {
+            R"({"ih":4,"k":1,"nh":3})",
+            R"({"ih":-1073741824,"k":2,"nh":-4})",
+            R"({"ih":1073741823,"k":3,"nh":4611686018427387903})",
+        };
+        EXPECT_EQ(row_form, want);
+        EXPECT_EQ(columnar, row_form);
+        if (!columnar_disabled_for_process()) {
+            // The file sink is row-only, so a batch that reached it on the
+            // sidecar was decoded there; a decode that fell back hands it rows.
+            EXPECT_GT(columnar_decoded, 0U)
+                << "integer tokens no longer decode columnar, so the fast path is lost";
+        }
+    }
+    if (columnar_disabled_for_process()) {
+        EXPECT_FALSE(clink::detail::columnar_enabled());
+    }
+    std::filesystem::remove(in_path);
+}
+
+// Arithmetic on a DOUBLE column fed integer tokens. The row decode coerces a
+// declared DOUBLE column's integers to double, as the columnar decode's double
+// column holds them, so `x / 2` gives 1.5 for 3, as SQL has it, on either
+// carrier; it used to keep the integer, and the row bridge gave 1 where the
+// columnar decode gave 1.5. Through a projection, and through a window whose
+// SUM over integers only feeds a division in the query over it, the run must
+// write what the row bridge writes, and the projection must still reach the
+// sink on the sidecar. The window runs at parallelism 1: behind a keyed
+// exchange the row wire codec writes 2.0 as 2, so the row carrier's SUM is an
+// integer again on the far side while the sidecar keeps the double. Registered
+// a second time with CLINK_DISABLE_COLUMNAR=1.
+TEST(SqlRuntime, IntegerTokensInADoubleColumnComputeAsDoubles) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_double_int_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_double_int_out_" + tag + ".ndjson");
+    const std::string cols = "k BIGINT, x DOUBLE, ts BIGINT";
+    write_lines(in_path,
+                {
+                    R"({"k":1,"x":3,"ts":1000})",
+                    R"({"k":2,"x":-5,"ts":2000})",
+                    R"({"k":1,"x":2.5,"ts":3000})",
+                    R"({"k":2,"x":7,"ts":4000})",
+                    R"({"k":1,"x":1,"ts":100000})",
+                });
+    {
+        SCOPED_TRACE("projection");
+        const std::string q = "INSERT INTO out_t SELECT k, x / 2 AS xh FROM t";
+        const std::string out_cols = "k BIGINT, xh DOUBLE";
+        const auto before = clink::detail::batch_materialize_counter().load();
+        const auto columnar = run_kafka_parity_case(cols, "", out_cols, q, in_path, out_path);
+        const auto columnar_decoded = clink::detail::batch_materialize_counter().load() - before;
+        const auto row_form =
+            run_kafka_parity_case(cols, "columnar_decode='false'", out_cols, q, in_path, out_path);
+        const std::multiset<std::string> want = {
+            R"({"k":1,"xh":1.5})",
+            R"({"k":2,"xh":-2.5})",
+            R"({"k":1,"xh":1.25})",
+            R"({"k":2,"xh":3.5})",
+            R"({"k":1,"xh":0.5})",
+        };
+        EXPECT_EQ(row_form, want);
+        EXPECT_EQ(columnar, row_form);
+        if (!columnar_disabled_for_process()) {
+            EXPECT_GT(columnar_decoded, 0U)
+                << "integer tokens in a DOUBLE column no longer decode columnar";
+        }
+    }
+    {
+        SCOPED_TRACE("window");
+        const std::string q =
+            "INSERT INTO out_t SELECT k, mx / 2 AS mh, c FROM ("
+            "SELECT k, MIN(x) AS mx, COUNT(*) AS c FROM t "
+            "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k) w";
+        const std::string out_cols = "k BIGINT, mh DOUBLE, c BIGINT";
+        const std::string with = "event_time_column='ts', watermark_lag_ms='0'";
+        const auto columnar = run_kafka_parity_case(
+            cols, with, out_cols, q, in_path, out_path, "tumbling_window_row", 2);
+        const auto row_form = run_kafka_parity_case(cols,
+                                                    with + ", columnar_decode='false'",
+                                                    out_cols,
+                                                    q,
+                                                    in_path,
+                                                    out_path,
+                                                    "tumbling_window_row",
+                                                    2);
+        const std::multiset<std::string> want = {
+            R"({"c":2,"k":1,"mh":1.25})",
+            R"({"c":2,"k":2,"mh":-2.5})",
+            R"({"c":1,"k":1,"mh":0.5})",
+        };
+        EXPECT_EQ(row_form, want);
+        EXPECT_EQ(columnar, row_form);
+    }
+    if (columnar_disabled_for_process()) {
+        EXPECT_FALSE(clink::detail::columnar_enabled());
+    }
     std::filesystem::remove(in_path);
 }
 

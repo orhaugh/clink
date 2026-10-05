@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -113,6 +114,18 @@ JsonStringToRowColumnarOperator::~JsonStringToRowColumnarOperator() = default;
 
 namespace {
 
+// An integer token outside 64 bits: more digits than any 64-bit integer, a
+// negative below INT64_MIN, or a positive at or above 2^64. The row decode's
+// DOM parse refuses the whole line for one, so the record never reaches the
+// row path, while get_double reads any digit count and dec_parse takes the raw
+// token. A column read through either must refuse it. Peeks only: the value is
+// left for the caller to read.
+bool integer_token_past_64_bits(simdjson::ondemand::value& v) {
+    simdjson::ondemand::number_type t{};
+    return v.get_number_type().get(t) == simdjson::SUCCESS &&
+           t == simdjson::ondemand::number_type::big_integer;
+}
+
 // Append one on-demand value to a typed builder, mirroring append_cell_'s
 // acceptance rules exactly. Returns false to bail the batch.
 //
@@ -132,24 +145,16 @@ bool append_ondemand(arrow::Type::type type_id,
     }
     switch (type_id) {
         case arrow::Type::INT64: {
+            // An integer token only, as the DOM arm takes it. The row decode
+            // carries an integer token as an exact int64 and a numeral with a
+            // decimal point or an exponent, such as 5.0 or 5e0, as a double, and
+            // the evaluator's arithmetic follows the value's kind, so a numeral
+            // is refused rather than carried as an integer. So is a token past
+            // int64, which a double read would clamp: -9223372036854775809 reads
+            // as exactly -2^63.
             std::int64_t out{};
-            if (v.get_int64().get(out) == simdjson::SUCCESS) {
-                return static_cast<arrow::Int64Builder*>(b)->Append(out).ok();
-            }
-            // A numeral like 5.0 is integral to the row decode, which parses
-            // every JSON number as a double - accept it the same way rather
-            // than diverging.
-            double d{};
-            if (v.get_double().get(d) != simdjson::SUCCESS) {
-                return false;
-            }
-            if (!std::isfinite(d) || d != std::floor(d)) {
-                return false;
-            }
-            if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) {
-                return false;
-            }
-            return static_cast<arrow::Int64Builder*>(b)->Append(static_cast<std::int64_t>(d)).ok();
+            return v.get_int64().get(out) == simdjson::SUCCESS &&
+                   static_cast<arrow::Int64Builder*>(b)->Append(out).ok();
         }
         case arrow::Type::TIMESTAMP: {
             // timestamp(ms[, tz]): the epoch milliseconds, from an integer token
@@ -160,22 +165,21 @@ bool append_ondemand(arrow::Type::type type_id,
                    static_cast<arrow::TimestampBuilder*>(b)->Append(out).ok();
         }
         case arrow::Type::INT32: {
-            double d{};
-            if (v.get_double().get(d) != simdjson::SUCCESS) {
+            // An integer token in int32 range, for the reason INT64 gives.
+            std::int64_t x{};
+            if (v.get_int64().get(x) != simdjson::SUCCESS ||
+                x < std::numeric_limits<std::int32_t>::min() ||
+                x > std::numeric_limits<std::int32_t>::max()) {
                 return false;
             }
-            if (!std::isfinite(d) || d != std::floor(d)) {
-                return false;
-            }
-            if (d < -2147483648.0 || d > 2147483647.0) {
-                return false;
-            }
-            return static_cast<arrow::Int32Builder*>(b)->Append(static_cast<std::int32_t>(d)).ok();
+            return static_cast<arrow::Int32Builder*>(b)->Append(static_cast<std::int32_t>(x)).ok();
         }
         case arrow::Type::DOUBLE: {
-            // An integer token is read as an integer first: the row decode keeps
-            // it exactly, so one past 2^53, which a double would round, has no
-            // faithful cell here. A failed get_int64 leaves the value unconsumed.
+            // An integer token is read as an integer first, as the DOM arm reads
+            // it, and one past 2^53, which has no exact double, is left to the
+            // row decode. A failed get_int64 leaves the value unconsumed. An
+            // unsigned token above INT64_MAX reads through get_double, which
+            // rounds it to the double the row decode's widening gives.
             constexpr std::int64_t kDoubleExactInt = std::int64_t{1} << 53;
             std::int64_t i{};
             if (v.get_int64().get(i) == simdjson::SUCCESS) {
@@ -185,14 +189,14 @@ bool append_ondemand(arrow::Type::type type_id,
                 return static_cast<arrow::DoubleBuilder*>(b)->Append(static_cast<double>(i)).ok();
             }
             double d{};
-            if (v.get_double().get(d) != simdjson::SUCCESS) {
+            if (integer_token_past_64_bits(v) || v.get_double().get(d) != simdjson::SUCCESS) {
                 return false;
             }
             return static_cast<arrow::DoubleBuilder*>(b)->Append(d).ok();
         }
         case arrow::Type::FLOAT: {
             double d{};
-            if (v.get_double().get(d) != simdjson::SUCCESS) {
+            if (integer_token_past_64_bits(v) || v.get_double().get(d) != simdjson::SUCCESS) {
                 return false;
             }
             return static_cast<arrow::FloatBuilder*>(b)->Append(static_cast<float>(d)).ok();
@@ -218,6 +222,9 @@ bool append_ondemand(arrow::Type::type type_id,
             // unlike the DOM path there is no second scan of the line for them.
             clink::config::JsonValue jv;
             if (v.type() == simdjson::ondemand::json_type::number) {
+                if (integer_token_past_64_bits(v)) {
+                    return false;
+                }
                 const std::string_view tok = v.raw_json_token();
                 std::size_t n = 0;
                 while (n < tok.size() &&

@@ -305,6 +305,24 @@ inline void coerce_row_floats(Row& r, const std::vector<std::string>& float_colu
     }
 }
 
+// Coerce declared DOUBLE columns' integer tokens to double, so a DOUBLE column
+// holds a double whichever way the producer wrote the number.
+//
+// The decode keeps an integer token as an exact int64, and the evaluator chooses
+// integer or double arithmetic by the value's kind, so without this `x / 2` on a
+// DOUBLE column fed 3 gave 1 where SQL gives 1.5. The columnar decoder stores a
+// DOUBLE column in a DoubleBuilder, so the two carriers also differed on it.
+// Applied at ingestion only. A token past 2^53 rounds to the nearest double, as
+// a DOUBLE column must hold it.
+inline void coerce_row_doubles(Row& r, const std::vector<std::string>& double_columns) {
+    for (const auto& col : double_columns) {
+        auto it = r.values.find(col);
+        if (it == r.values.end() || !it->second.is_integral_number())
+            continue;
+        it->second = clink::config::JsonValue{static_cast<double>(it->second.as_int())};
+    }
+}
+
 // Recover exact digits for any DECIMAL column that decoded to a (lossy) JSON
 // number: the generic parse rounds a numeral to a double, so re-read the
 // untruncated token straight from the source `line` and carry it as an exact

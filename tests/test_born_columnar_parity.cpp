@@ -552,6 +552,23 @@ JsonValue parity_json(const std::string& text) {
     return clink::config::parse(text);
 }
 
+// The value's text with each number's kind marked, `i:` an integer and `d:` a
+// double, through arrays, so two values compare equal only if they print the
+// same and compute the same.
+std::string parity_kinded(const JsonValue& v) {
+    if (v.is_array()) {
+        std::string out = "[";
+        for (const auto& e : v.as_array()) {
+            out += parity_kinded(e) + ",";
+        }
+        return out + "]";
+    }
+    if (v.is_number() && !clink::config::is_dec_string(v)) {
+        return (v.is_integral_number() ? "i:" : "d:") + v.serialize(0);
+    }
+    return std::to_string(static_cast<int>(v.type())) + ":" + v.serialize(0);
+}
+
 }  // namespace
 
 // Every value the check calls exact reads back as itself, kind and text; every
@@ -567,22 +584,28 @@ TEST(BornColumnarParity, CellIsExactAgreesWithTheRoundTrip) {
     const std::vector<Case> cases = {
         // Typed columns.
         {arrow::int64(), JsonValue{std::int64_t{9007199254740993}}, true},
-        {arrow::int64(), JsonValue{5.0}, true},
+        {arrow::int64(), JsonValue{5.0}, false},
+        {arrow::int64(), JsonValue{-0.0}, false},
         {arrow::int64(), JsonValue{5.5}, false},
         {arrow::int64(), JsonValue{std::string("5")}, false},
         {arrow::int32(), JsonValue{std::int64_t{2147483647}}, true},
         {arrow::int32(), JsonValue{std::int64_t{2147483648}}, false},
+        {arrow::int32(), JsonValue{5.0}, false},
         {arrow::float64(), JsonValue{0.1}, true},
-        {arrow::float64(), JsonValue{std::int64_t{9007199254740992}}, true},
+        {arrow::float64(), JsonValue{3.0}, true},
+        {arrow::float64(), JsonValue{std::int64_t{3}}, false},
         {arrow::float64(), JsonValue{std::int64_t{9007199254740993}}, false},
         {arrow::float32(), JsonValue{0.5}, true},
+        {arrow::float32(), JsonValue{3.0}, true},
+        {arrow::float32(), JsonValue{std::int64_t{3}}, false},
         {arrow::float32(), JsonValue{0.1}, false},
         {arrow::boolean(), JsonValue{true}, true},
         {arrow::boolean(), JsonValue{std::int64_t{1}}, false},
         {dec, clink::config::make_dec_value(*clink::config::dec_parse("12.34")), true},
         {dec, clink::config::make_dec_value(*clink::config::dec_parse("12.3")), false},
         {dec, JsonValue{12.34}, false},
-        {arrow::list(arrow::float32()), parity_json("[0.5, 1, 2.25]"), true},
+        {arrow::list(arrow::float32()), parity_json("[0.5, 1.0, 2.25]"), true},
+        {arrow::list(arrow::float32()), parity_json("[0.5, 1, 2.25]"), false},
         {arrow::list(arrow::float32()), parity_json("[0.1]"), false},
         // Stored as text.
         {arrow::utf8(), JsonValue{std::string("v1")}, true},
@@ -603,9 +626,11 @@ TEST(BornColumnarParity, CellIsExactAgreesWithTheRoundTrip) {
         EXPECT_EQ(cell_is_exact(*eff, &c.value), c.exact)
             << c.declared->ToString() << " " << c.value.serialize(0);
         const auto back = parity_round_trip(c.declared, c.value);
-        const bool same =
-            back.type() == c.value.type() || (back.is_number() && c.value.is_number());
-        EXPECT_EQ(same && back.serialize(0) == c.value.serialize(0), c.exact)
+        // Every layout must hand back the kind it was given as well, list
+        // elements included, because the evaluator divides an integer as an
+        // integer and a double as a double: 5.0 reading back as 5, or 5 as 5.0,
+        // prints the same and computes differently.
+        EXPECT_EQ(parity_kinded(back) == parity_kinded(c.value), c.exact)
             << c.declared->ToString() << " " << c.value.serialize(0) << " reads back as "
             << back.serialize(0);
     }
@@ -719,6 +744,103 @@ TEST(BornColumnarParity, WindowMinOfAnIntegralDoubleTimestampMatchesTheRowCarrie
     expect_parity(ddl,
                   "INSERT INTO out SELECT k, first_t / 1000 AS sec FROM ("
                   "SELECT k, MIN(t) AS first_t, COUNT(*) AS c FROM src "
+                  "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k HAVING COUNT(*) > 1) w;",
+                  "tumbling_window_row",
+                  dir,
+                  Carrier::Rows);
+    fs::remove_all(dir);
+}
+
+// --- A BIGINT or INTEGER held as a JSON double ----------------------------------
+
+// BIGINT and INTEGER columns fed integral numerals such as 7.0 and 9e0, the forms
+// a JSON encoder gives for a float. The file source keeps each one as the double
+// it parsed. The sidecar's int64 and int32 columns would hand back an integer,
+// which prints the same, but the evaluator divides an integer as an integer and
+// a double as a double. Every row carries one such numeral, in n or in i, so
+// every pair takes the row path, and the division after the join comes out as
+// the row carrier computes it.
+namespace {
+
+// Row i's n and i cells: odd values, so a halving tells the kinds apart, with n
+// written as a decimal numeral in even rows and i as an exponent in odd ones.
+std::string parity_integral_double_cells(int r) {
+    const auto n = std::to_string((2 * r) + 1);
+    const auto i = std::to_string((2 * r) + 3);
+    return R"("n":)" + (r % 2 == 0 ? n + ".0" : n) + R"(,"i":)" + (r % 2 == 0 ? i : i + "e0");
+}
+
+}  // namespace
+
+TEST(BornColumnarParity, JoinOutputOfIntegralDoubleIntegersMatchesTheRowCarrier) {
+    const auto dir = parity_scratch("join_int_double");
+    std::vector<std::string> src;
+    std::vector<std::string> keys;
+    for (int r = 1; r <= kParityRows; ++r) {
+        src.push_back(R"({"id":)" + std::to_string(r) + "," + parity_integral_double_cells(r) +
+                      "}");
+        keys.push_back(R"({"k":)" + std::to_string(r) + "}");
+    }
+    parity_write_lines(dir / "src.ndjson", src);
+    parity_write_lines(dir / "keys.ndjson", keys);
+    const std::string ddl =
+        parity_file_table("src", "(id BIGINT, n BIGINT, i INTEGER)", dir / "src.ndjson") +
+        parity_file_table("keys", "(k BIGINT)", dir / "keys.ndjson") +
+        parity_file_table("out", "(id BIGINT, nh DOUBLE, ih DOUBLE)", dir / "out.ndjson");
+    expect_parity(ddl,
+                  "INSERT INTO out SELECT a.id, a.n / 2 AS nh, a.i / 2 AS ih FROM src a "
+                  "JOIN keys b ON a.id = b.k;",
+                  "equi_join_row",
+                  dir,
+                  Carrier::Rows);
+    fs::remove_all(dir);
+}
+
+// The mirror case: DOUBLE and REAL columns fed integer tokens. The file source
+// keeps each one an integer, and the sidecar's double and float columns would
+// hand back a double, which prints the same but halves as a double where the
+// integer halved as an integer. So every pair takes the row path, and the
+// division after the join comes out as the row carrier computes it.
+TEST(BornColumnarParity, JoinOutputOfIntegerDoublesMatchesTheRowCarrier) {
+    const auto dir = parity_scratch("join_double_int");
+    std::vector<std::string> src;
+    std::vector<std::string> keys;
+    for (int r = 1; r <= kParityRows; ++r) {
+        src.push_back(R"({"id":)" + std::to_string(r) + R"(,"x":)" + std::to_string((2 * r) + 1) +
+                      R"(,"f":)" + std::to_string((2 * r) + 3) + "}");
+        keys.push_back(R"({"k":)" + std::to_string(r) + "}");
+    }
+    parity_write_lines(dir / "src.ndjson", src);
+    parity_write_lines(dir / "keys.ndjson", keys);
+    const std::string ddl =
+        parity_file_table("src", "(id BIGINT, x DOUBLE, f REAL)", dir / "src.ndjson") +
+        parity_file_table("keys", "(k BIGINT)", dir / "keys.ndjson") +
+        parity_file_table("out", "(id BIGINT, xh DOUBLE, fh DOUBLE)", dir / "out.ndjson");
+    expect_parity(ddl,
+                  "INSERT INTO out SELECT a.id, a.x / 2 AS xh, a.f / 2 AS fh FROM src a "
+                  "JOIN keys b ON a.id = b.k;",
+                  "equi_join_row",
+                  dir,
+                  Carrier::Rows);
+    fs::remove_all(dir);
+}
+
+// The window's version: MIN over integral doubles is that double, and a
+// projection over the window's output halves it.
+TEST(BornColumnarParity, WindowMinOfIntegralDoubleIntegersMatchesTheRowCarrier) {
+    const auto dir = parity_scratch("window_int_double");
+    const auto src = parity_window_source(
+        dir / "src.ndjson",
+        [](int g) { return R"("k":)" + std::to_string(g) + "," + parity_integral_double_cells(g); },
+        R"("k":0,"n":0.0,"i":0e0)");
+    const std::string ddl =
+        "CREATE TABLE src (ts BIGINT, k BIGINT, n BIGINT, i INTEGER) WITH (connector='file', "
+        "format='json', path='" +
+        src + "', event_time_column='ts', watermark_lag_ms='0');" +
+        parity_file_table("out", "(k BIGINT, nh DOUBLE, ih DOUBLE)", dir / "out.ndjson");
+    expect_parity(ddl,
+                  "INSERT INTO out SELECT k, mn / 2 AS nh, mi / 2 AS ih FROM ("
+                  "SELECT k, MIN(n) AS mn, MIN(i) AS mi, COUNT(*) AS c FROM src "
                   "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k HAVING COUNT(*) > 1) w;",
                   "tumbling_window_row",
                   dir,

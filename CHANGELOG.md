@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**Numbers in a Kafka or WebSocket JSON table compute the same on the columnar
+and row paths.** The columnar JSON decode, and joins and windows emitting
+born-columnar output, took a numeral with a decimal point or an exponent but an
+integral value, such as `7.0` or `5e0`, into a BIGINT or INTEGER column as an
+integer, while the row decode keeps it a double; arithmetic follows the value's
+kind, so `n / 2` gave 3 on the columnar path where the row path gives 3.5. A
+BIGINT or INTEGER column now decodes columnar only for integer tokens in its
+range, and anything else takes the row decode. The opposite held for DOUBLE: the
+row decode kept an integer token in a DOUBLE column as an integer, so `x / 2` on
+a value written as `3` gave 1 with `columnar_decode='false'`; a declared DOUBLE
+column now holds a double on both decodes (an integer past 2^53 prints as the
+nearest double), and born-columnar output falls back to rows for a DOUBLE or
+REAL value held as an integer. The columnar decode also refuses an integer
+token outside 64 bits, which the row decode drops, instead of handing the record
+on, and no longer reads `-9223372036854775809` into a BIGINT as its minimum.
+Streams whose integers arrive as integer tokens, nexmark's included, stay
+columnar.
+
 **TIMESTAMP and TIMESTAMPTZ columns ride the columnar path as Arrow millisecond
 timestamps.** Within a deployment admitted to the second Row layout (embedded,
 or a cluster whose workers all run protocol v3), the columnar JSON decode of a

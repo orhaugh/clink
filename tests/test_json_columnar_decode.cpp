@@ -941,12 +941,11 @@ TEST(JsonColumnarDecode, DomArmKeepsABigintPastTwoToTheFiftyThree) {
     EXPECT_EQ(b.Value(1), 9007199254740995);
 }
 
-// A DOUBLE column receiving an integer past 2^53. The row decode keeps the
-// integer token exactly, as for any column type but REAL and DECIMAL, so a
-// double column, which would round it, must not take the batch: both arms send
-// it to the row decode. An integer up to 2^53 has a double, reads back as the
-// same number, and stays columnar. `force_dom` adds a duplicate key, which the
-// on-demand arm declines, so the DOM arm decides instead; the counter says
+// A DOUBLE column receiving an integer past 2^53. The row decode rounds it to
+// the nearest double (coerce_row_doubles), but it has no exact double, so both
+// arms leave it to the row decode rather than decide it themselves. An integer
+// up to 2^53 has a double, reads back as the same number, and stays columnar. `force_dom` adds a
+// duplicate key, which the on-demand arm declines, so the DOM arm decides instead; the counter says
 // which arm did.
 namespace {
 void expect_double_integer_parity(const std::vector<std::string>& values,
@@ -988,6 +987,109 @@ TEST(JsonColumnarDecode, DoubleColumnKeepsAnIntegerUpToTwoToTheFiftyThreeColumna
             {"9007199254740992", "-9007199254740992", "5", "-0", "0", "1.5", "1e300"},
             force_dom,
             true);
+    }
+}
+
+// A BIGINT or INTEGER column fed a numeral with a decimal point or an exponent
+// but an integral value, such as 5.0, 5e0 or -0.0. The row decode keeps every
+// such numeral a double, as simdjson classes it, and the evaluator chooses
+// integer or double arithmetic by the value's kind, so `v / 2` is 2.5 on the
+// row path where an integer cell would give 2, though both print 5. Both arms
+// take an integer token only and send the rest to the row decode. An integer
+// token outside 64 bits fails the row decode's parse of the whole line, so it
+// has no faithful cell either; -9223372036854775809 reads through a double as
+// exactly -2^63, which a double fallback took for INT64_MIN. `force_dom` adds a
+// duplicate key, which the on-demand arm declines, so the DOM arm decides
+// instead; the counter says which arm did.
+namespace {
+
+// Each cell with its JSON kind: `i:` an integer, `d:` a double. encoded_rows
+// and exact_cells print 5 and 5.0 alike, so they cannot see a carrier that
+// changed one into the other.
+std::vector<std::string> kinded_cells(const Batch<Row>& b) {
+    std::vector<std::string> out;
+    for (const auto& rec : b) {
+        std::string line;
+        for (const auto& [k, v] : rec.value().values) {
+            const char* kind = v.is_integral_number() ? "i:" : (v.is_number() ? "d:" : "");
+            line += k.str() + "=" + kind + v.serialize(0) + ";";
+        }
+        out.push_back(line);
+    }
+    return out;
+}
+
+void expect_kinded_parity(const std::shared_ptr<arrow::DataType>& type,
+                          const std::vector<std::string>& values,
+                          bool columnar) {
+    SCOPED_TRACE(type->ToString() + " " + values.back());
+    const std::vector<RowColumn> schema = {{"a", arrow::int64()}, {"v", type}};
+    for (const bool force_dom : {false, true}) {
+        SCOPED_TRACE(force_dom ? "DOM arm" : "on-demand arm");
+        std::vector<std::string> lines;
+        lines.reserve(values.size());
+        for (const auto& v : values) {
+            lines.push_back((force_dom ? R"({"a":1,"a":1,"v":)" : R"({"a":1,"v":)") + v + "}");
+        }
+        auto oracle = make_typed_row_oracle(schema);
+        auto row_el = run_one(oracle, lines_batch(lines));
+        JsonStringToRowColumnarOperator col_op(schema);
+        const auto dom_before = clink::detail::json_columnar_dom_arm_counter().load();
+        auto col_el = run_one(col_op, lines_batch(lines));
+        const auto dom_runs = clink::detail::json_columnar_dom_arm_counter().load() - dom_before;
+
+        ASSERT_TRUE(col_el.is_data());
+        EXPECT_EQ(col_el.as_data().is_columnar(), columnar);
+        EXPECT_EQ(dom_runs, (force_dom && columnar) ? 1U : 0U);
+        EXPECT_EQ(kinded_cells(col_el.as_data()), kinded_cells(row_el.as_data()));
+    }
+}
+
+}  // namespace
+
+TEST(JsonColumnarDecode, IntegerColumnsTakeOnlyIntegerTokens) {
+    for (const auto& type : {arrow::int64(), arrow::int32()}) {
+        // Integer tokens go columnar, zero written as -0 and a null included.
+        expect_kinded_parity(type, {"5"}, true);
+        expect_kinded_parity(type, {"-1", "0", "-0", "123456"}, true);
+        expect_kinded_parity(type, {"7", "null"}, true);
+        // Integral numerals, in every spelling, send the batch to the row decode.
+        expect_kinded_parity(type, {"5.0"}, false);
+        expect_kinded_parity(type, {"7", "5e0"}, false);
+        expect_kinded_parity(type, {"1E3"}, false);
+        expect_kinded_parity(type, {"-0.0"}, false);
+        expect_kinded_parity(type, {"7", "1.1e1"}, false);
+        // So do a fraction, text and a boolean, as before.
+        expect_kinded_parity(type, {"5.5"}, false);
+        expect_kinded_parity(type, {R"("5")"}, false);
+        expect_kinded_parity(type, {"true"}, false);
+    }
+    // The ends of each range stay columnar; one past them does not.
+    expect_kinded_parity(
+        arrow::int64(), {"9223372036854775807", "-9223372036854775808", "9007199254740993"}, true);
+    expect_kinded_parity(arrow::int64(), {"9223372036854775808"}, false);
+    expect_kinded_parity(arrow::int64(), {"7", "-9223372036854775809"}, false);
+    expect_kinded_parity(arrow::int64(), {"18446744073709551616"}, false);
+    expect_kinded_parity(arrow::int32(), {"2147483647", "-2147483648"}, true);
+    expect_kinded_parity(arrow::int32(), {"2147483648"}, false);
+    expect_kinded_parity(arrow::int32(), {"-2147483649"}, false);
+}
+
+// DOUBLE, REAL and DECIMAL columns fed an integer token outside 64 bits: below
+// INT64_MIN, at or above 2^64, or more digits than either. The row decode's DOM
+// parse refuses the whole line for one, while a double read takes any digit
+// count and the decimal parser takes the raw token, so neither arm may hand the
+// record on columnar. An unsigned token below 2^64 parses on both and stays
+// columnar. A DOUBLE column's integer token is a double on both carriers, which
+// the kinded comparison sees where a printed one would not.
+TEST(JsonColumnarDecode, FloatingAndDecimalColumnsRefuseIntegerTokensPastSixtyFourBits) {
+    for (const auto& type : {arrow::float64(), arrow::float32(), arrow::decimal128(38, 0)}) {
+        expect_kinded_parity(type, {"7", "-9223372036854775809"}, false);
+        expect_kinded_parity(type, {"7", "18446744073709551616"}, false);
+        expect_kinded_parity(type, {"7", "100000000000000000000"}, false);
+        expect_kinded_parity(type, {"7", "-100000000000000000000"}, false);
+        expect_kinded_parity(type, {"7", "18446744073709551615"}, true);
+        expect_kinded_parity(type, {"7", "-3", "0", "1.5", "null"}, true);
     }
 }
 
