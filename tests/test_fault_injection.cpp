@@ -216,6 +216,32 @@ TEST_F(FaultInjectionTest, ResetReleasesAThreadStillOnItsWayToParking) {
     }
 }
 
+TEST_F(FaultInjectionTest, AThreadWhoseHitIsCountedIsCountedAsParked) {
+    // Tests wait for hits(point) and then expect release(point) to report the
+    // parked thread. reach() counted the hit in one hold of the mutex and the
+    // thread as parked only in the next, so a release() in between found no
+    // one waiting and returned 0, although it still let the thread through:
+    // CheckpointCompletion.ASuccessorsFramesAreHandledOnlyAfterItsPredecessorIsRetired
+    // failed that way under TSan. A thread that matches a Block rule now counts
+    // as parked in the same hold that counts its hit. The window cannot be
+    // opened from out here without a hook, so this hammers it, as the cases
+    // above do.
+    constexpr int kIterations = 2000;
+    for (int i = 0; i < kIterations; ++i) {
+        Registry::instance().reset();
+        const std::string point = "test.parked_count";
+        Registry::instance().arm(Rule{.point = point, .action = Action::Block});
+        std::thread worker([] { CLINK_FAULT_POINT("test.parked_count"); });
+        while (Registry::instance().hits(point) == 0) {
+            std::this_thread::yield();
+        }
+        const std::size_t woken = Registry::instance().release(point);
+        worker.join();
+        ASSERT_EQ(woken, 1U) << "iteration " << i
+                             << ": release() ran between the hit and the park and found no one";
+    }
+}
+
 TEST_F(FaultInjectionTest, ReleaseReachesAThreadStillOnItsWayToParking) {
     // Same window, reached through release(point) rather than reset(). The
     // per-point epoch has the identical lost-wakeup shape and the identical

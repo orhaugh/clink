@@ -297,6 +297,11 @@ Outcome Registry::reach(std::string_view point) {
         if (found && matched.action == Action::Block) {
             point_epoch_at_entry = release_epoch_[key];
             global_epoch_at_entry = global_release_epoch_;
+            // Counted as parked in the same hold that counts the hit, so a
+            // release() that a test issues as soon as it sees hits(point)
+            // reports this thread, and the epoch it bumps lets the thread
+            // through when it gets to the wait below.
+            ++blocked_[key];
         }
     }
     if (!found) {
@@ -339,7 +344,6 @@ Outcome Registry::reach(std::string_view point) {
         case Action::Block: {
             std::unique_lock lock(mu_);
             const std::string key(matched.point);
-            ++blocked_[key];
             const auto released = [&] {
                 return global_release_epoch_ != global_epoch_at_entry ||
                        release_epoch_[key] != point_epoch_at_entry;
