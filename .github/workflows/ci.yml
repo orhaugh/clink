@@ -573,11 +573,13 @@ jobs:
   formal-mutants:
     name: Every mutant of the exactly-once specification is refuted
     runs-on: ubuntu-24.04
-    # Fifteen independent runs, so four at a time with a single TLC worker each
-    # beats one at a time with all four: TLC scales sublinearly across workers.
-    # The two accepted mutants enumerate their whole state space and take well
-    # over an hour each on their own worker, which is why this is its own job
-    # rather than time added to the models'. M_id_reuse runs in the job below:
+    # The refuted mutants: independent runs, four at a time with a single TLC
+    # worker each, which beats one at a time with all four, since TLC scales
+    # sublinearly across workers. Each stops at its first counterexample. The
+    # accepted mutants (formal/mutants/expected.txt) enumerate their whole state
+    # space, well over an hour each, and run in the job below: together they had
+    # this job at 125 of its 150 minutes once the confirmed marker's write and
+    # advance became separate steps. M_id_reuse runs in its own job too:
     # since a takeover's next checkpoint id became a range (RedeployEffects) and
     # a coordinator whose claim on an id is refused can renumber (Renumber,
     # ZombieRenumber), its search, which allows two coordinator deaths, grew
@@ -595,18 +597,50 @@ jobs:
         with:
           path: ~/.clink-deps/formal-tools
           key: tla-tools-${{ hashFiles('formal/tools.env') }}
-      - name: Every mutant but M_id_reuse is refuted
+      - name: Every refuted mutant but M_id_reuse is refuted
         # Each configuration under formal/mutants/ switches one rule back to
         # a pre-fix form a qualification campaign (or the model itself) found
         # and fixed. TLC must produce a counterexample for each, or the
         # mutant is recorded in formal/mutants/expected.txt as one a later
         # rule guards as well and must stay accepted: either drift is a
-        # regression in the model or its record, not a pass.
+        # regression in the model or its record, not a pass. The accepted
+        # ones run in formal-mutants-accepted, read from the same record.
         run: |
           set -euo pipefail
-          mutants=$(cd formal/mutants && ls M_*.cfg | sed 's/\.cfg$//' | grep -vx 'M_id_reuse')
+          accepted=$(awk '$2 == "accepted" { print $1 }' formal/mutants/expected.txt)
+          mutants=$(cd formal/mutants && ls M_*.cfg | sed 's/\.cfg$//' | grep -vx 'M_id_reuse' \
+            | grep -vxF -f <(printf '%s\n' $accepted))
           # shellcheck disable=SC2086 # one argument per mutant, on purpose
           CHECK_JOBS=4 TLC_HEAP=3g ./scripts/formal-check.sh --mutants $mutants
+
+  formal-mutants-accepted:
+    name: The accepted mutants of the exactly-once specification stay accepted
+    runs-on: ubuntu-24.04
+    # The mutants formal/mutants/expected.txt records as accepted: a later rule
+    # guards the same defect, so TLC must enumerate each one's whole state space
+    # and find nothing. Two at a time, with two TLC workers each.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Cache the pinned TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps/formal-tools
+          key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - name: Every accepted mutant stays accepted
+        run: |
+          set -euo pipefail
+          accepted=$(awk '$2 == "accepted" { print $1 }' formal/mutants/expected.txt)
+          if [ -z "${accepted}" ]; then
+            echo "formal/mutants/expected.txt records no accepted mutant; nothing to run"
+            exit 0
+          fi
+          # shellcheck disable=SC2086 # one argument per mutant, on purpose
+          CHECK_JOBS=2 TLC_WORKERS=2 TLC_HEAP=6g ./scripts/formal-check.sh --mutants $accepted
 
   formal-mutant-id-reuse:
     name: The id-reuse mutant of the exactly-once specification is refuted
