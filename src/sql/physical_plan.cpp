@@ -1121,9 +1121,19 @@ std::string compile_node(const LogicalPlan& node,
                 // Passing it to only one would make the two carriers disagree on
                 // those columns, which is precisely what kept the columnar decoder
                 // from handling them at all.
+                //
+                // The columnar decode is an in-engine carrier, so it takes the
+                // second Row layout: TIMESTAMP and TIMESTAMPTZ as epoch
+                // milliseconds (ts_ms, tstz_ms), which a deployment the
+                // coordinator did not admit reads as text. The row bridge builds
+                // no sidecar and keeps the first layout, as every source and
+                // sink does.
                 if (binding.bridge_op == "json_string_to_row_columnar" ||
                     binding.bridge_op == "json_string_to_row") {
-                    bridge.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
+                    bridge.params["schema_columns"] = serialize_row_schema(
+                        row_columns_of(table),
+                        binding.bridge_op == "json_string_to_row_columnar" ? RowLayout::V2
+                                                                           : RowLayout::V1);
                     // Projection pushdown for the JSON bridges. The hint was previously
                     // written ONLY onto the source op, and for a Kafka JSON table the source
                     // is kafka_source_string, which emits raw text and cannot act on it - so
@@ -1231,9 +1241,12 @@ std::string compile_node(const LogicalPlan& node,
         // The join's typed output schema, stashed for enable_columnar_output()
         // below to promote to the real `columnar_output` param if this join's
         // consumers can take a columnar batch. Held under a private key so a
-        // plan where columnar output is not enabled carries no trace of it.
+        // plan where columnar output is not enabled carries no trace of it. In
+        // the second Row layout, as an in-engine carrier: a TIMESTAMP output
+        // column is held as epoch milliseconds where the deployment admits it.
         if (jn.schema() != nullptr) {
-            op.params[kOutputSchemaKey] = serialize_row_schema(row_columns_of_schema(*jn.schema()));
+            op.params[kOutputSchemaKey] =
+                serialize_row_schema(row_columns_of_schema(*jn.schema()), RowLayout::V2);
         }
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
@@ -1909,7 +1922,8 @@ std::string compile_node(const LogicalPlan& node,
                     cols.push_back(RowColumn{name, arrow::int64()});
                 }
             }
-            op.params[kOutputSchemaKey] = serialize_row_schema(cols);
+            // The second Row layout, as for the join's schema above.
+            op.params[kOutputSchemaKey] = serialize_row_schema(cols, RowLayout::V2);
         }
 
         std::string id = op.id;

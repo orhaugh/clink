@@ -26,10 +26,10 @@
 //
 // A column's Arrow type reaches a batcher through its row-schema code (see
 // serialize_row_schema at the end of this file), and the code's layout decides
-// what TIMESTAMP and TIMESTAMPTZ are carried as: text under RowLayout::V1, the
-// layout every producer writes, or epoch milliseconds under RowLayout::V2. The
-// readers below accept a timestamp(ms[, tz]) column already; nothing writes one
-// yet.
+// what TIMESTAMP and TIMESTAMPTZ are carried as: text under RowLayout::V1, or
+// epoch milliseconds under RowLayout::V2. The in-engine carriers (the columnar
+// Kafka JSON decode, born-columnar join and window output) write V2 within a
+// deployment admitted to it; sources, sinks and every other site write V1.
 
 #include <cmath>
 #include <cstdint>
@@ -354,12 +354,14 @@ inline bool cell_is_exact(const arrow::DataType& layout, const clink::config::Js
     };
     switch (layout.id()) {
         case arrow::Type::TIMESTAMP:
-            // Only timestamp(ms[, tz]) is a timestamp layout (effective_type);
-            // its cell reads back as the int64 it holds, as an INT64 cell does.
+            // Only timestamp(ms[, tz]) is a timestamp layout (effective_type).
+            // Its cell reads back as the int64 it holds, so only an integer comes
+            // back as it went in: an integral double would come back an integer,
+            // and the evaluator's arithmetic follows the value's kind.
             if (!is_timestamp_ms(layout)) {
                 break;
             }
-            [[fallthrough]];
+            return v->is_integral_number();
         case arrow::Type::INT64:
             // A double holding an integer reads back as that integer, which
             // serialises the same; a fraction would be truncated.
@@ -898,8 +900,9 @@ inline ArrowBatcher<Row> make_row_wire_batcher(clink::Codec<Row> codec) {
 // ';'/':'), same constraint as decimal_columns. No code may contain either
 // separator: parse_row_schema splits a column on its last ':'.
 //
-// Layouts. V1 is what every released planner wrote and what every producer
-// writes today: TIMESTAMP and TIMESTAMPTZ are `str`, carried as text. V2 adds
+// Layouts. V1 is what every released planner wrote, and what every site but
+// the in-engine carriers writes: TIMESTAMP and TIMESTAMPTZ are `str`, carried
+// as text. V2 adds
 // ts_ms (timestamp(ms)) for TIMESTAMP and tstz_ms (timestamp(ms, "UTC")) for
 // TIMESTAMPTZ, whatever the declared precision, because the Row value is epoch
 // milliseconds. `str` keeps meaning utf8 for good, so a persisted spec never

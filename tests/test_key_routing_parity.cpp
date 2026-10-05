@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -34,6 +35,9 @@
 #include "clink/cluster/type_registry.hpp"
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
+#include "clink/core/stream_element.hpp"
+#include "clink/operators/operator_base.hpp"
+#include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/key_groups.hpp"
 #include "clink/sql/install.hpp"
 #include "clink/sql/row.hpp"
@@ -168,4 +172,111 @@ TEST(KeyRoutingParity, MissingKeyFieldIsZeroOnBothCarriers) {
     Row r;
     r.values.emplace("something_else", clink::config::JsonValue{std::int64_t{7}});
     EXPECT_EQ(row_fn(r), 0);
+}
+
+// A TIMESTAMP grouping key. Under the second Row layout the columnar carriers hold
+// TIMESTAMP and TIMESTAMPTZ as timestamp(ms[, "UTC"]) columns, where the row path
+// holds the same epoch milliseconds as a JSON integer. row_compute_key folds the
+// key columns into __key on both carriers, and both must give every row the same
+// __key, or a key whose batches arrive on both carriers splits its group state
+// across subtasks, and keys move between subtasks across a restore.
+TEST(KeyRoutingParity, ATimestampKeyFoldsToTheSameKeyOnBothCarriers) {
+    clink::cluster::ensure_built_ins_registered();
+    clink::plugin::PluginRegistry reg;
+    clink::sql::install(reg);
+    const auto* factory = clink::cluster::OperatorRegistry::default_instance().find_operator(
+        "row_compute_key", "row", "row");
+    ASSERT_NE(factory, nullptr) << "row_compute_key is not registered";
+
+    // Epoch milliseconds over a wide range: negative epochs, values past 2^53,
+    // and a null. (hash_json_value reads a number through a double, so a value at
+    // the very ends of int64 would cast out of range on both carriers alike.)
+    std::vector<std::optional<std::int64_t>> stamps = {std::int64_t{1'700'000'000'000},
+                                                       std::int64_t{-1},
+                                                       std::int64_t{0},
+                                                       std::int64_t{-2'208'988'800'000},
+                                                       (std::int64_t{1} << 53) + 1,
+                                                       (std::int64_t{1} << 62) + 12345,
+                                                       -(std::int64_t{1} << 62),
+                                                       std::nullopt};
+    for (const auto k : wide_keys()) {
+        stamps.emplace_back(k % 20'000'000'000'000);
+    }
+    const auto n = static_cast<std::int64_t>(stamps.size());
+
+    for (const bool zoned : {false, true}) {
+        SCOPED_TRACE(zoned ? "TIMESTAMPTZ" : "TIMESTAMP");
+        const auto ts_type = zoned ? arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")
+                                   : arrow::timestamp(arrow::TimeUnit::MILLI);
+        // On its own and beside a BIGINT key, since the fold runs over every
+        // key column in order.
+        for (const std::string columns : {"ts", "id,ts"}) {
+            SCOPED_TRACE(columns);
+            clink::cluster::OperatorBuildContext ctx;
+            ctx.params["columns"] = columns;
+            auto op = std::static_pointer_cast<clink::Operator<Row, Row>>(factory->build(ctx));
+            ASSERT_TRUE(op->supports_columnar());
+
+            arrow::Int64Builder et_b;
+            arrow::Int64Builder id_b;
+            arrow::TimestampBuilder ts_b(ts_type, arrow::default_memory_pool());
+            Batch<Row> rows;
+            for (std::int64_t i = 0; i < n; ++i) {
+                ASSERT_TRUE(et_b.AppendNull().ok());
+                ASSERT_TRUE(id_b.Append(i * 7).ok());
+                Row r;
+                r.values.emplace("id", clink::config::JsonValue{i * 7});
+                const auto& s = stamps[static_cast<std::size_t>(i)];
+                if (s.has_value()) {
+                    ASSERT_TRUE(ts_b.Append(*s).ok());
+                    r.values.emplace("ts", clink::config::JsonValue{*s});
+                } else {
+                    ASSERT_TRUE(ts_b.AppendNull().ok());
+                    r.values.emplace("ts", clink::config::JsonValue{});
+                }
+                rows.emplace(std::move(r));
+            }
+            auto rb = arrow::RecordBatch::Make(
+                arrow::schema({arrow::field("event_time", arrow::int64(), true),
+                               arrow::field("id", arrow::int64(), true),
+                               arrow::field("ts", ts_type, true)}),
+                n,
+                {et_b.Finish().ValueOrDie(),
+                 id_b.Finish().ValueOrDie(),
+                 ts_b.Finish().ValueOrDie()});
+            Batch<Row> columnar{rb, static_cast<std::size_t>(n), clink::sql::row_materialize_fn()};
+
+            clink::BoundedChannel<clink::StreamElement<Row>> ch(8);
+            clink::Emitter<Row> out(&ch);
+            ASSERT_TRUE(
+                op->process_columnar(clink::StreamElement<Row>::data(std::move(columnar)), out))
+                << "row_compute_key declined a batch with a timestamp key column";
+            op->process(clink::StreamElement<Row>::data(std::move(rows)), out);
+            auto col_el = ch.try_pop();
+            auto row_el = ch.try_pop();
+            ASSERT_TRUE(col_el.has_value() && row_el.has_value());
+            ASSERT_TRUE(col_el->as_data().is_columnar());
+            const auto& sidecar = *col_el->as_data().arrow();
+            const auto key_col = sidecar.GetColumnByName(kRowKeyField);
+            ASSERT_NE(key_col, nullptr);
+            const auto& col_keys = static_cast<const arrow::Int64Array&>(*key_col);
+            ASSERT_EQ(row_el->as_data().size(), static_cast<std::size_t>(n));
+
+            std::size_t value_mismatch = 0;
+            std::size_t route_mismatch = 0;
+            std::size_t i = 0;
+            for (const auto& rec : row_el->as_data()) {
+                const std::int64_t row_key = rec.value().values.at(kRowKeyField).as_int();
+                const std::int64_t col_key = col_keys.Value(static_cast<std::int64_t>(i));
+                value_mismatch += row_key != col_key ? 1 : 0;
+                for (std::uint32_t par : {2U, 4U, 8U}) {
+                    route_mismatch += subtask_of(row_key, par) != subtask_of(col_key, par) ? 1 : 0;
+                }
+                ++i;
+            }
+            EXPECT_EQ(value_mismatch, 0U)
+                << value_mismatch << " of " << n << " rows folded to a different __key";
+            EXPECT_EQ(route_mismatch, 0U);
+        }
+    }
 }

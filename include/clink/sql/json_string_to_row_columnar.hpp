@@ -201,17 +201,18 @@ private:
     // number as a full-precision double and never produced a dec-string, so a
     // columnar float32 truncation or dec-string was a visible difference.
     //
-    // Temporal types are not listed. The planner hands this operator the
-    // columns its V1 row-schema code names, and the V1 code for TIMESTAMP and
-    // TIMESTAMPTZ is `str`, so they arrive as utf8 and ride the STRING case
-    // (string round-trips) or fall back (a numeric epoch value). A
-    // timestamp(ms[, tz]) column reaches effective_type only from a V2 code
-    // (ts_ms, tstz_ms), and effective_type passes it through; it is not here,
-    // so such a column turns the columnar decode off for the whole schema. A
-    // Dag-direct caller that passes declared types straight in (a TIMESTAMP(3)
-    // column is a timestamp(ms) Arrow type) gets that too: put the columns
-    // through parse_row_schema(serialize_row_schema(cols, RowLayout::V1)) first
-    // to keep the STRING case.
+    // TIMESTAMP and TIMESTAMPTZ are here as timestamp(ms[, tz]), the type their
+    // second Row layout codes (ts_ms, tstz_ms) name, and only where the
+    // deployment is admitted to that layout: otherwise parse_row_schema resolves
+    // those codes, and the first layout's `str`, to utf8, and the column rides
+    // the STRING case (a string round-trips, a number falls back). A timestamp
+    // column takes only an integer token in int64 range, because its cell is the
+    // epoch-millisecond value read back as that integer, and the row reference
+    // keeps a timestamp value as written: an integral numeral such as 5.0 stays a
+    // double there, and the evaluator's arithmetic follows the value's kind, so
+    // it falls back, as a string, ISO or digit text alike, does. effective_type passes only the
+    // millisecond unit through, so no other timestamp reaches here. DATE is not
+    // listed: its codes are `str` in both layouts.
     static bool columnar_capable_type_(arrow::Type::type id) {
         switch (id) {
             case arrow::Type::INT64:
@@ -221,6 +222,7 @@ private:
             case arrow::Type::DECIMAL128:
             case arrow::Type::BOOL:
             case arrow::Type::STRING:
+            case arrow::Type::TIMESTAMP:
                 return true;
             default:
                 return false;
@@ -260,6 +262,14 @@ private:
                     ->Append(static_cast<std::int64_t>(d))
                     .ok();
             }
+            case arrow::Type::TIMESTAMP:
+                // timestamp(ms[, tz]): the epoch milliseconds, from an integer token
+                // only. The row decode keeps a numeral such as 5.0 as a double, and
+                // the evaluator chooses integer or double arithmetic by the value's
+                // kind, so carrying it as an integer would change what `ts / 1000`
+                // computes.
+                return v.is_integral_number() &&
+                       static_cast<arrow::TimestampBuilder*>(b)->Append(v.as_int()).ok();
             case arrow::Type::INT32: {
                 if (!v.is_number()) {
                     return false;

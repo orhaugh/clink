@@ -800,7 +800,9 @@ TEST(RowLayoutReceive, CellIsExactForATimestampLayoutTakesIntegersOnly) {
     const cfg::JsonValue fraction{5.5};
     const cfg::JsonValue text{std::string{"1700000000123"}};
     EXPECT_TRUE(rcd::cell_is_exact(*type, &integer));
-    EXPECT_TRUE(rcd::cell_is_exact(*type, &whole));
+    // An integral double reads back as an integer, which prints the same but
+    // takes integer arithmetic where the double took double arithmetic.
+    EXPECT_FALSE(rcd::cell_is_exact(*type, &whole));
     EXPECT_FALSE(rcd::cell_is_exact(*type, &fraction));
     EXPECT_FALSE(rcd::cell_is_exact(*type, &text));
     EXPECT_TRUE(rcd::cell_is_exact(*type, nullptr));

@@ -714,6 +714,18 @@ if(CLINK_BUILD_SQL)
     set_tests_properties(SqlRuntime.RowBindIntoJsonFileSinkKeepsRowPathBytes.ColumnarDisabled
         PROPERTIES TIMEOUT 30 LABELS sql ENVIRONMENT "CLINK_DISABLE_COLUMNAR=1"
                    FAIL_REGULAR_EXPRESSION "0 tests from 0 test suites ran")
+    # Epoch-millisecond timestamps through a filter, through windows and through
+    # arithmetic, again with the columnar path off, for the same reason: both
+    # runs must write the row path's lines.
+    foreach(_ems_case EpochMillisTimestampsFilterAsTheRowPathDoes
+                      EpochMillisTimestampsWindowAsTheRowPathDoes
+                      EpochMillisIntegralDoubleTimestampsComputeAsTheRowPathDoes)
+        add_test(NAME SqlRuntime.${_ems_case}.ColumnarDisabled
+                 COMMAND clink_sql_tests --gtest_filter=SqlRuntime.${_ems_case})
+        set_tests_properties(SqlRuntime.${_ems_case}.ColumnarDisabled
+            PROPERTIES TIMEOUT 30 LABELS sql ENVIRONMENT "CLINK_DISABLE_COLUMNAR=1"
+                       FAIL_REGULAR_EXPRESSION "0 tests from 0 test suites ran")
+    endforeach()
 
     # The native ClickHouse sink driven through the SQL frontend, against the
     # in-process fake server: a differential with the collect sink, the keys

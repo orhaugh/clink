@@ -948,18 +948,30 @@ std::vector<JsonObject> edge_rows(std::mt19937_64& rng, std::int64_t& next_id) {
     return rows;
 }
 
-// Keeps only `columns` of a generated row. With `temporal_as_text`, every
-// DATE becomes its YYYY-MM-DD text and every TIMESTAMP its digit string: the
-// two forms that a text-carried column decodes columnar.
-std::string line_of(JsonObject row, const std::vector<Column>& columns, bool temporal_as_text) {
+// The forms a differential line writes its temporal values in. Generated rows
+// hold DATE values as days or YYYY-MM-DD text and TIMESTAMP values as epoch
+// milliseconds or their digit string, both forms the engine's convention allows.
+struct TemporalForms {
+    // Every DATE as its YYYY-MM-DD text.
+    bool dates_as_text = false;
+    // Every TIMESTAMP as the digit string of its epoch milliseconds.
+    bool timestamps_as_text = false;
+    // Every TIMESTAMP as its epoch milliseconds, a digit string read back.
+    bool timestamps_as_integers = false;
+};
+
+// Keeps only `columns` of a generated row, its temporal values in `forms`.
+std::string line_of(JsonObject row, const std::vector<Column>& columns, TemporalForms forms) {
     JsonObject kept;
     for (const auto& c : columns) {
         JsonValue v = row[c.name];
-        if (temporal_as_text && !v.is_null() && !v.is_string()) {
-            if (c.sql == "DATE") {
-                v = JsonValue{civil_text(v.as_int())};
-            } else if (c.sql.starts_with("TIMESTAMP")) {
+        if (!v.is_null() && c.sql == "DATE" && forms.dates_as_text && !v.is_string()) {
+            v = JsonValue{civil_text(v.as_int())};
+        } else if (!v.is_null() && c.sql.starts_with("TIMESTAMP")) {
+            if (forms.timestamps_as_text && !v.is_string()) {
                 v = JsonValue{std::to_string(v.as_int())};
+            } else if (forms.timestamps_as_integers && v.is_string()) {
+                v = JsonValue{static_cast<std::int64_t>(std::stoll(v.as_string()))};
             }
         }
         kept[c.name] = std::move(v);
@@ -970,15 +982,15 @@ std::string line_of(JsonObject row, const std::vector<Column>& columns, bool tem
 std::vector<std::string> differential_lines(
     std::size_t generated,
     const std::vector<Column>& columns = differential_columns(),
-    bool temporal_as_text = false) {
+    TemporalForms forms = {}) {
     std::mt19937_64 rng(20261001);
     std::int64_t next_id = 1;
     std::vector<std::string> lines;
     for (auto& r : edge_rows(rng, next_id)) {
-        lines.push_back(line_of(std::move(r), columns, temporal_as_text));
+        lines.push_back(line_of(std::move(r), columns, forms));
     }
     for (std::size_t k = 0; k < generated; ++k) {
-        lines.push_back(line_of(generated_row(next_id++, rng), columns, temporal_as_text));
+        lines.push_back(line_of(generated_row(next_id++, rng), columns, forms));
     }
     return lines;
 }
@@ -1180,9 +1192,11 @@ TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesForEveryType) {
 
 // The columns whose values the born-columnar layout holds exactly: BIGINT,
 // INTEGER, DOUBLE, BOOLEAN, VARCHAR and DECIMAL. Every other column of the
-// differential (SMALLINT, DATE, TIMESTAMP, arrays, maps and rows) arrives as a
-// number, array or object that the layout would store as text, so a join
-// emitting one takes the row path. REAL is left out too: the file source does
+// differential (SMALLINT, DATE, arrays, maps and rows) arrives as a number,
+// array or object that the layout would store as text, so a join emitting one
+// takes the row path. TIMESTAMP is left out too: the layout holds an
+// epoch-millisecond integer exactly, but the differential also writes digit
+// strings, which it does not. REAL is left out too: the file source does
 // not round a REAL to float precision, so the edge rows' 0.1 has no exact
 // float32 cell and its join takes the row path as well.
 const std::vector<Column>& born_columnar_columns() {
@@ -1262,8 +1276,9 @@ JoinCarrier join_differential(const std::string& scratch, const std::vector<Colu
 }
 
 // Every differential column behind a join the planner promotes to born
-// columnar. SMALLINT, DATE, TIMESTAMP, array, map and row values, and a REAL off
-// float precision, have no exact cell in that layout, so the join takes the row path for every pair
+// columnar. SMALLINT, DATE, array, map and row values, a TIMESTAMP written as a
+// digit string, and a REAL off float precision, have no exact cell in that
+// layout, so the join takes the row path for every pair
 // and the native sink receives rows built by the join, never a sidecar. The values must still
 // land as the collect sink sees them.
 //
@@ -1322,12 +1337,19 @@ const std::vector<Column>& columnar_decode_columns() {
 
 // The columnar JSON decode, the default for a Kafka table: the bridge builds
 // an Arrow sidecar at decode, the projection and the bind pass it on, and the
-// native sink converts it from its arrays. DATE and TIMESTAMP values are
-// written as text, the form that keeps the batch columnar.
+// native sink converts it from its arrays. DATE values are written as text,
+// which the decode carries as text, and TIMESTAMP values as epoch-millisecond
+// integers, which it carries as timestamp(ms[, "UTC"]): the forms that keep the
+// batch columnar.
 TEST(ClickHouseNativeSql, LandsWhatTheCollectSinkSeesBehindTheColumnarDecode) {
     ensure_installed();
     const auto& columns = columnar_decode_columns();
-    set_feed("diff_columnar", differential_lines(kGeneratedRows, columns, true), true);
+    set_feed(
+        "diff_columnar",
+        differential_lines(kGeneratedRows,
+                           columns,
+                           TemporalForms{.dates_as_text = true, .timestamps_as_integers = true}),
+        true);
     const std::string ddl = "CREATE TABLE src " + column_ddl(columns) +
                             " WITH (connector='kafka', format='json', topic='diff_columnar');";
     const std::string select = "SELECT " + column_list("", columns) + " FROM src;";
@@ -1737,9 +1759,10 @@ TEST(ClickHouseNativeSql, AWindowIntoTheNativeSinkReachesItColumnarAndLandsTheRo
 }
 
 // A window grouped by TIMESTAMP(3), SMALLINT and DATE keys into the native
-// sink. The born-columnar layout holds none of these exactly, so the window
-// may finish its panes in row form; whichever carrier reaches the sink, the
-// values that land equal the row-form run's.
+// sink. The born-columnar layout holds the TIMESTAMP key exactly but not the
+// SMALLINT or DATE key, so the window may finish its panes in row form;
+// whichever carrier reaches the sink, the values that land equal the row-form
+// run's.
 TEST(ClickHouseNativeSql, AWindowGroupedByTemporalAndSmallIntKeysLandsTheRowFormValues) {
     ensure_installed();
     const ScratchDir dir("window_temporal");
@@ -1765,6 +1788,76 @@ TEST(ClickHouseNativeSql, AWindowGroupedByTemporalAndSmallIntKeysLandsTheRowForm
     const auto [planned, rows] = window_into_native_both_ways(target, ddl, insert);
     EXPECT_FALSE(planned.rows.empty());
     EXPECT_EQ(planned.rows, rows.rows);
+}
+
+// --- The q0 shape with an epoch-millisecond TIMESTAMP ----------------------
+
+// The q0 chain with the bid's datetime declared TIMESTAMP(3) and its values the
+// epoch-millisecond integers the nexmark generator writes. The columnar decode
+// carries the column as timestamp(ms), so the chain builds no Row on its way to
+// the native sink, which takes every batch columnar. The same table with the
+// columnar decode turned off lands the same rows through the row path. A
+// process-wide delta of 0 alone would prove nothing, because a decode that fell
+// back to rows shows 0 too; the sink's own carrier count is the proof.
+TEST(ClickHouseNativeSql, AQ0ShapedPipelineWithAnEpochMillisTimestampBuildsNoRowAtTheSinkHop) {
+    ensure_installed();
+    if (q0_columnar_disabled()) {
+        GTEST_SKIP() << "the columnar path is off for this process";
+    }
+    const auto ddl = [](const std::string& topic, bool row_form) {
+        return "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+               "url VARCHAR, datetime TIMESTAMP(3)) WITH (connector='kafka', format='json', "
+               "topic='" +
+               topic + "'" + (row_form ? ", columnar_decode='false'" : "") +
+               ");"
+               "CREATE TABLE ch (auction BIGINT, bidder BIGINT, price BIGINT, datetime "
+               "TIMESTAMP(3)) WITH (" +
+               kNativeWith + ");";
+    };
+    const std::string insert = "INSERT INTO ch " + kQ0Select;
+
+    const auto plan = compile_script(ddl("q0_millis_plan", false), insert, 1);
+    ASSERT_EQ(plan.size(), 1U);
+    std::vector<std::string> types;
+    for (const auto& op : plan[0].ops) {
+        types.push_back(op.type);
+    }
+    EXPECT_EQ(types,
+              (std::vector<std::string>{"kafka_source_string",
+                                        "json_string_to_row_columnar",
+                                        "project_row",
+                                        "row_bind_columns",
+                                        "clickhouse_native_sink"}));
+    const auto decodes = ops_of_type(plan[0], "json_string_to_row_columnar");
+    ASSERT_EQ(decodes.size(), 1U);
+    EXPECT_EQ(decodes[0]->params.at("schema_columns"),
+              "auction:i64;bidder:i64;price:i64;channel:str;url:str;datetime:ts_ms");
+
+    const auto target = fake_table("events",
+                                   {{"auction", "Int64"},
+                                    {"bidder", "Int64"},
+                                    {"price", "Int64"},
+                                    {"datetime", "DateTime64(3)"}});
+    set_feed("q0_millis", q0_lines(), true);
+    set_feed("q0_millis_rows", q0_lines(), true);
+    WindowRun columnar;
+    {
+        const FakeServerScope fake(target);
+        columnar = window_into_native(fake, ddl("q0_millis", false), insert);
+    }
+    WindowRun rows;
+    {
+        const FakeServerScope fake(target);
+        rows = window_into_native(fake, ddl("q0_millis_rows", true), insert);
+    }
+    EXPECT_EQ(columnar.materialised, 0U) << "a Row was built on the way to the native sink";
+    EXPECT_EQ(columnar.columnar_batches, kQ0Batches)
+        << "the native sink did not take every batch columnar";
+    EXPECT_EQ(columnar.row_batches, 0U);
+    EXPECT_GT(rows.row_batches, 0U) << "the row-form run handed the sink no rows";
+    EXPECT_EQ(rows.columnar_batches, 0U);
+    EXPECT_EQ(columnar.rows.size(), kQ0Batches * 64);
+    EXPECT_EQ(columnar.rows, rows.rows);
 }
 
 // --- The keys the planner puts on the op ------------------------------------
@@ -2083,9 +2176,13 @@ TEST(ClickHouseNativeSql, AFinalCheckpointHeldPastItsBoundCostsOneRestartAndNoRo
 // columnar decode that is the Kafka default. The collect sink carries these
 // columns as the text of the value, so a rescale shows as different digits.
 // The row decode is fed both forms the engine's convention allows, integers
-// and digit strings. The columnar decode keeps a batch columnar only when
-// every value of a column it carries as text is a string, so it is fed the
-// text forms, which is what it decodes columnar in practice.
+// and digit strings. The columnar decode carries TIMESTAMP and TIMESTAMPTZ as
+// epoch milliseconds and DATE as text, so it keeps a batch columnar only when
+// every timestamp is an integer and every date a string. It is fed two ways
+// into the collect table: the same values with every timestamp as text, which
+// takes the row path, and with every timestamp as an integer, which the
+// collect sink, being row-only, receives on the sidecar and decodes. Each
+// lands the values as written.
 TEST(ClickHouseNativeSql, TheJsonDecodeHandsTimestampsAndDatesOnAsWritten) {
     ensure_installed();
     const std::vector<std::string> columns = {"t0", "t3", "t6", "t9", "tz", "dd"};
@@ -2100,24 +2197,48 @@ TEST(ClickHouseNativeSql, TheJsonDecodeHandsTimestampsAndDatesOnAsWritten) {
         R"({"id":2,"t0":"-86400000","t3":"-1","t6":"1700000000123","t9":"-1","tz":"0","dd":"2299-12-31"})",
         R"({"id":3,"t0":"0","t3":"0","t6":"0","t9":"0","tz":"1","dd":"1970-01-01"})",
     };
+    const std::vector<std::string> epoch_millis = {
+        R"({"id":1,"t0":1700000000000,"t3":1700000000123,"t6":-1,"t9":9223372036854,"tz":-2208988800000,"dd":"1969-07-20"})",
+        R"({"id":2,"t0":-86400000,"t3":-1,"t6":1700000000123,"t9":-1,"tz":0,"dd":"2299-12-31"})",
+        R"({"id":3,"t0":0,"t3":0,"t6":0,"t9":0,"tz":1,"dd":"1970-01-01"})",
+    };
     const std::string table =
         "(id BIGINT, t0 TIMESTAMP(0), t3 TIMESTAMP(3), t6 TIMESTAMP(6), t9 TIMESTAMP(9), tz "
         "TIMESTAMPTZ, "
         "dd DATE)";
-    for (const bool row_form : {true, false}) {
-        SCOPED_TRACE(row_form ? "json_string_to_row" : "json_string_to_row_columnar");
-        const std::string topic = row_form ? "decode_row" : "decode_columnar";
-        const auto& lines = row_form ? mixed : text_only;
-        set_feed(topic, lines, true);
+    struct Feed {
+        const char* label;
+        const char* topic;
+        const std::vector<std::string>* lines;
+        bool row_form;  // the table opts out of the columnar decode
+        bool decoded;   // the collect sink received the batches on the sidecar
+    };
+    const std::vector<Feed> feeds = {
+        {"json_string_to_row", "decode_row", &mixed, true, false},
+        {"json_string_to_row_columnar, timestamps as text",
+         "decode_columnar_text",
+         &text_only,
+         false,
+         false},
+        {"json_string_to_row_columnar, timestamps as epoch milliseconds",
+         "decode_columnar_millis",
+         &epoch_millis,
+         false,
+         true},
+    };
+    for (const auto& feed : feeds) {
+        SCOPED_TRACE(feed.label);
+        const auto& lines = *feed.lines;
+        set_feed(feed.topic, lines, true);
         const std::string ddl = "CREATE TABLE src " + table +
-                                " WITH (connector='kafka', format='json', topic='" + topic + "'" +
-                                (row_form ? ", columnar_decode='false'" : "") +
+                                " WITH (connector='kafka', format='json', topic='" + feed.topic +
+                                "'" + (feed.row_form ? ", columnar_decode='false'" : "") +
                                 "); CREATE TABLE out " + table + " WITH (connector='collect');";
         const std::string insert = "INSERT INTO out SELECT id, t0, t3, t6, t9, tz, dd FROM src;";
         const auto plan = compile_script(ddl, insert, 1);
         ASSERT_EQ(plan.size(), 1U);
         ASSERT_TRUE(
-            has_op(plan[0], row_form ? "json_string_to_row" : "json_string_to_row_columnar"));
+            has_op(plan[0], feed.row_form ? "json_string_to_row" : "json_string_to_row_columnar"));
 
         clink::embed::EngineOptions opts;
         std::ostringstream err;
@@ -2144,9 +2265,11 @@ TEST(ClickHouseNativeSql, TheJsonDecodeHandsTimestampsAndDatesOnAsWritten) {
             }
         }
         ASSERT_TRUE(engine.await_all()) << err.str();
-        if (!row_form) {
-            EXPECT_GT(clink::detail::batch_materialize_counter().load(), decoded_before)
-                << "the columnar decode took the row path for every batch";
+        const auto decoded = clink::detail::batch_materialize_counter().load() - decoded_before;
+        if (feed.decoded) {
+            EXPECT_GT(decoded, 0U) << "the columnar decode took the row path for every batch";
+        } else {
+            EXPECT_EQ(decoded, 0U) << "a batch reached the collect sink on the sidecar";
         }
         ASSERT_EQ(got.size(), lines.size());
         for (const auto& line : lines) {
@@ -2689,10 +2812,10 @@ std::vector<std::string> live_lines() {
     std::int64_t next_id = 1;
     std::vector<std::string> lines;
     for (auto& r : live_edge_rows(rng, next_id)) {
-        lines.push_back(line_of(std::move(r), live_columns(), false));
+        lines.push_back(line_of(std::move(r), live_columns(), {}));
     }
     for (std::size_t k = 0; k < kLiveGeneratedRows; ++k) {
-        lines.push_back(line_of(live_row(next_id++, rng), live_columns(), false));
+        lines.push_back(line_of(live_row(next_id++, rng), live_columns(), {}));
     }
     return lines;
 }

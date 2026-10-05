@@ -8,6 +8,7 @@
 // process-wide transport factory back.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -2211,6 +2212,116 @@ TEST(NativeSinkColumnar, AColumnarCellThatCannotConvertFailsTheTaskAsOnDataDoes)
     ASSERT_EQ(lines.size(), 1U);
     EXPECT_EQ(lines.front().level, "error");
     EXPECT_FALSE(ns_has(lines.front().message, "2024")) << lines.front().message;
+}
+
+// The three carriers a TIMESTAMP column reaches the sink on: a Row holding the
+// epoch milliseconds as an integer, a sidecar column under the second Row
+// layout (timestamp(ms), or timestamp(ms, "UTC") for TIMESTAMPTZ) and a sidecar
+// column under the first (utf8, the digit string). Each must hand the server
+// the same blocks, byte for byte, for every precision and zone, nulls and
+// epochs before 1970 included. ISO text in a utf8 TIMESTAMP column still fails
+// the task (AColumnarCellThatCannotConvertFailsTheTaskAsOnDataDoes).
+TEST(NativeSinkColumnar, ATimestampLandsTheSameBlocksFromARowAndFromEitherSidecarLayout) {
+    fake::FakeTable table = ns_table();
+    table.columns = {{"id", "Int64", DefaultKind::None, 1},
+                     {"ts", "Nullable(DateTime64(3))", DefaultKind::None, 2},
+                     {"t6", "DateTime64(6, 'UTC')", DefaultKind::None, 3},
+                     {"tz", "DateTime64(3, 'Asia/Tokyo')", DefaultKind::None, 4}};
+    const std::string types =
+        "id:BIGINT;ts:TIMESTAMP(3);t6:TIMESTAMP(6);tz:TIMESTAMP(3) WITH TIME ZONE";
+    // id, ts (nullable), t6, tz.
+    const std::vector<std::array<std::optional<std::int64_t>, 4>> values = {
+        {{1, 1'700'000'000'123, 1'700'000'000'123, 1'700'000'000'123}},
+        {{2, -1, -1, -1}},
+        {{3, 0, 0, 0}},
+        {{4, -2'208'988'800'000, -2'208'988'800'000, -2'208'988'800'000}},
+        {{5, 10'413'791'999'999, 10'413'791'999'999, 10'413'791'999'999}},
+        {{6, std::nullopt, 86'400'000, -86'400'001}},
+    };
+    const auto n = static_cast<std::int64_t>(values.size());
+
+    const auto run = [&](const std::function<void(NativeSink&)>& feed) {
+        NsDirect direct(table);
+        direct.params["sql_column_types"] = types;
+        NativeSink& sink = direct.open();
+        feed(sink);
+        sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink.flush();
+        sink.close();
+        return ns_received(*direct.server);
+    };
+
+    const auto from_rows = run([&](NativeSink& sink) {
+        Batch<sql::Row> batch;
+        for (const auto& v : values) {
+            clink::config::JsonObject object;
+            object["id"] = JsonValue{*v[0]};
+            object["ts"] = v[1].has_value() ? JsonValue{*v[1]} : JsonValue{};
+            object["t6"] = JsonValue{*v[2]};
+            object["tz"] = JsonValue{*v[3]};
+            sql::Row row;
+            row.values = sql::row_columns_from_json(std::move(object));
+            batch.emplace(std::move(row));
+        }
+        sink.on_data(batch);
+    });
+
+    // The rows as a sidecar: the timestamp columns as timestamp(ms[, "UTC"])
+    // under the second layout, as their digit strings under the first.
+    const auto sidecar = [&](bool second_layout) {
+        arrow::Int64Builder times;
+        arrow::Int64Builder ids;
+        std::vector<std::shared_ptr<arrow::Array>> stamps;
+        std::vector<std::shared_ptr<arrow::Field>> fields = {
+            arrow::field("event_time", arrow::int64()), arrow::field("id", arrow::int64())};
+        for (std::int64_t i = 0; i < n; ++i) {
+            EXPECT_TRUE(times.AppendNull().ok());
+            EXPECT_TRUE(ids.Append(*values[static_cast<std::size_t>(i)][0]).ok());
+        }
+        const std::vector<std::pair<std::string, bool>> columns = {
+            {"ts", false}, {"t6", false}, {"tz", true}};
+        for (std::size_t c = 0; c < columns.size(); ++c) {
+            const auto& [name, zoned] = columns[c];
+            std::shared_ptr<arrow::Array> array;
+            if (second_layout) {
+                const auto type = zoned ? arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")
+                                        : arrow::timestamp(arrow::TimeUnit::MILLI);
+                arrow::TimestampBuilder b(type, arrow::default_memory_pool());
+                for (const auto& v : values) {
+                    EXPECT_TRUE((v[c + 1].has_value() ? b.Append(*v[c + 1]) : b.AppendNull()).ok());
+                }
+                array = b.Finish().ValueOrDie();
+                fields.push_back(arrow::field(name, type));
+            } else {
+                arrow::StringBuilder b;
+                for (const auto& v : values) {
+                    EXPECT_TRUE((v[c + 1].has_value() ? b.Append(std::to_string(*v[c + 1]))
+                                                      : b.AppendNull())
+                                    .ok());
+                }
+                array = b.Finish().ValueOrDie();
+                fields.push_back(arrow::field(name, arrow::utf8()));
+            }
+            stamps.push_back(std::move(array));
+        }
+        std::vector<std::shared_ptr<arrow::Array>> arrays = {times.Finish().ValueOrDie(),
+                                                             ids.Finish().ValueOrDie()};
+        arrays.insert(arrays.end(), stamps.begin(), stamps.end());
+        return arrow::RecordBatch::Make(arrow::schema(fields), n, std::move(arrays));
+    };
+
+    const auto calls = std::make_shared<std::atomic<int>>(0);
+    const auto from_second_layout = run([&](NativeSink& sink) {
+        EXPECT_TRUE(sink.on_data_columnar(ns_counted(sidecar(true), calls)));
+    });
+    const auto from_first_layout = run([&](NativeSink& sink) {
+        EXPECT_TRUE(sink.on_data_columnar(ns_counted(sidecar(false), calls)));
+    });
+    EXPECT_EQ(calls->load(), 0) << "a Row was built from a sidecar on the sink's hop";
+    ASSERT_EQ(from_rows.size(), 1U);
+    ASSERT_EQ(from_rows.front().second.size(), values.size());
+    EXPECT_EQ(from_second_layout, from_rows);
+    EXPECT_EQ(from_first_layout, from_rows);
 }
 
 // --- Shared chunks are freed on the task thread ---------------------------------------

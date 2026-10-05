@@ -14,6 +14,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -1234,7 +1235,64 @@ std::vector<ReleasedFingerprint> v0100_fingerprints() {
              "CREATE TABLE joined (k BIGINT, x BIGINT, y BIGINT) WITH (connector='blackhole');"
              "INSERT INTO joined SELECT a.k, a.x, b.y FROM a JOIN b ON a.k = b.k;",
          "0639e14a4d089b0d"},
+        // A window whose output carries TIMESTAMP aggregates into a HAVING
+        // filter: v0.10.0 hashed its columnar_output with those columns as str,
+        // and this build writes ts_ms there.
+        {"window with timestamp aggregates into a filter",
+         {{"window_ts_having.ndjson",
+           {R"({"k":1,"ts":1000})", R"({"k":2,"ts":2000})", R"({"k":1,"ts":100000})"}}},
+         "CREATE TABLE ev (k BIGINT, ts TIMESTAMP(3)) WITH (connector='file', format='json', "
+         "path='" +
+             d +
+             "/window_ts_having.ndjson', event_time_column='ts', watermark_lag_ms='0');"
+             "CREATE TABLE per_window (k BIGINT, first_ts TIMESTAMP(3), last_ts TIMESTAMP(3), c "
+             "BIGINT) WITH (connector='blackhole');"
+             "INSERT INTO per_window SELECT k, MIN(ts) AS first_ts, MAX(ts) AS last_ts, COUNT(*) "
+             "AS c FROM ev GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k HAVING COUNT(*) > 0;",
+         "3aeda44484f48a79"},
+        // An inner join carrying a TIMESTAMP and a TIMESTAMPTZ into its
+        // projection: v0.10.0 hashed its columnar_output with both as str, and
+        // this build writes ts_ms and tstz_ms there.
+        {"inner join carrying timestamps",
+         {{"join_ts_a.ndjson", {R"({"k":1,"t":1000,"tz":2000})", R"({"k":2,"t":3000,"tz":4000})"}},
+          {"join_ts_b.ndjson", {R"({"k":1,"y":5})", R"({"k":3,"y":7})"}}},
+         "CREATE TABLE a (k BIGINT, t TIMESTAMP(3), tz TIMESTAMPTZ) WITH (connector='file', "
+         "format='json', path='" +
+             d +
+             "/join_ts_a.ndjson');"
+             "CREATE TABLE b (k BIGINT, y BIGINT) WITH (connector='file', format='json', path='" +
+             d +
+             "/join_ts_b.ndjson');"
+             "CREATE TABLE joined (k BIGINT, t TIMESTAMP(3), tz TIMESTAMPTZ, y BIGINT) WITH "
+             "(connector='blackhole');"
+             "INSERT INTO joined SELECT a.k, a.t, a.tz, b.y FROM a JOIN b ON a.k = b.k;",
+         "a609418b8454ee76"},
     };
+}
+
+// The job spec the script runner hands the embedded engine for `script`, which
+// holds one INSERT. The engine submits that spec as it is but for the per-engine
+// collect_scope, which the fingerprint leaves out, so its job_graph_fingerprint
+// is the one a checkpointed run of the script records.
+clink::cluster::JobGraphSpec planned_spec(const std::string& script) {
+    clink::sql::Catalog catalog;
+    clink::sql::ScriptRunOptions opts;
+    opts.parallelism = clink::embed::EngineOptions{}.parallelism;
+    std::ostringstream out;
+    std::ostringstream err;
+    std::vector<clink::cluster::JobGraphSpec> specs;
+    const int rc = clink::sql::run_script(
+        script,
+        catalog,
+        opts,
+        clink::sql::ScriptIO{&out, &err},
+        [&specs](const clink::cluster::JobGraphSpec& spec, const std::string&) {
+            specs.push_back(spec);
+            return 0;
+        });
+    EXPECT_EQ(rc, 0) << err.str();
+    EXPECT_EQ(specs.size(), 1U);
+    return specs.empty() ? clink::cluster::JobGraphSpec{} : specs.front();
 }
 
 // One checkpointed run of `script`. Returns execute_script's code; the engine
@@ -1274,7 +1332,8 @@ std::string read_file(const fs::path& path) {
 // upgrade would. The window into the bind is the case this build plans
 // differently (columnar where v0.10.0 planned rows); the filter and join cases
 // carried columnar_output under v0.10.0 already, and their fingerprints must
-// still include it.
+// still include it. The two timestamp cases carry it too, and this build spells
+// their timestamp columns there in the second Row layout's codes.
 TEST(EmbeddedEngine, AJobInterruptedUnderTheLastReleaseResumes) {
     std::error_code ec;
     fs::create_directories(kGoldenDir, ec);
@@ -1309,6 +1368,54 @@ TEST(EmbeddedEngine, AJobInterruptedUnderTheLastReleaseResumes) {
             fs::remove(fs::path{kGoldenDir} / file, ec);
         }
     }
+}
+
+// Jobs whose columnar carriers hold TIMESTAMP and TIMESTAMPTZ columns. This
+// build carries them as epoch milliseconds, so it writes ts_ms and tstz_ms where
+// v0.10.0 wrote str: in a window's or a join's columnar_output (the run-recorded
+// golden cases above) and in a Kafka JSON table's columnar decode
+// schema_columns. Each fingerprint must still be the one v0.10.0 recorded. A run
+// of the Kafka script needs a broker, so its fingerprint is the planned one;
+// v0.10.0's was recorded by running the script under the v0.10.0 runtime image
+// with --checkpoint-dir, which writes the fingerprint before any operator is
+// built. The run-recorded golden cases check that a planned fingerprint is the
+// one a run records.
+TEST(EmbeddedEngine, JobsCarryingTimestampsKeepTheFingerprintsTheLastReleaseRecorded) {
+    for (const auto& c : v0100_fingerprints()) {
+        SCOPED_TRACE(c.label);
+        const auto spec = planned_spec(c.script);
+        EXPECT_EQ(clink::cluster::job_graph_fingerprint(spec), c.recorded)
+            << "the planned fingerprint is not the one a run records";
+        if (std::string_view{c.label}.find("timestamp") != std::string_view::npos) {
+            bool carried = false;
+            for (const auto& op : spec.ops) {
+                const auto it = op.params.find("columnar_output");
+                carried = carried ||
+                          (it != op.params.end() && it->second.find("_ms") != std::string::npos);
+            }
+            EXPECT_TRUE(carried) << "no columnar_output carries a timestamp as epoch "
+                                    "milliseconds, so this case does not test the spelling";
+        }
+    }
+    const std::string kafka =
+        "CREATE TABLE ev (k BIGINT, ts TIMESTAMP(3), tz TIMESTAMPTZ) WITH (connector='kafka', "
+        "format='json', brokers='127.0.0.1:1', topic='fingerprint_ts', event_time_column='ts', "
+        "watermark_lag_ms='0');"
+        "CREATE TABLE sunk (k BIGINT, ts TIMESTAMP(3), tz TIMESTAMPTZ) WITH "
+        "(connector='blackhole');"
+        "INSERT INTO sunk SELECT k, ts, tz FROM ev;";
+    const auto spec = planned_spec(kafka);
+    std::string decode_schema;
+    for (const auto& op : spec.ops) {
+        if (op.type == "json_string_to_row_columnar") {
+            decode_schema = op.params.at("schema_columns");
+        }
+    }
+    EXPECT_EQ(decode_schema, "k:i64;ts:ts_ms;tz:tstz_ms")
+        << "the columnar decode does not carry the timestamps as epoch milliseconds, so this "
+           "case does not test the spelling the fingerprint must read back";
+    EXPECT_EQ(clink::cluster::job_graph_fingerprint(spec), "7bf9b02606fcea92")
+        << "this build fingerprints the Kafka timestamp table differently from v0.10.0";
 }
 
 // The embedded engine admits the Row sidecar's second layout through its own

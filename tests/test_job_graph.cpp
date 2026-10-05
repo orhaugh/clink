@@ -610,3 +610,58 @@ TEST(JobGraphFingerprint, IgnoresTheAdmittedRowLayoutOnEveryOp) {
     first.ops[1].params["row_layout"] = "1";
     EXPECT_EQ(job_graph_fingerprint(base), job_graph_fingerprint(first));
 }
+
+// The Row sidecar's second layout spells TIMESTAMP and TIMESTAMPTZ as ts_ms and
+// tstz_ms where every released planner wrote str, in the columnar JSON decode's
+// schema_columns and in a window's or join's columnar_output. Neither code was
+// ever written by a released planner, so reading each back as str before hashing
+// changes no recorded fingerprint, and a job interrupted under the earlier
+// release resumes. Every other code, and every column name, is still hashed.
+TEST(JobGraphFingerprint, ReadsTheMillisecondTimestampCodesAsTheTextTheyReplaced) {
+    // src_0 -> dec_1 -> win_2 -> filter_3 -> snk_4
+    auto spec_of = [](const std::string& decode_schema, const std::string& window_schema) {
+        JobGraphSpec spec;
+        OperatorSpec src;
+        src.type = "kafka_source_string";
+        src.id = "src_0";
+        src.params["schema_columns"] = "k:i64;ts:str;tz:str";
+        OperatorSpec dec;
+        dec.type = "json_string_to_row_columnar";
+        dec.id = "dec_1";
+        dec.inputs = {"src_0"};
+        dec.params["schema_columns"] = decode_schema;
+        OperatorSpec win;
+        win.type = "tumbling_window_row";
+        win.id = "win_2";
+        win.inputs = {"dec_1"};
+        win.params["columnar_output"] = window_schema;
+        OperatorSpec filter;
+        filter.type = "filter_row_predicate";
+        filter.id = "filter_3";
+        filter.inputs = {"win_2"};
+        OperatorSpec sink;
+        sink.type = "blackhole_sink_row";
+        sink.id = "snk_4";
+        sink.inputs = {"filter_3"};
+        spec.ops = {src, dec, win, filter, sink};
+        return spec;
+    };
+    const auto released = spec_of("k:i64;ts:str;tz:str", "k:i64;last_ts:str;c:i64");
+    const auto second_layout = spec_of("k:i64;ts:ts_ms;tz:tstz_ms", "k:i64;last_ts:ts_ms;c:i64");
+    EXPECT_EQ(job_graph_fingerprint(released), job_graph_fingerprint(second_layout));
+
+    // A column named after a code keeps its name: only the code after the last
+    // ':' is read back.
+    EXPECT_EQ(job_graph_fingerprint(spec_of("ts_ms:i64;tz:str", "k:i64")),
+              job_graph_fingerprint(spec_of("ts_ms:i64;tz:tstz_ms", "k:i64")));
+    EXPECT_NE(job_graph_fingerprint(spec_of("ts_ms:i64;tz:str", "k:i64")),
+              job_graph_fingerprint(spec_of("ts_ms:str;tz:str", "k:i64")));
+
+    // Every other change to a schema is still a different job.
+    EXPECT_NE(job_graph_fingerprint(released),
+              job_graph_fingerprint(spec_of("k:i64;ts:i64;tz:str", "k:i64;last_ts:str;c:i64")));
+    EXPECT_NE(job_graph_fingerprint(released),
+              job_graph_fingerprint(spec_of("k:i64;at:ts_ms;tz:str", "k:i64;last_ts:str;c:i64")));
+    EXPECT_NE(job_graph_fingerprint(released),
+              job_graph_fingerprint(spec_of("k:i64;ts:str;tz:str", "k:i64;last_ts:i64;c:i64")));
+}

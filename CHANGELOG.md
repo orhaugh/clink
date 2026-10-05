@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**TIMESTAMP and TIMESTAMPTZ columns ride the columnar path as Arrow millisecond
+timestamps.** Within a deployment admitted to the second Row layout (embedded,
+or a cluster whose workers all run protocol v3), the columnar JSON decode of a
+Kafka table (JSON or a Schema Registry format) or a WebSocket JSON table, and
+the born-columnar output of joins and windows, carry integer epoch-millisecond
+values as Arrow timestamps, so a Kafka or WebSocket JSON table projected into
+the native ClickHouse sink builds no Row on the way; a filter or computed
+expression on a TIMESTAMP column still builds rows at that operator. A batch
+whose timestamps are ISO or digit text, or numerals with a decimal point such
+as `1700000000500.0`, takes the row decode, and joins and windows whose
+TIMESTAMP values are text or JSON doubles emit rows, with the same results; a
+join switches to rows for the rest of its life on the first such value. On a
+cluster that still has an older worker, timestamps ride as text, as before. An
+embedded job interrupted under v0.10.0 still resumes: its resume fingerprint
+reads the new timestamp codes as the text codes they replaced.
+
 **A listener is never closed under a thread that may be accepting on it.**
 The coordinator, the data-plane receiver and the HTTP server woke their accept
 thread by closing its listening socket. On macOS a close racing the thread's

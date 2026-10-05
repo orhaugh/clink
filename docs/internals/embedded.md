@@ -147,6 +147,23 @@ version), and
 `EmbeddedEngine.AdmittingTheSecondRowLayoutLeavesTheResumeFingerprintAlone`
 pins that the admitted run records the v0.10.0 fingerprint.
 
+The codes `ts_ms` and `tstz_ms` are read back as `str` before hashing, in
+every operator's `schema_columns` and `columnar_output`. They are the second
+Row layout's spelling of a TIMESTAMP and a TIMESTAMPTZ column, which the
+planner writes into the columnar JSON decode's schema and into the
+born-columnar schemas of a join and a window, where every released planner
+wrote `str`. No released planner wrote either code, so reading them back
+changes no recorded fingerprint, and how a column is carried changes neither
+what state the job keeps nor how its keys route: a key's fold reads the same
+integer from a millisecond column as from the row. Every other code, and
+every column name, is hashed as written.
+`EmbeddedEngine.AJobInterruptedUnderTheLastReleaseResumes` pins a window with
+TIMESTAMP aggregates feeding a `HAVING` filter and a join carrying a
+TIMESTAMP and a TIMESTAMPTZ against the fingerprints v0.10.0 recorded, and
+`EmbeddedEngine.JobsCarryingTimestampsKeepTheFingerprintsTheLastReleaseRecorded`
+does the same for a Kafka JSON table with both column types, whose v0.10.0
+fingerprint was recorded by the v0.10.0 runtime image.
+
 The check runs in the coordinator, on a job submitted with
 `CheckpointConfig::track_runs`, which only the embedded engine sets. A job
 submitted to a cluster, and one an HA leader takes over, restores from the

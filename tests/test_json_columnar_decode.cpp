@@ -373,6 +373,8 @@ TEST(JsonColumnarDecode, MixedSchemaWithFloatAndDecimalStaysColumnarAndEquivalen
 TEST(JsonColumnarDecode, TimestampStringColumnRidesStringPathEquivalent) {
     const std::vector<RowColumn> declared = {{"a", arrow::int64()},
                                              {"ts", arrow::timestamp(arrow::TimeUnit::MILLI)}};
+    // The first layout, the one a deployment not admitted to the second decodes
+    // with: TIMESTAMP is carried as text.
     const auto schema = clink::sql::parse_row_schema(
         clink::sql::serialize_row_schema(declared, clink::sql::RowLayout::V1));
 
@@ -398,6 +400,78 @@ TEST(JsonColumnarDecode, TimestampStringColumnRidesStringPathEquivalent) {
         ASSERT_TRUE(col_el.is_data());
         EXPECT_FALSE(col_el.as_data().is_columnar());  // number in a utf8 column -> fallback
         EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
+    }
+    // The second layout, the one an admitted deployment decodes with: TIMESTAMP
+    // and TIMESTAMPTZ are timestamp(ms[, "UTC"]) columns holding the epoch
+    // milliseconds, and the decode takes a value columnar exactly when it would
+    // take it into a BIGINT column. Each value is checked on both arms against
+    // the row decode the planner gives json_string_to_row, which reads the
+    // schema in the first layout.
+    for (const bool zoned : {false, true}) {
+        SCOPED_TRACE(zoned ? "TIMESTAMPTZ" : "TIMESTAMP");
+        const std::vector<RowColumn> typed = {
+            {"a", arrow::int64()},
+            {"ts",
+             zoned ? arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")
+                   : arrow::timestamp(arrow::TimeUnit::MILLI)}};
+        const auto first = clink::sql::parse_row_schema(
+            clink::sql::serialize_row_schema(typed, clink::sql::RowLayout::V1));
+        const auto second = clink::sql::parse_row_schema(
+            clink::sql::serialize_row_schema(typed, clink::sql::RowLayout::V2),
+            clink::sql::RowLayout::V2);
+        ASSERT_EQ(second[1].type->id(), arrow::Type::TIMESTAMP);
+        // `force_dom` adds a duplicate key, which the on-demand arm declines, so
+        // the DOM arm decides instead; the counter says which arm did.
+        const auto expect = [&](const std::vector<std::string>& values, bool columnar) {
+            SCOPED_TRACE(values.back());
+            for (const bool force_dom : {false, true}) {
+                SCOPED_TRACE(force_dom ? "DOM arm" : "on-demand arm");
+                std::vector<std::string> lines;
+                for (const auto& v : values) {
+                    lines.push_back((force_dom ? R"({"a":1,"a":1,"ts":)" : R"({"a":1,"ts":)") + v +
+                                    "}");
+                }
+                auto oracle = make_typed_row_oracle(first);
+                auto row_el = run_one(oracle, lines_batch(lines));
+                JsonStringToRowColumnarOperator col_op(second);
+                const auto dom_before = clink::detail::json_columnar_dom_arm_counter().load();
+                auto col_el = run_one(col_op, lines_batch(lines));
+                const auto dom_runs =
+                    clink::detail::json_columnar_dom_arm_counter().load() - dom_before;
+                ASSERT_TRUE(col_el.is_data());
+                EXPECT_EQ(col_el.as_data().is_columnar(), columnar);
+                EXPECT_EQ(dom_runs, (force_dom && columnar) ? 1U : 0U);
+                EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
+                EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+                if (columnar && col_el.as_data().is_columnar()) {
+                    const auto& sidecar = *col_el.as_data().arrow();
+                    const auto column = sidecar.GetColumnByName("ts");
+                    ASSERT_NE(column, nullptr);
+                    EXPECT_TRUE(column->type()->Equals(*second[1].type))
+                        << column->type()->ToString();
+                }
+            }
+        };
+        // Epoch-millisecond integers go columnar, the range's ends, negative
+        // epochs, values past 2^53 and a null included.
+        expect({"1719662400000"}, true);
+        expect({"1719662400000", "-1", "0", "-62135596800000"}, true);
+        expect({"9007199254740993", "-9007199254740993"}, true);
+        expect({"9223372036854775807", "-9223372036854775807"}, true);
+        expect({"1719662400000", "null"}, true);
+        // An integral numeral, digit text, ISO text, a fraction, a value outside
+        // int64 and a boolean send the batch to the row decode, and the rows are
+        // the same. The row decode keeps 5.0 a double, and the evaluator's
+        // arithmetic follows the value's kind, so an integer cell for it would
+        // change what `ts / 1000` computes even though it prints the same.
+        expect({"5.0"}, false);
+        expect({"1719662400000", "1700000000500.0"}, false);
+        expect({"1719662400000", R"("1719662400000")"}, false);
+        expect({R"("2024-06-29T12:00:00Z")"}, false);
+        expect({"1719662400000.5"}, false);
+        expect({"9223372036854775808"}, false);
+        expect({"-1e300"}, false);
+        expect({"true"}, false);
     }
 }
 

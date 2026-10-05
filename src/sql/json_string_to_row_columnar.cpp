@@ -151,6 +151,14 @@ bool append_ondemand(arrow::Type::type type_id,
             }
             return static_cast<arrow::Int64Builder*>(b)->Append(static_cast<std::int64_t>(d)).ok();
         }
+        case arrow::Type::TIMESTAMP: {
+            // timestamp(ms[, tz]): the epoch milliseconds, from an integer token
+            // only, as the DOM arm takes them. A numeral such as 5.0 and a string,
+            // digit text included, are refused.
+            std::int64_t out{};
+            return v.get_int64().get(out) == simdjson::SUCCESS &&
+                   static_cast<arrow::TimestampBuilder*>(b)->Append(out).ok();
+        }
         case arrow::Type::INT32: {
             double d{};
             if (v.get_double().get(d) != simdjson::SUCCESS) {

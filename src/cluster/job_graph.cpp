@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -576,6 +577,44 @@ void JobGraphSpec::validate() const {
     }
 }
 
+namespace {
+
+// A row-schema param ("name:code;name:code", serialize_row_schema in
+// row_columnar_batcher.hpp) with the second Row layout's timestamp codes,
+// ts_ms and tstz_ms, read back as the first layout's str. A column splits on
+// its last ':', as parse_row_schema splits it, so a column named after a code
+// keeps its name.
+std::string with_first_layout_timestamp_codes(const std::string& schema) {
+    if (schema.find("_ms") == std::string::npos) {
+        return schema;
+    }
+    std::string out;
+    out.reserve(schema.size());
+    std::size_t pos = 0;
+    while (true) {
+        const auto semi = schema.find(';', pos);
+        const std::string_view entry{schema.data() + pos,
+                                     (semi == std::string::npos ? schema.size() : semi) - pos};
+        const auto colon = entry.rfind(':');
+        const auto code =
+            colon == std::string_view::npos ? std::string_view{} : entry.substr(colon + 1);
+        if (code == "ts_ms" || code == "tstz_ms") {
+            out.append(entry.substr(0, colon + 1));
+            out.append("str");
+        } else {
+            out.append(entry);
+        }
+        if (semi == std::string::npos) {
+            break;
+        }
+        out.push_back(';');
+        pos = semi + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
 std::string job_graph_fingerprint(const JobGraphSpec& spec) {
     JobGraphSpec normalised = spec;
     // Ops that feed the SQL sink-boundary bind. A release that recorded
@@ -607,6 +646,19 @@ std::string job_graph_fingerprint(const JobGraphSpec& spec) {
         op.params.erase("row_layout");
         if (feeds_the_bind.contains(op.id)) {
             op.params.erase("columnar_output");
+        }
+        // The second Row layout spells a TIMESTAMP column ts_ms and a
+        // TIMESTAMPTZ column tstz_ms where every released planner wrote str:
+        // in the columnar JSON decode's schema_columns and in a window's or
+        // join's columnar_output. No released planner wrote either code, so
+        // reading them back as str changes no recorded fingerprint, and the
+        // codes change only how a column is carried, not the state a job keeps
+        // or how its keys route (a key's fold reads the same integer from a
+        // millisecond column as from the row).
+        for (const char* key : {"schema_columns", "columnar_output"}) {
+            if (auto it = op.params.find(key); it != op.params.end()) {
+                it->second = with_first_layout_timestamp_codes(it->second);
+            }
         }
     }
     const auto json = normalised.to_json();

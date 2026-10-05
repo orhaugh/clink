@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -1836,8 +1837,21 @@ TEST(SqlRuntime, AnUnstampedWindowBuildsTheFirstLayoutAndAStampedOneTheSecond) {
 
 TEST(SqlRuntime, AnUnstampedJoinBuildsTheFirstLayoutAndAStampedOneTheSecond) {
     ensure_sql_installed_once();
-    const auto left = outer_join_rows({{1, 10}, {2, 20}}, "lv");
-    const auto right = outer_join_rows({{1, 100}, {2, 200}}, "rv");
+    // The joined values as JSON integers, the form a timestamp(ms) cell holds
+    // exactly. (outer_join_rows makes doubles, which no timestamp cell holds.)
+    const auto integers = [](const std::vector<std::pair<std::int64_t, std::int64_t>>& kv,
+                             const char* col) {
+        std::vector<Record<Row>> rows;
+        for (const auto& [id, v] : kv) {
+            Row r;
+            r.values["id"] = clink::config::JsonValue{id};
+            r.values[col] = clink::config::JsonValue{v};
+            rows.push_back(Record<Row>{std::move(r)});
+        }
+        return rows;
+    };
+    const auto left = integers({{1, 10}, {2, 20}}, "lv");
+    const auto right = integers({{1, 100}, {2, 200}}, "rv");
     const std::string schema = "l_id:i64;l_lv:ts_ms;r_id:i64;r_rv:i64";
 
     const auto row_run = run_equi_join_probed("inner", left, right, "");
@@ -1851,12 +1865,23 @@ TEST(SqlRuntime, AnUnstampedJoinBuildsTheFirstLayoutAndAStampedOneTheSecond) {
         << stamped.first_schema;
     EXPECT_EQ(serialized_rows(stamped.records), serialized_rows(row_run.records));
     EXPECT_EQ(serialized_rows(unstamped.records), serialized_rows(row_run.records));
+
+    // A timestamp held as a JSON double, even an integral one, would come back
+    // out of the timestamp(ms) column as an integer, which takes integer
+    // arithmetic where the double took double arithmetic: the stamped join
+    // bails it to rows.
+    const auto doubles = outer_join_rows({{1, 10}, {2, 20}}, "lv");
+    const auto double_rows = run_equi_join_probed("inner", doubles, right, "");
+    const auto stamped_doubles = run_equi_join_probed("inner", doubles, right, schema, "2");
+    EXPECT_GT(stamped_doubles.batches, 0);
+    EXPECT_EQ(stamped_doubles.columnar_batches, 0) << stamped_doubles.first_schema;
+    EXPECT_EQ(serialized_rows(stamped_doubles.records), serialized_rows(double_rows.records));
 }
 
 // The columnar Kafka JSON decode: unstamped, a ts_ms column is utf8 and text
 // timestamps ride columnar as text, which is what every released build did. The
-// stamp makes it timestamp(ms), which this build's decoder does not yet take,
-// so the decode stays row form; either way the rows are the row decode's.
+// stamp makes it timestamp(ms), which takes integer epoch milliseconds only, so
+// text decodes in row form; either way the rows are the row decode's.
 TEST(SqlRuntime, AnUnstampedColumnarJsonDecodeBuildsTheFirstLayout) {
     ensure_sql_installed_once();
     const std::vector<std::string> lines{R"({"k":1,"ts":"2026-10-05 10:00:00"})",
@@ -12374,6 +12399,202 @@ TEST(SqlRuntime, ColumnarDecodeParityOracleOverFloatAndDecimal) {
         EXPECT_FALSE(columnar.empty());
     }
 
+    std::filesystem::remove(in_path);
+}
+
+namespace {
+
+// Epoch-millisecond TIMESTAMP and TIMESTAMPTZ values on a Kafka JSON table, as
+// integers: the form the columnar decode carries typed under the second Row
+// layout. Two keys over four ten-second windows, the last fired by end of input.
+// Every line decodes columnar, so the columnar run carries the whole stream on
+// the sidecar.
+std::vector<std::string> epoch_millis_lines() {
+    const std::int64_t base = 1'700'000'000'000;
+    const std::vector<std::array<std::int64_t, 3>> rows = {
+        {1, 1000, 1000},
+        {2, 2000, 2000},
+        {1, 3000, 1000},
+        {2, 4000, 2000},
+        {1, 5000, 1000},
+        {1, 11000, 3000},
+        {2, 12000, 2000},
+        {1, 13000, 3000},
+        {2, 21000, 1000},
+        {1, 100000, 3000},
+    };
+    std::vector<std::string> out;
+    for (const auto& [k, ts, tz] : rows) {
+        out.push_back(R"({"k":)" + std::to_string(k) + R"(,"ts":)" + std::to_string(base + ts) +
+                      R"(,"tz":)" + std::to_string(base + tz) + "}");
+    }
+    return out;
+}
+
+const std::string kEpochMillisColumns = "k BIGINT, ts TIMESTAMP(3), tz TIMESTAMPTZ";
+
+bool columnar_disabled_for_process() {
+    const char* off = std::getenv("CLINK_DISABLE_COLUMNAR");
+    return off != nullptr && off[0] == '1';
+}
+
+}  // namespace
+
+// Epoch-millisecond timestamps through a filter on a TIMESTAMP and a TIMESTAMPTZ
+// comparison, behind the event-time assigner reading the TIMESTAMP column. The
+// columnar decode carries both columns as timestamp(ms[, "UTC"]) and the run
+// must write what the row bridge (columnar_decode='false') writes, which is the
+// row path's answer. Registered a second time with CLINK_DISABLE_COLUMNAR=1,
+// where every operator takes the row path and the same lines must land.
+TEST(SqlRuntime, EpochMillisTimestampsFilterAsTheRowPathDoes) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_ems_filter_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_ems_filter_out_" + tag + ".ndjson");
+    write_lines(in_path, epoch_millis_lines());
+
+    const std::string q =
+        "INSERT INTO out_t SELECT k, ts, tz FROM t "
+        "WHERE ts >= 1700000010000 AND tz < 1700000003000";
+    const auto before = clink::detail::batch_materialize_counter().load();
+    const auto columnar = run_kafka_parity_case(
+        kEpochMillisColumns, "event_time_column='ts'", kEpochMillisColumns, q, in_path, out_path);
+    const auto columnar_decoded = clink::detail::batch_materialize_counter().load() - before;
+    const auto row_form = run_kafka_parity_case(kEpochMillisColumns,
+                                                "event_time_column='ts', columnar_decode='false'",
+                                                kEpochMillisColumns,
+                                                q,
+                                                in_path,
+                                                out_path);
+    const std::multiset<std::string> want = {
+        R"({"k":2,"ts":1700000012000,"tz":1700000002000})",
+        R"({"k":2,"ts":1700000021000,"tz":1700000001000})",
+    };
+    EXPECT_EQ(columnar, want);
+    EXPECT_EQ(row_form, want);
+    if (columnar_disabled_for_process()) {
+        EXPECT_FALSE(clink::detail::columnar_enabled());
+    } else {
+        // The file sink is row-only, so a batch that reached it on the sidecar
+        // was decoded there. Without a sidecar from the decode there is
+        // nothing to decode, which is what a decode that fell back to rows
+        // shows.
+        EXPECT_GT(columnar_decoded, 0U)
+            << "the decode never handed the filter a sidecar, so the run took the row path";
+    }
+    std::filesystem::remove(in_path);
+}
+
+// Epoch-millisecond timestamps through tumbling windows whose event time is the
+// TIMESTAMP column, at parallelism 2 so the keyed split routes the sidecar, with
+// MIN and MAX over both timestamp types, and again grouped by the TIMESTAMPTZ
+// column, which the key fold reads from the sidecar. Each must write what the
+// row bridge writes. Registered a second time with CLINK_DISABLE_COLUMNAR=1.
+TEST(SqlRuntime, EpochMillisTimestampsWindowAsTheRowPathDoes) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_ems_window_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_ems_window_out_" + tag + ".ndjson");
+    write_lines(in_path, epoch_millis_lines());
+
+    const auto both = [&](const std::string& out_cols, const std::string& q) {
+        auto columnar = run_kafka_parity_case(kEpochMillisColumns,
+                                              "event_time_column='ts', watermark_lag_ms='0'",
+                                              out_cols,
+                                              q,
+                                              in_path,
+                                              out_path,
+                                              "tumbling_window_row",
+                                              2);
+        auto row_form = run_kafka_parity_case(
+            kEpochMillisColumns,
+            "event_time_column='ts', watermark_lag_ms='0', columnar_decode='false'",
+            out_cols,
+            q,
+            in_path,
+            out_path,
+            "tumbling_window_row",
+            2);
+        return std::make_pair(std::move(columnar), std::move(row_form));
+    };
+
+    {
+        SCOPED_TRACE("MIN and MAX over the timestamps, keyed by k");
+        const auto [columnar, row_form] = both(
+            "k BIGINT, first_ts TIMESTAMP(3), last_ts TIMESTAMP(3), last_tz TIMESTAMPTZ, c BIGINT",
+            "INSERT INTO out_t SELECT k, MIN(ts) AS first_ts, MAX(ts) AS last_ts, MAX(tz) AS "
+            "last_tz, COUNT(*) AS c FROM t GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k");
+        const std::multiset<std::string> want = {
+            R"({"c":3,"first_ts":1700000001000,"k":1,"last_ts":1700000005000,"last_tz":1700000001000})",
+            R"({"c":2,"first_ts":1700000002000,"k":2,"last_ts":1700000004000,"last_tz":1700000002000})",
+            R"({"c":2,"first_ts":1700000011000,"k":1,"last_ts":1700000013000,"last_tz":1700000003000})",
+            R"({"c":1,"first_ts":1700000012000,"k":2,"last_ts":1700000012000,"last_tz":1700000002000})",
+            R"({"c":1,"first_ts":1700000021000,"k":2,"last_ts":1700000021000,"last_tz":1700000001000})",
+            R"({"c":1,"first_ts":1700000100000,"k":1,"last_ts":1700000100000,"last_tz":1700000003000})",
+        };
+        EXPECT_EQ(columnar, want);
+        EXPECT_EQ(row_form, want);
+    }
+    {
+        SCOPED_TRACE("COUNT keyed by the TIMESTAMPTZ column");
+        const auto [columnar, row_form] = both("tz TIMESTAMPTZ, c BIGINT",
+                                               "INSERT INTO out_t SELECT tz, COUNT(*) AS c FROM t "
+                                               "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), tz");
+        const std::multiset<std::string> want = {
+            R"({"c":3,"tz":1700000001000})",
+            R"({"c":2,"tz":1700000002000})",
+            R"({"c":2,"tz":1700000003000})",
+            R"({"c":1,"tz":1700000002000})",
+            R"({"c":1,"tz":1700000001000})",
+            R"({"c":1,"tz":1700000003000})",
+        };
+        EXPECT_EQ(columnar, want);
+        EXPECT_EQ(row_form, want);
+    }
+    if (columnar_disabled_for_process()) {
+        EXPECT_FALSE(clink::detail::columnar_enabled());
+    }
+    std::filesystem::remove(in_path);
+}
+
+// Arithmetic on a TIMESTAMP column fed integral numerals (1700000000500.0, the
+// form a JSON encoder gives for a float) beside plain integers in the same
+// batch. The row decode keeps the numeral a double, and the evaluator divides a
+// double as a double and an integer as an integer, so `ts / 1000` gives
+// 1700000000.5 for the first and truncates the second. The columnar decode must
+// not hand the numeral on as an integer, which would print the same but divide
+// differently: the run must write what the row bridge writes. Registered a
+// second time with CLINK_DISABLE_COLUMNAR=1.
+TEST(SqlRuntime, EpochMillisIntegralDoubleTimestampsComputeAsTheRowPathDoes) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_ems_double_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_ems_double_out_" + tag + ".ndjson");
+    write_lines(in_path,
+                {
+                    R"({"k":1,"ts":1700000001000,"tz":1700000001000})",
+                    R"({"k":2,"ts":1700000000500.0,"tz":1700000002500.0})",
+                    R"({"k":3,"ts":1700000003999,"tz":1700000003999})",
+                    R"({"k":4,"ts":1700000004250.0,"tz":1700000004000})",
+                });
+
+    const std::string q = "INSERT INTO out_t SELECT k, ts / 1000 AS sec, tz / 1000 AS zsec FROM t";
+    const std::string out_cols = "k BIGINT, sec DOUBLE, zsec DOUBLE";
+    const auto columnar =
+        run_kafka_parity_case(kEpochMillisColumns, "", out_cols, q, in_path, out_path);
+    const auto row_form = run_kafka_parity_case(
+        kEpochMillisColumns, "columnar_decode='false'", out_cols, q, in_path, out_path);
+    const std::multiset<std::string> want = {
+        R"({"k":1,"sec":1700000001,"zsec":1700000001})",
+        R"({"k":2,"sec":1700000000.5,"zsec":1700000002.5})",
+        R"({"k":3,"sec":1700000003,"zsec":1700000003})",
+        R"({"k":4,"sec":1700000004.25,"zsec":1700000004})",
+    };
+    EXPECT_EQ(row_form, want);
+    EXPECT_EQ(columnar, row_form);
     std::filesystem::remove(in_path);
 }
 

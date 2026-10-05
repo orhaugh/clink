@@ -18,10 +18,13 @@
 //
 //   * Exact or bail. The sidecar layout (effective_type) keeps a handful of
 //     types as typed columns and stores the rest as text, so not every value
-//     comes back out of it as it went in: a TIMESTAMP, SMALLINT or DATE number,
-//     or an ARRAY, MAP or ROW value, would come back as a string. An operator
-//     therefore appends a row through try_append_row, which checks every cell
-//     with row_columnar_detail::cell_is_exact before appending any, and on false
+//     comes back out of it as it went in: a SMALLINT or DATE number, a
+//     TIMESTAMP number where the layout carries TIMESTAMP as text, or an ARRAY,
+//     MAP or ROW value, would come back as a string, and where it carries
+//     TIMESTAMP as epoch milliseconds a TIMESTAMP that is not an integer would
+//     not come back at all. An operator therefore appends a row through
+//     try_append_row, which checks every cell with
+//     row_columnar_detail::cell_is_exact before appending any, and on false
 //     takes the row path for that emission. What does go in is converted by
 //     append_json_cell, the function the row-batch converter (build_column)
 //     uses, and read back by read_cell, so a row consumer sees the row the

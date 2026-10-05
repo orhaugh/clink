@@ -665,3 +665,63 @@ TEST(BornColumnarParity, JoinOutputOfARealOffFloatPrecisionMatchesTheRowCarrier)
                   Carrier::Rows);
     fs::remove_all(dir);
 }
+
+// --- A TIMESTAMP held as a JSON double ------------------------------------------
+
+// A TIMESTAMP(3) column fed integral numerals such as 1700000000500.0, the form a
+// JSON encoder gives for a float. The file source keeps each one as the double it
+// parsed. The sidecar carries TIMESTAMP as epoch milliseconds, an integer that
+// prints the same, but the evaluator's arithmetic follows the value's kind: an
+// integer divided by 1000 truncates, a double does not. So every pair takes the
+// row path, and `t / 1000` after the join comes out as the row carrier computes
+// it.
+TEST(BornColumnarParity, JoinOutputOfAnIntegralDoubleTimestampMatchesTheRowCarrier) {
+    const auto dir = parity_scratch("join_ts_double");
+    std::vector<std::string> src;
+    std::vector<std::string> keys;
+    for (int i = 1; i <= kParityRows; ++i) {
+        src.push_back(R"({"id":)" + std::to_string(i) + R"(,"t":)" +
+                      std::to_string(kBaseMs + (static_cast<std::int64_t>(i) * 1000) + 500) +
+                      ".0}");
+        keys.push_back(R"({"k":)" + std::to_string(i) + "}");
+    }
+    parity_write_lines(dir / "src.ndjson", src);
+    parity_write_lines(dir / "keys.ndjson", keys);
+    const std::string ddl =
+        parity_file_table("src", "(id BIGINT, t TIMESTAMP(3))", dir / "src.ndjson") +
+        parity_file_table("keys", "(k BIGINT)", dir / "keys.ndjson") +
+        parity_file_table("out", "(id BIGINT, sec DOUBLE)", dir / "out.ndjson");
+    expect_parity(ddl,
+                  "INSERT INTO out SELECT a.id, a.t / 1000 AS sec FROM src a "
+                  "JOIN keys b ON a.id = b.k;",
+                  "equi_join_row",
+                  dir,
+                  Carrier::Rows);
+    fs::remove_all(dir);
+}
+
+// The window's version: MIN over integral-double timestamps is that double, and a
+// projection over the window's output divides it.
+TEST(BornColumnarParity, WindowMinOfAnIntegralDoubleTimestampMatchesTheRowCarrier) {
+    const auto dir = parity_scratch("window_ts_double");
+    const auto src = parity_window_source(
+        dir / "src.ndjson",
+        [](int g) {
+            return R"("k":)" + std::to_string(g) + R"(,"t":)" +
+                   std::to_string(kBaseMs + (static_cast<std::int64_t>(g) * 1000) + 500) + ".0";
+        },
+        R"("k":0,"t":0.0)");
+    const std::string ddl =
+        "CREATE TABLE src (ts BIGINT, k BIGINT, t TIMESTAMP(3)) WITH (connector='file', "
+        "format='json', path='" +
+        src + "', event_time_column='ts', watermark_lag_ms='0');" +
+        parity_file_table("out", "(k BIGINT, sec DOUBLE)", dir / "out.ndjson");
+    expect_parity(ddl,
+                  "INSERT INTO out SELECT k, first_t / 1000 AS sec FROM ("
+                  "SELECT k, MIN(t) AS first_t, COUNT(*) AS c FROM src "
+                  "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k HAVING COUNT(*) > 1) w;",
+                  "tumbling_window_row",
+                  dir,
+                  Carrier::Rows);
+    fs::remove_all(dir);
+}
