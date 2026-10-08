@@ -19,6 +19,10 @@
 //   - clink_malformed_frames_total
 //   - clink_client_connections_refused_total
 //   - clink_coordinator_handshake_failures_total
+//   - clink_coordinator_outbound_frames_discarded_total{class,reason}
+//     where class ∈ {control, bulk} and
+//           reason ∈ {overflow, allocation, write_failed,
+//                     flush_deadline, aborted}
 //
 // The metrics surface here is sized for dashboards and alert rules
 // rather than per-operator inner loops. Costs are bounded by the
@@ -26,6 +30,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "clink/metrics/metrics_registry.hpp"
 
@@ -50,6 +55,25 @@ inline std::string rescale_request_name(const char* result) {
 inline std::string autoscaler_decision_name(const char* outcome) {
     std::string out = "clink_autoscaler_decisions_total{outcome=\"";
     out += outcome;
+    out += "\"}";
+    return out;
+}
+
+// Frames queued for a peer on a control-plane connection that the
+// connection's outbox gave up, by class (bulk frames carry plugin bytes,
+// control frames are the rest) and by why the outbox stopped: a post found a
+// bound reached (overflow) or could not allocate (allocation), the transport
+// failed under the writer (write_failed), a flush ran out of time
+// (flush_deadline), or the owner gave the connection up (aborted). A queued
+// frame is either written or counted here, so a frame lost on the way out is
+// never silent. The converse does not hold: the frame being written when the
+// outbox stopped is counted too, though the transport may already have taken
+// some or all of it, so a count here never shows that the peer went without.
+inline std::string outbound_frames_discarded_name(std::string_view cls, std::string_view reason) {
+    std::string out = "clink_coordinator_outbound_frames_discarded_total{class=\"";
+    out += cls;
+    out += "\",reason=\"";
+    out += reason;
     out += "\"}";
     return out;
 }
@@ -162,6 +186,11 @@ inline void autoscaler_decision(const char* outcome) {
 }
 inline void unknown_control_frame() {
     MetricsRegistry::global().counter(kUnknownControlFrames).increment();
+}
+inline void outbound_frames_discarded(std::string_view cls,
+                                      std::string_view reason,
+                                      std::uint64_t n) {
+    MetricsRegistry::global().counter(outbound_frames_discarded_name(cls, reason)).increment(n);
 }
 inline void in_doubt_resolved() {
     MetricsRegistry::global().counter(kInDoubtResolved).increment();

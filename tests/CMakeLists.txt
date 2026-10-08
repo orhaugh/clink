@@ -108,6 +108,7 @@ add_executable(clink_core_tests
     test_protocol_versioning.cpp
     test_row_layout_admission.cpp
     test_frame_robustness.cpp
+    test_outbox.cpp
     test_plugin_cache.cpp
     test_cancel_teardown.cpp
     test_checkpoint_completion.cpp

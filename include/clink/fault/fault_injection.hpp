@@ -351,6 +351,13 @@ inline constexpr char kCoordinatorAdmissionQueued[] = "coordinator.admission_que
 // frame. Blocked here, every other first frame waits behind it, as behind a
 // registration that is slow to take the coordinator's lock.
 inline constexpr char kCoordinatorAdmissionBeforeHandle[] = "coordinator.admission_before_handle";
+// A connection's outbox writer has taken its next frame off the queue and has
+// not yet written any of it. Block or Delay here holds the writer with that
+// frame in flight, as a peer that stops reading does, while posts keep
+// queueing behind it and its stall clock runs; Error fails the write, as a
+// transport that broke under it does. The ordinal counts frames across every
+// outbox in the process.
+inline constexpr char kCoordinatorOutboxBeforeWrite[] = "coordinator.outbox_before_write";
 
 // Sink two-phase commit.
 inline constexpr char kSinkBeforePrepare[] = "sink.before_prepare";

@@ -4,6 +4,7 @@
 add_executable(clink_tls_tests
     register.cpp
     test_tls_coordinator_accept.cpp
+    test_tls_outbox.cpp
     test_tls_socket.cpp
 )
 target_link_libraries(clink_tls_tests PRIVATE
@@ -15,6 +16,9 @@ target_link_libraries(clink_tls_tests PRIVATE
     GTest::gtest_main
 )
 target_compile_definitions(clink_tls_tests PRIVATE CLINK_HAS_OPENSSL)
+# test_tls_outbox.cpp drives the cluster's private outbox (src/cluster/), which
+# clink::core compiles but does not install.
+target_include_directories(clink_tls_tests PRIVATE ${CMAKE_SOURCE_DIR})
 clink_set_warnings(clink_tls_tests)
 gtest_discover_tests(clink_tls_tests
     DISCOVERY_MODE PRE_TEST
