@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**A job cancelled while its restart waits now ends.** A cancel that landed while
+a restart was waiting for free slots or for in-doubt resolution was acknowledged
+and then did nothing: the restart is never re-fired for a cancelled job, and the
+cancel's own deadline skipped a job awaiting a restart, so the job stayed
+cancelled and running indefinitely. The coordinator now ends it on the
+watchdog's next tick, once any draining subtask has drained and no resolution
+is running.
+
 **A run that takes a savepoint passes trace validation.** A savepoint triggered
 its checkpoint without recording the protocol trace's `Trigger` event, so the
 trace of any run that took one held a completion for a checkpoint nothing had

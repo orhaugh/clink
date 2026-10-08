@@ -2663,6 +2663,73 @@ TEST(CheckpointCompletion, ARestartWaitingForCapacityAfterItsWalkDoesNotWalkAgai
     EXPECT_EQ(decides, 1U) << "the walk ran more than once for one restart";
 }
 
+// A cancel that lands while a restart waits for capacity ends the job. The
+// watchdog re-fires a waiting restart, and fails it at its capacity deadline,
+// only for a job no one has cancelled, and the cancel's own convergence bound
+// skips a job awaiting a restart. Nothing was running to report a
+// SubtaskFinished, so the job stayed cancelled and running for good.
+TEST(CheckpointCompletion, ACancelDuringARestartsCapacityWaitEndsTheJob) {
+    clink::fault::Registry::instance().reset();
+    Coordinator::Config cfg;
+    // Far past the test, so only the cancel can end the job.
+    cfg.restart_capacity_timeout = std::chrono::hours{1};
+    CheckpointFixture fx(cfg);
+    const auto job_id = fx.bring_up(
+        /*max_restarts=*/1, /*interval_ms=*/600'000, confirm_tracked_graph(fx.dir / "out"));
+    ASSERT_GT(job_id, 0U);
+    const auto since_ms = log_cursor_ms();
+    const auto waiting = [since_ms] {
+        for (const auto& rec :
+             LogBuffer::global().tail(1000, "warn", since_ms, "coordinator.restart")) {
+            if (rec.message.find("restart waiting for capacity") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // The only worker dies, so the restart has nowhere to go.
+    fx.worker->close();
+    ASSERT_TRUE(ckpt_await(waiting)) << "the restart never waited for capacity";
+    const auto ack = fx.coordinator->cancel_job(job_id);
+    ASSERT_TRUE(ack.ok) << ack.message;
+    EXPECT_TRUE(fx.coordinator->await_job_completion(
+        job_id, clink::test_support::scale_slack(std::chrono::milliseconds{10000})))
+        << "a cancel during the restart's capacity wait never ended the job";
+}
+
+// The same for a cancel that lands while the restart is held for in-doubt
+// resolution: the walk clears the restart's deadline when it returns and skips
+// the redeploy of a cancelled job, which left the job waiting on nothing.
+TEST(CheckpointCompletion, ACancelDuringInDoubtResolutionEndsTheJob) {
+    CompletionScopedRecordOverride tracked(tracked_file_2pc());
+    clink::fault::Registry::instance().reset();
+    CheckpointFixture fx;
+    const auto job_id = fx.bring_up(
+        /*max_restarts=*/1, /*interval_ms=*/600'000, confirm_tracked_graph(fx.dir / "out"));
+    ASSERT_GT(job_id, 0U);
+    const auto first = first_checkpoint_with_next_on_record(fx, job_id);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(fx.ack_all(job_id, *first, /*ok=*/true));
+    ASSERT_TRUE(fx.worker->await_frame(MessageKind::CommitCheckpoint).has_value());
+    // Completed and never confirmed: the restart is held for the walk, which
+    // waits at its fault point while the cancel lands.
+    clink::fault::ScopedFault hold{
+        clink::fault::Rule{.point = clink::fault::points::kCoordinatorBeforeInDoubtWalk,
+                           .ordinal = 1,
+                           .action = clink::fault::Action::Block}};
+    fx.worker->close();
+    ASSERT_TRUE(ckpt_await([] {
+        return clink::fault::Registry::instance().hits(
+                   clink::fault::points::kCoordinatorBeforeInDoubtWalk) >= 1;
+    })) << "the restart was never held for resolution";
+    const auto ack = fx.coordinator->cancel_job(job_id);
+    ASSERT_TRUE(ack.ok) << ack.message;
+    clink::fault::Registry::instance().release(clink::fault::points::kCoordinatorBeforeInDoubtWalk);
+    EXPECT_TRUE(fx.coordinator->await_job_completion(
+        job_id, clink::test_support::scale_slack(std::chrono::milliseconds{10000})))
+        << "a cancel during in-doubt resolution never ended the job";
+}
+
 // A job resumed from its own checkpoints by a rerun reports, in its takeover
 // line, the confirmed restore point it adopts. A CONFIRMED marker at or below
 // the run base belongs to an earlier run: this run neither restores from it nor

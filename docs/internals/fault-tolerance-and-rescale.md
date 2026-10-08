@@ -252,7 +252,7 @@ Scope and honesty: Row-channel operators (the SQL frontend's set - GROUP BY, win
 | `watchdog_interval` | `Coordinator::Config` | 100ms | How often the watchdog re-evaluates worker liveness |
 | `heartbeat_timeout` | `Coordinator::Config` | 2000ms | A worker is declared lost after this much silence |
 | `restart_drain_timeout` | `Coordinator::Config` | 30000ms | Upper bound on the `awaiting_restart` drain; on expiry the watchdog fails the job |
-| `restart_capacity_timeout` | `Coordinator::Config` | 180000ms | How long a restart whose drain is covered waits for free slots to redeploy; a worker registration restarts the clock, and on expiry the job fails with "no slot available" |
+| `restart_capacity_timeout` | `Coordinator::Config` | 180000ms | How long a restart whose drain is covered waits for free slots to redeploy; a worker registration restarts the clock, and on expiry the job fails with "no slot available". A cancel ends a job whose restart is waiting, here or in in-doubt resolution, on the watchdog's next tick once its drain is covered and no resolution is running |
 | `max_restarts` | `Coordinator::Config` | 0 | Per-failing-task retry budget (distinct from worker-level restarts) |
 | `max_restarts_on_worker_loss` | `CheckpointConfig` | `kRestartAuto` | Resolves to 10 (self-heal) with a checkpoint dir, 0 (fail-fast) without; explicit `N` caps attempts per burst |
 | `restart_budget_reset_after` | `Coordinator::Config` | 10 min | A checkpoint completing this long after the last restart forgives the spent restart budget |

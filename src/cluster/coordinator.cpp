@@ -6579,6 +6579,30 @@ void Coordinator::watchdog_loop_() {
                     }
                 }
             }
+            // A cancel that wins over a restart. The kick above re-fires a
+            // waiting restart only for a job no one has cancelled, and the
+            // terminal-cancel bound below skips a job awaiting a restart. A
+            // cancel that lands in the drain, in in-doubt resolution or in a
+            // capacity wait therefore left the job cancelled and running for
+            // good, with nothing running to report a SubtaskFinished. Once
+            // the drain is covered and no resolution is under way, nothing
+            // more can happen to it: end it as the cancel asked.
+            for (auto& [_, job] : jobs_) {
+                if (job->awaiting_restart && job->cancel_requested && !job->completion_signalled &&
+                    !job->resolving_in_doubt && restart_drain_covered_(*job)) {
+                    log::info("coordinator.restart",
+                              "job_id=" + std::to_string(job->id) +
+                                  " was cancelled while its restart waited; ending it");
+                    job->awaiting_restart = false;
+                    job->restart_deadline = {};
+                    job->restart_capacity_deadline = {};
+                    job->restart_pending.clear();
+                    job->restart_drained_keys.clear();
+                    job->restart_drain_expected.clear();
+                    job->completed_count = job->expected_completion;
+                    signal_job_completion_locked_(*job);
+                }
+            }
             // A transport failure that waited for its cause and never got
             // one. In a healthy job nothing else is coming: the refused send
             // IS the cause, and acting on it here is what keeps the bridge's
