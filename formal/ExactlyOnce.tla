@@ -151,7 +151,8 @@ VARIABLES
                     \* bumped by init_transactions, which fences every lower one
 
     \* Sink processes (state lost with the process) and control frames.
-    sink,           \* [Sinks -> record]: up, openTxn, ackDue, stage, suppress, opening
+    sink,           \* [Sinks -> record]: up, openTxn, ackDue, stage, confirmDue,
+                    \* suppress, opening
     pendingHandles, \* [Sinks -> SUBSET Ckpts]: handles currently in operator state
     barriers,       \* [Sinks -> SUBSET Ckpts]: barriers delivered, not yet processed
     boundEpoch,     \* [Workers -> Nat]: epoch bound at RegisterAck
@@ -208,8 +209,14 @@ NoTxn == [st |-> "none", owner |-> 0, desc |-> FALSE, has |-> FALSE]
 \* checkpoint follows the previous one within microseconds) is prepared
 \* before the earlier ack is sent, which the snapshot completes asynchronously;
 \* trace validation showed the shape in every run that ended cleanly.
+\*
+\* stage follows the worker's commit dispatch through one commit: "committing"
+\* (accepted), then for the recoverable family "idle" again once it executes,
+\* and for the Kafka family "committed" (executed), "receipted" (receipt
+\* durable) and "finished": the sink's own part is done and the worker has
+\* yet to send CommitConfirmed for confirmDue (SinkFinish, SinkConfirm).
 DownSink == [up |-> FALSE, openTxn |-> None, ackDue |-> << >>,
-             stage |-> "idle", suppress |-> 0, opening |-> FALSE]
+             stage |-> "idle", confirmDue |-> None, suppress |-> 0, opening |-> FALSE]
 
 \* Every id with a marker. A recovered job numbers new checkpoints above all
 \* of them (the marker readers in coordinator.cpp).
@@ -341,8 +348,13 @@ CanPrepare(s) ==
     \* dispatch thread, the prepare on the task thread, and they touch
     \* different handles (trace validation showed a prepare landing between a
     \* commit's delivery and its execution). A Kafka sink has one transaction
-    \* and begins the next only after the commit and its receipt.
-    /\ sink[s].up /\ (Kafka => sink[s].stage = "idle")
+    \* and seals the next only once the commit, its receipt and the sink's own
+    \* finish (SinkFinish) are done: on_barrier waits for the open transaction
+    \* to resolve. It does not wait for the worker's CommitConfirmed, which
+    \* goes out after the commit callback returns (SinkConfirm), so a prepare
+    \* can fall between the finish and the confirmation (trace validation
+    \* showed that too).
+    /\ sink[s].up /\ (Kafka => sink[s].stage \in {"idle", "finished"})
     /\ barriers[s] # {}
     /\ Kafka => sink[s].openTxn = None
 
@@ -585,9 +597,12 @@ Broadcast ==
 \* if its epoch is below the worker's bound, dropped if the sink is gone,
 \* refused if the sink holds no matching prepared transaction (the dispatch is
 \* then not confirmed and the persisted handle waits for restore-time
-\* recovery). Dispatch is one FIFO consumer per worker, so a frame waits while
-\* the sink is inside another commit. Fault point: sink.before_commit is the
-\* state after a commit is accepted and before SinkCommit.
+\* recovery). Dispatch is one FIFO consumer per worker
+\* (commit_dispatch_loop_), and it takes the next frame only once the last
+\* one's dispatch has returned, CommitConfirmed sent: a frame waits while the
+\* sink is inside another commit or its confirmation is still to go
+\* (SinkConfirm). Fault point: sink.before_commit is the state after a commit
+\* is accepted and before SinkCommit.
 CommitsFor(s) == {m \in msgs : m.kind = "commit" /\ m.s = s}
 
 DeliverCommit ==
@@ -609,6 +624,12 @@ DeliverCommit ==
 
 \* An abort frame (Worker::handle_abort_checkpoint_): the staged transaction is
 \* rolled back and the handle erased. Idempotent against a handle that is gone.
+\* Aborts run on the worker's reader thread, not the commit dispatch, so one
+\* is refused only while the sink is inside a commit; a Kafka sink that has
+\* finished its commit and prepared the next checkpoint aborts that one before
+\* its CommitConfirmed goes out.
+OutsideCommit(s) == sink[s].stage \in {"idle", "finished"}
+
 DeliverAbort ==
     \E m \in msgs :
         /\ m.kind = "abort"
@@ -616,7 +637,7 @@ DeliverAbort ==
         /\ LET s == m.s
                fenced == m.epoch < boundEpoch[Host[s]] /\ Bug # "no_fencing"
            IN IF sink[s].up /\ ~fenced /\ m.c \in pendingHandles[s]
-                 /\ txn[s][m.c].st = "prepared" /\ sink[s].stage = "idle"
+                 /\ txn[s][m.c].st = "prepared" /\ OutsideCommit(s)
               THEN /\ txn' = [txn EXCEPT ![s][m.c].st = "aborted"]
                    /\ pendingHandles' = [pendingHandles EXCEPT ![s] = @ \ {m.c}]
                    /\ sink' = [sink EXCEPT ![s].openTxn = IF @ = m.c THEN None ELSE @]
@@ -649,7 +670,7 @@ SinkCommit(s) ==
 \* The commit receipt sub<K>-<N>, fsync-durable, written between the broker's
 \* commit and the next begin_transaction (write_commit_receipt_ inside the
 \* commit_transaction callback). Fault point: sink.after_external_commit is the
-\* state after this step and before SinkConfirm.
+\* state after this step and before SinkFinish.
 SinkReceipt(s) ==
     /\ Kafka /\ sink[s].up /\ sink[s].stage = "committed"
     /\ LET c == sink[s].openTxn IN
@@ -659,21 +680,44 @@ SinkReceipt(s) ==
                     sinkHandles, unresolvedMk, txn, brokerUp, sinkGen, pendingHandles, barriers,
                     boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
 
-\* The staged handle is erased, the next transaction begins (after which the
-\* broker no longer names the previous commit), and CommitConfirmed goes to the
-\* coordinator (dispatch_commit_checkpoint_). A confirmation reaching a dead
-\* coordinator, or one that no longer tracks the id, is lost. The one that
-\* drains c's set is handled in the hold that starts c's CONFIRMED marker
-\* (handle_commit_confirmed_): c, and every id below it, leave tracking, and
-\* the marker is due (see WriteConfirmed).
-SinkConfirm(s) ==
+\* The Kafka sink's own part of the commit ends (the tail of on_commit in the
+\* 2PC sink): the staged handle is erased (erase_resume_handle_), the open
+\* transaction is resolved (resolve_open_), and the task thread, held in the
+\* next on_barrier until then, may prepare the next checkpoint. The successor
+\* transaction has begun, after which the broker no longer names the previous
+\* commit; the engine begins it a step earlier, inside commit_transaction
+\* straight after the receipt, and with the receipt on disk nothing reads the
+\* difference. The coordinator learns nothing here: the worker sends
+\* CommitConfirmed only once the commit callback has returned (SinkConfirm),
+\* and a prepare of the next checkpoint can fall between the two, as trace
+\* validation showed. Fault point: sink.after_external_commit is the state
+\* before this step.
+SinkFinish(s) ==
     /\ Kafka /\ sink[s].up /\ sink[s].stage = "receipted"
-    /\ LET c == sink[s].openTxn
+    /\ LET c == sink[s].openTxn IN
+       /\ txn' = [txn EXCEPT ![s][c].desc = FALSE]
+       /\ pendingHandles' = [pendingHandles EXCEPT ![s] = @ \ {c}]
+       /\ sink' = [sink EXCEPT ![s].stage = "finished", ![s].openTxn = None,
+                               ![s].confirmDue = c]
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, barriers, boundEpoch,
+                    msgs, jobVars, ghostVars, budgetVars >>
+
+\* CommitConfirmed goes to the coordinator (dispatch_commit_checkpoint_ in
+\* worker.cpp), once every commit callback of the subtask has returned. A
+\* confirmation reaching a dead coordinator, or one that no longer tracks the
+\* id, is lost. The one that drains c's set is handled in the hold that
+\* starts c's CONFIRMED marker (handle_commit_confirmed_): c, and every id
+\* below it, leave tracking, and the marker is due (see WriteConfirmed). The
+\* dispatch takes the worker's next CommitCheckpoint only after this send, so
+\* the next commit frame waits for this step (DeliverCommit). No named fault
+\* point lies between SinkFinish and this step; the model lets a process die
+\* there as anywhere else.
+SinkConfirm(s) ==
+    /\ Kafka /\ sink[s].up /\ sink[s].stage = "finished"
+    /\ LET c == sink[s].confirmDue
            tracked == coordUp /\ c \in broadcastIds
            drained == tracked /\ unconfirmed[c] \ {s} = {}
-       IN /\ txn' = [txn EXCEPT ![s][c].desc = FALSE]
-          /\ pendingHandles' = [pendingHandles EXCEPT ![s] = @ \ {c}]
-          /\ sink' = [sink EXCEPT ![s].stage = "idle", ![s].openTxn = None]
+       IN /\ sink' = [sink EXCEPT ![s].stage = "idle", ![s].confirmDue = None]
           /\ unconfirmed' = IF tracked
                             THEN [unconfirmed EXCEPT ![c] = @ \ {s}]
                             ELSE unconfirmed
@@ -681,8 +725,8 @@ SinkConfirm(s) ==
           /\ confirming' = IF drained THEN [confirming EXCEPT ![c] = "due"] ELSE confirming
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                     toBroadcast, markerDue, memCompleted, memConfirmed, staleCompleted, lateBatch,
-                    drainSet, freshLeader, rewindFloor, walkVars, diskVars, brokerUp, sinkGen, barriers,
-                    boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
+                    drainSet, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
+                    pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
 
 \* Every tracked sink confirmed c: CONFIRMED-<id>, durable
 \* (handle_commit_confirmed_). Restores of this family select the newest
@@ -1318,7 +1362,8 @@ SinkOpens(s) ==
           /\ sinkGen' = [sinkGen EXCEPT ![s] = @ + 1]
           /\ sink' = [sink EXCEPT ![s] = [up |-> TRUE,
                                           openTxn |-> None, ackDue |-> << >>,
-                                          stage |-> "idle", opening |-> FALSE,
+                                          stage |-> "idle", confirmDue |-> None,
+                                          opening |-> FALSE,
                                           suppress |-> IF Kafka /\ horizon > frontier
                                                        THEN horizon ELSE 0]]
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, sinkCut,
@@ -1350,7 +1395,7 @@ Next ==
     \/ \E s \in Sinks : SinkPrepare(s) \/ SinkPrepareFails(s) \/ SinkAck(s)
     \/ CoordComplete \/ WriteCompleted \/ WriteStaleCompleted \/ Broadcast
     \/ DeliverCommit \/ DeliverAbort
-    \/ \E s \in Sinks : SinkCommit(s) \/ SinkReceipt(s) \/ SinkConfirm(s)
+    \/ \E s \in Sinks : SinkCommit(s) \/ SinkReceipt(s) \/ SinkFinish(s) \/ SinkConfirm(s)
     \/ WriteConfirmed \/ AdvanceConfirmed
     \/ \E w \in Workers : WorkerDies(w)
     \/ RestartOnError
@@ -1371,7 +1416,8 @@ Fairness ==
     /\ WF_vars(Trigger) /\ WF_vars(DeliverBarrier)
     /\ \A s \in Sinks : WF_vars(SinkPrepare(s)) /\ WF_vars(SinkAck(s))
                         /\ WF_vars(SinkCommit(s)) /\ WF_vars(SinkReceipt(s))
-                        /\ WF_vars(SinkConfirm(s)) /\ WF_vars(SinkDrains(s))
+                        /\ WF_vars(SinkFinish(s)) /\ WF_vars(SinkConfirm(s))
+                        /\ WF_vars(SinkDrains(s))
                         /\ WF_vars(WalkReadsReceipt(s)) /\ WF_vars(WalkProbes(s))
                         /\ WF_vars(SinkOpens(s))
     /\ WF_vars(CoordComplete) /\ WF_vars(WriteCompleted) /\ WF_vars(WriteStaleCompleted)
@@ -1396,7 +1442,9 @@ TypeOK ==
     /\ receipts \subseteq Sinks \X Ckpts /\ unresolvedMk \subseteq Sinks \X Ckpts
     /\ \A s \in Sinks, c \in Ckpts :
          txn[s][c].st \in {"none", "prepared", "committed", "aborted"}
-    /\ \A s \in Sinks : sink[s].stage \in {"idle", "committing", "committed", "receipted"}
+    /\ \A s \in Sinks : sink[s].stage \in {"idle", "committing", "committed", "receipted",
+                                           "finished"}
+    /\ \A s \in Sinks : (sink[s].confirmDue # None) <=> (sink[s].stage = "finished")
     /\ confirming \in [Ckpts -> {"none", "due", "written", "stale"}]
     /\ staleCompleted \subseteq Ckpts
     /\ lateBatch \subseteq staleCompleted

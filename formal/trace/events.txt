@@ -49,6 +49,10 @@ unobserved ZombieStops
 unobserved TxnExpires
 unobserved BrokerGoesDown
 unobserved BrokerComesBack
+# The Kafka sink's finish (handle erased, open transaction resolved) has no line
+# of its own; the module takes it where the next SinkPrepare or SinkConfirm of
+# that sink needs it.
+unobserved SinkFinish
 unobserved Done
 unobserved JobFailed
 # A rescale renumbers and re-places the operator's subtasks. The model keys a

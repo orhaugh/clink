@@ -71,8 +71,13 @@ restores from the newest completed checkpoint.
 The atomic steps are chosen so that every named fault point in
 `include/clink/fault/fault_injection.hpp` is a distinct state between two
 actions, and a process may die between any two of them. Prepare, ack, marker
-write, broadcast, commit, receipt and confirmation are separate actions;
-so are the `CONFIRMED` marker's put and the advance of the confirmed restore
+write, broadcast, commit, receipt and confirmation are separate actions; so
+are the Kafka sink's own finish of a commit (`SinkFinish`: the staged handle
+erased, the open transaction resolved, the next prepare free to run) and the
+worker's `CommitConfirmed` after it (`SinkConfirm`), since the worker sends
+the confirmation only once the commit callback has returned and the sink's
+task thread can seal the next checkpoint in between; so are the `CONFIRMED`
+marker's put and the advance of the confirmed restore
 point behind it (`WriteConfirmed`, `AdvanceConfirmed`), which the engine runs
 in two holds of its lock with the put between them, and each stage of
 in-doubt resolution and of a sink's open. Every action
@@ -87,7 +92,8 @@ names, in its comment, the engine site it abstracts.
 | `coordinator.after_completed_marker`, `coordinator.before_commit_broadcast` | the marker durable, before `Broadcast` |
 | `sink.before_commit` | the commit accepted, before `SinkCommit` |
 | `sink.between_commit_and_receipt` | after `SinkCommit`, before `SinkReceipt` |
-| `sink.after_external_commit` | after `SinkReceipt`, before `SinkConfirm` |
+| `sink.after_external_commit` | after `SinkReceipt`, before `SinkFinish` |
+| none (the commit callback returned, `CommitConfirmed` not yet sent) | after `SinkFinish`, before `SinkConfirm`: the Kafka sink may already have prepared the next checkpoint, and its next commit waits for the confirmation |
 | `coordinator.before_confirmed_marker` | every tracked sink confirmed and the checkpoint out of tracking (`confirming[c] = "due"`), before `WriteConfirmed`: neither the marker nor the in-memory confirmed restore point has moved |
 | `coordinator.before_in_doubt_walk` | a restart held for resolution, its walk's start fixed by `RestartProceeds`, before the walk's first step: a confirmation's advance landing here moves the in-memory confirmed restore point, not where the walk starts |
 | `coordinator.takeover_after_marker_read` | a takeover's one read of the markers taken, before `CoordRecovers`: a stale `COMPLETED` put landing here is on disk, its superseded coordinator's line may come before the takeover's, and the takeover still reports and restores from the point it read |
@@ -126,11 +132,11 @@ is fenced.
 
 | Model | Family | Bounds | Result |
 |---|---|---|---|
-| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 48.9M distinct states, depth 80, all invariants hold, no deadlock |
-| `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 63,889 distinct states, depth 69, all invariants hold |
-| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 145.4M distinct states, depth 59, all invariants hold |
-| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | 7.8M distinct states, depth 53, all invariants hold |
-| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 6.1M distinct states |
+| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | 78.8M distinct states, depth 86, all invariants hold, no deadlock |
+| `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker death and snapshot failure only | 101,698 distinct states, depth 75, all invariants hold |
+| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure | 170.2M distinct states, depth 59, all invariants hold |
+| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts | 8.9M distinct states, depth 53, all invariants hold |
+| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | invariants and `EventuallySettled` hold, 7.4M distinct states |
 
 Within its bounds each run is exhaustive: TLC visits every reachable state.
 The bounds are small so that the push gate finishes in minutes; a larger
@@ -174,7 +180,7 @@ specification, or a stutter the trace module recognises.
 | `DeliverCommit`, `DeliverAbort` | the sink, on dispatch | `sub`, `ckpt`, `accepted` | `DeliverCommit`, `DeliverAbort` |
 | `SinkCommit` | the sink, external commit executed | `sub`, `ckpt` | `SinkCommit` |
 | `SinkReceipt` | the Kafka sink, receipt durable | `sub`, `ckpt` | `SinkReceipt` |
-| `SinkConfirm` | worker, `CommitConfirmed` sent | `job`, `sub`, `ckpt` | `SinkConfirm` (Kafka family; a stutter otherwise) |
+| `SinkConfirm` | worker, `CommitConfirmed` sent, after the subtask's commit callbacks have returned | `job`, `sub`, `ckpt` | `SinkConfirm` (Kafka family; a stutter otherwise), with the sink's `SinkFinish` before it as a hidden step |
 | `WriteConfirmed` | coordinator, in the hold that advances the confirmed restore point, after the `CONFIRMED` marker's put | `job`, `ckpt`, `epoch` | `WriteConfirmed` and `AdvanceConfirmed`, back to back, for the leader. From a superseded coordinator's epoch (it does not know it was superseded, and emits the line as the leader would), the stale put landing, or a stutter when the takeover already read the marker |
 | `WorkerDies` | coordinator, loss detected, or a superseded session retired after its worker re-registered | `job`, `worker`, and `spared` when a retirement leaves some of the worker's subtasks running | `WorkerDies` (any worker of the job; the model keeps only the source and the sinks, so the dead set may be empty). Validation takes the sinks the loss found on that worker from the run's own `Placement` events, not from the model's fixed hosts: a redeploy re-places a subtask, and a sink that has moved off the worker survives its death. A retirement kills only what the superseded session held; `spared` lists the worker's subtasks placed on a later session, which the engine drains as survivors, and validation does not kill them. It also lists the subtasks of an earlier session when the lost session was still retiring it: the predecessor's queued frames drain them, or the retirement's own `WorkerDies` kills them |
 | `RestartOnError` | coordinator, a whole-job restart begun for a subtask error or an unattributed transport failure | `job`, `cause` | `RestartOnError` (the survivors drain; a loss declared during the drain folds in as its own `WorkerDies`) |
@@ -193,7 +199,10 @@ coordinator dying, a superseded coordinator stopping, the broker expiring
 or losing a transaction. The trace module lets TLC take those as hidden
 steps between events, within the fault budgets the trace itself implies
 (one coordinator death per `CoordRecovers`, one expiry per refused probe,
-and so on).
+and so on). One step the engine could record has no line either: the Kafka
+sink's `SinkFinish`, between its `SinkReceipt` and the worker's
+`SinkConfirm`. The module takes it as a hidden step only where the next
+event needs it, that sink's `SinkConfirm` or its next `SinkPrepare`.
 
 ### Validating a trace
 
@@ -272,6 +281,29 @@ input queue (`Trigger` and `DeliverBarrier` admit a sink that is `opening`).
 None is an engine defect; each is a behaviour the engine has always had
 that the model had not admitted, and the recorded traces under
 `formal/traces/` now pin all three.
+
+A fourth came from a run of
+`KafkaWindowRecoveryTest.WorkerAndHaCoordinatorFailoverKeepSourceWindowAndSinkOnOneCut`,
+whose trace recorded a Kafka sink's `SinkPrepare` for checkpoint N+1 before
+its worker's `SinkConfirm` for N. The model had one step for both ends of a
+commit: the handle erased, the open transaction cleared and the
+confirmation counted at the coordinator, so the next prepare could only
+follow the confirmation. The engine splits them across two threads. The
+commit dispatch runs `on_commit(N)`, whose tail erases the handle and
+resolves the open transaction, waking the task thread that waits in
+`on_barrier(N+1)`; the worker sends `CommitConfirmed` only after the
+callback returns. The specification now takes the two as `SinkFinish` and
+`SinkConfirm`, with the checkpoint awaiting confirmation kept in the sink's
+`confirmDue`. `CanPrepare` admits a Kafka sink that has finished,
+`DeliverCommit` still holds the next commit frame until the confirmation
+(the dispatch is one FIFO thread per worker and takes the next
+`CommitCheckpoint` only after it), and an abort, which the worker handles on
+its reader thread, is accepted in between. TLC explores a worker death and
+a coordinator takeover in the new window, after the next prepare and before
+`CommitConfirmed`, and finds no violation: the receipt on disk proves the
+commit to the in-doubt walk, and the next checkpoint's snapshot no longer
+holds the erased handle. `formal/traces/kafka-prepare-before-confirmation`,
+synthetic, pins the order.
 
 Trace validation has since caught an engine defect. A takeover numbered its
 new checkpoints above the markers and the snapshot files it could see, and a

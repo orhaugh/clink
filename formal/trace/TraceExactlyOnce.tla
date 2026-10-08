@@ -250,7 +250,7 @@ StepDeliverAbort ==
                                   /\ ~(m.epoch < boundEpoch[Host[E.sub]])
                                   /\ E.ckpt \in pendingHandles[E.sub]
                                   /\ txn[E.sub][E.ckpt].st = "prepared"
-                                  /\ sink[E.sub].stage = "idle")
+                                  /\ OutsideCommit(E.sub))
        ELSE Skip
 
 StepSinkCommit ==
@@ -262,10 +262,12 @@ StepSinkReceipt ==
     /\ IF ForSink /\ Kafka THEN sink[E.sub].openTxn = E.ckpt /\ SinkReceipt(E.sub) ELSE Skip
 
 \* The recoverable family's worker also reports CommitConfirmed; the model has
-\* no such step for it, so the event is a stutter there.
+\* no such step for it, so the event is a stutter there. For the Kafka family
+\* the line confirms the checkpoint the sink finished, a step with no line of
+\* its own (FinishNeeded).
 StepSinkConfirm ==
     /\ Is("SinkConfirm")
-    /\ IF ForSink /\ Kafka THEN sink[E.sub].openTxn = E.ckpt /\ SinkConfirm(E.sub) ELSE Skip
+    /\ IF ForSink /\ Kafka THEN sink[E.sub].confirmDue = E.ckpt /\ SinkConfirm(E.sub) ELSE Skip
 
 \* The coordinator emits WriteConfirmed in the hold that advances its confirmed
 \* restore point, after the marker's put, so the leader's line stands for the
@@ -471,6 +473,18 @@ LostWalkDecides ==
     /\ \A s \in WalkHandles(walkC) : walkVerdict[s] = "committed"
     /\ WalkDecides
 
+\* The Kafka sink's finish (SinkFinish) has no line. The sink emits SinkReceipt
+\* inside its commit callback and the worker SinkConfirm as it sends
+\* CommitConfirmed, after the callback has returned, and nothing between marks
+\* the handle erased and the open transaction resolved. The finish is taken
+\* as a hidden step only where the next event needs it: that sink's
+\* SinkConfirm, or its next SinkPrepare, which the task thread can reach
+\* before the confirmation goes out, since the finish resolved the open
+\* transaction its barrier waits on. A death after the receipt needs no
+\* finish: the death takes the sink's handles with or without one, and the
+\* receipt on disk answers for the commit either way.
+FinishNeeded == E.event \in {"SinkPrepare", "SinkConfirm"} /\ ForSink /\ Kafka
+
 \* What the engine cannot observe and so never emits: the model may take
 \* these between events, within the budgets the trace implies.
 \* A dying leader takes its ids out of `triggered`; a superseded one keeps them,
@@ -481,6 +495,7 @@ Hidden ==
              \/ TxnExpires \/ BrokerGoesDown \/ BrokerComesBack
              \/ LostWriteCompleted \/ LostStaleCompletedAtWalk \/ LostWriteConfirmed
              \/ LostWalkDecides
+             \/ FinishNeeded /\ SinkFinish(E.sub)
           /\ UNCHANGED triggered
     /\ UNCHANGED <<l, ev, placed>>
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**The exactly-once specification lets a Kafka sink prepare its next
+checkpoint before its confirmation goes out, as the engine does.** Trace
+validation rejected a recorded Kafka run whose sink sealed checkpoint N+1
+between finishing the commit of N and the worker's `CommitConfirmed` for it:
+the model made those one step, so it never checked that interleaving. They are
+now separate steps (`SinkFinish`, then `SinkConfirm`), every model still checks
+with no violation, every mutant is refuted or accepted as before, and the trace
+is accepted.
+
 **SUM over a DOUBLE column is a DOUBLE, whole values included.** The row path
 summed a whole double such as 9.0 into its exact integer accumulator, so
 `SUM(x)` over a `DOUBLE` column of whole values came back an integer and

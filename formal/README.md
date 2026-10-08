@@ -129,7 +129,8 @@ them.
 | `coordinator.after_completed_marker`, `coordinator.before_commit_broadcast` | `toBroadcast = c`, before `Broadcast` |
 | `sink.before_commit` | `stage = "committing"`, before `SinkCommit(s)` |
 | `sink.between_commit_and_receipt` | `stage = "committed"`, before `SinkReceipt(s)` |
-| `sink.after_external_commit` | `stage = "receipted"`, before `SinkConfirm(s)` |
+| `sink.after_external_commit` | `stage = "receipted"`, before `SinkFinish(s)` |
+| (none: the commit callback has returned, `CommitConfirmed` not yet sent) | `stage = "finished"`, before `SinkConfirm(s)`; the sink may already have prepared the next checkpoint |
 | `coordinator.before_confirmed_marker` | `confirming[c] = "due"` (the confirmation set drained and `c` out of `broadcastIds`), before `WriteConfirmed`; neither `confirmedDisk` nor `memConfirmed` has moved |
 | `coordinator.before_in_doubt_walk` | `phase = "resolving"` with `walkC` fixed by `RestartProceeds`, before the walk's first step; an `AdvanceConfirmed` landing here moves `memConfirmed`, not `walkC` |
 | `checkpoint.before_write` and its siblings | `SinkPrepareFails(s)` (the capture fails, the ack says so) |
@@ -242,6 +243,17 @@ reads the furthest event index any path reached; deadlock checking is off,
 since a hidden-step branch the run did not need dies out harmlessly); a
 shorter reach names the first event no allowed step produced, and
 `formal-check.sh --trace` prints it.
+
+One step of the specification has no line at all: the Kafka sink's
+`SinkFinish`, between its `SinkReceipt` and the worker's `SinkConfirm`, where
+`on_commit` erases the staged handle and resolves the open transaction. The
+worker sends `CommitConfirmed` only after the callback returns, so the task
+thread can seal the next checkpoint between the two, and a recorded run of
+`KafkaWindowRecoveryTest.WorkerAndHaCoordinatorFailoverKeepSourceWindowAndSinkOnOneCut`
+did. The trace module takes the finish as a hidden step only where the next
+event needs it, that sink's `SinkConfirm` or its next `SinkPrepare`
+(`traces/kafka-prepare-before-confirmation`, synthetic, is accepted and
+diverges at the prepare when the finish and the confirmation are one step).
 
 A marker can be on disk without the line that reports it: a kill between the
 `COMPLETED` write and its `WriteCompleted` line, or between the `CONFIRMED`

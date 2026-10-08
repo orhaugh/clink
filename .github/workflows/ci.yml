@@ -500,11 +500,14 @@ jobs:
     runs-on: ubuntu-24.04
     # Every model but MC_RecoverableSmall, which runs in the job below: about
     # 42 minutes on the four-core runner, MC_KafkaLiveness and MC_KafkaSmall
-    # some 19 minutes each. They run one at a time with every worker, not
-    # several at a time with one each: TLC's workers are worth more to the
-    # long ones than concurrency is to the short ones (measured: a model that
-    # takes 221 s on all workers takes 22 min on one). The mutants are the
-    # opposite case and have their own job.
+    # some 19 minutes each, until a Kafka sink's finish and its confirmation
+    # became separate steps (SinkFinish): MC_KafkaSmall grew from 48.9M to
+    # 78.8M states and MC_KafkaLiveness from 6.1M to 7.4M, an estimated 58
+    # minutes in all, scaled from the state counts. They run one at a time
+    # with every worker, not several at a time with one each: TLC's workers
+    # are worth more to the long ones than concurrency is to the short ones
+    # (measured: a model that takes 221 s on all workers takes 22 min on one).
+    # The mutants are the opposite case and have their own job.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -549,8 +552,10 @@ jobs:
     name: The recoverable-small model of the exactly-once specification model-checks
     runs-on: ubuntu-24.04
     # MC_RecoverableSmall on its own runner with every worker, beside the other
-    # models: its search is the largest of the set, 145.4M states in about 70
-    # minutes. The models took 77 minutes in one job until a coordinator whose
+    # models: its search is the largest of the set, 170.2M states, which took
+    # 88 of the job's 120 minutes on the runner (145.4M states in about 70
+    # minutes before the confirmed marker's write and advance became separate
+    # steps). The models took 77 minutes in one job until a coordinator whose
     # claim on a checkpoint id is refused could renumber (Renumber,
     # ZombieRenumber): every supersession branches again, MC_RecoverableSmall
     # grew from 103M to 145M states, and the one job took 112 of its 130
