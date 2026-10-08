@@ -127,6 +127,14 @@ public:
     // group/join keys append each key column's value in place instead
     // of materialising an intermediate string via serialize(0).
     void serialize_into(std::string& out) const;
+    // Compact form that keeps every number's kind through a parse: a double with
+    // an integral value is written with a ".0" fraction (9.0, not 9; -0.0 keeps
+    // its sign), so parse() reads it back as a double, while an integer stays a
+    // bare integer. Every other byte matches serialize_into(). The output is
+    // plain JSON, so any reader accepts it. For the row codec between operators,
+    // where the kind decides integer or floating arithmetic downstream; external
+    // output and key text keep serialize()/serialize_output().
+    void serialize_kind_preserving_into(std::string& out) const;
 
     // Deep structural equality (recurses through arrays and objects). Numbers
     // compare by VALUE across the int64/double split, so an int-constructed and

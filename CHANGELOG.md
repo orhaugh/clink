@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**A double keeps its kind when a row crosses between operators or through
+operator state.** The row codec between operators, and the codecs of the SQL
+operators' state, wrote a double with an integral value, such as 9.0, as `9`,
+so it came back an integer. The evaluator picks integer or floating arithmetic
+by a value's kind, so after a keyed exchange between workers, a restore, or a
+read from a deferring state backend or a spilled join, `9.0 / 2` gave 4 where
+the same query held in memory gave 4.5. The codecs now write an integral double
+as `9.0` (and negative zero as `-0.0`), inside arrays and objects as well. The
+frames and state are still plain JSON: an earlier release reads what this one
+writes, and frames, snapshots and captures an earlier release wrote decode as
+before. Sink output, and the key text that group, join and `DISTINCT` state is
+stored under, are unchanged.
+
 **A grouped SELECT takes expressions over its aggregates.** `SELECT k, SUM(n) /
 8 FROM t GROUP BY k` escaped the binder as `std::bad_variant_access` when
 another aggregate stood beside the expression, and was refused as "GROUP BY

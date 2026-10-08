@@ -114,6 +114,19 @@ struct Row {
     }
 };
 
+// JSON text that keeps every number's kind through a parse (an integral double
+// is written 9.0; see JsonValue::serialize_kind_preserving_into). For a value a
+// codec writes and later decodes back into a row or an aggregate: the operator
+// state codecs in install.cpp use it as row_json_codec does. Key text and the
+// text a retraction is matched on keep serialize(0), which writes 9.0 and 9 the
+// same, so a row restored from a snapshot an earlier release wrote (integral
+// doubles bare, decoding as integers) still matches.
+inline std::string kind_preserving_json(const clink::config::JsonValue& v) {
+    std::string s;
+    v.serialize_kind_preserving_into(s);
+    return s;
+}
+
 // JSON-encoded Codec<Row>. Each row encodes to one JSON object body
 // (no trailing newline). The wire framing layer above handles record
 // boundaries.
@@ -123,9 +136,16 @@ inline clink::Codec<Row> row_json_codec() {
     // Shared append-body: encode (wrap) and encode_into (direct) serialise the
     // same JSON object; encode_into appends to the caller-cleared buffer,
     // avoiding the per-put Bytes allocation. Byte-identical by construction.
+    //
+    // The kind-preserving form writes an integral double as 9.0, not 9, so it
+    // decodes as a double again: the evaluator picks integer or floating
+    // arithmetic by kind, and a bare 9 would turn 9.0 / 2 after a shuffle into 4.
+    // The frame stays plain JSON, so a reader from any release decodes it, and a
+    // frame from an earlier writer (integral doubles bare) decodes as before.
     auto body = [](const Row& r, Bytes& out) {
         clink::config::JsonValue v{to_json_object(r.values)};
-        std::string s = v.serialize(0);
+        std::string s;
+        v.serialize_kind_preserving_into(s);
         const auto* p = reinterpret_cast<const std::byte*>(s.data());
         out.insert(out.end(), p, p + s.size());
     };
@@ -153,10 +173,11 @@ inline clink::Codec<Row> row_json_codec() {
     };
 }
 
-// JSON-encoded Codec for a LIST of Rows (a JSON array of the row objects).
-// Backs the async/disaggregated KeyedState path of the stream-stream INNER join,
-// where each join key's entry list (the rows seen on one side) round-trips
-// through the remote pool. Shares Codec<Row>'s per-row JSON shape.
+// JSON-encoded Codec for a LIST of Rows (a JSON array of the row objects),
+// sharing Codec<Row>'s per-row JSON shape, number kinds included. No engine
+// operator uses it: the stream-stream equi-join (INNER included) keeps its entry
+// lists through its own entry_list_codec in install.cpp, which also records the
+// null-padding flag. It stays for code built against this header.
 inline clink::Codec<std::vector<Row>> row_list_json_codec() {
     using Bytes = clink::Codec<std::vector<Row>>::Bytes;
     using BytesView = clink::Codec<std::vector<Row>>::BytesView;
@@ -168,7 +189,8 @@ inline clink::Codec<std::vector<Row>> row_list_json_codec() {
         for (const auto& r : rows) {
             arr.emplace_back(to_json_object(r.values));
         }
-        const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+        std::string s;
+        clink::config::JsonValue{std::move(arr)}.serialize_kind_preserving_into(s);
         const auto* p = reinterpret_cast<const std::byte*>(s.data());
         out.insert(out.end(), p, p + s.size());
     };

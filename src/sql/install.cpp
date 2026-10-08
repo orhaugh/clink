@@ -352,7 +352,7 @@ inline void put_str(std::vector<std::byte>& o, const std::string& s) {
         o.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
 }
 inline void put_json(std::vector<std::byte>& o, const clink::config::JsonValue& v) {
-    put_str(o, v.serialize(0));
+    put_str(o, clink::sql::kind_preserving_json(v));
 }
 
 struct Reader {
@@ -494,7 +494,7 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
     // construction. encode_into appends to the caller-cleared scratch buffer.
     auto body = [](const AggBucket& b, Bytes& o) {
         clink::config::JsonValue gv{clink::sql::to_json_object(b.group_values.values)};
-        agg_codec_detail::put_str(o, gv.serialize(0));
+        agg_codec_detail::put_str(o, clink::sql::kind_preserving_json(gv));
         agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
         for (const auto& s : b.agg_states)
             agg_codec_detail::encode_agg_state(o, s);
@@ -502,7 +502,7 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
         agg_codec_detail::put_u32(o, b.prior_emitted.has_value() ? 1u : 0u);
         if (b.prior_emitted.has_value()) {
             clink::config::JsonValue pe{clink::sql::to_json_object(b.prior_emitted->values)};
-            agg_codec_detail::put_str(o, pe.serialize(0));
+            agg_codec_detail::put_str(o, clink::sql::kind_preserving_json(pe));
         }
     };
     return clink::Codec<AggBucket>{
@@ -1468,7 +1468,7 @@ namespace window_codec_detail {
 inline void encode_bucket(std::vector<std::byte>& o, const WindowBucket& b) {
     agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(b.window_start));
     clink::config::JsonValue gv{clink::sql::to_json_object(b.group_values.values)};
-    agg_codec_detail::put_str(o, gv.serialize(0));
+    agg_codec_detail::put_str(o, clink::sql::kind_preserving_json(gv));
     agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
     for (const auto& s : b.agg_states) {
         agg_codec_detail::encode_agg_state(o, s);
@@ -4238,7 +4238,7 @@ private:
                 agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(start));
                 agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(s.end));
                 clink::config::JsonValue gv{clink::sql::to_json_object(s.group_values.values)};
-                agg_codec_detail::put_str(o, gv.serialize(0));
+                agg_codec_detail::put_str(o, clink::sql::kind_preserving_json(gv));
                 agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(s.agg_states.size()));
                 for (const auto& as : s.agg_states) {
                     agg_codec_detail::encode_agg_state(o, as);
@@ -5027,7 +5027,8 @@ private:
         using Bytes = clink::Codec<PartState>::Bytes;
         using BytesView = clink::Codec<PartState>::BytesView;
         auto row_text = [](const Row& r) {
-            return clink::config::JsonValue{clink::sql::to_json_object(r.values)}.serialize(0);
+            return clink::sql::kind_preserving_json(
+                clink::config::JsonValue{clink::sql::to_json_object(r.values)});
         };
         auto parse_row = [](const std::string& t) -> Row {
             Row r;
@@ -5500,7 +5501,7 @@ private:
         emit_batch.push(Record<Row>{std::move(result)});
     }
 
-    // Inverse of serialize_bare_, for the codec. Encoded by serialize_bare_, so a
+    // Inverse of state_text_, for the codec. Encoded by state_text_, so a
     // parse failure is impossible short of corruption; a throw propagates to the
     // runner, which fails the task loudly.
     static Row parse_bare_(const std::string& text) {
@@ -5519,21 +5520,26 @@ private:
 
     // Codec for ONE partition's state: the window rows IN VECTOR ORDER (the order
     // is the eviction order and the tie-break - see the note on open()), then the
-    // prior emission. Rows ride as serialize_bare_ text, the same encoding whose
-    // exact round-trip the top-N change gated cross-engine; retraction matching
-    // compares that same text, so the retract-after-restore test doubles as the
-    // canonical-encoding gate.
+    // prior emission. Rows ride as kind-preserving JSON object text, so a double
+    // column comes back a double. Retraction matching compares serialize_bare_
+    // text, which writes 9.0 and 9 alike, so a row restored from a snapshot an
+    // earlier release wrote (integral doubles bare) still matches its retraction;
+    // the retract-after-restore test gates that.
+    static std::string state_text_(const Row& r) {
+        return clink::sql::kind_preserving_json(
+            clink::config::JsonValue{clink::sql::to_json_object(r.values)});
+    }
     static clink::Codec<PartState> part_state_codec() {
         using Bytes = clink::Codec<PartState>::Bytes;
         using BytesView = clink::Codec<PartState>::BytesView;
         auto body = [](const PartState& st, Bytes& o) {
             agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(st.window.size()));
             for (const auto& r : st.window) {
-                agg_codec_detail::put_str(o, serialize_bare_(r));
+                agg_codec_detail::put_str(o, state_text_(r));
             }
             agg_codec_detail::put_bool(o, st.prior_emitted.has_value());
             if (st.prior_emitted.has_value()) {
-                agg_codec_detail::put_str(o, serialize_bare_(*st.prior_emitted));
+                agg_codec_detail::put_str(o, state_text_(*st.prior_emitted));
             }
         };
         return clink::Codec<PartState>{
@@ -7798,7 +7804,8 @@ private:
                 o["n"] = clink::config::JsonValue{e.null_emitted};
                 arr.emplace_back(std::move(o));
             }
-            const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+            const std::string s =
+                clink::sql::kind_preserving_json(clink::config::JsonValue{std::move(arr)});
             const auto* p = reinterpret_cast<const std::byte*>(s.data());
             out.insert(out.end(), p, p + s.size());
         };
@@ -8634,7 +8641,8 @@ private:
                 o["e"] = clink::config::JsonValue{e.emitted};
                 arr.emplace_back(std::move(o));
             }
-            const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+            const std::string s =
+                clink::sql::kind_preserving_json(clink::config::JsonValue{std::move(arr)});
             const auto* p = reinterpret_cast<const std::byte*>(s.data());
             out.insert(out.end(), p, p + s.size());
         };
@@ -9147,7 +9155,8 @@ private:
                 o["lr"] = clink::config::JsonValue{clink::sql::to_json_object(b.left_rep.values)};
             if (b.has_right_rep)
                 o["rr"] = clink::config::JsonValue{clink::sql::to_json_object(b.right_rep.values)};
-            const std::string s = clink::config::JsonValue{std::move(o)}.serialize(0);
+            const std::string s =
+                clink::sql::kind_preserving_json(clink::config::JsonValue{std::move(o)});
             const auto* p = reinterpret_cast<const std::byte*>(s.data());
             out.insert(out.end(), p, p + s.size());
         };
@@ -10158,18 +10167,24 @@ private:
     // encode per arrival, one decode per EVICTED row (needed only to emit its
     // changelog delete), and none per comparison.
     //
-    // The decode round-trip is exact - integral JSON numbers parse to exact int64,
-    // doubles print at full precision, dec-strings ride as strings - so the delete
-    // a decoded row emits carries the same column values as the insert emitted
-    // from the original. The upsert sink keys its tombstone from those values and
+    // The decode round-trip is exact - integers parse to exact int64, doubles
+    // print at full precision (an integral one as 9.0, so it parses back a
+    // double), dec-strings ride as strings - so the delete a decoded row emits
+    // carries the same column values, number kinds included, as the insert
+    // emitted from the original. The upsert sink keys its tombstone from those values and
     // the changelog tests replay them, both of which gate this change.
     struct StoredRow {
         std::string encoded;
         std::vector<clink::config::JsonValue> sort_vals;  // aligned to sort_columns_
     };
 
+    // Kind-preserving, so a double column comes back a double in the delete an
+    // evicted row emits and after a restore. Nothing compares this text: the
+    // probe and the tie tests use sort_vals, and a downstream retraction match
+    // keys on serialize(0) text, which writes 9.0 and 9 alike.
     static std::string encode_row_(const Row& row) {
-        return clink::config::JsonValue{clink::sql::to_json_object(row.values)}.serialize(0);
+        return clink::sql::kind_preserving_json(
+            clink::config::JsonValue{clink::sql::to_json_object(row.values)});
     }
 
     static Row decode_row_(const std::string& encoded) {
@@ -11629,7 +11644,8 @@ private:
                 o["m"] = clink::config::JsonValue{e.matched};
                 arr.emplace_back(std::move(o));
             }
-            const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+            const std::string s =
+                clink::sql::kind_preserving_json(clink::config::JsonValue{std::move(arr)});
             const auto* p = reinterpret_cast<const std::byte*>(s.data());
             out.insert(out.end(), p, p + s.size());
         };

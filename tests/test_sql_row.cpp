@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -89,6 +92,111 @@ TEST(SqlRow, RowCodecsEncodeIntoMatchesEncodeAndAppends) {
     check(row_json_codec(), r);
     std::vector<Row> rows = {r, r};
     check(row_list_json_codec(), rows);
+}
+
+// The row codec keeps a number's kind: a double with an integral value comes back
+// a double and an integer comes back an integer, at the top level and nested in
+// an array or object (ARRAY, MAP and ROW values). The evaluator picks integer or
+// floating arithmetic by kind, so a double decoded as an integer changes the
+// answer of `x / 2` after any hop that crosses this codec.
+TEST(SqlRow, JsonCodecKeepsNumberKind) {
+    using clink::config::JsonArray;
+    using clink::config::JsonObject;
+    using clink::config::JsonValue;
+    Row r;
+    r.values["d"] = JsonValue{9.0};
+    r.values["neg"] = JsonValue{-4.0};
+    r.values["zero"] = JsonValue{0.0};
+    r.values["negzero"] = JsonValue{-0.0};
+    r.values["big"] = JsonValue{1e18};
+    r.values["huge"] = JsonValue{1e300};
+    r.values["frac"] = JsonValue{2.5};
+    r.values["i"] = JsonValue{std::int64_t{9}};
+    r.values["imax"] = JsonValue{std::int64_t{9223372036854775807}};
+    r.values["arr"] = JsonValue{JsonArray{JsonValue{1.0}, JsonValue{std::int64_t{2}}}};
+    r.values["obj"] = JsonValue{JsonObject::from_entries({{"a", JsonValue{3.0}}})};
+
+    auto check = [](const Row& got) {
+        auto kind = [&](const char* name) { return got.values.find(name)->second.type(); };
+        using T = JsonValue::Type;
+        EXPECT_EQ(kind("d"), T::Number);
+        EXPECT_EQ(kind("neg"), T::Number);
+        EXPECT_EQ(kind("zero"), T::Number);
+        EXPECT_EQ(kind("negzero"), T::Number);
+        EXPECT_TRUE(std::signbit(got.values.find("negzero")->second.as_number()));
+        EXPECT_EQ(kind("big"), T::Number);
+        EXPECT_EQ(got.values.find("big")->second.as_number(), 1e18);
+        EXPECT_EQ(kind("huge"), T::Number);
+        EXPECT_EQ(got.values.find("huge")->second.as_number(), 1e300);
+        EXPECT_EQ(kind("frac"), T::Number);
+        EXPECT_EQ(kind("i"), T::Int);
+        EXPECT_EQ(kind("imax"), T::Int);
+        EXPECT_EQ(got.values.find("imax")->second.as_int(), 9223372036854775807);
+        const auto& arr = got.values.find("arr")->second.as_array();
+        ASSERT_EQ(arr.size(), 2u);
+        EXPECT_EQ(arr[0].type(), T::Number);
+        EXPECT_EQ(arr[1].type(), T::Int);
+        EXPECT_EQ(got.values.find("obj")->second.at("a").type(), T::Number);
+    };
+
+    auto codec = row_json_codec();
+    auto bytes = codec.encode(r);
+    auto decoded = codec.decode({bytes.data(), bytes.size()});
+    ASSERT_TRUE(decoded.has_value());
+    check(*decoded);
+
+    auto list_codec = row_list_json_codec();
+    auto list_bytes = list_codec.encode({r});
+    auto list = list_codec.decode({list_bytes.data(), list_bytes.size()});
+    ASSERT_TRUE(list.has_value());
+    ASSERT_EQ(list->size(), 1u);
+    check(list->front());
+}
+
+// Compatibility both ways. The frame is JSON text, so the new writer's frame must
+// be plain JSON any earlier reader accepts (every release decodes it with the
+// generic JSON parse), and a frame an earlier writer produced, with an integral
+// double written as a bare integer, must still decode as it always did.
+TEST(SqlRow, JsonCodecFramesStayReadableBothWays) {
+    using clink::config::JsonValue;
+    Row r;
+    r.values["d"] = JsonValue{9.0};
+    r.values["i"] = JsonValue{std::int64_t{9}};
+    auto codec = row_json_codec();
+    auto bytes = codec.encode(r);
+    const std::string text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    EXPECT_EQ(text, R"({"d":9.0,"i":9})");
+    auto generic = clink::config::parse(text);
+    EXPECT_EQ(generic.at("d").type(), JsonValue::Type::Number);
+    EXPECT_EQ(generic.at("d").as_number(), 9.0);
+    EXPECT_EQ(generic.at("i").type(), JsonValue::Type::Int);
+
+    // An earlier writer printed the double 9.0 bare. Its frame decodes as it
+    // always did: the bare token is an integer, at the top level and nested, and
+    // a fractional double stays a double.
+    const std::string earlier = R"({"d":9,"f":2.5,"arr":[9,2.5],"obj":{"a":9}})";
+    auto old_frame =
+        codec.decode({reinterpret_cast<const std::byte*>(earlier.data()), earlier.size()});
+    ASSERT_TRUE(old_frame.has_value());
+    const auto& old = old_frame->values;
+    EXPECT_EQ(old.find("d")->second.type(), JsonValue::Type::Int);
+    EXPECT_EQ(old.find("d")->second.as_int(), 9);
+    EXPECT_EQ(old.find("f")->second.type(), JsonValue::Type::Number);
+    EXPECT_EQ(old.find("f")->second.as_number(), 2.5);
+    const auto& old_arr = old.find("arr")->second.as_array();
+    ASSERT_EQ(old_arr.size(), 2u);
+    EXPECT_EQ(old_arr[0].type(), JsonValue::Type::Int);
+    EXPECT_EQ(old_arr[1].type(), JsonValue::Type::Number);
+    EXPECT_EQ(old.find("obj")->second.at("a").type(), JsonValue::Type::Int);
+}
+
+// External output is unchanged: the NDJSON sink still prints an integral double
+// as a bare integer. Only the row codec between operators carries the kind.
+TEST(SqlRow, JsonTextFormatStillPrintsIntegralDoubleBare) {
+    Row r;
+    r.values["d"] = clink::config::JsonValue{7.0};
+    EXPECT_EQ(row_json_text_format().encode(r), R"({"d":7})");
+    EXPECT_EQ(clink::config::JsonValue{7.0}.serialize(0), "7");
 }
 
 TEST(SqlRow, GetStringStringifiesNumbersAndBools) {

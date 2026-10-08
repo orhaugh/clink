@@ -51,6 +51,7 @@
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/runtime/network/local_data_plane.hpp"
 #include "clink/sql/analyze.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/binder.hpp"
@@ -2415,6 +2416,82 @@ TEST(SqlRuntime, AsyncStateSessionWindowMatchesSyncPath) {
         << "async session path must produce the same session relation as the sync path";
     EXPECT_GT(rrb->remote_loads(), 0u) << "session op did not route its per-group state through "
                                           "the deferring backend (async path)";
+}
+
+// A DOUBLE value keeps its kind through operator state. On a deferring backend
+// every record round-trips its key's state through the codec (hot cache off), so
+// the join's held entry list and the windows' group_values and MIN / MAX values
+// are decoded from codec text before they are emitted. Written with an integral
+// double bare, a 9.0 came back an integer, and `x / 2` downstream gave 4 instead
+// of 4.5. The in-memory runs are the control: they never decode.
+TEST(SqlRuntime, OperatorStateKeepsDoubleKindOnDeferringBackend) {
+    ensure_sql_installed_once();
+    using T = clink::config::JsonValue::Type;
+    auto deferring = [] {
+        return std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    };
+    auto kind_of = [](const Row& r, const char* col) { return r.values.at(col).type(); };
+
+    // Equi-join: one row a side on the same key, so whichever arrives second
+    // probes the other's entry list, which comes back through entry_list_codec.
+    auto doubles = [](const char* col, double v) {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{std::int64_t{1}};
+        r.values[col] = clink::config::JsonValue{v};
+        return std::vector<Record<Row>>{Record<Row>{std::move(r)}};
+    };
+    for (const bool defer : {false, true}) {
+        SCOPED_TRACE(defer ? "join, deferring backend" : "join, in-memory backend");
+        std::shared_ptr<StateBackend> backend = std::make_shared<InMemoryStateBackend>();
+        std::shared_ptr<RemoteReadBackend> rrb;
+        if (defer) {
+            rrb = deferring();
+            backend = rrb;
+        }
+        const auto out =
+            run_equi_join("inner", doubles("lv", 9.0), doubles("rv", 4.0), std::move(backend));
+        ASSERT_EQ(out.size(), 1u);
+        EXPECT_EQ(kind_of(out[0].value(), "l_lv"), T::Number);
+        EXPECT_EQ(kind_of(out[0].value(), "r_rv"), T::Number);
+        EXPECT_EQ(out[0].value().values.at("l_lv").as_number(), 9.0);
+        if (rrb) {
+            EXPECT_GT(rrb->remote_loads(), 0u) << "the join did not take the deferring path";
+        }
+    }
+
+    // Tumbling and session windows: k is a DOUBLE group key held in group_values,
+    // m a MAX over a DOUBLE column held as a JSON value in the aggregate state.
+    const std::map<std::string, std::string> extra = {
+        {"aggregates",
+         R"([{"name":"s","fn":"sum","input_column":"amt"},)"
+         R"({"name":"m","fn":"max","input_column":"amt"}])"}};
+    for (const bool session : {false, true}) {
+        for (const bool defer : {false, true}) {
+            SCOPED_TRACE(std::string{session ? "session" : "tumbling"} +
+                         (defer ? ", deferring backend" : ", in-memory backend"));
+            std::shared_ptr<StateBackend> backend = std::make_shared<InMemoryStateBackend>();
+            std::shared_ptr<RemoteReadBackend> rrb;
+            if (defer) {
+                rrb = deferring();
+                backend = rrb;
+            }
+            const auto out =
+                session ? run_session_window_with(
+                              std::make_shared<AsyncSessionScenarioSource>(), backend, extra)
+                        : run_tumbling_window_with(
+                              std::make_shared<AsyncSessionScenarioSource>(), backend, extra);
+            ASSERT_FALSE(out.empty());
+            for (const auto& rec : out) {
+                EXPECT_EQ(kind_of(rec.value(), "k"), T::Number);
+                EXPECT_EQ(kind_of(rec.value(), "m"), T::Number);
+            }
+            if (rrb) {
+                EXPECT_GT(rrb->remote_loads(), 0u) << "the window did not take the deferring path";
+            }
+        }
+    }
 }
 
 // Late-data correctness: a record arriving after its tumbling window has fired
@@ -12318,6 +12395,74 @@ TEST(SqlRuntime, ColumnarDecodeParityOracle) {
         EXPECT_EQ(columnar, row_form) << "windowed GROUP BY parity broken";
         EXPECT_FALSE(columnar.empty());
     }
+
+    std::filesystem::remove(in_path);
+}
+
+// A DOUBLE value keeps its kind across a keyed exchange on the row path. The
+// evaluator picks integer or floating arithmetic by the value's runtime kind, so
+// a double that came back from the row codec as an integer turns 9.0 / 2 into 4.
+// The same windowed query runs at parallelism 1 over the in-process data plane
+// (no codec) and at parallelism 2 behind a hash-partitioned edge with the
+// in-process data plane off, so every edge takes the socket and codec path a
+// cross-worker hop takes. The row bridge keeps the shuffled records in row form,
+// so the keyed exchange carries the per-record row encoding. Both runs must give
+// 9.0 / 2 = 4.5 and 3.0 / 2 = 1.5. The integer tokens 9 and 5 in the input are
+// doubles from ingestion on (declared DOUBLE), so they exercise the same path.
+TEST(SqlRuntime, RowPathDoubleKeepsItsKindAcrossKeyedExchange) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto tag = std::to_string(::getpid());
+    const auto in_path = tmp / ("clink_sql_wire_kind_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_wire_kind_out_" + tag + ".ndjson");
+    std::filesystem::remove(in_path);
+    write_lines(in_path,
+                {
+                    R"({"k":1,"x":9,"ts":1000})",
+                    R"({"k":1,"x":3.0,"ts":2000})",
+                    R"({"k":2,"x":7.0,"ts":3000})",
+                    R"({"k":3,"x":5,"ts":4000})",
+                });
+
+    const std::string cols = "k BIGINT, x DOUBLE, ts BIGINT";
+    const std::string out_cols = "k BIGINT, h DOUBLE, l DOUBLE";
+    const std::string q =
+        "INSERT INTO out_t SELECT k, MAX(x) / 2 AS h, MIN(x) / 2 AS l FROM t "
+        "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k";
+    const std::string with = "event_time_column='ts', columnar_decode='false'";
+
+    auto& plane = clink::network::LocalDataPlane::instance();
+    ASSERT_TRUE(plane.enabled()) << "the chained run needs the in-process data plane";
+    auto chained = run_kafka_parity_case(cols, with, out_cols, q, in_path, out_path);
+    const auto socket_before = plane.socket_fallbacks();
+    std::multiset<std::string> shuffled;
+    {
+        // Restored on every exit, so a failure here cannot leave later tests in
+        // this process on the socket path.
+        struct PlaneOff {
+            clink::network::LocalDataPlane& p;
+            ~PlaneOff() { p.set_enabled(true); }
+        } off{plane};
+        plane.set_enabled(false);
+        shuffled = run_kafka_parity_case(
+            cols, with, out_cols, q, in_path, out_path, "tumbling_window_row", 2);
+    }
+    EXPECT_GT(plane.socket_fallbacks(), socket_before) << "no edge took the socket path";
+
+    auto by_key = [](const std::multiset<std::string>& lines) {
+        std::map<std::int64_t, std::pair<double, double>> m;
+        for (const auto& l : lines) {
+            auto js = clink::config::parse(l);
+            m[js.at("k").as_int()] = {js.at("h").as_number(), js.at("l").as_number()};
+        }
+        return m;
+    };
+    const std::map<std::int64_t, std::pair<double, double>> want{
+        {1, {4.5, 1.5}}, {2, {3.5, 3.5}}, {3, {2.5, 2.5}}};
+    EXPECT_EQ(by_key(chained), want) << "chained at parallelism 1";
+    EXPECT_EQ(by_key(shuffled), want) << "behind a keyed exchange at parallelism 2";
+    EXPECT_EQ(chained, shuffled);
 
     std::filesystem::remove(in_path);
 }

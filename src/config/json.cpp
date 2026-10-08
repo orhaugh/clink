@@ -143,7 +143,10 @@ void escape_string(std::string& out, const std::string& s) {
     out.push_back('"');
 }
 
-void serialize_append(std::string& out, const JsonValue& v, int indent_width, int depth) {
+// `keep_kind` writes an integral double with a ".0" fraction so a parse reads it
+// back as a double rather than an integer (see serialize_kind_preserving_into).
+void serialize_append(
+    std::string& out, const JsonValue& v, int indent_width, int depth, bool keep_kind) {
     auto indent = [&](int n) {
         if (indent_width > 0) {
             out.append(static_cast<std::size_t>(n) * static_cast<std::size_t>(indent_width), ' ');
@@ -179,8 +182,17 @@ void serialize_append(std::string& out, const JsonValue& v, int indent_width, in
             char buf[32];
             if (std::isfinite(d) && d >= kInt64Lo && d < kInt64HiExclusive &&
                 d == static_cast<double>(static_cast<std::int64_t>(d))) {
+                if (keep_kind && d == 0.0 && std::signbit(d)) {
+                    out += "-0.0";
+                    return;
+                }
                 auto res = std::to_chars(buf, buf + sizeof(buf), static_cast<std::int64_t>(d));
                 out.append(buf, static_cast<std::size_t>(res.ptr - buf));
+                if (keep_kind) {
+                    // A bare integer token parses back as an int64, which turns
+                    // floating arithmetic downstream into integer arithmetic.
+                    out += ".0";
+                }
             } else {
                 // The SHORTEST representation that parses back to the same double.
                 //
@@ -225,7 +237,7 @@ void serialize_append(std::string& out, const JsonValue& v, int indent_width, in
                     out.push_back('\n');
                     indent(depth + 1);
                 }
-                serialize_append(out, arr[i], indent_width, depth + 1);
+                serialize_append(out, arr[i], indent_width, depth + 1, keep_kind);
                 if (i + 1 < arr.size()) {
                     out.push_back(',');
                     if (indent_width > 0) {
@@ -258,7 +270,7 @@ void serialize_append(std::string& out, const JsonValue& v, int indent_width, in
                 if (indent_width > 0) {
                     out.push_back(' ');
                 }
-                serialize_append(out, val, indent_width, depth + 1);
+                serialize_append(out, val, indent_width, depth + 1, keep_kind);
                 if (i + 1 < obj.size()) {
                     out.push_back(',');
                     if (indent_width > 0) {
@@ -345,12 +357,16 @@ bool JsonValue::bool_or(std::string_view key, bool fallback) const {
 
 std::string JsonValue::serialize(int indent_width) const {
     std::string out;
-    serialize_append(out, *this, indent_width, 0);
+    serialize_append(out, *this, indent_width, 0, false);
     return out;
 }
 
 void JsonValue::serialize_into(std::string& out) const {
-    serialize_append(out, *this, 0, 0);
+    serialize_append(out, *this, 0, 0, false);
+}
+
+void JsonValue::serialize_kind_preserving_into(std::string& out) const {
+    serialize_append(out, *this, 0, 0, true);
 }
 
 namespace {
