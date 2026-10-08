@@ -85,6 +85,42 @@ PostResult post_to(std::shared_ptr<Outbox> outbox, const Outbox::Frame& frame, F
     return ships_plugin_bytes(plugins) ? FrameClass::Bulk : FrameClass::Control;
 }
 
+// Why the watchdog declares a worker lost from its connection's outbound side
+// at `now`, or an empty string. Either the outbox has stopped by itself (a
+// post overflowed it or could not allocate, or the transport failed under the
+// writer), or frames have been pending with no progress for longer than
+// `stall_timeout` (zero or less: never). An outbox the coordinator stopped
+// itself, by an abort (a loss, a replacement, a session whose threads could
+// not start) or by the flush at stop(), is never a verdict.
+[[nodiscard]] std::string outbound_loss_cause(const Outbox& outbox,
+                                              Outbox::Clock::time_point now,
+                                              std::chrono::milliseconds stall_timeout) {
+    const auto s = outbox.snapshot();
+    if (s.state == OutboxState::Stopped) {
+        switch (s.stop_reason) {
+            case OutboxStopReason::Overflow:
+            case OutboxStopReason::Allocation:
+            case OutboxStopReason::WriteFailed:
+                return "outbound queue stopped (" + std::string{to_string(s.stop_reason)} +
+                       "): " + s.stop_detail;
+            default:
+                return {};
+        }
+    }
+    if (stall_timeout.count() <= 0) {
+        return {};
+    }
+    const auto stalled = outbox.stalled_for(now);
+    if (stalled <= stall_timeout) {
+        return {};
+    }
+    const auto pending = s.queued_control_frames + s.queued_bulk_frames + (s.writing ? 1U : 0U);
+    return "no outbound progress for " +
+           std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(stalled).count()) +
+           " ms with " + std::to_string(pending) + (pending == 1 ? " frame" : " frames") +
+           " pending";
+}
+
 // A name for one coordinator's claims on a job's checkpoint-id record, unique
 // to this deploy of the job in this process (record_triggered_id): a retry that
 // finds its own claim on record, the first attempt's answer lost, knows it for
@@ -2074,7 +2110,12 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn,
     // to this session after its RegisterAck goes through it. Its writer
     // starts with the session's other threads (start_reader_for_); what is
     // posted before then waits in the queue.
-    worker->outbox = std::make_shared<Outbox>(worker->conn, "worker '" + reg.worker_id + "'");
+    worker->outbox = std::make_shared<Outbox>(
+        worker->conn,
+        "worker '" + reg.worker_id + "'",
+        OutboxLimits{.max_control_frames = cfg_.max_outbound_control_frames,
+                     .max_control_bytes = cfg_.max_outbound_control_bytes,
+                     .max_bulk_bytes = cfg_.max_outbound_bulk_bytes});
     worker->last_seen.store(std::chrono::steady_clock::now(), std::memory_order_release);
     worker->slot_capacity = reg.slot_count == 0 ? std::uint32_t{1} : reg.slot_count;
     worker->protocol_version = reg.protocol_version;
@@ -6608,7 +6649,25 @@ void Coordinator::watchdog_loop_() {
                 // `now`; the difference is then negative and never stale.
                 if (now - worker->last_seen.load(std::memory_order_acquire) >
                     cfg_.heartbeat_timeout) {
-                    mark_worker_lost_locked_(*worker);
+                    mark_worker_lost_locked_(*worker, "heartbeat timeout");
+                    any_lost = true;
+                    continue;
+                }
+                // The outbound side. A worker that goes on heartbeating
+                // while it reads nothing is never silent, and a reader stuck
+                // in a dispatch pauses the worker's own lease, so only what
+                // the coordinator cannot write to it shows it: its frames
+                // stalled past outbound_stall_timeout, or its outbox stopped
+                // by itself (an overflow, a failed allocation, a transport
+                // that failed under the writer). A stopped outbox has closed
+                // the connection, so the watchdog takes that at once rather
+                // than waiting out heartbeat_timeout. Both read only the
+                // outbox, whose lock is a leaf, so they are safe under mu_.
+                const auto outbox = worker->outbox;
+                if (const auto cause =
+                        outbound_loss_cause(*outbox, now, cfg_.outbound_stall_timeout);
+                    !cause.empty()) {
+                    mark_worker_lost_locked_(*worker, cause);
                     any_lost = true;
                 }
             }
@@ -7126,10 +7185,10 @@ void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
         job.errors.clear();
     } else {
         // Fail-fast: synthesise an error per pending task on the
-        // lost worker and free its slot.
+        // lost worker, naming the cause, and free its slot.
         for (const auto& [role, sub] : it->second) {
             job.errors.push_back(worker_id + "/" + role + "[" + std::to_string(sub) +
-                                 "]: worker lost (heartbeat timeout)");
+                                 "]: " + cause);
             ++job.completed_count;
         }
     }
@@ -7165,7 +7224,7 @@ void Coordinator::release_task_slot_locked_(const JobState& job,
     release_slots_locked_(*w->second, 1);
 }
 
-void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
+void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker, const std::string& cause) {
     worker.lost = true;
     lost_worker_ids_.push_back(worker.worker_id);
     // A session still retiring its predecessor did not hold the predecessor's
@@ -7176,7 +7235,7 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
         fold_dead_subtasks_into_restart_locked_(*job,
                                                 worker.worker_id,
                                                 "coordinator.watchdog",
-                                                "worker lost (heartbeat timeout)",
+                                                "worker lost (" + cause + ")",
                                                 /*live_from_session=*/0,
                                                 dead_from);
     }
@@ -7187,15 +7246,20 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
     // moot: its subtasks were folded above. The abort discards the queue
     // (counted, with one log line naming the cause when anything was
     // pending), ends the writer, and shuts the socket both ways, so a worker
-    // that is still alive sees the end of the stream at once rather than
-    // waiting out its own lease. Safe under mu_: the outbox's lock is a leaf.
+    // that is still alive meets the end of the stream right after the frames
+    // already written to it, rather than waiting out its own lease. Until it
+    // notices, it can still act on those frames; the abort recalls none of
+    // them. Safe under mu_: the outbox's lock is a leaf.
+    // An outbox that stopped by itself (the cause of an outbound verdict) is
+    // stopped already, and this does nothing.
     const auto outbox = worker.outbox;
-    outbox->abort("declared lost: nothing was read from it within heartbeat_timeout");
+    outbox->abort("declared lost (" + cause + ")");
     worker.slots_gauge_retired = true;
     metrics::coordinator::worker_lost(worker.slot_capacity, worker.slots_in_use);
-    log::warn("coordinator.watchdog", "worker lost: " + worker.worker_id);
-    events::publish("coordinator.worker_lost",
-                    "{\"worker_id\":" + js_quote(worker.worker_id) + "}");
+    log::warn("coordinator.watchdog", "worker lost: " + worker.worker_id + " (" + cause + ")");
+    events::publish(
+        "coordinator.worker_lost",
+        "{\"worker_id\":" + js_quote(worker.worker_id) + ",\"cause\":" + js_quote(cause) + "}");
 }
 
 // A worker re-registered under an id that already had a live session. The previous

@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -59,6 +60,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/cluster/protocol_trace.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/capability.hpp"
 #include "clink/connectors/txn_resume_registry.hpp"
@@ -259,7 +261,7 @@ public:
     void start_reader() {
         reader_ = std::thread([this] {
             while (!stop_.load(std::memory_order_acquire)) {
-                auto frame = recv_frame(*conn_);
+                auto frame = read_step_ > 0 ? recv_frame_slowly_() : recv_frame(*conn_);
                 if (!frame.has_value()) {
                     ended_.store(true, std::memory_order_release);
                     return;  // closed
@@ -268,6 +270,14 @@ public:
                 inbox_.push_back(std::move(*frame));
             }
         });
+    }
+
+    // Read every frame's body `step_bytes` at a time, one step every
+    // `interval`: a worker that reads, slowly but without stopping. Called
+    // before registering.
+    void read_slowly(std::size_t step_bytes, std::chrono::milliseconds interval) {
+        read_step_ = step_bytes;
+        read_interval_ = interval;
     }
 
     // Take the first queued frame of `kind`, waiting up to `bound`.
@@ -447,6 +457,32 @@ public:
     FakeWorker& operator=(FakeWorker&&) = delete;
 
 private:
+    // recv_frame at read_slowly's pace: the length prefix at once, then the
+    // body a step at a time, with a pause between steps.
+    std::optional<std::vector<std::byte>> recv_frame_slowly_() {
+        std::array<std::byte, 4> hdr{};
+        if (!conn_->recv_all(hdr.data(), hdr.size())) {
+            return std::nullopt;
+        }
+        std::uint32_t len = 0;
+        for (const auto b : hdr) {
+            len = (len << 8) | static_cast<unsigned char>(b);
+        }
+        std::vector<std::byte> body(len);
+        std::size_t got = 0;
+        while (got < len) {
+            const auto n = std::min<std::size_t>(read_step_, len - got);
+            if (!conn_->recv_all(body.data() + got, n)) {
+                return std::nullopt;
+            }
+            got += n;
+            if (got < len) {
+                std::this_thread::sleep_for(read_interval_);
+            }
+        }
+        return body;
+    }
+
     std::string id_;
     std::uint32_t slots_;
     std::unique_ptr<network::Connection> conn_;
@@ -456,6 +492,9 @@ private:
     std::uint16_t local_port_{0};
     bool reads_{true};
     bool heartbeats_{true};
+    // Nonzero: read_slowly's pace.
+    std::size_t read_step_{0};
+    std::chrono::milliseconds read_interval_{0};
     std::thread reader_;
     std::thread heartbeat_;
     // Acks and heartbeats are written from different threads.
@@ -5220,27 +5259,38 @@ constexpr int kDeployUnderway = 8 * 1024;
 // any platform. A Deploy that ships it to a worker that reads nothing fills
 // both and stays unwritten: whatever writes it is held in send for as long as
 // the worker reads nothing. The bytes are never loaded; no worker runs them.
-std::vector<PluginBinary> wedging_plugin() {
+std::vector<PluginBinary> plugin_of(std::size_t bytes, const std::string& hash) {
     PluginBinary plugin;
-    plugin.name = "wedging_plugin";
-    plugin.content_hash = "wedging-plugin-never-loaded";
-    plugin.bytes.assign(std::size_t{16} * 1024 * 1024, std::byte{0x5a});
+    plugin.name = "test_plugin";
+    plugin.content_hash = hash;
+    plugin.bytes.assign(bytes, std::byte{0x5a});
     std::vector<PluginBinary> plugins;
     plugins.push_back(std::move(plugin));
     return plugins;
 }
 
-// True once the watchdog has logged worker `id` lost since `since_ms`. Read
-// from the log ring, which takes no lock of the coordinator's, so it answers
-// even while a coordinator thread holds them all.
-bool logged_lost(const std::string& id, std::int64_t since_ms) {
+std::vector<PluginBinary> wedging_plugin() {
+    return plugin_of(std::size_t{16} * 1024 * 1024, "wedging-plugin-never-loaded");
+}
+
+// The cause the watchdog logged when it declared worker `id` lost since
+// `since_ms` ("worker lost: <id> (<cause>)"), or nullopt. Read from the log
+// ring, which takes no lock of the coordinator's, so it answers even while a
+// coordinator thread holds them all.
+std::optional<std::string> logged_loss_cause(const std::string& id, std::int64_t since_ms) {
+    const std::string prefix = "worker lost: " + id + " (";
     for (const auto& rec :
          LogBuffer::global().tail(1000, "warn", since_ms, "coordinator.watchdog")) {
-        if (rec.message == "worker lost: " + id) {
-            return true;
+        if (rec.message.starts_with(prefix) && rec.message.ends_with(")")) {
+            return rec.message.substr(prefix.size(), rec.message.size() - prefix.size() - 1);
         }
     }
-    return false;
+    return std::nullopt;
+}
+
+// True once the watchdog has logged worker `id` lost since `since_ms`.
+bool logged_lost(const std::string& id, std::int64_t since_ms) {
+    return logged_loss_cause(id, since_ms).has_value();
 }
 
 std::uint64_t outbound_discards(std::string_view cls, std::string_view reason) {
@@ -5328,6 +5378,10 @@ TEST(CheckpointCompletion, AWorkerThatStopsReadingHoldsNoCoordinatorThread) {
     Coordinator::Config cfg;
     cfg.heartbeat_timeout = 1000ms;
     cfg.watchdog_interval = 50ms;
+    // Out of the way: the wedged worker is to stay registered, so that the
+    // checks below see every thread that sends to it carry on. That the
+    // stall verdict ends such a worker is the next test's.
+    cfg.outbound_stall_timeout = 120000ms;
     Coordinator c(cfg);
     const auto port = c.start();
     const auto start_ms = log_cursor_ms();
@@ -5693,4 +5747,676 @@ TEST(CheckpointCompletion, AReRegistrationAbortsTheReplacedSessionsOutboxAndJoin
     successor.close();
     replaced.close();
     c.stop();
+}
+
+// --- Worker connections: the outbound verdicts ---------------------------------
+//
+// A worker that goes on heartbeating but reads nothing is never silent, and a
+// reader stuck in a dispatch pauses the worker's own lease, so only what the
+// coordinator cannot write to it shows it. The watchdog declares such a worker
+// lost when its frames have stalled past outbound_stall_timeout, and declares
+// a worker lost at once when its outbox has stopped by itself.
+
+namespace {
+
+// When the log ring recorded the first warn line from `source` that starts
+// with `prefix`, since `since_ms`; nullopt if none.
+std::optional<std::int64_t> logged_at(std::string_view source,
+                                      const std::string& prefix,
+                                      std::int64_t since_ms) {
+    for (const auto& rec : LogBuffer::global().tail(1000, "warn", since_ms, source)) {
+        if (rec.message.starts_with(prefix)) {
+            return rec.ts_ms;
+        }
+    }
+    return std::nullopt;
+}
+
+// Polls for worker `id` to be logged lost, and returns how long after `from`
+// that was seen, or nullopt if it was not by `deadline`.
+std::optional<std::chrono::steady_clock::duration> lost_after(
+    const std::string& id,
+    std::int64_t since_ms,
+    std::chrono::steady_clock::time_point from,
+    std::chrono::steady_clock::time_point deadline) {
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (logged_lost(id, since_ms)) {
+            return std::chrono::steady_clock::now() - from;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    return std::nullopt;
+}
+
+std::filesystem::path verdict_test_path(const std::string& tag) {
+    return std::filesystem::temp_directory_path() /
+           ("clink_verdict_" + tag + "_" + std::to_string(::getpid()) + ".txt");
+}
+
+}  // namespace
+
+// Here a Deploy of 16 MiB fills the socket buffers of a worker that reads
+// nothing and goes on heartbeating, and nothing moves after that. The watchdog
+// declares it lost about outbound_stall_timeout and a tick after the last
+// progress, logs the stall as the cause, and fails the job's subtasks with the
+// same cause, since the job cannot restart. A healthy worker beside it is
+// untouched.
+TEST(CheckpointCompletion, AWorkerThatReadsNothingIsDeclaredLostByTheStallVerdict) {
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.outbound_stall_timeout = 1500ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+    FakeWorker wedged(port, "a-wedged", /*slots=*/4, kSmallReceiveBuffer);
+    ASSERT_TRUE(wedged.valid());
+    wedged.never_read();
+    ASSERT_TRUE(wedged.register_and_ack());
+    const auto job_id = c.submit_job(two_subtask_graph(verdict_test_path("stall")),
+                                     OperatorRegistry::default_instance(),
+                                     wedging_plugin(),
+                                     CheckpointConfig{});
+    ASSERT_GT(job_id, 0U);
+    ASSERT_TRUE(ckpt_await([&] { return wedged.unread_bytes() >= kDeployUnderway; }, 10s))
+        << "no Deploy reached the worker";
+    // Its last progress comes a moment after this, once the buffers are full.
+    const auto underway = std::chrono::steady_clock::now();
+    FakeWorker healthy(port, "h-healthy");
+    ASSERT_TRUE(healthy.valid());
+    ASSERT_TRUE(healthy.register_and_ack());
+
+    const auto after = lost_after("a-wedged",
+                                  start_ms,
+                                  underway,
+                                  underway + cfg.outbound_stall_timeout + cfg.watchdog_interval +
+                                      clink::test_support::scale_slack(std::chrono::seconds{1}));
+    ASSERT_TRUE(after.has_value())
+        << "a worker whose frames stalled past outbound_stall_timeout was not declared lost";
+    EXPECT_GE(*after, cfg.outbound_stall_timeout - 300ms)
+        << "declared lost before its frames had stalled for outbound_stall_timeout";
+    const auto cause = logged_loss_cause("a-wedged", start_ms);
+    ASSERT_TRUE(cause.has_value());
+    EXPECT_TRUE(cause->starts_with("no outbound progress for ")) << *cause;
+    EXPECT_TRUE(cause->ends_with(" pending")) << *cause;
+    // The job had no checkpoint directory, so it could not restart: its
+    // subtasks failed, with the cause in their errors.
+    ASSERT_TRUE(c.await_job_completion(job_id, 5s));
+    const auto errors = c.job_errors(job_id);
+    ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors.front().find("worker lost (no outbound progress for "), std::string::npos)
+        << errors.front();
+    EXPECT_TRUE(heartbeats_answered_throughout({&healthy}, 1000ms));
+    EXPECT_FALSE(logged_lost("h-healthy", start_ms)) << "the healthy worker was declared lost";
+    healthy.close();
+    wedged.close();
+    c.stop();
+}
+
+// The stall clock restarts at every chunk the socket takes, so a worker that
+// reads a large Deploy slowly but steadily is never declared lost, although
+// the whole transfer takes several times outbound_stall_timeout.
+TEST(CheckpointCompletion, AWorkerReadingALargeDeploySlowlyIsNotDeclaredLost) {
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    // Three times the longest gap between chunks this reader causes. Loopback
+    // on macOS gives a slow reader's sender its buffer space back about 256
+    // KiB at a time, so at this pace a chunk completes about every half
+    // second, not every 100 ms; a 500 ms timeout declared the reader lost.
+    cfg.outbound_stall_timeout = 1500ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+    FakeWorker slow(port, "a-slow", /*slots=*/4, kSmallReceiveBuffer);
+    ASSERT_TRUE(slow.valid());
+    // 16 KiB every 25 ms, about 640 KiB a second.
+    slow.read_slowly(16 * 1024, 25ms);
+    ASSERT_TRUE(slow.register_and_ack());
+    constexpr std::size_t kPluginBytes = std::size_t{3} * 1024 * 1024;
+    const auto submitted = std::chrono::steady_clock::now();
+    const auto job_id = c.submit_job(two_subtask_graph(verdict_test_path("slow")),
+                                     OperatorRegistry::default_instance(),
+                                     plugin_of(kPluginBytes, "slow-reader-plugin"),
+                                     CheckpointConfig{});
+    ASSERT_GT(job_id, 0U);
+    auto deploy = slow.await_frame(MessageKind::Deploy, 30s);
+    const auto took = std::chrono::steady_clock::now() - submitted;
+    ASSERT_TRUE(deploy.has_value()) << "the Deploy never arrived whole";
+    const auto plugins = decode_deploy(*deploy).plugins;
+    ASSERT_EQ(plugins.size(), 1U);
+    EXPECT_EQ(plugins.front().bytes.size(), kPluginBytes);
+    EXPECT_GE(took, 2 * cfg.outbound_stall_timeout)
+        << "the transfer was too quick to say anything about the stall clock";
+    EXPECT_FALSE(logged_lost("a-slow", start_ms))
+        << "a worker that kept reading was declared lost: "
+        << logged_loss_cause("a-slow", start_ms).value_or("");
+    slow.close();
+    c.stop();
+}
+
+// A worker whose outbound queue overflows has its connection closed by the
+// overflow, and is declared lost at the watchdog's next tick, naming the
+// overflow, rather than heartbeat_timeout later. Here the Deploy in flight
+// holds the writer, the answers to the worker's own heartbeats queue behind
+// it, and the fifth finds the four the bound allows. The stall verdict is off
+// (zero) and heartbeat_timeout far away, so neither can be what ends it.
+TEST(CheckpointCompletion, AWorkerWhoseOutboundQueueOverflowsIsDeclaredLostAtTheNextTick) {
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.heartbeat_timeout = 30000ms;
+    cfg.outbound_stall_timeout = 0ms;
+    cfg.max_outbound_control_frames = 4;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+    const auto control_before = outbound_discards("control", "overflow");
+    const auto bulk_before = outbound_discards("bulk", "overflow");
+    FakeWorker wedged(port, "a-overflows", /*slots=*/4, kSmallReceiveBuffer);
+    ASSERT_TRUE(wedged.valid());
+    wedged.never_read();
+    ASSERT_TRUE(wedged.register_and_ack());
+    const auto job_id = c.submit_job(two_subtask_graph(verdict_test_path("overflow")),
+                                     OperatorRegistry::default_instance(),
+                                     wedging_plugin(),
+                                     CheckpointConfig{});
+    ASSERT_GT(job_id, 0U);
+    ASSERT_TRUE(ckpt_await([&] { return wedged.unread_bytes() >= kDeployUnderway; }, 10s))
+        << "no Deploy reached the worker";
+
+    // A heartbeat every 200 ms: the overflow comes about a second in.
+    ASSERT_TRUE(ckpt_await([&] { return logged_lost("a-overflows", start_ms); },
+                           clink::test_support::scale_slack(std::chrono::milliseconds{5000})))
+        << "a worker whose outbound queue overflowed was not declared lost";
+    const auto cause = logged_loss_cause("a-overflows", start_ms);
+    ASSERT_TRUE(cause.has_value());
+    EXPECT_TRUE(cause->starts_with("outbound queue stopped (overflow): ")) << *cause;
+    const auto overflowed_ms = logged_at(
+        "coordinator.outbox", "worker 'a-overflows': stopped sending (overflow)", start_ms);
+    const auto lost_ms = logged_at("coordinator.watchdog", "worker lost: a-overflows (", start_ms);
+    ASSERT_TRUE(overflowed_ms.has_value() && lost_ms.has_value());
+    EXPECT_LE(
+        *lost_ms - *overflowed_ms,
+        (cfg.watchdog_interval + clink::test_support::scale_slack(std::chrono::milliseconds{250}))
+            .count())
+        << "the loss did not follow the overflow at the watchdog's next tick";
+    EXPECT_GE(outbound_discards("control", "overflow"), control_before + 4);
+    EXPECT_GE(outbound_discards("bulk", "overflow"), bulk_before + 1);
+    wedged.close();
+    c.stop();
+}
+
+// Each outbound bound in the Config is the one the worker's outbox keeps. The
+// worker reads nothing, so the first Deploy carrying plugin bytes stays with
+// the writer and whatever is posted after it queues. With one bound set to 1
+// and the others at their defaults, far away, the first frame of that bound's
+// class to queue reaches it and the next overflows it, and the overflow names
+// that bound: for the two control bounds, the answers to the worker's own
+// heartbeats; for the bulk bound, a third job's Deploy, whose submit fails.
+// Each job ships a plugin of its own, since a worker is sent a plugin's bytes
+// once.
+TEST(CheckpointCompletion, AWorkersOutboxKeepsEachConfiguredBound) {
+    enum class Bound { ControlFrames, ControlBytes, BulkBytes };
+    for (const auto bound : {Bound::ControlFrames, Bound::ControlBytes, Bound::BulkBytes}) {
+        Coordinator::Config cfg;
+        cfg.watchdog_interval = 50ms;
+        cfg.heartbeat_timeout = 30000ms;
+        cfg.outbound_stall_timeout = 0ms;
+        std::string named;
+        switch (bound) {
+            case Bound::ControlFrames:
+                cfg.max_outbound_control_frames = 1;
+                named = "found 1 control frames queued, against a bound of 1";
+                break;
+            case Bound::ControlBytes:
+                cfg.max_outbound_control_bytes = 1;
+                named = " bytes of control frames queued, against a bound of 1";
+                break;
+            case Bound::BulkBytes:
+                cfg.max_outbound_bulk_bytes = 1;
+                named = " bytes of them queued, against a bound of 1";
+                break;
+        }
+        SCOPED_TRACE(named);
+        Coordinator c(cfg);
+        const auto port = c.start();
+        const auto start_ms = log_cursor_ms();
+        FakeWorker wedged(port, "a-bounded", /*slots=*/8, kSmallReceiveBuffer);
+        ASSERT_TRUE(wedged.valid());
+        wedged.never_read();
+        ASSERT_TRUE(wedged.register_and_ack());
+        const auto submit = [&](const std::string& tag, std::vector<PluginBinary> plugins) {
+            return c.submit_job(two_subtask_graph(verdict_test_path("bound_" + tag)),
+                                OperatorRegistry::default_instance(),
+                                std::move(plugins),
+                                CheckpointConfig{});
+        };
+        ASSERT_GT(submit("first", wedging_plugin()), 0U);
+        ASSERT_TRUE(ckpt_await([&] { return wedged.unread_bytes() >= kDeployUnderway; }, 10s))
+            << "no Deploy reached the worker";
+        if (bound == Bound::BulkBytes) {
+            ASSERT_GT(submit("second", plugin_of(64 * 1024, "bound-second-plugin")), 0U);
+            EXPECT_THROW((void)submit("third", plugin_of(64 * 1024, "bound-third-plugin")),
+                         std::runtime_error);
+        }
+        ASSERT_TRUE(ckpt_await([&] { return logged_lost("a-bounded", start_ms); },
+                               clink::test_support::scale_slack(std::chrono::milliseconds{5000})))
+            << "a worker whose outbound queue reached a configured bound was not declared lost";
+        const auto cause = logged_loss_cause("a-bounded", start_ms);
+        ASSERT_TRUE(cause.has_value());
+        EXPECT_TRUE(cause->starts_with("outbound queue stopped (overflow): ")) << *cause;
+        EXPECT_NE(cause->find(named), std::string::npos) << *cause;
+        wedged.close();
+        c.stop();
+    }
+}
+
+// The stall verdict needs nothing from the worker's protocol. A real worker
+// registered at protocol v1 gets no heartbeat answers and, like a v1 build,
+// keeps no lease. Its reader is held in the dispatch of one Deploy
+// (worker.deploy_dispatch), as a reader is when the operating system stalls
+// the load of a fresh plugin, and the next Deploy, larger than the socket
+// buffers hold, stalls. It goes on heartbeating, and is declared lost by the
+// stall verdict.
+TEST(CheckpointCompletion, AV1WorkerThatStopsReadingIsDeclaredLostByTheStallVerdict) {
+    ensure_built_ins_registered();
+    clink::fault::Registry::instance().reset();
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.outbound_stall_timeout = 1500ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+    Worker::Config wcfg;
+    wcfg.slot_count = 8;
+    wcfg.heartbeat_interval = 200ms;
+    wcfg.coordinator_heartbeat_timeout = 0ms;
+    Worker worker("v1-worker", "127.0.0.1", wcfg);
+    ::setenv("CLINK_TEST_REGISTER_PROTOCOL_VERSION", "1", 1);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ::unsetenv("CLINK_TEST_REGISTER_PROTOCOL_VERSION");
+    const auto registered = c.snapshot_cluster().workers;
+    ASSERT_EQ(registered.size(), 1U);
+    ASSERT_EQ(registered.front().protocol_version, 1U) << "the worker did not register at v1";
+
+    clink::fault::ScopedFault hold{
+        clink::fault::Rule{.point = clink::fault::points::kWorkerDeployDispatch,
+                           .ordinal = 1,
+                           .action = clink::fault::Action::Block}};
+    const auto held = c.submit_job(two_subtask_graph(verdict_test_path("v1_held")),
+                                   OperatorRegistry::default_instance(),
+                                   {},
+                                   CheckpointConfig{});
+    ASSERT_GT(held, 0U);
+    ASSERT_TRUE(ckpt_await(
+        [] {
+            return clink::fault::Registry::instance().hits(
+                       clink::fault::points::kWorkerDeployDispatch) >= 1;
+        },
+        5s))
+        << "the worker's reader never reached the Deploy dispatch";
+    const auto posted = std::chrono::steady_clock::now();
+    const auto stalls = c.submit_job(two_subtask_graph(verdict_test_path("v1_stalls")),
+                                     OperatorRegistry::default_instance(),
+                                     wedging_plugin(),
+                                     CheckpointConfig{});
+    ASSERT_GT(stalls, 0U);
+
+    const auto after = lost_after("v1-worker",
+                                  start_ms,
+                                  posted,
+                                  posted + cfg.outbound_stall_timeout + cfg.watchdog_interval +
+                                      clink::test_support::scale_slack(std::chrono::seconds{2}));
+    ASSERT_TRUE(after.has_value()) << "a v1 worker that stopped reading was not declared lost";
+    EXPECT_GE(*after, cfg.outbound_stall_timeout - 300ms);
+    const auto cause = logged_loss_cause("v1-worker", start_ms);
+    ASSERT_TRUE(cause.has_value());
+    EXPECT_TRUE(cause->starts_with("no outbound progress for ")) << *cause;
+
+    clink::fault::Registry::instance().release(clink::fault::points::kWorkerDeployDispatch);
+    worker.stop();
+    c.stop();
+}
+
+namespace {
+
+// The values a file_2pc_sink_string under `dir` has committed, and how many of
+// its committed lines were not a number.
+struct CommittedValues {
+    std::vector<std::int64_t> values;
+    std::size_t malformed{0};
+};
+
+CommittedValues committed_values(const std::filesystem::path& dir) {
+    CommittedValues out;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir / "committed", ec)) {
+        std::ifstream in(entry.path());
+        std::string line;
+        while (std::getline(in, line)) {
+            std::int64_t v{};
+            const auto* end = line.data() + line.size();
+            const auto [ptr, err] = std::from_chars(line.data(), end, v);
+            if (err == std::errc{} && ptr == end) {
+                out.values.push_back(v);
+            } else {
+                ++out.malformed;
+            }
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+// A real worker hosting every subtask of a checkpointed job with a two-phase
+// sink stops reading: its reader is held in the dispatch of another job's
+// Deploy (worker.deploy_dispatch), as a reader is while the operating system
+// stalls the load of a fresh plugin, and a third job's Deploy, larger than the
+// socket buffers hold, stalls behind it. The worker goes on heartbeating, and
+// the stall verdict declares it lost. The worker learns that its session has
+// ended from its own heartbeats, which fail once the coordinator has shut the
+// connection down, and fences its subtasks; only then is the held reader let
+// go, so it executes none of the frames still in its socket. A worker declared
+// lost can act on those until it notices, which is a known property of the
+// loss path that the specification does not model; letting the reader go
+// sooner records a run the specification refuses, and, with a commit among
+// those frames, races the commit against the sink's teardown. The job restarts
+// from its last completed checkpoint on a worker that registers once the
+// stalled one has wound down, and runs to the end with every record committed
+// exactly once. The replacement waits for that only because both workers run
+// in this process and their sinks share one output directory, where a subtask
+// still winding down and its successor would write the same in-progress file;
+// workers on separate hosts do not share it. With CLINK_PROTOCOL_TRACE_DIR
+// set, this is a run to check against the specification: a worker lost to the
+// stall verdict while it hosts a checkpointing job.
+TEST(CheckpointCompletion, AStalledWorkerHostingACheckpointedJobIsDeclaredLostAndTheJobRecovers) {
+    ensure_built_ins_registered();
+    clink::fault::Registry::instance().reset();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_stalled_host_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    struct RemoveDir {
+        std::filesystem::path dir;
+        ~RemoveDir() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } remove_dir{dir};
+
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.outbound_stall_timeout = 1500ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+    Worker::Config wcfg;
+    wcfg.slot_count = 8;
+    Worker stalls("a-stalls", "127.0.0.1", wcfg);
+    // The held job's one task, which does nothing once the reader is let go.
+    stalls.register_role("held", [](const DeploymentTask&) {});
+    stalls.connect_to_coordinator("127.0.0.1", port);
+
+    // source -> int64_to_string -> file_2pc_sink_string, checkpointed often.
+    constexpr std::int64_t kRecords = 1500;
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", std::to_string(kRecords)}, {"delay_ms", "2"}};
+    g.ops.push_back(src);
+    OperatorSpec fmt;
+    fmt.type = "int64_to_string";
+    fmt.id = "fmt";
+    fmt.inputs = {"src"};
+    fmt.parallelism = 1;
+    fmt.out_channel = std::string{kChannelString};
+    g.ops.push_back(fmt);
+    OperatorSpec snk;
+    snk.type = "file_2pc_sink_string";
+    snk.id = "snk";
+    snk.inputs = {"fmt"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelString};
+    snk.params = {{"dir", (dir / "out").string()}};
+    g.ops.push_back(snk);
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = (dir / "ckpt").string();
+    ckpt.interval_ms = 100;
+    const auto job_id = c.submit_job(g, OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    ASSERT_TRUE(ckpt_await([&] { return c.latest_completed_checkpoint(job_id) >= 1; }, 10s))
+        << "the job never completed a checkpoint";
+
+    // Hold the worker's reader in the next Deploy's dispatch.
+    const auto dispatched =
+        clink::fault::Registry::instance().hits(clink::fault::points::kWorkerDeployDispatch);
+    clink::fault::ScopedFault hold{
+        clink::fault::Rule{.point = clink::fault::points::kWorkerDeployDispatch,
+                           .ordinal = dispatched + 1,
+                           .action = clink::fault::Action::Block}};
+    PlannedTask held_task;
+    held_task.worker_id = "a-stalls";
+    held_task.role = "held";
+    JobPlan held;
+    held.tasks.push_back(held_task);
+    c.deploy(held);
+    ASSERT_TRUE(ckpt_await(
+        [&] {
+            return clink::fault::Registry::instance().hits(
+                       clink::fault::points::kWorkerDeployDispatch) > dispatched;
+        },
+        5s))
+        << "the worker's reader never reached the held Deploy";
+    // Placement keeps both of this job's subtasks together, on the only
+    // worker there is.
+    const auto stalled = c.submit_job(two_subtask_graph(dir / "stalled.txt"),
+                                      OperatorRegistry::default_instance(),
+                                      wedging_plugin(),
+                                      CheckpointConfig{});
+    ASSERT_GT(stalled, 0U);
+
+    ASSERT_TRUE(ckpt_await([&] { return logged_lost("a-stalls", start_ms); },
+                           cfg.outbound_stall_timeout +
+                               clink::test_support::scale_slack(std::chrono::milliseconds{5000})))
+        << "the stalled worker was not declared lost";
+    const auto cause = logged_loss_cause("a-stalls", start_ms);
+    ASSERT_TRUE(cause.has_value());
+    EXPECT_TRUE(cause->starts_with("no outbound progress for ")) << *cause;
+    ASSERT_TRUE(ckpt_await([&] { return stalls.disconnected(); }, 10s))
+        << "the stalled worker never saw its session end";
+    ASSERT_TRUE(stalls.await_all_tasks(10s)) << "the stalled worker's subtasks never wound down";
+    clink::fault::Registry::instance().release(clink::fault::points::kWorkerDeployDispatch);
+
+    Worker replacement("b-replaces", "127.0.0.1", wcfg);
+    replacement.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(c.await_job_completion(job_id, 60s)) << "the job never finished after its restart";
+    const auto errors = c.job_errors(job_id);
+    EXPECT_TRUE(errors.empty()) << (errors.empty() ? std::string{} : errors.front());
+    const auto detail = c.snapshot_job(job_id);
+    ASSERT_TRUE(detail.has_value());
+    EXPECT_TRUE(std::all_of(detail->tasks.begin(), detail->tasks.end(), [](const JobTaskRecord& t) {
+        return t.worker_id == "b-replaces";
+    })) << "the job did not finish on the replacement";
+
+    auto committed = committed_values(dir / "out");
+    EXPECT_EQ(committed.malformed, 0U) << "committed lines that are not records";
+    auto& values = committed.values;
+    std::sort(values.begin(), values.end());
+    const auto unique_end = std::unique(values.begin(), values.end());
+    EXPECT_EQ(values.end() - unique_end, 0) << "records committed more than once";
+    values.erase(unique_end, values.end());
+    EXPECT_EQ(values.size(), static_cast<std::size_t>(kRecords)) << "records never committed";
+    if (!values.empty()) {
+        EXPECT_EQ(values.front(), 1);
+        EXPECT_EQ(values.back(), kRecords);
+    }
+
+    replacement.stop();
+    stalls.stop();
+    c.stop();
+}
+
+namespace {
+
+// A worker that reads nothing and hosts half of a restartable job, one that
+// hosts the other half and is then killed, and the coordinator they register
+// with. The job's Deploy carries 16 MiB of plugin, so the first worker's
+// buffers fill and its frames stall from the start; the second reads its own.
+struct WedgedSurvivorRig {
+    explicit WedgedSurvivorRig(const Coordinator::Config& cfg)
+        : dir(std::filesystem::temp_directory_path() /
+              ("clink_wedged_survivor_" + std::to_string(::getpid()) + "_" +
+               ::testing::UnitTest::GetInstance()->current_test_info()->name())),
+          c(cfg) {
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        port = c.start();
+        start_ms = log_cursor_ms();
+    }
+    ~WedgedSurvivorRig() {
+        wedged.reset();
+        killed.reset();
+        standby.reset();
+        c.stop();
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    WedgedSurvivorRig(const WedgedSurvivorRig&) = delete;
+    WedgedSurvivorRig& operator=(const WedgedSurvivorRig&) = delete;
+
+    // Brings the job up across the two workers. Placement takes them in id
+    // order, a subtask index to each in turn, so each hosts two of its four.
+    ::testing::AssertionResult bring_up() {
+        wedged = std::make_unique<FakeWorker>(port, "a-wedged", 4, kSmallReceiveBuffer);
+        wedged->never_read();
+        killed = std::make_unique<FakeWorker>(port, "b-killed");
+        if (!wedged->valid() || !wedged->register_and_ack() || !killed->valid() ||
+            !killed->register_and_ack()) {
+            return ::testing::AssertionFailure() << "the workers did not register";
+        }
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = (dir / "ckpt").string();
+        // Restartable, with no checkpoint falling due within the test.
+        ckpt.interval_ms = 600000;
+        job_id = c.submit_job(hot_cutover_graph(dir / "out.txt"),
+                              OperatorRegistry::default_instance(),
+                              wedging_plugin(),
+                              ckpt);
+        if (job_id == 0) {
+            return ::testing::AssertionFailure() << "the job was not submitted";
+        }
+        if (!ckpt_await([&] { return wedged->unread_bytes() >= kDeployUnderway; }, 10s)) {
+            return ::testing::AssertionFailure() << "no Deploy reached the wedged worker";
+        }
+        // The wedged worker's frames stall a moment after this, once its
+        // buffers are full.
+        underway_ms = log_cursor_ms();
+        if (!killed->await_frame(MessageKind::Deploy, 10s).has_value()) {
+            return ::testing::AssertionFailure() << "the other worker got no Deploy";
+        }
+        // Registered after the job was placed, so it hosts none of it: the
+        // capacity a restart redeploys onto.
+        standby = std::make_unique<FakeWorker>(port, "c-standby");
+        if (!standby->valid() || !standby->register_and_ack()) {
+            return ::testing::AssertionFailure() << "the standby worker did not register";
+        }
+        return ::testing::AssertionSuccess();
+    }
+
+    std::filesystem::path dir;
+    Coordinator c;
+    std::uint16_t port{};
+    std::int64_t start_ms{};
+    std::int64_t underway_ms{};
+    JobId job_id{};
+    std::unique_ptr<FakeWorker> wedged;
+    std::unique_ptr<FakeWorker> killed;
+    std::unique_ptr<FakeWorker> standby;
+};
+
+}  // namespace
+
+// A restart waits for its survivors to drain, and a wedged survivor never
+// does. With outbound_stall_timeout above restart_drain_timeout, the drain
+// deadline is what ends it: "restart drain timed out" is logged on time, and
+// the wedged worker is still registered then. The timeouts are shrunk to keep
+// the test short; their order is the point.
+TEST(CheckpointCompletion, AWedgedSurvivorTimesTheRestartDrainOutWhenTheStallTimeoutIsLonger) {
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.heartbeat_timeout = 600ms;
+    cfg.restart_drain_timeout = 2000ms;
+    cfg.outbound_stall_timeout = 6000ms;
+    WedgedSurvivorRig rig(cfg);
+    ASSERT_TRUE(rig.bring_up());
+
+    rig.killed->close();
+    ASSERT_TRUE(ckpt_await(
+        [&] { return logged_lost("b-killed", rig.start_ms); },
+        cfg.heartbeat_timeout + clink::test_support::scale_slack(std::chrono::seconds{2})))
+        << "the killed worker was not declared lost";
+    const auto restart_began = std::chrono::steady_clock::now();
+    const auto drained_out = [&] {
+        return logged_at("coordinator.watchdog",
+                         "job_id=" + std::to_string(rig.job_id) + " restart drain timed out",
+                         rig.start_ms)
+            .has_value();
+    };
+    ASSERT_TRUE(ckpt_await(drained_out,
+                           cfg.restart_drain_timeout + cfg.watchdog_interval +
+                               clink::test_support::scale_slack(std::chrono::seconds{1})))
+        << "the restart drain did not time out on time";
+    EXPECT_GE(std::chrono::steady_clock::now() - restart_began, cfg.restart_drain_timeout - 300ms);
+    EXPECT_FALSE(logged_lost("a-wedged", rig.start_ms))
+        << "the wedged survivor was declared lost before the drain deadline: "
+        << logged_loss_cause("a-wedged", rig.start_ms).value_or("");
+}
+
+// The same at the defaults: outbound_stall_timeout (10 s) is far below
+// restart_drain_timeout (120 s), so the wedged survivor is declared lost by
+// the stall verdict, about outbound_stall_timeout after its frames stalled,
+// its subtasks are folded into the restart, and the restart redeploys onto
+// the capacity left; no drain times out.
+TEST(CheckpointCompletion, AWedgedSurvivorIsDeclaredLostAndTheRestartProceedsAtTheDefaults) {
+    const Coordinator::Config cfg;
+    WedgedSurvivorRig rig(cfg);
+    ASSERT_TRUE(rig.bring_up());
+
+    rig.killed->close();
+    auto redeploy =
+        rig.standby->await_frame(MessageKind::Deploy,
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     cfg.outbound_stall_timeout + cfg.heartbeat_timeout +
+                                     clink::test_support::scale_slack(std::chrono::seconds{5})));
+    ASSERT_TRUE(redeploy.has_value()) << "the restart never redeployed onto the standby worker";
+    EXPECT_EQ(decode_deploy(*redeploy).job_id, rig.job_id);
+    const auto cause = logged_loss_cause("a-wedged", rig.start_ms);
+    ASSERT_TRUE(cause.has_value()) << "the wedged survivor was not declared lost";
+    EXPECT_TRUE(cause->starts_with("no outbound progress for ")) << *cause;
+    const auto lost_ms = logged_at("coordinator.watchdog", "worker lost: a-wedged (", rig.start_ms);
+    ASSERT_TRUE(lost_ms.has_value());
+    EXPECT_GE(*lost_ms - rig.underway_ms,
+              (cfg.outbound_stall_timeout -
+               clink::test_support::scale_slack(std::chrono::milliseconds{1000}))
+                  .count())
+        << "declared lost before its frames had stalled for the default outbound_stall_timeout";
+    EXPECT_FALSE(logged_at("coordinator.watchdog",
+                           "job_id=" + std::to_string(rig.job_id) + " restart drain timed out",
+                           rig.start_ms)
+                     .has_value());
+}
+
+// Where the default stall timeout sits among the other defaults: above the
+// silence the watchdog allows and above the worker's own lease, so a worker
+// either of those would end is ended that way first, and well below the
+// restart drain deadline, so a wedged survivor of a restart is lost to it long
+// before the drain times out.
+TEST(CheckpointCompletion, TheDefaultStallTimeoutSitsAboveTheLeaseAndWellBelowTheDrainDeadline) {
+    const Coordinator::Config cfg;
+    const Worker::Config wcfg;
+    EXPECT_GT(cfg.outbound_stall_timeout, cfg.heartbeat_timeout);
+    EXPECT_GT(cfg.outbound_stall_timeout, wcfg.coordinator_heartbeat_timeout);
+    EXPECT_LE(cfg.outbound_stall_timeout * 4, cfg.restart_drain_timeout);
 }

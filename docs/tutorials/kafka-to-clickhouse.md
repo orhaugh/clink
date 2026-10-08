@@ -239,7 +239,7 @@ docker compose logs coordinator | grep -iE 'lost|restart|restore'
 ```
 
 ```
-[coordinator.watchdog] worker lost: worker-1
+[coordinator.watchdog] worker lost: worker-1 (heartbeat timeout)
 [coordinator.watchdog] job_id=1 awaiting_restart (attempt 1/10) drain_expected=0
 [coordinator.restart]  job_id=1 restart waiting for capacity: 3 task(s) need slots,
                        0 free; a worker re-registration re-fires this restart

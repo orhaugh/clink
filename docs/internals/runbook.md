@@ -129,9 +129,9 @@ running, the system did its job and this alert is informational.
 **If the job did NOT recover, check first whether the worker came straight back.**
 A worker that dies and is restarted quickly - which is what a container
 orchestrator does by default - used to leave the job hung: the coordinator retired
-the previous session and never restarted the subtasks, because the watchdog cannot
-declare a worker lost while it is alive and heartbeating under the same id. That is
-fixed (F64), but the signature is worth recognising: the log shows
+the previous session and never restarted the subtasks, because the watchdog does not
+declare a worker lost while it is alive, heartbeating and reading under the same id.
+That is fixed (F64), but the signature is worth recognising: the log shows
 `worker=<id> re-registered; previous session retired` and then nothing.
 
 **Capacity:** if the lost worker's slots are needed and no survivor has room, the

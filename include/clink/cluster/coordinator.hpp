@@ -392,6 +392,47 @@ public:
         // Zero or less discards whatever is still queued at once; a value
         // too large to add to the clock saturates to no deadline.
         std::chrono::milliseconds outbound_flush_timeout{1000};
+        // How long a worker connection may have frames waiting to be written
+        // while none of them makes progress, before the watchdog declares
+        // the worker lost (at its first tick past this). The writer records
+        // progress after every chunk of at most 64 KiB the socket takes, and
+        // the clock runs only while something is pending, so an idle
+        // connection never stalls and a worker reading a large Deploy slowly
+        // but steadily is never judged by it. What it catches is a worker
+        // that has stopped reading and goes on heartbeating, a reader stuck
+        // in a dispatch say: that pauses the worker's own lease, so neither
+        // heartbeat_timeout nor the worker would ever end the session. The
+        // check runs on the coordinator alone and needs no protocol
+        // capability, so it covers v1 workers as well.
+        //
+        // The default is well above heartbeat_timeout (2 s) and the worker's
+        // lease (Worker::Config::coordinator_heartbeat_timeout, 3 s): a
+        // worker either of those would end is ended that way first, and a
+        // reader held up for a few seconds (a Deploy whose plugin load the
+        // operating system stalls has outlasted the lease) is not taken for
+        // a wedged one. It is well below restart_drain_timeout (120 s), so a
+        // wedged survivor of a restart is declared lost, and folded into the
+        // restart, long before the drain deadline would fail the job. Zero
+        // or less turns the check off; a worker whose outbound queue
+        // overflows, or whose transport fails under the writer, is declared
+        // lost all the same.
+        std::chrono::milliseconds outbound_stall_timeout{10000};
+        // Most frames, and most bytes, one worker connection may have queued
+        // for its writer: control frames (every frame without plugin bytes)
+        // in number and in bytes, and frames that carry plugin bytes (a
+        // Deploy shipping modules not yet sent on that connection) in bytes,
+        // counted apart so a burst of large Deploys never pushes out the
+        // protocol traffic queued beside it. The frame being written never
+        // counts. A frame that finds its class at a bound costs the worker
+        // its connection, and the watchdog declares it lost at its next
+        // tick. The defaults are far above anything a worker that reads at
+        // all lets build up; the bulk bound is four frames of the largest
+        // size a frame may have (kMaxFrameBytes, 256 MiB). Zero refuses
+        // every frame of the class, so every worker would be lost at its
+        // first such frame.
+        std::size_t max_outbound_control_frames{10000};
+        std::size_t max_outbound_control_bytes{std::size_t{64} * 1024 * 1024};
+        std::size_t max_outbound_bulk_bytes{std::size_t{4} * 256 * 1024 * 1024};
         // Host advertised to clients/peers in resolved peer addresses
         // when bind_host is a wildcard. Defaults to bind_host. Set to a
         // routable hostname/IP when bind_host = "0.0.0.0".
@@ -1998,7 +2039,12 @@ private:
                                WorkerDispatchQueue& queue);
     void answer_heartbeat_(WorkerConnection& worker, MessageReader& r);
     void watchdog_loop_();
-    void mark_worker_lost_locked_(WorkerConnection& worker);
+    // Declare `worker` lost, mu_ held. `cause` says why, in a few words
+    // ("heartbeat timeout", or one of the outbound verdicts'): it goes into
+    // the loss log line, the coordinator.worker_lost event, the abort of the
+    // session's outbox, and the error each of its pending subtasks gets when
+    // its job cannot restart ("worker lost (<cause>)").
+    void mark_worker_lost_locked_(WorkerConnection& worker, const std::string& cause);
     // Shared by mark_worker_lost_locked_ and retire_previous_session_subtasks_:
     // a worker's in-flight subtasks are dead either way, and both must fold them
     // into an in-progress restart or start one. See F64.

@@ -28,6 +28,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/frame_io.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/metrics_registry.hpp"
@@ -548,6 +549,16 @@ TEST(Outbox, AControlFrameAtTheByteBoundIsRefusedWithItsReason) {
     EXPECT_NE(s.stop_detail.find("1208 bytes of control frames queued"), std::string::npos)
         << s.stop_detail;
     EXPECT_EQ(s.frames_discarded, 2U);
+}
+
+// The coordinator's outbound bounds default to the outbox's own, so a
+// coordinator configured with nothing keeps the bounds documented here.
+TEST(Outbox, TheCoordinatorsOutboundBoundsDefaultToTheOutboxsOwn) {
+    const clink::cluster::Coordinator::Config cfg;
+    const OutboxLimits limits;
+    EXPECT_EQ(cfg.max_outbound_control_frames, limits.max_control_frames);
+    EXPECT_EQ(cfg.max_outbound_control_bytes, limits.max_control_bytes);
+    EXPECT_EQ(cfg.max_outbound_bulk_bytes, limits.max_bulk_bytes);
 }
 
 // Frames carrying plugin bytes have a bound of their own, and each class is
