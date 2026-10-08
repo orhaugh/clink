@@ -346,7 +346,7 @@ refused; compute the product in a derived table first), and a window function
 | Aggregate | Notes |
 |---|---|
 | `COUNT(x)`, `COUNT(*)` | row / non-null counts |
-| `SUM(x)`, `AVG(x)` | sum keeps integers and decimals exact; avg is `DOUBLE` |
+| `SUM(x)`, `AVG(x)` | `SUM` takes the type of `x`: an exact `BIGINT` over `BIGINT` or `INTEGER`, an exact `DECIMAL` over `DECIMAL`, a `DOUBLE` over `DOUBLE` or `REAL`, whole values included; `AVG` is `DOUBLE` |
 | `MIN(x)`, `MAX(x)` | input type |
 | `STDDEV[_POP\|_SAMP]`, `VARIANCE`, `VAR_POP`, `VAR_SAMP` | `DOUBLE` |
 | `STRING_AGG(x[, sep])` / `LISTAGG` | string concatenation (default separator `,`) |

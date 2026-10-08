@@ -199,6 +199,54 @@ TEST(SqlRow, JsonTextFormatStillPrintsIntegralDoubleBare) {
     EXPECT_EQ(clink::config::JsonValue{7.0}.serialize(0), "7");
 }
 
+TEST(SqlRow, IntegerColumnsTakeTheIntegerAWholeNumeralNames) {
+    using clink::config::JsonValue;
+    Row r;
+    r.values["whole"] = JsonValue{7.0};
+    r.values["negzero"] = JsonValue{-0.0};
+    r.values["big"] = JsonValue{9007199254740992.0};  // 2^53
+    r.values["lowest"] = JsonValue{-9223372036854775808.0};
+    r.values["frac"] = JsonValue{7.5};
+    r.values["over"] = JsonValue{9223372036854775808.0};  // 2^63, one past int64
+    r.values["nan"] = JsonValue{std::nan("")};
+    r.values["inf"] = JsonValue{HUGE_VAL};
+    r.values["int"] = JsonValue{std::int64_t{9}};
+    r.values["text"] = JsonValue{std::string{"7.0"}};
+    r.values["undeclared"] = JsonValue{7.0};
+    coerce_row_integers(r,
+                        {"whole",
+                         "negzero",
+                         "big",
+                         "lowest",
+                         "frac",
+                         "over",
+                         "nan",
+                         "inf",
+                         "int",
+                         "text",
+                         "absent"});
+    const auto kind = [&](const char* c) {
+        const auto& v = r.values.find(c)->second;
+        return v.is_integral_number() ? 'i' : (v.is_number() ? 'd' : 's');
+    };
+    EXPECT_EQ(kind("whole"), 'i');
+    EXPECT_EQ(r.values.find("whole")->second.as_int(), 7);
+    EXPECT_EQ(kind("negzero"), 'i');
+    EXPECT_EQ(r.values.find("negzero")->second.as_int(), 0);
+    EXPECT_EQ(r.values.find("big")->second.as_int(), std::int64_t{9007199254740992});
+    EXPECT_EQ(r.values.find("lowest")->second.as_int(), INT64_MIN);
+    // Not whole, not within 64 bits, or not a number: left as it is.
+    EXPECT_EQ(kind("frac"), 'd');
+    EXPECT_EQ(kind("over"), 'd');
+    EXPECT_EQ(kind("nan"), 'd');
+    EXPECT_EQ(kind("inf"), 'd');
+    EXPECT_EQ(kind("text"), 's');
+    EXPECT_EQ(r.values.find("int")->second.as_int(), 9);
+    // Only the named columns are touched, and a missing one is skipped.
+    EXPECT_EQ(kind("undeclared"), 'd');
+    EXPECT_EQ(r.values.find("absent"), r.values.end());
+}
+
 TEST(SqlRow, GetStringStringifiesNumbersAndBools) {
     Row r;
     r.values["i"] = clink::config::JsonValue{static_cast<std::int64_t>(100)};

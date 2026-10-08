@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -12270,29 +12271,31 @@ namespace {
 // given WITH-tail (empty = the columnar-decode default, "columnar_decode=
 // 'false'" = the row bridge), swap the kafka source for a file_text_source
 // over `in_path`, fan the named op out to `par` subtasks when set, run it,
-// and return the output file's lines as a multiset (subtask interleaving
-// makes line order non-deterministic; content must not be).
-std::multiset<std::string> run_kafka_parity_case(const std::string& table_cols,
-                                                 const std::string& with_tail,
-                                                 const std::string& out_cols,
-                                                 const std::string& query,
-                                                 const std::filesystem::path& in_path,
-                                                 const std::filesystem::path& out_path,
-                                                 const std::string& fan_out_op = {},
-                                                 std::uint32_t par = 1) {
+// and return the output file's lines in file order. `out_with_tail` adds
+// WITH-options to the output table (changelog='true' for a changelog stream).
+std::vector<std::string> run_kafka_case_lines(const std::string& table_cols,
+                                              const std::string& with_tail,
+                                              const std::string& out_cols,
+                                              const std::string& query,
+                                              const std::filesystem::path& in_path,
+                                              const std::filesystem::path& out_path,
+                                              const std::string& fan_out_op = {},
+                                              std::uint32_t par = 1,
+                                              const std::string& out_with_tail = {}) {
     std::filesystem::remove(out_path);
     Catalog cat;
-    auto ddl = parse("CREATE TABLE t (" + table_cols +
-                     ") "
-                     "WITH (connector='kafka', format='json', brokers='localhost:9092', "
-                     "topic='t', group_id='g', auto_offset_reset='earliest'" +
-                     (with_tail.empty() ? "" : ", " + with_tail) +
-                     ");"
-                     "CREATE TABLE out_t (" +
-                     out_cols +
-                     ") WITH (connector='file', format='json', "
-                     "path='" +
-                     out_path.string() + "')");
+    auto ddl =
+        parse("CREATE TABLE t (" + table_cols +
+              ") "
+              "WITH (connector='kafka', format='json', brokers='localhost:9092', "
+              "topic='t', group_id='g', auto_offset_reset='earliest'" +
+              (with_tail.empty() ? "" : ", " + with_tail) +
+              ");"
+              "CREATE TABLE out_t (" +
+              out_cols +
+              ") WITH (connector='file', format='json', "
+              "path='" +
+              out_path.string() + "'" + (out_with_tail.empty() ? "" : ", " + out_with_tail) + ")");
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, query.c_str());
@@ -12315,12 +12318,25 @@ std::multiset<std::string> run_kafka_parity_case(const std::string& table_cols,
         EXPECT_TRUE(r.completed) << "reject: " << r.reject_message;
         EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
     }
-    std::multiset<std::string> got;
-    for (const auto& l : read_lines(out_path)) {
-        got.insert(l);
-    }
+    auto lines = read_lines(out_path);
     std::filesystem::remove(out_path);
-    return got;
+    return lines;
+}
+
+// The same, as a multiset: subtask interleaving makes line order
+// non-deterministic, while content must not be.
+std::multiset<std::string> run_kafka_parity_case(const std::string& table_cols,
+                                                 const std::string& with_tail,
+                                                 const std::string& out_cols,
+                                                 const std::string& query,
+                                                 const std::filesystem::path& in_path,
+                                                 const std::filesystem::path& out_path,
+                                                 const std::string& fan_out_op = {},
+                                                 std::uint32_t par = 1,
+                                                 const std::string& out_with_tail = {}) {
+    const auto lines = run_kafka_case_lines(
+        table_cols, with_tail, out_cols, query, in_path, out_path, fan_out_op, par, out_with_tail);
+    return {lines.begin(), lines.end()};
 }
 
 }  // namespace
@@ -12744,14 +12760,15 @@ TEST(SqlRuntime, EpochMillisIntegralDoubleTimestampsComputeAsTheRowPathDoes) {
 
 // Arithmetic on BIGINT and INTEGER columns fed integral numerals (7.0, 5e0,
 // 1.1E1, the forms a JSON encoder gives for a float) beside plain integers in
-// the same batch. The row decode keeps each numeral a double, and the evaluator
-// divides a double as a double and an integer as an integer, so `n / 2` gives
-// 3.5 for 7.0 and 3 for 7. The columnar decode must not hand the numeral on as
-// an integer, which would print the same but compute differently: through a
-// projection, and through a window whose SUM and MIN feed a division in the
-// query over it, the run must write what the row bridge writes. The same columns fed
-// integers only must still reach the sink on the sidecar. Registered a second
-// time with CLINK_DISABLE_COLUMNAR=1.
+// the same batch. The evaluator divides a double as a double and an integer as
+// an integer, and the plan types these columns, and `n / 2` over them, as
+// integers, so the decode makes each numeral the integer it names
+// (coerce_row_integers): `n / 2` is 3 for 7.0 as for 7, on either carrier. The
+// row decode used to keep the numeral a double, giving 3.5, and SUM over it a
+// DOUBLE. Through a projection, and through a window whose SUM and MIN feed a
+// division in the query over it, both carriers must write SQL's answer. The same
+// columns fed integers only must still reach the sink on the sidecar. Registered
+// a second time with CLINK_DISABLE_COLUMNAR=1.
 TEST(SqlRuntime, IntegralDoubleIntegersComputeAsTheRowPathDoes) {
     ensure_sql_installed_once();
     const auto tag = std::to_string(getpid());
@@ -12776,9 +12793,9 @@ TEST(SqlRuntime, IntegralDoubleIntegersComputeAsTheRowPathDoes) {
             run_kafka_parity_case(cols, "columnar_decode='false'", out_cols, q, in_path, out_path);
         const std::multiset<std::string> want = {
             R"({"ih":4,"k":1,"nh":3})",
-            R"({"ih":4.5,"k":2,"nh":3.5})",
-            R"({"ih":1,"k":1,"nh":2.5})",
-            R"({"ih":5.5,"k":2,"nh":5})",
+            R"({"ih":4,"k":2,"nh":3})",
+            R"({"ih":1,"k":1,"nh":2})",
+            R"({"ih":5,"k":2,"nh":5})",
             R"({"ih":0,"k":1,"nh":0})",
         };
         EXPECT_EQ(row_form, want);
@@ -12792,9 +12809,10 @@ TEST(SqlRuntime, IntegralDoubleIntegersComputeAsTheRowPathDoes) {
             "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k) w";
         const std::string out_cols = "k BIGINT, sq DOUBLE, mh DOUBLE, c BIGINT";
         const std::string with = "event_time_column='ts', watermark_lag_ms='0'";
-        // The window sits behind a keyed exchange, and the row wire codec
-        // writes 7.0 as 7, so on this shape the window folds integers on either
-        // carrier; what is pinned is that the two carriers agree through it.
+        // The window sits behind a keyed exchange, whose codec keeps a value's
+        // kind, so a numeral left a double would be summed as one: SUM(n) / 8
+        // gave 1.5 and 2.25 where the plan types it BIGINT. k=1 sums 7 + 5 and
+        // k=2 sums 7 + 11 in the first window; the last row opens a second.
         const auto columnar = run_kafka_parity_case(
             cols, with, out_cols, q, in_path, out_path, "tumbling_window_row", 2);
         const auto row_form = run_kafka_parity_case(cols,
@@ -12805,7 +12823,12 @@ TEST(SqlRuntime, IntegralDoubleIntegersComputeAsTheRowPathDoes) {
                                                     out_path,
                                                     "tumbling_window_row",
                                                     2);
-        EXPECT_EQ(row_form.size(), 3U);
+        const std::multiset<std::string> want = {
+            R"({"c":2,"k":1,"mh":1,"sq":1})",
+            R"({"c":2,"k":2,"mh":4,"sq":2})",
+            R"({"c":1,"k":1,"mh":0,"sq":0})",
+        };
+        EXPECT_EQ(row_form, want);
         EXPECT_EQ(columnar, row_form);
     }
     {
@@ -12922,6 +12945,601 @@ TEST(SqlRuntime, IntegerTokensInADoubleColumnComputeAsDoubles) {
         EXPECT_FALSE(clink::detail::columnar_enabled());
     }
     std::filesystem::remove(in_path);
+}
+
+namespace {
+
+// The last line per value of `key` in file order: the answer of an unbounded
+// GROUP BY, which emits a running row per record on the row carrier and one per
+// group and batch on the columnar one.
+std::multiset<std::string> last_line_per_key(const std::vector<std::string>& lines,
+                                             const char* key) {
+    std::map<std::string, std::string> last;
+    for (const auto& l : lines) {
+        last[clink::config::parse(l).at(key).serialize(0)] = l;
+    }
+    std::multiset<std::string> out;
+    for (const auto& [k, l] : last) {
+        out.insert(l);
+    }
+    return out;
+}
+
+}  // namespace
+
+// SUM over a DOUBLE column is a DOUBLE however whole its values are, on either
+// carrier and through every operator that sums. The row path folded a whole
+// double into its exact integer accumulator, so 9.0 + 3 summed to the integer
+// 12 and SUM(x) / 8 gave 1 where SQL gives 1.5, while the columnar fold of the
+// same column kept a double. Group 1 holds only whole values, written both ways
+// a JSON encoder writes them; group 2 holds a fraction, which always summed as a
+// double. SUM over BIGINT stays BIGINT (integer division) beside it. Covered:
+// the unbounded GROUP BY (reduced to its last row per key), tumbling, hopping,
+// cumulating and session windows, a running OVER and a last-N rolling
+// aggregate. Registered a second time with CLINK_DISABLE_COLUMNAR=1.
+TEST(SqlRuntime, SumOfAWholeValuedDoubleColumnIsADouble) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_double_sum_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_double_sum_out_" + tag + ".ndjson");
+    const std::string cols = "k BIGINT, x DOUBLE, n BIGINT, ts BIGINT";
+    write_lines(in_path,
+                {
+                    R"({"k":1,"x":9.0,"n":9,"ts":1000})",
+                    R"({"k":1,"x":3,"n":3,"ts":2000})",
+                    R"({"k":2,"x":-4.0,"n":-4,"ts":3000})",
+                    R"({"k":2,"x":0.5,"n":1,"ts":4000})",
+                    R"({"k":1,"x":1,"n":1,"ts":100000})",
+                });
+    const std::string with = "event_time_column='ts', watermark_lag_ms='0'";
+    const std::string windowed_cols = "k BIGINT, s8 DOUBLE, n8 BIGINT, c BIGINT";
+    const auto windowed = [](const std::string& window) {
+        return "INSERT INTO out_t SELECT k, SUM(x) / 8 AS s8, SUM(n) / 8 AS n8, COUNT(*) AS c "
+               "FROM t GROUP BY " +
+               window + ", k";
+    };
+    // A window per (key, window) on either carrier: one row each.
+    const std::multiset<std::string> per_window = {
+        R"({"c":2,"k":1,"n8":1,"s8":1.5})",
+        R"({"c":2,"k":2,"n8":0,"s8":-0.4375})",
+        R"({"c":1,"k":1,"n8":0,"s8":0.125})",
+    };
+    // Hopping and cumulating windows put each record in two windows.
+    std::multiset<std::string> two_per_record;
+    for (const auto& l : per_window) {
+        two_per_record.insert(l);
+        two_per_record.insert(l);
+    }
+    {
+        SCOPED_TRACE("group by");
+        const std::string q =
+            "INSERT INTO out_t SELECT k, SUM(x) / 8 AS s8, SUM(n) / 8 AS n8, COUNT(*) AS c "
+            "FROM t GROUP BY k";
+        const auto columnar = last_line_per_key(
+            run_kafka_case_lines(cols, "", windowed_cols, q, in_path, out_path), "k");
+        const auto row_form = last_line_per_key(
+            run_kafka_case_lines(
+                cols, "columnar_decode='false'", windowed_cols, q, in_path, out_path),
+            "k");
+        const std::multiset<std::string> want = {
+            R"({"c":3,"k":1,"n8":1,"s8":1.625})",
+            R"({"c":2,"k":2,"n8":0,"s8":-0.4375})",
+        };
+        EXPECT_EQ(row_form, want);
+        EXPECT_EQ(columnar, row_form);
+    }
+    const struct {
+        const char* name;
+        const char* window;
+        const char* op;
+        const std::multiset<std::string>* want;
+    } windows[] = {
+        {"tumble", "TUMBLE(ts, INTERVAL '10' SECOND)", "tumbling_window_row", &per_window},
+        {"hop",
+         "HOP(ts, INTERVAL '10' SECOND, INTERVAL '5' SECOND)",
+         "hopping_window_row",
+         &two_per_record},
+        {"cumulate",
+         "CUMULATE(ts, INTERVAL '5' SECOND, INTERVAL '10' SECOND)",
+         "cumulate_window_row",
+         &two_per_record},
+        {"session", "SESSION(ts, INTERVAL '5' SECOND)", "session_window_row", &per_window},
+    };
+    for (const auto& w : windows) {
+        SCOPED_TRACE(w.name);
+        // At parallelism 2, behind a keyed exchange.
+        const auto columnar = run_kafka_parity_case(
+            cols, with, windowed_cols, windowed(w.window), in_path, out_path, w.op, 2);
+        const auto row_form = run_kafka_parity_case(cols,
+                                                    with + ", columnar_decode='false'",
+                                                    windowed_cols,
+                                                    windowed(w.window),
+                                                    in_path,
+                                                    out_path,
+                                                    w.op,
+                                                    2);
+        EXPECT_EQ(row_form, *w.want);
+        EXPECT_EQ(columnar, row_form);
+    }
+    {
+        SCOPED_TRACE("over");
+        const std::string q =
+            "INSERT INTO out_t SELECT k, s / 8 AS s8, sn / 8 AS n8 FROM ("
+            "SELECT *, SUM(x) OVER (PARTITION BY k ORDER BY ts) AS s, "
+            "SUM(n) OVER (PARTITION BY k ORDER BY ts) AS sn FROM t) o";
+        const std::string out_cols = "k BIGINT, s8 DOUBLE, n8 BIGINT";
+        const auto columnar = run_kafka_parity_case(cols, with, out_cols, q, in_path, out_path);
+        const auto row_form = run_kafka_parity_case(
+            cols, with + ", columnar_decode='false'", out_cols, q, in_path, out_path);
+        const std::multiset<std::string> want = {
+            R"({"k":1,"n8":1,"s8":1.125})",
+            R"({"k":1,"n8":1,"s8":1.5})",
+            R"({"k":2,"n8":0,"s8":-0.5})",
+            R"({"k":2,"n8":0,"s8":-0.4375})",
+            R"({"k":1,"n8":1,"s8":1.625})",
+        };
+        EXPECT_EQ(row_form, want);
+        EXPECT_EQ(columnar, row_form);
+    }
+    {
+        SCOPED_TRACE("last-N");
+        // A bounded ROWS frame over a table with no event-time column is the
+        // last-N rolling aggregate, which recomputes each frame and emits a
+        // changelog. The frame sums are 9, then 9 + 3, then 3 + 1 for key 1,
+        // and -4, then -4 + 0.5 for key 2.
+        const std::string q =
+            "INSERT INTO out_t SELECT k, s / 8 AS s8 FROM ("
+            "SELECT k, SUM(x) OVER (PARTITION BY k ORDER BY ts "
+            "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM t) l";
+        const std::string out_cols = "k BIGINT, s8 DOUBLE";
+        const auto columnar = run_kafka_parity_case(
+            cols, "", out_cols, q, in_path, out_path, {}, 1, "changelog='true'");
+        const auto row_form = run_kafka_parity_case(cols,
+                                                    "columnar_decode='false'",
+                                                    out_cols,
+                                                    q,
+                                                    in_path,
+                                                    out_path,
+                                                    {},
+                                                    1,
+                                                    "changelog='true'");
+        const std::multiset<std::string> want = {
+            R"({"__row_kind":"insert","k":1,"s8":1.125})",
+            R"({"__row_kind":"update_before","k":1,"s8":1.125})",
+            R"({"__row_kind":"update_after","k":1,"s8":1.5})",
+            R"({"__row_kind":"insert","k":2,"s8":-0.5})",
+            R"({"__row_kind":"update_before","k":2,"s8":-0.5})",
+            R"({"__row_kind":"update_after","k":2,"s8":-0.4375})",
+            R"({"__row_kind":"update_before","k":1,"s8":1.5})",
+            R"({"__row_kind":"update_after","k":1,"s8":0.5})",
+        };
+        EXPECT_EQ(row_form, want);
+        EXPECT_EQ(columnar, row_form);
+    }
+    if (columnar_disabled_for_process()) {
+        EXPECT_FALSE(clink::detail::columnar_enabled());
+    }
+    std::filesystem::remove(in_path);
+}
+
+// A GROUP BY over a GROUP BY folds a changelog: the inner aggregate retracts its
+// previous sum (update_before) before it adds the new one, so the outer SUM
+// retracts doubles as well as adding them. Inner sums 9.0, then 3, then 9.0 + 1
+// leave the outer sum at 9 + 3 - 9 + 10 = 13, and 13 / 8 is 1.625 on either
+// carrier; summed as integers it was 1.
+TEST(SqlRuntime, SumOverAChangelogOfWholeDoublesIsADouble) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_double_sum_cl_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_double_sum_cl_out_" + tag + ".ndjson");
+    const std::string cols = "g BIGINT, k BIGINT, x DOUBLE";
+    write_lines(in_path,
+                {
+                    R"({"g":1,"k":1,"x":9.0})",
+                    R"({"g":1,"k":2,"x":3})",
+                    R"({"g":1,"k":1,"x":1})",
+                });
+    const std::string q =
+        "INSERT INTO out_t SELECT g, SUM(s) / 8 AS s8 FROM ("
+        "SELECT g, k, SUM(x) AS s FROM t GROUP BY g, k) i GROUP BY g";
+    const std::string out_cols = "g BIGINT, s8 DOUBLE";
+    const auto columnar =
+        last_line_per_key(run_kafka_case_lines(cols, "", out_cols, q, in_path, out_path), "g");
+    const auto row_form = last_line_per_key(
+        run_kafka_case_lines(cols, "columnar_decode='false'", out_cols, q, in_path, out_path), "g");
+    // The outer aggregate folds a changelog, so it tags what it emits.
+    EXPECT_EQ(row_form,
+              (std::multiset<std::string>{R"({"__row_kind":"update_after","g":1,"s8":1.625})"}));
+    EXPECT_EQ(columnar, row_form);
+    std::filesystem::remove(in_path);
+}
+
+namespace {
+
+// Little-endian writers for the operator-state layouts in src/sql/install.cpp,
+// so a test can spell out the bytes an earlier release wrote.
+void put_u32_le(std::string& o, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i)
+        o.push_back(static_cast<char>((v >> (i * 8)) & 0xFF));
+}
+void put_u64_le(std::string& o, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i)
+        o.push_back(static_cast<char>((v >> (i * 8)) & 0xFF));
+}
+void put_f64_le(std::string& o, double d) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &d, sizeof(bits));
+    put_u64_le(o, bits);
+}
+void put_text_le(std::string& o, const std::string& s) {
+    put_u32_le(o, static_cast<std::uint32_t>(s.size()));
+    o += s;
+}
+
+// One SUM's AggState as v0.10.0, and every release before this change, wrote it
+// after summing whole doubles: as_decimal took each whole double into the exact
+// 128-bit accumulator, so the exact sum is begun and complete, no decimal was
+// seen, and the double running sum stands beside it. encode_agg_state's layout.
+std::string earlier_release_whole_double_sum(std::int64_t sum, std::int64_t count) {
+    std::string o;
+    put_f64_le(o, static_cast<double>(sum));                    // running_sum
+    put_f64_le(o, 0.0);                                         // running_sum_sq
+    put_u64_le(o, static_cast<std::uint64_t>(count));           // running_count
+    put_text_le(o, "null");                                     // running_min
+    put_text_le(o, "null");                                     // running_max
+    o.push_back('\0');                                          // initialised
+    put_u32_le(o, 0);                                           // value_counts
+    put_u32_le(o, 0);                                           // minmax_counts
+    put_text_le(o, std::string{'\x01'} + std::to_string(sum));  // running_sum_dec, a dec-string
+    o.push_back('\1');                                          // sum_dec_started
+    o.push_back('\0');                                          // sum_saw_decimal
+    o.push_back('\1');                                          // sum_dec_complete
+    put_u32_le(o, 0);                                           // percentile_values
+    put_u32_le(o, 0);                                           // array_values
+    put_text_le(o, "null");                                     // udaf_acc
+    o.push_back('\0');                                          // udaf_initialised
+    return o;
+}
+
+// The params the planner gives the operator of `op_type` for `query` over
+// t (k BIGINT, x DOUBLE, ts BIGINT, event time ts), born-columnar output off.
+std::map<std::string, std::string> planned_params(const std::string& query,
+                                                  const std::string& op_type) {
+    Catalog cat;
+    auto ddl = parse(
+        "CREATE TABLE t (k BIGINT, x DOUBLE, ts BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/clink_unused_in.ndjson', event_time_column='ts', watermark_lag_ms='0');"
+        "CREATE TABLE out_t (k BIGINT, s DOUBLE) WITH (connector='file', format='json', "
+        "path='/tmp/clink_unused_out.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, query.c_str());
+    for (const auto& op : spec.ops) {
+        if (op.type == op_type) {
+            auto params = op.params;
+            params.erase("columnar_output");
+            return params;
+        }
+    }
+    ADD_FAILURE() << "no " << op_type << " op planned for " << query;
+    return {};
+}
+
+std::shared_ptr<Operator<Row, Row>> build_row_op(const std::string& op_type,
+                                                 const std::map<std::string, std::string>& params) {
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        op_type, std::string{kChannelRow}, std::string{kChannelRow});
+    EXPECT_NE(factory, nullptr) << op_type;
+    cluster::OperatorBuildContext octx;
+    octx.params = params;
+    return std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+}
+
+Row sum_input_row(std::int64_t k, clink::config::JsonValue x, std::int64_t ts) {
+    Row r;
+    r.values["k"] = clink::config::JsonValue{k};
+    r.values["x"] = std::move(x);
+    r.values["ts"] = clink::config::JsonValue{ts};
+    return r;
+}
+
+// Process `rows` (each with event time ts) and then, when set, a watermark; return
+// the emitted rows.
+std::vector<Row> drive_row_op(Operator<Row, Row>& op,
+                              const std::vector<Row>& rows,
+                              std::optional<std::int64_t> watermark_ms) {
+    std::vector<Row> out;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                out.push_back(rec.value());
+            }
+        }
+        return true;
+    });
+    for (const auto& r : rows) {
+        Batch<Row> b;
+        b.emplace(r, EventTime{r.values.at("ts").as_int()});
+        op.process(StreamElement<Row>::data(std::move(b)), em);
+    }
+    if (watermark_ms.has_value()) {
+        op.process(StreamElement<Row>::watermark(Watermark{EventTime{*watermark_ms}}), em);
+    }
+    return out;
+}
+
+}  // namespace
+
+// A window an earlier release checkpointed mid-window over whole doubles
+// restores and goes on summing as a DOUBLE. That release summed 9.0 + 3.0 into
+// its exact integer accumulator and wrote the state with sum_dec_complete set,
+// which is byte for byte the state this release writes for the integers 9 and
+// 3; the test writes it that way and checks the bytes against the layout spelt
+// out by hand. Restored, a double folded into the window makes the sum a double
+// (13.0, not the integer 13). A window that fires with nothing further folded
+// still emits what the earlier release would have, the exact integer 12: the
+// state cannot say whether its whole values were integers or doubles.
+TEST(SqlRuntime, AWindowRestoredFromAnEarlierReleaseSumsDoublesAsDoubles) {
+    ensure_sql_installed_once();
+    using T = clink::config::JsonValue::Type;
+    const auto params = planned_params(
+        "INSERT INTO out_t SELECT k, SUM(x) AS s FROM t GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), "
+        "k",
+        "tumbling_window_row");
+    ASSERT_FALSE(params.empty());
+    const OperatorId op_id{4343};
+    MetricsRegistry metrics;
+
+    Snapshot snap;
+    {
+        auto backend = std::make_shared<InMemoryStateBackend>();
+        auto op = build_row_op("tumbling_window_row", params);
+        RuntimeContext ctx{op_id, "win", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        const auto fired = drive_row_op(*op,
+                                        {sum_input_row(1, clink::config::JsonValue{9}, 1000),
+                                         sum_input_row(1, clink::config::JsonValue{3}, 2000)},
+                                        std::int64_t{5000});
+        EXPECT_TRUE(fired.empty()) << "the window fired before the checkpoint";
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+    {
+        // The window map for key 1: one window ending at 10000 and starting at 0,
+        // its group values, and the one SUM's state.
+        std::string want;
+        put_u32_le(want, 1);
+        put_u64_le(want, 10000);
+        put_u64_le(want, 0);
+        put_text_le(want, R"({"k":1})");
+        put_u32_le(want, 1);
+        want += earlier_release_whole_double_sum(12, 2);
+        auto sp = state_processor::Savepoint::load_from_snapshot(
+            Snapshot{.checkpoint_id = snap.checkpoint_id, .bytes = snap.bytes});
+        const auto entries = state_processor::collect_entries(sp);
+        ASSERT_EQ(entries.count(op_id), 1U);
+        ASSERT_EQ(entries.at(op_id).count("win"), 1U);
+        const auto& slot = entries.at(op_id).at("win");
+        ASSERT_EQ(slot.size(), 1U);
+        EXPECT_EQ(slot.begin()->second.value, want)
+            << "the snapshot is not the state an earlier release wrote for 9.0 + 3.0";
+    }
+    auto restore_and_drive = [&](const std::vector<Row>& rows) {
+        auto restored = std::make_shared<InMemoryStateBackend>();
+        restored->restore(snap);
+        auto op = build_row_op("tumbling_window_row", params);
+        RuntimeContext ctx{op_id, "win", restored.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->restore_timers(*restored, op_id);
+        op->open();
+        auto out = drive_row_op(*op, rows, std::int64_t{20000});
+        op->close();
+        return out;
+    };
+    {
+        SCOPED_TRACE("a double folded after the restore");
+        const auto out = restore_and_drive({sum_input_row(1, clink::config::JsonValue{1.0}, 3000)});
+        ASSERT_EQ(out.size(), 1U);
+        EXPECT_EQ(out[0].values.at("s").type(), T::Number);
+        EXPECT_EQ(out[0].values.at("s").as_number(), 13.0);
+    }
+    {
+        SCOPED_TRACE("nothing folded after the restore");
+        const auto out = restore_and_drive({});
+        ASSERT_EQ(out.size(), 1U);
+        EXPECT_EQ(out[0].values.at("s").type(), T::Int);
+        EXPECT_EQ(out[0].values.at("s").as_int(), 12);
+    }
+}
+
+// The same for an unbounded GROUP BY restored from an earlier release's
+// snapshot, through its retracting path as well: retracting the double 3.0 makes
+// the sum the double 9.0, adding 1.0 makes it 13.0, and a row whose x is NULL,
+// which folds nothing, re-emits the earlier release's exact integer 12.
+TEST(SqlRuntime, AGroupRestoredFromAnEarlierReleaseSumsDoublesAsDoubles) {
+    ensure_sql_installed_once();
+    using T = clink::config::JsonValue::Type;
+    const auto params = planned_params("INSERT INTO out_t SELECT k, SUM(x) AS s FROM t GROUP BY k",
+                                       "aggregate_row");
+    ASSERT_FALSE(params.empty());
+    const OperatorId op_id{4344};
+    MetricsRegistry metrics;
+
+    Snapshot snap;
+    {
+        auto backend = std::make_shared<InMemoryStateBackend>();
+        auto op = build_row_op("aggregate_row", params);
+        RuntimeContext ctx{op_id, "agg", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        (void)drive_row_op(*op,
+                           {sum_input_row(1, clink::config::JsonValue{9}, 1000),
+                            sum_input_row(1, clink::config::JsonValue{3}, 2000)},
+                           std::nullopt);
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+    {
+        // The bucket for key 1: its group values, the one SUM's state, and no
+        // prior emission (the operator emits an append stream here).
+        std::string want;
+        put_text_le(want, R"({"k":1})");
+        put_u32_le(want, 1);
+        want += earlier_release_whole_double_sum(12, 2);
+        put_u32_le(want, 0);
+        auto sp = state_processor::Savepoint::load_from_snapshot(
+            Snapshot{.checkpoint_id = snap.checkpoint_id, .bytes = snap.bytes});
+        const auto entries = state_processor::collect_entries(sp);
+        ASSERT_EQ(entries.count(op_id), 1U);
+        ASSERT_EQ(entries.at(op_id).count("agg"), 1U);
+        const auto& slot = entries.at(op_id).at("agg");
+        ASSERT_EQ(slot.size(), 1U);
+        EXPECT_EQ(slot.begin()->second.value, want)
+            << "the snapshot is not the state an earlier release wrote for 9.0 + 3.0";
+    }
+    auto restore_and_drive = [&](const Row& row) {
+        auto restored = std::make_shared<InMemoryStateBackend>();
+        restored->restore(snap);
+        auto op = build_row_op("aggregate_row", params);
+        RuntimeContext ctx{op_id, "agg", restored.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        auto out = drive_row_op(*op, {row}, std::nullopt);
+        op->close();
+        return out;
+    };
+    {
+        SCOPED_TRACE("a double retracted after the restore");
+        Row del = sum_input_row(1, clink::config::JsonValue{3.0}, 3000);
+        clink::sql::set_row_kind(del, clink::sql::kRowKindDelete);
+        const auto out = restore_and_drive(del);
+        ASSERT_EQ(out.size(), 1U);
+        EXPECT_EQ(out[0].values.at("s").type(), T::Number);
+        EXPECT_EQ(out[0].values.at("s").as_number(), 9.0);
+    }
+    {
+        SCOPED_TRACE("a double folded after the restore");
+        const auto out = restore_and_drive(sum_input_row(1, clink::config::JsonValue{1.0}, 3000));
+        ASSERT_EQ(out.size(), 1U);
+        EXPECT_EQ(out[0].values.at("s").type(), T::Number);
+        EXPECT_EQ(out[0].values.at("s").as_number(), 13.0);
+    }
+    {
+        SCOPED_TRACE("nothing folded after the restore");
+        const auto out = restore_and_drive(sum_input_row(1, clink::config::JsonValue{}, 3000));
+        ASSERT_EQ(out.size(), 1U);
+        EXPECT_EQ(out[0].values.at("s").type(), T::Int);
+        EXPECT_EQ(out[0].values.at("s").as_int(), 12);
+    }
+}
+
+namespace {
+
+// Run `query` against t, a connector='file' JSON table over `in_path` (a file or
+// a directory of files), and return the output file's lines in file order.
+std::vector<std::string> run_file_case_lines(const std::string& table_cols,
+                                             const std::string& out_cols,
+                                             const std::string& query,
+                                             const std::filesystem::path& in_path,
+                                             const std::filesystem::path& out_path) {
+    std::filesystem::remove(out_path);
+    Catalog cat;
+    auto ddl = parse("CREATE TABLE t (" + table_cols +
+                     ") WITH (connector='file', format='json', path='" + in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (" +
+                     out_cols + ") WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, query.c_str());
+    {
+        InProcessCluster cluster("worker-file-reals", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        EXPECT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    auto lines = read_lines(out_path);
+    std::filesystem::remove(out_path);
+    return lines;
+}
+
+}  // namespace
+
+// A file source decodes a declared DOUBLE, REAL or BIGINT column as the JSON
+// bridges do: an integer token in a DOUBLE column becomes a double, a REAL value
+// is rounded to the precision a float holds, and a whole numeral such as 7.0 in
+// a BIGINT column becomes an integer. The file source kept the integer, so
+// over {"x":9} `x / 2` and MAX(x) / 2 gave 4 where the Kafka bridge gives 4.5,
+// and kept a REAL value at a precision its declared width cannot hold. Checked
+// against the row bridge's lines for the same input, on a file, on a directory
+// of files (the form a materialized view's backing takes), with the optimizer's
+// projection narrowing the read, and through an aggregate.
+TEST(SqlRuntime, AFileSourceDecodesDeclaredRealColumnsAsTheJsonBridgesDo) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_file_reals_in_" + tag + ".ndjson");
+    const auto in_dir = tmp / ("clink_sql_file_reals_dir_" + tag);
+    const auto out_path = tmp / ("clink_sql_file_reals_out_" + tag + ".ndjson");
+    const std::string cols = "k BIGINT, x DOUBLE, r REAL, n BIGINT";
+    const std::vector<std::string> lines = {
+        R"({"k":1,"x":9,"r":0.1,"n":7.0})",
+        R"({"k":2,"x":-3,"r":2,"n":-1})",
+        R"({"k":1,"x":2.5,"r":1.5,"n":2})",
+    };
+    write_lines(in_path, lines);
+    std::filesystem::remove_all(in_dir);
+    std::filesystem::create_directories(in_dir);
+    write_lines(in_dir / "part-0.ndjson", {lines[0], lines[1]});
+    write_lines(in_dir / "part-1.ndjson", {lines[2]});
+
+    const auto as_set = [](const std::vector<std::string>& v) {
+        return std::multiset<std::string>(v.begin(), v.end());
+    };
+    const struct {
+        const char* name;
+        const char* query;
+        const char* out_cols;
+    } cases[] = {
+        {"projection",
+         "INSERT INTO out_t SELECT k, x / 2 AS xh, r, n / 2 AS nh FROM t",
+         "k BIGINT, xh DOUBLE, r REAL, nh BIGINT"},
+        {"narrowed projection",
+         "INSERT INTO out_t SELECT k, x / 2 AS xh FROM t",
+         "k BIGINT, xh DOUBLE"},
+        {"aggregate",
+         "INSERT INTO out_t SELECT k, MAX(x) / 2 AS mh FROM t GROUP BY k",
+         "k BIGINT, mh DOUBLE"},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        const auto bridge = as_set(run_kafka_case_lines(
+            cols, "columnar_decode='false'", c.out_cols, c.query, in_path, out_path));
+        const auto file = as_set(run_file_case_lines(cols, c.out_cols, c.query, in_path, out_path));
+        const auto dir = as_set(run_file_case_lines(cols, c.out_cols, c.query, in_dir, out_path));
+        EXPECT_EQ(file, bridge);
+        EXPECT_EQ(dir, bridge);
+    }
+    // The bridge's lines, pinned, so the comparison above is against SQL's answer.
+    const auto projection = as_set(run_file_case_lines(
+        cols, "k BIGINT, xh DOUBLE, r REAL, nh BIGINT", cases[0].query, in_path, out_path));
+    const std::multiset<std::string> want = {
+        R"({"k":1,"nh":3,"r":0.10000000149011612,"xh":4.5})",
+        R"({"k":2,"nh":0,"r":2,"xh":-1.5})",
+        R"({"k":1,"nh":1,"r":1.5,"xh":1.25})",
+    };
+    EXPECT_EQ(projection, want);
+    std::filesystem::remove(in_path);
+    std::filesystem::remove_all(in_dir);
 }
 
 // WS6 increment 5: windowed MAX/MIN over a numeric columnar source vectorises.

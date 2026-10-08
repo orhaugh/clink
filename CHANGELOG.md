@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**SUM over a DOUBLE column is a DOUBLE, whole values included.** The row path
+summed a whole double such as 9.0 into its exact integer accumulator, so
+`SUM(x)` over a `DOUBLE` column of whole values came back an integer and
+`SUM(x) / 8` gave 1 where SQL gives 1.5, while the columnar fold of the same
+column gave a double. `SUM` now takes its type from its input on both carriers:
+an exact `BIGINT` over `BIGINT` and `INTEGER`, an exact `DECIMAL` over
+`DECIMAL`, and a `DOUBLE` over `DOUBLE` and `REAL`, in an unbounded or
+retracting `GROUP BY`, in tumbling, hopping, cumulating and session windows,
+and in `OVER` and last-N aggregates. A `DOUBLE` sum is a floating-point sum, so
+once its running total passes 2^53 it rounds, retractions included. State
+format and job-graph fingerprints are unchanged; a group restored from an
+earlier release's snapshot that had summed only whole doubles emits that
+release's exact integer until it folds or retracts its next double.
+
+**A file or queryable_state source reads declared numeric columns as the Kafka
+bridge does.** Both kept an integer token in a `DOUBLE` column as an integer,
+so `clink run` over `{"x":9}` computed `MAX(x) / 2` as 4, and kept a whole
+numeral such as `7.0` in a `BIGINT` column a double. Each value now decodes as
+its column's type says: a double in a `DOUBLE` column, an integer in a `BIGINT`
+or `INTEGER` column, and a `REAL` value rounded to float precision.
+
 **A double keeps its kind when a row crosses between operators or through
 operator state.** The row codec between operators, and the codecs of the SQL
 operators' state, wrote a double with an integral value, such as 9.0, as `9`,
@@ -88,13 +109,16 @@ evicted or failing their handshake count in
 per ten seconds, then summarised.
 
 **Numbers in a Kafka or WebSocket JSON table compute the same on the columnar
-and row paths.** The columnar JSON decode, and joins and windows emitting
-born-columnar output, took a numeral with a decimal point or an exponent but an
-integral value, such as `7.0` or `5e0`, into a BIGINT or INTEGER column as an
-integer, while the row decode keeps it a double; arithmetic follows the value's
-kind, so `n / 2` gave 3 on the columnar path where the row path gives 3.5. A
-BIGINT or INTEGER column now decodes columnar only for integer tokens in its
-range, and anything else takes the row decode. The opposite held for DOUBLE: the
+and row paths, as their declared types say.** The columnar JSON decode, and
+joins and windows emitting born-columnar output, took a numeral with a decimal
+point or an exponent but an integral value, such as `7.0` or `5e0`, into a
+BIGINT or INTEGER column as an integer, while the row decode kept it a double;
+arithmetic follows the value's kind, so `n / 2` gave 3 on the columnar path and
+3.5 on the row path. Both now hold such a numeral in a BIGINT or INTEGER column
+as the integer it names, so `n / 2` is 3, the integer division the plan types it
+as, and a fraction stays a double; the columnar decode still takes only integer
+tokens in the column's range and sends anything else to the row decode. The
+opposite held for DOUBLE: the
 row decode kept an integer token in a DOUBLE column as an integer, so `x / 2` on
 a value written as `3` gave 1 with `columnar_decode='false'`; a declared DOUBLE
 column now holds a double on both decodes (an integer past 2^53 prints as the

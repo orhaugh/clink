@@ -1,7 +1,9 @@
 #pragma once
 
 #include <charconv>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -345,6 +347,30 @@ inline void coerce_row_doubles(Row& r, const std::vector<std::string>& double_co
     }
 }
 
+// Coerce declared BIGINT and INTEGER columns' whole doubles to integers, so an
+// integer column holds an integer whichever way the producer wrote the number: a
+// JSON encoder writes 7.0 or 5e0 for a float that happens to be whole.
+//
+// The plan types such a column, and every expression over it, as an integer, but
+// the evaluator chooses integer or double arithmetic by the value's kind, so a
+// double left in it made `n / 2` 3.5 where the plan says BIGINT, and SUM over it a
+// DOUBLE. A value that is not whole, or does not fit in 64 bits, is left as it is.
+// Applied at ingestion only.
+inline void coerce_row_integers(Row& r, const std::vector<std::string>& integer_columns) {
+    // 2^63 is exactly representable as a double, so the upper bound is exclusive.
+    constexpr double kInt64Lo = -9223372036854775808.0;
+    constexpr double kInt64HiExclusive = 9223372036854775808.0;
+    for (const auto& col : integer_columns) {
+        auto it = r.values.find(col);
+        if (it == r.values.end() || !it->second.is_number() || it->second.is_integral_number())
+            continue;
+        const double d = it->second.as_number();
+        if (!std::isfinite(d) || d < kInt64Lo || d >= kInt64HiExclusive || d != std::trunc(d))
+            continue;
+        it->second = clink::config::JsonValue{static_cast<std::int64_t>(d)};
+    }
+}
+
 // Recover exact digits for any DECIMAL column that decoded to a (lossy) JSON
 // number: the generic parse rounds a numeral to a double, so re-read the
 // untruncated token straight from the source `line` and carry it as an exact
@@ -389,36 +415,6 @@ inline clink::TextFormat<Row> row_json_text_format_with_decimals(
             clink::config::JsonValue v{to_json_object(q.values)};
             return clink::config::serialize_output(v);
         },
-    };
-}
-
-// Schema-aware NDJSON decode for a declared column list: DECIMAL columns ingested
-// exactly and quantised to their scale (as above), and FLOAT columns coerced to
-// float precision. Both bridges off a JSON source build their decoder from this,
-// so a table's declared column types are honoured at decode whichever carrier
-// runs - which is the precondition for the columnar decoder handling FLOAT and
-// DECIMAL at all (it can only go columnar where it matches the row decode).
-//
-// With neither type declared this IS row_json_text_format_with_decimals, and with
-// no decimals either it is row_json_text_format - so a schema without FLOAT or
-// DECIMAL columns decodes exactly as before.
-inline clink::TextFormat<Row> row_json_text_format_typed(std::map<std::string, int> decimal_scales,
-                                                         std::vector<std::string> float_columns) {
-    if (float_columns.empty())
-        return row_json_text_format_with_decimals(std::move(decimal_scales));
-    auto base = row_json_text_format_with_decimals(std::move(decimal_scales));
-    return clink::TextFormat<Row>{
-        .decode = [base,
-                   floats = std::move(float_columns)](std::string_view line) -> std::optional<Row> {
-            auto r = base.decode(line);
-            if (r) {
-                coerce_row_floats(*r, floats);
-            }
-            return r;
-        },
-        // Encode is the base's: a coerced value is already a double carrying float
-        // precision, so there is nothing further to do on the way out.
-        .encode = base.encode,
     };
 }
 

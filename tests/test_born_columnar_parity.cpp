@@ -667,9 +667,12 @@ TEST(BornColumnarParity, TryAppendRowAppendsAllOrNothing) {
     EXPECT_TRUE(rb->GetColumnByName("t")->IsNull(1));
 }
 
-// A REAL the source did not round to float precision: the file source keeps
-// 0.1 as the double it parsed, which a float32 column would hand back as
-// 0.10000000149011612. Every row has one, so every pair takes the row path.
+// A REAL written off float precision, such as 1.1. The file source rounds a REAL
+// value to float precision at decode, as the JSON bridges do, so the join's
+// output holds 1.100000023841858, which a float32 column holds exactly: every
+// pair rides the sidecar and writes what the row carrier writes. A value off
+// float precision still bails a float32 cell, which
+// CellIsExactAgreesWithTheRoundTrip pins.
 TEST(BornColumnarParity, JoinOutputOfARealOffFloatPrecisionMatchesTheRowCarrier) {
     const auto dir = parity_scratch("join_real");
     std::vector<std::string> src;
@@ -687,7 +690,7 @@ TEST(BornColumnarParity, JoinOutputOfARealOffFloatPrecisionMatchesTheRowCarrier)
                   "INSERT INTO out SELECT a.id, a.r FROM src a JOIN keys b ON a.id = b.k;",
                   "equi_join_row",
                   dir,
-                  Carrier::Rows);
+                  Carrier::Columnar);
     fs::remove_all(dir);
 }
 
@@ -754,12 +757,12 @@ TEST(BornColumnarParity, WindowMinOfAnIntegralDoubleTimestampMatchesTheRowCarrie
 // --- A BIGINT or INTEGER held as a JSON double ----------------------------------
 
 // BIGINT and INTEGER columns fed integral numerals such as 7.0 and 9e0, the forms
-// a JSON encoder gives for a float. The file source keeps each one as the double
-// it parsed. The sidecar's int64 and int32 columns would hand back an integer,
-// which prints the same, but the evaluator divides an integer as an integer and
-// a double as a double. Every row carries one such numeral, in n or in i, so
-// every pair takes the row path, and the division after the join comes out as
-// the row carrier computes it.
+// a JSON encoder gives for a float. The file source makes each one the integer
+// it names (coerce_row_integers), as the JSON bridges do, so the sidecar's int64
+// and int32 columns hold it exactly: every pair rides the sidecar, and the
+// division after the join halves an integer on either carrier, as the plan types
+// it. A double still bails an int64 or int32 cell, which
+// CellIsExactAgreesWithTheRoundTrip pins.
 namespace {
 
 // Row i's n and i cells: odd values, so a halving tells the kinds apart, with n
@@ -792,15 +795,15 @@ TEST(BornColumnarParity, JoinOutputOfIntegralDoubleIntegersMatchesTheRowCarrier)
                   "JOIN keys b ON a.id = b.k;",
                   "equi_join_row",
                   dir,
-                  Carrier::Rows);
+                  Carrier::Columnar);
     fs::remove_all(dir);
 }
 
 // The mirror case: DOUBLE and REAL columns fed integer tokens. The file source
-// keeps each one an integer, and the sidecar's double and float columns would
-// hand back a double, which prints the same but halves as a double where the
-// integer halved as an integer. So every pair takes the row path, and the
-// division after the join comes out as the row carrier computes it.
+// decodes each one as a double, as the JSON bridges do, so the sidecar's double
+// and float columns hold it exactly: every pair rides the sidecar, and the
+// division after the join halves a double on either carrier. An integer still
+// bails a double or float cell, which CellIsExactAgreesWithTheRoundTrip pins.
 TEST(BornColumnarParity, JoinOutputOfIntegerDoublesMatchesTheRowCarrier) {
     const auto dir = parity_scratch("join_double_int");
     std::vector<std::string> src;
@@ -821,12 +824,12 @@ TEST(BornColumnarParity, JoinOutputOfIntegerDoublesMatchesTheRowCarrier) {
                   "JOIN keys b ON a.id = b.k;",
                   "equi_join_row",
                   dir,
-                  Carrier::Rows);
+                  Carrier::Columnar);
     fs::remove_all(dir);
 }
 
-// The window's version: MIN over integral doubles is that double, and a
-// projection over the window's output halves it.
+// The window's version: MIN over the integers those numerals name, which a
+// projection over the window's output halves as an integer on either carrier.
 TEST(BornColumnarParity, WindowMinOfIntegralDoubleIntegersMatchesTheRowCarrier) {
     const auto dir = parity_scratch("window_int_double");
     const auto src = parity_window_source(
@@ -844,6 +847,6 @@ TEST(BornColumnarParity, WindowMinOfIntegralDoubleIntegersMatchesTheRowCarrier) 
                   "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k HAVING COUNT(*) > 1) w;",
                   "tumbling_window_row",
                   dir,
-                  Carrier::Rows);
+                  Carrier::Columnar);
     fs::remove_all(dir);
 }

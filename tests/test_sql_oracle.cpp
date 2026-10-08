@@ -238,6 +238,31 @@ protected:
                 << R"({"k":3,"v":7})" << "\n"
                 << R"({"k":4,"v":0})" << "\n";
         }
+        // d: a DOUBLE column holding whole values, written the two ways a JSON
+        // encoder writes a whole double (9 and 9.0), so a group's every value
+        // is whole and a SUM over it must still be a double. Group 6 also
+        // holds a fraction and group 7 is entirely NULL. Its own generator,
+        // so the tables above keep their data.
+        {
+            std::mt19937_64 drng{kDataSeed + 1};
+            auto dpick = [&drng](int lo, int hi) {
+                return std::uniform_int_distribution<int>(lo, hi)(drng);
+            };
+            std::ofstream out(dir_ / "d.ndjson", std::ios::trunc);
+            for (int i = 0; i < 80; ++i) {
+                std::string x = "null";
+                if (dpick(1, 100) > 15) {
+                    x = std::to_string(dpick(-40, 40));
+                    if (dpick(0, 1) == 1) {
+                        x += ".0";
+                    }
+                }
+                out << "{\"k\":" << dpick(0, 5) << ",\"x\":" << x << "}\n";
+            }
+            out << R"({"k":6,"x":9})" << "\n"
+                << R"({"k":6,"x":2.5})" << "\n"
+                << R"({"k":7,"x":null})" << "\n";
+        }
     }
 
     // --- the clink side ----------------------------------------------------
@@ -264,6 +289,10 @@ protected:
             "CREATE TABLE t2 (k BIGINT, v BIGINT) "
             "WITH (connector='file', format='json', path='" +
             (dir_ / "t2.ndjson").string() +
+            "');"
+            "CREATE TABLE d (k BIGINT, x DOUBLE) "
+            "WITH (connector='file', format='json', path='" +
+            (dir_ / "d.ndjson").string() +
             "');"
             "CREATE TABLE oracle_out (" +
             ddl_cols +
@@ -304,6 +333,8 @@ protected:
                    << "CREATE TABLE t2 AS SELECT * FROM read_json('"
                    << (dir_ / "t2.ndjson").string()
                    << "', format='newline_delimited', columns={k: 'BIGINT', v: 'BIGINT'});\n"
+                   << "CREATE TABLE d AS SELECT * FROM read_json('" << (dir_ / "d.ndjson").string()
+                   << "', format='newline_delimited', columns={k: 'BIGINT', x: 'DOUBLE'});\n"
                    << "COPY (" << select_sql << ") TO '" << out_path.string()
                    << "' (FORMAT JSON);\n";
         }
@@ -668,6 +699,49 @@ TEST_F(SqlOracle, CastToDoubleDividesAsDouble) {
     // is what makes the operand a double, whatever integer went in.
     const auto d = run_pair({.name = "cast_double_div",
                              .select_sql = "SELECT k AS c0, CAST(v AS DOUBLE) / 4 AS c1 FROM t",
+                             .out_cols = {{"c0", "BIGINT"}, {"c1", "DOUBLE"}},
+                             .group_keys = {}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
+// SUM over a DOUBLE column is a DOUBLE however whole its values are. A group
+// of whole values (9 and 3.0) summed as an integer divides as one, so
+// SUM(x) / 8 gave 1 where SQL gives 1.5. AVG, and MIN and MAX through a
+// division, are checked over the same groups, and d's integer tokens check
+// that the file source hands a DOUBLE column's integers on as doubles.
+TEST_F(SqlOracle, SumOfAWholeValuedDoubleColumnIsADouble) {
+    const auto d = run_pair({.name = "double_sum",
+                             .select_sql = "SELECT k AS g0, SUM(x) AS c0, SUM(x) / 8 AS c1, "
+                                           "AVG(x) AS c2, MAX(x) / 2 AS c3, MIN(x) / 2 AS c4, "
+                                           "COUNT(x) AS c5 FROM d GROUP BY k",
+                             .out_cols = {{"g0", "BIGINT"},
+                                          {"c0", "DOUBLE"},
+                                          {"c1", "DOUBLE"},
+                                          {"c2", "DOUBLE"},
+                                          {"c3", "DOUBLE"},
+                                          {"c4", "DOUBLE"},
+                                          {"c5", "BIGINT"}},
+                             .group_keys = {"g0"}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
+TEST_F(SqlOracle, VarianceOfAWholeValuedDoubleColumn) {
+    const auto d = run_pair({.name = "double_variance",
+                             .select_sql = "SELECT k AS g0, VAR_POP(x) AS c0, VAR_SAMP(x) AS c1, "
+                                           "STDDEV_POP(x) AS c2, STDDEV_SAMP(x) AS c3 "
+                                           "FROM d GROUP BY k",
+                             .out_cols = {{"g0", "BIGINT"},
+                                          {"c0", "DOUBLE"},
+                                          {"c1", "DOUBLE"},
+                                          {"c2", "DOUBLE"},
+                                          {"c3", "DOUBLE"}},
+                             .group_keys = {"g0"}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
+TEST_F(SqlOracle, IntegerTokensInADoubleColumnDivideAsDoubles) {
+    const auto d = run_pair({.name = "double_tokens",
+                             .select_sql = "SELECT k AS c0, x / 2 AS c1 FROM d",
                              .out_cols = {{"c0", "BIGINT"}, {"c1", "DOUBLE"}},
                              .group_keys = {}});
     EXPECT_FALSE(d.diverged) << d.report;

@@ -811,7 +811,15 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
         return;
     }
     if (spec.fn == "sum" || spec.fn == "avg") {
-        if (auto dv = clink::config::as_decimal(v)) {  // #56: mirror the exact decimal sum
+        if (v.is_number() && !v.is_integral_number()) {
+            // Mirrors update_agg: a double leaves the exact sum alone and clears
+            // sum_dec_complete. A state an earlier release wrote can hold whole
+            // doubles in the exact sum, marked complete; were this one taken off
+            // the double running_sum only, that exact sum, still holding it,
+            // would be the result.
+            st.running_sum -= v.as_number();
+            st.sum_dec_complete = false;
+        } else if (auto dv = clink::config::as_decimal(v)) {  // #56: mirror the exact decimal sum
             if (st.sum_dec_started) {
                 if (auto s = clink::config::dec_sub(st.extras_read().running_sum_dec, *dv))
                     st.extras().running_sum_dec = *s;
@@ -819,8 +827,6 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
                     st.sum_dec_complete = false;
             }
             st.running_sum -= clink::config::dec_to_double(*dv);
-        } else if (v.is_number()) {
-            st.running_sum -= v.as_number();
         }
         if (st.running_count > 0)
             --st.running_count;
@@ -904,9 +910,18 @@ void update_agg(AggState& st, const AggSpec& spec, const Row& row) {
         return;
     }
     if (spec.fn == "sum" || spec.fn == "avg") {
-        // #56: accumulate an EXACT decimal sum (covers decimals and integers)
-        // alongside the double running_sum used by AVG.
-        if (auto dv = clink::config::as_decimal(v)) {
+        if (v.is_number() && !v.is_integral_number()) {
+            // A double sums as a double, whole or not: SUM over a DOUBLE or REAL
+            // column is a DOUBLE. Clearing sum_dec_complete makes the double
+            // running_sum the result, as the columnar fold of a double column
+            // does. Checked before as_decimal, which takes a whole double as an
+            // integer: through it 9.0 + 3.0 summed to the integer 12, and
+            // SUM(x) / 8 gave 1 where SQL gives 1.5.
+            st.running_sum += v.as_number();
+            st.sum_dec_complete = false;
+        } else if (auto dv = clink::config::as_decimal(v)) {
+            // #56: accumulate an EXACT decimal sum (covers decimals and integers)
+            // alongside the double running_sum used by AVG.
             if (st.sum_dec_started) {
                 if (auto s = clink::config::dec_add(st.extras_read().running_sum_dec, *dv))
                     st.extras().running_sum_dec = *s;
@@ -919,9 +934,6 @@ void update_agg(AggState& st, const AggSpec& spec, const Row& row) {
             if (clink::config::is_dec_string(v))
                 st.sum_saw_decimal = true;
             st.running_sum += clink::config::dec_to_double(*dv);
-        } else if (v.is_number()) {
-            st.running_sum += v.as_number();
-            st.sum_dec_complete = false;  // a non-integral double -> decimal sum is not exact
         }
         ++st.running_count;
         return;
@@ -1048,8 +1060,12 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
         if (st.running_count == 0)
             return clink::config::JsonValue{nullptr};
         // The exact 128-bit accumulator (running_sum_dec) covers integers and
-        // decimals; it is authoritative unless a fractional double was summed
-        // or it overflowed 128-bit (either clears sum_dec_complete).
+        // decimals; it is authoritative unless a double was summed or retracted
+        // (SUM over a DOUBLE is a DOUBLE, whole values included) or it overflowed
+        // 128-bit (either clears sum_dec_complete). A state an earlier release
+        // wrote holds whole doubles in it, marked complete, so a group restored
+        // from one emits the exact integer, as that release did, until it folds
+        // or retracts its next double.
         if (st.sum_dec_started && st.sum_dec_complete) {
             if (st.sum_saw_decimal)
                 return clink::config::make_dec_value(
@@ -1061,7 +1077,8 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
                 return clink::config::JsonValue{*i};
             return clink::config::make_dec_value(st.extras_read().running_sum_dec);
         }
-        // A fractional double was summed: the double running_sum is the answer.
+        // A double was summed, or the exact sum overflowed: the double running_sum
+        // is the answer.
         return clink::config::JsonValue{st.running_sum};
     }
     if (spec.fn == "avg") {
@@ -1350,8 +1367,8 @@ inline void vectorised_fold_slice(const std::vector<AggSpec>& aggs,
                             st.sum_dec_complete = false;  // 128-bit overflow -> double result
                         }
                     } else {
-                        // A float/double column: the exact accumulator cannot stay
-                        // exact (matches the row path's non-integral-double case).
+                        // A float/double column sums as a double, whole values
+                        // included, as update_agg sums a double.
                         st.sum_dec_complete = false;
                     }
                     ++st.running_count;
@@ -3425,6 +3442,7 @@ private:
                 }
             }
             a.sum_saw_decimal = a.sum_saw_decimal || b.sum_saw_decimal;
+            // A double summed on either side makes the merged sum a double.
             a.sum_dec_complete = a.sum_dec_complete && b.sum_dec_complete;
             for (const auto& [k, c] : b.extras_read().value_counts)
                 a.extras().value_counts[k] += c;
@@ -5901,15 +5919,11 @@ public:
     }
 
     // WS6 Increment 1: is every aggregate foldable column-at-a-time for THIS
-    // batch's column types? COUNT (any input column) yes; SUM/AVG only over
-    // int64/int32 columns. For an integer column the row path's SUM result
-    // reduces to running_sum (a double) + running_count - the exact-decimal SUM
-    // machinery never engages (an int column never carries a dec-string, so
-    // sum_saw_decimal stays false and finalize_agg returns running_sum) - so
-    // `running_sum += (double)Value(i)` is byte-identical. DOUBLE/FLOAT SUM
-    // (where as_decimal-on-double could diverge), DECIMAL, MIN/MAX, variance and
-    // string aggregates all return false and take the row path, which is already
-    // correct. batch_fold_eligible_ has already excluded distinct/udaf/retractable.
+    // batch's column types? The set is aggs_vectorisable's, and
+    // vectorised_fold_slice folds each aggregate as update_agg does: an integer
+    // column summed exactly, a DOUBLE or FLOAT column as a double, a DECIMAL
+    // column exactly. batch_fold_eligible_ has already excluded
+    // distinct/udaf/retractable.
     bool batch_vectorisable_(const arrow::RecordBatch& rb) const {
         return aggs_vectorisable(aggregates_, rb);
     }
@@ -12138,14 +12152,16 @@ public:
                          std::string role,
                          std::string slot,
                          std::size_t limit,
-                         std::size_t batch_size)
+                         std::size_t batch_size,
+                         DeclaredNumericColumns numerics = {})
         : coordinator_host_(std::move(coordinator_host)),
           coordinator_port_(coordinator_port),
           job_id_(std::move(job_id)),
           role_(std::move(role)),
           slot_(std::move(slot)),
           limit_(limit),
-          batch_size_(batch_size == 0 ? 256 : batch_size) {}
+          batch_size_(batch_size == 0 ? 256 : batch_size),
+          numerics_(std::move(numerics)) {}
 
     [[nodiscard]] bool is_bounded() const noexcept override { return true; }
 
@@ -12178,6 +12194,10 @@ public:
             }
             Row row;
             row.values = clink::sql::row_columns_from_json(entry.at("value").as_object());
+            // A served value is JSON, where a whole double is a bare integer, so the
+            // declared REAL, DOUBLE, BIGINT and INTEGER columns are coerced as the
+            // JSON bridges do.
+            numerics_.coerce(row);
             batch.push(Record<Row>{std::move(row)});
             if (++in_batch >= batch_size_) {
                 out.emit_data(std::move(batch));
@@ -12199,6 +12219,7 @@ private:
     std::string slot_;
     std::size_t limit_;
     std::size_t batch_size_;
+    DeclaredNumericColumns numerics_;
     bool done_{false};
 };
 
@@ -12581,7 +12602,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                 std::move(role),
                 std::move(slot),
                 static_cast<std::size_t>(limit),
-                static_cast<std::size_t>(batch_size));
+                static_cast<std::size_t>(batch_size),
+                declared_numeric_columns(parse_row_schema(ctx.param_or("schema_columns"))));
         });
 
     // file_json_source: read NDJSON, emit one Row per line. When `path` names a
@@ -12619,19 +12641,21 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             // #56: DECIMAL columns are tagged exact at ingestion.
             auto decimals = parse_decimal_columns(ctx.param_or("decimal_columns"));
+            // Declared REAL, DOUBLE, BIGINT and INTEGER columns decode as the JSON
+            // bridges decode them, from the schema_columns the planner gives every
+            // Row source.
+            // Without the param (a programmatic construction) the decode is as it
+            // was.
+            auto format = with_declared_numeric_columns(
+                row_json_text_format_projected(std::move(decimals), std::move(projected)),
+                parse_row_schema(ctx.param_or("schema_columns")));
             std::error_code dir_ec;
             if (std::filesystem::is_directory(path, dir_ec)) {
                 return std::make_shared<DirectoryFileSource<Row>>(
-                    path,
-                    row_json_text_format_projected(std::move(decimals), std::move(projected)),
-                    batch_size,
-                    "file_json_source");
+                    path, std::move(format), batch_size, "file_json_source");
             }
             return std::make_shared<FileSource<Row>>(
-                path,
-                row_json_text_format_projected(std::move(decimals), std::move(projected)),
-                batch_size,
-                "file_json_source");
+                path, std::move(format), batch_size, "file_json_source");
         });
 
     // ---- Sinks ----

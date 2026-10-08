@@ -492,12 +492,78 @@ inline clink::config::JsonValue read_cell(const std::shared_ptr<arrow::DataType>
 
 }  // namespace row_columnar_detail
 
-// The schema-aware NDJSON decoder for a declared column list: the DECIMAL scales,
-// FLOAT columns and DOUBLE columns are read off the declared types, so a caller
-// only has to hold the schema it already has. Types are taken through
-// effective_type, matching what the columnar carriers actually store. A DOUBLE
-// column's integer tokens become doubles (coerce_row_doubles), as the columnar
-// decoder's DoubleBuilder holds them.
+// The declared numeric columns of a schema that a JSON decode must coerce so each
+// holds what its declared type holds, as the columnar decoder's builders do: a REAL
+// (FLOAT) value rounded to float precision (coerce_row_floats), a DOUBLE column's
+// integer tokens made doubles (coerce_row_doubles), and a BIGINT or INTEGER
+// column's whole doubles made integers (coerce_row_integers). Types are taken
+// through effective_type, matching what the columnar carriers store; TIMESTAMP,
+// DATE and the other types schema_columns carries as text are untouched.
+//
+// The evaluator picks integer or floating arithmetic by a value's kind, and SUM's
+// result follows the kinds it folds, so a decode that skips this computes
+// differently downstream: over {"x":9} in a DOUBLE column `x / 2` gives 4 rather
+// than 4.5, and over {"n":7.0} in a BIGINT column `n / 2` gives 3.5 where the plan
+// types it BIGINT.
+struct DeclaredNumericColumns {
+    std::vector<std::string> floats;
+    std::vector<std::string> doubles;
+    std::vector<std::string> integers;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return floats.empty() && doubles.empty() && integers.empty();
+    }
+    void coerce(Row& r) const {
+        coerce_row_floats(r, floats);
+        coerce_row_doubles(r, doubles);
+        coerce_row_integers(r, integers);
+    }
+};
+
+inline DeclaredNumericColumns declared_numeric_columns(const std::vector<RowColumn>& columns) {
+    DeclaredNumericColumns out;
+    for (const auto& c : columns) {
+        const auto eff = row_columnar_detail::effective_type(c.type);
+        if (eff->id() == arrow::Type::FLOAT) {
+            out.floats.push_back(c.name);
+        } else if (eff->id() == arrow::Type::DOUBLE) {
+            out.doubles.push_back(c.name);
+        } else if (eff->id() == arrow::Type::INT64 || eff->id() == arrow::Type::INT32) {
+            out.integers.push_back(c.name);
+        }
+    }
+    return out;
+}
+
+// `base` with each decoded row's declared numeric columns coerced as above. Every
+// JSON decode that builds rows for a declared schema goes through this, or through
+// DeclaredNumericColumns::coerce: both JSON-source bridges
+// (row_json_text_format_for_columns), the file source and the queryable-state
+// source. A coerced value serialises as it did, so encode is the base's.
+inline clink::TextFormat<Row> with_declared_numeric_columns(clink::TextFormat<Row> base,
+                                                            const std::vector<RowColumn>& columns) {
+    auto numerics = declared_numeric_columns(columns);
+    if (numerics.empty()) {
+        return base;
+    }
+    auto encode = std::move(base.encode);
+    return clink::TextFormat<Row>{
+        .decode = [decode = std::move(base.decode),
+                   numerics = std::move(numerics)](std::string_view line) -> std::optional<Row> {
+            auto r = decode(line);
+            if (r.has_value()) {
+                numerics.coerce(*r);
+            }
+            return r;
+        },
+        .encode = std::move(encode),
+    };
+}
+
+// The schema-aware NDJSON decoder for a declared column list: DECIMAL columns are
+// ingested exactly and quantised to the scale their declared type gives, and REAL
+// DOUBLE, BIGINT and INTEGER columns are coerced (with_declared_numeric_columns), so a caller only
+// has to hold the schema it already has.
 //
 // Both JSON-source bridges build their decoder from this - the plain
 // json_string_to_row and the columnar decoder's row fallback - so the two agree
@@ -505,34 +571,14 @@ inline clink::config::JsonValue read_cell(const std::shared_ptr<arrow::DataType>
 inline clink::TextFormat<Row> row_json_text_format_for_columns(
     const std::vector<RowColumn>& columns) {
     std::map<std::string, int> decimal_scales;
-    std::vector<std::string> float_columns;
-    std::vector<std::string> double_columns;
     for (const auto& c : columns) {
         const auto eff = row_columnar_detail::effective_type(c.type);
         if (eff->id() == arrow::Type::DECIMAL128) {
             decimal_scales[c.name] = static_cast<const arrow::Decimal128Type&>(*eff).scale();
-        } else if (eff->id() == arrow::Type::FLOAT) {
-            float_columns.push_back(c.name);
-        } else if (eff->id() == arrow::Type::DOUBLE) {
-            double_columns.push_back(c.name);
         }
     }
-    auto typed = row_json_text_format_typed(std::move(decimal_scales), std::move(float_columns));
-    if (double_columns.empty()) {
-        return typed;
-    }
-    return clink::TextFormat<Row>{
-        .decode = [typed, doubles = std::move(double_columns)](
-                      std::string_view line) -> std::optional<Row> {
-            auto r = typed.decode(line);
-            if (r.has_value()) {
-                coerce_row_doubles(*r, doubles);
-            }
-            return r;
-        },
-        // A coerced value serialises as the integer did, so encode is unchanged.
-        .encode = typed.encode,
-    };
+    return with_declared_numeric_columns(
+        row_json_text_format_with_decimals(std::move(decimal_scales)), columns);
 }
 
 // row_json_text_format_for_columns, restricted to a keep-list of column names.

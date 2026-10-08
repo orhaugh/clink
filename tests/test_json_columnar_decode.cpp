@@ -991,11 +991,10 @@ TEST(JsonColumnarDecode, DoubleColumnKeepsAnIntegerUpToTwoToTheFiftyThreeColumna
 }
 
 // A BIGINT or INTEGER column fed a numeral with a decimal point or an exponent
-// but an integral value, such as 5.0, 5e0 or -0.0. The row decode keeps every
-// such numeral a double, as simdjson classes it, and the evaluator chooses
-// integer or double arithmetic by the value's kind, so `v / 2` is 2.5 on the
-// row path where an integer cell would give 2, though both print 5. Both arms
-// take an integer token only and send the rest to the row decode. An integer
+// but an integral value, such as 5.0, 5e0 or -0.0. Both arms take an integer
+// token only and send the rest to the row decode, which makes such a numeral the
+// integer it names (coerce_row_integers), so the kinds compared below agree
+// either way; a fraction stays a double there, as before. An integer
 // token outside 64 bits fails the row decode's parse of the whole line, so it
 // has no faithful cell either; -9223372036854775809 reads through a double as
 // exactly -2^63, which a double fallback took for INT64_MIN. `force_dom` adds a

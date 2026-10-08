@@ -9,9 +9,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include <arrow/api.h>
@@ -394,4 +396,65 @@ TEST(SqlQueryableState, LiveWholeJobStateExportOverHttp) {
     fs::remove(in_path);
     fs::remove(out_path);
     fs::remove_all(ckpt_dir);
+}
+
+#include "clink/embed/embedded_engine.hpp"
+
+// The state-as-table source decodes a declared DOUBLE, REAL or BIGINT column as
+// the JSON bridges do. A served value is JSON, where a whole double is a bare
+// integer (12), so a DOUBLE column read back an integer and `total / 8` gave 1
+// where it gives 1.5, and a REAL column kept a precision its declared width
+// cannot hold. A whole numeral such as 7.0 in a BIGINT column becomes the
+// integer it names, so `n / 2` is 3, as the plan types it. A stand-in for the
+// coordinator's scan route serves the entries.
+TEST(SqlQueryableState, DeclaredRealColumnsDecodeAsTheJsonBridgesDo) {
+    clink::http::HttpServer scan_route;
+    scan_route.get("/api/v1/queryable_state/*", [](const clink::http::HttpRequest&) {
+        clink::http::HttpResponse resp;
+        resp.body = R"({"entries":[)"
+                    R"({"key":"alice","value":{"usr":"alice","total":12,"r":0.1,"n":7.0}},)"
+                    R"({"key":"bob","value":{"usr":"bob","total":-3,"r":2,"n":5}}],)"
+                    R"("truncated":false})";
+        return resp;
+    });
+    const auto port = scan_route.start("127.0.0.1", 0);
+
+    const auto out_path = fs::temp_directory_path() /
+                          ("clink_qs_reals_out_" + std::to_string(::getpid()) + ".ndjson");
+    fs::remove(out_path);
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    const std::string script =
+        "CREATE TABLE live (usr TEXT, total DOUBLE, r REAL, n BIGINT) "
+        "WITH (connector='queryable_state', format='json', coordinator_host='127.0.0.1', "
+        "coordinator_port='" +
+        std::to_string(port) +
+        "', job_id='1');"
+        "CREATE TABLE snap (usr TEXT, t8 DOUBLE, r REAL, nh BIGINT) "
+        "WITH (connector='file', format='json', path='" +
+        out_path.string() +
+        "');"
+        "INSERT INTO snap SELECT usr, total / 8 AS t8, r, n / 2 AS nh FROM live";
+    ASSERT_EQ(engine.execute_script(script), 0) << err.str();
+    ASSERT_TRUE(engine.await_all()) << err.str();
+    scan_route.stop();
+
+    std::multiset<std::string> got;
+    {
+        std::ifstream in(out_path);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                got.insert(line);
+            }
+        }
+    }
+    const std::multiset<std::string> want = {
+        R"({"nh":3,"r":0.10000000149011612,"t8":1.5,"usr":"alice"})",
+        R"({"nh":2,"r":2,"t8":-0.375,"usr":"bob"})",
+    };
+    EXPECT_EQ(got, want);
+    fs::remove(out_path);
 }

@@ -72,7 +72,12 @@ subtask role), `slot` (default `agg`), `limit` (default 100000, the
 route's cap), `batch_size` (default 256). The snapshot is taken once, at
 the first produce; `truncated` results are cut at `limit`. Delivery is a
 bounded read of a moving target - consistent per subtask scan, not a
-global point-in-time snapshot.
+global point-in-time snapshot. Declared `DOUBLE`, `REAL`, `BIGINT` and
+`INTEGER` columns decode as they do off the JSON bridges: a served value is
+JSON, where a whole double is a bare integer such as `12`, so a `DOUBLE`
+column turns it back into a double, a `REAL` value is rounded to float
+precision, and a whole numeral in a `BIGINT` or `INTEGER` column becomes an
+integer.
 
 ## `collect` (embedded only)
 

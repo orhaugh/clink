@@ -56,6 +56,8 @@ Options are read from `BuildContext` params in `src/cluster/built_in_factories.c
 | `mode` | `file` sink | No | append | `mode='upsert'` nets a changelog by the table's PRIMARY KEY. |
 | `delivery_guarantee` | `file` / `parquet` sink | No | at-least-once | `delivery_guarantee='exactly_once'` selects the 2PC sink. |
 
+The `file` JSON row source decodes each line against the table's declared columns, as the Kafka JSON bridge does: a `DECIMAL` value is carried exactly at the column's scale, a `REAL` value is rounded to float precision, an integer token in a `DOUBLE` column becomes a double, so `x / 2` over `{"x":9}` is 4.5, and a whole numeral such as `7.0` in a `BIGINT` or `INTEGER` column becomes an integer, so `n / 2` over `{"n":7.0}` is 3, as the column's type says. A directory `path` decodes the same way.
+
 The `parquet` row source derives its Arrow schema from the table's declared columns (`schema_columns`), so no separate schema option is needed. It resolves those columns by name, with the same type, in any file: one clink wrote, or one another tool wrote (pyarrow, DuckDB, Spark, ClickHouse). A file from another tool carries none of clink's own columns, and its rows read with no event time; a declared column the file lacks, or holds as another type, is refused at open, naming it.
 
 ## SQL usage

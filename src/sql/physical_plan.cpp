@@ -1079,8 +1079,10 @@ std::string compile_node(const LogicalPlan& node,
             if (!dec_csv.empty())
                 op.params["decimal_columns"] = std::move(dec_csv);
             // Typed-columnar connectors (parquet) read the full column
-            // schema from here to build their Arrow batcher. Other Row
-            // connectors ignore it.
+            // schema from here to build their Arrow batcher, and the file and
+            // queryable-state JSON sources to coerce declared REAL, DOUBLE,
+            // BIGINT and INTEGER columns (with_declared_numeric_columns). Other
+            // Row connectors ignore it.
             op.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
         }
         if (!scan.projected_columns().empty()) {
