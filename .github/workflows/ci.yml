@@ -498,16 +498,16 @@ jobs:
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04
-    # Every model but MC_RecoverableSmall, which runs in the job below: about
-    # 42 minutes on the four-core runner, MC_KafkaLiveness and MC_KafkaSmall
-    # some 19 minutes each, until a Kafka sink's finish and its confirmation
-    # became separate steps (SinkFinish): MC_KafkaSmall grew from 48.9M to
-    # 78.8M states and MC_KafkaLiveness from 6.1M to 7.4M, an estimated 58
-    # minutes in all, scaled from the state counts. They run one at a time
-    # with every worker, not several at a time with one each: TLC's workers
-    # are worth more to the long ones than concurrency is to the short ones
-    # (measured: a model that takes 221 s on all workers takes 22 min on one).
-    # The mutants are the opposite case and have their own job.
+    # Every model but MC_RecoverableSmall and MC_KafkaSmall, which run in the
+    # jobs below. All but MC_RecoverableSmall took 65 of this job's 75 minutes
+    # once a Kafka sink's finish and its confirmation became separate steps
+    # (SinkFinish), MC_KafkaSmall growing from 48.9M to 78.8M states and
+    # MC_KafkaLiveness from 6.1M to 7.4M, so MC_KafkaSmall has a runner of its
+    # own too. They run one at a time with every worker, not several at a
+    # time with one each: TLC's workers are worth more to the long ones than
+    # concurrency is to the short ones (measured: a model that takes 221 s on
+    # all workers takes 22 min on one). The mutants are the opposite case and
+    # have their own job.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -520,7 +520,7 @@ jobs:
         with:
           path: ~/.clink-deps/formal-tools
           key: tla-tools-${{ hashFiles('formal/tools.env') }}
-      - name: Every model but MC_RecoverableSmall proves its invariants
+      - name: Every model but MC_RecoverableSmall and MC_KafkaSmall proves its invariants
         # formal/ExactlyOnce.tla is the exactly-once protocol as a checkable
         # model (design record 012). TLC enumerates every interleaving of
         # protocol steps and faults within each configuration's bounds and
@@ -529,10 +529,10 @@ jobs:
         # refused unless their SHA-256 matches formal/tools.env. No C++
         # toolchain: this runs on the bare runner beside the manifest gates.
         # A model added under formal/models/ runs here unless it is excluded
-        # by name like MC_RecoverableSmall.
+        # by name like MC_RecoverableSmall and MC_KafkaSmall.
         run: |
           set -euo pipefail
-          models=$(cd formal/models && ls MC_*.cfg | sed 's/\.cfg$//' | grep -vx 'MC_RecoverableSmall')
+          models=$(cd formal/models && ls MC_*.cfg | sed 's/\.cfg$//' | grep -vx -e 'MC_RecoverableSmall' -e 'MC_KafkaSmall')
           # shellcheck disable=SC2086 # one argument per model, on purpose
           TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh $models
       - name: The protocol trace vocabulary agrees with the engine and the trace module
@@ -574,6 +574,28 @@ jobs:
           key: tla-tools-${{ hashFiles('formal/tools.env') }}
       - name: MC_RecoverableSmall proves its invariants
         run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh MC_RecoverableSmall
+
+  formal-kafka-small:
+    name: The Kafka-small model of the exactly-once specification model-checks
+    runs-on: ubuntu-24.04
+    # MC_KafkaSmall on its own runner with every worker, beside the other
+    # models: 78.8M states since a Kafka sink's finish and its confirmation
+    # became separate steps (SinkFinish), which left the shared models job at
+    # 65 of its 75 minutes.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Cache the pinned TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps/formal-tools
+          key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - name: MC_KafkaSmall proves its invariants
+        run: TLC_WORKERS=auto TLC_HEAP=6g ./scripts/formal-check.sh MC_KafkaSmall
 
   formal-mutants:
     name: Every mutant of the exactly-once specification is refuted
