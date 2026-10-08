@@ -880,8 +880,11 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
                 return JsonValue{clink::config::dec_to_double(*d)};  // #56: lossy, intended
             return value_expr_detail::null_value();
         }
+        // An integer becomes a double here, not later: arithmetic picks integer
+        // or floating by the runtime kind, so passing an integer through made
+        // CAST(n AS DOUBLE) / 4 integer division.
         if (args[0].is_number())
-            return args[0];
+            return JsonValue{args[0].as_number()};
         if (args[0].is_string()) {
             try {
                 return JsonValue{std::stod(args[0].as_string())};

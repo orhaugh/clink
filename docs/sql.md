@@ -321,8 +321,27 @@ JSON paths support `$`, `.key` and `[index]`.
 
 ## Aggregating
 
-`GROUP BY` produces one row per key. Every non-aggregate item in the `SELECT` must
-be a group key (there is no `SELECT *` with `GROUP BY`).
+`GROUP BY` produces one row per key. A `SELECT` item may be a group key, an
+aggregate, or any expression over them: arithmetic, `CASE`, casts and scalar
+functions of aggregates, aggregates of different columns combined, and, in a
+windowed `GROUP BY`, `window_start` and `window_end`. A column that is neither
+grouped nor inside an aggregate is refused by name, and there is no `SELECT *`
+with `GROUP BY`.
+
+```sql
+SELECT k, SUM(n) / 8 AS eighths,
+       CAST(SUM(n) AS DOUBLE) / COUNT(*) AS mean,
+       CASE WHEN COUNT(*) > 1 THEN 'many' ELSE 'one' END AS size,
+       window_end - window_start AS width
+FROM events
+GROUP BY k, TUMBLE(ts, INTERVAL '1' SECOND);
+```
+
+When a `SELECT` item is an expression, each distinct aggregate call is computed
+once however many expressions use it.
+An aggregate's argument must be a column reference (`SUM(price * qty)` is
+refused; compute the product in a derived table first), and a window function
+(`... OVER (...)`) cannot sit inside an expression of a grouped `SELECT`.
 
 | Aggregate | Notes |
 |---|---|
@@ -334,8 +353,13 @@ be a group key (there is no `SELECT *` with `GROUP BY`).
 | `ARRAY_AGG(x)` / `COLLECT` | collect values into an array |
 | `PERCENTILE(x, f)`, `APPROX_PERCENTILE(x, f)` | fraction `f` in `[0,1]` |
 
-`HAVING` filters grouped results and requires a `GROUP BY`. `DISTINCT` inside an
-aggregate is supported only for `COUNT`, `STRING_AGG` and `ARRAY_AGG`.
+`HAVING` filters grouped results and requires a `GROUP BY`. It takes the same
+expressions as the `SELECT` list, may name an aggregate the `SELECT` does not
+compute (`HAVING COUNT(*) > 1` with no `COUNT(*)` selected), and may use an
+aggregate item's alias. Its top level must be a predicate (a comparison,
+`AND` / `OR` / `NOT`, `IS [NOT] NULL`, `LIKE`, `BETWEEN` or `IN`), as in `WHERE`.
+`DISTINCT` inside an aggregate is supported only for `COUNT`, `STRING_AGG` and
+`ARRAY_AGG`.
 
 ```sql
 SELECT url, COUNT(*) AS n, COUNT(DISTINCT user_id) AS uniques
@@ -611,9 +635,9 @@ Being explicit so you are not surprised at compile time:
 - **No state TTL** on unbounded joins, `DISTINCT`, or unbounded `GROUP BY` in this
   version.
 - **Silently accepted, then ignored:** `WITH CHECK OPTION` on a view; the options
-  to `EXPLAIN ANALYZE` / `EXPLAIN VERBOSE` (no execution or timing); `HAVING`
-  without `GROUP BY`. (Inline `PRIMARY KEY` is honoured; every other column
-  constraint is rejected, never ignored.)
+  to `EXPLAIN ANALYZE` / `EXPLAIN VERBOSE` (no execution or timing). (Inline
+  `PRIMARY KEY` is honoured; every other column constraint is rejected, never
+  ignored. `HAVING` without `GROUP BY` is refused.)
 
 ## See also
 

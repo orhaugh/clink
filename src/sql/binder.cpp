@@ -3,10 +3,15 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <functional>
+#include <map>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 #include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
@@ -1538,195 +1543,126 @@ AggregateExtraction extract_aggregate(const ast::Expression& expr,
     return out;
 }
 
-// Deep-copy an Expression. Variant arms holding unique_ptr
-// need allocation; literals and ColumnRef copy by value.
-ast::Expression clone_expression(const ast::Expression& expr);
+// Rebuild `expr`, offering every node to `leaf` first: a node `leaf` returns a
+// replacement for is replaced whole (its children are not visited), any other
+// node is copied with its children rebuilt the same way. Every arm of
+// ast::Expression is covered, so a rewrite never drops a field a node carries
+// (a CAST's precision and scale, an aggregate's DISTINCT, a ROW field's name).
+// The two arms that cannot be copied - a subquery and a window function's OVER
+// clause - refuse, so a caller that can place them handles them in `leaf`.
+using ExprLeafRewrite = std::function<std::optional<ast::Expression>(const ast::Expression&)>;
 
-ast::Expression clone_expression(const ast::Expression& expr) {
-    if (std::holds_alternative<ast::ColumnRef>(expr))
-        return std::get<ast::ColumnRef>(expr);
-    if (std::holds_alternative<ast::IntLiteral>(expr))
-        return std::get<ast::IntLiteral>(expr);
-    if (std::holds_alternative<ast::FloatLiteral>(expr))
-        return std::get<ast::FloatLiteral>(expr);
-    if (std::holds_alternative<ast::StringLiteral>(expr))
-        return std::get<ast::StringLiteral>(expr);
-    if (std::holds_alternative<ast::BoolLiteral>(expr))
-        return std::get<ast::BoolLiteral>(expr);
-    if (std::holds_alternative<ast::NullLiteral>(expr))
-        return std::get<ast::NullLiteral>(expr);
-    if (std::holds_alternative<std::unique_ptr<ast::BinaryOp>>(expr)) {
-        const auto& b = *std::get<std::unique_ptr<ast::BinaryOp>>(expr);
-        auto nb = std::make_unique<ast::BinaryOp>();
-        nb->op = b.op;
-        nb->loc = b.loc;
-        nb->left = clone_expression(b.left);
-        nb->right = clone_expression(b.right);
-        return ast::Expression{std::move(nb)};
+ast::Expression rewrite_expression(const ast::Expression& expr, const ExprLeafRewrite& leaf) {
+    if (auto replaced = leaf(expr)) {
+        return std::move(*replaced);
     }
-    if (std::holds_alternative<std::unique_ptr<ast::LogicalOp>>(expr)) {
-        const auto& l = *std::get<std::unique_ptr<ast::LogicalOp>>(expr);
-        auto nl = std::make_unique<ast::LogicalOp>();
-        nl->op = l.op;
-        nl->loc = l.loc;
-        for (const auto& a : l.args)
-            nl->args.push_back(clone_expression(a));
-        return ast::Expression{std::move(nl)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::NotOp>>(expr)) {
-        const auto& n = *std::get<std::unique_ptr<ast::NotOp>>(expr);
-        auto nn = std::make_unique<ast::NotOp>();
-        nn->loc = n.loc;
-        nn->arg = clone_expression(n.arg);
-        return ast::Expression{std::move(nn)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::IsNullOp>>(expr)) {
-        const auto& n = *std::get<std::unique_ptr<ast::IsNullOp>>(expr);
-        auto nn = std::make_unique<ast::IsNullOp>();
-        nn->loc = n.loc;
-        nn->negated = n.negated;
-        nn->arg = clone_expression(n.arg);
-        return ast::Expression{std::move(nn)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::ArithOp>>(expr)) {
-        const auto& a = *std::get<std::unique_ptr<ast::ArithOp>>(expr);
-        auto na = std::make_unique<ast::ArithOp>();
-        na->op = a.op;
-        na->loc = a.loc;
-        for (const auto& sub : a.args)
-            na->args.push_back(clone_expression(sub));
-        return ast::Expression{std::move(na)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::FunctionCall>>(expr)) {
-        const auto& f = *std::get<std::unique_ptr<ast::FunctionCall>>(expr);
-        auto nf = std::make_unique<ast::FunctionCall>();
-        nf->name = f.name;
-        nf->loc = f.loc;
-        for (const auto& sub : f.args)
-            nf->args.push_back(clone_expression(sub));
-        return ast::Expression{std::move(nf)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::CastOp>>(expr)) {
-        const auto& c = *std::get<std::unique_ptr<ast::CastOp>>(expr);
-        auto nc = std::make_unique<ast::CastOp>();
-        nc->target_type = c.target_type;
-        nc->loc = c.loc;
-        nc->arg = clone_expression(c.arg);
-        return ast::Expression{std::move(nc)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::CaseExpr>>(expr)) {
-        const auto& ce = *std::get<std::unique_ptr<ast::CaseExpr>>(expr);
-        auto nce = std::make_unique<ast::CaseExpr>();
-        nce->loc = ce.loc;
-        for (const auto& br : ce.branches) {
-            ast::CaseBranch nb;
-            nb.loc = br.loc;
-            nb.when_expr = clone_expression(br.when_expr);
-            nb.then_expr = clone_expression(br.then_expr);
-            nce->branches.push_back(std::move(nb));
-        }
-        if (ce.else_expr.has_value())
-            nce->else_expr = clone_expression(*ce.else_expr);
-        return ast::Expression{std::move(nce)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::ArrayLiteral>>(expr)) {
-        const auto& al = *std::get<std::unique_ptr<ast::ArrayLiteral>>(expr);
-        auto na = std::make_unique<ast::ArrayLiteral>();
-        na->loc = al.loc;
-        for (const auto& el : al.elements)
-            na->elements.push_back(clone_expression(el));
-        return ast::Expression{std::move(na)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::Subscript>>(expr)) {
-        const auto& sub = *std::get<std::unique_ptr<ast::Subscript>>(expr);
-        auto ns = std::make_unique<ast::Subscript>();
-        ns->loc = sub.loc;
-        ns->base = clone_expression(sub.base);
-        ns->index = clone_expression(sub.index);
-        return ast::Expression{std::move(ns)};
-    }
-    bind_error("clone_expression: unsupported variant arm", 0);
-}
-
-// Rewrite aggregate FunctionCalls in a HAVING expression
-// into ColumnRef(output_name) so lower_predicate can resolve them
-// against the synthetic post-aggregate schema. Errors when an
-// aggregate FunctionCall has no matching slot in `aggregates`.
-ast::Expression rewrite_aggregates_for_having(const ast::Expression& expr,
-                                              const std::vector<AggregateOutput>& aggregates,
-                                              const TableDef& source,
-                                              const std::string& source_alias) {
-    auto rewrite = [&](const ast::Expression& sub) {
-        return rewrite_aggregates_for_having(sub, aggregates, source, source_alias);
-    };
-    if (std::holds_alternative<std::unique_ptr<ast::FunctionCall>>(expr)) {
-        auto extracted = extract_aggregate(expr, source, source_alias);
-        if (extracted.found) {
-            for (const auto& a : aggregates) {
-                if (a.agg_fn == extracted.fn && a.input_column == extracted.input_column) {
-                    ast::ColumnRef cr;
-                    cr.parts = {a.output_name};
-                    cr.loc = std::get<std::unique_ptr<ast::FunctionCall>>(expr)->loc;
-                    return ast::Expression{cr};
+    auto rewrite = [&leaf](const ast::Expression& sub) { return rewrite_expression(sub, leaf); };
+    return std::visit(
+        [&](const auto& node) -> ast::Expression {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ast::ColumnRef> || std::is_same_v<T, ast::IntLiteral> ||
+                          std::is_same_v<T, ast::FloatLiteral> ||
+                          std::is_same_v<T, ast::StringLiteral> ||
+                          std::is_same_v<T, ast::BoolLiteral> ||
+                          std::is_same_v<T, ast::NullLiteral>) {
+                return node;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::BinaryOp>>) {
+                auto n = std::make_unique<ast::BinaryOp>();
+                n->op = node->op;
+                n->loc = node->loc;
+                n->left = rewrite(node->left);
+                n->right = rewrite(node->right);
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::LogicalOp>>) {
+                auto n = std::make_unique<ast::LogicalOp>();
+                n->op = node->op;
+                n->loc = node->loc;
+                for (const auto& a : node->args)
+                    n->args.push_back(rewrite(a));
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::NotOp>>) {
+                auto n = std::make_unique<ast::NotOp>();
+                n->loc = node->loc;
+                n->arg = rewrite(node->arg);
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::IsNullOp>>) {
+                auto n = std::make_unique<ast::IsNullOp>();
+                n->loc = node->loc;
+                n->negated = node->negated;
+                n->arg = rewrite(node->arg);
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::ArithOp>>) {
+                auto n = std::make_unique<ast::ArithOp>();
+                n->op = node->op;
+                n->loc = node->loc;
+                for (const auto& a : node->args)
+                    n->args.push_back(rewrite(a));
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::FunctionCall>>) {
+                if (node->over_clause != nullptr) {
+                    bind_error("window function " + node->name +
+                                   "() OVER (...) is not supported in this position",
+                               node->loc.pos);
                 }
+                auto n = std::make_unique<ast::FunctionCall>();
+                n->name = node->name;
+                n->loc = node->loc;
+                n->agg_distinct = node->agg_distinct;
+                for (const auto& a : node->args)
+                    n->args.push_back(rewrite(a));
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::CastOp>>) {
+                auto n = std::make_unique<ast::CastOp>();
+                n->target_type = node->target_type;
+                n->typmods = node->typmods;
+                n->loc = node->loc;
+                n->arg = rewrite(node->arg);
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::CaseExpr>>) {
+                auto n = std::make_unique<ast::CaseExpr>();
+                n->loc = node->loc;
+                for (const auto& br : node->branches) {
+                    ast::CaseBranch nb;
+                    nb.loc = br.loc;
+                    nb.when_expr = rewrite(br.when_expr);
+                    nb.then_expr = rewrite(br.then_expr);
+                    n->branches.push_back(std::move(nb));
+                }
+                if (node->else_expr.has_value())
+                    n->else_expr = rewrite(*node->else_expr);
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::SubLink>>) {
+                bind_error("a subquery is not supported in this position", node->loc.pos);
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::ArrayLiteral>>) {
+                auto n = std::make_unique<ast::ArrayLiteral>();
+                n->loc = node->loc;
+                for (const auto& el : node->elements)
+                    n->elements.push_back(rewrite(el));
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::Subscript>>) {
+                auto n = std::make_unique<ast::Subscript>();
+                n->loc = node->loc;
+                n->base = rewrite(node->base);
+                n->index = rewrite(node->index);
+                return n;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ast::RowConstructor>>) {
+                auto n = std::make_unique<ast::RowConstructor>();
+                n->loc = node->loc;
+                n->field_names = node->field_names;
+                for (const auto& f : node->fields)
+                    n->fields.push_back(rewrite(f));
+                return n;
+            } else {
+                static_assert(std::is_same_v<T, std::unique_ptr<ast::FieldAccess>>,
+                              "rewrite_expression: an ast::Expression arm is not handled");
+                auto n = std::make_unique<ast::FieldAccess>();
+                n->loc = node->loc;
+                n->field = node->field;
+                n->base = rewrite(node->base);
+                return n;
             }
-            bind_error(
-                "HAVING references " + extracted.fn +
-                    " but no matching aggregate appears in SELECT (use an alias to reference it)",
-                std::get<std::unique_ptr<ast::FunctionCall>>(expr)->loc.pos);
-        }
-        // Non-aggregate FunctionCall: clone with args rewritten.
-        const auto& f = *std::get<std::unique_ptr<ast::FunctionCall>>(expr);
-        auto nf = std::make_unique<ast::FunctionCall>();
-        nf->name = f.name;
-        nf->loc = f.loc;
-        for (const auto& sub : f.args)
-            nf->args.push_back(rewrite(sub));
-        return ast::Expression{std::move(nf)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::BinaryOp>>(expr)) {
-        const auto& b = *std::get<std::unique_ptr<ast::BinaryOp>>(expr);
-        auto nb = std::make_unique<ast::BinaryOp>();
-        nb->op = b.op;
-        nb->loc = b.loc;
-        nb->left = rewrite(b.left);
-        nb->right = rewrite(b.right);
-        return ast::Expression{std::move(nb)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::LogicalOp>>(expr)) {
-        const auto& l = *std::get<std::unique_ptr<ast::LogicalOp>>(expr);
-        auto nl = std::make_unique<ast::LogicalOp>();
-        nl->op = l.op;
-        nl->loc = l.loc;
-        for (const auto& a : l.args)
-            nl->args.push_back(rewrite(a));
-        return ast::Expression{std::move(nl)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::NotOp>>(expr)) {
-        const auto& n = *std::get<std::unique_ptr<ast::NotOp>>(expr);
-        auto nn = std::make_unique<ast::NotOp>();
-        nn->loc = n.loc;
-        nn->arg = rewrite(n.arg);
-        return ast::Expression{std::move(nn)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::IsNullOp>>(expr)) {
-        const auto& n = *std::get<std::unique_ptr<ast::IsNullOp>>(expr);
-        auto nn = std::make_unique<ast::IsNullOp>();
-        nn->loc = n.loc;
-        nn->negated = n.negated;
-        nn->arg = rewrite(n.arg);
-        return ast::Expression{std::move(nn)};
-    }
-    if (std::holds_alternative<std::unique_ptr<ast::ArithOp>>(expr)) {
-        const auto& a = *std::get<std::unique_ptr<ast::ArithOp>>(expr);
-        auto na = std::make_unique<ast::ArithOp>();
-        na->op = a.op;
-        na->loc = a.loc;
-        for (const auto& sub : a.args)
-            na->args.push_back(rewrite(sub));
-        return ast::Expression{std::move(na)};
-    }
-    return clone_expression(expr);
+        },
+        expr);
 }
 
 std::shared_ptr<arrow::DataType> aggregate_output_type(const std::string& fn,
@@ -1774,6 +1710,323 @@ std::shared_ptr<arrow::DataType> aggregate_output_type(const std::string& fn,
         return rt;
     }
     return arrow::utf8();
+}
+
+// --- Expressions over aggregates in a grouped SELECT ----------------------
+
+// Two aggregate calls share one accumulator only when every field that changes
+// the result matches: COUNT(DISTINCT v) is not COUNT(v), and STRING_AGG with
+// another separator is another aggregate.
+bool same_aggregate(const AggregateOutput& a, const AggregateExtraction& e) {
+    return a.agg_fn == e.fn && a.input_column == e.input_column && a.distinct == e.distinct &&
+           a.separator == e.separator && a.percentile == e.percentile;
+}
+
+// The output name of an unaliased aggregate SELECT item. A multi-argument
+// UDAF's input_column is comma-joined; keep the name a plain identifier.
+std::string default_aggregate_name(const std::string& fn, const std::string& input_column) {
+    std::string name = fn + (input_column.empty() ? std::string{"_star"} : "_" + input_column);
+    std::replace(name.begin(), name.end(), ',', '_');
+    return name;
+}
+
+// True when `expr` calls an aggregate anywhere below it (a window function's
+// aggregate does not count: it is not computed per group).
+bool contains_aggregate_call(const ast::Expression& expr) {
+    bool found = false;
+    (void)rewrite_expression(
+        expr, [&found](const ast::Expression& e) -> std::optional<ast::Expression> {
+            if (std::holds_alternative<std::unique_ptr<ast::FunctionCall>>(e)) {
+                const auto& fc = *std::get<std::unique_ptr<ast::FunctionCall>>(e);
+                if (fc.over_clause != nullptr) {
+                    return ast::Expression{ast::NullLiteral{}};
+                }
+                if (is_aggregate_fn_name(fc.name)) {
+                    found = true;
+                    return ast::Expression{ast::NullLiteral{}};
+                }
+            } else if (std::holds_alternative<std::unique_ptr<ast::SubLink>>(e)) {
+                return ast::Expression{ast::NullLiteral{}};
+            }
+            return std::nullopt;
+        });
+    return found;
+}
+
+// Where the expressions of one grouped SELECT (its items and its HAVING)
+// resolve after the aggregate: an aggregate call becomes a reference to the
+// aggregate's output column, a group key or window bound a reference to the
+// name it is emitted under, and any other column is refused by name.
+struct GroupedScope {
+    const TableDef& source;
+    const std::string& source_alias;
+    const std::vector<std::string>& group_keys;
+    // The name each group key carries in the aggregate's output, parallel to
+    // group_keys.
+    std::vector<std::string> key_names{};
+    bool windowed = false;
+    // The output names of window_start / window_end, empty when the aggregate
+    // does not emit that bound.
+    std::string window_start_name{};
+    std::string window_end_name{};
+    std::vector<AggregateOutput>* aggregates = nullptr;
+    // When true an aggregate call the list does not hold yet is added to it
+    // under a hidden name. When false (an aggregate whose output is the SELECT
+    // list as written) such a call, or a bound the aggregate does not emit,
+    // sets needs_post_aggregate instead.
+    bool may_add = false;
+    bool needs_post_aggregate = false;
+    // HAVING only: an aggregate SELECT item's output name, which HAVING may use
+    // in place of the call (`SELECT COUNT(*) AS n ... HAVING n > 1`).
+    std::map<std::string, std::string> aggregate_aliases{};
+};
+
+ast::Expression column_ref_named(const std::string& name, const ast::Loc& loc) {
+    ast::ColumnRef cr;
+    cr.parts = {name};
+    cr.loc = loc;
+    return ast::Expression{std::move(cr)};
+}
+
+std::string hidden_aggregate_name(const GroupedScope& s) {
+    for (std::size_t i = s.aggregates->size();; ++i) {
+        std::string name = "__agg" + std::to_string(i);
+        bool taken = source_has_column(s.source, name);
+        for (const auto& a : *s.aggregates) {
+            taken = taken || a.output_name == name;
+        }
+        for (const auto& k : s.key_names) {
+            taken = taken || k == name;
+        }
+        if (!taken) {
+            return name;
+        }
+    }
+}
+
+std::optional<ast::Expression> resolve_grouped_node(const ast::Expression& e, GroupedScope& s) {
+    if (std::holds_alternative<std::unique_ptr<ast::FunctionCall>>(e)) {
+        const auto& fc = *std::get<std::unique_ptr<ast::FunctionCall>>(e);
+        if (fc.over_clause != nullptr) {
+            bind_error("window function " + fc.name +
+                           "() OVER (...) cannot be used inside an expression of a grouped "
+                           "SELECT; compute it in a query over the grouped result",
+                       fc.loc.pos);
+        }
+        if (!is_aggregate_fn_name(fc.name)) {
+            return std::nullopt;
+        }
+        auto agg = extract_aggregate(e, s.source, s.source_alias);
+        for (const auto& a : *s.aggregates) {
+            if (same_aggregate(a, agg)) {
+                return column_ref_named(a.output_name, fc.loc);
+            }
+        }
+        if (!s.may_add) {
+            s.needs_post_aggregate = true;
+            return ast::Expression{ast::NullLiteral{}};
+        }
+        AggregateOutput a;
+        a.output_name = hidden_aggregate_name(s);
+        a.type = aggregate_output_type(agg.fn, s.source, agg.input_column);
+        a.agg_fn = std::move(agg.fn);
+        a.input_column = std::move(agg.input_column);
+        a.distinct = agg.distinct;
+        a.separator = std::move(agg.separator);
+        a.percentile = agg.percentile;
+        s.aggregates->push_back(std::move(a));
+        return column_ref_named(s.aggregates->back().output_name, fc.loc);
+    }
+    if (std::holds_alternative<std::unique_ptr<ast::SubLink>>(e)) {
+        bind_error(
+            "a subquery cannot be used inside an expression of a grouped SELECT or its HAVING",
+            std::get<std::unique_ptr<ast::SubLink>>(e)->loc.pos);
+    }
+    if (!std::holds_alternative<ast::ColumnRef>(e)) {
+        return std::nullopt;
+    }
+    const auto& cr = std::get<ast::ColumnRef>(e);
+    if (cr.is_star || cr.parts.empty()) {
+        bind_error("* cannot be used inside an expression of a grouped SELECT", cr.loc.pos);
+    }
+    if (is_synthetic_window_bound(cr, s.source)) {
+        if (!s.windowed) {
+            bind_error("column " + cr.parts[0] +
+                           " is only available with a window TVF in GROUP BY "
+                           "(TUMBLE / HOP / SESSION / CUMULATE)",
+                       cr.loc.pos);
+        }
+        const auto& name = cr.parts[0] == "window_end" ? s.window_end_name : s.window_start_name;
+        if (name.empty()) {
+            s.needs_post_aggregate = true;
+            return ast::Expression{ast::NullLiteral{}};
+        }
+        return column_ref_named(name, cr.loc);
+    }
+    if (cr.parts.size() == 1) {
+        for (std::size_t i = 0; i < s.group_keys.size(); ++i) {
+            if (s.group_keys[i] == cr.parts[0]) {
+                return column_ref_named(s.key_names[i], cr.loc);
+            }
+        }
+        if (auto it = s.aggregate_aliases.find(cr.parts[0]); it != s.aggregate_aliases.end()) {
+            return column_ref_named(it->second, cr.loc);
+        }
+    }
+    const std::string name = resolve_value_column_name(cr, s.source, s.source_alias);
+    for (std::size_t i = 0; i < s.group_keys.size(); ++i) {
+        if (s.group_keys[i] == name) {
+            return column_ref_named(s.key_names[i], cr.loc);
+        }
+    }
+    bind_error(
+        "column '" + name + "' must appear in GROUP BY or be used inside an aggregate function",
+        cr.loc.pos);
+}
+
+// A SESSION window merges sessions, so a UDAF used there must supply a merge
+// closure. Reject a merge-less UDAF at bind time with a clear error rather than
+// letting it fail mid-merge at runtime (the runtime keeps a defensive throw).
+void check_session_udafs_merge(const std::optional<WindowSpec>& window,
+                               const std::vector<AggregateOutput>& aggregates,
+                               int pos) {
+    if (!window.has_value() || window->kind != WindowSpec::Kind::Session) {
+        return;
+    }
+    for (const auto& a : aggregates) {
+        if (is_registered_udaf_name(a.agg_fn)) {
+            auto e = AggFunctionRegistry::global().lookup(a.agg_fn);
+            if (e && !e->has_merge()) {
+                bind_error("UDAF '" + a.agg_fn +
+                               "' has no merge closure and cannot be used in a SESSION window; "
+                               "register a merge closure or use TUMBLE/HOP/CUMULATE/GROUP BY",
+                           pos);
+            }
+        }
+    }
+}
+
+// A grouped SELECT whose items are expressions (over aggregates, group keys or
+// window bounds), or whose HAVING needs an aggregate or window bound the SELECT
+// list does not emit. The aggregate emits every group key under its own name,
+// both window bounds when windowed, and one column per distinct aggregate call;
+// HAVING filters that row and a projection evaluates the SELECT list over it.
+// This is the plan `SELECT ... FROM (SELECT keys, aggregates ... GROUP BY ...)`
+// binds to, so the runtime meets nothing a derived table does not already
+// give it.
+std::unique_ptr<LogicalPlan> bind_grouped_expressions(const ast::SelectStmt& stmt,
+                                                      const TableDef& source,
+                                                      const std::string& alias,
+                                                      std::unique_ptr<LogicalPlan> input,
+                                                      std::optional<WindowSpec> window,
+                                                      const std::vector<std::string>& group_keys) {
+    std::vector<AggregateOutput> aggregates;
+    GroupedScope scope{source, alias, group_keys};
+    scope.key_names = group_keys;
+    scope.windowed = window.has_value();
+    if (window.has_value()) {
+        scope.window_start_name = "window_start";
+        scope.window_end_name = "window_end";
+    }
+    scope.aggregates = &aggregates;
+    scope.may_add = true;
+    auto leaf = [&scope](const ast::Expression& e) { return resolve_grouped_node(e, scope); };
+
+    std::vector<ast::SelectItem> items;
+    items.reserve(stmt.target_list.size());
+    // (alias, aggregate slot) for each item that is one aggregate call. They
+    // become names HAVING may use only once every SELECT item is rewritten, so
+    // a bare name in another item still resolves against the source and an
+    // ungrouped column is refused whatever the item order.
+    std::vector<std::pair<std::string, std::string>> item_aggregate_aliases;
+    for (const auto& item : stmt.target_list) {
+        ast::SelectItem out;
+        out.loc = item.loc;
+        out.alias = item.alias;
+        out.expr = rewrite_expression(item.expr, leaf);
+        // An item that is one aggregate call keeps the output name it has always
+        // had.
+        if (std::holds_alternative<std::unique_ptr<ast::FunctionCall>>(item.expr) &&
+            std::holds_alternative<ast::ColumnRef>(out.expr)) {
+            const std::string slot = std::get<ast::ColumnRef>(out.expr).parts[0];
+            for (const auto& a : aggregates) {
+                if (a.output_name == slot) {
+                    if (!out.alias.has_value()) {
+                        out.alias = default_aggregate_name(a.agg_fn, a.input_column);
+                    }
+                    item_aggregate_aliases.emplace_back(*out.alias, slot);
+                    break;
+                }
+            }
+        }
+        items.push_back(std::move(out));
+    }
+    std::optional<ast::Expression> having;
+    if (stmt.having_clause.has_value()) {
+        for (const auto& [item_alias, slot] : item_aggregate_aliases) {
+            scope.aggregate_aliases.emplace(item_alias, slot);
+        }
+        having = rewrite_expression(*stmt.having_clause, leaf);
+    }
+    check_session_udafs_merge(window, aggregates, stmt.loc.pos);
+
+    std::vector<lowering::GroupOutputColumn> columns;
+    columns.reserve(group_keys.size() + 2 + aggregates.size());
+    for (const auto& gk : group_keys) {
+        lowering::GroupOutputColumn c;
+        c.key_source_column = gk;
+        c.key_output_name = gk;
+        columns.push_back(std::move(c));
+    }
+    if (window.has_value()) {
+        for (const bool is_end : {false, true}) {
+            lowering::GroupOutputColumn c;
+            c.is_window_bound = true;
+            c.window_is_end = is_end;
+            c.key_source_column = is_end ? scope.window_end_name : scope.window_start_name;
+            c.key_output_name = c.key_source_column;
+            columns.push_back(std::move(c));
+        }
+    }
+    for (std::size_t i = 0; i < aggregates.size(); ++i) {
+        lowering::GroupOutputColumn c;
+        c.is_aggregate = true;
+        c.agg_index = i;
+        columns.push_back(std::move(c));
+    }
+    auto agg_schema = lowering::build_group_output_schema(columns, aggregates, source);
+    TableDef grouped;
+    grouped.name = "__grouped";
+    for (const auto& f : agg_schema->fields()) {
+        grouped.columns.push_back(ColumnSpec{f->name(), f->type()});
+    }
+
+    std::unique_ptr<LogicalPlan> plan;
+    if (window.has_value()) {
+        const std::string start_name = scope.window_start_name;
+        const std::string end_name = scope.window_end_name;
+        plan = std::make_unique<LogicalWindowAggregate>(std::move(input),
+                                                        std::move(*window),
+                                                        group_keys,
+                                                        std::move(aggregates),
+                                                        agg_schema,
+                                                        group_keys,
+                                                        start_name,
+                                                        end_name);
+    } else {
+        plan = std::make_unique<LogicalAggregate>(
+            std::move(input), group_keys, std::move(aggregates), agg_schema, group_keys);
+    }
+    if (having.has_value()) {
+        auto predicate_json = lower_predicate(*having, grouped).serialize(0);
+        plan = std::make_unique<LogicalFilter>(std::move(plan), std::move(predicate_json));
+    }
+    plan = std::make_unique<LogicalProject>(std::move(plan),
+                                            resolve_select_items(items, grouped, grouped.name));
+    if (stmt.distinct) {
+        plan = std::make_unique<LogicalDistinct>(std::move(plan));
+    }
+    return wrap_top_n_or_limit(std::move(plan), stmt);
 }
 
 }  // namespace
@@ -4380,6 +4633,9 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
     std::vector<AggregateOutput> aggregates;
     std::vector<std::pair<std::size_t, std::string>> agg_target_indices;  // (target idx, alias)
     std::vector<std::pair<std::size_t, std::string>> key_target_indices;  // (target idx, col)
+    // Items that are neither one aggregate call nor one column: expressions
+    // over aggregates, group keys or window bounds, and literals.
+    std::vector<std::size_t> computed_target_indices;
     for (std::size_t i = 0; i < stmt.target_list.size(); ++i) {
         const auto& item = stmt.target_list[i];
         auto agg = extract_aggregate(item.expr, source, alias);
@@ -4390,10 +4646,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             a.distinct = agg.distinct;
             a.separator = std::move(agg.separator);
             a.percentile = agg.percentile;
-            a.output_name = item.alias.value_or(
-                a.agg_fn + (a.input_column.empty() ? std::string{"_star"} : "_" + a.input_column));
-            // A multi-arg UDAF's input_column is comma-joined; keep the
-            // default output name a plain identifier.
+            a.output_name = item.alias.value_or(default_aggregate_name(a.agg_fn, a.input_column));
             std::replace(a.output_name.begin(), a.output_name.end(), ',', '_');
             a.type = aggregate_output_type(a.agg_fn, source, a.input_column);
             aggregates.push_back(std::move(a));
@@ -4410,10 +4663,20 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             } else {
                 key_target_indices.emplace_back(i, resolve_value_column_name(cr, source, alias));
             }
+        } else if (!std::holds_alternative<ast::ColumnRef>(item.expr)) {
+            computed_target_indices.push_back(i);
         }
     }
 
-    const bool has_aggs = !aggregates.empty();
+    // An aggregate counts wherever it is called: as a whole item, inside an
+    // expression item, or in HAVING.
+    bool has_aggs = !aggregates.empty();
+    for (const auto idx : computed_target_indices) {
+        has_aggs = has_aggs || contains_aggregate_call(stmt.target_list[idx].expr);
+    }
+    if (stmt.having_clause.has_value()) {
+        has_aggs = has_aggs || contains_aggregate_call(*stmt.having_clause);
+    }
     const bool has_group = !stmt.group_clause.empty();
     if ((has_aggs || has_group) && !stmt.target_list.empty()) {
         for (const auto& item : stmt.target_list) {
@@ -4527,6 +4790,52 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         }
     }
 
+    // An item that is an expression, or a HAVING that needs an aggregate or a
+    // window bound the SELECT list does not emit, binds as aggregate-then-
+    // project (bind_grouped_expressions). Everything else keeps the single
+    // aggregate whose output is the SELECT list as written, so a query whose
+    // results were already correct keeps its plan and job-graph fingerprint.
+    // On that path HAVING resolves here: an aggregate call to the matching
+    // item's output column, a group key to the name the aggregate emits it
+    // under (its SELECT alias).
+    bool post_aggregate = !computed_target_indices.empty();
+    std::optional<ast::Expression> having_expr;
+    if (!post_aggregate && stmt.having_clause.has_value()) {
+        GroupedScope scope{source, alias, group_keys};
+        for (const auto& gk : group_keys) {
+            std::string name = gk;
+            for (const auto& [idx, col] : key_target_indices) {
+                if (col == gk) {
+                    name = stmt.target_list[idx].alias.value_or(col);
+                    break;
+                }
+            }
+            scope.key_names.push_back(std::move(name));
+        }
+        scope.windowed = window.has_value();
+        scope.aggregates = &aggregates;
+        for (const auto& a : aggregates) {
+            scope.aggregate_aliases.emplace(a.output_name, a.output_name);
+        }
+        auto rewritten = rewrite_expression(
+            *stmt.having_clause,
+            [&scope](const ast::Expression& e) { return resolve_grouped_node(e, scope); });
+        if (scope.needs_post_aggregate) {
+            post_aggregate = true;
+        } else {
+            having_expr = std::move(rewritten);
+        }
+    }
+    if (post_aggregate) {
+        std::unique_ptr<LogicalPlan> input = make_table_plan(ref.name, source, ref.loc.pos);
+        if (stmt.where_clause.has_value() && !consumed_topn_where_) {
+            auto predicate_json = lower_predicate(*stmt.where_clause, source).serialize(0);
+            input = std::make_unique<LogicalFilter>(std::move(input), std::move(predicate_json));
+        }
+        return bind_grouped_expressions(
+            stmt, source, alias, std::move(input), std::move(window), group_keys);
+    }
+
     // Describe the output columns in target_list order (keys + aggregates
     // interleaved as the user SELECTed them). The schema assembly itself lives
     // in lowering::build_group_output_schema so the programmatic Table API
@@ -4583,23 +4892,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             std::make_unique<LogicalFilter>(std::move(scan_or_filter), std::move(predicate_json));
     }
     auto out_schema = lowering::build_group_output_schema(out_columns, aggregates, source);
-    // SQLOPT-3: a SESSION window merges sessions, so a UDAF used there must
-    // supply a merge closure. Reject a merge-less UDAF at bind time with a clear
-    // error rather than letting it fail mid-merge at runtime. (The runtime keeps
-    // a defensive throw too.)
-    if (window.has_value() && window->kind == WindowSpec::Kind::Session) {
-        for (const auto& a : aggregates) {
-            if (is_registered_udaf_name(a.agg_fn)) {
-                auto e = AggFunctionRegistry::global().lookup(a.agg_fn);
-                if (e && !e->has_merge()) {
-                    bind_error("UDAF '" + a.agg_fn +
-                                   "' has no merge closure and cannot be used in a SESSION window; "
-                                   "register a merge closure or use TUMBLE/HOP/CUMULATE/GROUP BY",
-                               ref.loc.pos);
-                }
-            }
-        }
-    }
+    check_session_udafs_merge(window, aggregates, ref.loc.pos);
     // Output name per group key (parallel to group_keys): honour a SELECT alias
     // on the key (`GROUP BY user_id` + `SELECT user_id AS uid`), else the raw
     // name. Without this the runtime aggregate emits the key under its raw name
@@ -4638,28 +4931,18 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         agg_plan = std::make_unique<LogicalAggregate>(
             std::move(scan_or_filter), group_keys, aggregates, out_schema, key_output_names);
     }
-    if (stmt.having_clause.has_value()) {
-        // HAVING runs on the aggregate's emitted rows. Build
-        // a synthetic source whose columns are (group keys with their
-        // source types) + (aggregate alias with declared agg type) so
-        // lower_predicate can resolve refs against the post-aggregate
-        // schema.
-        //
-        // When HAVING references aggregates directly
-        // (e.g. `HAVING SUM(amount) > 100` without an alias), rewrite
-        // the expression to replace each aggregate FunctionCall with
-        // a ColumnRef to the matching aggregate slot's output_name.
-        // The matching rule is (fn name, input column): same as how
-        // we'd recognise it in SELECT. Unmatched aggregate refs (no
-        // matching slot in SELECT) error out.
-        auto having = rewrite_aggregates_for_having(*stmt.having_clause, aggregates, source, alias);
-
+    if (having_expr.has_value()) {
+        // HAVING runs on the aggregate's emitted rows, so it resolves against
+        // a synthetic source of what that row carries: each group key under
+        // the name it is emitted as (its SELECT alias, see key_output_names)
+        // with its source type, then each aggregate under its output name.
+        // having_expr already names those columns (see above).
         TableDef synthetic;
         synthetic.name = "__having";
-        for (const auto& gk : group_keys) {
+        for (std::size_t i = 0; i < group_keys.size(); ++i) {
             for (const auto& c : source.columns) {
-                if (c.name == gk) {
-                    synthetic.columns.push_back(c);
+                if (c.name == group_keys[i]) {
+                    synthetic.columns.push_back(ColumnSpec{key_output_names[i], c.type});
                     break;
                 }
             }
@@ -4667,7 +4950,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         for (const auto& a : aggregates) {
             synthetic.columns.push_back(ColumnSpec{a.output_name, a.type});
         }
-        auto predicate_json = lower_predicate(having, synthetic).serialize(0);
+        auto predicate_json = lower_predicate(*having_expr, synthetic).serialize(0);
         agg_plan = std::make_unique<LogicalFilter>(std::move(agg_plan), std::move(predicate_json));
     }
     if (stmt.distinct) {

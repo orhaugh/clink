@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+**A grouped SELECT takes expressions over its aggregates.** `SELECT k, SUM(n) /
+8 FROM t GROUP BY k` escaped the binder as `std::bad_variant_access` when
+another aggregate stood beside the expression, and was refused as "GROUP BY
+without aggregate functions" when none did; over a window it failed the same
+way. Arithmetic, `CASE`, casts and scalar functions of aggregates, aggregates of
+different columns combined, expressions over group keys and over
+`window_start` / `window_end`, and `HAVING` over all of these now bind and run
+on a plain `GROUP BY` and on tumbling, hopping, cumulating and session windows,
+and `HAVING` may name an aggregate the `SELECT` does not compute. When a
+`SELECT` item is an expression over aggregates, each distinct aggregate call is
+computed once however many expressions use it. A column that is neither
+grouped nor aggregated, an aggregate whose argument is an expression, and a
+window function inside a grouped expression are refused by name. A grouped
+query whose results were already correct keeps its plan and job-graph
+fingerprint.
+
+**HAVING reads the row the aggregate emits.** `SELECT k AS kk, SUM(n) FROM t
+GROUP BY k HAVING k > 1` filtered every row out, because the key is emitted
+under its alias and `HAVING` looked for `k`; it now passes the matching groups.
+`HAVING` also matched an aggregate to a selected one by function and column
+alone, so `HAVING COUNT(DISTINCT v) > 1` filtered on a selected `COUNT(v)`;
+aggregates now match on function, argument, `DISTINCT`, separator and
+fraction. Both kinds of query now bind to a different plan, and a savepoint an
+earlier release took for a job of the second kind does not restore onto it,
+because SQL aggregate state is stored by position.
+
+**`CAST(x AS DOUBLE)` makes a double.** An integer passed through the cast
+unchanged, so `CAST(n AS DOUBLE) / 4` was integer division: 10 gave 2, not 2.5.
+
 **A worker's TLS connect to the coordinator, and the Kafka resume's TLS
 connect to a broker, no longer wait for ever.** The TLS client connect was a
 blocking TCP connect followed by a blocking `SSL_connect` with no deadline, so

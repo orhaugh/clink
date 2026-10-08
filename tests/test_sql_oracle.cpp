@@ -602,6 +602,77 @@ TEST_F(SqlOracle, AvgIsADouble) {
     EXPECT_FALSE(d.diverged) << d.report;
 }
 
+// Expressions over aggregates in a grouped SELECT. `/` is left out on
+// purpose: DuckDB's `/` on two integers is floating division where clink
+// (like Postgres) divides integers, so an integer `/` would measure the
+// dialect, not the expression path. The double division here is explicit.
+TEST_F(SqlOracle, ExpressionsOverAggregates) {
+    const auto d = run_pair(
+        {.name = "group_expr",
+         .select_sql = "SELECT k AS g0, SUM(v) + SUM(w) AS c0, COUNT(*) * 2 - COUNT(v) AS c1, "
+                       "CASE WHEN SUM(v) > 0 THEN 1 ELSE 0 END AS c2, "
+                       "ABS(MIN(v) - MAX(w)) AS c3, COALESCE(SUM(v), -1) AS c4, "
+                       "CAST(SUM(w) AS DOUBLE) / COUNT(*) AS c5 FROM t GROUP BY k",
+         .out_cols = {{"g0", "BIGINT"},
+                      {"c0", "BIGINT"},
+                      {"c1", "BIGINT"},
+                      {"c2", "BIGINT"},
+                      {"c3", "BIGINT"},
+                      {"c4", "BIGINT"},
+                      {"c5", "DOUBLE"}},
+         .group_keys = {"g0"}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
+TEST_F(SqlOracle, AnExpressionOverTheGroupKey) {
+    // k + 1 is functionally dependent on k, so it is a legal SELECT item and
+    // a key of its own for the last-emission reduction.
+    const auto d = run_pair({.name = "group_key_expr",
+                             .select_sql = "SELECT k + 1 AS g0, SUM(v) - k AS c0 FROM t GROUP BY k",
+                             .out_cols = {{"g0", "BIGINT"}, {"c0", "BIGINT"}},
+                             .group_keys = {"g0"}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
+TEST_F(SqlOracle, HavingOverAnAggregateTheSelectDoesNotCompute) {
+    // COUNT only grows, so once a group passes it keeps passing and the last
+    // running emission per key is the final answer the reduction compares.
+    const auto d = run_pair({.name = "having_hidden",
+                             .select_sql = "SELECT k AS g0, MAX(v) AS c0 FROM t GROUP BY k "
+                                           "HAVING COUNT(*) > 24",
+                             .out_cols = {{"g0", "BIGINT"}, {"c0", "BIGINT"}},
+                             .group_keys = {"g0"}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
+TEST_F(SqlOracle, HavingOverAnExpressionOfAggregates) {
+    const auto d = run_pair({.name = "having_expr",
+                             .select_sql = "SELECT k AS g0, COUNT(v) * 2 AS c0 FROM t GROUP BY k "
+                                           "HAVING COUNT(v) * 2 + COUNT(*) > 50",
+                             .out_cols = {{"g0", "BIGINT"}, {"c0", "BIGINT"}},
+                             .group_keys = {"g0"}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
+TEST_F(SqlOracle, HavingOnAGroupKeyTheSelectAliases) {
+    const auto d = run_pair({.name = "having_aliased_key",
+                             .select_sql = "SELECT k AS g0, SUM(v) AS c0 FROM t GROUP BY k "
+                                           "HAVING k > 3",
+                             .out_cols = {{"g0", "BIGINT"}, {"c0", "BIGINT"}},
+                             .group_keys = {"g0"}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
+TEST_F(SqlOracle, CastToDoubleDividesAsDouble) {
+    // CAST(v AS DOUBLE) / 4 is floating division in every dialect: the cast
+    // is what makes the operand a double, whatever integer went in.
+    const auto d = run_pair({.name = "cast_double_div",
+                             .select_sql = "SELECT k AS c0, CAST(v AS DOUBLE) / 4 AS c1 FROM t",
+                             .out_cols = {{"c0", "BIGINT"}, {"c1", "DOUBLE"}},
+                             .group_keys = {}});
+    EXPECT_FALSE(d.diverged) << d.report;
+}
+
 TEST_F(SqlOracle, ModSignFollowsTheDividend) {
     const auto d = run_pair({.name = "mod_sign",
                              .select_sql = "SELECT k AS c0, MOD(v, 7) AS c1 FROM t "
@@ -743,6 +814,42 @@ TEST_F(SqlOracle, GeneratedGroupedAggregatesAgree) {
         }
         sql += " GROUP BY k";
         const auto d = run_pair({.name = "gen_agg_" + std::to_string(i),
+                                 .select_sql = sql,
+                                 .out_cols = {{"g0", "BIGINT"}, {"c0", "BIGINT"}, {"c1", "BIGINT"}},
+                                 .group_keys = {"g0"}});
+        EXPECT_FALSE(d.diverged) << "seed=" << gen::seed() << "\n" << d.report;
+    }
+}
+
+// Expressions over aggregates: integer combinations of two aggregates and a
+// constant, optionally behind a HAVING whose predicate only grows (COUNT),
+// so the running stream's last emission per key is still the final answer.
+TEST_F(SqlOracle, GeneratedExpressionsOverAggregatesAgree) {
+    gen::Rng r{std::mt19937_64{gen::seed() ^ 0xE5}};
+    static const char* kAggs[] = {
+        "COUNT(*)", "COUNT(v)", "SUM(v)", "MIN(v)", "MAX(v)", "SUM(w)", "MIN(w)", "MAX(w)"};
+    static const char* kOps[] = {" + ", " - ", " * "};
+    auto agg = [&r] { return std::string{kAggs[r.pick(0, 7)]}; };
+    auto agg_expr = [&](int shape) -> std::string {
+        switch (shape) {
+            case 0:
+                return agg() + kOps[r.pick(0, 2)] + agg();
+            case 1:
+                return "ABS(" + agg() + " - " + r.constant() + ")";
+            case 2:
+                return "COALESCE(" + agg() + ", " + r.constant() + ")";
+            default:
+                return "CASE WHEN " + agg() + " > " + r.constant() + " THEN " + agg() + " ELSE " +
+                       agg() + " END";
+        }
+    };
+    for (int i = 0; i < gen::per_family(); ++i) {
+        std::string sql = "SELECT k AS g0, " + agg_expr(r.pick(0, 3)) + " AS c0, " +
+                          agg_expr(r.pick(0, 3)) + " AS c1 FROM t GROUP BY k";
+        if (r.pick(0, 1) == 1) {
+            sql += " HAVING COUNT(*) > " + std::to_string(r.pick(15, 30));
+        }
+        const auto d = run_pair({.name = "gen_agg_expr_" + std::to_string(i),
                                  .select_sql = sql,
                                  .out_cols = {{"g0", "BIGINT"}, {"c0", "BIGINT"}, {"c1", "BIGINT"}},
                                  .group_keys = {"g0"}});

@@ -1915,14 +1915,20 @@ TEST(SqlBinder, HavingDirectAggregateUnaliasedSelectStillWorks) {
         << f.predicate_json();
 }
 
-TEST(SqlBinder, HavingDirectAggregateWithoutMatchInSelectRejected) {
+TEST(SqlBinder, HavingDirectAggregateWithoutMatchInSelectBinds) {
     Catalog cat;
     register_clicks(cat);
     Binder b(cat);
-    // HAVING references SUM(user_id) but SELECT only has COUNT(*).
-    EXPECT_THROW(b.bind_select(as_select(parse("SELECT url, COUNT(*) AS n FROM clicks GROUP BY url "
-                                               "HAVING SUM(user_id) > 100"))),
-                 TranslationError);
+    // HAVING references SUM(user_id) but SELECT only has COUNT(*). Standard
+    // SQL accepts this: the aggregate is computed for the filter and not
+    // projected, so the output carries only the SELECT's columns.
+    auto plan =
+        b.bind_select(as_select(parse("SELECT url, COUNT(*) AS n FROM clicks GROUP BY url "
+                                      "HAVING SUM(user_id) > 100")));
+    auto schema = plan->schema();
+    ASSERT_EQ(schema->num_fields(), 2);
+    EXPECT_EQ(schema->field(0)->name(), "url");
+    EXPECT_EQ(schema->field(1)->name(), "n");
 }
 
 // --- OFFSET -------------------------------------------------------

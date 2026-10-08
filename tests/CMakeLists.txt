@@ -656,6 +656,7 @@ if(CLINK_BUILD_SQL)
         test_sql_runtime.cpp
         test_sql_bounded_state.cpp
         test_sql_unsupported_semantics.cpp
+        test_sql_grouped_expressions.cpp
         test_submit_checkpoint_config.cpp
         test_sql_state_ttl_runtime.cpp
         test_sql_memory_budget.cpp

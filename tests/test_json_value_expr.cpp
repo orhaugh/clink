@@ -237,6 +237,23 @@ TEST(JsonValueExpr, Casts) {
     EXPECT_TRUE(eval(R"({"op":"cast_int","args":[{"lit":"not a number"}]})").is_null());
 }
 
+// CAST(x AS DOUBLE) of an integer is a double, not the integer passed through:
+// arithmetic picks integer or floating by the runtime kind of its operands, so
+// an integer surviving the cast made CAST(n AS DOUBLE) / 4 integer division
+// (10 -> 2, not 2.5).
+TEST(JsonValueExpr, CastFloatOfAnIntegerIsADouble) {
+    const auto v =
+        eval(R"({"op":"cast_float","args":[{"col":"n"}]})", {{"n", JsonValue{std::int64_t{10}}}});
+    ASSERT_TRUE(v.is_number());
+    EXPECT_FALSE(v.is_integral_number());
+    EXPECT_EQ(v.as_number(), 10.0);
+    const auto q =
+        eval(R"({"op":"div","args":[{"op":"cast_float","args":[{"col":"n"}]},{"lit":4}]})",
+             {{"n", JsonValue{std::int64_t{10}}}});
+    ASSERT_TRUE(q.is_number());
+    EXPECT_EQ(q.as_number(), 2.5);
+}
+
 TEST(JsonValueExpr, NestedArithmeticWithColumnRefs) {
     auto v = eval(R"({"op":"add","args":[
                        {"col":"x"},
