@@ -985,8 +985,8 @@ void PluginRegistry::register_co_operator(
     }
     // Codecs for the two inputs, captured now from the type registration
     // that register_type<In1/In2> performed above. Threaded into
-    // add_co_operator so it can serialize the unpaused input's in-flight
-    // records during an unaligned checkpoint (and replay them on restore).
+    // add_co_operator so it can replay the in-flight records a checkpoint
+    // from an earlier release, taken under unaligned checkpoints, carries.
     std::optional<clink::Codec<In1>> in1_codec_opt;
     std::optional<clink::Codec<In2>> in2_codec_opt;
     if (auto c = this->template codec_for<In1>()) {

@@ -20,6 +20,14 @@
 //                                        "alignment lag" metric
 //                                        operators watch for slow
 //                                        paths
+//   - barrier_forced_alignments_total  : per-operator barriers stamped
+//                                        Unaligned that the operator
+//                                        aligned across several inputs,
+//                                        because no operator captures
+//                                        in-flight rows; nonzero means
+//                                        unaligned or adaptive
+//                                        checkpoints are paying aligned
+//                                        latency at this fan-in
 //   - subtask_snapshot_ack_total       : SubtaskCheckpointed ok acks
 //   - subtask_snapshot_failure_total   : SubtaskCheckpointed not-ok
 //                                        acks (snapshot threw or
@@ -173,13 +181,24 @@ inline void restore_observe(std::uint64_t duration_ns) {
 // Per-operator barrier alignment. Wired from MultiInputAlignment::on_barrier
 // which stamps first-delivery time per checkpoint and observes the
 // aligned-duration when every alive input has delivered the same id.
-inline void barrier_aligned(std::uint64_t op_id, std::uint64_t wait_ns) {
-    MetricsRegistry::global()
-        .counter(op_metric_name("barrier_alignments_total", op_id))
-        .increment();
-    MetricsRegistry::global()
-        .histogram(op_metric_name("barrier_align_wait_ns", op_id))
+//
+// `reg` is the registry the operator's RuntimeContext carries (nullptr: the
+// process-global one). The aligner is inline code, compiled into a job module
+// on the plugin path, where MetricsRegistry::global() is the module's own
+// copy and never reaches the worker's /metrics.
+inline void barrier_aligned(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t wait_ns) {
+    MetricsRegistry& r = reg != nullptr ? *reg : MetricsRegistry::global();
+    r.counter(op_metric_name("barrier_alignments_total", op_id)).increment();
+    r.histogram(op_metric_name("barrier_align_wait_ns", op_id))
         .observe(static_cast<double>(wait_ns));
+}
+
+// A barrier stamped Unaligned that MultiInputAlignment aligned across several
+// inputs because the operator does not capture in-flight rows. Counted on
+// top of barrier_aligned, which the same alignment also feeds.
+inline void barrier_forced_aligned(MetricsRegistry* reg, std::uint64_t op_id) {
+    MetricsRegistry& r = reg != nullptr ? *reg : MetricsRegistry::global();
+    r.counter(op_metric_name("barrier_forced_alignments_total", op_id)).increment();
 }
 
 }  // namespace ckpt

@@ -175,9 +175,9 @@ struct RunnerContext {
     // nullptr falls back to the local default_instance(), which is correct
     // for the in-process paths where there is only one.
     const SideOutputAttacherRegistry* side_output_attachers{nullptr};
-    // Per-job alignment policy. false = aligned (default); true =
-    // unaligned (barriers overtake in-flight records at multi-input
-    // operators). Propagated through the wire from CheckpointConfig
+    // Per-job alignment setting. false = aligned (default); true =
+    // sources stamp barriers Unaligned, which multi-input operators
+    // still align. Propagated through the wire from CheckpointConfig
     // and copied to JobConfig.unaligned_checkpoints by the plugin
     // runner.
     bool unaligned_checkpoints{false};

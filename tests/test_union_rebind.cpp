@@ -209,11 +209,13 @@ TEST(UnionRebind, AlignmentRefusesAJoinWhileABarrierIsInFlight) {
 }
 
 TEST(UnionRebind, ALingeringCompletedUnalignedEntryDoesNotWedgeTheJoin) {
-    // Single input, unaligned barrier: the first delivery forwards and the
+    // Single input, unaligned barrier, at an aligner for an operator that
+    // captures in-flight rows (the only kind that forwards an unaligned
+    // barrier on its first delivery): the first delivery forwards and the
     // bookkeeping entry lingers (its GC runs on SUBSEQUENT deliveries,
     // which never come at input_count == 1). add_input must sweep it
     // rather than read it as in-flight.
-    MultiInputAlignment align(1);
+    MultiInputAlignment align(1, /*captures_in_flight=*/true);
     const auto adv = align.on_barrier(
         0, CheckpointBarrier{CheckpointId{7}, false, CheckpointBarrier::Mode::Unaligned});
     EXPECT_TRUE(adv.forward);

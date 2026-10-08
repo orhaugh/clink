@@ -452,13 +452,11 @@ struct SinkCore::Impl {
           qualified(qualified_table(options.database, options.table)) {}
 
     void cache(const RuntimeContext* ctx, std::uint64_t fallback_id, const std::string& fallback);
-    void check_barrier_mode(const RuntimeContext* ctx) const;
     void apply_memory_cap();
     [[nodiscard]] Opened open_target();
     void start(Opened opened, const std::function<void()>& prepare);
     void report_open(const TargetInfo& target, const ColumnPlan& plan) const;
     void open_failed(const NativeSinkError& e) const;
-    [[noreturn]] void refuse_unaligned_barrier(std::uint64_t checkpoint) const;
     void require_writer(const char* call) const;
     // The tail every intake shares: charge a built chunk to the budget, queue
     // it and count it under its carrier. `shares_input` when the chunk reuses
@@ -520,37 +518,6 @@ void SinkCore::Impl::cache(const RuntimeContext* ctx,
         row_batches = &metrics->counter(
             tagged(metric::kInputBatchesTotal, op_id, "carrier", metric::kCarrierRow));
     }
-}
-
-void SinkCore::Impl::check_barrier_mode(const RuntimeContext* ctx) const {
-    if (ctx == nullptr) {
-        return;
-    }
-    // Under unaligned barriers a fan-in upstream forwards a barrier at once,
-    // and nothing captures the rows still in flight on its other inputs, so a
-    // row can reach the sink after a barrier its upstream already snapshotted
-    // past. Adaptive mode turns unaligned under backpressure, which this sink
-    // applies on purpose while it retries. The fan-in sits upstream, so the
-    // sink's own parallelism does not matter.
-    std::string why;
-    if (ctx->unaligned_checkpoints()) {
-        why = "the job runs unaligned checkpoints";
-    } else if (ctx->adaptive_barrier_mode()) {
-        why =
-            "the job runs adaptive checkpoints, which turn unaligned under backpressure, and "
-            "this sink backpressures while it retries";
-    } else if (ctx->barrier_mode_override() == CheckpointBarrier::Mode::Unaligned) {
-        why = "the sink's operator carries an unaligned barrier-mode override";
-    } else {
-        return;
-    }
-    throw NativeSinkError(code::kBarrierModeUnsupported,
-                          "clickhouse native sink: " + why +
-                              ", and the native ClickHouse sink needs aligned checkpoint barriers "
-                              "until the engine captures the rows in flight at a fan-in: a row "
-                              "that reached the sink after a barrier its upstream had already "
-                              "snapshotted past would be lost on a restart. Run the job with "
-                              "aligned checkpoints.");
 }
 
 void SinkCore::Impl::apply_memory_cap() {
@@ -796,25 +763,6 @@ void SinkCore::Impl::open_failed(const NativeSinkError& e) const {
         "clickhouse native sink: subtask=" + subtask() + " did not open: " + e.what());
 }
 
-void SinkCore::Impl::refuse_unaligned_barrier(std::uint64_t checkpoint) const {
-    // An override on an upstream operator is invisible from this context, so
-    // the barrier itself is the only place the mode shows. The throw comes
-    // before the ack: the checkpoint never completes and a restart replays
-    // from the one before.
-    const NativeSinkError e(
-        code::kBarrierModeUnsupported,
-        "clickhouse native sink: checkpoint barrier " + std::to_string(checkpoint) +
-            " arrived unaligned although the job and the sink run aligned checkpoints, which an "
-            "unaligned barrier-mode override on an upstream operator does. The native "
-            "ClickHouse sink needs aligned checkpoint barriers until the engine captures the "
-            "rows in flight at a fan-in, so the checkpoint is not acknowledged. Remove the "
-            "override from the operators upstream of the sink.");
-    count_refusal(e.code());
-    log(LogSeverity::Error,
-        "clickhouse native sink: subtask=" + subtask() + " refused a barrier: " + e.what());
-    throw e;
-}
-
 void SinkCore::Impl::require_writer(const char* call) const {
     if (!writer) {
         throw std::logic_error(std::string("clickhouse native sink: ") + call +
@@ -885,8 +833,10 @@ void SinkCore::open(const RuntimeContext* ctx,
     s.opened_at = Clock::now();
     try {
         // The checks that need no server come first, so a refusal never waits
-        // out an outage.
-        s.check_barrier_mode(ctx);
+        // out an outage. Every checkpoint barrier mode is accepted: a fan-in
+        // upstream aligns every barrier whatever its stamp, so one stamped
+        // Unaligned reaches this sink only along a single in-order path,
+        // where it cuts exactly where an aligned one would.
         s.apply_memory_cap();
         s.start(s.open_target(), prepare);
     } catch (const NativeSinkError& e) {
@@ -922,9 +872,6 @@ void SinkCore::barrier(CheckpointBarrier barrier) {
     s.require_writer("on_barrier");
     s.writer->drain_released();
     try {
-        if (barrier.mode() == CheckpointBarrier::Mode::Unaligned && !barrier.is_terminal()) {
-            s.refuse_unaligned_barrier(barrier.id().value());
-        }
         s.writer->flush(barrier.id().value());
     } catch (...) {
         s.writer->abort();

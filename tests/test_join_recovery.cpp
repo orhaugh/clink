@@ -189,12 +189,11 @@ TEST(JoinRecovery, BufferedLeftRecordsMatchAcrossRestart) {
 }
 
 // Same restart shape as above, but both runs execute with unaligned
-// checkpoints enabled. The barrier-overtake, in-flight capture, and
-// channel-replay primitives are covered at the operator level by the
-// IntervalJoinUnaligned + MultiInputAlignment suites; this is the
+// checkpoints enabled. The join aligns an unaligned barrier like any
+// other (the CoOperatorUnaligned, IntervalJoinUnaligned and
+// MultiInputAlignment suites pin that at the operator level); this is the
 // end-to-end complement: a real snapshot/restore cycle under unaligned
-// mode must still produce each join result exactly once (no records
-// lost when the barrier overtakes, none duplicated on replay).
+// mode must still produce each join result exactly once.
 TEST(JoinRecovery, UnalignedModeBufferedRecordsMatchExactlyOnceAcrossRestart) {
     using V = std::int64_t;
     using K = std::string;

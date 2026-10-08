@@ -55,8 +55,9 @@ public:
     // Throws rather than returns when the rows cannot be acknowledged (a
     // permanent failure, an exhausted retry window, a cancel), because a
     // normal return lets the checkpoint complete over rows that never reached
-    // the table. An unaligned barrier other than the terminal one is refused
-    // with clickhouse.barrier_mode_unsupported, before anything is flushed.
+    // the table. A barrier stamped Unaligned is flushed as an aligned one: a
+    // fan-in upstream aligns every barrier, so it arrives only along a single
+    // in-order path.
     void on_barrier(CheckpointBarrier barrier) override;
     // Clean end of input: every row received is acknowledged before it returns.
     void flush() override;

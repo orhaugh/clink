@@ -373,7 +373,9 @@ TEST(NativeTypedSinkGuarantee, TheSinkMustBeTheOnlySinkOnItsChainWhicheverIsAdde
     }
 }
 
-TEST(NativeTypedSinkGuarantee, UnalignedOrAdaptiveCheckpointsAreRefusedAtOpenBeforeAnyConnect) {
+// Every barrier mode is accepted, as on the SQL path: a fan-in upstream aligns
+// every barrier whatever its stamp.
+TEST(NativeTypedSinkGuarantee, UnalignedOrAdaptiveCheckpointsCommitAsAlignedOnes) {
     const std::vector<std::pair<std::string, TsConfigure>> modes = {
         {"unaligned", [](JobConfig& c) { c.unaligned_checkpoints = true; }},
         {"adaptive", [](JobConfig& c) { c.adaptive_barrier_mode = true; }},
@@ -382,12 +384,9 @@ TEST(NativeTypedSinkGuarantee, UnalignedOrAdaptiveCheckpointsAreRefusedAtOpenBef
         SCOPED_TRACE(label);
         TsRig rig;
         rig.start({ts_data(0, 10), ts_barrier(1)}, nullptr, configure);
-        const auto errors = rig.errors();
-        ASSERT_EQ(errors.size(), 1U);
-        EXPECT_TRUE(ts_has(errors.front(), "[clickhouse.barrier_mode_unsupported]"))
-            << errors.front();
-        EXPECT_EQ(rig.server->connects(), 0U);
-        EXPECT_TRUE(rig.acknowledged().empty());
+        EXPECT_TRUE(rig.errors().empty());
+        EXPECT_EQ(rig.acknowledged(), std::vector<std::uint64_t>{1});
+        EXPECT_GE(rig.server->connects(), 1U);
     }
 }
 

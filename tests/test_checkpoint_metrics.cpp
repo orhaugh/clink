@@ -1,8 +1,10 @@
 // Checkpoint metric helpers + MultiInputAlignment metric emission.
 
 #include <chrono>
+#include <cstdint>
 #include <numeric>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -119,6 +121,84 @@ TEST(CheckpointMetrics, AlignmentMetricsDisabledWhenOpIdUnset) {
     EXPECT_TRUE(adv.forward);
     // No counter created for op_id=0 because the aligner short-circuits.
     EXPECT_EQ(counter_value(clink::metrics::op_metric_name("barrier_alignments_total", 0)), 0u);
+}
+
+TEST(CheckpointMetrics, EveryForcedAlignmentIsCountedAndOnlyTheFirstIsNoticed) {
+    namespace mm = clink::metrics;
+    MultiInputAlignment a(2);
+    const std::uint64_t op_id = 4243;
+    a.set_operator_id(op_id);
+    std::vector<std::uint64_t> noticed;
+    a.set_forced_alignment_notice(
+        [&noticed](CheckpointBarrier b) { noticed.push_back(b.id().value()); });
+    const auto metric = mm::op_metric_name("barrier_forced_alignments_total", op_id);
+    const auto before = counter_value(metric);
+
+    for (const std::uint64_t id : {1u, 2u}) {
+        const CheckpointBarrier unaligned{
+            CheckpointId{id}, /*terminal=*/false, CheckpointBarrier::Mode::Unaligned};
+        EXPECT_FALSE(a.on_barrier(0, unaligned).forward);
+        EXPECT_TRUE(a.on_barrier(1, unaligned).forward);
+    }
+    // An aligned checkpoint is not a forced alignment.
+    const CheckpointBarrier aligned{
+        CheckpointId{3}, /*terminal=*/false, CheckpointBarrier::Mode::Aligned};
+    EXPECT_FALSE(a.on_barrier(0, aligned).forward);
+    EXPECT_TRUE(a.on_barrier(1, aligned).forward);
+
+    EXPECT_EQ(a.forced_alignments(), 2u);
+    EXPECT_EQ(counter_value(metric) - before, 2u);
+    EXPECT_EQ(noticed, (std::vector<std::uint64_t>{1}))
+        << "the notice is a once-per-runner log line";
+}
+
+// The aligner is inline code, compiled into the job module on the plugin path,
+// where MetricsRegistry::global() is the module's own copy and never reaches the
+// worker's /metrics. Its counts go to the registry the runner hands it (the
+// RuntimeContext's), and none to the global one.
+TEST(CheckpointMetrics, AlignmentMetricsGoToTheRegistryTheRunnerGives) {
+    namespace mm = clink::metrics;
+    MetricsRegistry runner_registry;
+    MultiInputAlignment a(2);
+    const std::uint64_t op_id = 4251;
+    a.set_operator_id(op_id, &runner_registry);
+    const auto forced = mm::op_metric_name("barrier_forced_alignments_total", op_id);
+    const auto aligned = mm::op_metric_name("barrier_alignments_total", op_id);
+    const auto global_forced_before = counter_value(forced);
+    const auto global_aligned_before = counter_value(aligned);
+
+    const CheckpointBarrier unaligned{
+        CheckpointId{1}, /*terminal=*/false, CheckpointBarrier::Mode::Unaligned};
+    EXPECT_FALSE(a.on_barrier(0, unaligned).forward);
+    EXPECT_TRUE(a.on_barrier(1, unaligned).forward);
+
+    const auto in_runner_registry = [&runner_registry](const std::string& name) {
+        for (const auto& [n, v] : runner_registry.snapshot().counters) {
+            if (n == name) {
+                return v;
+            }
+        }
+        return std::uint64_t{0};
+    };
+    EXPECT_EQ(in_runner_registry(forced), 1u);
+    EXPECT_EQ(in_runner_registry(aligned), 1u);
+    EXPECT_EQ(counter_value(forced), global_forced_before);
+    EXPECT_EQ(counter_value(aligned), global_aligned_before);
+}
+
+TEST(CheckpointMetrics, ASingleInputHasNoForcedAlignmentToCount) {
+    // One input has nothing to wait for: the barrier forwards at once and is
+    // marked Aligned, but nothing was held back to count.
+    MultiInputAlignment a(1);
+    bool noticed = false;
+    a.set_forced_alignment_notice([&noticed](CheckpointBarrier) { noticed = true; });
+    const auto adv = a.on_barrier(
+        0,
+        CheckpointBarrier{CheckpointId{7}, /*terminal=*/false, CheckpointBarrier::Mode::Unaligned});
+    ASSERT_TRUE(adv.forward);
+    EXPECT_EQ(adv.barrier.mode(), CheckpointBarrier::Mode::Aligned);
+    EXPECT_EQ(a.forced_alignments(), 0u);
+    EXPECT_FALSE(noticed);
 }
 
 // --- checkpoint staleness ------------------------------------------------

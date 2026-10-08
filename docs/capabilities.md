@@ -59,7 +59,7 @@ embedded or submits to a cluster, unchanged.
 
 | Capability | Notes | Reference |
 | --- | --- | --- |
-| Checkpointing | Chandy-Lamport barrier alignment; unaligned checkpoints at multi-input operators; async snapshot workers; fsync-gated acks | [Checkpointing](internals/checkpointing.md) |
+| Checkpointing | Chandy-Lamport barrier alignment at every multi-input operator, in every alignment mode (unaligned and adaptive are accepted and align at each fan-in, so every checkpoint is a consistent cut); async snapshot workers; fsync-gated acks | [Checkpointing](internals/checkpointing.md) |
 | Exactly-once sinks | Generic committer (prepare at barrier, commit on global durability, recover-and-re-commit): file, Kafka, Parquet, raw S3 multipart, Postgres `PREPARE TRANSACTION` | [Sink committer framework](internals/sink-committer-framework.md) |
 | Effectively-once upserts | Changelog upsert and delete by `PRIMARY KEY`: Postgres, MySQL, Cassandra, Redis | [Sink committer framework](internals/sink-committer-framework.md) |
 | Source replay | Source-offset recovery generalised across connectors | [Checkpointing](internals/checkpointing.md) |

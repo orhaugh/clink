@@ -220,6 +220,23 @@ template <typename SinkPtr, typename T>
     return sink->on_data_columnar(batch);
 }
 
+// Connects a multi-input runner's aligner to its operator: the alignment
+// metrics under the operator's id, and one log line the first time it aligns
+// a barrier stamped Unaligned (unaligned checkpoints, an adaptive checkpoint
+// the policy turned unaligned, or a per-operator override). Logged once per
+// runner rather than per barrier; clink_op_barrier_forced_alignments_total
+// counts every one.
+inline void observe_alignment(MultiInputAlignment& align, const RuntimeContext& ctx) {
+    align.set_operator_id(ctx.operator_id().value(), ctx.metrics());
+    align.set_forced_alignment_notice([&ctx](CheckpointBarrier b) {
+        ctx.log_info("checkpoint " + std::to_string(b.id().value()) +
+                     " arrived stamped unaligned, and this operator aligned it across its "
+                     "inputs: unaligned and adaptive checkpoints align at every fan-in, so each "
+                     "checkpoint is a consistent cut. Logged once; "
+                     "clink_op_barrier_forced_alignments_total counts every one.");
+    });
+}
+
 }  // namespace detail
 
 // SourceHandle, OpHandle, and SinkHandle are tag types returned by the
@@ -783,13 +800,12 @@ public:
             // is per-subtask and lives on this runner thread. Note on
             // unaligned checkpoints: an async-state single-input operator
             // FORCE-ALIGNS - it drains to quiescence before capture (below)
-            // regardless of the barrier's mode, because drain-to-quiescence is
-            // incompatible with unaligned in-flight capture. For a single
-            // input this is lossless (there is no cross-input alignment to
-            // skip). Multi-input async (co-operator) is now supported too (see
-            // add_co_operator): it force-aligns the popped/in-flight tail via
-            // drain_for_barrier while keeping the unaligned in-flight-capture
-            // fast path for the unpopped other-channel records.
+            // regardless of the barrier's mode. For a single input this is
+            // lossless (there is no cross-input alignment to skip).
+            // Multi-input async (co-operator) is supported too (see
+            // add_co_operator): it aligns the barrier across both inputs, as
+            // every multi-input runner does, and drains the popped/in-flight
+            // tail via drain_for_barrier before the capture.
             std::shared_ptr<AsyncExecutionController> aec;
             const bool async_mode = op->supports_async() && ctx.has_state_backend() &&
                                     ctx.state_backend()->supports_async_get();
@@ -1663,9 +1679,10 @@ public:
     // Merges N upstream stages of the same type into a single output stream.
     // Data records are forwarded immediately from whichever input has them
     // (order across inputs is unspecified). Watermarks downstream are the
-    // running min across inputs. Checkpoint barriers are aligned: an input
-    // that has delivered barrier B is paused until every other input has
-    // also delivered B; only then is B forwarded downstream.
+    // running min across inputs. Checkpoint barriers are aligned, whatever
+    // mode they are stamped with: an input that has delivered barrier B is
+    // paused until every other input has also delivered B; only then is B
+    // forwarded downstream.
     //
     // Records arriving on slow inputs (those that haven't reached B yet) are
     // still processed during alignment - they belong to checkpoint B, not
@@ -1688,24 +1705,18 @@ public:
         runner.id = id;
         runner.run = [in_channels, out_channel, n, rebind](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
-            // Unaligned mode flips the alignment state machine so the
-            // first barrier from any input forwards immediately. The
-            // already-queued records on the other inputs are NOT held
-            // back - they get forwarded as the union runner picks them
-            // up on subsequent iterations. From the downstream's
-            // perspective those records arrive AFTER the barrier, so
-            // they belong to the next checkpoint epoch. This matches
-            // unaligned semantics where in-flight records past
-            // the barrier are captured into the snapshot at the
-            // *destination* operator (the one with state) - union has
-            // no state itself, so its job is just to let the barrier
-            // overtake.
-            // Per-barrier mode. The aligner reads each
-            // barrier's stamped mode rather than capturing the
-            // job-global flag at startup; the coordinator stamps mode
-            // when issuing the barrier (defaults derive from
-            // JobConfig.unaligned_checkpoints).
+            // Every barrier is aligned here, including one stamped Unaligned
+            // (unaligned checkpoints, adaptive ones under pressure, a
+            // per-operator override): the union merges its inputs into one
+            // in-order channel, so nothing downstream can tell a slow input's
+            // pre-barrier rows from the post-barrier rows around them, and
+            // only holding the barrier until every input has delivered it
+            // keeps those rows inside the checkpoint their sources' offsets
+            // already put them in. Forwarding the first unaligned barrier at
+            // once, as this runner used to, put them in the next checkpoint
+            // at whatever consumed the union, so a restore lost them.
             MultiInputAlignment align(n);
+            detail::observe_alignment(align, ctx);
             // Runner-local, growable copy of the input set (hot rescale
             // downstream rebind): the runner is the single writer, so a
             // splice is a plain push_back here. The cancel/depth closures
@@ -1931,8 +1942,9 @@ public:
     // Serialize a vector of typed records into bytes using the given
     // codec. Format: [u32 count] then for each record:
     // [u8 has_event_time][i64 event_time_ms if present][u32 value_len]
-    // [value_bytes]. Stable across runs; the cycle-checkpoint and
-    // unaligned-checkpoint paths both rely on this layout.
+    // [value_bytes]. Stable across runs; the cycle-checkpoint path and the
+    // restore of the in-flight slots earlier releases wrote under unaligned
+    // checkpoints both rely on this layout.
     template <typename T>
     static std::vector<std::byte> serialize_records_(const std::vector<Record<T>>& records,
                                                      const Codec<T>& codec) {
@@ -2264,20 +2276,15 @@ public:
                       late_policy,
                       id](RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
-            // Aligner reads each barrier's stamped mode;
-            // can_unalign now gates only the in-flight CAPTURE step
-            // (we still need codecs + state backend to serialize the
-            // in-flight buffer). If a barrier arrives stamped
-            // Unaligned at an operator that can't capture, the aligner
-            // still forwards immediately (mode is the coordinator's
-            // policy decision) but the records left on the unpaused
-            // inputs roll into the next checkpoint epoch rather than
-            // being snapshotted into this one. 26b will surface a
-            // per-operator override for operators that must force
-            // aligned semantics.
-            const bool can_unalign =
+            // Every barrier is aligned here, an unaligned one included, so
+            // the rows the other input still has ahead of its barrier are
+            // joined in the live run, inside the checkpoint. The codecs and
+            // a state backend are needed only to replay the in-flight slots
+            // a checkpoint from an earlier release can carry (see below).
+            const bool can_replay_inflight =
                 left_codec.has_value() && right_codec.has_value() && ctx.has_state_backend();
             MultiInputAlignment align(2);
+            detail::observe_alignment(align, ctx);
 
             struct LeftEntry {
                 EventTime t;
@@ -2601,26 +2608,6 @@ public:
                     auto adv =
                         align.on_barrier(0, ctx.apply_barrier_mode_override(el.as_barrier()));
                     if (adv.forward) {
-                        // Terminal barriers signal end-of-stream - drain
-                        // would strand records we haven't joined yet,
-                        // and unaligned semantics don't apply when no
-                        // more records are coming.
-                        if (adv.unaligned_first && can_unalign && !adv.barrier.is_terminal()) {
-                            std::vector<Record<B>> right_inflight;
-                            while (auto m = right_ch->try_pop()) {
-                                if (m->is_data()) {
-                                    for (auto& r : m->as_data()) {
-                                        right_inflight.push_back(std::move(r));
-                                    }
-                                }
-                            }
-                            auto bytes = Dag::serialize_records_(right_inflight, *right_codec);
-                            ctx.state_backend()->put(
-                                id,
-                                StateBackend::KeyView{"__interval_join_right_inflight__"},
-                                StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()),
-                                                        bytes.size()});
-                        }
                         out_channel->push(StreamElement<C>::barrier(adv.barrier));
                     }
                 }
@@ -2677,39 +2664,27 @@ public:
                     auto adv =
                         align.on_barrier(1, ctx.apply_barrier_mode_override(el.as_barrier()));
                     if (adv.forward) {
-                        if (adv.unaligned_first && can_unalign && !adv.barrier.is_terminal()) {
-                            std::vector<Record<A>> left_inflight;
-                            while (auto m = left_ch->try_pop()) {
-                                if (m->is_data()) {
-                                    for (auto& r : m->as_data()) {
-                                        left_inflight.push_back(std::move(r));
-                                    }
-                                }
-                            }
-                            auto bytes = Dag::serialize_records_(left_inflight, *left_codec);
-                            ctx.state_backend()->put(
-                                id,
-                                StateBackend::KeyView{"__interval_join_left_inflight__"},
-                                StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()),
-                                                        bytes.size()});
-                        }
                         out_channel->push(StreamElement<C>::barrier(adv.barrier));
                     }
                 }
             };
 
-            // Restore in-flight buffers on startup if a previous run
-            // persisted them under our slots. We hold the restored
-            // records in local pending queues rather than pushing back
-            // into left_ch/right_ch - those upstream channels may have
-            // already been closed by their source runners (whose
-            // threads spawn concurrently with this one), and pushing
-            // into a closed channel silently no-ops. The main poll
-            // loop below drains the pending queues first, exactly the
-            // way it would drain a channel.
+            // Replay the in-flight slots a checkpoint from an earlier
+            // release can carry: those releases forwarded an unaligned
+            // barrier at once and parked the other input's queued records
+            // under these keys instead of joining them. Each slot is read
+            // once and erased before the first element is processed, so the
+            // next checkpoint no longer holds it and its records replay
+            // exactly once. They wait in local pending queues rather than
+            // being pushed back into left_ch/right_ch, because those upstream
+            // channels may already have been closed by their source runners
+            // (whose threads spawn concurrently with this one), and pushing
+            // into a closed channel silently no-ops. The main poll loop
+            // below drains the pending queues first, exactly the way it
+            // would drain a channel.
             std::deque<StreamElement<A>> pending_left;
             std::deque<StreamElement<B>> pending_right;
-            if (can_unalign) {
+            if (can_replay_inflight) {
                 if (auto stored = ctx.state_backend()->get(
                         id, StateBackend::KeyView{"__interval_join_left_inflight__"});
                     stored.has_value()) {
@@ -2936,50 +2911,17 @@ public:
                 throw std::runtime_error("broadcast_process requires JobConfig::state_backend");
             }
             auto state = ctx.template broadcast_state<State>(slot_name, state_codec);
+            // Every barrier is aligned here, an unaligned one included, so
+            // the rows the other input still has ahead of its barrier are
+            // applied in the live run, inside the checkpoint. The record
+            // codecs are needed only to replay the in-flight slots a
+            // checkpoint from an earlier release can carry (see below).
             MultiInputAlignment align(2);
-            // Unaligned-checkpoint in-flight capture (mirrors
-            // add_co_operator). When the first barrier forwards under
-            // unaligned mode, drain the other input's queued pre-barrier
-            // records into a reserved slot so the snapshot captures them
-            // and they replay on restore. Gated on both record codecs +
-            // a state backend; without them the barrier still forwards but
-            // the unpaused input's records roll into the next epoch.
+            detail::observe_alignment(align, ctx);
             static constexpr const char* kMainInflight = "__broadcast_main_inflight__";
             static constexpr const char* kBrodInflight = "__broadcast_brod_inflight__";
-            const bool can_unalign =
+            const bool can_replay_inflight =
                 main_codec.has_value() && brod_codec.has_value() && ctx.has_state_backend();
-            auto capture_main_inflight = [&] {
-                std::vector<Record<Main>> inflight;
-                while (auto m = main_ch->try_pop()) {
-                    if (m->is_data()) {
-                        for (auto& r : m->as_data()) {
-                            inflight.push_back(std::move(r));
-                        }
-                    }
-                }
-                auto bytes = Dag::serialize_records_(inflight, *main_codec);
-                ctx.state_backend()->put(
-                    id,
-                    StateBackend::KeyView{kMainInflight},
-                    StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()),
-                                            bytes.size()});
-            };
-            auto capture_brod_inflight = [&] {
-                std::vector<Record<Brod>> inflight;
-                while (auto m = brod_ch->try_pop()) {
-                    if (m->is_data()) {
-                        for (auto& r : m->as_data()) {
-                            inflight.push_back(std::move(r));
-                        }
-                    }
-                }
-                auto bytes = Dag::serialize_records_(inflight, *brod_codec);
-                ctx.state_backend()->put(
-                    id,
-                    StateBackend::KeyView{kBrodInflight},
-                    StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()),
-                                            bytes.size()});
-            };
 
             auto emit_buffer = [&](std::vector<Out>& buf, std::optional<EventTime> et) {
                 if (buf.empty()) {
@@ -3018,9 +2960,6 @@ public:
                     auto adv =
                         align.on_barrier(1, ctx.apply_barrier_mode_override(el.as_barrier()));
                     if (adv.forward) {
-                        if (adv.unaligned_first && can_unalign && !adv.barrier.is_terminal()) {
-                            capture_main_inflight();
-                        }
                         out_channel->push(StreamElement<Out>::barrier(adv.barrier));
                     }
                 }
@@ -3047,19 +2986,18 @@ public:
                     auto adv =
                         align.on_barrier(0, ctx.apply_barrier_mode_override(el.as_barrier()));
                     if (adv.forward) {
-                        if (adv.unaligned_first && can_unalign && !adv.barrier.is_terminal()) {
-                            capture_brod_inflight();
-                        }
                         out_channel->push(StreamElement<Out>::barrier(adv.barrier));
                     }
                 }
             };
 
-            // Restore in-flight buffers persisted by a prior run, replayed
-            // ahead of the live channels (mirrors add_co_operator).
+            // Replay the in-flight slots a checkpoint from an earlier
+            // release can carry, once, ahead of the live channels, and
+            // erase each one so the next checkpoint no longer holds it
+            // (mirrors add_co_operator).
             std::deque<StreamElement<Main>> pending_main;
             std::deque<StreamElement<Brod>> pending_brod;
-            if (can_unalign) {
+            if (can_replay_inflight) {
                 if (auto stored =
                         ctx.state_backend()->get(id, StateBackend::KeyView{kMainInflight});
                     stored.has_value()) {
@@ -3260,11 +3198,10 @@ public:
             // Async-state path: ONE controller per subtask, shared by BOTH
             // inputs - so same-key records from either side serialise through
             // the per-key gate (observing each other's writes to the shared
-            // keyed state) and share the epoch. Multi-input async is now
-            // supported: the popped/in-flight tail force-aligns via
-            // drain_for_barrier at the barrier, while the unpopped other-channel
-            // records keep the unaligned in-flight-capture fast path. A
-            // non-deferring backend takes the byte-identical sync process path.
+            // keyed state) and share the epoch. The barrier is aligned across
+            // both inputs, and the popped/in-flight tail drains via
+            // drain_for_barrier before the capture. A non-deferring backend
+            // takes the byte-identical sync process path.
             std::shared_ptr<AsyncExecutionController> aec;
             const bool async_mode = op->supports_async() && ctx.has_state_backend() &&
                                     ctx.state_backend()->supports_async_get();
@@ -3321,20 +3258,20 @@ public:
             Emitter<Out> out_emitter(out_channel.get());
             out_emitter.set_operator_id(id.value());
             out_emitter.set_metrics_registry(ctx.metrics());
+            // Every barrier is aligned here, an unaligned one included: the
+            // input that delivered it pauses, the other input's rows ahead
+            // of its own barrier are processed in the live run, and the
+            // snapshot is taken once both have delivered it. This runner
+            // used to snapshot on the first unaligned delivery and drain the
+            // other input's queue into a state slot, rows that were then
+            // never processed in the live run, so a join lost them. The
+            // codecs are needed only to replay the slots a checkpoint from
+            // an earlier release can carry (see below).
             MultiInputAlignment align(2);
-            // Unaligned-checkpoint in-flight capture. When the first
-            // barrier arrives on one input, we snapshot immediately and
-            // forward; the OTHER input's already-queued pre-barrier
-            // records would be lost on restore (the upstream is past its
-            // own barrier and won't replay them), so we drain them into a
-            // reserved state slot that the snapshot then captures, and
-            // replay them on restore. Mirrors interval_join. Gated on
-            // both codecs + a state backend; otherwise the barrier still
-            // forwards (the coordinator owns the mode) but the unpaused
-            // input's records roll into the next epoch instead.
+            detail::observe_alignment(align, ctx);
             static constexpr const char* kLeftInflight = "__co_op_left_inflight__";
             static constexpr const char* kRightInflight = "__co_op_right_inflight__";
-            const bool can_unalign =
+            const bool can_replay_inflight =
                 in1_codec.has_value() && in2_codec.has_value() && ctx.has_state_backend();
             auto* timers = ctx.timer_service();
             auto fire_due = [&] {
@@ -3408,9 +3345,8 @@ public:
             auto snapshot_and_ack = [&](CheckpointBarrier barrier) {
                 // Quiesce all in-flight async reads from BOTH inputs before the
                 // cut, so capture() reflects every pre-barrier record's write
-                // (no torn/half-applied state). The unpopped other-channel
-                // records were captured separately (capture_*_inflight) before
-                // this runs; the two populations are disjoint.
+                // (no torn/half-applied state). Both inputs have delivered the
+                // barrier by now, so every record ahead of it has been popped.
                 if (aec) {
                     aec->drain_for_barrier();
                 }
@@ -3437,9 +3373,6 @@ public:
                     chain_epoch->await_captured(barrier.id().value());
                     return;
                 }
-                // Any in-flight capture has already put() its rows into the
-                // backend before this runs (see handle_left/handle_right),
-                // so capture()/snapshot() here includes them.
                 if (snap_worker) {
                     std::string err;
                     bool ok = true;
@@ -3479,44 +3412,6 @@ public:
                     }
                 }
             };
-            // Drain the still-pending input's queued data records into a
-            // reserved state slot BEFORE snapshot_and_ack runs snapshot(),
-            // so the in-flight is captured into this checkpoint. Keep only
-            // data records: a same-id barrier popped here is absorbed by
-            // the aligner anyway (unaligned forwards on first delivery),
-            // and watermarks re-establish from the next one.
-            auto capture_right_inflight = [&] {
-                std::vector<Record<In2>> inflight;
-                while (auto m = right_ch->try_pop()) {
-                    if (m->is_data()) {
-                        for (auto& r : m->as_data()) {
-                            inflight.push_back(std::move(r));
-                        }
-                    }
-                }
-                auto bytes = Dag::serialize_records_(inflight, *in2_codec);
-                ctx.state_backend()->put(
-                    id,
-                    StateBackend::KeyView{kRightInflight},
-                    StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()),
-                                            bytes.size()});
-            };
-            auto capture_left_inflight = [&] {
-                std::vector<Record<In1>> inflight;
-                while (auto m = left_ch->try_pop()) {
-                    if (m->is_data()) {
-                        for (auto& r : m->as_data()) {
-                            inflight.push_back(std::move(r));
-                        }
-                    }
-                }
-                auto bytes = Dag::serialize_records_(inflight, *in1_codec);
-                ctx.state_backend()->put(
-                    id,
-                    StateBackend::KeyView{kLeftInflight},
-                    StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()),
-                                            bytes.size()});
-            };
 
             auto handle_left = [&](const StreamElement<In1>& el) {
                 if (el.is_data()) {
@@ -3545,9 +3440,6 @@ public:
                     auto adv =
                         align.on_barrier(0, ctx.apply_barrier_mode_override(el.as_barrier()));
                     if (adv.forward) {
-                        if (adv.unaligned_first && can_unalign && !adv.barrier.is_terminal()) {
-                            capture_right_inflight();
-                        }
                         snapshot_and_ack(adv.barrier);
                     }
                 }
@@ -3579,21 +3471,23 @@ public:
                     auto adv =
                         align.on_barrier(1, ctx.apply_barrier_mode_override(el.as_barrier()));
                     if (adv.forward) {
-                        if (adv.unaligned_first && can_unalign && !adv.barrier.is_terminal()) {
-                            capture_left_inflight();
-                        }
                         snapshot_and_ack(adv.barrier);
                     }
                 }
             };
 
-            // Restore in-flight buffers persisted by a prior run. Held in
-            // local pending queues (not pushed back into the upstream
-            // channels, which may already be closed) and drained ahead of
-            // the live channels in the poll loop below.
+            // Replay the in-flight slots a checkpoint from an earlier release
+            // can carry: those releases parked the waiting input's queued
+            // records under these keys when an unaligned barrier arrived. Each
+            // slot is read once and erased before the first element is
+            // processed, so the next checkpoint no longer holds it and its
+            // records replay exactly once. Held in local pending queues (not
+            // pushed back into the upstream channels, which may already be
+            // closed) and drained ahead of the live channels in the poll loop
+            // below, so they land ahead of the restored run's first barrier.
             std::deque<StreamElement<In1>> pending_left;
             std::deque<StreamElement<In2>> pending_right;
-            if (can_unalign) {
+            if (can_replay_inflight) {
                 if (auto stored =
                         ctx.state_backend()->get(id, StateBackend::KeyView{kLeftInflight});
                     stored.has_value()) {
@@ -4142,7 +4036,10 @@ public:
                 using namespace std::chrono_literals;
                 sink->attach_runtime(&ctx);
                 sink->open();
+                // Every barrier is aligned across the inputs, an unaligned one
+                // included, so the sink sees each checkpoint as one cut.
                 MultiInputAlignment align(ins.size());
+                detail::observe_alignment(align, ctx);
                 // Input k is closed AND drained (see the co_operator runner
                 // note: a push+close can land between a failed try_pop and the
                 // check). The close can complete a pending barrier's alignment,
@@ -4901,7 +4798,10 @@ private:
                 op->attach_runtime(&ctx);
                 op->open();
                 Emitter<Out> out_emitter(stage_emitter.get());
+                // Every barrier is aligned across the shuffle's inputs, an
+                // unaligned one included, so each checkpoint is one cut here.
                 MultiInputAlignment align(ins.size());
+                detail::observe_alignment(align, ctx);
                 // Input k is closed AND drained (see the co_operator runner
                 // note: a push+close can land between a failed try_pop and the
                 // check). The close can complete a pending barrier's alignment,

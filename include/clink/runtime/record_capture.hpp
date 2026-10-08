@@ -17,8 +17,9 @@
 // header records both the truncation and the true count, so a replay can
 // tell "complete epoch" from "sampled epoch".
 //
-// The plain record framing is shared with the engine's unaligned-checkpoint
-// in-flight capture (Dag::serialize_records_ delegates here): per record a
+// The plain record framing is shared with the engine's in-flight state slots
+// (Dag::serialize_records_ delegates here), the iteration head's and those
+// earlier releases wrote under unaligned checkpoints: per record a
 // presence-tagged event time plus the value's Codec<T> bytes. A .cap file
 // prepends a small header: magic "CCAP", format version, truncated flag,
 // and the true records-seen count.

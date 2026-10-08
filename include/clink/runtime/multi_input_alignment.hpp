@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
@@ -23,6 +25,14 @@ namespace clink {
 // whether to forward a watermark, forward a barrier, and which inputs are
 // currently paused (i.e. should not be polled because they've passed a
 // barrier that other inputs haven't reached yet).
+//
+// Every checkpoint is a consistent cut across all inputs. A barrier is
+// forwarded only once every alive input has delivered it, whatever mode it
+// is stamped with, unless the operator captures in-flight rows (see the
+// constructor): forwarding an Unaligned barrier on its first delivery leaves
+// the rows still queued on the other inputs to reach the operator after it,
+// outside the checkpoint their sources' offsets already put them in, and only
+// a capture of those rows into the checkpoint makes that sound.
 class MultiInputAlignment {
 public:
     // Alias to CheckpointBarrier::Mode. The aligner formerly
@@ -33,20 +43,48 @@ public:
     // `MultiInputAlignment::Mode::Unaligned` continue to compile.
     using Mode = CheckpointBarrier::Mode;
 
-    explicit MultiInputAlignment(std::size_t input_count)
+    // `captures_in_flight` says whether the owning operator, when a barrier
+    // stamped Unaligned arrives, captures the rows still queued on its other
+    // inputs into the checkpoint. Only then may the aligner forward that
+    // barrier on its first delivery. No operator does today, so every runner
+    // leaves it false, and an Unaligned barrier is aligned exactly as an
+    // Aligned one and forwarded marked Aligned: unaligned and adaptive
+    // checkpoints align at every fan-in. The flag keeps the
+    // forward-on-first-delivery path for a capture that is correct.
+    explicit MultiInputAlignment(std::size_t input_count, bool captures_in_flight = false)
         : input_wm_(input_count, Watermark::min()),
           paused_(input_count, false),
           closed_(input_count, false),
           cancelled_close_(input_count, false),
           drained_(input_count, false),
-          idle_(input_count, false) {}
+          idle_(input_count, false),
+          captures_in_flight_(captures_in_flight) {}
 
     // Stamp the aligner with the OperatorId.value() of the operator
     // it belongs to so per-op barrier alignment metrics route to the
     // right counter. Zero (the default) disables metric emission so
     // unit tests of the aligner itself don't fabricate counter
     // entries.
-    void set_operator_id(std::uint64_t op_id) noexcept { op_id_for_metrics_ = op_id; }
+    // `metrics` is the registry they go to: the RuntimeContext's, so that on
+    // the plugin path they reach the host's registry and not the job module's
+    // copy of the global one (nullptr: the global registry).
+    void set_operator_id(std::uint64_t op_id, MetricsRegistry* metrics = nullptr) noexcept {
+        op_id_for_metrics_ = op_id;
+        metrics_ = metrics;
+    }
+
+    [[nodiscard]] bool captures_in_flight() const noexcept { return captures_in_flight_; }
+
+    // Called once, on the first forced alignment: a barrier stamped
+    // Unaligned that this aligner aligned across more than one input because
+    // the operator does not capture in-flight rows. The runner routes it to
+    // its log; the count of every one is forced_alignments() and, with an
+    // operator id set, clink_op_barrier_forced_alignments_total.
+    void set_forced_alignment_notice(std::function<void(CheckpointBarrier)> notice) {
+        forced_alignment_notice_ = std::move(notice);
+    }
+
+    [[nodiscard]] std::uint64_t forced_alignments() const noexcept { return forced_alignments_; }
 
     struct WatermarkAdvance {
         bool forward{false};
@@ -56,11 +94,11 @@ public:
     struct BarrierAdvance {
         bool forward{false};
         CheckpointBarrier barrier{};
-        // True iff this advance was triggered by the FIRST input to
-        // deliver this barrier (unaligned mode). The runner uses this
-        // flag to know when to capture the in-flight records on the
-        // other channels into the snapshot. Always false in aligned
-        // mode - by the time we forward, every input has delivered.
+        // True iff this advance forwards an Unaligned barrier on its FIRST
+        // delivery, which only an aligner built with captures_in_flight does:
+        // the runner then captures the rows still queued on the other inputs
+        // (pending_inputs_for) into the checkpoint. Always false otherwise,
+        // since by the time the barrier forwards every input has delivered it.
         bool unaligned_first{false};
     };
 
@@ -106,15 +144,15 @@ public:
     // is now aligned across all alive inputs and should be forwarded
     // downstream.
     //
-    // The barrier's stamped Mode decides behaviour per-barrier:
-    //   Aligned: paused_[i] = true; further delivery of the same
-    //     barrier on other inputs may complete alignment and forward.
-    //   Unaligned: first delivery forwards immediately and never
-    //     pauses; subsequent deliveries of the same id are absorbed
-    //     silently. The first-delivery advance carries
-    //     `unaligned_first=true` so the operator runner knows to
-    //     capture the still-pending inputs' in-flight records into
-    //     the snapshot.
+    // Input i pauses (paused_[i] = true) and the barrier forwards once every
+    // alive input has delivered the same id, whatever its stamped Mode. An
+    // Unaligned stamp changes that only for an aligner built with
+    // captures_in_flight: its first delivery forwards immediately and never
+    // pauses, subsequent deliveries of the same id are absorbed silently, and
+    // the first-delivery advance carries `unaligned_first=true` so the runner
+    // captures the still-pending inputs' in-flight rows into the snapshot.
+    // Without that flag an Unaligned barrier is aligned like any other and
+    // forwarded marked Aligned, since that is the cut it now describes.
     //
     // Modes can change across checkpoints; the first delivery of a
     // given checkpoint id pins the mode for that checkpoint at this
@@ -128,13 +166,15 @@ public:
             // first-seen mode (Chandy-Lamport requires per-checkpoint
             // mode agreement; a mismatch is a stamping bug upstream).
             seen_mode_[b.id().value()] = b.mode();
+            seen_terminal_[b.id().value()] = b.is_terminal();
             first_seen_time_[b.id().value()] = std::chrono::steady_clock::now();
+        } else if (!b.is_terminal()) {
+            seen_terminal_[b.id().value()] = false;
         }
         const bool first_for_this_barrier = !any_true_(seen);
         seen[i] = true;
-        const Mode effective_mode = seen_mode_[b.id().value()];
 
-        if (effective_mode == Mode::Unaligned) {
+        if (forwards_on_first_delivery_(b.id().value())) {
             if (!first_for_this_barrier) {
                 // Subsequent deliveries: harmless. Don't re-forward.
                 // GC the bookkeeping once every alive input has been
@@ -174,7 +214,18 @@ public:
         cancelled_close_[i] = cancelled || drained_[i];
         input_wm_[i] = Watermark::max();  // closed inputs no longer hold back time
         // A close may complete alignment for a pending barrier; check each.
-        for (auto& [id, _] : seen_barriers_) {
+        // A barrier forwarded on its first delivery is not pending: the
+        // close only lets its bookkeeping go, and it must not forward again.
+        std::vector<std::uint64_t> ids;
+        ids.reserve(seen_barriers_.size());
+        for (const auto& [id, _] : seen_barriers_) {
+            ids.push_back(id);
+        }
+        for (const auto id : ids) {
+            if (forwards_on_first_delivery_(id)) {
+                maybe_drop_seen_(id);
+                continue;
+            }
             if (auto adv = check_alignment_(id); adv.forward) {
                 return adv;
             }
@@ -266,10 +317,10 @@ public:
     // drain). Empty result means "every alive input has delivered;
     // there's no in-flight to capture."
     //
-    // Stateful multi-input operators consult this on the
-    // `adv.unaligned_first` advance to know which channels they
-    // should drain into snapshot state before the barrier moves
-    // downstream. The aligner records same-id deliveries via
+    // An operator that captures in-flight rows consults this on the
+    // `adv.unaligned_first` advance to know which channels it must
+    // capture before the barrier moves downstream; no runner does
+    // today. The aligner records same-id deliveries via
     // on_barrier; this accessor reads that bitmap. Calling it for an
     // unknown ck_id (one that no input has delivered yet) returns
     // every alive input.
@@ -303,9 +354,19 @@ private:
         return false;
     }
 
-    // In unaligned mode we no longer need the bitmap once every alive
-    // input has been seen - it just tracks "have we forwarded for this
-    // id". GC it eagerly to keep the map small.
+    // Whether checkpoint `ck_id` was forwarded on its first delivery: it is
+    // stamped Unaligned and the operator captures in-flight rows.
+    bool forwards_on_first_delivery_(std::uint64_t ck_id) const {
+        if (!captures_in_flight_) {
+            return false;
+        }
+        const auto it = seen_mode_.find(ck_id);
+        return it != seen_mode_.end() && it->second == Mode::Unaligned;
+    }
+
+    // A barrier forwarded on its first delivery needs its bitmap only to
+    // absorb the later deliveries of its id. GC it once every alive input
+    // has been seen, to keep the map small.
     void maybe_drop_seen_(std::uint64_t ck_id) {
         auto it = seen_barriers_.find(ck_id);
         if (it == seen_barriers_.end()) {
@@ -318,6 +379,8 @@ private:
         }
         seen_barriers_.erase(it);
         seen_mode_.erase(ck_id);
+        seen_terminal_.erase(ck_id);
+        first_seen_time_.erase(ck_id);
     }
 
     BarrierAdvance check_alignment_(std::uint64_t ck_id) {
@@ -331,27 +394,47 @@ private:
                 return {};  // not yet aligned
             }
         }
-        // All alive inputs delivered this barrier - release. Preserve
-        // the stamped mode on the forwarded barrier so downstream
-        // operators see the same policy.
+        // All alive inputs delivered this barrier, so release it, carrying
+        // the stamped mode on so downstream operators see the same policy.
+        // An Unaligned stamp reaches here only when the operator does not
+        // capture in-flight rows, and was aligned like any other: it goes on
+        // marked Aligned, which is the cut it now describes.
         Mode m = Mode::Aligned;
+        bool forced = false;
         if (auto mit = seen_mode_.find(ck_id); mit != seen_mode_.end()) {
-            m = mit->second;
+            forced = mit->second == Mode::Unaligned && !captures_in_flight_;
+            m = forced ? Mode::Aligned : mit->second;
+        }
+        // A single input has nothing to wait for, so only an alignment
+        // across several inputs counts as forced.
+        const bool across_inputs = flags.size() > 1;
+        // A terminal barrier (a bounded source's local end-of-stream commit)
+        // stays terminal once every input has delivered it or finished, so
+        // the sink behind the fan-in commits the tail as it would behind one
+        // input. Not when an input closed by cancellation or for a rescale
+        // handoff: that is not end of input, and the tail must not be
+        // published.
+        bool terminal = false;
+        if (auto tit = seen_terminal_.find(ck_id); tit != seen_terminal_.end()) {
+            terminal = tit->second && std::none_of(cancelled_close_.begin(),
+                                                   cancelled_close_.end(),
+                                                   [](bool c) { return c; });
         }
         BarrierAdvance adv;
         adv.forward = true;
-        adv.barrier = CheckpointBarrier{CheckpointId{ck_id}, /*terminal=*/false, m};
+        adv.barrier = CheckpointBarrier{CheckpointId{ck_id}, terminal, m};
         seen_barriers_.erase(it);
         seen_mode_.erase(ck_id);
+        seen_terminal_.erase(ck_id);
         if (op_id_for_metrics_ != 0) {
             if (auto tit = first_seen_time_.find(ck_id); tit != first_seen_time_.end()) {
                 const auto wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - tit->second)
                                          .count();
-                clink::metrics::ckpt::barrier_aligned(op_id_for_metrics_,
-                                                      static_cast<std::uint64_t>(wait_ns));
+                clink::metrics::ckpt::barrier_aligned(
+                    metrics_, op_id_for_metrics_, static_cast<std::uint64_t>(wait_ns));
             } else {
-                clink::metrics::ckpt::barrier_aligned(op_id_for_metrics_, 0);
+                clink::metrics::ckpt::barrier_aligned(metrics_, op_id_for_metrics_, 0);
             }
         }
         first_seen_time_.erase(ck_id);
@@ -361,7 +444,22 @@ private:
                 paused_[j] = false;
             }
         }
+        if (forced && across_inputs) {
+            note_forced_alignment_(adv.barrier);
+        }
         return adv;
+    }
+
+    // Count a forced alignment, and hand the first one to the runner's
+    // notice so it is logged once per operator rather than per barrier.
+    void note_forced_alignment_(const CheckpointBarrier& b) {
+        ++forced_alignments_;
+        if (op_id_for_metrics_ != 0) {
+            clink::metrics::ckpt::barrier_forced_aligned(metrics_, op_id_for_metrics_);
+        }
+        if (forced_alignments_ == 1 && forced_alignment_notice_) {
+            forced_alignment_notice_(b);
+        }
     }
 
     WatermarkAdvance recompute_watermark_() {
@@ -451,6 +549,9 @@ private:
     // delivery so aligned and unaligned semantics never mix mid-flight
     // for one checkpoint. Entries are GC'd alongside seen_barriers_.
     std::unordered_map<std::uint64_t, Mode> seen_mode_;
+    // Whether every delivery of a pending checkpoint id so far was a
+    // terminal barrier. GC'd alongside seen_barriers_.
+    std::unordered_map<std::uint64_t, bool> seen_terminal_;
     std::vector<Watermark> input_wm_;
     std::vector<bool> paused_;
     std::vector<bool> closed_;
@@ -473,8 +574,16 @@ private:
     // runner that constructs the aligner; 0 means "don't emit
     // metrics" (aligner-only UTs leave this default).
     std::uint64_t op_id_for_metrics_{0};
+    MetricsRegistry* metrics_{nullptr};
     Watermark emitted_wm_{Watermark::min()};
     bool last_emitted_idle_{false};
+    // See the constructor. False everywhere today.
+    bool captures_in_flight_{false};
+    // Barriers stamped Unaligned that were aligned across several inputs
+    // because the operator does not capture in-flight rows, and the notice
+    // the first of them is handed to.
+    std::uint64_t forced_alignments_{0};
+    std::function<void(CheckpointBarrier)> forced_alignment_notice_;
 };
 
 }  // namespace clink

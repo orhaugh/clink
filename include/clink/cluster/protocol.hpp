@@ -419,9 +419,9 @@ struct DeployMsg {
     std::uint32_t restore_generation{1};
     // Unaligned-checkpoint mode for this job, echoed from
     // CheckpointConfig.alignment. The worker passes it through to each
-    // RunnerContext so multi-input operator runners can switch
-    // their alignment state machine. v1 trailing field - old workers
-    // see EOF and default to aligned.
+    // RunnerContext, where source runners stamp it onto their barriers;
+    // multi-input runners align every barrier whatever its stamp. A v1
+    // trailing field: old workers see EOF and default to aligned.
     bool unaligned_checkpoints{false};
     // Adaptive checkpoint mode (CheckpointAlignment::Adaptive): sources
     // forward the barrier stamp the coordinator's trigger carried
@@ -660,12 +660,13 @@ struct HelloClientMsg {
 // and historical mode) waits at multi-input operators until
 // every input channel has delivered a barrier - records arriving on
 // already-aligned inputs get held back, which adds latency under
-// backpressure. Unaligned (newer mode, since 1.11) lets the
-// barrier overtake in-flight records: it forwards immediately on the
-// first input that delivers, and the still-queued records on the
-// other inputs are captured into the checkpoint and replayed at
-// restore. Faster under backpressure; larger checkpoints. Single-
-// input operators behave identically either way.
+// backpressure. Unaligned and Adaptive stamp barriers Unaligned
+// (Adaptive only under measured pressure), but every multi-input
+// operator aligns them exactly as Aligned ones: no operator captures
+// the records still queued on its other inputs, so forwarding early
+// would leave them outside the checkpoint. Both stay accepted so
+// existing jobs keep starting, and each checkpoint is a consistent cut
+// in every mode. Single-input operators behave identically either way.
 enum class CheckpointAlignment : std::uint8_t {
     Aligned = 0,
     Unaligned = 1,
@@ -717,8 +718,10 @@ struct CheckpointConfig {
     // effective_max_restarts() at the coordinator. Has no effect without checkpoint_dir.
     std::uint32_t max_restarts_on_worker_loss{kRestartAuto};
 
-    // Aligned vs unaligned barrier handling at multi-input operators.
-    // Default Aligned - back-compat with every existing job.
+    // The barrier stamp the job asks for. Default Aligned. Every
+    // multi-input operator aligns whatever the stamp (see
+    // CheckpointAlignment), so this is deploy configuration only: it is
+    // not part of the job graph or its fingerprint.
     CheckpointAlignment alignment{CheckpointAlignment::Aligned};
 
     // Per-subtask state-backend URI, decoupled from checkpoint_dir. When

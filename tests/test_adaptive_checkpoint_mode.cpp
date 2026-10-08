@@ -12,11 +12,11 @@
 //   6. the coordinator's trigger stamps the policy's decision on the
 //      barrier (and per-trigger override still bypasses it).
 //
-// Checkpoint CORRECTNESS under either mode is pinned elsewhere: the
-// aligner honours the per-barrier stamp (test_co_operator_unaligned
-// proves capture/replay for unaligned and no-capture for aligned, and
-// the aligner pins the first-seen mode per checkpoint id), so a mode
-// flip between checkpoints exercises already-proven per-mode paths.
+// Checkpoint CORRECTNESS under either stamp is pinned elsewhere: every
+// multi-input operator aligns an unaligned barrier exactly as an aligned
+// one (test_fan_in_checkpoint_cut, test_co_operator_unaligned, and the
+// DagUnion test of an adaptive checkpoint stamped unaligned), so a stamp
+// flip between checkpoints changes nothing about where a checkpoint cuts.
 
 #include <gtest/gtest.h>
 

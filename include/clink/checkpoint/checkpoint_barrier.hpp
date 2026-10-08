@@ -28,9 +28,11 @@ public:
     // Aligned (default): multi-input operators pause inputs that
     //   already saw the barrier and wait for every alive input
     //   before forwarding; in-flight records are NOT persisted.
-    // Unaligned: forward the barrier on the first input's delivery
-    //   and snapshot the in-flight records of the other inputs into
-    //   state. Recovers faster under backpressure; pays state size.
+    // Unaligned: asks for the barrier to overtake the records in flight
+    //   on the other inputs, which only an operator that captures those
+    //   records into the checkpoint could honour. None does, so every
+    //   multi-input operator aligns an Unaligned barrier exactly as an
+    //   Aligned one and forwards it marked Aligned.
     enum class Mode : std::uint8_t {
         Aligned = 0,
         Unaligned = 1,

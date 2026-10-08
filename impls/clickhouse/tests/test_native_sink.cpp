@@ -1158,8 +1158,15 @@ TEST(NativeSinkMemory, TheWriterClosesItsInsertsAtTheCappedBatchBytes) {
 }
 
 // --- Barrier modes and the chain rule ---------------------------------------------
+//
+// Every barrier mode is accepted. A fan-in upstream aligns every barrier
+// whatever its stamp, so one stamped Unaligned reaches the sink only along a
+// single in-order path, where it cuts exactly where an aligned one would. The
+// sink used to refuse unaligned and adaptive checkpoints, because a fan-in
+// forwarded such a barrier ahead of the rows still in flight on its other
+// inputs.
 
-TEST(NativeSinkBarrierMode, UnalignedOrAdaptiveCheckpointsAreRefusedAtOpenBeforeAnyConnect) {
+TEST(NativeSinkBarrierMode, UnalignedOrAdaptiveCheckpointsCommitAsAlignedOnes) {
     const std::vector<std::pair<std::string, NsConfigure>> modes = {
         {"unaligned",
          [](JobConfig& c, OperatorId /*source*/, OperatorId /*sink*/) {
@@ -1179,79 +1186,40 @@ TEST(NativeSinkBarrierMode, UnalignedOrAdaptiveCheckpointsAreRefusedAtOpenBefore
         NsRig rig;
         rig.start({ns_data(0, 10), ns_barrier(1)}, true, configure);
         rig.wait();
-        const auto refused = rig.errors_with(code::kBarrierModeUnsupported);
-        ASSERT_EQ(refused.size(), 1U);
-        EXPECT_TRUE(ns_has(refused.front(), "needs aligned checkpoint barriers"))
-            << refused.front();
-        EXPECT_EQ(rig.server->connects(), 0U);
-        EXPECT_TRUE(rig.acknowledged().empty());
-        EXPECT_EQ(
-            ns_count(
-                rig.metrics,
-                ns_name(
-                    metric::kRefusalsTotal, rig.op_id(), "reason", code::kBarrierModeUnsupported)),
-            1U);
+        EXPECT_TRUE(rig.exec->operator_errors().empty());
+        EXPECT_EQ(rig.acknowledged(), std::vector<std::uint64_t>{1});
+        EXPECT_TRUE(ns_each_landed(*rig.server, 0, 10));
     }
 }
 
-TEST(NativeSinkBarrierMode, AnUnalignedBarrierOnAnAlignedJobIsRefusedAndNeverAcknowledged) {
+TEST(NativeSinkBarrierMode, AnUnalignedBarrierFromAnUpstreamOverrideIsFlushedAndAcknowledged) {
     NsRig rig;
-    // An override upstream is invisible from the sink's own context: only
-    // the barrier carries it. The source is bounded, so a sink that let the
-    // barrier through would end the job rather than leave the case waiting.
+    // An override upstream shows only on the barrier; the path from the
+    // source is one in-order channel, so nothing can overtake it.
     rig.start({ns_data(0, 10), ns_barrier(1), ns_data(10, 20)},
               true,
               [](JobConfig& c, OperatorId source, OperatorId /*sink*/) {
                   c.barrier_mode_overrides_by_operator[source] = CheckpointBarrier::Mode::Unaligned;
               });
     rig.wait();
-    const auto refused = rig.errors_with(code::kBarrierModeUnsupported);
-    ASSERT_EQ(refused.size(), 1U);
-    EXPECT_TRUE(ns_has(refused.front(), "checkpoint barrier 1 arrived unaligned"))
-        << refused.front();
-    EXPECT_TRUE(rig.acknowledged().empty());
-    // It opened: the refusal came at the barrier, before anything was flushed.
-    EXPECT_GE(rig.server->connects(), 1U);
-    EXPECT_EQ(rig.server->rows(kNsTable), 0U);
-    EXPECT_EQ(
-        ns_count(
-            rig.metrics,
-            ns_name(metric::kRefusalsTotal, rig.op_id(), "reason", code::kBarrierModeUnsupported)),
-        1U);
+    EXPECT_TRUE(rig.exec->operator_errors().empty());
+    EXPECT_EQ(rig.acknowledged(), std::vector<std::uint64_t>{1});
+    EXPECT_TRUE(ns_each_landed(*rig.server, 0, 20));
 }
 
-// A terminal barrier ends a bounded stream: nothing can arrive after it, so
-// there are no rows in flight for an unaligned one to lose, and it is
-// flushed. Only a barrier with more to come is refused.
-TEST(NativeSinkBarrierMode, ATerminalUnalignedBarrierIsFlushedAndOnlyANonTerminalOneIsRefused) {
+TEST(NativeSinkBarrierMode, AnUnalignedBarrierIsFlushedTerminalOrNot) {
     NsDirect d;
     NativeSink& sink = d.open();
     sink.on_data(ns_rows(0, 10));
     EXPECT_NO_THROW(
+        sink.on_barrier(CheckpointBarrier{CheckpointId{5}, CheckpointBarrier::Mode::Unaligned}));
+    EXPECT_EQ(d.server->rows(kNsTable), 10U);
+    sink.on_data(ns_rows(10, 20));
+    EXPECT_NO_THROW(
         sink.on_barrier(CheckpointBarrier{CheckpointId{std::numeric_limits<std::uint64_t>::max()},
                                           true,
                                           CheckpointBarrier::Mode::Unaligned}));
-    EXPECT_EQ(d.server->rows(kNsTable), 10U);
-
-    const std::int64_t since = ns_log_mark();
-    sink.on_data(ns_rows(10, 20));
-    const auto refused = ns_error([&sink] {
-        sink.on_barrier(CheckpointBarrier{CheckpointId{5}, CheckpointBarrier::Mode::Unaligned});
-    });
-    ASSERT_TRUE(refused);
-    EXPECT_EQ(refused->code(), code::kBarrierModeUnsupported);
-    EXPECT_EQ(d.server->rows(kNsTable), 10U);
-    EXPECT_EQ(
-        ns_count(
-            d.metrics,
-            ns_name(
-                metric::kRefusalsTotal, NsDirect::kOpId, "reason", code::kBarrierModeUnsupported)),
-        1U);
-    // The refusal stopped the writer, so nothing more is taken.
-    EXPECT_THROW(sink.on_data(ns_rows(20, 30)), std::exception);
-    d.sink.reset();
-    EXPECT_TRUE(ns_has(ns_cancelled_summary(since), " abandoned_rows=10 "));
-    EXPECT_EQ(d.server->rows(kNsTable), 10U);
+    EXPECT_EQ(d.server->rows(kNsTable), 20U);
 }
 
 TEST(NativeSinkChain, TheSinkMustBeTheOnlySinkOnItsChainWhicheverIsAddedFirst) {

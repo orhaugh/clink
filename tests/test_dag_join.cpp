@@ -793,11 +793,11 @@ TEST(IntervalJoin, ReversedBoundsProduceNoMatches) {
 }
 
 // ---------------------------------------------------------------------------
-// Unaligned-mode correctness at interval_join (the canonical // stateful multi-input operator). The
-// capture path persists in-flight records from the not-yet-aligned channel into state at
-// first-barrier time; the restore path pushes them back into the input channels at runner startup.
-// Combined, restarts from a snapshot pick up exactly the records that were in flight at the
-// unaligned barrier moment.
+// Unaligned-mode correctness at interval_join. A barrier stamped Unaligned is
+// aligned here as at every multi-input runner, so the rows the other input
+// still has ahead of its barrier are joined in the live run and nothing goes
+// to an in-flight slot. The restore path still replays a slot a checkpoint
+// from an earlier release carries, once, ahead of the live inputs.
 // ---------------------------------------------------------------------------
 
 #include "clink/core/codec.hpp"
@@ -873,7 +873,7 @@ private:
 
 }  // namespace
 
-TEST(IntervalJoinUnaligned, BarrierFromLeftCapturesRightInflightIntoState) {
+TEST(IntervalJoinUnaligned, BarrierFromLeftLeavesTheRightRowsToTheLiveRun) {
     auto backend = std::make_shared<InMemoryStateBackend>();
 
     Dag dag;
@@ -924,23 +924,34 @@ TEST(IntervalJoinUnaligned, BarrierFromLeftCapturesRightInflightIntoState) {
     LocalExecutor exec(std::move(dag), std::move(cfg));
     exec.start();
 
+    // The right source never delivers barrier 77, so the join holds it with
+    // the left input paused and joins the right rows as they arrive. Nothing
+    // goes to an in-flight slot at any point.
     bool slot_seen = false;
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (std::chrono::steady_clock::now() < deadline && !slot_seen) {
+    const auto scan_for_slot = [&] {
         backend->scan(join_id, [&](StateBackend::KeyView k, StateBackend::ValueView) {
-            if (k == "__interval_join_right_inflight__") {
+            if (k == "__interval_join_right_inflight__" || k == "__interval_join_left_inflight__") {
                 slot_seen = true;
             }
         });
-        if (!slot_seen) {
-            std::this_thread::sleep_for(10ms);
-        }
+    };
+    const auto deadline = std::chrono::steady_clock::now() +
+                          clink::test_support::scale_slack(std::chrono::seconds{5});
+    while (std::chrono::steady_clock::now() < deadline && sink->collected().size() < 3) {
+        scan_for_slot();
+        std::this_thread::sleep_for(10ms);
     }
+    scan_for_slot();
     exec.cancel();
     exec.await_termination();
 
-    EXPECT_TRUE(slot_seen) << "unaligned-mode interval_join should have captured right-channel "
-                              "in-flight records into the state backend";
+    EXPECT_FALSE(slot_seen) << "the join drained the right input's rows into an in-flight slot "
+                               "instead of joining them in the live run";
+    auto results = sink->collected();
+    std::sort(results.begin(), results.end());
+    EXPECT_EQ(results,
+              (std::vector<std::pair<std::int64_t, std::int64_t>>{{1, 10}, {1, 11}, {1, 12}}))
+        << "the right rows were not all joined in the live run";
 }
 
 TEST(IntervalJoinUnaligned, RestoreReplaysCapturedInflightRecordsIntoChannels) {

@@ -212,7 +212,7 @@ At-least-once, under the conditions below:
 
 The conditions, each enforced rather than assumed:
 
-- Aligned checkpoints. The sink refuses unaligned and adaptive checkpoints (see [Topology and checkpoint limits](#topology-and-checkpoint-limits)).
+- A consistent cut at every checkpoint. The engine aligns every barrier at a fan-in whatever the job's alignment mode, so unaligned and adaptive checkpoints cut where aligned ones do (see [Topology and checkpoint limits](#topology-and-checkpoint-limits)).
 - The sink alone on its chain. `Dag::add_sink` refuses another sink beside it.
 - A synchronous INSERT. Every INSERT sends `async_insert=0, wait_for_async_insert=1`, and the sink refuses a target whose table or server settings would make it asynchronous anyway.
 - For a Distributed target, a synchronous write to the shards. Every INSERT sends `distributed_foreground_insert=1`, so the rows are on the shards when the INSERT is acknowledged. A Distributed table does not deduplicate, so every resend into one counts as possibly duplicated.
@@ -258,7 +258,6 @@ At open, before any network work:
 
 | Code | Cause | Fix |
 | --- | --- | --- |
-| `clickhouse.barrier_mode_unsupported` | The job runs unaligned or adaptive checkpoints, or the sink's operator carries an unaligned barrier-mode override. | Run the job with aligned checkpoints, the default (`--alignment aligned` when submitting SQL with `clink_submit_sql`). |
 | `clickhouse.memory_budget_too_small` | The subtask's memory budget leaves less than 1 MiB of `batch_bytes` once the sink plans its buffers into half of it. | Give each subtask a budget of at least 37748736 bytes (36 MiB), or none. |
 
 At open, from the server and the table. A table-level or configuration change fixes each of these; the sink does not change the table itself.
@@ -289,7 +288,6 @@ At run time, after open. Each fails the task, and the job's restart replays from
 
 | Code | Cause | Fix |
 | --- | --- | --- |
-| `clickhouse.barrier_mode_unsupported` | A checkpoint barrier arrived unaligned although the job runs aligned checkpoints, which an unaligned barrier-mode override on an upstream operator does. The checkpoint is not acknowledged, so nothing is lost, but the job spends restarts until it fails. | Remove the override from the operators upstream of the sink. |
 | `clickhouse.header_drift` | The table changed since open: the INSERT's header no longer matches the column plan. | Restart the job so that the sink plans against the table as it is now. |
 | `clickhouse.conversion_failed` | A value the target column cannot hold (see [Type mapping](#type-mapping)). The error line names the column and shows the row with its values redacted. | Fix the data, or the declared type or the target type. A replay meets the same row, so this fails again until it is fixed. |
 | `clickhouse.too_many_partitions` | One INSERT touches more partitions than the server's `max_partitions_per_insert_block` allows. | Make the table's `PARTITION BY` coarser, or lower `batch_rows` so each INSERT spans fewer partitions. |
@@ -416,7 +414,7 @@ A refusal at run time, an exhausted window or a permanent failure fails the subt
 
 The sink must be the only sink on its chain. Its guarantee rests on writing out the interval inside the barrier, before the chain's checkpoint is acknowledged, which holds only while the sink owns that checkpoint, and a second sink on the chain would take ownership away. `Dag::add_sink` refuses the combination in either order, with a message that names the sink and says it must be the only sink on its chain; give the other sink its own subtask. See [checkpointing](../internals/checkpointing.md#guarantees-and-caveats).
 
-Unaligned and adaptive checkpoints are refused (`clickhouse.barrier_mode_unsupported`). Under them a fan-in upstream of the sink forwards a barrier at once without capturing the rows still in flight on its other inputs, so a row could reach the sink after a barrier its upstream had already snapshotted past, and a crash would lose it. A cluster sink subtask has a fan-in in front of it whenever the upstream parallelism is above 1, so the refusal applies at any parallelism. Adaptive mode would turn unaligned under backpressure, which this sink applies on purpose while it retries.
+Unaligned and adaptive checkpoints are accepted, and cut where aligned ones do. A fan-in upstream of the sink (a cluster sink subtask has one whenever the upstream parallelism is above 1) aligns every barrier whatever its stamp, so a barrier stamped unaligned reaches the sink only along a single in-order path, where no row can overtake it. The sink used to refuse both modes, because a fan-in forwarded such a barrier at once, ahead of the rows still in flight on its other inputs, and a crash would have lost them.
 
 Two engine paths bound how long a barrier may be held, and both bounds are below the default `retry_window_ms` of 600000:
 
@@ -609,7 +607,7 @@ Source: a `SELECT` materialises a finite (bounded) result set. The source persis
 - Text sink batches are concatenated in memory and inserted with `client.Execute()`; there is no streaming insert, no 2PC, no upsert, and no deduplication of a replayed batch. A failed flush at a barrier throws, which fails that checkpoint rather than completing it over rows ClickHouse never received.
 - The text sink is at-least-once only as the only sink on its chain; beside a second sink a checkpoint can complete over rows it has not yet written.
 - The native sink appends only: no exactly-once, no `mode='upsert'`, no `changelog='true'`, no full-refresh materialised views.
-- The native sink refuses SharedMergeTree targets, asynchronous-insert targets, and unaligned and adaptive checkpoints, and must be the only sink on its chain.
+- The native sink refuses SharedMergeTree targets and asynchronous-insert targets, and must be the only sink on its chain.
 - A resent INSERT is deduplicated only on targets that keep a deduplication log, and only on 26.3 and 26.8.
 - A retry that holds the barrier beyond `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` (default 30 s) at the end of a bounded job or at a hot cutover spends a restart; nothing is lost.
 - The native sink converts a columnar batch from its arrays only when its event-time column is int64 and every value column has a type the Row sidecar carries; any other columnar batch goes through its row accessors, and `clink_clickhouse_columnar_declined_total` says why. The text sink takes rows only.

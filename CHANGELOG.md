@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+**Unaligned and adaptive checkpoints align at every fan-in, so no row is lost
+across a checkpoint.** Under unaligned checkpoints, and adaptive ones once they
+turned unaligned, a multi-input operator forwarded a barrier on its first
+delivery and let the rows still queued on its other inputs follow it, and
+nothing captured them: a union handed them to an operator downstream that sees
+one in-order channel. A sink fed by several upstream subtasks, every keyed
+aggregate or window above parallelism 1, and SQL `UNION ALL` could therefore
+lose a row across the cut on a crash, and the joins' and the broadcast
+operator's own capture took the waiting rows out of the live run, so a SQL join
+under unaligned mode dropped rows even without a failure. Every multi-input
+operator now aligns a barrier stamped unaligned exactly as an aligned one, so
+each checkpoint is a consistent cut in every mode, at the latency of aligned
+checkpoints under backpressure; `clink_op_barrier_forced_alignments_total`
+counts these alignments. `--alignment unaligned` and `adaptive` are still
+accepted. Checkpoints an earlier release took in those modes still restore,
+replaying the rows they captured exactly once, but the output of earlier
+unaligned or adaptive runs with joins or fan-ins may be missing rows. A fan-in
+also passes a bounded job's end-of-stream barrier on as terminal once every
+input has delivered it, so a two-phase sink behind one commits its tail rather
+than failing after 30 s, and the native ClickHouse sink accepts unaligned and
+adaptive checkpoints, which it had refused for this reason.
+
 **A job cancelled while its restart waits now ends.** A cancel that landed while
 a restart was waiting for free slots or for in-doubt resolution was acknowledged
 and then did nothing: the restart is never re-fired for a cancelled job, and the

@@ -158,22 +158,21 @@ Watermark merging is a running minimum. The forwarded watermark is `min` over al
 - When a previously-idle input becomes active again, its effective watermark is clamped to at least the currently-emitted global watermark so time cannot regress.
 - When every alive input is idle, a single idle marker is emitted (not repeated). Closed inputs are also pinned to `Watermark::max()` and so drop out of the min.
 
-Barrier alignment follows Chandy-Lamport, and the policy is carried per-barrier by the barrier's stamped `Mode`:
+Barrier alignment follows Chandy-Lamport, and every runner aligns every barrier, whatever `Mode` it is stamped with:
 
+```mermaid
+flowchart LR
+  I0["input 0 delivers barrier 7"] --> P0["input 0 paused"]
+  I1["input 1 delivers barrier 7"] --> P1["input 1 paused"]
+  I2["input 2 still delivering rows, then barrier 7"] --> ALL["every alive input delivered barrier 7"]
+  P0 --> ALL
+  P1 --> ALL
+  ALL --> FWD["forward barrier 7 downstream, unpause all inputs"]
 ```
-Aligned barrier across inputs 0,1,2:
 
-  input 0 ---B(ck=7)----------------|  paused after delivering B
-  input 1 ----------B(ck=7)---------|  paused after delivering B
-  input 2 -----------------B(ck=7)--|  last to deliver
-                                    ^
-                          all alive inputs delivered ck=7
-                          -> forward B downstream, unpause all
-```
+Each input that delivers a barrier is paused (`paused_[i] = true`) so it is not polled again until the barrier completes; the inputs that have not delivered it yet are still polled, and their rows belong to the checkpoint. Once every alive input has delivered, the barrier is forwarded and all inputs unpause. Closed inputs implicitly satisfy any in-flight barrier. The first-delivery timestamp feeds a `barrier_align_wait_ns` metric.
 
-In `Aligned` mode each input that delivers a barrier is paused (`paused_[i] = true`) so it is not polled again until the barrier completes; once every alive input has delivered, the barrier is forwarded and all inputs unpause. Closed inputs implicitly satisfy any in-flight barrier. The first-delivery timestamp feeds a `barrier_align_wait_ns` metric.
-
-In `Unaligned` mode the first delivery forwards the barrier immediately and never pauses; the advance carries `unaligned_first = true`, which tells the runner to capture the still-pending inputs' in-flight records into the snapshot. Subsequent deliveries of the same id are absorbed. `pending_inputs_for(ck_id)` enumerates the inputs that have not yet delivered a given barrier so the operator knows which channels to drain. The mode is pinned per checkpoint id on first delivery so aligned and unaligned semantics never mix mid-checkpoint. The interaction with the checkpointing protocol is detailed in [./checkpointing.md](./checkpointing.md).
+A barrier stamped `Unaligned` (unaligned checkpoints, adaptive alignment once its policy turns unaligned, or a per-operator override) is aligned in exactly the same way and forwarded marked `Aligned`, because no runner captures the rows still in flight on its other inputs: forwarding at once would let those rows reach the operator downstream after a barrier their sources had already passed, outside the checkpoint that should hold them. So unaligned and adaptive checkpoints align at every fan-in, and every checkpoint is a consistent cut across all inputs, with the latency of aligned checkpoints under backpressure. Each such alignment counts in `clink_op_barrier_forced_alignments_total{op_id="N"}` at the first fan-in on a path (it forwards the barrier marked `Aligned`, so a later fan-in counts nothing), and each runner logs the first one. The forward-on-first-delivery path, whose advance carries `unaligned_first = true` and whose `pending_inputs_for(ck_id)` names the inputs to drain, is kept behind the aligner's `captures_in_flight` constructor flag for an operator that captures those rows; no runner sets it. The mode is pinned per checkpoint id on first delivery. The interaction with the checkpointing protocol is detailed in [./checkpointing.md](./checkpointing.md).
 
 ### Cluster control plane transport
 
@@ -212,7 +211,7 @@ Operator data and watermarks use the channel/bridge stack above. The cluster con
 - The bridge pairing is one sink to one source over a single TCP connection. A shuffle is built from many such pairs, not multiplexed over one socket.
 - Framing tolerates trailing-byte additions (length-prefixed), which is how the optional barrier-mode byte and the idle-watermark kind were added without breaking older peers; absent fields default (mode to `Aligned`).
 - Watermark merging guarantees downstream monotonicity even across idle and re-activating inputs (the idle-to-active clamp prevents regression).
-- Barrier alignment is per-barrier by stamped mode, not chosen once at startup. `Unaligned` mode requires the operator runner to capture in-flight records on pending inputs on the `unaligned_first` advance; getting that capture wrong is a snapshot-correctness bug, not just a latency issue. See [./checkpointing.md](./checkpointing.md).
+- Every multi-input runner aligns every barrier, including one stamped `Unaligned`, so a checkpoint is a consistent cut across all inputs in every alignment mode. Forwarding an unaligned barrier on its first delivery is only correct for an operator that captures the rows still in flight on its other inputs into the checkpoint; none does, and getting that capture wrong is a snapshot-correctness bug, not just a latency issue. See [./checkpointing.md](./checkpointing.md).
 - TLS applies to the cluster control plane via `Connection`. The data-plane `NetworkChannel` path described here uses `NetworkSocket` plain TCP, so binding a data port on a non-loopback interface exposes unencrypted record traffic on that interface.
 - Teardown correctness depends on never closing the listener while the recv thread can be waiting on it: wake it through its `AcceptWake`, join it, then close. Closing to wake is a real cross-platform hazard: `close` alone leaves `accept()` blocked on Linux (which once hung subtask teardown for colocated jobs), and on Darwin a close racing the thread's entry into `accept()` can wedge both until a connection arrives.
 

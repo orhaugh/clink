@@ -90,17 +90,30 @@ std::vector<ConfigProblem> lint_checkpoint_config(const CheckpointConfig& c) {
                            "bound applies to nothing."});
     }
 
-    // Unaligned barrier handling is a property of checkpointing. Asking for
-    // it without checkpointing is not harmful, but it means the setting was
-    // misunderstood.
-    if (c.alignment != CheckpointAlignment::Aligned && !periodic_checkpointing_will_run(c)) {
-        out.push_back({LintSeverity::Warning,
-                       "unaligned_checkpoints",
-                       std::string{c.alignment == CheckpointAlignment::Adaptive
-                                       ? "adaptive checkpoint alignment was requested"
-                                       : "unaligned checkpoints were requested"} +
-                           " but this job takes no periodic checkpoints, so the setting has "
-                           "nothing to apply to."});
+    // Unaligned and adaptive alignment are accepted, so existing deployments
+    // and saved configurations still start, but neither cuts a checkpoint
+    // through in-flight rows any more: no operator captures the rows queued
+    // on its other inputs, so every multi-input operator aligns their
+    // barriers exactly as aligned checkpoints do. Said once at submission so
+    // nobody expects the latency the setting used to promise. Asking for
+    // either without checkpointing means the setting was misunderstood.
+    if (c.alignment != CheckpointAlignment::Aligned) {
+        const std::string requested = c.alignment == CheckpointAlignment::Adaptive
+                                          ? "adaptive checkpoint alignment was requested"
+                                          : "unaligned checkpoints were requested";
+        out.push_back(
+            {LintSeverity::Warning,
+             "unaligned_checkpoints",
+             periodic_checkpointing_will_run(c)
+                 ? requested +
+                       ", but every fan-in aligns its barriers as aligned checkpoints do: a "
+                       "union, a join, a keyed exchange and a sink fed by several subtasks each "
+                       "hold a barrier until every input has delivered it. Each checkpoint is a "
+                       "consistent cut, with the latency of aligned checkpoints under "
+                       "backpressure."
+                 : requested +
+                       " but this job takes no periodic checkpoints, so the setting has nothing "
+                       "to apply to."});
     }
 
     // --- combinations that contradict each other -------------------------

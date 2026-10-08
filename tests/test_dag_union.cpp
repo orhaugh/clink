@@ -1,12 +1,18 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "clink/metrics/metrics_registry.hpp"
+#include "clink/metrics/operator_metrics.hpp"
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -229,11 +235,90 @@ private:
 // Unaligned-checkpoint state machine + end-to-end
 // ---------------------------------------------------------------------------
 
-// Mode is carried on the barrier itself. Tests below stamp
-// each barrier with its desired Mode; the aligner reads mode from the
-// barrier on first delivery for a given checkpoint id.
+// An operator that does not capture in-flight rows, which is every runner
+// today, aligns a barrier stamped Unaligned exactly as an Aligned one, so the
+// checkpoint is a consistent cut across its inputs, and passes it on marked
+// Aligned.
+TEST(MultiInputAlignment, AnUnalignedBarrierIsAlignedWhenTheOperatorDoesNotCapture) {
+    MultiInputAlignment a(2);
+    const auto unaligned =
+        CheckpointBarrier{CheckpointId{9}, /*terminal=*/false, CheckpointBarrier::Mode::Unaligned};
+
+    const auto first = a.on_barrier(0, unaligned);
+    EXPECT_FALSE(first.forward) << "an unaligned barrier overtook the rows still on input 1";
+    EXPECT_FALSE(first.unaligned_first);
+    EXPECT_TRUE(a.input_paused(0));
+    EXPECT_FALSE(a.input_paused(1));
+
+    const auto second = a.on_barrier(1, unaligned);
+    ASSERT_TRUE(second.forward);
+    EXPECT_EQ(second.barrier.id().value(), 9u);
+    EXPECT_EQ(second.barrier.mode(), CheckpointBarrier::Mode::Aligned)
+        << "the barrier was aligned here, so it goes on marked Aligned";
+    EXPECT_FALSE(second.unaligned_first);
+    EXPECT_FALSE(a.input_paused(0));
+    EXPECT_FALSE(a.input_paused(1));
+}
+
+TEST(MultiInputAlignment, AnUnalignedBarrierCompletesWhenTheWaitingInputCloses) {
+    MultiInputAlignment a(2);
+    EXPECT_FALSE(a.on_barrier(0,
+                              CheckpointBarrier{CheckpointId{3},
+                                                /*terminal=*/false,
+                                                CheckpointBarrier::Mode::Unaligned})
+                     .forward);
+    const auto released = a.on_input_closed(1);
+    ASSERT_TRUE(released.forward);
+    EXPECT_EQ(released.barrier.id().value(), 3u);
+    EXPECT_EQ(released.barrier.mode(), CheckpointBarrier::Mode::Aligned);
+}
+
+TEST(MultiInputAlignment, ATerminalBarrierStaysTerminalOnceEveryInputDeliversOrFinishes) {
+    // A bounded source's local end-of-stream barrier: the sink behind the
+    // fan-in commits the tail on it, so it must still read terminal after
+    // alignment, whichever mode stamped it.
+    const auto terminal = [](CheckpointBarrier::Mode mode) {
+        return CheckpointBarrier{
+            CheckpointId{std::numeric_limits<std::uint64_t>::max()}, /*terminal=*/true, mode};
+    };
+    for (const auto mode : {CheckpointBarrier::Mode::Aligned, CheckpointBarrier::Mode::Unaligned}) {
+        MultiInputAlignment both(2);
+        EXPECT_FALSE(both.on_barrier(0, terminal(mode)).forward);
+        const auto released = both.on_barrier(1, terminal(mode));
+        ASSERT_TRUE(released.forward);
+        EXPECT_TRUE(released.barrier.is_terminal());
+
+        // An input that finished without a barrier of its own is at its end too.
+        MultiInputAlignment one_finished(2);
+        EXPECT_FALSE(one_finished.on_barrier(0, terminal(mode)).forward);
+        const auto on_close = one_finished.on_input_closed(1, /*cancelled=*/false);
+        ASSERT_TRUE(on_close.forward);
+        EXPECT_TRUE(on_close.barrier.is_terminal());
+    }
+}
+
+TEST(MultiInputAlignment, ACancelledInputKeepsATerminalBarrierFromCommittingTheTail) {
+    // Teardown is not end of input: a sink that read the barrier as terminal
+    // would publish a tail no checkpoint covers.
+    MultiInputAlignment a(2);
+    EXPECT_FALSE(
+        a.on_barrier(0,
+                     CheckpointBarrier{CheckpointId{std::numeric_limits<std::uint64_t>::max()},
+                                       /*terminal=*/true,
+                                       CheckpointBarrier::Mode::Aligned})
+            .forward);
+    const auto released = a.on_input_closed(1, /*cancelled=*/true);
+    ASSERT_TRUE(released.forward);
+    EXPECT_FALSE(released.barrier.is_terminal());
+}
+
+// An aligner built for an operator that captures in-flight rows
+// (captures_in_flight) forwards an Unaligned barrier on its first delivery.
+// No runner builds one today; the tests below pin that path for the capture
+// that would. Mode is carried on the barrier itself: the aligner reads it
+// on first delivery for a given checkpoint id.
 TEST(MultiInputAlignment, UnalignedModeForwardsFirstBarrierImmediately) {
-    MultiInputAlignment a(3);
+    MultiInputAlignment a(3, /*captures_in_flight=*/true);
     auto first = a.on_barrier(
         1,
         CheckpointBarrier{CheckpointId{9}, /*terminal=*/false, CheckpointBarrier::Mode::Unaligned});
@@ -248,7 +333,7 @@ TEST(MultiInputAlignment, UnalignedModeForwardsFirstBarrierImmediately) {
 }
 
 TEST(MultiInputAlignment, UnalignedModeAbsorbsLaterBarriersForSameId) {
-    MultiInputAlignment a(3);
+    MultiInputAlignment a(3, /*captures_in_flight=*/true);
     const auto unaligned =
         CheckpointBarrier{CheckpointId{4}, /*terminal=*/false, CheckpointBarrier::Mode::Unaligned};
     (void)a.on_barrier(0, unaligned);
@@ -264,18 +349,33 @@ TEST(MultiInputAlignment, AlignedAndUnalignedModesAreIndependentPerBarrier) {
     auto b1 = a1.on_barrier(0, CheckpointBarrier{CheckpointId{1}});  // default Aligned
     EXPECT_FALSE(b1.forward) << "aligned barrier shouldn't forward until both inputs deliver";
 
-    MultiInputAlignment a2(2);
+    MultiInputAlignment a2(2, /*captures_in_flight=*/true);
     auto b2 = a2.on_barrier(
         0,
         CheckpointBarrier{CheckpointId{1}, /*terminal=*/false, CheckpointBarrier::Mode::Unaligned});
     EXPECT_TRUE(b2.forward) << "unaligned barrier forwards on first delivery";
 }
 
+TEST(MultiInputAlignment, ACapturingAlignerDoesNotForwardAnUnalignedBarrierAgainOnAClose) {
+    // The barrier went downstream on its first delivery; the other input
+    // closing without delivering it only releases the bookkeeping. Before
+    // the guard the close re-forwarded it, so the operator snapshotted and
+    // the sink saw the same checkpoint twice.
+    MultiInputAlignment a(2, /*captures_in_flight=*/true);
+    ASSERT_TRUE(a.on_barrier(0,
+                             CheckpointBarrier{CheckpointId{3},
+                                               /*terminal=*/false,
+                                               CheckpointBarrier::Mode::Unaligned})
+                    .forward);
+    EXPECT_FALSE(a.on_input_closed(1).forward);
+    EXPECT_TRUE(a.add_input().has_value()) << "the closed checkpoint's bookkeeping lingered";
+}
+
 TEST(MultiInputAlignment, SameAlignerHandlesAlignedThenUnalignedAcrossCheckpoints) {
     // One aligner can serve checkpoint 1 in aligned mode
     // and checkpoint 2 in unaligned mode; mode is per-checkpoint, not
     // per-aligner. The coordinator decides each checkpoint's mode.
-    MultiInputAlignment a(2);
+    MultiInputAlignment a(2, /*captures_in_flight=*/true);
 
     // Checkpoint 1: aligned. First delivery doesn't forward.
     auto adv1a =
@@ -342,9 +442,11 @@ TEST(DagUnion, PerOperatorOverrideForcesAlignedDespiteUnalignedJobConfig) {
     }
     ASSERT_NE(union_id.value(), 0u);
 
+    MetricsRegistry registry;
     JobConfig cfg;
     cfg.unaligned_checkpoints = true;  // global flag = Unaligned
     cfg.barrier_mode_overrides_by_operator[union_id] = CheckpointBarrier::Mode::Aligned;
+    cfg.metrics = &registry;
 
     LocalExecutor exec(std::move(dag), std::move(cfg));
     exec.start();
@@ -356,16 +458,68 @@ TEST(DagUnion, PerOperatorOverrideForcesAlignedDespiteUnalignedJobConfig) {
     EXPECT_TRUE(sink->log().empty())
         << "per-operator Aligned override should have suppressed forwarding";
 
+    // The union aligns an Unaligned barrier too, so holding it back no longer
+    // shows the override at work. What does: a barrier the override restamped
+    // Aligned is no forced alignment, where one left Unaligned is counted.
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (sink->log().empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_FALSE(sink->log().empty()) << "the barrier never reached the sink";
+    const auto forced_name =
+        clink::metrics::op_metric_name("barrier_forced_alignments_total", union_id.value());
+    std::uint64_t forced = 0;
+    for (const auto& [name, value] : registry.snapshot().counters) {
+        if (name == forced_name) {
+            forced = value;
+        }
+    }
+    EXPECT_EQ(forced, 0u) << "the override did not restamp the barrier Aligned";
+
     exec.cancel();
     exec.await_termination();
 }
 
-// pending_inputs_for tells stateful multi-input operators
-// which input channels still need draining when a barrier goes
-// unaligned. Foundation for generic in-flight capture beyond the
-// bespoke interval-join logic.
+// A terminal barrier stays terminal through a fan-in only when every input
+// delivered it or finished. An input closed for a rescale handoff (a drain) or
+// by cancellation is not end of input, so the tail must not be published there
+// and the barrier goes on as an ordinary one.
+TEST(MultiInputAlignment, ATerminalBarrierGoesOnOrdinaryWhenAnInputClosedForAHandoff) {
+    const CheckpointBarrier terminal{CheckpointId{std::numeric_limits<std::uint64_t>::max()},
+                                     /*terminal=*/true,
+                                     CheckpointBarrier::Mode::Aligned};
+    {
+        SCOPED_TRACE("the other input finished");
+        MultiInputAlignment a(2);
+        EXPECT_FALSE(a.on_barrier(0, terminal).forward);
+        const auto adv = a.on_input_closed(1);
+        ASSERT_TRUE(adv.forward);
+        EXPECT_TRUE(adv.barrier.is_terminal());
+    }
+    {
+        SCOPED_TRACE("the other input was drained for a handoff");
+        MultiInputAlignment a(2);
+        EXPECT_FALSE(a.on_barrier(0, terminal).forward);
+        a.on_drain(1);
+        const auto adv = a.on_input_closed(1);
+        ASSERT_TRUE(adv.forward);
+        EXPECT_FALSE(adv.barrier.is_terminal());
+    }
+    {
+        SCOPED_TRACE("the other input was cancelled");
+        MultiInputAlignment a(2);
+        EXPECT_FALSE(a.on_barrier(0, terminal).forward);
+        const auto adv = a.on_input_closed(1, /*cancelled=*/true);
+        ASSERT_TRUE(adv.forward);
+        EXPECT_FALSE(adv.barrier.is_terminal());
+    }
+}
+
+// pending_inputs_for tells an operator that captures in-flight rows which
+// input channels it must capture when a barrier forwards on its first
+// delivery.
 TEST(MultiInputAlignment, PendingInputsForReportsUnseenInputs) {
-    MultiInputAlignment a(3);
+    MultiInputAlignment a(3, /*captures_in_flight=*/true);
     const auto unaligned =
         CheckpointBarrier{CheckpointId{50}, /*terminal=*/false, CheckpointBarrier::Mode::Unaligned};
 
@@ -399,7 +553,7 @@ TEST(MultiInputAlignment, FirstDeliveryPinsModeForCheckpoint) {
     // job might), the aligner pins the mode from the first delivery
     // and applies it to every same-id delivery. This keeps the
     // aligner deterministic in the face of upstream mistakes.
-    MultiInputAlignment a(2);
+    MultiInputAlignment a(2, /*captures_in_flight=*/true);
     auto adv1 =
         a.on_barrier(0, CheckpointBarrier{CheckpointId{5}, CheckpointBarrier::Mode::Unaligned});
     EXPECT_TRUE(adv1.forward);  // forwarded as unaligned on first delivery
@@ -413,63 +567,113 @@ TEST(MultiInputAlignment, FirstDeliveryPinsModeForCheckpoint) {
     EXPECT_FALSE(adv2.forward);
 }
 
-TEST(DagUnion, UnalignedBarrierForwardsBeforeAllInputsDeliver) {
-    // Source A emits a barrier and exits. Source B is intentionally
-    // slow - it sleeps before emitting its own barrier. With aligned
-    // semantics the sink wouldn't see the barrier until B catches up;
-    // with unaligned semantics A's barrier reaches the sink almost
-    // immediately, well before B closes.
-    Dag dag;
-    auto a = std::make_shared<BarrierOnlySource>(CheckpointBarrier{CheckpointId{77}}, "a");
+namespace {
 
-    class SlowBarrierSource final : public Source<int> {
-    public:
-        bool produce(Emitter<int>& out) override {
-            if (this->cancelled()) {
-                return false;
-            }
-            std::this_thread::sleep_for(200ms);
-            if (!emitted_) {
-                out.emit_barrier(CheckpointBarrier{CheckpointId{77}});
-                emitted_ = true;
-                return true;
-            }
+// Emits barrier 77, stamped `stamp`, after a pause, recording that it did.
+class SlowUnionInputSource final : public Source<int> {
+public:
+    SlowUnionInputSource(std::shared_ptr<std::atomic<bool>> delivered,
+                         CheckpointBarrier::Mode stamp)
+        : delivered_(std::move(delivered)), stamp_(stamp) {}
+    bool produce(Emitter<int>& out) override {
+        if (this->cancelled() || emitted_) {
             return false;
         }
-        std::string name() const override { return "slow_b"; }
+        std::this_thread::sleep_for(200ms);
+        delivered_->store(true);
+        out.emit_barrier(CheckpointBarrier{CheckpointId{77}, /*terminal=*/false, stamp_});
+        emitted_ = true;
+        return true;
+    }
+    std::string name() const override { return "slow_b"; }
 
-    private:
-        bool emitted_{false};
+private:
+    std::shared_ptr<std::atomic<bool>> delivered_;
+    CheckpointBarrier::Mode stamp_;
+    bool emitted_{false};
+};
+
+// Records each barrier the sink receives, its mode, and whether the slow
+// source had delivered its own barrier by then.
+class UnionBarrierLog final : public Sink<int> {
+public:
+    struct Seen {
+        std::uint64_t id;
+        CheckpointBarrier::Mode mode;
+        bool after_slow_input;
     };
-    auto b = std::make_shared<SlowBarrierSource>();
-    auto sink = std::make_shared<BarrierLog>();
+    explicit UnionBarrierLog(std::shared_ptr<std::atomic<bool>> slow_delivered)
+        : slow_delivered_(std::move(slow_delivered)) {}
+    void on_data(const Batch<int>&) override {}
+    void on_barrier(CheckpointBarrier b) override {
+        std::lock_guard lock(mu_);
+        seen_.push_back(Seen{b.id().value(), b.mode(), slow_delivered_->load()});
+    }
+    std::vector<Seen> seen() const {
+        std::lock_guard lock(mu_);
+        return seen_;
+    }
 
+private:
+    std::shared_ptr<std::atomic<bool>> slow_delivered_;
+    mutable std::mutex mu_;
+    std::vector<Seen> seen_;
+};
+
+// Source A emits barrier 77 and exits; source B emits the same barrier only
+// after a pause. Both stamp it `stamp`, which their runners keep under
+// adaptive alignment and replace with the job's mode otherwise. Returns what
+// the sink behind their union received.
+std::vector<UnionBarrierLog::Seen> barriers_behind_a_union(JobConfig cfg,
+                                                           CheckpointBarrier::Mode stamp) {
+    auto b_delivered = std::make_shared<std::atomic<bool>>(false);
+    Dag dag;
+    auto a = std::make_shared<BarrierOnlySource>(
+        CheckpointBarrier{CheckpointId{77}, /*terminal=*/false, stamp}, "a");
+    auto b = std::make_shared<SlowUnionInputSource>(b_delivered, stamp);
+    auto sink = std::make_shared<UnionBarrierLog>(b_delivered);
     auto h_a = dag.add_source<int>(a);
     auto h_b = dag.add_source<int>(b);
     auto h_u = dag.union_streams<int>(std::vector<StageHandle<int>>{h_a, h_b});
     dag.add_sink<int>(h_u, sink);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->seen();
+}
 
+}  // namespace
+
+TEST(DagUnion, UnalignedBarrierWaitsForEveryInputBeforeForwarding) {
+    // The job runs unaligned checkpoints, and the union still holds A's
+    // barrier until B delivers its own: a fan-in aligns every barrier, so the
+    // checkpoint is a consistent cut across both inputs. The barrier reaches
+    // the sink once, marked Aligned.
     JobConfig cfg;
     cfg.unaligned_checkpoints = true;
-    LocalExecutor exec(std::move(dag), std::move(cfg));
-    exec.start();
+    const auto seen = barriers_behind_a_union(std::move(cfg), CheckpointBarrier::Mode::Unaligned);
 
-    // The barrier should appear at the sink well before B's sleep
-    // finishes. Poll for up to 100ms (well under B's 200ms sleep).
-    const auto deadline = std::chrono::steady_clock::now() + 100ms;
-    while (std::chrono::steady_clock::now() < deadline && sink->log().empty()) {
-        std::this_thread::sleep_for(5ms);
-    }
-    EXPECT_FALSE(sink->log().empty())
-        << "unaligned mode should forward A's barrier before B's slow emission";
-    exec.cancel();
-    exec.await_termination();
-    // Once everything drains, exactly one barrier should have made
-    // it through - the first one A delivered. B's later barrier for
-    // the same id is absorbed by the alignment state machine.
-    auto final_log = sink->log();
-    ASSERT_GE(final_log.size(), 1u);
-    EXPECT_EQ(final_log.front().value(), 77u);
+    ASSERT_EQ(seen.size(), 1u) << "barrier 77 should reach the sink exactly once";
+    EXPECT_EQ(seen[0].id, 77u);
+    EXPECT_TRUE(seen[0].after_slow_input)
+        << "the union forwarded A's barrier before B delivered its own, so whatever B sent ahead "
+           "of its barrier would fall outside the checkpoint";
+    EXPECT_EQ(seen[0].mode, CheckpointBarrier::Mode::Aligned)
+        << "the union aligned the barrier, so it goes on marked Aligned";
+}
+
+TEST(DagUnion, AnAdaptiveCheckpointStampedUnalignedIsAlignedToo) {
+    // Under adaptive alignment the sources leave the stamp a trigger carries,
+    // and under pressure the policy stamps Unaligned. The union aligns that
+    // barrier exactly as under static unaligned checkpoints.
+    JobConfig cfg;
+    cfg.adaptive_barrier_mode = true;
+    const auto seen = barriers_behind_a_union(std::move(cfg), CheckpointBarrier::Mode::Unaligned);
+
+    ASSERT_EQ(seen.size(), 1u) << "barrier 77 should reach the sink exactly once";
+    EXPECT_TRUE(seen[0].after_slow_input)
+        << "the union forwarded an adaptive checkpoint's unaligned barrier before every input "
+           "delivered it";
+    EXPECT_EQ(seen[0].mode, CheckpointBarrier::Mode::Aligned);
 }
 
 TEST(DagUnion, BarrierAlignmentReleasesOnlyAfterAllInputsDeliver) {

@@ -181,7 +181,7 @@ Both exit when `await_termination()` flips `running_` to false.
 | `JobConfig::metrics` | `job_config.hpp` | `nullptr` | Enables the metrics-poll thread and per-operator gauges. |
 | `JobConfig::external_cancel_token` | `job_config.hpp` | `nullptr` | Out-of-band cancel signal; enables the watcher thread. |
 | `JobConfig::pin_operator_threads` | `job_config.hpp` | `false` | Round-robin pin operator thread `i` to core `i % cores`; best-effort, no-op where hard affinity is unavailable (macOS). |
-| `JobConfig::unaligned_checkpoints` | `job_config.hpp` | `false` | Barrier alignment policy at multi-input operators (see [./checkpointing.md](./checkpointing.md)). |
+| `JobConfig::unaligned_checkpoints` | `job_config.hpp` | `false` | The mode sources stamp on barriers. Multi-input operators align an `Unaligned` barrier as an aligned one, so every checkpoint is a consistent cut either way (see [./checkpointing.md](./checkpointing.md)). |
 | `JobConfig::dead_letter_queue` | `job_config.hpp` | `nullptr` | When null, the executor installs a `LoggingDeadLetterQueue` so poison records are logged with zero config. |
 | `Dag` channel capacity | `dag.hpp` | `1024` elements | Per-edge `BoundedChannel` capacity; set via the `Dag` constructor or `set_default_channel_capacity`. |
 | `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` | `dag.hpp` | `30000` | Source EOS wait for its coordinator-coordinated final checkpoint to commit. |
@@ -193,7 +193,7 @@ Both exit when `await_termination()` flips `running_` to false.
 - An operator-thread exception is captured into `operator_errors()` and winds the job down via cancellation rather than crashing the process. Only `std::exception` is caught at this site; the stack trace is best-effort and only present when built with `<stacktrace>` support (`CLINK_HAS_STACKTRACE`). The recorded trace is from the capture (runner) site, not the throw site.
 - Backpressure is automatic but in-process only: it propagates through blocking channel pushes. There is no credit-based flow control inside the executor; cross-Worker backpressure is handled by the network stack ([./network-stack.md](./network-stack.md)).
 - The `flush()` end-of-input hook runs only on a clean shutdown, never on cancel, so buffered windows/joins emit residual output exactly when the stream ends naturally.
-- Async-state operators force-align at a barrier: they drain in-flight async work to quiescence before capture regardless of the barrier's mode, because drain-to-quiescence is incompatible with unaligned in-flight capture. For a single input this is lossless. See [./async-state-execution.md](./async-state-execution.md).
+- Async-state operators force-align at a barrier: they drain in-flight async work to quiescence before capture regardless of the barrier's mode. For a single input this is lossless, and multi-input runners align every barrier across their inputs anyway, unaligned or not. See [./async-state-execution.md](./async-state-execution.md).
 - Timer restore on the operator path is same-parallelism only: timers ride operator-state and `restore_timers` narrows by key-group range on a rescale; the rescale timer-routing story is detailed in [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md).
 - `take_savepoint` requires the job to be stopped and a backend to be configured, and throws otherwise; it does not interrupt a running job.
 

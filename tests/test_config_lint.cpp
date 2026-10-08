@@ -178,10 +178,19 @@ TEST(ConfigLint, UnalignedWithoutCheckpointingWarnsRatherThanRefuses) {
     EXPECT_TRUE(has_warning_for(ps, "unaligned_checkpoints")) << render_problems(ps);
     EXPECT_FALSE(has_any_error(ps));
 
-    // With checkpointing actually running, it applies to something.
-    auto ok = coherent();
-    ok.alignment = CheckpointAlignment::Unaligned;
-    EXPECT_FALSE(has_warning_for(lint_checkpoint_config(ok), "unaligned_checkpoints"));
+    // With checkpointing running it applies, as aligned checkpoints at every
+    // fan-in, which the warning says so nobody expects the latency the mode
+    // used to promise. Still never an error: existing jobs keep starting.
+    for (const auto alignment : {CheckpointAlignment::Unaligned, CheckpointAlignment::Adaptive}) {
+        auto running = coherent();
+        running.alignment = alignment;
+        const auto problems = lint_checkpoint_config(running);
+        EXPECT_TRUE(has_warning_for(problems, "unaligned_checkpoints"))
+            << render_problems(problems);
+        EXPECT_FALSE(has_any_error(problems)) << render_problems(problems);
+        EXPECT_NE(render_problems(problems).find("every fan-in aligns"), std::string::npos)
+            << render_problems(problems);
+    }
 }
 
 // --- contradictions ------------------------------------------------------

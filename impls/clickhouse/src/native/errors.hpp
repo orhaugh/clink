@@ -52,7 +52,6 @@ inline constexpr const char* kTargetAsyncInsert = "clickhouse.target_async_inser
 inline constexpr const char* kTargetUnreadable = "clickhouse.target_unreadable";
 inline constexpr const char* kColumnPlan = "clickhouse.column_plan";
 inline constexpr const char* kMemoryBudgetTooSmall = "clickhouse.memory_budget_too_small";
-inline constexpr const char* kBarrierModeUnsupported = "clickhouse.barrier_mode_unsupported";
 // Runtime, after open:
 inline constexpr const char* kHeaderDrift = "clickhouse.header_drift";
 inline constexpr const char* kConversionFailed = "clickhouse.conversion_failed";

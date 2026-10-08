@@ -294,11 +294,11 @@ public:
         return wait_final_committed_;
     }
 
-    // Aligned vs unaligned checkpoint barrier handling. Set by the
-    // executor at open(); multi-input operator runners read it to
-    // decide whether to wait for every input to deliver a barrier
-    // (aligned) or to forward on the first delivery and capture the
-    // in-flight records on the others (unaligned).
+    // The job's alignment setting. Set by the executor at open(); source
+    // runners stamp it onto the barriers they emit. Multi-input runners
+    // wait for every input to deliver a barrier whatever its stamp, since
+    // no operator captures the records in flight on its other inputs, so
+    // it does not change where a checkpoint cuts.
     void set_unaligned_checkpoints(bool v) noexcept { unaligned_checkpoints_ = v; }
     bool unaligned_checkpoints() const noexcept { return unaligned_checkpoints_; }
 

@@ -164,16 +164,14 @@ struct JobConfig {
     // can outlive the caller's stack frame.
     std::shared_ptr<std::atomic<bool>> external_cancel_token;
 
-    // Checkpoint barrier alignment policy at multi-input operators.
-    // Default false (Aligned, the historical Chandy-Lamport-with-
-    // alignment semantic). When true, barriers overtake records on
-    // the not-yet-arrived input channels - checkpoints complete
-    // faster under backpressure, at the cost of larger snapshots
-    // that include the captured in-flight records. Each multi-input
-    // operator runner is responsible for honouring this flag (the
-    // alignment state machine forwards barriers immediately; the
-    // runner separately captures + replays the per-channel in-flight
-    // buffer via the state backend).
+    // Checkpoint barrier mode the sources stamp. Default false (Aligned,
+    // the Chandy-Lamport-with-alignment semantic). When true, barriers are
+    // stamped Unaligned, but every multi-input operator still aligns them:
+    // no operator captures the records in flight on its other inputs, and
+    // forwarding a barrier ahead of them would leave them outside the
+    // checkpoint their sources' offsets put them in. Accepted so existing
+    // configurations keep starting; each checkpoint is a consistent cut
+    // either way.
     bool unaligned_checkpoints{false};
     // Adaptive checkpoint mode: source runners keep the mode already
     // stamped on an injected barrier (the coordinator's per-trigger

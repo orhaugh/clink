@@ -67,6 +67,7 @@ add_executable(clink_core_tests
     test_dag_join.cpp
     test_join_recovery.cpp
     test_co_operator_unaligned.cpp
+    test_fan_in_checkpoint_cut.cpp
     test_dag_self_join.cpp
     test_broadcast_state.cpp
     test_parallel_reduce.cpp
