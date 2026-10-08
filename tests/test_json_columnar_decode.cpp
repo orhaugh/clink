@@ -7,9 +7,13 @@
 // the row shape (extra / missing column): the operator must fall back to the
 // row form rather than emit a silently-divergent columnar batch.
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <arrow/array.h>
@@ -1157,4 +1161,407 @@ TEST(JsonColumnarDecode, FieldOrderIndependence) {
 
     ASSERT_TRUE(col_el.as_data().is_columnar()) << "reordered keys must still go columnar";
     EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+}
+
+// ---- lines the row decode refuses ----------------------------------------------------
+//
+// The row decode parses each line with a validating DOM parse, and a line that parse
+// refuses decodes to an empty row, on json_string_to_row and on this operator's own row
+// fallback alike. The columnar arms must hand on that same empty row, so a line the DOM
+// parse refuses must never ride columnar: whichever column holds the offending value,
+// and whether or not the query reads that column. The on-demand arm reads only the
+// columns it builds, so a value in a declared column outside the keep-list is the case
+// these tests exist for: the arm still has to reach the DOM parse's verdict on it.
+namespace {
+
+// One declared column of each type a columnar-capable schema can hold, plus `id`, which
+// every keep-list below keeps and which never holds an offending value.
+std::vector<RowColumn> refusal_schema() {
+    return {
+        {"id", arrow::int64()},
+        {"n", arrow::int64()},
+        {"i", arrow::int32()},
+        {"x", arrow::float64()},
+        {"r", arrow::float32()},
+        {"m", arrow::decimal128(10, 2)},
+        {"s", arrow::utf8()},
+        {"f", arrow::boolean()},
+        {"t", arrow::timestamp(arrow::TimeUnit::MILLI)},
+    };
+}
+
+// The columns an offending value is placed in: every declared one but `id`, and "zz",
+// which the schema does not declare.
+const std::vector<std::string>& refusal_columns() {
+    static const std::vector<std::string> cols = {"n", "i", "x", "r", "m", "s", "f", "t", "zz"};
+    return cols;
+}
+
+// A well-formed line for refusal_schema() with id `id`, except that column `col`, when
+// given, holds the raw JSON text `raw`. For "zz" the line gains that undeclared key.
+std::string refusal_line(int id, const std::string& col = {}, const std::string& raw = {}) {
+    const std::vector<std::pair<std::string, std::string>> fields = {
+        {"id", std::to_string(id)},
+        {"n", "10"},
+        {"i", "-3"},
+        {"x", "1.5"},
+        {"r", "0.25"},
+        {"m", "12.34"},
+        {"s", R"("txt")"},
+        {"f", "true"},
+        {"t", "1700000000000"},
+    };
+    std::string out = "{";
+    for (const auto& [name, value] : fields) {
+        if (out.size() > 1) {
+            out += ',';
+        }
+        out += '"' + name + "\":" + (name == col ? raw : value);
+    }
+    if (col == "zz") {
+        out += R"(,"zz":)" + raw;
+    }
+    return out + "}";
+}
+
+// The keep-lists a column is tried under: outside the projection, inside it, and with no
+// projection at all. An undeclared key has no "inside".
+std::vector<std::pair<std::string, std::vector<std::string>>> keep_lists(const std::string& col) {
+    std::vector<std::pair<std::string, std::vector<std::string>>> out = {
+        {"unprojected", {"id"}},
+        {"no projection", {}},
+    };
+    if (col != "zz") {
+        out.emplace_back("projected", std::vector<std::string>{"id", col});
+    }
+    return out;
+}
+
+// The typed row decode under the same keep-list: this operator's own row fallback, and
+// what json_string_to_row hands on once the query has dropped the columns it does not
+// read.
+MapOperator<std::string, Row> make_projected_row_oracle(const std::vector<RowColumn>& schema,
+                                                        const std::vector<std::string>& keep) {
+    auto fmt = std::make_shared<clink::TextFormat<Row>>(
+        clink::sql::row_json_text_format_for_columns_projected(schema, keep));
+    return MapOperator<std::string, Row>(
+        [fmt](const std::string& line) -> Row { return fmt->decode(line).value_or(Row{}); },
+        "json_string_to_row");
+}
+
+// Raw bytes made readable in a failure message, and a long value shortened.
+std::string printable(const std::string& raw) {
+    std::string out;
+    for (const char c : raw.size() > 40 ? raw.substr(0, 12) : raw) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u >= 0x7f) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\x%02x", u);
+            out += buf;
+        } else {
+            out += c;
+        }
+    }
+    if (raw.size() > 40) {
+        out += "...(" + std::to_string(raw.size()) + " bytes)";
+    }
+    return out;
+}
+
+std::string joined(const std::vector<std::string>& cells) {
+    std::string out = "(" + std::to_string(cells.size()) + ")";
+    for (const auto& c : cells) {
+        out += " [" + c + "]";
+    }
+    return out;
+}
+
+// How one batch decoded on the columnar operator, against the row decode under the same
+// keep-list. `divergence` is empty when both handed on the same records with the same
+// cells and kinds, and otherwise says how they differ, so a test can list every
+// diverging case rather than stop at the first. A throw out of process() is a divergence.
+struct Decoded {
+    std::string divergence;
+    bool columnar{false};
+    std::uint64_t dom_runs{0};
+};
+
+Decoded decode_against_rows(const std::vector<std::string>& lines,
+                            const std::vector<std::string>& keep) {
+    const auto schema = refusal_schema();
+    auto oracle = make_projected_row_oracle(schema, keep);
+    const auto want = kinded_cells(run_one(oracle, lines_batch(lines)).as_data());
+    JsonStringToRowColumnarOperator col_op(schema, keep);
+    Decoded out;
+    const auto dom_before = clink::detail::json_columnar_dom_arm_counter().load();
+    try {
+        auto el = run_one(col_op, lines_batch(lines));
+        out.columnar = el.as_data().is_columnar();
+        const auto got = kinded_cells(el.as_data());
+        if (got != want) {
+            out.divergence = "rows " + joined(want) + " vs columnar " + joined(got);
+        }
+    } catch (const std::exception& e) {
+        out.divergence = std::string("the columnar decode threw: ") + e.what();
+    }
+    out.dom_runs = clink::detail::json_columnar_dom_arm_counter().load() - dom_before;
+    return out;
+}
+
+// Values the DOM parse refuses wherever they stand, so a line holding one decodes to an
+// empty row.
+std::vector<std::string> parse_refused_values() {
+    std::vector<std::string> v = {
+        // Integers outside 64 bits.
+        "123456789012345678901234567890",
+        "-9223372036854775809",
+        "18446744073709551616",
+        // Numerals the JSON grammar does not have.
+        "01",
+        "-01",
+        "1.",
+        "-",
+        ".5",
+        "+1",
+        "1e",
+        "1e+",
+        "1.2.3",
+        "0x1F",
+        "1ee5",
+        "--1",
+        "1-2",
+        "Infinity",
+        "NaN",
+        // Numbers past the largest double.
+        "1e400",
+        "-1e400",
+        "1e309",
+        "2e308",
+        // Atoms other than true, false and null.
+        "tru",
+        "nul",
+        "fals",
+        "True",
+        "truex",
+        "null1",
+        "nan",
+        "undefined",
+        // Escapes the parse refuses.
+        R"("\q")",
+        R"("\x41")",
+        R"("\u12G4")",
+        R"("\u12")",
+        R"("\ud800")",
+        R"("\udc00")",
+        R"("\ud800\u0041")",
+        // The same past the first eight bytes of the token, and at the end of one.
+        R"("abcdefg\q")",
+        R"("abcdefghijklmnopqrstuvw\x")",
+        R"("abcdefghijklmnop\u12")",
+        // Invalid UTF-8 and unescaped control characters.
+        "\"\xff\"",
+        "\"\xc0\xaf\"",
+        "\"\xe2\x82\"",
+        "\"\xed\xa0\x80\"",
+        "\"a\tb\"",
+        "\"a\x01"
+        "b\"",
+        // A missing or truncated value.
+        "",
+        "[1,2",
+        R"({"a":1)",
+        // Nested values the parse refuses.
+        "[1,,2]",
+        "[1 2]",
+        "[1,]",
+        "[,1]",
+        R"({"a" 1})",
+        R"({"a":1,})",
+        R"({"a":})",
+        "{1:2}",
+        "[1,2}",
+        R"({"a":1])",
+        R"([1,"\q"])",
+        R"({"a":01})",
+        R"({"\q":1})",
+        "[tru]",
+        "[1e400]",
+        // A string followed by a colon, where only a comma or a closing bracket may
+        // follow a value. An unread string is skipped by the iterator, whose skip
+        // takes the colon as a key's and runs on to the next closing bracket.
+        R"("txt":0])",
+        R"(["x":0],1])",
+        R"({"a":"x":0],"b":1})",
+    };
+    // Nesting past the parse's depth limit.
+    v.push_back(std::string(1100, '[') + std::string(1100, ']'));
+    return v;
+}
+
+}  // namespace
+
+// A value the DOM parse refuses, in each declared column and in an undeclared key, read
+// by the query or not. The columnar decode must hand on what the row decode does, an
+// empty row between two whole ones, and must not carry that batch columnar.
+TEST(JsonColumnarDecode, ALineTheRowDecodeRefusesNeverRidesColumnar) {
+    const auto row_decode = clink::sql::row_json_text_format_for_columns(refusal_schema());
+    std::vector<std::string> diverged;
+    std::size_t cases = 0;
+    for (const auto& raw : parse_refused_values()) {
+        for (const auto& col : refusal_columns()) {
+            const std::string bad = refusal_line(2, col, raw);
+            ASSERT_FALSE(row_decode.decode(bad).has_value())
+                << "the row decode takes " << printable(bad) << ", so the case tests nothing";
+            for (const auto& [mode, keep] : keep_lists(col)) {
+                ++cases;
+                const auto d = decode_against_rows({refusal_line(1), bad, refusal_line(3)}, keep);
+                if (!d.divergence.empty() || d.columnar) {
+                    diverged.push_back(mode + " " + col + "=" + printable(raw) + ": " +
+                                       (d.divergence.empty() ? "rode columnar" : d.divergence));
+                }
+            }
+        }
+    }
+    std::string list;
+    for (const auto& d : diverged) {
+        list += "  " + d + "\n";
+    }
+    EXPECT_TRUE(diverged.empty()) << diverged.size() << " of " << cases
+                                  << " cases diverged from the row decode:\n"
+                                  << list;
+}
+
+// Content after the closing brace makes the DOM parse refuse the line, whatever the
+// object holds. The on-demand walk stops at the brace, so it has to look for it.
+TEST(JsonColumnarDecode, ContentAfterTheObjectSendsTheLineToRows) {
+    const auto row_decode = clink::sql::row_json_text_format_for_columns(refusal_schema());
+    for (const std::string tail : {" {}", "}", ",{}", R"( {"id":9})", "{}", " []", " 1", " x"}) {
+        SCOPED_TRACE("tail '" + tail + "'");
+        const std::string bad = refusal_line(2) + tail;
+        ASSERT_FALSE(row_decode.decode(bad).has_value());
+        for (const auto& [mode, keep] : keep_lists("zz")) {
+            SCOPED_TRACE(mode);
+            const auto d = decode_against_rows({refusal_line(1), bad, refusal_line(3)}, keep);
+            EXPECT_EQ(d.divergence, "");
+            EXPECT_FALSE(d.columnar);
+        }
+    }
+    // Whitespace around the object and a byte order mark are not content: both
+    // decodes take the line, and the on-demand arm keeps it.
+    for (const std::string& line :
+         {refusal_line(2) + " \t ", "  " + refusal_line(2), "\xEF\xBB\xBF" + refusal_line(2)}) {
+        SCOPED_TRACE(printable(line));
+        ASSERT_TRUE(row_decode.decode(line).has_value());
+        for (const auto& [mode, keep] : keep_lists("zz")) {
+            SCOPED_TRACE(mode);
+            const auto d = decode_against_rows({refusal_line(1), line, refusal_line(3)}, keep);
+            EXPECT_EQ(d.divergence, "");
+            EXPECT_TRUE(d.columnar);
+            EXPECT_EQ(d.dom_runs, 0U);
+        }
+    }
+}
+
+// A REAL column fed -0. The row decode reads the integer token 0 and rounds it to float
+// precision, +0.0; the on-demand arm read the token as a double, -0.0, which prints the
+// same, so only the sign bit tells them apart. Both arms must hold +0.0.
+TEST(JsonColumnarDecode, ARealColumnFedMinusZeroHoldsPositiveZeroOnEitherArm) {
+    const std::vector<RowColumn> schema = {{"a", arrow::int64()}, {"r", arrow::float32()}};
+    const auto r_of = [](const Batch<Row>& b) {
+        std::vector<double> out;
+        for (const auto& rec : b) {
+            out.push_back(rec.value().values.find("r")->second.as_number());
+        }
+        return out;
+    };
+    for (const bool force_dom : {false, true}) {
+        SCOPED_TRACE(force_dom ? "DOM arm" : "on-demand arm");
+        const std::string line = force_dom ? R"({"a":1,"a":1,"r":-0})" : R"({"a":1,"r":-0})";
+        auto oracle = make_typed_row_oracle(schema);
+        auto row_el = run_one(oracle, lines_batch({line}));
+        JsonStringToRowColumnarOperator col_op(schema);
+        auto col_el = run_one(col_op, lines_batch({line}));
+        ASSERT_TRUE(row_el.is_data());
+        ASSERT_TRUE(col_el.is_data());
+        EXPECT_TRUE(col_el.as_data().is_columnar());
+        const auto row_r = r_of(row_el.as_data());
+        const auto col_r = r_of(col_el.as_data());
+        ASSERT_EQ(row_r.size(), 1U);
+        ASSERT_EQ(col_r.size(), 1U);
+        EXPECT_FALSE(std::signbit(row_r[0]));
+        EXPECT_FALSE(std::signbit(col_r[0]));
+    }
+}
+
+// The other side of the same contract, and the speed the projection exists for: a value
+// the DOM parse accepts, in a column outside the keep-list, keeps the batch on the
+// on-demand arm whatever its type, and its record matches the row decode. Inside the
+// keep-list the carrier depends on the value's type, so only the records are compared.
+TEST(JsonColumnarDecode, WellFormedValuesOutsideTheProjectionStayOnTheOnDemandArm) {
+    const auto row_decode = clink::sql::row_json_text_format_for_columns(refusal_schema());
+    const std::vector<std::string> values = {
+        "0",
+        "-0",
+        "7",
+        "-0.0",
+        "1.5e-3",
+        "1E+2",
+        "1e308",
+        "-1e308",
+        "1e-400",
+        "0e999999",
+        "1e-99999999999999999999",
+        "123456789012345678",
+        "1234567890123456789",
+        "-1234567890123456789",
+        "12345678901234567890",
+        "18446744073709551615",
+        "9223372036854775807",
+        "-9223372036854775808",
+        "3.14159265358979323846264338327950288419716939937510",
+        "true",
+        "false",
+        "null",
+        R"("plain")",
+        R"("")",
+        R"("\ud83d\ude00")",
+        R"("\n\t\\\"\/\b\f\r")",
+        R"("\u00e9")",
+        R"("abcdefg\n")",
+        R"("abcdefghijklmnopqrstuvw\u00e9xyz")",
+        R"("the quick brown fox jumps over the lazy dog")",
+        "\"\xc3\xa9\xe4\xb8\xad\"",
+        "[]",
+        "{}",
+        "[1,2]",
+        R"([1,"\u0041",[true,null],{"k":-2.5e3}])",
+        R"({"a":[1,{"b":null}],"\u0063":"d"})",
+        std::string(20, '[') + std::string(20, ']'),
+    };
+    std::vector<std::string> diverged;
+    for (const auto& raw : values) {
+        for (const auto& col : refusal_columns()) {
+            if (col == "zz") {
+                continue;  // an undeclared key always sends the batch to the DOM arm
+            }
+            const std::string line = refusal_line(2, col, raw);
+            ASSERT_TRUE(row_decode.decode(line).has_value()) << printable(line);
+            for (const auto& [mode, keep] : keep_lists(col)) {
+                const auto d = decode_against_rows({refusal_line(1), line, refusal_line(3)}, keep);
+                const bool unprojected = mode == "unprojected";
+                if (!d.divergence.empty() || (unprojected && (!d.columnar || d.dom_runs != 0))) {
+                    diverged.push_back(
+                        mode + " " + col + "=" + printable(raw) + ": " +
+                        (d.divergence.empty()
+                             ? (d.columnar ? "left the on-demand arm" : "fell to rows")
+                             : d.divergence));
+                }
+            }
+        }
+    }
+    std::string list;
+    for (const auto& d : diverged) {
+        list += "  " + d + "\n";
+    }
+    EXPECT_TRUE(diverged.empty()) << diverged.size() << " cases:\n" << list;
 }

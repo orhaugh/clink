@@ -12564,6 +12564,152 @@ TEST(SqlRuntime, ColumnarDecodeParityOracleOverFloatAndDecimal) {
 
 namespace {
 
+// What a query over a Kafka JSON table writes when every input line is a batch of its
+// own, with the JSON bridge the planner chose and the projection it gave that bridge.
+// One line per batch makes each line's carrier its own decision: a batch the columnar
+// decode sends to rows takes every line in it along, which would hide a line the
+// columnar arm kept from the comparison.
+struct LinePerBatchRun {
+    std::multiset<std::string> lines;
+    std::string bridge;
+    std::string projected;
+};
+
+LinePerBatchRun run_kafka_case_line_per_batch(const std::string& table_cols,
+                                              const std::string& with_tail,
+                                              const std::string& out_cols,
+                                              const std::string& query,
+                                              const std::filesystem::path& in_path,
+                                              const std::filesystem::path& out_path) {
+    std::filesystem::remove(out_path);
+    Catalog cat;
+    auto ddl = parse("CREATE TABLE t (" + table_cols +
+                     ") WITH (connector='kafka', format='json', brokers='localhost:9092', "
+                     "topic='t', group_id='g', auto_offset_reset='earliest'" +
+                     (with_tail.empty() ? "" : ", " + with_tail) +
+                     ");"
+                     "CREATE TABLE out_t (" +
+                     out_cols + ") WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, query.c_str());
+    LinePerBatchRun run;
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = in_path.string();
+            op.params["batch_size"] = "1";
+        }
+        if (op.type == "json_string_to_row_columnar" || op.type == "json_string_to_row") {
+            run.bridge = op.type;
+            if (auto it = op.params.find("projected_columns"); it != op.params.end()) {
+                run.projected = it->second;
+            }
+        }
+    }
+    {
+        InProcessCluster cluster("worker-line-batches", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        EXPECT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    const auto out = read_lines(out_path);
+    run.lines = {out.begin(), out.end()};
+    std::filesystem::remove(out_path);
+    return run;
+}
+
+}  // namespace
+
+// A line the row bridge's parse refuses decodes there to an empty row, which the query
+// then filters out or counts nowhere. The columnar decode must lose the same records
+// when the offending value sits in a column the query never reads: a declared column the
+// optimizer's projection pushdown leaves out of the decode, or a key the table does not
+// declare. The values: an integer past 64 bits, a numeral with a leading zero, a bad
+// escape, a misspelt atom, a malformed array, content after the object, and an integer
+// past 64 bits under an undeclared key. Two shapes, both projecting the decode to k and
+// ts: a filter and projection, and a windowed COUNT(*), which names no other source
+// column anywhere, so only the pushdown through the aggregate leaves the rest out, and
+// whose counts are the records each run kept. Then the same filter over misspelt
+// atoms in the columns it does read, which must be dropped the same way and must not
+// stop the job.
+TEST(SqlRuntime, ColumnarDecodeDropsWhatTheRowBridgeDropsOutsideTheProjection) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(::getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / ("clink_sql_unprojected_refusal_in_" + tag + ".ndjson");
+    const auto out_path = tmp / ("clink_sql_unprojected_refusal_out_" + tag + ".ndjson");
+    const std::string cols = "k BIGINT, n BIGINT, x DOUBLE, s VARCHAR, f BOOLEAN, ts BIGINT";
+
+    const auto check = [&](const std::vector<std::string>& input,
+                           const std::string& with,
+                           const std::string& out_cols,
+                           const std::string& q,
+                           const std::multiset<std::string>& want) {
+        SCOPED_TRACE(q);
+        write_lines(in_path, input);
+        const auto columnar =
+            run_kafka_case_line_per_batch(cols, with, out_cols, q, in_path, out_path);
+        const auto row_form = run_kafka_case_line_per_batch(
+            cols,
+            with + (with.empty() ? "" : ", ") + "columnar_decode='false'",
+            out_cols,
+            q,
+            in_path,
+            out_path);
+        ASSERT_EQ(columnar.bridge, "json_string_to_row_columnar");
+        ASSERT_EQ(row_form.bridge, "json_string_to_row");
+        EXPECT_EQ(columnar.projected, "k,ts")
+            << "n, x, s and f must be projected out of the decode for this case to test them";
+        EXPECT_EQ(row_form.lines, want) << "the row bridge's answer";
+        EXPECT_EQ(columnar.lines.size(), row_form.lines.size()) << "record count";
+        EXPECT_EQ(columnar.lines, row_form.lines);
+    };
+
+    const std::vector<std::string> unread = {
+        R"({"k":1,"n":10,"x":1.5,"s":"a","f":true,"ts":1000})",
+        R"({"k":2,"n":123456789012345678901234567890,"x":2.5,"s":"b","f":false,"ts":2000})",
+        R"({"k":3,"n":30,"x":01,"s":"c","f":true,"ts":3000})",
+        R"({"k":1,"n":40,"x":4.5,"s":"\q","f":true,"ts":4000})",
+        R"({"k":2,"n":50,"x":5.5,"s":"e","f":tru,"ts":5000})",
+        R"({"k":3,"n":[1,,2],"x":6.5,"s":"f","f":true,"ts":6000})",
+        R"({"k":1,"n":70,"x":7.5,"s":"g","f":true,"ts":7000} {})",
+        R"({"k":2,"n":80,"x":8.5,"s":"h","f":false,"ts":8000,"zz":123456789012345678901234567890})",
+        R"({"k":3,"n":90,"x":9.5,"s":"i","f":true,"ts":9000})",
+        R"({"k":1,"n":100,"x":10.5,"s":"j","f":false,"ts":11000})",
+    };
+    check(unread,
+          "",
+          "k BIGINT, ts BIGINT",
+          "INSERT INTO out_t SELECT k, ts FROM t WHERE k > 0",
+          {R"({"k":1,"ts":1000})", R"({"k":3,"ts":9000})", R"({"k":1,"ts":11000})"});
+    check(unread,
+          "event_time_column='ts'",
+          "k BIGINT, cnt BIGINT",
+          "INSERT INTO out_t SELECT k, COUNT(*) AS cnt FROM t "
+          "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k",
+          {R"({"cnt":1,"k":1})", R"({"cnt":1,"k":3})", R"({"cnt":1,"k":1})"});
+    check(
+        {
+            R"({"k":1,"n":10,"x":1.5,"s":"a","f":true,"ts":1000})",
+            R"({"k":nul,"n":20,"x":2.5,"s":"b","f":false,"ts":2000})",
+            R"({"k":3,"n":30,"x":3.5,"s":"c","f":true,"ts":nan})",
+            R"({"k":4,"n":40,"x":4.5,"s":"d","f":true,"ts":4000})",
+        },
+        "",
+        "k BIGINT, ts BIGINT",
+        "INSERT INTO out_t SELECT k, ts FROM t WHERE k > 0",
+        {R"({"k":1,"ts":1000})", R"({"k":4,"ts":4000})"});
+    std::filesystem::remove(in_path);
+}
+
+namespace {
+
 // Epoch-millisecond TIMESTAMP and TIMESTAMPTZ values on a Kafka JSON table, as
 // integers: the form the columnar decode carries typed under the second Row
 // layout. Two keys over four ten-second windows, the last fired by end of input.

@@ -62,11 +62,13 @@ namespace clink::sql {
 //   representable in its declared Arrow type with an identity round-trip
 //   (append_cell_ mirrors make_row_columnar_arrow_batcher's build_column +
 //   read_cell). The moment any record is not faithful (wrong type, non-integer
-//   or out-of-range int, number-in-string, extra / missing field, non-JSON
-//   line), the WHOLE batch falls back to the plain row decode (fmt_, identical
-//   to json_string_to_row). FLOAT (lossy double<->float) and DECIMAL128
-//   (exact-or-fails coercion) columns, and any "__"-reserved column name, are
-//   excluded at the schema level (schema_capable_) and always take the row path.
+//   or out-of-range int, number-in-string, extra / missing field, or a line the
+//   row decode's parse refuses, whichever column, read or not, holds the value
+//   it cannot parse), the WHOLE batch falls back to the plain row decode (fmt_,
+//   identical to json_string_to_row). The schema decides first: a column type
+//   outside columnar_capable_type_ (int64, int32, double, float, decimal128, bool,
+//   utf8 and the V2 timestamp), or any "__"-reserved column name, sends every
+//   batch to the row path (schema_capable_).
 //
 //   A PARTITIONED record (Record::source_partition set - every record from a
 //   Kafka topic) is carried through the columnar path via the engine-only
@@ -182,8 +184,10 @@ private:
         // Only meaningful for DECIMAL128; 0 elsewhere.
         std::int32_t scale{0};
         // False when the column is declared but not in the projection keep-list: its
-        // value is still parsed and type-checked by the gate, then discarded instead of
-        // appended to a builder, and it is omitted from the emitted Arrow schema.
+        // value is still read as far as the row decode's parse reads it, since that
+        // parse refuses the whole line over a value it cannot read, then discarded
+        // instead of appended to a builder, and it is omitted from the emitted Arrow
+        // schema.
         bool projected{true};
         // Precomputed name length, so the lookup's reject test is two integer
         // comparisons before it touches any bytes.

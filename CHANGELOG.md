@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**The columnar JSON decode drops every line the row decode drops, and a
+malformed token no longer fails the job.** The row decode refuses a whole line
+over any value its JSON parse cannot read and hands on an empty row, which a
+filter or an aggregate then drops. The columnar decode skipped the values of
+declared columns a query does not read, so a line kept its record when such a
+column held an integer past 64 bits, a numeral such as `01` or `1.`, a number
+past the largest double, a misspelt `true`, `false` or `null`, a bad escape, a
+malformed array or object, or a string followed by a stray colon, or when more
+followed the closing brace: a filter passed it and a windowed `COUNT(*)`
+counted it, where `columnar_decode='false'` did not. In a column the query
+reads, a token such as `nul` or `nan` failed the job, and a `DECIMAL` column
+read `01` as 1 and `0x1F` as 0. Each such line now takes the row decode,
+whichever column holds the value, and a `REAL` column fed `-0` holds +0.0 on
+both decodes. Checking the values a query does not read costs about 5% on the
+projected decode benchmark; a decode without a projection is unchanged.
+
 **The exactly-once specification lets a Kafka sink prepare its next
 checkpoint before its confirmation goes out, as the engine does.** Trace
 validation rejected a recorded Kafka run whose sink sealed checkpoint N+1
