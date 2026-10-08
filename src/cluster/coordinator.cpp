@@ -54,9 +54,36 @@
 #include "clink/runtime/network/network_socket.hpp"
 #include "clink/state/durable_file_write.hpp"
 
+#include "outbox.hpp"
+
 namespace clink::cluster {
 
 namespace {
+
+// A frame for a worker's outbox: encoded once, and shared by every
+// connection it is posted to.
+[[nodiscard]] Outbox::Frame shared_frame(std::vector<std::byte> bytes) {
+    return std::make_shared<const std::vector<std::byte>>(std::move(bytes));
+}
+
+// Post `frame` to `outbox`. Taken by value, so the caller's thread holds a
+// reference of its own for the whole call, as the outbox asks of every
+// caller. Refused for a null outbox.
+PostResult post_to(std::shared_ptr<Outbox> outbox, const Outbox::Frame& frame, FrameClass cls) {
+    return outbox ? outbox->post(frame, cls) : PostResult::Refused;
+}
+
+// A Deploy that ships the bytes of any plugin is a bulk frame; one that
+// refers to every plugin by hash, or carries none, is a control frame like
+// any other.
+[[nodiscard]] bool ships_plugin_bytes(const std::vector<PluginBinary>& plugins) {
+    return std::any_of(
+        plugins.begin(), plugins.end(), [](const PluginBinary& p) { return !p.bytes.empty(); });
+}
+
+[[nodiscard]] FrameClass deploy_frame_class(const std::vector<PluginBinary>& plugins) {
+    return ships_plugin_bytes(plugins) ? FrameClass::Bulk : FrameClass::Control;
+}
 
 // A name for one coordinator's claims on a job's checkpoint-id record, unique
 // to this deploy of the job in this process (record_triggered_id): a retry that
@@ -1219,11 +1246,7 @@ void Coordinator::in_doubt_resolution_loop_() {
                 deploys = restart_job_locked_(job);
             }
             lock.unlock();
-            for (auto& d : deploys) {
-                if (d.conn) {
-                    send_frame(*d.conn, d.frame);
-                }
-            }
+            post_frames_(deploys);
             lock.lock();
         }
     }
@@ -1749,6 +1772,32 @@ bool Coordinator::send_admission_reply_(network::Connection& conn,
     return sent;
 }
 
+void Coordinator::post_frames_(const std::vector<PendingDeploy>& frames) {
+    for (const auto& f : frames) {
+        (void)post_to(
+            f.outbox, f.frame, f.ships_plugin_bytes ? FrameClass::Bulk : FrameClass::Control);
+    }
+}
+
+void Coordinator::post_cancels_(
+    const std::vector<std::pair<std::shared_ptr<Outbox>, JobId>>& cancels) const {
+    // Each job's CancelJob is encoded once and shared by every session it
+    // goes to; the pairs are posted in the order given.
+    std::unordered_map<JobId, Outbox::Frame> frames;
+    for (const auto& [outbox, job_id] : cancels) {
+        if (!outbox) {
+            continue;
+        }
+        auto& frame = frames[job_id];
+        if (!frame) {
+            CancelJobMsg cj;
+            cj.job_id = job_id;
+            frame = shared_frame(fenced_frame_(MessageKind::CancelJob, cj));
+        }
+        (void)post_to(outbox, frame, FrameClass::Control);
+    }
+}
+
 void Coordinator::admit_connection_(std::uint64_t id,
                                     int fd,
                                     std::unique_ptr<network::Connection> conn,
@@ -2005,9 +2054,9 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn,
                 "coordinator is at its worker-connection limit (" +
                 std::to_string(cfg_.max_worker_connections) + " already connected); refusing '" +
                 reg.worker_id +
-                "'. Refusing is deliberate - admitting would spawn two threads (a reader and a "
-                "dispatcher) the coordinator cannot account for. Raise max_worker_connections "
-                "if the cluster genuinely is this large.";
+                "'. Refusing is deliberate - admitting would spawn three threads (a reader, a "
+                "dispatcher and a writer) the coordinator cannot account for. Raise "
+                "max_worker_connections if the cluster genuinely is this large.";
             log::warn("coordinator.register", reason);
             metrics::orch::worker_connection_refused();
             RegisterAckMsg nack{.ok = false, .message = reason, .retryable = true};
@@ -2021,6 +2070,11 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn,
     worker->worker_id = reg.worker_id;
     worker->data_host = reg.data_host;
     worker->conn = std::move(conn);
+    // Before the session is published, and never replaced: everything sent
+    // to this session after its RegisterAck goes through it. Its writer
+    // starts with the session's other threads (start_reader_for_); what is
+    // posted before then waits in the queue.
+    worker->outbox = std::make_shared<Outbox>(worker->conn, "worker '" + reg.worker_id + "'");
     worker->last_seen.store(std::chrono::steady_clock::now(), std::memory_order_release);
     worker->slot_capacity = reg.slot_count == 0 ? std::uint32_t{1} : reg.slot_count;
     worker->protocol_version = reg.protocol_version;
@@ -2114,6 +2168,15 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn,
                 }
                 return;
             }
+            // The replaced session is set aside here, so nothing more is
+            // sent on it: what is queued is discarded (counted, with one log
+            // line), its writer ends, and its transport is shut both ways,
+            // which wakes its reader. Only now, once the ack has gone: a
+            // failed registration above restores this session as it was.
+            if (replaced) {
+                const auto replaced_outbox = replaced->outbox;
+                replaced_outbox->abort("replaced by a new session of the same worker");
+            }
         }
     }
     if (!refusal.empty()) {
@@ -2129,7 +2192,8 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn,
     // registering thread: dropped unjoined, its reader would end holding the
     // last reference to its own WorkerConnection and destroy its own joinable
     // std::thread, which is std::terminate. The new session never got its
-    // threads, so it is shut down and reported finished; with nothing stamping
+    // threads, so it is shut down and reported finished: its outbox is
+    // aborted, since no writer will ever write it, and with nothing stamping
     // it, the watchdog declares it lost.
     struct RetireUnlessHandedOver {
         Coordinator& self;
@@ -2144,17 +2208,20 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn,
             if (successor.conn) {
                 successor.conn->shutdown_read();
             }
+            const auto outbox = successor.outbox;
+            outbox->abort("the session's threads were never started");
             successor.reader_finished->store(true, std::memory_order_release);
+            successor.writer_finished->store(true, std::memory_order_release);
             if (replaced) {
                 self.retire_replaced_session_(successor, replaced, replaced_was_lost);
             }
         }
     } retire_guard{*this, *worker, replaced, replaced_was_lost};
-    if (replaced && replaced->conn) {
-        // Wake a reader parked in read_frame. It stops reading, and the
-        // frames it has already read are handled before it exits.
-        replaced->conn->shutdown_read();
-    }
+    // The replaced session's reader, parked in read_frame, was woken by the
+    // abort in the swap hold, which shut its socket both ways (or by the stop
+    // that came before it, when its outbox had already stopped). It stops
+    // reading, and the frames it has already read are handled before it
+    // exits.
     // A registration IS forward progress for any restart waiting on
     // capacity: reset every waiting job's capacity clock so the deadline
     // measures restart_capacity_timeout with NO worker arriving - genuine
@@ -2217,12 +2284,19 @@ void Coordinator::retire_replaced_session_(WorkerConnection& successor,
     } catch (...) {
         // Not a std::exception; the join below is what matters.
     }
-    // The join is the retirement's first act; if it was never reached, or
-    // threw, it is attempted again here. join() throws only when it cannot
-    // join at all, and then nothing more can be done.
+    // The joins are the retirement's first acts; if they were never reached,
+    // or threw, they are attempted again here. join() throws only when it
+    // cannot join at all, and then nothing more can be done.
     try {
         if (replaced->reader.joinable()) {
             replaced->reader.join();
+        }
+    } catch (...) {
+        // Not joinable from here; nothing more can be done.
+    }
+    try {
+        if (replaced->writer.joinable()) {
+            replaced->writer.join();
         }
     } catch (...) {
         // Not joinable from here; nothing more can be done.
@@ -2246,6 +2320,11 @@ void Coordinator::retire_replaced_session_unguarded_(
     // the fold below rather than leaving it to be counted as lost.
     if (replaced->reader.joinable()) {
         replaced->reader.join();
+    }
+    // Its writer ends once its outbox has stopped, which the registration's
+    // abort saw to, so this waits on no peer.
+    if (replaced->writer.joinable()) {
+        replaced->writer.join();
     }
     if (stop_.load(std::memory_order_acquire)) {
         return;  // stop() abandons the old session's backlog; nothing to fold
@@ -2348,18 +2427,28 @@ std::size_t Coordinator::reap_finished_workers_() {
             if (!worker) {
                 continue;
             }
-            if (worker->reader_finished->load(std::memory_order_acquire)) {
+            // Both threads, not the reader alone: a session whose reader has
+            // ended (the peer half-closed, say) can still have frames queued
+            // for a peer that reads, and its writer ends only once its
+            // outbox has closed or stopped.
+            if (worker->reader_finished->load(std::memory_order_acquire) &&
+                worker->writer_finished->load(std::memory_order_acquire)) {
                 if (worker->reader.joinable()) {
                     to_join.push_back(std::move(worker->reader));
                 }
-                // Drop the socket too. shutdown_read() only half-closes, so
-                // without this the fd survives every lost worker for the life of
-                // the process. This releases the map's reference only: a sender
-                // that staged a frame under mu_ holds its own shared_ptr and
-                // the Connection lives until that send returns. The null check
-                // at every send site was never enough on its own - a raw
-                // pointer copied before this reset dangled after it.
+                if (worker->writer.joinable()) {
+                    to_join.push_back(std::move(worker->writer));
+                }
+                // Drop the socket too. Neither a shutdown nor the outbox's
+                // close releases the descriptor, so without this the fd
+                // survives every lost worker for the life of the process.
+                // Both references go: the record's, and the one the outbox
+                // keeps for as long as the record keeps it. A thread still
+                // inside a call on the outbox holds a reference of its own,
+                // and the Connection lives until that call returns.
                 worker->conn.reset();
+                const auto outbox = worker->outbox;
+                outbox->release_transport();
             }
             if (worker->conn) {
                 ++live;
@@ -2904,10 +2993,8 @@ std::vector<Coordinator::RouteTarget> Coordinator::subtask_targets_for_role(
 CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
     CancelJobAckMsg ack;
     ack.job_id = job_id;
-    // Collect worker connections inside the lock, fan out outside. A blocked
-    // send on one peer must not stall every other client / worker holding mu_
-    // (heartbeats, SubtaskFinished, ...).
-    std::vector<std::shared_ptr<network::Connection>> worker_conns;
+    // Collect the worker sessions' outboxes inside the lock, post outside it.
+    std::vector<std::shared_ptr<Outbox>> worker_outboxes;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -2933,12 +3020,12 @@ CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
                 auto worker_it = registered_.find(worker_id);
                 if (worker_it != registered_.end() && !worker_it->second->lost &&
                     worker_it->second->conn) {
-                    worker_conns.push_back(worker_it->second->conn);
+                    worker_outboxes.push_back(worker_it->second->outbox);
                 }
             }
             ack.ok = true;
             ack.message =
-                "cancel broadcast to " + std::to_string(worker_conns.size()) + " worker(s)";
+                "cancel broadcast to " + std::to_string(worker_outboxes.size()) + " worker(s)";
         }
     }
     if (ack.ok) {
@@ -2948,9 +3035,9 @@ CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
         CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCancelBroadcast);
         CancelJobMsg cj;
         cj.job_id = job_id;
-        const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
-        for (const auto& c : worker_conns) {
-            send_frame(*c, frame);
+        const auto frame = shared_frame(fenced_frame_(MessageKind::CancelJob, cj));
+        for (const auto& o : worker_outboxes) {
+            (void)post_to(o, frame, FrameClass::Control);
         }
     }
     return ack;
@@ -2967,7 +3054,7 @@ RescaleJobAckMsg Coordinator::rescale_job(
     RescaleJobAckMsg ack;
     ack.job_id = job_id;
 
-    std::vector<std::shared_ptr<network::Connection>> worker_conns;
+    std::vector<std::shared_ptr<Outbox>> worker_outboxes;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -3144,13 +3231,13 @@ RescaleJobAckMsg Coordinator::rescale_job(
         job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
         populate_restart_drain_locked_(job);
         // Empty drain (no in-flight subtasks): fire restart immediately.
-        // Typical case is mid-stream, so we just collect worker conns for
+        // Typical case is mid-stream, so we just collect worker outboxes for
         // the cancel broadcast and let the existing drain do its work.
         for (const auto& [worker_id, _] : job.tasks_by_worker) {
             auto worker_it = registered_.find(worker_id);
             if (worker_it != registered_.end() && !worker_it->second->lost &&
                 worker_it->second->conn) {
-                worker_conns.push_back(worker_it->second->conn);
+                worker_outboxes.push_back(worker_it->second->outbox);
             }
         }
 
@@ -3166,13 +3253,13 @@ RescaleJobAckMsg Coordinator::rescale_job(
     // now picks up rescale_overrides and emits the rescaled deploys.
     CancelJobMsg cj;
     cj.job_id = job_id;
-    const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
-    for (const auto& c : worker_conns) {
-        send_frame(*c, frame);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::CancelJob, cj));
+    for (const auto& o : worker_outboxes) {
+        (void)post_to(o, frame, FrameClass::Control);
     }
 
     ack.ok = true;
-    ack.message = "rescale initiated; draining " + std::to_string(worker_conns.size()) +
+    ack.message = "rescale initiated; draining " + std::to_string(worker_outboxes.size()) +
                   " worker connection(s)";
     return ack;
 }
@@ -3227,7 +3314,7 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
         return RescaleCoordinator::RequestResult{.ok = false, .reason = reason};
     };
 
-    std::vector<std::shared_ptr<network::Connection>> worker_conns;
+    std::vector<std::shared_ptr<Outbox>> worker_outboxes;
     std::vector<PendingDeploy> hot_frames;
     bool hot_engaged = false;
     std::uint32_t old_parallelism = 0;
@@ -3455,13 +3542,13 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
                 auto worker_it = registered_.find(worker_id);
                 if (worker_it != registered_.end() && !worker_it->second->lost &&
                     worker_it->second->conn) {
-                    worker_conns.push_back(worker_it->second->conn);
+                    worker_outboxes.push_back(worker_it->second->outbox);
                 }
             }
             log::info("coordinator.rescale",
                       "accepted job_id=" + std::to_string(job_id) + " op_id=" + op_id + " " +
                           std::to_string(old_parallelism) + "->" + std::to_string(new_parallelism) +
-                          "; draining " + std::to_string(worker_conns.size()) +
+                          "; draining " + std::to_string(worker_outboxes.size()) +
                           " worker connection(s) before replanning from checkpoint " +
                           std::to_string(job.latest_completed_checkpoint_id));
         }
@@ -3490,28 +3577,24 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
             return RescaleCoordinator::RequestResult{.ok = true,
                                                      .accepted_target = new_parallelism};
         }
-        // Sent in the same lock hold as the check, so on every connection the
-        // arm frames precede any abort's frames: an abort runs under the lock
-        // and sends after it. Sent after the lock, as they were, an abort
-        // landing between the check and the send could get its CancelJob out
-        // first. Arming subtasks that are being cancelled is harmless (a
-        // union's UnionRebindSlot hold yields to the runner's stop predicate,
-        // await_armed_cutover_commit returns on the cancel token, and
-        // GroupCutoverGate's waits take the stop probe), but an arm held up
-        // past the abort's drain and redeploy, on a stalled sender or behind a
-        // slow send to a lost worker, reaches the replan's new subtasks, whose
-        // arm callbacks Worker::handle_begin_rescale_ finds under the same job
-        // and operator, for a checkpoint that is never triggered: their unions
-        // hold open at end of input, a sink waits out its bound for a commit
-        // that never comes, and the feeding groups' gates refuse the next
-        // cutover's arm. Arm frames are a few dozen bytes, and
-        // send_peer_updates_locked_ sends under the lock too.
+        // Posted in the same lock hold as the check, so on every connection
+        // the arm frames precede any abort's frames: an abort runs under the
+        // lock and posts after it. Sent after the lock, as they were, an
+        // abort landing between the check and the send could get its
+        // CancelJob out first. Arming subtasks that are being cancelled is
+        // harmless (a union's UnionRebindSlot hold yields to the runner's
+        // stop predicate, await_armed_cutover_commit returns on the cancel
+        // token, and GroupCutoverGate's waits take the stop probe), but an
+        // arm held up past the abort's drain and redeploy, on a stalled
+        // sender or behind a slow send to a lost worker, reaches the replan's
+        // new subtasks, whose arm callbacks Worker::handle_begin_rescale_
+        // finds under the same job and operator, for a checkpoint that is
+        // never triggered: their unions hold open at end of input, a sink
+        // waits out its bound for a commit that never comes, and the feeding
+        // groups' gates refuse the next cutover's arm. A post never waits on
+        // the peer, so this holds the lock no longer than queueing them.
         CLINK_FAULT_POINT(clink::fault::points::kHotCutoverArmSend);
-        for (auto& f : hot_frames) {
-            if (f.conn != nullptr) {
-                send_frame(*f.conn, f.frame);
-            }
-        }
+        post_frames_(hot_frames);
         // Arm frames only; the job keeps running.
         return RescaleCoordinator::RequestResult{.ok = true, .accepted_target = new_parallelism};
     }
@@ -3519,9 +3602,9 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
     // Drain outside the lock, as rescale_job does.
     CancelJobMsg cj;
     cj.job_id = job_id;
-    const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
-    for (const auto& c : worker_conns) {
-        send_frame(*c, frame);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::CancelJob, cj));
+    for (const auto& o : worker_outboxes) {
+        (void)post_to(o, frame, FrameClass::Control);
     }
     return RescaleCoordinator::RequestResult{.ok = true, .accepted_target = new_parallelism};
 }
@@ -3818,11 +3901,11 @@ bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
     arm.op_id = op_id;
     arm.target_parallelism = new_parallelism;
     arm.cutover_checkpoint = hot.cutover_checkpoint;
-    const auto frame = fenced_frame_(MessageKind::BeginRescale, arm);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::BeginRescale, arm));
     for (const auto& worker_id : arm_workers) {
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn, frame});
+            out_frames.push_back({it->second->outbox, frame});
         }
     }
 
@@ -3922,11 +4005,11 @@ void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
     tc.job_id = job.id;
     tc.checkpoint_id = ckpt_id;
     tc.generation = job.state_generation;
-    const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, tc);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::TriggerCheckpoint, tc));
     for (const auto& [worker_id, _] : job.tasks_by_worker) {
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn, frame});
+            out_frames.push_back({it->second->outbox, frame});
         }
     }
     hot.phase = JobState::HotCutover::Phase::AwaitingCut;
@@ -4015,11 +4098,11 @@ void Coordinator::hot_cutover_begin_rebind_locked_(JobState& job,
     for (std::uint32_t i = 0; i < hot.target_parallelism; ++i) {
         rb.new_subtask_indices.push_back(hot.appended_base + i);
     }
-    const auto frame = fenced_frame_(MessageKind::CutoverRebind, rb);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::CutoverRebind, rb));
     for (const auto& worker_id : fed_workers) {
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn, frame});
+            out_frames.push_back({it->second->outbox, frame});
         }
     }
     log::info("coordinator.rescale",
@@ -4136,7 +4219,9 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         // layout they were deployed with: the job's current one, never a
         // recomputed one.
         stamped_ops += stamp_row_layout(dm.tasks, job.row_layout);
-        out_frames.push_back({it->second->conn, fenced_frame_(MessageKind::Deploy, dm)});
+        out_frames.push_back({it->second->outbox,
+                              shared_frame(fenced_frame_(MessageKind::Deploy, dm)),
+                              ships_plugin_bytes(dm.plugins)});
     }
     hot.phase = JobState::HotCutover::Phase::Deploying;
     hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
@@ -4194,7 +4279,8 @@ void Coordinator::hot_cutover_complete_locked_(JobState& job,
         msg.job_id = job.id;
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn, fenced_frame_(MessageKind::PeerUpdate, msg)});
+            out_frames.push_back(
+                {it->second->outbox, shared_frame(fenced_frame_(MessageKind::PeerUpdate, msg))});
         }
     }
 
@@ -4248,7 +4334,8 @@ void Coordinator::hot_cutover_complete_locked_(JobState& job,
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
             out_frames.push_back(
-                {it->second->conn, fenced_frame_(MessageKind::CutoverPeerUpdate, msg)});
+                {it->second->outbox,
+                 shared_frame(fenced_frame_(MessageKind::CutoverPeerUpdate, msg))});
         }
     }
 
@@ -4344,11 +4431,11 @@ void Coordinator::abort_hot_cutover_locked_(JobState& job,
     populate_restart_drain_locked_(job);
     CancelJobMsg cj;
     cj.job_id = job.id;
-    const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::CancelJob, cj));
     for (const auto& [worker_id, _] : job.tasks_by_worker) {
         auto it = registered_.find(worker_id);
         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-            out_frames.push_back({it->second->conn, frame});
+            out_frames.push_back({it->second->outbox, frame});
         }
     }
 }
@@ -4400,11 +4487,7 @@ void Coordinator::handle_begin_rescale_ack_(MessageReader& r, const WorkerConnec
             hot_cutover_trigger_c_locked_(job, frames);
         }
     }
-    for (auto& f : frames) {
-        if (f.conn != nullptr) {
-            send_frame(*f.conn, f.frame);
-        }
-    }
+    post_frames_(frames);
 }
 
 std::optional<OperatorRescaleStatus> Coordinator::operator_rescale_status(
@@ -4442,7 +4525,7 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
     constexpr int kClaimRounds = 3;
     std::uint64_t ckpt_id = 0;
     std::uint64_t gen_for_trigger = 0;
-    std::vector<std::shared_ptr<network::Connection>> worker_conns;
+    std::vector<std::shared_ptr<Outbox>> worker_outboxes;
     std::string unclaimed_why;
     for (int round = 0;; ++round) {
         std::shared_ptr<JobState::TriggeredRecord> record;
@@ -4522,7 +4605,7 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
                     auto worker_it = registered_.find(worker_id);
                     if (worker_it != registered_.end() && !worker_it->second->lost &&
                         worker_it->second->conn) {
-                        worker_conns.push_back(worker_it->second->conn);
+                        worker_outboxes.push_back(worker_it->second->outbox);
                     }
                 }
                 ack.checkpoint_dir = job.checkpoint.checkpoint_dir;
@@ -4565,13 +4648,13 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
     tc.job_id = job_id;
     tc.checkpoint_id = ckpt_id;
     tc.generation = gen_for_trigger;
-    const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, tc);
-    for (const auto& c : worker_conns) {
-        send_frame(*c, frame);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::TriggerCheckpoint, tc));
+    for (const auto& o : worker_outboxes) {
+        (void)post_to(o, frame, FrameClass::Control);
     }
     log::info("coordinator.savepoint",
               "job_id=" + std::to_string(job_id) + " ckpt_id=" + std::to_string(ckpt_id) +
-                  " worker_count=" + std::to_string(worker_conns.size()));
+                  " worker_count=" + std::to_string(worker_outboxes.size()));
 
     // Wait for handle_subtask_checkpointed_ to drain pending_checkpoint_
     // acks[ckpt_id] and advance latest_completed_checkpoint_id past
@@ -4612,7 +4695,7 @@ StopJobAckMsg Coordinator::stop_job(JobId job_id, std::chrono::milliseconds time
         timeout = std::chrono::milliseconds{60'000};
     }
 
-    std::vector<std::shared_ptr<network::Connection>> worker_conns;
+    std::vector<std::shared_ptr<Outbox>> worker_outboxes;
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
@@ -4641,20 +4724,20 @@ StopJobAckMsg Coordinator::stop_job(JobId job_id, std::chrono::milliseconds time
             auto worker_it = registered_.find(worker_id);
             if (worker_it != registered_.end() && !worker_it->second->lost &&
                 worker_it->second->conn) {
-                worker_conns.push_back(worker_it->second->conn);
+                worker_outboxes.push_back(worker_it->second->outbox);
             }
         }
         log::info("coordinator.stop",
                   "job_id=" + std::to_string(job_id) + " graceful stop requested; telling " +
-                      std::to_string(worker_conns.size()) +
+                      std::to_string(worker_outboxes.size()) +
                       " worker(s) to stop producing and take a final checkpoint");
     }
 
     StopSubtasksMsg msg;
     msg.job_id = job_id;
-    const auto frame = fenced_frame_(MessageKind::StopSubtasks, msg);
-    for (const auto& c : worker_conns) {
-        send_frame(*c, frame);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::StopSubtasks, msg));
+    for (const auto& o : worker_outboxes) {
+        (void)post_to(o, frame, FrameClass::Control);
     }
 
     // Wait for the job to finish on its own. The runners take the final
@@ -5860,13 +5943,12 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                     "{\"job_id\":" + std::to_string(job_id) +
                         ",\"tasks\":" + std::to_string(resolved_plan.tasks.size()) + "}");
 
-    // Send Deploy to each affected worker.
+    // Post Deploy to each affected worker.
     std::size_t stamped_ops = 0;
     for (auto& [worker_id, tasks] : by_worker) {
-        // The socket is copied in the hold: reap_finished_workers_ resets
-        // WorkerConnection::conn under mu_, so reading it after the hold
-        // races that reset and can dereference a null pointer.
-        std::shared_ptr<network::Connection> conn;
+        // The session's outbox, copied in the hold that records which
+        // plugins this Deploy ships to it.
+        std::shared_ptr<Outbox> outbox;
         std::vector<PluginBinary> worker_plugins;
         {
             std::lock_guard lock(mu_);
@@ -5875,7 +5957,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                 throw std::runtime_error("Coordinator::deploy: worker not registered: " +
                                          worker_id);
             }
-            conn = it->second->conn;
+            outbox = it->second->outbox;
             worker_plugins = plugins_for_worker_locked_(*job, *it->second);
         }
         DeployMsg deploy_msg;
@@ -5901,8 +5983,11 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.expected_state_versions_packed = job->expected_state_versions_packed;
         deploy_msg.udfs_packed = job->udfs_packed;
         stamped_ops += stamp_row_layout(deploy_msg.tasks, row_layout);
-        const auto frame = fenced_frame_(MessageKind::Deploy, deploy_msg);
-        if (!conn || !send_frame(*conn, frame)) {
+        const auto frame = shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg));
+        // Queued is not delivered: a session lost before its writer gets the
+        // frame out goes through the loss path like any other subtask on it.
+        // Refused means the session's outbox has already stopped.
+        if (post_to(outbox, frame, deploy_frame_class(deploy_msg.plugins)) != PostResult::Queued) {
             throw std::runtime_error("Coordinator::deploy: send failed for " + worker_id);
         }
     }
@@ -5947,12 +6032,15 @@ void Coordinator::start_reader_for_(std::shared_ptr<WorkerConnection> worker,
                                     std::shared_ptr<WorkerConnection> predecessor,
                                     bool predecessor_was_lost) {
     // Shuts a session down whose threads could not all be started: the reader
-    // is reported finished so the reaper releases the connection, and with
-    // nothing stamping last_seen the watchdog declares the worker lost.
+    // is reported finished, and the outbox aborted, which ends the writer, so
+    // the reaper releases the connection; with nothing stamping last_seen the
+    // watchdog declares the worker lost.
     const auto abandon = [&worker](const char* which, const char* why) noexcept {
         if (worker->conn) {
             worker->conn->shutdown_read();
         }
+        const auto outbox = worker->outbox;
+        outbox->abort("the session's threads could not all be started");
         worker->reader_finished->store(true, std::memory_order_release);
         try {
             log::error("coordinator.worker",
@@ -5962,12 +6050,43 @@ void Coordinator::start_reader_for_(std::shared_ptr<WorkerConnection> worker,
             // Only the log line was lost.
         }
     };
-    // Both threads start here, on the registering thread, so a failure to
-    // create one is caught rather than escaping a thread function, which is
-    // std::terminate. Allocating the queue, and std::thread's constructor,
-    // throw std::bad_alloc or std::system_error; either way the session is
-    // shut down, and the predecessor, which no dispatch thread now owns, is
-    // retired here, on the registering thread.
+    // The writer first. It holds the outbox and never the session, so it can
+    // never be the thread that drops the last reference to the session and
+    // joins itself. Started before the others, so a writer that cannot be
+    // started has given the outbox up before the reader reads anything, and
+    // the reader meets the end of the stream at once.
+    try {
+        worker->writer = std::thread([outbox = worker->outbox, finished = worker->writer_finished] {
+            // Set on every exit path, as the reader's flag is.
+            struct MarkFinished {
+                std::shared_ptr<std::atomic<bool>> flag;
+                ~MarkFinished() { flag->store(true, std::memory_order_release); }
+            } mark{finished};
+            outbox->run_writer();
+        });
+    } catch (const std::exception& e) {
+        // Nothing will ever write what is posted to this session, so it is
+        // given up: the abort discards it and closes the transport, the
+        // reader sees the end of the stream, and the watchdog declares the
+        // worker lost by the usual path. Reported finished in the writer's
+        // place, or the reaper would wait for it for ever.
+        const auto outbox = worker->outbox;
+        outbox->abort("its writer thread could not be started");
+        worker->writer_finished->store(true, std::memory_order_release);
+        try {
+            log::error("coordinator.worker",
+                       "could not start the writer thread for worker '" + worker->worker_id +
+                           "': " + e.what() + "; dropping its connection");
+        } catch (...) {
+            // Only the log line was lost.
+        }
+    }
+    // The dispatch thread and the reader start here too, on the registering
+    // thread, so a failure to create one is caught rather than escaping a
+    // thread function, which is std::terminate. Allocating the queue, and
+    // std::thread's constructor, throw std::bad_alloc or std::system_error;
+    // either way the session is shut down, and the predecessor, which no
+    // dispatch thread now owns, is retired here, on the registering thread.
     std::shared_ptr<WorkerDispatchQueue> queue;
     try {
         queue = std::make_shared<WorkerDispatchQueue>();
@@ -6194,8 +6313,10 @@ void Coordinator::answer_heartbeat_(WorkerConnection& worker, MessageReader& r) 
     // disconnect, so the registration version gates it explicitly.
     if (worker.protocol_version >= 2 && worker.conn) {
         HeartbeatAckMsg ack{.worker_id = worker.worker_id, .sequence = heartbeat.sequence};
-        const auto frame = fenced_frame_(MessageKind::HeartbeatAck, ack);
-        if (!send_frame(*worker.conn, frame)) {
+        // Posted, never sent from here: a worker that has stopped reading
+        // cannot hold this reader, which is what stamps its liveness.
+        const auto frame = shared_frame(fenced_frame_(MessageKind::HeartbeatAck, ack));
+        if (post_to(worker.outbox, frame, FrameClass::Control) != PostResult::Queued) {
             worker.conn->close();
         }
     }
@@ -6229,7 +6350,7 @@ void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>
             break;
         case MessageKind::RequestFinalCheckpoint:
             if (worker->conn) {
-                handle_request_final_checkpoint_(r, *worker, worker->conn);
+                handle_request_final_checkpoint_(r, *worker, worker->outbox);
             }
             break;
         default:
@@ -6333,11 +6454,7 @@ void Coordinator::handle_subtask_listening_(MessageReader& r, const WorkerConnec
             }
         }
     }
-    for (auto& f : hot_frames) {
-        if (f.conn != nullptr) {
-            send_frame(*f.conn, f.frame);
-        }
-    }
+    post_frames_(hot_frames);
 }
 
 void Coordinator::send_peer_updates_locked_(JobState& job) {
@@ -6376,24 +6493,27 @@ void Coordinator::send_peer_updates_locked_(JobState& job) {
             per_worker[worker_id].tasks.push_back(std::move(tp));
         }
     }
+    // Posted under mu_, which a post allows: it never waits on the peer.
     for (auto& [worker_id, msg] : per_worker) {
         msg.job_id = job.id;
         auto worker_it = registered_.find(worker_id);
         if (worker_it == registered_.end() || worker_it->second->lost) {
             continue;
         }
-        const auto frame = fenced_frame_(MessageKind::PeerUpdate, msg);
+        const auto frame = shared_frame(fenced_frame_(MessageKind::PeerUpdate, msg));
         if (worker_it->second->conn)
-            send_frame(*worker_it->second->conn, frame);
+            (void)post_to(worker_it->second->outbox, frame, FrameClass::Control);
     }
 
     // Subtasks with empty peers[] still need a "go" signal. Send an
     // empty PeerUpdate to each worker that hosts at least one such task and
-    // hasn't already received a real update.
+    // hasn't already received a real update. The same frame for each, so it
+    // is encoded once.
     std::unordered_set<std::string> workers_with_real_update;
     for (const auto& [worker_id, _] : per_worker) {
         workers_with_real_update.insert(worker_id);
     }
+    Outbox::Frame empty_frame;
     for (const auto& [worker_id, _] : job.tasks_by_worker) {
         if (workers_with_real_update.count(worker_id) > 0) {
             continue;
@@ -6402,11 +6522,13 @@ void Coordinator::send_peer_updates_locked_(JobState& job) {
         if (worker_it == registered_.end() || worker_it->second->lost) {
             continue;
         }
-        PeerUpdateMsg empty;
-        empty.job_id = job.id;
-        const auto frame = fenced_frame_(MessageKind::PeerUpdate, empty);
+        if (!empty_frame) {
+            PeerUpdateMsg empty;
+            empty.job_id = job.id;
+            empty_frame = shared_frame(fenced_frame_(MessageKind::PeerUpdate, empty));
+        }
         if (worker_it->second->conn)
-            send_frame(*worker_it->second->conn, frame);
+            (void)post_to(worker_it->second->outbox, empty_frame, FrameClass::Control);
     }
 }
 
@@ -6436,15 +6558,11 @@ void Coordinator::watchdog_loop_() {
                     }
                 }
             }
-            for (auto& f : abort_frames) {
-                if (f.conn != nullptr) {
-                    send_frame(*f.conn, f.frame);
-                }
-            }
+            post_frames_(abort_frames);
         }
         const auto now = std::chrono::steady_clock::now();
         bool any_lost = false;
-        std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> survivor_cancels;
+        std::vector<std::pair<std::shared_ptr<Outbox>, JobId>> survivor_cancels;
         std::vector<PendingDeploy> deferred_restart_deploys;
         {
             std::lock_guard lock(mu_);
@@ -6465,11 +6583,17 @@ void Coordinator::watchdog_loop_() {
             // DURING the pause is still declared lost - one heartbeat_timeout
             // later than it would have been, which is the honest price of
             // the coordinator having been absent for the evidence window.
+            //
+            // The outboxes' stall clocks restart with it: no writer could
+            // make progress during the pause either, so it is not a peer's
+            // stall.
             if (now - last_watchdog_sweep_ > cfg_.watchdog_interval + cfg_.heartbeat_timeout) {
                 log::warn("coordinator.watchdog",
                           "watchdog resumed after a suspension; deferring staleness "
                           "judgement one interval");
                 for (auto& [_, worker] : registered_) {
+                    const auto outbox = worker->outbox;
+                    outbox->restart_stall_clock(now);
                     if (!worker->lost) {
                         worker->last_seen.store(now, std::memory_order_release);
                     }
@@ -6509,7 +6633,7 @@ void Coordinator::watchdog_loop_() {
                     for (const auto& [worker_id, _] : job->tasks_by_worker) {
                         auto it = registered_.find(worker_id);
                         if (it != registered_.end() && !it->second->lost && it->second->conn) {
-                            survivor_cancels.emplace_back(it->second->conn, job_id);
+                            survivor_cancels.emplace_back(it->second->outbox, job_id);
                         }
                     }
                     // If the job is awaiting_restart and no surviving
@@ -6765,15 +6889,10 @@ void Coordinator::watchdog_loop_() {
                 }
             }
         }
-        for (const auto& [conn, jid] : survivor_cancels) {
-            CancelJobMsg cj;
-            cj.job_id = jid;
-            send_frame(*conn, fenced_frame_(MessageKind::CancelJob, cj));
-        }
-        for (auto& d : deferred_restart_deploys) {
-            if (d.conn)
-                send_frame(*d.conn, d.frame);
-        }
+        // Posted, so a survivor that has stopped reading cannot hold the
+        // watchdog, and with it every later loss, here.
+        post_cancels_(survivor_cancels);
+        post_frames_(deferred_restart_deploys);
         if (any_lost) {
             cv_.notify_all();
         }
@@ -7064,6 +7183,14 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
     if (worker.conn) {
         worker.conn->shutdown_read();
     }
+    // Nothing more is sent to a lost session, and what is queued for it is
+    // moot: its subtasks were folded above. The abort discards the queue
+    // (counted, with one log line naming the cause when anything was
+    // pending), ends the writer, and shuts the socket both ways, so a worker
+    // that is still alive sees the end of the stream at once rather than
+    // waiting out its own lease. Safe under mu_: the outbox's lock is a leaf.
+    const auto outbox = worker.outbox;
+    outbox->abort("declared lost: nothing was read from it within heartbeat_timeout");
     worker.slots_gauge_retired = true;
     metrics::coordinator::worker_lost(worker.slot_capacity, worker.slots_in_use);
     log::warn("coordinator.watchdog", "worker lost: " + worker.worker_id);
@@ -7085,7 +7212,7 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
 void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id,
                                                     std::uint64_t successor_session) {
     bool touched = false;
-    std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> survivor_cancels;
+    std::vector<std::pair<std::shared_ptr<Outbox>, JobId>> survivor_cancels;
     {
         std::lock_guard lock(mu_);
         for (auto& [job_id, job] : jobs_) {
@@ -7135,16 +7262,12 @@ void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id
                 }
                 auto it = registered_.find(other_worker_id);
                 if (it != registered_.end() && !it->second->lost && it->second->conn) {
-                    survivor_cancels.emplace_back(it->second->conn, job_id);
+                    survivor_cancels.emplace_back(it->second->outbox, job_id);
                 }
             }
         }
     }
-    for (const auto& [conn, job_id] : survivor_cancels) {
-        CancelJobMsg cancel;
-        cancel.job_id = job_id;
-        (void)send_frame(*conn, fenced_frame_(MessageKind::CancelJob, cancel));
-    }
+    post_cancels_(survivor_cancels);
     // A fold may have emptied the drain, which is the condition that fires the
     // redeploy, and a fresh restart needs the watchdog to act on it. Either way,
     // nudge rather than wait a whole interval for a state change already made.
@@ -7924,7 +8047,9 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
         stamped_ops += stamp_row_layout(deploy_msg.tasks, job.row_layout);
-        out.push_back({worker_it->second->conn, fenced_frame_(MessageKind::Deploy, deploy_msg)});
+        out.push_back({worker_it->second->outbox,
+                       shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg)),
+                       ships_plugin_bytes(deploy_msg.plugins)});
     }
     log::info(is_rescale || is_replan_rescale ? "coordinator.rescale" : "coordinator.restart",
               "job_id=" + std::to_string(job.id) + " " + row_layout_note +
@@ -7970,14 +8095,14 @@ void Coordinator::dispatch_begin_rescale_locked_(JobState& job,
     msg.op_id = op_id;
     msg.target_parallelism = target_parallelism;
     msg.cutover_checkpoint = cutover_checkpoint;
-    const auto frame = fenced_frame_(MessageKind::BeginRescale, msg);
+    const auto frame = shared_frame(fenced_frame_(MessageKind::BeginRescale, msg));
     std::size_t dispatched = 0;
     for (const auto& worker_id : workers_with_op) {
         auto worker_it = registered_.find(worker_id);
         if (worker_it == registered_.end() || worker_it->second->lost || !worker_it->second->conn) {
             continue;
         }
-        out.push_back({worker_it->second->conn, frame});
+        out.push_back({worker_it->second->outbox, frame});
         ++dispatched;
     }
     log::info("coordinator.rescale",
@@ -8189,7 +8314,9 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.udfs_packed = job.udfs_packed;
         // A partial deploy: the job's current layout, never a recomputed one.
         stamp_row_layout(deploy_msg.tasks, job.row_layout);
-        out.push_back({worker_it->second->conn, fenced_frame_(MessageKind::Deploy, deploy_msg)});
+        out.push_back({worker_it->second->outbox,
+                       shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg)),
+                       ships_plugin_bytes(deploy_msg.plugins)});
     }
 }
 
@@ -8203,17 +8330,17 @@ void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& s
 
     bool retry = false;
     std::shared_ptr<WorkerConnection> target_conn;
-    // The retry's socket, copied in the hold that picks the target: the
-    // reaper resets WorkerConnection::conn under mu_, so it is never read
-    // after the hold.
-    std::shared_ptr<network::Connection> retry_conn;
+    // The retry's outbox, copied in the hold that picks the target, and only
+    // while that session still holds its socket (the reaper resets
+    // WorkerConnection::conn under mu_).
+    std::shared_ptr<Outbox> retry_outbox;
     DeploymentTask retry_task;
     JobId job_id = msg.job_id;
     std::shared_ptr<JobState> job_to_signal;
     std::vector<PendingDeploy> restart_deploys;
     // CancelJob frames to drain still-running subtasks when a subtask error
-    // triggers a whole-job restart of a checkpointed job; sent outside mu_.
-    std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> error_restart_cancels;
+    // triggers a whole-job restart of a checkpointed job; posted outside mu_.
+    std::vector<std::pair<std::shared_ptr<Outbox>, JobId>> error_restart_cancels;
     // Decoded on the sender's dispatch thread, which checked the session was
     // not lost before dispatching, and not yet under mu_: the watchdog can
     // declare the session lost in between.
@@ -8357,7 +8484,9 @@ void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& s
                     // operator needs to see.
                     metrics::orch::subtask_redeployed();
                     target_conn = worker_it->second;
-                    retry_conn = target_conn->conn;
+                    if (target_conn->conn) {
+                        retry_outbox = target_conn->outbox;
+                    }
                     // When the current session is not the one reporting the
                     // error (a superseded one's frame, handled after its
                     // successor registered), the subtask moves there: its
@@ -8546,7 +8675,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& s
                     for (const auto& [worker_id2, _] : job.tasks_by_worker) {
                         auto cit = registered_.find(worker_id2);
                         if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
-                            error_restart_cancels.emplace_back(cit->second->conn, job_id);
+                            error_restart_cancels.emplace_back(cit->second->outbox, job_id);
                             ++peers;
                         }
                     }
@@ -8574,30 +8703,21 @@ void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& s
             }
         }
     }
-    // Fire restart deploys outside the lock so a slow send doesn't
-    // stall mu_-holders. Best-effort: if a send fails the watchdog
-    // will catch the second worker loss on the next tick.
-    for (auto& d : restart_deploys) {
-        if (d.conn)
-            send_frame(*d.conn, d.frame);
-    }
+    // Post restart deploys outside the lock. Best-effort: a frame a lost
+    // worker never gets is the watchdog's to catch, as a second worker loss
+    // on its next tick.
+    post_frames_(restart_deploys);
     // Drain the still-running subtasks of a checkpointed job we just put into
     // awaiting_restart (their SubtaskFinished arrivals count toward the drain,
     // then restart_job_locked_ redeploys from the last checkpoint).
-    for (const auto& [conn, jid] : error_restart_cancels) {
-        if (conn) {
-            CancelJobMsg cj;
-            cj.job_id = jid;
-            send_frame(*conn, fenced_frame_(MessageKind::CancelJob, cj));
-        }
-    }
+    post_cancels_(error_restart_cancels);
 
-    if (retry && retry_conn) {
+    if (retry && retry_outbox) {
         DeployMsg deploy_msg;
         deploy_msg.job_id = job_id;
         deploy_msg.tasks.push_back(std::move(retry_task));
-        const auto frame = fenced_frame_(MessageKind::Deploy, deploy_msg);
-        send_frame(*retry_conn, frame);
+        const auto frame = shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg));
+        (void)post_to(retry_outbox, frame, deploy_frame_class(deploy_msg.plugins));
     }
     // Slot freed: wake any submit_job waiting on capacity.
     cv_.notify_all();
@@ -8989,6 +9109,11 @@ void Coordinator::stop() {
         }
         registered_.clear();
     }
+    // shutdown_read wakes each reader and touches nothing queued, so no frame
+    // is given up here that could still be written. (Darwin resets a
+    // connection that receives data once its read side is shut down, so
+    // there a worker that sends during the flush below loses what is queued
+    // for it, counted as write_failed.)
     for (auto& worker : workers) {
         if (worker->conn) {
             worker->conn->shutdown_read();
@@ -8996,6 +9121,33 @@ void Coordinator::stop() {
         if (worker->reader.joinable()) {
             worker->reader.join();
         }
+    }
+    // Every thread that posts to a worker has been joined by now: the
+    // readers, and with them the dispatch threads (and any retirement one
+    // was running), the watchdog, the trigger loop, the recovery and
+    // in-doubt threads, the autoscalers, the admission threads and the
+    // client sessions. None of them could have been held by a peer, since a
+    // post never waits on one. What they queued is flushed now, against one
+    // deadline for every connection, so a peer that has stopped reading
+    // holds stop() no longer than outbound_flush_timeout: what is still
+    // unwritten then is discarded and counted (reason flush_deadline), and
+    // the abort at the deadline wakes a writer blocked in send. Frames
+    // queued at stop() are written or counted, never dropped unseen.
+    const auto flush_deadline = network::NetworkSocket::deadline_after(cfg_.outbound_flush_timeout);
+    for (const auto& worker : workers) {
+        const auto outbox = worker->outbox;
+        outbox->close_after_flush(flush_deadline);
+    }
+    for (const auto& worker : workers) {
+        const auto outbox = worker->outbox;
+        (void)outbox->wait_closed(flush_deadline);
+    }
+    for (auto& worker : workers) {
+        if (worker->writer.joinable()) {
+            worker->writer.join();
+        }
+        const auto outbox = worker->outbox;
+        outbox->release_transport();
         worker->conn.reset();  // destructor closes
     }
     // Last, once every thread that starts a checkpoint-id claimer (the
@@ -9020,10 +9172,9 @@ void Coordinator::stop() {
     }
 }
 
-void Coordinator::handle_request_final_checkpoint_(
-    MessageReader& r,
-    const WorkerConnection& sender,
-    const std::shared_ptr<network::Connection>& reply_conn) {
+void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
+                                                   const WorkerConnection& sender,
+                                                   const std::shared_ptr<Outbox>& reply_outbox) {
     auto msg = decode_request_final_checkpoint(r);
     // Holds a request in the window a cancel can open: decided here, the
     // CancelJob broadcast still in flight (see cancel_job).
@@ -9055,7 +9206,7 @@ void Coordinator::handle_request_final_checkpoint_(
         reply = decide_final_request_locked_(job, msg.job_id, msg.role, msg.subtask_idx);
         if (!reply.has_value()) {
             job->held_final_requests.push_back(
-                {.role = msg.role, .subtask_idx = msg.subtask_idx, .reply_conn = reply_conn});
+                {.role = msg.role, .subtask_idx = msg.subtask_idx, .reply_outbox = reply_outbox});
             record = job->triggered_record;
             want = job->next_checkpoint_id;
         }
@@ -9072,7 +9223,9 @@ void Coordinator::handle_request_final_checkpoint_(
         wake_trigger_loop_();
         return;
     }
-    send_frame(*reply_conn, fenced_frame_(MessageKind::FinalCheckpointAssigned, *reply));
+    (void)post_to(reply_outbox,
+                  shared_frame(fenced_frame_(MessageKind::FinalCheckpointAssigned, *reply)),
+                  FrameClass::Control);
 }
 
 std::optional<FinalCheckpointAssignedMsg> Coordinator::decide_final_request_locked_(
@@ -9164,8 +9317,7 @@ std::optional<FinalCheckpointAssignedMsg> Coordinator::decide_final_request_lock
 
 bool Coordinator::answer_final_requests_locked_(
     JobState& job,
-    std::vector<std::pair<std::shared_ptr<network::Connection>, FinalCheckpointAssignedMsg>>&
-        replies) {
+    std::vector<std::pair<std::shared_ptr<Outbox>, FinalCheckpointAssignedMsg>>& replies) {
     // A job awaiting its restart answers nothing: the subtasks that asked are
     // being torn down (a request held past the source's own bounded wait is
     // what failed it), and an id assigned now would trigger a checkpoint in
@@ -9182,7 +9334,7 @@ bool Coordinator::answer_final_requests_locked_(
             // the same id.
             return false;
         }
-        replies.emplace_back(std::move(held.reply_conn), std::move(*reply));
+        replies.emplace_back(std::move(held.reply_outbox), std::move(*reply));
         job.held_final_requests.erase(job.held_final_requests.begin());
     }
     return true;
@@ -9301,7 +9453,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
     JobState& job,
     const std::string& reason,
     const std::string& cause,
-    std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>>& cancels) {
+    std::vector<std::pair<std::shared_ptr<Outbox>, JobId>>& cancels) {
     job.awaiting_restart = true;
     // The specification's RestartOnError: a whole-job restart the coordinator
     // starts for a subtask error or an unattributed transport failure, with
@@ -9380,7 +9532,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked
     for (const auto& [worker_id, _] : job.tasks_by_worker) {
         auto cit = registered_.find(worker_id);
         if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
-            cancels.emplace_back(cit->second->conn, job.id);
+            cancels.emplace_back(cit->second->outbox, job.id);
         }
     }
     return {};
@@ -9427,7 +9579,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
     // discards a staged interval only a rewind re-emits). Collected under
     // the lock; dispatched outside it, after the abort broadcast.
     std::vector<PendingDeploy> failed_ckpt_deploys;
-    std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>> failed_ckpt_cancels;
+    std::vector<std::pair<std::shared_ptr<Outbox>, JobId>> failed_ckpt_cancels;
     // BeginRescale frames queued by the checkpoint-completed
     // path. When the cutover checkpoint ack closes, any operator still
     // in Preparing advances to Draining and we send BeginRescale to
@@ -9691,7 +9843,8 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                                 auto cit = registered_.find(worker_id2);
                                 if (cit != registered_.end() && !cit->second->lost &&
                                     cit->second->conn) {
-                                    failed_ckpt_cancels.emplace_back(cit->second->conn, msg.job_id);
+                                    failed_ckpt_cancels.emplace_back(cit->second->outbox,
+                                                                     msg.job_id);
                                 }
                             }
                         }
@@ -9729,7 +9882,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                             auto cit = registered_.find(worker_id2);
                             if (cit != registered_.end() && !cit->second->lost &&
                                 cit->second->conn) {
-                                failed_ckpt_cancels.emplace_back(cit->second->conn, msg.job_id);
+                                failed_ckpt_cancels.emplace_back(cit->second->outbox, msg.job_id);
                             }
                         }
                     }
@@ -9937,24 +10090,21 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
             }
         }
     }
-    // Send BeginRescale frames outside the lock. Best-effort:
-    // a send failure means the watchdog will catch the worker loss; the
+    // Post BeginRescale frames outside the lock. Best-effort:
+    // a frame a lost worker never gets is the watchdog's to catch; the
     // coordinator's rescale will time out from the user's POV (no
     // dedicated timeout wired here yet) and a future re-request will
     // start fresh.
-    for (auto& f : rescale_frames) {
-        if (f.conn)
-            send_frame(*f.conn, f.frame);
-    }
+    post_frames_(rescale_frames);
 
     // Broadcast AbortCheckpoint to every worker hosting tasks
     // for this job. Each worker dispatches to its registered abort
     // callbacks; non-group sinks ignore (their Sink::on_abort is the
-    // default no-op). We send abort BEFORE the commit broadcast below
+    // default no-op). We post abort BEFORE the commit broadcast below
     // so the receiving worker processes the abort first; aborted-group
     // sinks then no-op on the following CommitCheckpoint.
     for (const auto& [jid, ckpt_id] : groups_to_abort) {
-        std::vector<std::shared_ptr<network::Connection>> worker_conns;
+        std::vector<std::shared_ptr<Outbox>> worker_outboxes;
         {
             std::lock_guard lock(mu_);
             auto job_it = jobs_.find(jid);
@@ -9963,7 +10113,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                     auto worker_it = registered_.find(worker_id);
                     if (worker_it != registered_.end() && !worker_it->second->lost &&
                         worker_it->second->conn) {
-                        worker_conns.push_back(worker_it->second->conn);
+                        worker_outboxes.push_back(worker_it->second->outbox);
                     }
                 }
             }
@@ -9971,27 +10121,17 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
         AbortCheckpointMsg ac;
         ac.job_id = jid;
         ac.checkpoint_id = ckpt_id;
-        const auto frame = fenced_frame_(MessageKind::AbortCheckpoint, ac);
-        for (const auto& c : worker_conns)
-            send_frame(*c, frame);
+        const auto frame = shared_frame(fenced_frame_(MessageKind::AbortCheckpoint, ac));
+        for (const auto& o : worker_outboxes)
+            (void)post_to(o, frame, FrameClass::Control);
     }
     // The failed-checkpoint restart: cancels drain the in-flight subtasks
     // (their SubtaskFinished arrivals complete the drain and fire the
     // redeploy); deploys are the immediate-redeploy branch when nothing was
     // in flight. After the aborts above so the sinks process the abort
     // before any teardown reaches them.
-    for (const auto& [conn, jid] : failed_ckpt_cancels) {
-        if (conn) {
-            CancelJobMsg cj;
-            cj.job_id = jid;
-            send_frame(*conn, fenced_frame_(MessageKind::CancelJob, cj));
-        }
-    }
-    for (auto& d : failed_ckpt_deploys) {
-        if (d.conn) {
-            send_frame(*d.conn, d.frame);
-        }
-    }
+    post_cancels_(failed_ckpt_cancels);
+    post_frames_(failed_ckpt_deploys);
     // Write the COMPLETED marker outside the lock so a slow store does not
     // hold mu_. This runs on the acking worker's dispatch thread, not its
     // reader, so the write delays that worker's later frames but never its
@@ -10171,7 +10311,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
         // seeded the old run's checkpoint into the new run, whose restart had
         // just cleared pending_confirms, and committed it on the new run's
         // connections after the Redeploy line.
-        std::vector<std::shared_ptr<network::Connection>> worker_conns;
+        std::vector<std::shared_ptr<Outbox>> worker_outboxes;
         CommitCheckpointMsg cc;
         cc.job_id = jid;
         cc.checkpoint_id = ckpt_id;
@@ -10225,7 +10365,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                 auto worker_it = registered_.find(worker_id);
                 if (worker_it != registered_.end() && !worker_it->second->lost &&
                     worker_it->second->conn) {
-                    worker_conns.push_back(worker_it->second->conn);
+                    worker_outboxes.push_back(worker_it->second->outbox);
                 }
             }
             // Commit-confirmed restore protocol. Seed this checkpoint's
@@ -10261,9 +10401,9 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                     .emit();
             }
         }
-        const auto frame = fenced_frame_(MessageKind::CommitCheckpoint, cc);
-        for (const auto& c : worker_conns)
-            send_frame(*c, frame);
+        const auto frame = shared_frame(fenced_frame_(MessageKind::CommitCheckpoint, cc));
+        for (const auto& o : worker_outboxes)
+            (void)post_to(o, frame, FrameClass::Control);
     }
     // Wake anyone waiting on latest_completed_checkpoint_id to advance
     // (take_savepoint, recovery probes, tests).
@@ -10285,8 +10425,7 @@ void Coordinator::checkpoint_trigger_loop_() {
         // for one job holds nobody else's checkpoints.
         std::vector<std::pair<std::shared_ptr<JobState::TriggeredRecord>, std::uint64_t>> to_record;
         // Answers to end-of-input requests held until their id was on record.
-        std::vector<std::pair<std::shared_ptr<network::Connection>, FinalCheckpointAssignedMsg>>
-            final_replies;
+        std::vector<std::pair<std::shared_ptr<Outbox>, FinalCheckpointAssignedMsg>> final_replies;
         {
             std::lock_guard lock(mu_);
             for (auto& [jid, job_ptr] : jobs_) {
@@ -10490,9 +10629,12 @@ void Coordinator::checkpoint_trigger_loop_() {
                     jid, next_id, job.state_generation, barrier_mode_plus1, std::move(worker_ids));
             }
         }
-        for (auto& [conn, reply] : final_replies) {
-            if (conn) {
-                send_frame(*conn, fenced_frame_(MessageKind::FinalCheckpointAssigned, reply));
+        for (auto& [outbox, reply] : final_replies) {
+            if (outbox) {
+                (void)post_to(
+                    outbox,
+                    shared_frame(fenced_frame_(MessageKind::FinalCheckpointAssigned, reply)),
+                    FrameClass::Control);
             }
         }
         for (const auto& [jid, ckpt_id, gen, mode_plus1, worker_ids] : to_trigger) {
@@ -10501,18 +10643,18 @@ void Coordinator::checkpoint_trigger_loop_() {
             m.checkpoint_id = ckpt_id;
             m.generation = gen;
             m.barrier_mode_plus1 = mode_plus1;
-            const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, m);
+            const auto frame = shared_frame(fenced_frame_(MessageKind::TriggerCheckpoint, m));
             for (const auto& worker_id : worker_ids) {
-                std::shared_ptr<network::Connection> c;
+                std::shared_ptr<Outbox> outbox;
                 {
                     std::lock_guard lock(mu_);
                     auto it = registered_.find(worker_id);
                     if (it != registered_.end() && !it->second->lost && it->second->conn) {
-                        c = it->second->conn;
+                        outbox = it->second->outbox;
                     }
                 }
-                if (c) {
-                    send_frame(*c, frame);
+                if (outbox) {
+                    (void)post_to(outbox, frame, FrameClass::Control);
                 }
             }
         }

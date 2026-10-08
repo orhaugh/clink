@@ -42,6 +42,9 @@ enum class AdmissionProgress : std::uint8_t;
 // Bounds the log lines admission refusals and drops produce
 // (admission_policy.hpp).
 class AdmissionLogLimiter;
+// One connection's outbound frames, written by one thread of its own
+// (src/cluster/outbox.hpp, private to the library).
+class Outbox;
 
 // One task in the user-supplied job plan. peer_refs are resolved against
 // the rest of the plan at deployment time to compute the actual host:port
@@ -350,8 +353,8 @@ public:
         // Most WORKER connections the coordinator will hold at once. Beyond this
         // a registration is refused with a reason rather than admitted into
         // threads the coordinator cannot account for (each worker connection
-        // has two: a reader and a dispatch thread) - the same contract as the
-        // client cap above, on the path that had none.
+        // has three: a reader, a dispatch thread and a writer) - the same
+        // contract as the client cap above, on the path that had none.
         //
         // The anchor is the engine's own ceiling rather than taste: a keyed
         // operator cannot be split finer than kNumKeyGroups = 128 ways, so 128
@@ -376,6 +379,19 @@ public:
         // empty backlog, whatever its size.
         std::size_t max_worker_dispatch_backlog_frames{10000};
         std::size_t max_worker_dispatch_backlog_bytes{std::size_t{64} * 1024 * 1024};
+        // How long stop() lets the worker connections write what is queued
+        // for them. Every frame to a worker is queued on its connection and
+        // written by that connection's own writer thread, so no thread that
+        // sends one waits on the peer. stop() first joins every thread that
+        // queues frames, then lets each writer write what is still queued,
+        // against one deadline this far away for all of them. What a peer
+        // has not taken by then is discarded and counted
+        // (clink_coordinator_outbound_frames_discarded_total, reason
+        // flush_deadline) and its connection closed, so a worker that has
+        // stopped reading holds stop() this long at most, never for ever.
+        // Zero or less discards whatever is still queued at once; a value
+        // too large to add to the clock saturates to no deadline.
+        std::chrono::milliseconds outbound_flush_timeout{1000};
         // Host advertised to clients/peers in resolved peer addresses
         // when bind_host is a wildcard. Defaults to bind_host. Set to a
         // routable hostname/IP when bind_host = "0.0.0.0".
@@ -948,26 +964,49 @@ private:
         // session starts empty and receives full bytes again. The worker's
         // process-level content cache still deduplicates the bytes on disk.
         // Recorded at Deploy build under
-        // mu_ - if the send then fails, the worker is on its way to lost
-        // or re-registered, both of which reset this.
+        // mu_ - if the Deploy is then refused or never written, the session
+        // is on its way to lost or replaced, and a new session starts
+        // without these.
         std::unordered_set<std::string> shipped_plugin_hashes;
         // The protocol version this peer registered with. Checked at register and
         // then discarded, which left a mixed-version cluster diagnosable only by
         // reading logs - the version that refused a peer was reported, the versions
         // that were ACCEPTED were not. Retained so the read API can show them.
         std::uint32_t protocol_version{0};
-        // Transport. Owns the underlying fd (or TLS session). Reader
-        // thread borrows; close() runs on watchdog teardown.
+        // Transport. Owns the underlying fd (or TLS session). The reader
+        // reads it; nothing but `writer` writes it, through `outbox`, apart
+        // from the RegisterAck, which the registration sends before the
+        // writer starts.
         //
-        // Shared, not unique: control frames are staged under mu_ and sent
-        // after it is released, and reap_finished_workers_() drops this
-        // reference under mu_. With unique ownership the reaper freed a
-        // Connection a sender had already copied the raw pointer of - a
-        // use-after-free TSan caught in a same-id re-registration during a
-        // restart drain. Every off-lock sender now holds its own reference,
-        // so the object outlives the last send that touches it.
+        // Shared: `outbox` holds a reference, and the writer one of its own
+        // while it runs. reap_finished_workers_() drops this one under mu_
+        // once the reader and the writer have both finished, and has the
+        // outbox let go of its own, so the descriptor closes then.
         std::shared_ptr<network::Connection> conn;
+        // Every frame this session is sent after its RegisterAck, queued in
+        // the order posted and written by `writer` alone
+        // (src/cluster/outbox.hpp). A post returns at once and never waits
+        // on the peer, so no thread that sends to a worker, under mu_ or
+        // not, can be held by one that has stopped reading. A post that
+        // returns Queued is not a delivery: the frame is written later, or
+        // discarded and counted when the outbox stops.
+        //
+        // Created with the session record, before it is published, and
+        // never reset or reassigned, so a pointer copied under mu_, or read
+        // after publication, is always valid; the outbox outlives the
+        // transport, which the reaper releases. Every thread that calls
+        // into it holds a shared_ptr of its own for the whole call. A loss
+        // or a replacement aborts it, which discards what is queued and
+        // closes the transport both ways, so the peer sees the end of the
+        // stream; stop() flushes it (Config::outbound_flush_timeout).
+        std::shared_ptr<Outbox> outbox;
         std::thread reader;
+        // Runs the outbox's writer (Outbox::run_writer) until the outbox
+        // closes or stops. It holds the outbox, never this record, so it
+        // can never be the thread that drops the last reference to the
+        // record and joins itself. Joined wherever the reader is: by the
+        // reaper, by the retirement of a replaced session, and by stop().
+        std::thread writer;
         // Set by the reader as its LAST act, so another thread can tell a
         // finished reader from a running one and join it safely.
         //
@@ -983,6 +1022,13 @@ private:
         // down with it. Same shape as the client-session leak, on the path that
         // had no reaper.
         std::shared_ptr<std::atomic<bool>> reader_finished =
+            std::make_shared<std::atomic<bool>>(false);
+        // Set by the writer as its LAST act, as reader_finished is by the
+        // reader, and set in its place when the writer could not be started.
+        // The reaper takes a session only once both are set: a session whose
+        // reader has ended can still have frames queued for a peer that
+        // reads.
+        std::shared_ptr<std::atomic<bool>> writer_finished =
             std::make_shared<std::atomic<bool>>(false);
         // Stamped by the reader for every frame it reads, without mu_, so a
         // dispatch waiting on the store or on mu_ cannot make a live worker
@@ -1653,7 +1699,8 @@ private:
         struct HeldFinalRequest {
             std::string role;
             std::uint32_t subtask_idx{0};
-            std::shared_ptr<network::Connection> reply_conn;
+            // The requesting session's outbox (WorkerConnection::outbox).
+            std::shared_ptr<Outbox> reply_outbox;
         };
         std::vector<HeldFinalRequest> held_final_requests;
         // Test-only (CLINK_TEST_STALL_FIRST_FINAL_CKPT): force the no-crash
@@ -1827,11 +1874,23 @@ private:
     void handle_submit_(network::Connection& conn, MessageReader& r);
     void handle_list_jobs_(network::Connection& conn);
     void handle_cancel_job_(network::Connection& conn, MessageReader& r);
-    // Deferred control-plane frame: staged under mu_, sent outside it.
+    // Deferred control-plane frame for a worker: staged under mu_, then
+    // posted to the session's outbox by the stager's caller, where the frame
+    // used to be sent. The frame is shared, so a broadcast staged for many
+    // sessions is encoded once.
     struct PendingDeploy {
-        std::shared_ptr<network::Connection> conn;
-        std::vector<std::byte> frame;
+        std::shared_ptr<Outbox> outbox;
+        std::shared_ptr<const std::vector<std::byte>> frame;
+        // A Deploy that ships plugin bytes, posted as a bulk frame; every
+        // other frame, a Deploy that refers to its plugins by hash only
+        // included, is a control frame.
+        bool ships_plugin_bytes{false};
     };
+    // Post each staged frame to its outbox, in order. Never waits on a peer.
+    static void post_frames_(const std::vector<PendingDeploy>& frames);
+    // Post a CancelJob for each (outbox, job) pair, in order, encoding each
+    // job's frame once. Never waits on a peer.
+    void post_cancels_(const std::vector<std::pair<std::shared_ptr<Outbox>, JobId>>& cancels) const;
 
     // `sender` is the session whose connection delivered the frame: the
     // subtask's slot is released against it. Every worker-frame handler takes
@@ -1887,7 +1946,7 @@ private:
     // tasks, CutoverPeerUpdate to the feeders, durable bookkeeping.
     void hot_cutover_complete_locked_(JobState& job, std::vector<PendingDeploy>& out_frames);
     // Abort at any phase: clear the hot state and fall back to the replan
-    // at the requested parallelism. Returns the CancelJob frames to send.
+    // at the requested parallelism. Stages the CancelJob frames to post.
     void abort_hot_cutover_locked_(JobState& job,
                                    const std::string& reason,
                                    std::vector<PendingDeploy>& out_frames);
@@ -1897,12 +1956,18 @@ private:
     void handle_rescale_operator_(network::Connection& conn, MessageReader& r);
     void handle_savepoint_(network::Connection& conn, MessageReader& r);
     void handle_stop_job_(network::Connection& conn, MessageReader& r);
-    // A worker connection runs on two threads. The reader reads every frame,
-    // stamps last_seen and answers heartbeats; every other frame goes, in
-    // the order read, to the connection's dispatch thread, which runs the
+    // A worker connection runs on three threads. The reader reads every
+    // frame, stamps last_seen and answers heartbeats; every other frame goes,
+    // in the order read, to the connection's dispatch thread, which runs the
     // handlers one at a time. A handler that waits on the store, or on mu_
     // held across another's store write, therefore never stops its worker's
-    // heartbeats being read and answered.
+    // heartbeats being read and answered. The writer writes what is posted to
+    // the connection's outbox, and nothing else writes the socket, so neither
+    // the reader's heartbeat answers nor any other sender waits on the peer.
+    //
+    // The writer starts first. A thread that cannot be started shuts the
+    // session down (its outbox aborted, the thread reported finished), and
+    // the watchdog declares the worker lost.
     //
     // `predecessor` is the session a same-id re-registration replaced. The new
     // session's reader starts at once, so its heartbeats are answered from the
@@ -1915,12 +1980,13 @@ private:
                            std::shared_ptr<WorkerConnection> predecessor = nullptr,
                            bool predecessor_was_lost = false);
     // Joins the replaced session's reader, which joins its dispatch thread once
-    // that has handled every frame the session read, then folds whatever the
-    // session still had in flight and moves the capacity gauges. Runs on the
-    // successor's dispatch thread, off mu_ and off every thread of the session
-    // it joins. Never throws: the join comes first and is attempted again if
-    // anything after it fails, because a replaced session left unjoined ends
-    // with its reader destroying its own joinable std::thread, which is
+    // that has handled every frame the session read, and its writer, which
+    // the registration's abort of its outbox has ended, then folds whatever
+    // the session still had in flight and moves the capacity gauges. Runs on
+    // the successor's dispatch thread, off mu_ and off every thread of the
+    // session it joins. Never throws: the joins come first and are attempted
+    // again if anything after them fails, because a replaced session left
+    // unjoined ends with a joinable std::thread destroyed, which is
     // std::terminate. Clears the successor's retiring_predecessor last.
     void retire_replaced_session_(WorkerConnection& successor,
                                   const std::shared_ptr<WorkerConnection>& replaced,
@@ -2013,12 +2079,12 @@ private:
     // assigning the original task set onto survivor workers, reset
     // transient JobState fields, and broadcast fresh Deploys with
     // restore_from set to the coordinator's latest_completed_checkpoint_id.
-    // Returns the new Deploy frames to send outside the lock.
+    // Returns the new Deploy frames to post outside the lock.
     std::vector<PendingDeploy> restart_job_locked_(JobState& job);
     // Begin a whole-job restart under mu_: drain bookkeeping, budget count,
     // the restart log line, and either an immediate redeploy (nothing in
-    // flight, no in-doubt hold - the returned deploys) or CancelJob sends
-    // the caller dispatches outside the lock (`cancels`). Shared by the
+    // flight, no in-doubt hold - the returned deploys) or CancelJob frames
+    // the caller posts outside the lock (`cancels`). Shared by the
     // subtask-error path and the failed-checkpoint path: a failed
     // checkpoint aborts the sinks' staged transactions, and without the
     // rewind this initiates, the aborted interval was simply GONE - the
@@ -2027,7 +2093,7 @@ private:
         JobState& job,
         const std::string& reason,
         const std::string& cause,
-        std::vector<std::pair<std::shared_ptr<network::Connection>, JobId>>& cancels);
+        std::vector<std::pair<std::shared_ptr<Outbox>, JobId>>& cancels);
 
     // Replan a job at a changed per-operator parallelism.
     //
@@ -2047,7 +2113,7 @@ private:
     //
     // dispatch_begin_rescale_locked_: builds one BeginRescaleMsg per
     // worker hosting at least one old subtask of `op_id`. Appended to
-    // `out`. Caller sends outside the lock.
+    // `out`. Caller posts outside the lock.
     void dispatch_begin_rescale_locked_(JobState& job,
                                         const std::string& op_id,
                                         std::uint64_t cutover_checkpoint,
@@ -2093,7 +2159,7 @@ private:
     // (JobState::held_final_requests) until the trigger loop can answer it.
     void handle_request_final_checkpoint_(MessageReader& r,
                                           const WorkerConnection& sender,
-                                          const std::shared_ptr<network::Connection>& reply_conn);
+                                          const std::shared_ptr<Outbox>& reply_outbox);
     // Under mu_: the answer to one source's end-of-input request, assigning the
     // job's final id (once per job) and seeding its pending ack set, or nothing
     // while the id the job would assign next is not on record yet. `job` is
@@ -2101,12 +2167,11 @@ private:
     std::optional<FinalCheckpointAssignedMsg> decide_final_request_locked_(
         JobState* job, JobId job_id, const std::string& role, std::uint32_t subtask_idx);
     // Under mu_: answer the job's held final-id requests once the id is on
-    // record, staging each reply in `replies` for the caller to send after the
+    // record, staging each reply in `replies` for the caller to post after the
     // lock. False, leaving them held, while the id is still not on record.
     bool answer_final_requests_locked_(
         JobState& job,
-        std::vector<std::pair<std::shared_ptr<network::Connection>, FinalCheckpointAssignedMsg>>&
-            replies);
+        std::vector<std::pair<std::shared_ptr<Outbox>, FinalCheckpointAssignedMsg>>& replies);
     void checkpoint_trigger_loop_();
     // Put the job's next checkpoint id on record, so that this coordinator
     // may allocate it: a takeover numbers above the job's checkpoint-id
@@ -2350,13 +2415,16 @@ private:
     // each new client, so the cost is paid by the connection that would
     // otherwise have grown the list. Returns the number still live.
     std::size_t reap_finished_clients_();
-    // Join finished worker readers and drop their sockets, KEEPING the
-    // registration record. Returns the number of workers still holding a
-    // connection, which is what max_worker_connections bounds.
+    // Join the reader and the writer of every session whose two threads have
+    // both finished and drop its socket, KEEPING the registration record and
+    // its outbox, which lets go of the transport too. Returns the number of
+    // workers still holding a connection, which is what
+    // max_worker_connections bounds.
     //
     // The record is kept deliberately: several paths distinguish "absent" from
     // "present and lost" and behave differently, so erasing would quietly change
-    // restart and drain semantics. What is released is the thread and the socket.
+    // restart and drain semantics. What is released is the threads and the
+    // socket.
     std::size_t reap_finished_workers_();
 
     // Wraps an accepted socket into a Connection. Default plain TCP via

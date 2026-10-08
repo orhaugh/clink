@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <dirent.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -39,10 +40,15 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/coordinator.hpp"
@@ -113,7 +119,77 @@ public:
         conn_ = network::connect_plain("127.0.0.1", port);
     }
 
+    // A worker whose own socket the test can look at (unread_bytes,
+    // local_port), its receive buffer pinned to `receive_buffer_bytes`
+    // before the connect. One that stops reading fills its buffers after
+    // little data, and the coordinator's writer is then held in send.
+    FakeWorker(std::uint16_t port, std::string id, std::uint32_t slots, int receive_buffer_bytes)
+        : id_(std::move(id)), slots_(slots) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return;
+        }
+        (void)::setsockopt(
+            fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes, sizeof(receive_buffer_bytes));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        sockaddr_in local{};
+        socklen_t len = sizeof(local);
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            ::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &len) != 0) {
+            ::close(fd);
+            return;
+        }
+        fd_ = fd;
+        local_port_ = ntohs(local.sin_port);
+        conn_ = network::make_plain_connection(fd);
+    }
+
     [[nodiscard]] bool valid() const { return conn_ != nullptr; }
+
+    // Read nothing after the RegisterAck: neither the frames the coordinator
+    // sends nor the end of the stream. Heartbeats still go out, so the
+    // coordinator keeps reading this worker and counts it alive. Called
+    // before registering.
+    void never_read() { reads_ = false; }
+
+    // Send no periodic heartbeats; only those the test sends itself
+    // (send_heartbeat). Called before registering.
+    void no_periodic_heartbeats() { heartbeats_ = false; }
+
+    // End the stream towards the coordinator and go on reading: its reader
+    // for this worker ends, and what it writes still arrives.
+    void half_close() {
+        std::lock_guard lock(send_mu_);
+        conn_->shutdown_write();
+    }
+
+    // Stop heartbeating and leave the connection open, as a worker process
+    // that hangs does: the coordinator declares it lost.
+    void stop_heartbeats() {
+        heartbeats_stopped_.store(true, std::memory_order_release);
+        if (heartbeat_.joinable()) {
+            heartbeat_.join();
+        }
+    }
+
+    // True once the coordinator has ended the stream, waiting up to `bound`.
+    [[nodiscard]] bool await_end_of_stream(std::chrono::milliseconds bound) {
+        return ckpt_await([this] { return ended_.load(std::memory_order_acquire); }, bound);
+    }
+
+    // What the coordinator has sent that waits unread in this worker's
+    // receive buffer. Needs the constructor that keeps the socket.
+    [[nodiscard]] int unread_bytes() const {
+        int n = 0;
+        return fd_ >= 0 && ::ioctl(fd_, FIONREAD, &n) == 0 ? n : 0;
+    }
+
+    // This worker's end of the connection. Needs the constructor that keeps
+    // the socket.
+    [[nodiscard]] std::uint16_t local_port() const { return local_port_; }
 
     [[nodiscard]] bool register_and_ack() {
         const auto ack = register_reply();
@@ -139,8 +215,12 @@ public:
         if (ack.ok) {
             // Only now: the handshake read above is synchronous and would
             // race the pump for the same bytes.
-            start_reader();
-            start_heartbeat();
+            if (reads_) {
+                start_reader();
+            }
+            if (heartbeats_) {
+                start_heartbeat();
+            }
         }
         return ack;
     }
@@ -157,7 +237,11 @@ public:
     // off a safety mechanism to make a test pass.
     void start_heartbeat() {
         heartbeat_ = std::thread([this] {
-            while (!stop_.load(std::memory_order_acquire)) {
+            const auto running = [this] {
+                return !stop_.load(std::memory_order_acquire) &&
+                       !heartbeats_stopped_.load(std::memory_order_acquire);
+            };
+            while (running()) {
                 {
                     std::lock_guard lock(send_mu_);
                     if (!send_frame(*conn_,
@@ -165,7 +249,7 @@ public:
                         return;
                     }
                 }
-                for (int i = 0; i < 20 && !stop_.load(std::memory_order_acquire); ++i) {
+                for (int i = 0; i < 20 && running(); ++i) {
                     std::this_thread::sleep_for(10ms);
                 }
             }
@@ -177,6 +261,7 @@ public:
             while (!stop_.load(std::memory_order_acquire)) {
                 auto frame = recv_frame(*conn_);
                 if (!frame.has_value()) {
+                    ended_.store(true, std::memory_order_release);
                     return;  // closed
                 }
                 std::lock_guard lock(mu_);
@@ -365,11 +450,20 @@ private:
     std::string id_;
     std::uint32_t slots_;
     std::unique_ptr<network::Connection> conn_;
+    // The socket conn_ owns, and its local port, when the constructor that
+    // keeps them made this worker; -1 and 0 otherwise.
+    int fd_{-1};
+    std::uint16_t local_port_{0};
+    bool reads_{true};
+    bool heartbeats_{true};
     std::thread reader_;
     std::thread heartbeat_;
     // Acks and heartbeats are written from different threads.
     std::mutex send_mu_;
     std::atomic<bool> stop_{false};
+    std::atomic<bool> heartbeats_stopped_{false};
+    // The reader met the end of the stream.
+    std::atomic<bool> ended_{false};
     std::mutex mu_;
     std::vector<std::vector<std::byte>> inbox_;
 };
@@ -5100,4 +5194,503 @@ TEST(CheckpointCompletion, SeparatedRecoveredFaultsDoNotExhaustTheRestartBudget)
     coordinator.stop();
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+// --- Worker connections: every frame posted, written by one thread -------------
+//
+// Every frame to a worker is posted to its session's outbox and written by that
+// connection's own writer thread, so no thread that sends to a worker waits on
+// it. These tests pin what that delivers: a worker that stops reading holds no
+// coordinator thread, stop() is bounded, a lost or replaced session's outbox is
+// given up, and a lost session is reaped with both of its threads.
+
+namespace {
+
+// Small enough that a worker which reads nothing stops taking bytes almost at
+// once.
+constexpr int kSmallReceiveBuffer = 16 * 1024;
+
+// More unread bytes than any frame but a Deploy shipping plugin bytes: once a
+// worker that reads nothing has this much waiting, the Deploy is being
+// written, and whatever writes it is held in send. Anything smaller, a
+// heartbeat answer say, can arrive before the Deploy has begun.
+constexpr int kDeployUnderway = 8 * 1024;
+
+// A plugin far larger than a loopback connection's two socket buffers hold on
+// any platform. A Deploy that ships it to a worker that reads nothing fills
+// both and stays unwritten: whatever writes it is held in send for as long as
+// the worker reads nothing. The bytes are never loaded; no worker runs them.
+std::vector<PluginBinary> wedging_plugin() {
+    PluginBinary plugin;
+    plugin.name = "wedging_plugin";
+    plugin.content_hash = "wedging-plugin-never-loaded";
+    plugin.bytes.assign(std::size_t{16} * 1024 * 1024, std::byte{0x5a});
+    std::vector<PluginBinary> plugins;
+    plugins.push_back(std::move(plugin));
+    return plugins;
+}
+
+// True once the watchdog has logged worker `id` lost since `since_ms`. Read
+// from the log ring, which takes no lock of the coordinator's, so it answers
+// even while a coordinator thread holds them all.
+bool logged_lost(const std::string& id, std::int64_t since_ms) {
+    for (const auto& rec :
+         LogBuffer::global().tail(1000, "warn", since_ms, "coordinator.watchdog")) {
+        if (rec.message == "worker lost: " + id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint64_t outbound_discards(std::string_view cls, std::string_view reason) {
+    return MetricsRegistry::global()
+        .counter(clink::metrics::outbound_frames_discarded_name(cls, reason))
+        .value();
+}
+
+// The descriptors open in this process.
+std::vector<int> open_descriptors() {
+    std::vector<int> out;
+    DIR* d = ::opendir("/dev/fd");
+    if (d == nullptr) {
+        return out;
+    }
+    while (const auto* e = ::readdir(d)) {
+        const std::string name = e->d_name;
+        if (!name.empty() && std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+                return ch >= '0' && ch <= '9';
+            })) {
+            out.push_back(std::stoi(name));
+        }
+    }
+    ::closedir(d);
+    return out;
+}
+
+// The local port of socket `fd`, or its peer's; nullopt when it has none.
+std::optional<std::uint16_t> port_of(int fd, bool peer) {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    const int rc = peer ? ::getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len)
+                        : ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len);
+    if (rc != 0 || addr.sin_family != AF_INET) {
+        return std::nullopt;
+    }
+    return ntohs(addr.sin_port);
+}
+
+// The coordinator's end of the connection a fake worker in this process opened
+// from `worker_port`: the socket on the coordinator's port whose peer is that
+// port, or -1. Looked up while the connection is up, since a socket shut down
+// both ways reports no peer.
+int coordinator_end_of(std::uint16_t coordinator_port, std::uint16_t worker_port) {
+    for (const int fd : open_descriptors()) {
+        if (port_of(fd, false) == coordinator_port && port_of(fd, true) == worker_port) {
+            return fd;
+        }
+    }
+    return -1;
+}
+
+// Whether `fd`, found by coordinator_end_of, still holds that socket: open, on
+// the coordinator's port, and connected to that worker or to nothing (a socket
+// shut down both ways reports no peer). Once it is closed, or the descriptor
+// reissued to another connection, it does not.
+bool still_coordinator_end(int fd, std::uint16_t coordinator_port, std::uint16_t worker_port) {
+    if (port_of(fd, false) != coordinator_port) {
+        return false;
+    }
+    const auto peer = port_of(fd, true);
+    return !peer.has_value() || *peer == worker_port;
+}
+
+}  // namespace
+
+// A worker that stops reading holds no coordinator thread. Here one reads
+// nothing while a Deploy carrying a plugin of 16 MiB is sent to it, so its
+// socket buffers fill. Sent by the thread that decided it, the Deploy held the
+// submitting thread in send for as long as the worker read nothing; the
+// PeerUpdate the job's last listening then sent the wedged worker, under the
+// coordinator's lock, held the lock with it, so the watchdog stopped and a
+// worker killed meanwhile was never declared lost; and the wedged worker's
+// own reader, held in sending it a heartbeat answer, stopped reading, so the
+// worker was declared lost while it was alive. Every frame is now posted and
+// written by the wedged connection's own writer, so a healthy worker's
+// heartbeats are answered throughout and the killed one is declared lost on
+// time. Its loss has the watchdog itself post a CancelJob to the wedged worker,
+// which hosts the same job, and a second worker killed after that is declared
+// lost on time too. The listenings go out within moments of the submit, long
+// before the wedged worker's reader could cost it its session. Everything
+// checked while the wedge stands is read without the coordinator's lock, so a
+// coordinator that is wedged fails this test rather than hanging it.
+TEST(CheckpointCompletion, AWorkerThatStopsReadingHoldsNoCoordinatorThread) {
+    Coordinator::Config cfg;
+    cfg.heartbeat_timeout = 1000ms;
+    cfg.watchdog_interval = 50ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+
+    // Placement takes the workers in id order, a subtask index to each in
+    // turn, so the job lands on both of these.
+    FakeWorker wedged(port, "a-wedged", /*slots=*/4, kSmallReceiveBuffer);
+    ASSERT_TRUE(wedged.valid());
+    wedged.never_read();
+    ASSERT_TRUE(wedged.register_and_ack());
+    FakeWorker killed(port, "b-killed");
+    ASSERT_TRUE(killed.valid());
+    ASSERT_TRUE(killed.register_and_ack());
+
+    // Off the test thread, which must stay free to observe: a submit that
+    // sends from its own thread waits there until the wedged worker goes.
+    std::atomic<bool> submitted{false};
+    std::thread submitter([&] {
+        try {
+            (void)c.submit_job(hot_cutover_graph(std::filesystem::temp_directory_path() /
+                                                 ("clink_wedge_" + std::to_string(::getpid()))),
+                               OperatorRegistry::default_instance(),
+                               wedging_plugin(),
+                               CheckpointConfig{});
+        } catch (const std::exception&) {
+            // A send that failed once the wedged worker closed; nothing to add.
+        }
+        submitted.store(true, std::memory_order_release);
+    });
+    // On every exit path: the wedged worker closes first, which ends any send
+    // still held on it, and only then is the submitter joined.
+    struct CloseThenJoin {
+        FakeWorker& worker;
+        std::thread& thread;
+        ~CloseThenJoin() {
+            worker.close();
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    } close_then_join{wedged, submitter};
+
+    ASSERT_TRUE(ckpt_await([&] { return wedged.unread_bytes() >= kDeployUnderway; }, 10s))
+        << "no Deploy reached the wedged worker";
+
+    JobId job_id = 0;
+    ASSERT_TRUE(ckpt_await([&] {
+        const auto jobs = c.snapshot_jobs();
+        job_id = jobs.empty() ? 0 : jobs.front().id;
+        return job_id != 0;
+    }));
+    const auto detail = c.snapshot_job(job_id);
+    ASSERT_TRUE(detail.has_value());
+    bool on_wedged = false;
+    bool on_killed = false;
+    for (const auto& t : detail->tasks) {
+        on_wedged = on_wedged || t.worker_id == "a-wedged";
+        on_killed = on_killed || t.worker_id == "b-killed";
+    }
+    ASSERT_TRUE(on_wedged && on_killed) << "the job was not placed across both workers";
+
+    FakeWorker healthy(port, "h-healthy");
+    ASSERT_TRUE(healthy.valid());
+    ASSERT_TRUE(healthy.register_and_ack());
+    FakeWorker killed_later(port, "z-killed-later");
+    ASSERT_TRUE(killed_later.valid());
+    ASSERT_TRUE(killed_later.register_and_ack());
+    // The last listening resolves the job's peers, and a PeerUpdate goes to
+    // each worker hosting it, the wedged one included, from the coordinator's
+    // lock.
+    std::uint16_t fake_port = 47300;
+    for (const auto& t : detail->tasks) {
+        ASSERT_TRUE(healthy.report_listening(job_id, t.role, t.subtask_idx, fake_port++));
+    }
+    EXPECT_TRUE(ckpt_await([&] { return submitted.load(std::memory_order_acquire); },
+                           clink::test_support::scale_slack(std::chrono::milliseconds{2000})))
+        << "the submit waited on a worker that reads nothing";
+    EXPECT_TRUE(killed.await_frame(MessageKind::PeerUpdate, 5s).has_value())
+        << "the job's peers were never resolved, so nothing was posted to the wedged worker";
+
+    EXPECT_TRUE(heartbeats_answered_throughout({&healthy}, 2000ms));
+    const auto on_time = cfg.heartbeat_timeout + cfg.watchdog_interval +
+                         clink::test_support::scale_slack(std::chrono::milliseconds{1000});
+    const auto killed_ms = log_cursor_ms();
+    killed.close();
+    EXPECT_TRUE(ckpt_await([&] { return logged_lost("b-killed", killed_ms); }, on_time))
+        << "a worker killed while another read nothing was not declared lost on time";
+    // The loss had the watchdog post a CancelJob to the wedged worker, a
+    // survivor of the job, after the lock: the watchdog goes on regardless.
+    const auto killed_later_ms = log_cursor_ms();
+    killed_later.close();
+    EXPECT_TRUE(ckpt_await([&] { return logged_lost("z-killed-later", killed_later_ms); }, on_time))
+        << "a worker killed after the watchdog sent to the wedged worker was not declared lost on "
+           "time";
+    EXPECT_TRUE(heartbeats_answered_throughout({&healthy}, 1000ms));
+    EXPECT_FALSE(logged_lost("h-healthy", start_ms)) << "the healthy worker was declared lost";
+    EXPECT_FALSE(logged_lost("a-wedged", start_ms))
+        << "the wedged worker's heartbeats went unread: its reader waited on its socket";
+}
+
+// stop() writes what is queued for each worker against one deadline,
+// outbound_flush_timeout away, and gives up whatever a worker has not taken by
+// then. With a worker that reads nothing and a Deploy of 16 MiB queued to it,
+// stop() returns once that deadline passes, and the Deploy is counted as
+// discarded rather than dropped unseen.
+//
+// The worker sends nothing either, as a hung process does. One that sends
+// after stop() has shut the read side down frees the writer by another path
+// on Darwin, which resets a connection that receives data once its read side
+// is shut down.
+TEST(CheckpointCompletion, StopReturnsWithinTheFlushTimeoutWhenAWorkerReadsNothing) {
+    Coordinator::Config cfg;
+    cfg.outbound_flush_timeout = 750ms;
+    // Nothing is to be declared lost before stop(): the worker sends nothing.
+    cfg.heartbeat_timeout = 30000ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    FakeWorker wedged(port, "w", /*slots=*/4, kSmallReceiveBuffer);
+    ASSERT_TRUE(wedged.valid());
+    wedged.never_read();
+    wedged.no_periodic_heartbeats();
+    ASSERT_TRUE(wedged.register_and_ack());
+    const auto job_id =
+        c.submit_job(two_subtask_graph(std::filesystem::temp_directory_path() /
+                                       ("clink_stop_flush_" + std::to_string(::getpid()) + ".txt")),
+                     OperatorRegistry::default_instance(),
+                     wedging_plugin(),
+                     CheckpointConfig{});
+    ASSERT_GT(job_id, 0U);
+    ASSERT_TRUE(ckpt_await([&] { return wedged.unread_bytes() >= kDeployUnderway; }, 10s))
+        << "no Deploy reached the worker";
+    const auto discarded_before = outbound_discards("bulk", "flush_deadline");
+
+    // On a thread of its own, so a stop that never returns fails the test
+    // rather than hanging it: closing the worker then frees its writer.
+    std::atomic<bool> stopped{false};
+    std::chrono::steady_clock::duration took{};
+    const auto started = std::chrono::steady_clock::now();
+    std::thread stopper([&] {
+        c.stop();
+        took = std::chrono::steady_clock::now() - started;
+        stopped.store(true, std::memory_order_release);
+    });
+    const bool on_time =
+        ckpt_await([&] { return stopped.load(std::memory_order_acquire); },
+                   cfg.outbound_flush_timeout +
+                       clink::test_support::scale_slack(std::chrono::milliseconds{3000}));
+    if (!on_time) {
+        wedged.close();
+    }
+    stopper.join();
+    EXPECT_TRUE(on_time) << "stop() waited on a worker that reads nothing";
+    EXPECT_GE(took, cfg.outbound_flush_timeout)
+        << "stop() gave the queued Deploy up without letting the writer try to flush it";
+    EXPECT_GE(outbound_discards("bulk", "flush_deadline"), discarded_before + 1)
+        << "the Deploy left unwritten at stop() was not counted";
+}
+
+// What is queued for a worker when stop() begins is written before stop()
+// returns, while the deadline allows. The writer is held, by the fault point,
+// with one HeartbeatAck taken and a second queued behind it, until stop() is
+// under way; both then reach the worker.
+TEST(CheckpointCompletion, FramesQueuedForAWorkerAtStopAreWrittenBeforeItReturns) {
+    clink::fault::Registry::instance().reset();
+    Coordinator::Config cfg;
+    cfg.outbound_flush_timeout = 5000ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    // Only the heartbeats the test sends, so the writer writes nothing else.
+    w.no_periodic_heartbeats();
+    ASSERT_TRUE(w.register_and_ack());
+
+    clink::fault::ScopedFault hold{
+        clink::fault::Rule{.point = clink::fault::points::kCoordinatorOutboxBeforeWrite,
+                           .ordinal = 1,
+                           .action = clink::fault::Action::Block}};
+    ASSERT_TRUE(w.send_heartbeat(1));
+    ASSERT_TRUE(w.send_heartbeat(2));
+    ASSERT_TRUE(ckpt_await([] {
+        return clink::fault::Registry::instance().hits(
+                   clink::fault::points::kCoordinatorOutboxBeforeWrite) >= 1;
+    })) << "the writer never took the first HeartbeatAck";
+
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] {
+        c.stop();
+        stopped.store(true, std::memory_order_release);
+    });
+    // stop() reaches its flush within a watchdog interval or so; the writer
+    // is let go only once it has had ample time to.
+    EXPECT_FALSE(ckpt_await([&] { return stopped.load(std::memory_order_acquire); },
+                            clink::test_support::scale_slack(std::chrono::milliseconds{500})))
+        << "stop() returned with a frame still held";
+    clink::fault::Registry::instance().release(clink::fault::points::kCoordinatorOutboxBeforeWrite);
+    EXPECT_TRUE(w.await_heartbeat_ack(1)) << "the frame in flight at stop() was not written";
+    EXPECT_TRUE(w.await_heartbeat_ack(2)) << "the frame queued at stop() was not written";
+    EXPECT_TRUE(ckpt_await([&] { return stopped.load(std::memory_order_acquire); }, 5s));
+    stopper.join();
+    w.close();
+}
+
+// A worker declared lost is told so at once: its session's outbox is aborted,
+// which shuts the socket both ways, so a worker that is in fact alive sees the
+// end of the stream instead of a connection that stays open and silent until
+// its own lease runs out.
+TEST(CheckpointCompletion, AWorkerDeclaredLostSeesTheEndOfTheStreamPromptly) {
+    Coordinator::Config cfg;
+    cfg.heartbeat_timeout = 600ms;
+    cfg.watchdog_interval = 50ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+
+    w.stop_heartbeats();
+    ASSERT_TRUE(ckpt_await(
+        [&] { return worker_was_lost(c, "w"); },
+        cfg.heartbeat_timeout + clink::test_support::scale_slack(std::chrono::milliseconds{2000})))
+        << "the silent worker was never declared lost";
+    EXPECT_TRUE(
+        w.await_end_of_stream(clink::test_support::scale_slack(std::chrono::milliseconds{1000})))
+        << "the lost worker's connection stayed open";
+    w.close();
+    c.stop();
+}
+
+// A lost session is reaped once its reader and its writer have both finished:
+// both joined, and its socket closed, while its record stays. With room for one
+// worker connection, a newcomer is admitted only once that has happened, since
+// reaping runs on registration and the limit counts the sessions still holding
+// a connection.
+TEST(CheckpointCompletion, ALostWorkersSessionIsReapedWithBothThreadsJoinedAndItsSocketClosed) {
+    Coordinator::Config cfg;
+    cfg.heartbeat_timeout = 600ms;
+    cfg.watchdog_interval = 50ms;
+    cfg.max_worker_connections = 1;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    FakeWorker lost(port, "lost", /*slots=*/4, /*receive_buffer_bytes=*/64 * 1024);
+    ASSERT_TRUE(lost.valid());
+    ASSERT_TRUE(lost.register_and_ack());
+    const int coordinator_fd = coordinator_end_of(port, lost.local_port());
+    ASSERT_GE(coordinator_fd, 0) << "the coordinator's end of the connection was not found";
+
+    lost.stop_heartbeats();
+    ASSERT_TRUE(ckpt_await(
+        [&] { return worker_was_lost(c, "lost"); },
+        cfg.heartbeat_timeout + clink::test_support::scale_slack(std::chrono::milliseconds{2000})))
+        << "the silent worker was never declared lost";
+
+    std::unique_ptr<FakeWorker> newcomer;
+    EXPECT_TRUE(ckpt_await(
+        [&] {
+            newcomer = std::make_unique<FakeWorker>(port, "newcomer");
+            return newcomer->valid() && newcomer->register_and_ack();
+        },
+        clink::test_support::scale_slack(std::chrono::milliseconds{5000})))
+        << "the lost session was never reaped, so it still counts against the limit";
+    EXPECT_FALSE(still_coordinator_end(coordinator_fd, port, lost.local_port()))
+        << "the reaped session's socket is still open";
+    EXPECT_EQ(c.worker_connection_count(), 1U);
+    EXPECT_TRUE(worker_was_lost(c, "lost")) << "reaping forgot the lost worker's record";
+    EXPECT_EQ(c.snapshot_workers().size(), 2U);
+    if (newcomer) {
+        newcomer->close();
+    }
+    lost.close();
+    c.stop();
+}
+
+// A session is reaped only once its writer has finished as well as its reader.
+// A worker that half-closes its connection ends its reader at once, but it
+// still reads, and until it is declared lost what the coordinator sends it is
+// written: a registration that runs the reaper meanwhile leaves the session
+// alone, and the next job's Deploy reaches it.
+TEST(CheckpointCompletion, ASessionWhoseReaderHasEndedIsNotReapedWhileItsWriterRuns) {
+    Coordinator::Config cfg;
+    // Not declared lost within the test: its last frames are its last proof of
+    // life.
+    cfg.heartbeat_timeout = 30000ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    FakeWorker w(port, "a-half-closed");
+    ASSERT_TRUE(w.valid());
+    w.no_periodic_heartbeats();
+    ASSERT_TRUE(w.register_and_ack());
+    const auto out = std::filesystem::temp_directory_path() /
+                     ("clink_half_closed_" + std::to_string(::getpid()) + ".txt");
+    const auto first = c.submit_job(
+        two_subtask_graph(out), OperatorRegistry::default_instance(), {}, CheckpointConfig{});
+    ASSERT_GT(first, 0U);
+    auto deploy = w.await_frame(MessageKind::Deploy);
+    ASSERT_TRUE(deploy.has_value());
+    for (const auto& t : decode_deploy(*deploy).tasks) {
+        ASSERT_TRUE(w.send_finished(first, t.role, t.subtask_idx));
+    }
+    w.half_close();
+    // The reader read the finishes, then the end of the stream; it reports
+    // itself finished once its dispatch thread has handled them, so as soon
+    // as the job has completed.
+    ASSERT_TRUE(c.await_job_completion(first, 5s));
+
+    // Runs the reaper.
+    FakeWorker probe(port, "z-probe");
+    ASSERT_TRUE(probe.valid());
+    ASSERT_TRUE(probe.register_and_ack());
+    EXPECT_EQ(c.worker_connection_count(), 2U)
+        << "a session whose writer still ran was reaped with its reader";
+    // Placement takes the workers in id order, so the half-closed worker gets
+    // a subtask of the next job.
+    JobId second = 0;
+    EXPECT_NO_THROW(
+        second = c.submit_job(
+            two_subtask_graph(out), OperatorRegistry::default_instance(), {}, CheckpointConfig{}));
+    EXPECT_GT(second, 0U);
+    EXPECT_TRUE(w.await_frame(MessageKind::Deploy).has_value())
+        << "nothing more reached a worker that still reads";
+    probe.close();
+    w.close();
+    c.stop();
+}
+
+// A re-registration under the same id gives the replaced session's outbox up
+// in the hold that sets the session aside. Its writer, held in send by a
+// worker that reads nothing, is freed, so the retirement that joins it ends;
+// the Deploy it held is counted as discarded, and the old socket is closed.
+TEST(CheckpointCompletion, AReRegistrationAbortsTheReplacedSessionsOutboxAndJoinsItsWriter) {
+    Coordinator c;
+    const auto port = c.start();
+    FakeWorker replaced(port, "w", /*slots=*/4, kSmallReceiveBuffer);
+    ASSERT_TRUE(replaced.valid());
+    replaced.never_read();
+    ASSERT_TRUE(replaced.register_and_ack());
+    const int coordinator_fd = coordinator_end_of(port, replaced.local_port());
+    ASSERT_GE(coordinator_fd, 0) << "the coordinator's end of the connection was not found";
+    const auto job_id =
+        c.submit_job(two_subtask_graph(std::filesystem::temp_directory_path() /
+                                       ("clink_replaced_" + std::to_string(::getpid()) + ".txt")),
+                     OperatorRegistry::default_instance(),
+                     wedging_plugin(),
+                     CheckpointConfig{});
+    ASSERT_GT(job_id, 0U);
+    ASSERT_TRUE(ckpt_await([&] { return replaced.unread_bytes() >= kDeployUnderway; }, 10s))
+        << "no Deploy reached the worker";
+    const auto aborted_before = outbound_discards("bulk", "aborted");
+
+    const auto since_ms = log_cursor_ms();
+    FakeWorker successor(port, "w");
+    ASSERT_TRUE(successor.valid());
+    ASSERT_TRUE(successor.register_and_ack());
+    EXPECT_TRUE(ckpt_await([&] { return previous_session_retired(since_ms); },
+                           clink::test_support::scale_slack(std::chrono::milliseconds{5000})))
+        << "the replaced session was never retired: its writer, held in send, was not freed";
+    EXPECT_GE(outbound_discards("bulk", "aborted"), aborted_before + 1)
+        << "the Deploy held for the replaced session was not counted as discarded";
+    EXPECT_TRUE(ckpt_await(
+        [&] { return !still_coordinator_end(coordinator_fd, port, replaced.local_port()); },
+        clink::test_support::scale_slack(std::chrono::milliseconds{2000})))
+        << "the replaced session's socket is still open";
+    successor.close();
+    replaced.close();
+    c.stop();
 }
