@@ -170,7 +170,7 @@ specification, or a stutter the trace module recognises.
 
 | Event | Emitted by | Fields | Specification step |
 |---|---|---|---|
-| `Trigger` | coordinator: the trigger loop, or a source's end-of-input final id (`final`) | `job`, `ckpt`, `epoch` | `Trigger` (or `ZombieTrigger` from a superseded coordinator); diverges when another coordinator that can still reach a worker has triggered the same id |
+| `Trigger` | coordinator: the trigger loop, a savepoint (`savepoint`), a hot rescale's cut checkpoint (`cutover`, in a run outside the specification's scope), or a source's end-of-input final id (`final`) | `job`, `ckpt`, `epoch` | `Trigger` (or `ZombieTrigger` from a superseded coordinator); diverges when another coordinator that can still reach a worker has triggered the same id |
 | `DeliverBarrier` | worker, on `TriggerCheckpoint` | `job`, `ckpt`, `epoch`, `worker`, `fenced` | `DeliverBarrier` |
 | `SinkPrepare` | the two-phase sink, transaction sealed | `sub`, `ckpt`, `family`, `staged` | `SinkPrepare` or `SinkPrepareFails`; the ack decides which |
 | `SubtaskAck` | worker, as `SubtaskCheckpointed` is sent (the subtask's own step, so it precedes the subtask's next prepare in the merged trace) | `job`, `sub`, `ckpt`, `ok` | `SinkAck` (a non-sink subtask's ack is a stutter) |
@@ -237,7 +237,12 @@ them all, so the engine's behaviour under the faults the integration suite
 injects is checked against the model on each commit, not only when a
 fixture is refreshed. A run that rescaled an operator carries a `Rescale`
 scope marker and is skipped and counted rather than judged: the model keys
-a sink by its subtask index and fixes the set and its hosts for the run.
+a sink by its subtask index and fixes the set and its hosts for the run. A
+savepoint is a checkpoint the trigger loop did not start, and records its own
+`Trigger` (marked `savepoint`); before it did, a run that took one diverged at
+that checkpoint's completion, an id nothing had triggered.
+`formal/traces/savepoint-between-checkpoints`, recorded from
+`Cluster.ASavepointSurvivesTheCheckpointsTakenAfterIt`, pins it.
 The merge script also writes the model's constants (the sink set, the
 hosts, the fault budgets, the checkpoint range) as a generated module of
 literals, `TraceConstants.tla`, which the trace module extends from TLC's

@@ -3907,6 +3907,17 @@ void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
     }
     job.pending_checkpoint_start_times[ckpt_id] = std::chrono::steady_clock::now();
     clink::metrics::ckpt::triggered();
+    // The cut checkpoint is triggered here, not by the trigger loop. A run
+    // that rescales is outside the specification's scope (the trace's Rescale
+    // event), but its trace still carries every trigger.
+    if (protocol_trace::enabled()) {
+        protocol_trace::Event("Trigger")
+            .u("job", job.id)
+            .u("ckpt", ckpt_id)
+            .u("epoch", epoch())
+            .b("cutover", true)
+            .emit();
+    }
     TriggerCheckpointMsg tc;
     tc.job_id = job.id;
     tc.checkpoint_id = ckpt_id;
@@ -4467,6 +4478,18 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
                 want = job.next_checkpoint_id;
             } else {
                 ckpt_id = job.next_checkpoint_id++;
+                // A savepoint is a checkpoint the trigger loop did not start:
+                // the trace marks its trigger as the loop's are, or a run that
+                // takes one has acks and a completion for an id nothing
+                // triggered.
+                if (protocol_trace::enabled()) {
+                    protocol_trace::Event("Trigger")
+                        .u("job", job.id)
+                        .u("ckpt", ckpt_id)
+                        .u("epoch", epoch())
+                        .b("savepoint", true)
+                        .emit();
+                }
                 std::unordered_set<std::string> pending;
                 for (const auto& [key, _] : job.task_records) {
                     pending.insert(key);

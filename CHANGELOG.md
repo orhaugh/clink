@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**A run that takes a savepoint passes trace validation.** A savepoint triggered
+its checkpoint without recording the protocol trace's `Trigger` event, so the
+trace of any run that took one held a completion for a checkpoint nothing had
+triggered, and validation against the exactly-once specification rejected it.
+The savepoint now records its trigger, marked `savepoint`, and a hot rescale's
+cut checkpoint records one marked `cutover`.
+
 **The columnar JSON decode drops every line the row decode drops, and a
 malformed token no longer fails the job.** The row decode refuses a whole line
 over any value its JSON parse cannot read and hands on an empty row, which a
