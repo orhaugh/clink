@@ -2338,9 +2338,14 @@ TEST(Cluster, CancelDuringAnArmedCheckpointWindowStaysBounded) {
     ASSERT_TRUE(d.has_value());
     EXPECT_TRUE(d->cancel_requested);
 
-    std::filesystem::remove_all(ckpt_dir);
+    // Removed once nothing can write there: the snapshot write held at the
+    // armed point can still land after the job reports cancelled, and a
+    // throwing remove_all walking the tree then failed a test whose assertions
+    // had all passed ("Directory not empty").
     worker.stop();
     coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(ckpt_dir, ec);
 }
 
 namespace {
@@ -2727,11 +2732,13 @@ TEST(Cluster, ATruncatedCheckpointIsRefusedAtRestoreWhileTheGoodOneStillRestores
             << "the good checkpoint must still restore run 1's counts";
     }
 
-    for (const auto& p : {dir_good, dir_bad}) {
-        std::filesystem::remove_all(p);
-    }
+    // Removed once nothing can write there, and best-effort.
     worker.stop();
     coordinator.stop();
+    for (const auto& p : {dir_good, dir_bad}) {
+        std::error_code ec;
+        std::filesystem::remove_all(p, ec);
+    }
 }
 
 // A whole-job restart that fires BEFORE the job completes its first own
@@ -2836,11 +2843,13 @@ TEST(Cluster, ARestartBeforeTheFirstCheckpointKeepsTheSubmittedRestorePoint) {
             << "the restart dropped the submitted restore point and counted from scratch";
     }
 
-    for (const auto& p : {dir_good, dir_scratch}) {
-        std::filesystem::remove_all(p);
-    }
+    // Removed once nothing can write there, and best-effort.
     worker.stop();
     coordinator.stop();
+    for (const auto& p : {dir_good, dir_scratch}) {
+        std::error_code ec;
+        std::filesystem::remove_all(p, ec);
+    }
 }
 
 // The configured checkpoint interval must gate the trigger, not just the sleep.

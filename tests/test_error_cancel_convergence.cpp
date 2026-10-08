@@ -578,7 +578,9 @@ TEST(ErrorCancelConvergence, ATransportFailureWithNoCauseBehindItStillDrivesReco
     EXPECT_TRUE(wb->await_frame(MessageKind::CancelJob, 5s).has_value())
         << "a transport failure with no cause behind it was never acted on: the job carried on "
            "with records missing from its stream";
-    std::filesystem::remove_all(dir);
+    // Best-effort: the coordinator is still running, and may be writing here.
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 TEST(ErrorCancelConvergence, ATransportFailureDoesNotStartRecoveryAheadOfItsCause) {
@@ -629,7 +631,9 @@ TEST(ErrorCancelConvergence, ATransportFailureDoesNotStartRecoveryAheadOfItsCaus
     ASSERT_TRUE(wb->send_finished(job_id, d.b[0].first, d.b[0].second, /*had_error=*/true));
     EXPECT_TRUE(wa->await_frame(MessageKind::CancelJob, 5s).has_value())
         << "the real cause did not drive recovery";
-    std::filesystem::remove_all(dir);
+    // Best-effort: the coordinator is still running, and may be writing here.
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 // ----- Item 73: a worker lost WHILE a whole-job restart is draining -----
@@ -696,7 +700,9 @@ TEST(ErrorCancelConvergence, AWorkerLostMidDrainDoesNotWedgeTheRestart) {
     EXPECT_TRUE(wa->await_frame(MessageKind::Deploy, 10s).has_value())
         << "no redeploy within 10s of the overlap: the restart is waiting on a worker that "
            "is gone (item 73)";
-    std::filesystem::remove_all(dir);
+    // Best-effort: the coordinator is still running, and may be writing here.
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 TEST(ErrorCancelConvergence, AWorkerReturningUnderItsOwnIdMidDrainDoesNotWedgeTheRestart) {
@@ -755,5 +761,7 @@ TEST(ErrorCancelConvergence, AWorkerReturningUnderItsOwnIdMidDrainDoesNotWedgeTh
     EXPECT_TRUE(redeployed)
         << "no redeploy within 10s: the restart is waiting on a session that was replaced "
            "(item 73, same-id return)";
-    std::filesystem::remove_all(dir);
+    // Best-effort: the coordinator is still running, and may be writing here.
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
