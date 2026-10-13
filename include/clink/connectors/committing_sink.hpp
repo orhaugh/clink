@@ -62,11 +62,19 @@
 // dispatched COMMIT PREPARED desyncs the wire protocol and blocks both
 // threads forever (found by the Postgres exactly-once suite; see the
 // conn_mu_ in postgres_json_sink_2pc.hpp). Filesystem-rename sinks and
-// thread-safe clients (AWS SDK, librdkafka) need nothing extra.
+// thread-safe clients (AWS SDK, librdkafka) need nothing extra. What a
+// connector may rely on: commit() and abort() never run concurrently with
+// close(), and never after it. The sink's runner fences dispatch before its
+// teardown begins (Sink::fence_commit_dispatch) and waits for a commit already
+// inside commit(); one that has not called commit() or abort() yet refuses
+// instead, so the teardown never waits on an external call that had not
+// started. A commit or abort that reaches a sink whose runtime has been
+// detached throws rather than return as if it had finalised anything.
 
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -309,8 +317,23 @@ private:
 
     void finalise_(std::uint64_t checkpoint_id, bool is_commit) {
         auto* state = state_backend_();
-        if (state == nullptr)
+        if (state == nullptr) {
+            // A sink its runner has torn down can finalise nothing: the
+            // handle is in its checkpoint, out of reach. Returning would look
+            // exactly like a commit that ran, and the worker confirms what
+            // returns. The runner fences commit dispatch before teardown, so
+            // this is the second line. The handle stays persisted, and a
+            // restore from its checkpoint commits it. A sink never given a
+            // runtime holds no handles, and returns as it always did.
+            if (this->runtime_detached()) {
+                throw std::runtime_error(
+                    "[" + this->name() + "] " + (is_commit ? "commit" : "abort") +
+                    " for checkpoint " + std::to_string(checkpoint_id) +
+                    " reached the sink after its runner tore it down; nothing was finalised, "
+                    "and the prepared handle stays persisted for restore-time recovery");
+            }
             return;
+        }
         const auto key = state_key_(checkpoint_id);
         auto stored = state->get_operator_state(this->id(), key);
         if (clink::protocol_trace::enabled()) {
@@ -341,6 +364,7 @@ private:
             //                          idempotent commit() survives, and
             //                          the one the brief singles out.
             CLINK_FAULT_POINT(clink::fault::points::kSinkBeforeCommit);
+            refuse_if_teardown_begun_(checkpoint_id, is_commit);
             commit(committable);
             CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
             if (clink::protocol_trace::enabled()) {
@@ -350,9 +374,28 @@ private:
                     .emit();
             }
         } else {
+            refuse_if_teardown_begun_(checkpoint_id, is_commit);
             abort(committable);
         }
         state->erase_operator_state(this->id(), key);
+    }
+
+    // The last moment a dispatch can still decline: nothing external has
+    // happened yet. Once the runner has begun this sink's teardown it waits
+    // for a dispatch already running, so a commit that started its external
+    // call now would hold the teardown for as long as the external system
+    // takes to answer - indefinitely, while it is down, and a restart drain
+    // with it. Declining is a refusal like any other: nothing committed,
+    // nothing confirmed, the handle left for restore-time recovery. A commit
+    // already past this point is waited for.
+    void refuse_if_teardown_begun_(std::uint64_t checkpoint_id, bool is_commit) const {
+        if (this->teardown_begun()) {
+            throw std::runtime_error(
+                "[" + this->name() + "] " + (is_commit ? "commit" : "abort") + " for checkpoint " +
+                std::to_string(checkpoint_id) +
+                " refused: the sink's teardown began before it started; nothing was "
+                "finalised, and the prepared handle stays persisted for restore-time recovery");
+        }
     }
 
     // Walk operator state for "_xo_pending_sub<N>_*" handles left prepared by a

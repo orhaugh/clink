@@ -112,6 +112,7 @@ add_executable(clink_core_tests
     test_outbox.cpp
     test_plugin_cache.cpp
     test_cancel_teardown.cpp
+    test_commit_teardown_fence.cpp
     test_checkpoint_completion.cpp
     test_protocol_trace.cpp
     test_checkpoint_retention_e2e.cpp

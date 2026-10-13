@@ -650,8 +650,13 @@ public:
         // claim actually gets decided.
         CLINK_FAULT_POINT(clink::fault::points::kSinkBeforeCommit);
         std::lock_guard lk(mu_);
-        const bool accepted =
-            !closed_ && open_txn_ckpt_.has_value() && *open_txn_ckpt_ == checkpoint_id;
+        // The runner has begun this sink's teardown and waits for this
+        // dispatch: a commit_transaction started now would hold the teardown
+        // on the broker, indefinitely while the broker is unreachable, and the
+        // restart drain with it. Declined like a commit after close().
+        const bool tearing_down = this->teardown_begun();
+        const bool accepted = !closed_ && !tearing_down && open_txn_ckpt_.has_value() &&
+                              *open_txn_ckpt_ == checkpoint_id;
         if (protocol_trace::enabled()) {
             protocol_trace::Event("DeliverCommit")
                 .u("sub", trace_subtask_())
@@ -668,6 +673,12 @@ public:
             throw std::runtime_error(
                 "kafka_2pc_sink_string: commit for checkpoint " + std::to_string(checkpoint_id) +
                 " arrived after the sink closed; the prepared transaction is left for "
+                "in-doubt resolution and must not be confirmed by this process");
+        }
+        if (tearing_down) {
+            throw std::runtime_error(
+                "kafka_2pc_sink_string: commit for checkpoint " + std::to_string(checkpoint_id) +
+                " arrived as the sink's teardown began; the prepared transaction is left for "
                 "in-doubt resolution and must not be confirmed by this process");
         }
         if (!open_txn_ckpt_.has_value() || *open_txn_ckpt_ != checkpoint_id) {
@@ -725,7 +736,10 @@ public:
     // Idempotent against same checkpoint id.
     void on_abort(std::uint64_t checkpoint_id) override {
         std::lock_guard lk(mu_);
-        const bool accepted = open_txn_ckpt_.has_value() && *open_txn_ckpt_ == checkpoint_id;
+        // As on_commit: once the teardown has begun the broker call is not
+        // started, and the prepared transaction is left as close() leaves it.
+        const bool accepted = !this->teardown_begun() && open_txn_ckpt_.has_value() &&
+                              *open_txn_ckpt_ == checkpoint_id;
         if (protocol_trace::enabled()) {
             protocol_trace::Event("DeliverAbort")
                 .u("sub", trace_subtask_())

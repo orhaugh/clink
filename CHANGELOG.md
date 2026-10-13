@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**A commit that reaches a sink after its teardown has begun is refused, not
+confirmed.** A worker delivers `CommitCheckpoint` to a sink on its own thread,
+and a cancel, a restart or the end of the worker's coordinator session could
+tear the sink down while a commit was on its way. A commit already running
+then ran against a sink being closed under it, and one that arrived after the
+close reached a sink with no state: a sink built on the committing-sink base,
+or the Iceberg sink, returned without committing, and the worker confirmed the
+checkpoint as though it had. The coordinator acts on confirmations only for
+the Kafka transactional sink, which already refused a commit after its close,
+and the prepared transaction stayed in its checkpoint for a restore to commit;
+but a confirmation has to mean that the commit ran. A sink's runner now fences
+commit dispatch before it closes the sink: a commit already inside its external
+call finishes first, one that has not started it declines, so a store that is
+down cannot hold a restart drain through a commit it was never asked for, and
+a later one is refused, logged and not confirmed. A committing sink, the Kafka
+transactional sink or the Iceberg sink reached after its teardown fails the
+commit instead of returning, and a sink runner that fails fences dispatch and
+detaches its sink too, where a commit could otherwise reach the sink through a
+destroyed runtime context. The end-of-stream wait for staged commits still
+comes first, so a bounded job's final commit and a hot rescale's cutover commit
+still run. A sink that needs a commit after its input ends must report it as
+staged, as every committing sink does.
+
 **Unaligned and adaptive checkpoints align at every fan-in, so no row is lost
 across a checkpoint.** Under unaligned checkpoints, and adaptive ones once they
 turned unaligned, a multi-input operator forwarded a barrier on its first

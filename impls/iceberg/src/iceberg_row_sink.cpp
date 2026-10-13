@@ -552,6 +552,11 @@ public:
         if (dormant_) {
             return;
         }
+        // A sink its runner has begun to tear down, or has torn down, commits
+        // nothing now: the teardown waits for this dispatch, and returning
+        // quietly would read as a commit that ran. The staged files stay
+        // recorded in the checkpoint, and a restore from it commits them.
+        refuse_after_teardown_(checkpoint_id, "commit");
         // Runs on the worker reader thread; serialise against close()/on_barrier and bail if the
         // sink was torn down concurrently (a late CommitCheckpoint racing shutdown).
         std::lock_guard<std::mutex> lk(mu_);
@@ -574,6 +579,7 @@ public:
         if (dormant_) {
             return;
         }
+        refuse_after_teardown_(checkpoint_id, "abort");
         std::lock_guard<std::mutex> lk(mu_);
         auto* state = state_backend_();
         if (state == nullptr || file_io_ == nullptr) {
@@ -647,6 +653,16 @@ private:
     };
 
     bool two_phase_() const noexcept { return state_backend_() != nullptr; }
+
+    void refuse_after_teardown_(std::uint64_t checkpoint_id, const char* what) const {
+        if (this->teardown_begun() || this->runtime_detached()) {
+            throw std::runtime_error(opts_.name + ": " + what + " for checkpoint " +
+                                     std::to_string(checkpoint_id) +
+                                     " refused: the sink's teardown has begun; nothing was "
+                                     "finalised, and the staged files stay recorded for "
+                                     "restore-time recovery");
+        }
+    }
 
     StateBackend* state_backend_() const noexcept {
         return this->runtime() != nullptr ? this->runtime()->state_backend() : nullptr;

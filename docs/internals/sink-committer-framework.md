@@ -69,24 +69,49 @@ Key points:
   invokes the registered callbacks. See [checkpointing](checkpointing.md).
 - The threading contract for connector verbs: `write`/`prepare_commit`/`close`
   run on the subtask's task thread, while `commit`/`abort`/`recover` may run on
-  the worker's dispatch thread concurrently with the task thread preparing the
-  next interval. A connector whose client is not thread-safe must serialise
+  a worker thread concurrently with the task thread preparing the next
+  interval. A connector whose client is not thread-safe must serialise
   access itself - the Postgres sink holds a connection mutex across every
   libpq call for exactly this reason (an unsynchronised overlap desyncs the
   wire protocol and blocks both threads forever, found by the Postgres
   exactly-once suite). Rename-based sinks and thread-safe clients (AWS SDK,
-  librdkafka) need nothing extra.
-- Dispatch is serialised against runner teardown by a per-task
-  `CommitDispatchGate` (`include/clink/cluster/commit_dispatch_gate.hpp`). The
-  callback runs on the worker's reader thread while the subtask runner owns the
-  `LocalExecutor` - and with it the `RuntimeContext` and `StateBackend` that
-  `finalise_` touches. The worker wraps every registered commit/abort callback
-  to enter the gate for the dispatch's duration, and the runner retires the
-  gate (draining in-flight dispatch) strictly before its executor is destroyed.
-  Without it, a commit held in the external system that overlapped a
+  librdkafka) need nothing extra. What a connector can rely on: `commit` and
+  `abort` never run concurrently with `close`, and never after it; one that
+  has not started when the teardown begins is not started at all.
+- Dispatch is serialised against the sink's teardown by a per-task
+  `CommitDispatchGate` (`include/clink/cluster/commit_dispatch_gate.hpp`).
+  Commits run on the worker's commit-dispatch thread and aborts on its reader
+  thread, while the subtask runner owns the `LocalExecutor` - and with it the
+  `RuntimeContext` and `StateBackend` that `finalise_` touches. The worker
+  wraps every registered commit/abort callback to enter the gate for the
+  dispatch's duration. The code that registers a sink's callbacks also
+  installs the gate as the sink's commit-dispatch fence
+  (`Sink::set_commit_dispatch_fence`), and the sink's runner retires it as the
+  teardown begins: after the end-of-stream wait below, before `close()` or
+  `close_cancelled()`, and on an exit by exception. A commit already inside
+  `commit()` finishes before `close()` proceeds; one that has entered the gate
+  but not yet called `commit()` or `abort()` sees `Sink::teardown_begun()` and
+  declines, so the teardown never waits on an external call that had not
+  started (a store that is down would otherwise hold a restart drain until it
+  answered); and a later one is refused, logged and not confirmed. The runner
+  retires the gate again before its executor is destroyed. A refused or
+  declined dispatch is safe: the persisted handle is re-committed idempotently
+  by `recover_all_()` at the next restore. The Kafka transactional sink and the
+  Iceberg sink decline the same way. As a second line,
+  `finalise_` throws rather than returns when the sink's runtime has been
+  detached after it was attached, so a commit that reaches a torn-down sink can
+  never look like one that ran; a sink driven directly, never given a runtime,
+  still treats a commit as a no-op.
+- Each of those retirements closed a defect. Without the one before the
+  executor is destroyed, a commit held in the external system that overlapped a
   cancel-for-restart ran `finalise_` against a freed backend and took the whole
-  worker down. A dispatch refused after retirement is safe: the persisted
-  handle is re-committed idempotently by `recover_all_()` at the next restore.
+  worker down. Without the one at teardown, the runner closed the sink and
+  detached its runtime while the gate stayed open, and a commit dispatched into
+  that window - a cancel or a lost coordinator session racing a
+  `CommitCheckpoint` - found no state backend, returned without committing, and
+  was confirmed: the confirmed-means-committed rule broken, as in QUAL-01's
+  refused-but-confirmed commit. A commit running when the teardown began ran
+  against a sink being closed under it.
 - `pending_committables()` exposes the persisted-but-unfinalised handles so a
   connector can reconcile an external registry at `on_open()` (e.g. an XA sink
   rolling back prepared transactions that are not in the restored set).
@@ -99,7 +124,12 @@ Key points:
   in-flight final commit, failing it against a torn-down client while the job
   still completed with exit 0. The S3 exactly-once outage gate caught the
   resulting silent loss of the final pane; the runner-side wait closes it for
-  every `CommittingSink` connector at once.
+  every `CommittingSink` connector at once. The teardown fence comes after
+  this wait, so the commit it waits for still runs. The same wait carries a hot
+  rescale's cutover commit, since an old subtask's input ends cleanly after the
+  cutover barrier. A sink that reports no staged commits gets no such wait: a
+  commit that reaches it after its input ends is refused rather than run
+  against a closed sink.
 - `recover_all_()` logs the number of prepared handles it finalises at open
   (`sink.2pc` channel). A restore that should have re-committed a handle but
   logs zero recovered lost it before the sink opened - that line is the first

@@ -370,6 +370,12 @@ inline constexpr char kSinkBeforeCommit[] = "sink.before_commit";
 // qual01-20260818d's duplicates rode exactly this window.
 inline constexpr char kSinkBetweenCommitAndReceipt[] = "sink.between_commit_and_receipt";
 inline constexpr char kSinkAfterExternalCommit[] = "sink.after_external_commit";
+// A sink's runner has closed the sink and detached its runtime, on the
+// runner thread; the task's executor, and the state backend it owns, still
+// stand. Every sink runner reaches it, network bridges included. A Block here
+// holds the window between a sink's teardown and the end of its task, in which
+// a commit dispatched from the worker can still arrive for a sink that is gone.
+inline constexpr char kSinkAfterTeardown[] = "sink.after_teardown";
 
 // Sharded keyed stage: a shard whose operator threw, between closing its
 // input queue and delivering its failure for the control round in flight.
@@ -427,6 +433,12 @@ inline constexpr char kWorkerBeforeSubtaskFinished[] = "worker.before_subtask_fi
 // the window in which a takeover that numbered only above the files it could
 // see reused the id.
 inline constexpr char kWorkerAfterTriggerDelivered[] = "worker.after_trigger_delivered";
+// A CommitCheckpoint has been taken off the worker's dispatch queue and is
+// about to reach the subtasks' commit callbacks, on the commit-dispatch thread,
+// while the reader goes on handling frames. A Block here is a dispatch that
+// falls behind a CancelJob read after it: the subtask it addresses is torn down
+// before its commit arrives.
+inline constexpr char kWorkerBeforeCommitDispatch[] = "worker.before_commit_dispatch";
 
 // ----- Rescale lifecycle -----
 //

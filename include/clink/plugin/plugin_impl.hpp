@@ -691,10 +691,10 @@ void PluginRegistry::register_sink(
         }
         // 2PC support: route CommitCheckpoint -> sink->on_commit.
         // Non-2PC sinks have the default no-op so this is harmless.
-        // Weak-capture the sink: the runner returns when the
-        // executor exits, but the worker may still receive a late
-        // CommitCheckpoint while the sink is shutting down - the
-        // weak_ptr lock returns nullptr after destruction.
+        // Weak-capture the sink: a late CommitCheckpoint can outlive the
+        // sink object, and the weak_ptr lock returns nullptr after
+        // destruction. It never reaches a sink that has begun its teardown:
+        // the fence installed below refuses it first.
         if (rctx.register_commit_callbacks) {
             std::weak_ptr<clink::Sink<T>> weak_sink = sink;
             rctx.register_commit_callbacks({
@@ -721,6 +721,20 @@ void PluginRegistry::register_sink(
                 },
             });
         }
+        // The worker dispatches those callbacks on its own threads, each
+        // inside this task's commit-dispatch gate. Retiring the gate as the
+        // sink's teardown begins drains a dispatch already running, so close()
+        // never runs under a commit, and refuses every later one, so none
+        // reaches the sink once it is closed. (A running dispatch that has not
+        // yet started its external call declines, so the drain never waits on
+        // an external system it had not yet asked.) Retired only when the
+        // executor was destroyed, the gate let a commit reach a sink already
+        // closed and detached, which finalised nothing and was confirmed all
+        // the same.
+        if (rctx.commit_dispatch_gate) {
+            sink->set_commit_dispatch_fence(
+                [gate = rctx.commit_dispatch_gate] { gate->retire_and_drain(); });
+        }
         clink::Dag dag;
         auto h0 = clink::cluster::build_typed_input_stage<T>(
             dag,
@@ -734,22 +748,24 @@ void PluginRegistry::register_sink(
         dag.set_all_runners_attributed_op_id(dag.runner_id_at(hs.runner_index));
         clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
         // Constructed after exec so reverse destruction retires the commit
-        // dispatch gate - draining an in-flight CommitCheckpoint dispatch into
-        // this sink's on_commit - before the executor and the StateBackend the
-        // sink's finalise path touches are destroyed. Covers the throw below
-        // (armed-cutover timeout) and cancel-for-restart alike; the cutover
-        // wait itself runs before retirement, so the cutover commit can still
-        // enter the gate.
+        // dispatch gate before the executor and the StateBackend the sink's
+        // finalise path touches are destroyed. The sink's runner has normally
+        // retired it already, through the fence above; this is the backstop
+        // for an executor whose sink runner never ran.
         clink::cluster::CommitDispatchRetirer commit_retirer(rctx.commit_dispatch_gate);
         detail::run_subtask_to_completion(exec, rctx.cancel_token);
         // Armed cutover: C is staged and acked and the input has closed,
         // but its CommitCheckpoint only arrives once the coordinator
         // completes C. Returning now would erase this subtask's committer
         // registration (the worker's exit cleanup) and strand the staged
-        // transaction with no restart coming to recover it. Bounded, and
-        // loud on timeout for the same reason the EOS final-checkpoint
-        // wait is: completing silently without durability is the failure
-        // mode, not the safeguard.
+        // transaction with no restart coming to recover it. The input closes
+        // as a clean end of stream, so a sink that reports staged commits
+        // holds its teardown open until C's commit has run, and this wait
+        // finds it recorded. A sink that does not was already torn down,
+        // and its commit is refused: the wait then times out, loudly, for
+        // the same reason the EOS final-checkpoint wait does: completing
+        // silently without durability is the failure mode, not the
+        // safeguard.
         if (!detail::await_armed_cutover_commit(
                 *cutover_gate, rctx.cancel_token, clink::eos_final_checkpoint_timeout())) {
             throw std::runtime_error(

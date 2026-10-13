@@ -246,10 +246,12 @@ struct RunnerContext {
 
     // Serialises commit/abort dispatch against this runner's teardown. The
     // worker wraps every callback registered above so it enters this gate for
-    // the duration of the dispatch; the runner retires the gate (blocking
-    // until in-flight dispatch drains) before its LocalExecutor - and the
+    // the duration of the dispatch. A sink runner installs the gate as its
+    // sink's commit-dispatch fence, so it is retired (blocking until
+    // in-flight dispatch drains) as the sink's teardown begins, and every
+    // runner retires it again before its LocalExecutor - and the
     // RuntimeContext + StateBackend the executor owns - is destroyed. See
-    // commit_dispatch_gate.hpp for the failure this closes. Null for
+    // commit_dispatch_gate.hpp for the failures this closes. Null for
     // in-process paths, and unused by operator/co-operator runners, which
     // register no commit callbacks.
     std::shared_ptr<CommitDispatchGate> commit_dispatch_gate;

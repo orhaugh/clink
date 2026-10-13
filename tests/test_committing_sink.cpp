@@ -463,3 +463,74 @@ TEST(CommittingSink, WithoutASuccessionASiblingsHandlesAreLeftAlone) {
     EXPECT_EQ(world.committed(), (std::vector<std::string>{"p0"}));
     EXPECT_TRUE(state.get_operator_state(kOp, "_xo_pending_sub1_7").has_value());
 }
+
+TEST(CommittingSink, ACommitThatReachesATornDownSinkThrowsAndLeavesItsHandle) {
+    // The worker counts a commit callback that returns as a commit that ran,
+    // and confirms it. A sink whose runner has closed it and detached its
+    // runtime can finalise nothing, so returning quietly there is a lie the
+    // commit-confirmed restore protocol believes. It must throw, and the
+    // handle must stay persisted for a restore to commit.
+    World world;
+    InMemoryStateBackend state;
+    RuntimeContext rctx(kOp, "fake", &state, nullptr);
+    auto sink = make_sink(world, rctx);
+    sink->open();
+    sink->on_data(batch_of({"t"}));
+    sink->on_barrier(CheckpointBarrier{CheckpointId{3}});
+    // What the sink's runner does at teardown.
+    sink->close();
+    sink->attach_runtime(nullptr);
+    ASSERT_TRUE(sink->runtime_detached());
+
+    EXPECT_THROW(sink->on_commit(3), std::runtime_error)
+        << "a commit that reached a torn-down sink returned as if it had committed";
+    EXPECT_THROW(sink->on_abort(3), std::runtime_error);
+    EXPECT_TRUE(world.committed().empty());
+    EXPECT_TRUE(world.aborted().empty());
+    EXPECT_TRUE(has_pending(state, 0, 3)) << "the prepared handle must stay persisted";
+
+    // The restore's open() commits it.
+    World restored;
+    auto again = make_sink(restored, rctx);
+    again->open();
+    EXPECT_EQ(restored.committed(), (std::vector<std::string>{"t"}));
+}
+
+TEST(CommittingSink, ACommitNotYetStartedWhenTheTeardownBeganDeclinesAndLeavesItsHandle) {
+    // The runner waits for a dispatch already running once it begins the
+    // sink's teardown, so a commit that has not called commit() by then must
+    // decline rather than start an external call the teardown would wait on.
+    World world;
+    InMemoryStateBackend state;
+    RuntimeContext rctx(kOp, "fake", &state, nullptr);
+    auto sink = make_sink(world, rctx);
+    sink->open();
+    sink->on_data(batch_of({"u"}));
+    sink->on_barrier(CheckpointBarrier{CheckpointId{4}});
+    sink->fence_commit_dispatch();  // the runner begins the teardown
+    ASSERT_TRUE(sink->teardown_begun());
+
+    EXPECT_THROW(sink->on_commit(4), std::runtime_error);
+    EXPECT_THROW(sink->on_abort(4), std::runtime_error);
+    EXPECT_TRUE(world.committed().empty());
+    EXPECT_TRUE(world.aborted().empty());
+    EXPECT_TRUE(has_pending(state, 0, 4)) << "the prepared handle must stay persisted";
+
+    // A runtime given again starts a new life, and the commit runs.
+    sink->attach_runtime(&rctx);
+    EXPECT_FALSE(sink->teardown_begun());
+    sink->on_commit(4);
+    EXPECT_EQ(world.committed(), (std::vector<std::string>{"u"}));
+}
+
+TEST(CommittingSink, ASinkNeverGivenARuntimeStillTreatsACommitAsANoOp) {
+    // Driven directly, with no runtime, a sink holds no handles and a commit
+    // has nothing to do. That is not a teardown, and stays a quiet no-op.
+    World world;
+    auto sink = std::make_shared<FakeCommittingSink>(&world);
+    sink->set_id(kOp);
+    EXPECT_FALSE(sink->runtime_detached());
+    EXPECT_NO_THROW(sink->on_commit(1));
+    EXPECT_NO_THROW(sink->on_abort(1));
+    EXPECT_TRUE(world.committed().empty());
+}

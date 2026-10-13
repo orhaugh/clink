@@ -3,20 +3,30 @@
 // CommitDispatchGate - serialises CommitCheckpoint/AbortCheckpoint dispatch
 // against subtask-runner teardown.
 //
-// The worker dispatches a sink's commit callback on its reader thread, outside
-// any lock, while the subtask runner owns the LocalExecutor on its own thread.
-// The callback weak-captures the sink, which pins the SINK object alive - but
-// not the RuntimeContext and StateBackend the executor owns. A slow external
-// commit (a held broker transaction, a SQL COMMIT PREPARED over a slow link)
-// overlapping a cancel-for-restart therefore ran CommittingSink::finalise_
-// against a freed backend and took the whole worker down with SIGSEGV (found
-// by the mid-commit worker-kill integration test in test_fault_recovery.cpp).
+// The worker dispatches a sink's commit callback on its commit-dispatch thread
+// (an abort on its reader thread), outside any lock, while the subtask runner
+// owns the LocalExecutor on its own thread. The callback weak-captures the
+// sink, which pins the SINK object alive - but not the RuntimeContext and
+// StateBackend the executor owns. A slow external commit (a held broker
+// transaction, a SQL COMMIT PREPARED over a slow link) overlapping a
+// cancel-for-restart therefore ran CommittingSink::finalise_ against a freed
+// backend and took the whole worker down with SIGSEGV (found by the mid-commit
+// worker-kill integration test in test_fault_recovery.cpp).
 //
 // The protocol: the worker wraps every registered commit/abort callback so it
-// enters the gate for the duration of the dispatch, and the runner retires the
-// gate - blocking until in-flight dispatch drains - strictly BEFORE its
-// executor is destroyed (CommitDispatchRetirer, constructed after the
-// executor, does this on every exit path including exceptions).
+// enters the gate for the duration of the dispatch, and the gate is retired -
+// blocking until in-flight dispatch drains - in two places. The code that
+// registers a sink's callbacks installs the gate as the sink's commit-dispatch
+// fence (Sink::set_commit_dispatch_fence), and the sink's runner retires it as
+// the sink's teardown begins: after the end-of-stream wait for staged commits,
+// before close() or close_cancelled(), and on an exit by exception. The drain
+// waits for a dispatch that is inside its external call; one that has not
+// started it sees Sink::teardown_begun() and declines, so a store that is
+// down cannot hold the teardown through a commit it was never asked. Then the
+// runner retires it again strictly BEFORE its executor is destroyed
+// (CommitDispatchRetirer, constructed after the executor, does this on every
+// exit path including exceptions), the backstop for an executor whose sink
+// runner never ran.
 //
 // A dispatch arriving after retirement is REFUSED, and a refusal must be
 // reported as a failure to commit - never as a commit. The refusal is safe
@@ -37,6 +47,16 @@
 // mistake it for a commit, because the only way to observe "it ran" is the
 // absence of an exception. Refusing an abort is likewise equivalent to a
 // crash before the abort, which the same recovery reconciles.
+//
+// The same rule broke again from the other side, which is why the sink's
+// teardown retires the gate. With only the executor-time retirement, the
+// sink's runner closed the sink and detached its runtime while the gate
+// stayed open, and a commit dispatched into that window - a CancelJob or a
+// lost coordinator session racing a CommitCheckpoint - reached a sink with no
+// state backend. CommittingSink::finalise_ returned without committing and
+// without throwing, so the callback looked like a commit that ran and the
+// worker confirmed it. A commit already running when the teardown began ran
+// on against a sink being closed under it.
 
 #include <condition_variable>
 #include <cstdint>
@@ -49,7 +69,7 @@
 
 namespace clink::cluster {
 
-// A commit/abort dispatch that arrived after its runner retired.
+// A commit/abort dispatch that arrived after its gate retired.
 //
 // A distinct type, not a bare runtime_error, so the dispatch loop can say
 // which of the two things happened: the sink tried to commit and failed, or
@@ -59,7 +79,8 @@ class CommitDispatchRefused : public std::runtime_error {
 public:
     explicit CommitDispatchRefused(std::uint64_t checkpoint_id)
         : std::runtime_error("commit/abort dispatch for checkpoint " +
-                             std::to_string(checkpoint_id) + " arrived after runner retirement"),
+                             std::to_string(checkpoint_id) +
+                             " arrived after its task began teardown"),
           checkpoint_id_(checkpoint_id) {}
     [[nodiscard]] std::uint64_t checkpoint_id() const { return checkpoint_id_; }
 
@@ -115,8 +136,10 @@ private:
 
 // RAII retirement. Construct AFTER the LocalExecutor so reverse destruction
 // order retires the gate (draining in-flight dispatch) before the executor -
-// and the RuntimeContext + StateBackend it owns - is destroyed. A null gate
-// (in-process paths that never register commit callbacks) is a no-op.
+// and the RuntimeContext + StateBackend it owns - is destroyed. A sink's
+// runner has normally retired it already, at the start of the sink's
+// teardown; retiring twice is harmless. A null gate (in-process paths that
+// never register commit callbacks) is a no-op.
 class CommitDispatchRetirer {
 public:
     explicit CommitDispatchRetirer(std::shared_ptr<CommitDispatchGate> gate)
@@ -137,7 +160,7 @@ private:
 
 // A commit/abort callback together with the gate that owns it.
 //
-// The pairing is what lets a dispatch DROP entries whose runner has retired.
+// The pairing is what lets a dispatch DROP entries whose gate has retired.
 // A gate never un-retires, so such an entry can only ever refuse - and one
 // refusal blocks confirmation for its whole subtask, including a live
 // callback the replacement runner registered beside it. A subtask whose

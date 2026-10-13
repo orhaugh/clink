@@ -589,13 +589,18 @@ TEST(FusedSourceCommit, SinkHooksDriveTypedSinkCommitAndAreWeak) {
 
     auto snk = std::make_shared<CommitCountingSink>();
     std::shared_ptr<void> boxed = std::static_pointer_cast<void>(snk);
-    auto [commit_cb, abort_cb] = ops->fused_sink_commit_hooks(boxed);
+    int fenced = 0;
+    auto [commit_cb, abort_cb] = ops->fused_sink_commit_hooks(boxed, [&fenced] { ++fenced; });
 
     commit_cb(11);
     abort_cb(12);
     commit_cb(13);
     EXPECT_EQ(snk->committed, (std::vector<std::uint64_t>{11, 13}));
     EXPECT_EQ(snk->aborted, (std::vector<std::uint64_t>{12}));
+    // The hook also hands the sink the fence its runner calls before teardown.
+    snk->fence_commit_dispatch();
+    snk->fence_commit_dispatch();
+    EXPECT_EQ(fenced, 1) << "the teardown fence was not installed, or ran twice";
 
     boxed.reset();
     snk.reset();

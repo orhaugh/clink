@@ -964,6 +964,7 @@ void Worker::commit_dispatch_loop_() {
         auto msg = std::move(commit_dispatch_queue_.front());
         commit_dispatch_queue_.pop_front();
         lock.unlock();
+        CLINK_FAULT_POINT(clink::fault::points::kWorkerBeforeCommitDispatch);
         dispatch_commit_checkpoint_(msg);
         lock.lock();
     }
@@ -983,22 +984,40 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
     // sending for every committer subtask is correct for unflagged jobs
     // too (one small frame per subtask per checkpoint).
     std::vector<std::pair<std::uint32_t, std::vector<CommitCallback>>> to_invoke;
+    std::vector<std::pair<std::uint32_t, std::size_t>> dropped;
     {
         std::lock_guard lock(mu_);
         auto job_it = per_job_committers_.find(msg.job_id);
         if (job_it != per_job_committers_.end()) {
             for (auto& [sub_idx, entry] : job_it->second) {
-                // Drop callbacks whose runner has retired. A gate never
+                // Drop callbacks whose gate has retired: their sink has begun
+                // its teardown, or their runner has exited. A gate never
                 // un-retires, so these can only refuse - and one refusal
                 // blocks confirmation for the whole subtask, including a live
                 // callback registered beside it by the runner that replaced
                 // them. A subtask whose teardown hangs never reaches the code
                 // that removes its own registrations, so without this the job
                 // stops confirming anything, permanently.
-                std::erase_if(entry, [](const CommitCallback& c) { return c.dead(); });
+                const auto n =
+                    std::erase_if(entry, [](const CommitCallback& c) { return c.dead(); });
+                if (n > 0) {
+                    dropped.emplace_back(sub_idx, n);
+                }
                 to_invoke.emplace_back(sub_idx, entry);
             }
         }
+    }
+    for (const auto& [sub_idx, n] : dropped) {
+        // A drop is a refusal made early, and as with the refusal below this
+        // line is its only witness: nothing was committed through these
+        // callbacks, so nothing is confirmed for them.
+        clink::log::info("worker.commit",
+                         "checkpoint " + std::to_string(msg.checkpoint_id) +
+                             " not dispatched to subtask " + std::to_string(sub_idx) + ": " +
+                             std::to_string(n) +
+                             " commit callback(s) belong to a task that has begun its teardown, so "
+                             "nothing ran through them and nothing is confirmed for them; a "
+                             "prepared handle stays persisted for restore-time recovery");
     }
     for (auto& [sub_idx, fns] : to_invoke) {
         bool all_ok = true;
@@ -2248,14 +2267,17 @@ void Worker::run_generic_subtask_(JobId job_id,
     ensure_built_ins_registered();
     // Commit-dispatch gate for this task run. Every commit/abort callback the
     // task registers (2PC sink, ack-at-barrier source, fused endpoint hooks)
-    // is wrapped to enter the gate for the duration of its dispatch, and the
-    // runner retires the gate before its LocalExecutor is destroyed. Without
-    // this, a commit held in the external system (broker transaction, SQL
-    // COMMIT PREPARED) that overlaps a cancel-for-restart runs the sink's
-    // finalise path against the freed StateBackend the executor owned and
-    // takes the whole worker down with SIGSEGV. A refused post-retirement
-    // dispatch is safe: the prepared handle stays persisted, so the next
-    // restore re-commits it idempotently.
+    // is wrapped to enter the gate for the duration of its dispatch. The
+    // task's sink retires it as its teardown begins (the fence its
+    // registration installs), and the runner retires it again before its
+    // LocalExecutor is destroyed. Without the second, a commit held in the
+    // external system (broker transaction, SQL COMMIT PREPARED) that overlaps
+    // a cancel-for-restart runs the sink's finalise path against the freed
+    // StateBackend the executor owned and takes the whole worker down with
+    // SIGSEGV; without the first, a commit reaches a sink already closed and
+    // detached, finalises nothing, and is confirmed. A refused dispatch is
+    // safe: the prepared handle stays persisted, so the next restore
+    // re-commits it idempotently.
     auto dispatch_gate = std::make_shared<CommitDispatchGate>();
     auto gated = [dispatch_gate](RunnerContext::CommitCheckpointFn fn) {
         // gated_dispatch THROWS on refusal. It used to log and return, which
@@ -2981,7 +3003,11 @@ void Worker::run_generic_subtask_(JobId job_id,
             // ownership still moves to the dag below. The same post-run cleanup
             // that drops the fused source's callbacks covers these.
             if (out_ops->fused_sink_commit_hooks) {
-                auto [commit_cb, abort_cb] = out_ops->fused_sink_commit_hooks(boxed);
+                // The sink's runner retires the gate as its teardown begins, as
+                // the SubtaskRunner path does: a commit already running
+                // finishes before close(), and a later one is refused.
+                auto [commit_cb, abort_cb] = out_ops->fused_sink_commit_hooks(
+                    boxed, [dispatch_gate] { dispatch_gate->retire_and_drain(); });
                 std::lock_guard lock(mu_);
                 per_job_committers_[job_id][task.subtask_idx].push_back(
                     gated(std::move(commit_cb)));

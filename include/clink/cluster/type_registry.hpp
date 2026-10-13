@@ -164,9 +164,13 @@ struct TypeOps {
     // 2PC sink fused into a par-1 chain commits per checkpoint - the same wiring
     // the non-fused SubtaskRunner does via register_commit_callbacks. on_commit /
     // on_abort are idempotent (the dag's terminal path may also fire them), so a
-    // duplicate commit for the terminal checkpoint is harmless.
+    // duplicate commit for the terminal checkpoint is harmless. `teardown_fence`
+    // (if set) becomes the sink's commit-dispatch fence
+    // (Sink::set_commit_dispatch_fence): the sink's runner calls it before it
+    // tears the sink down, and it must return only once no dispatch of these
+    // callbacks is running and none can start.
     std::function<std::pair<std::function<void(std::uint64_t)>, std::function<void(std::uint64_t)>>(
-        std::shared_ptr<void> /*sink*/)>
+        std::shared_ptr<void> /*sink*/, std::function<void()> /*teardown_fence*/)>
         fused_sink_commit_hooks;
 };
 
@@ -478,10 +482,14 @@ inline void TypeRegistry::register_typed(const std::string& name,
         };
         return {std::move(commit), std::move(abort)};
     };
-    ops.fused_sink_commit_hooks = [](std::shared_ptr<void> sink)
+    ops.fused_sink_commit_hooks = [](std::shared_ptr<void> sink,
+                                     std::function<void()> teardown_fence)
         -> std::pair<std::function<void(std::uint64_t)>, std::function<void(std::uint64_t)>> {
-        std::weak_ptr<clink::Sink<T>> weak =
-            std::static_pointer_cast<clink::Sink<T>>(std::move(sink));
+        auto typed = std::static_pointer_cast<clink::Sink<T>>(std::move(sink));
+        if (teardown_fence) {
+            typed->set_commit_dispatch_fence(std::move(teardown_fence));
+        }
+        std::weak_ptr<clink::Sink<T>> weak = typed;
         auto commit = [weak](std::uint64_t ckpt) {
             if (auto s = weak.lock()) {
                 s->on_commit(ckpt);

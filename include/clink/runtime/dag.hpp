@@ -18,6 +18,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/core/stream_element.hpp"
 #include "clink/core/types.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/counter.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -219,6 +220,37 @@ template <typename SinkPtr, typename T>
     }
     return sink->on_data_columnar(batch);
 }
+
+// A sink runner's exit by exception. The normal path fences commit dispatch,
+// closes the sink and detaches its runtime, then disarms this; an exception
+// skips close(), but the RuntimeContext the sink holds is destroyed with the
+// executor's threads all the same, so commit dispatch is still fenced off and
+// the runtime detached here. Otherwise a commit dispatched from another thread
+// could still reach the sink, and through it the dead context.
+template <typename In>
+class SinkExitGuard {
+public:
+    explicit SinkExitGuard(Sink<In>* sink) noexcept : sink_(sink) {}
+    SinkExitGuard(const SinkExitGuard&) = delete;
+    SinkExitGuard& operator=(const SinkExitGuard&) = delete;
+    SinkExitGuard(SinkExitGuard&&) = delete;
+    SinkExitGuard& operator=(SinkExitGuard&&) = delete;
+    ~SinkExitGuard() {
+        if (sink_ == nullptr) {
+            return;
+        }
+        try {
+            sink_->fence_commit_dispatch();
+        } catch (...) {
+            // Unwinding already: the runner's own exception is the one to report.
+        }
+        sink_->attach_runtime(nullptr);
+    }
+    void disarm() noexcept { sink_ = nullptr; }
+
+private:
+    Sink<In>* sink_;
+};
 
 // Connects a multi-input runner's aligner to its operator: the alignment
 // metrics under the operator's id, and one log line the first time it aligns
@@ -4035,6 +4067,7 @@ public:
                                      const std::function<bool()>& should_stop) {
                 using namespace std::chrono_literals;
                 sink->attach_runtime(&ctx);
+                detail::SinkExitGuard<T> exit_guard(sink.get());
                 sink->open();
                 // Every barrier is aligned across the inputs, an unaligned one
                 // included, so the sink sees each checkpoint as one cut.
@@ -4134,12 +4167,18 @@ public:
                 if (!should_stop() && !in_cancelled) {
                     sink->flush();
                 }
+                // Teardown begins: no commit dispatched from another thread may
+                // run under close() or reach the sink after it (see
+                // Sink::fence_commit_dispatch).
+                sink->fence_commit_dispatch();
                 if (should_stop() || in_cancelled) {
                     sink->close_cancelled();
                 } else {
                     sink->close();
                 }
                 sink->attach_runtime(nullptr);
+                exit_guard.disarm();
+                CLINK_FAULT_POINT(clink::fault::points::kSinkAfterTeardown);
             };
             runner.cancel = [ins] {
                 for (auto& ch : ins) {
@@ -4433,6 +4472,7 @@ public:
         runner.run = [sink, in_channel, sink_owns_checkpoint, id, chain_epoch = chain_epoch_](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             sink->attach_runtime(&ctx);
+            detail::SinkExitGuard<In> exit_guard(sink.get());
             sink->open();
             // Per-subtask async snapshot worker (FileBacked + disk-backed
             // changelog). Only the non-terminal snapshot+ack path uses it;
@@ -4622,6 +4662,16 @@ public:
                     }
                 }
             }
+            // Teardown begins here, and only here: after the wait above, so the
+            // commits it waits for still run. From this point no commit
+            // dispatched from another thread may run under close() or reach the
+            // sink after it: one already inside its external call finishes
+            // first, one that has not started it declines (Sink::teardown_begun),
+            // and a later one is the host's to refuse (see
+            // Sink::fence_commit_dispatch). Closing first left a window in which
+            // a commit reached a sink already closed and detached, finalised
+            // nothing, and returned as if it had committed.
+            sink->fence_commit_dispatch();
             // Forward WHY the stream ended (item 79): a cancelled exit - own
             // stop or an input closed by cancellation - carries the reason
             // downstream (NetworkBridgeSink puts it on the wire) instead of
@@ -4632,6 +4682,8 @@ public:
                 sink->close();
             }
             sink->attach_runtime(nullptr);
+            exit_guard.disarm();
+            CLINK_FAULT_POINT(clink::fault::points::kSinkAfterTeardown);
         };
         runner.cancel = [in_channel, chain_epoch = chain_epoch_] {
             chain_epoch->abort();

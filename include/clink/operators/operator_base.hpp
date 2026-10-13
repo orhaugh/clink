@@ -1273,8 +1273,52 @@ public:
     void set_spec_node_id(std::string s) noexcept { spec_node_id_ = std::move(s); }
     [[nodiscard]] const std::string& spec_node_id() const noexcept { return spec_node_id_; }
 
-    void attach_runtime(RuntimeContext* ctx) noexcept { runtime_ = ctx; }
+    void attach_runtime(RuntimeContext* ctx) noexcept {
+        runtime_detached_ = ctx == nullptr && (runtime_ != nullptr || runtime_detached_);
+        if (ctx != nullptr) {
+            // A runtime starts a life of its own; an earlier teardown is over.
+            teardown_begun_.value.store(false, std::memory_order_release);
+        }
+        runtime_ = ctx;
+    }
     RuntimeContext* runtime() const noexcept { return runtime_; }
+    // True once a runtime this sink was given has been taken away again: its
+    // runner has torn it down. A sink that never had one (a test driving it
+    // directly) answers false. A committing sink tells the two apart, because a
+    // commit that reaches it after its teardown can finalise nothing and must
+    // fail rather than return as if it had committed.
+    [[nodiscard]] bool runtime_detached() const noexcept { return runtime_detached_; }
+
+    // Fence over commit and abort dispatch from threads other than the
+    // runner's. A host that delivers on_commit / on_abort from its own thread
+    // (the cluster worker's commit dispatch) installs one here, and the sink's
+    // runner calls fence_commit_dispatch() once it is done with the sink and
+    // before its teardown begins: after the end-of-stream wait for staged
+    // commits, before close() or close_cancelled(), and on an exit by
+    // exception. The fence returns only once no such dispatch is running and
+    // none can start, so a commit never runs under close() and never reaches
+    // the sink after it; refusing a later one, and not reporting it as a
+    // commit, is the host's part. Runs at most once. Unset, as on the
+    // in-process paths, which commit only on the runner's own thread, it does
+    // nothing.
+    void set_commit_dispatch_fence(std::function<void()> fence) {
+        commit_dispatch_fence_ = std::move(fence);
+    }
+    void fence_commit_dispatch() {
+        teardown_begun_.value.store(true, std::memory_order_release);
+        if (auto fence = std::exchange(commit_dispatch_fence_, nullptr)) {
+            fence();
+        }
+    }
+    // True once the runner has begun this sink's teardown (the fence above).
+    // The fence waits for a dispatch already running, so such a dispatch must
+    // check this before it starts its external commit or abort, and refuse
+    // rather than start one: the teardown would otherwise wait on the
+    // external system, and with it unreachable, the subtask would not stop.
+    // A dispatch already inside its external call is waited for.
+    [[nodiscard]] bool teardown_begun() const noexcept {
+        return teardown_begun_.value.load(std::memory_order_acquire);
+    }
 
     // Commit-group declaration, informational on this object: nothing in
     // the engine reads it. The coordinator builds its groups from the
@@ -1299,6 +1343,18 @@ private:
     std::string spec_node_id_;
     std::string commit_group_;
     RuntimeContext* runtime_{nullptr};
+    bool runtime_detached_{false};
+    std::function<void()> commit_dispatch_fence_;
+    // Read by the dispatch thread, written by the runner's. A copy does not
+    // inherit it (a copied sink has begun no teardown), which keeps a sink
+    // copyable as it always was.
+    struct TeardownFlag {
+        std::atomic<bool> value{false};
+        TeardownFlag() = default;
+        TeardownFlag(const TeardownFlag& /*other*/) noexcept {}
+        TeardownFlag& operator=(const TeardownFlag& /*other*/) noexcept { return *this; }
+    };
+    TeardownFlag teardown_begun_;
 };
 
 }  // namespace clink
