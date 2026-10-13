@@ -1024,13 +1024,13 @@ OrphanSettlement settle_orphan(const std::string& bootstrap_host,
                                        auth,
                                        Needs{.end_txn = true, .describe = true});
         if (!dance.link.has_value()) {
+            // No coordinator to ask: unreachable, refused credentials, or
+            // versions this module does not speak. The caller's attempts and
+            // deadline are the retry; rounds here would multiply its wait by
+            // kRounds against a broker that is down, and an open that waits
+            // that long is cancelled by the restart before it can refuse.
             last_detail = dance.detail;
-            if (dance.final) {
-                // Refused credentials or versions this module does not speak:
-                // no verdict, and retrying here will not produce one.
-                break;
-            }
-            continue;
+            break;
         }
         auto& link = *dance.link;
         std::string dt_detail;
@@ -1108,7 +1108,7 @@ OrphanSettlement settle_orphan(const std::string& bootstrap_host,
                   " was refused with " + wire::error_name(*code);
     }
     out.status = Status::TransportError;
-    out.detail = last_detail + " (no verdict after " + std::to_string(kRounds) + " rounds)";
+    out.detail = last_detail + " (no verdict)";
     return out;
 }
 
