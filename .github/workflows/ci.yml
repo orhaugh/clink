@@ -507,7 +507,13 @@ jobs:
     # time with one each: TLC's workers are worth more to the long ones than
     # concurrency is to the short ones (measured: a model that takes 221 s on
     # all workers takes 22 min on one). The mutants are the opposite case and
-    # have their own job.
+    # have their own job. A worker declared lost while its process still runs
+    # (MaxLostRunning) added MC_KafkaLostWorker (15.7M states, 374 s on three
+    # local workers) and about doubled MC_RecoverableNoBudget (8.9M to 19.0M
+    # states, 205 s to 436 s on a quiet machine); on three local workers this
+    # job's models went from about 24 to about 34 minutes. MC_KafkaSmall,
+    # MC_RecoverableSmall and MC_KafkaLiveness keep MaxLostRunning at 0 for
+    # their budgets; formal/README.md says what that leaves out.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -672,7 +678,7 @@ jobs:
   formal-mutant-id-reuse:
     name: The id-reuse mutant of the exactly-once specification is refuted
     runs-on: ubuntu-24.04
-    # M_id_reuse on its own runner with every worker, beside the other fifteen:
+    # M_id_reuse on its own runner with every worker, beside the other seventeen:
     # its refutation is the largest search of the set (about 104M states).
     timeout-minutes: 150
     steps:

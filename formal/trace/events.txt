@@ -53,6 +53,12 @@ unobserved BrokerComesBack
 # of its own; the module takes it where the next SinkPrepare or SinkConfirm of
 # that sink needs it.
 unobserved SinkFinish
+# A WorkerDies line is the coordinator declaring the worker lost; the process
+# may still be running, and its old incarnations' lines map onto the Lost*
+# steps. Its process stopping (its reader reaching the end of the session, or a
+# kill) is recorded nowhere.
+unobserved LostSinkStops
+unobserved LostSourceStops
 unobserved Done
 unobserved JobFailed
 # A rescale renumbers and re-places the operator's subtasks. The model keys a

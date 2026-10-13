@@ -35,6 +35,13 @@
 (* identity, so the job runs the commit-confirmed restore protocol, commit    *)
 (* receipts, in-doubt resolution and replay suppression.                      *)
 (*                                                                            *)
+(* A worker the coordinator declares lost need not be dead. The declaration   *)
+(* is the coordinator's (heartbeat silence, an outbound stall, an outbound    *)
+(* queue overflow); the process may still be running, and it executes the     *)
+(* frames already on the wire to it before it notices. WorkerLost takes both  *)
+(* cases, and the old incarnation a running process keeps is followed until a *)
+(* hidden step stops it (the LOST WORKERS section).                           *)
+(*                                                                            *)
 (* Mutants. Bug = "none" is the shipped protocol. Every other value switches  *)
 (* one rule back to a pre-fix form that a qualification campaign found and    *)
 (* fixed; the checker must refute each (formal/README.md lists them with the  *)
@@ -52,6 +59,7 @@ CONSTANTS
     MaxInFlight,       \* checkpoints the coordinator keeps in flight at once
     Recoverable,       \* TRUE: staged-artifact/XA family; FALSE: Kafka family
     MaxWorkerDeaths,   \* fault budgets: each fault is an action bounded by one
+    MaxLostRunning,    \* worker losses whose process is still running (of MaxWorkerDeaths)
     MaxCoordDeaths,
     MaxExpiries,       \* broker transaction expiries (transaction.timeout.ms)
     MaxSnapFails,      \* snapshot captures that fail (ack ok = FALSE)
@@ -79,7 +87,9 @@ Mutants == {
     "complete_above_failed",          \* found by this model: a checkpoint completed above a FAILED one during the rewind
     "restore_from_memory",            \* found by this model: the restore point ran ahead of the durable marker
     "sail_on_without_budget",         \* with no restart budget left, a FAILED checkpoint's interval sailed on
-    "advance_before_confirmed_put"    \* found in review: latest_confirmed moved before the CONFIRMED marker was durable
+    "advance_before_confirmed_put",   \* found in review: latest_confirmed moved before the CONFIRMED marker was durable
+    "orphan_left_to_init"             \* found by this model: a reopening sink left an undecided orphan for its init
+                                      \* to abort, and the lost worker still running committed it in between
 }
 
 ASSUME Host \in [Sinks -> Workers]
@@ -87,6 +97,7 @@ ASSUME SrcWorker \in Workers
 ASSUME Bug \in Mutants
 ASSUME MaxCkpt \in Nat /\ MaxCkpt >= 1
 ASSUME MaxInFlight \in Nat /\ MaxInFlight >= 1
+ASSUME MaxLostRunning \in Nat
 
 None == 0
 Ckpts == 1..MaxCkpt
@@ -158,6 +169,22 @@ VARIABLES
     boundEpoch,     \* [Workers -> Nat]: epoch bound at RegisterAck
     msgs,           \* control frames in flight
 
+    \* A worker declared lost while its process still runs (WorkerLost). The
+    \* coordinator posts nothing more to it, but what was already on the wire
+    \* reaches it, and the sinks it hosted run on as old incarnations beside
+    \* whatever the restart deploys, until the process stops.
+    lost,           \* [Sinks -> record]: the old incarnation of each sink, or LostDown:
+                    \* st ("attached" while the job's run is still the one it was
+                    \* deployed in, "detached" once the job has redeployed), stage
+                    \* and openTxn (as a live sink's, Kafka family), barriers, and
+                    \* gen, the generation it opened as (its producer epoch)
+    lostCommits,    \* SUBSET (Sinks \X Ckpts): CommitCheckpoint frames on the wire to
+                    \* an old incarnation when its worker was declared lost
+    lostAborts,     \* SUBSET (Sinks \X Ckpts): AbortCheckpoint frames likewise
+    lostTriggers,   \* SUBSET Ckpts: TriggerCheckpoint frames on the wire to a lost
+                    \* process hosting the source
+    lostSrc,        \* TRUE while that source still runs, in the run it was deployed in
+
     \* The source and the job.
     srcPos,         \* logical position the source has emitted up to
     frontier,       \* cut of the current restore point; nothing at or below re-emits
@@ -172,7 +199,8 @@ VARIABLES
     \* Fault budgets.
     workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels,
     errorRestarts,
-    ckptRewinds     \* failed-checkpoint rewinds begun: the restart budget they spend
+    ckptRewinds,    \* failed-checkpoint rewinds begun: the restart budget they spend
+    lostRunning     \* worker losses that left the process running
 
 vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
@@ -180,9 +208,10 @@ vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            freshLeader, rewindFloor, walkC, walkVerdict, walkRetries,
            completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles, receipts,
            unresolvedMk, txn, brokerUp, sinkGen, sink, pendingHandles, barriers,
-           boundEpoch, msgs, srcPos, frontier, restorePoint, cutOf, published, restoreSound,
+           boundEpoch, msgs, lost, lostCommits, lostAborts, lostTriggers, lostSrc,
+           srcPos, frontier, restorePoint, cutOf, published, restoreSound,
            staleAccepted, workerDeaths, coordDeaths, expiries, snapFails,
-           brokerOutages, walkCancels, errorRestarts, ckptRewinds >>
+           brokerOutages, walkCancels, errorRestarts, ckptRewinds, lostRunning >>
 
 leaderVars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext >>
 \* coordMem is the job's memory; confirming and staleCompleted are the handlers'
@@ -195,11 +224,14 @@ coordVars  == << coordMem, confirming, staleCompleted, lateBatch >>
 walkVars   == << walkC, walkVerdict, walkRetries >>
 diskVars   == << completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles,
                  receipts, unresolvedMk >>
-sinkVars   == << sink, pendingHandles, barriers >>
+\* The old incarnations a lost worker's process still runs are sink processes
+\* too: an action that leaves the sinks alone leaves them alone as well.
+lostVars   == << lost, lostCommits, lostAborts, lostTriggers, lostSrc >>
+sinkVars   == << sink, pendingHandles, barriers, lostVars >>
 jobVars    == << srcPos, frontier, restorePoint, cutOf >>
 ghostVars  == << published, restoreSound, staleAccepted >>
 budgetVars == << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages,
-                 walkCancels, errorRestarts, ckptRewinds >>
+                 walkCancels, errorRestarts, ckptRewinds, lostRunning >>
 
 NoTxn == [st |-> "none", owner |-> 0, desc |-> FALSE, has |-> FALSE]
 
@@ -217,6 +249,33 @@ NoTxn == [st |-> "none", owner |-> 0, desc |-> FALSE, has |-> FALSE]
 \* yet to send CommitConfirmed for confirmDue (SinkFinish, SinkConfirm).
 DownSink == [up |-> FALSE, openTxn |-> None, ackDue |-> << >>,
              stage |-> "idle", confirmDue |-> None, suppress |-> 0, opening |-> FALSE]
+
+\* No old incarnation of the sink is running (see LOST WORKERS).
+LostDown == [st |-> "down", stage |-> "idle", openTxn |-> None, barriers |-> {}, gen |-> 0]
+
+\* Whether a barrier can still reach an old incarnation that is in the job's
+\* run: one still on the wire to the run's source, live or lost. (Nothing new
+\* is triggered while one is in the run: the job is not running.)
+BarrierAhead(frames, triggers) ==
+    \/ \E m \in frames : m.kind = "barrier" /\ m.epoch >= boundEpoch[SrcWorker]
+    \/ triggers # {}
+
+\* An old incarnation that can still do something the model sees: a commit in
+\* progress, a frame on its wire, or a barrier it can still seal (a Kafka sink
+\* seals nothing while it holds a transaction, or once a newer incarnation has
+\* fenced its producer).
+LostActive(s, rec, commits, aborts, gens, ahead) ==
+    \/ rec.stage # "idle"
+    \/ \E c \in Ckpts : <<s, c>> \in commits \/ <<s, c>> \in aborts
+    \/ /\ Recoverable \/ (rec.openTxn = None /\ rec.gen = gens[s])
+       /\ rec.barriers # {} \/ (rec.st = "attached" /\ ahead)
+
+\* The old incarnations after a step, less the ones that can do nothing more.
+\* Such a one is as good as stopped, and the model stops following it rather
+\* than count the same behaviours twice over.
+Settle(raw, commits, aborts, gens, ahead) ==
+    [s \in Sinks |-> IF raw[s].st = "down" \/ LostActive(s, raw[s], commits, aborts, gens, ahead)
+                     THEN raw[s] ELSE LostDown]
 
 \* Every id with a marker. A recovered job numbers new checkpoints above all
 \* of them (the marker readers in coordinator.cpp).
@@ -262,12 +321,15 @@ Init ==
     /\ barriers = [s \in Sinks |-> {}]
     /\ boundEpoch = [w \in Workers |-> 1]
     /\ msgs = {}
+    /\ lost = [s \in Sinks |-> LostDown]
+    /\ lostCommits = {} /\ lostAborts = {} /\ lostTriggers = {} /\ lostSrc = FALSE
     /\ srcPos = 0 /\ frontier = 0 /\ restorePoint = 0
     /\ cutOf = [c \in Ckpts |-> 0]
     /\ published = [s \in Sinks |-> [p \in Positions |-> 0]]
     /\ restoreSound = TRUE /\ staleAccepted = FALSE
     /\ workerDeaths = 0 /\ coordDeaths = 0 /\ expiries = 0 /\ snapFails = 0
     /\ brokerOutages = 0 /\ walkCancels = 0 /\ errorRestarts = 0 /\ ckptRewinds = 0
+    /\ lostRunning = 0
 
 --------------------------------------------------------------------------------
 (* CHECKPOINT: trigger, barrier, prepare, ack. *)
@@ -308,7 +370,25 @@ ZombieTrigger ==
 \* the barrier flows on to every sink behind this interval's records. One
 \* logical interval per barrier: the source advanced one position. A frame
 \* from an epoch below the worker's bound is dropped (Worker::accept_epoch_).
+\* The barrier also reaches the old incarnation of a sink whose worker was
+\* declared lost while it still runs in this run: its data-plane connection
+\* from the source is still up (BarrierReach).
 Barriers == {m \in msgs : m.kind = "barrier"}
+
+\* Every sink of the run a barrier the source emits now reaches: the live
+\* ones, up or still opening, and the old incarnations still in this run
+\* (BarrierReach).
+LiveReach(c) == [s \in Sinks |-> IF sink[s].up \/ sink[s].opening
+                                 THEN barriers[s] \cup {c} ELSE barriers[s]]
+LostReach(c) == [s \in Sinks |-> IF lost[s].st = "attached"
+                                 THEN [lost[s] EXCEPT !.barriers = @ \cup {c}] ELSE lost[s]]
+
+\* frames and triggers are what is left on the wire to the run's source after
+\* this delivery.
+BarrierReach(c, frames, triggers) ==
+    /\ barriers' = LiveReach(c)
+    /\ lost' = Settle(LostReach(c), lostCommits, lostAborts, sinkGen,
+                      BarrierAhead(frames, triggers))
 
 DeliverBarrier ==
     \E m \in Barriers :
@@ -317,18 +397,16 @@ DeliverBarrier ==
         /\ LET c == m.c
                fenced == m.epoch < boundEpoch[SrcWorker] /\ Bug # "no_fencing"
            IN IF fenced
-              THEN UNCHANGED << srcPos, srcCut, cutOf, barriers, staleAccepted >>
+              THEN UNCHANGED << srcPos, srcCut, cutOf, barriers, lost, staleAccepted >>
               ELSE /\ staleAccepted' = (staleAccepted \/ m.epoch < leaderEpoch)
                    /\ srcPos' = srcPos + 1
                    /\ srcCut' = [srcCut EXCEPT ![c] = srcPos + 1]
                    /\ cutOf' = [cutOf EXCEPT ![c] = srcPos + 1]
-                   /\ barriers' = [s \in Sinks |-> IF sink[s].up \/ sink[s].opening
-                                                  THEN barriers[s] \cup {c}
-                                                  ELSE barriers[s]]
+                   /\ BarrierReach(c, msgs \ {m}, lostTriggers)
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, sinkCut,
                     sinkHandles, receipts, unresolvedMk, txn, brokerUp, sinkGen, sink,
-                    pendingHandles, boundEpoch, frontier, restorePoint, published,
-                    restoreSound, budgetVars >>
+                    pendingHandles, boundEpoch, lostCommits, lostAborts, lostTriggers, lostSrc,
+                    frontier, restorePoint, published, restoreSound, budgetVars >>
 
 \* Sink::on_barrier: the prepare. The Kafka sink flushes the open transaction,
 \* stages its resume handle inside this checkpoint and will not seal another
@@ -372,8 +450,8 @@ SinkPrepare(s) ==
           /\ sink' = [sink EXCEPT ![s].openTxn = IF Kafka THEN c ELSE @,
                                   ![s].ackDue = Append(@, [c |-> c, ok |-> TRUE])]
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, receipts,
-                    unresolvedMk, brokerUp, sinkGen, boundEpoch, msgs, jobVars, ghostVars,
-                    budgetVars >>
+                    unresolvedMk, brokerUp, sinkGen, boundEpoch, msgs, lostVars, jobVars,
+                    ghostVars, budgetVars >>
 
 \* The runner's capture for this checkpoint fails (a transient disk error): the
 \* ack goes back ok = FALSE and nothing of this id reaches disk for the sink.
@@ -390,9 +468,9 @@ SinkPrepareFails(s) ==
           /\ sink' = [sink EXCEPT ![s].openTxn = IF Kafka THEN c ELSE @,
                                   ![s].ackDue = Append(@, [c |-> c, ok |-> FALSE])]
     /\ snapFails' = snapFails + 1
-    /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, boundEpoch, msgs, jobVars,
-                    ghostVars, workerDeaths, coordDeaths, expiries, brokerOutages,
-                    walkCancels, errorRestarts, ckptRewinds >>
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, boundEpoch, msgs,
+                    lostVars, jobVars, ghostVars, workerDeaths, coordDeaths, expiries,
+                    brokerOutages, walkCancels, errorRestarts, ckptRewinds, lostRunning >>
 
 \* SubtaskCheckpointed reaches the coordinator (handle_subtask_checkpointed_).
 \* An ack for an id the coordinator no longer tracks is ignored; an ack to a
@@ -410,7 +488,7 @@ SinkAck(s) ==
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, completeDue, toBroadcast,
                     markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed,
                     drainSet, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
-                    pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars,
+                    pendingHandles, barriers, boundEpoch, msgs, lostVars, jobVars, ghostVars,
                     budgetVars >>
 
 --------------------------------------------------------------------------------
@@ -473,7 +551,7 @@ CoordComplete ==
                     memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed, freshLeader,
                     walkVars, diskVars, txn, brokerUp, sinkGen, sinkVars, boundEpoch, jobVars,
                     ghostVars, workerDeaths, coordDeaths, expiries, snapFails, brokerOutages,
-                    walkCancels, errorRestarts >>
+                    walkCancels, errorRestarts, lostRunning >>
 
 \* The COMPLETED-<id> marker, fsync-durable, written before any commit is
 \* broadcast (the marker write in handle_subtask_checkpointed_). Found by this
@@ -620,7 +698,8 @@ DeliverCommit ==
                       /\ staleAccepted' = (staleAccepted \/ m.epoch < leaderEpoch)
                  ELSE UNCHANGED << sink, staleAccepted >>
     /\ UNCHANGED << leaderVars, coordVars, diskVars, txn, brokerUp, sinkGen, pendingHandles,
-                    barriers, boundEpoch, jobVars, published, restoreSound, budgetVars >>
+                    barriers, boundEpoch, lostVars, jobVars, published, restoreSound,
+                    budgetVars >>
 
 \* An abort frame (Worker::handle_abort_checkpoint_): the staged transaction is
 \* rolled back and the handle erased. Idempotent against a handle that is gone.
@@ -643,7 +722,7 @@ DeliverAbort ==
                    /\ sink' = [sink EXCEPT ![s].openTxn = IF @ = m.c THEN None ELSE @]
               ELSE UNCHANGED << txn, pendingHandles, sink >>
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, barriers, boundEpoch,
-                    jobVars, ghostVars, budgetVars >>
+                    lostVars, jobVars, ghostVars, budgetVars >>
 
 \* The external commit executes: commit_transaction on the broker, or the
 \* atomic rename / COMMIT PREPARED of the recoverable family. The broker bumps
@@ -665,7 +744,7 @@ SinkCommit(s) ==
                /\ sink' = [sink EXCEPT ![s].stage = "committed"]
                /\ UNCHANGED pendingHandles
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, barriers, boundEpoch, msgs,
-                    jobVars, restoreSound, staleAccepted, budgetVars >>
+                    lostVars, jobVars, restoreSound, staleAccepted, budgetVars >>
 
 \* The commit receipt sub<K>-<N>, fsync-durable, written between the broker's
 \* commit and the next begin_transaction (write_commit_receipt_ inside the
@@ -678,7 +757,7 @@ SinkReceipt(s) ==
        /\ sink' = [sink EXCEPT ![s].stage = "receipted"]
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, sinkCut,
                     sinkHandles, unresolvedMk, txn, brokerUp, sinkGen, pendingHandles, barriers,
-                    boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
+                    boundEpoch, msgs, lostVars, jobVars, ghostVars, budgetVars >>
 
 \* The Kafka sink's own part of the commit ends (the tail of on_commit in the
 \* 2PC sink): the staged handle is erased (erase_resume_handle_), the open
@@ -700,7 +779,7 @@ SinkFinish(s) ==
        /\ sink' = [sink EXCEPT ![s].stage = "finished", ![s].openTxn = None,
                                ![s].confirmDue = c]
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, barriers, boundEpoch,
-                    msgs, jobVars, ghostVars, budgetVars >>
+                    msgs, lostVars, jobVars, ghostVars, budgetVars >>
 
 \* CommitConfirmed goes to the coordinator (dispatch_commit_checkpoint_ in
 \* worker.cpp), once every commit callback of the subtask has returned. A
@@ -726,7 +805,8 @@ SinkConfirm(s) ==
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                     toBroadcast, markerDue, memCompleted, memConfirmed, staleCompleted, lateBatch,
                     drainSet, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
-                    pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
+                    pendingHandles, barriers, boundEpoch, msgs, lostVars, jobVars, ghostVars,
+                    budgetVars >>
 
 \* Every tracked sink confirmed c: CONFIRMED-<id>, durable
 \* (handle_commit_confirmed_). Restores of this family select the newest
@@ -803,20 +883,59 @@ ConfirmingAfterDeath ==
 --------------------------------------------------------------------------------
 (* FAULTS: processes die, the broker forgets, the coordinator is superseded. *)
 
-\* A worker dies: every sink it hosts loses its process state and its
-\* undelivered frames. The broker keeps their transactions as they were: a
-\* prepared transaction stays prepared until resolved, fenced or expired; a
-\* committed one stays committed. The live coordinator detects the loss and
-\* begins a restart: survivors are cancelled and must drain before anything
-\* redeploys (mark_worker_lost_locked_). A loss during an ongoing drain folds
-\* into it.
+\* The coordinator declares a worker lost (mark_worker_lost_locked_): for
+\* heartbeat silence, for an outbound stall (its frames to the worker made no
+\* progress for outbound_stall_timeout), or for an outbound queue overflow.
+\* Every sink the worker hosts is gone from the job's point of view: the live
+\* coordinator begins a restart, survivors are cancelled and must drain before
+\* anything redeploys, and a loss during an ongoing drain folds into it. The
+\* broker keeps the sinks' transactions as they were: a prepared transaction
+\* stays prepared until resolved, fenced or expired; a committed one stays
+\* committed.
+\*
+\* The declaration is the coordinator's, and the process need not be dead.
+\* `running` says which. FALSE is a process that is gone (killed, crashed): what
+\* it hosted loses its process state and the frames to it die on the wire.
+\* TRUE is a process the declaration finds alive. The declaration aborts the
+\* session's outbox (the queue is discarded, the socket is shut down both
+\* ways), nothing more is posted to the session (every send site skips a lost
+\* worker), and its later frames are dropped on receipt (sender.lost in every
+\* handler, so its acks and confirmations never count). What the writer had
+\* already handed to the kernel still reaches the process: the worker's reader
+\* executes those frames before it reads end of stream (Worker::reader_loop_),
+\* and only then ends the session (signal_disconnect_). Until it stops, the
+\* process is an old incarnation of each sink it hosted (OldIncarnation), with
+\* the commit and abort frames on the wire to it and the barriers in its input
+\* queue; if it hosts the source, the TriggerCheckpoint frames on the wire to it
+\* stay deliverable there (LostDeliverBarrier). On Linux that lasts until the
+\* coordinator's descriptor closes; on macOS a heartbeat from the worker draws
+\* a reset sooner; a paused process resumes whenever it resumes. The model
+\* takes no view of how long: a hidden step stops it (LostSinkStops,
+\* LostSourceStops). A sink still opening at the declaration is taken down at
+\* once in both cases. That leaves out an open the engine may still finish on
+\* the lost process: a Kafka open that fences the identity after a newer
+\* incarnation has opened would fail that incarnation's commits.
+\*
 \* `dead` is the set of sinks the loss takes with it, a parameter rather than
 \* a lookup: the model fixes each sink's host for the run, but the engine
 \* re-places a subtask when the job redeploys, and a sink that has moved off w
 \* does not die with it. Trace validation follows the placements the run
-\* recorded and passes the set they imply; WorkerDies below is the model's own
-\* case, where Host is the whole story.
-WorkerDiesKilling(w, dead) ==
+\* recorded and passes the set they imply; WorkerDies and WorkerLostRunning
+\* below are the model's own cases, where Host is the whole story.
+OldIncarnation(s) ==
+    [st |-> "attached",
+     \* A Kafka commit that has executed and awaits its receipt goes on; one
+     \* accepted and not yet executed is back on the wire (WorkerLost), at the
+     \* head, since the dispatch took it first; the finish after a receipt, and
+     \* the CommitConfirmed after that, change nothing anything reads once the
+     \* receipt is durable and the session is gone.
+     stage |-> IF Kafka /\ sink[s].stage = "committed" THEN "committed" ELSE "idle",
+     openTxn |-> IF Kafka /\ sink[s].stage \in {"idle", "committing", "committed"}
+                 THEN sink[s].openTxn ELSE None,
+     barriers |-> barriers[s],
+     gen |-> sinkGen[s]]
+
+WorkerLost(w, dead, running) ==
     /\ workerDeaths < MaxWorkerDeaths
     \* Any worker of the job may die, whatever it hosts. The model keeps only
     \* the source and the sinks; the engine restarts the job for the loss of
@@ -825,10 +944,36 @@ WorkerDiesKilling(w, dead) ==
     \* validation showed both: a keyed operator's worker killed at the
     \* restore point, and a survivor lost after its sinks had drained).
     /\ w \in Workers
+    /\ LET kept == IF running THEN {s \in dead : sink[s].up} ELSE {}
+           \* A barrier from a superseded coordinator would be fenced there, as
+           \* at a live worker, and so does nothing.
+           triggers == {m.c : m \in {n \in Barriers : n.epoch >= boundEpoch[SrcWorker]}}
+           srcKept == running /\ SrcWorker = w /\ triggers # {}
+           wire == {m \in msgs : IF m.kind = "barrier" THEN SrcWorker # w ELSE m.s \notin dead}
+           \* One old incarnation per sink: an older one of a sink kept here (a
+           \* loss in an earlier run whose process still runs) is let go.
+           commits == {p \in lostCommits : p[1] \notin kept}
+                \cup {<<m.s, m.c>> : m \in {n \in msgs : n.kind = "commit" /\ n.s \in kept}}
+                \cup {<<s, sink[s].openTxn>> : s \in {t \in kept : sink[t].stage = "committing"}}
+           aborts == {p \in lostAborts : p[1] \notin kept}
+                \cup {<<m.s, m.c>> : m \in {n \in msgs : n.kind = "abort" /\ n.s \in kept}}
+           srcTriggers == IF srcKept THEN lostTriggers \cup triggers ELSE lostTriggers
+           after == Settle([s \in Sinks |-> IF s \in kept THEN OldIncarnation(s) ELSE lost[s]],
+                           commits, aborts, sinkGen, BarrierAhead(wire, srcTriggers))
+       IN /\ running => /\ coordUp   \* the declaration is a live coordinator's
+                        /\ lostRunning < MaxLostRunning
+                        \* else it is a death like any other
+                        /\ srcKept \/ \E s \in kept : after[s].st # "down"
+          /\ lost' = after
+          /\ lostCommits' = commits
+          /\ lostAborts' = aborts
+          /\ lostTriggers' = srcTriggers
+          /\ lostSrc' = (lostSrc \/ srcKept)
+          /\ lostRunning' = IF running THEN lostRunning + 1 ELSE lostRunning
+          /\ msgs' = wire
     /\ sink' = [s \in Sinks |-> IF s \in dead THEN DownSink ELSE sink[s]]
     /\ pendingHandles' = [s \in Sinks |-> IF s \in dead THEN {} ELSE pendingHandles[s]]
     /\ barriers' = [s \in Sinks |-> IF s \in dead THEN {} ELSE barriers[s]]
-    /\ msgs' = {m \in msgs : IF m.kind = "barrier" THEN SrcWorker # w ELSE m.s \notin dead}
     /\ IF coordUp /\ phase = "running"
        THEN /\ phase' = "draining"
             \* Whether a sink that the last redeploy placed but that has not
@@ -851,7 +996,8 @@ WorkerDiesKilling(w, dead) ==
                     jobVars, ghostVars, coordDeaths, expiries, snapFails, brokerOutages,
                     walkCancels, errorRestarts, ckptRewinds >>
 
-WorkerDies(w) == WorkerDiesKilling(w, {s \in Sinks : Host[s] = w})
+WorkerDies(w) == WorkerLost(w, {s \in Sinks : Host[s] = w}, FALSE)
+WorkerLostRunning(w) == WorkerLost(w, {s \in Sinks : Host[s] = w}, TRUE)
 
 \* A cancelled survivor drains: the sink closes. close() aborts only the open
 \* tail; a barrier-sealed prepared transaction is preserved for the resolver
@@ -867,14 +1013,15 @@ WorkerDies(w) == WorkerDiesKilling(w, {s \in Sinks : Host[s] = w})
 RestartOnError ==
     /\ coordUp /\ phase = "running" /\ errorRestarts < MaxErrorRestarts
     /\ phase' = "draining"
-    /\ \E waitOpening \in BOOLEAN :   \* as in WorkerDiesKilling
+    /\ \E waitOpening \in BOOLEAN :   \* as in WorkerLost
           drainSet' = {s \in Sinks : sink[s].up \/ (waitOpening /\ sink[s].opening)}
     /\ errorRestarts' = errorRestarts + 1
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                     toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, txn, brokerUp, sinkGen,
-                    sink, pendingHandles, barriers, boundEpoch, msgs, jobVars, ghostVars,
-                    workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels, ckptRewinds >>
+                    sinkVars, boundEpoch, msgs, jobVars, ghostVars,
+                    workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, walkCancels, ckptRewinds,
+                    lostRunning >>
 
 \* A sink still opening drains like any other: the redeploy deployed the
 \* subtask, so a loss landing before its open() returned cancels it and waits
@@ -897,12 +1044,21 @@ SinkDrains(s) ==
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                     toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, freshLeader, rewindFloor, walkVars, diskVars, brokerUp, sinkGen, boundEpoch,
-                    jobVars, ghostVars, budgetVars >>
+                    lostVars, jobVars, ghostVars, budgetVars >>
 
 \* The coordinator dies. Its memory goes with it; the workers' control sessions
 \* end and every subtask is cancelled (WorkerSupervisor), so every sink closes
 \* with its prepared transactions preserved. Frames on the wire are lost with
-\* the connections.
+\* the connections. The model takes a lost worker's old incarnations down with
+\* every other sink here, its frames with every other frame: a worker reads what
+\* its socket buffered before it sees the end of the session, whether the
+\* coordinator declared it lost or died, and the model takes such a frame as
+\* executed before the death or not at all, as it always has for live workers.
+\* The takeover's range of checkpoint ids rests on that (RedeployEffects).
+StopAllLost ==
+    /\ lost' = [s \in Sinks |-> LostDown]
+    /\ lostCommits' = {} /\ lostAborts' = {} /\ lostTriggers' = {} /\ lostSrc' = FALSE
+
 CoordDies ==
     /\ coordDeaths < MaxCoordDeaths /\ coordUp
     /\ coordUp' = FALSE
@@ -910,12 +1066,13 @@ CoordDies ==
     /\ pendingHandles' = [s \in Sinks |-> {}]
     /\ barriers' = [s \in Sinks |-> {}]
     /\ msgs' = {}
+    /\ StopAllLost
     /\ confirming' = ConfirmingAfterDeath
     /\ coordDeaths' = coordDeaths + 1
     /\ UNCHANGED << leaderEpoch, zombie, zombieEpoch, zombieNext, coordMem, staleCompleted, lateBatch,
                     diskVars, txn,
                     brokerUp, sinkGen, boundEpoch, jobVars, ghostVars, workerDeaths, expiries,
-                    snapFails, brokerOutages, walkCancels, errorRestarts, ckptRewinds >>
+                    snapFails, brokerOutages, walkCancels, errorRestarts, ckptRewinds, lostRunning >>
 
 \* The coordinator is superseded without dying: partitioned from the store or
 \* paused past its lease, it keeps its trigger loop. The workers reconnect to
@@ -930,6 +1087,7 @@ CoordSuperseded ==
     /\ pendingHandles' = [s \in Sinks |-> {}]
     /\ barriers' = [s \in Sinks |-> {}]
     /\ msgs' = {}
+    /\ StopAllLost   \* as at CoordDies
     /\ confirming' = ConfirmingOrphaned
     /\ staleCompleted' = CompletedOrphaned \cup DecidedLate
     /\ lateBatch' = IF DecidedLate = {} THEN lateBatch
@@ -937,7 +1095,7 @@ CoordSuperseded ==
     /\ coordDeaths' = coordDeaths + 1
     /\ UNCHANGED << leaderEpoch, coordMem, diskVars, txn, brokerUp, sinkGen, boundEpoch, jobVars,
                     ghostVars, workerDeaths, expiries, snapFails, brokerOutages,
-                    walkCancels, errorRestarts, ckptRewinds >>
+                    walkCancels, errorRestarts, ckptRewinds, lostRunning >>
 
 ZombieStops ==
     /\ zombie
@@ -985,19 +1143,194 @@ TxnExpires ==
     /\ expiries' = expiries + 1
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
                     jobVars, ghostVars, workerDeaths, coordDeaths, snapFails,
-                    brokerOutages, walkCancels, errorRestarts, ckptRewinds >>
+                    brokerOutages, walkCancels, errorRestarts, ckptRewinds, lostRunning >>
 
 BrokerGoesDown ==
     /\ Kafka /\ brokerUp /\ brokerOutages < MaxBrokerOutages
     /\ brokerUp' = FALSE /\ brokerOutages' = brokerOutages + 1
     /\ UNCHANGED << leaderVars, coordVars, diskVars, txn, sinkGen, sinkVars, boundEpoch, msgs,
                     jobVars, ghostVars, workerDeaths, coordDeaths, expiries, snapFails,
-                    walkCancels, errorRestarts, ckptRewinds >>
+                    walkCancels, errorRestarts, ckptRewinds, lostRunning >>
 
 BrokerComesBack ==
     /\ ~brokerUp
     /\ brokerUp' = TRUE
     /\ UNCHANGED << leaderVars, coordVars, diskVars, txn, sinkGen, sinkVars, boundEpoch, msgs,
+                    jobVars, ghostVars, budgetVars >>
+
+--------------------------------------------------------------------------------
+(* LOST WORKERS: a process declared lost runs on until it stops. *)
+
+\* What a lost worker's process does once the declaration has cut it off
+\* (WorkerLost). Nothing it sends counts: the coordinator drops a lost
+\* session's frames (sender.lost in handle_subtask_checkpointed_ and
+\* handle_commit_confirmed_), so its acks and CommitConfirmed frames have no
+\* step here. What it does to the outside world does count: an external commit,
+\* a receipt, a prepared transaction, an abort.
+
+\* The lost process's source takes a TriggerCheckpoint that was on the wire to
+\* it (handle_trigger_checkpoint_, on its reader): it snapshots its cut and the
+\* barrier flows on to every sink its data-plane connections still reach, its
+\* own process's old incarnations and the run's other sinks until they drain.
+\* Its ack is dropped, so the coordinator can never decide this checkpoint: it
+\* leaves tracking here, as one that will never complete. A redeploy rewires
+\* the data plane (a receiver accepts the one sender its PeerUpdate named), so
+\* after it the source would reach only its own process's old incarnations,
+\* whose checkpoint can never complete; the model stops following it there
+\* (RedeployEffects).
+LostDeliverBarrier ==
+    /\ lostSrc /\ lostTriggers # {}
+    /\ LET c == Min(lostTriggers) IN   \* one FIFO control connection: in order
+       /\ lostTriggers' = lostTriggers \ {c}
+       /\ lostSrc' = (lostTriggers' # {})   \* with nothing left to take, it is done
+       /\ srcPos' = srcPos + 1
+       /\ srcCut' = [srcCut EXCEPT ![c] = srcPos + 1]
+       /\ cutOf' = [cutOf EXCEPT ![c] = srcPos + 1]
+       /\ BarrierReach(c, msgs, lostTriggers')
+       /\ inFlight' = inFlight \ {c}
+    /\ UNCHANGED << leaderVars, phase, nextCkpt, ackedOk, ackedFail, completeDue, toBroadcast,
+                    markerDue, memCompleted, memConfirmed, broadcastIds, unconfirmed, drainSet,
+                    freshLeader, rewindFloor, walkVars, confirming, staleCompleted, lateBatch,
+                    completedDisk, confirmedDisk, sinkCut, sinkHandles, receipts, unresolvedMk,
+                    txn, brokerUp, sinkGen, sink, pendingHandles, boundEpoch, msgs, lostCommits,
+                    lostAborts, frontier, restorePoint, ghostVars, budgetVars >>
+
+\* The old incarnations after an old incarnation's own step: the frames on its
+\* wire as given, nothing else moved.
+LostAfter(raw, commits, aborts) ==
+    Settle(raw, commits, aborts, sinkGen, BarrierAhead(msgs, lostTriggers))
+
+\* An old incarnation seals the next barrier in its input queue, as SinkPrepare
+\* does. Its ack is dropped, so the checkpoint can never complete and nothing
+\* will ever commit the transaction: neither the walk nor a reopening sink sees
+\* a handle of a checkpoint without a marker, and no commit frame for it was on
+\* the wire. A Kafka sink waits for the open transaction to resolve first, as
+\* on_barrier does, and its producer is fenced once a newer incarnation has
+\* opened (init_transactions bumped the epoch): its flush then fails and the
+\* subtask ends. The capture lands too, under an id that can never complete;
+\* nothing reads it, and the model does not record it. Nor does it record what
+\* the transaction carries: nothing commits it.
+LostSinkPrepare(s) ==
+    /\ lost[s].st # "down" /\ lost[s].barriers # {}
+    /\ Kafka => /\ lost[s].stage = "idle" /\ lost[s].openTxn = None
+                /\ sinkGen[s] = lost[s].gen
+    /\ LET c == Min(lost[s].barriers) IN
+       /\ txn' = [txn EXCEPT ![s][c] = [st |-> "prepared", owner |-> lost[s].gen,
+                                        desc |-> FALSE, has |-> TRUE]]
+       /\ lost' = LostAfter([lost EXCEPT ![s].barriers = @ \ {c},
+                                         ![s].openTxn = IF Kafka THEN c ELSE @],
+                            lostCommits, lostAborts)
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, sink, pendingHandles,
+                    barriers, boundEpoch, msgs, lostCommits, lostAborts, lostTriggers, lostSrc,
+                    jobVars, ghostVars, budgetVars >>
+
+\* The next CommitCheckpoint on the wire to an old incarnation, in the order
+\* sent (one FIFO dispatch per worker), once its dispatch is free.
+LostCommitHead(s) ==
+    IF lost[s].st = "down" \/ lost[s].stage # "idle" THEN {}
+    ELSE {c \in Ckpts : /\ <<s, c>> \in lostCommits
+                        /\ \A d \in Ckpts : <<s, d>> \in lostCommits => c <= d}
+
+\* Whether an old incarnation accepts a frame for c, on what it holds itself:
+\* a persisted handle for c (CommittingSink::finalise_: one it sealed, which
+\* nothing but its own frame for c takes out of its state), or c as its sealed
+\* transaction (the Kafka sink's on_commit and on_abort).
+LostAccepts(s, c) ==
+    IF Recoverable THEN txn[s][c].owner = lost[s].gen /\ txn[s][c].st # "none"
+    ELSE lost[s].openTxn = c
+
+\* An old incarnation's commit dispatch takes that frame and the external
+\* commit runs (commit_dispatch_loop_ goes on until the sink's runner retires
+\* its dispatch gate, which it does only after the session has ended). The
+\* dispatch and the commit are one step: nothing but the process sees the
+\* frame between them. A recoverable commit is idempotent: a handle a newer
+\* incarnation has already re-committed at its open stays committed once. A
+\* Kafka commit of a transaction the broker has since aborted (a newer
+\* incarnation's init, an expiry) or committed (the walk's probe under the
+\* saved identity, which moved the producer epoch on) fails, and the sink holds
+\* the transaction as its open one until it stops. Its CommitConfirmed is
+\* dropped.
+LostSinkCommit(s) ==
+    \E c \in LostCommitHead(s) :
+        /\ lostCommits' = lostCommits \ {<<s, c>>}
+        /\ LET executes == LostAccepts(s, c) /\ txn[s][c].st = "prepared"
+           IN /\ executes => brokerUp
+              /\ published' = IF executes THEN Publish(s, c) ELSE published
+              /\ txn' = IF ~executes THEN txn
+                        ELSE IF Recoverable THEN [txn EXCEPT ![s][c].st = "committed"]
+                        ELSE [txn EXCEPT ![s][c].st = "committed",
+                                         ![s][c].desc = (Bug # "receipt_after_begin")]
+              /\ lost' = LostAfter(IF Kafka /\ executes
+                                   THEN [lost EXCEPT ![s].stage = "committed"]
+                                   ELSE lost,
+                                   lostCommits', lostAborts)
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, sink, pendingHandles,
+                    barriers, boundEpoch, msgs, lostAborts, lostTriggers, lostSrc, jobVars,
+                    restoreSound, staleAccepted, budgetVars >>
+
+\* The old incarnation's receipt, written inside the commit callback before
+\* its successor transaction begins, and the end of that commit: SinkReceipt
+\* and SinkFinish in one step, since once the receipt is durable nothing reads
+\* whether the broker still names the commit.
+LostSinkReceipt(s) ==
+    /\ Kafka /\ lost[s].st # "down" /\ lost[s].stage = "committed"
+    /\ LET c == lost[s].openTxn IN
+       /\ receipts' = IF Bug = "no_receipts" THEN receipts ELSE receipts \cup {<<s, c>>}
+       /\ txn' = [txn EXCEPT ![s][c].desc = FALSE]
+       /\ lost' = LostAfter([lost EXCEPT ![s].stage = "idle", ![s].openTxn = None],
+                            lostCommits, lostAborts)
+    /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, sinkCut,
+                    sinkHandles, unresolvedMk, brokerUp, sinkGen, sink, pendingHandles, barriers,
+                    boundEpoch, msgs, lostCommits, lostAborts, lostTriggers, lostSrc, jobVars,
+                    ghostVars, budgetVars >>
+
+\* An AbortCheckpoint on the wire to an old incarnation: run on its reader, as
+\* for a live sink (DeliverAbort), accepted on what it holds, and refused while
+\* its commit is inside the callback (the Kafka sink's lock).
+LostDeliverAbort ==
+    \E s \in Sinks, c \in Ckpts :
+        /\ <<s, c>> \in lostAborts /\ lost[s].st # "down"
+        /\ lostAborts' = lostAborts \ {<<s, c>>}
+        /\ LET accepted == LostAccepts(s, c) /\ lost[s].stage = "idle"
+           IN /\ txn' = IF accepted /\ txn[s][c].st = "prepared"
+                        THEN [txn EXCEPT ![s][c].st = "aborted"] ELSE txn
+              /\ lost' = LostAfter(IF accepted /\ Kafka
+                                   THEN [lost EXCEPT ![s].openTxn = None]
+                                   ELSE lost,
+                                   lostCommits, lostAborts')
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, sink, pendingHandles,
+                    barriers, boundEpoch, msgs, lostCommits, lostTriggers, lostSrc, jobVars,
+                    ghostVars, budgetVars >>
+
+\* The lost process stops: its reader reached the end of the session and ended
+\* it (signal_disconnect_ flips every cancel token; a sink closes once its
+\* commit in progress has returned, its dispatch gate retired, and a commit
+\* still queued is then refused), or the process was killed. Each subtask
+\* stops on its own. The engine records nothing for either: both are hidden
+\* steps to trace validation. The sink's close() aborts only its open tail, as
+\* at a drain (SinkDrains), so its prepared transactions stay as they are.
+LostSinkStops(s) ==
+    /\ lost[s].st # "down"
+    /\ lost' = [lost EXCEPT ![s] = LostDown]
+    /\ lostCommits' = {p \in lostCommits : p[1] # s}
+    /\ lostAborts' = {p \in lostAborts : p[1] # s}
+    /\ txn' = IF Bug = "close_aborts_prepared"
+              THEN [txn EXCEPT ![s] = [c \in Ckpts |->
+                        IF txn[s][c].st = "prepared" /\ txn[s][c].owner = lost[s].gen
+                        THEN [txn[s][c] EXCEPT !.st = "aborted"]
+                        ELSE txn[s][c]]]
+              ELSE txn
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, sink,
+                    pendingHandles, barriers, boundEpoch, msgs, lostTriggers, lostSrc, jobVars,
+                    ghostVars, budgetVars >>
+
+LostSourceStops ==
+    /\ lostSrc
+    /\ lostSrc' = FALSE /\ lostTriggers' = {}
+    \* An old incarnation waiting only for this source's barriers has none to come.
+    /\ lost' = Settle(lost, lostCommits, lostAborts, sinkGen, BarrierAhead(msgs, {}))
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, txn, brokerUp, sinkGen, sink,
+                    pendingHandles, barriers, boundEpoch, msgs, lostCommits, lostAborts,
                     jobVars, ghostVars, budgetVars >>
 
 --------------------------------------------------------------------------------
@@ -1115,7 +1448,8 @@ WalkCancelled ==
     /\ Walking /\ Unsettled # {} /\ walkCancels < MaxWalkCancels
     /\ walkCancels' = walkCancels + 1
     /\ EndUnresolved
-    /\ UNCHANGED << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, errorRestarts, ckptRewinds >>
+    /\ UNCHANGED << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages, errorRestarts,
+                    ckptRewinds, lostRunning >>
 
 \* Every handle of the id has a verdict. All committed: CONFIRMED-<id> is
 \* written and the walk moves on. Any refusal: the walk stops and the job
@@ -1252,6 +1586,16 @@ RedeployEffects ==
     /\ pendingHandles' = [s \in Sinks |-> {}]
     /\ barriers' = [s \in Sinks |-> {}]
     /\ msgs' = {}
+    \* The new run has its own data plane: an old incarnation a lost process
+    \* still runs is no longer wired to the job's source, and the lost source
+    \* reaches only its own process (LostDeliverBarrier). What is on the wire to
+    \* the old incarnations stays there.
+    /\ lost' = Settle([s \in Sinks |-> IF lost[s].st = "attached"
+                                       THEN [lost[s] EXCEPT !.st = "detached"]
+                                       ELSE lost[s]],
+                      lostCommits, lostAborts, sinkGen, FALSE)
+    /\ lostTriggers' = {} /\ lostSrc' = FALSE
+    /\ UNCHANGED << lostCommits, lostAborts >>
 
 \* The redeploy after a held resolution: the resolution thread re-acquires the
 \* lock and runs restart_job_locked_.
@@ -1313,20 +1657,43 @@ ZombieRenumber ==
                     budgetVars >>
 
 \* The redeployed sink opens. Kafka family (open() in the 2PC sink): first, an
-\* .unresolved marker for one of its own handles is settled with a read-only
-\* DescribeTransactions on the never-fenced identity: a commit the broker still
-\* names gets its receipt written here (suppression then arms from it); an
-\* undecided or aborted transaction is left for the init's abort. While no
-\* broker can answer, the sink REFUSES to open (a blind fence would erase the
-\* distinction for good). Second, init_transactions fences every older
-\* identity: undecided transactions abort, and the broker stops naming their
-\* outcomes. Third, replay suppression arms from the receipts newer than the
-\* restore point: re-emissions at or below the receipted horizon are swallowed.
-\* Recoverable family (CommittingSink::open): recover_all_ re-commits every
-\* handle the restored snapshot holds; commit is idempotent.
+\* .unresolved marker for one of its own handles is settled on the
+\* never-fenced identity: a commit the broker names gets its receipt written
+\* here (suppression then arms from it); an undecided transaction is ended
+\* with an abort under its own identity, and an aborted one stays aborted.
+\* While no broker can answer, the sink REFUSES to open (a blind fence would
+\* erase the distinction for good). Second, init_transactions fences every
+\* older identity, and the broker stops naming their outcomes. Third, replay
+\* suppression arms from the receipts newer than the restore point:
+\* re-emissions at or below the receipted horizon are swallowed. Recoverable
+\* family (CommittingSink::open): recover_all_ re-commits every handle the
+\* restored snapshot holds; commit is idempotent.
+\*
+\* Settling an undecided orphan before the init matters once its producer
+\* may still be running (WorkerLost). The old incarnation's commit of the
+\* next frame on its wire can land at any moment of the open
+\* (OpenWindowCommits). The open's abort and that commit are both EndTxn on
+\* the orphan's identity, and the broker's transaction coordinator takes one
+\* of them: if the abort is first the commit is refused, and if the commit is
+\* first the abort is refused, the open describes again and writes the
+\* receipt. Either way the outcome is decided, and known, before the init and
+\* before suppression arms; in the model the decision is the open's own step,
+\* with the old incarnation's commit before it or not at all. The open used to
+\* describe the orphan and leave an undecided one for the init to abort
+\* (mutant orphan_left_to_init): a commit landing between the describe and the
+\* init was then neither aborted nor receipted, and the restore's replay
+\* published its interval a second time. This model found that; see
+\* formal/README.md.
 Older(s) == {c \in Ckpts : txn[s][c].owner # 0 /\ txn[s][c].owner <= sinkGen[s]}
 
-SinkOpens(s) ==
+OpenWindowCommits(s) ==
+    IF Kafka /\ brokerUp
+    THEN {c \in LostCommitHead(s) : LostAccepts(s, c) /\ txn[s][c].st = "prepared"}
+    ELSE {}
+
+\* z is None, or the checkpoint an old incarnation of s commits during the
+\* open, before the open has decided its orphan.
+SinkOpensWith(s, z) ==
     /\ sink[s].opening
     /\ LET r == restorePoint
            \* Only the newest marker above the restore point is consulted: the
@@ -1336,29 +1703,38 @@ SinkOpens(s) ==
            above == {c \in Ckpts : <<s, c>> \in unresolvedMk /\ c > r}
            myMarkers == IF above = {} THEN {} ELSE {Max(above)}
            describeOk == Bug = "blind_fence" \/ myMarkers = {} \/ brokerUp
+           \* The old incarnation's commit has landed.
+           mid == IF z = None THEN txn[s]
+                  ELSE [txn[s] EXCEPT ![z].st = "committed",
+                                      ![z].desc = (Bug # "receipt_after_begin")]
+           \* What the open learns of its orphan: the outcome its settling
+           \* decided, or, in the mutant, what a describe saw before the old
+           \* incarnation's commit landed.
+           seen == IF Bug = "orphan_left_to_init" THEN txn[s] ELSE mid
            describedCommits == IF Bug = "blind_fence" THEN {}
-                               ELSE {c \in myMarkers : txn[s][c].st = "committed" /\ txn[s][c].desc}
+                               ELSE {c \in myMarkers : seen[c].st = "committed" /\ seen[c].desc}
            receipts1 == IF Kafka THEN receipts \cup {<<s, c>> : c \in describedCommits}
                         ELSE receipts
            recoverSet == IF Recoverable /\ r # None
                          THEN {c \in sinkHandles[s][r] : txn[s][c].st = "prepared"}
                          ELSE {}
            after == [c \in Ckpts |->
-                        IF Kafka /\ c \in Older(s) /\ txn[s][c].st = "prepared"
-                        THEN [txn[s][c] EXCEPT !.st = "aborted", !.desc = FALSE]
+                        IF Kafka /\ c \in Older(s) /\ mid[c].st = "prepared"
+                        THEN [mid[c] EXCEPT !.st = "aborted", !.desc = FALSE]
                         ELSE IF Kafka /\ c \in Older(s)
-                        THEN [txn[s][c] EXCEPT !.desc = FALSE]
+                        THEN [mid[c] EXCEPT !.desc = FALSE]
                         ELSE IF c \in recoverSet
-                        THEN [txn[s][c] EXCEPT !.st = "committed"]
-                        ELSE txn[s][c]]
+                        THEN [mid[c] EXCEPT !.st = "committed"]
+                        ELSE mid[c]]
            recovered == {p \in Positions : \E c \in recoverSet : cutOf[c] = p /\ txn[s][c].has}
            horizon == Max({cutOf[c] : c \in {d \in Ckpts : <<s, d>> \in receipts1 /\ d > r}})
        IN /\ describeOk
           /\ receipts' = receipts1
           /\ unresolvedMk' = unresolvedMk \ {<<s, c>> : c \in myMarkers}
           /\ txn' = [txn EXCEPT ![s] = after]
-          /\ published' = [published EXCEPT ![s] =
-                             [p \in Positions |-> IF p \in recovered THEN @[p] + 1 ELSE @[p]]]
+          /\ published' = IF z # None THEN Publish(s, z)
+                          ELSE [published EXCEPT ![s] =
+                                  [p \in Positions |-> IF p \in recovered THEN @[p] + 1 ELSE @[p]]]
           /\ sinkGen' = [sinkGen EXCEPT ![s] = @ + 1]
           /\ sink' = [sink EXCEPT ![s] = [up |-> TRUE,
                                           openTxn |-> None, ackDue |-> << >>,
@@ -1366,9 +1742,18 @@ SinkOpens(s) ==
                                           opening |-> FALSE,
                                           suppress |-> IF Kafka /\ horizon > frontier
                                                        THEN horizon ELSE 0]]
+          /\ lostCommits' = lostCommits \ {<<s, z>>}
+          \* The init fences the old incarnation's producer, which may leave it
+          \* nothing more it can do.
+          /\ lost' = Settle(IF z = None THEN lost ELSE [lost EXCEPT ![s].stage = "committed"],
+                            lostCommits', lostAborts, [sinkGen EXCEPT ![s] = @ + 1],
+                            BarrierAhead(msgs, lostTriggers))
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, sinkCut,
                     sinkHandles, brokerUp, pendingHandles, barriers, boundEpoch, msgs,
-                    jobVars, restoreSound, staleAccepted, budgetVars >>
+                    lostAborts, lostTriggers, lostSrc, jobVars, restoreSound, staleAccepted,
+                    budgetVars >>
+
+SinkOpens(s) == \E z \in {None} \cup OpenWindowCommits(s) : SinkOpensWith(s, z)
 
 --------------------------------------------------------------------------------
 (* THE RUN ENDS when every allocated id is settled and nothing is in flight. *)
@@ -1397,7 +1782,10 @@ Next ==
     \/ DeliverCommit \/ DeliverAbort
     \/ \E s \in Sinks : SinkCommit(s) \/ SinkReceipt(s) \/ SinkFinish(s) \/ SinkConfirm(s)
     \/ WriteConfirmed \/ AdvanceConfirmed
-    \/ \E w \in Workers : WorkerDies(w)
+    \/ \E w \in Workers : WorkerDies(w) \/ WorkerLostRunning(w)
+    \/ LostDeliverBarrier \/ LostDeliverAbort \/ LostSourceStops
+    \/ \E s \in Sinks : LostSinkPrepare(s) \/ LostSinkCommit(s) \/ LostSinkReceipt(s)
+                        \/ LostSinkStops(s)
     \/ RestartOnError
     \/ \E s \in Sinks : SinkDrains(s)
     \/ CoordDies \/ CoordSuperseded \/ ZombieStops \/ CoordRecovers
@@ -1448,6 +1836,13 @@ TypeOK ==
     /\ confirming \in [Ckpts -> {"none", "due", "written", "stale"}]
     /\ staleCompleted \subseteq Ckpts
     /\ lateBatch \subseteq staleCompleted
+    /\ \A s \in Sinks : /\ lost[s].st \in {"down", "attached", "detached"}
+                        /\ lost[s].stage \in {"idle", "committed"}
+                        /\ lost[s].st = "down" => lost[s] = LostDown
+    /\ lostCommits \subseteq Sinks \X Ckpts /\ lostAborts \subseteq Sinks \X Ckpts
+    /\ \A p \in lostCommits \cup lostAborts : lost[p[1]].st # "down"
+    /\ lostTriggers \subseteq Ckpts /\ (lostSrc <=> lostTriggers # {})
+    /\ lostRunning <= MaxLostRunning
 
 \* No sink publishes any position more than once.
 NoDuplicate ==

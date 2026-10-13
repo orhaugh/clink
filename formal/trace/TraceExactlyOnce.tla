@@ -45,7 +45,17 @@
    the path the leader's capture of that id writes. A ghost of the ids
    triggered under each epoch costs the model searches nothing here, and a
    trace whose leader and superseded coordinator both trigger one id diverges
-   at the second Trigger. *)
+   at the second Trigger.
+
+   A WorkerDies line is the coordinator declaring the worker lost, and the
+   process may still be running: the module takes the loss either way
+   (WorkerLost, killed or running). A process still running goes on emitting
+   lines for the frames already on the wire to it, its old incarnations'
+   SinkPrepare, DeliverCommit, SinkCommit, SinkReceipt and DeliverAbort, and
+   its source's DeliverBarrier, which the module maps onto the
+   specification's Lost* steps; its SubtaskAck and SinkConfirm lines are
+   stutters, since the coordinator drops a lost session's frames. Its process
+   stopping has no line: LostSinkStops and LostSourceStops are hidden steps. *)
 EXTENDS ExactlyOnce, Json, IOUtils, TLC, Sequences, TraceConstants
 
 \* The merged trace, named by the environment (the validator sets it).
@@ -124,6 +134,9 @@ StepTrigger ==
             \/ ZombieTrigger /\ zombieNext = E.ckpt /\ zombieEpoch = ModelEpoch(E.epoch)
 
 \* One barrier per id in the model; a second source subtask's copy is a stutter.
+\* A barrier on the wire to a source whose worker was declared lost while it
+\* still runs is the lost source's (LostDeliverBarrier); with the source
+\* stopped, its line is a stutter like any copy the model does not follow.
 StepDeliverBarrier ==
     /\ Is("DeliverBarrier")
     /\ IF E.ckpt \in {m.c : m \in Barriers}
@@ -131,23 +144,38 @@ StepDeliverBarrier ==
             /\ LET m == CHOOSE n \in Barriers : n.c = E.ckpt
                IN E.fenced <=> (m.epoch < boundEpoch[SrcWorker])
             /\ DeliverBarrier
+       ELSE IF ~E.fenced /\ E.ckpt \in lostTriggers
+       THEN Min(lostTriggers) = E.ckpt /\ LostDeliverBarrier
        ELSE Skip
 
 \* The engine learns whether the capture failed only from the ack, so the
-\* prepare step is either action; the ack's `ok` picks the branch.
+\* prepare step is either action; the ack's `ok` picks the branch. An old
+\* incarnation's prepare (LostSinkPrepare) seals the next barrier in its own
+\* queue.
 StepSinkPrepare ==
     /\ Is("SinkPrepare")
     /\ IF ForSink
-       THEN /\ CanPrepare(E.sub) /\ Min(barriers[E.sub]) = E.ckpt
-            /\ SinkPrepare(E.sub) \/ SinkPrepareFails(E.sub)
+       THEN \/ /\ CanPrepare(E.sub) /\ Min(barriers[E.sub]) = E.ckpt
+               /\ SinkPrepare(E.sub) \/ SinkPrepareFails(E.sub)
+            \/ /\ lost[E.sub].st # "down" /\ lost[E.sub].barriers # {}
+               /\ Min(lost[E.sub].barriers) = E.ckpt
+               /\ LostSinkPrepare(E.sub)
        ELSE Skip
+
+\* A checkpoint an earlier incarnation of the sink sealed, which the live one
+\* does not hold: the old incarnation's own lines about it are on a session
+\* the coordinator has dropped (sender.lost), and change nothing.
+FormerSeal(s, c) ==
+    /\ txn[s][c].st # "none"
+    /\ ~sink[s].up \/ txn[s][c].owner < sinkGen[s]
 
 StepSubtaskAck ==
     /\ Is("SubtaskAck")
     /\ IF ForSink
-       THEN /\ Len(sink[E.sub].ackDue) > 0
-            /\ Head(sink[E.sub].ackDue).c = E.ckpt /\ Head(sink[E.sub].ackDue).ok = E.ok
-            /\ SinkAck(E.sub)
+       THEN \/ /\ Len(sink[E.sub].ackDue) > 0
+               /\ Head(sink[E.sub].ackDue).c = E.ckpt /\ Head(sink[E.sub].ackDue).ok = E.ok
+               /\ SinkAck(E.sub)
+            \/ FormerSeal(E.sub, E.ckpt) /\ Skip
        ELSE Skip
 
 \* A completion decided before the takeover's line is the leader's, with the
@@ -228,46 +256,82 @@ StepBroadcast ==
                /\ Broadcast
             \/ SupersededBeforeTakeover /\ Skip
 
+\* An old incarnation's dispatch of a frame that was on the wire to it. The
+\* specification takes the dispatch and the commit as one step
+\* (LostSinkCommit): a refused frame is that step, and an accepted one is a
+\* stutter until its SinkCommit line.
 StepDeliverCommit ==
     /\ Is("DeliverCommit")
     /\ IF ForSink
-       THEN \E m \in msgs :
-               /\ m.kind = "commit" /\ m.s = E.sub /\ m.c = E.ckpt
-               /\ DeliverCommit /\ m \notin msgs'
-               /\ E.accepted <=> (/\ sink[E.sub].up
-                                  /\ ~(m.epoch < boundEpoch[Host[E.sub]])
-                                  /\ E.ckpt \in pendingHandles[E.sub]
-                                  /\ txn[E.sub][E.ckpt].st = "prepared")
+       THEN \/ \E m \in msgs :
+                  /\ m.kind = "commit" /\ m.s = E.sub /\ m.c = E.ckpt
+                  /\ DeliverCommit /\ m \notin msgs'
+                  /\ E.accepted <=> (/\ sink[E.sub].up
+                                     /\ ~(m.epoch < boundEpoch[Host[E.sub]])
+                                     /\ E.ckpt \in pendingHandles[E.sub]
+                                     /\ txn[E.sub][E.ckpt].st = "prepared")
+            \/ /\ E.ckpt \in LostCommitHead(E.sub)
+               /\ E.accepted <=> LostAccepts(E.sub, E.ckpt)
+               /\ IF E.accepted
+                  THEN Skip
+                  ELSE LostSinkCommit(E.sub) /\ <<E.sub, E.ckpt>> \notin lostCommits'
        ELSE Skip
 
 StepDeliverAbort ==
     /\ Is("DeliverAbort")
     /\ IF ForSink
-       THEN \E m \in msgs :
-               /\ m.kind = "abort" /\ m.s = E.sub /\ m.c = E.ckpt
-               /\ DeliverAbort /\ m \notin msgs'
-               /\ E.accepted <=> (/\ sink[E.sub].up
-                                  /\ ~(m.epoch < boundEpoch[Host[E.sub]])
-                                  /\ E.ckpt \in pendingHandles[E.sub]
-                                  /\ txn[E.sub][E.ckpt].st = "prepared"
-                                  /\ OutsideCommit(E.sub))
+       THEN \/ \E m \in msgs :
+                  /\ m.kind = "abort" /\ m.s = E.sub /\ m.c = E.ckpt
+                  /\ DeliverAbort /\ m \notin msgs'
+                  /\ E.accepted <=> (/\ sink[E.sub].up
+                                     /\ ~(m.epoch < boundEpoch[Host[E.sub]])
+                                     /\ E.ckpt \in pendingHandles[E.sub]
+                                     /\ txn[E.sub][E.ckpt].st = "prepared"
+                                     /\ OutsideCommit(E.sub))
+            \/ /\ <<E.sub, E.ckpt>> \in lostAborts /\ lost[E.sub].st # "down"
+               /\ E.accepted <=> (LostAccepts(E.sub, E.ckpt) /\ lost[E.sub].stage = "idle")
+               /\ LostDeliverAbort /\ <<E.sub, E.ckpt>> \notin lostAborts'
        ELSE Skip
 
+\* An old incarnation's SinkCommit is its accepted frame's commit
+\* (LostSinkCommit); a Kafka line means the broker committed. The line of a
+\* commit the specification took inside a reopening sink's open
+\* (OpenWindowCommits) can come after that open's own line: the commit has
+\* landed, and the line is a stutter.
 StepSinkCommit ==
     /\ Is("SinkCommit")
-    /\ IF ForSink THEN sink[E.sub].openTxn = E.ckpt /\ SinkCommit(E.sub) ELSE Skip
+    /\ IF ForSink
+       THEN \/ sink[E.sub].openTxn = E.ckpt /\ SinkCommit(E.sub)
+            \/ /\ E.ckpt \in LostCommitHead(E.sub) /\ LostAccepts(E.sub, E.ckpt)
+               /\ Kafka => txn[E.sub][E.ckpt].st = "prepared"
+               /\ LostSinkCommit(E.sub) /\ <<E.sub, E.ckpt>> \notin lostCommits'
+            \/ /\ Kafka /\ lost[E.sub].st # "down" /\ lost[E.sub].stage = "committed"
+               /\ lost[E.sub].openTxn = E.ckpt
+               /\ Skip
+       ELSE Skip
 
 StepSinkReceipt ==
     /\ Is("SinkReceipt")
-    /\ IF ForSink /\ Kafka THEN sink[E.sub].openTxn = E.ckpt /\ SinkReceipt(E.sub) ELSE Skip
+    /\ IF ForSink /\ Kafka
+       THEN \/ sink[E.sub].openTxn = E.ckpt /\ SinkReceipt(E.sub)
+            \/ /\ lost[E.sub].st # "down" /\ lost[E.sub].stage = "committed"
+               /\ lost[E.sub].openTxn = E.ckpt
+               /\ LostSinkReceipt(E.sub)
+       ELSE Skip
 
 \* The recoverable family's worker also reports CommitConfirmed; the model has
 \* no such step for it, so the event is a stutter there. For the Kafka family
 \* the line confirms the checkpoint the sink finished, a step with no line of
-\* its own (FinishNeeded).
+\* its own (FinishNeeded). An old incarnation's confirmation, sent once its
+\* commit callback has returned (after its receipt), is a stutter.
 StepSinkConfirm ==
     /\ Is("SinkConfirm")
-    /\ IF ForSink /\ Kafka THEN sink[E.sub].confirmDue = E.ckpt /\ SinkConfirm(E.sub) ELSE Skip
+    /\ IF ForSink /\ Kafka
+       THEN \/ sink[E.sub].confirmDue = E.ckpt /\ SinkConfirm(E.sub)
+            \/ /\ FormerSeal(E.sub, E.ckpt) /\ txn[E.sub][E.ckpt].st = "committed"
+               /\ ~(lost[E.sub].st # "down" /\ lost[E.sub].openTxn = E.ckpt)
+               /\ Skip
+       ELSE Skip
 
 \* The coordinator emits WriteConfirmed in the hold that advances its confirmed
 \* restore point, after the marker's put, so the leader's line stands for the
@@ -313,9 +377,13 @@ StepWriteConfirmed ==
 \* event names them in `spared`.
 Spared == IF Has(E, "spared") THEN {E.spared[k] : k \in DOMAIN E.spared} ELSE {}
 
+\* The line is the coordinator's declaration; whether the process is gone
+\* (WorkerDies) or still running (WorkerLostRunning) the engine cannot see,
+\* so the module takes either, within the budget the trace implies.
 StepWorkerDies ==
     /\ Is("WorkerDies")
-    /\ WorkerDiesKilling(E.worker, {s \in Sinks : placed[s] = E.worker /\ s \notin Spared})
+    /\ \E running \in BOOLEAN :
+          WorkerLost(E.worker, {s \in Sinks : placed[s] = E.worker /\ s \notin Spared}, running)
 
 \* The coordinator restarts the whole job for a subtask error or a transport
 \* failure it could not attribute to a worker loss: the survivors drain, then
@@ -488,7 +556,8 @@ FinishNeeded == E.event \in {"SinkPrepare", "SinkConfirm"} /\ ForSink /\ Kafka
 \* What the engine cannot observe and so never emits: the model may take
 \* these between events, within the budgets the trace implies.
 \* A dying leader takes its ids out of `triggered`; a superseded one keeps them,
-\* under the epoch it goes on triggering with.
+\* under the epoch it goes on triggering with. A lost worker's process
+\* stopping (LostSinkStops, LostSourceStops) has no line either.
 Hidden ==
     /\ \/ CoordDies /\ triggered' = {p \in triggered : p[1] # leaderEpoch}
        \/ /\ \/ CoordSuperseded \/ ZombieStops
@@ -496,6 +565,8 @@ Hidden ==
              \/ LostWriteCompleted \/ LostStaleCompletedAtWalk \/ LostWriteConfirmed
              \/ LostWalkDecides
              \/ FinishNeeded /\ SinkFinish(E.sub)
+             \/ \E s \in Sinks : LostSinkStops(s)
+             \/ LostSourceStops
           /\ UNCHANGED triggered
     /\ UNCHANGED <<l, ev, placed>>
 

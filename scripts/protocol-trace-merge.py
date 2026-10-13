@@ -103,6 +103,9 @@ def write_constants(events: list[dict], out: str) -> None:
         f"TraceMaxInFlight == {max_ckpt + 1}   \\* the engine does not bound in-flight checkpoints",
         f"TraceRecoverable == {'TRUE' if recoverable else 'FALSE'}",
         f"TraceMaxWorkerDeaths == {len(of('WorkerDies'))}",
+        # A WorkerDies line is the coordinator's declaration; the process may
+        # still be running, which the engine cannot see, so any of them may be.
+        f"TraceMaxLostRunning == {len(of('WorkerDies'))}",
         f"TraceMaxCoordDeaths == {len(of('CoordRecovers'))}",
         f"TraceMaxSnapFails == {sum(1 for e in of('SubtaskAck') if not e.get('ok', True))}",
         f"TraceMaxExpiries == {sum(1 for e in of('WalkProbes') if e.get('verdict') == 'refused')}",

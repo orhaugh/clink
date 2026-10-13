@@ -99,6 +99,33 @@ weakly fair. The job's restart budget is a bound of its own
 (`MaxJobRestarts`): a failed checkpoint rewinds the job while budget is
 left, and fails the job when none is.
 
+A worker loss is the coordinator's declaration, and the process need not be
+dead (`WorkerLost`). The coordinator declares a worker lost for heartbeat
+silence, for an outbound stall or for an outbound queue overflow; it posts
+nothing more to the session and drops whatever the session sends. Frames
+already handed to the kernel still reach the process, which executes them
+before it reads the end of the session. `WorkerDies` is the process gone;
+`WorkerLostRunning` is the process still running, and `MaxLostRunning` bounds
+how many losses may be of that kind. Each sink the running process hosted
+becomes an old incarnation (`lost[s]`, beside the live `sink[s]` the restart
+deploys). It executes only the frames on its wire at the declaration
+(`lostCommits`, `lostAborts`) and the barriers already queued to it, and seals
+or commits accordingly (`LostSinkPrepare`, `LostSinkCommit`, `LostSinkReceipt`,
+`LostDeliverAbort`). If the process hosts the source, its
+`TriggerCheckpoint` frames stay deliverable there (`LostDeliverBarrier`): the
+barrier reaches the run's sinks over the data plane until the redeploy rewires
+it, and the checkpoint can never complete, since the coordinator drops the
+source's ack. Nothing the process sends counts, so acks and `CommitConfirmed`
+have no step. A hidden step stops each old incarnation (`LostSinkStops`,
+`LostSourceStops`), and one that can do nothing more is taken as stopped
+(`Settle`), which keeps the states it adds to those that differ. Three things
+are left out and stated as such: a sink still opening at the declaration is
+taken down at once, although its open may finish on the lost process; a
+coordinator's death or supersession takes the old incarnations down with every
+other sink, as it already took every frame on the wire; and the lost source's
+barriers are not followed past the redeploy, where they reach only its own
+process, whose checkpoint cannot complete.
+
 The `CONFIRMED` marker takes three steps where `COMPLETED` takes one, because
 the coordinator puts it outside its lock: the hold that drains the
 confirmation set (inside `SinkConfirm`) leaves the marker due, `WriteConfirmed`
@@ -142,15 +169,30 @@ go from a step in a counterexample to the code.
 
 | Model | Family | Bounds | What it adds |
 |---|---|---|---|
-| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault | The push gate for the Kafka family |
-| `MC_KafkaTwoInFlight` | Kafka | as above with 2 checkpoints in flight, no coordinator death or broker fault | The barrier for the next interval overtaking an outstanding commit; a failed checkpoint below a completing one |
-| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight | Re-commit at open, restore from the newest completed checkpoint |
-| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall` with no restart budget and no error restarts | A failed checkpoint that cannot rewind fails the job rather than completing above itself |
-| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault | Checks `EventuallySettled` as well as the invariants |
+| `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault; no lost worker left running | The push gate for the Kafka family |
+| `MC_KafkaTwoInFlight` | Kafka | as above with 2 checkpoints in flight, no coordinator death or broker fault; a lost worker may run on | The barrier for the next interval overtaking an outstanding commit; a failed checkpoint below a completing one |
+| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight; no lost worker left running | Re-commit at open, restore from the newest completed checkpoint |
+| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall` with no restart budget and no error restarts; a lost worker may run on | A failed checkpoint that cannot rewind fails the job rather than completing above itself; an old incarnation's commit racing the re-commit at open |
+| `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault; no lost worker left running | Checks `EventuallySettled` as well as the invariants |
+| `MC_KafkaLostWorker` | Kafka | as `MC_KafkaLiveness`, safety only, with the lost worker running on | An old incarnation executing the frames on its wire alongside the drain, the walk, the redeploy and the reopening sinks |
 
 Bounds are small on purpose: a push gate has minutes, and within its bounds
 TLC is exhaustive. Larger bounds are for a deliberate longer run, not for
 the gate.
+
+`MaxLostRunning` is 1 in `MC_KafkaTwoInFlight`, `MC_RecoverableNoBudget` and
+`MC_KafkaLostWorker`, and 0 in the other three. A lost worker left running about
+doubles a search (2.4 times for `MC_KafkaTwoInFlight`, 2.1 for
+`MC_RecoverableNoBudget`), and `MC_RecoverableSmall` and `MC_KafkaSmall` each
+fill a CI job of their own already, so they keep the old search, as does
+`MC_KafkaLiveness`, whose strongly connected components pass grows with it.
+The cost of that choice: in the Kafka family the lost worker is checked with
+every fault at two checkpoints (`MC_KafkaLostWorker`) and at three checkpoints
+with fewer faults (`MC_KafkaTwoInFlight`), and in the recoverable family with
+the restart budget spent (`MC_RecoverableNoBudget`); nothing checks it at three
+checkpoints with every fault, and liveness is not checked with it. With
+`MaxLostRunning` at 0 the extension adds no state (`MC_KafkaTwoInFlight` gives
+the same 101,698 states as before it).
 
 ## Mutants: the model must see what the rigs saw
 
@@ -181,12 +223,13 @@ each and judges the outcome against `mutants/expected.txt`.
 | `restore_from_memory` | The in-memory restore point advances with the durable marker, not before | this model | refuted: FrontierCovered |
 | `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | refuted: NoLoss |
 | `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its CONFIRMED marker is durable | review of the per-connection dispatch change | refuted: ConfirmedMemoryOnDisk |
+| `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan (abort, or the receipt of the commit that beat the abort) before `init_transactions` | this model, once a lost worker could run on | refuted: NoDuplicate. The engine still opens this way; the change it implies is specified, not yet made (see What the model found) |
 
 A mutant TLC accepts is recorded in `mutants/expected.txt`, not deleted: it
 means a later rule guards the same defect (defence in depth), and the check
 then holds that record in both directions: the day TLC refutes an
 `accepted` mutant, the other guard has gone and the record is wrong. Two of
-the seventeen are accepted today, both superseded by receipts, in-doubt
+the eighteen are accepted today, both superseded by receipts, in-doubt
 resolution and the marker rule the refusal-wall finding added; the withheld
 broadcast left that set when trace validation widened the specification,
 and the check would have failed had it stayed recorded as accepted. The
@@ -224,6 +267,34 @@ mutant above:
    coordinator could not see, and the recoverable sinks had already
    re-committed its handles at open. Fix: memory advances with the durable
    write.
+
+A fourth came later, and its engine fix has not landed:
+
+4. **The orphan left to the init.** Once a worker declared lost could run on
+   (`WorkerLost`), TLC found a duplicate, a counterexample 28 states long,
+   on the `MC_KafkaLiveness` bounds. A checkpoint completes and its commit frame is
+   on the wire to w1 when w1 is declared lost, still running. The walk is
+   cancelled before it probes anything and leaves `.unresolved` markers; the
+   job restores from the confirmed point below. s1's new incarnation opens:
+   its describe sees the orphan `Ongoing` and writes no receipt; the old
+   incarnation's commit lands; `init_transactions` finds the transaction
+   committed and aborts nothing; suppression arms with no receipt; and the
+   replay publishes the interval again. The engine's open is that shape
+   (`resolve_unresolved_orphan_` in `impls/kafka/src/register_factories.cpp`
+   leaves an undecided orphan "for the init below" to abort). The
+   specification now states the fixed open: the reopening sink ends an
+   undecided orphan with `EndTxn(abort)` under the orphan's own identity
+   before the init, and if that abort is refused because the old incarnation's
+   commit got there first, it describes again and writes the receipt. Either
+   way the outcome is decided, and known, before the fence and before
+   suppression arms. The broker offers no way to learn a transaction's outcome
+   once a later `init_transactions` has superseded it, so fencing first and
+   asking afterwards is not an option. Abort rather than commit because the
+   restore point is already below the orphan, so the replay re-produces its
+   interval whatever the open does, and an abort makes the replay the only
+   copy without leaning on replay suppression. The mutant keeps today's open.
+   The engine change is specified in a separate note for its implementer; until
+   it lands, the specification's open is ahead of the engine's.
 
 ## Trace validation
 
@@ -336,6 +407,29 @@ the takeover's walk left open, as `RestartProceeds` requires
 re-registers keeps whatever was placed on its new session when the old one is
 retired, and a new session lost while still retiring the old one leaves the
 old session's subtasks to that retirement.
+
+A `WorkerDies` line is the coordinator's declaration, and the module takes it
+either way: the process gone, or still running (`WorkerLost` with `running`
+true, within `TraceMaxLostRunning`, one per `WorkerDies` line). A process
+still running goes on writing lines for the frames already on the wire to it.
+Its source's `DeliverBarrier` is `LostDeliverBarrier`; its old incarnations'
+`SinkPrepare`, `SinkCommit`, `SinkReceipt` and `DeliverAbort` are
+`LostSinkPrepare`, `LostSinkCommit`, `LostSinkReceipt` and `LostDeliverAbort`;
+a `DeliverCommit` it refused is `LostSinkCommit` with no effect, and one it
+accepted is a stutter until its `SinkCommit`, since the specification takes the
+dispatch and the commit as one step. Its `SubtaskAck` and `SinkConfirm` lines
+are stutters: the coordinator drops a lost session's frames. They are accepted
+for a checkpoint an earlier incarnation of the sink sealed and the live one does
+not hold, which is looser than the old incarnation's own record, since the
+specification stops following an old incarnation that can do nothing more. Its
+process stopping has no line: `LostSinkStops` and `LostSourceStops` are hidden
+steps. `traces/lost-worker-commits-after-declaration` is the run that showed
+it, recorded with a temporary test that held a worker's reader on a `Deploy`
+until the coordinator's outbound stall verdict declared the worker lost, then
+let it read the `CommitCheckpoint` already queued behind that `Deploy`. Before
+this module it diverged at event 44, the lost worker's accepted
+`DeliverCommit`; it is accepted now, the recovery re-commit at the next open a
+no-op.
 
 To record a run: set the variable, run the job (the in-process protocol
 trace test and every multi-process harness test do this themselves when
