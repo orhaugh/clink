@@ -139,10 +139,10 @@ of the `coordinator.worker_lost` event. It is one of three:
 - `outbound queue stopped (<reason>): <detail>`: the worker's outbound queue on
   the coordinator stopped by itself. `overflow` means more was queued for the
   worker than the outbound bounds allow, so it had stopped reading for a while
-  (the detail names the bound); `write_failed` means the connection broke under
-  the coordinator's writer, usually because the worker went away; `allocation`
-  means the coordinator could not allocate memory to queue a frame, so look at
-  the coordinator's own memory.
+  (the detail names the bound); `allocation` means the coordinator could not
+  allocate memory to queue a frame, so look at the coordinator's own memory. A
+  connection that broke under the coordinator's writer is not a cause of its
+  own: the worker's heartbeats stop with it, and it reads `heartbeat timeout`.
 
 **Look at:** whether the job recovered. The coordinator logs
 `awaiting_restart (attempt N/M)` and then a redeploy. If both appear and the job is

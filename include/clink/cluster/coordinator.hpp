@@ -417,8 +417,9 @@ public:
         // restart, long before the drain deadline would fail the job. Zero
         // or less turns the check off, and so does a value too large for the
         // clock (up to milliseconds::max()), which never passes; either way,
-        // a worker whose outbound queue overflows, or whose transport fails
-        // under the writer, is declared lost all the same.
+        // a worker whose outbound queue overflows is declared lost all the
+        // same. A transport that fails under the writer is left to
+        // heartbeat_timeout: the worker's heartbeats stop with it.
         std::chrono::milliseconds outbound_stall_timeout{10000};
         // Most frames, and most bytes, one worker connection may have queued
         // for its writer: control frames (every frame but a Deploy) in number

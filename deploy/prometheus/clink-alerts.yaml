@@ -94,8 +94,7 @@ groups:
             heartbeat timeout (the worker went silent: a crash, a pause, or a
             timeout set too tight for the network), no outbound progress (it
             kept heartbeating but stopped reading what it was sent), or
-            outbound queue stopped (its queue overflowed, or the connection
-            failed under the coordinator's writer). One is a restart; a
+            outbound queue stopped (its queue overflowed). One is a restart; a
             repeating count is a crash loop or one of these recurring.
 
       # Restarts are the self-healing path working. A SUSTAINED restart rate

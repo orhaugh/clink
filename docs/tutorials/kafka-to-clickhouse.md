@@ -245,12 +245,8 @@ docker compose logs coordinator | grep -iE 'lost|restart|restore'
                        0 free; a worker re-registration re-fires this restart
 ```
 
-The words in parentheses are why the Coordinator gave up on the Worker, and they
-vary. A killed Worker usually goes silent first, which reads `heartbeat timeout`.
-If a frame the Coordinator sends it fails to write before the heartbeat timeout
-runs out, the line names its outbound queue instead, as in
-`(outbound queue stopped (write_failed): ...)`. Either way the restart that
-follows is the same.
+The words in parentheses are why the Coordinator gave up on the Worker. A killed
+Worker goes silent, which reads `heartbeat timeout`.
 
 The job is not failed and not abandoned. It is waiting for somewhere to run.
 Give it somewhere:

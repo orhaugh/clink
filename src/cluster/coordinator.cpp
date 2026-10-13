@@ -108,10 +108,16 @@ PostResult post_to(std::shared_ptr<Outbox> outbox, const Outbox::Frame& frame, F
         switch (s.stop_reason) {
             case OutboxStopReason::Overflow:
             case OutboxStopReason::Allocation:
-            case OutboxStopReason::WriteFailed:
                 return "outbound queue stopped (" + std::string{to_string(s.stop_reason)} +
                        "): " + s.stop_detail;
             default:
+                // A transport that failed under the writer is a connection
+                // that is gone both ways: the worker's heartbeats stop with
+                // it, and heartbeat_timeout declares the loss. Taking it at
+                // once would race the worker's own re-registration when the
+                // worker retired the session itself, as it does when its
+                // lease runs out across a coordinator pause, and the
+                // re-registration is what retires the old session then.
                 return {};
         }
     }
@@ -6780,11 +6786,13 @@ void Coordinator::watchdog_loop_() {
                 // in a dispatch pauses the worker's own lease, so only what
                 // the coordinator cannot write to it shows it: its frames
                 // stalled past outbound_stall_timeout, or its outbox stopped
-                // by itself (an overflow, a failed allocation, a transport
-                // that failed under the writer). A stopped outbox has closed
-                // the connection, so the watchdog takes that at once rather
-                // than waiting out heartbeat_timeout. Both read only the
-                // outbox, whose lock is a leaf, so they are safe under mu_.
+                // by itself on an overflow or a failed allocation. Such a
+                // stop has closed the connection of a worker that may still
+                // be heartbeating, so the watchdog takes it at once rather
+                // than waiting out heartbeat_timeout. A failed transport is
+                // left to heartbeat_timeout (outbound_loss_cause). Both read
+                // only the outbox, whose lock is a leaf, so they are safe
+                // under mu_.
                 const auto outbox = worker->outbox;
                 if (const auto cause =
                         outbound_loss_cause(*outbox, now, cfg_.outbound_stall_timeout);
