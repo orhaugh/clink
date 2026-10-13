@@ -171,7 +171,8 @@ std::uint64_t new_run_checkpoint_floor(const std::string& checkpoint_dir,
                 continue;
             }
             try {
-                floor = std::max(floor, std::stoull(name.substr(prefix.size())));
+                floor = std::max(
+                    floor, static_cast<std::uint64_t>(std::stoull(name.substr(prefix.size()))));
             } catch (const std::exception&) {
                 // Not a marker this layout names; it bounds nothing.
             }
