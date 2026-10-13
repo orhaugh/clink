@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "clink/cluster/config_lint.hpp"
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/config/json.hpp"
@@ -80,6 +81,10 @@ void usage() {
               << "                               flag: the node fixes it at 500 and only the\n"
               << "                               embedded API can change it. Accepted here\n"
               << "                               because the timeout check needs it.\n"
+              << "  --outbound-stall-timeout-ms=N, --max-outbound-control-frames=N,\n"
+              << "  --max-outbound-control-bytes=N, --max-outbound-bulk-bytes=N,\n"
+              << "  --restart-drain-timeout-ms=N  outbound queue settings, checked\n"
+              << "                               against the liveness ones\n"
               << "     Checked only when at least one is given, because linting the\n"
               << "     defaults of a process this command is not starting would report\n"
               << "     problems about a cluster nobody configured.\n"
@@ -206,6 +211,43 @@ int clink_cmd_lint(int argc, char** argv) {
         const auto to = std::stoll(get_arg(argc, argv, "heartbeat-timeout-ms", "5000"));
         const auto wd = std::stoll(get_arg(argc, argv, "watchdog-interval-ms", "200"));
         for (auto& p : clink::cluster::lint_liveness_config(hb, to, wd)) {
+            problems.push_back(std::move(p));
+        }
+    }
+
+    // The outbound settings, on the same terms: only when a cluster flag was
+    // given, and with clink_node's defaults for the ones that were not. Those
+    // defaults are Coordinator::Config's own, which clink_node takes as well.
+    const bool any_outbound = has_arg(argc, argv, "outbound-stall-timeout-ms") ||
+                              has_arg(argc, argv, "max-outbound-control-frames") ||
+                              has_arg(argc, argv, "max-outbound-control-bytes") ||
+                              has_arg(argc, argv, "max-outbound-bulk-bytes") ||
+                              has_arg(argc, argv, "restart-drain-timeout-ms");
+    if (any_liveness || any_outbound) {
+        const clink::cluster::Coordinator::Config defaults;
+        clink::cluster::OutboundLintInput in;
+        in.outbound_stall_timeout_ms =
+            std::stoll(get_arg(argc,
+                               argv,
+                               "outbound-stall-timeout-ms",
+                               std::to_string(defaults.outbound_stall_timeout.count())));
+        in.heartbeat_timeout_ms = std::stoll(get_arg(argc, argv, "heartbeat-timeout-ms", "5000"));
+        in.watchdog_interval_ms = std::stoll(get_arg(argc, argv, "watchdog-interval-ms", "200"));
+        in.restart_drain_timeout_ms =
+            std::stoll(get_arg(argc, argv, "restart-drain-timeout-ms", "120000"));
+        // Negative counts are clink_node's to refuse at startup; here they
+        // read as the zero that the lint refuses.
+        const auto bound = [&](const char* flag, std::size_t fallback) -> std::uint64_t {
+            const long long v = std::stoll(get_arg(argc, argv, flag, std::to_string(fallback)));
+            return v < 0 ? 0 : static_cast<std::uint64_t>(v);
+        };
+        in.max_outbound_control_frames =
+            bound("max-outbound-control-frames", defaults.max_outbound_control_frames);
+        in.max_outbound_control_bytes =
+            bound("max-outbound-control-bytes", defaults.max_outbound_control_bytes);
+        in.max_outbound_bulk_bytes =
+            bound("max-outbound-bulk-bytes", defaults.max_outbound_bulk_bytes);
+        for (auto& p : clink::cluster::lint_outbound_config(in)) {
             problems.push_back(std::move(p));
         }
     }

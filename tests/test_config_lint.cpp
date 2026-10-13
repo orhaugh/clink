@@ -25,6 +25,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/config_lint.hpp"
 #include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/worker.hpp"
@@ -278,6 +279,107 @@ TEST(ConfigLint, LivenessCheckesIgnoreUnsetValues) {
     // zeros are misconfigured.
     EXPECT_TRUE(lint_liveness_config(0, 0, 0).empty());
     EXPECT_TRUE(lint_liveness_config(500, 0, 0).empty());
+}
+
+// --- outbound ------------------------------------------------------------
+
+namespace {
+
+// What clink_node runs with when no flag changes it: Coordinator::Config's
+// outbound defaults, and clink_node's own liveness defaults.
+OutboundLintInput shipped_outbound() {
+    const Coordinator::Config d;
+    OutboundLintInput in;
+    in.outbound_stall_timeout_ms = d.outbound_stall_timeout.count();
+    in.heartbeat_timeout_ms = 5000;
+    in.watchdog_interval_ms = 200;
+    in.restart_drain_timeout_ms = 120000;
+    in.max_outbound_control_frames = d.max_outbound_control_frames;
+    in.max_outbound_control_bytes = d.max_outbound_control_bytes;
+    in.max_outbound_bulk_bytes = d.max_outbound_bulk_bytes;
+    return in;
+}
+
+}  // namespace
+
+TEST(ConfigLint, TheShippedOutboundDefaultsAreClean) {
+    // Against clink_node's defaults and against Coordinator::Config's own
+    // (2000 ms heartbeat timeout, 100 ms watchdog, 120 s drain).
+    const auto node = lint_outbound_config(shipped_outbound());
+    EXPECT_TRUE(node.empty()) << render_problems(node);
+
+    const Coordinator::Config d;
+    auto in = shipped_outbound();
+    in.heartbeat_timeout_ms = d.heartbeat_timeout.count();
+    in.watchdog_interval_ms = d.watchdog_interval.count();
+    in.restart_drain_timeout_ms = d.restart_drain_timeout.count();
+    const auto library = lint_outbound_config(in);
+    EXPECT_TRUE(library.empty()) << render_problems(library);
+}
+
+TEST(ConfigLint, AnOutboundBoundOfZeroIsRefused) {
+    // Outbox::post refuses a frame whose class is at its bound, so at zero
+    // every worker is lost at its first frame of that class.
+    for (const char* setting :
+         {"max_outbound_control_frames", "max_outbound_control_bytes", "max_outbound_bulk_bytes"}) {
+        auto in = shipped_outbound();
+        const std::string s{setting};
+        if (s == "max_outbound_control_frames") {
+            in.max_outbound_control_frames = 0;
+        } else if (s == "max_outbound_control_bytes") {
+            in.max_outbound_control_bytes = 0;
+        } else {
+            in.max_outbound_bulk_bytes = 0;
+        }
+        const auto ps = lint_outbound_config(in);
+        EXPECT_TRUE(has_error_for(ps, setting)) << setting << "\n" << render_problems(ps);
+    }
+}
+
+TEST(ConfigLint, ABulkBoundBelowOneLargestFrameWarns) {
+    auto in = shipped_outbound();
+    in.max_outbound_bulk_bytes = kMaxFrameBytes - 1;
+    const auto below = lint_outbound_config(in);
+    EXPECT_TRUE(has_warning_for(below, "max_outbound_bulk_bytes")) << render_problems(below);
+    EXPECT_FALSE(has_any_error(below));
+
+    in.max_outbound_bulk_bytes = kMaxFrameBytes;
+    EXPECT_TRUE(lint_outbound_config(in).empty());
+}
+
+TEST(ConfigLint, AStallTimeoutNotAboveTheHeartbeatTimeoutWarns) {
+    auto in = shipped_outbound();
+    in.outbound_stall_timeout_ms = in.heartbeat_timeout_ms;
+    const auto ps = lint_outbound_config(in);
+    EXPECT_TRUE(has_warning_for(ps, "outbound_stall_timeout")) << render_problems(ps);
+    EXPECT_FALSE(has_any_error(ps));
+}
+
+TEST(ConfigLint, AStallTimeoutNotBelowTheDrainDeadlineWarns) {
+    auto in = shipped_outbound();
+    in.outbound_stall_timeout_ms = in.restart_drain_timeout_ms;
+    const auto ps = lint_outbound_config(in);
+    EXPECT_TRUE(has_warning_for(ps, "outbound_stall_timeout")) << render_problems(ps);
+}
+
+TEST(ConfigLint, AWatchdogSlowerThanTheStallTimeoutWarns) {
+    auto in = shipped_outbound();
+    in.watchdog_interval_ms = in.outbound_stall_timeout_ms + 1;
+    const auto ps = lint_outbound_config(in);
+    EXPECT_TRUE(has_warning_for(ps, "watchdog_interval")) << render_problems(ps);
+}
+
+TEST(ConfigLint, AStallCheckTurnedOffIsNotComparedWithAnything) {
+    // Zero or less turns the stall verdict off; a check that never runs has
+    // no timing to get wrong. The bounds are still checked.
+    auto in = shipped_outbound();
+    in.watchdog_interval_ms = 600000;
+    for (const std::int64_t off : {std::int64_t{0}, std::int64_t{-1}}) {
+        in.outbound_stall_timeout_ms = off;
+        EXPECT_TRUE(lint_outbound_config(in).empty()) << off;
+    }
+    in.max_outbound_bulk_bytes = 0;
+    EXPECT_TRUE(has_error_for(lint_outbound_config(in), "max_outbound_bulk_bytes"));
 }
 
 // --- the submission gate -------------------------------------------------

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**A worker that stops reading no longer holds up the coordinator.** Each
+frame to a worker was sent by the thread that decided it, so a worker that had
+stopped reading, behind a large `Deploy` say, held that thread in `send()`, and
+when the sender held the coordinator's lock the watchdog stopped too: no worker
+could be declared lost until the send ended. Every frame to a worker after its
+`RegisterAck` now goes through that connection's outbox, a queue its own writer
+thread writes, so no thread that decides a frame waits on the peer. A worker
+whose queued frames make no progress for `outbound_stall_timeout` (10 s by
+default) is declared lost even while it goes on heartbeating, and so is one
+whose queue reaches a bound (10000 control frames or 64 MiB of them, or 1 GiB
+of `Deploy`s); the loss is logged with its cause, and
+`clink_coordinator_outbound_frames_discarded_total` counts what was given up.
+`stop()` lets the queues drain for up to `outbound_flush_timeout` (1 s).
+`clink_node` takes the settings as `--outbound-stall-timeout-ms`,
+`--outbound-flush-timeout-ms`, `--max-outbound-control-frames`,
+`--max-outbound-control-bytes` and `--max-outbound-bulk-bytes`, reports them on
+`GET /api/v1/config` and refuses a bound of zero, and `clink lint` checks them
+against the liveness settings. A submit whose `Deploy` is refused after its job
+is published now reports the job instead of failing, since a resubmit ran a
+second copy.
+
 **A commit that reaches a sink after its teardown has begun is refused, not
 confirmed.** A worker delivers `CommitCheckpoint` to a sink on its own thread,
 and a cancel, a restart or the end of the worker's coordinator session could

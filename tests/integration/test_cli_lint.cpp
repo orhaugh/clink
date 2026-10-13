@@ -189,6 +189,25 @@ TEST_F(CliLintTest, TheNodeDefaultsAreWhatGetLinted) {
                               << r.output;
 }
 
+TEST_F(CliLintTest, TheOutboundSettingsAreCheckedAgainstTheLivenessOnes) {
+    // clink_node's outbound defaults are Coordinator::Config's own, and
+    // against its liveness defaults they come back clean.
+    const auto clean = run_lint("--outbound-stall-timeout-ms=10000");
+    EXPECT_EQ(clean.exit_code, 0) << clean.output;
+    EXPECT_FALSE(clean.mentions("outbound")) << clean.output;
+
+    // A bound of zero loses every worker at its first frame: an error.
+    const auto zero = run_lint("--max-outbound-bulk-bytes=0");
+    EXPECT_EQ(zero.exit_code, 1) << zero.output;
+    EXPECT_TRUE(zero.mentions("max_outbound_bulk_bytes")) << zero.output;
+
+    // A stall timeout under the heartbeat timeout given beside it: a warning.
+    const auto short_stall =
+        run_lint("--heartbeat-timeout-ms=5000 --outbound-stall-timeout-ms=3000");
+    EXPECT_EQ(short_stall.exit_code, 0) << short_stall.output;
+    EXPECT_TRUE(short_stall.mentions("outbound_stall_timeout")) << short_stall.output;
+}
+
 // --- guarantee cross-check (follow-up 24) -----------------------------------
 //
 // The config linter and the delivery-guarantee analyser answer adjacent

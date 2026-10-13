@@ -81,6 +81,24 @@ struct ConfigProblem {
                                                               std::int64_t heartbeat_timeout_ms,
                                                               std::int64_t watchdog_interval_ms);
 
+// The coordinator's outbound settings (Coordinator::Config's
+// outbound_stall_timeout and max_outbound_*), with the liveness settings
+// they are measured against. Every value is the one in effect: a
+// coordinator has all of them, defaults included, so none means "unknown".
+struct OutboundLintInput {
+    std::int64_t outbound_stall_timeout_ms{0};
+    std::int64_t heartbeat_timeout_ms{0};
+    std::int64_t watchdog_interval_ms{0};
+    std::int64_t restart_drain_timeout_ms{0};
+    std::uint64_t max_outbound_control_frames{0};
+    std::uint64_t max_outbound_control_bytes{0};
+    std::uint64_t max_outbound_bulk_bytes{0};
+};
+
+// Lint the outbound settings. Belongs to the coordinator process, like the
+// liveness settings.
+[[nodiscard]] std::vector<ConfigProblem> lint_outbound_config(const OutboundLintInput& in);
+
 // Render for a human. One line per problem, errors first.
 [[nodiscard]] std::string render_problems(const std::vector<ConfigProblem>& problems);
 

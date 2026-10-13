@@ -544,6 +544,11 @@ void write_coordinator_config(clink::http::JsonWriter& w,
     w.kv("handshake_timeout_ms",
          std::chrono::duration_cast<std::chrono::milliseconds>(c.handshake_timeout).count());
     w.kv("max_pending_connections", static_cast<std::int64_t>(c.max_pending_connections));
+    w.kv("outbound_flush_timeout_ms", static_cast<std::int64_t>(c.outbound_flush_timeout.count()));
+    w.kv("outbound_stall_timeout_ms", static_cast<std::int64_t>(c.outbound_stall_timeout.count()));
+    w.kv("max_outbound_control_frames", static_cast<std::int64_t>(c.max_outbound_control_frames));
+    w.kv("max_outbound_control_bytes", static_cast<std::int64_t>(c.max_outbound_control_bytes));
+    w.kv("max_outbound_bulk_bytes", static_cast<std::int64_t>(c.max_outbound_bulk_bytes));
     w.end_object();
 }
 
@@ -2017,6 +2022,33 @@ int run_coordinator(int argc, char** argv) {
                 argv,
                 "max-pending-connections",
                 std::to_string(kCfgDefaults.max_pending_connections));
+    // The worker connections' outbound queues (Coordinator::Config's
+    // outbound_flush_timeout, outbound_stall_timeout and max_outbound_*).
+    const auto outbound_flush_timeout_str =
+        get_arg(argc,
+                argv,
+                "outbound-flush-timeout-ms",
+                std::to_string(kCfgDefaults.outbound_flush_timeout.count()));
+    const auto outbound_stall_timeout_str =
+        get_arg(argc,
+                argv,
+                "outbound-stall-timeout-ms",
+                std::to_string(kCfgDefaults.outbound_stall_timeout.count()));
+    const auto max_outbound_control_frames_str =
+        get_arg(argc,
+                argv,
+                "max-outbound-control-frames",
+                std::to_string(kCfgDefaults.max_outbound_control_frames));
+    const auto max_outbound_control_bytes_str =
+        get_arg(argc,
+                argv,
+                "max-outbound-control-bytes",
+                std::to_string(kCfgDefaults.max_outbound_control_bytes));
+    const auto max_outbound_bulk_bytes_str =
+        get_arg(argc,
+                argv,
+                "max-outbound-bulk-bytes",
+                std::to_string(kCfgDefaults.max_outbound_bulk_bytes));
     // Cluster-level default state backend for jobs that submit without their
     // own --state-backend. Empty (default) keeps the legacy resolution
     // (memory / file-from-checkpoint-dir). Set it to a deferring backend to
@@ -2061,6 +2093,35 @@ int run_coordinator(int argc, char** argv) {
             return 2;
         }
         cfg.max_pending_connections = static_cast<std::size_t>(max_pending);
+        // The timeouts take zero or less as meaningful (discard at once, turn
+        // the stall verdict off). The bounds are counts: parsed signed so a
+        // negative one is refused rather than read as a huge one.
+        cfg.outbound_flush_timeout =
+            std::chrono::milliseconds{std::stoll(outbound_flush_timeout_str)};
+        cfg.outbound_stall_timeout =
+            std::chrono::milliseconds{std::stoll(outbound_stall_timeout_str)};
+        const auto parse_bound =
+            [](const char* flag, const std::string& text, std::size_t& out) -> bool {
+            const long long value = std::stoll(text);
+            if (value < 0) {
+                std::cerr << "coordinator: --" << flag << "=" << text
+                          << " is out of range: give 0 or more\n";
+                return false;
+            }
+            out = static_cast<std::size_t>(value);
+            return true;
+        };
+        if (!parse_bound("max-outbound-control-frames",
+                         max_outbound_control_frames_str,
+                         cfg.max_outbound_control_frames) ||
+            !parse_bound("max-outbound-control-bytes",
+                         max_outbound_control_bytes_str,
+                         cfg.max_outbound_control_bytes) ||
+            !parse_bound("max-outbound-bulk-bytes",
+                         max_outbound_bulk_bytes_str,
+                         cfg.max_outbound_bulk_bytes)) {
+            return 2;
+        }
     }
     cfg.restart_drain_timeout = std::chrono::milliseconds{std::stoll(restart_drain_timeout_str)};
     cfg.default_state_backend_uri = default_state_backend;
@@ -2099,6 +2160,34 @@ int run_coordinator(int argc, char** argv) {
              std::chrono::duration_cast<std::chrono::milliseconds>(cfg.watchdog_interval)
                  .count())) {
         clink::log::warn("node.config", problem.setting + ": " + problem.message);
+    }
+    // The outbound settings likewise, with one exception: a bound of zero
+    // costs every worker its connection at its first frame of that class,
+    // which no reason makes useful, so it is refused.
+    {
+        using std::chrono::duration_cast;
+        using std::chrono::milliseconds;
+        clink::cluster::OutboundLintInput outbound;
+        outbound.outbound_stall_timeout_ms = cfg.outbound_stall_timeout.count();
+        outbound.heartbeat_timeout_ms = duration_cast<milliseconds>(cfg.heartbeat_timeout).count();
+        outbound.watchdog_interval_ms = duration_cast<milliseconds>(cfg.watchdog_interval).count();
+        outbound.restart_drain_timeout_ms =
+            duration_cast<milliseconds>(cfg.restart_drain_timeout).count();
+        outbound.max_outbound_control_frames = cfg.max_outbound_control_frames;
+        outbound.max_outbound_control_bytes = cfg.max_outbound_control_bytes;
+        outbound.max_outbound_bulk_bytes = cfg.max_outbound_bulk_bytes;
+        bool refused = false;
+        for (const auto& problem : clink::cluster::lint_outbound_config(outbound)) {
+            if (problem.is_error()) {
+                std::cerr << "coordinator: " << problem.setting << ": " << problem.message << "\n";
+                refused = true;
+            } else {
+                clink::log::warn("node.config", problem.setting + ": " + problem.message);
+            }
+        }
+        if (refused) {
+            return 2;
+        }
     }
 
     Coordinator coordinator(cfg);
@@ -3350,7 +3439,20 @@ int main(int argc, char** argv) {
                    "                               it the least advanced connection from the\n"
                    "                               busiest peer address is evicted, or the new\n"
                    "                               one refused.\n"
-                << "  --ha-allow-unsafe-locks      Stand for leadership even when --ha-dir is on "
+                << "  --outbound-stall-timeout-ms=<n> how long frames may wait for a worker\n"
+                   "                               with none moving before it is declared\n"
+                   "                               lost (default 10000; 0 or less turns the\n"
+                   "                               check off).\n"
+                << "  --outbound-flush-timeout-ms=<n> how long shutdown lets queued frames reach\n"
+                   "                               the workers (default 1000).\n"
+                << "  --max-outbound-control-frames=<n> control frames one worker may have\n"
+                   "                               queued (default 10000).\n"
+                << "  --max-outbound-control-bytes=<n> bytes of them (default 67108864).\n"
+                << "  --max-outbound-bulk-bytes=<n> bytes of Deploys one worker may have\n"
+                   "                               queued (default 1073741824). A worker\n"
+                   "                               whose queue reaches a bound is declared\n"
+                   "                               lost; 0 is refused.\n"
+                << "  --ha-allow-unsafe-locks     Stand for leadership even when --ha-dir is on "
                    "a\n"
                    "                               filesystem that does not honour the leader "
                    "lock.\n"

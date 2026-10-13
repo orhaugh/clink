@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <sstream>
+#include <string>
 #include <vector>
 
+#include "clink/cluster/frame_io.hpp"
 #include "clink/runtime/key_groups.hpp"
 
 namespace clink::cluster {
@@ -323,6 +325,92 @@ std::vector<ConfigProblem> lint_liveness_config(std::int64_t heartbeat_interval_
                            std::to_string(heartbeat_timeout_ms) +
                            "ms), so worker loss is detected on the watchdog's schedule rather "
                            "than the timeout's. The effective timeout is the watchdog period."});
+    }
+
+    return out;
+}
+
+std::vector<ConfigProblem> lint_outbound_config(const OutboundLintInput& in) {
+    std::vector<ConfigProblem> out;
+
+    // Outbox::post refuses a frame whose class is at its bound before the
+    // frame is counted (outbox.cpp, at_bound), and the refusal costs the
+    // worker its connection. At zero every frame of the class is refused,
+    // so every worker is declared lost at its first such frame.
+    const auto refuse_zero = [&out](std::uint64_t value, const char* setting, const char* what) {
+        if (value == 0) {
+            out.push_back({LintSeverity::Error,
+                           setting,
+                           std::string{"a bound of 0 refuses every "} + what +
+                               ", so every worker is declared lost at its first one. Leave it "
+                               "at its default unless you have measured a reason to change "
+                               "it."});
+        }
+    };
+    refuse_zero(in.max_outbound_control_frames, "max_outbound_control_frames", "control frame");
+    refuse_zero(in.max_outbound_control_bytes, "max_outbound_control_bytes", "control frame");
+    refuse_zero(in.max_outbound_bulk_bytes, "max_outbound_bulk_bytes", "Deploy");
+
+    // A Deploy carries the bytes of every plugin it ships, up to the frame
+    // cap. A Deploy that finds another still queued ahead of it is refused
+    // once the queued bytes reach the bound, so below one largest frame two
+    // Deploys sent back to back to a healthy worker can cost it its
+    // connection.
+    if (in.max_outbound_bulk_bytes > 0 && in.max_outbound_bulk_bytes < kMaxFrameBytes) {
+        out.push_back({LintSeverity::Warning,
+                       "max_outbound_bulk_bytes",
+                       "max_outbound_bulk_bytes (" + std::to_string(in.max_outbound_bulk_bytes) +
+                           ") is below the largest frame (" + std::to_string(kMaxFrameBytes) +
+                           " bytes), so a Deploy queued behind another, as when two jobs "
+                           "deploy to one worker together, can cost a HEALTHY worker its "
+                           "connection."});
+    }
+
+    // Zero or less turns the stall verdict off (Coordinator::Config), and
+    // the comparisons below are then about a check that never runs.
+    const auto stall = in.outbound_stall_timeout_ms;
+    if (stall <= 0) {
+        return out;
+    }
+
+    // The stall verdict is meant for a worker that goes on heartbeating
+    // while it has stopped reading. At or below heartbeat_timeout it also
+    // takes a worker whose reader is held up for less time than the
+    // coordinator tolerates silence from it, a Deploy's plugin load say,
+    // and declares it lost.
+    if (in.heartbeat_timeout_ms > 0 && stall <= in.heartbeat_timeout_ms) {
+        out.push_back({LintSeverity::Warning,
+                       "outbound_stall_timeout",
+                       "outbound_stall_timeout (" + std::to_string(stall) +
+                           "ms) is not longer than heartbeat_timeout (" +
+                           std::to_string(in.heartbeat_timeout_ms) +
+                           "ms), so a worker whose reader is held up briefly is declared lost "
+                           "before the heartbeat would declare it. Keep it well above the "
+                           "heartbeat timeout."});
+    }
+
+    // A survivor that stops reading during a restart's drain is folded into
+    // the restart by the stall verdict. At or beyond restart_drain_timeout
+    // the drain deadline fails the job first.
+    if (in.restart_drain_timeout_ms > 0 && stall >= in.restart_drain_timeout_ms) {
+        out.push_back({LintSeverity::Warning,
+                       "outbound_stall_timeout",
+                       "outbound_stall_timeout (" + std::to_string(stall) +
+                           "ms) is not shorter than restart_drain_timeout (" +
+                           std::to_string(in.restart_drain_timeout_ms) +
+                           "ms), so a survivor that stops reading during a restart fails the job "
+                           "at the drain deadline instead of being declared lost and restarted."});
+    }
+
+    // The watchdog sweep runs the stall check, as it runs the heartbeat
+    // check, so detection cannot come sooner than its period.
+    if (in.watchdog_interval_ms > 0 && in.watchdog_interval_ms > stall) {
+        out.push_back({LintSeverity::Warning,
+                       "watchdog_interval",
+                       "watchdog_interval (" + std::to_string(in.watchdog_interval_ms) +
+                           "ms) is longer than outbound_stall_timeout (" + std::to_string(stall) +
+                           "ms), so a stalled worker is detected on the watchdog's schedule. The "
+                           "effective stall timeout is the watchdog period."});
     }
 
     return out;
