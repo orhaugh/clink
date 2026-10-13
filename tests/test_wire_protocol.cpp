@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -527,8 +528,8 @@ TEST(WireProtocol, AFinalCheckpointDeclineSaysWhy) {
 }
 
 TEST(WireProtocol, DeployRoundTripsEachTasksSuccession) {
-    // The per-operator successor range rides ahead of the fencing epoch; a
-    // task left at the default succeeds itself, and the epoch still decodes.
+    // The per-operator successor range rides after the fencing epoch; a task
+    // left at the default succeeds itself, and the epoch still decodes.
     DeployMsg in;
     in.job_id = 7;
     in.coordinator_epoch = 41;
@@ -558,8 +559,9 @@ TEST(WireProtocol, DeployRoundTripsEachTasksSuccession) {
 }
 
 TEST(WireProtocol, DeployCarriesTheRunsCheckpointIdFloorAfterTheEpoch) {
-    // The run's checkpoint-id floor rides after the fencing epoch, an additive
-    // tail: an older worker reads the epoch as its last field and stops there.
+    // The run's checkpoint-id floor rides after the fencing epoch and the
+    // per-task succession, an additive tail: an older worker reads the epoch
+    // as its last field and stops there.
     DeployMsg in;
     in.job_id = 9;
     in.coordinator_epoch = 41;
@@ -581,26 +583,81 @@ TEST(WireProtocol, DeployCarriesTheRunsCheckpointIdFloorAfterTheEpoch) {
     ASSERT_TRUE(out.run_checkpoint_floor.has_value());
     EXPECT_EQ(*out.run_checkpoint_floor, 57U);
     EXPECT_EQ(out.coordinator_epoch, 41U);
+}
 
-    // A frame that ends at the epoch, as an older coordinator sends it: the
-    // floor is absent, so the worker's sinks keep the rule they had before it,
-    // and the epoch still decodes.
-    const auto framed = encode_frame(MessageKind::Deploy, in);
-    auto legacy = body_of(framed);
-    ASSERT_GT(legacy.size(), 9U);
-    legacy.resize(legacy.size() - 9);  // presence byte + the id
-    MessageReader r(legacy);
-    (void)r.read_u8();
-    const auto old = decode_deploy(r);
-    EXPECT_FALSE(old.run_checkpoint_floor.has_value());
-    EXPECT_EQ(old.coordinator_epoch, 41U);
-    // And what an older worker reads of a new frame: everything up to and
-    // including the epoch is byte for byte the frame without the floor.
-    DeployMsg unset = in;
-    unset.run_checkpoint_floor.reset();
-    const auto without = body_of(encode_frame(MessageKind::Deploy, unset));
-    ASSERT_EQ(without.size(), legacy.size() + 9);
-    EXPECT_TRUE(std::equal(legacy.begin(), legacy.end(), without.begin()));
+// The Deploy's tail after the fencing epoch, in order: the per-task succession
+// (8 bytes a task), then the run's checkpoint-id floor (a presence byte and 8
+// bytes). Each must decode with and without what follows it, and a frame that
+// ends at the epoch is what v0.10.0 sends (tests/fixtures/deploy-msg-v0.10.0.bin
+// pins those bytes from that release's own writer).
+TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
+    DeployMsg in;
+    in.job_id = 9;
+    in.coordinator_epoch = 41;
+    DeploymentTask first;
+    first.role = "sink";
+    first.subtask_idx = 0;
+    first.succeeds_first = 3;
+    first.succeeds_count = 2;
+    DeploymentTask second;
+    second.role = "sink";
+    second.subtask_idx = 1;
+    second.succeeds_first = 5;
+    second.succeeds_count = 0;
+    in.tasks = {first, second};
+    in.run_checkpoint_floor = 57;
+    const auto full = body_of(encode_frame(MessageKind::Deploy, in));
+    constexpr std::size_t kSuccession = 2 * 8;
+    constexpr std::size_t kFloor = 1 + 8;
+    ASSERT_GT(full.size(), kSuccession + kFloor + 8);
+    const auto decode_prefix = [&](std::size_t drop) {
+        std::vector<std::byte> body(full.begin(), full.end() - static_cast<std::ptrdiff_t>(drop));
+        MessageReader r(std::move(body));
+        EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::Deploy);
+        return decode_deploy(r);
+    };
+
+    // Everything.
+    auto out = decode_prefix(0);
+    EXPECT_EQ(out.coordinator_epoch, 41U);
+    EXPECT_EQ(out.tasks[0].succeeds_first, 3U);
+    EXPECT_EQ(out.tasks[0].succeeds_count, 2U);
+    EXPECT_EQ(out.tasks[1].succeeds_first, 5U);
+    EXPECT_EQ(out.tasks[1].succeeds_count, 0U);
+    EXPECT_EQ(out.run_checkpoint_floor, std::optional<std::uint64_t>{57});
+
+    // A sender that stopped after the succession: no floor.
+    out = decode_prefix(kFloor);
+    EXPECT_EQ(out.coordinator_epoch, 41U);
+    EXPECT_EQ(out.tasks[0].succeeds_first, 3U);
+    EXPECT_EQ(out.tasks[1].succeeds_count, 0U);
+    EXPECT_FALSE(out.run_checkpoint_floor.has_value());
+
+    // A sender that stopped at the epoch, as v0.10.0 does: every task succeeds
+    // itself, no floor, and the epoch is the one sent.
+    out = decode_prefix(kSuccession + kFloor);
+    EXPECT_EQ(out.coordinator_epoch, 41U);
+    for (const auto& task : out.tasks) {
+        EXPECT_EQ(task.succeeds_first, kRestoreFromSelf);
+        EXPECT_EQ(task.succeeds_count, 1U);
+    }
+    EXPECT_FALSE(out.run_checkpoint_floor.has_value());
+
+    // And what a v0.10.0 worker reads of the full frame: the bytes up to and
+    // including the epoch are the frame a sender with no tail writes.
+    DeployMsg bare = in;
+    for (auto& task : bare.tasks) {
+        task.succeeds_first = kRestoreFromSelf;
+        task.succeeds_count = 1;
+    }
+    bare.run_checkpoint_floor.reset();
+    const auto bare_body = body_of(encode_frame(MessageKind::Deploy, bare));
+    const auto through_epoch = full.size() - kSuccession - kFloor;
+    ASSERT_EQ(bare_body.size(), full.size());
+    EXPECT_TRUE(std::equal(
+        full.begin(), full.begin() + static_cast<std::ptrdiff_t>(through_epoch), bare_body.begin()))
+        << "a field moved ahead of the epoch: a v0.10.0 worker reads its epoch from the wrong "
+           "bytes";
 }
 
 // Two MessageKinds deliberately share the value 117, and this pins that
@@ -718,8 +775,8 @@ TEST(WireProtocol, DeployCarriesAdaptiveBarrierModeFlag) {
     in.coordinator_epoch = 4;
     auto out = round_trip(MessageKind::Deploy, in, decode_deploy);
     EXPECT_TRUE(out.adaptive_barrier_mode);
-    // The flag sits before the epoch on the wire (the epoch stays the
-    // final field by contract); both must survive together.
+    // The flag is the last field before the epoch, where a v0.10.0 Deploy
+    // ends; both must survive together.
     EXPECT_EQ(out.coordinator_epoch, 4U);
     EXPECT_FALSE(out.unaligned_checkpoints)
         << "adaptive deploys leave the static flag false - aligned is the default the "
@@ -1158,11 +1215,12 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
         in.job_id = 11;
         in.tasks.push_back(DeploymentTask{.role = "r", .subtask_idx = 3});
         in.coordinator_epoch = 9;
-        // Deploy's tail has grown past the epoch: the run's checkpoint-id floor
-        // (a presence byte and 8 bytes) follows it. A peer that predates both
-        // sends neither, so 17 bytes come off, not 8.
+        // Deploy's tail has grown past the epoch: the per-task succession (8
+        // bytes for this one task), then the run's checkpoint-id floor (a
+        // presence byte and 8 bytes). A peer that predates all three sends
+        // none, so 25 bytes come off, not 8.
         auto out = round_trip_without_epoch_field(
-            MessageKind::Deploy, in, decode_deploy, /*tail_bytes=*/17);
+            MessageKind::Deploy, in, decode_deploy, /*tail_bytes=*/25);
         EXPECT_EQ(out.job_id, 11U);
         ASSERT_EQ(out.tasks.size(), 1U);
         EXPECT_EQ(out.tasks[0].subtask_idx, 3U);

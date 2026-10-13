@@ -17,6 +17,7 @@
 // purpose - a failing read here IS a compatibility break with shipped
 // artefacts, and the fix belongs in the reader.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -128,6 +129,73 @@ TEST(FormatFixtures, RegisterMsgV1FrameStaysDecodable) {
     EXPECT_EQ(msg.http_port, 8081);
     EXPECT_EQ(msg.protocol_version, 1u);
     EXPECT_EQ(msg.min_compatible_protocol_version, 1u);
+}
+
+// A Deploy frame written by v0.10.0's own encoder: its messages.hpp and
+// protocol.hpp, taken from the tag and built into a one-off writer. v0.10.0 is
+// the last release whose Deploy ends at the fencing epoch, and a v0.10.0
+// worker reads the epoch as its last field. This fixture is never regenerated:
+// the current writer cannot write a v0.10.0 frame. It holds both directions of
+// a rolling upgrade across that release. The current reader decodes it as
+// v0.10.0 meant it, with the tail fields at their defaults; and the current
+// writer's frame for the same message begins with these bytes, so a v0.10.0
+// worker reading up to the epoch reads exactly what it always did.
+TEST(FormatFixtures, DeployMsgV0100FrameStaysDecodableAndPrefixesTheCurrentFrame) {
+    using namespace clink::cluster;
+    const auto frame = read_bytes(fixture_path("deploy-msg-v0.10.0.bin"));
+    ASSERT_GT(frame.size(), 5u);
+    std::uint32_t len = 0;
+    for (int i = 0; i < 4; ++i) {
+        len = (len << 8) | static_cast<std::uint8_t>(frame[static_cast<std::size_t>(i)]);
+    }
+    ASSERT_EQ(len, frame.size() - 4) << "length prefix no longer matches the payload";
+    MessageReader r(std::vector<std::byte>(frame.begin() + 4, frame.end()));
+    ASSERT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::Deploy);
+    const auto msg = decode_deploy(r);
+    EXPECT_EQ(msg.job_id, 7u);
+    ASSERT_EQ(msg.tasks.size(), 2u);
+    EXPECT_EQ(msg.tasks[0].role, "src");
+    EXPECT_EQ(msg.tasks[0].data_port, 4100);
+    ASSERT_EQ(msg.tasks[0].peers.size(), 1u);
+    EXPECT_EQ(msg.tasks[0].peers[0].host, "10.0.0.2");
+    EXPECT_EQ(msg.tasks[0].extra_config, "{\"op\":\"source\"}");
+    EXPECT_EQ(msg.tasks[0].restore_from_subtask_idx, 2u);
+    EXPECT_EQ(msg.tasks[0].restore_from_parent_count, 3u);
+    EXPECT_EQ(msg.tasks[0].key_group_first, 16);
+    EXPECT_EQ(msg.tasks[0].key_group_last, 48);
+    EXPECT_EQ(msg.tasks[1].role, "sink");
+    EXPECT_EQ(msg.tasks[1].subtask_idx, 1u);
+    EXPECT_EQ(msg.checkpoint_dir, "/ckpt");
+    EXPECT_EQ(msg.restore_from_checkpoint_id, 5u);
+    EXPECT_TRUE(msg.unaligned_checkpoints);
+    EXPECT_EQ(msg.expected_state_versions_packed, "op|keyed|2");
+    EXPECT_EQ(msg.state_backend_uri, "file:///state");
+    EXPECT_EQ(msg.capture_dir, "/cap");
+    EXPECT_EQ(msg.capture_records, 64u);
+    EXPECT_EQ(msg.udfs_packed, "[]");
+    EXPECT_EQ(msg.generation, 3u);
+    EXPECT_EQ(msg.restore_generation, 2u);
+    EXPECT_TRUE(msg.adaptive_barrier_mode);
+    EXPECT_EQ(msg.coordinator_epoch, 9u);
+    // The tail v0.10.0 never wrote reads as its defaults.
+    for (const auto& t : msg.tasks) {
+        EXPECT_EQ(t.succeeds_first, kRestoreFromSelf);
+        EXPECT_EQ(t.succeeds_count, 1u);
+    }
+    EXPECT_FALSE(msg.run_checkpoint_floor.has_value());
+
+    // The same message from the current writer, with the tail filled in.
+    auto now = msg;
+    now.tasks[0].succeeds_first = 1;
+    now.tasks[0].succeeds_count = 2;
+    now.run_checkpoint_floor = 4;
+    const auto written = encode_frame(MessageKind::Deploy, now);
+    ASSERT_GT(written.size(), frame.size());
+    EXPECT_TRUE(std::equal(frame.begin() + 4, frame.end(), written.begin() + 4))
+        << "the current Deploy no longer begins with the v0.10.0 frame: a v0.10.0 worker reads "
+           "its epoch from the wrong bytes";
+    EXPECT_EQ(written.size() - frame.size(), 2u * 8u + 9u)
+        << "the tail after the epoch is the per-task succession, then the run's floor";
 }
 
 // --- job plan JSON (additive-only, absent-tolerant) ---------------------------

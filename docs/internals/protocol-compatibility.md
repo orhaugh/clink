@@ -67,10 +67,26 @@ may differ as long as each side can speak something the other accepts.
   reads as version 1 (pre-versioning peers still decode). Bump
   `kClusterProtocolVersion` only for a change old peers would misread.
   Where a frame's fencing epoch is read as its last field (`Deploy`,
-  `FinalCheckpointAssigned`), a new field goes after the epoch, not before
-  it: an older peer reads the epoch where it always did and stops. The
-  Deploy's run checkpoint-id floor is such a tail (a presence byte, then the
-  id); a Deploy without it keeps a 2PC sink's older rule at restore point 0.
+  `FinalCheckpointAssigned`, and every other frame that carries one), a new
+  field goes after the epoch, not before it: an older peer reads the epoch
+  where it always did and stops. A field placed before the epoch shifts the
+  bytes an older peer takes for its epoch.
+- **Deploy tail, after the fencing epoch.** A v0.10.0 Deploy ends with
+  `adaptive_barrier_mode` (u8) and then the fencing epoch (u64), and a
+  v0.10.0 worker reads no further. Every field added since follows the epoch.
+  From the epoch on, in this order: the epoch (u64; absent, 0, unfenced); the
+  per-task succession, for each task in task order `succeeds_first` and
+  `succeeds_count` (two u32s; absent, every task succeeds itself,
+  `kRestoreFromSelf` and 1); then the run's checkpoint-id floor, a presence
+  byte and the id (u8, u64; absent, unset, and a 2PC sink keeps its older
+  rule at restore point 0). A decoder reads each in turn while bytes remain,
+  so a frame from any sender since v0.10.0 decodes with the fields it carried
+  and defaults for the rest, and a v0.10.0 worker reads the leading bytes it
+  always read. `tests/fixtures/deploy-msg-v0.10.0.bin`, written by v0.10.0's
+  own encoder, pins both directions
+  (`FormatFixtures.DeployMsgV0100FrameStaysDecodableAndPrefixesTheCurrentFrame`),
+  and `WireProtocol.DeployTailDecodesWhereverASenderStopped` decodes each
+  prefix of the tail.
 - **Version 2 capability:** worker heartbeats carry a tail sequence and a v2
   coordinator returns `HeartbeatAck`. The worker uses acknowledgements as a
   bidirectional control-session lease, detecting one-way partitions that do
@@ -88,7 +104,9 @@ may differ as long as each side can speak something the other accepts.
 - **Tests:** `tests/test_protocol_versioning.cpp` (both refusal directions
   end to end, pre-versioning decode, refusal legibility);
   `fuzz/fuzz_cluster_frame.cpp` with its committed-reproducer replay;
-  `tests/fixtures/register-msg-v1.bin` pins the handshake bytes.
+  `tests/fixtures/register-msg-v1.bin` pins the handshake bytes, and
+  `tests/fixtures/deploy-msg-v0.10.0.bin` the last Deploy that ends at its
+  epoch.
 
 ## Data plane (operator-to-operator wire frames)
 

@@ -312,7 +312,9 @@ struct DeploymentTask {
     // succeeds_count). Unlike restore_from_subtask_idx these are not the
     // deployed global indices, and at a scale-up the count is 0 for every
     // subtask but the first of a parent's children. kRestoreFromSelf = this
-    // subtask itself, the answer for every deploy that is not a rescale.
+    // subtask itself, the answer for every deploy that is not a rescale. On
+    // the wire the Deploy carries them after its fencing epoch, one pair per
+    // task in task order.
     std::uint32_t succeeds_first{kRestoreFromSelf};
     std::uint32_t succeeds_count{1};
 };
@@ -462,6 +464,9 @@ struct DeployMsg {
     // additive-field idiom the rest of this protocol uses: 0 means "an
     // unfenced peer" and preserves the pre-fencing behaviour exactly, so
     // a mixed-version cluster keeps working while it is being upgraded.
+    // A v0.10.0 Deploy ends here and its readers stop here, so every field
+    // added since follows the epoch on the wire (the per-task succession,
+    // then the run's checkpoint-id floor), never precedes it.
     std::uint64_t coordinator_epoch{0};
     // The run's checkpoint-id floor: the receipts and unresolved markers of
     // this job id in this checkpoint directory above it are this run's to read,
@@ -478,8 +483,9 @@ struct DeployMsg {
     // restarts and an HA takeover. Unset from a
     // coordinator that predates it, or when the coordinator cannot vouch for
     // one (a takeover of a job persisted without it): the sink then keeps its
-    // older rule and skips both at restore point 0. Appended after the
-    // epoch, an additive tail: an older worker stops reading before it.
+    // older rule and skips both at restore point 0. On the wire it follows
+    // the epoch and the per-task succession, an additive tail: an older
+    // worker stops reading before it.
     std::optional<std::uint64_t> run_checkpoint_floor;
 };
 

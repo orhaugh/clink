@@ -127,6 +127,11 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // deploy-static mode. A peer that stops reading earlier keeps the
     // default false = static stamping, the historical behaviour.
     b.put_u8(m.adaptive_barrier_mode ? 1 : 0);
+    // Fencing epoch: where a v0.10.0 Deploy ends, and the last field such a
+    // peer reads. Anything new is appended AFTER it: a field placed before it
+    // shifts the epoch an older peer reads. The tail after the epoch, in this
+    // order (docs/internals/protocol-compatibility.md):
+    b.put_u64_be(m.coordinator_epoch);
     // Per-task succession, in task order. A peer that stops reading earlier
     // leaves every task succeeding itself, the answer for any deploy that is
     // not a rescale.
@@ -134,10 +139,6 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
         b.put_u32_be(t.succeeds_first);
         b.put_u32_be(t.succeeds_count);
     }
-    // Fencing epoch. An older peer reads it as its last field, so a field
-    // placed before it shifts the epoch such a peer reads; new fields are
-    // appended after it, where an older peer stops reading.
-    b.put_u64_be(m.coordinator_epoch);
     // The run's checkpoint-id floor: a presence byte, then the id. A peer that
     // stops reading earlier leaves it unset, and its sinks keep the rule they
     // had before it.
@@ -633,8 +634,6 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     if (!r.eof()) {
         m.udfs_packed = r.read_string();
     }
-    // Fencing epoch. Absent from a pre-fencing peer, which reads
-    // as 0 = unfenced and preserves the old behaviour.
     // Topology generation pair. Absent from a peer that predates it, which reads
     // as 1/1 - the generation of a job that has never rescaled.
     if (!r.eof()) {
@@ -648,6 +647,9 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     if (!r.eof()) {
         m.adaptive_barrier_mode = r.read_u8() != 0;
     }
+    // Fencing epoch: where a v0.10.0 Deploy ends. Absent from a pre-fencing
+    // peer, which reads as 0 = unfenced.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     // Per-task succession. Absent from older coordinator peers -> each task
     // succeeds itself.
     if (!r.eof()) {
@@ -656,8 +658,6 @@ inline DeployMsg decode_deploy(MessageReader& r) {
             t.succeeds_count = r.read_u32_be();
         }
     }
-    // Fencing epoch, after the fields above, matching the encoder.
-    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     // The run's checkpoint-id floor. Absent from older coordinator peers ->
     // unset, so their sinks keep the rule they had before it.
     if (!r.eof()) {
