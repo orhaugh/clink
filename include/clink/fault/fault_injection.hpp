@@ -384,6 +384,12 @@ inline constexpr char kSinkAfterExternalCommit[] = "sink.after_external_commit";
 // holds the window between a sink's teardown and the end of its task, in which
 // a commit dispatched from the worker can still arrive for a sink that is gone.
 inline constexpr char kSinkAfterTeardown[] = "sink.after_teardown";
+// Inside a reopening Kafka 2PC sink's open: its unresolved orphan described
+// Ongoing, not yet ended (the EndTxn(abort) not yet sent), nothing fenced.
+// Block here holds the open while an old incarnation's commit of the same
+// transaction lands, or does not; a death here leaves the marker, and the
+// next open settles again.
+inline constexpr char kSinkOrphanDescribed[] = "sink.orphan_described";
 
 // Sharded keyed stage: a shard whose operator threw, between closing its
 // input queue and delivering its failure for the control round in flight.

@@ -5,6 +5,7 @@
 // Kafka-protocol bytes over a real socket. The live half (a genuine orphan
 // committed on a real broker) is test_txn_resume_live.cpp.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -324,6 +325,22 @@ struct FakeSasl {
     std::string scram_server_final{"v=Zm9yZ2Vkc2lnbmF0dXJlZm9yZ2Vk"};
 };
 
+// One scripted DescribeTransactions answer; `drop` closes the connection
+// instead of answering (a transport failure).
+struct DescribeReply {
+    std::string state;
+    std::int64_t pid{42};
+    std::int16_t epoch{3};
+    bool drop{false};
+};
+
+// One scripted EndTxn answer; `drop` closes the connection after reading the
+// request (a transport failure after the request was sent).
+struct EndTxnReply {
+    std::int16_t error{0};
+    bool drop{false};
+};
+
 // A broker whose behaviour is the script: for each accepted connection it
 // answers requests until the peer hangs up. Records the EndTxn bodies it saw
 // so tests can assert what actually went over the wire.
@@ -389,6 +406,21 @@ public:
         describe_state_ = std::move(state);
         describe_pid_ = pid;
         describe_epoch_ = epoch;
+    }
+    // Script DescribeTransactions / EndTxn per request, in arrival order. The
+    // last entry repeats once the others are used; an empty script falls back
+    // to set_describe / the constructor's end_txn_error.
+    void script_describe(std::vector<DescribeReply> replies) {
+        std::lock_guard lock(mu_);
+        describe_script_ = std::move(replies);
+    }
+    void script_end_txn(std::vector<EndTxnReply> replies) {
+        std::lock_guard lock(mu_);
+        end_txn_script_ = std::move(replies);
+    }
+    [[nodiscard]] std::size_t describe_count() const {
+        std::lock_guard lock(mu_);
+        return describe_count_;
     }
     // The SaslAuthenticate auth_bytes each connection presented, in arrival
     // order - one entry per authenticated connection.
@@ -470,27 +502,40 @@ private:
                     req.correlation,
                     api_versions_body(fc_min_, fc_max_, et_min_, et_max_, dt_min_, dt_max_));
             } else if (req.api_key == wire::kDescribeTransactionsKey) {
-                std::string state;
-                std::int64_t pid = 0;
-                std::int16_t epoch = 0;
+                DescribeReply reply;
                 {
                     std::lock_guard lock(mu_);
-                    state = describe_state_;
-                    pid = describe_pid_;
-                    epoch = describe_epoch_;
+                    reply = DescribeReply{describe_state_, describe_pid_, describe_epoch_, false};
+                    if (!describe_script_.empty()) {
+                        const auto i = std::min(describe_count_, describe_script_.size() - 1);
+                        reply = describe_script_[i];
+                    }
+                    ++describe_count_;
+                }
+                if (reply.drop) {
+                    return;
                 }
                 send_response(fd,
                               req.correlation,
-                              describe_transactions_body(0, "resume-me", state, pid, epoch));
+                              describe_transactions_body(
+                                  0, "resume-me", reply.state, reply.pid, reply.epoch));
             } else if (req.api_key == wire::kFindCoordinatorKey) {
                 // The coordinator is this same fake broker.
                 send_response(fd, req.correlation, find_coordinator_body(0, "127.0.0.1", port_));
             } else if (req.api_key == wire::kEndTxnKey) {
+                EndTxnReply reply{end_txn_error_, false};
                 {
                     std::lock_guard lock(mu_);
+                    if (!end_txn_script_.empty()) {
+                        const auto i = std::min(end_txn_bodies_.size(), end_txn_script_.size() - 1);
+                        reply = end_txn_script_[i];
+                    }
                     end_txn_bodies_.push_back(req.body);
                 }
-                send_response(fd, req.correlation, end_txn_body(end_txn_error_));
+                if (reply.drop) {
+                    return;
+                }
+                send_response(fd, req.correlation, end_txn_body(reply.error));
             } else {
                 return;
             }
@@ -514,6 +559,9 @@ private:
     mutable std::mutex mu_;
     std::vector<std::vector<std::uint8_t>> end_txn_bodies_;
     std::vector<std::vector<std::uint8_t>> auth_bytes_seen_;
+    std::vector<DescribeReply> describe_script_;
+    std::vector<EndTxnReply> end_txn_script_;
+    std::size_t describe_count_{0};
 };
 
 clink::kafka::ConnectFn plain_connect() {
@@ -681,6 +729,224 @@ TEST(TxnResume, TheOrphanVerdictProvesOnlyCommitDecisionsUnderTheStagedIdentity)
     EXPECT_FALSE(orphan_commit_proven(observed("CompleteCommit", 43, 3), 42, 3));
     EXPECT_FALSE(orphan_commit_proven(observed("CompleteCommit", 42, 4), 42, 3));
     EXPECT_FALSE(orphan_commit_proven(observed("CompleteCommit", -1, -1), 42, 3));
+}
+
+// --- settling an orphan at a reopening sink's open ----------------------------
+//
+// settle_orphan is what the 2PC sink's open() runs for an .unresolved marker
+// above its restore point, before init_transactions: it aborts an undecided
+// orphan under the identity DescribeTransactions reports, and proves a commit
+// that got there first. The mapping from a describe to the next step is pure
+// and pinned state by state; the exchange is pinned against the fake broker,
+// scripted request by request.
+
+TEST(TxnResumeSettle, TheSettleStepMapsEveryCoordinatorStateUnderEveryIdentity) {
+    using clink::kafka::DescribeState;
+    using clink::kafka::next_settle_step;
+    using clink::kafka::SettleStep;
+    const auto step = [](std::string state, std::int64_t pid, std::int16_t epoch) {
+        DescribeState d;
+        d.state = std::move(state);
+        d.producer_id = pid;
+        d.producer_epoch = epoch;
+        return next_settle_step(d, /*staged_pid=*/42, /*floor_epoch=*/5);
+    };
+    const std::vector<std::string> ended = {
+        "PrepareAbort", "CompleteAbort", "Empty", "Dead", "PrepareEpochFence"};
+    for (const std::int16_t epoch : {std::int16_t{4}, std::int16_t{5}, std::int16_t{6}}) {
+        SCOPED_TRACE("epoch " + std::to_string(epoch) + " against floor 5");
+        // Under the staged producer id. A commit decision proves the orphan's
+        // commit at or above the floor; below it, it names an older
+        // transaction.
+        const auto commit = epoch >= 5 ? SettleStep::Committed : SettleStep::NotCommitted;
+        EXPECT_EQ(step("PrepareCommit", 42, epoch), commit);
+        EXPECT_EQ(step("CompleteCommit", 42, epoch), commit);
+        // Undecided, at whatever epoch the broker reports it: end it there.
+        EXPECT_EQ(step("Ongoing", 42, epoch), SettleStep::AbortWith);
+        for (const auto& st : ended) {
+            EXPECT_EQ(step(st, 42, epoch), SettleStep::NotCommitted) << st;
+        }
+        // A state this module does not know is neither proof nor safe to end.
+        EXPECT_EQ(step("SomethingNew", 42, epoch), SettleStep::Retry);
+        EXPECT_EQ(step("", 42, epoch), SettleStep::Retry);
+        // Under any other producer id the transactional id was re-initialised,
+        // and that init ended the orphan: nothing here is the orphan's.
+        for (const std::int64_t foreign : {std::int64_t{43}, std::int64_t{-1}}) {
+            for (const auto& st : {"PrepareCommit",
+                                   "CompleteCommit",
+                                   "Ongoing",
+                                   "PrepareAbort",
+                                   "CompleteAbort",
+                                   "Empty",
+                                   "Dead",
+                                   "PrepareEpochFence",
+                                   "SomethingNew"}) {
+                EXPECT_EQ(step(st, foreign, epoch), SettleStep::NotCommitted)
+                    << st << " under pid " << foreign;
+            }
+        }
+    }
+}
+
+namespace settle_fixture {
+
+// identity(): staged pid 42 at epoch 3. The scripts describe the orphan at
+// epoch 5, so an abort sent under the staged epoch is told apart from one
+// sent under the described epoch.
+clink::kafka::OrphanSettlement settle(const FakeBroker& broker, int* before_abort_calls) {
+    return clink::kafka::settle_orphan(
+        "127.0.0.1", broker.port(), identity(), plain_connect(), {}, [before_abort_calls] {
+            ++*before_abort_calls;
+        });
+}
+
+// EndTxn body for "resume-me": string (2 + 9), pid (8), epoch (2), commit (1).
+std::int16_t body_epoch(const std::vector<std::uint8_t>& b) {
+    return static_cast<std::int16_t>((b[19] << 8) | b[20]);
+}
+
+}  // namespace settle_fixture
+
+using OrphanStatus = clink::kafka::OrphanSettlement::Status;
+
+TEST(TxnResumeSettle, AnOngoingOrphanIsAbortedUnderTheDescribedEpoch) {
+    FakeBroker broker;
+    broker.script_describe({{"Ongoing", 42, 5}});
+    broker.script_end_txn({{0}});
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    ASSERT_EQ(s.status, OrphanStatus::Aborted) << s.detail;
+    EXPECT_EQ(hooks, 1) << "the hook runs once, between the describe and the abort";
+    EXPECT_EQ(s.state, "Ongoing");
+    EXPECT_EQ(s.producer_epoch, 5);
+    const auto bodies = broker.end_txn_bodies();
+    ASSERT_EQ(bodies.size(), 1U);
+    const auto& b = bodies[0];
+    ASSERT_EQ(b.size(), 2U + 9U + 8U + 2U + 1U);
+    EXPECT_EQ(std::string(b.begin() + 2, b.begin() + 11), "resume-me");
+    EXPECT_EQ(b[18], 42U) << "producer_id low byte";
+    EXPECT_EQ(settle_fixture::body_epoch(b), 5)
+        << "the abort must ride the DESCRIBED epoch; the staged one (3) is a commit stale and "
+           "would be fenced without deciding anything";
+    EXPECT_EQ(b[21], 0U) << "the settle sends an abort, never a commit";
+    EXPECT_EQ(broker.describe_count(), 1U);
+}
+
+TEST(TxnResumeSettle, AnAbortRefusedByACommitThatWonIsProvenCommittedByTheNextDescribe) {
+    FakeBroker broker;
+    broker.script_describe({{"Ongoing", 42, 5}, {"CompleteCommit", 42, 5}});
+    broker.script_end_txn({{48}});  // INVALID_TXN_STATE: the commit completed first
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    EXPECT_EQ(s.status, OrphanStatus::Committed) << s.detail;
+    EXPECT_EQ(s.state, "CompleteCommit");
+    EXPECT_EQ(broker.end_txn_bodies().size(), 1U);
+    EXPECT_EQ(broker.describe_count(), 2U) << "the verdict comes from the describe, not the code";
+}
+
+TEST(TxnResumeSettle, AFencedAbortThenACommitAtTheNextEpochIsCommitted) {
+    FakeBroker broker;
+    broker.script_describe({{"Ongoing", 42, 5}, {"CompleteCommit", 42, 6}});
+    broker.script_end_txn({{90}});  // PRODUCER_FENCED: the commit moved the epoch on
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    EXPECT_EQ(s.status, OrphanStatus::Committed) << s.detail;
+    EXPECT_EQ(s.producer_epoch, 6);
+}
+
+TEST(TxnResumeSettle, ConcurrentTransactionsIsRetriedUntilTheDescribeDecides) {
+    FakeBroker broker;
+    broker.script_describe({{"Ongoing", 42, 5}, {"CompleteCommit", 42, 5}});
+    broker.script_end_txn({{51}});  // CONCURRENT_TRANSACTIONS: PrepareCommit completing
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    EXPECT_EQ(s.status, OrphanStatus::Committed) << s.detail;
+    EXPECT_EQ(broker.describe_count(), 2U);
+
+    // The same refusal followed by a describe that still reads Ongoing: the
+    // abort is sent again, and its success is the verdict.
+    FakeBroker again;
+    again.script_describe({{"Ongoing", 42, 5}, {"Ongoing", 42, 5}});
+    again.script_end_txn({{51}, {0}});
+    int again_hooks = 0;
+    const auto t = settle_fixture::settle(again, &again_hooks);
+    EXPECT_EQ(t.status, OrphanStatus::Aborted) << t.detail;
+    EXPECT_EQ(again.end_txn_bodies().size(), 2U);
+    EXPECT_EQ(again_hooks, 2);
+}
+
+TEST(TxnResumeSettle, AnOrphanFoundDecidedWithoutACommitSendsNoEndTxn) {
+    for (const auto* state : {"CompleteAbort", "Empty"}) {
+        SCOPED_TRACE(state);
+        FakeBroker broker;
+        broker.script_describe({{state, 42, 5}});
+        int hooks = 0;
+        const auto s = settle_fixture::settle(broker, &hooks);
+        EXPECT_EQ(s.status, OrphanStatus::NotCommitted) << s.detail;
+        EXPECT_TRUE(broker.end_txn_bodies().empty());
+        EXPECT_EQ(hooks, 0);
+    }
+}
+
+TEST(TxnResumeSettle, TransportFailuresOnTheDescribeAndTheAbortLeaveNoVerdict) {
+    FakeBroker broker;
+    broker.script_describe({{.drop = true}, {"Ongoing", 42, 5}, {.drop = true}});
+    broker.script_end_txn({{.drop = true}});
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    EXPECT_EQ(s.status, OrphanStatus::TransportError) << s.detail;
+    EXPECT_EQ(broker.end_txn_bodies().size(), 1U)
+        << "a dropped abort is ambiguous: the next round describes, it does not re-send blind";
+    EXPECT_EQ(s.floor_epoch, 5) << "the epoch seen Ongoing anchors a retrying caller's proof";
+}
+
+TEST(TxnResumeSettle, ACommitBelowTheEpochSeenOngoingIsNotTheOrphans) {
+    // Epoch 4 is at or above the staged epoch (3), but below the epoch the
+    // orphan was seen Ongoing at: a commit decision there names an older
+    // transaction, and proving it would suppress panes never published.
+    FakeBroker broker;
+    broker.script_describe({{"Ongoing", 42, 5}, {"CompleteCommit", 42, 4}});
+    broker.script_end_txn({{48}});
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    EXPECT_EQ(s.status, OrphanStatus::NotCommitted) << s.detail;
+}
+
+TEST(TxnResumeSettle, AReinitialisedTransactionalIdIsNotCommitted) {
+    FakeBroker broker;
+    broker.script_describe({{"Ongoing", 42, 5}, {"Ongoing", 77, 0}});
+    broker.script_end_txn({{90}});
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    EXPECT_EQ(s.status, OrphanStatus::NotCommitted) << s.detail;
+    EXPECT_EQ(broker.end_txn_bodies().size(), 1U) << "another producer's transaction is not ended";
+}
+
+TEST(TxnResumeSettle, AnUnknownStateIsNeitherProvenNorEnded) {
+    FakeBroker broker;
+    broker.script_describe({{"SomethingNew", 42, 5}});
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    EXPECT_EQ(s.status, OrphanStatus::TransportError) << s.detail;
+    EXPECT_NE(s.detail.find("SomethingNew"), std::string::npos) << s.detail;
+    EXPECT_TRUE(broker.end_txn_bodies().empty());
+}
+
+TEST(TxnResumeSettle, ABrokerWithoutDescribeTransactionsGivesNoVerdict) {
+    FakeBroker broker(/*end_txn_error=*/0,
+                      /*fc_min=*/0,
+                      /*fc_max=*/4,
+                      /*et_min=*/0,
+                      /*et_max=*/4,
+                      FakeSasl{},
+                      /*dt_min=*/1,
+                      /*dt_max=*/4);
+    int hooks = 0;
+    const auto s = settle_fixture::settle(broker, &hooks);
+    EXPECT_EQ(s.status, OrphanStatus::TransportError) << s.detail;
+    EXPECT_NE(s.detail.find("DescribeTransactions v0"), std::string::npos) << s.detail;
+    EXPECT_EQ(broker.describe_count(), 0U);
+    EXPECT_TRUE(broker.end_txn_bodies().empty());
 }
 
 TEST(TxnResume, TheRegisteredResolverDrivesTheWholeChainFromAHandle) {

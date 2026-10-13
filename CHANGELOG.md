@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**A reopening Kafka sink settles its orphaned transaction before it fences
+the producer.** A `kafka_2pc` sink whose recovery left an `.unresolved` marker
+described the orphan at `open()` and, finding it `Ongoing`, left it for
+`init_transactions` to abort. When the worker that sealed it had been declared
+lost while its process still ran, that process could still execute the
+orphan's `CommitCheckpoint`, already on its socket, between the describe and
+the init: the init then aborted nothing, replay suppression armed with no
+receipt, and the restore's replay published the checkpoint's interval a second
+time. The exactly-once specification found it once it let a lost worker run
+on. The open now ends an undecided orphan itself with `EndTxn(abort)` under the
+producer id and epoch `DescribeTransactions` reports, before the fence and
+before suppression arms. If the old commit reaches the broker first, the abort
+is refused, and the open describes again, proves the commit and writes the
+receipt before the marker goes. A commit decision proves the orphan's commit at
+or above the handle's epoch, where the open used to require exactly it, since
+the handle's epoch can trail the broker's. The `SinkOpens` trace line names the
+orphan and how the open settled it, the fault point `sink.orphan_described`
+holds the open between its describe and its abort, and a test with two sinks
+on one transactional id gates both orders against a real broker.
+
 **A worker that stops reading no longer holds up the coordinator.** Each
 frame to a worker was sent by the thread that decided it, so a worker that had
 stopped reading, behind a large `Deploy` say, held that thread in `send()`, and

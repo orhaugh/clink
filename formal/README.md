@@ -160,6 +160,7 @@ them.
 | (none: the commit callback has returned, `CommitConfirmed` not yet sent) | `stage = "finished"`, before `SinkConfirm(s)`; the sink may already have prepared the next checkpoint |
 | `coordinator.before_confirmed_marker` | `confirming[c] = "due"` (the confirmation set drained and `c` out of `broadcastIds`), before `WriteConfirmed`; neither `confirmedDisk` nor `memConfirmed` has moved |
 | `coordinator.before_in_doubt_walk` | `phase = "resolving"` with `walkC` fixed by `RestartProceeds`, before the walk's first step; an `AdvanceConfirmed` landing here moves `memConfirmed`, not `walkC` |
+| `sink.orphan_described` | `sink[s].opening`, before `SinkOpens(s)`: the reopening Kafka sink's describe has seen its orphan `Ongoing` and the abort is not yet sent. A death there is an open that never happened: the marker stays, and the next open settles again |
 | `checkpoint.before_write` and its siblings | `SinkPrepareFails(s)` (the capture fails, the ack says so) |
 
 Every action's comment names the engine site it abstracts, so a reader can
@@ -223,7 +224,7 @@ each and judges the outcome against `mutants/expected.txt`.
 | `restore_from_memory` | The in-memory restore point advances with the durable marker, not before | this model | refuted: FrontierCovered |
 | `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | refuted: NoLoss |
 | `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its CONFIRMED marker is durable | review of the per-connection dispatch change | refuted: ConfirmedMemoryOnDisk |
-| `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan (abort, or the receipt of the commit that beat the abort) before `init_transactions` | this model, once a lost worker could run on | refuted: NoDuplicate. The engine still opens this way; the change it implies is specified, not yet made (see What the model found) |
+| `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan (abort, or the receipt of the commit that beat the abort) before `init_transactions` | this model, once a lost worker could run on | refuted: NoDuplicate |
 
 A mutant TLC accepts is recorded in `mutants/expected.txt`, not deleted: it
 means a later rule guards the same defect (defence in depth), and the check
@@ -268,7 +269,8 @@ mutant above:
    re-committed its handles at open. Fix: memory advances with the durable
    write.
 
-A fourth came later, and its engine fix has not landed:
+A fourth came later, once a lost worker could run on, and was fixed in the
+engine after the specification stated the fix:
 
 4. **The orphan left to the init.** Once a worker declared lost could run on
    (`WorkerLost`), TLC found a duplicate, a counterexample 28 states long,
@@ -292,9 +294,17 @@ A fourth came later, and its engine fix has not landed:
    asking afterwards is not an option. Abort rather than commit because the
    restore point is already below the orphan, so the replay re-produces its
    interval whatever the open does, and an abort makes the replay the only
-   copy without leaning on replay suppression. The mutant keeps today's open.
-   The engine change is specified in a separate note for its implementer; until
-   it lands, the specification's open is ahead of the engine's.
+   copy without leaning on replay suppression. The mutant keeps the old open.
+   The engine's open now settles the orphan this way
+   (`resolve_unresolved_orphan_`, over `settle_orphan` in
+   `impls/kafka/src/txn_resume.cpp`), with the fault point
+   `sink.orphan_described` between its describe and its abort. Pinned by
+   `TxnResumeLive.AnOrphanCommittedDuringTheOpenIsReceiptedBeforeTheFence` and
+   `TxnResumeLive.AnOrphanAbortedByTheOpenRefusesTheOldCommitAndIsReplayedOnce`
+   (two sinks on one transactional id, the old commit and the new open released
+   in each order; the first publishes the interval twice against the old open),
+   by the `TxnResumeSettle` cases for the wire exchange, and by its `SinkOpens`
+   line in trace validation (below).
 
 ## Trace validation
 
@@ -430,6 +440,25 @@ let it read the `CommitCheckpoint` already queued behind that `Deploy`. Before
 this module it diverged at event 44, the lost worker's accepted
 `DeliverCommit`; it is accepted now, the recovery re-commit at the next open a
 no-op.
+
+A Kafka sink's `SinkOpens` line carries `orphan` and `settled` when its open
+found an `.unresolved` marker above the restore point and settled it:
+`receipt` (a receipt already answered for it), `committed` (the open proved a
+commit and wrote the receipt), `aborted` (the open's `EndTxn(abort)` ended it)
+or `not_committed` (found decided without a commit). The module then takes the
+open (`SinkOpensWith`, with or without the old incarnation's commit landing
+during it) only where the orphan is the newest marker above the restore point
+and the outcome is one the specification's open can reach from that state; a
+line without the fields, from an engine before the settle or an open with no
+marker, is taken as before. `traces/kafka-orphan-settled-at-open`, synthetic,
+has two losses of a worker whose process runs on and each value once; it is
+accepted, and a field changed to an outcome the state rules out diverges (a
+`committed` read as `aborted` diverges at the old incarnation's `SinkCommit`,
+and an `aborted` read as `committed` at the walk's probe that finds the
+transaction aborted). An outcome the specification allows from the same state
+is accepted, as it must be: an `aborted` read as `not_committed` is a broker
+expiry the engine cannot observe, taken as a hidden step. The merge script
+grants one expiry per `not_committed` line for that reason.
 
 To record a run: set the variable, run the job (the in-process protocol
 trace test and every multi-process harness test do this themselves when

@@ -141,19 +141,16 @@ struct DescribeState {
     const ConnectFn& connect,
     const ResumeAuth& auth = {});
 
-// The pre-fence orphan verdict: does the observed coordinator state PROVE
-// that the staged producer's prepared transaction committed? True only for
-// a commit decision (CompleteCommit, or PrepareCommit - decided, being
-// completed) under EXACTLY the staged identity: a different producer id or
-// epoch means the state describes some other generation's transaction, and
-// treating it as this orphan's commit would arm replay suppression for
-// panes that were never published (data loss, the inverse failure of the
-// duplicate this verdict exists to prevent). Everything else - Ongoing,
-// the abort states, Empty, an unknown string - is "not proven": the
-// producer open that follows aborts an undecided transaction, and the
-// restore's replay legitimately re-produces the interval. Pure so the
-// mapping is unit-tested state by state; the 2PC sink's open() is the
-// caller.
+// The describe-only orphan verdict the 2PC sink's open() used before it
+// settled orphans itself (settle_orphan below): does the observed
+// coordinator state PROVE that the staged producer's prepared transaction
+// committed? True only for a commit decision (CompleteCommit, or
+// PrepareCommit - decided, being completed) under EXACTLY the staged
+// identity. Everything else is "not proven". Kept for compatibility; the
+// open no longer calls it. Leaving an undecided orphan to the
+// init_transactions that follows holds only while nobody else holds the
+// producer, and a worker declared lost while its process still runs does
+// (formal/ExactlyOnce.tla, mutant orphan_left_to_init).
 [[nodiscard]] inline bool orphan_commit_proven(const DescribeState& observed,
                                                std::int64_t staged_producer_id,
                                                std::int16_t staged_producer_epoch) noexcept {
@@ -161,6 +158,104 @@ struct DescribeState {
                       observed.producer_epoch == staged_producer_epoch;
     return ours && (observed.state == "CompleteCommit" || observed.state == "PrepareCommit");
 }
+
+// --- settling an orphan at a reopening sink's open ---------------------------
+//
+// A reopening 2PC sink that finds an .unresolved marker above its restore
+// point decides the orphan itself, before init_transactions fences the
+// identity and before replay suppression arms. The worker that sealed the
+// orphan may have been declared lost while its process still runs, with the
+// orphan's CommitCheckpoint already on its wire, so its EndTxn(commit) can
+// land at any moment of the open. The open ends an undecided orphan with
+// EndTxn(abort) under the producer id and epoch DescribeTransactions just
+// reported for it, and the transaction coordinator takes one of the two
+// requests first: abort first, the old commit is refused; commit first, the
+// abort is refused, and a fresh describe proves the commit so the open can
+// write its receipt. Either way the outcome is decided, and known, before
+// the fence. Nothing after the fence can learn it: InitProducerId does not
+// report whether it aborted or waited, and DescribeTransactions then names
+// the new epoch's state.
+
+// What the open does next with one describe's answer.
+//   Committed    - a commit decision for the orphan: write its receipt.
+//   NotCommitted - decided without a commit, or no longer this producer's.
+//   AbortWith    - undecided: send EndTxn(abort) under the described epoch.
+//   Retry        - a state this module does not know: neither a decision it
+//                  can read nor an undecided transaction it can safely end.
+enum class SettleStep { Committed, NotCommitted, AbortWith, Retry };
+
+// The mapping, state by state. `floor_epoch` is the staged epoch on the
+// first round and the epoch observed Ongoing afterwards. A commit decision
+// (PrepareCommit or CompleteCommit) proves the orphan's commit only under the
+// staged producer id at or above the floor: the staged epoch rides
+// librdkafka's periodic statistics and can trail the broker's (librdkafka
+// can bump its own epoch when it recovers from an abortable error, and a
+// broker may bump it as a commit completes), so equality could miss a real
+// commit, while
+// an epoch below the floor names an older transaction. The pinned broker
+// keeps one epoch across an incarnation's commits and aborts
+// (TxnResumeLive.DescribeReportsTheProducerEpochsAroundACommitAndAnAbort). A state under any other
+// producer id means the transactional id has been re-initialised and that
+// init ended the orphan. For AbortWith, the epoch to abort under is
+// observed.producer_epoch.
+[[nodiscard]] inline SettleStep next_settle_step(const DescribeState& observed,
+                                                 std::int64_t staged_pid,
+                                                 std::int16_t floor_epoch) noexcept {
+    if (observed.producer_id != staged_pid) {
+        return SettleStep::NotCommitted;
+    }
+    const auto& st = observed.state;
+    if (st == "PrepareCommit" || st == "CompleteCommit") {
+        return observed.producer_epoch >= floor_epoch ? SettleStep::Committed
+                                                      : SettleStep::NotCommitted;
+    }
+    if (st == "Ongoing") {
+        return SettleStep::AbortWith;
+    }
+    if (st == "PrepareAbort" || st == "CompleteAbort" || st == "Empty" || st == "Dead" ||
+        st == "PrepareEpochFence") {
+        return SettleStep::NotCommitted;
+    }
+    return SettleStep::Retry;
+}
+
+struct OrphanSettlement {
+    enum class Status {
+        Committed,       // a describe proved the orphan's commit
+        Aborted,         // this settle's EndTxn(abort) ended it
+        NotCommitted,    // found decided without a commit
+        TransportError,  // no verdict: unreachable, refused, unsupported, out of rounds
+    };
+    Status status{Status::TransportError};
+    // What the deciding describe reported (for Aborted: the Ongoing
+    // transaction this settle ended). Empty / -1 when nothing was described.
+    std::string state;
+    std::int64_t producer_id{-1};
+    std::int16_t producer_epoch{-1};
+    // The floor the settle ended with: the staged epoch, or the epoch it last
+    // saw Ongoing. A caller retrying after TransportError passes it back as
+    // the staged epoch, so an anchor learnt in one call holds in the next.
+    std::int16_t floor_epoch{-1};
+    std::string detail;
+};
+
+// One bootstrap address, bounded rounds inside, like resume_commit; the
+// caller walks the bootstrap list and its own deadline. Each round runs the
+// coordinator dance ([SASL] -> ApiVersions -> FindCoordinator -> coordinator
+// -> [SASL]) and DescribeTransactions v0, then follows next_settle_step. An
+// EndTxn(abort) answered 0 is Aborted; any other answer leads to a describe,
+// since the verdict comes from the describe, never from the error code. A
+// transport failure after the abort was sent is ambiguous and also leads to a
+// describe. `before_abort`, when set, runs after a describe saw the orphan
+// Ongoing and before the abort is sent (the 2PC sink places its
+// sink.orphan_described fault point there). staged.producer_epoch is the
+// first round's floor.
+[[nodiscard]] OrphanSettlement settle_orphan(const std::string& bootstrap_host,
+                                             std::uint16_t bootstrap_port,
+                                             const TxnIdentity& staged,
+                                             const ConnectFn& connect,
+                                             const ResumeAuth& auth = {},
+                                             const std::function<void()>& before_abort = {});
 
 // --- wire encoding, exposed for the frame tests -----------------------------
 

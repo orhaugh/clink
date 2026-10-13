@@ -24,6 +24,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -524,19 +525,24 @@ public:
 
     void open() override {
         // BEFORE inner_.open(): opening the transactional producer fences
-        // the previous incarnation, which aborts an undecided orphan and
-        // erases the broker state that could have named a committed one.
-        // Anything this subtask must still learn about its predecessor has
-        // to be learned first.
+        // the previous incarnation and erases the broker state that names
+        // how its last transaction ended. Anything this subtask must still
+        // decide or learn about its predecessor has to be done first, and
+        // the receipt a proven commit earns must be durable before replay
+        // suppression arms from the receipts below.
         resolve_unresolved_orphan_();
         inner_.open();
         std::lock_guard lk(mu_);
         arm_replay_suppression_();
         if (protocol_trace::enabled()) {
-            protocol_trace::Event("SinkOpens")
-                .u("sub", trace_subtask_())
-                .s("family", "kafka")
-                .emit();
+            auto ev = protocol_trace::Event("SinkOpens");
+            ev.u("sub", trace_subtask_()).s("family", "kafka");
+            // Present only when an unresolved marker above the restore point
+            // was found and settled: which checkpoint, and how it ended.
+            if (settled_verdict_ != nullptr) {
+                ev.u("orphan", settled_orphan_ckpt_).s("settled", settled_verdict_);
+            }
+            ev.emit();
         }
     }
 
@@ -903,10 +909,12 @@ private:
     // emissions), which is the premise the connector page documents for
     // the replay_suppression option.
 
-    void write_commit_receipt_(std::uint64_t ckpt, std::int64_t wm_horizon) {
+    // True when the receipt is durable. Commit-path callers ignore the
+    // answer (see the catch); the open's settle needs it.
+    bool write_commit_receipt_(std::uint64_t ckpt, std::int64_t wm_horizon) {
         const auto* rt = this->runtime();
         if (!replay_suppression_ || rt == nullptr || rt->commit_receipt_dir().empty()) {
-            return;
+            return false;
         }
         try {
             const std::filesystem::path dir{rt->commit_receipt_dir()};
@@ -914,6 +922,7 @@ private:
             clink::state::detail::write_string_fsync_rename(
                 dir / clink::connectors::commit_receipt_file_name(subtask_idx_, ckpt),
                 "wm=" + std::to_string(wm_horizon) + "\n");
+            return true;
         } catch (const std::exception& e) {
             // Best-effort by design: the commit DID execute, and confirming
             // it stays truthful. Losing the receipt only widens this
@@ -926,26 +935,38 @@ private:
                     "); a recovery crossing this checkpoint falls back to bounded replay");
             }
         }
+        return false;
     }
 
     // Called from open() BEFORE the transactional producer opens. When the
     // coordinator's in-doubt resolution could not settle this subtask's
     // prepared transaction (broker outage mid-walk, walk cancelled), it
     // leaves a sub<K>-<N>.unresolved marker next to the receipts, carrying
-    // the staged handle. This is the LAST moment the orphan's fate is
-    // knowable: nothing has re-initialised the producer yet, so the
-    // broker's transaction coordinator still names it (CompleteCommit for a
-    // commit that executed in the ack window; Ongoing for one that never
-    // did). init_transactions would abort the undecided case and bump the
-    // epoch - after which no probe can tell the two apart. So ask FIRST,
-    // with the read-only DescribeTransactions: committed => write the
-    // receipt here (replay suppression arms from it right after),
-    // undecided or aborted => delete the marker and let the restore's
-    // replay re-produce the interval. An unreachable broker is a refusal
-    // to fence blind: throw, let the restart cycle retry, converge when
-    // the broker returns. Skipping this is what published one subtask's
-    // committed windows twice on the qual01 rig-night composite.
+    // the staged handle. This is the LAST moment the orphan's fate can be
+    // decided and known: nothing has re-initialised the producer yet, so the
+    // broker's transaction coordinator still names it. init_transactions
+    // would fence the identity, and after it no request reports how the
+    // orphan ended.
+    //
+    // The open decides the orphan itself (txn_resume.hpp, settle_orphan).
+    // A commit the broker names gets its receipt written here, durably,
+    // before the marker goes and before replay suppression arms from it. An
+    // undecided orphan is ended with EndTxn(abort) under the identity the
+    // describe just reported, so the restore's replay is the interval's only
+    // copy. Leaving it for the init to abort is not enough: the worker that
+    // sealed it may have been declared lost while its process still runs,
+    // with the orphan's CommitCheckpoint on its wire, and its commit can land
+    // between a describe and the init (formal/ExactlyOnce.tla, mutant
+    // orphan_left_to_init). The broker takes the abort or that commit first;
+    // an abort refused because the commit won is followed by a describe that
+    // proves the commit. An unreachable broker is a refusal to fence blind:
+    // throw, let the restart cycle retry, converge when the broker returns.
+    // Order: settle, receipt (only when committed), retire the marker, then
+    // init_transactions in open(), then arm. A crash before the marker is
+    // retired leaves it, and the next open settles again; that is idempotent,
+    // since no init has run since the marker was written.
     void resolve_unresolved_orphan_() {
+        settled_verdict_ = nullptr;
         const auto* rt = this->runtime();
         if (!replay_suppression_ || rt == nullptr || rt->commit_receipt_dir().empty() ||
             rt->restore_from_checkpoint_id() == 0) {
@@ -977,17 +998,24 @@ private:
         const auto marker_path =
             std::filesystem::path{rt->commit_receipt_dir()} /
             (clink::connectors::commit_receipt_file_name(subtask_idx_, marker_ckpt) + suffix);
+        const auto receipt_path =
+            std::filesystem::path{rt->commit_receipt_dir()} /
+            clink::connectors::commit_receipt_file_name(subtask_idx_, marker_ckpt);
         const auto retire = [&] {
             std::error_code rec;
             std::filesystem::remove(marker_path, rec);
         };
-        // A receipt for the marker's checkpoint outranks it (the walk or a
-        // prior incarnation resolved it after the marker was written).
-        if (std::filesystem::exists(
-                std::filesystem::path{rt->commit_receipt_dir()} /
-                    clink::connectors::commit_receipt_file_name(subtask_idx_, marker_ckpt),
-                ec)) {
+        const auto has_receipt = [&] {
+            std::error_code rec;
+            return std::filesystem::exists(receipt_path, rec);
+        };
+        // A receipt for the marker's checkpoint outranks it (the walk, a
+        // prior incarnation, or the old incarnation itself resolved it after
+        // the marker was written).
+        if (has_receipt()) {
             retire();
+            settled_orphan_ckpt_ = marker_ckpt;
+            settled_verdict_ = "receipt";
             return;
         }
         std::string handle;
@@ -1031,29 +1059,39 @@ private:
             // Cannot ask AND must not fence blind: fail the open loudly.
             throw std::runtime_error("kafka_2pc_sink_string: unresolved orphan for checkpoint " +
                                      std::to_string(marker_ckpt) +
-                                     " cannot be described: " + dialer.error);
+                                     " cannot be settled: " + dialer.error);
         }
         // Bounded both ways: by attempts (a fast-refusing dead port must not
         // spin) and by wall clock (a raw blocking connect against a black
         // hole can eat the OS connect timeout per attempt). Either bound
         // expiring means throw below - the restart cycle is the outer retry.
         // The 90s must stay BELOW the coordinator's restart drain deadline
-        // (120s): a restart cancel arriving mid-describe is only observed
+        // (120s): a restart cancel arriving mid-settle is only observed
         // when this loop exits, and a drain deadline that undercuts it
         // reads the sink as a wedged survivor and fails the whole job
         // (exactly how the orphaned-commit gate first died).
-        constexpr int kDescribeAttempts = 6;
-        const auto describe_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{90};
-        std::optional<clink::kafka::DescribeState> verdict;
-        for (int attempt = 0; attempt < kDescribeAttempts && !verdict.has_value() &&
-                              std::chrono::steady_clock::now() < describe_deadline;
+        constexpr int kSettleAttempts = 6;
+        const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{90};
+        clink::kafka::TxnIdentity staged{.transactional_id = transactional_id_,
+                                         .producer_id = handle_pid,
+                                         .producer_epoch = handle_epoch};
+        std::optional<clink::kafka::OrphanSettlement> verdict;
+        std::string last_detail;
+        for (int attempt = 0; attempt < kSettleAttempts && !verdict.has_value() &&
+                              std::chrono::steady_clock::now() < settle_deadline;
              ++attempt) {
             for (const auto& [host, port] : parse_bootstrap_entries(brokers_)) {
-                verdict = clink::kafka::describe_transaction_state(
-                    host, port, transactional_id_, dialer.connect, dialer.auth);
-                if (verdict.has_value()) {
+                auto settled = clink::kafka::settle_orphan(
+                    host, port, staged, dialer.connect, dialer.auth, [] {
+                        CLINK_FAULT_POINT(clink::fault::points::kSinkOrphanDescribed);
+                    });
+                if (settled.status != clink::kafka::OrphanSettlement::Status::TransportError) {
+                    verdict = std::move(settled);
                     break;
                 }
+                last_detail = settled.detail;
+                // The epoch a call saw Ongoing anchors the next call's proof.
+                staged.producer_epoch = settled.floor_epoch;
             }
         }
         if (!verdict.has_value()) {
@@ -1063,39 +1101,61 @@ private:
             // answers.
             throw std::runtime_error(
                 "kafka_2pc_sink_string: checkpoint " + std::to_string(marker_ckpt) +
-                " left an unresolved prepared transaction and no broker is reachable to "
-                "describe it; refusing to fence blind (a blind fence turns \"committed in "
-                "the ack window\" into replayed duplicates)");
+                " left an unresolved prepared transaction and no broker settled it (" +
+                last_detail +
+                "); refusing to fence blind (a blind fence turns \"committed in the ack "
+                "window\" into replayed duplicates)");
         }
-        const bool ours =
-            verdict->producer_id == handle_pid && verdict->producer_epoch == handle_epoch;
-        if (clink::kafka::orphan_commit_proven(*verdict, handle_pid, handle_epoch)) {
+        const std::string seen = " (" + verdict->state +
+                                 " pid=" + std::to_string(verdict->producer_id) +
+                                 " epoch=" + std::to_string(verdict->producer_epoch) + ")";
+        using Status = clink::kafka::OrphanSettlement::Status;
+        if (verdict->status == Status::Committed) {
             if (wm.empty()) {
                 this->runtime()->log_error(
                     std::string{"kafka_2pc_sink_string: orphaned transaction for checkpoint "} +
-                    std::to_string(marker_ckpt) + " proved committed (" + verdict->state +
-                    ") but its handle carries no watermark horizon (older binary); no receipt "
+                    std::to_string(marker_ckpt) + " proved committed" + seen +
+                    " but its handle carries no watermark horizon (older binary); no receipt "
                     "can be written and the replay of its interval will NOT be suppressed");
-            } else {
-                write_commit_receipt_(marker_ckpt, std::strtoll(wm.c_str(), nullptr, 10));
-                this->runtime()->log_info(
-                    std::string{"kafka_2pc_sink_string: orphaned transaction for checkpoint "} +
-                    std::to_string(marker_ckpt) + " resolved COMMITTED before fencing (" +
-                    verdict->state + " pid=" + std::to_string(verdict->producer_id) +
-                    " epoch=" + std::to_string(verdict->producer_epoch) +
-                    "); receipt written, replay suppression arms from it");
+                retire();
+                return;
+            }
+            // The receipt must be durable before the marker goes: a marker
+            // retired over a lost receipt would leave the replay unsuppressed
+            // for an interval the broker published. Throwing keeps the
+            // marker, and the next open settles again and finds the commit.
+            if (!write_commit_receipt_(marker_ckpt, std::strtoll(wm.c_str(), nullptr, 10))) {
+                throw std::runtime_error(
+                    "kafka_2pc_sink_string: orphaned transaction for checkpoint " +
+                    std::to_string(marker_ckpt) +
+                    " proved committed but its receipt could not be written; the marker stays "
+                    "and the next open settles it again");
             }
             retire();
+            settled_orphan_ckpt_ = marker_ckpt;
+            settled_verdict_ = "committed";
+            this->runtime()->log_info(
+                std::string{"kafka_2pc_sink_string: orphaned transaction for checkpoint "} +
+                std::to_string(marker_ckpt) + " resolved COMMITTED before fencing" + seen +
+                "; receipt written, replay suppression arms from it");
             return;
         }
+        retire();
+        settled_orphan_ckpt_ = marker_ckpt;
+        // A receipt that appeared while the settle ran answers for the
+        // orphan: the old incarnation committed it and wrote the receipt
+        // before the describe, which then saw whatever followed on that
+        // producer (a successor transaction this open may have ended).
+        settled_verdict_ = has_receipt()                        ? "receipt"
+                           : verdict->status == Status::Aborted ? "aborted"
+                                                                : "not_committed";
         this->runtime()->log_info(
             std::string{"kafka_2pc_sink_string: orphaned transaction for checkpoint "} +
-            std::to_string(marker_ckpt) + " resolved not-committed before fencing (state=" +
-            verdict->state + " pid=" + std::to_string(verdict->producer_id) +
-            " epoch=" + std::to_string(verdict->producer_epoch) + (ours ? "" : ", not ours") +
-            "); the init below aborts any undecided remains and the replay re-produces the "
-            "interval");
-        retire();
+            std::to_string(marker_ckpt) + " resolved " + settled_verdict_ + " before fencing" +
+            seen + ": " + verdict->detail +
+            (std::string_view{settled_verdict_} == "receipt"
+                 ? "; replay suppression arms from its receipt"
+                 : "; the restore's replay is the interval's only copy"));
     }
 
     // Called from open() (under mu_): arm suppression from receipts newer
@@ -1215,6 +1275,13 @@ private:
     // Set by close(). A commit arriving after teardown aborted the prepared
     // transaction must refuse rather than read as executed.
     bool closed_{false};
+    // What this open's settle decided about an unresolved orphan above the
+    // restore point, for the SinkOpens trace line: the marker's checkpoint and
+    // "receipt", "committed", "aborted" or "not_committed". Null when no
+    // marker was found, or when the open could not act on the one it found
+    // (unparseable, another lineage, a proven commit with no horizon).
+    std::uint64_t settled_orphan_ckpt_{0};
+    const char* settled_verdict_{nullptr};
 };
 
 // Upsert-shaped Kafka sink. Takes JSON rows (each row is

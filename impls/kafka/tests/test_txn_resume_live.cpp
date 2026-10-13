@@ -7,11 +7,16 @@
 // identity must be REFUSED, never claimed committed. Skips without Docker,
 // same convention as the exactly-once suites.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,9 +25,11 @@
 #include <sys/wait.h>
 
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/cluster/protocol_trace.hpp"
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/connectors/txn_resume_registry.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/kafka/consume_all.hpp"
 #include "clink/kafka/txn_resume.hpp"
 #include "clink/runtime/network/connection.hpp"
@@ -687,5 +694,492 @@ TEST_F(TxnResumeLive, AnArmedRestoreSuppressesAlreadyPublishedReemissions) {
            "above it lost";
     std::filesystem::remove_all(receipt_dir);
 }
+
+// --- settling an orphan at a reopening sink's open, on a real broker ------------
+//
+// settle_orphan against a genuine orphan (produced, flushed, the producer
+// _exit()ed in a fork): it aborts an undecided one under the identity
+// DescribeTransactions reports, after which the old identity's commit is
+// refused; and when a commit lands between its describe and its abort, the
+// abort is refused and the next describe proves the commit.
+
+TEST_F(TxnResumeLive, TheSettleAbortsAGenuineOrphanAndTheOldCommitIsThenRefused) {
+    const auto txn = produce_orphan("settle-live-abort", {"x1", "x2"});
+    ASSERT_TRUE(txn.complete());
+    const auto [host, port] = broker_addr();
+    int before_abort = 0;
+    const auto settled = clink::kafka::settle_orphan(
+        host, port, txn, connect_plain_fn(), {}, [&before_abort] { ++before_abort; });
+    ASSERT_EQ(settled.status, clink::kafka::OrphanSettlement::Status::Aborted) << settled.detail;
+    EXPECT_EQ(before_abort, 1);
+    EXPECT_EQ(settled.producer_id, txn.producer_id);
+
+    // The old incarnation's commit, arriving after the abort, must not land.
+    const auto late = clink::kafka::resume_commit(host, port, txn, connect_plain_fn());
+    EXPECT_FALSE(late.committed()) << "a commit after the settle's abort landed: " << late.detail;
+    std::cout << "SETTLE-LIVE abort: " << settled.detail
+              << "; the old commit after it: " << late.detail << "\n";
+    EXPECT_TRUE(
+        clink::kafka::consume_all_committed(broker_->brokers(), topic_, std::chrono::seconds(20))
+            .empty())
+        << "the aborted orphan's records must stay invisible";
+}
+
+TEST_F(TxnResumeLive, TheSettleProvesACommitThatLandsBetweenItsDescribeAndItsAbort) {
+    const std::vector<std::string> values = {"y1", "y2", "y3"};
+    const auto txn = produce_orphan("settle-live-commit-wins", values);
+    ASSERT_TRUE(txn.complete());
+    const auto [host, port] = broker_addr();
+    // The old incarnation's commit lands in the one window that matters: the
+    // describe has seen Ongoing, the abort is not yet sent.
+    clink::kafka::ResumeOutcome raced;
+    int before_abort = 0;
+    const auto settled = clink::kafka::settle_orphan(
+        host, port, txn, connect_plain_fn(), {}, [&, h = host, p = port] {
+            ++before_abort;
+            raced = clink::kafka::resume_commit(h, p, txn, connect_plain_fn());
+        });
+    ASSERT_TRUE(raced.committed()) << raced.detail;
+    EXPECT_EQ(before_abort, 1) << "the settle must have described the orphan Ongoing first";
+    EXPECT_EQ(settled.status, clink::kafka::OrphanSettlement::Status::Committed)
+        << "the abort was sent after the commit landed; the broker must refuse it and the next "
+           "describe prove the commit: "
+        << settled.detail;
+    std::cout << "SETTLE-LIVE commit-wins: " << settled.detail << "\n";
+    EXPECT_EQ(
+        clink::kafka::consume_all_committed(broker_->brokers(), topic_, std::chrono::seconds(20)),
+        values)
+        << "the commit that won is the only copy, and the abort undid nothing";
+
+    // A settle that runs after the commit has completed proves it directly.
+    int again = 0;
+    const auto later =
+        clink::kafka::settle_orphan(host, port, txn, connect_plain_fn(), {}, [&again] { ++again; });
+    EXPECT_EQ(later.status, clink::kafka::OrphanSettlement::Status::Committed) << later.detail;
+    EXPECT_EQ(again, 0) << "a decided transaction is described, never aborted";
+}
+
+// The producer epochs DescribeTransactions reports around a commit and an
+// abort on the pinned broker, next to the epoch librdkafka's statistics
+// report: the facts the settle's proof rule and orphan_commit_proven's
+// exact-epoch rule rest on. Printed (EPOCH-PROBE lines) and pinned.
+TEST_F(TxnResumeLive, DescribeReportsTheProducerEpochsAroundACommitAndAnAbort) {
+    const std::string txn_id = "epoch-probe";
+    // A wide topic, so the first commit has a control marker to write to
+    // every partition and the describes during it have a window to land in.
+    constexpr int kPartitions = 64;
+    const std::string wide = topic_ + "_wide";
+    broker_->create_topic(wide, kPartitions);
+    KafkaSink::Options o;
+    o.brokers = broker_->brokers();
+    o.topic = wide;
+    o.transactional_id = txn_id;
+    o.metric_prefix.clear();
+    KafkaSink sink(o);
+    sink.open();
+    const auto [host, port] = broker_addr();
+    const auto describe = [&, h = host, p = port] {
+        return clink::kafka::describe_transaction_state(h, p, txn_id, connect_plain_fn());
+    };
+    // The statistics epoch, refreshed: drive librdkafka's poll loop past a
+    // couple of statistics ticks (100 ms each).
+    const auto stats_epoch = [&sink] {
+        for (int i = 0; i < 4; ++i) {
+            sink.flush();
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        }
+        const auto ident = sink.producer_identity();
+        return ident.has_value() ? static_cast<int>(ident->producer_epoch) : -1;
+    };
+    const auto text = [](const std::optional<clink::kafka::DescribeState>& d) {
+        return d.has_value() ? d->state + "@" + std::to_string(d->producer_epoch) +
+                                   " pid=" + std::to_string(d->producer_id)
+                             : std::string{"<no answer>"};
+    };
+    std::vector<std::pair<std::string, std::optional<clink::kafka::DescribeState>>> seen;
+    const auto note = [&](const std::string& when) {
+        const auto d = describe();
+        std::cout << "EPOCH-PROBE " << when << ": describe " << text(d) << ", stats epoch "
+                  << stats_epoch() << "\n";
+        seen.emplace_back(when, d);
+        return d;
+    };
+
+    const auto after_init = note("after init_transactions");
+    const auto produce = [&sink](const std::string& v) {
+        Batch<KafkaMessage> b;
+        b.emplace(KafkaMessage{v});
+        sink.on_data(b);
+        sink.flush();
+    };
+    {
+        Batch<KafkaMessage> b;
+        for (int p = 0; p < kPartitions; ++p) {
+            KafkaMessage m{"e1"};
+            m.partition = p;
+            b.emplace(std::move(m));
+        }
+        sink.on_data(b);
+        sink.flush();
+    }
+    const auto ongoing_1 = note("first transaction, records flushed");
+
+    // Commit while a second thread describes as fast as it can, to catch the
+    // PrepareCommit window if the broker exposes one.
+    std::atomic<bool> committing{true};
+    std::mutex during_mu;
+    std::vector<std::string> during;
+    int samples = 0;
+    std::thread poller([&] {
+        while (committing.load()) {
+            const auto d = describe();
+            std::lock_guard lock(during_mu);
+            ++samples;
+            if (during.empty() || during.back() != text(d)) {
+                during.push_back(text(d));
+            }
+        }
+    });
+    sink.commit_transaction();
+    committing.store(false);
+    poller.join();
+    std::cout << "EPOCH-PROBE during the commit (" << samples << " describes):";
+    for (const auto& d : during) {
+        std::cout << " " << d;
+    }
+    std::cout << "\n";
+    const auto committed_1 = note("after commit_transaction");
+
+    produce("e2");
+    const auto ongoing_2 = note("second transaction, records flushed");
+    sink.abort_transaction();
+    const auto aborted_2 = note("after abort_transaction");
+    produce("e3");
+    const auto ongoing_3 = note("third transaction, records flushed");
+    // A successor opens the same transactional id: the fence a reopening
+    // sink's init_transactions applies.
+    KafkaSink successor(o);
+    successor.open();
+    const auto fenced = describe();
+    std::cout << "EPOCH-PROBE after a successor's init_transactions: describe " << text(fenced)
+              << "\n";
+    successor.close();
+    sink.close();
+
+    ASSERT_TRUE(after_init.has_value() && ongoing_1.has_value() && committed_1.has_value() &&
+                ongoing_2.has_value() && aborted_2.has_value() && ongoing_3.has_value() &&
+                fenced.has_value());
+    EXPECT_EQ(ongoing_1->state, "Ongoing");
+    EXPECT_EQ(committed_1->state, "CompleteCommit");
+    EXPECT_EQ(ongoing_2->state, "Ongoing");
+    EXPECT_EQ(aborted_2->state, "CompleteAbort");
+    // What the settle's proof rests on: a completed commit is described under
+    // the producer id and at or above the epoch its transaction was described
+    // Ongoing at, and a successor's init moves the epoch past the old one.
+    for (const auto& [when, d] : seen) {
+        EXPECT_EQ(d->producer_id, ongoing_1->producer_id)
+            << when << ": only the successor's init re-initialises the transactional id";
+    }
+    EXPECT_GE(committed_1->producer_epoch, ongoing_1->producer_epoch);
+    EXPECT_GE(aborted_2->producer_epoch, ongoing_2->producer_epoch);
+    EXPECT_TRUE(fenced->producer_id != ongoing_3->producer_id ||
+                fenced->producer_epoch > ongoing_3->producer_epoch)
+        << "a successor's init must fence the old identity: " << text(fenced);
+}
+
+// --- the orphan raced at a reopening open, through the engine's own sink ---------
+//
+// Needs the fault points (compiled into test builds).
+#if CLINK_FAULT_ENABLED
+//
+// The deterministic gate for the defect formal/ExactlyOnce.tla found once a
+// worker declared lost could run on (mutant orphan_left_to_init). Two
+// kafka_2pc sinks share one transactional id in this process, each with its
+// own runtime context, and one receipt directory. The OLD incarnation seals
+// checkpoint 2 and holds its commit at sink.before_commit; the walk's
+// .unresolved marker for 2 is on disk; the NEW incarnation opens restored from
+// checkpoint 1 and is held at sink.orphan_described, its describe having seen
+// the orphan Ongoing. The test then picks which reaches the broker first.
+class OrphanRace {
+public:
+    OrphanRace(const std::string& topic, const std::string& txn_id)
+        : topic_(topic),
+          dir_(std::filesystem::temp_directory_path() /
+               ("clink_orphan_race_" + std::to_string(::getpid()) + "_" + txn_id)),
+          old_rctx_(clink::OperatorId{45}, "race_old", &old_state_, nullptr),
+          new_rctx_(clink::OperatorId{46}, "race_new", &new_state_, nullptr) {
+        std::filesystem::remove_all(dir_);
+        std::filesystem::create_directories(dir_ / "trace");
+        ::setenv("CLINK_PROTOCOL_TRACE_DIR", (dir_ / "trace").c_str(), 1);
+        clink::protocol_trace::reset_for_tests();
+        old_rctx_.set_commit_receipts(dir_.string(), /*restore_from_ckpt=*/0);
+        new_rctx_.set_commit_receipts(dir_.string(), /*restore_from_ckpt=*/1);
+        old_ = build(txn_id, old_rctx_, clink::OperatorId{45});
+        new_ = build(txn_id, new_rctx_, clink::OperatorId{46});
+    }
+
+    ~OrphanRace() {
+        clink::fault::Registry::instance().reset();
+        ::unsetenv("CLINK_PROTOCOL_TRACE_DIR");
+        clink::protocol_trace::reset_for_tests();
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+
+    OrphanRace(const OrphanRace&) = delete;
+    OrphanRace& operator=(const OrphanRace&) = delete;
+    OrphanRace(OrphanRace&&) = delete;
+    OrphanRace& operator=(OrphanRace&&) = delete;
+
+    // The old incarnation commits checkpoint 1, then seals checkpoint 2, and
+    // the walk's marker for 2 carries its staged handle. Returns the handle.
+    std::string seal_the_orphan() {
+        old_->open();
+        Batch<std::string> one;
+        one.emplace(std::string{"a1"}, clink::EventTime{100});
+        one.emplace(std::string{"a2"}, clink::EventTime{200});
+        old_->on_data(one);
+        old_->on_watermark(clink::Watermark{clink::EventTime{300}});
+        old_->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        old_->on_commit(1);
+        old_->on_data(interval_two());
+        old_->on_watermark(clink::Watermark{clink::EventTime{600}});
+        old_->on_barrier(CheckpointBarrier{CheckpointId{2}});
+        const std::string key = std::string(clink::connectors::kTxnResumeStateKeyPrefix) + "sub0";
+        const auto staged = old_state_.get_operator_state(
+            clink::OperatorId{45}, clink::StateBackend::KeyView{key.data(), key.size()});
+        if (!staged.has_value()) {
+            return {};
+        }
+        std::string handle(reinterpret_cast<const char*>(staged->data()), staged->size());
+        std::ofstream(marker_path()) << handle;
+        return handle;
+    }
+
+    // Checkpoint 2's interval, as the restore's replay re-produces it.
+    static Batch<std::string> interval_two() {
+        Batch<std::string> two;
+        two.emplace(std::string{"b1"}, clink::EventTime{400});
+        two.emplace(std::string{"b2"}, clink::EventTime{500});
+        return two;
+    }
+
+    // The new incarnation runs on after its open: the replay of checkpoint
+    // 2's interval, one record past it, and checkpoint 3 committed.
+    void replay_and_commit_three() {
+        new_->on_data(interval_two());
+        Batch<std::string> three;
+        three.emplace(std::string{"c1"}, clink::EventTime{700});
+        new_->on_data(three);
+        new_->on_watermark(clink::Watermark{clink::EventTime{800}});
+        new_->on_barrier(CheckpointBarrier{CheckpointId{3}});
+        new_->on_commit(3);
+        new_->close();
+    }
+
+    [[nodiscard]] std::filesystem::path receipt_path(std::uint64_t ckpt) const {
+        return dir_ / clink::connectors::commit_receipt_file_name(0, ckpt);
+    }
+    [[nodiscard]] std::filesystem::path marker_path() const {
+        return dir_ / (clink::connectors::commit_receipt_file_name(0, 2) + ".unresolved");
+    }
+
+    // The new incarnation's SinkOpens line (the one carrying the settle).
+    [[nodiscard]] std::string settled_open_line() const {
+        std::string found;
+        for (const auto& f : std::filesystem::directory_iterator(dir_ / "trace")) {
+            std::ifstream in(f.path());
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.find("\"event\":\"SinkOpens\"") != std::string::npos &&
+                    line.find("\"orphan\"") != std::string::npos) {
+                    found = line;
+                }
+            }
+        }
+        return found;
+    }
+
+    clink::Sink<std::string>& old_sink() { return *old_; }
+    clink::Sink<std::string>& new_sink() { return *new_; }
+    [[nodiscard]] bool built() const { return old_ != nullptr && new_ != nullptr; }
+
+private:
+    std::shared_ptr<clink::Sink<std::string>> build(const std::string& txn_id,
+                                                    clink::RuntimeContext& rctx,
+                                                    clink::OperatorId id) {
+        auto& registry = clink::cluster::OperatorRegistry::default_instance();
+        const auto* factory =
+            registry.find_sink("kafka_2pc_sink_string", clink::cluster::ChannelType{"string"});
+        if (factory == nullptr) {
+            return nullptr;
+        }
+        clink::cluster::OperatorBuildContext ctx;
+        ctx.params = {
+            {"brokers", broker_->brokers()}, {"topic", topic_}, {"transactional_id", txn_id}};
+        auto sink = std::static_pointer_cast<clink::Sink<std::string>>(factory->build(ctx));
+        sink->set_id(id);
+        sink->attach_runtime(&rctx);
+        return sink;
+    }
+
+    std::string topic_;
+    std::filesystem::path dir_;
+    clink::InMemoryStateBackend old_state_;
+    clink::InMemoryStateBackend new_state_;
+    clink::RuntimeContext old_rctx_;
+    clink::RuntimeContext new_rctx_;
+    std::shared_ptr<clink::Sink<std::string>> old_;
+    std::shared_ptr<clink::Sink<std::string>> new_;
+};
+
+// Parks the calling test until `point` has been reached `n` times (bounded).
+bool wait_for_hits(std::string_view point, std::uint64_t n) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (clink::fault::Registry::instance().hits(point) < n) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
+void arm_race_points() {
+    using clink::fault::Action;
+    namespace points = clink::fault::points;
+    auto& reg = clink::fault::Registry::instance();
+    reg.reset();
+    for (const auto* point : {points::kSinkBeforeCommit,
+                              points::kSinkBetweenCommitAndReceipt,
+                              points::kSinkOrphanDescribed}) {
+        reg.arm(
+            clink::fault::Rule{.point = point, .ordinal = 1, .action = Action::Block, .arg = 0});
+    }
+}
+
+TEST_F(TxnResumeLive, AnOrphanCommittedDuringTheOpenIsReceiptedBeforeTheFence) {
+    OrphanRace race(topic_, "race-commit-wins");
+    ASSERT_TRUE(race.built());
+    const auto handle = race.seal_the_orphan();
+    ASSERT_FALSE(handle.empty()) << "the barrier must stage a resume handle";
+    ASSERT_EQ(handle.find("\"producer_id\":\"-1\""), std::string::npos) << handle;
+
+    namespace points = clink::fault::points;
+    auto& reg = clink::fault::Registry::instance();
+    arm_race_points();
+    std::thread old_commit([&] {
+        try {
+            race.old_sink().on_commit(2);
+        } catch (const std::exception&) {
+            // Fenced by the new incarnation's init once its receipt landed:
+            // the commit itself executed, which is what this order is about.
+        }
+    });
+    ASSERT_TRUE(wait_for_hits(points::kSinkBeforeCommit, 1));
+    std::string open_error;
+    std::thread new_open([&] {
+        try {
+            race.new_sink().open();
+        } catch (const std::exception& e) {
+            open_error = e.what();
+        }
+    });
+    ASSERT_TRUE(wait_for_hits(points::kSinkOrphanDescribed, 1))
+        << "the new open never described the orphan Ongoing";
+
+    // Order A: the old incarnation's commit reaches the broker first, and its
+    // receipt is held back so only the new open can write one.
+    reg.release(points::kSinkBeforeCommit);
+    ASSERT_TRUE(wait_for_hits(points::kSinkBetweenCommitAndReceipt, 1))
+        << "the old incarnation's broker commit never executed";
+    reg.release(points::kSinkOrphanDescribed);
+    new_open.join();
+    ASSERT_TRUE(open_error.empty()) << open_error;
+
+    EXPECT_TRUE(std::filesystem::exists(race.receipt_path(2)))
+        << "the open's abort was refused by the commit that won; it must prove the commit and "
+           "write the receipt itself before init_transactions (the old incarnation is still "
+           "parked before its own receipt)";
+    EXPECT_FALSE(std::filesystem::exists(race.marker_path()));
+    const auto line = race.settled_open_line();
+    EXPECT_NE(line.find("\"orphan\":2"), std::string::npos) << line;
+    EXPECT_NE(line.find("\"settled\":\"committed\""), std::string::npos) << line;
+
+    reg.release(points::kSinkBetweenCommitAndReceipt);
+    old_commit.join();
+    race.old_sink().close();
+    reg.reset();
+
+    // Suppression armed from checkpoint 2's receipt swallows the replay.
+    race.replay_and_commit_three();
+    EXPECT_EQ(
+        clink::kafka::consume_all_committed(broker_->brokers(), topic_, std::chrono::seconds(20)),
+        (std::vector<std::string>{"a1", "a2", "b1", "b2", "c1"}))
+        << "the orphan's interval must be published exactly once: by the old incarnation's "
+           "commit, with the replay suppressed";
+}
+
+TEST_F(TxnResumeLive, AnOrphanAbortedByTheOpenRefusesTheOldCommitAndIsReplayedOnce) {
+    OrphanRace race(topic_, "race-abort-wins");
+    ASSERT_TRUE(race.built());
+    const auto handle = race.seal_the_orphan();
+    ASSERT_FALSE(handle.empty()) << "the barrier must stage a resume handle";
+    ASSERT_EQ(handle.find("\"producer_id\":\"-1\""), std::string::npos) << handle;
+
+    namespace points = clink::fault::points;
+    auto& reg = clink::fault::Registry::instance();
+    arm_race_points();
+    std::string old_error;
+    std::thread old_commit([&] {
+        try {
+            race.old_sink().on_commit(2);
+        } catch (const std::exception& e) {
+            old_error = e.what();
+        }
+    });
+    ASSERT_TRUE(wait_for_hits(points::kSinkBeforeCommit, 1));
+    std::string open_error;
+    std::thread new_open([&] {
+        try {
+            race.new_sink().open();
+        } catch (const std::exception& e) {
+            open_error = e.what();
+        }
+    });
+    ASSERT_TRUE(wait_for_hits(points::kSinkOrphanDescribed, 1))
+        << "the new open never described the orphan Ongoing";
+
+    // Order B: the new open's abort reaches the broker first.
+    reg.release(points::kSinkOrphanDescribed);
+    new_open.join();
+    ASSERT_TRUE(open_error.empty()) << open_error;
+    EXPECT_FALSE(std::filesystem::exists(race.receipt_path(2)))
+        << "the open ended the orphan; no receipt may claim its commit";
+    EXPECT_FALSE(std::filesystem::exists(race.marker_path()));
+    const auto line = race.settled_open_line();
+    EXPECT_NE(line.find("\"orphan\":2"), std::string::npos) << line;
+    EXPECT_NE(line.find("\"settled\":\"aborted\""), std::string::npos) << line;
+
+    reg.release(points::kSinkBeforeCommit);
+    old_commit.join();
+    EXPECT_FALSE(old_error.empty()) << "the old incarnation's commit of an aborted, fenced "
+                                       "transaction must fail, never read as executed";
+    std::cout << "ORPHAN-RACE abort wins; the old incarnation's commit: " << old_error << "\n";
+    EXPECT_EQ(reg.hits(points::kSinkBetweenCommitAndReceipt), 0U)
+        << "the old incarnation reached its receipt: its commit executed after the abort";
+    EXPECT_FALSE(std::filesystem::exists(race.receipt_path(2)));
+    race.old_sink().close();
+    reg.reset();
+
+    // Nothing is armed from checkpoint 2, so the replay is its only copy.
+    race.replay_and_commit_three();
+    EXPECT_EQ(
+        clink::kafka::consume_all_committed(broker_->brokers(), topic_, std::chrono::seconds(20)),
+        (std::vector<std::string>{"a1", "a2", "b1", "b2", "c1"}))
+        << "the orphan's interval must be published exactly once: by the replay";
+}
+
+#endif  // CLINK_FAULT_ENABLED
 
 }  // namespace

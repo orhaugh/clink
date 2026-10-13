@@ -108,7 +108,9 @@ def write_constants(events: list[dict], out: str) -> None:
         f"TraceMaxLostRunning == {len(of('WorkerDies'))}",
         f"TraceMaxCoordDeaths == {len(of('CoordRecovers'))}",
         f"TraceMaxSnapFails == {sum(1 for e in of('SubtaskAck') if not e.get('ok', True))}",
-        f"TraceMaxExpiries == {sum(1 for e in of('WalkProbes') if e.get('verdict') == 'refused')}",
+        # One expiry per refused probe, and one per orphan a reopening sink found
+        # ended without a commit: the broker may have expired either.
+        f"TraceMaxExpiries == {sum(1 for e in of('WalkProbes') if e.get('verdict') == 'refused') + sum(1 for e in of('SinkOpens') if e.get('settled') == 'not_committed')}",
         f"TraceMaxBrokerOutages == {len(of('WalkRetries')) + len(of('WalkExhausted'))}",
         f"TraceMaxWalkCancels == {len(of('WalkCancelled'))}",
         f"TraceMaxErrorRestarts == {len(of('RestartOnError'))}",

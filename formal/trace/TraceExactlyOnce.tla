@@ -461,11 +461,42 @@ StepWalkDecides ==
     /\ E.confirmed <=> (E.ckpt \in confirmedDisk')
 StepWalkFinishes == Is("WalkFinishes") /\ WalkFinishes
 
+\* What a Kafka sink's open reports about the unresolved orphan it settled:
+\* `orphan`, the marker's checkpoint, and `settled`, how it ended. The fields
+\* are present only when the open found a marker above the restore point and
+\* acted on it, so a line without them (an open with no marker, or an engine
+\* from before the open settled its orphan) is taken as before. The orphan is
+\* the newest marker above the restore point, the one SinkOpensWith consults,
+\* and `seen` is the specification's view of it once the open has decided it:
+\* the transaction as it stood, or committed when the old incarnation's
+\* commit z landed during the open.
+\*   receipt        a receipt already answered for it
+\*   committed      the open proved a commit and wrote the receipt
+\*   aborted        the open's EndTxn(abort) ended it
+\*   not_committed  the open found it decided without a commit
+SettledAs(s, z) ==
+    LET o == E.orphan
+        above == {c \in Ckpts : <<s, c>> \in unresolvedMk /\ c > restorePoint}
+        seen == IF z = None THEN txn[s] ELSE [txn[s] EXCEPT ![z].st = "committed"]
+    IN /\ above # {} /\ o = Max(above)
+       /\ CASE E.settled = "receipt" -> <<s, o>> \in receipts
+            [] E.settled = "committed" -> <<s, o>> \in receipts'
+            [] E.settled = "aborted" -> seen[o].st = "prepared" /\ txn'[s][o].st = "aborted"
+            [] E.settled = "not_committed" -> seen[o].st \in {"aborted", "none"}
+            [] OTHER -> FALSE
+
 \* A sink opening on its first deployment is the model's initial state; only
-\* an open after a redeploy is a step.
+\* an open after a redeploy is a step. With the settle's fields, the step is
+\* the open with the old incarnation's commit during it or not (SinkOpens),
+\* constrained to the outcome the line reports.
 StepSinkOpens ==
     /\ Is("SinkOpens")
-    /\ IF ForSink /\ sink[E.sub].opening THEN SinkOpens(E.sub) ELSE Skip
+    /\ IF ForSink /\ sink[E.sub].opening
+       THEN IF Has(E, "settled")
+            THEN \E z \in {None} \cup OpenWindowCommits(E.sub) :
+                    SinkOpensWith(E.sub, z) /\ SettledAs(E.sub, z)
+            ELSE SinkOpens(E.sub)
+       ELSE Skip
 
 StepPlacement == Is("Placement") /\ Skip
 

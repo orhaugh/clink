@@ -486,6 +486,8 @@ std::string error_name(std::int16_t code) {
             return "INVALID_PRODUCER_EPOCH";
         case 48:
             return "INVALID_TXN_STATE";
+        case 51:
+            return "CONCURRENT_TRANSACTIONS";
         case 53:
             return "TRANSACTIONAL_ID_AUTHORIZATION_FAILED";
         case 58:
@@ -677,6 +679,189 @@ std::optional<SaslStepFailure> authenticate(Connection& conn,
 #endif
 }
 
+// What an exchange needs the bootstrap to advertise beyond FindCoordinator.
+struct Needs {
+    bool end_txn{false};   // EndTxn v1
+    bool describe{false};  // DescribeTransactions v0
+};
+
+// An authenticated connection to the transactional id's coordinator, the
+// versions the bootstrap advertised, and the last correlation id used.
+struct CoordinatorLink {
+    std::unique_ptr<Connection> conn;
+    std::int32_t corr{0};
+    wire::ApiVersionsResponse versions;
+};
+
+// The dance every exchange here shares: [SASL] -> ApiVersions ->
+// FindCoordinator(transactional.id) on the bootstrap, then a fresh
+// connection to the coordinator -> [SASL]. Three outcomes: the link; a FINAL
+// answer retrying cannot change (`final`: a refused authentication, a
+// non-retriable FindCoordinator error, versions this module does not speak),
+// carried as the ResumeOutcome status it maps to; or a transport failure
+// (neither), which the caller's retry loop decides.
+struct DanceOutcome {
+    std::optional<CoordinatorLink> link;
+    bool final{false};
+    ResumeOutcome::Status status{ResumeOutcome::Status::TransportError};
+    std::string detail;
+};
+
+DanceOutcome reach_coordinator(const std::string& bootstrap_host,
+                               std::uint16_t bootstrap_port,
+                               const std::string& transactional_id,
+                               const ConnectFn& connect,
+                               const ResumeAuth& auth,
+                               Needs needs) {
+    using Status = ResumeOutcome::Status;
+    const auto transport = [](std::string detail) {
+        return DanceOutcome{std::nullopt, false, Status::TransportError, std::move(detail)};
+    };
+    const auto final_answer = [](Status status, std::string detail) {
+        return DanceOutcome{std::nullopt, true, status, std::move(detail)};
+    };
+
+    auto bootstrap = connect(bootstrap_host, bootstrap_port);
+    if (bootstrap == nullptr) {
+        return transport("cannot connect to bootstrap " + bootstrap_host + ":" +
+                         std::to_string(bootstrap_port));
+    }
+    (void)bootstrap->set_recv_timeout(std::chrono::milliseconds(5000));
+
+    // 0. Authenticate this connection, when the caller has credentials.
+    std::int32_t corr = 0;
+    if (const auto sasl = authenticate(*bootstrap, auth, corr); sasl.has_value()) {
+        if (!sasl->transport) {
+            return final_answer(sasl->outcome.status, sasl->outcome.detail);  // refusals are final
+        }
+        return transport(sasl->detail + " against bootstrap");
+    }
+
+    // 1. What does this broker still speak?
+    ++corr;
+    const auto av_body = roundtrip(*bootstrap, wire::api_versions_request_v0(corr));
+    if (!av_body.has_value()) {
+        return transport("ApiVersions transport failure against bootstrap");
+    }
+    const auto av = wire::parse_api_versions_response_v0(*av_body, corr);
+    if (!av.has_value()) {
+        return transport("ApiVersions response did not parse");
+    }
+    if (av->error_code != 0) {
+        return final_answer(Status::Unsupported,
+                            "ApiVersions: " + wire::error_name(av->error_code));
+    }
+    if (!av->find_coordinator.has_value() || (needs.end_txn && !av->end_txn.has_value())) {
+        return final_answer(Status::Unsupported,
+                            needs.end_txn ? "broker lists no FindCoordinator/EndTxn support"
+                                          : "broker lists no FindCoordinator support");
+    }
+    // Non-flexible versions only: FindCoordinator 1..2, EndTxn exactly 1.
+    std::int16_t fc_version = 0;
+    if (av->find_coordinator->min <= 1 && av->find_coordinator->max >= 1) {
+        fc_version = 1;
+    } else if (av->find_coordinator->min <= 2 && av->find_coordinator->max >= 2) {
+        fc_version = 2;
+    } else {
+        return final_answer(Status::Unsupported,
+                            "broker FindCoordinator range [" +
+                                std::to_string(av->find_coordinator->min) + "," +
+                                std::to_string(av->find_coordinator->max) +
+                                "] excludes the non-flexible versions this module speaks");
+    }
+    if (needs.end_txn && (av->end_txn->min > 1 || av->end_txn->max < 1)) {
+        return final_answer(Status::Unsupported,
+                            "broker EndTxn range [" + std::to_string(av->end_txn->min) + "," +
+                                std::to_string(av->end_txn->max) +
+                                "] excludes v1 (the non-flexible version this module speaks)");
+    }
+    // DescribeTransactions has only flexible versions; v0 is the one spoken.
+    if (needs.describe &&
+        (!av->describe_transactions.has_value() || av->describe_transactions->min > 0)) {
+        return final_answer(Status::Unsupported, "broker lists no DescribeTransactions v0 support");
+    }
+
+    // 2. Which broker coordinates this transactional.id?
+    ++corr;
+    const auto fc_body =
+        roundtrip(*bootstrap, wire::find_coordinator_request(fc_version, corr, transactional_id));
+    if (!fc_body.has_value()) {
+        return transport("FindCoordinator transport failure");
+    }
+    const auto fc = wire::parse_find_coordinator_response(*fc_body, corr);
+    if (!fc.has_value()) {
+        return transport("FindCoordinator response did not parse");
+    }
+    if (fc->error_code != 0) {
+        auto detail = "FindCoordinator: " + wire::error_name(fc->error_code);
+        if (retriable(fc->error_code)) {
+            return transport(std::move(detail));
+        }
+        return final_answer(Status::Refused, std::move(detail));
+    }
+
+    // 3. The coordinator itself. The bootstrap connection has served its
+    // purpose; release it before dialing rather than holding a socket across
+    // the exchange that matters.
+    bootstrap.reset();
+    auto coord = connect(fc->host, static_cast<std::uint16_t>(fc->port));
+    if (coord == nullptr) {
+        return transport("cannot connect to coordinator " + fc->host + ":" +
+                         std::to_string(fc->port));
+    }
+    (void)coord->set_recv_timeout(std::chrono::milliseconds(5000));
+    // The coordinator connection is a fresh session: authenticate it too.
+    if (const auto sasl = authenticate(*coord, auth, corr); sasl.has_value()) {
+        if (!sasl->transport) {
+            return final_answer(sasl->outcome.status, sasl->outcome.detail);
+        }
+        return transport(sasl->detail + " against coordinator");
+    }
+    return DanceOutcome{CoordinatorLink{std::move(coord), corr, *av}, false, Status::Committed, {}};
+}
+
+// DescribeTransactions v0 on an established coordinator link. nullopt, with
+// `detail` set, when no state came back: a transport failure, an unparseable
+// response, or a broker error.
+std::optional<DescribeState> describe_on(CoordinatorLink& link,
+                                         const std::string& transactional_id,
+                                         std::string& detail) {
+    ++link.corr;
+    const auto dt_body =
+        roundtrip(*link.conn, wire::describe_transactions_request_v0(link.corr, transactional_id));
+    if (!dt_body.has_value()) {
+        detail = "DescribeTransactions transport failure";
+        return std::nullopt;
+    }
+    const auto dt = wire::parse_describe_transactions_response_v0(*dt_body, link.corr);
+    if (!dt.has_value()) {
+        detail = "DescribeTransactions response did not parse";
+        return std::nullopt;
+    }
+    if (dt->error_code != 0) {
+        detail = "DescribeTransactions: " + wire::error_name(dt->error_code);
+        return std::nullopt;
+    }
+    return DescribeState{
+        .state = dt->state, .producer_id = dt->producer_id, .producer_epoch = dt->producer_epoch};
+}
+
+std::string describe_text(const DescribeState& d) {
+    return "state=" + d.state + " pid=" + std::to_string(d.producer_id) +
+           " epoch=" + std::to_string(d.producer_epoch);
+}
+
+// A mechanism this module does not speak is refused before a byte goes out:
+// silently proceeding unauthenticated would be a downgrade.
+std::optional<std::string> unspoken_mechanism(const ResumeAuth& auth) {
+    if (auth.enabled() && auth.mechanism != "PLAIN" && auth.mechanism != "SCRAM-SHA-256") {
+        return "SASL mechanism '" + auth.mechanism +
+               "' is not spoken by the resume path (PLAIN and SCRAM-SHA-256 only); "
+               "refusing rather than downgrading to unauthenticated";
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 ResumeOutcome resume_commit(const std::string& bootstrap_host,
@@ -690,13 +875,8 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
                 "handle carries no producer identity (pid/epoch were never captured); "
                 "nothing can be resumed"};
     }
-    // A mechanism this module does not speak is refused HERE, before a byte
-    // goes out: silently proceeding unauthenticated would be a downgrade.
-    if (auth.enabled() && auth.mechanism != "PLAIN" && auth.mechanism != "SCRAM-SHA-256") {
-        return {Status::Refused,
-                "SASL mechanism '" + auth.mechanism +
-                    "' is not spoken by the resume path (PLAIN and SCRAM-SHA-256 only); "
-                    "refusing rather than downgrading to unauthenticated"};
+    if (const auto refusal = unspoken_mechanism(auth); refusal.has_value()) {
+        return {Status::Refused, *refusal};
     }
 
     // Bounded retry around the coordinator dance: leadership can be mid-move
@@ -707,110 +887,31 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
         if (attempt > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-
-        auto bootstrap = connect(bootstrap_host, bootstrap_port);
-        if (bootstrap == nullptr) {
-            last_detail = "cannot connect to bootstrap " + bootstrap_host + ":" +
-                          std::to_string(bootstrap_port);
-            continue;
-        }
-        (void)bootstrap->set_recv_timeout(std::chrono::milliseconds(5000));
-
-        // 0. Authenticate this connection, when the caller has credentials.
-        std::int32_t corr = 0;
-        if (const auto sasl = authenticate(*bootstrap, auth, corr); sasl.has_value()) {
-            if (!sasl->transport) {
-                return sasl->outcome;  // refusals are final
+        auto dance = reach_coordinator(bootstrap_host,
+                                       bootstrap_port,
+                                       txn.transactional_id,
+                                       connect,
+                                       auth,
+                                       Needs{.end_txn = true});
+        if (!dance.link.has_value()) {
+            if (dance.final) {
+                return {dance.status, dance.detail};
             }
-            last_detail = sasl->detail + " against bootstrap";
+            last_detail = dance.detail;
             continue;
         }
+        auto& link = *dance.link;
+        const auto& av = link.versions;
 
-        // 1. What does this broker still speak?
-        ++corr;
-        const auto av_body = roundtrip(*bootstrap, wire::api_versions_request_v0(corr));
-        if (!av_body.has_value()) {
-            last_detail = "ApiVersions transport failure against bootstrap";
-            continue;
-        }
-        const auto av = wire::parse_api_versions_response_v0(*av_body, corr);
-        if (!av.has_value()) {
-            last_detail = "ApiVersions response did not parse";
-            continue;
-        }
-        if (av->error_code != 0) {
-            return {Status::Unsupported, "ApiVersions: " + wire::error_name(av->error_code)};
-        }
-        if (!av->find_coordinator.has_value() || !av->end_txn.has_value()) {
-            return {Status::Unsupported, "broker lists no FindCoordinator/EndTxn support"};
-        }
-        // Non-flexible versions only: FindCoordinator 1..2, EndTxn exactly 1.
-        std::int16_t fc_version = 0;
-        if (av->find_coordinator->min <= 1 && av->find_coordinator->max >= 1) {
-            fc_version = 1;
-        } else if (av->find_coordinator->min <= 2 && av->find_coordinator->max >= 2) {
-            fc_version = 2;
-        } else {
-            return {Status::Unsupported,
-                    "broker FindCoordinator range [" + std::to_string(av->find_coordinator->min) +
-                        "," + std::to_string(av->find_coordinator->max) +
-                        "] excludes the non-flexible versions this module speaks"};
-        }
-        if (av->end_txn->min > 1 || av->end_txn->max < 1) {
-            return {Status::Unsupported,
-                    "broker EndTxn range [" + std::to_string(av->end_txn->min) + "," +
-                        std::to_string(av->end_txn->max) +
-                        "] excludes v1 (the non-flexible version this module speaks)"};
-        }
-
-        // 2. Which broker coordinates this transactional.id?
-        ++corr;
-        const auto fc_body = roundtrip(
-            *bootstrap, wire::find_coordinator_request(fc_version, corr, txn.transactional_id));
-        if (!fc_body.has_value()) {
-            last_detail = "FindCoordinator transport failure";
-            continue;
-        }
-        const auto fc = wire::parse_find_coordinator_response(*fc_body, corr);
-        if (!fc.has_value()) {
-            last_detail = "FindCoordinator response did not parse";
-            continue;
-        }
-        if (fc->error_code != 0) {
-            last_detail = "FindCoordinator: " + wire::error_name(fc->error_code);
-            if (retriable(fc->error_code)) {
-                continue;
-            }
-            return {Status::Refused, last_detail};
-        }
-
-        // 3. Commit, on the coordinator itself. The bootstrap connection has
-        // served its purpose; release it before dialing rather than holding
-        // a socket across the exchange that matters.
-        bootstrap.reset();
-        auto coord = connect(fc->host, static_cast<std::uint16_t>(fc->port));
-        if (coord == nullptr) {
-            last_detail =
-                "cannot connect to coordinator " + fc->host + ":" + std::to_string(fc->port);
-            continue;
-        }
-        (void)coord->set_recv_timeout(std::chrono::milliseconds(5000));
-        // The coordinator connection is a fresh session: authenticate it too.
-        if (const auto sasl = authenticate(*coord, auth, corr); sasl.has_value()) {
-            if (!sasl->transport) {
-                return sasl->outcome;
-            }
-            last_detail = sasl->detail + " against coordinator";
-            continue;
-        }
-        ++corr;
+        // Commit, on the coordinator itself.
+        ++link.corr;
         const auto et_body =
-            roundtrip(*coord, wire::end_txn_request_v1(corr, txn, /*commit=*/true));
+            roundtrip(*link.conn, wire::end_txn_request_v1(link.corr, txn, /*commit=*/true));
         if (!et_body.has_value()) {
             last_detail = "EndTxn transport failure";
             continue;
         }
-        const auto code = wire::parse_end_txn_response(*et_body, corr);
+        const auto code = wire::parse_end_txn_response(*et_body, link.corr);
         if (!code.has_value()) {
             last_detail = "EndTxn response did not parse";
             continue;
@@ -836,35 +937,28 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
         // sound because every resolution walk runs before anything
         // redeploys, so no successor can have produced that state.
         if ((*code == 47 /*INVALID_PRODUCER_EPOCH*/ || *code == 90 /*PRODUCER_FENCED*/) &&
-            av->describe_transactions.has_value() && av->describe_transactions->min <= 0) {
-            ++corr;
-            const auto dt_body = roundtrip(
-                *coord, wire::describe_transactions_request_v0(corr, txn.transactional_id));
-            if (dt_body.has_value()) {
-                const auto dt = wire::parse_describe_transactions_response_v0(*dt_body, corr);
-                if (dt.has_value() && dt->error_code == 0 && dt->state == "CompleteCommit" &&
-                    dt->producer_id == txn.producer_id &&
-                    dt->producer_epoch >= txn.producer_epoch) {
-                    return {Status::Committed,
-                            "DescribeTransactions proves CompleteCommit for '" +
-                                txn.transactional_id + "' pid " + std::to_string(txn.producer_id) +
-                                " (staged epoch " + std::to_string(txn.producer_epoch) +
-                                " was stale, broker epoch " + std::to_string(dt->producer_epoch) +
-                                "); the fenced EndTxn was a stale-epoch artefact, not a verdict"};
-                }
-                if (dt.has_value()) {
-                    last_detail +=
-                        "; DescribeTransactions: " +
-                        (dt->error_code != 0
-                             ? wire::error_name(dt->error_code)
-                             : ("state=" + dt->state + " pid=" + std::to_string(dt->producer_id) +
-                                " epoch=" + std::to_string(dt->producer_epoch)));
-                }
+            av.describe_transactions.has_value() && av.describe_transactions->min <= 0) {
+            std::string dt_detail;
+            const auto dt = describe_on(link, txn.transactional_id, dt_detail);
+            if (dt.has_value() && dt->state == "CompleteCommit" &&
+                dt->producer_id == txn.producer_id && dt->producer_epoch >= txn.producer_epoch) {
+                return {Status::Committed,
+                        "DescribeTransactions proves CompleteCommit for '" + txn.transactional_id +
+                            "' pid " + std::to_string(txn.producer_id) + " (staged epoch " +
+                            std::to_string(txn.producer_epoch) + " was stale, broker epoch " +
+                            std::to_string(dt->producer_epoch) +
+                            "); the fenced EndTxn was a stale-epoch artefact, not a verdict"};
+            }
+            if (dt.has_value()) {
+                last_detail += "; DescribeTransactions: " + describe_text(*dt);
+            } else if (dt_detail.rfind("DescribeTransactions: ", 0) == 0) {
+                last_detail += "; " + dt_detail;  // the broker answered with an error
             }
         }
         return {Status::Refused, last_detail};
     }
-    return {Status::TransportError, last_detail + " (after " + std::to_string(3) + " attempts)"};
+    return {Status::TransportError,
+            last_detail + " (after " + std::to_string(kAttempts) + " attempts)"};
 }
 
 std::optional<DescribeState> describe_transaction_state(const std::string& bootstrap_host,
@@ -872,68 +966,150 @@ std::optional<DescribeState> describe_transaction_state(const std::string& boots
                                                         const std::string& transactional_id,
                                                         const ConnectFn& connect,
                                                         const ResumeAuth& auth) {
-    // The read-only half of resume_commit's dance: [SASL] -> ApiVersions ->
-    // FindCoordinator -> coordinator -> DescribeTransactions. Single
-    // attempt; the caller polls (it exists to BE a wait condition).
-    auto bootstrap = connect(bootstrap_host, bootstrap_port);
-    if (bootstrap == nullptr) {
+    // The read-only half of resume_commit's dance. Single attempt; the
+    // caller polls (it exists to BE a wait condition).
+    auto dance = reach_coordinator(
+        bootstrap_host, bootstrap_port, transactional_id, connect, auth, Needs{.describe = true});
+    if (!dance.link.has_value()) {
         return std::nullopt;
     }
-    (void)bootstrap->set_recv_timeout(std::chrono::milliseconds(5000));
-    std::int32_t corr = 0;
-    if (const auto sasl = authenticate(*bootstrap, auth, corr); sasl.has_value()) {
-        return std::nullopt;
+    std::string detail;
+    return describe_on(*dance.link, transactional_id, detail);
+}
+
+OrphanSettlement settle_orphan(const std::string& bootstrap_host,
+                               std::uint16_t bootstrap_port,
+                               const TxnIdentity& staged,
+                               const ConnectFn& connect,
+                               const ResumeAuth& auth,
+                               const std::function<void()>& before_abort) {
+    using Status = OrphanSettlement::Status;
+    OrphanSettlement out;
+    out.floor_epoch = staged.producer_epoch;
+    if (!staged.complete()) {
+        out.detail =
+            "the orphan's handle carries no producer identity (pid/epoch were never captured); "
+            "it cannot be described or ended";
+        return out;
     }
-    ++corr;
-    const auto av_body = roundtrip(*bootstrap, wire::api_versions_request_v0(corr));
-    if (!av_body.has_value()) {
-        return std::nullopt;
+    if (const auto refusal = unspoken_mechanism(auth); refusal.has_value()) {
+        out.detail = *refusal;
+        return out;
     }
-    const auto av = wire::parse_api_versions_response_v0(*av_body, corr);
-    if (!av.has_value() || av->error_code != 0 || !av->find_coordinator.has_value() ||
-        !av->describe_transactions.has_value() || av->describe_transactions->min > 0) {
-        return std::nullopt;
+    const auto verdict = [&out](Status status, const DescribeState& d, std::string detail) {
+        out.status = status;
+        out.state = d.state;
+        out.producer_id = d.producer_id;
+        out.producer_epoch = d.producer_epoch;
+        out.detail = std::move(detail);
+        return out;
+    };
+
+    // Bounded rounds. A refused abort costs one: the next round describes
+    // again, which is where the verdict comes from. Each round redoes the
+    // dance, since a coordinator that refused or dropped a request may also
+    // have moved.
+    constexpr int kRounds = 4;
+    std::int16_t floor_epoch = staged.producer_epoch;
+    std::string last_detail;
+    std::string refused;  // the last abort's refusal, reported beside the verdict
+    for (int round = 0; round < kRounds; ++round) {
+        if (round > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        auto dance = reach_coordinator(bootstrap_host,
+                                       bootstrap_port,
+                                       staged.transactional_id,
+                                       connect,
+                                       auth,
+                                       Needs{.end_txn = true, .describe = true});
+        if (!dance.link.has_value()) {
+            last_detail = dance.detail;
+            if (dance.final) {
+                // Refused credentials or versions this module does not speak:
+                // no verdict, and retrying here will not produce one.
+                break;
+            }
+            continue;
+        }
+        auto& link = *dance.link;
+        std::string dt_detail;
+        const auto observed = describe_on(link, staged.transactional_id, dt_detail);
+        if (!observed.has_value()) {
+            last_detail = dt_detail;
+            continue;
+        }
+        out.state = observed->state;
+        out.producer_id = observed->producer_id;
+        out.producer_epoch = observed->producer_epoch;
+        switch (next_settle_step(*observed, staged.producer_id, floor_epoch)) {
+            case SettleStep::Committed:
+                return verdict(Status::Committed,
+                               *observed,
+                               "DescribeTransactions proves the orphan's commit (" +
+                                   describe_text(*observed) + ", floor epoch " +
+                                   std::to_string(floor_epoch) + ")" + refused);
+            case SettleStep::NotCommitted:
+                return verdict(Status::NotCommitted,
+                               *observed,
+                               "DescribeTransactions finds the orphan decided without a commit (" +
+                                   describe_text(*observed) +
+                                   (observed->producer_id == staged.producer_id
+                                        ? ""
+                                        : ", not the staged producer id " +
+                                              std::to_string(staged.producer_id)) +
+                                   ")" + refused);
+            case SettleStep::Retry:
+                last_detail = "DescribeTransactions reported a state this module does not know (" +
+                              describe_text(*observed) + ")";
+                continue;
+            case SettleStep::AbortWith:
+                break;
+        }
+
+        // Undecided: end it under the identity the describe just reported.
+        // The staged epoch rides librdkafka's statistics and can trail the
+        // broker's, and an abort under a trailing epoch would be fenced
+        // without deciding anything.
+        floor_epoch = observed->producer_epoch;
+        out.floor_epoch = floor_epoch;
+        if (before_abort) {
+            before_abort();
+        }
+        const TxnIdentity ongoing{.transactional_id = staged.transactional_id,
+                                  .producer_id = observed->producer_id,
+                                  .producer_epoch = observed->producer_epoch};
+        ++link.corr;
+        const auto et_body =
+            roundtrip(*link.conn, wire::end_txn_request_v1(link.corr, ongoing, /*commit=*/false));
+        if (!et_body.has_value()) {
+            last_detail =
+                "EndTxn(abort) transport failure after the request was sent; the next describe "
+                "learns whether it landed";
+            continue;
+        }
+        const auto code = wire::parse_end_txn_response(*et_body, link.corr);
+        if (!code.has_value()) {
+            last_detail = "EndTxn(abort) response did not parse";
+            continue;
+        }
+        if (*code == 0) {
+            return verdict(Status::Aborted,
+                           *observed,
+                           "EndTxn(abort) accepted for '" + staged.transactional_id + "' pid " +
+                               std::to_string(observed->producer_id) + " epoch " +
+                               std::to_string(observed->producer_epoch));
+        }
+        // CONCURRENT_TRANSACTIONS (a decision completing), INVALID_TXN_STATE
+        // or a fenced epoch (a commit that got there first), or anything
+        // else: the code is not the verdict, the next describe is.
+        last_detail = "EndTxn(abort) answered " + wire::error_name(*code) + "; describing again";
+        refused = "; the abort under epoch " + std::to_string(observed->producer_epoch) +
+                  " was refused with " + wire::error_name(*code);
     }
-    std::int16_t fc_version = 0;
-    if (av->find_coordinator->min <= 1 && av->find_coordinator->max >= 1) {
-        fc_version = 1;
-    } else if (av->find_coordinator->min <= 2 && av->find_coordinator->max >= 2) {
-        fc_version = 2;
-    } else {
-        return std::nullopt;
-    }
-    ++corr;
-    const auto fc_body =
-        roundtrip(*bootstrap, wire::find_coordinator_request(fc_version, corr, transactional_id));
-    if (!fc_body.has_value()) {
-        return std::nullopt;
-    }
-    const auto fc = wire::parse_find_coordinator_response(*fc_body, corr);
-    if (!fc.has_value() || fc->error_code != 0) {
-        return std::nullopt;
-    }
-    bootstrap.reset();
-    auto coord = connect(fc->host, static_cast<std::uint16_t>(fc->port));
-    if (coord == nullptr) {
-        return std::nullopt;
-    }
-    (void)coord->set_recv_timeout(std::chrono::milliseconds(5000));
-    corr = 0;
-    if (const auto sasl = authenticate(*coord, auth, corr); sasl.has_value()) {
-        return std::nullopt;
-    }
-    ++corr;
-    const auto dt_body =
-        roundtrip(*coord, wire::describe_transactions_request_v0(corr, transactional_id));
-    if (!dt_body.has_value()) {
-        return std::nullopt;
-    }
-    const auto dt = wire::parse_describe_transactions_response_v0(*dt_body, corr);
-    if (!dt.has_value() || dt->error_code != 0) {
-        return std::nullopt;
-    }
-    return DescribeState{
-        .state = dt->state, .producer_id = dt->producer_id, .producer_epoch = dt->producer_epoch};
+    out.status = Status::TransportError;
+    out.detail = last_detail + " (no verdict after " + std::to_string(kRounds) + " rounds)";
+    return out;
 }
 
 }  // namespace clink::kafka

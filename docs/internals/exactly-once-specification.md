@@ -96,6 +96,7 @@ names, in its comment, the engine site it abstracts.
 | none (the commit callback returned, `CommitConfirmed` not yet sent) | after `SinkFinish`, before `SinkConfirm`: the Kafka sink may already have prepared the next checkpoint, and its next commit waits for the confirmation |
 | `coordinator.before_confirmed_marker` | every tracked sink confirmed and the checkpoint out of tracking (`confirming[c] = "due"`), before `WriteConfirmed`: neither the marker nor the in-memory confirmed restore point has moved |
 | `coordinator.before_in_doubt_walk` | a restart held for resolution, its walk's start fixed by `RestartProceeds`, before the walk's first step: a confirmation's advance landing here moves the in-memory confirmed restore point, not where the walk starts |
+| `sink.orphan_described` | a reopening Kafka sink still opening, before `SinkOpens`: its describe has seen the orphan `Ongoing` and its abort is not yet sent. A death there is an open that never happened; the marker stays, and the next open settles again |
 | `coordinator.takeover_after_marker_read` | a takeover's one read of the markers taken, before `CoordRecovers`: a stale `COMPLETED` put landing here is on disk, its superseded coordinator's line may come before the takeover's, and the takeover still reports and restores from the point it read |
 | `coordinator.takeover_before_walk` | a takeover's `CoordRecovers` (and `RestartProceeds` when it resolves) taken, before its walk's first step: a stale `COMPLETED` put landing here is on disk, and the walk still ends at the takeover's `completed` |
 | `checkpoint.before_write` and its siblings | `SinkPrepareFails`: the capture fails and the ack says so |
@@ -132,7 +133,7 @@ until the redeploy rewires the data plane, and those checkpoints never complete,
 since the source's ack is dropped. The Kafka sink's open is where this matters
 most: an old incarnation's commit can land in the middle of a reopening sink's
 open, and the specification states an open that settles its orphan before
-anything can race it (see What the model found).
+anything can race it, as the engine's open now does (see What the model found).
 
 ### The invariants
 
@@ -221,7 +222,7 @@ specification, or a stutter the trace module recognises.
 | `Redeploy` | coordinator, deploying: once per restart, after the deploy frames are built, whatever their number | `job`, `restore`, `next` | `RestartProceeds` (from the drain) or `Redeploy` (after resolution) |
 | `Renumber` | coordinator, a claim on the job's next checkpoint id refused because the record already holds it | `job`, `next`, `epoch` | `Renumber` (the leader, past a superseded coordinator's claims) or `ZombieRenumber` (the superseded coordinator, under its own epoch, past the leader's) |
 | `WalkSkips`, `WalkReadsReceipt`, `WalkProbes`, `WalkRetries`, `WalkExhausted`, `WalkCancelled`, `WalkDecides`, `WalkFinishes` | the in-doubt walk | `job`, `ckpt`, and `sub`, `verdict`, `confirmed` where they apply | the walk's steps, one each |
-| `SinkOpens` | the sink, `open()` done | `sub`, `family` | `SinkOpens` after a redeploy; the first open is the initial state |
+| `SinkOpens` | the sink, `open()` done | `sub`, `family`; for a Kafka sink that found an `.unresolved` marker above its restore point and settled it, also `orphan` (the marker's checkpoint) and `settled`: `receipt`, `committed`, `aborted` or `not_committed` | `SinkOpens` after a redeploy; the first open is the initial state. With `settled`, the open must find that orphan the newest marker above the restore point and reach that outcome: a receipt already there, a receipt written, the orphan prepared and then aborted, or the orphan aborted or never prepared (`SinkOpensWith`, with the old incarnation's commit during the open or not) |
 | `Placement` | worker, task deployed | `job`, `sub`, `worker`, `source` | none: tells the module which worker hosts what |
 | `Rescale` | coordinator, a replan staged or a hot cutover armed | `job`, `op`, `from`, `to`, `mode` | none: a scope marker. The model keys a sink by its subtask index and fixes the set and its hosts for the run; a rescale changes both, so the validator skips the run and counts it, until the model covers rescale |
 
@@ -617,7 +618,7 @@ against the bug it guards is decorative.
 | `restore_from_memory` | The in-memory restore point advances with the durable marker, not before | this model | yes, `FrontierCovered` |
 | `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | yes, `NoLoss` |
 | `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its `CONFIRMED` marker is durable | review of the per-connection dispatch change | yes, `ConfirmedMemoryOnDisk` |
-| `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan before `init_transactions` | this model, with a lost worker left running | yes, `NoDuplicate`; the engine still opens this way (see What the model found) |
+| `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan before `init_transactions` | this model, with a lost worker left running | yes, `NoDuplicate` |
 
 Sixteen of the eighteen are refuted. The two that are not are recorded in
 `formal/mutants/expected.txt` rather than deleted, and the check holds that
@@ -682,7 +683,7 @@ not happen to hit them.
    interval twice. Memory now advances where the marker becomes durable.
 
 A fourth came when the specification first let a worker declared lost run
-on, and the engine change it calls for has not landed yet:
+on. The specification stated the fix first, and the engine followed:
 
 4. **The orphan left to the init.** TLC found a duplicate, a counterexample
    28 states long, on the liveness configuration's bounds. A checkpoint completes and its
@@ -707,9 +708,18 @@ on, and the engine change it calls for has not landed yet:
    the restore point is already below the orphan: the replay re-produces its
    interval whatever the open does, and an abort makes the replay the only copy
    without leaning on replay suppression's premise. `orphan_left_to_init` keeps
-   today's open as a mutant. Until the engine change lands, the specification's
-   open is ahead of the engine's, and trace validation cannot tell the two
-   apart, since no line records what the describe saw.
+   the old open as a mutant. The engine's open now settles the orphan this way,
+   before `init_transactions` and before suppression arms, and records the
+   outcome on its `SinkOpens` line, which trace validation checks against the
+   specification's open (`formal/traces/kafka-orphan-settled-at-open`,
+   synthetic, carries each outcome). Pinned by
+   `TxnResumeLive.AnOrphanCommittedDuringTheOpenIsReceiptedBeforeTheFence` and
+   `TxnResumeLive.AnOrphanAbortedByTheOpenRefusesTheOldCommitAndIsReplayedOnce`:
+   two Kafka sinks on one transactional id against a real broker, the old one's
+   commit held at `sink.before_commit` and the new one's open at
+   `sink.orphan_described`, released in each order, with the output exactly
+   once both ways. Against the old open the first publishes the interval
+   twice.
 
 Two further counterexamples in the first runs were defects in the model,
 not the engine (a producer identity kept in the sink's process record and
@@ -734,10 +744,6 @@ In the honesty categories the qualification pages use:
   four checkpoints or two coordinator deaths in one run is outside what the
   push gate has enumerated. A worker declared lost and still running is in
   three of the six configurations, not the two largest or the liveness one.
-- **Specified, not yet in the engine:** the Kafka sink's open settling its
-  orphan before `init_transactions` (finding 4). The specification checks the
-  fixed open; the engine runs the open the `orphan_left_to_init` mutant
-  describes until the change lands.
 - **Demonstrated, per run:** the recorded traces under `formal/traces/`
   and the traces every CI test run leaves are behaviours of the model
   (design record 012, increments 3 and 4). That is evidence about the runs
@@ -765,7 +771,10 @@ In the honesty categories the qualification pages use:
   running, and what it does in an `open()` it finishes after the declaration
   or in frames it reads after a coordinator's death; the Kafka broker's
   producer epochs, which the fixed open's abort and its proof of a commit
-  depend on; network frame
+  depend on (what the pinned broker reports is held by
+  `TxnResumeLive.DescribeReportsTheProducerEpochsAroundACommitAndAnAbort`: one
+  epoch for an incarnation's commits and aborts, the next at a successor's
+  init); network frame
   encoding; time. Each has its own evidence elsewhere. A snapshot that
   fails in an operator rather than a sink is outside trace validation too: the
   trace module skips acks from subtasks it does not model, so such a run
