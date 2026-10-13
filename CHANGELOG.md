@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**A Kafka sink restarted from nothing settles its orphan and arms replay
+suppression.** A restart before any checkpoint of a run is confirmed restores
+from checkpoint 0, and the `kafka_2pc` sink took restore point 0 for a fresh
+start: it neither settled an `.unresolved` marker nor armed suppression from
+its receipts. A commit that executed without its receipt (a kill in the ack
+window), which in-doubt resolution then could not settle, was replayed from the
+start and published twice, and the race with a worker declared lost while its
+process still ran went unsettled there too. The skip kept a fresh start in a
+reused checkpoint directory from reading an earlier run's receipts, since job
+ids restart at 1 in every coordinator process. Every deploy now carries the
+run's checkpoint-id floor, fixed when the run is first submitted and kept by
+its restarts and an HA takeover through the job manifest. A fresh start's floor
+sits above every id an earlier run of the job left on record or as a marker; a
+submit that restores from checkpoint R continues the run that took R, and its
+floor is R. The sink settles markers and arms from receipts above the larger of
+the restore point and the floor, so a fresh start still reads none of an
+earlier run's and owes its full output, and a restore still suppresses the
+replay of what the receipts above it prove published. The floor is a trailing
+field after the Deploy's fencing epoch; a Deploy without it, from an older
+coordinator or a takeover of a job persisted before it, keeps the old rule. The
+exactly-once specification keeps the old open as the mutant
+`open_skips_restore_zero`, which TLC refutes.
+
 **A reopening Kafka sink settles its orphaned transaction before it fences
 the producer.** A `kafka_2pc` sink whose recovery left an `.unresolved` marker
 described the orphan at `open()` and, finding it `Ongoing`, left it for

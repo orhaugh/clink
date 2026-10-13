@@ -152,6 +152,34 @@ std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir, Job
     return body.has_value() ? triggered_id_of(*body) : 0;
 }
 
+std::uint64_t new_run_checkpoint_floor(const std::string& checkpoint_dir,
+                                       JobId job_id,
+                                       std::uint64_t restore_from_checkpoint_id,
+                                       std::uint64_t numbering_floor) {
+    if (restore_from_checkpoint_id > 0) {
+        return restore_from_checkpoint_id;
+    }
+    std::uint64_t floor = numbering_floor;
+    if (checkpoint_dir.empty()) {
+        return floor;
+    }
+    for (const auto& key :
+         make_coordination_store(checkpoint_dir)->list("_jobs/" + std::to_string(job_id))) {
+        const auto name = std::filesystem::path(key).filename().string();
+        for (const std::string_view prefix : {"COMPLETED-", "CONFIRMED-"}) {
+            if (name.rfind(prefix, 0) != 0) {
+                continue;
+            }
+            try {
+                floor = std::max(floor, std::stoull(name.substr(prefix.size())));
+            } catch (const std::exception&) {
+                // Not a marker this layout names; it bounds nothing.
+            }
+        }
+    }
+    return floor;
+}
+
 TriggeredIdClaim record_triggered_id(const std::string& checkpoint_dir,
                                      JobId job_id,
                                      std::uint64_t id,

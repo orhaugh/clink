@@ -3401,8 +3401,14 @@ DeployMsg recovered_deploy_before_any_checkpoint(const std::string& tag,
         EXPECT_TRUE(deploy.has_value());
         if (deploy.has_value()) {
             // The premise: the first deploy carried the submitted restore point.
-            EXPECT_EQ(decode_deploy(*deploy).restore_from_checkpoint_id,
-                      restore_from_checkpoint_id);
+            const auto submitted = decode_deploy(*deploy);
+            EXPECT_EQ(submitted.restore_from_checkpoint_id, restore_from_checkpoint_id);
+            // A run that restores from a checkpoint continues the run that
+            // took it: its checkpoint-id floor is that restore point, so its
+            // sinks arm from the receipts above it. A fresh one in an empty
+            // directory has nothing below it.
+            EXPECT_EQ(submitted.run_checkpoint_floor,
+                      std::optional<std::uint64_t>{restore_from_checkpoint_id});
         }
         // No checkpoint is ever acked: the leader dies before the job's first.
         w.close();
@@ -3441,8 +3447,123 @@ TEST(CheckpointCompletion, RecoveryBeforeTheFirstCheckpointKeepsTheSubmittedRest
     EXPECT_EQ(msg.restore_from_dir, savepoint.string());
     EXPECT_EQ(msg.restore_from_checkpoint_id, 7U)
         << "the recovered job did not resume from the savepoint it was submitted with";
+    EXPECT_EQ(msg.run_checkpoint_floor, std::optional<std::uint64_t>{7})
+        << "the takeover did not keep the floor the run's submit fixed";
     std::error_code ec;
     std::filesystem::remove_all(savepoint, ec);
+}
+
+// The run's checkpoint-id floor (DeployMsg::run_checkpoint_floor): the id at
+// or below which every receipt and marker belongs to an earlier run, so a
+// 2PC sink reopening at restore point 0 reads this run's receipts and none of
+// an earlier run's. A run's first submit fixes it above what an earlier run
+// of the same job id left in the directory; its restart and a takeover keep
+// it, although the takeover numbers its own checkpoints above everything on
+// record. A takeover of a job persisted without one deploys without one.
+TEST(CheckpointCompletion, EveryDeployOfARunCarriesTheFloorItsFirstSubmitFixed) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_run_floor_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    // An earlier run of job 1 in this directory, which claimed ids up to 5. (It
+    // completed none: a takeover restores from any COMPLETED marker under the
+    // job id, which would make this a test of something else.)
+    const auto jobs = ckpt_dir / "_jobs" / "1";
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(jobs);
+    std::ofstream(jobs / "TRIGGERED") << "5\n";
+    JobId job_id = 0;
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        auto w = std::make_unique<FakeWorker>(port, "w");
+        ASSERT_TRUE(w->valid());
+        ASSERT_TRUE(w->register_and_ack());
+        ASSERT_TRUE(a.await_registrations(2s));
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 600'000;
+        ckpt.max_restarts_on_worker_loss = 1;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        ASSERT_EQ(job_id, 1U);
+        auto first = w->await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(first.has_value());
+        const auto submitted = decode_deploy(*first);
+        EXPECT_EQ(submitted.restore_from_checkpoint_id, 0U);
+        ASSERT_TRUE(submitted.run_checkpoint_floor.has_value())
+            << "a fresh run with a checkpoint directory deploys without its floor";
+        EXPECT_EQ(*submitted.run_checkpoint_floor, 5U)
+            << "the floor must cover the earlier run's checkpoints, or its receipts read as this "
+               "run's";
+
+        // A restart of the same run, from nothing: the floor stays.
+        FakeWorker spare(port, "w2");
+        ASSERT_TRUE(spare.valid());
+        ASSERT_TRUE(spare.register_and_ack());
+        w->close();
+        ASSERT_TRUE(ckpt_await([&] { return worker_was_lost(a, "w"); },
+                               clink::test_support::scale_slack(std::chrono::milliseconds{5000})));
+        auto redeploy = spare.await_frame(MessageKind::Deploy, 20s);
+        ASSERT_TRUE(redeploy.has_value()) << "the restart never redeployed";
+        const auto restarted = decode_deploy(*redeploy);
+        EXPECT_EQ(restarted.restore_from_checkpoint_id, 0U);
+        ASSERT_TRUE(restarted.run_checkpoint_floor.has_value());
+        EXPECT_EQ(*restarted.run_checkpoint_floor, 5U);
+        // The leader goes before its last worker, so no loss can end the job.
+        a.stop();
+        spare.close();
+    }
+    const auto takeover_deploy = [&] {
+        std::optional<DeployMsg> out;
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        EXPECT_TRUE(w.valid());
+        EXPECT_TRUE(w.register_and_ack());
+        EXPECT_TRUE(b.await_registrations(2s));
+        b.recover_persisted_jobs();
+        if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+            out = decode_deploy(*deploy);
+        }
+        b.stop();
+        w.close();
+        return out;
+    };
+    // The run claimed ids of its own above 5 before its leader died: the
+    // takeover numbers above them, and keeps the run's floor.
+    std::ofstream(jobs / "TRIGGERED") << "8\n";
+    const auto taken_over = takeover_deploy();
+    ASSERT_TRUE(taken_over.has_value()) << "the new leader dropped the job";
+    ASSERT_TRUE(taken_over->run_checkpoint_floor.has_value());
+    EXPECT_EQ(*taken_over->run_checkpoint_floor, 5U)
+        << "the takeover moved the floor above the dead leader's checkpoints, which are this "
+           "run's: their receipts would no longer be read";
+
+    // A manifest from before the floor: the takeover deploys without one.
+    const auto manifest_path = ha_dir / "jobs" / std::to_string(job_id) / "manifest.json";
+    std::string manifest;
+    {
+        std::ifstream in(manifest_path);
+        manifest.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::string field = ",\"run_checkpoint_floor\":5";
+    const auto at = manifest.find(field);
+    ASSERT_NE(at, std::string::npos) << manifest;
+    manifest.erase(at, field.size());
+    std::ofstream(manifest_path, std::ios::trunc) << manifest;
+    const auto legacy = takeover_deploy();
+    ASSERT_TRUE(legacy.has_value()) << "the new leader dropped the job";
+    EXPECT_FALSE(legacy->run_checkpoint_floor.has_value())
+        << "a takeover invented a floor its manifest did not record";
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
 }
 
 // The takeover's protocol trace reports, as `confirmed`, the newest CONFIRMED
@@ -3494,6 +3615,7 @@ TEST(CheckpointCompletion, RecoveryBeforeTheFirstCheckpointOfAFreshJobStartsItFr
     const auto msg = recovered_deploy_before_any_checkpoint("fresh", "", 0);
     EXPECT_TRUE(msg.restore_from_dir.empty());
     EXPECT_EQ(msg.restore_from_checkpoint_id, 0U);
+    EXPECT_EQ(msg.run_checkpoint_floor, std::optional<std::uint64_t>{0});
 }
 
 // --- what a takeover numbers its checkpoints from -----------------------

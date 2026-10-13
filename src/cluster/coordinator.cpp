@@ -521,6 +521,11 @@ void persist_job_manifest_(const std::string& ha_dir,
     manifest += requires_commit_confirmation ? "true" : "false";
     manifest +=
         ",\"restore_from_checkpoint_id\":" + std::to_string(checkpoint.restore_from_checkpoint_id);
+    // The run's checkpoint-id floor, which a takeover keeps: the job it takes
+    // over is the same run. Absent when the job has none.
+    if (checkpoint.run_checkpoint_floor.has_value()) {
+        manifest += ",\"run_checkpoint_floor\":" + std::to_string(*checkpoint.run_checkpoint_floor);
+    }
     manifest += ",\"max_restarts_on_worker_loss\":" +
                 std::to_string(checkpoint.max_restarts_on_worker_loss);
     manifest += ",\"plugins\":[";
@@ -785,6 +790,12 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         ckpt.interval_ms = static_cast<std::int64_t>(read_uint_field(body, "interval_ms"));
         ckpt.restore_from_dir = read_string_field(body, "restore_from_dir");
         ckpt.restore_from_checkpoint_id = read_uint_field(body, "restore_from_checkpoint_id");
+        // The run's checkpoint-id floor its first submit fixed. A manifest
+        // written before the floor existed has none, and the takeover deploys
+        // without one: its sinks keep the rule they had before it.
+        if (body.find("\"run_checkpoint_floor\":") != std::string::npos) {
+            ckpt.run_checkpoint_floor = read_uint_field(body, "run_checkpoint_floor");
+        }
         ckpt.max_restarts_on_worker_loss =
             static_cast<std::uint32_t>(read_uint_field(body, "max_restarts_on_worker_loss"));
         // Pin the recovered job to the backend it ran with BEFORE submit_job
@@ -4269,6 +4280,7 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         // tasks at generation 1 regardless of the job's.
         dm.restore_from_dir = job.checkpoint.checkpoint_dir;
         dm.restore_from_checkpoint_id = hot.cutover_checkpoint;
+        dm.run_checkpoint_floor = job.run_checkpoint_floor;
         dm.generation = job.state_generation;
         dm.restore_generation = job.state_generation;
         dm.unaligned_checkpoints = job.checkpoint.alignment == CheckpointAlignment::Unaligned;
@@ -5329,14 +5341,23 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
         }
         if (!ha_dir_.empty()) {
             bool confirm_flag = false;
+            // The floor the deploy computed (or a takeover kept), so the next
+            // takeover of this run keeps it too.
+            auto manifest_checkpoint = checkpoint_copy;
             {
                 std::lock_guard lock(mu_);
                 if (auto it = jobs_.find(job_id); it != jobs_.end()) {
                     confirm_flag = !it->second->confirm_task_keys.empty();
+                    manifest_checkpoint.run_checkpoint_floor = it->second->run_checkpoint_floor;
                 }
             }
-            persist_job_manifest_(
-                ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy, epoch(), confirm_flag);
+            persist_job_manifest_(ha_dir_,
+                                  job_id,
+                                  graph_json,
+                                  plugins_copy,
+                                  manifest_checkpoint,
+                                  epoch(),
+                                  confirm_flag);
         }
     }
 
@@ -5501,6 +5522,8 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                             checkpoint.restore_from_dir.empty();
     const std::string fingerprint_key = "_jobs/" + std::to_string(job_id) + "/graph-fingerprint";
     bool resumed_from_existing = false;
+    // The base a resumed run recorded when it began: it continues that run.
+    std::uint64_t resumed_run_base = 0;
     if (track_runs && !checkpoint.start_fresh) {
         const auto store = make_coordination_store(checkpoint.checkpoint_dir);
         const auto completed = latest_completed_id_on_disk(checkpoint.checkpoint_dir, job_id);
@@ -5605,6 +5628,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                     throw std::runtime_error(reject);
                 }
                 resumed_from_existing = true;
+                resumed_run_base = run_base;
                 log::info("coordinator.restart",
                           "job_id=" + std::to_string(job_id) + " resuming from checkpoint " +
                               std::to_string(restore) + " in " + checkpoint.checkpoint_dir +
@@ -5721,6 +5745,51 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         }
     }
     job->first_checkpoint_id = job->next_checkpoint_id;
+    // The run's checkpoint-id floor (DeployMsg::run_checkpoint_floor): the
+    // receipts and unresolved markers above it are this run's to read, its
+    // own or those of the run it continues, and every checkpoint of this run
+    // numbers above it. The 2PC sinks read them above max(restore point,
+    // floor), so a restart that restores from nothing (no checkpoint of this
+    // run confirmed yet) still settles this run's orphans and arms from its
+    // receipts, while a fresh start in a reused directory reads none of an
+    // earlier run's: job ids restart at 1 in every coordinator process, and
+    // the receipts directory is per job id.
+    if (!checkpoint.checkpoint_dir.empty()) {
+        if (checkpoint.taken_over) {
+            // The same run under a new leader: the floor its first submit fixed,
+            // as the manifest recorded it. Numbering from the takeover's floor
+            // would put the dead leader's receipts below it.
+            job->run_checkpoint_floor = checkpoint.run_checkpoint_floor;
+        } else if (resumed_from_existing) {
+            // A tracked run resuming continues the run that recorded this base.
+            job->run_checkpoint_floor = resumed_run_base;
+        } else {
+            // A new run (new_run_checkpoint_floor). One that restores from a
+            // checkpoint continues the run that took it, and the receipts above
+            // it are output already published: its floor is the restore point,
+            // as the sinks' rule was before the floor existed. A restart of it
+            // never restores from 0: with nothing of its own confirmed it
+            // restores the submitted point again (restart_job_locked_). A fresh
+            // start owes its full output, and its floor sits above every id an
+            // earlier run left: a floored job numbers above every id on record
+            // and every marker, and a fresh one from 1, its claims on ids the
+            // record holds refused and renumbered above it.
+            try {
+                job->run_checkpoint_floor =
+                    new_run_checkpoint_floor(checkpoint.checkpoint_dir,
+                                             job_id,
+                                             checkpoint.restore_from_checkpoint_id,
+                                             std::max(job->next_checkpoint_id - 1, ids_on_record));
+            } catch (const std::exception& e) {
+                log::warn("coordinator.submit",
+                          "job_id=" + std::to_string(job_id) +
+                              " could not read its markers to fix its run's checkpoint-id "
+                              "floor (" +
+                              e.what() +
+                              "); its sinks treat a restart from nothing as a fresh start");
+            }
+        }
+    }
     if (track_runs) {
         // Recorded before the deploy, in this order, so that whatever happens to
         // this run from here - a failed deploy, a kill before its first
@@ -6044,6 +6113,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.capture_records = checkpoint.capture_records;
         deploy_msg.restore_from_dir = checkpoint.restore_from_dir;
         deploy_msg.restore_from_checkpoint_id = checkpoint.restore_from_checkpoint_id;
+        deploy_msg.run_checkpoint_floor = job->run_checkpoint_floor;
         // Generation 1 is an initial deploy. A restore here reads an EXTERNAL
         // directory (a savepoint, or an explicit --restore-from-checkpoint-id), so
         // its generation is whatever that directory holds rather than anything this
@@ -8139,6 +8209,8 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         deploy_msg.capture_records = job.checkpoint.capture_records;
         deploy_msg.restore_from_dir = restore_from_dir;
         deploy_msg.restore_from_checkpoint_id = restore_from_checkpoint_id;
+        // The same run: the floor its first submit fixed.
+        deploy_msg.run_checkpoint_floor = job.run_checkpoint_floor;
         // Which generation this deploy WRITES, and which one produced the restore
         // point. They differ exactly when the restore crosses a rescale, and the
         // boundary is the same one that decides whether the parent INDEX needs
@@ -8422,6 +8494,7 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         // subtasks load a consistent snapshot frozen at the drain barrier.
         deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
         deploy_msg.restore_from_checkpoint_id = status->cutover_checkpoint;
+        deploy_msg.run_checkpoint_floor = job.run_checkpoint_floor;
         deploy_msg.unaligned_checkpoints =
             job.checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.adaptive_barrier_mode =
@@ -8829,6 +8902,8 @@ void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& s
     post_cancels_(error_restart_cancels);
 
     if (retry && retry_outbox) {
+        // A subtask retry of a job without checkpoints: no checkpoint
+        // directory, so no receipts and no run checkpoint-id floor to carry.
         DeployMsg deploy_msg;
         deploy_msg.job_id = job_id;
         deploy_msg.tasks.push_back(std::move(retry_task));

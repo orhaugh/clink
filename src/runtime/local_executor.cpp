@@ -191,6 +191,11 @@ void LocalExecutor::start() {
         // sinks that keep their output across a restore decide on it, and a
         // savepoint restore can run with no checkpoint directory at all.
         contexts_.back()->set_restore_from_checkpoint_id(config_.restore_from_checkpoint_id);
+        // The run's checkpoint-id floor, when the deploy carried one: receipts
+        // and markers above it are this run's to read.
+        if (config_.run_checkpoint_floor.has_value()) {
+            contexts_.back()->set_run_checkpoint_floor(*config_.run_checkpoint_floor);
+        }
         // Which previous subtasks' single-owner state (a 2PC sink's prepared
         // transactions) this task takes over; unset = only its own.
         if (config_.restore_succession.has_value()) {

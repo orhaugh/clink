@@ -463,6 +463,24 @@ struct DeployMsg {
     // unfenced peer" and preserves the pre-fencing behaviour exactly, so
     // a mixed-version cluster keeps working while it is being upgraded.
     std::uint64_t coordinator_epoch{0};
+    // The run's checkpoint-id floor: the receipts and unresolved markers of
+    // this job id in this checkpoint directory above it are this run's to read,
+    // its own or those of the run it continues, and every checkpoint this run
+    // takes numbers above it. A fresh start's floor sits above everything an
+    // earlier run left; a run that restores from checkpoint R continues the
+    // run that took R, and its floor is R, so the receipts above R, output
+    // already published, suppress the replay's re-emissions. A 2PC sink
+    // settles unresolved markers and arms replay suppression from receipts
+    // above max(restore point, floor), so a restart that restores from nothing
+    // (no checkpoint of this run confirmed yet) still reads this run's
+    // receipts, and a fresh start reads no earlier run's. Fixed when the run
+    // is first submitted (new_run_checkpoint_floor) and kept across its
+    // restarts and an HA takeover. Unset from a
+    // coordinator that predates it, or when the coordinator cannot vouch for
+    // one (a takeover of a job persisted without it): the sink then keeps its
+    // older rule and skips both at restore point 0. Appended after the
+    // epoch, an additive tail: an older worker stops reading before it.
+    std::optional<std::uint64_t> run_checkpoint_floor;
 };
 
 struct StartJobMsg {
@@ -778,6 +796,11 @@ struct CheckpointConfig {
     // one: the gap the takeover's own walk left (a refusal, a broker outage)
     // is still open, and the restart walks it again.
     std::uint64_t resumed_completed{0};
+    // The run's checkpoint-id floor (DeployMsg::run_checkpoint_floor), as an
+    // HA takeover reads it back from the job's persisted manifest; in-process
+    // only. Unset on a submit, which computes it, and on a takeover of a job
+    // persisted without one, which deploys without a floor.
+    std::optional<std::uint64_t> run_checkpoint_floor;
 };
 
 // Resolve max_restarts_on_worker_loss to its effective value (see the field +

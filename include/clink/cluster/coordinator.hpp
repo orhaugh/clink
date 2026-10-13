@@ -1648,6 +1648,13 @@ private:
         // takeover's Redeploy protocol event reports, read after the trigger
         // loop may already have moved next_checkpoint_id on.
         std::uint64_t first_checkpoint_id{1};
+        // The run's checkpoint-id floor, carried on every Deploy
+        // (DeployMsg::run_checkpoint_floor): receipts and markers above it are
+        // this run's to read. Fixed when the run is first submitted
+        // (new_run_checkpoint_floor); a takeover keeps the one the manifest
+        // recorded. Unset when the job has no checkpoint
+        // directory or a takeover's manifest predates it.
+        std::optional<std::uint64_t> run_checkpoint_floor;
 
         // The job's checkpoint-id record (_jobs/<id>/TRIGGERED, see
         // claim_checkpoint_id_): which ids this coordinator may allocate, and

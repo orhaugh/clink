@@ -619,8 +619,9 @@ against the bug it guards is decorative.
 | `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | yes, `NoLoss` |
 | `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its `CONFIRMED` marker is durable | review of the per-connection dispatch change | yes, `ConfirmedMemoryOnDisk` |
 | `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan before `init_transactions` | this model, with a lost worker left running | yes, `NoDuplicate` |
+| `open_skips_restore_zero` | A Kafka sink reopening at restore point 0 settles its orphan and arms suppression, as at any other | this model, against the engine's open | yes, `NoDuplicate` |
 
-Sixteen of the eighteen are refuted. The two that are not are recorded in
+Seventeen of the nineteen are refuted. The two that are not are recorded in
 `formal/mutants/expected.txt` rather than deleted, and the check holds that
 record in both directions: each of them disables a rule that a later rule
 now guards as well. The preserved prepared transaction predates commit
@@ -721,6 +722,33 @@ on. The specification stated the fix first, and the engine followed:
    once both ways. Against the old open the first publishes the interval
    twice.
 
+A fifth came from reading the engine's open against the specification's:
+
+5. **The restart from nothing taken for a fresh start.** The specification
+   settles markers and arms suppression above the restore point for every
+   restore point, 0 included; the engine's open skipped both at 0. A restart
+   before any checkpoint of the run is confirmed restores from 0, so a commit
+   that executed without its receipt, which the walk then could not settle,
+   was replayed from the start and published twice, with no lost worker
+   needed. `open_skips_restore_zero` keeps that open as a mutant, and TLC
+   refutes it in 24 states. The skip guarded something real: job ids restart
+   at 1 in every coordinator process and the receipts directory is per job id,
+   so a fresh start in a reused directory can find an earlier run's receipts.
+   The model has one run per behaviour, a fresh start being the initial state,
+   so every receipt in it is the current run's. The engine now tells them
+   apart with the run's checkpoint-id floor, which every deploy carries: the
+   open reads receipts and markers above the larger of the restore point and
+   the floor. A fresh start's floor sits above everything an earlier run of the
+   job left; a run that restores from checkpoint R continues the run that took
+   it, and its floor is R. The run's restarts and an HA takeover keep it.
+   Pinned by
+   `TxnResumeLive.ACommitWithoutItsReceiptIsReceiptedAtARestartFromNothing`
+   and `TxnResumeLive.AnOrphanRacedAtARestartFromNothingIsSettledBeforeTheFence`,
+   which publish the interval twice against the old open, by
+   `TxnResumeLive.AFreshStartAboveAnEarlierRunsReceiptsArmsNothing` and
+   `TxnResumeLive.AResubmitFromACheckpointArmsFromTheReceiptsAboveIt`, and by
+   `CheckpointCompletion.EveryDeployOfARunCarriesTheFloorItsFirstSubmitFixed`.
+
 Two further counterexamples in the first runs were defects in the model,
 not the engine (a producer identity kept in the sink's process record and
 so lost with the process; control frames delivered out of order), and were
@@ -735,7 +763,7 @@ In the honesty categories the qualification pages use:
   reachable interleaving of the modelled protocol steps and faults satisfies
   the invariants, the run never deadlocks, and (in the liveness
   configuration) every run with bounded faults settles with every
-  vouched-for position published exactly once. Sixteen of the eighteen
+  vouched-for position published exactly once. Seventeen of the nineteen
   mutants produce a counterexample; the two that do not are recorded as
   guarded by a later rule, and the check fails the day that stops being
   true.

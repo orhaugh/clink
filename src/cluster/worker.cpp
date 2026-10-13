@@ -1787,6 +1787,7 @@ void Worker::handle_deploy_(MessageReader& r) {
             .state_backend_uri = msg.state_backend_uri,
             .capture_dir = msg.capture_dir,
             .capture_records = msg.capture_records,
+            .run_checkpoint_floor = msg.run_checkpoint_floor,
         };
     }
     for (auto& task : msg.tasks) {
@@ -2111,6 +2112,9 @@ void Worker::run_generic_subtask_(JobId job_id,
     // Record-capture flight recorder (empty = off).
     std::string capture_dir;
     std::uint64_t capture_records = 0;
+    // The run's checkpoint-id floor, for the 2PC sinks' receipts (unset when the
+    // coordinator sent none).
+    std::optional<std::uint64_t> run_checkpoint_floor;
     {
         std::lock_guard lock(mu_);
         auto it = per_job_bundle_.find(job_id);
@@ -2126,6 +2130,7 @@ void Worker::run_generic_subtask_(JobId job_id,
             state_backend_uri = ck->second.state_backend_uri;
             capture_dir = ck->second.capture_dir;
             capture_records = ck->second.capture_records;
+            run_checkpoint_floor = ck->second.run_checkpoint_floor;
         }
     }
     const auto& bundle_tr = *job_tr;
@@ -2706,6 +2711,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .commit_receipt_dir = checkpoint_dir.empty()
                                           ? std::string{}
                                           : commit_receipt_dir_for(checkpoint_dir, job_id).string(),
+                .run_checkpoint_floor = run_checkpoint_floor,
                 .generation = generation,
                 .restore_from_generation = restore_from_generation,
                 .capture_dir = capture_dir,
@@ -3106,6 +3112,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 checkpoint_dir.empty()
                     ? std::string{}
                     : clink::cluster::commit_receipt_dir_for(checkpoint_dir, job_id).string(),
+            .run_checkpoint_floor = run_checkpoint_floor,
             .generation = generation,
             .restore_from_generation = restore_from_generation,
             .capture_dir = capture_dir,

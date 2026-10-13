@@ -66,6 +66,11 @@ may differ as long as each side can speak something the other accepts.
   absent tail as the field's v1 default, and a peer that declares nothing
   reads as version 1 (pre-versioning peers still decode). Bump
   `kClusterProtocolVersion` only for a change old peers would misread.
+  Where a frame's fencing epoch is read as its last field (`Deploy`,
+  `FinalCheckpointAssigned`), a new field goes after the epoch, not before
+  it: an older peer reads the epoch where it always did and stops. The
+  Deploy's run checkpoint-id floor is such a tail (a presence byte, then the
+  id); a Deploy without it keeps a 2PC sink's older rule at restore point 0.
 - **Version 2 capability:** worker heartbeats carry a tail sequence and a v2
   coordinator returns `HeartbeatAck`. The worker uses acknowledgements as a
   bidirectional control-session lease, detecting one-way partitions that do

@@ -77,6 +77,9 @@ struct JobConfig {
     // legacy paths). restore_from_checkpoint_id is 0 on a fresh start.
     std::string commit_receipt_dir;
     std::uint64_t restore_from_checkpoint_id{0};
+    // The run's checkpoint-id floor (RuntimeContext::run_checkpoint_floor),
+    // set by the cluster path from the deploy; unset in-process.
+    std::optional<std::uint64_t> run_checkpoint_floor;
 
     // The previous run's subtasks this subtask succeeds (see
     // RestoreSuccession), copied onto every operator's RuntimeContext. Set by

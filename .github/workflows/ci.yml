@@ -678,7 +678,7 @@ jobs:
   formal-mutant-id-reuse:
     name: The id-reuse mutant of the exactly-once specification is refuted
     runs-on: ubuntu-24.04
-    # M_id_reuse on its own runner with every worker, beside the other seventeen:
+    # M_id_reuse on its own runner with every worker, beside the other eighteen:
     # its refutation is the largest search of the set (about 104M states).
     timeout-minutes: 150
     steps:

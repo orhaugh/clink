@@ -134,9 +134,15 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
         b.put_u32_be(t.succeeds_first);
         b.put_u32_be(t.succeeds_count);
     }
-    // Fencing epoch, appended last so an older peer that stops reading here still
-    // decodes the rest correctly. Anything new goes BEFORE this, not after.
+    // Fencing epoch. An older peer reads it as its last field, so a field
+    // placed before it shifts the epoch such a peer reads; new fields are
+    // appended after it, where an older peer stops reading.
     b.put_u64_be(m.coordinator_epoch);
+    // The run's checkpoint-id floor: a presence byte, then the id. A peer that
+    // stops reading earlier leaves it unset, and its sinks keep the rule they
+    // had before it.
+    b.put_u8(m.run_checkpoint_floor.has_value() ? 1 : 0);
+    b.put_u64_be(m.run_checkpoint_floor.value_or(0));
 }
 
 inline void encode_body(MessageBuilder& b, const StartJobMsg& m) {
@@ -650,9 +656,17 @@ inline DeployMsg decode_deploy(MessageReader& r) {
             t.succeeds_count = r.read_u32_be();
         }
     }
-    // Fencing epoch LAST, matching the encoder. It is deliberately the final field
-    // so a peer that stops reading earlier still decodes everything before it.
+    // Fencing epoch, after the fields above, matching the encoder.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    // The run's checkpoint-id floor. Absent from older coordinator peers ->
+    // unset, so their sinks keep the rule they had before it.
+    if (!r.eof()) {
+        const bool has_floor = r.read_u8() != 0;
+        const auto floor = r.read_u64_be();
+        if (has_floor) {
+            m.run_checkpoint_floor = floor;
+        }
+    }
     return m;
 }
 

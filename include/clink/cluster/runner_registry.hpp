@@ -116,6 +116,9 @@ struct RunnerContext {
     // (in-process / legacy paths). See commit_receipt_dir_for in
     // clink/cluster/in_doubt_resolution.hpp for who reads them.
     std::string commit_receipt_dir;
+    // The run's checkpoint-id floor, from DeployMsg::run_checkpoint_floor.
+    // Unset when the deploy carried none. See RuntimeContext.
+    std::optional<std::uint64_t> run_checkpoint_floor;
     // Topology generation. State is rooted at
     // `<checkpoint_dir>/v<generation>/<subtask_idx>` rather than
     // `<checkpoint_dir>/<subtask_idx>`, because a job-global subtask index is

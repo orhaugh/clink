@@ -438,6 +438,9 @@ private:
         // Record-capture flight recorder (echoed from DeployMsg); empty = off.
         std::string capture_dir;
         std::uint64_t capture_records{0};
+        // The run's checkpoint-id floor (echoed from DeployMsg); unset when the
+        // coordinator sent none.
+        std::optional<std::uint64_t> run_checkpoint_floor;
     };
     std::unordered_map<JobId, JobCheckpointState> per_job_checkpoint_;
 

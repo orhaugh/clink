@@ -13,6 +13,7 @@
 // Plugins that need the full KafkaMessage (key/headers/partition) can
 // register their own KafkaMessage-typed sources/sinks via the same API.
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -967,12 +968,11 @@ private:
     // since no init has run since the marker was written.
     void resolve_unresolved_orphan_() {
         settled_verdict_ = nullptr;
-        const auto* rt = this->runtime();
-        if (!replay_suppression_ || rt == nullptr || rt->commit_receipt_dir().empty() ||
-            rt->restore_from_checkpoint_id() == 0) {
+        const auto above = receipts_above_();
+        if (!above.has_value()) {
             return;
         }
-        const auto restore_from = rt->restore_from_checkpoint_id();
+        const auto* rt = this->runtime();
         const std::string prefix = "sub" + std::to_string(subtask_idx_) + "-";
         const std::string suffix = ".unresolved";
         std::uint64_t marker_ckpt = 0;
@@ -988,7 +988,7 @@ private:
                 continue;
             }
             const auto id = std::strtoull(name.c_str() + prefix.size(), nullptr, 10);
-            if (id > restore_from && id > marker_ckpt) {
+            if (id > *above && id > marker_ckpt) {
                 marker_ckpt = id;
             }
         }
@@ -1158,16 +1158,43 @@ private:
                  : "; the restore's replay is the interval's only copy"));
     }
 
-    // Called from open() (under mu_): arm suppression from receipts newer
-    // than the checkpoint this run restored from. Fresh starts (restore id
-    // 0) never arm - a deliberate resubmit that reprocesses from scratch
-    // owes the user its full output.
-    void arm_replay_suppression_() {
+    // The id above which this run's receipts and unresolved markers lie, for
+    // the open: max(restore point, run floor). A fresh start's floor sits above
+    // everything an earlier run of this job left in the directory, so it
+    // (restore point 0, nothing of its own above its floor yet) reads none of
+    // it and owes the user its full output. A run that restores from a
+    // checkpoint continues the run that took it and reads that run's receipts
+    // above the restore point, output already published. A restart that
+    // restores from nothing (no checkpoint of this run confirmed yet) still
+    // reads this run's receipts and markers. nullopt when
+    // the open reads neither: receipts off, or a deploy that carried no floor
+    // (an older coordinator, a takeover of a job persisted without one) and
+    // restores from nothing, which this sink takes for a fresh start, as it
+    // did before the floor existed.
+    std::optional<std::uint64_t> receipts_above_() const {
         const auto* rt = this->runtime();
-        if (!replay_suppression_ || rt == nullptr || rt->commit_receipt_dir().empty() ||
-            rt->restore_from_checkpoint_id() == 0) {
+        if (!replay_suppression_ || rt == nullptr || rt->commit_receipt_dir().empty()) {
+            return std::nullopt;
+        }
+        const auto restore_from = rt->restore_from_checkpoint_id();
+        const auto floor = rt->run_checkpoint_floor();
+        if (!floor.has_value()) {
+            if (restore_from == 0) {
+                return std::nullopt;
+            }
+            return restore_from;
+        }
+        return std::max(restore_from, *floor);
+    }
+
+    // Called from open() (under mu_): arm suppression from this run's receipts
+    // newer than the checkpoint it restored from (receipts_above_).
+    void arm_replay_suppression_() {
+        const auto above = receipts_above_();
+        if (!above.has_value()) {
             return;
         }
+        const auto* rt = this->runtime();
         const auto restore_from = rt->restore_from_checkpoint_id();
         const std::string prefix = "sub" + std::to_string(subtask_idx_) + "-";
         std::uint64_t best_ckpt = 0;
@@ -1182,7 +1209,7 @@ private:
                 continue;
             }
             const auto id = std::strtoull(name.c_str() + prefix.size(), nullptr, 10);
-            if (id > restore_from && id > best_ckpt) {
+            if (id > *above && id > best_ckpt) {
                 best_ckpt = id;
             }
         }

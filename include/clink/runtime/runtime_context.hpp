@@ -209,6 +209,19 @@ public:
     std::uint64_t restore_from_checkpoint_id() const noexcept {
         return restore_from_checkpoint_id_;
     }
+    // The run's checkpoint-id floor: the receipts and unresolved markers above
+    // it are this run's to read, its own or those of the run it continues
+    // from a restored checkpoint, and every checkpoint of this run numbers
+    // above it. A 2PC sink reads them above max(restore point, floor), so a
+    // restart that restores from nothing still finds this run's, and a fresh
+    // start, whose floor sits above everything an earlier run left, finds
+    // none of an earlier run's. Unset when the deploy carried none (in-process
+    // paths, an older coordinator): such a sink treats restore point 0 as a
+    // fresh start, as it did before the floor existed.
+    void set_run_checkpoint_floor(std::uint64_t floor) noexcept { run_checkpoint_floor_ = floor; }
+    [[nodiscard]] std::optional<std::uint64_t> run_checkpoint_floor() const noexcept {
+        return run_checkpoint_floor_;
+    }
 
     // The previous run's subtasks this subtask succeeds (see RestoreSuccession):
     // set by the cluster's executor on every deploy. Unset on in-process paths,
@@ -657,6 +670,7 @@ private:
     std::size_t capture_subtask_idx_{0};
     std::string commit_receipt_dir_;
     std::uint64_t restore_from_checkpoint_id_{0};
+    std::optional<std::uint64_t> run_checkpoint_floor_;
     std::optional<RestoreSuccession> restore_succession_;
     std::string runner_role_;
     std::size_t runner_subtask_idx_{0};

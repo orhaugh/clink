@@ -225,12 +225,13 @@ each and judges the outcome against `mutants/expected.txt`.
 | `sail_on_without_budget` | A FAILED checkpoint with no restart budget left fails the job instead of carrying on | framework review | refuted: NoLoss |
 | `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its CONFIRMED marker is durable | review of the per-connection dispatch change | refuted: ConfirmedMemoryOnDisk |
 | `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan (abort, or the receipt of the commit that beat the abort) before `init_transactions` | this model, once a lost worker could run on | refuted: NoDuplicate |
+| `open_skips_restore_zero` | A Kafka sink reopening at restore point 0 settles its orphan and arms suppression, as at any other | this model, against the engine's open | refuted: NoDuplicate |
 
 A mutant TLC accepts is recorded in `mutants/expected.txt`, not deleted: it
 means a later rule guards the same defect (defence in depth), and the check
 then holds that record in both directions: the day TLC refutes an
 `accepted` mutant, the other guard has gone and the record is wrong. Two of
-the eighteen are accepted today, both superseded by receipts, in-doubt
+the nineteen are accepted today, both superseded by receipts, in-doubt
 resolution and the marker rule the refusal-wall finding added; the withheld
 broadcast left that set when trace validation widened the specification,
 and the check would have failed had it stayed recorded as accepted. The
@@ -305,6 +306,39 @@ engine after the specification stated the fix:
    in each order; the first publishes the interval twice against the old open),
    by the `TxnResumeSettle` cases for the wire exchange, and by its `SinkOpens`
    line in trace validation (below).
+
+A fifth came from comparing the engine's open with the specification's:
+
+5. **The restart from nothing taken for a fresh start.** The specification's
+   open settles markers and arms suppression above the restore point r for
+   every r, 0 included, while the engine's open skipped both at restore point
+   0. A restart before any checkpoint of the run is confirmed restores from 0,
+   so a commit that executed without its receipt (an ack-window kill), which
+   the walk then could not settle (cancelled, a broker outage), was neither
+   receipted nor suppressed, and the replay from the start published its
+   interval a second time; no worker left running is needed. TLC refutes the
+   engine's shape (`open_skips_restore_zero`) in 24 states: checkpoint 1
+   completes and is broadcast, s1 commits it, s1's worker dies before the
+   receipt, the walk is cancelled, the job redeploys from 0, checkpoint 2 cuts
+   the same position, and s1 reopens without settling or arming and commits it
+   again. The engine skipped restore point 0 for a real reason: job ids restart
+   at 1 in every coordinator process and the receipts directory is per job id,
+   so a fresh start in a reused directory can find an earlier run's receipts,
+   and arming from them would swallow output the new run owes. The model has
+   one run per behaviour, a fresh start being the initial state, whose first
+   open is no step, so every receipt and marker in it is the current run's.
+   The engine now says which are: every deploy carries the run's
+   checkpoint-id floor, kept by the run's restarts and an HA takeover, and the
+   open reads receipts and markers above the larger of the restore point and
+   the floor. A fresh start's floor sits above every id an earlier run of the
+   job left in the directory; a run that restores from checkpoint R continues
+   the run that took it, and its floor is R. Pinned by
+   `TxnResumeLive.ACommitWithoutItsReceiptIsReceiptedAtARestartFromNothing`
+   and `TxnResumeLive.AnOrphanRacedAtARestartFromNothingIsSettledBeforeTheFence`
+   (both publish the interval twice against the open that skipped restore point
+   0), `TxnResumeLive.AFreshStartAboveAnEarlierRunsReceiptsArmsNothing`,
+   `TxnResumeLive.AResubmitFromACheckpointArmsFromTheReceiptsAboveIt`, and
+   `CheckpointCompletion.EveryDeployOfARunCarriesTheFloorItsFirstSubmitFixed`.
 
 ## Trace validation
 
@@ -459,6 +493,11 @@ transaction aborted). An outcome the specification allows from the same state
 is accepted, as it must be: an `aborted` read as `not_committed` is a broker
 expiry the engine cannot observe, taken as a hidden step. The merge script
 grants one expiry per `not_committed` line for that reason.
+`traces/kafka-orphan-settled-at-restart-from-nothing`, synthetic, is the
+settle at restore point 0: a commit without its receipt, the walk cancelled,
+the redeploy restoring from nothing, and the open receipting the commit. It is
+accepted, and diverges at the open with any other `settled` value or another
+`orphan`.
 
 To record a run: set the variable, run the job (the in-process protocol
 trace test and every multi-process harness test do this themselves when

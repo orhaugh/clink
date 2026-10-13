@@ -12,6 +12,7 @@
 //     binary content.
 //   - MessageReader truncation rejection.
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -554,6 +555,52 @@ TEST(WireProtocol, DeployRoundTripsEachTasksSuccession) {
     EXPECT_EQ(out.tasks[2].succeeds_first, kRestoreFromSelf);
     EXPECT_EQ(out.tasks[2].succeeds_count, 1u);
     EXPECT_EQ(out.coordinator_epoch, 41u);
+}
+
+TEST(WireProtocol, DeployCarriesTheRunsCheckpointIdFloorAfterTheEpoch) {
+    // The run's checkpoint-id floor rides after the fencing epoch, an additive
+    // tail: an older worker reads the epoch as its last field and stops there.
+    DeployMsg in;
+    in.job_id = 9;
+    in.coordinator_epoch = 41;
+    DeploymentTask t;
+    t.role = "sink";
+    t.subtask_idx = 0;
+    in.tasks = {t};
+
+    // Unset round-trips as unset; 0 and a value round-trip as themselves.
+    auto out = round_trip(MessageKind::Deploy, in, decode_deploy);
+    EXPECT_FALSE(out.run_checkpoint_floor.has_value());
+    EXPECT_EQ(out.coordinator_epoch, 41U);
+    in.run_checkpoint_floor = 0;
+    out = round_trip(MessageKind::Deploy, in, decode_deploy);
+    ASSERT_TRUE(out.run_checkpoint_floor.has_value());
+    EXPECT_EQ(*out.run_checkpoint_floor, 0U);
+    in.run_checkpoint_floor = 57;
+    out = round_trip(MessageKind::Deploy, in, decode_deploy);
+    ASSERT_TRUE(out.run_checkpoint_floor.has_value());
+    EXPECT_EQ(*out.run_checkpoint_floor, 57U);
+    EXPECT_EQ(out.coordinator_epoch, 41U);
+
+    // A frame that ends at the epoch, as an older coordinator sends it: the
+    // floor is absent, so the worker's sinks keep the rule they had before it,
+    // and the epoch still decodes.
+    const auto framed = encode_frame(MessageKind::Deploy, in);
+    auto legacy = body_of(framed);
+    ASSERT_GT(legacy.size(), 9U);
+    legacy.resize(legacy.size() - 9);  // presence byte + the id
+    MessageReader r(legacy);
+    (void)r.read_u8();
+    const auto old = decode_deploy(r);
+    EXPECT_FALSE(old.run_checkpoint_floor.has_value());
+    EXPECT_EQ(old.coordinator_epoch, 41U);
+    // And what an older worker reads of a new frame: everything up to and
+    // including the epoch is byte for byte the frame without the floor.
+    DeployMsg unset = in;
+    unset.run_checkpoint_floor.reset();
+    const auto without = body_of(encode_frame(MessageKind::Deploy, unset));
+    ASSERT_EQ(without.size(), legacy.size() + 9);
+    EXPECT_TRUE(std::equal(legacy.begin(), legacy.end(), without.begin()));
 }
 
 // Two MessageKinds deliberately share the value 117, and this pins that
@@ -1111,7 +1158,11 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
         in.job_id = 11;
         in.tasks.push_back(DeploymentTask{.role = "r", .subtask_idx = 3});
         in.coordinator_epoch = 9;
-        auto out = round_trip_without_epoch_field(MessageKind::Deploy, in, decode_deploy);
+        // Deploy's tail has grown past the epoch: the run's checkpoint-id floor
+        // (a presence byte and 8 bytes) follows it. A peer that predates both
+        // sends neither, so 17 bytes come off, not 8.
+        auto out = round_trip_without_epoch_field(
+            MessageKind::Deploy, in, decode_deploy, /*tail_bytes=*/17);
         EXPECT_EQ(out.job_id, 11U);
         ASSERT_EQ(out.tasks.size(), 1U);
         EXPECT_EQ(out.tasks[0].subtask_idx, 3U);

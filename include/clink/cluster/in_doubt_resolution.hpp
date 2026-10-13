@@ -94,6 +94,23 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 [[nodiscard]] std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir,
                                                         JobId job_id);
 
+// The checkpoint-id floor of a new run of the job (DeployMsg::run_checkpoint_floor):
+// a 2PC sink reads receipts and unresolved markers above the larger of its
+// restore point and this floor. A run that restores from checkpoint R > 0
+// continues the run that took R: R is its floor, and the receipts above R are
+// output already published, which the restore's replay re-emits and
+// suppression swallows. A fresh start (R = 0) owes its full output, so its
+// floor sits above everything an earlier run of the same job id left in the
+// directory: the ids the run numbers above (`numbering_floor`, its next id
+// less one and the ids on record) and every COMPLETED and CONFIRMED marker,
+// which bound every earlier receipt and unresolved marker, since both name
+// completed checkpoints and markers are never pruned. Not for a takeover or a
+// resumed tracked run: those continue a run whose floor is already fixed.
+[[nodiscard]] std::uint64_t new_run_checkpoint_floor(const std::string& checkpoint_dir,
+                                                     JobId job_id,
+                                                     std::uint64_t restore_from_checkpoint_id,
+                                                     std::uint64_t numbering_floor);
+
 // What a claim on one checkpoint id found.
 struct TriggeredIdClaim {
     // True when the id is on record as this claimant's, which makes it the

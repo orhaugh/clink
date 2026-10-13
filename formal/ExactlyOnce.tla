@@ -88,8 +88,10 @@ Mutants == {
     "restore_from_memory",            \* found by this model: the restore point ran ahead of the durable marker
     "sail_on_without_budget",         \* with no restart budget left, a FAILED checkpoint's interval sailed on
     "advance_before_confirmed_put",   \* found in review: latest_confirmed moved before the CONFIRMED marker was durable
-    "orphan_left_to_init"             \* found by this model: a reopening sink left an undecided orphan for its init
+    "orphan_left_to_init",            \* found by this model: a reopening sink left an undecided orphan for its init
                                       \* to abort, and the lost worker still running committed it in between
+    "open_skips_restore_zero"         \* found by this model: a sink reopening at restore point 0 took the restart
+                                      \* for a fresh start, and neither settled its orphan nor armed suppression
 }
 
 ASSUME Host \in [Sinks -> Workers]
@@ -1696,11 +1698,19 @@ OpenWindowCommits(s) ==
 SinkOpensWith(s, z) ==
     /\ sink[s].opening
     /\ LET r == restorePoint
+           \* The open settles markers and arms suppression above r for every r,
+           \* 0 included. A restart with nothing confirmed restores from 0, and
+           \* every receipt and marker here is this run's: a fresh start is the
+           \* initial state, whose first open is not a step. The engine's open
+           \* used to take restore point 0 for a fresh start and skip both
+           \* (mutant open_skips_restore_zero): a commit that executed without
+           \* its receipt before the restart was then replayed from the start.
+           skips == Bug = "open_skips_restore_zero" /\ Kafka /\ r = 0
            \* Only the newest marker above the restore point is consulted: the
            \* broker's DescribeTransactions names one transaction per identity,
            \* the last, and the receipt-before-begin ordering means only a
            \* sink's last transaction can be committed without a receipt.
-           above == {c \in Ckpts : <<s, c>> \in unresolvedMk /\ c > r}
+           above == IF skips THEN {} ELSE {c \in Ckpts : <<s, c>> \in unresolvedMk /\ c > r}
            myMarkers == IF above = {} THEN {} ELSE {Max(above)}
            describeOk == Bug = "blind_fence" \/ myMarkers = {} \/ brokerUp
            \* The old incarnation's commit has landed.
@@ -1727,7 +1737,8 @@ SinkOpensWith(s, z) ==
                         THEN [mid[c] EXCEPT !.st = "committed"]
                         ELSE mid[c]]
            recovered == {p \in Positions : \E c \in recoverSet : cutOf[c] = p /\ txn[s][c].has}
-           horizon == Max({cutOf[c] : c \in {d \in Ckpts : <<s, d>> \in receipts1 /\ d > r}})
+           horizon == IF skips THEN 0
+                      ELSE Max({cutOf[c] : c \in {d \in Ckpts : <<s, d>> \in receipts1 /\ d > r}})
        IN /\ describeOk
           /\ receipts' = receipts1
           /\ unresolvedMk' = unresolvedMk \ {<<s, c>> : c \in myMarkers}
