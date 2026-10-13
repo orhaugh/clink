@@ -27,12 +27,12 @@
 //
 // Bounds. Only queued frames count: the frame being written never does, so a
 // large Deploy in flight cannot make a heartbeat answer overflow. The caller
-// says what each frame is. Control frames (everything without plugin bytes)
-// are bounded in frames and in bytes; Bulk frames (those carrying plugin
-// bytes) only in bytes, against a separate and larger bound, so a burst of
-// Deploys never pushes out the protocol traffic queued beside it, nor the
-// other way round. A frame is admitted while its class is under its bounds,
-// so a class holds at most its byte bound plus one frame. See OutboxLimits.
+// says what each frame is. Control frames (everything but a Deploy) are
+// bounded in frames and in bytes; Bulk frames (Deploys) only in bytes,
+// against a separate and larger bound, so a burst of Deploys never pushes out
+// the protocol traffic queued beside it, nor the other way round. A frame is admitted while its
+// class is under its bounds, so a class holds at most its byte bound plus one frame. See
+// OutboxLimits.
 //
 // Outcomes. post() answers Queued or Refused. Refused means the frame will
 // never be written: the outbox is flushing, closed or stopped, or the post
@@ -92,12 +92,12 @@ namespace clink::cluster {
 
 // What a frame carries, for the outbox's bounds.
 enum class FrameClass : std::uint8_t {
-    // Every frame without plugin bytes: acks, barriers, commits, cancels, peer
-    // updates, heartbeat answers, and a Deploy that refers to its plugins by
-    // hash only.
+    // Every frame but a Deploy: acks, barriers, commits, cancels, peer
+    // updates, heartbeat answers. Each is small, and each is protocol state.
     Control,
-    // A frame carrying plugin bytes: a Deploy that ships modules the peer has
-    // not been sent on this connection.
+    // A Deploy. Besides the bytes of any plugin it ships, a Deploy carries
+    // the job's UDF modules and a chain spec per task, so even one that
+    // refers to every plugin by hash can be megabytes.
     Bulk,
 };
 
@@ -137,16 +137,17 @@ struct OutboxLimits {
     // above anything a peer that reads at all lets build up.
     std::size_t max_control_frames{10000};
     std::size_t max_control_bytes{std::size_t{64} * 1024 * 1024};
-    // Plugin bytes. A Deploy carries every module of its job that the peer
-    // has not been sent, up to kMaxFrameBytes, and one decision can post one
-    // Deploy per job hosted on a worker (a restart, a recovery): a burst of
-    // several large frames is the normal case for this class, and a slow
-    // reader is the stall clock's to judge, not a bound's. Four of the
-    // largest frames allowed, so a burst of four maximum-size Deploys, or of
-    // twenty-six of 40 MiB, is admitted even when the writer has taken none
-    // of it. The bound is a backstop against memory growing without limit:
-    // a module's bytes go to a connection once, and later Deploys on it
-    // refer to the module by hash.
+    // Deploys. A Deploy carries every module of its job that the peer has
+    // not been sent, its UDF modules and a chain spec per task, up to
+    // kMaxFrameBytes, and one decision can post one Deploy per job hosted on
+    // a worker (a restart, a recovery): a burst of several large frames is
+    // the normal case for this class, and a slow reader is the stall clock's
+    // to judge, not a bound's. Four of the largest frames allowed, so a
+    // burst of four maximum-size Deploys, or of twenty-six of 40 MiB, is
+    // admitted even when the writer has taken none of it. The bound is a
+    // backstop against memory growing without limit: a module's bytes go to
+    // a connection once, and later Deploys on it refer to the module by
+    // hash.
     std::size_t max_bulk_bytes{4 * kMaxFrameBytes};
 };
 

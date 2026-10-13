@@ -291,6 +291,10 @@ inline constexpr char kCoordinatorBeforeConfirmedMarker[] = "coordinator.before_
 // is neither published to the coordinator's jobs nor deployed: a worker that
 // re-registers here has its old session retired without seeing the job.
 inline constexpr char kCoordinatorDeployAfterPlacement[] = "coordinator.deploy_after_placement";
+// A submit has published its job to the coordinator's jobs and has posted
+// none of its Deploys: a worker declared lost or replaced here has the job's
+// subtasks folded by that path, and the Deploy to it is then refused.
+inline constexpr char kCoordinatorDeployAfterPublish[] = "coordinator.deploy_after_publish";
 // A worker's SubtaskFinished is decoded on its connection's dispatch thread,
 // after that thread's check that the session is not lost, and its handler has
 // not yet taken the coordinator's lock.
@@ -358,6 +362,10 @@ inline constexpr char kCoordinatorAdmissionBeforeHandle[] = "coordinator.admissi
 // transport that broke under it does. The ordinal counts frames across every
 // outbox in the process.
 inline constexpr char kCoordinatorOutboxBeforeWrite[] = "coordinator.outbox_before_write";
+// The watchdog has woken for a sweep and judged nothing yet. Block here, with
+// the outbox writers held at coordinator.outbox_before_write, stands for the
+// whole coordinator process being suspended: the sweep that follows is late.
+inline constexpr char kCoordinatorWatchdogSweep[] = "coordinator.watchdog_sweep";
 
 // Sink two-phase commit.
 inline constexpr char kSinkBeforePrepare[] = "sink.before_prepare";

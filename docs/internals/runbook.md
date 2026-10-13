@@ -119,8 +119,30 @@ state growth, not a storage problem.
 
 `increase(clink_coordinator_workers_lost_total[10m]) > 0`
 
-A worker missed its heartbeats and was declared lost. Its jobs roll back to their
-last completed checkpoint and redeploy onto the survivors.
+The coordinator declared a worker lost. Its jobs roll back to their last completed
+checkpoint and redeploy onto the survivors.
+
+**Find the cause first.** The coordinator logs it in its
+`worker lost: <id> (<cause>)` line, and puts the same text in the `cause` field
+of the `coordinator.worker_lost` event. It is one of three:
+
+- `heartbeat timeout`: nothing arrived from the worker for `heartbeat_timeout`.
+  The process died, was paused, or the network between the two failed. Check
+  whether the worker process is still running and what it logged last. A
+  repeating count with live workers is a heartbeat timeout set too tight for the
+  network or the hosts' load.
+- `no outbound progress for <N> ms with <M> frames pending`: the worker went on
+  heartbeating but stopped reading what the coordinator sent it, for longer than
+  `outbound_stall_timeout`. Check the worker's log for a frame whose handling
+  never returned (a `Deploy` held in loading a fresh plugin is the usual one),
+  and its host for CPU, memory or disk pressure.
+- `outbound queue stopped (<reason>): <detail>`: the worker's outbound queue on
+  the coordinator stopped by itself. `overflow` means more was queued for the
+  worker than the outbound bounds allow, so it had stopped reading for a while
+  (the detail names the bound); `write_failed` means the connection broke under
+  the coordinator's writer, usually because the worker went away; `allocation`
+  means the coordinator could not allocate memory to queue a frame, so look at
+  the coordinator's own memory.
 
 **Look at:** whether the job recovered. The coordinator logs
 `awaiting_restart (attempt N/M)` and then a redeploy. If both appear and the job is

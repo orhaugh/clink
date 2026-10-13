@@ -245,7 +245,9 @@ public:
         // A worker is declared lost if no message has arrived from it for
         // longer than this. Heartbeats from a healthy worker should have a
         // shorter interval - typically heartbeat_timeout / 3 - so a
-        // single missed message doesn't trigger a false positive.
+        // single missed message doesn't trigger a false positive. A value
+        // too large for the clock (up to milliseconds::max()) never passes:
+        // no worker is declared lost for its silence.
         std::chrono::milliseconds heartbeat_timeout{2000};
         // Interface to bind the control-plane listener on. Default is
         // loopback (single-host tests). Set to "0.0.0.0" or a specific
@@ -413,23 +415,25 @@ public:
         // a wedged one. It is well below restart_drain_timeout (120 s), so a
         // wedged survivor of a restart is declared lost, and folded into the
         // restart, long before the drain deadline would fail the job. Zero
-        // or less turns the check off; a worker whose outbound queue
-        // overflows, or whose transport fails under the writer, is declared
-        // lost all the same.
+        // or less turns the check off, and so does a value too large for the
+        // clock (up to milliseconds::max()), which never passes; either way,
+        // a worker whose outbound queue overflows, or whose transport fails
+        // under the writer, is declared lost all the same.
         std::chrono::milliseconds outbound_stall_timeout{10000};
         // Most frames, and most bytes, one worker connection may have queued
-        // for its writer: control frames (every frame without plugin bytes)
-        // in number and in bytes, and frames that carry plugin bytes (a
-        // Deploy shipping modules not yet sent on that connection) in bytes,
-        // counted apart so a burst of large Deploys never pushes out the
-        // protocol traffic queued beside it. The frame being written never
-        // counts. A frame that finds its class at a bound costs the worker
-        // its connection, and the watchdog declares it lost at its next
-        // tick. The defaults are far above anything a worker that reads at
-        // all lets build up; the bulk bound is four frames of the largest
-        // size a frame may have (kMaxFrameBytes, 256 MiB). Zero refuses
-        // every frame of the class, so every worker would be lost at its
-        // first such frame.
+        // for its writer: control frames (every frame but a Deploy) in number
+        // and in bytes, and Deploys in bytes. A Deploy carries the bytes of
+        // any plugin it ships, the job's UDF modules and a chain spec per
+        // task, so even one that refers to its plugins by hash can be
+        // megabytes; Deploys are counted apart so a burst of them never
+        // pushes out the protocol traffic queued beside it. The frame being
+        // written never counts. A frame that finds its class at a bound
+        // costs the worker its connection, and the watchdog declares it lost
+        // at its next tick. The defaults are far above anything a worker
+        // that reads at all lets build up; the bulk bound is four frames of
+        // the largest size a frame may have (kMaxFrameBytes, 256 MiB). Zero
+        // refuses every frame of the class, so every worker would be lost at
+        // its first such frame.
         std::size_t max_outbound_control_frames{10000};
         std::size_t max_outbound_control_bytes{std::size_t{64} * 1024 * 1024};
         std::size_t max_outbound_bulk_bytes{std::size_t{4} * 256 * 1024 * 1024};
@@ -1922,10 +1926,11 @@ private:
     struct PendingDeploy {
         std::shared_ptr<Outbox> outbox;
         std::shared_ptr<const std::vector<std::byte>> frame;
-        // A Deploy that ships plugin bytes, posted as a bulk frame; every
-        // other frame, a Deploy that refers to its plugins by hash only
-        // included, is a control frame.
-        bool ships_plugin_bytes{false};
+        // A Deploy, posted as a bulk frame: besides the bytes of any plugin
+        // it ships, it carries the job's UDF modules and a chain spec per
+        // task, so even one that refers to its plugins by hash can be
+        // megabytes. Every other frame is a control frame.
+        bool deploy{false};
     };
     // Post each staged frame to its outbox, in order. Never waits on a peer.
     static void post_frames_(const std::vector<PendingDeploy>& frames);

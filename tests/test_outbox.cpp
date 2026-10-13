@@ -561,10 +561,9 @@ TEST(Outbox, TheCoordinatorsOutboundBoundsDefaultToTheOutboxsOwn) {
     EXPECT_EQ(cfg.max_outbound_bulk_bytes, limits.max_bulk_bytes);
 }
 
-// Frames carrying plugin bytes have a bound of their own, and each class is
-// judged against its own bounds alone: plugin bytes queued never refuse a
-// control frame, and control frames at their bound never refuse a frame
-// carrying plugin bytes.
+// Bulk frames (Deploys) have a bound of their own, and each class is judged
+// against its own bounds alone: bulk bytes queued never refuse a control
+// frame, and control frames at their bound never refuse a bulk frame.
 TEST(Outbox, BulkFramesAreBoundedApartFromControlFrames) {
     const OutboxLimits limits{.max_control_frames = 2,
                               .max_control_bytes = 1024,
@@ -577,15 +576,16 @@ TEST(Outbox, BulkFramesAreBoundedApartFromControlFrames) {
                   PostResult::Queued);
         EXPECT_EQ(outbox.post(outbox_test_frame(1, 600 * 1024), FrameClass::Bulk),
                   PostResult::Queued);
-        // 1.2 MiB of plugin bytes queued, far over the control byte bound.
+        // 1.2 MiB of bulk frames queued, far over the control byte bound.
         EXPECT_EQ(outbox.post(outbox_test_frame(2, 64), FrameClass::Control), PostResult::Queued)
-            << "plugin bytes counted against the control frames' bound";
+            << "bulk bytes counted against the control frames' bound";
         EXPECT_EQ(outbox.post(outbox_test_frame(3, 64), FrameClass::Control), PostResult::Queued);
-        // The plugin bytes are at their own bound.
+        // The bulk frames are at their own bound.
         EXPECT_EQ(outbox.post(outbox_test_frame(4, 64), FrameClass::Bulk), PostResult::Refused);
         const auto s = outbox.snapshot();
         EXPECT_EQ(s.stop_reason, OutboxStopReason::Overflow);
-        EXPECT_NE(s.stop_detail.find("plugin bytes"), std::string::npos) << s.stop_detail;
+        EXPECT_NE(s.stop_detail.find("bytes of bulk frames queued"), std::string::npos)
+            << s.stop_detail;
         EXPECT_EQ(s.frames_discarded, 4U);
     }
     {
@@ -597,7 +597,7 @@ TEST(Outbox, BulkFramesAreBoundedApartFromControlFrames) {
         // The control frames are at their frame bound.
         EXPECT_EQ(outbox.post(outbox_test_frame(2, 600 * 1024), FrameClass::Bulk),
                   PostResult::Queued)
-            << "the control frames' bound refused a frame carrying plugin bytes";
+            << "the control frames' bound refused a bulk frame";
         EXPECT_EQ(outbox.post(outbox_test_frame(3, 64), FrameClass::Control), PostResult::Refused);
         const auto s = outbox.snapshot();
         EXPECT_EQ(s.stop_reason, OutboxStopReason::Overflow);
@@ -674,7 +674,7 @@ TEST(Outbox, TheFrameBeingWrittenDoesNotCountAgainstTheBounds) {
     fault::Registry::instance().release(fault::points::kCoordinatorOutboxBeforeWrite);
     ASSERT_TRUE(outbox_test_await([&] { return outbox->snapshot().frames_written == 2; }, kPrompt));
 
-    // The same for plugin bytes.
+    // The same for bulk frames.
     ASSERT_EQ(outbox->post(outbox_test_frame(2, 2 * kMiB), FrameClass::Bulk), PostResult::Queued);
     ASSERT_TRUE(held(3));
     ASSERT_TRUE(outbox->snapshot().writing);
@@ -874,7 +874,7 @@ TEST(Outbox, AbortFreesAWriterBlockedInSendOnPlainTcp) {
     EXPECT_EQ(s.stop_reason, OutboxStopReason::Aborted);
     EXPECT_EQ(s.stop_detail, "worker lost: the test gave it up");
     EXPECT_EQ(s.frames_discarded, 4U) << "the frame in flight and the three queued";
-    // Counted by class: the frame in flight carried plugin bytes.
+    // Counted by class: the frame in flight was a bulk frame.
     EXPECT_EQ(outbox_test_discards(FrameClass::Control, OutboxStopReason::Aborted) - control_before,
               3U);
     EXPECT_EQ(outbox_test_discards(FrameClass::Bulk, OutboxStopReason::Aborted) - bulk_before, 1U);

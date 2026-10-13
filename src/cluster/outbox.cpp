@@ -40,9 +40,9 @@ std::string overflow_detail(bool bulk,
                             std::size_t frames,
                             std::size_t bytes) noexcept {
     if (bulk) {
-        return joined({"a frame carrying plugin bytes found ",
+        return joined({"a bulk frame found ",
                        number(bytes),
-                       " bytes of them queued, against a bound of ",
+                       " bytes of bulk frames queued, against a bound of ",
                        number(limits.max_bulk_bytes)});
     }
     if (frames >= limits.max_control_frames) {
@@ -440,16 +440,16 @@ void Outbox::report_stop_(OutboxStopReason reason, Discards discards) const noex
         if (discarded == 0 && reason == OutboxStopReason::Aborted) {
             return;
         }
-        std::string with_plugins;
+        std::string bulk_note;
         if (discards.bulk > 0) {
-            with_plugins = " (" + std::to_string(discards.bulk) + " carrying plugin bytes)";
+            bulk_note = " (" + std::to_string(discards.bulk) + " of them bulk)";
         }
         // stop_detail_ was written by the transition this follows and is
         // never written again, so it is read here without the lock.
         log::warn("coordinator.outbox",
                   peer_ + ": stopped sending (" + std::string{to_string(reason)} + "), " +
                       std::to_string(discarded) +
-                      (discarded == 1 ? " frame discarded" : " frames discarded") + with_plugins +
+                      (discarded == 1 ? " frame discarded" : " frames discarded") + bulk_note +
                       ": " + stop_detail_);
     } catch (...) {
         // Only the count or the log line was lost.

@@ -5711,7 +5711,13 @@ TEST(CheckpointCompletion, ASessionWhoseReaderHasEndedIsNotReapedWhileItsWriterR
 // in the hold that sets the session aside. Its writer, held in send by a
 // worker that reads nothing, is freed, so the retirement that joins it ends;
 // the Deploy it held is counted as discarded, and the old socket is closed.
+// It is closed by the retirement itself, which drops the transport as the
+// reaper does for a lost session: here a second submit, placed on the old
+// session and parked before it publishes (coordinator.deploy_after_placement),
+// still holds that session's record, and used to keep the descriptor open
+// until it let go. Released, it deploys its job on the new session.
 TEST(CheckpointCompletion, AReRegistrationAbortsTheReplacedSessionsOutboxAndJoinsItsWriter) {
+    clink::fault::Registry::instance().reset();
     Coordinator c;
     const auto port = c.start();
     FakeWorker replaced(port, "w", /*slots=*/4, kSmallReceiveBuffer);
@@ -5720,16 +5726,38 @@ TEST(CheckpointCompletion, AReRegistrationAbortsTheReplacedSessionsOutboxAndJoin
     ASSERT_TRUE(replaced.register_and_ack());
     const int coordinator_fd = coordinator_end_of(port, replaced.local_port());
     ASSERT_GE(coordinator_fd, 0) << "the coordinator's end of the connection was not found";
-    const auto job_id =
-        c.submit_job(two_subtask_graph(std::filesystem::temp_directory_path() /
-                                       ("clink_replaced_" + std::to_string(::getpid()) + ".txt")),
-                     OperatorRegistry::default_instance(),
-                     wedging_plugin(),
-                     CheckpointConfig{});
+    const auto out = std::filesystem::temp_directory_path() /
+                     ("clink_replaced_" + std::to_string(::getpid()) + ".txt");
+    const auto job_id = c.submit_job(two_subtask_graph(out),
+                                     OperatorRegistry::default_instance(),
+                                     wedging_plugin(),
+                                     CheckpointConfig{});
     ASSERT_GT(job_id, 0U);
     ASSERT_TRUE(ckpt_await([&] { return replaced.unread_bytes() >= kDeployUnderway; }, 10s))
         << "no Deploy reached the worker";
     const auto aborted_before = outbound_discards("bulk", "aborted");
+
+    clink::fault::Registry::instance().arm(
+        {.point = clink::fault::points::kCoordinatorDeployAfterPlacement,
+         .ordinal = 1,
+         .action = clink::fault::Action::Block});
+    std::atomic<JobId> held{0};
+    std::thread submitter([&] {
+        try {
+            held = c.submit_job(two_subtask_graph(out),
+                                OperatorRegistry::default_instance(),
+                                {},
+                                CheckpointConfig{});
+        } catch (const std::exception&) {
+            // held stays 0, which the test reports.
+        }
+    });
+    ReleaseThenJoin join_submitter{clink::fault::points::kCoordinatorDeployAfterPlacement,
+                                   submitter};
+    ASSERT_TRUE(ckpt_await([] {
+        return clink::fault::Registry::instance().hits(
+                   clink::fault::points::kCoordinatorDeployAfterPlacement) >= 1;
+    })) << "the second submit never placed its tasks";
 
     const auto since_ms = log_cursor_ms();
     FakeWorker successor(port, "w");
@@ -5743,7 +5771,15 @@ TEST(CheckpointCompletion, AReRegistrationAbortsTheReplacedSessionsOutboxAndJoin
     EXPECT_TRUE(ckpt_await(
         [&] { return !still_coordinator_end(coordinator_fd, port, replaced.local_port()); },
         clink::test_support::scale_slack(std::chrono::milliseconds{2000})))
-        << "the replaced session's socket is still open";
+        << "the replaced session's socket is still open while a submit holds its record";
+
+    EXPECT_EQ(clink::fault::Registry::instance().release(
+                  clink::fault::points::kCoordinatorDeployAfterPlacement),
+              1U);
+    submitter.join();
+    EXPECT_GT(held.load(), 0U) << "the submit placed on the replaced session failed";
+    EXPECT_TRUE(successor.await_frame(MessageKind::Deploy, 5s).has_value())
+        << "the parked submit's job was not deployed on the new session";
     successor.close();
     replaced.close();
     c.stop();
@@ -5945,14 +5981,15 @@ TEST(CheckpointCompletion, AWorkerWhoseOutboundQueueOverflowsIsDeclaredLostAtThe
 }
 
 // Each outbound bound in the Config is the one the worker's outbox keeps. The
-// worker reads nothing, so the first Deploy carrying plugin bytes stays with
-// the writer and whatever is posted after it queues. With one bound set to 1
-// and the others at their defaults, far away, the first frame of that bound's
-// class to queue reaches it and the next overflows it, and the overflow names
-// that bound: for the two control bounds, the answers to the worker's own
-// heartbeats; for the bulk bound, a third job's Deploy, whose submit fails.
-// Each job ships a plugin of its own, since a worker is sent a plugin's bytes
-// once.
+// worker reads nothing, so the first Deploy, which ships 16 MiB of plugin,
+// stays with the writer and whatever is posted after it queues. With one bound
+// set to 1 and the others at their defaults, far away, the first frame of that
+// bound's class to queue reaches it and the next overflows it, and the
+// overflow names that bound: for the two control bounds, the answers to the
+// worker's own heartbeats; for the bulk bound, the Deploys of two more jobs,
+// which ship no plugin and are bulk all the same. The third job's Deploy is
+// refused after the job was published, so its submit still succeeds, and the
+// loss path ends the job with the overflow as its cause.
 TEST(CheckpointCompletion, AWorkersOutboxKeepsEachConfiguredBound) {
     enum class Bound { ControlFrames, ControlBytes, BulkBytes };
     for (const auto bound : {Bound::ControlFrames, Bound::ControlBytes, Bound::BulkBytes}) {
@@ -5972,7 +6009,7 @@ TEST(CheckpointCompletion, AWorkersOutboxKeepsEachConfiguredBound) {
                 break;
             case Bound::BulkBytes:
                 cfg.max_outbound_bulk_bytes = 1;
-                named = " bytes of them queued, against a bound of 1";
+                named = " bytes of bulk frames queued, against a bound of 1";
                 break;
         }
         SCOPED_TRACE(named);
@@ -5992,10 +6029,12 @@ TEST(CheckpointCompletion, AWorkersOutboxKeepsEachConfiguredBound) {
         ASSERT_GT(submit("first", wedging_plugin()), 0U);
         ASSERT_TRUE(ckpt_await([&] { return wedged.unread_bytes() >= kDeployUnderway; }, 10s))
             << "no Deploy reached the worker";
+        JobId refused = 0;
         if (bound == Bound::BulkBytes) {
-            ASSERT_GT(submit("second", plugin_of(64 * 1024, "bound-second-plugin")), 0U);
-            EXPECT_THROW((void)submit("third", plugin_of(64 * 1024, "bound-third-plugin")),
-                         std::runtime_error);
+            ASSERT_GT(submit("second", {}), 0U);
+            EXPECT_NO_THROW(refused = submit("third", {}))
+                << "a submit whose job was published failed when its Deploy was refused";
+            EXPECT_GT(refused, 0U);
         }
         ASSERT_TRUE(ckpt_await([&] { return logged_lost("a-bounded", start_ms); },
                                clink::test_support::scale_slack(std::chrono::milliseconds{5000})))
@@ -6004,9 +6043,92 @@ TEST(CheckpointCompletion, AWorkersOutboxKeepsEachConfiguredBound) {
         ASSERT_TRUE(cause.has_value());
         EXPECT_TRUE(cause->starts_with("outbound queue stopped (overflow): ")) << *cause;
         EXPECT_NE(cause->find(named), std::string::npos) << *cause;
+        if (refused > 0) {
+            // On record, and ended by the loss path with the overflow as its
+            // cause: it had no checkpoint directory, so it could not restart.
+            EXPECT_TRUE(c.snapshot_job(refused).has_value()) << "the job was never published";
+            ASSERT_TRUE(c.await_job_completion(refused, 5s));
+            const auto errors = c.job_errors(refused);
+            ASSERT_FALSE(errors.empty());
+            EXPECT_NE(errors.front().find("worker lost (outbound queue stopped (overflow): "),
+                      std::string::npos)
+                << errors.front();
+        }
         wedged.close();
         c.stop();
     }
+}
+
+// A Deploy refused after its job is published does not fail the submit. Here
+// the job's only worker is declared lost between the job's publication and
+// its Deploy's post (coordinator.deploy_after_publish), so the post finds the
+// session's outbox stopped. The job is on record by then, and the loss fold
+// has already ended it: it had no checkpoint directory, so it failed with the
+// loss as its cause. The submit reports the job it published, and the refusal
+// is logged. It used to throw, telling the caller a job that existed had not
+// been submitted, and skipping the Deploys still to post.
+TEST(CheckpointCompletion, ADeployRefusedAfterItsJobIsPublishedLeavesTheJobToTheLossPath) {
+    clink::fault::Registry::instance().reset();
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.heartbeat_timeout = 600ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+    FakeWorker w(port, "a-lost-before-its-deploy");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+
+    clink::fault::Registry::instance().arm(
+        {.point = clink::fault::points::kCoordinatorDeployAfterPublish,
+         .ordinal = 1,
+         .action = clink::fault::Action::Block});
+    std::atomic<JobId> published{0};
+    std::string failure;  // read only after the join
+    std::thread submitter([&] {
+        try {
+            published = c.submit_job(two_subtask_graph(verdict_test_path("refused_after_publish")),
+                                     OperatorRegistry::default_instance(),
+                                     {},
+                                     CheckpointConfig{});
+        } catch (const std::exception& e) {
+            failure = e.what();
+        }
+    });
+    ReleaseThenJoin join_submitter{clink::fault::points::kCoordinatorDeployAfterPublish, submitter};
+    ASSERT_TRUE(ckpt_await([] {
+        return clink::fault::Registry::instance().hits(
+                   clink::fault::points::kCoordinatorDeployAfterPublish) >= 1;
+    })) << "the submit never published its job";
+
+    // The worker goes silent while the job's Deploy waits to be posted.
+    w.stop_heartbeats();
+    ASSERT_TRUE(ckpt_await(
+        [&] { return logged_lost("a-lost-before-its-deploy", start_ms); },
+        cfg.heartbeat_timeout + clink::test_support::scale_slack(std::chrono::milliseconds{2000})))
+        << "the silent worker was never declared lost";
+
+    EXPECT_EQ(clink::fault::Registry::instance().release(
+                  clink::fault::points::kCoordinatorDeployAfterPublish),
+              1U);
+    submitter.join();
+    EXPECT_TRUE(failure.empty()) << "the submit failed for a job it had published: " << failure;
+    ASSERT_GT(published.load(), 0U);
+    const auto job_id = published.load();
+    EXPECT_TRUE(c.snapshot_job(job_id).has_value()) << "the job is not on record";
+    ASSERT_TRUE(c.await_job_completion(job_id, 5s)) << "the loss path never ended the job";
+    const auto errors = c.job_errors(job_id);
+    ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors.front().find("worker lost (heartbeat timeout)"), std::string::npos)
+        << errors.front();
+    EXPECT_TRUE(logged_at("coordinator.submit",
+                          "job_id=" + std::to_string(job_id) +
+                              " Deploy to worker 'a-lost-before-its-deploy' refused",
+                          start_ms)
+                    .has_value())
+        << "the refused Deploy was not logged";
+    w.close();
+    c.stop();
 }
 
 // The stall verdict needs nothing from the worker's protocol. A real worker
@@ -6419,4 +6541,108 @@ TEST(CheckpointCompletion, TheDefaultStallTimeoutSitsAboveTheLeaseAndWellBelowTh
     EXPECT_GT(cfg.outbound_stall_timeout, cfg.heartbeat_timeout);
     EXPECT_GT(cfg.outbound_stall_timeout, wcfg.coordinator_heartbeat_timeout);
     EXPECT_LE(cfg.outbound_stall_timeout * 4, cfg.restart_drain_timeout);
+}
+
+// A timeout too large for the clock is one that never passes. Compared in the
+// clock's nanoseconds, milliseconds::max() overflowed to a negative timeout
+// that every span exceeds, so the first tick declared every worker lost: by
+// heartbeat_timeout every worker, and by the stall verdict a worker with
+// frames pending. Here both are milliseconds::max(), and neither a worker that
+// reads nothing, with a Deploy stalled in its buffers, nor a healthy one is
+// declared lost over many ticks.
+TEST(CheckpointCompletion, ATimeoutTooLargeForTheClockNeverDeclaresAWorkerLost) {
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.heartbeat_timeout = std::chrono::milliseconds::max();
+    cfg.outbound_stall_timeout = std::chrono::milliseconds::max();
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+    FakeWorker wedged(port, "a-wedged", /*slots=*/4, kSmallReceiveBuffer);
+    ASSERT_TRUE(wedged.valid());
+    wedged.never_read();
+    ASSERT_TRUE(wedged.register_and_ack());
+    FakeWorker healthy(port, "h-healthy");
+    ASSERT_TRUE(healthy.valid());
+    ASSERT_TRUE(healthy.register_and_ack());
+    // Placement keeps both subtasks together, on the first worker by id.
+    const auto job_id = c.submit_job(two_subtask_graph(verdict_test_path("huge_timeouts")),
+                                     OperatorRegistry::default_instance(),
+                                     wedging_plugin(),
+                                     CheckpointConfig{});
+    ASSERT_GT(job_id, 0U);
+    ASSERT_TRUE(ckpt_await([&] { return wedged.unread_bytes() >= kDeployUnderway; }, 10s))
+        << "no Deploy reached the worker";
+
+    EXPECT_FALSE(ckpt_await(
+        [&] { return logged_lost("a-wedged", start_ms) || logged_lost("h-healthy", start_ms); },
+        1000ms))
+        << "declared lost by a timeout that cannot pass: "
+        << logged_loss_cause("a-wedged", start_ms).value_or("") << " / "
+        << logged_loss_cause("h-healthy", start_ms).value_or("");
+    healthy.close();
+    wedged.close();
+    c.stop();
+}
+
+// A coordinator suspended for longer than outbound_stall_timeout, and for less
+// than heartbeat_timeout, does not take its own pause for the stall of a
+// worker with frames pending. The watchdog is held at the start of a sweep
+// (coordinator.watchdog_sweep) and the worker's writer before a write
+// (coordinator.outbox_before_write), as a suspended process holds both, for
+// three times the stall timeout. The first sweep after it is late by more
+// than the interval and the stall timeout, so it restarts the stall clocks
+// instead of judging them, and the writer is let go at once after. The pause
+// bound used to be the interval and heartbeat_timeout alone, and that sweep
+// declared the worker lost.
+TEST(CheckpointCompletion, ACoordinatorPauseLongerThanTheStallTimeoutIsNotTakenForAStall) {
+    clink::fault::Registry::instance().reset();
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.heartbeat_timeout = 5000ms;
+    cfg.outbound_stall_timeout = 500ms;
+    Coordinator c(cfg);
+    const auto port = c.start();
+    const auto start_ms = log_cursor_ms();
+    FakeWorker w(port, "a-mid-transfer");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+
+    auto& faults = clink::fault::Registry::instance();
+    const auto sweeps = faults.hits(clink::fault::points::kCoordinatorWatchdogSweep);
+    clink::fault::ScopedFault suspend{
+        clink::fault::Rule{.point = clink::fault::points::kCoordinatorWatchdogSweep,
+                           .ordinal = sweeps + 1,
+                           .action = clink::fault::Action::Block}};
+    ASSERT_TRUE(ckpt_await([&] {
+        return faults.hits(clink::fault::points::kCoordinatorWatchdogSweep) > sweeps;
+    })) << "the watchdog never reached its next sweep";
+    // The next frame the writer takes, the answer to the worker's next
+    // heartbeat, is held before any of it is written: from here the frame is
+    // pending with no progress.
+    const auto writes = faults.hits(clink::fault::points::kCoordinatorOutboxBeforeWrite);
+    faults.arm({.point = clink::fault::points::kCoordinatorOutboxBeforeWrite,
+                .ordinal = writes + 1,
+                .action = clink::fault::Action::Block});
+    ASSERT_TRUE(ckpt_await([&] {
+        return faults.hits(clink::fault::points::kCoordinatorOutboxBeforeWrite) > writes;
+    })) << "the writer never took another frame";
+    // The suspension.
+    std::this_thread::sleep_for(3 * cfg.outbound_stall_timeout);
+
+    faults.release(clink::fault::points::kCoordinatorWatchdogSweep);
+    const auto resumed = [&] {
+        return logged_at("coordinator.watchdog", "watchdog resumed after a suspension", start_ms)
+            .has_value();
+    };
+    ASSERT_TRUE(ckpt_await([&] { return resumed() || logged_lost("a-mid-transfer", start_ms); },
+                           clink::test_support::scale_slack(std::chrono::milliseconds{2000})))
+        << "the watchdog never swept again";
+    faults.release(clink::fault::points::kCoordinatorOutboxBeforeWrite);
+    EXPECT_TRUE(resumed()) << "the sweep after the suspension did not see that it was late";
+    EXPECT_FALSE(ckpt_await([&] { return logged_lost("a-mid-transfer", start_ms); }, 500ms))
+        << "the coordinator's own pause was taken for the worker's stall: "
+        << logged_loss_cause("a-mid-transfer", start_ms).value_or("");
+    w.close();
+    c.stop();
 }

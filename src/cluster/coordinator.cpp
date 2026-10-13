@@ -73,25 +73,33 @@ PostResult post_to(std::shared_ptr<Outbox> outbox, const Outbox::Frame& frame, F
     return outbox ? outbox->post(frame, cls) : PostResult::Refused;
 }
 
-// A Deploy that ships the bytes of any plugin is a bulk frame; one that
-// refers to every plugin by hash, or carries none, is a control frame like
-// any other.
-[[nodiscard]] bool ships_plugin_bytes(const std::vector<PluginBinary>& plugins) {
-    return std::any_of(
-        plugins.begin(), plugins.end(), [](const PluginBinary& p) { return !p.bytes.empty(); });
+// Whether `elapsed`, a span of the steady clock, is longer than `timeout`.
+// Compared in milliseconds: converting the timeout to the clock's nanoseconds
+// instead overflows above about 292 years, and milliseconds::max() then reads
+// as a negative timeout that every span exceeds. A timeout too large for the
+// clock is one that never passes.
+[[nodiscard]] bool longer_than(std::chrono::steady_clock::duration elapsed,
+                               std::chrono::milliseconds timeout) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(elapsed) > timeout;
 }
 
-[[nodiscard]] FrameClass deploy_frame_class(const std::vector<PluginBinary>& plugins) {
-    return ships_plugin_bytes(plugins) ? FrameClass::Bulk : FrameClass::Control;
+// a + b, or milliseconds::max() where the sum would not fit.
+[[nodiscard]] std::chrono::milliseconds saturating_sum(std::chrono::milliseconds a,
+                                                       std::chrono::milliseconds b) {
+    if (b.count() > 0 && a > std::chrono::milliseconds::max() - b) {
+        return std::chrono::milliseconds::max();
+    }
+    return a + b;
 }
 
 // Why the watchdog declares a worker lost from its connection's outbound side
 // at `now`, or an empty string. Either the outbox has stopped by itself (a
 // post overflowed it or could not allocate, or the transport failed under the
 // writer), or frames have been pending with no progress for longer than
-// `stall_timeout` (zero or less: never). An outbox the coordinator stopped
-// itself, by an abort (a loss, a replacement, a session whose threads could
-// not start) or by the flush at stop(), is never a verdict.
+// `stall_timeout` (zero or less: never; too large for the clock: never). An
+// outbox the coordinator stopped itself, by an abort (a loss, a replacement,
+// a session whose threads could not start) or by the flush at stop(), is
+// never a verdict.
 [[nodiscard]] std::string outbound_loss_cause(const Outbox& outbox,
                                               Outbox::Clock::time_point now,
                                               std::chrono::milliseconds stall_timeout) {
@@ -110,8 +118,9 @@ PostResult post_to(std::shared_ptr<Outbox> outbox, const Outbox::Frame& frame, F
     if (stall_timeout.count() <= 0) {
         return {};
     }
+    // Zero: nothing pending, or the outbox has finished.
     const auto stalled = outbox.stalled_for(now);
-    if (stalled <= stall_timeout) {
+    if (stalled == Outbox::Clock::duration::zero() || !longer_than(stalled, stall_timeout)) {
         return {};
     }
     const auto pending = s.queued_control_frames + s.queued_bulk_frames + (s.writing ? 1U : 0U);
@@ -1810,8 +1819,7 @@ bool Coordinator::send_admission_reply_(network::Connection& conn,
 
 void Coordinator::post_frames_(const std::vector<PendingDeploy>& frames) {
     for (const auto& f : frames) {
-        (void)post_to(
-            f.outbox, f.frame, f.ships_plugin_bytes ? FrameClass::Bulk : FrameClass::Control);
+        (void)post_to(f.outbox, f.frame, f.deploy ? FrameClass::Bulk : FrameClass::Control);
     }
 }
 
@@ -2342,8 +2350,19 @@ void Coordinator::retire_replaced_session_(WorkerConnection& successor,
     } catch (...) {
         // Not joinable from here; nothing more can be done.
     }
+    // Then drop the transport, as the reaper does for a lost session: the
+    // record's reference and the one its outbox keeps. Whatever still holds
+    // the outbox (a held final-checkpoint request, a staged Deploy) or the
+    // record (a submit placed on this session) would otherwise keep the
+    // descriptor open until it let go. A thread still inside a call on the
+    // outbox holds a reference of its own until that call returns.
     try {
         std::lock_guard lock(mu_);
+        replaced->conn.reset();
+        const auto outbox = replaced->outbox;
+        if (outbox) {
+            outbox->release_transport();
+        }
         successor.retiring_predecessor = false;
     } catch (...) {
         // mu_ could not be locked; the flag only gates a retryable refusal.
@@ -4260,9 +4279,9 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         // layout they were deployed with: the job's current one, never a
         // recomputed one.
         stamped_ops += stamp_row_layout(dm.tasks, job.row_layout);
-        out_frames.push_back({it->second->outbox,
-                              shared_frame(fenced_frame_(MessageKind::Deploy, dm)),
-                              ships_plugin_bytes(dm.plugins)});
+        out_frames.push_back({.outbox = it->second->outbox,
+                              .frame = shared_frame(fenced_frame_(MessageKind::Deploy, dm)),
+                              .deploy = true});
     }
     hot.phase = JobState::HotCutover::Phase::Deploying;
     hot.phase_deadline = std::chrono::steady_clock::now() + cfg_.hot_cutover_phase_timeout;
@@ -5907,6 +5926,17 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         // slots. A worker with no live session left, or one whose new session
         // is full, fails the deploy retryably, as a lack of slots does; the
         // slots charged here go back with it.
+        //
+        // This hold is the last place a deploy can fail. Once the job is
+        // published its Deploys go out whatever happens to their sessions,
+        // so a task placed on a worker that was never registered is refused
+        // here, not left unposted on a published job.
+        for (const auto& [worker_id, _] : by_worker) {
+            if (!targets.contains(worker_id)) {
+                throw std::runtime_error("Coordinator::deploy: worker not registered: " +
+                                         worker_id);
+            }
+        }
         for (auto& [worker_id, target] : targets) {
             const auto current = registered_.find(worker_id);
             if (current == registered_.end() || current->second->lost) {
@@ -5983,20 +6013,23 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     events::publish("coordinator.job_submitted",
                     "{\"job_id\":" + std::to_string(job_id) +
                         ",\"tasks\":" + std::to_string(resolved_plan.tasks.size()) + "}");
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorDeployAfterPublish);
 
-    // Post Deploy to each affected worker.
+    // Post Deploy to each affected worker. Nothing from here on fails the
+    // deploy: the job is published, and the loss path, not the submit,
+    // answers for whatever happens to its sessions.
     std::size_t stamped_ops = 0;
     for (auto& [worker_id, tasks] : by_worker) {
         // The session's outbox, copied in the hold that records which
-        // plugins this Deploy ships to it.
+        // plugins this Deploy ships to it. Every worker of the job has a
+        // target: the publication hold checked.
         std::shared_ptr<Outbox> outbox;
         std::vector<PluginBinary> worker_plugins;
         {
             std::lock_guard lock(mu_);
-            auto it = targets.find(worker_id);
+            const auto it = targets.find(worker_id);
             if (it == targets.end()) {
-                throw std::runtime_error("Coordinator::deploy: worker not registered: " +
-                                         worker_id);
+                continue;
             }
             outbox = it->second->outbox;
             worker_plugins = plugins_for_worker_locked_(*job, *it->second);
@@ -6027,9 +6060,18 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         const auto frame = shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg));
         // Queued is not delivered: a session lost before its writer gets the
         // frame out goes through the loss path like any other subtask on it.
-        // Refused means the session's outbox has already stopped.
-        if (post_to(outbox, frame, deploy_frame_class(deploy_msg.plugins)) != PostResult::Queued) {
-            throw std::runtime_error("Coordinator::deploy: send failed for " + worker_id);
+        // Refused means the session's outbox has already stopped: the session
+        // was lost, replaced, or overflowed since the job was published. Each
+        // of those folds the job's subtasks on it (the loss, the retirement,
+        // the overflow verdict), so the refusal is logged, as at every other
+        // post, and the remaining Deploys still go out. Throwing here told
+        // the caller a published job had failed to submit, which a resubmit
+        // then ran a second time, and left its other workers' Deploys unsent.
+        if (post_to(outbox, frame, FrameClass::Bulk) != PostResult::Queued) {
+            log::warn("coordinator.submit",
+                      "job_id=" + std::to_string(job_id) + " Deploy to worker '" + worker_id +
+                          "' refused: its session's outbound queue has stopped, and the job's "
+                          "subtasks there are folded with the session");
         }
     }
     log::info("coordinator.submit",
@@ -6579,6 +6621,7 @@ void Coordinator::watchdog_loop_() {
         if (stop_.load(std::memory_order_acquire)) {
             return;
         }
+        CLINK_FAULT_POINT(clink::fault::points::kCoordinatorWatchdogSweep);
         // Hot-cutover phase deadlines: a cutover stuck in any phase past
         // its bound aborts to the replan path. Checked here rather than in
         // any handler because the failure mode is precisely that no more
@@ -6627,8 +6670,17 @@ void Coordinator::watchdog_loop_() {
             //
             // The outboxes' stall clocks restart with it: no writer could
             // make progress during the pause either, so it is not a peer's
-            // stall.
-            if (now - last_watchdog_sweep_ > cfg_.watchdog_interval + cfg_.heartbeat_timeout) {
+            // stall. That is also why the bound is the interval plus the
+            // shorter of the two timeouts judged below, the stall timeout
+            // only when it is on: a pause longer than outbound_stall_timeout
+            // and shorter than heartbeat_timeout would otherwise read as a
+            // stall of every worker with frames pending, one mid-transfer
+            // included.
+            const auto judged = cfg_.outbound_stall_timeout.count() > 0
+                                    ? std::min(cfg_.heartbeat_timeout, cfg_.outbound_stall_timeout)
+                                    : cfg_.heartbeat_timeout;
+            if (longer_than(now - last_watchdog_sweep_,
+                            saturating_sum(cfg_.watchdog_interval, judged))) {
                 log::warn("coordinator.watchdog",
                           "watchdog resumed after a suspension; deferring staleness "
                           "judgement one interval");
@@ -6647,8 +6699,8 @@ void Coordinator::watchdog_loop_() {
                 }
                 // A reader stamps without mu_, so a stamp may be later than
                 // `now`; the difference is then negative and never stale.
-                if (now - worker->last_seen.load(std::memory_order_acquire) >
-                    cfg_.heartbeat_timeout) {
+                if (longer_than(now - worker->last_seen.load(std::memory_order_acquire),
+                                cfg_.heartbeat_timeout)) {
                     mark_worker_lost_locked_(*worker, "heartbeat timeout");
                     any_lost = true;
                     continue;
@@ -8111,9 +8163,9 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
         stamped_ops += stamp_row_layout(deploy_msg.tasks, job.row_layout);
-        out.push_back({worker_it->second->outbox,
-                       shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg)),
-                       ships_plugin_bytes(deploy_msg.plugins)});
+        out.push_back({.outbox = worker_it->second->outbox,
+                       .frame = shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg)),
+                       .deploy = true});
     }
     log::info(is_rescale || is_replan_rescale ? "coordinator.rescale" : "coordinator.restart",
               "job_id=" + std::to_string(job.id) + " " + row_layout_note +
@@ -8378,9 +8430,9 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.udfs_packed = job.udfs_packed;
         // A partial deploy: the job's current layout, never a recomputed one.
         stamp_row_layout(deploy_msg.tasks, job.row_layout);
-        out.push_back({worker_it->second->outbox,
-                       shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg)),
-                       ships_plugin_bytes(deploy_msg.plugins)});
+        out.push_back({.outbox = worker_it->second->outbox,
+                       .frame = shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg)),
+                       .deploy = true});
     }
 }
 
@@ -8781,7 +8833,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& s
         deploy_msg.job_id = job_id;
         deploy_msg.tasks.push_back(std::move(retry_task));
         const auto frame = shared_frame(fenced_frame_(MessageKind::Deploy, deploy_msg));
-        (void)post_to(retry_outbox, frame, deploy_frame_class(deploy_msg.plugins));
+        (void)post_to(retry_outbox, frame, FrameClass::Bulk);
     }
     // Slot freed: wake any submit_job waiting on capacity.
     cv_.notify_all();

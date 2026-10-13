@@ -251,7 +251,7 @@ Scope and honesty: Row-channel operators (the SQL frontend's set - GROUP BY, win
 | --- | --- | --- | --- |
 | `watchdog_interval` | `Coordinator::Config` | 100ms | How often the watchdog re-evaluates worker liveness |
 | `heartbeat_timeout` | `Coordinator::Config` | 2000ms | A worker is declared lost after this much silence |
-| `outbound_stall_timeout` | `Coordinator::Config` | 10000ms | A worker is declared lost after the frames sent to it make no progress for this long; zero or less turns the check off |
+| `outbound_stall_timeout` | `Coordinator::Config` | 10000ms | A worker is declared lost after the frames sent to it make no progress for this long; zero or less turns the check off, and a value too large for the clock never passes |
 | `restart_drain_timeout` | `Coordinator::Config` | 120000ms | Upper bound on the `awaiting_restart` drain; on expiry the watchdog fails the job |
 | `restart_capacity_timeout` | `Coordinator::Config` | 180000ms | How long a restart whose drain is covered waits for free slots to redeploy; a worker registration restarts the clock, and on expiry the job fails with "no slot available". A cancel ends a job whose restart is waiting, here or in in-doubt resolution, on the watchdog's next tick once its drain is covered and no resolution is running |
 | `max_restarts` | `Coordinator::Config` | 0 | Per-failing-task retry budget (distinct from worker-level restarts) |

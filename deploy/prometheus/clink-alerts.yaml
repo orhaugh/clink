@@ -89,9 +89,14 @@ groups:
         annotations:
           summary: "A worker was declared lost"
           description: >-
-            {{ $value }} worker(s) lost in the last 10 minutes. One is a
-            restart; a repeating count is a crash loop or a heartbeat timeout
-            set too tight for the network.
+            {{ $value }} worker(s) lost in the last 10 minutes. The cause is in
+            the coordinator's "worker lost" log line and its worker_lost event:
+            heartbeat timeout (the worker went silent: a crash, a pause, or a
+            timeout set too tight for the network), no outbound progress (it
+            kept heartbeating but stopped reading what it was sent), or
+            outbound queue stopped (its queue overflowed, or the connection
+            failed under the coordinator's writer). One is a restart; a
+            repeating count is a crash loop or one of these recurring.
 
       # Restarts are the self-healing path working. A SUSTAINED restart rate
       # is that path failing to converge, which is a different thing and the
