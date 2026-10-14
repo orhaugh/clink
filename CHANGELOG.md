@@ -8,7 +8,8 @@ sink settles an orphaned transaction before it fences, a restart with nothing
 confirmed no longer republishes, and a commit that reaches a sink during its
 teardown is refused rather than confirmed. TLS clients now check the server's
 host name, and JSON output writes NaN and the infinities deliberately. The
-plugin ABI fingerprint changes and the TLS hostname check is on by default; see
+plugin ABI fingerprint changes, the TLS hostname check is on by default, and a
+plain Parquet sink now writes a directory of files rather than one file; see
 Compatibility below.
 
 **JSON output writes NaN and the infinities deliberately, and clink reads its
@@ -985,28 +986,28 @@ registration test checks the names the planner emits.
   now reads a file whose columns are a superset of the batcher's, by name,
   where it refused one before. The plain sinks no longer read the WebHDFS
   `overwrite` option.
-- `RuntimeContext` gains `set_restore_from_checkpoint_id`, which changes a
-  header on the plugin ABI surface: rebuild job modules against this
-  release.
-
-**Compatibility.** Thirty-three headers on the plugin ABI surface changed, so
-the plugin ABI fingerprint rotates: rebuild job modules against this release.
-TLS clients verify the server's host name by default. A worker that reaches its
-coordinator by an address or name the coordinator's certificate does not carry
-no longer registers: reissue the certificate with that host in its
-`subjectAltName`, or start the worker with `--tls-no-verify-hostname`. A
-coordinator whose Kafka sinks set `ssl_endpoint_identification_algorithm='none'`
-needs `CLINK_KAFKA_RESUME_TLS_ENDPOINT_IDENTIFICATION_ALGORITHM=none` for its
-in-doubt resolver. JSON output writes a non-finite double as `null` where it
-wrote an invalid bare token; `json_non_finite = 'string'` writes the strings
-instead. `SELECT DISTINCT` state an earlier release wrote for a NaN row does not
-match after the upgrade, so each such row is emitted once more. The Deploy frame
-gains a trailing checkpoint-id floor, and its per-task succession field now
-follows the fencing epoch: a v0.10.0 worker reads a v0.11.0 coordinator's Deploy
-correctly, and a v0.11.0 worker reads a v0.10.0 coordinator's. Without the floor
-a Kafka sink keeps the earlier rule at a restore from checkpoint 0. The
-coordinator's outbound queue settings are new `clink_node` flags with their
-defaults, and a bound of 0 stops the coordinator from starting.
+- Thirty-three headers on the plugin ABI surface changed, among them
+  `RuntimeContext`, which gains `set_restore_from_checkpoint_id`, so the
+  plugin ABI fingerprint rotates: rebuild job modules against this release.
+- TLS clients verify the server's host name by default. A worker that
+  reaches its coordinator by an address or name the coordinator's
+  certificate does not carry no longer registers: reissue the certificate
+  with that host in its `subjectAltName`, or start the worker with
+  `--tls-no-verify-hostname`. A coordinator whose Kafka sinks set
+  `ssl_endpoint_identification_algorithm='none'` needs
+  `CLINK_KAFKA_RESUME_TLS_ENDPOINT_IDENTIFICATION_ALGORITHM=none` for its
+  in-doubt resolver.
+- JSON output writes a non-finite double as `null` where it wrote an invalid
+  bare token; `json_non_finite = 'string'` writes the strings instead.
+  `SELECT DISTINCT` state an earlier release wrote for a NaN row does not
+  match after the upgrade, so each such row is emitted once more.
+- The Deploy frame gains a trailing checkpoint-id floor, and its per-task
+  succession field now follows the fencing epoch. A v0.10.0 worker reads a
+  v0.11.0 coordinator's Deploy correctly, and a v0.11.0 worker reads a
+  v0.10.0 coordinator's. Without the floor a Kafka sink keeps the earlier
+  rule at a restore from checkpoint 0.
+- The coordinator's outbound queue settings are new `clink_node` flags with
+  their defaults, and a bound of 0 stops the coordinator from starting.
 
 ## v0.10.0 (September 2026)
 
