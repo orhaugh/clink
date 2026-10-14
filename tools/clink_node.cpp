@@ -2968,12 +2968,15 @@ int run_worker(int argc, char** argv) {
     const auto http_port_str = get_arg(argc, argv, "http-port", "0");
     const auto http_bind = get_arg(argc, argv, "http-bind", "127.0.0.1");
     // TLS for the control-plane connection. --tls-ca turns on TLS and
-    // verifies the coordinator cert against this CA. --tls-client-cert/--key are
-    // optional mTLS material (required if the coordinator was started with
-    // --tls-client-ca).
+    // verifies the coordinator cert against this CA, and that the cert names
+    // the host connected to (--coordinator-host, or the leader's advertised
+    // host under HA) unless --tls-no-verify-hostname turns that half off.
+    // --tls-client-cert/--key are optional mTLS material (required if the
+    // coordinator was started with --tls-client-ca).
     const auto tls_ca = get_arg(argc, argv, "tls-ca", "");
     const auto tls_client_cert = get_arg(argc, argv, "tls-client-cert", "");
     const auto tls_client_key = get_arg(argc, argv, "tls-client-key", "");
+    const bool tls_no_verify_hostname = has_flag(argc, argv, clink::cli::kNoVerifyHostnameArg);
     // Deadline for each TLS connect to the coordinator, the TCP connect and the
     // handshake together. A coordinator whose TCP connection completes and
     // that never answers the ClientHello (frozen, or with its accept thread
@@ -3088,11 +3091,11 @@ int run_worker(int argc, char** argv) {
                                                                   tls_client_cert,
                                                                   tls_client_key,
 #ifdef CLINK_LINKED_TLS
-                                                                  true
+                                                                  true,
 #else
-                                                                  false
+                                                                  false,
 #endif
-        );
+                                                                  tls_no_verify_hostname);
         tls_err.has_value()) {
         std::cerr << "worker: " << *tls_err << "\n";
         return 2;
@@ -3109,19 +3112,31 @@ int run_worker(int argc, char** argv) {
     static_assert(std::chrono::milliseconds{clink::cli::kDefaultWorkerHandshakeTimeoutMs} ==
                       clink::network::kDefaultTlsConnectTimeout,
                   "the worker's --handshake-timeout-ms default is the TLS client's default");
+    static_assert(
+        clink::network::kTlsNoVerifyHostnameFlag.substr(2) == clink::cli::kNoVerifyHostnameArg,
+        "a hostname mismatch names the flag the worker takes");
     if (!tls_ca.empty()) {
         auto client_ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
         if (!tls_client_cert.empty() && !tls_client_key.empty()) {
             client_ctx->set_client_cert(tls_client_cert, tls_client_key);
         }
-        const clink::network::TlsConnectOptions connect_opts{.connect_timeout = handshake_timeout};
+        const clink::network::TlsConnectOptions connect_opts{
+            .connect_timeout = handshake_timeout,
+            .verify_hostname = !tls_no_verify_hostname,
+            .verify_hostname_opt_out = clink::network::kTlsNoVerifyHostnameFlag};
         supervisor.set_connect_factory(
             [client_ctx, connect_opts](const std::string& host, std::uint16_t port) {
                 return clink::network::connect_tls_connection(host, port, client_ctx, connect_opts);
             });
         std::cout << "worker TLS enabled (ca=" << tls_ca
                   << (tls_client_cert.empty() ? "" : ", mTLS=on")
-                  << ", handshake_timeout_ms=" << handshake_timeout.count() << ")\n";
+                  << ", handshake_timeout_ms=" << handshake_timeout.count()
+                  << ", verify_hostname=" << (tls_no_verify_hostname ? "off" : "on") << ")\n";
+        if (tls_no_verify_hostname) {
+            std::cerr << "worker: " << clink::network::kTlsNoVerifyHostnameFlag
+                      << " is set: any certificate the --tls-ca CA signed is accepted for the "
+                         "coordinator, whatever host it names\n";
+        }
     }
 #endif
 
@@ -3430,6 +3445,12 @@ int main(int argc, char** argv) {
                 << "  --watchdog-interval-ms=<n>   worker-liveness poll cadence (default 200).\n"
                 << "  --max-client-connections=<n> concurrent client connections (default 256).\n"
                 << "  --max-worker-connections=<n> concurrent worker connections (default 1024).\n"
+                << "  --tls-cert=<pem> --tls-key=<pem> serve the control plane over TLS with\n"
+                   "                               this certificate, which must name every host\n"
+                   "                               and address workers connect by (DNS: and IP:\n"
+                   "                               subjectAltName entries); both or neither.\n"
+                << "  --tls-client-ca=<pem>        require client certificates signed by this CA\n"
+                   "                               (mTLS); only with --tls-cert.\n"
                 << "  --handshake-timeout-ms=<n>   deadline for each connection's TLS handshake,\n"
                    "                               0 to 86400000 (default 5000); 0 leaves it\n"
                    "                               bounded only by the admission deadline\n"
@@ -3469,6 +3490,20 @@ int main(int argc, char** argv) {
                 << "  --reconnect-max-backoff-ms=<n>         retry cap (default 5000).\n"
                 << "\n"
                 << "Worker TLS flags:\n"
+                << "  --tls-ca=<pem>               connect to the coordinator over TLS, verifying\n"
+                   "                               its certificate against this CA and that the\n"
+                   "                               certificate names the host connected to\n"
+                   "                               (--coordinator-host, or the leader's "
+                   "advertised\n"
+                   "                               host under HA): a DNS name against its DNS\n"
+                   "                               names, an IP address against its IP entries.\n"
+                << "  --tls-client-cert=<pem>      client certificate for mTLS, with\n"
+                << "  --tls-client-key=<pem>       its key; both or neither, and only with\n"
+                   "                               --tls-ca.\n"
+                << "  --tls-no-verify-hostname     accept a certificate the CA signed whatever\n"
+                   "                               host it names. Only for a deployment whose\n"
+                   "                               certificates cannot name the address workers\n"
+                   "                               connect by; only with --tls-ca.\n"
                 << "  --handshake-timeout-ms=<n>   deadline for each TLS connect to the\n"
                    "                               coordinator (--tls-ca), the TCP connect\n"
                    "                               and the handshake together, 1 to 86400000\n"

@@ -6,6 +6,8 @@
 
 #include <chrono>
 #include <cstring>
+#include <exception>
+#include <string>
 #include <thread>
 
 namespace clink::kafka {
@@ -721,10 +723,24 @@ DanceOutcome reach_coordinator(const std::string& bootstrap_host,
         return DanceOutcome{std::nullopt, true, status, std::move(detail)};
     };
 
-    auto bootstrap = connect(bootstrap_host, bootstrap_port);
+    // A failed connect returns nullptr or throws (see ConnectFn); the reason a
+    // throw gives, a certificate that does not name the broker, say, is the
+    // one an operator needs, so it goes into the detail.
+    const auto dial = [&connect](const std::string& host,
+                                 std::uint16_t port,
+                                 std::string& why) -> std::unique_ptr<network::Connection> {
+        try {
+            return connect(host, port);
+        } catch (const std::exception& e) {
+            why = std::string{": "} + e.what();
+            return nullptr;
+        }
+    };
+    std::string why;
+    auto bootstrap = dial(bootstrap_host, bootstrap_port, why);
     if (bootstrap == nullptr) {
         return transport("cannot connect to bootstrap " + bootstrap_host + ":" +
-                         std::to_string(bootstrap_port));
+                         std::to_string(bootstrap_port) + why);
     }
     (void)bootstrap->set_recv_timeout(std::chrono::milliseconds(5000));
 
@@ -804,10 +820,10 @@ DanceOutcome reach_coordinator(const std::string& bootstrap_host,
     // purpose; release it before dialing rather than holding a socket across
     // the exchange that matters.
     bootstrap.reset();
-    auto coord = connect(fc->host, static_cast<std::uint16_t>(fc->port));
+    auto coord = dial(fc->host, static_cast<std::uint16_t>(fc->port), why);
     if (coord == nullptr) {
         return transport("cannot connect to coordinator " + fc->host + ":" +
-                         std::to_string(fc->port));
+                         std::to_string(fc->port) + why);
     }
     (void)coord->set_recv_timeout(std::chrono::milliseconds(5000));
     // The coordinator connection is a fresh session: authenticate it too.

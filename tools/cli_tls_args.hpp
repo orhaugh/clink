@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 namespace clink::cli {
@@ -45,6 +46,11 @@ inline constexpr long long kMaxHandshakeTimeoutMs = 24LL * 60 * 60 * 1000;
 // The worker's --handshake-timeout-ms when none is given: the TLS client's own
 // default (network::kDefaultTlsConnectTimeout), which clink_node pins it to.
 inline constexpr long long kDefaultWorkerHandshakeTimeoutMs = 5000;
+
+// The worker's opt-out from checking that the coordinator's certificate names
+// the host it connects to: network::kTlsNoVerifyHostnameFlag without the
+// dashes, as clink_node's flag helpers take it.
+inline constexpr std::string_view kNoVerifyHostnameArg{"tls-no-verify-hostname"};
 
 enum class HandshakeRole : std::uint8_t { Coordinator, Worker };
 
@@ -109,19 +115,22 @@ inline std::optional<std::string> validate_coordinator_tls_args(const std::strin
     return std::nullopt;
 }
 
+// `no_verify_hostname` is --tls-no-verify-hostname.
 inline std::optional<std::string> validate_worker_tls_args(const std::string& ca,
                                                            const std::string& client_cert,
                                                            const std::string& client_key,
-                                                           bool linked) {
-    const bool any = !ca.empty() || !client_cert.empty() || !client_key.empty();
+                                                           bool linked,
+                                                           bool no_verify_hostname = false) {
+    const bool any =
+        !ca.empty() || !client_cert.empty() || !client_key.empty() || no_verify_hostname;
     if (!any) {
         return std::nullopt;
     }
     if (!linked) {
-        return "TLS was requested (--tls-ca/--tls-client-cert/--tls-client-key) but this "
-               "binary was built without TLS support. Refusing to start: connecting in "
-               "plaintext to a coordinator configured for TLS is the downgrade this check "
-               "exists to prevent.";
+        return "TLS was requested (--tls-ca/--tls-client-cert/--tls-client-key/"
+               "--tls-no-verify-hostname) but this binary was built without TLS support. "
+               "Refusing to start: connecting in plaintext to a coordinator configured for TLS "
+               "is the downgrade this check exists to prevent.";
     }
     if (client_cert.empty() != client_key.empty()) {
         return std::string{
@@ -135,6 +144,11 @@ inline std::optional<std::string> validate_worker_tls_args(const std::string& ca
         return "--tls-client-cert/--tls-client-key were given without --tls-ca. Refusing to "
                "start: that configures client credentials for a connection that is not "
                "protected at all, which is the shape the Kafka connector already refuses.";
+    }
+    if (ca.empty() && no_verify_hostname) {
+        return "--tls-no-verify-hostname was given without --tls-ca. Refusing to start: it "
+               "relaxes a check on a TLS connection, and without --tls-ca the connection to "
+               "the coordinator is plaintext, not protected at all.";
     }
     return std::nullopt;
 }

@@ -176,7 +176,7 @@ A barrier stamped `Unaligned` (unaligned checkpoints, adaptive alignment once it
 
 ### Cluster control plane transport
 
-Operator data and watermarks use the channel/bridge stack above. The cluster control plane (Coordinator to Worker: deploy, cancel, heartbeat, frame readers) instead uses the `Connection` abstraction (`connection.hpp`), a transport interface with `send_all` / `recv_all` / `shutdown_write` / `shutdown_read` / `close`, implemented over plain TCP (`make_plain_connection`, `connect_plain`) or TLS. This keeps the dozens of control-plane call sites ignorant of whether a given peer is TLS. See [./distributed-runtime.md](./distributed-runtime.md).
+Operator data and watermarks use the channel/bridge stack above. The cluster control plane (Coordinator to Worker: deploy, cancel, heartbeat, frame readers) instead uses the `Connection` abstraction (`connection.hpp`), a transport interface with `send_all` / `recv_all` / `shutdown_write` / `shutdown_read` / `close`, implemented over plain TCP (`make_plain_connection`, `connect_plain`) or TLS. This keeps the dozens of control-plane call sites ignorant of whether a given peer is TLS. A TLS client connect (`connect_tls_connection`, `TlsSocket::connect` in `impls/tls/`) verifies the server's certificate chain against its CAs and, by default, that the certificate names the host connected to (`TlsConnectOptions::verify_hostname`). See [./distributed-runtime.md](./distributed-runtime.md#worker-control-session-recovery).
 
 ## Key types and APIs
 

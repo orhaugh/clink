@@ -88,7 +88,9 @@ struct ResumeOutcome {
 };
 
 // Connection factory: production passes network::connect_plain (or a TLS
-// dialer); tests pass a factory that dials a fake broker.
+// dialer); tests pass a factory that dials a fake broker. A connect that
+// fails returns nullptr or throws; either is a transport failure, and a
+// throw's message (a TLS handshake's reason, say) joins the outcome's detail.
 using ConnectFn = std::function<std::unique_ptr<network::Connection>(const std::string& host,
                                                                      std::uint16_t port)>;
 

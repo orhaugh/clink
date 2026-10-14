@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+**TLS clients check that the server's certificate names the host they
+connect to.** A worker started with `--tls-ca` verified the coordinator's
+certificate chain against that CA but never checked the name on it, so any
+certificate the CA signed was accepted for any host: one stolen from, or
+issued to, another service on the same CA could stand in for the coordinator.
+`TlsSocket::connect` now checks the host the client connected by: a DNS name
+against the certificate's `subjectAltName` DNS entries (its subject CN only
+when it has none; a wildcard only as a whole left-most label), and an IPv4 or
+IPv6 literal against its IP entries. This changes what operators will see. A
+worker that connects by an address or name its coordinator's certificate does
+not carry (the common case is `--coordinator-host=127.0.0.1`, or an IP, with a
+certificate that lists only DNS names, or a CN with no `subjectAltName`) now
+fails every connect with `the server's certificate does not match the host
+<host> (it names ...)` and keeps retrying with backoff, never registering.
+Under HA the host is the leader's advertised host (`--advertise-host`), so
+each coordinator's certificate must carry that name. Reissue the certificate
+with the host in its `subjectAltName` (`DNS:<name>` or `IP:<address>`), or
+connect by a name it carries; `--tls-no-verify-hostname` on the worker
+restores the old behaviour, still verifying the chain. The flag is refused
+without `--tls-ca`. The Kafka transactional-resume dialer checks broker names
+too: a sink's own settle at open follows the sink's
+`ssl_endpoint_identification_algorithm` (librdkafka's default, `https`, when
+unset), so it checks names exactly when the sink's producer does, and the
+coordinator's in-doubt resolver, which never sees a sink's options, reads the
+same setting from `CLINK_KAFKA_RESUME_TLS_ENDPOINT_IDENTIFICATION_ALGORITHM`
+(`https` or `none`). A deployment that sets `CLINK_KAFKA_RESUME_TLS_CA` and
+whose sinks set `ssl_endpoint_identification_algorithm='none'` needs that
+variable set to `none` on its coordinators too; without it their resolution
+walks fail as transport failures whose detail names it. The reason a resume
+connect failed, a TLS handshake's included, now reaches the resolution's
+detail instead of a bare `cannot connect`.
+
 **A Kafka sink restarted from nothing settles its orphan and arms replay
 suppression.** A restart before any checkpoint of a run is confirmed restores
 from checkpoint 0, and the `kafka_2pc` sink took restore point 0 for a fresh

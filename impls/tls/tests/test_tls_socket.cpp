@@ -11,6 +11,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <poll.h>
 #include <string>
 #include <thread>
@@ -37,17 +38,24 @@ namespace {
 // Generate a self-signed cert + private key in a fresh temp dir using the
 // openssl CLI. Avoids hand-rolling X.509 from the OpenSSL C API for what
 // is genuinely fixture work. Returns the dir path; cert is at "cert.pem"
-// and key at "key.pem" inside it.
-std::filesystem::path generate_self_signed_cert() {
-    const auto dir =
-        std::filesystem::temp_directory_path() / ("clink_tls_test_" + std::to_string(::getpid()));
+// and key at "key.pem" inside it. `subject_alt_names` is the certificate's
+// subjectAltName, none when empty; the default names both ways these tests
+// connect, so the client's hostname check passes. `tag` keeps the
+// certificates of one test apart.
+std::filesystem::path generate_self_signed_cert(
+    const std::string& subject_alt_names = "DNS:localhost,IP:127.0.0.1",
+    const std::string& common_name = "localhost",
+    const std::string& tag = "") {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_tls_test_" + std::to_string(::getpid()) + tag);
     std::filesystem::create_directories(dir);
     const auto cert = dir / "cert.pem";
     const auto key = dir / "key.pem";
-    const std::string cmd = "openssl req -x509 -newkey rsa:2048 -nodes -keyout " + key.string() +
-                            " -out " + cert.string() +
-                            " -days 1 -subj /CN=localhost"
-                            " > /dev/null 2>&1";
+    const std::string cmd =
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout " + key.string() + " -out " +
+        cert.string() + " -days 1 -subj /CN=" + common_name +
+        (subject_alt_names.empty() ? "" : " -addext subjectAltName=" + subject_alt_names) +
+        " > /dev/null 2>&1";
     const int rc = std::system(cmd.c_str());
     if (rc != 0) {
         return {};  // openssl CLI unavailable / failed
@@ -742,4 +750,273 @@ TEST(TlsSocketConnect, TheSocketIsBlockingAgainOnceTheHandshakeIsDone) {
     EXPECT_TRUE(server_echoed);
     NetworkSocket::close(listener);
     std::filesystem::remove_all(cert_dir);
+}
+
+// ---------- hostname verification ----------
+//
+// The client checks that the server's certificate names the host it connected
+// by, not only that one of its CAs signed it: a DNS name against the
+// certificate's DNS names, an address against its IP address entries. Each
+// certificate here is self-signed and trusted as its own CA, so the chain
+// verifies and the name is the only thing that can fail.
+
+namespace {
+
+// Serve handshakes with the certificate and key in `served` on 127.0.0.1
+// until stopped, each on the accepting thread.
+class OneCertServer {
+public:
+    explicit OneCertServer(const std::filesystem::path& served)
+        : ctx_((served / "cert.pem").string(), (served / "key.pem").string()) {
+        listener_ = NetworkSocket::listen_on(port_, "127.0.0.1");
+        if (listener_ < 0) {
+            return;
+        }
+        wake_ = std::make_unique<AcceptWake>(listener_);
+        thread_ = std::thread([this] {
+            for (;;) {
+                const int fd = NetworkSocket::accept_one(listener_, *wake_);
+                if (fd < 0) {
+                    return;  // woken
+                }
+                try {
+                    (void)TlsSocket::handshake_accepted(
+                        fd, ctx_, TlsAcceptOptions{.handshake_timeout = 10s, .wake = wake_.get()});
+                } catch (const std::exception&) {
+                    // A client that refuses the certificate fails this side too.
+                }
+            }
+        });
+    }
+    ~OneCertServer() {
+        if (wake_) {
+            wake_->wake();
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        wake_.reset();
+        if (listener_ >= 0) {
+            NetworkSocket::close(listener_);
+        }
+    }
+    OneCertServer(const OneCertServer&) = delete;
+    OneCertServer& operator=(const OneCertServer&) = delete;
+    OneCertServer(OneCertServer&&) = delete;
+    OneCertServer& operator=(OneCertServer&&) = delete;
+
+    [[nodiscard]] bool listening() const { return listener_ >= 0; }
+    [[nodiscard]] std::uint16_t port() const { return port_; }
+
+private:
+    TlsServerContext ctx_;
+    std::uint16_t port_{0};
+    int listener_{-1};
+    std::unique_ptr<AcceptWake> wake_;
+    std::thread thread_;
+};
+
+// Connect as `host` (localhost resolves to 127.0.0.1 too) to a server
+// presenting the certificate in `cert_dir`, trusting that certificate, with
+// `opts`, or with no options at all when nullopt. Returns the error the
+// connect threw, or empty when it connected.
+std::string connect_by_name(const std::filesystem::path& cert_dir,
+                            const std::string& host,
+                            const std::optional<TlsConnectOptions>& opts) {
+    OneCertServer server(cert_dir);
+    if (!server.listening()) {
+        return "the test could not listen";
+    }
+    TlsClientContext client_ctx((cert_dir / "cert.pem").string());
+    return connect_error([&] {
+        if (opts.has_value()) {
+            (void)TlsSocket::connect(host, server.port(), client_ctx, *opts);
+        } else {
+            (void)TlsSocket::connect(host, server.port(), client_ctx);
+        }
+    });
+}
+
+// A self-signed certificate with these names, in a directory of its own.
+std::filesystem::path names_cert(const std::string& subject_alt_names,
+                                 const std::string& common_name,
+                                 const std::string& tag) {
+    return generate_self_signed_cert(subject_alt_names, common_name, "_" + tag);
+}
+
+bool mentions(const std::string& text, const std::string& what) {
+    return text.find(what) != std::string::npos;
+}
+
+// Whether a mismatch says what the certificate names. OpenSSL 3 keeps the
+// peer's chain after a failed verify; 1.1.1 does not, and the error then says
+// so instead.
+bool lists_names(const std::string& error, const std::string& names) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    return mentions(error, "(it names " + names + ")");
+#else
+    return mentions(error, "(it names " + names + ")") ||
+           mentions(error, "(what it names could not be read)");
+#endif
+}
+
+}  // namespace
+
+TEST(TlsSocketHostname, ACertificateNamingTheHostConnects) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto dir = names_cert("DNS:localhost", "localhost", "dns_ok");
+    if (dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    EXPECT_EQ(connect_by_name(dir, "localhost", TlsConnectOptions{}), "");
+    std::filesystem::remove_all(dir);
+}
+
+TEST(TlsSocketHostname, ACertificateNamingAnotherHostIsRefusedNamingTheHostAndTheOptOut) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto dir = names_cert("DNS:coordinator.invalid", "coordinator.invalid", "dns_other");
+    if (dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    const std::string error = connect_by_name(dir, "localhost", TlsConnectOptions{});
+    EXPECT_TRUE(mentions(error, "certificate does not match the host localhost")) << error;
+    EXPECT_TRUE(mentions(error, "--tls-no-verify-hostname")) << error;
+    EXPECT_TRUE(lists_names(error, "DNS:coordinator.invalid")) << error;
+    std::filesystem::remove_all(dir);
+}
+
+// The subject CN counts for a name only when the certificate has no DNS names
+// at all, as OpenSSL's defaults have it; it never counts for an address.
+TEST(TlsSocketHostname, TheSubjectNameCountsOnlyWhenThereAreNoDnsNames) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto cn_only = names_cert("", "localhost", "cn_only");
+    const auto cn_and_dns = names_cert("DNS:coordinator.invalid", "localhost", "cn_and_dns");
+    if (cn_only.empty() || cn_and_dns.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    EXPECT_EQ(connect_by_name(cn_only, "localhost", TlsConnectOptions{}), "");
+    const std::string error = connect_by_name(cn_and_dns, "localhost", TlsConnectOptions{});
+    EXPECT_TRUE(mentions(error, "certificate does not match the host localhost")) << error;
+    std::filesystem::remove_all(cn_only);
+    std::filesystem::remove_all(cn_and_dns);
+}
+
+TEST(TlsSocketHostname, AnAddressMatchingAnIpEntryConnects) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto dir = names_cert("IP:127.0.0.1", "coordinator", "ip_ok");
+    if (dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    EXPECT_EQ(connect_by_name(dir, "127.0.0.1", TlsConnectOptions{}), "");
+    std::filesystem::remove_all(dir);
+}
+
+// An address is matched against the IP entries only: neither a DNS name that
+// resolves to it nor a subject CN spelling it counts.
+TEST(TlsSocketHostname, AnAddressMissingFromTheIpEntriesIsRefused) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto names_only = names_cert("DNS:localhost", "127.0.0.1", "ip_names_only");
+    const auto other_ip = names_cert("DNS:localhost,IP:10.0.0.1", "localhost", "ip_other");
+    if (names_only.empty() || other_ip.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    const std::string by_names = connect_by_name(names_only, "127.0.0.1", TlsConnectOptions{});
+    EXPECT_TRUE(mentions(by_names, "certificate does not match the host 127.0.0.1")) << by_names;
+    EXPECT_TRUE(mentions(by_names, "--tls-no-verify-hostname")) << by_names;
+    EXPECT_TRUE(lists_names(by_names, "DNS:localhost")) << by_names;
+    const std::string by_other = connect_by_name(other_ip, "127.0.0.1", TlsConnectOptions{});
+    EXPECT_TRUE(mentions(by_other, "certificate does not match the host 127.0.0.1")) << by_other;
+    EXPECT_TRUE(lists_names(by_other, "DNS:localhost, IP:10.0.0.1")) << by_other;
+    std::filesystem::remove_all(names_only);
+    std::filesystem::remove_all(other_ip);
+}
+
+TEST(TlsSocketHostname, TheOptOutConnectsDespiteAMismatch) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto dir = names_cert("DNS:coordinator.invalid", "coordinator.invalid", "opt_out");
+    if (dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    const TlsConnectOptions no_check{.verify_hostname = false};
+    EXPECT_EQ(connect_by_name(dir, "localhost", no_check), "");
+    EXPECT_EQ(connect_by_name(dir, "127.0.0.1", no_check), "");
+    std::filesystem::remove_all(dir);
+}
+
+// The opt-out turns off the name check, not the chain's: a certificate no
+// trusted CA signed is still refused.
+TEST(TlsSocketHostname, TheOptOutStillVerifiesTheChain) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto served = names_cert("DNS:localhost", "localhost", "chain_served");
+    const auto trusted = names_cert("DNS:some-ca.invalid", "some-ca.invalid", "chain_trusted");
+    if (served.empty() || trusted.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    OneCertServer server(served);
+    ASSERT_TRUE(server.listening());
+    TlsClientContext client_ctx((trusted / "cert.pem").string());
+    const std::string error = connect_error([&] {
+        (void)TlsSocket::connect(
+            "localhost", server.port(), client_ctx, TlsConnectOptions{.verify_hostname = false});
+    });
+    EXPECT_TRUE(mentions(error, "TLS handshake with localhost:")) << error;
+    EXPECT_TRUE(mentions(error, "certificate verify failed")) << error;
+    std::filesystem::remove_all(served);
+    std::filesystem::remove_all(trusted);
+}
+
+// On unless a caller turns it off: the default options, and both overloads
+// that take none, check the name.
+TEST(TlsSocketHostname, TheCheckIsOnByDefault) {
+    static_assert(TlsConnectOptions{}.verify_hostname);
+    static_assert(TlsConnectOptions{}.verify_hostname_opt_out == kTlsNoVerifyHostnameFlag);
+    static_assert(kTlsNoVerifyHostnameFlag == "--tls-no-verify-hostname");
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto dir = names_cert("DNS:coordinator.invalid", "coordinator.invalid", "default");
+    if (dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    const std::string error = connect_by_name(dir, "localhost", std::nullopt);
+    EXPECT_TRUE(mentions(error, "certificate does not match the host localhost")) << error;
+
+    OneCertServer server(dir);
+    ASSERT_TRUE(server.listening());
+    auto client_ctx = std::make_shared<TlsClientContext>((dir / "cert.pem").string());
+    const std::string via_connection = connect_error(
+        [&] { (void)connect_tls_connection("127.0.0.1", server.port(), client_ctx); });
+    EXPECT_TRUE(mentions(via_connection, "certificate does not match the host 127.0.0.1"))
+        << via_connection;
+    std::filesystem::remove_all(dir);
+}
+
+// A caller whose opt-out is not clink_node's flag names its own.
+TEST(TlsSocketHostname, AMismatchNamesTheOptOutTheCallerGives) {
+    if (!TlsClientContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto dir = names_cert("DNS:coordinator.invalid", "coordinator.invalid", "named_opt_out");
+    if (dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    const std::string error = connect_by_name(
+        dir, "localhost", TlsConnectOptions{.verify_hostname_opt_out = "SOME_SETTING=none"});
+    EXPECT_TRUE(mentions(error, "turn the hostname check off with SOME_SETTING=none")) << error;
+    EXPECT_FALSE(mentions(error, "--tls-no-verify-hostname")) << error;
+    std::filesystem::remove_all(dir);
 }

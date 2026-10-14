@@ -107,6 +107,23 @@ TEST(CliTlsArgs, ClientCredentialsWithoutAProtectedTransportAreRefused) {
     EXPECT_NE(err->find("not protected"), std::string::npos) << *err;
 }
 
+// --tls-no-verify-hostname relaxes a check on a TLS connection; with TLS on
+// it is a legitimate choice, without it the connection it was meant for is
+// plaintext.
+TEST(CliTlsArgs, TheHostnameOptOutIsAcceptedWithTlsAndRefusedWithout) {
+    EXPECT_FALSE(validate_worker_tls_args("ca.pem", "", "", kLinked, true).has_value());
+    EXPECT_FALSE(validate_worker_tls_args("ca.pem", "cc.pem", "ck.pem", kLinked, true).has_value());
+    const auto plaintext = validate_worker_tls_args("", "", "", kLinked, true);
+    ASSERT_TRUE(plaintext.has_value());
+    EXPECT_NE(plaintext->find("--tls-no-verify-hostname was given without --tls-ca"),
+              std::string::npos)
+        << *plaintext;
+    const auto unlinked = validate_worker_tls_args("", "", "", kNotLinked, true);
+    ASSERT_TRUE(unlinked.has_value());
+    EXPECT_NE(unlinked->find("built without TLS support"), std::string::npos) << *unlinked;
+    EXPECT_EQ(clink::cli::kNoVerifyHostnameArg, "tls-no-verify-hostname");
+}
+
 TEST(CliTlsArgs, EveryRefusalExplainsWhatWouldHaveHappened) {
     // A refusal an operator cannot act on is a refusal they will work
     // around. Each message must name the consequence it prevented.
@@ -116,6 +133,7 @@ TEST(CliTlsArgs, EveryRefusalExplainsWhatWouldHaveHappened) {
         *validate_coordinator_tls_args("", "", "ca.pem", kLinked),
         *validate_worker_tls_args("ca.pem", "cc.pem", "", kLinked),
         *validate_worker_tls_args("", "cc.pem", "ck.pem", kLinked),
+        *validate_worker_tls_args("", "", "", kLinked, true),
     };
     for (const auto& msg : cases) {
         EXPECT_NE(msg.find("Refusing to start"), std::string::npos) << msg;

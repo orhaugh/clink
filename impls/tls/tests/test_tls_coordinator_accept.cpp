@@ -49,7 +49,8 @@ namespace {
 constexpr auto kFailureBound = 10s;
 
 // A self-signed certificate and key in a fresh directory, from the openssl CLI.
-// Empty when the CLI is unavailable.
+// Empty when the CLI is unavailable. It names the host the workers here
+// connect by, 127.0.0.1, so their hostname check passes.
 struct TlsAcceptCertDir {
     std::filesystem::path dir;
     TlsAcceptCertDir() {
@@ -58,7 +59,9 @@ struct TlsAcceptCertDir {
         std::filesystem::create_directories(d);
         const std::string cmd = "openssl req -x509 -newkey rsa:2048 -nodes -keyout " +
                                 (d / "key.pem").string() + " -out " + (d / "cert.pem").string() +
-                                " -days 1 -subj /CN=localhost > /dev/null 2>&1";
+                                " -days 1 -subj /CN=localhost"
+                                " -addext subjectAltName=DNS:localhost,IP:127.0.0.1"
+                                " > /dev/null 2>&1";
         if (std::system(cmd.c_str()) == 0) {
             dir = d;
         } else {

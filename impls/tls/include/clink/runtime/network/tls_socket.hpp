@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace clink::network {
 
@@ -108,6 +109,10 @@ struct TlsAcceptOptions {
 // How long a TLS client connect may take unless its caller says otherwise.
 inline constexpr std::chrono::milliseconds kDefaultTlsConnectTimeout{5000};
 
+// The clink_node flag that turns a worker's hostname check off, and what a
+// mismatch names unless the caller says otherwise (see TlsConnectOptions).
+inline constexpr std::string_view kTlsNoVerifyHostnameFlag{"--tls-no-verify-hostname"};
+
 // Bounds on the client side of a connect. Unlike TlsAcceptOptions, the
 // default is bounded: a server whose TCP connection completes and that never
 // answers the ClientHello would otherwise hold the connecting thread for ever.
@@ -121,6 +126,18 @@ struct TlsConnectOptions {
     // a caller that owns the server too should choose. Name resolution is not
     // covered (see NetworkSocket::connect_within).
     std::chrono::milliseconds connect_timeout{kDefaultTlsConnectTimeout};
+    // Check that the server's certificate names the host connected to, as
+    // well as that one of the context's CAs signed it. Without the check any
+    // certificate those CAs signed is accepted for any host. A DNS name is
+    // matched against the certificate's DNS names (a wildcard only as a whole
+    // left-most label, never part of one), and an IPv4 or IPv6 literal
+    // against its IP address entries: a certificate that lists only names
+    // does not match a connect by address. Off only for a deployment whose
+    // certificates cannot name the address it connects by.
+    bool verify_hostname{true};
+    // The setting that turns the check off, named in the error a mismatch
+    // throws so whoever reads it knows what to change. Must outlive the call.
+    std::string_view verify_hostname_opt_out{kTlsNoVerifyHostnameFlag};
 };
 
 // A TLS-wrapped TCP socket. Send/recv go through OpenSSL's record layer.
@@ -147,16 +164,19 @@ public:
                                         const TlsServerContext& ctx,
                                         const TlsAcceptOptions& opts);
     // Connect to host:port and run the client handshake, verifying the server
-    // against the CAs in `ctx`, all within opts.connect_timeout. Throws
-    // std::runtime_error, naming the stage, when the host does not resolve,
-    // the TCP connect fails, the handshake fails, or the deadline passes
-    // first; the connection is closed either way. The returned socket is
-    // blocking.
+    // against the CAs in `ctx` and, unless opts.verify_hostname is false,
+    // that its certificate names `host`, all within opts.connect_timeout.
+    // Throws std::runtime_error, naming the stage, when the host does not
+    // resolve, the TCP connect fails, the handshake fails (a certificate that
+    // does not name the host says so, naming the host and
+    // opts.verify_hostname_opt_out), or the deadline passes first; the
+    // connection is closed either way. The returned socket is blocking.
     static TlsSocket connect(const std::string& host,
                              std::uint16_t port,
                              const TlsClientContext& ctx,
                              const TlsConnectOptions& opts);
-    // With the default deadline, kDefaultTlsConnectTimeout.
+    // With the default options: the deadline kDefaultTlsConnectTimeout, and
+    // the hostname checked.
     static TlsSocket connect(const std::string& host,
                              std::uint16_t port,
                              const TlsClientContext& ctx);

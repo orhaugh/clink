@@ -128,16 +128,19 @@ bool await_http_ready(std::uint16_t port, std::chrono::milliseconds timeout) {
 
 // Generate a self-signed cert + key via the openssl CLI; returns the
 // directory containing cert.pem + key.pem. Empty path = openssl missing.
-std::filesystem::path generate_self_signed_cert() {
+// `subject_alt_names` is the certificate's subjectAltName: by default the
+// names the workers here connect by, so their hostname check passes.
+std::filesystem::path generate_self_signed_cert(
+    const std::string& subject_alt_names = "DNS:localhost,IP:127.0.0.1") {
     const auto dir = std::filesystem::temp_directory_path() /
                      ("clink_cluster_tls_test_" + std::to_string(::getpid()));
     std::filesystem::create_directories(dir);
     const auto cert = dir / "cert.pem";
     const auto key = dir / "key.pem";
-    const std::string cmd = "openssl req -x509 -newkey rsa:2048 -nodes -keyout " + key.string() +
-                            " -out " + cert.string() +
-                            " -days 1 -subj /CN=localhost"
-                            " > /dev/null 2>&1";
+    const std::string cmd =
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout " + key.string() + " -out " +
+        cert.string() + " -days 1 -subj /CN=localhost -addext subjectAltName=" + subject_alt_names +
+        " > /dev/null 2>&1";
     const int rc = std::system(cmd.c_str());
     if (rc != 0)
         return {};
@@ -257,4 +260,91 @@ TEST(ClusterTls, PlainWorkerStaysAliveButCannotJoinTlsCoordinator) {
 
     kill_quietly(worker);
     kill_quietly(coordinator);
+}
+
+// A worker checks that the coordinator's certificate names the host it
+// connects by, not only that its CA signed it. A certificate that names
+// another host is refused: the worker stays up, retrying, and its status says
+// why and which flag turns the check off. With that flag it joins.
+TEST(ClusterTls, AWorkerRefusesACoordinatorCertificateThatDoesNotNameItsHost) {
+    const auto node = node_binary_path();
+    if (!std::filesystem::exists(node)) {
+        GTEST_SKIP() << "clink_node not built";
+    }
+    const auto cert_dir = generate_self_signed_cert("DNS:coordinator.invalid");
+    if (cert_dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable";
+    }
+    const auto cert = (cert_dir / "cert.pem").string();
+    const auto key = (cert_dir / "key.pem").string();
+
+    const auto control_port = probe_free_port();
+    const auto http_port = probe_free_port();
+    const pid_t coordinator = spawn_proc({"clink_node",
+                                          "--role=coordinator",
+                                          "--port=" + std::to_string(control_port),
+                                          "--http-port=" + std::to_string(http_port),
+                                          "--http-bind=127.0.0.1",
+                                          "--tls-cert=" + cert,
+                                          "--tls-key=" + key},
+                                         node);
+    ASSERT_GT(coordinator, 0);
+    ASSERT_TRUE(await_http_ready(http_port, 3s)) << "coordinator didn't come up";
+
+    const auto worker_http = probe_free_port();
+    const pid_t refused = spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-name-mismatch",
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(control_port),
+                                      "--http-port=" + std::to_string(worker_http),
+                                      "--http-bind=127.0.0.1",
+                                      "--tls-ca=" + cert},
+                                     node);
+    ASSERT_GT(refused, 0);
+    ASSERT_TRUE(await_http_ready(worker_http, 3s)) << "worker didn't come up";
+    std::string status;
+    EXPECT_TRUE(clink::itest::await_condition(
+        [&] {
+            status = http_get("127.0.0.1", worker_http, "/api/v1/worker").body;
+            return status.find("does not match the host 127.0.0.1") != std::string::npos &&
+                   status.find("--tls-no-verify-hostname") != std::string::npos;
+        },
+        std::chrono::seconds(20)))
+        << "the worker's status never said its connect was refused for the host name: " << status;
+    EXPECT_FALSE(wait_for_exit(refused, 1s))
+        << "a refused certificate killed the worker process instead of leaving it retrying";
+    const auto before = http_get("127.0.0.1", http_port, "/api/v1/workers");
+    EXPECT_EQ(before.body.find("worker-name-mismatch"), std::string::npos)
+        << "a worker registered with a coordinator whose certificate does not name its host; "
+           "body: "
+        << before.body;
+
+    const auto opted_out_http = probe_free_port();
+    const pid_t opted_out = spawn_proc({"clink_node",
+                                        "--role=worker",
+                                        "--id=worker-no-verify-hostname",
+                                        "--coordinator-host=127.0.0.1",
+                                        "--coordinator-port=" + std::to_string(control_port),
+                                        "--http-port=" + std::to_string(opted_out_http),
+                                        "--http-bind=127.0.0.1",
+                                        "--tls-ca=" + cert,
+                                        "--tls-no-verify-hostname"},
+                                       node);
+    ASSERT_GT(opted_out, 0);
+    EXPECT_TRUE(clink::itest::await_condition(
+        [&] {
+            const auto probe = http_get("127.0.0.1", http_port, "/api/v1/workers");
+            return probe.status == 200 &&
+                   probe.body.find("\"worker_id\":\"worker-no-verify-hostname\"") !=
+                       std::string::npos;
+        },
+        std::chrono::seconds(20)))
+        << "a worker with --tls-no-verify-hostname never registered";
+
+    kill_quietly(opted_out);
+    kill_quietly(refused);
+    kill_quietly(coordinator);
+    std::error_code ec;
+    std::filesystem::remove_all(cert_dir, ec);
 }

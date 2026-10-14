@@ -38,14 +38,17 @@ using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
 // A self-signed certificate and key in a fresh directory, from the openssl
-// CLI; empty when it is not available.
+// CLI; empty when it is not available. It names 127.0.0.1, the host the peer
+// connects by, so the peer's hostname check passes.
 std::filesystem::path tls_outbox_self_signed_cert() {
     const auto dir = std::filesystem::temp_directory_path() /
                      ("clink_tls_outbox_test_" + std::to_string(::getpid()));
     std::filesystem::create_directories(dir);
     const std::string cmd = "openssl req -x509 -newkey rsa:2048 -nodes -keyout " +
                             (dir / "key.pem").string() + " -out " + (dir / "cert.pem").string() +
-                            " -days 1 -subj /CN=localhost > /dev/null 2>&1";
+                            " -days 1 -subj /CN=localhost"
+                            " -addext subjectAltName=DNS:localhost,IP:127.0.0.1"
+                            " > /dev/null 2>&1";
     if (std::system(cmd.c_str()) != 0) {
         return {};
     }

@@ -40,8 +40,9 @@ std::unique_ptr<Connection> handshake_accepted_tls_connection(int fd,
                                                               std::shared_ptr<TlsServerContext> ctx,
                                                               const TlsAcceptOptions& opts);
 
-// Connect to host:port over TLS, verifying against the CAs in `ctx`, with
-// the TCP connect and the handshake bounded together by `opts` (see
+// Connect to host:port over TLS, verifying against the CAs in `ctx` and,
+// unless opts.verify_hostname is false, that the certificate names `host`,
+// with the TCP connect and the handshake bounded together by `opts` (see
 // TlsConnectOptions). Throws std::runtime_error, naming the stage, when
 // either fails or the deadline passes first.
 std::unique_ptr<Connection> connect_tls_connection(const std::string& host,
@@ -49,7 +50,8 @@ std::unique_ptr<Connection> connect_tls_connection(const std::string& host,
                                                    std::shared_ptr<TlsClientContext> ctx,
                                                    const TlsConnectOptions& opts);
 
-// As above with the default deadline, kDefaultTlsConnectTimeout.
+// As above with the default options: the deadline kDefaultTlsConnectTimeout,
+// and the hostname checked.
 std::unique_ptr<Connection> connect_tls_connection(const std::string& host,
                                                    std::uint16_t port,
                                                    std::shared_ptr<TlsClientContext> ctx);

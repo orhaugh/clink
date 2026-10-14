@@ -27,11 +27,17 @@
 #ifdef CLINK_KAFKA_RESUME_TLS
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <mutex>
 
+#include "clink/cluster/operator_registry.hpp"
 #include "clink/kafka/scram.hpp"
+#include "clink/operators/operator_base.hpp"
 #include "clink/runtime/network/tls_connection.hpp"
 #include "clink/runtime/network/tls_socket.hpp"
+#include "clink/runtime/runtime_context.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 #endif
 
 namespace {
@@ -1243,16 +1249,19 @@ TEST(TxnResumeScram, AttackShapesAreRefusedAtParseAndComputeTime) {
 // verifying against that certificate as its CA. Gated on the build
 // carrying clink::tls, exactly like the resolver branch under test.
 
-std::filesystem::path resume_tls_cert_dir() {
-    const auto dir =
-        std::filesystem::temp_directory_path() / ("clink_resume_tls_" + std::to_string(::getpid()));
+// `subject_alt_names` defaults to the address the fake brokers listen on, so
+// the client's hostname check passes; a test of that check names another.
+std::filesystem::path resume_tls_cert_dir(const std::string& subject_alt_names = "IP:127.0.0.1",
+                                          const std::string& tag = "") {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_resume_tls_" + std::to_string(::getpid()) + tag);
     std::filesystem::create_directories(dir);
     const auto cert = dir / "cert.pem";
     const auto key = dir / "key.pem";
-    const std::string cmd = "openssl req -x509 -newkey rsa:2048 -nodes -keyout " + key.string() +
-                            " -out " + cert.string() +
-                            " -days 1 -subj /CN=127.0.0.1"
-                            " -addext subjectAltName=IP:127.0.0.1 > /dev/null 2>&1";
+    const std::string cmd =
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout " + key.string() + " -out " +
+        cert.string() + " -days 1 -subj /CN=127.0.0.1 -addext subjectAltName=" + subject_alt_names +
+        " > /dev/null 2>&1";
     if (std::system(cmd.c_str()) != 0) {
         return {};
     }
@@ -1264,9 +1273,14 @@ std::filesystem::path resume_tls_cert_dir() {
 // connection before dialing the coordinator.
 class TlsResumeBroker {
 public:
-    explicit TlsResumeBroker(const std::filesystem::path& cert_dir)
-        : ctx_(std::make_shared<clink::network::TlsServerContext>(
-              (cert_dir / "cert.pem").string(), (cert_dir / "key.pem").string())) {
+    // `find_coordinator_error`, when not 0, is the error every FindCoordinator
+    // is answered with, which ends a resume or a settle at once with no
+    // verdict.
+    explicit TlsResumeBroker(const std::filesystem::path& cert_dir,
+                             std::int16_t find_coordinator_error = 0)
+        : ctx_(std::make_shared<clink::network::TlsServerContext>((cert_dir / "cert.pem").string(),
+                                                                  (cert_dir / "key.pem").string())),
+          find_coordinator_error_(find_coordinator_error) {
         std::uint16_t bound = 0;
         listen_fd_ = clink::network::NetworkSocket::listen_on(bound, "127.0.0.1");
         port_ = bound;
@@ -1301,6 +1315,11 @@ public:
     [[nodiscard]] std::size_t end_txn_count() const {
         std::lock_guard lock(mu_);
         return end_txn_count_;
+    }
+    // Requests read over a completed handshake, of any kind.
+    [[nodiscard]] std::size_t request_count() const {
+        std::lock_guard lock(mu_);
+        return request_count_;
     }
 
 private:
@@ -1359,12 +1378,16 @@ private:
                 (std::uint32_t(static_cast<std::uint8_t>(payload[5])) << 16) |
                 (std::uint32_t(static_cast<std::uint8_t>(payload[6])) << 8) |
                 std::uint32_t(static_cast<std::uint8_t>(payload[7])));
+            {
+                std::lock_guard lock(mu_);
+                ++request_count_;
+            }
 
             std::vector<std::uint8_t> body;
             if (api_key == wire::kApiVersionsKey) {
                 body = api_versions_body(0, 4, 0, 4);
             } else if (api_key == wire::kFindCoordinatorKey) {
-                body = find_coordinator_body(0, "127.0.0.1", port_);
+                body = find_coordinator_body(find_coordinator_error_, "127.0.0.1", port_);
             } else if (api_key == wire::kEndTxnKey) {
                 {
                     std::lock_guard lock(mu_);
@@ -1393,6 +1416,7 @@ private:
     }
 
     std::shared_ptr<clink::network::TlsServerContext> ctx_;
+    std::int16_t find_coordinator_error_{0};
     int listen_fd_{-1};
     std::uint16_t port_{0};
     // Created before the accept thread starts, released after it is joined
@@ -1403,6 +1427,7 @@ private:
     bool stopping_{false};                          // guarded by mu_
     clink::network::Connection* serving_{nullptr};  // guarded by mu_
     std::size_t end_txn_count_{0};
+    std::size_t request_count_{0};
 };
 
 TEST(TxnResumeTls, TheResumeCommitsOverAVerifiedTlsSession) {
@@ -1472,6 +1497,171 @@ TEST(TxnResumeTls, AnUnusableCaRefusesLoudlyInsteadOfDowngradingToPlaintext) {
     EXPECT_NE(result.detail.find("could not be built"), std::string::npos) << result.detail;
     EXPECT_TRUE(broker.end_txn_bodies().empty())
         << "the resolver dialed PLAINTEXT after TLS was requested - the downgrade defect";
+}
+
+// --- the broker's name ----------------------------------------------------------
+//
+// Over TLS the resume checks that each broker's certificate names the host it
+// dials, as librdkafka does with ssl.endpoint.identification.algorithm=https,
+// its default. The coordinator's resolver takes that setting from its
+// environment; a sink's own settle takes it from the sink's options.
+
+std::string kafka_2pc_handle(std::uint16_t port) {
+    return "{\"v\":1,\"resolver\":\"kafka_2pc\",\"bootstrap\":\"127.0.0.1:" + std::to_string(port) +
+           "\",\"transactional_id\":\"resume-me\",\"producer_id\":\"42\","
+           "\"producer_epoch\":\"3\",\"ckpt\":\"2\"}";
+}
+
+// Sets an environment variable for one scope.
+class ScopedEnv {
+public:
+    ScopedEnv(const char* name, const std::string& value) : name_(name) {
+        ::setenv(name_, value.c_str(), 1);
+    }
+    ~ScopedEnv() { ::unsetenv(name_); }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+    ScopedEnv(ScopedEnv&&) = delete;
+    ScopedEnv& operator=(ScopedEnv&&) = delete;
+
+private:
+    const char* name_;
+};
+
+constexpr const char* kResumeNameCheckEnv =
+    "CLINK_KAFKA_RESUME_TLS_ENDPOINT_IDENTIFICATION_ALGORITHM";
+
+TEST(TxnResumeTls, TheResolverRefusesABrokerWhoseCertificateNamesAnotherHost) {
+    if (std::system("openssl version > /dev/null 2>&1") != 0) {
+        GTEST_SKIP() << "openssl CLI not available for the cert fixture";
+    }
+    const auto cert_dir = resume_tls_cert_dir("DNS:broker.invalid", "_other_host");
+    ASSERT_FALSE(cert_dir.empty());
+    TlsResumeBroker broker(cert_dir);
+    const ScopedEnv ca("CLINK_KAFKA_RESUME_TLS_CA", (cert_dir / "cert.pem").string());
+
+    const auto resolver = clink::connectors::TxnResumeRegistry::instance().find("kafka_2pc");
+    ASSERT_TRUE(resolver.has_value());
+    const auto result = (*resolver)(kafka_2pc_handle(broker.port()));
+    EXPECT_FALSE(result.committed);
+    EXPECT_TRUE(result.transport_inconclusive)
+        << "a refused certificate is no verdict on the transaction: " << result.detail;
+    EXPECT_NE(result.detail.find("does not match the host 127.0.0.1"), std::string::npos)
+        << result.detail;
+    EXPECT_NE(result.detail.find(std::string{kResumeNameCheckEnv} + "=none"), std::string::npos)
+        << result.detail;
+    EXPECT_EQ(broker.request_count(), 0U) << "a request crossed a session the client refused";
+    std::error_code ec;
+    std::filesystem::remove_all(cert_dir, ec);
+}
+
+TEST(TxnResumeTls, TheResolverSkipsTheNameCheckWhenItsEnvironmentSaysNone) {
+    if (std::system("openssl version > /dev/null 2>&1") != 0) {
+        GTEST_SKIP() << "openssl CLI not available for the cert fixture";
+    }
+    const auto cert_dir = resume_tls_cert_dir("DNS:broker.invalid", "_name_check_off");
+    ASSERT_FALSE(cert_dir.empty());
+    TlsResumeBroker broker(cert_dir);
+    const ScopedEnv ca("CLINK_KAFKA_RESUME_TLS_CA", (cert_dir / "cert.pem").string());
+    const ScopedEnv off(kResumeNameCheckEnv, "none");
+
+    const auto resolver = clink::connectors::TxnResumeRegistry::instance().find("kafka_2pc");
+    ASSERT_TRUE(resolver.has_value());
+    const auto result = (*resolver)(kafka_2pc_handle(broker.port()));
+    EXPECT_TRUE(result.committed) << result.detail;
+    EXPECT_EQ(broker.end_txn_count(), 1U);
+    std::error_code ec;
+    std::filesystem::remove_all(cert_dir, ec);
+}
+
+TEST(TxnResumeTls, ANameCheckSettingNeitherHttpsNorNoneIsRefusedBeforeDialling) {
+    if (std::system("openssl version > /dev/null 2>&1") != 0) {
+        GTEST_SKIP() << "openssl CLI not available for the cert fixture";
+    }
+    const auto cert_dir = resume_tls_cert_dir();
+    ASSERT_FALSE(cert_dir.empty());
+    TlsResumeBroker broker(cert_dir);
+    const ScopedEnv ca("CLINK_KAFKA_RESUME_TLS_CA", (cert_dir / "cert.pem").string());
+    const ScopedEnv typo(kResumeNameCheckEnv, "off");
+
+    const auto resolver = clink::connectors::TxnResumeRegistry::instance().find("kafka_2pc");
+    ASSERT_TRUE(resolver.has_value());
+    const auto result = (*resolver)(kafka_2pc_handle(broker.port()));
+    EXPECT_FALSE(result.committed);
+    EXPECT_NE(result.detail.find("is 'off', neither 'https' nor 'none'"), std::string::npos)
+        << result.detail;
+    EXPECT_EQ(broker.request_count(), 0U);
+    std::error_code ec;
+    std::filesystem::remove_all(cert_dir, ec);
+}
+
+// The settle a sink runs at open, before its producer, dials the same brokers
+// the producer does, so it checks their names exactly when the producer does:
+// by the sink's ssl_endpoint_identification_algorithm, librdkafka's default
+// (https) when unset. The coordinator's environment setting is not the
+// sink's, and does not loosen it.
+TEST(TxnResumeTls, TheSinksSettleChecksBrokerNamesAsItsProducerDoes) {
+    if (std::system("openssl version > /dev/null 2>&1") != 0) {
+        GTEST_SKIP() << "openssl CLI not available for the cert fixture";
+    }
+    const auto cert_dir = resume_tls_cert_dir("DNS:broker.invalid", "_sink_settle");
+    ASSERT_FALSE(cert_dir.empty());
+    // Every FindCoordinator refused, so a settle past the handshake ends at
+    // once, with no verdict, and the open refuses without opening a producer.
+    constexpr std::int16_t kTransactionalIdAuthorizationFailed = 53;
+    TlsResumeBroker broker(cert_dir, kTransactionalIdAuthorizationFailed);
+    const ScopedEnv ca("CLINK_KAFKA_RESUME_TLS_CA", (cert_dir / "cert.pem").string());
+    const ScopedEnv coordinator_off(kResumeNameCheckEnv, "none");
+
+    auto& registry = clink::cluster::OperatorRegistry::default_instance();
+    const auto* factory =
+        registry.find_sink("kafka_2pc_sink_string", clink::cluster::ChannelType{"string"});
+    ASSERT_NE(factory, nullptr);
+    // The error the sink's open threw, with an unresolved marker for
+    // checkpoint 2 above its restore point.
+    const auto open_error = [&](const std::string& tag,
+                                const std::map<std::string, std::string>& extra) -> std::string {
+        const auto receipts = cert_dir / ("receipts_" + tag);
+        std::filesystem::create_directories(receipts);
+        std::ofstream(receipts /
+                      (clink::connectors::commit_receipt_file_name(0, 2) + ".unresolved"))
+            << kafka_2pc_handle(broker.port());
+        clink::InMemoryStateBackend state;
+        clink::RuntimeContext rctx(clink::OperatorId{45}, "settle_names_" + tag, &state, nullptr);
+        rctx.set_commit_receipts(receipts.string(), /*restore_from_ckpt=*/1);
+        clink::cluster::OperatorBuildContext ctx;
+        ctx.params = {{"brokers", "127.0.0.1:" + std::to_string(broker.port())},
+                      {"topic", "settle-names"},
+                      {"transactional_id", "resume-me"}};
+        ctx.params.insert(extra.begin(), extra.end());
+        auto sink = std::static_pointer_cast<clink::Sink<std::string>>(factory->build(ctx));
+        sink->set_id(clink::OperatorId{45});
+        sink->attach_runtime(&rctx);
+        try {
+            sink->open();
+        } catch (const std::exception& e) {
+            return e.what();
+        }
+        sink->close();
+        return {};
+    };
+
+    const std::string checked = open_error("checked", {});
+    EXPECT_NE(checked.find("does not match the host 127.0.0.1"), std::string::npos) << checked;
+    EXPECT_NE(checked.find("ssl_endpoint_identification_algorithm='none' on the sink"),
+              std::string::npos)
+        << checked;
+    EXPECT_EQ(broker.request_count(), 0U)
+        << "the settle crossed a session the sink's own setting refuses";
+
+    const std::string unchecked =
+        open_error("unchecked", {{"ssl_endpoint_identification_algorithm", "none"}});
+    EXPECT_EQ(unchecked.find("does not match the host"), std::string::npos) << unchecked;
+    EXPECT_NE(unchecked.find("FindCoordinator"), std::string::npos)
+        << "the settle should have got past the handshake to the broker's refusal: " << unchecked;
+    EXPECT_GT(broker.request_count(), 0U);
+    std::error_code ec;
+    std::filesystem::remove_all(cert_dir, ec);
 }
 
 #endif  // CLINK_KAFKA_RESUME_TLS

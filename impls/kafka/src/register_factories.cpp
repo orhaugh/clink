@@ -14,11 +14,13 @@
 // register their own KafkaMessage-typed sources/sinks via the same API.
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -368,14 +370,44 @@ private:
 // process's environment names a CA bundle, SASL from the environment. Shared
 // by the coordinator-side resolver (resolve_kafka_2pc_handle) and the sink's
 // pre-fence orphan resolution - transport security is always the CALLING
-// process's configuration, never the staged handle's.
+// process's configuration, never the staged handle's. Over TLS it also checks
+// that each broker's certificate names the host dialled, unless the
+// ResumeNameCheck the caller passes says `none`.
 struct ResumeDialer {
     clink::kafka::ConnectFn connect;
     clink::kafka::ResumeAuth auth;
     std::string error;  // non-empty: refused (TLS misconfiguration)
 };
 
-ResumeDialer build_resume_dialer() {
+// Whether the TLS dialer checks that a broker's certificate names the host it
+// dials (the bootstrap entry, then the transaction coordinator FindCoordinator
+// names), set the way librdkafka's ssl.endpoint.identification.algorithm is:
+// `https` checks, `none` does not, unset is librdkafka's default, `https`.
+struct ResumeNameCheck {
+    std::string algorithm;  // as configured, empty when unset
+    const char* setting;    // what configured it, for a refusal
+    const char* opt_out;    // what turns the check off, named by a mismatch
+};
+
+// A sink's own settle checks names exactly when the sink's producer does, so
+// the two connections to the same brokers cannot disagree about it.
+ResumeNameCheck sink_name_check(const std::map<std::string, std::string>& conf) {
+    const auto it = conf.find("ssl.endpoint.identification.algorithm");
+    return {.algorithm = it == conf.end() ? std::string{} : it->second,
+            .setting = "the sink's ssl_endpoint_identification_algorithm",
+            .opt_out = "ssl_endpoint_identification_algorithm='none' on the sink"};
+}
+
+// The coordinator's resolver never sees a sink's options: the same setting
+// comes from its environment, beside CLINK_KAFKA_RESUME_TLS_CA.
+ResumeNameCheck environment_name_check() {
+    const char* v = std::getenv("CLINK_KAFKA_RESUME_TLS_ENDPOINT_IDENTIFICATION_ALGORITHM");
+    return {.algorithm = v == nullptr ? std::string{} : std::string{v},
+            .setting = "CLINK_KAFKA_RESUME_TLS_ENDPOINT_IDENTIFICATION_ALGORITHM",
+            .opt_out = "CLINK_KAFKA_RESUME_TLS_ENDPOINT_IDENTIFICATION_ALGORITHM=none"};
+}
+
+ResumeDialer build_resume_dialer(const ResumeNameCheck& names = environment_name_check()) {
     ResumeDialer d;
     d.connect = [](const std::string& host, std::uint16_t port) {
         return clink::network::connect_plain(host, port);
@@ -383,6 +415,17 @@ ResumeDialer build_resume_dialer() {
     if (const char* tls_ca = std::getenv("CLINK_KAFKA_RESUME_TLS_CA");
         tls_ca != nullptr && *tls_ca != '\0') {
 #ifdef CLINK_KAFKA_RESUME_TLS
+        std::string algorithm = names.algorithm;
+        std::transform(algorithm.begin(), algorithm.end(), algorithm.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (!algorithm.empty() && algorithm != "https" && algorithm != "none") {
+            d.error = std::string{"TLS requested (CLINK_KAFKA_RESUME_TLS_CA) but "} +
+                      names.setting + " is '" + names.algorithm +
+                      "', neither 'https' nor 'none'; refusing rather than guessing whether "
+                      "to check the broker's certificate names its host";
+            return d;
+        }
         try {
             auto ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
             const char* cert = std::getenv("CLINK_KAFKA_RESUME_TLS_CERT");
@@ -390,22 +433,21 @@ ResumeDialer build_resume_dialer() {
             if (cert != nullptr && *cert != '\0' && key != nullptr && *key != '\0') {
                 ctx->set_client_cert(cert, key);
             }
-            d.connect = [ctx](const std::string& host,
-                              std::uint16_t port) -> std::unique_ptr<clink::network::Connection> {
-                // The same bound as each read of the resume (5 s): a restore
-                // waits on this, and a broker whose TCP connection completes
-                // and that never answers the ClientHello (frozen, or behind a
-                // stalled middlebox) would otherwise hold it for ever.
-                constexpr clink::network::TlsConnectOptions kResumeConnect{
-                    .connect_timeout = std::chrono::milliseconds{5000}};
-                try {
-                    return clink::network::connect_tls_connection(host, port, ctx, kResumeConnect);
-                } catch (const std::exception&) {
-                    // A failed handshake is a transport failure: bounded
-                    // retries and the honest transport fallback, the same
-                    // as an unreachable broker.
-                    return nullptr;
-                }
+            // The same bound as each read of the resume (5 s): a restore
+            // waits on this, and a broker whose TCP connection completes and
+            // that never answers the ClientHello (frozen, or behind a stalled
+            // middlebox) would otherwise hold it for ever.
+            const clink::network::TlsConnectOptions resume_connect{
+                .connect_timeout = std::chrono::milliseconds{5000},
+                .verify_hostname = algorithm != "none",
+                .verify_hostname_opt_out = names.opt_out};
+            d.connect = [ctx, resume_connect](const std::string& host, std::uint16_t port) {
+                // A failed handshake throws, and the resume takes it as a
+                // transport failure, as it does an unreachable broker: bounded
+                // retries and the honest transport fallback, with the reason
+                // (a certificate that does not name the broker, say) in the
+                // outcome's detail.
+                return clink::network::connect_tls_connection(host, port, ctx, resume_connect);
             };
         } catch (const std::exception& e) {
             d.error =
@@ -416,6 +458,7 @@ ResumeDialer build_resume_dialer() {
             return d;
         }
 #else
+        (void)names;
         d.error =
             "TLS requested (CLINK_KAFKA_RESUME_TLS_CA) but this build carries no "
             "clink::tls; refusing rather than downgrading to plaintext";
@@ -514,6 +557,7 @@ public:
           transactional_id_(opts.transactional_id),
           subtask_idx_(subtask_idx),
           replay_suppression_(replay_suppression),
+          resume_names_(sink_name_check(opts.conf)),
           inner_(std::move(opts)),
           encoder_(std::move(encoder)) {}
 
@@ -1054,7 +1098,7 @@ private:
             retire();
             return;
         }
-        const auto dialer = build_resume_dialer();
+        const auto dialer = build_resume_dialer(resume_names_);
         if (!dialer.error.empty()) {
             // Cannot ask AND must not fence blind: fail the open loudly.
             throw std::runtime_error("kafka_2pc_sink_string: unresolved orphan for checkpoint " +
@@ -1278,6 +1322,8 @@ private:
     std::string transactional_id_;
     std::uint32_t subtask_idx_{0};
     bool replay_suppression_{true};
+    // How the settle's TLS dialer checks broker names: as the producer does.
+    ResumeNameCheck resume_names_;
     KafkaSink inner_;
     ValueEncoderPtr encoder_;
     std::mutex mu_;
@@ -1437,10 +1483,11 @@ clink::connectors::InDoubtResolution resolve_kafka_2pc_handle(const std::string&
                     "the barrier); nothing can be resumed"};
     }
     // Dialer + SASL from the resolving process's environment (see
-    // build_resume_dialer): transport security and credentials are never the
-    // staged handle's to carry. TLS requested but unusable is refused
-    // LOUDLY; silently dialing plaintext would leak the SASL password the
-    // operator configured TLS to protect.
+    // build_resume_dialer), the broker name check included, which this
+    // process cannot take from the sink's options: transport security and
+    // credentials are never the staged handle's to carry. TLS requested but
+    // unusable is refused LOUDLY; silently dialing plaintext would leak the
+    // SASL password the operator configured TLS to protect.
     const auto dialer = build_resume_dialer();
     if (!dialer.error.empty()) {
         return {false, dialer.error};

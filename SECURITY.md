@@ -29,7 +29,10 @@ are designed to run inside a trusted network. Operating beyond one:
 - Enable TLS / mTLS on the transport (`clink_node --tls-cert` /
   `--tls-ca`, and `--tls-client-*` for mutual auth). A TLS
   configuration the control plane cannot honour is refused at startup
-  rather than silently served plaintext.
+  rather than silently served plaintext. A worker checks that the
+  coordinator's certificate names the host it connects by, so issue
+  certificates whose `subjectAltName` carries every name and address
+  workers use.
 - Set `CLINK_AUTH_TOKEN` on `clink_node` so the HTTP control plane
   requires a bearer token; without it the API is open to whoever can reach
   the port. The HTTP server is off entirely unless `--http-port` is set.

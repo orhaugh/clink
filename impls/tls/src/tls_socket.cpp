@@ -18,8 +18,11 @@
 #include <fcntl.h>
 #include <poll.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -108,6 +111,92 @@ constexpr auto kStepWaitSlice = std::chrono::milliseconds{10};
 // Nothing here renegotiates; TLS 1.3 has no renegotiation at all.
 void refuse_renegotiation(SSL_CTX* ctx) {
     SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+}
+
+// The address `host` spells when it is an IPv4 or IPv6 literal, without an
+// IPv6 zone ("fe80::1%en0"); empty when it is a name.
+std::string ip_literal(const std::string& host) {
+    in_addr v4{};
+    if (::inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+        return host;
+    }
+    const std::string unzoned = host.substr(0, host.find('%'));
+    in6_addr v6{};
+    if (::inet_pton(AF_INET6, unzoned.c_str(), &v6) == 1) {
+        return unzoned;
+    }
+    return {};
+}
+
+// Make the handshake check that the server's certificate names `host`. A name
+// is matched against the certificate's DNS names (or, with none, its subject
+// CN), a wildcard only as a whole left-most label; an address against its IP
+// address entries, set explicitly because SSL_set1_host does not match an
+// address on every OpenSSL this builds against (1.1.1 takes it as a name).
+// Set on the session, not the context, which other connects share.
+void require_certificate_names(SSL* ssl, const std::string& host) {
+    X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
+    const std::string ip = ip_literal(host);
+    int ok = 0;
+    if (!ip.empty()) {
+        ok = X509_VERIFY_PARAM_set1_ip_asc(param, ip.c_str());
+    } else {
+        X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        ok = X509_VERIFY_PARAM_set1_host(param, host.c_str(), host.size());
+    }
+    if (ok != 1) {
+        throw std::runtime_error("TlsSocket::connect: cannot check the certificate against " +
+                                 host + ": " + ossl_last_error());
+    }
+}
+
+// What the server's certificate names, for the error a mismatch throws: its
+// subjectAltName DNS and IP entries, and its subject CN when it has no DNS
+// names (the one a name is then matched against). Read from the peer's chain,
+// which OpenSSL 3 keeps after a failed verify and 1.1.1 does not; the
+// verified peer certificate is never set on a failed one.
+std::string certificate_names(SSL* ssl) {
+    STACK_OF(X509)* chain = SSL_get_peer_cert_chain(ssl);
+    if (chain == nullptr || sk_X509_num(chain) == 0) {
+        return "what it names could not be read";
+    }
+    X509* cert = sk_X509_value(chain, 0);
+    std::string names;
+    bool any_dns = false;
+    const auto add = [&names](const std::string& name) {
+        names += (names.empty() ? "" : ", ") + name;
+    };
+    auto* sans =
+        static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+    if (sans != nullptr) {
+        for (int i = 0; i < sk_GENERAL_NAME_num(sans); ++i) {
+            const GENERAL_NAME* gn = sk_GENERAL_NAME_value(sans, i);
+            if (gn->type == GEN_DNS) {
+                const ASN1_STRING* s = gn->d.dNSName;
+                add("DNS:" + std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(s)),
+                                         static_cast<std::size_t>(ASN1_STRING_length(s))));
+                any_dns = true;
+            } else if (gn->type == GEN_IPADD) {
+                const ASN1_OCTET_STRING* s = gn->d.iPAddress;
+                const int len = ASN1_STRING_length(s);
+                char text[INET6_ADDRSTRLEN] = {};
+                const int family = len == 4 ? AF_INET : (len == 16 ? AF_INET6 : AF_UNSPEC);
+                if (family != AF_UNSPEC &&
+                    ::inet_ntop(family, ASN1_STRING_get0_data(s), text, sizeof(text)) != nullptr) {
+                    add(std::string{"IP:"} + text);
+                }
+            }
+        }
+        GENERAL_NAMES_free(sans);
+    }
+    if (!any_dns) {
+        char cn[256] = {};
+        if (X509_NAME_get_text_by_NID(X509_get_subject_name(cert), NID_commonName, cn, sizeof(cn)) >
+            0) {
+            add(std::string{"CN="} + cn);
+        }
+    }
+    return names.empty() ? "it names nothing" : "it names " + names;
 }
 
 void init_openssl() {
@@ -483,6 +572,9 @@ TlsSocket TlsSocket::connect(const std::string& host,
     }
     SSL_set_fd(out.impl_->ssl, fd);
     SSL_set_tlsext_host_name(out.impl_->ssl, host.c_str());
+    if (opts.verify_hostname) {
+        require_certificate_names(out.impl_->ssl, host);
+    }
 
     // Non-blocking, so every wait for the server happens in wait_ready below,
     // where the deadline reaches it. A blocking SSL_connect waits in recv()
@@ -501,6 +593,17 @@ TlsSocket TlsSocket::connect(const std::string& host,
         }
         const int ssl_error = SSL_get_error(out.impl_->ssl, rc);
         if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+            const long verified = SSL_get_verify_result(out.impl_->ssl);
+            if (opts.verify_hostname && (verified == X509_V_ERR_HOSTNAME_MISMATCH ||
+                                         verified == X509_V_ERR_IP_ADDRESS_MISMATCH)) {
+                throw std::runtime_error(
+                    "TlsSocket::connect: TLS handshake with " + peer +
+                    " failed: the server's certificate does not match the host " + host + " (" +
+                    certificate_names(out.impl_->ssl) +
+                    "). Connect by a name or address the certificate carries, reissue it with " +
+                    host + " in its subjectAltName, or turn the hostname check off with " +
+                    std::string{opts.verify_hostname_opt_out} + ".");
+            }
             throw std::runtime_error("TlsSocket::connect: TLS handshake with " + peer +
                                      " failed: " + handshake_error(ssl_error));
         }
