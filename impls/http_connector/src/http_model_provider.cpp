@@ -159,8 +159,11 @@ public:
     // concurrent use), and the lease reuses a kept-alive connection instead of a fresh
     // handshake per call.
     clink::sql::Row predict(const clink::sql::Row& features) override {
+        // The model server is a reader other than clink: a NaN or infinity
+        // feature is sent as null, so the body is always valid JSON.
         const std::string body =
-            clink::config::JsonValue{clink::sql::to_json_object(features.values)}.serialize(0);
+            clink::config::JsonValue{clink::sql::to_json_object(features.values)}
+                .serialize_external();
         ClientLease lease(*pool_, pool_->acquire());
         clink::config::JsonValue root = post_and_root_(lease.get(), body);
         return extract_output_(root, output_columns_);
@@ -182,7 +185,7 @@ public:
         for (const auto& f : features_batch) {
             body_arr.push_back(clink::config::JsonValue{clink::sql::to_json_object(f.values)});
         }
-        const std::string body = clink::config::JsonValue{std::move(body_arr)}.serialize(0);
+        const std::string body = clink::config::JsonValue{std::move(body_arr)}.serialize_external();
         ClientLease lease(*pool_, pool_->acquire());
         clink::config::JsonValue root = post_and_root_(lease.get(), body);
         if (!root.is_array()) {

@@ -88,6 +88,8 @@ Read it back with a table on the same `prefix`.
 
 For a local MinIO or localstack target, add `endpoint_override = 'http://localhost:9000'`. The `int64` factories are reachable only through the programmatic API.
 
+A `format='json'` sink table's rows are serialised by the `row_to_json_string` bridge, so a NaN or infinite double in the stored JSON text is `null`, or `"NaN"`, `"Infinity"` or `"-Infinity"` with `json_non_finite='string'`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Based on the construction shape exercised in `impls/s3/tests/test_parquet_s3.cpp`. Writing `int64` records to a single Parquet object on S3 with the programmatic `ParquetS3Sink<T>`:

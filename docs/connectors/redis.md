@@ -109,6 +109,8 @@ CREATE TABLE events_out (
 );
 ```
 
+A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Programmatic use via the typed classes and their option structs, mirroring `impls/redis/tests/test_redis_live.cpp`:

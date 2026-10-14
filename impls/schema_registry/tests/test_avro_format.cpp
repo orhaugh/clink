@@ -2,8 +2,12 @@
 // (GenericDatum + binaryEncoder), so the decoder is checked against the
 // reference implementation; the encoder is checked by decoding its output
 // with avro-cpp and by round-tripping through the decoder.
+#include <cmath>
+#include <limits>
+
 #include <gtest/gtest.h>
 
+#include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
 #include "clink/schema_registry/formats.hpp"
 #include "clink/schema_registry/wire_format.hpp"
@@ -257,6 +261,63 @@ TEST(AvroFormat, EncoderAgainstARegistryHeldSchemaHonoursLogicalTypesAndRefusesB
         enc->from_json(R"({"id":1,"n":2,"ok":true,"px":0.5,"ratio":0.5,"blob":"","colour":"BLUE",
         "tags":[],"attrs":{},"addr":{"city":""},"amount":"1.23","fixed_amount":0,"day":0,"t_ms":0,"ts_ms":0,"ts_us":0,"uid":""})"),
         std::runtime_error);
+}
+
+// A NaN or an infinity reaches the encoder in the tagged form the
+// row_to_json_string bridge writes for a binary registry format (text clink's
+// parser reads back as the double), and the Avro bytes carry the IEEE value
+// itself. Covers the nullable fields a derived schema declares (a union with
+// null, where the double branch is chosen) and required double / float fields.
+TEST(AvroFormat, NonFiniteDoublesEncodeAsTheirIeeeValues) {
+    using L = std::numeric_limits<double>;
+    Fixture fx;
+    FormatOptions derived;
+    derived.format = Format::Avro;
+    derived.subject = "nf-value";
+    derived.columns = "id:i64;px:f64;r:f32";
+    auto enc = make_encoder(derived, fx.client);
+    const auto derived_schema =
+        avro::compileJsonSchemaFromString(fx.client->schema_by_id(enc->schema_id()).schema);
+
+    const auto req_id =
+        fx.reg.add("req-value",
+                   "AVRO",
+                   R"({"type":"record","name":"Req","fields":[{"name":"px","type":"double"},)"
+                   R"({"name":"r","type":"float"}]})");
+    FormatOptions required;
+    required.format = Format::Avro;
+    required.subject = "req-value";
+    required.auto_register = false;
+    auto req_enc = make_encoder(required, fx.client);
+    ASSERT_EQ(req_enc->schema_id(), req_id);
+    const auto req_schema =
+        avro::compileJsonSchemaFromString(fx.client->schema_by_id(req_id).schema);
+
+    const auto same = [](double got, double want) {
+        return std::isnan(want) ? std::isnan(got) : got == want;
+    };
+    for (const double x : {L::quiet_NaN(), L::infinity(), -L::infinity()}) {
+        clink::config::JsonObject row;
+        row["id"] = JsonValue{std::int64_t{1}};
+        row["px"] = JsonValue{x};
+        row["r"] = JsonValue{x};
+        const auto json = clink::config::serialize_output(JsonValue{std::move(row)},
+                                                          clink::config::NonFinite::Tagged);
+        ASSERT_NE(json.find("\\u0002"), std::string::npos) << json;
+
+        const auto d =
+            decode_bytes(derived_schema, parse_frame(enc->from_json(json), false)->payload);
+        const auto& r = d.value<avro::GenericRecord>();
+        EXPECT_NE(r.field("px").unionBranch(), 0u) << "took the null branch for " << json;
+        EXPECT_TRUE(same(r.field("px").value<double>(), x)) << json;
+        EXPECT_TRUE(same(static_cast<double>(r.field("r").value<float>()), x)) << json;
+
+        const auto rd =
+            decode_bytes(req_schema, parse_frame(req_enc->from_json(json), false)->payload);
+        const auto& rr = rd.value<avro::GenericRecord>();
+        EXPECT_TRUE(same(rr.field("px").value<double>(), x)) << json;
+        EXPECT_TRUE(same(static_cast<double>(rr.field("r").value<float>()), x)) << json;
+    }
 }
 
 }  // namespace

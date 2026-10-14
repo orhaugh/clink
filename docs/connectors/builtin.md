@@ -3,7 +3,8 @@
 Row-channel sinks compiled into the engine itself - no client library, no
 `CLINK_WITH_*` knob, always available when `CLINK_BUILD_SQL=ON`. They are
 selected by connector name in `CREATE TABLE ... WITH (connector='...')` and
-take no further option. blackhole, changelog and print are registered by
+take no further option, apart from `json_non_finite` on the two that write
+JSON, changelog and print. blackhole, changelog and print are registered by
 `clink::sql::install()` (`src/sql/install.cpp`); collect is registered by the
 embedded engine and only works there. The one built-in that is not a SQL
 connector, the programmatic `GeneratorSource<T>`, is described at the end.
@@ -27,7 +28,10 @@ CREATE TABLE sink (bidder BIGINT, bid_count BIGINT) WITH (connector='blackhole')
 Nets a changelog stream (insert / delete / update_before / update_after) into
 its final relation by full-row multiplicity - no primary key needed - and
 writes the survivors on flush. For keyless changelog outputs, e.g. a
-retracting aggregate joined to another stream.
+retracting aggregate joined to another stream. A NaN or infinite double is
+written as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` with
+`json_non_finite='string'`; see
+[NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
 
 ## `print`
 
@@ -46,7 +50,9 @@ stripped from the printed object.
 
 Lines are written with a single `fwrite` each, so concurrent subtasks at
 parallelism above 1 interleave whole lines, never fragments. Row order
-across subtasks is not defined, same as any parallel sink.
+across subtasks is not defined, same as any parallel sink. A NaN or infinite
+double prints as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` with
+`json_non_finite='string'`, as the other JSON sinks write it.
 
 ## `queryable_state` (source)
 
@@ -77,7 +83,8 @@ global point-in-time snapshot. Declared `DOUBLE`, `REAL`, `BIGINT` and
 JSON, where a whole double is a bare integer such as `12`, so a `DOUBLE`
 column turns it back into a double, a `REAL` value is rounded to float
 precision, and a whole numeral in a `BIGINT` or `INTEGER` column becomes an
-integer.
+integer. The scan route is an HTTP API JSON response, where a NaN or infinite
+value is `null`, so this source reads it as SQL `NULL`.
 
 ## `collect` (embedded only)
 

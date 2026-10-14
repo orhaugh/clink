@@ -124,6 +124,8 @@ CREATE TABLE click_counts (
 );
 ```
 
+A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Programmatic use of the Kinesis source and sink, following `impls/aws/tests/test_kinesis_live.cpp`:

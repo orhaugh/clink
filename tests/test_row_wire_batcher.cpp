@@ -14,6 +14,7 @@
 //   - the batcher exposes a null schema so the receiver skips its fixed-schema
 //     equality gate (the columnar schema varies per edge).
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -117,6 +118,34 @@ TEST(RowWireBatcher, RowFormRoundTripsAsRows) {
     EXPECT_TRUE(out->records()[0].event_time().has_value());
     EXPECT_EQ(out->records()[0].event_time()->millis(), 11);
     EXPECT_FALSE(out->records()[1].event_time().has_value());
+}
+
+// A row-form batch carrying NaN and the infinities crosses the wire through the
+// row codec's JSON. That text used to be nan / inf, which the receiving decode
+// rejected, so the rows never arrived on the other worker.
+TEST(RowWireBatcher, RowFormNonFiniteDoublesCrossTheWire) {
+    using L = std::numeric_limits<double>;
+    auto wire = clink::sql::make_row_wire_batcher(clink::sql::row_json_codec());
+    Batch<Row> in;
+    for (const double d : {L::quiet_NaN(), L::infinity(), -L::infinity(), -0.0}) {
+        Row r;
+        r.values["x"] = clink::config::JsonValue{d};
+        r.values["k"] = clink::config::JsonValue{std::string{"a"}};
+        in.emplace(std::move(r), EventTime{5});
+    }
+
+    auto out = wire_roundtrip(wire, in);
+    ASSERT_TRUE(out.has_value());
+    ASSERT_EQ(out->size(), 4u) << "rows carrying NaN / Inf were lost on the wire";
+    const auto x = [&](std::size_t i) {
+        return out->records()[i].value().values.at("x").as_number();
+    };
+    EXPECT_TRUE(std::isnan(x(0)));
+    EXPECT_EQ(x(1), L::infinity());
+    EXPECT_EQ(x(2), -L::infinity());
+    EXPECT_EQ(x(3), 0.0);
+    EXPECT_TRUE(std::signbit(x(3)));
+    EXPECT_EQ(out->records()[0].event_time()->millis(), 5);
 }
 
 TEST(RowWireBatcher, UnsupportedSidecarSchemaRejectedAtParse) {

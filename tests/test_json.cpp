@@ -3,9 +3,14 @@
 // errors. Exhaustive coverage isn't the goal - the parser is intentionally
 // a subset of full JSON; the goal is that the subset is correct.
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <map>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -541,4 +546,206 @@ TEST(Json, IntegralDoublesStillRenderAsIntegers) {
     EXPECT_EQ(clink::config::JsonValue{42.0}.serialize(0), "42");
     EXPECT_EQ(clink::config::JsonValue{-7.0}.serialize(0), "-7");
     EXPECT_EQ(clink::config::JsonValue{0.0}.serialize(0), "0");
+}
+
+// ----- Non-finite doubles (NaN, +Inf, -Inf) -----
+//
+// JSON has no token for these. Every writer renders them deliberately: the
+// Tagged form for text clink reads back itself, null or the "NaN" /
+// "Infinity" / "-Infinity" strings for a reader other than clink. They used to
+// print bare (nan, inf, -inf), which no parser accepts, this one included.
+
+namespace {
+
+struct NonFiniteCase {
+    double value;
+    const char* tagged;  // the Tagged form's JSON text
+    const char* named;   // the String form's JSON text
+};
+
+const NonFiniteCase kNonFinite[] = {
+    {std::numeric_limits<double>::quiet_NaN(), R"("\u0002NaN")", R"("NaN")"},
+    {-std::numeric_limits<double>::quiet_NaN(), R"("\u0002NaN")", R"("NaN")"},
+    {std::numeric_limits<double>::infinity(), R"("\u0002Infinity")", R"("Infinity")"},
+    {-std::numeric_limits<double>::infinity(), R"("\u0002-Infinity")", R"("-Infinity")"},
+};
+
+// The same double: NaN matches any NaN, everything else compares bitwise, so
+// -0.0 is told apart from 0.0.
+bool same_double(double a, double b) {
+    if (std::isnan(a) || std::isnan(b)) {
+        return std::isnan(a) && std::isnan(b);
+    }
+    return std::memcmp(&a, &b, sizeof a) == 0;
+}
+
+}  // namespace
+
+TEST(Json, NonFiniteDefaultFormIsTaggedAndReadsBack) {
+    for (const auto& c : kNonFinite) {
+        const JsonValue v{c.value};
+        EXPECT_EQ(v.serialize(0), c.tagged);
+        EXPECT_EQ(v.serialize(2), c.tagged);
+        std::string into;
+        v.serialize_into(into);
+        EXPECT_EQ(into, c.tagged);
+        std::string kind;
+        v.serialize_kind_preserving_into(kind);
+        EXPECT_EQ(kind, c.tagged);
+
+        const auto back = parse(c.tagged);
+        ASSERT_TRUE(back.is_number()) << c.tagged;
+        EXPECT_FALSE(back.is_integral_number());
+        EXPECT_TRUE(same_double(back.as_number(), c.value)) << c.tagged;
+    }
+}
+
+TEST(Json, NonFiniteTaggedFormReadsBackNestedAndThroughParseObject) {
+    JsonObject obj;
+    obj["nan"] = JsonValue{std::numeric_limits<double>::quiet_NaN()};
+    obj["inf"] = JsonValue{std::numeric_limits<double>::infinity()};
+    obj["arr"] = JsonValue{JsonArray{JsonValue{-std::numeric_limits<double>::infinity()},
+                                     JsonValue{1.5},
+                                     JsonValue{std::string{"NaN"}}}};
+    const std::string text = JsonValue{std::move(obj)}.serialize(0);
+    EXPECT_EQ(text,
+              R"({"arr":["\u0002-Infinity",1.5,"NaN"],"inf":"\u0002Infinity","nan":"\u0002NaN"})");
+
+    const auto check = [](const JsonObject& o) {
+        EXPECT_TRUE(std::isnan(o.find("nan")->second.as_number()));
+        EXPECT_EQ(o.find("inf")->second.as_number(), std::numeric_limits<double>::infinity());
+        const auto& arr = o.find("arr")->second.as_array();
+        ASSERT_EQ(arr.size(), 3u);
+        EXPECT_EQ(arr[0].as_number(), -std::numeric_limits<double>::infinity());
+        EXPECT_EQ(arr[1].as_number(), 1.5);
+        // The plain string "NaN" is a string, not a number.
+        ASSERT_TRUE(arr[2].is_string());
+        EXPECT_EQ(arr[2].as_string(), "NaN");
+    };
+    check(parse(text).as_object());
+    const auto direct = parse_object(text);
+    ASSERT_TRUE(direct.has_value());
+    check(*direct);
+    const std::vector<std::string> keep{"inf", "nan", "arr"};
+    const auto projected = parse_object(text, keep);
+    ASSERT_TRUE(projected.has_value());
+    check(*projected);
+}
+
+TEST(Json, NonFiniteExternalFormIsNullByDefault) {
+    for (const auto& c : kNonFinite) {
+        const JsonValue v{c.value};
+        EXPECT_EQ(v.serialize_external(), "null");
+        EXPECT_EQ(v.serialize_external(NonFinite::Null), "null");
+        EXPECT_TRUE(parse(v.serialize_external()).is_null());
+    }
+    JsonObject obj;
+    obj["a"] =
+        JsonValue{JsonArray{JsonValue{std::numeric_limits<double>::quiet_NaN()}, JsonValue{2.5}}};
+    obj["b"] = JsonValue{std::numeric_limits<double>::infinity()};
+    std::string out;
+    JsonValue{std::move(obj)}.serialize_external_into(out);
+    EXPECT_EQ(out, R"({"a":[null,2.5],"b":null})");
+    EXPECT_NO_THROW((void)parse(out));
+}
+
+TEST(Json, NonFiniteExternalStringFormNamesTheValue) {
+    for (const auto& c : kNonFinite) {
+        const JsonValue v{c.value};
+        const auto text = v.serialize_external(NonFinite::String);
+        EXPECT_EQ(text, c.named);
+        // A string to every reader, clink's parser included: only the Tagged
+        // form reads back as the double.
+        const auto back = parse(text);
+        ASSERT_TRUE(back.is_string()) << text;
+    }
+}
+
+TEST(Json, FiniteDoublesAreTheSameInEveryForm) {
+    using L = std::numeric_limits<double>;
+    for (const double d : {0.0,
+                           -0.0,
+                           0.1,
+                           -2.5,
+                           7.0,
+                           1e300,
+                           -1e-300,
+                           L::denorm_min(),
+                           -L::denorm_min(),
+                           2.2250738585072009e-308,  // the largest subnormal
+                           L::min(),
+                           L::max(),
+                           L::lowest(),
+                           L::epsilon()}) {
+        const JsonValue v{d};
+        const auto plain = v.serialize(0);
+        EXPECT_EQ(v.serialize_external(), plain) << plain;
+        EXPECT_EQ(v.serialize_external(NonFinite::String), plain) << plain;
+        EXPECT_EQ(v.serialize_external(NonFinite::Tagged), plain) << plain;
+        EXPECT_EQ(parse(plain).as_number(), d) << plain;
+        // The kind-preserving form also keeps -0.0's sign.
+        std::string kind;
+        v.serialize_kind_preserving_into(kind);
+        EXPECT_TRUE(same_double(parse(kind).as_number(), d)) << kind;
+    }
+}
+
+TEST(Json, BareNonFiniteTokensAreStillRejected) {
+    for (const char* bad : {"NaN",
+                            "Infinity",
+                            "-Infinity",
+                            "nan",
+                            "inf",
+                            "-inf",
+                            "1e400",
+                            R"({"x":NaN})",
+                            R"({"x":inf})"}) {
+        EXPECT_THROW((void)parse(bad), ParseError) << bad;
+        EXPECT_FALSE(parse_object(bad).has_value()) << bad;
+    }
+}
+
+TEST(Json, OnlyTheExactTaggedSpellingsReadAsNumbers) {
+    // Near misses of the Tagged form stay strings, byte for byte.
+    for (const char* text : {R"("\u0002nan")",
+                             R"("\u0002NaNx")",
+                             R"("\u0002Inf")",
+                             R"("\u0002+Infinity")",
+                             R"("\u0002")",
+                             R"("\u0001NaN")",
+                             R"("x\u0002NaN")"}) {
+        const auto v = parse(text);
+        ASSERT_TRUE(v.is_string()) << text;
+        EXPECT_EQ(JsonValue{v.as_string()}.serialize(0), text);
+    }
+}
+
+TEST(Json, NonFiniteOptionAcceptsNullAndStringOnly) {
+    EXPECT_EQ(non_finite_from_option("null"), NonFinite::Null);
+    EXPECT_EQ(non_finite_from_option("string"), NonFinite::String);
+    for (const char* bad : {"", "Null", "STRING", "tagged", "nan", "none", "strings"}) {
+        EXPECT_FALSE(non_finite_from_option(bad).has_value()) << bad;
+    }
+    EXPECT_EQ(require_non_finite_option("string", "file_json_sink"), NonFinite::String);
+    try {
+        (void)require_non_finite_option("nan", "file_json_sink");
+        FAIL() << "json_non_finite='nan' was accepted";
+    } catch (const std::invalid_argument& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("file_json_sink"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("json_non_finite='nan'"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("'null', 'string'"), std::string::npos) << msg;
+    }
+}
+
+TEST(Json, NonFiniteNamesAreTheStringFormsSpellings) {
+    EXPECT_EQ(non_finite_name(std::numeric_limits<double>::quiet_NaN()), "NaN");
+    EXPECT_EQ(non_finite_name(std::numeric_limits<double>::infinity()), "Infinity");
+    EXPECT_EQ(non_finite_name(-std::numeric_limits<double>::infinity()), "-Infinity");
+    std::string out;
+    append_non_finite(out, std::numeric_limits<double>::infinity(), NonFinite::Tagged);
+    EXPECT_EQ(out, R"("\u0002Infinity")");
+    // The Tagged text is what the general string escaper writes for the tag byte.
+    EXPECT_EQ(JsonValue{std::string{kNonFiniteTag} + "Infinity"}.serialize(0),
+              R"("\u0002Infinity")");
 }

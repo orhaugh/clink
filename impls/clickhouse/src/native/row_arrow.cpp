@@ -151,6 +151,16 @@ const char* expectation(SqlKind kind) {
     }
 }
 
+// A number as a diagnostic shows it: its JSON text, or a NaN or infinity by
+// name ("NaN", "Infinity", "-Infinity") rather than as the tagged string the
+// JSON writer gives it.
+std::string number_text(const JsonValue& v) {
+    if (v.is_number() && !std::isfinite(v.as_number())) {
+        return std::string{clink::config::non_finite_name(v.as_number())};
+    }
+    return v.serialize(0);
+}
+
 // Row data may be confidential, so a cell is described by its kind: a number
 // or a decimal is shown, text only by its length, an array or an object only
 // by its size.
@@ -165,7 +175,7 @@ std::string describe(const JsonValue& v) {
             return "a boolean";
         case JsonValue::Type::Number:
         case JsonValue::Type::Int:
-            return v.serialize(0);
+            return number_text(v);
         case JsonValue::Type::String:
             return "text(len " + std::to_string(v.as_string().size()) + ")";
         case JsonValue::Type::Array:
@@ -182,7 +192,7 @@ bool shows_value(const JsonValue& v) {
 
 // Text the cell's own value would be shown as, numbers only.
 std::string value_text(const JsonValue& v) {
-    return clink::config::is_dec_string(v) ? v.as_string().substr(1) : v.serialize(0);
+    return clink::config::is_dec_string(v) ? v.as_string().substr(1) : number_text(v);
 }
 
 enum class TextInt : std::uint8_t { Ok, NotDigits, OutOfRange };

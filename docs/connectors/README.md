@@ -120,3 +120,50 @@ Guarantees vary by connector and are stated on each page. In summary:
   object index, row index) and any caveats are documented per connector.
 - Messaging sources (RabbitMQ, NATS, Pulsar) acknowledge at the checkpoint
   barrier rather than post-commit; unacknowledged messages are redelivered.
+
+## NaN and infinity in JSON output
+
+JSON has no token for NaN or an infinity, so every sink that writes JSON
+renders a non-finite `DOUBLE` or `REAL` value deliberately. That covers the
+sinks that write the JSON themselves (`file` with `format='json'`, including
+its upsert, exactly-once and `partition_by` forms, `changelog` and `print`) and
+every string sink the planner feeds through the `row_to_json_string` bridge:
+Kafka (`format='json'`, and the registry format `'json-schema'`), RabbitMQ,
+NATS, Pulsar, Pub/Sub, the HTTP family (`http`,
+`elasticsearch`, `opensearch`, `splunk_hec`, `influxdb`, `prometheus`), Redis,
+MySQL, Postgres, Cassandra, ClickHouse with `insert_format='jsoneachrow'`,
+Kinesis, Firehose, DynamoDB and the object-store Parquet string sinks. The
+table option `json_non_finite` chooses the form:
+
+| `json_non_finite` | NaN | +Infinity | -Infinity |
+| --- | --- | --- | --- |
+| `'null'` (default) | `null` | `null` | `null` |
+| `'string'` | `"NaN"` | `"Infinity"` | `"-Infinity"` |
+
+`'string'` is for a consumer that must tell NaN from a missing value. Any other
+value is refused at `CREATE TABLE`, and again when the job is planned, naming
+the accepted values; a sink factory built outside SQL refuses it too. The
+option is refused on a sink that writes no JSON (`parquet`, `delta`, `iceberg`,
+ClickHouse `insert_format='native'`, `collect`, `blackhole`, or a single-TEXT
+column table, which writes each record as it is): a typed sink holds NaN and
+the infinities as they are. So does Kafka with the registry format
+`format='avro'` or `'protobuf'`, which refuses the option too: its encoder
+writes the IEEE value itself, in a nullable field as in a required one (see
+[Schema Registry formats](schema-registry.md#sql-usage)). A sink that turns the
+bridge's JSON into its own encoding (the database sinks, InfluxDB, Prometheus,
+DynamoDB) receives the `null` or the string, and treats it as it treats any
+null or string value in that column.
+
+Reading such output back with a JSON source: `null` in a `DOUBLE` column is
+SQL `NULL`. The strings `"NaN"`, `"Infinity"` and `"-Infinity"` are not turned
+back into doubles. The column holds the string: a JSON sink writes it out again
+unchanged, arithmetic on it gives `NULL`, and a typed sink such as Parquet
+stores `NULL`.
+
+Other surfaces follow the same rule with no option: the HTTP API's JSON
+responses (the queryable-state routes) write `null`, and so do dead-letter
+payloads and `json_object`. The queryable-state Arrow scan is typed and carries
+the float64 value itself. Text clink writes and reads back itself (operator
+state, the row codec between operators, the JSON in front of an Avro or
+Protobuf encoder) keeps the value exactly; see
+[the SQL frontend internals](../internals/sql-frontend.md).

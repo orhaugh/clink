@@ -571,6 +571,19 @@ TEST(JsonValueExpr, JsonExistsAndConstruct) {
     EXPECT_TRUE(eval(R"({"op":"json_value","args":[{"lit":null},{"lit":"$.a"}]})").is_null());
 }
 
+// JSON_OBJECT's text is a value the query hands on, so it is standard JSON: a
+// NaN or infinity is null, never a bare nan or the tagged string clink keeps
+// for its own read-back.
+TEST(JsonValueExpr, JsonObjectWritesNonFiniteAsNull) {
+    const auto text =
+        eval(R"({"op":"json_object","args":[{"lit":"q"},{"col":"x"},{"lit":"r"},{"col":"y"}]})",
+             {{"x", JsonValue{std::numeric_limits<double>::quiet_NaN()}},
+              {"y", JsonValue{-std::numeric_limits<double>::infinity()}}})
+            .as_string();
+    EXPECT_EQ(text, R"({"q":null,"r":null})");
+    EXPECT_TRUE(clink::config::parse(text).at("q").is_null());
+}
+
 // --- Wave 5c: ROW make_row / field_at -----------------------------------
 
 TEST(JsonValueExpr, MakeRowBuildsNamedObject) {

@@ -65,6 +65,8 @@ CREATE TABLE sensor_out (
 
 `mode='upsert'` with a PRIMARY KEY selects the changelog-aware upsert sink (`cassandra_upsert_sink_string`, see Delivery semantics), which applies deletes as well as upserts so a retracting query can maintain the table. `exactly_once` (2PC) is rejected; the default sink is at-least-once (idempotent for a stable primary key).
 
+A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Based on `impls/cassandra/tests/test_cassandra_live.cpp`. The keyspace and table are assumed to already exist (the sink does not create schema).

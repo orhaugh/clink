@@ -1663,7 +1663,8 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
     }
     // JSON_OBJECT('k1', v1, 'k2', v2, ...) -> JSON object text. (The
     // SQL KEY 'k' VALUE v spelling is not modeled; use the positional
-    // form.) Keys sorted for deterministic output.
+    // form.) Keys sorted for deterministic output. The text is a value the
+    // query hands on, so it is standard JSON: a NaN or infinity is null.
     if (op == ValueOp::JsonObjectFn) {
         if (args.size() % 2 != 0) {
             throw std::runtime_error(
@@ -1673,7 +1674,7 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
         for (std::size_t i = 0; i + 1 < args.size(); i += 2) {
             obj[value_expr_detail::to_text(args[i])] = args[i + 1];
         }
-        return JsonValue{JsonValue{std::move(obj)}.serialize(0)};
+        return JsonValue{JsonValue{std::move(obj)}.serialize_external()};
     }
     // SQLOPT-3: not a built-in (ValueOp::Udf) - try a registered scalar UDF,
     // invoked with the already-evaluated argument values. Resolved at

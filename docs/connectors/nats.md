@@ -92,6 +92,8 @@ CREATE TABLE orders (
 
 A sink table uses the same `connector='nats'` with at least `subject` set, for example `subject='clink.results'`.
 
+A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Based on `impls/nats/tests/test_nats_live.cpp`, using the typed classes directly:

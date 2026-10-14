@@ -19,6 +19,9 @@ namespace {
 struct ClosedDomain {
     const char* option;
     std::vector<std::string> allowed;
+    // What the value decides, for the refusal. Empty means the general
+    // consequence: an unrecognised value would be ignored.
+    const char* meaning = "";
 };
 
 const std::vector<ClosedDomain>& closed_domains() {
@@ -33,6 +36,13 @@ const std::vector<ClosedDomain>& closed_domains() {
         {"changelog", {"true", "false"}},
         {"columnar_decode", {"true", "false"}},
         {"insert_format", {"native", "jsoneachrow"}},
+        // How a JSON-writing sink renders NaN and the infinities. Read off
+        // config::non_finite_from_option, which the planner and the sink
+        // factories also check against.
+        {"json_non_finite",
+         {"null", "string"},
+         "It decides how a sink that writes JSON writes NaN and the infinities: 'null' as "
+         "null, 'string' as \"NaN\", \"Infinity\" and \"-Infinity\"."},
     };
     return domains;
 }
@@ -61,6 +71,7 @@ const std::vector<std::string>& interpreted_table_options() {
         "freshness",
         "bounded",
         "insert_format",
+        "json_non_finite",
     };
     return opts;
 }
@@ -84,12 +95,15 @@ std::vector<TableOptionProblem> check_table_options(
                 for (std::size_t i = 0; i < d.allowed.size(); ++i) {
                     allowed += (i > 0 ? ", '" : "'") + d.allowed[i] + "'";
                 }
-                problems.push_back(
-                    {key,
-                     "table '" + table_name + "': option '" + key + "' has value '" + value +
-                         "', which is not one of " + allowed +
-                         ". An unrecognised value is ignored, so the table would silently "
-                         "behave as if the option had not been set."});
+                const std::string meaning =
+                    *d.meaning != '\0' ? std::string{d.meaning}
+                                       : std::string{
+                                             "An unrecognised value is ignored, so the table would "
+                                             "silently behave as if the option had not been set."};
+                problems.push_back({key,
+                                    "table '" + table_name + "': option '" + key + "' has value '" +
+                                        value + "', which is not one of " + allowed + ". " +
+                                        meaning});
             }
             // delivery_guarantee has its own vocabulary, owned by the
             // connector capability contract rather than a literal list

@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -28,14 +30,20 @@
 #include "clink/config/json.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
+#include "clink/metrics/metrics_registry.hpp"
+#include "clink/operators/operator_base.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/queryable_state/arrow_scan.hpp"
 #include "clink/queryable_state/coordinator_routes.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/queryable_state/server.hpp"
+#include "clink/runtime/bounded_channel.hpp"
+#include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/install.hpp"
+#include "clink/sql/row.hpp"
 #include "clink/sql/script_runner.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 
 namespace fs = std::filesystem;
 
@@ -457,4 +465,125 @@ TEST(SqlQueryableState, DeclaredRealColumnsDecodeAsTheJsonBridgesDo) {
     };
     EXPECT_EQ(got, want);
     fs::remove(out_path);
+}
+
+// A JSON response is read by something other than clink, so a NaN or infinity
+// in a served value is null and the body is always valid JSON; the Arrow scan is
+// typed and carries the double itself. The served text used to carry the bare
+// tokens (inf), so the coordinator's fan-out parse of a worker's body failed and
+// the whole subtask was skipped, and the Arrow scan failed. Drives the aggregate
+// directly, as the runner would, then reads the slot through the registry and the
+// worker's routes.
+TEST(SqlQueryableState, NonFiniteStateValuesAreServedAsNull) {
+    clink::cluster::ensure_built_ins_registered();
+    clink::plugin::PluginRegistry reg;
+    clink::sql::install(reg);
+
+    clink::sql::Catalog catalog;
+    std::ostringstream out_s, err_s;
+    clink::sql::ScriptIO io{&out_s, &err_s};
+    std::vector<clink::cluster::JobGraphSpec> captured;
+    auto capture = [&](const clink::cluster::JobGraphSpec& spec, const std::string&) -> int {
+        captured.push_back(spec);
+        return 0;
+    };
+    const std::string script =
+        "CREATE TABLE nf_qs_in (usr TEXT, x DOUBLE) "
+        "WITH (connector='file', format='json', path='/tmp/nf_qs_in.ndjson');"
+        "CREATE TABLE nf_qs_out (usr TEXT, mx DOUBLE) "
+        "WITH (connector='file', format='json', path='/tmp/nf_qs_out.ndjson');"
+        "INSERT INTO nf_qs_out SELECT usr, MAX(x) AS mx FROM nf_qs_in GROUP BY usr";
+    ASSERT_EQ(clink::sql::run_script(script, catalog, {}, io, capture), 0) << err_s.str();
+    ASSERT_EQ(captured.size(), 1u);
+    std::map<std::string, std::string> agg_params;
+    for (const auto& op : captured[0].ops) {
+        if (op.type == "aggregate_row") {
+            agg_params = op.params;
+        }
+    }
+    ASSERT_FALSE(agg_params.empty());
+
+    const auto* factory = clink::cluster::OperatorRegistry::default_instance().find_operator(
+        "aggregate_row", "row", "row");
+    ASSERT_NE(factory, nullptr);
+    clink::cluster::OperatorBuildContext octx;
+    octx.params = agg_params;
+    auto op = std::static_pointer_cast<clink::Operator<clink::sql::Row, clink::sql::Row>>(
+        factory->build(octx));
+    clink::MetricsRegistry metrics;
+    clink::InMemoryStateBackend backend;
+    clink::RuntimeContext ctx{clink::OperatorId{4545}, "agg", &backend, &metrics};
+    const std::string role = "nf-qs-role-" + std::to_string(::getpid());
+    ctx.set_runner_identity(role, 0);
+    op->attach_runtime(&ctx);
+    op->open();
+
+    clink::Batch<clink::sql::Row> b;
+    for (const double x : {std::numeric_limits<double>::infinity(), 1.0}) {
+        clink::sql::Row r;
+        r.values["usr"] = clink::config::JsonValue{std::string{"alice"}};
+        r.values["x"] = clink::config::JsonValue{x};
+        b.push(clink::Record<clink::sql::Row>{std::move(r)});
+    }
+    clink::BoundedChannel<clink::StreamElement<clink::sql::Row>> ch(64);
+    clink::Emitter<clink::sql::Row> em(&ch);
+    op->process(clink::StreamElement<clink::sql::Row>::data(std::move(b)), em);
+
+    const auto slot = clink::queryable_state::compose_subtask_slot(role, 0, "agg");
+    const auto value = clink::queryable_state::Registry::global().lookup_json(slot, "alice");
+    ASSERT_TRUE(value.has_value());
+    // The registry holds clink's internal form, which reads back as the double.
+    EXPECT_EQ(*value, R"({"mx":"\u0002Infinity","usr":"alice"})");
+    EXPECT_EQ(clink::config::parse(*value).at("mx").as_number(),
+              std::numeric_limits<double>::infinity());
+
+    clink::http::HttpServer worker_http;
+    clink::queryable_state::register_routes(worker_http,
+                                            clink::queryable_state::Registry::global());
+    clink::queryable_state::register_arrow_scan_route(worker_http,
+                                                      clink::queryable_state::Registry::global());
+    const auto port = worker_http.start("127.0.0.1", 0);
+    clink::http::HttpClient client("127.0.0.1", port);
+    const std::string base = "/api/v1/queryable_state/op/" + role + "/subtask/0/json/agg";
+
+    const auto lookup = client.get(base + "?key=alice");
+    ASSERT_EQ(lookup.status, 200) << lookup.body;
+    EXPECT_EQ(lookup.body, R"({"key":"alice","value":{"mx":null,"usr":"alice"}})");
+
+    const auto resp = client.get(base + "/scan");
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const auto js = clink::config::parse(resp.body);  // throws on an invalid token
+    const auto& entries = js.at("entries").as_array();
+    ASSERT_EQ(entries.size(), 1u);
+    EXPECT_TRUE(entries.at(0).at("value").at("mx").is_null()) << resp.body;
+    EXPECT_EQ(resp.body.find("\\u0002"), std::string::npos) << resp.body;
+
+    // What clink's own fan-out asks for: the internal form.
+    const auto tagged = client.get(base + "/scan?non_finite=tagged");
+    ASSERT_EQ(tagged.status, 200) << tagged.body;
+    EXPECT_EQ(clink::config::parse(tagged.body)
+                  .at("entries")
+                  .as_array()
+                  .at(0)
+                  .at("value")
+                  .at("mx")
+                  .as_number(),
+              std::numeric_limits<double>::infinity());
+
+    // The Arrow scan carries the double.
+    const auto arrow_scan = client.get(base + "/scan.arrow");
+    ASSERT_EQ(arrow_scan.status, 200) << arrow_scan.body;
+    auto reader_r = arrow::ipc::RecordBatchStreamReader::Open(
+        std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(arrow_scan.body)));
+    ASSERT_TRUE(reader_r.ok()) << reader_r.status().ToString();
+    auto table_r = (*reader_r)->ToTable();
+    ASSERT_TRUE(table_r.ok()) << table_r.status().ToString();
+    const auto mx_col = (*table_r)->GetColumnByName("mx");
+    ASSERT_NE(mx_col, nullptr);
+    ASSERT_TRUE(mx_col->type()->Equals(arrow::float64()));
+    const auto mx = std::static_pointer_cast<arrow::DoubleArray>(mx_col->chunk(0));
+    ASSERT_FALSE(mx->IsNull(0));
+    EXPECT_EQ(mx->Value(0), std::numeric_limits<double>::infinity());
+    worker_http.stop();
+    op->close();
 }

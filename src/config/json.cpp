@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <optional>
 #include <simdjson.h>
@@ -40,6 +41,28 @@ namespace clink::config {
 
 namespace {
 
+// append_non_finite writes the tag as its JSON escape, \u0002.
+static_assert(kNonFiniteTag == '\x02');
+
+// The double a Tagged non-finite string denotes, or nullopt for any other
+// string. The tag byte comes first, so an ordinary string costs one compare.
+std::optional<double> tagged_non_finite(std::string_view s) noexcept {
+    if (s.size() < 4 || s.front() != kNonFiniteTag) {
+        return std::nullopt;
+    }
+    s.remove_prefix(1);
+    if (s == "NaN") {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (s == "Infinity") {
+        return std::numeric_limits<double>::infinity();
+    }
+    if (s == "-Infinity") {
+        return -std::numeric_limits<double>::infinity();
+    }
+    return std::nullopt;
+}
+
 // Single-pass recursive-descent JSON parser. Whitespace per RFC 8259:
 // space, tab, LF, CR. No comments. Strict - trailing commas and bare
 // numbers like "01" are rejected.
@@ -51,7 +74,9 @@ namespace {
 // preserved from the hand-rolled parser it replaced: strict RFC 8259,
 // no trailing content, numbers surface as double, duplicate object keys
 // keep the FIRST occurrence, \uXXXX escapes decode to UTF-8, and
-// malformed input throws ParseError.
+// malformed input throws ParseError. One addition: a string that is
+// exactly a Tagged non-finite double (see NonFinite) reads back as that
+// double, so text clink writes for itself round-trips.
 JsonValue from_dom(const simdjson::dom::element& e) {
     switch (e.type()) {
         case simdjson::dom::element_type::OBJECT: {
@@ -72,8 +97,13 @@ JsonValue from_dom(const simdjson::dom::element& e) {
             }
             return JsonValue{std::move(arr)};
         }
-        case simdjson::dom::element_type::STRING:
-            return JsonValue{std::string(std::string_view(e))};
+        case simdjson::dom::element_type::STRING: {
+            const std::string_view s(e);
+            if (const auto d = tagged_non_finite(s)) {
+                return JsonValue{*d};
+            }
+            return JsonValue{std::string(s)};
+        }
         case simdjson::dom::element_type::INT64:
             // Integer tokens are carried EXACTLY as int64 (no double round-trip),
             // so a BIGINT column survives past 2^53.
@@ -145,8 +175,13 @@ void escape_string(std::string& out, const std::string& s) {
 
 // `keep_kind` writes an integral double with a ".0" fraction so a parse reads it
 // back as a double rather than an integer (see serialize_kind_preserving_into).
-void serialize_append(
-    std::string& out, const JsonValue& v, int indent_width, int depth, bool keep_kind) {
+// `non_finite` is the form a NaN or infinity takes (see NonFinite).
+void serialize_append(std::string& out,
+                      const JsonValue& v,
+                      int indent_width,
+                      int depth,
+                      bool keep_kind,
+                      NonFinite non_finite) {
     auto indent = [&](int n) {
         if (indent_width > 0) {
             out.append(static_cast<std::size_t>(n) * static_cast<std::size_t>(indent_width), ' ');
@@ -173,6 +208,13 @@ void serialize_append(
         }
         case JsonValue::Type::Number: {
             const double d = v.as_number();
+            // JSON has no token for these. Printed bare they came out as nan,
+            // inf or -inf (-nan on glibc for a NaN with its sign bit set), which
+            // no parser accepts, this one included.
+            if (!std::isfinite(d)) {
+                append_non_finite(out, d, non_finite);
+                return;
+            }
             // Render integers without trailing ".0" for nicer output. The range
             // guard is load-bearing: a double->int64 cast is UB outside int64, and
             // the magnitude check must short-circuit BEFORE the equality cast.
@@ -180,7 +222,7 @@ void serialize_append(
             constexpr double kInt64Lo = -9223372036854775808.0;          // -2^63
             constexpr double kInt64HiExclusive = 9223372036854775808.0;  //  2^63
             char buf[32];
-            if (std::isfinite(d) && d >= kInt64Lo && d < kInt64HiExclusive &&
+            if (d >= kInt64Lo && d < kInt64HiExclusive &&
                 d == static_cast<double>(static_cast<std::int64_t>(d))) {
                 if (keep_kind && d == 0.0 && std::signbit(d)) {
                     out += "-0.0";
@@ -237,7 +279,7 @@ void serialize_append(
                     out.push_back('\n');
                     indent(depth + 1);
                 }
-                serialize_append(out, arr[i], indent_width, depth + 1, keep_kind);
+                serialize_append(out, arr[i], indent_width, depth + 1, keep_kind, non_finite);
                 if (i + 1 < arr.size()) {
                     out.push_back(',');
                     if (indent_width > 0) {
@@ -270,7 +312,7 @@ void serialize_append(
                 if (indent_width > 0) {
                     out.push_back(' ');
                 }
-                serialize_append(out, val, indent_width, depth + 1, keep_kind);
+                serialize_append(out, val, indent_width, depth + 1, keep_kind, non_finite);
                 if (i + 1 < obj.size()) {
                     out.push_back(',');
                     if (indent_width > 0) {
@@ -357,16 +399,72 @@ bool JsonValue::bool_or(std::string_view key, bool fallback) const {
 
 std::string JsonValue::serialize(int indent_width) const {
     std::string out;
-    serialize_append(out, *this, indent_width, 0, false);
+    serialize_append(out, *this, indent_width, 0, false, NonFinite::Tagged);
     return out;
 }
 
 void JsonValue::serialize_into(std::string& out) const {
-    serialize_append(out, *this, 0, 0, false);
+    serialize_append(out, *this, 0, 0, false, NonFinite::Tagged);
 }
 
 void JsonValue::serialize_kind_preserving_into(std::string& out) const {
-    serialize_append(out, *this, 0, 0, true);
+    serialize_append(out, *this, 0, 0, true, NonFinite::Tagged);
+}
+
+void JsonValue::serialize_external_into(std::string& out, NonFinite policy) const {
+    serialize_append(out, *this, 0, 0, false, policy);
+}
+
+std::string JsonValue::serialize_external(NonFinite policy) const {
+    std::string out;
+    serialize_external_into(out, policy);
+    return out;
+}
+
+std::string_view non_finite_name(double d) noexcept {
+    if (std::isnan(d)) {
+        return "NaN";
+    }
+    return d > 0 ? "Infinity" : "-Infinity";
+}
+
+void append_non_finite(std::string& out, double d, NonFinite policy) {
+    switch (policy) {
+        case NonFinite::Null:
+            out += "null";
+            return;
+        case NonFinite::String:
+            out.push_back('"');
+            out += non_finite_name(d);
+            out.push_back('"');
+            return;
+        case NonFinite::Tagged:
+            // The tag byte written as its JSON escape, as escape_string writes
+            // any control byte, so the text stays printable ASCII.
+            out += "\"\\u0002";
+            out += non_finite_name(d);
+            out.push_back('"');
+            return;
+    }
+}
+
+std::optional<NonFinite> non_finite_from_option(std::string_view value) noexcept {
+    if (value == "null") {
+        return NonFinite::Null;
+    }
+    if (value == "string") {
+        return NonFinite::String;
+    }
+    return std::nullopt;
+}
+
+NonFinite require_non_finite_option(std::string_view value, std::string_view owner) {
+    if (const auto policy = non_finite_from_option(value)) {
+        return *policy;
+    }
+    throw std::invalid_argument(std::string{owner} + ": " + std::string{kJsonNonFiniteOption} +
+                                "='" + std::string{value} + "' is not one of " +
+                                std::string{kJsonNonFiniteValues});
 }
 
 namespace {

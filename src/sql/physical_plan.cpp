@@ -938,6 +938,64 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         connector + "')");
 }
 
+// A registry format whose encoding is binary (Avro, Protobuf). Its encoder
+// reads the bridge's JSON and writes each double as an IEEE value, so a NaN or
+// an infinity has a lossless form there: the bridge writes the tagged text
+// clink's parser reads back as the double (non_finite_form='tagged'), and the
+// JSON output option does not apply. JSON Schema is JSON text, so it follows
+// json_non_finite like any JSON sink.
+bool registry_format_is_binary(const TableDef& table) {
+    const auto fmt = registry_format_of(table);
+    return fmt.has_value() && (*fmt == "avro" || *fmt == "protobuf");
+}
+
+// The Row sinks that write the JSON themselves, with no row_to_json_string
+// bridge in front, and so read json_non_finite from their own params.
+bool row_sink_writes_json(const std::string& op_type) {
+    return op_type == "file_json_sink" || op_type == "file_json_upsert_sink" ||
+           op_type == "file_2pc_sink_row" || op_type == "partition_file_sink" ||
+           op_type == "partition_overwrite_sink" || op_type == "changelog_net_sink" ||
+           op_type == "print_sink_row";
+}
+
+// The sink table's json_non_finite option, checked against the sink it binds
+// to: a value outside 'null' / 'string' is refused, as is the option on a sink
+// that writes no JSON, where it would do nothing. Returns the value to forward
+// to the op that writes the JSON, or nullopt when the table does not set it.
+// Checked here as well as at CREATE TABLE, because a materialised view's
+// backing table never passes the catalog check.
+std::optional<std::string> sink_json_non_finite(const TableDef& table,
+                                                const std::string& writer_op) {
+    const auto it = table.properties.find(std::string{clink::config::kJsonNonFiniteOption});
+    if (it == table.properties.end()) {
+        return std::nullopt;
+    }
+    if (!clink::config::non_finite_from_option(it->second)) {
+        unsupported("table '" + table.name + "': json_non_finite='" + it->second +
+                    "' is not one of " + std::string{clink::config::kJsonNonFiniteValues});
+    }
+    if (writer_op.empty()) {
+        unsupported("table '" + table.name +
+                    "': json_non_finite applies to a sink that writes JSON, and this sink writes "
+                    "each record's text as it is (a single TEXT column without format='json'). "
+                    "Remove the option.");
+    }
+    if (writer_op != "row_to_json_string" && !row_sink_writes_json(writer_op)) {
+        const auto c = table.properties.find("connector");
+        unsupported("table '" + table.name +
+                    "': json_non_finite applies to a sink that writes JSON, and connector='" +
+                    (c == table.properties.end() ? std::string{} : c->second) +
+                    "' does not (its sink is '" + writer_op + "'). Remove the option.");
+    }
+    if (registry_format_is_binary(table)) {
+        unsupported("table '" + table.name + "': json_non_finite does not apply to format='" +
+                    *registry_format_of(table) +
+                    "', which writes a NaN or an infinity as the IEEE double itself. Remove the "
+                    "option.");
+    }
+    return it->second;
+}
+
 // Copy properties from a TableDef to an OperatorSpec's params,
 // excluding the connector= and format= keys (which selected the
 // factory and channel respectively) and event-time keys (which the
@@ -2197,6 +2255,10 @@ std::string compile_node(const LogicalPlan& node,
 
         if (ch == Channel::Row) {
             auto binding = row_sink_binding_for(table);
+            // json_non_finite goes to whichever op writes the JSON: the bridge
+            // when there is one, else the sink itself (through build_params).
+            const auto non_finite = sink_json_non_finite(
+                table, binding.bridge_op.empty() ? binding.source_or_sink_op : binding.bridge_op);
             std::string before_sink = std::move(input_id);
             // The sink-boundary schema contract: what a sink writes is the
             // TABLE's declared schema, not the row's internal one. The
@@ -2262,6 +2324,14 @@ std::string compile_node(const LogicalPlan& node,
                 bridge.type = binding.bridge_op;
                 bridge.inputs = {std::move(before_sink)};
                 bridge.out_channel = binding.source_or_sink_channel;
+                if (non_finite) {
+                    bridge.params[std::string{clink::config::kJsonNonFiniteOption}] = *non_finite;
+                }
+                if (registry_format_is_binary(table)) {
+                    // The JSON only reaches clink's own Avro / Protobuf encoder,
+                    // which reads the tagged form back as the IEEE value.
+                    bridge.params["non_finite_form"] = "tagged";
+                }
                 before_sink = bridge.id;
                 spec.ops.push_back(std::move(bridge));
             }
@@ -2271,6 +2341,10 @@ std::string compile_node(const LogicalPlan& node,
             op.inputs = {std::move(before_sink)};
             op.out_channel = binding.source_or_sink_channel;
             op.params = build_params(table);
+            if (!binding.bridge_op.empty()) {
+                // The bridge wrote the JSON; the sink after it only carries the text.
+                op.params.erase(std::string{clink::config::kJsonNonFiniteOption});
+            }
             for (const auto& [k, v] : binding.extra_params) {
                 op.params[k] = v;  // binding-forced params override passed-through WITH-options
             }
@@ -2294,6 +2368,9 @@ std::string compile_node(const LogicalPlan& node,
             spec.ops.push_back(std::move(op));
             return id;
         }
+        // A string-channel sink writes each record's text as it is: no JSON is
+        // encoded, so the option would do nothing. Refused rather than ignored.
+        (void)sink_json_non_finite(table, std::string{});
         cluster::OperatorSpec op;
         op.id = "snk_" + std::to_string(next_id++);
         op.type = string_sink_factory_for(table);

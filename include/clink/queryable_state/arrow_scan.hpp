@@ -12,8 +12,13 @@
 // object document: number -> float64 (JSON numbers are doubles, so a
 // BIGINT total arrives as float64), bool -> bool, string -> utf8,
 // anything else -> utf8 carrying the serialised JSON. A field that is
-// missing - or of a different kind - in a later row becomes null.
+// missing - or of a different kind - in a later row becomes null. The value
+// documents are clink's internal JSON (the registry's slot text, or the
+// coordinator's fan-out asked for with non_finite=tagged), so a NaN or an
+// infinity arrives as the float64 value itself, where the JSON routes serve
+// null.
 
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -128,8 +133,12 @@ inline std::optional<std::string> arrow_ipc_from_scan(
                         st = b.AppendNull();
                     } else if (v->is_string()) {
                         st = b.Append(v->as_string());
+                    } else if (v->is_number() && !std::isfinite(v->as_number())) {
+                        // A text cell is not JSON: a NaN or infinity is named.
+                        st = b.Append(std::string{config::non_finite_name(v->as_number())});
                     } else {
-                        st = b.Append(v->serialize(0));
+                        // Nested JSON in a text cell is read outside clink.
+                        st = b.Append(v->serialize_external());
                     }
                     break;
                 }

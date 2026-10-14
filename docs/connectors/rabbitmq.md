@@ -112,6 +112,8 @@ CREATE TABLE orders_out (
 
 The planner rejects `mode='upsert'` and exactly-once delivery for the sink (RabbitMQ has no producer dedup key), reporting the at-least-once nature in the error message.
 
+A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Based on the round-trip in `impls/rabbitmq/tests/test_rabbitmq_live.cpp`, using the typed classes with their `Options`:

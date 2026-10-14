@@ -2,8 +2,13 @@
 // index path, references resolved through the registry, and the reflection
 // walk in both directions (checked against libprotobuf's own dynamic
 // messages).
+#include <cmath>
+#include <limits>
+#include <utility>
+
 #include <gtest/gtest.h>
 
+#include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
 #include "clink/schema_registry/formats.hpp"
 #include "clink/schema_registry/wire_format.hpp"
@@ -22,6 +27,7 @@ namespace clink::schema_registry {
 namespace {
 
 namespace pb = google::protobuf;
+using clink::config::JsonValue;
 
 constexpr const char* kOrders = R"(syntax = "proto3";
 import "google/protobuf/timestamp.proto";
@@ -327,6 +333,52 @@ TEST(ProtobufFormat, EncoderAgainstARegistryHeldSchemaHandlesEveryShapeAndNamedM
     } catch (const std::runtime_error& e) {
         EXPECT_NE(std::string(e.what()).find("'id'"), std::string::npos) << e.what();
     }
+}
+
+// A NaN or an infinity reaches the encoder in the tagged form the
+// row_to_json_string bridge writes for a binary registry format, and the
+// Protobuf bytes carry the IEEE value itself. A null, the JSON sinks' default,
+// would leave a proto3 field unset, which a reader takes for 0: the reason the
+// planner never sends this encoder the JSON output policy.
+TEST(ProtobufFormat, NonFiniteDoublesEncodeAsTheirIeeeValues) {
+    using L = std::numeric_limits<double>;
+    Fixture fx;
+    FormatOptions o;
+    o.format = Format::Protobuf;
+    o.subject = "nf-value";
+    o.columns = "id:i64;px:f64;r:f32";
+    auto enc = make_encoder(o, fx.client);
+    Compiled ref(fx.client->schema_by_id(enc->schema_id()).schema);
+
+    const auto read = [&](const std::string& json) {
+        auto msg = ref.make("nf");
+        const auto framed = enc->from_json(json);  // the frame views into it
+        const auto f = parse_frame(framed, true);
+        EXPECT_TRUE(msg->ParseFromArray(f->payload.data(), static_cast<int>(f->payload.size())));
+        const auto* r = msg->GetReflection();
+        const auto* d = msg->GetDescriptor();
+        return std::pair<double, double>{
+            r->GetDouble(*msg, d->FindFieldByName("px")),
+            static_cast<double>(r->GetFloat(*msg, d->FindFieldByName("r")))};
+    };
+    const auto same = [](double got, double want) {
+        return std::isnan(want) ? std::isnan(got) : got == want;
+    };
+    for (const double x : {L::quiet_NaN(), L::infinity(), -L::infinity()}) {
+        clink::config::JsonObject row;
+        row["id"] = JsonValue{std::int64_t{1}};
+        row["px"] = JsonValue{x};
+        row["r"] = JsonValue{x};
+        const auto json = clink::config::serialize_output(JsonValue{std::move(row)},
+                                                          clink::config::NonFinite::Tagged);
+        ASSERT_NE(json.find("\\u0002"), std::string::npos) << json;
+        const auto [px, r] = read(json);
+        EXPECT_TRUE(same(px, x)) << json;
+        EXPECT_TRUE(same(r, x)) << json;
+    }
+    const auto [null_px, null_r] = read(R"({"id":1,"px":null,"r":null})");
+    EXPECT_EQ(null_px, 0.0);
+    EXPECT_EQ(null_r, 0.0);
 }
 
 }  // namespace

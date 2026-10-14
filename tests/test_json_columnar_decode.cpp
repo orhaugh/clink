@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -860,6 +861,47 @@ TEST(JsonColumnarDecode, EscapedAndUnicodeStringsMatchTheRowDecode) {
     ASSERT_TRUE(col_el.is_data());
     EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()))
         << "on-demand string decoding must match the row decode byte for byte";
+}
+
+// A string that is exactly a tagged non-finite double ("\u0002NaN", the form
+// clink writes NaN and the infinities in text it reads back) is read by the row
+// decode's parse as the double, so neither carrier may take it as text. Near
+// misses of the tagged form, and the plain names, stay text on both.
+TEST(JsonColumnarDecode, TaggedNonFiniteStringsMatchTheRowDecode) {
+    const std::vector<RowColumn> schema = {
+        {"a", arrow::int64()}, {"s", arrow::utf8()}, {"b", arrow::float64()}};
+    // Each batch on its own, so one cell's fallback cannot hide another's: the
+    // text-column batch is otherwise columnar-clean.
+    const std::vector<std::vector<std::string>> batches = {
+        {
+            R"({"a":1,"s":"\u0002NaN","b":1.5})",
+            R"({"a":2,"s":"\u0002nan","b":2.5})",
+            R"({"a":3,"s":"NaN","b":3.5})",
+        },
+        {
+            R"({"a":4,"s":"x","b":"\u0002Infinity"})",
+            R"({"a":5,"s":"y","b":"\u0002-Infinity"})",
+        },
+    };
+    std::vector<Row> rows;
+    for (const auto& lines : batches) {
+        auto oracle = make_typed_row_oracle(schema);
+        auto row_el = run_one(oracle, lines_batch(lines));
+        JsonStringToRowColumnarOperator col_op(schema);
+        auto col_el = run_one(col_op, lines_batch(lines));
+        ASSERT_TRUE(row_el.is_data());
+        ASSERT_TRUE(col_el.is_data());
+        EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+        for (const auto& rec : row_el.as_data()) {
+            rows.push_back(rec.value());
+        }
+    }
+    ASSERT_EQ(rows.size(), 5u);
+    EXPECT_TRUE(std::isnan(rows[0].values.at("s").as_number()));
+    EXPECT_EQ(rows[1].values.at("s").as_string(), "\x02nan");
+    EXPECT_EQ(rows[2].values.at("s").as_string(), "NaN");
+    EXPECT_EQ(rows[3].values.at("b").as_number(), std::numeric_limits<double>::infinity());
+    EXPECT_EQ(rows[4].values.at("b").as_number(), -std::numeric_limits<double>::infinity());
 }
 
 // An escaped KEY must still produce the right row, and this test previously did not

@@ -561,8 +561,14 @@ inline std::string agg_value_key(const clink::config::JsonValue& v, const AggSpe
         if (auto d = clink::config::as_decimal(v))
             return clink::config::dec_canonical_key(*d);
     }
-    if (spec.fn == "string_agg")
-        return v.is_string() ? v.as_string() : v.serialize(0);
+    if (spec.fn == "string_agg") {
+        if (v.is_string())
+            return v.as_string();
+        // Joined text, not JSON: a NaN or infinity is named, as a person reads it.
+        if (v.is_number() && !std::isfinite(v.as_number()))
+            return std::string{clink::config::non_finite_name(v.as_number())};
+        return v.serialize(0);
+    }
     return v.serialize(0);
 }
 
@@ -593,6 +599,15 @@ inline std::map<std::string, int> parse_decimal_columns(const std::string& csv) 
         pos = comma + 1;
     }
     return out;
+}
+
+// The json_non_finite param of an op that writes JSON for a reader other than
+// clink: how a NaN or infinity is written. Absent means null; any value but
+// 'null' or 'string' fails the build, naming the op.
+inline clink::config::NonFinite json_non_finite_param(const BuildContext& ctx,
+                                                      std::string_view op) {
+    return clink::config::require_non_finite_option(
+        ctx.param_or(std::string{clink::config::kJsonNonFiniteOption}, "null"), op);
 }
 
 // Decode the optional distinct / separator fields shared by every
@@ -2938,7 +2953,10 @@ private:
         if (rt == nullptr)
             return;
         clink::BadRecord br;
-        br.payload = clink::config::JsonValue{clink::sql::to_json_object(row.values)}.serialize(0);
+        // Read only outside clink (the logging queue, or a host's own queue),
+        // so it is external JSON: a NaN or infinity is null.
+        br.payload =
+            clink::config::JsonValue{clink::sql::to_json_object(row.values)}.serialize_external();
         br.error = "late record dropped: window fired and purged";
         br.connector = "sql_window";
         br.direction = "operator";
@@ -3253,7 +3271,10 @@ public:
         if (rt == nullptr)
             return;
         clink::BadRecord br;
-        br.payload = clink::config::JsonValue{clink::sql::to_json_object(row.values)}.serialize(0);
+        // Read only outside clink (the logging queue, or a host's own queue),
+        // so it is external JSON: a NaN or infinity is null.
+        br.payload =
+            clink::config::JsonValue{clink::sql::to_json_object(row.values)}.serialize_external();
         br.error = "late record dropped: session fired and purged";
         br.connector = "sql_session_window";
         br.direction = "operator";
@@ -6718,7 +6739,10 @@ private:
     // dropped every pre-checkpoint contribution from the running totals.
     // The serving form of one bucket: the FINALISED output row (group
     // columns + aggregate results) as a JSON document. Caller holds
-    // serving_mu_.
+    // serving_mu_. clink's internal JSON, so a NaN or infinity keeps its value
+    // as the tagged form: the queryable-state routes turn it into null for a
+    // JSON response and back into the double for an Arrow scan
+    // (detail::served_json in queryable_state/server.hpp).
     std::string serving_row_json_(const AggBucket& bucket) const {
         Row result = bucket.group_values;
         for (std::size_t i = 0; i < aggregates_.size(); ++i) {
@@ -9480,10 +9504,12 @@ class FileJsonUpsertSink final : public Sink<Row> {
 public:
     FileJsonUpsertSink(std::string path,
                        std::vector<std::string> primary_key,
-                       std::map<std::string, int> decimal_scales = {})
+                       std::map<std::string, int> decimal_scales = {},
+                       clink::config::NonFinite non_finite = clink::config::NonFinite::Null)
         : path_(std::move(path)),
           primary_key_(std::move(primary_key)),
-          decimal_scales_(std::move(decimal_scales)) {
+          decimal_scales_(std::move(decimal_scales)),
+          non_finite_(non_finite) {
         if (primary_key_.empty()) {
             throw std::runtime_error("file_json_upsert_sink: 'primary_key' is required");
         }
@@ -9571,7 +9597,7 @@ public:
                 Row q = row;  // #56: quantise DECIMAL columns to declared scale + clean render
                 requantise_row_decimals(q, decimal_scales_);
                 clink::config::JsonValue v{clink::sql::to_json_object(q.values)};
-                auto s = clink::config::serialize_output(v);
+                auto s = clink::config::serialize_output(v, non_finite_);
                 out.write(s.data(), static_cast<std::streamsize>(s.size()));
                 out.put('\n');
             }
@@ -9635,6 +9661,7 @@ private:
     std::string path_;
     std::vector<std::string> primary_key_;
     std::map<std::string, int> decimal_scales_;  // #56: column -> declared scale
+    clink::config::NonFinite non_finite_;        // json_non_finite: how NaN / Inf are written
     // True when a state backend is attached but not a deferring one; the view is
     // then written through per dirty key and reloaded in open(). Same gate and
     // same stated deferring-backend gap as the operator family.
@@ -9652,8 +9679,12 @@ private:
 // while its net count stays positive.
 class ChangelogNetSink final : public Sink<Row> {
 public:
-    ChangelogNetSink(std::string path, std::map<std::string, int> decimal_scales = {})
-        : path_(std::move(path)), decimal_scales_(std::move(decimal_scales)) {}
+    ChangelogNetSink(std::string path,
+                     std::map<std::string, int> decimal_scales = {},
+                     clink::config::NonFinite non_finite = clink::config::NonFinite::Null)
+        : path_(std::move(path)),
+          decimal_scales_(std::move(decimal_scales)),
+          non_finite_(non_finite) {}
 
     void on_data(const Batch<Row>& batch) override {
         std::vector<std::string> dirty;
@@ -9717,7 +9748,7 @@ public:
                 Row q = slot.row;
                 requantise_row_decimals(q, decimal_scales_);
                 clink::config::JsonValue v{clink::sql::to_json_object(q.values)};
-                auto s = clink::config::serialize_output(v);
+                auto s = clink::config::serialize_output(v, non_finite_);
                 out.write(s.data(), static_cast<std::streamsize>(s.size()));
                 out.put('\n');
             }
@@ -9773,11 +9804,26 @@ private:
 
     std::string path_;
     std::map<std::string, int> decimal_scales_;
+    clink::config::NonFinite non_finite_;  // json_non_finite: how NaN / Inf are written
     // Same gate and stated deferring-backend gap as FileJsonUpsertSink.
     bool persist_inmem_ = false;
     clink::FlatMap<std::string, Slot> state_;
     bool flushed_{false};
 };
+
+// The text a partition value contributes to its file name, before percent-
+// encoding: a string verbatim, a NaN or infinity by name ("NaN", "Infinity",
+// "-Infinity"), anything else as its JSON text. A name, not JSON, so it is the
+// same whichever json_non_finite form the rows inside take.
+std::string partition_value_text(const clink::config::JsonValue& v) {
+    if (v.is_string()) {
+        return v.as_string();
+    }
+    if (v.is_number() && !std::isfinite(v.as_number())) {
+        return std::string{clink::config::non_finite_name(v.as_number())};
+    }
+    return v.serialize(0);
+}
 
 // A partitioning JSON sink: routes each row to a per-partition-key file (one
 // file per distinct value of the partition_by column), written on flush. For
@@ -9788,10 +9834,12 @@ class PartitionedJsonSink final : public Sink<Row> {
 public:
     PartitionedJsonSink(std::string base_path,
                         std::string partition_col,
-                        std::map<std::string, int> decimal_scales = {})
+                        std::map<std::string, int> decimal_scales = {},
+                        clink::config::NonFinite non_finite = clink::config::NonFinite::Null)
         : base_path_(std::move(base_path)),
           partition_col_(std::move(partition_col)),
-          decimal_scales_(std::move(decimal_scales)) {
+          decimal_scales_(std::move(decimal_scales)),
+          non_finite_(non_finite) {
         if (partition_col_.empty()) {
             throw std::runtime_error("partition_file_sink: 'partition_by' is required");
         }
@@ -9804,7 +9852,7 @@ public:
             Row q = row;
             requantise_row_decimals(q, decimal_scales_);
             const std::string line = clink::config::serialize_output(
-                clink::config::JsonValue{clink::sql::to_json_object(q.values)});
+                clink::config::JsonValue{clink::sql::to_json_object(q.values)}, non_finite_);
             // Write incrementally to a per-partition file handle (opened once,
             // truncating; kept open until flush) rather than buffering all rows -
             // so memory stays bounded by the number of distinct partitions. A
@@ -9849,8 +9897,7 @@ private:
         if (it == row.values.end() || it->second.is_null()) {
             return "%null";
         }
-        const std::string raw =
-            it->second.is_string() ? it->second.as_string() : it->second.serialize(0);
+        const std::string raw = partition_value_text(it->second);
         if (raw.empty()) {
             return "%empty";
         }
@@ -9874,6 +9921,7 @@ private:
     std::string base_path_;
     std::string partition_col_;
     std::map<std::string, int> decimal_scales_;
+    clink::config::NonFinite non_finite_;  // json_non_finite: how NaN / Inf are written
     std::map<std::string, std::ofstream> files_;
 };
 
@@ -9890,10 +9938,12 @@ class PartitionOverwriteSink final : public Sink<Row> {
 public:
     PartitionOverwriteSink(std::string dir,
                            std::vector<std::string> partition_cols,
-                           std::map<std::string, int> decimal_scales = {})
+                           std::map<std::string, int> decimal_scales = {},
+                           clink::config::NonFinite non_finite = clink::config::NonFinite::Null)
         : dir_(std::move(dir)),
           partition_cols_(std::move(partition_cols)),
-          decimal_scales_(std::move(decimal_scales)) {
+          decimal_scales_(std::move(decimal_scales)),
+          non_finite_(non_finite) {
         if (partition_cols_.empty()) {
             throw std::runtime_error("partition_overwrite_sink: 'partition_by' is required");
         }
@@ -9926,7 +9976,7 @@ public:
             Row q = row;
             requantise_row_decimals(q, decimal_scales_);
             const std::string line = clink::config::serialize_output(
-                clink::config::JsonValue{clink::sql::to_json_object(q.values)});
+                clink::config::JsonValue{clink::sql::to_json_object(q.values)}, non_finite_);
             auto [it, inserted] = files_.try_emplace(key);
             if (inserted) {
                 const std::string path = staging_ + "/" + key;
@@ -9990,8 +10040,7 @@ private:
                 key += "%null";
                 continue;
             }
-            const std::string raw =
-                it->second.is_string() ? it->second.as_string() : it->second.serialize(0);
+            const std::string raw = partition_value_text(it->second);
             if (raw.empty()) {
                 key += "%empty";
                 continue;
@@ -10015,6 +10064,7 @@ private:
     std::vector<std::string> partition_cols_;
     std::string staging_;
     std::map<std::string, int> decimal_scales_;
+    clink::config::NonFinite non_finite_;  // json_non_finite: how NaN / Inf are written
     std::map<std::string, std::ofstream> files_;
     bool published_ = false;
 };
@@ -12684,7 +12734,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<FileSink<Row>>(
                 path,
                 row_json_text_format_with_decimals(
-                    parse_decimal_columns(ctx.param_or("decimal_columns"))),
+                    parse_decimal_columns(ctx.param_or("decimal_columns")),
+                    json_non_finite_param(ctx, "file_json_sink")),
                 append,
                 "file_json_sink",
                 overwrite);
@@ -12707,7 +12758,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             auto sink = std::make_shared<FileSink2PC<Row>>(
                 dir,
                 row_json_text_format_with_decimals(
-                    parse_decimal_columns(ctx.param_or("decimal_columns"))),
+                    parse_decimal_columns(ctx.param_or("decimal_columns")),
+                    json_non_finite_param(ctx, "file_2pc_sink_row")),
                 ctx.subtask_idx,
                 "file_2pc_sink_row");
             // Declare commit-group membership so the coordinator can
@@ -12901,7 +12953,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<FileJsonUpsertSink>(
                 std::move(path),
                 std::move(pk),
-                parse_decimal_columns(ctx.param_or("decimal_columns")));
+                parse_decimal_columns(ctx.param_or("decimal_columns")),
+                json_non_finite_param(ctx, "file_json_upsert_sink"));
         });
 
     // changelog_net_sink: nets a changelog stream (insert/delete/update_*) into
@@ -12918,7 +12971,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                 path += "." + std::to_string(ctx.subtask_idx);
             }
             return std::make_shared<ChangelogNetSink>(
-                std::move(path), parse_decimal_columns(ctx.param_or("decimal_columns")));
+                std::move(path),
+                parse_decimal_columns(ctx.param_or("decimal_columns")),
+                json_non_finite_param(ctx, "changelog_net_sink"));
         });
 
     // partition_file_sink: writes one JSON file per distinct value of the
@@ -12939,7 +12994,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<PartitionedJsonSink>(
                 std::move(path),
                 std::move(partition_by),
-                parse_decimal_columns(ctx.param_or("decimal_columns")));
+                parse_decimal_columns(ctx.param_or("decimal_columns")),
+                json_non_finite_param(ctx, "partition_file_sink"));
         });
 
     // partition_overwrite_sink: the full-refresh partitioned backing (materialized
@@ -12982,7 +13038,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<PartitionOverwriteSink>(
                 std::move(path),
                 std::move(cols),
-                parse_decimal_columns(ctx.param_or("decimal_columns")));
+                parse_decimal_columns(ctx.param_or("decimal_columns")),
+                json_non_finite_param(ctx, "partition_overwrite_sink"));
         });
 
     // blackhole_sink_row: discard sink - counts then drops every row (the
@@ -13002,11 +13059,12 @@ void install(clink::plugin::PluginRegistry& reg) {
     // (-U / +U / -D) and the marker field itself is stripped from the printed
     // object. One fwrite per line keeps concurrent subtasks' lines whole, and
     // each record flushes immediately (a demo sink favours promptness over
-    // throughput). No params.
+    // throughput). Params: json_non_finite (optional, 'null' or 'string').
     reg.register_sink<Row>(
-        "print_sink_row", [](const BuildContext& /*ctx*/) -> std::shared_ptr<Sink<Row>> {
+        "print_sink_row", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
+            const auto non_finite = json_non_finite_param(ctx, "print_sink_row");
             return std::make_shared<FunctionSink<Row>>(
-                [](const Row& row) {
+                [non_finite](const Row& row) {
                     std::string prefix;
                     auto vals = clink::sql::to_json_object(row.values);
                     if (auto it = vals.find(std::string{kRowKindField}); it != vals.end()) {
@@ -13024,7 +13082,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                     const std::string line =
                         prefix +
                         clink::config::serialize_output(
-                            clink::config::JsonValue{clink::config::JsonObject{std::move(vals)}}) +
+                            clink::config::JsonValue{clink::config::JsonObject{std::move(vals)}},
+                            non_finite) +
                         "\n";
                     std::fwrite(line.data(), 1, line.size(), stdout);
                     std::fflush(stdout);
@@ -13228,11 +13287,24 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     // row_to_json_string: bridge from the Row channel back to the
     // string channel for sinks that consume std::string (kafka_sink_
-    // string). Encodes each Row as a single-line JSON object.
+    // string). Encodes each Row as a single-line JSON object. Params:
+    // json_non_finite (optional): how a NaN or infinity is written, 'null'
+    // (default) or 'string'. The planner forwards the sink table's option.
+    // non_finite_form='tagged' (optional) instead writes the tagged form clink's
+    // own parser reads back as the double, for a sink that hands the JSON to
+    // clink's Avro or Protobuf encoder rather than to a reader outside clink;
+    // the planner sets it for those formats. Any other value fails the build.
     reg.register_operator<Row, std::string>(
         "row_to_json_string",
-        [](const BuildContext&) -> std::shared_ptr<Operator<Row, std::string>> {
-            auto fmt = std::make_shared<clink::TextFormat<Row>>(row_json_text_format());
+        [](const BuildContext& ctx) -> std::shared_ptr<Operator<Row, std::string>> {
+            auto non_finite = json_non_finite_param(ctx, "row_to_json_string");
+            if (const auto form = ctx.param_or("non_finite_form"); form == "tagged") {
+                non_finite = clink::config::NonFinite::Tagged;
+            } else if (!form.empty()) {
+                throw std::invalid_argument("row_to_json_string: non_finite_form='" + form +
+                                            "' is not 'tagged'");
+            }
+            auto fmt = std::make_shared<clink::TextFormat<Row>>(row_json_text_format(non_finite));
             return std::make_shared<MapOperator<Row, std::string>>(
                 [fmt](const Row& r) -> std::string { return fmt->encode(r); },
                 "row_to_json_string");

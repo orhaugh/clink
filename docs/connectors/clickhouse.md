@@ -200,6 +200,8 @@ A script with two INSERTs from one source runs them as two jobs, each reading th
 
 Both sinks append only. `mode='upsert'` and exactly-once delivery are rejected at planning time for either. A materialised view over a keyed `GROUP BY` gets `mode='upsert'` automatically when it sets no mode, so a ClickHouse backing table for such a view must set `mode='append'` itself. Every updated aggregate then lands as a new row, and collapsing them to the latest per key is left to ClickHouse (a `ReplacingMergeTree` keyed on the group columns, for example). A full-refresh materialised view cannot use the native sink: each refresh would append the whole result again, and the planner refuses it. The planner also refuses `changelog='true'` on a native table.
 
+With `insert_format='jsoneachrow'` a NaN or infinite double reaches ClickHouse through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`. The native sink writes typed columns, which hold the value itself, and refuses the option. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Native sink
 
 ### What it guarantees

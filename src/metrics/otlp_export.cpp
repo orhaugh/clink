@@ -1,11 +1,14 @@
 #include "clink/metrics/otlp_export.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <random>
 #include <stdexcept>
 #include <thread>
+
+#include "clink/config/json.hpp"
 
 #ifdef CLINK_HAS_HTTP
 #include "clink/http/http_client.hpp"
@@ -58,7 +61,16 @@ std::string ju64(std::uint64_t v) {
     return "\"" + std::to_string(v) + "\"";
 }
 
+// A NaN or infinity (a histogram fed one) takes the protobuf-JSON mapping's
+// own spelling for a double, the strings "NaN", "Infinity" and "-Infinity":
+// %.17g printed it bare, which no collector parses. null would read as the
+// field's default, 0, so the String form is the one that keeps the value.
 std::string jdouble(double v) {
+    if (!std::isfinite(v)) {
+        std::string out;
+        config::append_non_finite(out, v, config::NonFinite::String);
+        return out;
+    }
     char buf[64];
     std::snprintf(buf, sizeof buf, "%.17g", v);
     return buf;

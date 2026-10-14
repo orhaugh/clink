@@ -523,6 +523,11 @@ TEST(RowColumnarBatcher, NumbersRenderedAsTextAreExact) {
     EXPECT_EQ(to_utf8(cfg::JsonValue{1.23456789012}), "1.23456789012");
     EXPECT_EQ(to_utf8(cfg::JsonValue{42.0}), "42");
     EXPECT_EQ(to_utf8(cfg::JsonValue{std::int64_t{-5}}), "-5");
+    // A text cell is not JSON: a NaN or infinity is named, never written as
+    // the tagged string the JSON writer keeps for clink's own read-back.
+    EXPECT_EQ(to_utf8(cfg::JsonValue{std::numeric_limits<double>::quiet_NaN()}), "NaN");
+    EXPECT_EQ(to_utf8(cfg::JsonValue{std::numeric_limits<double>::infinity()}), "Infinity");
+    EXPECT_EQ(to_utf8(cfg::JsonValue{-std::numeric_limits<double>::infinity()}), "-Infinity");
 }
 
 // --- Row layouts --------------------------------------------------------------

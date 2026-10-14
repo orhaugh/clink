@@ -234,6 +234,8 @@ CREATE TABLE feed (
 
 A `connector='http'` table must declare `format='json'` so the row is rendered to a JSON string before the string-channel `http_sink` receives it.
 
+A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Programmatic use of the Elasticsearch sink, based on the live test (`impls/http_connector/tests/test_elasticsearch_sink_live.cpp`). Each record is already a JSON object string:

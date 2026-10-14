@@ -499,6 +499,15 @@ bool append_ondemand(arrow::Type::type type_id,
             if (v.get_string().get(sv) != simdjson::SUCCESS) {
                 return false;
             }
+            // The row decode's parse reads a string that is exactly a tagged
+            // non-finite double (config::NonFinite::Tagged) as that double, so a
+            // text cell holding one is not faithful. The parser itself decides;
+            // only a string that starts with the tag byte pays for asking it.
+            if (!sv.empty() && sv.front() == clink::config::kNonFiniteTag &&
+                clink::config::parse(clink::config::JsonValue{std::string(sv)}.serialize(0))
+                    .is_number()) {
+                return false;
+            }
             return static_cast<arrow::StringBuilder*>(b)
                 ->Append(sv.data(), static_cast<std::int32_t>(sv.size()))
                 .ok();

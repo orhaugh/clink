@@ -318,8 +318,11 @@ inline int dec_compare(const Decimal& a, const Decimal& b) {
 // dec-string as an unquoted JSON number token (sentinel stripped) rather than a
 // quoted string. The operator-to-operator wire keeps the plain serialize (the
 // dec-string rides as an escaped String and round-trips exactly), so only the
-// terminal sink needs this. Non-decimal scalars defer to JsonValue::serialize.
-inline std::string serialize_output(const JsonValue& v) {
+// terminal sink needs this. Non-decimal scalars defer to
+// JsonValue::serialize_external, so a NaN or infinity is written per
+// `non_finite`: null by default, or "NaN" / "Infinity" / "-Infinity" for a sink
+// that sets json_non_finite='string'.
+inline std::string serialize_output(const JsonValue& v, NonFinite non_finite = NonFinite::Null) {
     if (is_dec_string(v)) {
         return v.as_string().substr(1);  // canonical decimal, unquoted, no sentinel
     }
@@ -331,7 +334,7 @@ inline std::string serialize_output(const JsonValue& v) {
                 out += ',';
             }
             first = false;
-            out += serialize_output(e);
+            out += serialize_output(e, non_finite);
         }
         out += ']';
         return out;
@@ -346,12 +349,12 @@ inline std::string serialize_output(const JsonValue& v) {
             first = false;
             out += JsonValue{k}.serialize(0);  // quoted + escaped key
             out += ':';
-            out += serialize_output(val);
+            out += serialize_output(val, non_finite);
         }
         out += '}';
         return out;
     }
-    return v.serialize(0);
+    return v.serialize_external(non_finite);
 }
 
 // Scale-invariant canonical key for GROUP BY / DISTINCT / min-max bucketing, so

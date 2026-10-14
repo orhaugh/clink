@@ -265,6 +265,40 @@ TEST(SqlUnsupportedSemantics, InsertFormatIsAClosedDomain) {
     EXPECT_NE(near_miss.find("insert_format"), std::string::npos) << near_miss;
 }
 
+// json_non_finite picks how a JSON sink writes NaN and the infinities; any
+// value but the two it names is refused at CREATE TABLE, listing them.
+TEST(SqlUnsupportedSemantics, JsonNonFiniteIsAClosedDomain) {
+    for (const char* v : {"null", "string"}) {
+        EXPECT_EQ(register_ddl(std::string("CREATE TABLE t (k DOUBLE) WITH (connector='kafka', "
+                                           "format='json', topic='t', json_non_finite='") +
+                               v + "');"),
+                  "")
+            << "json_non_finite='" << v << "' was refused";
+    }
+    for (const char* bad : {"nan", "String", "NULL", "", "tagged"}) {
+        const auto err =
+            register_ddl(std::string("CREATE TABLE t (k DOUBLE) WITH (connector='kafka', "
+                                     "format='json', topic='t', json_non_finite='") +
+                         bad + "');");
+        ASSERT_FALSE(err.empty()) << "json_non_finite='" << bad << "' was accepted";
+        EXPECT_NE(err.find("'null', 'string'"), std::string::npos) << err;
+        // The message says what the option decides; the general "ignored"
+        // consequence would be untrue, since the planner refuses it too.
+        EXPECT_NE(err.find("NaN and the infinities"), std::string::npos) << err;
+        EXPECT_EQ(err.find("ignored"), std::string::npos) << err;
+    }
+    // Other closed domains keep the general consequence.
+    const auto bad_mode = register_ddl(
+        "CREATE TABLE t (k BIGINT) WITH (connector='file', format='json', path='/tmp/x', "
+        "mode='upsrt');");
+    EXPECT_NE(bad_mode.find("is ignored"), std::string::npos) << bad_mode;
+    const auto near_miss = register_ddl(
+        "CREATE TABLE t (k DOUBLE) WITH (connector='kafka', format='json', topic='t', "
+        "json_non_finit='string');");
+    ASSERT_FALSE(near_miss.empty()) << "a misspelt json_non_finite was accepted";
+    EXPECT_NE(near_miss.find("json_non_finite"), std::string::npos) << near_miss;
+}
+
 TEST(SqlUnsupportedSemantics, InsertFormatIsRefusedOffClickHouse) {
     const auto kafka = register_ddl(
         "CREATE TABLE t (k BIGINT) WITH (connector='kafka', format='json', topic='t', "

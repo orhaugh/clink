@@ -75,6 +75,8 @@ CREATE TABLE hdfs_out (
 );
 ```
 
+A `format='json'` sink table's rows are serialised by the `row_to_json_string` bridge, so a NaN or infinite double in the stored JSON text is `null`, or `"NaN"`, `"Infinity"` or `"-Infinity"` with `json_non_finite='string'`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Based on the round-trip in `impls/webhdfs/tests/test_webhdfs_parquet.cpp`: write three `int64` records to a Parquet file on HDFS, then read them back.

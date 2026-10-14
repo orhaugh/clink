@@ -168,6 +168,8 @@ CREATE TABLE orders_out (
 
 On the SQL path, `columns` defaults to the declared table schema, so it does not need to be repeated. `mode='upsert'` with a PRIMARY KEY selects the changelog-aware upsert sink (`mysql_upsert_sink`, see Delivery semantics), which lets a retracting query maintain the table; `on_duplicate='update'` is the lighter append-stream idempotent-by-key option on the default sink. Exactly-once (XA 2PC) delivery is not supported.
 
+A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 The sink and cursor source can be constructed directly from their typed Options, as the live test does in `impls/mysql/tests/test_mysql_live.cpp`:

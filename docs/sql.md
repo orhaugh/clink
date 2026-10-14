@@ -111,6 +111,7 @@ Per-connector options live in the [connector reference](connectors/README.md).
 | `primary_key` | comma-separated key columns; required for `mode='upsert'` |
 | `delivery_guarantee` | `'at_least_once'` (default) or `'exactly_once'` |
 | `partition_by` | partition column(s) for a file or object-store sink |
+| `json_non_finite` | how a sink that writes JSON writes NaN and the infinities: `'null'` (default) or `'string'` (`"NaN"`, `"Infinity"`, `"-Infinity"`); see [NaN and infinity in JSON output](connectors/README.md#nan-and-infinity-in-json-output) |
 
 ### Event time and watermarks
 
@@ -297,7 +298,7 @@ through), text (`TEXT`/`VARCHAR`) and `BOOLEAN`. Casting to date, timestamp or
 | `json_value(j, path)` | scalar at a path (as text) |
 | `json_query(j, path)` | object/array at a path (as JSON text) |
 | `json_exists(j, path)` | boolean |
-| `json_object(k, v, ...)` | build a JSON object |
+| `json_object(k, v, ...)` | build a JSON object (a NaN or infinite value is written as `null`) |
 | `ARRAY[e1, e2, ...]`, `a[i]` | array literal, 1-based subscript |
 | `MAP(k1, v1, ...)`, `m['k']` | map literal and lookup |
 | `ROW(v1, ...)`, `(r).f` | row literal and field access |
@@ -521,7 +522,8 @@ OUTPUT (vec DOUBLE PRECISION ARRAY)
 WITH ('provider'='http', 'endpoint'='http://localhost:8900/embed');
 ```
 
-Providers are `http` (POST features as a JSON row, read named output columns back),
+Providers are `http` (POST features as a JSON row, read named output columns back; a
+NaN or infinite feature is sent as `null`),
 `onnx` (a local model file, opt-in build) and in-process closures.
 
 **Score rows** with `ML_PREDICT`, which appends the model's output columns:

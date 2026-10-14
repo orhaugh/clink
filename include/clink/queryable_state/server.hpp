@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <string>
 
+#include "clink/config/json.hpp"
 #include "clink/http/http_server.hpp"
 #include "clink/queryable_state/registry.hpp"
 
@@ -104,6 +105,29 @@ inline std::string json_escape(const std::string& s) {
     }
     out.push_back('"');
     return out;
+}
+
+// A JSON slot's value text is clink's internal JSON, where a NaN or an infinity
+// is the tagged string config::parse reads back as the double; the Arrow scan
+// routes read it that way and carry the double itself. A JSON response is read
+// by something other than clink, so it carries null there instead. Only text
+// holding the tag's escape is parsed and rewritten.
+inline std::string served_json(const std::string& text) {
+    if (text.find("\\u0002") == std::string::npos) {
+        return text;
+    }
+    try {
+        return config::parse(text).serialize_external();
+    } catch (...) {
+        return text;
+    }
+}
+
+// The scan query parameter a clink reader passes to keep the internal form:
+// the coordinator's fan-out, so its Arrow scan carries the double too.
+inline bool wants_tagged(const http::HttpRequest& req) {
+    const auto it = req.query.find("non_finite");
+    return it != req.query.end() && it->second == "tagged";
 }
 
 }  // namespace detail
@@ -235,7 +259,7 @@ inline void register_routes(http::HttpServer& server,
                        return resp;
                    }
                    resp.body = "{\"key\":" + detail::json_escape(key_it->second) +
-                               ",\"value\":" + *value + "}";
+                               ",\"value\":" + detail::served_json(*value) + "}";
                    return resp;
                });
 
@@ -244,7 +268,9 @@ inline void register_routes(http::HttpServer& server,
     //   {"entries":[{"key":"...","value":{...}}, ...],"truncated":bool}.
     // Order unspecified. The scan holds the operator's serving lock for
     // its duration - hence the clamp; state-as-table reads are bounded
-    // snapshots, not cursors.
+    // snapshots, not cursors. A NaN or infinity in a value is null, unless
+    // the caller passes non_finite=tagged (clink's own fan-out does) to get
+    // the internal form it reads back as the double.
     server.get("/api/v1/queryable_state/op/:role/subtask/:subtask/json/:slot/scan",
                [&registry](const http::HttpRequest& req) -> http::HttpResponse {
                    http::HttpResponse resp;
@@ -284,13 +310,15 @@ inline void register_routes(http::HttpServer& server,
                        resp.body = "{\"error\":\"slot not registered\"}";
                        return resp;
                    }
+                   const bool tagged = detail::wants_tagged(req);
                    std::string body = "{\"entries\":[";
                    for (std::size_t i = 0; i < result->entries.size(); ++i) {
                        if (i > 0) {
                            body.push_back(',');
                        }
+                       const auto& value = result->entries[i].second;
                        body += "{\"key\":" + detail::json_escape(result->entries[i].first) +
-                               ",\"value\":" + result->entries[i].second + "}";
+                               ",\"value\":" + (tagged ? value : detail::served_json(value)) + "}";
                    }
                    body += "],\"truncated\":";
                    body += result->truncated ? "true" : "false";

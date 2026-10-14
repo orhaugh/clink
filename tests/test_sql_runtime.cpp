@@ -10,6 +10,7 @@
 #include <any>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <random>
@@ -20121,6 +20123,455 @@ TEST(SqlRuntime, RowBindIntoJsonFileSinkKeepsRowPathBytes) {
     EXPECT_EQ(got, want);
     std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
+}
+
+// ---------------------------------------------------------------------------
+// Non-finite doubles (NaN, +Inf, -Inf) in JSON output and in the internal codec.
+//
+// JSON has no token for them. A JSON sink writes them as null by default, or as
+// the strings "NaN", "Infinity" and "-Infinity" with json_non_finite='string';
+// they used to come out bare (nan, inf), which no JSON reader accepts. Text
+// clink reads back itself (operator state, the row codec) uses a tagged form
+// its own parser reads back as the same double.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Run `insert` over a file source of `lines` into a file sink declared with
+// `sink_opts`, and return the sink's output lines.
+std::vector<std::string> nf_run_to_file(const std::string& tag,
+                                        const std::vector<std::string>& lines,
+                                        const std::string& src_cols,
+                                        const std::string& sink_cols,
+                                        const std::string& sink_opts,
+                                        const std::string& insert) {
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto stem = "clink_sql_nf_" + tag + "_" + std::to_string(::getpid());
+    const auto in_path = dir / (stem + "_in.ndjson");
+    const auto out_path = dir / (stem + "_out.ndjson");
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    write_lines(in_path, lines);
+    Catalog cat;
+    auto ddl =
+        parse("CREATE TABLE nf_src " + src_cols + " WITH (connector='file', format='json', path='" +
+              in_path.string() + "');CREATE TABLE nf_out " + sink_cols +
+              " WITH (connector='file', format='json', path='" + out_path.string() + "'" +
+              sink_opts + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, insert.c_str());
+
+    InProcessCluster cluster("worker-sql-nf-" + tag, 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    EXPECT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+    auto out = read_lines(out_path);
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    return out;
+}
+
+// Output lines keyed by their "id" column, each parsed with clink's own parser
+// (which throws on a token that is not JSON, the old bare nan / inf included).
+std::map<std::int64_t, clink::config::JsonValue> nf_by_id(const std::vector<std::string>& lines) {
+    std::map<std::int64_t, clink::config::JsonValue> out;
+    for (const auto& l : lines) {
+        clink::config::JsonValue js;
+        try {
+            js = clink::config::parse(l);
+        } catch (const std::exception& e) {
+            ADD_FAILURE() << "sink wrote invalid JSON (" << e.what() << "): " << l;
+            continue;
+        }
+        EXPECT_EQ(l.find("\\u0002"), std::string::npos) << "internal tag leaked: " << l;
+        out[js.at("id").as_int()] = std::move(js);
+    }
+    return out;
+}
+
+// s: text CAST to a double, the way a query meets NaN / Inf. f: a DOUBLE read
+// from JSON, carrying the finite edge cases whose text must not change.
+const std::vector<std::string> kNfLines = {
+    R"({"id":1,"s":"NaN","f":-0.0})",
+    R"({"id":2,"s":"Infinity","f":4.9406564584124654e-324})",
+    R"({"id":3,"s":"-Infinity","f":2.2250738585072009e-308})",
+    R"({"id":4,"s":"1.5","f":1.7976931348623157e308})",
+    R"({"id":5,"s":"-2.5","f":-1.7976931348623157e308})",
+    R"({"id":6,"s":"0","f":2.2250738585072014e-308})",
+};
+
+constexpr const char* kNfSrcCols = "(id BIGINT, s TEXT, f DOUBLE)";
+constexpr const char* kNfSinkCols = "(id BIGINT, d DOUBLE, f DOUBLE)";
+constexpr const char* kNfInsert =
+    "INSERT INTO nf_out SELECT id, CAST(s AS DOUBLE) AS d, f FROM nf_src";
+
+// The finite edge cases arrive exactly as they were read.
+void nf_expect_finite_edges(const std::map<std::int64_t, clink::config::JsonValue>& rows) {
+    using L = std::numeric_limits<double>;
+    const double nz = rows.at(1).at("f").as_number();
+    EXPECT_EQ(nz, 0.0);
+    EXPECT_EQ(rows.at(2).at("f").as_number(), L::denorm_min());
+    EXPECT_EQ(rows.at(3).at("f").as_number(), 2.2250738585072009e-308);  // largest subnormal
+    EXPECT_EQ(rows.at(4).at("f").as_number(), L::max());
+    EXPECT_EQ(rows.at(5).at("f").as_number(), L::lowest());
+    EXPECT_EQ(rows.at(6).at("f").as_number(), L::min());
+    EXPECT_EQ(rows.at(4).at("d").as_number(), 1.5);
+    EXPECT_EQ(rows.at(5).at("d").as_number(), -2.5);
+    EXPECT_EQ(rows.at(6).at("d").as_number(), 0.0);
+}
+
+}  // namespace
+
+TEST(SqlRuntime, JsonSinkWritesNonFiniteDoublesAsNullByDefault) {
+    ensure_sql_installed_once();
+    const auto rows =
+        nf_by_id(nf_run_to_file("null", kNfLines, kNfSrcCols, kNfSinkCols, "", kNfInsert));
+    ASSERT_EQ(rows.size(), kNfLines.size());
+    for (const std::int64_t id : {1, 2, 3}) {
+        EXPECT_TRUE(rows.at(id).at("d").is_null()) << "id " << id;
+    }
+    nf_expect_finite_edges(rows);
+}
+
+TEST(SqlRuntime, JsonSinkWritesNonFiniteDoublesAsStringsOnRequest) {
+    ensure_sql_installed_once();
+    const auto rows = nf_by_id(nf_run_to_file(
+        "string", kNfLines, kNfSrcCols, kNfSinkCols, ", json_non_finite='string'", kNfInsert));
+    ASSERT_EQ(rows.size(), kNfLines.size());
+    EXPECT_EQ(rows.at(1).at("d").as_string(), "NaN");
+    EXPECT_EQ(rows.at(2).at("d").as_string(), "Infinity");
+    EXPECT_EQ(rows.at(3).at("d").as_string(), "-Infinity");
+    nf_expect_finite_edges(rows);
+}
+
+// Through a keyed aggregate: NaN group keys form one group, an infinite MAX
+// survives the aggregate's state and key text, and the sink applies the option.
+TEST(SqlRuntime, GroupByOverNonFiniteDoublesWritesValidJson) {
+    ensure_sql_installed_once();
+    const std::vector<std::string> lines = {
+        R"({"id":1,"s":"NaN","v":"Infinity"})",
+        R"({"id":2,"s":"NaN","v":"1"})",
+        R"({"id":3,"s":"2","v":"-Infinity"})",
+        R"({"id":4,"s":"2","v":"3"})",
+    };
+    const std::string insert =
+        "INSERT INTO nf_out SELECT g, MAX(x) AS mx, MIN(x) AS mn, COUNT(*) AS n FROM "
+        "(SELECT CAST(s AS DOUBLE) AS g, CAST(v AS DOUBLE) AS x FROM nf_src) AS t GROUP BY g";
+    for (const bool named : {false, true}) {
+        const auto out = nf_run_to_file(named ? "agg_string" : "agg_null",
+                                        lines,
+                                        "(id BIGINT, s TEXT, v TEXT)",
+                                        "(g DOUBLE, mx DOUBLE, mn DOUBLE, n BIGINT)",
+                                        named ? ", json_non_finite='string'" : "",
+                                        insert);
+        // The last emission per group is its final value.
+        std::map<std::string, clink::config::JsonValue> last;
+        for (const auto& l : out) {
+            const auto js = clink::config::parse(l);  // throws on an invalid token
+            EXPECT_EQ(l.find("\\u0002"), std::string::npos) << l;
+            last[js.at("g").serialize(0)] = js;
+        }
+        ASSERT_EQ(last.size(), 2u) << "NaN keys must group together";
+        const std::string nan_key = named ? R"("NaN")" : "null";
+        ASSERT_EQ(last.count(nan_key), 1u);
+        const auto& nan_group = last.at(nan_key);
+        EXPECT_EQ(nan_group.at("n").as_int(), 2);
+        const auto& two = last.at("2");
+        EXPECT_EQ(two.at("n").as_int(), 2);
+        EXPECT_EQ(two.at("mx").as_number(), 3.0);
+        if (named) {
+            EXPECT_EQ(nan_group.at("mx").as_string(), "Infinity");
+            EXPECT_EQ(two.at("mn").as_string(), "-Infinity");
+        } else {
+            EXPECT_TRUE(nan_group.at("mx").is_null());
+            EXPECT_TRUE(two.at("mn").is_null());
+        }
+    }
+}
+
+// An aggregate's state holds the group values and MIN / MAX accumulators as
+// JSON text. An infinite accumulator or a NaN group value was written as inf /
+// nan, which the restore's own parse rejected, so the bucket was lost across a
+// checkpoint. Drives the runner's checkpoint sequence as the restore test above
+// does.
+TEST(SqlRuntime, GroupByStateWithNonFiniteDoublesSurvivesSnapshotRestore) {
+    ensure_sql_installed_once();
+    using L = std::numeric_limits<double>;
+
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE nf_t (g DOUBLE, x DOUBLE) "
+                    "WITH (connector='file', format='json', path='/tmp/nf_restore_in.ndjson');"
+                    "CREATE TABLE nf_r (g DOUBLE, mx DOUBLE, mn DOUBLE, n BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/nf_restore_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO nf_r SELECT g, MAX(x) AS mx, MIN(x) AS mn, COUNT(*) AS n "
+                        "FROM nf_t GROUP BY g");
+    std::map<std::string, std::string> agg_params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "aggregate_row") {
+            agg_params = op.params;
+        }
+    }
+    ASSERT_FALSE(agg_params.empty());
+
+    auto build_agg = [&]() {
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            "aggregate_row", std::string{kChannelRow}, std::string{kChannelRow});
+        EXPECT_NE(factory, nullptr);
+        cluster::OperatorBuildContext octx;
+        octx.params = agg_params;
+        return std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+    };
+    auto mk = [](double g, double x) {
+        Row r;
+        r.values["g"] = clink::config::JsonValue{g};
+        r.values["x"] = clink::config::JsonValue{x};
+        return Record<Row>{std::move(r)};
+    };
+    struct Result {
+        double mx;
+        double mn;
+        std::int64_t n;
+    };
+    // Last emission per group, keyed by the group value's name.
+    auto feed = [](Operator<Row, Row>& op, std::vector<Record<Row>> recs) {
+        Batch<Row> b;
+        for (auto& r : recs) {
+            b.push(std::move(r));
+        }
+        BoundedChannel<StreamElement<Row>> ch(64);
+        Emitter<Row> em(&ch);
+        op.process(StreamElement<Row>::data(std::move(b)), em);
+        std::map<std::string, Result> out;
+        while (auto el = ch.try_pop()) {
+            if (!el->is_data()) {
+                continue;
+            }
+            for (const auto& rec : el->as_data()) {
+                const Row& row = rec.value();
+                const double g = row.values.at("g").as_number();
+                const std::string key = std::isnan(g) ? "NaN" : std::to_string(g);
+                out[key] = Result{row.values.at("mx").as_number(),
+                                  row.values.at("mn").as_number(),
+                                  row.values.at("n").as_int()};
+            }
+        }
+        return out;
+    };
+
+    const OperatorId op_id{4343};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    Snapshot snap;
+    {
+        auto op = build_agg();
+        RuntimeContext ctx{op_id, "agg", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        auto got = feed(*op, {mk(L::quiet_NaN(), 1.0), mk(1.0, L::infinity()), mk(1.0, 2.0)});
+        ASSERT_EQ(got.count("NaN"), 1u);
+        EXPECT_EQ(got.at("NaN").n, 1);
+        EXPECT_EQ(got.at(std::to_string(1.0)).mx, L::infinity());
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+    {
+        auto restored = std::make_shared<InMemoryStateBackend>();
+        restored->restore(snap);
+        auto op = build_agg();
+        RuntimeContext ctx{op_id, "agg", restored.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        auto got = feed(*op, {mk(L::quiet_NaN(), -L::infinity()), mk(1.0, 0.5)});
+        ASSERT_EQ(got.count("NaN"), 1u);
+        EXPECT_EQ(got.at("NaN").n, 2) << "the NaN group's state was lost across the restore";
+        EXPECT_EQ(got.at("NaN").mx, 1.0);
+        EXPECT_EQ(got.at("NaN").mn, -L::infinity());
+        const auto& one = got.at(std::to_string(1.0));
+        EXPECT_EQ(one.n, 3) << "the group holding an infinite MAX lost its state";
+        EXPECT_EQ(one.mx, L::infinity());
+        EXPECT_EQ(one.mn, 0.5);
+        op->close();
+    }
+}
+
+// The bridge in front of Kafka and the other string sinks, built as the planner
+// builds it: null by default, the strings on request, a bad value refused.
+TEST(SqlRuntime, RowToJsonStringBridgeTakesTheNonFiniteOption) {
+    ensure_sql_installed_once();
+    auto run = [](std::map<std::string, std::string> params) {
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            "row_to_json_string", std::string{kChannelRow}, "string");
+        EXPECT_NE(factory, nullptr);
+        cluster::OperatorBuildContext octx;
+        octx.params = std::move(params);
+        auto op = std::static_pointer_cast<Operator<Row, std::string>>(factory->build(octx));
+        Row r;
+        r.values["nan"] = clink::config::JsonValue{std::numeric_limits<double>::quiet_NaN()};
+        r.values["inf"] = clink::config::JsonValue{-std::numeric_limits<double>::infinity()};
+        r.values["one"] = clink::config::JsonValue{1.25};
+        Batch<Row> b;
+        b.push(Record<Row>{std::move(r)});
+        BoundedChannel<StreamElement<std::string>> ch(8);
+        Emitter<std::string> em(&ch);
+        op->process(StreamElement<Row>::data(std::move(b)), em);
+        std::string line;
+        while (auto el = ch.try_pop()) {
+            if (el->is_data()) {
+                for (const auto& rec : el->as_data()) {
+                    line = rec.value();
+                }
+            }
+        }
+        return line;
+    };
+    EXPECT_EQ(run({}), R"({"inf":null,"nan":null,"one":1.25})");
+    EXPECT_EQ(run({{"json_non_finite", "null"}}), R"({"inf":null,"nan":null,"one":1.25})");
+    EXPECT_EQ(run({{"json_non_finite", "string"}}),
+              R"({"inf":"-Infinity","nan":"NaN","one":1.25})");
+    try {
+        (void)run({{"json_non_finite", "nan"}});
+        FAIL() << "the bridge accepted json_non_finite='nan'";
+    } catch (const std::exception& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("row_to_json_string"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("'null', 'string'"), std::string::npos) << msg;
+    }
+    // In front of an Avro or Protobuf encoder the planner asks for the tagged
+    // form, which clink's parser (and so the encoder) reads back as the double.
+    const auto tagged = run({{"non_finite_form", "tagged"}});
+    EXPECT_EQ(tagged, R"({"inf":"\u0002-Infinity","nan":"\u0002NaN","one":1.25})");
+    const auto back = clink::config::parse(tagged);
+    EXPECT_TRUE(std::isnan(back.at("nan").as_number()));
+    EXPECT_EQ(back.at("inf").as_number(), -std::numeric_limits<double>::infinity());
+    EXPECT_THROW((void)run({{"non_finite_form", "lossless"}}), std::exception);
+}
+
+// Every Row sink that writes JSON itself refuses a bad value when it is built,
+// so a programmatic job cannot get past the check the planner makes.
+TEST(SqlRuntime, RowJsonSinksRefuseABadNonFiniteValue) {
+    ensure_sql_installed_once();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_sql_nf_sinks_" + std::to_string(::getpid()));
+    std::filesystem::create_directories(dir);
+    for (const char* type : {"file_json_sink",
+                             "file_2pc_sink_row",
+                             "file_json_upsert_sink",
+                             "changelog_net_sink",
+                             "partition_file_sink",
+                             "partition_overwrite_sink",
+                             "print_sink_row"}) {
+        const auto* f =
+            cluster::OperatorRegistry::default_instance().find_sink(type, std::string{kChannelRow});
+        ASSERT_NE(f, nullptr) << type;
+        cluster::OperatorBuildContext octx;
+        octx.params = {{"path", (dir / type).string()},
+                       {"primary_key", "id"},
+                       {"partition_by", "id"},
+                       {"json_non_finite", "Infinity"}};
+        octx.parallelism = 1;
+        try {
+            (void)f->build(octx);
+            ADD_FAILURE() << type << " accepted json_non_finite='Infinity'";
+        } catch (const std::exception& e) {
+            const std::string msg = e.what();
+            EXPECT_NE(msg.find(type), std::string::npos) << msg;
+            EXPECT_NE(msg.find("'null', 'string'"), std::string::npos) << msg;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// A partition file is named after its partition value. A NaN or infinity is
+// named the same whichever form the rows inside take, never as JSON text.
+TEST(SqlRuntime, PartitionFileSinkNamesNonFinitePartitionValues) {
+    ensure_sql_installed_once();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_sql_nf_part_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto base = dir / "p";
+    const auto* f = cluster::OperatorRegistry::default_instance().find_sink(
+        "partition_file_sink", std::string{kChannelRow});
+    ASSERT_NE(f, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = {{"path", base.string()}, {"partition_by", "g"}, {"json_non_finite", "string"}};
+    octx.parallelism = 1;
+    auto sink = std::static_pointer_cast<Sink<Row>>(f->build(octx));
+    sink->open();
+    Batch<Row> b;
+    for (const double g : {std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity()}) {
+        Row r;
+        r.values["g"] = clink::config::JsonValue{g};
+        b.push(Record<Row>{std::move(r)});
+    }
+    sink->on_data(b);
+    sink->flush();
+    EXPECT_EQ(read_lines(dir / "p.NaN"), std::vector<std::string>{R"({"g":"NaN"})"});
+    EXPECT_EQ(read_lines(dir / "p.Infinity"), std::vector<std::string>{R"({"g":"Infinity"})"});
+    EXPECT_EQ(read_lines(dir / "p.-Infinity"), std::vector<std::string>{R"({"g":"-Infinity"})"});
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+namespace {
+
+// LateDataWindowSource with the late record carrying an infinite amount.
+class LateNonFiniteWindowSource final : public Source<Row> {
+public:
+    bool produce(Emitter<Row>& out) override {
+        if (this->cancelled() || done_) {
+            return false;
+        }
+        Batch<Row> b1;
+        b1.push(window_input_row(1, 1, 5));
+        out.emit_data(std::move(b1));
+        out.emit_watermark(Watermark{EventTime{10}});  // fires + purges [0,10)
+        Batch<Row> b2;
+        auto late = window_input_row(1, 2, 0);  // LATE: belongs to the purged [0,10)
+        late.value().values["amt"] =
+            clink::config::JsonValue{std::numeric_limits<double>::infinity()};
+        b2.push(std::move(late));
+        out.emit_data(std::move(b2));
+        out.emit_watermark(Watermark{EventTime{30}});
+        done_ = true;
+        return false;
+    }
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    std::string name() const override { return "late_non_finite_window_src"; }
+
+private:
+    bool done_ = false;
+};
+
+}  // namespace
+
+// The dead-letter payload is read only outside clink (the logging queue, or a
+// host's own queue), so it is external JSON: an infinite value is null, never
+// the tagged form clink keeps for text it reads back itself.
+TEST(SqlRuntime, DeadLetterPayloadWritesNonFiniteAsNull) {
+    ensure_sql_installed_once();
+    CapturingDeadLetterQueue dlq;
+    run_tumbling_window_with(std::make_shared<LateNonFiniteWindowSource>(),
+                             std::make_shared<InMemoryStateBackend>(),
+                             {{"late_records_to_dlq", "true"}},
+                             &dlq);
+    const auto recs = dlq.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_NE(recs[0].payload.find(R"("amt":null)"), std::string::npos) << recs[0].payload;
+    EXPECT_EQ(recs[0].payload.find("\\u0002"), std::string::npos) << recs[0].payload;
+    EXPECT_TRUE(clink::config::parse(recs[0].payload).at("amt").is_null());
 }
 
 }  // namespace clink::sql

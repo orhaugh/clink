@@ -204,6 +204,8 @@ id it got back. `mode='upsert'` and exactly-once (`kafka_2pc_sink_string`)
 sinks take the same options; an upsert sink keeps its JSON-derived primary
 key as the message key and frames only the value.
 
+A NaN or infinite double keeps its value through `format='avro'` and `format='protobuf'`. The planner gives the bridge in front of such a sink `non_finite_form='tagged'`, so it writes the tagged form clink's parser reads back as the double, and the encoder writes the IEEE value itself: in a nullable Avro field (the union with null a derived schema declares, where the `double` or `float` branch is chosen), a required one, and a Protobuf `double` or `float` field. `json_non_finite` is refused on these formats. `format='json-schema'` writes JSON text, so it follows `json_non_finite` like any JSON sink: `null` by default, or `"NaN"`, `"Infinity"` and `"-Infinity"`. Decoding is unchanged: a source reading Avro or Protobuf turns a NaN or an infinity into `null`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Programmatic use
 
 `impls/kafka/include/clink/kafka/string_channel.hpp` builds the same source

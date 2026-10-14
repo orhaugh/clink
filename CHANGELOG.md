@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+**JSON output writes NaN and the infinities deliberately, and clink reads its
+own back.** JSON has no token for a non-finite double, and every writer printed
+one bare, as `nan`, `inf` or `-inf` (`-nan` on glibc for a NaN with its sign bit
+set), which no JSON reader accepts. A file sink, and Kafka and every other sink
+the `row_to_json_string` bridge feeds, wrote lines their consumers could not
+parse. The queryable-state API served bodies its own coordinator could not
+parse, so a fan-out scan silently dropped that subtask's entries and the Arrow
+scan failed. The same tokens sat in text clink reads back itself, and its parser
+refused them too: the row codec dropped a row carrying one at a network edge,
+and an aggregate whose state held one (a `MAX` that reached infinity, a NaN
+group value) lost that bucket on restore. One helper in `config::json` now
+decides the form for every writer:
+
+| Writer | Before | After |
+| --- | --- | --- |
+| JSON sinks: `file`, `print`, `changelog` and the `row_to_json_string` bridge (Kafka with `format='json'` or `'json-schema'`, RabbitMQ, NATS, Pulsar, Pub/Sub, HTTP family, Redis, MySQL, Postgres, Cassandra, ClickHouse `jsoneachrow`, Kinesis, Firehose, DynamoDB, object-store Parquet) | `nan`, `inf`, `-inf` | `null` by default; `"NaN"`, `"Infinity"`, `"-Infinity"` with the new table option `json_non_finite='string'` |
+| Kafka with `format='avro'` or `'protobuf'` | the encoder refused the row | the IEEE value itself, in a nullable field as in a required one; `json_non_finite` is refused there |
+| HTTP API JSON responses (queryable state), dead-letter payloads, `json_object`, the `ML_PREDICT` http provider's request | `nan`, `inf`, `-inf` | `null` |
+| Queryable-state Arrow scan | an error (the worker) or the subtask dropped (the coordinator) | the float64 value itself |
+| OTLP export | `nan`, `inf` | `"NaN"`, `"Infinity"`, `"-Infinity"`, the protobuf-JSON spelling |
+| Row codec, operator state, group and join key text | `nan`, `inf`, `-inf`, refused on read | `"\u0002NaN"`, `"\u0002Infinity"`, `"\u0002-Infinity"`, read back as the same double |
+| A double in a typed (Arrow, Parquet) text column, `STRING_AGG`, `partition_by` file names | `nan`, `inf`, `-inf` | `NaN`, `Infinity`, `-Infinity` |
+
+`json_non_finite` takes `'null'` (the default) or `'string'`; any other value
+is refused at `CREATE TABLE` and again at planning, naming both, and the option
+is refused on a sink that writes no JSON or writes a binary registry format.
+Finite doubles are written exactly as before, `-0.0`, subnormals and the
+extremes included. A JSON source reads `null` back as SQL `NULL`; the strings
+stay strings.
+
+Upgrading: state or a frame an earlier release wrote with a bare token still
+fails to decode, as it always did. The key text of a NaN or infinite value
+changed, from `nan` / `inf` to the tagged form, so a key an earlier release
+wrote for such a row does not match the same row after the upgrade. A
+`SELECT DISTINCT` marker is the case that restored before: expect one
+re-emission per such row. The `file` upsert and `changelog` sinks' state, and
+an aggregate's, held the value itself too and never restored, so they lose
+nothing.
+
 **The Kafka transactional sink and the Iceberg sink wait at the end of input
 for their last commit.** At a clean end of input a sink's runner holds the sink
 open, for up to 30 seconds, while it reports staged commits, so a bounded job's

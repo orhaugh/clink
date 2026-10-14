@@ -236,8 +236,11 @@ inline constexpr std::string_view kChannelRow = "row";
 // Line-oriented JSON text format for FileSource<Row> / FileSink<Row>.
 // One row per line; lines that don't parse as JSON objects are skipped
 // (decoder returns nullopt). The encoder emits the JSON object with
-// no trailing newline; FileSink adds the newline.
-inline clink::TextFormat<Row> row_json_text_format() {
+// no trailing newline; FileSink adds the newline. The encoder writes for a
+// reader other than clink, so a NaN or infinity takes the external form
+// `non_finite` names: null by default (see config::NonFinite).
+inline clink::TextFormat<Row> row_json_text_format(
+    clink::config::NonFinite non_finite = clink::config::NonFinite::Null) {
     return clink::TextFormat<Row>{
         .decode = [](std::string_view line) -> std::optional<Row> {
             if (line.empty())
@@ -250,11 +253,11 @@ inline clink::TextFormat<Row> row_json_text_format() {
             r.values = row_columns_from_json(std::move(*obj));
             return r;
         },
-        .encode = [](const Row& r) -> std::string {
+        .encode = [non_finite](const Row& r) -> std::string {
             // #56: render dec-strings as clean unquoted JSON numbers for
             // external output (the wire codec above keeps the tagged form).
             clink::config::JsonValue v{to_json_object(r.values)};
-            return clink::config::serialize_output(v);
+            return clink::config::serialize_output(v, non_finite);
         },
     };
 }
@@ -394,11 +397,12 @@ inline void ingest_exact_decimals(Row& r,
 // Schema-aware NDJSON format: the named DECIMAL columns are ingested exactly
 // (raw token, not the rounded double) and re-quantised to their declared scale
 // on decode; on encode the value is quantised and rendered as a clean unquoted
-// number via serialize_output.
+// number via serialize_output, a NaN or infinity in the form `non_finite` names.
 inline clink::TextFormat<Row> row_json_text_format_with_decimals(
-    std::map<std::string, int> decimal_scales) {
+    std::map<std::string, int> decimal_scales,
+    clink::config::NonFinite non_finite = clink::config::NonFinite::Null) {
     if (decimal_scales.empty())
-        return row_json_text_format();
+        return row_json_text_format(non_finite);
     auto base = row_json_text_format();
     return clink::TextFormat<Row>{
         .decode = [decimal_scales, base](std::string_view line) -> std::optional<Row> {
@@ -409,11 +413,11 @@ inline clink::TextFormat<Row> row_json_text_format_with_decimals(
             }
             return r;
         },
-        .encode = [decimal_scales](const Row& r) -> std::string {
+        .encode = [decimal_scales, non_finite](const Row& r) -> std::string {
             Row q = r;
             requantise_row_decimals(q, decimal_scales);
             clink::config::JsonValue v{to_json_object(q.values)};
-            return clink::config::serialize_output(v);
+            return clink::config::serialize_output(v, non_finite);
         },
     };
 }

@@ -6,6 +6,7 @@
 // mistake (unbalanced nesting, a number where the protobuf-JSON mapping
 // wants a string) fails here and not in a collector at 2am.
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,44 @@ TEST(OtlpExport, MetricsJsonCarriesEveryKindInProtobufJsonShape) {
     ASSERT_EQ(hist.at("explicitBounds").as_array().size(), 2u);
     EXPECT_EQ(hist.at("bucketCounts").as_array().at(2).as_string(), "4");
     EXPECT_DOUBLE_EQ(hist.at("explicitBounds").as_array().at(1).as_number(), 20.0);
+}
+
+// A histogram fed a NaN or an infinity: the protobuf-JSON mapping spells a
+// non-finite double as the string "NaN", "Infinity" or "-Infinity". It was
+// printed bare (nan, inf), which made the whole export body unparseable.
+TEST(OtlpExport, NonFiniteHistogramDoublesTakeTheProtobufJsonStrings) {
+    MetricsRegistry::Snapshot snap;
+    MetricsRegistry::HistogramEntry h;
+    h.name = "clink_test_odd";
+    h.data.upper_bounds = {1.0, std::numeric_limits<double>::infinity()};
+    h.data.bucket_counts = {0, 1, 0};
+    h.data.sum = std::numeric_limits<double>::quiet_NaN();
+    h.data.count = 1;
+    snap.histograms.push_back(h);
+    h.name = "clink_test_neg";
+    h.data.upper_bounds = {-std::numeric_limits<double>::infinity()};
+    h.data.bucket_counts = {0, 1};
+    h.data.sum = -std::numeric_limits<double>::infinity();
+    snap.histograms.push_back(h);
+
+    const auto json = clink::metrics::otlp_metrics_json(snap, "clink-test", 1);
+    const auto root = clink::config::parse(json);  // throws on an invalid token
+    const auto& metrics = root.at("resourceMetrics")
+                              .as_array()
+                              .at(0)
+                              .at("scopeMetrics")
+                              .as_array()
+                              .at(0)
+                              .at("metrics")
+                              .as_array();
+    ASSERT_EQ(metrics.size(), 2u);
+    const auto& odd = metrics.at(0).at("histogram").at("dataPoints").as_array().at(0);
+    EXPECT_EQ(odd.at("sum").as_string(), "NaN");
+    EXPECT_DOUBLE_EQ(odd.at("explicitBounds").as_array().at(0).as_number(), 1.0);
+    EXPECT_EQ(odd.at("explicitBounds").as_array().at(1).as_string(), "Infinity");
+    const auto& neg = metrics.at(1).at("histogram").at("dataPoints").as_array().at(0);
+    EXPECT_EQ(neg.at("sum").as_string(), "-Infinity");
+    EXPECT_EQ(neg.at("explicitBounds").as_array().at(0).as_string(), "-Infinity");
 }
 
 TEST(OtlpExport, SpansJsonCarriesIdentityTimesAttributesAndStatus) {

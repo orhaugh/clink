@@ -55,8 +55,11 @@ Options are read from `BuildContext` params in `src/cluster/built_in_factories.c
 | `partition_by` | `file` sink | No | unset | Route rows to one file per distinct value of the named column(s); append-only. |
 | `mode` | `file` sink | No | append | `mode='upsert'` nets a changelog by the table's PRIMARY KEY. |
 | `delivery_guarantee` | `file` / `parquet` sink | No | at-least-once | `delivery_guarantee='exactly_once'` selects the 2PC sink. |
+| `json_non_finite` | `file` JSON sink | No | `null` | How a NaN or infinite double is written: `'null'`, or `'string'` for `"NaN"`, `"Infinity"` and `"-Infinity"`. Any other value is refused. Applies to every `format='json'` file sink (plain, upsert, exactly-once, `partition_by`); a `parquet` sink refuses it. |
 
 The `file` JSON row source decodes each line against the table's declared columns, as the Kafka JSON bridge does: a `DECIMAL` value is carried exactly at the column's scale, a `REAL` value is rounded to float precision, an integer token in a `DOUBLE` column becomes a double, so `x / 2` over `{"x":9}` is 4.5, and a whole numeral such as `7.0` in a `BIGINT` or `INTEGER` column becomes an integer, so `n / 2` over `{"n":7.0}` is 3, as the column's type says. A directory `path` decodes the same way.
+
+JSON has no token for NaN or an infinity, so the `file` JSON sinks write a non-finite double as `null` by default, or as `"NaN"`, `"Infinity"` and `"-Infinity"` with `json_non_finite='string'`. A `partition_by` sink names the file of a NaN or infinite partition value `NaN`, `Infinity` or `-Infinity` in either case. Read back by the `file` source, `null` is SQL `NULL`, and the strings stay strings: they are not turned back into doubles. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output). A `parquet` sink stores the value itself.
 
 The `parquet` row source derives its Arrow schema from the table's declared columns (`schema_columns`), so no separate schema option is needed. It resolves those columns by name, with the same type, in any file: one clink wrote, or one another tool wrote (pyarrow, DuckDB, Spark, ClickHouse). A file from another tool carries none of clink's own columns, and its rows read with no event time; a declared column the file lacks, or holds as another type, is refused at open, naming it.
 

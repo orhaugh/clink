@@ -86,6 +86,8 @@ CREATE TABLE azure_out (
 
 The same property keys apply to a source table. Authentication can instead use `account_key`, `anonymous = 'true'`, or `use_default_credential = 'true'`; for an Azurite emulator, set `blob_storage_authority` and `blob_storage_scheme = 'http'`.
 
+A `format='json'` sink table's rows are serialised by the `row_to_json_string` bridge, so a NaN or infinite double in the stored JSON text is `null`, or `"NaN"`, `"Infinity"` or `"-Infinity"` with `json_non_finite='string'`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Programmatic use with the typed sink and source classes, mirroring `impls/azure/tests/test_parquet_azure_live.cpp`:

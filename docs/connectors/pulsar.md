@@ -83,6 +83,8 @@ CREATE TABLE events (
 
 The sink rejects `mode='upsert'` and rejects `exactly_once`; it is at-least-once only (see Delivery semantics).
 
+A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Programmatic round trip using the typed classes, based on `impls/pulsar/tests/test_pulsar_live.cpp`. Subscribe before publishing so the durable subscription cursor covers the messages.

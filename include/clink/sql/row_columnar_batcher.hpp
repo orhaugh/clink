@@ -139,7 +139,11 @@ inline std::string to_utf8(const clink::config::JsonValue& v) {
     // a double in the shortest form that reads back to the same value. This
     // used std::to_string, which went through a double for integers (lossy past
     // 2^53, undefined past 2^63) and kept six decimals for the rest (1e-7 came
-    // out as "0.000000").
+    // out as "0.000000"). A NaN or infinity is a text cell, not JSON, so it is
+    // named: "NaN", "Infinity", "-Infinity".
+    if (v.is_number() && !std::isfinite(v.as_number())) {
+        return std::string{clink::config::non_finite_name(v.as_number())};
+    }
     return v.serialize(0);
 }
 

@@ -101,7 +101,8 @@ inline FannedScan fan_out_scan(cluster::Coordinator& coordinator,
         http::HttpClient client(t.host, t.port);
         auto worker_resp = client.get("/api/v1/queryable_state/op/" + role + "/subtask/" +
                                       std::to_string(t.subtask_idx) + "/json/" + slot +
-                                      "/scan?limit=" + std::to_string(limit - out.entries.size()));
+                                      "/scan?limit=" + std::to_string(limit - out.entries.size()) +
+                                      "&non_finite=tagged");
         if (worker_resp.status != 200) {
             continue;  // subtask without the slot (or gone): skip
         }
@@ -113,6 +114,9 @@ inline FannedScan fan_out_scan(cluster::Coordinator& coordinator,
                     out.truncated = true;
                     break;
                 }
+                // Kept in clink's internal form (asked for with
+                // non_finite=tagged): the Arrow scan carries a NaN or infinity
+                // as the double, and the JSON scan route serves it as null.
                 out.entries.emplace_back(entry.at("key").as_string(),
                                          entry.at("value").serialize(0));
             }
@@ -339,7 +343,7 @@ inline void register_coordinator_routes(http::HttpServer& server,
                            body.push_back(',');
                        }
                        body += "{\"key\":" + detail::json_escape(scan.entries[i].first) +
-                               ",\"value\":" + scan.entries[i].second + "}";
+                               ",\"value\":" + detail::served_json(scan.entries[i].second) + "}";
                    }
                    body += "],\"truncated\":";
                    body += scan.truncated ? "true" : "false";

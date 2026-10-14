@@ -3463,4 +3463,168 @@ TEST(SqlPhysical, AQ0ShapedNativePlanIsUnchangedByTheGate) {
                                         "clickhouse_native_sink"}));
 }
 
+// --- json_non_finite --------------------------------------------------------
+//
+// How a JSON-writing sink renders NaN and the infinities. The planner hands the
+// option to the op that writes the JSON: the row_to_json_string bridge for a
+// string sink (Kafka and the rest), the sink itself for the file family.
+
+namespace {
+
+cluster::JobGraphSpec compile_sink(const std::string& sink_ddl, const char* insert) {
+    Catalog cat;
+    register_json(cat, "nf_src", "(a DOUBLE)", "");
+    auto s = parse(sink_ddl);
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    auto plan = bind_insert(cat, insert);
+    PhysicalPlanner pp;
+    return pp.compile(static_cast<const LogicalSink&>(*plan));
+}
+
+// The planner's answer for a sink table registered as a TableDef, which skips
+// the CREATE TABLE option check (the path a materialised view's backing table
+// takes), or "" when it compiles.
+std::string json_non_finite_refusal(std::map<std::string, std::string> props) {
+    Catalog cat;
+    register_json(cat, "nf_src", "(a DOUBLE)", "");
+    TableDef dst;
+    dst.name = "nf_out";
+    dst.columns.push_back(ColumnSpec{"a", arrow::float64()});
+    dst.properties = std::move(props);
+    cat.register_table(std::move(dst));
+    try {
+        auto plan = bind_insert(cat, "INSERT INTO nf_out SELECT a FROM nf_src");
+        PhysicalPlanner pp;
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+TEST(SqlPhysical, JsonNonFiniteGoesToTheBridgeInFrontOfAStringSink) {
+    const auto spec = compile_sink(
+        "CREATE TABLE nf_out (a DOUBLE) WITH (connector='kafka', format='json', topic='o', "
+        "brokers='b:9092', json_non_finite='string')",
+        "INSERT INTO nf_out SELECT a FROM nf_src");
+    const auto* bridge = find_op(spec, "row_to_json_string");
+    ASSERT_NE(bridge, nullptr);
+    ASSERT_EQ(bridge->params.count("json_non_finite"), 1u);
+    EXPECT_EQ(bridge->params.at("json_non_finite"), "string");
+    const auto* sink = find_op(spec, "kafka_sink_string");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->params.count("json_non_finite"), 0u)
+        << "the sink after the bridge only carries the text";
+}
+
+TEST(SqlPhysical, JsonNonFiniteGoesToAFileSinkItself) {
+    const auto spec = compile_sink(
+        "CREATE TABLE nf_out (a DOUBLE) WITH (connector='file', format='json', "
+        "path='/tmp/nf_out.ndjson', json_non_finite='string')",
+        "INSERT INTO nf_out SELECT a FROM nf_src");
+    const auto* sink = find_op(spec, "file_json_sink");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->params.at("json_non_finite"), "string");
+}
+
+TEST(SqlPhysical, WithoutJsonNonFiniteTheBridgeTakesTheDefault) {
+    const auto spec = compile_sink(
+        "CREATE TABLE nf_out (a DOUBLE) WITH (connector='kafka', format='json', topic='o', "
+        "brokers='b:9092')",
+        "INSERT INTO nf_out SELECT a FROM nf_src");
+    const auto* bridge = find_op(spec, "row_to_json_string");
+    ASSERT_NE(bridge, nullptr);
+    EXPECT_EQ(bridge->params.count("json_non_finite"), 0u);
+}
+
+TEST(SqlPhysical, AnUnknownJsonNonFiniteValueIsRefusedAtPlanTime) {
+    for (const char* connector : {"kafka", "file"}) {
+        const auto err = json_non_finite_refusal({{"connector", connector},
+                                                  {"format", "json"},
+                                                  {"topic", "o"},
+                                                  {"path", "/tmp/nf_out.ndjson"},
+                                                  {"json_non_finite", "nan"}});
+        EXPECT_NE(err.find("json_non_finite='nan' is not one of 'null', 'string'"),
+                  std::string::npos)
+            << connector << ": " << err;
+        EXPECT_NE(err.find("nf_out"), std::string::npos) << err;
+    }
+    EXPECT_EQ(json_non_finite_refusal({{"connector", "kafka"},
+                                       {"format", "json"},
+                                       {"topic", "o"},
+                                       {"json_non_finite", "null"}}),
+              "");
+}
+
+TEST(SqlPhysical, JsonNonFiniteIsRefusedOnASinkThatWritesNoJson) {
+    const auto parquet = json_non_finite_refusal({{"connector", "parquet"},
+                                                  {"format", "json"},
+                                                  {"path", "/tmp/nf_out.parquet"},
+                                                  {"json_non_finite", "string"}});
+    EXPECT_NE(parquet.find("applies to a sink that writes JSON"), std::string::npos) << parquet;
+    EXPECT_NE(parquet.find("parquet_row_sink"), std::string::npos) << parquet;
+
+    // A single TEXT column on the string channel writes each record as it is.
+    Catalog cat;
+    register_text(cat, "nf_txt_src", "file", "/tmp/in.txt");
+    auto s = parse(
+        "CREATE TABLE nf_txt_out (line TEXT) WITH (connector='file', path='/tmp/o.txt', "
+        "json_non_finite='string')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    auto plan = bind_insert(cat, "INSERT INTO nf_txt_out SELECT line FROM nf_txt_src");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+        FAIL() << "json_non_finite on a raw-text sink compiled";
+    } catch (const TranslationError& e) {
+        EXPECT_NE(std::string(e.what()).find("applies to a sink that writes JSON"),
+                  std::string::npos)
+            << e.what();
+    }
+}
+
+// A binary registry format (Avro, Protobuf) carries a NaN or an infinity as the
+// IEEE double itself, so the bridge in front of it writes the tagged form its
+// encoder reads back losslessly, and the JSON output option does not apply.
+// JSON Schema output is JSON text and keeps the JSON policy.
+TEST(SqlPhysical, BinaryRegistryFormatsGetTheLosslessBridgeAndRefuseJsonNonFinite) {
+    const auto registry_sink = [](const std::string& format, const std::string& extra) {
+        return "CREATE TABLE nf_out (a DOUBLE) WITH (connector='kafka', format='" + format +
+               "', brokers='b:9092', topic='o', schema_registry_url='http://sr:8081'" + extra + ")";
+    };
+    for (const char* fmt : {"avro", "protobuf"}) {
+        const auto spec =
+            compile_sink(registry_sink(fmt, ""), "INSERT INTO nf_out SELECT a FROM nf_src");
+        const auto* bridge = find_op(spec, "row_to_json_string");
+        ASSERT_NE(bridge, nullptr) << fmt;
+        ASSERT_EQ(bridge->params.count("non_finite_form"), 1u) << fmt;
+        EXPECT_EQ(bridge->params.at("non_finite_form"), "tagged") << fmt;
+        EXPECT_EQ(bridge->params.count("json_non_finite"), 0u) << fmt;
+
+        for (const char* value : {"null", "string"}) {
+            try {
+                (void)compile_sink(
+                    registry_sink(fmt, std::string{", json_non_finite='"} + value + "'"),
+                    "INSERT INTO nf_out SELECT a FROM nf_src");
+                FAIL() << "json_non_finite was accepted on format='" << fmt << "'";
+            } catch (const TranslationError& e) {
+                const std::string msg = e.what();
+                EXPECT_NE(msg.find(std::string{"does not apply to format='"} + fmt + "'"),
+                          std::string::npos)
+                    << msg;
+                EXPECT_NE(msg.find("IEEE"), std::string::npos) << msg;
+            }
+        }
+    }
+
+    const auto js = compile_sink(registry_sink("json-schema", ", json_non_finite='string'"),
+                                 "INSERT INTO nf_out SELECT a FROM nf_src");
+    const auto* bridge = find_op(js, "row_to_json_string");
+    ASSERT_NE(bridge, nullptr);
+    EXPECT_EQ(bridge->params.count("non_finite_form"), 0u);
+    EXPECT_EQ(bridge->params.at("json_non_finite"), "string");
+}
+
 }  // namespace clink::sql

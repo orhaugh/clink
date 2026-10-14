@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -381,6 +384,144 @@ TEST(RowProjectedFormat, RetainCompactsInOnePassPreservingOrder) {
     for (const auto& [k, v] : r.values)
         order += k;
     EXPECT_EQ(order, "bd");
+}
+
+// ----- Non-finite doubles through the Row codecs and the JSON text format -----
+
+namespace {
+
+using NfL = std::numeric_limits<double>;
+
+// A row carrying every non-finite double, at the top level and nested, beside
+// the finite edge cases whose text must not change.
+Row non_finite_row() {
+    using clink::config::JsonArray;
+    using clink::config::JsonValue;
+    Row r;
+    r.values["nan"] = JsonValue{NfL::quiet_NaN()};
+    r.values["pinf"] = JsonValue{NfL::infinity()};
+    r.values["ninf"] = JsonValue{-NfL::infinity()};
+    r.values["nested"] = JsonValue{JsonArray{JsonValue{NfL::infinity()}, JsonValue{1.5}}};
+    r.values["negzero"] = JsonValue{-0.0};
+    r.values["subnormal"] = JsonValue{NfL::denorm_min()};
+    r.values["max"] = JsonValue{NfL::max()};
+    r.values["lowest"] = JsonValue{NfL::lowest()};
+    r.values["min"] = JsonValue{NfL::min()};
+    r.values["text"] = JsonValue{std::string{"NaN"}};
+    return r;
+}
+
+void expect_non_finite_row(const Row& r) {
+    EXPECT_TRUE(std::isnan(r.values.find("nan")->second.as_number()));
+    EXPECT_EQ(r.values.find("pinf")->second.as_number(), NfL::infinity());
+    EXPECT_EQ(r.values.find("ninf")->second.as_number(), -NfL::infinity());
+    const auto& nested = r.values.find("nested")->second.as_array();
+    ASSERT_EQ(nested.size(), 2u);
+    EXPECT_EQ(nested[0].as_number(), NfL::infinity());
+    EXPECT_EQ(nested[1].as_number(), 1.5);
+    const double nz = r.values.find("negzero")->second.as_number();
+    EXPECT_EQ(nz, 0.0);
+    EXPECT_TRUE(std::signbit(nz)) << "the row codec keeps -0.0's sign";
+    EXPECT_EQ(r.values.find("subnormal")->second.as_number(), NfL::denorm_min());
+    EXPECT_EQ(r.values.find("max")->second.as_number(), NfL::max());
+    EXPECT_EQ(r.values.find("lowest")->second.as_number(), NfL::lowest());
+    EXPECT_EQ(r.values.find("min")->second.as_number(), NfL::min());
+    ASSERT_TRUE(r.values.find("text")->second.is_string());
+    EXPECT_EQ(r.values.find("text")->second.as_string(), "NaN");
+}
+
+}  // namespace
+
+// The row codec carries rows between operators and into operator state. Its
+// text for a non-finite double used to be nan / inf, which its own decode
+// rejected, so the row was dropped (decode returned nullopt) on the wire and
+// a state entry holding one failed to restore.
+TEST(SqlRow, JsonCodecRoundTripsNonFiniteDoubles) {
+    const auto codec = row_json_codec();
+    const auto bytes = codec.encode(non_finite_row());
+    const auto decoded = codec.decode({bytes.data(), bytes.size()});
+    ASSERT_TRUE(decoded.has_value()) << "the codec dropped a row carrying NaN / Inf";
+    expect_non_finite_row(*decoded);
+
+    std::vector<std::byte> into;
+    codec.encode_into(non_finite_row(), into);
+    EXPECT_EQ(into, bytes);
+}
+
+TEST(SqlRow, RowListCodecRoundTripsNonFiniteDoubles) {
+    const auto codec = row_list_json_codec();
+    const auto bytes = codec.encode({non_finite_row(), non_finite_row()});
+    const auto decoded = codec.decode({bytes.data(), bytes.size()});
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->size(), 2u);
+    expect_non_finite_row((*decoded)[0]);
+    expect_non_finite_row((*decoded)[1]);
+}
+
+TEST(SqlRow, KindPreservingJsonRoundTripsNonFiniteDoubles) {
+    const clink::config::JsonValue v{to_json_object(non_finite_row().values)};
+    const auto text = kind_preserving_json(v);
+    Row back;
+    back.values = row_columns_from_json(clink::config::parse(text).as_object());
+    expect_non_finite_row(back);
+}
+
+// The JSON text format is what file sinks and the row_to_json_string bridge in
+// front of Kafka and the other string sinks write: external output. Null by
+// default; the String form on request. Either way valid JSON.
+TEST(SqlRow, JsonTextFormatWritesNonFiniteAsNullByDefault) {
+    const auto line = row_json_text_format().encode(non_finite_row());
+    EXPECT_NE(line.find(R"("nan":null)"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("pinf":null)"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("ninf":null)"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("nested":[null,1.5])"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("text":"NaN")"), std::string::npos) << line;
+    EXPECT_EQ(line.find("\\u0002"), std::string::npos) << "internal tag leaked: " << line;
+    // Finite values exactly as the plain serializer writes them.
+    EXPECT_NE(line.find(R"("negzero":0)"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("max":1.7976931348623157e+308)"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("lowest":-1.7976931348623157e+308)"), std::string::npos) << line;
+    for (const char* key : {"subnormal", "min"}) {
+        const auto text = std::string{"\""} + key +
+                          "\":" + non_finite_row().values.find(key)->second.serialize(0);
+        EXPECT_NE(line.find(text), std::string::npos) << text << " in " << line;
+    }
+
+    const auto back = clink::config::parse(line);  // valid JSON
+    ASSERT_TRUE(back.is_object());
+    EXPECT_TRUE(back.at("nan").is_null());
+    EXPECT_EQ(back.at("max").as_number(), NfL::max());
+    EXPECT_EQ(back.at("min").as_number(), NfL::min());
+    EXPECT_EQ(back.at("subnormal").as_number(), NfL::denorm_min());
+}
+
+TEST(SqlRow, JsonTextFormatWritesNonFiniteAsStringsOnRequest) {
+    const auto fmt = row_json_text_format(clink::config::NonFinite::String);
+    const auto line = fmt.encode(non_finite_row());
+    EXPECT_NE(line.find(R"("nan":"NaN")"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("pinf":"Infinity")"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("ninf":"-Infinity")"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("nested":["Infinity",1.5])"), std::string::npos) << line;
+    EXPECT_NE(line.find(R"("max":1.7976931348623157e+308)"), std::string::npos) << line;
+    EXPECT_EQ(line,
+              row_json_text_format_with_decimals({}, clink::config::NonFinite::String)
+                  .encode(non_finite_row()));
+    EXPECT_TRUE(clink::config::parse(line).is_object());
+}
+
+TEST(SqlRow, DecimalJsonTextFormatTakesTheNonFiniteFormToo) {
+    Row r = non_finite_row();
+    r.values["amount"] = clink::config::JsonValue{12.5};
+    const std::map<std::string, int> scales{{"amount", 2}};
+    const auto null_line = row_json_text_format_with_decimals(scales).encode(r);
+    EXPECT_NE(null_line.find(R"("amount":12.50)"), std::string::npos) << null_line;
+    EXPECT_NE(null_line.find(R"("pinf":null)"), std::string::npos) << null_line;
+    const auto string_line =
+        row_json_text_format_with_decimals(scales, clink::config::NonFinite::String).encode(r);
+    EXPECT_NE(string_line.find(R"("amount":12.50)"), std::string::npos) << string_line;
+    EXPECT_NE(string_line.find(R"("pinf":"Infinity")"), std::string::npos) << string_line;
+    EXPECT_TRUE(clink::config::parse(null_line).is_object());
+    EXPECT_TRUE(clink::config::parse(string_line).is_object());
 }
 
 }  // namespace clink::sql

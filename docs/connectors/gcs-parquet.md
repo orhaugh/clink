@@ -85,6 +85,8 @@ Read it back with a table on the same `prefix`.
 
 Other option keys from the table above (`anonymous`, `access_token`, `endpoint_override`, `scheme`, `retry_limit_seconds`) are passed through the same `WITH (...)` properties.
 
+A `format='json'` sink table's rows are serialised by the `row_to_json_string` bridge, so a NaN or infinite double in the stored JSON text is `null`, or `"NaN"`, `"Infinity"` or `"-Infinity"` with `json_non_finite='string'`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+
 ## Example
 
 Programmatic use of the single-object classes with their `Options`, based on `impls/gcs/tests/test_parquet_gcs_live.cpp`. Write one Parquet object, then read it back on the int64 channel. (The registered sink factories build `ParquetRollingSink<T>` instead; see Delivery semantics.)
