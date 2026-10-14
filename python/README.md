@@ -21,9 +21,9 @@ publishing, from v0.9.1. The wheels are built by
 
 - macOS arm64 (`macosx_14_0_arm64`), without connectors.
 - Linux x86_64 and aarch64 (`manylinux_2_28`), with the Kafka connector.
-  From the release after v0.10.0 they also carry the ClickHouse connector,
-  its native sink (`insert_format='native'`) and that sink's TLS; v0.10.0
-  and earlier have no ClickHouse connector. They install on any glibc 2.28
+  From v0.11.0 they also carry the ClickHouse connector, its native sink
+  (`insert_format='native'`) and that sink's TLS; v0.10.0 and earlier have
+  no ClickHouse connector. They install on any glibc 2.28
   or later distribution (AlmaLinux 8, Debian 10+, Ubuntu 20.04+) and need
   nothing beyond the C and C++ runtime.
 
