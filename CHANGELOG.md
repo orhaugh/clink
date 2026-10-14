@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**The restart hang listed as a known issue in v0.11.0 was a ThreadSanitizer
+deadlock, not an engine defect.** Under TSan,
+`Cluster.ARestartBeforeTheFirstCheckpointKeepsTheSubmittedRestorePoint`
+sometimes stopped with a source subtask that never exited its cancel and a
+coordinator that never failed the job at its drain deadline. A local
+reproduction matching the CI runs line for line showed, from its thread stacks,
+the whole process waiting on TSan's own locks. One thread was capturing a
+`std::stacktrace` for an operator error, which holds the loader lock inside
+`dl_iterate_phdr` and then needed a TSan lock. Another was reporting a race in
+Arrow's allocator, one a suppression would have dropped: it held TSan's locks
+and needed the loader lock to find the module of a heap address. The
+coordinator's watchdog, like every other thread, was waiting on a TSan lock.
+The executor's capture-site stack trace is now off in ThreadSanitizer builds,
+whose reports carry their own stacks. Other builds are unchanged and cannot
+hit this: without the sanitizer, neither thread holds or waits for a TSan
+lock.
+
 **Sanitizer runs record where a hung test was blocked.**
 `build_and_test.sh` and the sanitizer CI jobs run ctest through
 `scripts/ctest-with-hang-dump.sh`, which attaches gdb to any test still running

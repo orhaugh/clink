@@ -978,7 +978,19 @@ else()
 endif()
 set(CMAKE_REQUIRED_LIBRARIES "")
 set(CMAKE_REQUIRED_FLAGS "${_st_saved_flags}")
-if(_clink_have_stacktrace)
+# Off under ThreadSanitizer. std::stacktrace symbolises through libbacktrace,
+# which walks the loaded objects with dl_iterate_phdr and runs instrumented
+# code in its callback while holding the loader lock. A TSan race report takes
+# that same lock, to find the module of a heap address, while it holds TSan's
+# own locks, and it does so before any suppression is applied. One thread
+# capturing a trace while another reports a race (even one a suppression then
+# drops) therefore deadlocks the process: every thread stops at its next TSan
+# lock, the coordinator's watchdog included. That was the restart-drain hang
+# the TSan runs hit on 2026-10-06 and 2026-10-14. A TSan report carries its
+# own stacks, so the build loses nothing it needs.
+if(_clink_have_stacktrace AND CMAKE_CXX_FLAGS MATCHES "-fsanitize=thread")
+    message(STATUS "clink::core - std::stacktrace off under ThreadSanitizer; operator failure traces disabled")
+elseif(_clink_have_stacktrace)
     target_compile_definitions(clink_core PRIVATE CLINK_HAS_STACKTRACE=1)
     if(_clink_stacktrace_lib)
         target_link_libraries(clink_core PUBLIC ${_clink_stacktrace_lib})
