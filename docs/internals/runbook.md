@@ -231,10 +231,10 @@ the NFS mode that matters most for multi-node. Use the etcd coordinator there.
 A peer was rejected for an incompatible protocol version. Almost always a partial
 upgrade: some binaries at the new version, some at the old.
 
-**Look at:** the coordinator log, which names the peer and both versions.
-
-There is no CLI that reports the negotiated version, so the log is the only source
-today.
+**Look at:** the coordinator log, which names the refused peer and both versions.
+`/api/v1/workers` reports the `protocol_version` each admitted worker registered with
+(0 for a peer that predates the field), which shows how far a partial upgrade has
+got. No CLI command reports either.
 
 ---
 

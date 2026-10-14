@@ -98,6 +98,12 @@ may differ as long as each side can speak something the other accepts.
   changes on the control wire; the version is the gate the coordinator uses
   to admit that layout per deployment. v1 and v2 peers remain compatible and
   never receive it.
+- **Visibility:** the coordinator keeps the version each worker registered
+  with, and `GET /api/v1/workers` and `GET /api/v1/cluster` report it per
+  worker as `protocol_version` (0 for a peer that declared none), so a
+  mixed-version cluster during a rolling upgrade shows in the read API and
+  not only in the coordinator's logs. Pinned by
+  `ProtocolVersioning.TheReadApiReportsTheVersionEachWorkerRegisteredWith`.
 - **Known limitation:** client enforcement is one-directional. The
   coordinator sends no hello ack on success, so a CLI never learns the
   coordinator's version.

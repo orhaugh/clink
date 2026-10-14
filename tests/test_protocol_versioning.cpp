@@ -352,6 +352,60 @@ TEST(ProtocolVersioning, ARealCoordinatorAdmitsAPeerThatDeclaresNothing) {
     coordinator.stop();
 }
 
+TEST(ProtocolVersioning, TheReadApiReportsTheVersionEachWorkerRegisteredWith) {
+    // A mixed-version cluster is meant to be visible from the read API
+    // (GET /api/v1/workers and /api/v1/cluster), not only from the
+    // coordinator's logs. snapshot_workers() left the field unset, so every
+    // worker read 0 there, "a peer that predates the field", whatever it had
+    // registered with. One real worker, and one peer declaring the oldest
+    // version this build still admits.
+    using namespace std::chrono_literals;
+    Coordinator coordinator;
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"current", "oldest"});
+
+    Worker::Config cfg;
+    cfg.heartbeat_interval = 0ms;
+    Worker worker("current", "127.0.0.1", cfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+
+    auto conn = clink::network::connect_plain("127.0.0.1", port);
+    ASSERT_NE(conn, nullptr);
+    RegisterMsg reg{.worker_id = "oldest", .data_host = "127.0.0.1", .slot_count = 1};
+    reg.protocol_version = kMinCompatibleClusterProtocolVersion;
+    reg.min_compatible_protocol_version = kMinCompatibleClusterProtocolVersion;
+    ASSERT_TRUE(send_raw_frame(*conn, encode_frame(MessageKind::Register, reg)));
+    auto reply = read_raw_frame(*conn);
+    ASSERT_TRUE(reply.has_value());
+    MessageReader rr(std::move(*reply));
+    ASSERT_EQ(static_cast<MessageKind>(rr.read_u8()), MessageKind::RegisterAck);
+    const auto ack = decode_register_ack(rr);
+    ASSERT_TRUE(ack.ok) << ack.message;
+    ASSERT_TRUE(coordinator.await_registrations(5s));
+
+    const auto version_of = [](const std::vector<WorkerSummary>& workers,
+                               const std::string& id) -> std::optional<std::uint32_t> {
+        for (const auto& w : workers) {
+            if (w.worker_id == id) {
+                return w.protocol_version;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto workers = coordinator.snapshot_workers();
+    EXPECT_EQ(version_of(workers, "current"), kClusterProtocolVersion)
+        << "GET /api/v1/workers does not report the version the worker registered with";
+    EXPECT_EQ(version_of(workers, "oldest"), kMinCompatibleClusterProtocolVersion);
+    const auto cluster = coordinator.snapshot_cluster();
+    EXPECT_EQ(version_of(cluster.workers, "current"), kClusterProtocolVersion)
+        << "GET /api/v1/cluster does not report the version the worker registered with";
+    EXPECT_EQ(version_of(cluster.workers, "oldest"), kMinCompatibleClusterProtocolVersion);
+
+    conn->close();
+    worker.stop();
+    coordinator.stop();
+}
+
 // --- the snapshot format-version gate ------------------------------------
 
 // Rewrite an Arrow IPC stream with a different format-version marker,

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**`GET /api/v1/workers` reports the protocol version each worker registered
+with.** `WorkerSummary::protocol_version` exists so a mixed-version cluster is
+visible from the read API. `GET /api/v1/cluster` filled it, but
+`Coordinator::snapshot_workers()`, behind `GET /api/v1/workers` and the MCP
+server's `cluster` tool, never set it, so every worker read 0 there, the value
+for a peer that predates the field. Both endpoints now build a worker's summary
+in one place.
+
 **TLS clients check that the server's certificate names the host they
 connect to.** A worker started with `--tls-ca` verified the coordinator's
 certificate chain against that CA but never checked the name on it, so any

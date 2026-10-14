@@ -2656,6 +2656,26 @@ bool Coordinator::dispatch_client_frame_(network::Connection& conn, MessageReade
     return false;
 }
 
+namespace {
+
+// One worker's read-API summary. GET /api/v1/cluster and GET /api/v1/workers
+// both build it here: each used to copy the fields itself, and the workers
+// endpoint's copy never set protocol_version, so every worker read 0 there.
+template <typename WorkerRecord>
+WorkerSummary summarise_worker(const WorkerRecord& worker) {
+    WorkerSummary ts;
+    ts.worker_id = worker.worker_id;
+    ts.data_host = worker.data_host;
+    ts.slot_capacity = worker.slot_capacity;
+    ts.slots_in_use = worker.slots_in_use;
+    ts.lost = worker.lost;
+    ts.http_port = worker.http_port;
+    ts.protocol_version = worker.protocol_version;
+    return ts;
+}
+
+}  // namespace
+
 ClusterSnapshot Coordinator::snapshot_cluster() const {
     ClusterSnapshot s;
     s.bind_host = cfg_.bind_host;
@@ -2663,19 +2683,11 @@ ClusterSnapshot Coordinator::snapshot_cluster() const {
     s.control_port = bound_port_;
     std::lock_guard lock(mu_);
     for (const auto& [worker_id, worker] : registered_) {
-        WorkerSummary ts;
-        ts.worker_id = worker->worker_id;
-        ts.data_host = worker->data_host;
-        ts.slot_capacity = worker->slot_capacity;
-        ts.slots_in_use = worker->slots_in_use;
-        ts.lost = worker->lost;
-        ts.http_port = worker->http_port;
-        ts.protocol_version = worker->protocol_version;
         if (!worker->lost) {
             s.total_slot_capacity += worker->slot_capacity;
             s.slots_in_use += worker->slots_in_use;
         }
-        s.workers.push_back(std::move(ts));
+        s.workers.push_back(summarise_worker(*worker));
     }
     s.jobs_total = jobs_.size();
     for (const auto& [_, job] : jobs_) {
@@ -2693,14 +2705,7 @@ std::vector<WorkerSummary> Coordinator::snapshot_workers() const {
     std::lock_guard lock(mu_);
     out.reserve(registered_.size());
     for (const auto& [_, worker] : registered_) {
-        WorkerSummary ts;
-        ts.worker_id = worker->worker_id;
-        ts.data_host = worker->data_host;
-        ts.slot_capacity = worker->slot_capacity;
-        ts.slots_in_use = worker->slots_in_use;
-        ts.lost = worker->lost;
-        ts.http_port = worker->http_port;
-        out.push_back(std::move(ts));
+        out.push_back(summarise_worker(*worker));
     }
     return out;
 }
