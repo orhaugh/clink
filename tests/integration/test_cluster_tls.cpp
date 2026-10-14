@@ -275,6 +275,17 @@ TEST(ClusterTls, AWorkerRefusesACoordinatorCertificateThatDoesNotNameItsHost) {
     if (cert_dir.empty()) {
         GTEST_SKIP() << "openssl CLI unavailable";
     }
+    // Every process this test starts is killed however the test ends: an
+    // assertion that returns early would otherwise leave them holding the
+    // test's output, and ctest waits on that until its timeout.
+    struct Spawned {
+        std::vector<pid_t> pids;
+        ~Spawned() {
+            for (const auto pid : pids) {
+                kill_quietly(pid);
+            }
+        }
+    } spawned;
     const auto cert = (cert_dir / "cert.pem").string();
     const auto key = (cert_dir / "key.pem").string();
 
@@ -289,6 +300,7 @@ TEST(ClusterTls, AWorkerRefusesACoordinatorCertificateThatDoesNotNameItsHost) {
                                           "--tls-key=" + key},
                                          node);
     ASSERT_GT(coordinator, 0);
+    spawned.pids.push_back(coordinator);
     ASSERT_TRUE(await_http_ready(http_port, 3s)) << "coordinator didn't come up";
 
     const auto worker_http = probe_free_port();
@@ -302,7 +314,10 @@ TEST(ClusterTls, AWorkerRefusesACoordinatorCertificateThatDoesNotNameItsHost) {
                                       "--tls-ca=" + cert},
                                      node);
     ASSERT_GT(refused, 0);
-    ASSERT_TRUE(await_http_ready(worker_http, 3s)) << "worker didn't come up";
+    spawned.pids.push_back(refused);
+    // Not await_http_ready: a worker that cannot reach its coordinator reports
+    // itself unhealthy, so its health check never reads 200. The status poll
+    // below waits for its HTTP server as well.
     std::string status;
     EXPECT_TRUE(clink::itest::await_condition(
         [&] {
@@ -332,6 +347,7 @@ TEST(ClusterTls, AWorkerRefusesACoordinatorCertificateThatDoesNotNameItsHost) {
                                         "--tls-no-verify-hostname"},
                                        node);
     ASSERT_GT(opted_out, 0);
+    spawned.pids.push_back(opted_out);
     EXPECT_TRUE(clink::itest::await_condition(
         [&] {
             const auto probe = http_get("127.0.0.1", http_port, "/api/v1/workers");
@@ -342,9 +358,11 @@ TEST(ClusterTls, AWorkerRefusesACoordinatorCertificateThatDoesNotNameItsHost) {
         std::chrono::seconds(20)))
         << "a worker with --tls-no-verify-hostname never registered";
 
-    kill_quietly(opted_out);
-    kill_quietly(refused);
-    kill_quietly(coordinator);
+    // Kill them before the certificates go.
+    for (const auto pid : spawned.pids) {
+        kill_quietly(pid);
+    }
+    spawned.pids.clear();
     std::error_code ec;
     std::filesystem::remove_all(cert_dir, ec);
 }
