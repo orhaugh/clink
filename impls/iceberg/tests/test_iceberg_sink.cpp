@@ -8,9 +8,11 @@
 #error "test_iceberg_sink requires iceberg-cpp"
 #endif
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -20,13 +22,18 @@
 #include <gtest/gtest.h>
 #include <parquet/arrow/reader.h>
 
+#include "clink/cluster/commit_dispatch_gate.hpp"
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
+#include "clink/core/stream_element.hpp"
 #include "clink/iceberg/iceberg_row_sink.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+
+#include "tests/test_helpers/sanitizer_slack.hpp"
+#include "tests/test_helpers/sink_runner_harness.hpp"
 
 using clink::Batch;
 using clink::CheckpointBarrier;
@@ -371,6 +378,127 @@ TEST(IcebergSink2PC, CorruptStagedStateFailsLoudlyOnRecovery) {
     sink->attach_runtime(&rctx);
     EXPECT_THROW(sink->open(), std::runtime_error);
 
+    fs::remove_all(wh);
+}
+
+// ---- The end of input ----
+// A bounded job's last checkpoint stages its files at the barrier, and the
+// coordinator's CommitCheckpoint for it reaches the sink on another thread,
+// possibly after the sink's input has ended. The sink's runner holds the
+// teardown open for that commit only while the sink reports a staged commit
+// (Sink::staged_commits_outstanding). This sink used to report none, so the late
+// commit was refused: safe, since the staged files stay recorded for a restore,
+// but the job's last interval was not published until a restore committed it.
+// Each test drives the sink through its own runner, with commits dispatched as
+// the worker dispatches them (tests/test_helpers/sink_runner_harness.hpp).
+namespace {
+
+using EoiHarness = clink::test_support::SinkRunnerHarness<Row>;
+
+IcebergRowSinkOptions eoi_opts(const fs::path& wh) {
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.batcher = make_row_columnar_arrow_batcher(schema());
+    return o;
+}
+
+clink::StreamElement<Row> eoi_rows() {
+    Batch<Row> b;
+    b.emplace(make_row(1, "a"));
+    b.emplace(make_row(2, "b"));
+    return clink::StreamElement<Row>::data(std::move(b));
+}
+
+}  // namespace
+
+// The final checkpoint's commit arrives once the input has ended. The runner
+// must still be holding the sink open for it, the commit must run rather than
+// be refused, and the teardown follows it.
+TEST(IcebergSinkEndOfInput, AFinalCommitArrivingAfterTheInputEndedIsCommittedNotRefused) {
+    using clink::test_support::AfterInput;
+    using clink::test_support::scale_slack;
+    using namespace std::chrono_literals;
+    auto wh = make_2pc_wh("eoi_commit");
+    InMemoryStateBackend state;
+    auto sink = make_iceberg_row_sink(eoi_opts(wh));
+    ASSERT_TRUE(sink->stages_state_at_barrier());
+    {
+        EoiHarness h(sink, &state);
+        h.push(eoi_rows());
+        h.push(clink::StreamElement<Row>::barrier(CheckpointBarrier{CheckpointId{1}}));
+        h.end_input();
+        h.start();
+
+        EXPECT_EQ(h.await_end_of_input(scale_slack(30s)), AfterInput::Waiting)
+            << "the runner began the sink's teardown while checkpoint 1's staged files were "
+               "still waiting for their commit";
+        EXPECT_EQ(count_paths_containing(wh, "snap-"), 0) << "a barrier alone committed";
+        // The coordinator's CommitCheckpoint for checkpoint 1, after the end of input.
+        EXPECT_NO_THROW(h.commit(1)) << "the final checkpoint's commit was refused";
+
+        ASSERT_TRUE(h.join(scale_slack(30s))) << "the runner did not tear down after the commit";
+        EXPECT_FALSE(h.failure()) << "the runner failed instead of finishing cleanly";
+        EXPECT_TRUE(h.dispatch_retired()) << "the teardown did not fence commit dispatch";
+        EXPECT_TRUE(sink->runtime_detached()) << "the teardown did not detach the sink";
+        EXPECT_THROW(h.commit(2), clink::cluster::CommitDispatchRefused);
+    }
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "the final interval was not committed";
+    fs::remove_all(wh);
+}
+
+// An AbortCheckpoint for the final checkpoint resolves its staged files just as
+// a commit does. The runner must let the teardown go at once: still waiting, it
+// would hold the subtask for 30 s and then fail a healthy one.
+TEST(IcebergSinkEndOfInput, AnAbortedFinalCheckpointDoesNotHoldTheTeardown) {
+    using clink::test_support::AfterInput;
+    using clink::test_support::scale_slack;
+    using namespace std::chrono_literals;
+    auto wh = make_2pc_wh("eoi_abort");
+    InMemoryStateBackend state;
+    auto sink = make_iceberg_row_sink(eoi_opts(wh));
+    {
+        EoiHarness h(sink, &state);
+        h.push(eoi_rows());
+        h.push(clink::StreamElement<Row>::barrier(CheckpointBarrier{CheckpointId{7}}));
+        h.end_input();
+        h.start();
+
+        EXPECT_EQ(h.await_end_of_input(scale_slack(30s)), AfterInput::Waiting);
+        EXPECT_NO_THROW(h.abort(7)) << "the final checkpoint's abort was refused";
+
+        // Well inside the 30 s the wait would otherwise run to.
+        ASSERT_TRUE(h.join(scale_slack(10s)))
+            << "the runner went on waiting after the final checkpoint was aborted";
+        EXPECT_FALSE(h.failure()) << "the runner failed after an abort it should have accepted";
+    }
+    EXPECT_EQ(count_paths_containing(wh, ".parquet"), 0) << "the aborted staged file was kept";
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 0) << "an aborted interval was committed";
+    fs::remove_all(wh);
+}
+
+// A terminal barrier stages and commits the tail on the runner's own thread, so
+// nothing is left staged for the end-of-stream wait to hold the sink open for.
+TEST(IcebergSinkEndOfInput, ATerminalCheckpointCommittedLocallyDoesNotHoldTheTeardown) {
+    using clink::test_support::scale_slack;
+    using namespace std::chrono_literals;
+    auto wh = make_2pc_wh("eoi_terminal");
+    InMemoryStateBackend state;
+    auto sink = make_iceberg_row_sink(eoi_opts(wh));
+    {
+        EoiHarness h(sink, &state);
+        h.push(eoi_rows());
+        h.push(clink::StreamElement<Row>::barrier(
+            CheckpointBarrier{CheckpointId{std::numeric_limits<std::uint64_t>::max()},
+                              /*terminal=*/true}));
+        h.end_input();
+        h.start();
+
+        ASSERT_TRUE(h.join(scale_slack(15s)))
+            << "the runner waited at the end of its input for a commit it had made itself";
+        EXPECT_FALSE(h.failure()) << "the runner failed instead of finishing cleanly";
+    }
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "the terminal interval was not committed";
     fs::remove_all(wh);
 }
 

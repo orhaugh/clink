@@ -19,6 +19,8 @@ target_link_libraries(clink_iceberg_tests PRIVATE
 )
 target_compile_definitions(clink_iceberg_tests PRIVATE CLINK_HAS_ICEBERG)
 clink_set_warnings(clink_iceberg_tests)
+# For tests/test_helpers/sink_runner_harness.hpp (the end-of-input commit tests).
+target_include_directories(clink_iceberg_tests PRIVATE ${CMAKE_SOURCE_DIR})
 gtest_discover_tests(clink_iceberg_tests
     DISCOVERY_MODE PRE_TEST
     PROPERTIES TIMEOUT 120 LABELS iceberg

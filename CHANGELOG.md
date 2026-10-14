@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**The Kafka transactional sink and the Iceberg sink wait at the end of input
+for their last commit.** At a clean end of input a sink's runner holds the sink
+open, for up to 30 seconds, while it reports staged commits, so a bounded job's
+last `CommitCheckpoint`, which reaches the sink's worker on another thread and
+can arrive after the input ended, still runs. Only `CommittingSink` reported
+any. The `kafka_2pc` sink and the Iceberg sink reported none, so their runner
+went straight to the teardown and that commit was refused: safe, since the
+prepared transaction is left for in-doubt resolution and the staged files for
+restore-time recovery, but the job's last interval waited for a restore to
+publish it. The Kafka sink now reports its sealed transaction from the barrier
+that prepares it until the commit or abort that resolves it, and the Iceberg
+sink its subtask's staged-files handles. A terminal barrier's local commit and
+an `AbortCheckpoint` both clear the count, so neither holds a healthy subtask
+for the 30 seconds and fails it. The exactly-once specification is unchanged:
+it ends a run only once every sink is up with nothing left to commit, which is
+what the wait now gives these two sinks.
+
 **`GET /api/v1/workers` reports the protocol version each worker registered
 with.** `WorkerSummary::protocol_version` exists so a mixed-version cluster is
 visible from the read API. `GET /api/v1/cluster` filled it, but

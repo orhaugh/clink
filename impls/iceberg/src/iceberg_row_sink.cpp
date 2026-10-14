@@ -391,6 +391,35 @@ public:
     // so it must be inside the checkpoint that barrier names.
     [[nodiscard]] bool stages_state_at_barrier() const noexcept override { return true; }
 
+    // The checkpoints whose staged files await their commit: this subtask's
+    // handles in operator state, each put by a barrier that staged files and
+    // erased by the commit or abort that finalises it. The runner's
+    // end-of-stream wait holds the teardown open while there are any, so the
+    // last checkpoint's commit, arriving on the dispatch thread after the input
+    // ended, runs instead of being refused and left for restore-time recovery.
+    // A terminal barrier stages and commits on the runner's own thread (or
+    // aborts, on a stopping task) before the wait starts, an AbortCheckpoint
+    // erases its handle as a commit does, and open() has already finalised or
+    // erased every handle it restored, so none of them leaves the wait holding.
+    // The scan takes no mu_, which on_commit holds across the catalog commit;
+    // the backend serialises it against the dispatch thread's erase, and a
+    // handle is erased only once its commit has returned.
+    [[nodiscard]] std::size_t staged_commits_outstanding() const override {
+        auto* state = state_backend_();
+        if (dormant_ || state == nullptr) {
+            return 0;
+        }
+        std::size_t n = 0;
+        state->scan_operator_state(
+            this->id(), [&](StateBackend::KeyView k, StateBackend::ValueView) {
+                const auto parsed = parse_pending_key_(k);
+                if (parsed.has_value() && parsed->first == opts_.subtask_idx) {
+                    ++n;
+                }
+            });
+        return n;
+    }
+
     void open() override {
         if (dormant_) {
             // Only subtask 0 writes, and subtask 0 succeeds the old subtask 0 at

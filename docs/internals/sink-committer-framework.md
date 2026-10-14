@@ -124,7 +124,20 @@ Key points:
   in-flight final commit, failing it against a torn-down client while the job
   still completed with exit 0. The S3 exactly-once outage gate caught the
   resulting silent loss of the final pane; the runner-side wait closes it for
-  every `CommittingSink` connector at once. The teardown fence comes after
+  every `CommittingSink` connector at once. The two transactional sinks
+  outside the framework report theirs as well: the Kafka transactional sink
+  counts its sealed transaction from the barrier that prepares it until the
+  commit or abort that resolves it, and the Iceberg sink counts its subtask's
+  staged-files handles in operator state. Until they did, a bounded job's last
+  commit could reach either after its input ended and be refused: safe, since
+  the prepared transaction is left for in-doubt resolution and the staged
+  files for restore-time recovery, but the job's last interval then waited for
+  a restore to publish it. Nothing may leave the count standing once its
+  commit can no longer come, or the wait would hold a healthy subtask for the
+  30 seconds and then fail it: a terminal barrier's local commit (or its abort
+  on a stopping task) resolves the transaction before the wait begins, and an
+  `AbortCheckpoint` clears it as a commit does (`KafkaTxnEndOfInputLive` and
+  `IcebergSinkEndOfInput` pin all three cases). The teardown fence comes after
   this wait, so the commit it waits for still runs. The same wait carries a hot
   rescale's cutover commit, since an old subtask's input ends cleanly after the
   cutover barrier. A sink that reports no staged commits gets no such wait: a

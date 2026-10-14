@@ -10,6 +10,7 @@ add_executable(clink_kafka_tests
     test_kafka.cpp
     test_txn_resume.cpp
     test_txn_resume_live.cpp
+    test_end_of_input_commit_live.cpp
     test_kafka_security.cpp
     test_pipeline_loader.cpp
     test_pipeline_config.cpp

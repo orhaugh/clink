@@ -14,6 +14,7 @@
 // register their own KafkaMessage-typed sources/sinks via the same API.
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -595,6 +596,21 @@ public:
     // capture - same contract as CommittingSink's prepared handles.
     [[nodiscard]] bool stages_state_at_barrier() const noexcept override { return true; }
 
+    // The sealed transaction awaiting its CommitCheckpoint: 1 from the barrier
+    // that prepares it until the commit or abort that resolves it, else 0. The
+    // runner's end-of-stream wait reads it and holds the teardown open while it
+    // is 1, so the last checkpoint's commit, arriving on the dispatch thread
+    // after the input ended, runs instead of being refused and left for
+    // in-doubt resolution. A terminal barrier's local commit (or its abort on a
+    // stopping task) resolves its transaction before the wait starts, and an
+    // AbortCheckpoint resolves it as a commit does, so neither leaves the wait
+    // holding. Read on the runner's thread without mu_, which on_commit holds
+    // across the broker's commit: a mirror of open_txn_ckpt_, written under mu_
+    // wherever that is.
+    [[nodiscard]] std::size_t staged_commits_outstanding() const override {
+        return awaiting_commit_.load(std::memory_order_acquire) ? 1 : 0;
+    }
+
     void on_data(const Batch<std::string>& b) override {
         std::lock_guard lk(mu_);
         if (suppress_armed_) {
@@ -670,6 +686,7 @@ public:
         inner_.flush();
         inner_.on_barrier(b);
         open_txn_ckpt_ = b.id().value();
+        awaiting_commit_.store(true, std::memory_order_release);
         // The watermark horizon this transaction's records are covered by:
         // stamped into the commit receipt so a later restore knows how far
         // its replayed re-emissions are already published.
@@ -871,6 +888,7 @@ private:
     // enters the fresh transaction and normal streaming resumes.
     void resolve_open_() {
         open_txn_ckpt_.reset();
+        awaiting_commit_.store(false, std::memory_order_release);
         if (!tail_.empty()) {
             Batch<KafkaMessage> out_b;
             for (auto& v : tail_) {
@@ -1329,6 +1347,8 @@ private:
     std::mutex mu_;
     std::condition_variable pending_cv_;
     std::optional<std::uint64_t> open_txn_ckpt_;
+    // open_txn_ckpt_.has_value(), for staged_commits_outstanding().
+    std::atomic<bool> awaiting_commit_{false};
     std::vector<std::string> tail_;
     // Highest non-idle watermark seen, and its value when the open
     // transaction's barrier sealed it (the receipt's horizon).
