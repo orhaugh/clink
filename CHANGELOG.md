@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Sanitizer runs record where a hung test was blocked.**
+`build_and_test.sh` and the sanitizer CI jobs run ctest through
+`scripts/ctest-with-hang-dump.sh`, which attaches gdb to any test still running
+after 240 s and writes every thread's backtrace to the job log and to
+`Testing/Temporary/hang-stacks-<pid>.log`, uploaded with the failed run's logs.
+
 ## v0.11.0 (October 2026)
 
 A worker that stops reading can no longer stall the coordinator, and a run of

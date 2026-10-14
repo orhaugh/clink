@@ -116,6 +116,15 @@ on) is pinned; the host machine can be missing pieces. Never run two
 Build artifacts go into `build/`, `build-asan/`, `build-tsan/`, `build-ubsan/`,
 and `build-coverage/`, all of which are gitignored.
 
+`build_and_test.sh` and the sanitizer CI jobs run ctest through
+`scripts/ctest-with-hang-dump.sh <build-dir> [ctest args]`. Where gdb is
+available, it attaches to any test still running after
+`CLINK_HANG_DUMP_AFTER` seconds (default 240, inside the sanitizer jobs' 300 s
+timeout) and writes every thread's backtrace to
+`<build-dir>/Testing/Temporary/hang-stacks-<pid>.log` and to the job log. CI
+uploads it with the failed run's logs. A timed-out test therefore shows where
+it was blocked, not only what it last logged.
+
 ## Fast path
 
 For everyday local iteration without sanitizers:
