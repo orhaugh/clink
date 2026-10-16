@@ -21,6 +21,13 @@ namespace clink::redis {
 
 namespace {
 
+// Whether this build can open a TLS connection (libhiredis_ssl was found).
+#ifdef CLINK_REDIS_TLS
+constexpr bool kTls = true;
+#else
+constexpr bool kTls = false;
+#endif
+
 // Shared connection options (host/port/password/username/db) off a BuildContext.
 ConnectOptions conn_options_from(const clink::plugin::BuildContext& ctx) {
     ConnectOptions o;
@@ -86,7 +93,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .auth_methods = {"none", "password"},
-        .tls = false,
+        .tls = kTls,
         .backpressure = true,
         .retries = false,
         .timeout_options = {},
@@ -109,7 +116,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .transactional = false,
         .idempotency_key_option = "key_columns",
         .auth_methods = {"none", "password"},
-        .tls = false,
+        .tls = kTls,
         .backpressure = true,
         .retries = false,
         .timeout_options = {},

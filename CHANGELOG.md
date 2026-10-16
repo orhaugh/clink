@@ -19,6 +19,11 @@ whose reports carry their own stacks. Other builds are unchanged and cannot
 hit this: without the sanitizer, neither thread holds or waits for a TSan
 lock.
 
+**`clink connectors` reports TLS where a connector has it.** The capability
+record said RabbitMQ had TLS, which it does not (it is plain TCP only), and
+that Redis and MySQL had none, though both do. Redis reports it when the build
+found `libhiredis_ssl`.
+
 **Sanitizer runs record where a hung test was blocked.**
 `build_and_test.sh` and the sanitizer CI jobs run ctest through
 `scripts/ctest-with-hang-dump.sh`, which attaches gdb to any test still running

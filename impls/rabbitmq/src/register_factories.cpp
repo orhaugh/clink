@@ -50,7 +50,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .auth_methods = {"none", "token", "password"},
-        .tls = true,
+        .tls = false,
         .backpressure = true,
         .retries = false,
         .timeout_options = {},
