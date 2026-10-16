@@ -86,7 +86,7 @@ void PulsarSink::open() {
     const pulsar_result r = pulsar_client_create_producer(
         impl_->client, impl_->opts.topic.c_str(), conf, &impl_->producer);
     pulsar_producer_configuration_free(conf);
-    detail::check(r, impl_->opts.name + ": create_producer");
+    detail::check_first_contact(r, impl_->opts.name + ": create_producer", impl_->opts.conn);
 }
 
 void PulsarSink::on_data(const Batch<std::string>& batch) {

@@ -87,7 +87,7 @@ void PulsarSource::open() {
                                                     conf,
                                                     &impl_->consumer);
     pulsar_consumer_configuration_free(conf);
-    detail::check(r, impl_->opts.name + ": subscribe");
+    detail::check_first_contact(r, impl_->opts.name + ": subscribe", impl_->opts.conn);
 }
 
 bool PulsarSource::produce(Emitter<std::string>& out) {

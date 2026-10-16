@@ -23,6 +23,8 @@ PulsarConnParams parse_conn(const clink::plugin::BuildContext& ctx) {
     c.service_url = ctx.param_or("service_url", "pulsar://localhost:6650");
     c.token = ctx.param_or("token", "");
     c.operation_timeout_s = static_cast<int>(ctx.param_int64_or("operation_timeout_s", 30));
+    c.tls_ca = ctx.param_or("tls_ca", "");
+    c.tls_verify_hostname = ctx.param_or("tls_verify_hostname", "true") != "false";
     return c;
 }
 

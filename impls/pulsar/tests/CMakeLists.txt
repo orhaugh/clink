@@ -13,6 +13,15 @@ target_link_libraries(clink_pulsar_tests PRIVATE
     clink::pulsar
     GTest::gtest_main
 )
+# The broker-certificate tests connect to a local TLS listener
+# (test_helpers/tls_handshake_server.hpp), which needs OpenSSL; libpulsar does
+# not expose the one it carries.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    target_sources(clink_pulsar_tests PRIVATE test_pulsar_tls.cpp)
+    target_link_libraries(clink_pulsar_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_include_directories(clink_pulsar_tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+endif()
 target_compile_definitions(clink_pulsar_tests PRIVATE CLINK_HAS_PULSAR)
 clink_set_warnings(clink_pulsar_tests)
 gtest_discover_tests(clink_pulsar_tests

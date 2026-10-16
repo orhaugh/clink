@@ -23,9 +23,14 @@
 #include <hiredis/hiredis.h>
 
 #ifdef CLINK_REDIS_TLS
+#include <memory>
 #include <mutex>
 
+#include <arpa/inet.h>
 #include <hiredis/hiredis_ssl.h>
+#include <netinet/in.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #endif
 
 namespace clink::redis {
@@ -80,14 +85,17 @@ struct ConnectOptions {
     // TLS (requires the build to find libhiredis_ssl, i.e. CLINK_REDIS_TLS). When
     // tls is true the connection is wrapped in TLS before AUTH (credentials are
     // encrypted). tls_ca/cert/key are optional PEM paths (CA for server verify,
-    // cert+key for mutual TLS). tls_sni overrides the SNI/verify hostname (default
-    // = host). tls_verify=false skips server-cert verification (self-signed dev).
+    // cert+key for mutual TLS). tls_sni is the name sent as SNI and the one the
+    // server's certificate must carry (default = host). tls_verify=false skips
+    // server-cert verification (self-signed dev); tls_verify_hostname=false keeps
+    // the chain check but accepts a certificate that names another host.
     bool tls{false};
     std::string tls_ca;
     std::string tls_cert;
     std::string tls_key;
     std::string tls_sni;
     bool tls_verify{true};
+    bool tls_verify_hostname{true};
 };
 
 // Owns a redisContext. Move-only. Connects (+ AUTH/SELECT) in the ctor and
@@ -127,17 +135,12 @@ public:
 
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
-    Connection(Connection&& o) noexcept : ctx_(o.ctx_), ssl_ctx_(o.ssl_ctx_) {
-        o.ctx_ = nullptr;
-        o.ssl_ctx_ = nullptr;
-    }
+    Connection(Connection&& o) noexcept : ctx_(o.ctx_) { o.ctx_ = nullptr; }
     Connection& operator=(Connection&& o) noexcept {
         if (this != &o) {
             free_();
             ctx_ = o.ctx_;
-            ssl_ctx_ = o.ssl_ctx_;
             o.ctx_ = nullptr;
-            o.ssl_ctx_ = nullptr;
         }
         return *this;
     }
@@ -218,26 +221,31 @@ private:
 #ifdef CLINK_REDIS_TLS
         static std::once_flag init_once;
         std::call_once(init_once, [] { redisInitOpenSSL(); });
-        redisSSLOptions sopt{};
-        sopt.cacert_filename = o.tls_ca.empty() ? nullptr : o.tls_ca.c_str();
-        sopt.capath = nullptr;
-        sopt.cert_filename = o.tls_cert.empty() ? nullptr : o.tls_cert.c_str();
-        sopt.private_key_filename = o.tls_key.empty() ? nullptr : o.tls_key.c_str();
-        const std::string& sni = o.tls_sni.empty() ? o.host : o.tls_sni;
-        sopt.server_name = sni.empty() ? nullptr : sni.c_str();
-        sopt.verify_mode = o.tls_verify ? REDIS_SSL_VERIFY_PEER : REDIS_SSL_VERIFY_NONE;
-        redisSSLContextError ssl_err = REDIS_SSL_CTX_NONE;
-        redisSSLContext* sctx = redisCreateSSLContextWithOptions(&sopt, &ssl_err);
-        if (sctx == nullptr) {
-            const std::string e = redisSSLContextGetError(ssl_err);
-            redisFree(ctx_);
-            ctx_ = nullptr;
-            throw std::runtime_error("redis: TLS context init failed: " + e);
+        const std::string& name = o.tls_sni.empty() ? o.host : o.tls_sni;
+        SSL* ssl = nullptr;
+        try {
+            ssl = tls_session_(o, name);
+        } catch (...) {
+            free_();
+            throw;
         }
-        ssl_ctx_ = sctx;
-        if (redisInitiateSSLWithContext(ctx_, sctx) != REDIS_OK) {
-            const std::string e = ctx_->errstr;
-            free_();  // frees ctx_ + ssl_ctx_
+        if (redisInitiateSSL(ctx_, ssl) != REDIS_OK) {
+            // hiredis owns the session only once the handshake succeeds.
+            std::string e = ctx_->errstr;
+            const long verified = SSL_get_verify_result(ssl);
+            if (o.tls_verify && o.tls_verify_hostname &&
+                (verified == X509_V_ERR_HOSTNAME_MISMATCH ||
+                 verified == X509_V_ERR_IP_ADDRESS_MISMATCH)) {
+                e = "the server's certificate does not match the host " + name + " (" +
+                    certificate_names_(ssl) +
+                    "). Connect by a name or address the certificate carries (tls_sni sets the "
+                    "name checked), reissue it with " +
+                    name +
+                    " in its subjectAltName, or turn the hostname check off with "
+                    "tls_verify_hostname=false.";
+            }
+            SSL_free(ssl);
+            free_();
             throw std::runtime_error("redis: TLS handshake failed: " + e);
         }
 #else
@@ -254,16 +262,153 @@ private:
             redisFree(ctx_);
             ctx_ = nullptr;
         }
-#ifdef CLINK_REDIS_TLS
-        if (ssl_ctx_ != nullptr) {
-            redisFreeSSLContext(static_cast<redisSSLContext*>(ssl_ctx_));
-            ssl_ctx_ = nullptr;
-        }
-#endif
     }
 
+#ifdef CLINK_REDIS_TLS
+    [[noreturn]] static void tls_init_failed_(redisSSLContextError e) {
+        throw std::runtime_error(std::string("redis: TLS context init failed: ") +
+                                 redisSSLContextGetError(e));
+    }
+
+    // The session for one connection, built here rather than by
+    // redisCreateSSLContextWithOptions: hiredis sends SNI but never checks that
+    // the certificate names the host, and the check has to be set on the
+    // session before the handshake. Otherwise the settings, and the errors,
+    // are hiredis's own: TLS 1.2 or later, the CAs in tls_ca or else the
+    // default paths, and the client certificate when one is given.
+    static SSL* tls_session_(const ConnectOptions& o, const std::string& name) {
+        if (o.tls_cert.empty() != o.tls_key.empty()) {
+            tls_init_failed_(REDIS_SSL_CTX_CERT_KEY_REQUIRED);
+        }
+        // Each session holds a reference to its context, so this one is
+        // released on return.
+        const std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(
+            SSL_CTX_new(TLS_client_method()), &SSL_CTX_free);
+        if (!ctx) {
+            tls_init_failed_(REDIS_SSL_CTX_CREATE_FAILED);
+        }
+        SSL_CTX_set_min_proto_version(ctx.get(), TLS1_2_VERSION);
+        SSL_CTX_set_verify(ctx.get(), o.tls_verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, nullptr);
+        if (!o.tls_ca.empty()) {
+            if (SSL_CTX_load_verify_locations(ctx.get(), o.tls_ca.c_str(), nullptr) != 1) {
+                tls_init_failed_(REDIS_SSL_CTX_CA_CERT_LOAD_FAILED);
+            }
+        } else if (SSL_CTX_set_default_verify_paths(ctx.get()) != 1) {
+            tls_init_failed_(REDIS_SSL_CTX_CLIENT_DEFAULT_CERT_FAILED);
+        }
+        if (!o.tls_cert.empty()) {
+            if (SSL_CTX_use_certificate_chain_file(ctx.get(), o.tls_cert.c_str()) != 1) {
+                tls_init_failed_(REDIS_SSL_CTX_CLIENT_CERT_LOAD_FAILED);
+            }
+            if (SSL_CTX_use_PrivateKey_file(ctx.get(), o.tls_key.c_str(), SSL_FILETYPE_PEM) != 1) {
+                tls_init_failed_(REDIS_SSL_CTX_PRIVATE_KEY_LOAD_FAILED);
+            }
+        }
+        std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx.get()), &SSL_free);
+        if (!ssl) {
+            tls_init_failed_(REDIS_SSL_CTX_CREATE_FAILED);
+        }
+        if (!name.empty()) {
+            // SSL_set_tlsext_host_name, spelt out: the macro casts C-style, which
+            // warns in every translation unit that includes this header.
+            SSL_ctrl(ssl.get(),
+                     SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                     TLSEXT_NAMETYPE_host_name,
+                     const_cast<char*>(name.c_str()));
+        }
+        if (o.tls_verify && o.tls_verify_hostname) {
+            require_name_(ssl.get(), name);
+        }
+        return ssl.release();
+    }
+
+    // The address `host` spells when it is an IPv4 or IPv6 literal, without an
+    // IPv6 zone ("fe80::1%en0"); empty when it is a name.
+    static std::string ip_literal_(const std::string& host) {
+        in_addr v4{};
+        if (::inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+            return host;
+        }
+        const std::string unzoned = host.substr(0, host.find('%'));
+        in6_addr v6{};
+        if (::inet_pton(AF_INET6, unzoned.c_str(), &v6) == 1) {
+            return unzoned;
+        }
+        return {};
+    }
+
+    // Make the handshake check that the certificate names `name`: a name
+    // against its DNS subjectAltNames (or, with none, its subject CN), a
+    // wildcard only as a whole left-most label; an address against its IP
+    // address entries.
+    static void require_name_(SSL* ssl, const std::string& name) {
+        X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
+        const std::string ip = ip_literal_(name);
+        int ok = 0;
+        if (!ip.empty()) {
+            ok = X509_VERIFY_PARAM_set1_ip_asc(param, ip.c_str());
+        } else {
+            X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+            ok = X509_VERIFY_PARAM_set1_host(param, name.c_str(), name.size());
+        }
+        if (ok != 1) {
+            throw std::runtime_error("redis: cannot check the server's certificate against " +
+                                     name);
+        }
+    }
+
+    // What the server's certificate names, for the error a mismatch throws:
+    // its subjectAltName DNS and IP entries, and its subject CN when it has no
+    // DNS names. Read from the peer's chain, which OpenSSL 3 keeps after a
+    // failed verify and 1.1.1 does not.
+    static std::string certificate_names_(SSL* ssl) {
+        STACK_OF(X509)* chain = SSL_get_peer_cert_chain(ssl);
+        if (chain == nullptr || sk_X509_num(chain) == 0) {
+            return "what it names could not be read";
+        }
+        X509* cert = sk_X509_value(chain, 0);
+        std::string names;
+        bool any_dns = false;
+        const auto add = [&names](const std::string& n) {
+            names += (names.empty() ? "" : ", ") + n;
+        };
+        auto* sans = static_cast<GENERAL_NAMES*>(
+            X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+        if (sans != nullptr) {
+            for (int i = 0; i < sk_GENERAL_NAME_num(sans); ++i) {
+                const GENERAL_NAME* gn = sk_GENERAL_NAME_value(sans, i);
+                if (gn->type == GEN_DNS) {
+                    const ASN1_STRING* a = gn->d.dNSName;
+                    add("DNS:" +
+                        std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(a)),
+                                    static_cast<std::size_t>(ASN1_STRING_length(a))));
+                    any_dns = true;
+                } else if (gn->type == GEN_IPADD) {
+                    const ASN1_OCTET_STRING* a = gn->d.iPAddress;
+                    const int len = ASN1_STRING_length(a);
+                    char text[INET6_ADDRSTRLEN] = {};
+                    const int family = len == 4 ? AF_INET : (len == 16 ? AF_INET6 : AF_UNSPEC);
+                    if (family != AF_UNSPEC &&
+                        ::inet_ntop(family, ASN1_STRING_get0_data(a), text, sizeof(text)) !=
+                            nullptr) {
+                        add(std::string{"IP:"} + text);
+                    }
+                }
+            }
+            GENERAL_NAMES_free(sans);
+        }
+        if (!any_dns) {
+            char cn[256] = {};
+            if (X509_NAME_get_text_by_NID(
+                    X509_get_subject_name(cert), NID_commonName, cn, sizeof(cn)) > 0) {
+                add(std::string{"CN="} + cn);
+            }
+        }
+        return names.empty() ? "it names nothing" : "it names " + names;
+    }
+#endif
+
     redisContext* ctx_{nullptr};
-    void* ssl_ctx_{nullptr};  // redisSSLContext* (type-erased to avoid the TLS header here)
 };
 
 }  // namespace clink::redis

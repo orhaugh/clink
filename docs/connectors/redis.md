@@ -52,10 +52,13 @@ Options are parsed off the `BuildContext` in `register_factories.cpp`; the share
 | `tls_ca` | No | (empty) | Optional PEM path to a CA certificate for server verification. |
 | `tls_cert` | No | (empty) | Optional PEM path to a client certificate for mutual TLS. |
 | `tls_key` | No | (empty) | Optional PEM path to the client private key for mutual TLS. |
-| `tls_sni` | No | (empty) | Overrides the SNI / verify hostname; defaults to `host`. |
-| `tls_verify` | No | `true` | `false` skips server-certificate verification (self-signed development certs). |
+| `tls_sni` | No | (empty) | The name sent as SNI and the one the server's certificate must carry; defaults to `host`. |
+| `tls_verify` | No | `true` | `false` skips server-certificate verification (self-signed development certs), the hostname check included. |
+| `tls_verify_hostname` | No | `true` | `false` keeps the certificate-chain check but accepts a certificate that names another host. |
 
 Authentication-related options are `username`, `password`, and the `tls_*` set. The TLS handshake runs before `AUTH`, so credentials are sent over the encrypted channel when `tls=true`.
+
+With `tls_verify` on, the handshake checks both that the server's certificate chains to a trusted CA (`tls_ca`, or the system store when it is empty) and that it names the host connected to (`tls_sni` when set, otherwise `host`). A name is matched against the certificate's DNS subjectAltNames, or its subject CN when it has none, with a wildcard covering one whole left-most label; an IP address is matched against its IP subjectAltNames only. A mismatch fails the connect with an error that names the host, what the certificate names, and `tls_verify_hostname=false`. hiredis itself checks only the chain, so the connector builds the TLS session and asks for the name before the handshake.
 
 ### Sink (`redis_sink`)
 
@@ -174,11 +177,13 @@ Honest caveat (stated in `redis_source.hpp`): `XACK` is an external side effect 
 - An `XDEL`-tombstoned entry that is still pending is acknowledged and paged past but not emitted.
 - The `XACK`-on-checkpoint commit is not transactional with the global checkpoint, so a single batch can be at-most-once if a checkpoint fails after the ack (see Delivery semantics).
 - Rescale caveat: a consumer is named `<prefix>-<subtask_idx>` and a restart re-drains only its own PEL. On a scale-down the removed subtasks' consumers are never recreated, so their un-acked (pending) entries are orphaned in the group and not redelivered. Reclaiming them would need `XAUTOCLAIM` over the dropped consumers and is not done; op-level rescale is not currently reachable from the SQL path. Same-parallelism and scale-up restarts are unaffected.
-- TLS is available only when the build finds `libhiredis_ssl` and OpenSSL (`CLINK_REDIS_TLS`); otherwise `tls=true` is rejected at runtime.
+- TLS is available only when the build finds `libhiredis_ssl` and OpenSSL (`CLINK_REDIS_TLS`); otherwise `tls=true` is rejected at runtime, and `clink connectors` reports the connector without TLS.
 
 ## Testing
 
-The connector has both in-process logic tests (`test_redis_sink_logic.cpp`, `test_redis_source_logic.cpp`) and an env-gated live integration test (`test_redis_live.cpp`).
+The connector has in-process logic tests (`test_redis_sink_logic.cpp`, `test_redis_source_logic.cpp`), server-certificate tests (`test_redis_tls.cpp`), and an env-gated live integration test (`test_redis_live.cpp`).
+
+The certificate tests run in every TLS-enabled build without a Redis server: they connect to a local TLS listener (`tests/test_helpers/tls_handshake_server.hpp`), since the handshake completes before the client sends any command. They cover a certificate that names the address, one that names another host (refused, with the error), `tls_sni` as the name checked, wildcards, the hostname opt-out still checking the chain, and `tls_verify=false`.
 
 The live test is skipped unless `CLINK_REDIS_TEST_URL` is set (for example `redis://localhost:6379`). The integration service is the `redis:7` Docker image defined in `docker/integration-services.yml`. It covers a sink-to-source round-trip, PEL replay of an un-acked consumer on restart, that acked entries are not replayed, multi-field JSON-object rendering, and idempotent `XGROUP CREATE`.
 

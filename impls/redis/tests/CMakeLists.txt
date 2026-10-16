@@ -10,6 +10,7 @@ add_executable(clink_redis_tests
     test_redis_sink_logic.cpp
     test_redis_source_logic.cpp
     test_redis_live.cpp
+    test_redis_tls.cpp
     test_redis_upsert_sink.cpp
     test_redis_upsert_contract.cpp
 )
@@ -19,12 +20,16 @@ target_link_libraries(clink_redis_tests PRIVATE
     GTest::gtest_main
     ${_redis_target}
 )
-# The live test constructs a TLS Connection directly, so the test TU instantiates
-# the redis_client.hpp TLS path and needs the SSL libs (clink::redis links them
-# PRIVATE). Inherited from the parent scope; empty when TLS is unavailable.
+# The live and TLS tests construct a TLS Connection directly, so their TUs
+# instantiate the redis_client.hpp TLS path and need the SSL libs (clink::redis
+# links them PRIVATE). Inherited from the parent scope; empty when TLS is
+# unavailable.
 if(_redis_ssl_target)
     target_link_libraries(clink_redis_tests PRIVATE ${_redis_ssl_target})
 endif()
+# For test_helpers/tls_handshake_server.hpp, the TLS listener the TLS tests
+# connect to.
+target_include_directories(clink_redis_tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_compile_definitions(clink_redis_tests PRIVATE CLINK_HAS_REDIS)
 clink_set_warnings(clink_redis_tests)
 gtest_discover_tests(clink_redis_tests

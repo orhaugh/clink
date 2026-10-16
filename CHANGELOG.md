@@ -19,6 +19,26 @@ whose reports carry their own stacks. Other builds are unchanged and cannot
 hit this: without the sanitizer, neither thread holds or waits for a TSan
 lock.
 
+**The Redis and Pulsar connectors check that the server's certificate names
+the host they connect to.** v0.11.0 added the check to the cluster transport
+and the Kafka resume dialer. A review of the remaining TLS clients found two
+that checked only the chain: hiredis sends SNI but never checks the name, and
+libpulsar checks it only when asked. Both now check by default, a DNS name
+against the certificate's `subjectAltName` DNS entries (its subject CN only
+when it has none; a wildcard only as a whole left-most label) and an IP literal
+against its IP entries. Redis checks `tls_sni` when it is set and `host`
+otherwise, building the TLS session itself so it can ask for the name before
+the handshake; a mismatch names the host, what the certificate names, and the
+opt-out. Pulsar checks each broker by the host it dials. `tls_verify_hostname`
+set to `false` turns the check off on either and keeps the chain check. Pulsar
+also gains `tls_ca`, a trust file for `pulsar+ssl://` service URLs, and a
+refused broker certificate, which libpulsar reports as a plain `ConnectError`,
+now says how to tell it from a broker that is down. The other TLS clients
+already checked the name: the WebSocket client, librdkafka, the HTTP
+connectors' client, the native ClickHouse client, mongoc, nats.c as Debian and
+Homebrew build it, MariaDB Connector/C and libmosquitto with verification on,
+and libpq under `sslmode=verify-full`.
+
 **`clink connectors` reports TLS where a connector has it.** The capability
 record said RabbitMQ had TLS, which it does not (it is plain TCP only), and
 that Redis and MySQL had none, though both do. Redis reports it when the build
@@ -29,6 +49,15 @@ found `libhiredis_ssl`.
 `scripts/ctest-with-hang-dump.sh`, which attaches gdb to any test still running
 after 240 s and writes every thread's backtrace to the job log and to
 `Testing/Temporary/hang-stacks-<pid>.log`, uploaded with the failed run's logs.
+
+**Compatibility.**
+
+- A Redis connection with `tls='true'` and `tls_verify` on, or a Pulsar
+  `pulsar+ssl://` service URL, now fails when the server's certificate does
+  not name the host connected by. Connect by a name the certificate carries
+  (on Redis, `tls_sni` sets the name checked), reissue the certificate with
+  that name in its `subjectAltName`, or set `tls_verify_hostname='false'`,
+  which still verifies the chain.
 
 ## v0.11.0 (October 2026)
 

@@ -45,6 +45,10 @@ Shared connection options:
 | `service_url` | No | `pulsar://localhost:6650` | Pulsar broker service URL. |
 | `token` | No | (empty) | Optional JWT for authentication (`pulsar_authentication_token`). Leave blank for no-auth. |
 | `operation_timeout_s` | No | `30` | Per-operation timeout in seconds. |
+| `tls_ca` | No | (empty) | PEM file of the CAs to trust for a `pulsar+ssl://` service URL, in place of the default store. Checked at open. |
+| `tls_verify_hostname` | No | `true` | `false` keeps the certificate-chain check but accepts a broker certificate that names another host. |
+
+A `pulsar+ssl://` service URL connects over TLS. The client checks that each broker's certificate chains to a trusted CA (`tls_ca`, or the default store when it is empty) and that it names the host the client dials that broker by: the host in `service_url` for the first connection, and the address the lookup returns for each broker after that. libpulsar leaves the name check off unless asked, so the connector turns it on. A refused certificate surfaces as a `ConnectError` from `create_producer` or `subscribe`, and the client log says `Handshake failed: certificate verify failed`; the error clink raises says so and names `tls_verify_hostname=false`.
 
 Source (`pulsar_source_string`) options:
 
@@ -130,11 +134,14 @@ Both ends are at-least-once.
 - Source and sink each handle a single topic; no topic patterns, glob or multi-topic subscription.
 - Sink is at-least-once only. `exactly_once` and `mode='upsert'` are rejected by the SQL planner; no producer dedup (producer name + sequence id) is wired.
 - Source acknowledges at checkpoint commit (not the barrier), so the earlier crash-window drop is closed; duplicates on replay remain the at-least-once trade-off. This relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch, wired for both the default (non-fused) deployment and the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`).
-- Authentication is limited to an optional JWT token; no other auth mechanisms are exposed.
+- Authentication is limited to an optional JWT token; no other auth mechanisms are exposed, and there is no TLS client certificate option.
+- With `tls_ca` empty, the trusted CAs are those in the default store of the OpenSSL libpulsar carries, not necessarily the system's. The prebuilt Apache package in the build image points it at `/etc/ssl`.
 
 ## Testing
 
 A factory-registration test (`impls/pulsar/tests/test_factory_registration.cpp`) checks that `install()` registers both string-channel factories. It runs without a broker.
+
+Broker-certificate tests (`impls/pulsar/tests/test_pulsar_tls.cpp`) run without a broker too, in any build that finds OpenSSL. They open a sink against a local TLS listener (`tests/test_helpers/tls_handshake_server.hpp`), which counts the handshakes the client completes: libpulsar finishes the handshake before it sends anything, so a refused certificate never completes one. They cover a certificate naming another host (refused by default, with the error), one naming the host, the hostname opt-out, the opt-out still checking the chain, and a missing `tls_ca` file.
 
 A live integration test (`impls/pulsar/tests/test_pulsar_live.cpp`, `PulsarLive.PublishThenConsumeRoundTrip`) drives the sink and source against a real broker. It is skipped unless the environment variable `CLINK_PULSAR_TEST_ENDPOINT` is set to a Pulsar service URL, for example:
 
