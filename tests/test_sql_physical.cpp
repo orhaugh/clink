@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <set>
 #include <sstream>
 
 #include <gtest/gtest.h>
@@ -12,6 +13,7 @@
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+#include "clink/sql/script_runner.hpp"
 
 namespace clink::sql {
 
@@ -944,6 +946,155 @@ TEST(SqlPhysical, PostgresCdcKeepRowsPlacesTheRowKeepingStage) {
     const auto without = pp.compile(static_cast<const LogicalSink&>(
         *bind_insert(cat, "INSERT INTO replica SELECT id, status FROM pg_plain")));
     EXPECT_EQ(find_op(without, "cdc_keep_rows_row"), nullptr);
+}
+
+// CDC tables on one replication slot share one source, which routes each
+// table's rows to its own branch: within one statement (a join) and across the
+// INSERTs of an EXECUTE STATEMENT SET. Two jobs naming one slot are refused.
+namespace {
+
+Catalog shared_slot_catalog(const std::string& orders_extra = "") {
+    Catalog cat;
+    const std::string cdc =
+        "connector='postgres', format='json', mode='cdc', changelog_mode='upsert', "
+        "keep_rows='true', conninfo='host=pg dbname=shop', slot_name='shop', "
+        "publication_names='shop'";
+    auto s = parse(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_id BIGINT, amount DOUBLE) WITH (" +
+        cdc + ", \"table\"='public.orders'" + orders_extra +
+        ");"
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, name VARCHAR) WITH (" +
+        cdc +
+        ", \"table\"='public.customers');"
+        "CREATE TABLE shown (id BIGINT, name VARCHAR, amount DOUBLE) WITH (connector='print', "
+        "format='json');"
+        "CREATE TABLE orders_out (id BIGINT PRIMARY KEY, customer_id BIGINT, amount DOUBLE) WITH ("
+        "connector='postgres', format='json', mode='upsert', conninfo='host=pg', "
+        "\"table\"='public.orders_out');"
+        "CREATE TABLE customers_out (id BIGINT PRIMARY KEY, name VARCHAR) WITH ("
+        "connector='postgres', format='json', mode='upsert', conninfo='host=pg', "
+        "\"table\"='public.customers_out');");
+    for (const auto& st : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    return cat;
+}
+
+std::vector<const cluster::OperatorSpec*> ops_of(const cluster::JobGraphSpec& spec,
+                                                 const std::string& type) {
+    std::vector<const cluster::OperatorSpec*> out;
+    for (const auto& op : spec.ops) {
+        if (op.type == type) {
+            out.push_back(&op);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(SqlPhysical, PostgresCdcTablesOnOneSlotShareOneSource) {
+    const Catalog cat = shared_slot_catalog();
+    PhysicalPlanner pp;
+    const auto spec = pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat,
+                     "INSERT INTO shown SELECT o.id, c.name, o.amount FROM orders o JOIN "
+                     "customers c ON o.customer_id = c.id")));
+    const auto sources = ops_of(spec, "postgres_cdc_source");
+    ASSERT_EQ(sources.size(), 1U);
+    const auto& src = *sources.front();
+    EXPECT_EQ(src.params.at("selector_fn"), "postgres_cdc_table");
+    EXPECT_EQ(src.params.count("table"), 0U);
+    const auto tables = clink::config::parse(src.params.at("tables"));
+    ASSERT_TRUE(tables.is_array());
+    ASSERT_EQ(tables.as_array().size(), 2U);
+    std::vector<std::string> refs;
+    for (const auto* bridge : ops_of(spec, "json_string_to_row")) {
+        ASSERT_EQ(bridge->inputs.size(), 1U);
+        refs.push_back(bridge->inputs.front());
+    }
+    std::sort(refs.begin(), refs.end());
+    EXPECT_EQ(refs, (std::vector<std::string>{src.id + ".0", src.id + ".1"}));
+    // Each entry is the table's own: its key and columns.
+    for (const auto& e : tables.as_array()) {
+        EXPECT_EQ(e.as_object().at("keep_rows").as_string(), "true");
+        EXPECT_FALSE(e.as_object().at("declared_types").as_string().empty());
+    }
+}
+
+TEST(SqlPhysical, PostgresCdcTablesOnOneSlotMustAgreeOnTheSlotsOptions) {
+    const Catalog cat = shared_slot_catalog(", snapshot_batch_rows='50'");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(
+            *bind_insert(cat,
+                         "INSERT INTO shown SELECT o.id, c.name, o.amount FROM orders o JOIN "
+                         "customers c ON o.customer_id = c.id")));
+        FAIL() << "tables on one slot with different snapshot_batch_rows were fused";
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("snapshot_batch_rows"), std::string::npos) << what;
+        EXPECT_NE(what.find("slot shop"), std::string::npos) << what;
+    }
+}
+
+TEST(SqlPhysical, AStatementSetIsOneJobAndItsCdcTablesShareTheSlot) {
+    const Catalog cat = shared_slot_catalog();
+    PhysicalPlanner pp;
+    std::vector<cluster::JobGraphSpec> specs;
+    specs.push_back(pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat, "INSERT INTO orders_out SELECT id, customer_id, amount FROM orders"))));
+    specs.push_back(pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat, "INSERT INTO customers_out SELECT id, name FROM customers"))));
+    const auto merged = merge_statement_set(std::move(specs));
+    std::set<std::string> ids;
+    for (const auto& op : merged.ops) {
+        EXPECT_TRUE(ids.insert(op.id).second) << "op id " << op.id << " twice";
+    }
+    ASSERT_EQ(ops_of(merged, "postgres_cdc_source").size(), 1U);
+    EXPECT_EQ(ops_of(merged, "postgres_upsert_sink").size() +
+                  ops_of(merged, "postgres_upsert_sink_row").size(),
+              2U);
+    // Every input names an op of the merged job.
+    for (const auto& op : merged.ops) {
+        for (const auto& in : op.inputs) {
+            const auto base = in.substr(0, in.find_first_of(".:"));
+            EXPECT_EQ(ids.count(base), 1U) << op.id << " reads " << in;
+        }
+    }
+
+    // Through the script runner: separate INSERTs on one slot are refused,
+    // a statement set is submitted as one job.
+    Catalog runner_cat = shared_slot_catalog();
+    std::vector<cluster::JobGraphSpec> submitted;
+    const SubmitFn submit = [&](const cluster::JobGraphSpec& spec, const std::string&) {
+        submitted.push_back(spec);
+        return 0;
+    };
+    std::ostringstream out;
+    std::ostringstream err;
+    const ScriptIO io{&out, &err};
+    EXPECT_NE(run_script("INSERT INTO orders_out SELECT id, customer_id, amount FROM orders;"
+                         "INSERT INTO customers_out SELECT id, name FROM customers;",
+                         runner_cat,
+                         ScriptRunOptions{},
+                         io,
+                         submit),
+              0);
+    EXPECT_NE(err.str().find("EXECUTE STATEMENT SET"), std::string::npos) << err.str();
+    submitted.clear();
+    err.str("");
+    EXPECT_EQ(run_script("EXECUTE STATEMENT SET BEGIN "
+                         "INSERT INTO orders_out SELECT id, customer_id, amount FROM orders;"
+                         "INSERT INTO customers_out SELECT id, name FROM customers; END;",
+                         runner_cat,
+                         ScriptRunOptions{},
+                         io,
+                         submit),
+              0)
+        << err.str();
+    ASSERT_EQ(submitted.size(), 1U);
+    EXPECT_EQ(ops_of(submitted.front(), "postgres_cdc_source").size(), 1U);
 }
 
 // M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via

@@ -101,6 +101,16 @@ values. The source records, in its checkpoint, the WAL position a snapshot
 taken fresh was read at, so the stage can tell a replayed update of a row
 deleted before that snapshot from a row it should hold and does not.
 
+**Several CDC tables can share one replication slot.** Tables that name the
+same `conninfo` and `slot_name` are now read by one source: one slot, one
+walsender, the WAL decoded once. Each table keeps its own declaration; the
+source checks each at open, snapshots each from the same exported snapshot and
+routes every row to its own table's branch of the plan. They must be read by
+one job, so `EXECUTE STATEMENT SET BEGIN ... END;` now runs several INSERT
+statements as one job, and two separate jobs naming the same slot are refused
+at compile time. There is no transaction atomicity across the tables
+downstream.
+
 **A column added to a captured table can be captured.** Stop the job with
 `clink stop`, declare the column, and resubmit from the stop's checkpoint: the
 restored source compares the declared columns with those its checkpoint

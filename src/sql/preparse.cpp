@@ -5,6 +5,7 @@
 #include <cctype>
 #include <charconv>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1526,6 +1527,138 @@ bool strip_allow_unbounded_state(std::string& sql) {
 }
 
 }  // namespace
+
+namespace {
+
+// The next token start at or after `i`: past whitespace, quotes and comments
+// are not skipped (a statement set's keywords are plain words).
+std::size_t skip_space_and_comments(std::string_view s, std::size_t i) {
+    while (i < s.size()) {
+        if (std::isspace(static_cast<unsigned char>(s[i])) != 0) {
+            ++i;
+            continue;
+        }
+        const bool comment = (s[i] == '-' && i + 1 < s.size() && s[i + 1] == '-') ||
+                             (s[i] == '/' && i + 1 < s.size() && s[i + 1] == '*');
+        if (!comment) {
+            break;
+        }
+        i = skip_quote_or_comment(s, i);
+    }
+    return i;
+}
+
+// `words` in order at `i`, whitespace and comments between them. The index
+// just past the last, or npos.
+std::size_t words_at(std::string_view s,
+                     std::size_t i,
+                     std::initializer_list<std::string_view> words) {
+    for (const auto w : words) {
+        i = skip_space_and_comments(s, i);
+        if (!left_boundary(s, i) || !word_at(s, i, w)) {
+            return std::string_view::npos;
+        }
+        i += w.size();
+    }
+    return i;
+}
+
+}  // namespace
+
+std::vector<ScriptPiece> split_statement_sets(std::string_view sql) {
+    std::vector<ScriptPiece> pieces;
+    std::size_t piece_start = 0;
+    int sets = 0;
+    // Scan for EXECUTE STATEMENT SET BEGIN at a statement start: the start of
+    // the script or just after a `;`.
+    std::size_t i = 0;
+    bool statement_start = true;
+    while (i < sql.size()) {
+        const std::size_t q = skip_quote_or_comment(sql, i);
+        if (q != i) {
+            i = q;
+            continue;
+        }
+        if (std::isspace(static_cast<unsigned char>(sql[i])) != 0) {
+            ++i;
+            continue;
+        }
+        if (sql[i] == ';') {
+            statement_start = true;
+            ++i;
+            continue;
+        }
+        if (statement_start) {
+            const std::size_t body = words_at(sql, i, {"execute", "statement", "set", "begin"});
+            if (body != std::string_view::npos) {
+                if (i > piece_start) {
+                    pieces.push_back({sql.substr(piece_start, i - piece_start), -1, piece_start});
+                }
+                // The END that closes it: first token after a `;`, followed by
+                // `;` or the end of the script.
+                std::size_t j = body;
+                bool after_semicolon = true;
+                std::size_t end_at = std::string_view::npos;
+                std::size_t resume = std::string_view::npos;
+                while (j < sql.size()) {
+                    const std::size_t qj = skip_quote_or_comment(sql, j);
+                    if (qj != j) {
+                        j = qj;
+                        continue;
+                    }
+                    if (std::isspace(static_cast<unsigned char>(sql[j])) != 0) {
+                        ++j;
+                        continue;
+                    }
+                    if (sql[j] == ';') {
+                        after_semicolon = true;
+                        ++j;
+                        continue;
+                    }
+                    if (after_semicolon &&
+                        words_at(sql, j, {"execute", "statement", "set", "begin"}) !=
+                            std::string_view::npos) {
+                        throw TranslationError(
+                            "a statement set cannot contain another EXECUTE STATEMENT SET",
+                            static_cast<int>(j));
+                    }
+                    if (after_semicolon && left_boundary(sql, j) && word_at(sql, j, "end")) {
+                        const std::size_t after = skip_space_and_comments(sql, j + 3);
+                        if (after >= sql.size() || sql[after] == ';') {
+                            end_at = j;
+                            resume = after >= sql.size() ? sql.size() : after + 1;
+                            break;
+                        }
+                    }
+                    after_semicolon = false;
+                    ++j;
+                }
+                if (end_at == std::string_view::npos) {
+                    throw TranslationError(
+                        "EXECUTE STATEMENT SET BEGIN is not closed by END; after its last "
+                        "statement",
+                        static_cast<int>(i));
+                }
+                const std::string_view text = sql.substr(body, end_at - body);
+                if (text.find_first_not_of(" \t\r\n;") == std::string_view::npos) {
+                    throw TranslationError("a statement set holds no statements",
+                                           static_cast<int>(i));
+                }
+                pieces.push_back({text, sets++, body});
+                piece_start = resume;
+                i = resume;
+                statement_start = true;
+                continue;
+            }
+        }
+        statement_start = false;
+        ++i;
+    }
+    if (piece_start < sql.size()) {
+        pieces.push_back({sql.substr(piece_start), -1, piece_start});
+    }
+    return pieces;
+}
 
 PreparseResult preparse(std::string_view sql) {
     PreparseResult res;

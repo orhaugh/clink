@@ -18,6 +18,7 @@
 // missing - and a snapshot restarted from scratch is checked for convergence.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -31,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -315,6 +317,7 @@ struct Change {
     std::uint64_t version{0};
     bool deleted{false};
     clink::config::JsonObject row;
+    std::string raw;  // the row as the source emitted it
 };
 
 class Downstream {
@@ -328,6 +331,7 @@ public:
         c.op = c.row.at("__op").as_string();
         c.version = static_cast<std::uint64_t>(c.row.at("__version").as_int());
         c.deleted = c.row.at("__deleted").as_bool();
+        c.raw = json;
         changes_.push_back(std::move(c));
     }
     void mark(std::uint64_t ckpt) { at_[ckpt] = changes_.size(); }
@@ -1805,6 +1809,115 @@ TEST(PostgresCdcContractLive, AColumnDeclaredSinceTheCheckpointIsRefusedWithoutK
         EXPECT_NE(what.find("keep_rows='true'"), std::string::npos) << what;
     }
     second.crash();
+}
+
+// Several tables on one slot (the SQL planner's `tables`): one source, one
+// replication stream in commit order, each table with its own key, columns
+// and changelog form, and each row leading with the index of its table, which
+// the postgres_cdc_table selector routes on. A checkpoint inside the stream
+// replays exactly, across both tables.
+TEST(PostgresCdcContractLive, SeveralTablesShareOneSlot) {
+    REQUIRE_SERVER();
+    Fixture a("multia");
+    Fixture b("multib");
+    sql(a.dsn(), "ALTER PUBLICATION " + a.pub() + " ADD TABLE " + b.table());
+    {
+        Session s(a.dsn());
+        (void)s.returning(insert_rows(a.table(), 1, 20));
+        (void)s.returning(insert_rows(b.table(), 1, 30));
+    }
+    auto params = a.params();
+    for (const char* k : {"table", "primary_key", "declared_types", "changelog_mode"}) {
+        params.erase(k);
+    }
+    const std::string b_declared =
+        "id:BIGINT;rev:INTEGER;status:VARCHAR;__op:VARCHAR;__version:BIGINT;__deleted:BOOLEAN";
+    params["tables"] = "[{\"table\":\"public." + a.table() +
+                       "\",\"primary_key\":\"id\",\"declared_types\":\"" + std::string{kDeclared} +
+                       "\",\"changelog_mode\":\"append\"},{\"table\":\"public." + b.table() +
+                       "\",\"primary_key\":\"id\",\"declared_types\":\"" + b_declared +
+                       "\",\"changelog_mode\":\"append\",\"keep_rows\":\"true\"}]";
+
+    std::map<std::uint64_t, InMemoryStateBackend> backends;
+    Downstream down;
+    {
+        CdcRun run(params, down);
+        run.open();
+        {
+            // One transaction across both tables.
+            Session s(a.dsn());
+            s.exec("BEGIN");
+            (void)s.returning(update_rows(a.table(), "id <= 5"));
+            (void)s.returning(update_rows(b.table(), "id <= 8"));
+            s.exec("COMMIT");
+            (void)s.returning(delete_rows(b.table(), "id % 7 = 0"));
+        }
+        commit_marker(a);
+        run.pump_until([&] { return down.streamed(kMarker); });
+        run.checkpoint(backends, 1);
+        run.complete(1);
+        {
+            Session s(a.dsn());
+            (void)s.returning(update_rows(a.table(), "id > 15"));
+            (void)s.returning(insert_rows(b.table(), 100, 110));
+        }
+        run.pump_until([&] {
+            return std::any_of(down.changes().begin(), down.changes().end(), [](const Change& c) {
+                return c.id == 110 && c.op == "insert";
+            });
+        });
+        run.crash();
+    }
+    {
+        Session s(a.dsn());
+        (void)s.returning(update_rows(b.table(), "id BETWEEN 100 AND 104"));
+    }
+    sql(a.dsn(),
+        "UPDATE " + a.table() + " SET rev = rev + 1 WHERE id = " + std::to_string(kMarker));
+    const std::int64_t marker_rev = std::stoll(
+        scalar(a.dsn(), "SELECT rev FROM " + a.table() + " WHERE id = " + std::to_string(kMarker)));
+    CdcRun second(params, down);
+    second.restore(backends, 1);
+    second.open();
+    second.pump_until([&] {
+        return std::any_of(down.changes().begin(), down.changes().end(), [&](const Change& c) {
+            return c.id == kMarker && c.rev == marker_rev && c.op != "snapshot";
+        });
+    });
+    second.close();
+
+    const auto* selector =
+        clink::cluster::SelectorRegistry::default_instance().find_string("postgres_cdc_table");
+    ASSERT_NE(selector, nullptr);
+    // Each table's rows, the latest version per key, deletes removed.
+    std::array<std::map<std::int64_t, const Change*>, 2> latest;
+    std::set<std::tuple<std::int64_t, std::int64_t, std::uint64_t>> seen;
+    for (const auto& c : down.changes()) {
+        ASSERT_EQ(c.row.count("__cdc_table"), 1U) << "a row without its table";
+        const auto t = static_cast<std::size_t>(c.row.at("__cdc_table").as_int());
+        ASSERT_LT(t, 2U);
+        EXPECT_EQ((*selector)(c.raw), static_cast<int>(t)) << c.raw.substr(0, 40);
+        EXPECT_EQ(c.row.count("amount"), t == 0 ? 1U : 0U) << "table " << t << "'s columns";
+        EXPECT_EQ(c.row.count("__cdc_kind"), t == 1 ? 1U : 0U) << "only table 1 keeps rows";
+        EXPECT_TRUE(seen.emplace(static_cast<std::int64_t>(t), c.id, c.version).second ||
+                    c.op == "snapshot")
+            << "table " << t << " id " << c.id << " emitted twice";
+        auto& slot = latest[t][c.id];
+        if (slot == nullptr || c.version >= slot->version) {
+            slot = &c;
+        }
+    }
+    const auto state_of = [&](std::size_t t) {
+        std::map<std::int64_t, std::int64_t> out;
+        for (const auto& [id, c] : latest[t]) {
+            if (!c->deleted) {
+                out[id] = c->rev;
+            }
+        }
+        return out;
+    };
+    EXPECT_EQ(state_of(0), table_state(a));
+    EXPECT_EQ(state_of(1), table_state(b));
 }
 
 // Microsecond timestamps: refused by default, and with

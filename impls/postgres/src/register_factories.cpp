@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -93,15 +94,26 @@ public:
     // encoder set (json=true with changelog_mode): the SQL CDC contract - typed
     //   values for the declared columns, refused when a value cannot be held
     //   exactly, and __row_kind in upsert mode (cdc_row_encoder.hpp).
+    // indexed (several tables): each row leads with "__cdc_table", the index of
+    //   its table in the configured order, which the postgres_cdc_table
+    //   selector reads to route it to that table's branch of the plan.
     explicit StringPostgresCdcSource(PostgresCdcSource::Options opts,
                                      bool json = false,
-                                     std::optional<cdc::RowEncoder> encoder = std::nullopt)
+                                     std::vector<cdc::RowEncoder> encoders = {},
+                                     bool indexed = false)
         : inner_(opts),
           json_(json),
-          encoder_(std::move(encoder)),
+          encoders_(std::move(encoders)),
+          indexed_(indexed),
           policy_(opts.decode_error_policy) {}
 
-    void open() override { inner_.open(); }
+    void open() override {
+        inner_.open();
+        const auto names = inner_.captured_tables();
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            table_index_[names[i]] = i;
+        }
+    }
     void close() override { inner_.close(); }
     void cancel() override {
         Source<std::string>::cancel();
@@ -122,7 +134,7 @@ public:
                             b.emplace(serialize(r.value()));
                             continue;
                         }
-                        if (encoder_) {
+                        if (!encoders_.empty()) {
                             if (auto row = encode_(r.value(), snapshot_rows)) {
                                 b.emplace(std::move(*row));
                             }
@@ -225,18 +237,33 @@ private:
     std::optional<std::string> encode_(const CdcEvent& ev, bool snapshot_row) {
         try {
             truncated_.clear();
+            std::size_t index = 0;
+            if (encoders_.size() > 1 || indexed_) {
+                const auto it = table_index_.find(ev.table);
+                if (it == table_index_.end()) {
+                    return std::nullopt;  // a transaction marker, or not captured
+                }
+                index = it->second;
+            }
+            const cdc::RowEncoder& encoder = encoders_.at(index);
             // keep_rows: a streamed change before the position a fresh
             // snapshot was read at may replay what that snapshot holds.
             bool converging = false;
-            if (!snapshot_row && encoder_->keep_rows()) {
+            if (!snapshot_row && encoder.keep_rows()) {
                 if (const auto w = inner_.converging_until(); w != 0) {
                     const auto lsn = cdc::parse_lsn(ev.lsn);
                     converging = lsn.has_value() && *lsn < w;
                 }
             }
-            auto row = encoder_->encode(ev, snapshot_row, &truncated_, converging);
+            auto row = encoder.encode(ev, snapshot_row, &truncated_, converging);
             if (!truncated_.empty()) {
                 note_truncated_();
+            }
+            if (row && indexed_) {
+                // {"__cdc_table":N, ... - first, so the selector reads it
+                // without parsing the row.
+                *row = "{\"__cdc_table\":" + std::to_string(index) + (row->size() > 2 ? "," : "") +
+                       row->substr(1);
             }
             return row;
         } catch (const cdc::EncodeError& e) {
@@ -273,7 +300,9 @@ private:
 
     PostgresCdcSource inner_;
     bool json_{false};
-    std::optional<cdc::RowEncoder> encoder_;
+    std::vector<cdc::RowEncoder> encoders_;
+    bool indexed_{false};
+    std::map<std::string, std::size_t> table_index_;
     PostgresCdcSource::DecodeErrorPolicy policy_;
     std::vector<std::string> truncated_;
     std::set<std::string> truncation_logged_;
@@ -428,12 +457,74 @@ std::string domain_option(const clink::plugin::BuildContext& ctx,
 
 struct CdcConfig {
     PostgresCdcSource::Options source;
-    std::optional<cdc::ChangelogMode> changelog_mode;
-    std::vector<cdc::ColumnPlan> plan;
+    // Under the SQL contract, one encoder per captured table, in their order.
+    std::vector<cdc::RowEncoder> encoders;
+    // Several tables share the source (`tables`): each row leads with the
+    // index of its table, for the postgres_cdc_table selector.
+    bool indexed{false};
 };
 
+// One table under the SQL contract, from `ctx`'s table, primary_key,
+// declared_types, changelog_mode, keep_rows and on_sub_millisecond.
+struct ContractTable {
+    PostgresCdcSource::Options::Table table;
+    cdc::RowEncoder encoder;
+};
+
+ContractTable contract_table(const clink::plugin::BuildContext& ctx, const std::string& factory) {
+    const std::string mode =
+        domain_option(ctx, factory, "changelog_mode", "", {"upsert", "append"});
+    PostgresCdcSource::Options::Table t;
+    t.table = ctx.param_or("table");
+    t.key_columns = split_csv(ctx.param_or("primary_key"));
+    if (mode.empty()) {
+        throw std::runtime_error(factory + ": each captured table needs its changelog_mode");
+    }
+    if (t.table.empty()) {
+        throw std::runtime_error(factory +
+                                 ": changelog_mode needs 'table', the schema-qualified PostgreSQL "
+                                 "table to capture");
+    }
+    if (t.key_columns.empty()) {
+        throw std::runtime_error(factory + ": capturing table " + t.table +
+                                 " needs its primary key (PRIMARY KEY in the table definition, or "
+                                 "primary_key='col,...')");
+    }
+    std::vector<cdc::ColumnPlan> plan;
+    try {
+        plan = cdc::plan_columns(ctx.param_or("declared_types"));
+    } catch (const cdc::EncodeError& e) {
+        throw std::runtime_error(factory + ": " + e.what());
+    }
+    bool captures = false;
+    for (const auto& col : plan) {
+        t.declared_columns.emplace_back(col.name, col.sql_type);
+        captures = captures || !cdc::is_metadata_column(col.name);
+    }
+    if (!captures) {
+        throw std::runtime_error(factory + ": table " + t.table +
+                                 " declares no columns to capture");
+    }
+    for (const auto& key : t.key_columns) {
+        const bool declared = std::any_of(
+            plan.begin(), plan.end(), [&](const cdc::ColumnPlan& c) { return c.name == key; });
+        if (!declared) {
+            throw std::runtime_error(factory + ": primary key column " + key +
+                                     " is not a declared column");
+        }
+    }
+    if (domain_option(ctx, factory, "on_sub_millisecond", "fail", {"fail", "truncate"}) ==
+        "truncate") {
+        cdc::truncate_sub_millisecond_outside_key(plan, t.key_columns);
+    }
+    t.consumer_keeps_rows = bool_option(ctx, factory, "keep_rows", false);
+    const auto encoder_mode =
+        mode == "upsert" ? cdc::ChangelogMode::Upsert : cdc::ChangelogMode::Append;
+    return ContractTable{t, cdc::RowEncoder(std::move(plan), encoder_mode, t.consumer_keeps_rows)};
+}
+
 // The options every CDC factory takes. `sql_contract` admits changelog_mode,
-// which selects the SQL CDC contract (postgres_cdc_source only):
+// which selects the SQL CDC contract, and `tables` (postgres_cdc_source only):
 //
 //   conninfo, slot_name            required
 //   plugin                         test_decoding | pgoutput (pgoutput under the contract)
@@ -459,6 +550,12 @@ struct CdcConfig {
 //                                  (cdc_keep_rows_row), so unchanged TOAST
 //                                  values and a TRUNCATE are passed on for it
 //   declared_types                 the SQL table's columns, set by the planner
+//   tables                         several tables on the one slot, set by the
+//                                  planner: a JSON array of objects, each with
+//                                  that table's table, primary_key,
+//                                  declared_types, changelog_mode, keep_rows
+//                                  and on_sub_millisecond (strings); none of
+//                                  those is then given outside it
 CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
                      const std::string& factory,
                      bool sql_contract) {
@@ -472,18 +569,14 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
     if (o.slot_name.empty()) {
         throw std::runtime_error(factory + ": 'slot_name' is required");
     }
-    if (ctx.params.count("changelog_mode") != 0) {
-        if (!sql_contract) {
-            throw std::runtime_error(factory +
-                                     ": 'changelog_mode' applies to postgres_cdc_source (the SQL "
-                                     "source) only");
+    const bool several = ctx.params.count("tables") != 0;
+    for (const char* option : {"changelog_mode", "tables"}) {
+        if (ctx.params.count(option) != 0 && !sql_contract) {
+            throw std::runtime_error(factory + ": '" + option +
+                                     "' applies to postgres_cdc_source (the SQL source) only");
         }
-        cfg.changelog_mode =
-            domain_option(ctx, factory, "changelog_mode", "", {"upsert", "append"}) == "upsert"
-                ? cdc::ChangelogMode::Upsert
-                : cdc::ChangelogMode::Append;
     }
-    const bool contract = cfg.changelog_mode.has_value();
+    const bool contract = several || ctx.params.count("changelog_mode") != 0;
     o.plugin = domain_option(ctx,
                              factory,
                              "plugin",
@@ -504,56 +597,63 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
             ctx, factory, "on_decode_error", contract ? "fail" : "drop", {"drop", "fail"}) == "fail"
             ? PostgresCdcSource::DecodeErrorPolicy::Fail
             : PostgresCdcSource::DecodeErrorPolicy::Drop;
-    o.table = ctx.param_or("table");
-    o.key_columns = split_csv(ctx.param_or("primary_key"));
     const std::string snapshot_mode = domain_option(
         ctx, factory, "snapshot_mode", contract ? "initial" : "never", {"initial", "never"});
-    if (contract && o.table.empty()) {
-        throw std::runtime_error(factory +
-                                 ": changelog_mode needs 'table', the schema-qualified PostgreSQL "
-                                 "table to capture");
-    }
-    if (!o.table.empty() && o.key_columns.empty()) {
-        throw std::runtime_error(factory + ": capturing table " + o.table +
-                                 " needs its primary key (PRIMARY KEY in the table definition, or "
-                                 "primary_key='col,...')");
-    }
-    if (snapshot_mode == "initial" && o.table.empty()) {
-        throw std::runtime_error(factory +
-                                 ": snapshot_mode='initial' needs 'table', the table to read the "
-                                 "existing rows from");
-    }
-    if (contract) {
-        try {
-            cfg.plan = cdc::plan_columns(ctx.param_or("declared_types"));
-        } catch (const cdc::EncodeError& e) {
-            throw std::runtime_error(factory + ": " + e.what());
-        }
-        bool captures = false;
-        for (const auto& col : cfg.plan) {
-            o.declared_columns.emplace_back(col.name, col.sql_type);
-            captures = captures || !cdc::is_metadata_column(col.name);
-        }
-        if (!captures) {
-            throw std::runtime_error(factory + ": the table declares no columns to capture");
-        }
-        for (const auto& key : o.key_columns) {
-            const bool declared =
-                std::any_of(cfg.plan.begin(), cfg.plan.end(), [&](const cdc::ColumnPlan& c) {
-                    return c.name == key;
-                });
-            if (!declared) {
-                throw std::runtime_error(factory + ": primary key column " + key +
-                                         " is not a declared column");
+    if (several) {
+        for (const char* option : {"table",
+                                   "primary_key",
+                                   "declared_types",
+                                   "changelog_mode",
+                                   "keep_rows",
+                                   "on_sub_millisecond"}) {
+            if (ctx.params.count(option) != 0) {
+                throw std::runtime_error(factory + ": '" + option +
+                                         "' belongs to each entry of 'tables', not beside it");
             }
         }
-        if (domain_option(ctx, factory, "on_sub_millisecond", "fail", {"fail", "truncate"}) ==
-            "truncate") {
-            cdc::truncate_sub_millisecond_outside_key(cfg.plan, o.key_columns);
+        clink::config::JsonValue list;
+        try {
+            list = clink::config::parse(ctx.param_or("tables"));
+        } catch (const std::exception& e) {
+            throw std::runtime_error(factory + ": 'tables' is not JSON: " + e.what());
         }
+        if (!list.is_array() || list.as_array().empty()) {
+            throw std::runtime_error(factory + ": 'tables' must be a non-empty JSON array");
+        }
+        for (const auto& entry : list.as_array()) {
+            if (!entry.is_object()) {
+                throw std::runtime_error(factory + ": each entry of 'tables' is a JSON object");
+            }
+            clink::plugin::BuildContext one;
+            for (const auto& [key, value] : entry.as_object()) {
+                if (!value.is_string()) {
+                    throw std::runtime_error(factory + ": 'tables' entry field " + key +
+                                             " must be a string");
+                }
+                one.params[key] = value.as_string();
+            }
+            auto t = contract_table(one, factory);
+            o.tables.push_back(std::move(t.table));
+            cfg.encoders.push_back(std::move(t.encoder));
+        }
+        cfg.indexed = true;
         o.strict = true;
-        o.consumer_keeps_rows = bool_option(ctx, factory, "keep_rows", false);
+    } else if (contract) {
+        auto t = contract_table(ctx, factory);
+        o.table = t.table.table;
+        o.key_columns = t.table.key_columns;
+        o.declared_columns = t.table.declared_columns;
+        o.consumer_keeps_rows = t.table.consumer_keeps_rows;
+        cfg.encoders.push_back(std::move(t.encoder));
+        o.strict = true;
     } else {
+        o.table = ctx.param_or("table");
+        o.key_columns = split_csv(ctx.param_or("primary_key"));
+        if (!o.table.empty() && o.key_columns.empty()) {
+            throw std::runtime_error(factory + ": capturing table " + o.table +
+                                     " needs its primary key (PRIMARY KEY in the table "
+                                     "definition, or primary_key='col,...')");
+        }
         for (const char* option : {"on_sub_millisecond", "keep_rows"}) {
             if (ctx.params.count(option) != 0) {
                 throw std::runtime_error(factory + ": '" + option +
@@ -561,6 +661,11 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
                                          "value is carried as text)");
             }
         }
+    }
+    if (snapshot_mode == "initial" && o.table.empty() && o.tables.empty()) {
+        throw std::runtime_error(factory +
+                                 ": snapshot_mode='initial' needs 'table', the table to read the "
+                                 "existing rows from");
     }
     o.snapshot_batch_rows =
         static_cast<std::size_t>(int_option(ctx, factory, "snapshot_batch_rows", 1000, 1));
@@ -572,8 +677,8 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
         std::chrono::milliseconds{int_option(ctx, factory, "connect_timeout_ms", 30000, 1)};
     o.reconnect_timeout =
         std::chrono::milliseconds{int_option(ctx, factory, "reconnect_timeout_ms", 60000, 0)};
-    // The source reads the table itself at open, with the declared columns and
-    // the publications' row filter.
+    // The source reads the tables itself at open, with the declared columns
+    // and the publications' row filters.
     o.enable_initial_snapshot = snapshot_mode == "initial";
     return cfg;
 }
@@ -606,10 +711,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         .limitations = {"CDC needs a logical replication slot, confirmed only by completed "
                         "checkpoints: WAL is retained while the job is stopped or not "
                         "checkpointing",
-                        "CDC captures one table per source (changelog_mode); of its schema "
-                        "changes only an added column is followed, declared on a restore with "
-                        "keep_rows; a partitioned table through its root, where attaching, "
-                        "detaching or truncating one partition publishes nothing",
+                        "CDC tables that share a slot share a source, with no transaction "
+                        "atomicity across them downstream; of a table's schema changes only an "
+                        "added column is followed, declared on a restore with keep_rows; a "
+                        "partitioned table through its root, where attaching, detaching or "
+                        "truncating one partition publishes nothing",
                         "a CDC snapshot interrupted by a failure is taken again and converges; "
                         "it does not resume",
                         "the plain sink is at-least-once - use postgres_2pc or the upsert sink"},
@@ -733,15 +839,24 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_source<std::string>(
         "postgres_cdc_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             auto cfg = cdc_config(ctx, "postgres_cdc_source", /*sql_contract=*/true);
-            if (cfg.changelog_mode) {
-                const bool keep_rows = cfg.source.consumer_keeps_rows;
-                return std::make_shared<StringPostgresCdcSource>(
-                    std::move(cfg.source),
-                    /*json=*/true,
-                    cdc::RowEncoder(std::move(cfg.plan), *cfg.changelog_mode, keep_rows));
-            }
-            return std::make_shared<StringPostgresCdcSource>(std::move(cfg.source), /*json=*/true);
+            return std::make_shared<StringPostgresCdcSource>(
+                std::move(cfg.source), /*json=*/true, std::move(cfg.encoders), cfg.indexed);
         });
+
+    // postgres_cdc_table: the branch a row of a source capturing several
+    // tables goes to - the index its leading "__cdc_table" field names.
+    reg.register_selector<std::string>("postgres_cdc_table", [](const std::string& row) -> int {
+        constexpr std::string_view kPrefix = "{\"__cdc_table\":";
+        if (row.compare(0, kPrefix.size(), kPrefix) != 0) {
+            return 0;
+        }
+        int index = 0;
+        for (std::size_t i = kPrefix.size(); i < row.size() && row[i] >= '0' && row[i] <= '9';
+             ++i) {
+            index = (index * 10) + (row[i] - '0');
+        }
+        return index;
+    });
 
     // postgres_text_source: SELECT rows joined with `delim` (default "|").
     // params:

@@ -73,6 +73,22 @@ struct PreparseResult {
 // unbalanced MAP<...> or a ROW field without a type).
 PreparseResult preparse(std::string_view sql);
 
+// One piece of a script: text outside any statement set (`set` -1), or the
+// body of the `set`-th EXECUTE STATEMENT SET BEGIN ... END block. `offset` is
+// where the text starts in the script.
+struct ScriptPiece {
+    std::string_view text;
+    int set{-1};
+    std::size_t offset{0};
+};
+
+// Cut a script at its statement sets, keeping the order: the text before,
+// between and after them, and each set's body. A set's END is an END that
+// follows the `;` of a statement and is itself followed by `;` or the end of
+// the script, so a CASE ... END inside a statement never closes one. Throws
+// TranslationError on a set that is not closed, is empty, or opens another.
+std::vector<ScriptPiece> split_statement_sets(std::string_view sql);
+
 // Parse a composite type expression ("MAP<TEXT,BIGINT>", "ROW<a INT, b TEXT>",
 // "MULTISET<INT>", "ARRAY<...>", with nesting) into an ast::TypeName. Scalar
 // leaves delegate to parse_sql_type_expression so they get PG-canonical names.

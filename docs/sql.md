@@ -35,6 +35,25 @@ single process. Two flags matter for production runs:
 
 See [Embedded execution](internals/embedded.md) for the full CLI.
 
+### Several statements as one job
+
+Each `INSERT` starts a job of its own. To run several as one job, put them in a
+statement set:
+
+```sql
+EXECUTE STATEMENT SET BEGIN
+  INSERT INTO orders_copy SELECT * FROM orders_cdc;
+  INSERT INTO customers_copy SELECT * FROM customers_cdc;
+END;
+```
+
+The statements in a set compile as before and are submitted together: one
+job, checkpointed as one, its sources and sinks side by side. A set holds
+`INSERT` statements only. Tables that must share one reader need it, such as
+PostgreSQL CDC tables on one replication slot
+([several tables on one slot](connectors/postgres.md#several-tables-on-one-slot));
+two separate jobs naming the same slot are refused, with the set named.
+
 ## Your first pipeline
 
 Read newline-delimited JSON, keep the checkout clicks, write them out:

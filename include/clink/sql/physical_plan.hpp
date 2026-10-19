@@ -65,6 +65,13 @@ private:
     bool allow_unbounded_state_ = false;
 };
 
+// The INSERT statements of one EXECUTE STATEMENT SET, compiled each on its own,
+// as one job: every op id is prefixed by its statement ("s0_", "s1_", ...),
+// lineage and UDFs are combined, and PostgreSQL CDC sources that share a
+// replication slot are fused into one source that routes each table's rows to
+// its own branch.
+cluster::JobGraphSpec merge_statement_set(std::vector<cluster::JobGraphSpec> specs);
+
 // The planner's last pass over a compiled spec, which compile() runs: it
 // promotes each producer's stashed output schema to the producer's
 // `columnar_output` param when every consumer of the producer takes a columnar

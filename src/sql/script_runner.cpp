@@ -4,8 +4,12 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
+#include <optional>
+#include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
@@ -288,22 +292,93 @@ int run_script(const std::string& sql,
                     << ")\n";
             }
         };
+        // A replication slot has one reader, so the jobs one script submits
+        // must not share one; the tables that do belong in one statement set.
+        std::map<std::string, std::string> slot_users;  // "conninfo|slot" -> sink table
+        auto claim_slots = [&](const cluster::JobGraphSpec& spec, const std::string& who) {
+            for (const auto& op : spec.ops) {
+                if (op.type != "postgres_cdc_source") {
+                    continue;
+                }
+                const auto get = [&](const char* k) {
+                    const auto it = op.params.find(k);
+                    return it == op.params.end() ? std::string{} : it->second;
+                };
+                const std::string slot = get("conninfo") + "|" + get("slot_name");
+                const auto [it, fresh] = slot_users.emplace(slot, who);
+                if (!fresh) {
+                    throw TranslationError("the jobs writing " + it->second + " and " + who +
+                                               " would both read replication slot " +
+                                               get("slot_name") +
+                                               ", which has one reader; run their INSERTs as one "
+                                               "job with EXECUTE STATEMENT SET BEGIN ... END;",
+                                           -1);
+                }
+            }
+        };
         // Bind + optimize + compile an INSERT, then submit (or explain).
-        auto handle_insert = [&](const ast::InsertStmt& ins) -> int {
+        auto compile_insert =
+            [&](const ast::InsertStmt& ins) -> std::optional<cluster::JobGraphSpec> {
             auto plan = binder.bind_insert(ins);
             plan = optimize(std::move(plan));
             if (opts.explain) {
                 out << explain_with_estimates(*plan);
                 explain_determinism(static_cast<const LogicalSink&>(*plan));
-                return 0;
+                return std::nullopt;
             }
             const auto& sink = static_cast<const LogicalSink&>(*plan);
-            auto spec = planner.compile(sink);
+            return planner.compile(sink);
+        };
+        auto handle_insert = [&](const ast::InsertStmt& ins) -> int {
+            auto spec = compile_insert(ins);
+            if (!spec) {
+                return 0;
+            }
+            claim_slots(*spec, ins.target.name);
+            apply_parallelism(*spec);
+            attach_udfs(*spec);
+            return submit(*spec, opts.job_name);
+        };
+        // The INSERTs of one EXECUTE STATEMENT SET: one job.
+        auto handle_statement_set = [&](std::size_t first, std::size_t last) -> int {
+            std::vector<cluster::JobGraphSpec> specs;
+            std::string targets;
+            for (std::size_t i = first; i < last; ++i) {
+                if (!std::holds_alternative<ast::InsertStmt>(script.statements[i])) {
+                    err << "error: a statement set holds INSERT statements only\n";
+                    return 1;
+                }
+                const auto& ins = std::get<ast::InsertStmt>(script.statements[i]);
+                auto spec = compile_insert(ins);
+                if (spec) {
+                    specs.push_back(std::move(*spec));
+                }
+                targets += (targets.empty() ? "" : ", ") + ins.target.name;
+            }
+            if (specs.empty()) {
+                return 0;  // EXPLAIN
+            }
+            auto spec = merge_statement_set(std::move(specs));
+            claim_slots(spec, targets);
             apply_parallelism(spec);
             attach_udfs(spec);
             return submit(spec, opts.job_name);
         };
-        for (auto& stmt : script.statements) {
+        for (std::size_t si = 0; si < script.statements.size(); ++si) {
+            if (!script.statement_sets.empty() && script.statement_sets[si] >= 0) {
+                std::size_t last = si;
+                while (last < script.statements.size() &&
+                       script.statement_sets[last] == script.statement_sets[si]) {
+                    ++last;
+                }
+                if (int rc = handle_statement_set(si, last); rc != 0) {
+                    return rc;
+                }
+                produced_spec = true;
+                si = last - 1;
+                continue;
+            }
+            auto& stmt = script.statements[si];
             if (std::holds_alternative<std::unique_ptr<ast::ExplainStmt>>(stmt)) {
                 const auto& exp = *std::get<std::unique_ptr<ast::ExplainStmt>>(stmt);
                 if (std::holds_alternative<ast::InsertStmt>(exp.query)) {

@@ -178,6 +178,21 @@ public:
         // rather than refused, and a TRUNCATE of the table is emitted as a
         // Truncate event for the consumer to expand into deletes.
         bool consumer_keeps_rows{false};
+
+        // ----- Several tables on one slot -----
+        // One table this source captures, as `table`, `key_columns`,
+        // `declared_columns` and `consumer_keeps_rows` describe a single one.
+        struct Table {
+            std::string table;
+            std::vector<std::string> key_columns;
+            std::vector<std::pair<std::string, std::string>> declared_columns;
+            bool consumer_keeps_rows{false};
+        };
+        // The tables this source captures from its one slot, each checked at
+        // open like `table`, snapshotted in turn and streamed in commit order
+        // with every event naming its table. When set, `table`, `key_columns`,
+        // `declared_columns` and `consumer_keeps_rows` are not used.
+        std::vector<Table> tables{};
     };
 
     explicit PostgresCdcSource(Options opts);
@@ -228,6 +243,10 @@ public:
 
     // The position the slot has been confirmed at by this source (0 = none).
     [[nodiscard]] std::uint64_t confirmed_lsn() const noexcept;
+
+    // The schema-qualified names of the tables captured, in the order they
+    // were configured, as events name them. Known after open().
+    [[nodiscard]] std::vector<std::string> captured_tables() const;
 
     // After a snapshot taken fresh (a restore during the snapshot, or a slot
     // that already existed), the WAL position that snapshot was read at:

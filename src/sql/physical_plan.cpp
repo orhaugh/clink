@@ -324,6 +324,135 @@ std::string input_base_id(const std::string& ref) {
 // operator between it and the sink passes rows through or applies them by key.
 // A consumer that retracts - a grouping, a join - never counted that row, and
 // a retraction of it would be wrong, so there the stage drops such deletes.
+// CDC tables that name the same server and replication slot share one source:
+// a slot has one reader. The fused source captures every table (`tables`, one
+// entry per PostgreSQL table) and routes each row to its table's branch with
+// the postgres_cdc_table selector; each table's JSON bridge consumes
+// "<source>.<index>". The options that belong to the slot must agree.
+void fuse_cdc_sources(cluster::JobGraphSpec& spec) {
+    const auto param = [](const cluster::OperatorSpec& op, const std::string& key) {
+        const auto it = op.params.find(key);
+        return it == op.params.end() ? std::string{} : it->second;
+    };
+    std::map<std::pair<std::string, std::string>, std::vector<std::size_t>> groups;
+    for (std::size_t i = 0; i < spec.ops.size(); ++i) {
+        const auto& op = spec.ops[i];
+        if (op.type == "postgres_cdc_source" && !param(op, "changelog_mode").empty()) {
+            groups[{param(op, "conninfo"), param(op, "slot_name")}].push_back(i);
+        }
+    }
+    static const std::vector<std::string> kSlotOptions = {"publication_names",
+                                                          "plugin",
+                                                          "snapshot_mode",
+                                                          "create_slot",
+                                                          "drop_slot_on_close",
+                                                          "on_decode_error",
+                                                          "snapshot_batch_rows",
+                                                          "poll_interval_ms",
+                                                          "status_interval_ms",
+                                                          "connect_timeout_ms",
+                                                          "reconnect_timeout_ms"};
+    static const std::vector<std::string> kTableOptions = {"table",
+                                                           "primary_key",
+                                                           "declared_types",
+                                                           "changelog_mode",
+                                                           "keep_rows",
+                                                           "on_sub_millisecond"};
+    std::set<std::string> fused_away;
+    std::map<std::string, std::string> rewire;  // op id -> what its consumers read now
+    for (const auto& [key, members] : groups) {
+        if (members.size() < 2) {
+            continue;
+        }
+        const auto& base = spec.ops[members.front()];
+        for (const auto i : members) {
+            for (const auto& o : kSlotOptions) {
+                if (param(spec.ops[i], o) != param(base, o)) {
+                    throw TranslationError(
+                        "tables " + param(base, "table") + " and " + param(spec.ops[i], "table") +
+                            " share replication slot " + key.second +
+                            " and so one source, and must agree on " + o + " ('" + param(base, o) +
+                            "' and '" + param(spec.ops[i], o) + "')",
+                        -1);
+                }
+            }
+        }
+        // One entry per PostgreSQL table; two SQL tables over the same one
+        // share its entry when they declare it alike.
+        clink::config::JsonArray entries;
+        std::map<std::string, std::size_t> index_of_table;
+        std::map<std::string, std::string> entry_text;
+        std::vector<std::size_t> index(members.size());
+        for (std::size_t m = 0; m < members.size(); ++m) {
+            const auto& op = spec.ops[members[m]];
+            clink::config::JsonObject entry;
+            for (const auto& o : kTableOptions) {
+                if (const auto v = param(op, o); !v.empty()) {
+                    entry[o] = clink::config::JsonValue{v};
+                }
+            }
+            const std::string table = param(op, "table");
+            const std::string text = clink::config::JsonValue{entry}.serialize(0);
+            if (const auto it = index_of_table.find(table); it != index_of_table.end()) {
+                if (entry_text[table] != text) {
+                    throw TranslationError("PostgreSQL table " + table +
+                                               " is declared twice on replication slot " +
+                                               key.second +
+                                               ", with different columns or options; one source "
+                                               "captures it for both, so declare it alike",
+                                           -1);
+                }
+                index[m] = it->second;
+                continue;
+            }
+            index[m] = entries.size();
+            index_of_table[table] = entries.size();
+            entry_text[table] = text;
+            entries.emplace_back(std::move(entry));
+        }
+        if (entries.size() == 1) {
+            // One table read twice: the one source feeds both.
+            for (std::size_t m = 1; m < members.size(); ++m) {
+                rewire[spec.ops[members[m]].id] = base.id;
+                fused_away.insert(spec.ops[members[m]].id);
+            }
+            continue;
+        }
+        auto& fused = spec.ops[members.front()];
+        for (const auto& o : kTableOptions) {
+            fused.params.erase(o);
+        }
+        for (const char* o : {"schema_columns", "decimal_columns", "projected_columns"}) {
+            fused.params.erase(o);
+        }
+        fused.params["tables"] = clink::config::JsonValue{std::move(entries)}.serialize(0);
+        fused.params["selector_fn"] = "postgres_cdc_table";
+        for (std::size_t m = 0; m < members.size(); ++m) {
+            rewire[spec.ops[members[m]].id] = fused.id + "." + std::to_string(index[m]);
+            if (m > 0) {
+                fused_away.insert(spec.ops[members[m]].id);
+            }
+        }
+    }
+    if (rewire.empty()) {
+        return;
+    }
+    std::vector<cluster::OperatorSpec> kept;
+    kept.reserve(spec.ops.size());
+    for (auto& op : spec.ops) {
+        if (fused_away.count(op.id) != 0) {
+            continue;
+        }
+        for (auto& in : op.inputs) {
+            if (const auto it = rewire.find(in); it != rewire.end()) {
+                in = it->second;
+            }
+        }
+        kept.push_back(std::move(op));
+    }
+    spec.ops = std::move(kept);
+}
+
 void decide_cdc_unheld_deletes(cluster::JobGraphSpec& spec) {
     std::map<std::string, std::vector<const cluster::OperatorSpec*>> consumers;
     for (const auto& op : spec.ops) {
@@ -2992,6 +3121,7 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     spec.column_lineage = capture_column_lineage(root, sink_id);
     mark_changelog_producers(spec);
     decide_cdc_unheld_deletes(spec);
+    fuse_cdc_sources(spec);
     propagate_forced_singletons(spec);
     enable_columnar_output(spec);
     // Every operator in this spec is planner-emitted engine code: wall-clock
@@ -3035,6 +3165,62 @@ ScanSourceSpec row_scan_source_spec(const TableDef& table) {
     }
     spec.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
     return spec;
+}
+
+cluster::JobGraphSpec merge_statement_set(std::vector<cluster::JobGraphSpec> specs) {
+    cluster::JobGraphSpec out;
+    if (specs.empty()) {
+        return out;
+    }
+    clink::config::JsonObject lineage;
+    std::set<std::string> udfs;
+    for (std::size_t n = 0; n < specs.size(); ++n) {
+        auto& spec = specs[n];
+        const std::string prefix = "s" + std::to_string(n) + "_";
+        const auto renamed = [&](const std::string& ref) {
+            return prefix + ref;  // "id", "id.N" and "id::tag" keep their suffix
+        };
+        for (auto& op : spec.ops) {
+            op.id = renamed(op.id);
+            for (auto& in : op.inputs) {
+                in = renamed(in);
+            }
+            out.ops.push_back(std::move(op));
+        }
+        if (!spec.column_lineage.empty()) {
+            try {
+                const auto v = clink::config::parse(spec.column_lineage);
+                if (v.is_object()) {
+                    for (const auto& [sink, edges] : v.as_object()) {
+                        lineage[prefix + sink] = edges;
+                    }
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        for (auto& u : spec.udfs) {
+            if (udfs.insert(u.name).second) {
+                out.udfs.push_back(std::move(u));
+            }
+        }
+        // The SQL planner declares no expected state versions or shapes; a
+        // spec that did keeps the first one's.
+        if (out.expected_state_versions.empty()) {
+            out.expected_state_versions = spec.expected_state_versions;
+        }
+        if (out.expected_state_fingerprints.empty()) {
+            out.expected_state_fingerprints = spec.expected_state_fingerprints;
+        }
+        if (out.determinism_coverage.empty()) {
+            out.determinism_coverage = spec.determinism_coverage;
+        }
+    }
+    if (!lineage.empty()) {
+        out.column_lineage = clink::config::JsonValue{std::move(lineage)}.serialize(0);
+    }
+    fuse_cdc_sources(out);
+    propagate_forced_singletons(out);
+    return out;
 }
 
 }  // namespace clink::sql

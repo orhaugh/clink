@@ -744,6 +744,11 @@ struct Script {
     // pre-parser strips it at text level before libpg_query sees it, so
     // there is no grammar node to hang it on. See preparse.hpp.
     bool allow_unbounded_state{false};
+
+    // clink extension: for each statement, the EXECUTE STATEMENT SET BEGIN ...
+    // END block it belongs to (0, 1, ... in script order), or -1. Empty when
+    // the script has none. The statements of one set run as one job.
+    std::vector<int> statement_sets;
 };
 
 }  // namespace clink::sql::ast

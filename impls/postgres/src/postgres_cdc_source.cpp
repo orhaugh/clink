@@ -77,18 +77,23 @@ constexpr const char* kMetricsName = "postgres_cdc";
 // arriving is a protocol error, since the transaction it belongs to could
 // not be told apart from a committed one.
 
-struct DecoderConfig {
-    // Schema-qualified table to capture ("public.orders"); empty = every table.
-    std::string table;
+// How one captured table's changes are decoded.
+struct DecoderTable {
     // Strict mode's key, for telling a key-changing UPDATE apart.
     std::vector<std::string> key_columns;
     // Columns the consumer reads; empty = every column.
     std::set<std::string> needed;
-    bool strict{false};
     // Strict only: the consumer keeps the latest row of every key, so an
     // unchanged out-of-line value is marked (cdc::kUnchangedToastType) for it
     // to fill in, and a TRUNCATE of the table is an event it expands.
     bool keep_rows{false};
+};
+
+struct DecoderConfig {
+    // The tables to capture by schema-qualified name ("public.orders"),
+    // several when they share the slot; empty = every table.
+    std::map<std::string, DecoderTable> tables;
+    bool strict{false};
 };
 
 // One decoded pgoutput message.
@@ -118,7 +123,7 @@ public:
     // The declared columns already seen stay seen.
     void reset_relations() { relations_.clear(); }
 
-    void set_table(std::string table) { cfg_.table = std::move(table); }
+    void set_tables(std::map<std::string, DecoderTable> tables) { cfg_.tables = std::move(tables); }
 
     Decoded on_message(std::string_view payload, const std::string& lsn) {
         Decoded d;
@@ -184,20 +189,29 @@ private:
     DecoderConfig cfg_;
     std::int64_t current_xid_{0};
     std::unordered_map<std::uint32_t, Relation> relations_;
-    // Declared columns some Relation message of the captured table has had.
-    // One missing from a later message was dropped or renamed; one missing
-    // before it was ever seen was added after the change that lacks it.
-    std::set<std::string> seen_;
+    // Per captured table, the declared columns some Relation message of it has
+    // had. One missing from a later message was dropped or renamed; one
+    // missing before it was ever seen was added after the change that lacks it.
+    std::map<std::string, std::set<std::string>> seen_;
     // User-defined type names from Y messages: oid -> "ns.name". Built-in
     // types are not sent as Y messages; resolve those via
     // lookup_builtin_type_name().
     std::unordered_map<std::uint32_t, std::string> user_types_;
 
-    [[nodiscard]] bool is_target(const Relation& rel) const {
-        return cfg_.table.empty() || rel.qualified() == cfg_.table;
+    // The rules for a relation this decoder captures, or nullptr. With no
+    // tables configured every relation is captured, every column read.
+    [[nodiscard]] const DecoderTable* target_of(const Relation& rel) const {
+        static const DecoderTable kEveryColumn{};
+        if (cfg_.tables.empty()) {
+            return &kEveryColumn;
+        }
+        const auto it = cfg_.tables.find(rel.qualified());
+        return it == cfg_.tables.end() ? nullptr : &it->second;
     }
-    [[nodiscard]] bool needed(const std::string& column) const {
-        return cfg_.needed.empty() || cfg_.needed.count(column) != 0;
+    [[nodiscard]] bool is_target(const Relation& rel) const { return target_of(rel) != nullptr; }
+    [[nodiscard]] bool needed(const Relation& rel, const std::string& column) const {
+        const auto* t = target_of(rel);
+        return t != nullptr && (t->needed.empty() || t->needed.count(column) != 0);
     }
 
     Decoded drop_(std::string why) {
@@ -282,13 +296,14 @@ private:
         }
         Decoded d;
         d.kind = Decoded::Kind::Change;
-        d.target = cfg_.table.empty();
+        d.target = cfg_.tables.empty();
         CdcEvent ev;
         ev.op = CdcEvent::Op::Truncate;
         ev.lsn = lsn;
         // We pick the first relation as the event's "table"; if the
         // TRUNCATE batched several, the rest are added as values entries
         // so users still see them.
+        std::vector<const Relation*> targets;
         for (std::uint32_t i = 0; i < n; ++i) {
             const std::uint32_t rel_id = read_be32(rest.data() + (static_cast<std::size_t>(i) * 4));
             auto it = relations_.find(rel_id);
@@ -296,6 +311,7 @@ private:
                                                              : ("oid=" + std::to_string(rel_id));
             if (it != relations_.end() && is_target(it->second)) {
                 d.target = true;
+                targets.push_back(&it->second);
             }
             if (i == 0) {
                 ev.table = tbl;
@@ -308,20 +324,26 @@ private:
             return d;
         }
         if (cfg_.strict) {
-            if (!cfg_.keep_rows) {
-                return drop_("TRUNCATE of " + (cfg_.table.empty() ? ev.table : cfg_.table) +
-                             " at " + lsn +
-                             " cannot be expressed as row changes without the rows; declare the "
-                             "table with keep_rows='true', capture it again from a new slot with "
-                             "a fresh snapshot, or leave truncate out of the publication's "
-                             "publish list");
+            // One Truncate event per captured table it names; the consumer of
+            // each holds its rows and deletes every one.
+            for (const auto* rel : targets) {
+                if (!target_of(*rel)->keep_rows) {
+                    return drop_("TRUNCATE of " + rel->qualified() + " at " + lsn +
+                                 " cannot be expressed as row changes without the rows; declare "
+                                 "the table with keep_rows='true', capture it again from a new "
+                                 "slot with a fresh snapshot, or leave truncate out of the "
+                                 "publication's publish list");
+                }
             }
-            // The consumer holds every row and deletes each one.
-            if (!cfg_.table.empty()) {
-                ev.table = cfg_.table;
+            for (const auto* rel : targets) {
+                CdcEvent t;
+                t.op = CdcEvent::Op::Truncate;
+                t.lsn = lsn;
+                t.table = rel->qualified();
+                t.xid = current_xid_;
+                d.events.push_back(std::move(t));
             }
-            ev.xid = current_xid_;
-            ev.values.clear();
+            return d;
         }
         d.events.push_back(std::move(ev));
         return d;
@@ -363,10 +385,10 @@ private:
             rest.remove_prefix(8);
             rel.columns.push_back(std::move(c));
         }
-        if (is_target(rel)) {
+        if (const auto* t = target_of(rel); t != nullptr) {
             for (const auto& c : rel.columns) {
-                if (cfg_.needed.count(c.name) != 0) {
-                    seen_.insert(c.name);
+                if (t->needed.count(c.name) != 0) {
+                    seen_[rel.qualified()].insert(c.name);
                 }
             }
         }
@@ -453,22 +475,24 @@ private:
         const Relation& rel,
         const std::string& lsn,
         std::vector<std::string>* predating = nullptr) const {
-        if (!cfg_.strict || cfg_.needed.empty()) {
+        const auto* t = target_of(rel);
+        if (!cfg_.strict || t == nullptr || t->needed.empty()) {
             return std::nullopt;
         }
+        const auto seen = seen_.find(rel.qualified());
         std::string later;
-        for (const auto& want : cfg_.needed) {
+        for (const auto& want : t->needed) {
             const bool present = std::any_of(rel.columns.begin(),
                                              rel.columns.end(),
                                              [&](const Column& c) { return c.name == want; });
             if (present) {
                 continue;
             }
-            if (seen_.count(want) != 0) {
+            if (seen != seen_.end() && seen->second.count(want) != 0) {
                 return "table " + rel.qualified() + " no longer has column " + want +
                        " (dropped or renamed since the job was declared)";
             }
-            if (cfg_.keep_rows && predating != nullptr) {
+            if (t->keep_rows && predating != nullptr) {
                 predating->push_back(want);
             } else {
                 later += (later.empty() ? "" : ", ") + want;
@@ -547,7 +571,7 @@ private:
             values.reserve(cells.size());
             for (auto& c : cells) {
                 if (c.kind == 'u') {
-                    if (!needed(c.field.name)) {
+                    if (!needed(rel, c.field.name)) {
                         continue;
                     }
                     return drop_("INSERT into " + rel.qualified() + " at " + lsn +
@@ -632,10 +656,10 @@ private:
                     c.field.value = old_cells[i].field.value;
                     c.field.is_null = old_cells[i].field.is_null;
                 } else if (cfg_.strict) {
-                    if (!needed(c.field.name)) {
+                    if (!needed(rel, c.field.name)) {
                         continue;  // not read by the consumer: leave it out
                     }
-                    if (cfg_.keep_rows) {
+                    if (target_of(rel)->keep_rows) {
                         // The consumer fills it in from the row it holds.
                         c.field.type = std::string{cdc::kUnchangedToastType};
                         values.push_back(std::move(c.field));
@@ -671,10 +695,11 @@ private:
     [[nodiscard]] bool key_changed(const Relation& rel,
                                    const std::vector<Cell>& old_cells,
                                    const std::vector<CdcField>& values) const {
+        const auto* t = target_of(rel);
         const auto is_key = [&](const std::string& name, std::size_t idx) {
-            if (!cfg_.key_columns.empty()) {
-                return std::find(cfg_.key_columns.begin(), cfg_.key_columns.end(), name) !=
-                       cfg_.key_columns.end();
+            if (t != nullptr && !t->key_columns.empty()) {
+                return std::find(t->key_columns.begin(), t->key_columns.end(), name) !=
+                       t->key_columns.end();
             }
             return idx < rel.columns.size() && (rel.columns[idx].flags & 1U) != 0;
         };
@@ -1046,38 +1071,87 @@ constexpr const char* kCursorKey = "__postgres_cdc_cursor__";
 // column declared since.
 constexpr const char* kColumnsKey = "__postgres_cdc_columns__";
 
-std::string declared_spec(const PostgresCdcSource::Options& o) {
+// What a checkpoint records of the tables it was taken with: one line per
+// table, its name, a tab and its declared columns ("name:TYPE;...").
+std::string declared_record(const std::vector<PostgresCdcSource::Options::Table>& tables) {
     std::string out;
-    for (const auto& [name, type] : o.declared_columns) {
-        out += (out.empty() ? "" : ";") + name + ":" + type;
+    for (const auto& t : tables) {
+        out += (out.empty() ? "" : "\n") + t.table + "\t";
+        bool first = true;
+        for (const auto& [name, type] : t.declared_columns) {
+            out += (first ? "" : ";") + name + ":" + type;
+            first = false;
+        }
     }
     return out;
 }
 
-// Data columns declared now that the recorded declaration lacked or declared
-// with another type: the ones a restore must read the table again for.
-std::vector<std::string> columns_declared_since(const std::string& recorded,
-                                                const PostgresCdcSource::Options& o) {
-    std::map<std::string, std::string> before;
+// What a restore declares that its checkpoint did not.
+struct DeclaredSince {
+    // Data columns of a recorded table declared now and not then, or with
+    // another type, as "table.column".
+    std::vector<std::string> columns;
+    // The tables those belong to that do not keep rows: the replayed changes
+    // that predate a column could not be completed.
+    std::vector<std::string> without_kept_rows;
+    // Tables the checkpoint did not capture at all.
+    std::vector<std::string> tables;
+};
+
+DeclaredSince declared_since(const std::string& recorded,
+                             const std::vector<PostgresCdcSource::Options::Table>& tables) {
+    std::map<std::string, std::map<std::string, std::string>> before;
     std::size_t pos = 0;
     while (pos < recorded.size()) {
-        const auto semi = recorded.find(';', pos);
-        const std::string entry =
-            recorded.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
-        pos = semi == std::string::npos ? recorded.size() : semi + 1;
-        if (const auto colon = entry.find(':'); colon != std::string::npos) {
-            before[entry.substr(0, colon)] = entry.substr(colon + 1);
-        }
-    }
-    std::vector<std::string> out;
-    for (const auto& [name, type] : o.declared_columns) {
-        if (cdc::is_metadata_column(name)) {
+        const auto nl = recorded.find('\n', pos);
+        const std::string line =
+            recorded.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = nl == std::string::npos ? recorded.size() : nl + 1;
+        const auto tab = line.find('\t');
+        if (tab == std::string::npos) {
             continue;
         }
-        const auto it = before.find(name);
-        if (it == before.end() || it->second != type) {
-            out.push_back(name);
+        auto& cols = before[line.substr(0, tab)];
+        std::size_t p = tab + 1;
+        while (p < line.size()) {
+            const auto semi = line.find(';', p);
+            const std::string entry =
+                line.substr(p, semi == std::string::npos ? std::string::npos : semi - p);
+            p = semi == std::string::npos ? line.size() : semi + 1;
+            if (const auto colon = entry.find(':'); colon != std::string::npos) {
+                cols[entry.substr(0, colon)] = entry.substr(colon + 1);
+            }
         }
+    }
+    DeclaredSince out;
+    for (const auto& t : tables) {
+        const auto rec = before.find(t.table);
+        if (rec == before.end()) {
+            out.tables.push_back(t.table);
+            continue;
+        }
+        bool added = false;
+        for (const auto& [name, type] : t.declared_columns) {
+            if (cdc::is_metadata_column(name)) {
+                continue;
+            }
+            const auto it = rec->second.find(name);
+            if (it == rec->second.end() || it->second != type) {
+                out.columns.push_back(t.table + "." + name);
+                added = true;
+            }
+        }
+        if (added && !t.consumer_keeps_rows) {
+            out.without_kept_rows.push_back(t.table);
+        }
+    }
+    return out;
+}
+
+std::string joined(const std::vector<std::string>& items) {
+    std::string out;
+    for (const auto& i : items) {
+        out += (out.empty() ? "" : ", ") + i;
     }
     return out;
 }
@@ -1098,11 +1172,15 @@ PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages
 PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages,
                                         const PgDecodeConfig& config) {
     DecoderConfig cfg;
-    cfg.table = config.table;
-    cfg.key_columns = config.key_columns;
-    cfg.needed = std::set<std::string>(config.needed_columns.begin(), config.needed_columns.end());
+    if (!config.table.empty()) {
+        DecoderTable t;
+        t.key_columns = config.key_columns;
+        t.needed =
+            std::set<std::string>(config.needed_columns.begin(), config.needed_columns.end());
+        t.keep_rows = config.consumer_keeps_rows;
+        cfg.tables.emplace(config.table, std::move(t));
+    }
     cfg.strict = config.strict;
-    cfg.keep_rows = config.consumer_keeps_rows;
     PgOutputState state(std::move(cfg));
     PgDecodeResult result;
     for (const auto& msg : messages) {
@@ -1168,8 +1246,8 @@ struct PostgresCdcSource::Impl {
     // The declared columns the restored checkpoint was taken with
     // ("name:TYPE;..."), when it recorded them.
     std::optional<std::string> restored_columns;
-    // The captured table's snapshot query, for a backfill.
-    std::optional<PostgresCdcSnapshotQuery> table_snapshot;
+    // The captured tables' snapshot queries, for a backfill.
+    std::vector<PostgresCdcSnapshotQuery> table_snapshots;
 
     // ---- acknowledgement ----
     cdc::AckLedger ledger;
@@ -1214,6 +1292,15 @@ void validate_options(const PostgresCdcSource::Options& o) {
     if (o.strict && o.proto_version != 1) {
         throw std::runtime_error(
             "PostgresCdcSource: strict decoding needs pgoutput protocol version 1");
+    }
+    for (const auto& t : o.tables) {
+        if (t.table.empty() || t.key_columns.empty()) {
+            throw std::runtime_error(
+                "PostgresCdcSource: each of `tables` needs a table and its primary key columns");
+        }
+        if (t.consumer_keeps_rows && !o.strict) {
+            throw std::runtime_error("postgres_cdc: consumer_keeps_rows needs strict decoding");
+        }
     }
     if (!o.table.empty() && o.key_columns.empty()) {
         throw std::runtime_error("PostgresCdcSource: capturing table " + o.table +
@@ -1661,17 +1748,15 @@ void check_slot(const SlotInfo& slot,
 void PostgresCdcSource::open() {
     auto& s = *impl_;
     validate_options(s.opts);
-    DecoderConfig cfg;
-    cfg.table = s.opts.table;
-    cfg.key_columns = s.opts.key_columns;
-    for (const auto& [name, type] : s.opts.declared_columns) {
-        (void)type;
-        if (!cdc::is_metadata_column(name)) {
-            cfg.needed.insert(name);
-        }
+    // The tables captured: `tables`, or `table` on its own.
+    if (s.opts.tables.empty() && !s.opts.table.empty()) {
+        s.opts.tables.push_back(Options::Table{.table = s.opts.table,
+                                               .key_columns = s.opts.key_columns,
+                                               .declared_columns = s.opts.declared_columns,
+                                               .consumer_keeps_rows = s.opts.consumer_keeps_rows});
     }
+    DecoderConfig cfg;
     cfg.strict = s.opts.strict;
-    cfg.keep_rows = s.opts.consumer_keeps_rows;
     s.pgoutput = PgOutputState(std::move(cfg));
 
     try {
@@ -1680,39 +1765,60 @@ void PostgresCdcSource::open() {
             admin.get(), s.opts.conninfo, "postgres_cdc_source");
         s.tls_reported = true;
         check_server(admin.get(), s.cancel);
-        if (!s.opts.table.empty()) {
-            const TableCheck table = check_table(admin.get(), s.opts, s.cancel);
-            s.pgoutput.set_table(table.canonical);
-            // The snapshot of the captured table: the declared columns (every
-            // column when none are declared), filtered as the publications
-            // filter the changes. The initial snapshot and a backfill read it.
-            std::string select_list;
-            for (const auto& [name, type] : s.opts.declared_columns) {
-                (void)type;
-                if (!cdc::is_metadata_column(name)) {
-                    select_list += (select_list.empty() ? "" : ", ") + quote_ident(name);
+        if (!s.opts.tables.empty()) {
+            std::map<std::string, DecoderTable> decoded;
+            std::optional<std::string> filtered;
+            const std::string first_declared = s.opts.tables.front().table;
+            for (auto& t : s.opts.tables) {
+                Options one = s.opts;
+                one.table = t.table;
+                one.key_columns = t.key_columns;
+                one.declared_columns = t.declared_columns;
+                one.consumer_keeps_rows = t.consumer_keeps_rows;
+                const TableCheck table = check_table(admin.get(), one, s.cancel);
+                DecoderTable rules;
+                rules.key_columns = t.key_columns;
+                rules.keep_rows = t.consumer_keeps_rows;
+                // The table's snapshot: its declared columns (every column
+                // when none are declared), filtered as the publications filter
+                // its changes. The initial snapshot and a backfill read it.
+                std::string select_list;
+                for (const auto& [name, type] : t.declared_columns) {
+                    (void)type;
+                    if (!cdc::is_metadata_column(name)) {
+                        rules.needed.insert(name);
+                        select_list += (select_list.empty() ? "" : ", ") + quote_ident(name);
+                    }
                 }
+                if (!decoded.emplace(table.canonical, std::move(rules)).second) {
+                    throw std::runtime_error("postgres_cdc: table " + table.canonical +
+                                             " is captured twice by one source");
+                }
+                s.table_snapshots.push_back(PostgresCdcSnapshotQuery{
+                    .table = table.canonical,
+                    .query = "SELECT " + (select_list.empty() ? std::string{"*"} : select_list) +
+                             " FROM " + table.quoted +
+                             (table.row_filter ? " WHERE " + *table.row_filter : std::string{})});
+                if (table.row_filter && !filtered) {
+                    filtered = table.canonical + ", filtered by " + *table.row_filter;
+                }
+                t.table = table.canonical;
             }
-            s.table_snapshot = PostgresCdcSnapshotQuery{
-                .table = table.canonical,
-                .query = "SELECT " + (select_list.empty() ? std::string{"*"} : select_list) +
-                         " FROM " + table.quoted +
-                         (table.row_filter ? " WHERE " + *table.row_filter : std::string{})};
+            s.pgoutput.set_tables(std::move(decoded));
             if (s.opts.enable_initial_snapshot && s.opts.initial_snapshot.empty()) {
-                s.opts.initial_snapshot.push_back(*s.table_snapshot);
-            } else if (table.row_filter && s.opts.enable_initial_snapshot) {
+                s.opts.initial_snapshot = s.table_snapshots;
+            } else if (filtered && s.opts.enable_initial_snapshot) {
                 throw std::runtime_error(
-                    "postgres_cdc: table " + table.canonical +
-                    ": its publications filter its rows (" + *table.row_filter +
-                    "), which a snapshot query given in initial_snapshot does not apply; leave "
+                    "postgres_cdc: table " + *filtered +
+                    ", which a snapshot query given in initial_snapshot does not apply; leave "
                     "initial_snapshot empty and the source reads the table with that filter");
             }
             for (auto& q : s.opts.initial_snapshot) {
-                if (q.table == s.opts.table) {
-                    q.table = table.canonical;
+                if (q.table == first_declared) {
+                    q.table = s.opts.tables.front().table;
                 }
             }
-            s.opts.table = table.canonical;
+            s.opts.table = s.opts.tables.front().table;
         }
         const SlotInfo slot = read_slot(admin.get(), s.opts.slot_name, s.cancel);
         const bool want_snapshot =
@@ -1728,42 +1834,41 @@ void PostgresCdcSource::open() {
                 interrupted = std::make_pair(r.txn_id, r.txn_changes);
             }
             s.cursor.start(r.resume_lsn, interrupted);
-            // Columns declared since the checkpoint: the rows already
-            // delivered lack them, so the table is read again (a backfill)
-            // before the stream resumes. The kept rows complete the replayed
-            // changes that predate a column; without them the restore stops.
-            std::vector<std::string> added;
+            // Columns, or tables, declared since the checkpoint: the rows
+            // already delivered lack them, so the tables are read again (a
+            // backfill) before the stream resumes. The kept rows complete the
+            // replayed changes that predate a column; without them the
+            // restore stops.
+            DeclaredSince since;
             if (s.opts.strict && s.restored_columns) {
-                added = columns_declared_since(*s.restored_columns, s.opts);
+                since = declared_since(*s.restored_columns, s.opts.tables);
             } else if (s.opts.strict) {
                 clink::log::info(kLog,
                                  "the checkpoint does not record the columns it was taken "
                                  "with; a column declared since is not read for the rows "
                                  "already delivered");
             }
-            std::string added_list;
-            for (const auto& c : added) {
-                added_list += (added_list.empty() ? "" : ", ") + c;
-            }
-            if (!added.empty() && !s.opts.consumer_keeps_rows) {
+            if (!since.without_kept_rows.empty()) {
                 throw std::runtime_error(
-                    "postgres_cdc: table " + s.opts.table + ": column(s) " + added_list +
+                    "postgres_cdc: column(s) " + joined(since.columns) +
                     " are declared since the checkpoint this job restores, and the rows already "
-                    "delivered do not have them. Declare the table with keep_rows='true', which "
-                    "reads the table again for them on restore, or start the job afresh with a "
-                    "new slot and snapshot");
+                    "delivered do not have them. Declare " +
+                    joined(since.without_kept_rows) +
+                    " with keep_rows='true', which reads the table again for them on restore, "
+                    "or start the job afresh with a new slot and snapshot");
             }
-            const bool backfill = !added.empty();
-            if ((r.phase == cdc::Phase::Snapshot || backfill) && s.opts.initial_snapshot.empty() &&
-                s.table_snapshot) {
-                s.opts.initial_snapshot.push_back(*s.table_snapshot);
+            const bool backfill = !since.columns.empty() || !since.tables.empty();
+            const std::string added_list =
+                joined(since.columns) +
+                (since.columns.empty() || since.tables.empty() ? "" : ", ") + joined(since.tables);
+            if ((r.phase == cdc::Phase::Snapshot || backfill) && s.opts.initial_snapshot.empty()) {
+                s.opts.initial_snapshot = s.table_snapshots;
             }
             if ((r.phase == cdc::Phase::Snapshot || backfill) && !s.opts.initial_snapshot.empty()) {
                 admin.reset();
                 s.snapshot_from = r.resume_lsn;
                 begin_snapshot_("");
-                plan = backfill ? "restored at " + format_lsn(r.resume_lsn) + "; column(s) " +
-                                      added_list +
+                plan = backfill ? "restored at " + format_lsn(r.resume_lsn) + "; " + added_list +
                                       " declared since the checkpoint, so the table is read "
                                       "again (a backfill, fresh), streaming from " +
                                       format_lsn(r.resume_lsn) + " afterwards"
@@ -1859,10 +1964,14 @@ void PostgresCdcSource::open() {
                        format_lsn(slot.confirmed_flush);
             }
         }
+        std::vector<std::string> names;
+        for (const auto& t : s.opts.tables) {
+            names.push_back(t.table);
+        }
         clink::log::info(
             kLog,
             "postgres cdc source open: slot=" + s.opts.slot_name + " plugin=" + s.opts.plugin +
-                " table=" + (s.opts.table.empty() ? std::string{"(all published)"} : s.opts.table) +
+                " table=" + (names.empty() ? std::string{"(all published)"} : joined(names)) +
                 " plan: " + plan);
         if (s.phase == Impl::Phase::Stream) {
             start_or_retry_();
@@ -2372,6 +2481,16 @@ std::uint64_t PostgresCdcSource::converging_until() const noexcept {
     return impl_ != nullptr ? impl_->converge_until.load() : 0;
 }
 
+std::vector<std::string> PostgresCdcSource::captured_tables() const {
+    std::vector<std::string> out;
+    if (impl_ != nullptr) {
+        for (const auto& t : impl_->opts.tables) {
+            out.push_back(t.table);
+        }
+    }
+    return out;
+}
+
 void PostgresCdcSource::close() {
     if (impl_ == nullptr) {
         return;
@@ -2408,7 +2527,7 @@ void PostgresCdcSource::snapshot_offset(StateBackend& backend,
                                StateBackend::KeyView{kCursorKey, std::strlen(kCursorKey)},
                                StateBackend::ValueView{bytes.data(), bytes.size()});
     if (s.opts.strict) {
-        const std::string columns = declared_spec(s.opts);
+        const std::string columns = declared_record(s.opts.tables);
         backend.put_operator_state(op_id,
                                    StateBackend::KeyView{kColumnsKey, std::strlen(kColumnsKey)},
                                    StateBackend::ValueView{columns.data(), columns.size()});
@@ -2557,6 +2676,9 @@ std::uint64_t PostgresCdcSource::confirmed_lsn() const noexcept {
 }
 std::uint64_t PostgresCdcSource::converging_until() const noexcept {
     return 0;
+}
+std::vector<std::string> PostgresCdcSource::captured_tables() const {
+    return {};
 }
 void PostgresCdcSource::close() {}
 void PostgresCdcSource::drop_slot() {}

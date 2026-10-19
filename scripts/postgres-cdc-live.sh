@@ -49,11 +49,11 @@ run recovery "${BUILD_DIR}/tests/clink_integration_tests" \
 python3 scripts/check-gtest-reports.py \
     --expect 'CdcRowEncoder.*=13' \
     --expect 'CdcCursor.*=9' \
-    --expect 'PostgresCdcFactoryOptions.*=8' \
+    --expect 'PostgresCdcFactoryOptions.*=9' \
     --expect 'PostgresCdcDecodeStrict.*=14' \
     --expect 'PostgresCdcLive.*=3' \
-    --expect 'PostgresCdcContractLive.*=27' \
-    --expect 'PostgresCdcSql.*=3' \
+    --expect 'PostgresCdcContractLive.*=28' \
+    --expect 'PostgresCdcSql.*=4' \
     --expect 'Cells/PostgresCdcClickHouseRecovery.*=5' \
     --expect 'PostgresCdcSlot.*=1' \
     --expect 'PostgresCdcIntegration.*=2' \

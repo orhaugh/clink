@@ -475,3 +475,131 @@ TEST(PostgresCdcSql, KeptRowsConvergeAfterASnapshotTakenFresh) {
         std::filesystem::remove_all(c);
     }
 }
+
+// Several tables on one replication slot: an EXECUTE STATEMENT SET keeps a
+// replica of each from one source and one walsender, the source routing each
+// table's rows to its own branch, while transactions touch both. Checkpoints
+// complete through the routed branches, so the slot is confirmed.
+TEST(PostgresCdcSql, TablesOnOneSlotFeedTheirTargetsFromOneSource) {
+    if (dsn_env() == nullptr) {
+        GTEST_SKIP() << "set CLINK_POSTGRES_CDC_TEST_DSN (docker/integration-services.yml)";
+    }
+    ensure_installed();
+    const std::string dsn = dsn_env();
+    const std::string tag = std::to_string(::getpid());
+    const std::string orders = "shared_orders_" + tag;
+    const std::string customers = "shared_customers_" + tag;
+    const std::string pub = "pub_shared_" + tag;
+    const std::string slot = "slot_shared_" + tag;
+    const std::string order_cols =
+        "(id bigint PRIMARY KEY, customer_id bigint, amount numeric(12, 2))";
+    const std::string customer_cols = "(id bigint PRIMARY KEY, name text)";
+    for (const auto& [t, cols] :
+         std::vector<std::pair<std::string, std::string>>{{orders, order_cols},
+                                                          {orders + "_r", order_cols},
+                                                          {customers, customer_cols},
+                                                          {customers + "_r", customer_cols}}) {
+        query(dsn, "DROP TABLE IF EXISTS " + t);
+        query(dsn, "CREATE TABLE " + t + " " + cols);
+    }
+    query(dsn, "DROP PUBLICATION IF EXISTS " + pub);
+    query(dsn, "CREATE PUBLICATION " + pub + " FOR TABLE " + orders + ", " + customers);
+    query(dsn, "INSERT INTO " + customers + " SELECT g, 'c' || g FROM generate_series(1, 50) g");
+    query(
+        dsn,
+        "INSERT INTO " + orders + " SELECT g, g % 50 + 1, g * 1.5 FROM generate_series(1, 200) g");
+
+    const auto ckpt = std::filesystem::temp_directory_path() / ("clink_pgcdc_shared_" + tag);
+    std::filesystem::remove_all(ckpt);
+    std::ostringstream log;
+    clink::embed::EngineOptions opts;
+    opts.out = &log;
+    opts.err = &log;
+    opts.checkpoint_dir = ckpt.string();
+    opts.checkpoint_interval_ms = 300;
+    auto engine = std::make_unique<clink::embed::EmbeddedEngine>(std::move(opts));
+    const std::string cdc =
+        " WITH (connector='postgres', format='json', mode='cdc', "
+        "changelog_mode='upsert', conninfo='" +
+        dsn + "', slot_name='" + slot + "', publication_names='" + pub + "', \"table\"='public.";
+    const std::string upsert =
+        " WITH (connector='postgres', format='json', mode='upsert', "
+        "conninfo='" +
+        dsn + "', \"table\"='public.";
+    const std::string order_sql =
+        "(id BIGINT PRIMARY KEY, customer_id BIGINT, amount DECIMAL(12, 2))";
+    const std::string customer_sql = "(id BIGINT PRIMARY KEY, name VARCHAR)";
+    const std::string script =
+        "CREATE TABLE orders_cdc " + order_sql + cdc + orders + "');" +
+        "CREATE TABLE customers_cdc " + customer_sql + cdc + customers + "');" +
+        "CREATE TABLE orders_r " + order_sql + upsert + orders + "_r');" +
+        "CREATE TABLE customers_r " + customer_sql + upsert + customers + "_r');" +
+        "EXECUTE STATEMENT SET BEGIN "
+        "INSERT INTO orders_r SELECT id, customer_id, amount FROM orders_cdc;"
+        "INSERT INTO customers_r SELECT id, name FROM customers_cdc;"
+        "END;";
+    ASSERT_EQ(engine->execute_script(script), 0) << log.str();
+
+    const auto differ = [&](const std::string& t) {
+        return "SELECT (SELECT count(*) FROM (SELECT * FROM " + t + " EXCEPT SELECT * FROM " + t +
+               "_r) a) + (SELECT count(*) FROM (SELECT * FROM " + t + "_r EXCEPT SELECT * FROM " +
+               t + ") b)";
+    };
+    const auto converge = [&](const char* what) {
+        const auto deadline = Clock::now() + 90s;
+        while (query(dsn, differ(orders)) != "0" || query(dsn, differ(customers)) != "0") {
+            ASSERT_LT(Clock::now(), deadline) << what << ": a replica never matched:\n"
+                                              << log.str();
+            std::this_thread::sleep_for(200ms);
+        }
+    };
+    converge("the snapshot");
+    // Transactions across both tables.
+    query(dsn,
+          "BEGIN; UPDATE " + customers + " SET name = name || '!' WHERE id % 3 = 0; UPDATE " +
+              orders + " SET amount = amount + 10 WHERE customer_id % 3 = 0; COMMIT");
+    query(dsn, "DELETE FROM " + orders + " WHERE id % 7 = 0");
+    query(dsn, "INSERT INTO " + customers + " VALUES (51, 'new')");
+    query(dsn, "INSERT INTO " + orders + " VALUES (201, 51, 9.99)");
+    converge("the stream");
+    // One source: one walsender reads the slot.
+    EXPECT_EQ(query(dsn,
+                    "SELECT count(*) FROM pg_stat_replication WHERE application_name = "
+                    "'clink_cdc_" +
+                        slot + "'"),
+              "1");
+    // Checkpoints complete through the routed branches and confirm the slot.
+    const auto confirmed = [&] {
+        return lsn(
+            query(dsn,
+                  "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '" +
+                      slot + "'"));
+    };
+    const std::uint64_t before = confirmed();
+    query(dsn, "UPDATE " + customers + " SET name = 'tail' WHERE id = 1");
+    const auto confirm_deadline = Clock::now() + 30s;
+    while (confirmed() <= before) {
+        ASSERT_LT(Clock::now(), confirm_deadline) << "no completed checkpoint confirmed the slot\n"
+                                                  << log.str();
+        std::this_thread::sleep_for(200ms);
+    }
+
+    engine->cancel_all();
+    engine.reset();
+    for (int i = 0; i < 50; ++i) {
+        if (query(dsn,
+                  "SELECT active FROM pg_replication_slots WHERE slot_name = '" + slot + "'") !=
+            "t") {
+            break;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    query(dsn,
+          "SELECT pg_drop_replication_slot('" + slot +
+              "') FROM pg_replication_slots WHERE slot_name = '" + slot + "'");
+    query(dsn, "DROP PUBLICATION IF EXISTS " + pub);
+    for (const auto& t : {orders, orders + "_r", customers, customers + "_r"}) {
+        query(dsn, "DROP TABLE IF EXISTS " + t);
+    }
+    std::filesystem::remove_all(ckpt);
+}

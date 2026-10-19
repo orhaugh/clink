@@ -145,6 +145,30 @@ TEST(PostgresCdcFactoryOptions, SubMillisecondTruncationIsPartOfTheContractOnly)
     EXPECT_TRUE(mentions(build_error("postgres_cdc_source", k), "changelog_mode"));
 }
 
+// Several tables on one slot: `tables` carries each table's own options, and
+// is the SQL source's alone.
+TEST(PostgresCdcFactoryOptions, SeveralTablesAreGivenAsTablesAndNothingBesideThem) {
+    Params p = {{"conninfo", "host=127.0.0.1 port=1 dbname=x"},
+                {"slot_name", "s"},
+                {"publication_names", "p"},
+                {"tables",
+                 R"([{"table":"public.a","primary_key":"id","declared_types":"id:BIGINT",)"
+                 R"("changelog_mode":"upsert"},{"table":"public.b","primary_key":"k",)"
+                 R"("declared_types":"k:BIGINT;v:VARCHAR","changelog_mode":"append",)"
+                 R"("keep_rows":"true"}])"}};
+    EXPECT_EQ(build_error("postgres_cdc_source", p), "");
+    auto beside = p;
+    beside["changelog_mode"] = "upsert";
+    EXPECT_TRUE(mentions(build_error("postgres_cdc_source", beside), "belongs to each entry"));
+    auto no_mode = p;
+    no_mode["tables"] = R"([{"table":"public.a","primary_key":"id","declared_types":"id:BIGINT"}])";
+    EXPECT_TRUE(mentions(build_error("postgres_cdc_source", no_mode), "changelog_mode"));
+    auto not_json = p;
+    not_json["tables"] = "public.a,public.b";
+    EXPECT_TRUE(mentions(build_error("postgres_cdc_source", not_json), "'tables'"));
+    EXPECT_TRUE(mentions(build_error("postgres_cdc_text_source", p), "postgres_cdc_source"));
+}
+
 TEST(PostgresCdcFactoryOptions, WithoutChangelogModeTheEarlierDefaultsHold) {
     // No contract: test_decoding by default, no snapshot, no table needed.
     const Params p = {{"conninfo", "host=127.0.0.1 port=1"}, {"slot_name", "s"}};

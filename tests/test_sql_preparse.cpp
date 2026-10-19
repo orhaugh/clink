@@ -809,3 +809,35 @@ TEST(SqlPreparse, MaterializedViewNameCollisionRejected) {
                      cat),
                  TranslationError);
 }
+
+// EXECUTE STATEMENT SET BEGIN ... END: the INSERTs between run as one job. The
+// set closes at an END that follows a statement's `;` and is followed by `;`,
+// so a CASE ... END in a statement does not close it.
+TEST(SqlPreparse, StatementSetsTagTheirStatements) {
+    const auto script = parse(
+        "CREATE TABLE t (a BIGINT, b BIGINT) WITH (connector='file', format='json', path='/tmp/t');"
+        "execute statement set begin "
+        "  INSERT INTO t SELECT a, b FROM t;"
+        "  INSERT INTO t SELECT a, CASE WHEN b > 1 THEN 1 ELSE 2 END FROM t;"
+        "END;"
+        "INSERT INTO t SELECT a, b FROM t;"
+        "EXECUTE /* the second */ STATEMENT SET BEGIN INSERT INTO t SELECT b, a FROM t; END");
+    ASSERT_EQ(script.statements.size(), 5U);
+    EXPECT_EQ(script.statement_sets, (std::vector<int>{-1, 0, 0, -1, 1}));
+
+    // No sets: no tags.
+    EXPECT_TRUE(parse("INSERT INTO t SELECT a, b FROM t;").statement_sets.empty());
+
+    EXPECT_THROW((void)parse("EXECUTE STATEMENT SET BEGIN INSERT INTO t SELECT a, b FROM t;"),
+                 clink::sql::TranslationError);
+    EXPECT_THROW((void)parse("EXECUTE STATEMENT SET BEGIN END;"), clink::sql::TranslationError);
+    EXPECT_THROW((void)parse("EXECUTE STATEMENT SET BEGIN INSERT INTO t SELECT a, b FROM t; "
+                             "EXECUTE STATEMENT SET BEGIN INSERT INTO t SELECT a, b FROM t; END; "
+                             "END;"),
+                 clink::sql::TranslationError);
+    // The keywords inside a string are text.
+    const auto quoted = parse(
+        "INSERT INTO t SELECT a, b FROM t WHERE 'EXECUTE STATEMENT SET "
+        "BEGIN' <> '';");
+    EXPECT_TRUE(quoted.statement_sets.empty());
+}
