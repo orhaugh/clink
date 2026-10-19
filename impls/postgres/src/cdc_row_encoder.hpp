@@ -46,6 +46,20 @@
 // insert for a snapshot row or an INSERT, update_after for an UPDATE, delete
 // for a DELETE. In append mode no row carries one: every change is an
 // appended row.
+//
+// With keep_rows the rows feed the SQL operator that keeps the latest row of
+// every key (cdc_keep_rows_row, include/clink/sql/cdc_keep_rows.hpp), which
+// sets __row_kind itself. Each row then carries, for that operator only:
+//   __cdc_kind       snapshot, insert, update, delete or truncate
+//   __cdc_version    the change's WAL position, 0 for a snapshot row
+//   __cdc_unchanged  the declared columns an UPDATE left unchanged and stored
+//                    out of line without carrying them (written null here),
+//                    present only when there are some
+//   __cdc_converging true on a streamed change that a snapshot taken fresh
+//                    may already hold (PostgresCdcSource::converging_until),
+//                    present only then
+// A TRUNCATE of the table is a row of its own: its data columns null and its
+// metadata columns those of a delete.
 
 #include <cstdint>
 #include <optional>
@@ -57,6 +71,19 @@
 #include "clink/connectors/cdc_event.hpp"
 
 namespace clink::postgres::cdc {
+
+// The fields a keep_rows row carries for the row-keeping operator. The SQL
+// side spells the same names in cdc_keep_rows.hpp.
+inline constexpr std::string_view kKindField = "__cdc_kind";
+inline constexpr std::string_view kVersionField = "__cdc_version";
+inline constexpr std::string_view kUnchangedField = "__cdc_unchanged";
+inline constexpr std::string_view kConvergingField = "__cdc_converging";
+
+// The CdcField::type the strict decoder gives an unchanged out-of-line value it
+// could not take from an old row, when the consumer keeps rows and fills it in.
+// No PostgreSQL type name is spelt like this: built-in names have no
+// parentheses and user-defined ones carry their schema.
+inline constexpr std::string_view kUnchangedToastType = "(unchanged toast)";
 
 // How changes reach SQL.
 enum class ChangelogMode : std::uint8_t {
@@ -149,22 +176,28 @@ std::optional<std::uint64_t> parse_lsn(std::string_view text);
 
 class RowEncoder {
 public:
-    RowEncoder(std::vector<ColumnPlan> columns, ChangelogMode mode);
+    // `keep_rows`: the rows feed the row-keeping operator (see above).
+    RowEncoder(std::vector<ColumnPlan> columns, ChangelogMode mode, bool keep_rows = false);
 
-    // The JSON object for one Insert, Update or Delete event, or nullopt for a
-    // transaction marker or other event kind. `snapshot_row` marks a row of the
-    // initial snapshot. Throws EncodeError when a value cannot be carried. Each
-    // column whose value lost digits below the millisecond is appended to
-    // `truncated`, when given.
-    [[nodiscard]] std::optional<std::string> encode(
-        const CdcEvent& ev, bool snapshot_row, std::vector<std::string>* truncated = nullptr) const;
+    // The JSON object for one Insert, Update or Delete event (and with
+    // keep_rows a Truncate), or nullopt for a transaction marker or other event
+    // kind. `snapshot_row` marks a row of the initial snapshot. Throws EncodeError when a value
+    // cannot be carried. Each column whose value lost digits below the millisecond is appended to
+    // `truncated`, when given. `converging` marks a streamed change before the
+    // position a snapshot taken fresh was read at (keep_rows only).
+    [[nodiscard]] std::optional<std::string> encode(const CdcEvent& ev,
+                                                    bool snapshot_row,
+                                                    std::vector<std::string>* truncated = nullptr,
+                                                    bool converging = false) const;
 
     [[nodiscard]] const std::vector<ColumnPlan>& columns() const noexcept { return columns_; }
     [[nodiscard]] ChangelogMode mode() const noexcept { return mode_; }
+    [[nodiscard]] bool keep_rows() const noexcept { return keep_rows_; }
 
 private:
     std::vector<ColumnPlan> columns_;
     ChangelogMode mode_;
+    bool keep_rows_{false};
 };
 
 }  // namespace clink::postgres::cdc

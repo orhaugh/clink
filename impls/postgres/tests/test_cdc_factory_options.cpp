@@ -81,7 +81,8 @@ TEST(PostgresCdcFactoryOptions, ValuesOutsideTheirDomainAreRefusedByName) {
                           Case{"reconnect_timeout_ms", "-1"},
                           Case{"status_interval_ms", "10s"},
                           Case{"poll_interval_ms", "0"},
-                          Case{"on_sub_millisecond", "round"}}) {
+                          Case{"on_sub_millisecond", "round"},
+                          Case{"keep_rows", "yes"}}) {
         const std::string err = build_error("postgres_cdc_source", contract({{c.key, c.value}}));
         EXPECT_TRUE(mentions(err, "'" + c.key + "'")) << c.key << "=" << c.value << ": " << err;
     }
@@ -137,6 +138,11 @@ TEST(PostgresCdcFactoryOptions, SubMillisecondTruncationIsPartOfTheContractOnly)
                       {"slot_name", "s"},
                       {"on_sub_millisecond", "truncate"}};
     EXPECT_TRUE(mentions(build_error("postgres_cdc_source", p), "changelog_mode"));
+    // keep_rows likewise.
+    EXPECT_EQ(build_error("postgres_cdc_source", contract({{"keep_rows", "true"}})), "");
+    const Params k = {
+        {"conninfo", "host=127.0.0.1 port=1"}, {"slot_name", "s"}, {"keep_rows", "true"}};
+    EXPECT_TRUE(mentions(build_error("postgres_cdc_source", k), "changelog_mode"));
 }
 
 TEST(PostgresCdcFactoryOptions, WithoutChangelogModeTheEarlierDefaultsHold) {

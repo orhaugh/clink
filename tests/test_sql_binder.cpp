@@ -3409,13 +3409,13 @@ TEST(SqlBinder, ValidWindowFormsStillBind) {
 
 namespace {
 
-Catalog cdc_catalog(const std::string& mode = "upsert") {
+Catalog cdc_catalog(const std::string& mode = "upsert", bool keep_rows = false) {
     Catalog cat;
     auto s = parse(
         "CREATE TABLE orders (id BIGINT PRIMARY KEY, status VARCHAR, amount DOUBLE) WITH ("
         "connector='postgres', format='json', mode='cdc', changelog_mode='" +
-        mode +
-        "', conninfo='host=pg', slot_name='s', publication_names='p', \"table\"='public.orders');"
+        mode + "'" + (keep_rows ? ", keep_rows='true'" : "") +
+        ", conninfo='host=pg', slot_name='s', publication_names='p', \"table\"='public.orders');"
         "CREATE TABLE replica (id BIGINT PRIMARY KEY, status VARCHAR, amount DOUBLE) WITH ("
         "connector='postgres', format='json', mode='upsert', conninfo='host=pg', "
         "\"table\"='public.replica');"
@@ -3481,6 +3481,30 @@ TEST(SqlBinderUpsertCdc, AGroupingOverItIsRefused) {
         "INSERT INTO totals SELECT status, COUNT(*) AS n FROM orders GROUP BY status");
     EXPECT_NE(err.find("upsert changelog"), std::string::npos) << err;
     EXPECT_NE(err.find("Aggregate"), std::string::npos) << err;
+    EXPECT_NE(err.find("keep_rows='true'"), std::string::npos) << err;
+}
+
+// keep_rows='true': each update carries the row it replaced and each delete
+// the row it removed, so any consumer can retract from it.
+TEST(SqlBinderUpsertCdc, KeepingTheRowsMakesItAChangelogAnyConsumerCanRetractFrom) {
+    const Catalog cat = cdc_catalog("upsert", /*keep_rows=*/true);
+    EXPECT_EQ(cdc_bind_error(cat,
+                             "INSERT INTO totals SELECT status, COUNT(*) AS n FROM orders "
+                             "GROUP BY status"),
+              "");
+    EXPECT_EQ(cdc_bind_error(cat, "INSERT INTO replica SELECT * FROM orders WHERE status = 'paid'"),
+              "");
+    EXPECT_EQ(cdc_bind_error(cat,
+                             "INSERT INTO replica SELECT a.id, a.status, b.amount FROM orders a "
+                             "JOIN orders b ON a.id = b.id"),
+              "");
+    // Still a changelog: an append-only sink is refused, with the append mode named.
+    const std::string err = cdc_bind_error(cat, "INSERT INTO log_out SELECT * FROM orders");
+    EXPECT_NE(err.find("append-only"), std::string::npos) << err;
+    EXPECT_NE(err.find("changelog_mode='append'"), std::string::npos) << err;
+    Binder b(cat);
+    const auto plan = b.bind_insert(as_insert(parse("INSERT INTO shown SELECT * FROM orders")));
+    EXPECT_TRUE(is_changelog_plan(static_cast<const LogicalSink&>(*plan).input()));
 }
 
 TEST(SqlBinderUpsertCdc, ASinkKeyedByAnotherColumnIsRefused) {

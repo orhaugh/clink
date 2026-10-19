@@ -312,6 +312,26 @@ TEST(SqlUnsupportedSemantics, InsertFormatIsRefusedOffClickHouse) {
               "");
 }
 
+// keep_rows places the row-keeping stage behind a PostgreSQL CDC table; it is
+// a closed domain and does nothing on any other table.
+TEST(SqlUnsupportedSemantics, KeepRowsIsAClosedDomainOnACdcTableOnly) {
+    const std::string cdc =
+        "CREATE TABLE t (k BIGINT PRIMARY KEY) WITH (connector='postgres', format='json', "
+        "mode='cdc', changelog_mode='upsert', conninfo='host=pg', slot_name='s', "
+        "publication_names='p', \"table\"='public.t', keep_rows='";
+    EXPECT_EQ(register_ddl(cdc + "true');"), "");
+    EXPECT_EQ(register_ddl(cdc + "false');"), "");
+    const auto yes = register_ddl(cdc + "yes');");
+    ASSERT_FALSE(yes.empty()) << "keep_rows='yes' was accepted";
+    EXPECT_NE(yes.find("'true', 'false'"), std::string::npos) << yes;
+
+    const auto file = register_ddl(
+        "CREATE TABLE t (k BIGINT) WITH (connector='file', format='json', path='/tmp/x', "
+        "keep_rows='true');");
+    ASSERT_FALSE(file.empty()) << "keep_rows on a file table was silently ignored";
+    EXPECT_NE(file.find("PostgreSQL CDC table"), std::string::npos) << file;
+}
+
 TEST(SqlUnsupportedSemantics, EveryLegitimateModeValueIsAccepted) {
     // Guard against the domain list being narrowed by guesswork. The first
     // version of it omitted 'cdc' and rejected every CDC table in the

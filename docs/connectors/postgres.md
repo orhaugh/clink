@@ -67,6 +67,7 @@ Every option is checked when the job is built: a value outside an option's domai
 | `changelog_mode` | No | unset | `upsert` or `append`; selects the SQL CDC contract. |
 | `snapshot_mode` | No | `never`; `initial` with `changelog_mode` | `initial` reads the rows already in the table before streaming its changes; `never` streams changes only. |
 | `on_decode_error` | No | `drop`; `fail` with `changelog_mode` | What to do with a change that cannot be decoded, or under the contract cannot be represented. `fail` stops the job on it and never moves past it; `drop` counts it in `dropped_events_total` and continues (the change is lost). |
+| `keep_rows` | No | `false` | With `changelog_mode` only. `true` keeps the latest row of every key in the job's state, behind the source, which fills in unchanged out-of-line values, turns a TRUNCATE into deletes, and gives an upsert table's updates and deletes their old rows; see [Keeping the rows](#keeping-the-rows-keep_rows). |
 | `on_sub_millisecond` | No | `fail` | With `changelog_mode` only. What a `TIMESTAMP` value with non-zero digits below the millisecond does: `fail` refuses it, as any value its type cannot hold; `truncate` drops those digits, rounding the value down to the millisecond, counts it in `clink_connector_timestamps_truncated_total{connector="postgres_cdc"}` and names the column in the log the first time. A primary key column is never truncated, since two keys could become one. |
 | `create_slot` | No | `true` | Create the slot when it does not exist and the job has no checkpoint that depends on it. A restore never recreates a missing slot. |
 | `drop_slot_on_close` | No | `false` | Drop the slot when the source closes, for throwaway jobs. A job that drops its slot cannot be restored from its checkpoints. |
@@ -223,9 +224,9 @@ CREATE TABLE orders_cdc (
 | Replica identity `DEFAULT` (the primary key), `USING INDEX` on the primary key's columns, or `FULL`; not `NOTHING`. For a partitioned table, every partition's | a delete must carry its key | the identity to set, and the partition |
 | A publication, named in `publication_names`, that contains the table and publishes inserts, updates and deletes, under one row filter for all three if it has one, and with every declared column in its column list (if it has one). For a partitioned table, the table itself with `publish_via_partition_root = true`, and none of its partitions on their own | a change the publication leaves out never arrives | the publication and what it lacks |
 
-Out-of-line (TOAST) values need `REPLICA IDENTITY FULL` in one case: an UPDATE that leaves a large `text`, `jsonb` or `bytea` value unchanged does not carry it, and only the old row that `FULL` adds to the change holds it. Under `FULL` the source takes the value from there. Without `FULL`, such an UPDATE to a declared column stops the source with a message that names the column and the `ALTER TABLE` to run; the source warns at open when a declared column can be stored out of line and the identity is not `FULL`. `FULL` also gives every delete the deleted row's values rather than its key alone.
+Out-of-line (TOAST) values need `REPLICA IDENTITY FULL` or `keep_rows='true'` in one case: an UPDATE that leaves a large `text`, `jsonb` or `bytea` value unchanged does not carry it, and only the old row that `FULL` adds to the change holds it. Under `FULL` the source takes the value from there; with `keep_rows` the job takes it from the row it keeps. With neither, such an UPDATE to a declared column stops the source with a message that names the column and both remedies; the source warns at open when a declared column can be stored out of line and the identity is not `FULL`. `FULL` also gives every delete the deleted row's values rather than its key alone.
 
-An UPDATE that changes the primary key is emitted as a delete of the old key followed by the new row. A TRUNCATE of the table stops the source, since it cannot be expressed as row changes; leave `truncate` out of the publication's `publish` list only if the downstream copy should keep the rows a TRUNCATE removes. A declared column that is dropped or renamed on the server stops the source at the next change; there is no schema evolution.
+An UPDATE that changes the primary key is emitted as a delete of the old key followed by the new row. A TRUNCATE of the table is a delete of every row with `keep_rows='true'`, and otherwise stops the source, since without the rows it cannot be expressed as row changes; leave `truncate` out of the publication's `publish` list only if the downstream copy should keep the rows a TRUNCATE removes. A declared column that is dropped or renamed on the server stops the source at the next change; there is no schema evolution.
 
 ### Row filters
 
@@ -280,11 +281,11 @@ Declared columns with these reserved names carry the change rather than the row:
 
 ### `changelog_mode='upsert'`: a changelog keyed by the primary key
 
-Each row carries its changelog kind: `insert` for a snapshot row or an INSERT, `update_after` for an UPDATE, `delete` for a DELETE. An update carries the new row only, never the row it replaced, so the table is a changelog only to a consumer that applies rows by that key. The binder holds that line:
+Each row carries its changelog kind: `insert` for a snapshot row or an INSERT, `update_after` for an UPDATE, `delete` for a DELETE. An update carries the new row only, never the row it replaced, so the table is a changelog only to a consumer that applies rows by that key. The binder holds that line, unless the table is declared with `keep_rows='true'` (below), which gives every update and delete its old row:
 
 - allowed between the table and the sink: projections that keep each key column (renamed or not) and WHERE conditions on key columns;
 - allowed sinks: `mode='upsert'` keyed by the table's primary key, carried unchanged, or a sink that writes the changelog as it is (`connector='changelog'`, `'blackhole'`, `'print'`, or `changelog='true'`);
-- refused, with the reason and `changelog_mode='append'` named: grouping, joins and every other operator, a WHERE on a column an update can change (a row moved out of the condition would never be removed), an upsert sink keyed otherwise, and an append-only sink.
+- refused, with the reason and `keep_rows='true'` and `changelog_mode='append'` named: grouping, joins and every other operator, a WHERE on a column an update can change (a row moved out of the condition would never be removed), an upsert sink keyed otherwise, and an append-only sink.
 
 ```sql
 CREATE TABLE orders_replica (
@@ -307,6 +308,38 @@ CREATE TABLE orders_changes (
         conninfo = '...', slot_name = 'clink_orders', publication_names = 'clink_orders',
         "table" = 'public.orders');
 ```
+
+### Keeping the rows (`keep_rows`)
+
+`keep_rows='true'` puts a stage behind the source that keeps the latest row of every primary key in the job's keyed state: one copy of the declared columns, checkpointed with the job and held by its state backend (RocksDB included), on one subtask like the source. From the row it keeps it
+
+- fills in an out-of-line value an UPDATE left unchanged without carrying it, so `REPLICA IDENTITY FULL` is not needed for large values, including when the UPDATE also changed the key;
+- turns a TRUNCATE of the table into a delete of every row it keeps;
+- in `changelog_mode='upsert'`, emits an update as `update_before` with the row it replaced followed by `update_after`, and a delete with the row it removed, so the table is a changelog any consumer can retract from: grouping, joins and a WHERE on any column are allowed. An update that changes nothing is not emitted;
+- in `changelog_mode='append'`, gives a delete row the values of the row it removed and the delete's own `__op`, `__version` and `__deleted`;
+- drops a change no newer than the row it keeps, which only a replay can deliver.
+
+```sql
+CREATE TABLE orders_cdc (
+  id BIGINT PRIMARY KEY, status VARCHAR, amount DECIMAL(12, 2), notes VARCHAR
+) WITH (connector = 'postgres', format = 'json', mode = 'cdc', changelog_mode = 'upsert',
+        keep_rows = 'true', conninfo = '...', slot_name = 'clink_orders',
+        publication_names = 'clink_orders', "table" = 'public.orders');
+
+CREATE TABLE totals (status VARCHAR PRIMARY KEY, n BIGINT, total DECIMAL(14, 2))
+  WITH (connector = 'postgres', format = 'json', mode = 'upsert', conninfo = '...',
+        "table" = 'public.totals');
+
+INSERT INTO totals
+SELECT status, COUNT(*) AS n, SUM(amount) AS total FROM orders_cdc GROUP BY status
+ALLOW UNBOUNDED STATE;
+```
+
+A windowless grouping keeps one accumulator per group for the life of the job, which the planner admits only with `ALLOW UNBOUNDED STATE` (or a `state_ttl`). A group whose rows have all gone stays in the target with a count of 0.
+
+A change to a key the stage keeps no row for is one it cannot complete. After a snapshot taken fresh (a restore during the snapshot, or a slot that already existed), the stream replays changes the snapshot already holds, among them updates of rows deleted before the snapshot was read; until the stream passes the WAL position that snapshot was read at, which the source keeps in its checkpoint, such updates are passed over, and the deletes that follow remove nothing. Outside that window an update of a key it keeps no row for is emitted as an insert, and stops the job when it left an out-of-line value unchanged: the row reached the table some way the change stream does not carry (a partition attached, rows restored outside the slot). A delete of such a key is passed on with the columns it carries when every operator between the stage and the sink applies rows by key (it can remove a row an earlier run wrote), and dropped when a consumer retracts, which would retract a row it never counted.
+
+Turning `keep_rows` on or off changes the job's plan: start the job afresh, with a new slot and snapshot, rather than restoring a savepoint taken under the other setting. A stage that starts with no rows cannot complete the changes of rows it never saw.
 
 Without `changelog_mode` a `mode='cdc'` table keeps its earlier form: `test_decoding` unless `plugin` says otherwise, no snapshot, `on_decode_error='drop'`, every value as text, every table of the publication, and each change, delete included, an appended row with `__op`, `__table`, `__lsn` and `__xid`. It is kept for existing jobs; a new job should set `changelog_mode`.
 
@@ -395,7 +428,7 @@ CDC source, stated part by part (see [Position, snapshot and recovery](#position
 - Source replay: from a checkpoint taken while streaming, exact. Every change committed after the checkpoint's cut is emitted, and none before it, including when the cut fell inside a transaction. A snapshot interrupted by a failure is taken again from scratch and converges rather than resuming.
 - Duplicates: after a job restart, everything emitted since the last completed checkpoint is emitted again, so a sink without two-phase commit receives those changes twice. A snapshot taken again re-emits every row. A reconnect within `reconnect_timeout_ms` emits nothing twice.
 - Transaction visibility: an aborted transaction, or a rolled-back savepoint, is never emitted; committed transactions arrive in commit order. A transaction's changes can be split across checkpoints and across the sink's batches, so a reader of the downstream copy may see part of a transaction.
-- Downstream state: a consumer that applies rows by the primary key (an upsert sink, or a store that keeps the highest `__version` per key and removes `__deleted` keys) converges on the table's state once it has caught up.
+- Downstream state: a consumer that applies rows by the primary key (an upsert sink, or a store that keeps the highest `__version` per key and removes `__deleted` keys) converges on the table's state once it has caught up. With `keep_rows='true'` so does a consumer that retracts, such as a grouping, which works from whole rows.
 - Losses: none without a refusal. A change the contract cannot carry stops the job and is met again on every restart (`on_decode_error='fail'`), and the slot is never confirmed past it. `on_decode_error='drop'` loses that change, counted in `dropped_events_total`. Without `changelog_mode` the default is still `drop`.
 - End to end: the source on its own is not a delivery guarantee; the job's guarantee is the weaker of the source's replay and the sink's. Into the at-least-once ClickHouse sink the result is at-least-once delivery of every change and a correct current state through `__version`; into the PostgreSQL upsert sink it is effectively-once on the replica table.
 
@@ -410,15 +443,16 @@ SELECT source: the cursor is the row index into the materialised result set. A r
 - A partitioned table is captured through its root, on PostgreSQL 13 or later. Attaching or detaching a partition, and a TRUNCATE of one partition, publish nothing, so the downstream copy keeps the rows they add or remove.
 - A snapshot is not resumable. A failure during the snapshot takes it again from scratch, and the downstream converges through the replay rather than seeing an exact boundary.
 - Timestamps carry milliseconds. A PostgreSQL value with finer digits is refused, or rounded down with `on_sub_millisecond='truncate'`; a primary key timestamp is always refused. Declare `VARCHAR` to keep the full text.
-- Without `REPLICA IDENTITY FULL`, an UPDATE that leaves an out-of-line value of a declared column unchanged stops the source.
-- A TRUNCATE of the captured table stops the source.
+- Without `REPLICA IDENTITY FULL` or `keep_rows='true'`, an UPDATE that leaves an out-of-line value of a declared column unchanged stops the source.
+- Without `keep_rows='true'`, a TRUNCATE of the captured table stops the source.
+- `keep_rows='true'` keeps a copy of the captured columns in the job's state, on one subtask.
 - The slot is confirmed only by completed checkpoints, so WAL is retained for as long as the job is stopped or not checkpointing. A job containing a sink whose commit cannot be re-executed (the Kafka transactional sink) can be restored to a checkpoint older than one already reported complete; the CDC source then refuses, since the slot was confirmed past it.
 - `on_decode_error=fail` stops the pipeline with no quarantine, and does so again on every restart for a permanently undecodable change.
 - Dropping a replication slot requires that no session is using it; `drop_slot()` must be called after `close()`, or via `drop_slot_on_close=true`.
 
 ## Testing
 
-Tests that need no server run unconditionally under the `postgres` label: the pgoutput decoder (including strict decoding of unchanged TOAST values, key changes and TRUNCATE), the SQL contract's row encoder and type conversions, the position and acknowledgement rules (`test_cdc_cursor.cpp`), the CDC factories' option checks, the replay-offset encodings, and the sink and codec units. The binder's rules for the upsert changelog and the planner's singleton placement are in `clink_sql_tests` (`SqlBinderUpsertCdc.*`, `SqlPhysical.PostgresCdc*`).
+Tests that need no server run unconditionally under the `postgres` label: the pgoutput decoder (including strict decoding of unchanged TOAST values, key changes and TRUNCATE), the SQL contract's row encoder and type conversions, the position and acknowledgement rules (`test_cdc_cursor.cpp`), the CDC factories' option checks, the replay-offset encodings, and the sink and codec units. The binder's rules for the upsert changelog, the planner's singleton placement and the row-keeping stage (`keep_rows`: old rows, filled values, truncates, replays, the window after a fresh snapshot, restore from a checkpoint) are in `clink_sql_tests` (`SqlBinderUpsertCdc.*`, `SqlPhysical.PostgresCdc*`, `SqlCdcKeepRows.*`).
 
 Live tests run against a real PostgreSQL server and are skipped unless `CLINK_POSTGRES_CDC_TEST_DSN` names one started with `wal_level=logical`. The reference server is the `postgres-cdc` service in `docker/integration-services.yml`, PostgreSQL 16.15 pinned by digest. The same DSN drives the sink live tests.
 
@@ -428,7 +462,7 @@ export CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres passw
 ctest --test-dir build -L postgres -j1
 ```
 
-`PostgresCdcContractLive.*` drives the source through its checkpoint hooks, with a model of a transactional downstream that a restore rewinds, and checks every case against two oracles: the table itself, and every row version the workload committed. It covers a snapshot taken while the table changes, rolled-back work, a transaction spanning a checkpoint, a crash during snapshot setup, during the snapshot rows and at the transition to streaming, a restore after the transition, acknowledgement only by completed checkpoints (an aborted or pending one confirms nothing), a walsender ended inside a large transaction, a missing slot and a slot advanced past the checkpoint, decode-error refusal and the drop policy, the open-time refusals, cancellation from every wait, the supported types with NULLs and unchanged TOAST values, microsecond timestamps refused by default and rounded down on request, a partitioned table captured through its root (a row moved between partitions included, and the partition TRUNCATE that PostgreSQL does not publish) with the publications that would hide its partitions' changes refused, publication row filters applied to the snapshot and the stream (rows moving in and out, two publications combined) with filters that differ by action refused, and the upsert changelog's kinds. `PostgresCdcSql.*` (`clink_postgres_sql_tests`) runs a `changelog_mode='upsert'` table through the SQL frontend into the upsert sink and compares the replica with its source.
+`PostgresCdcContractLive.*` drives the source through its checkpoint hooks, with a model of a transactional downstream that a restore rewinds, and checks every case against two oracles: the table itself, and every row version the workload committed. It covers a snapshot taken while the table changes, rolled-back work, a transaction spanning a checkpoint, a crash during snapshot setup, during the snapshot rows and at the transition to streaming, a restore after the transition, acknowledgement only by completed checkpoints (an aborted or pending one confirms nothing), a walsender ended inside a large transaction, a missing slot and a slot advanced past the checkpoint, decode-error refusal and the drop policy, the open-time refusals, cancellation from every wait, the supported types with NULLs and unchanged TOAST values, microsecond timestamps refused by default and rounded down on request, a partitioned table captured through its root (a row moved between partitions included, and the partition TRUNCATE that PostgreSQL does not publish) with the publications that would hide its partitions' changes refused, publication row filters applied to the snapshot and the stream (rows moving in and out, two publications combined) with filters that differ by action refused, and the upsert changelog's kinds. `PostgresCdcSql.*` (`clink_postgres_sql_tests`) runs a `changelog_mode='upsert'` table through the SQL frontend into the upsert sink and compares the replica with its source; with `keep_rows='true'` under `REPLICA IDENTITY DEFAULT` it keeps a grouping and a whole-row replica equal to the table through updates that leave large values unchanged, a key change, deletes and a TRUNCATE, and converges after a snapshot taken fresh on a slot an earlier run left.
 
 The CDC recovery cells (`Cells/PostgresCdcClickHouseRecovery.*` in `clink_integration_tests`) run the SQL job in a cluster, a coordinator and two `clink_node` workers, capturing a table with `changelog_mode='append'` into a ClickHouse change log while a workload commits inserts, updates and deletes. A ClickHouse materialised view feeds a `ReplacingMergeTree(__version, __deleted)`. Each cell parks the source's worker at a fault point and kills it once the fault framework's witness line shows the phase was reached: during the snapshot after a checkpoint completed in it, at the transition to streaming, after a streaming checkpoint recorded its position but before it completed, and just after a completed checkpoint was confirmed to the slot. A fifth restarts the PostgreSQL server while the job streams, which the source must ride out with no job restart. After a marker row arrives through the stream, every cell requires the table read with `FINAL`, and rebuilt from the log with `argMax`, to equal the PostgreSQL table in every column; every committed row version and delete to be in the log; and exactly the restarts it names. `PostgresCdcSlot.ASlotThatLostItsWalIsRefused` gives a slot a low `max_slot_wal_keep_size` on its own server, lets the server invalidate it, and requires the restore to refuse. These start their own PostgreSQL and ClickHouse containers.
 

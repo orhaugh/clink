@@ -699,7 +699,7 @@ TEST(PostgresCdcContractLive, ATransactionSpanningACheckpointReplaysExactly) {
         run.checkpoint(backends, 1);
         run.complete(1);
         const std::string bytes = cursor_bytes(backends[1]);
-        ASSERT_EQ(bytes.size(), 27U);
+        ASSERT_EQ(bytes.size(), 35U);
         EXPECT_EQ(bytes[2], 1) << "the checkpoint is not inside the transaction";
         run.pump_until([&] { return down.changes().size() > 2000; });
         run.crash();

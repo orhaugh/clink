@@ -667,6 +667,7 @@ if(CLINK_BUILD_SQL)
         test_submit_checkpoint_config.cpp
         test_sql_state_ttl_runtime.cpp
         test_sql_memory_budget.cpp
+        test_sql_cdc_keep_rows.cpp
         test_columnar_split.cpp
         test_key_routing_parity.cpp
         test_json_columnar_decode.cpp

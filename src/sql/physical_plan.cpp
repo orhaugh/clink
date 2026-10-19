@@ -1,12 +1,17 @@
 #include "clink/sql/physical_plan.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "clink/cluster/job_graph.hpp"
 #include "clink/config/json.hpp"
@@ -290,6 +295,72 @@ bool is_postgres_cdc_table(const TableDef& table) {
     const auto m = table.properties.find("mode");
     return c != table.properties.end() && c->second == "postgres" && m != table.properties.end() &&
            m->second == "cdc";
+}
+
+// A CDC table declared keep_rows='true': the plan keeps the latest row of every
+// key behind its source.
+bool keeps_rows(const TableDef& table) {
+    const auto k = table.properties.find("keep_rows");
+    return k != table.properties.end() && k->second == "true";
+}
+
+// The base op id an input reference names ("id", "id.N" or "id::tag").
+std::string input_base_id(const std::string& ref) {
+    if (const auto colons = ref.find("::"); colons != std::string::npos) {
+        return ref.substr(0, colons);
+    }
+    const auto dot = ref.rfind('.');
+    if (dot != std::string::npos && dot + 1 < ref.size() &&
+        std::all_of(ref.begin() + static_cast<std::ptrdiff_t>(dot) + 1, ref.end(), [](char c) {
+            return c >= '0' && c <= '9';
+        })) {
+        return ref.substr(0, dot);
+    }
+    return ref;
+}
+
+// A keep_rows stage in upsert mode may pass on a delete of a key it holds no
+// row for (a row an earlier run may have written to the sink) only when every
+// operator between it and the sink passes rows through or applies them by key.
+// A consumer that retracts - a grouping, a join - never counted that row, and
+// a retraction of it would be wrong, so there the stage drops such deletes.
+void decide_cdc_unheld_deletes(cluster::JobGraphSpec& spec) {
+    std::map<std::string, std::vector<const cluster::OperatorSpec*>> consumers;
+    for (const auto& op : spec.ops) {
+        for (const auto& in : op.inputs) {
+            consumers[input_base_id(in)].push_back(&op);
+        }
+    }
+    static const std::set<std::string> kPassThrough = {"filter_row_predicate",
+                                                       "project_row",
+                                                       "assign_timestamps_row",
+                                                       "identity_row",
+                                                       "row_bind_columns",
+                                                       "row_compute_key",
+                                                       "row_to_json_string"};
+    for (auto& op : spec.ops) {
+        if (op.type != "cdc_keep_rows_row" || op.params["changelog_mode"] != "upsert") {
+            continue;
+        }
+        bool by_key = true;
+        std::vector<std::string> frontier{op.id};
+        std::set<std::string> seen;
+        while (!frontier.empty() && by_key) {
+            const std::string id = frontier.back();
+            frontier.pop_back();
+            for (const auto* c : consumers[id]) {
+                if (!seen.insert(c->id).second || consumers[c->id].empty()) {
+                    continue;  // visited, or the sink
+                }
+                if (kPassThrough.count(c->type) == 0) {
+                    by_key = false;
+                    break;
+                }
+                frontier.push_back(c->id);
+            }
+        }
+        op.params["unheld_deletes"] = by_key ? "emit" : "drop";
+    }
 }
 
 RowConnectorBinding row_source_binding_for(const TableDef& table) {
@@ -1264,6 +1335,29 @@ std::string compile_node(const LogicalPlan& node,
             std::string src_id = op.id;
             spec.ops.push_back(std::move(op));
             after_src = src_id;
+        }
+        if (ch == Channel::Row && is_postgres_cdc_table(table) && keeps_rows(table)) {
+            // keep_rows: the stage that keeps the latest row of every key
+            // (cdc_keep_rows.hpp), before event time is assigned so a delete
+            // it makes from a held row carries that row's columns.
+            // unheld_deletes is settled by decide_cdc_unheld_deletes once
+            // the consumers behind it are compiled.
+            cluster::OperatorSpec keep;
+            keep.id = "cdc_rows_" + std::to_string(next_id++);
+            keep.type = "cdc_keep_rows_row";
+            keep.inputs = {after_src};
+            keep.out_channel = std::string{kChannelRow};
+            std::string pk;
+            for (const auto& k : table.primary_key) {
+                pk += (pk.empty() ? "" : ",") + k;
+            }
+            keep.params["key_columns"] = std::move(pk);
+            const auto mode = table.properties.find("changelog_mode");
+            keep.params["changelog_mode"] =
+                mode == table.properties.end() ? std::string{} : mode->second;
+            keep.params["unheld_deletes"] = "emit";
+            after_src = keep.id;
+            spec.ops.push_back(std::move(keep));
         }
         if (auto ts_id = maybe_emit_assign_timestamps(table, ch, after_src, spec, next_id)) {
             return *ts_id;
@@ -2897,6 +2991,7 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     // cannot trace.
     spec.column_lineage = capture_column_lineage(root, sink_id);
     mark_changelog_producers(spec);
+    decide_cdc_unheld_deletes(spec);
     propagate_forced_singletons(spec);
     enable_columnar_output(spec);
     // Every operator in this spec is planner-emitted engine code: wall-clock

@@ -60,6 +60,7 @@
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/blackhole_row_sink.hpp"
+#include "clink/sql/cdc_keep_rows.hpp"
 #include "clink/sql/delta_row_sink.hpp"
 #include "clink/sql/expr_lowering.hpp"
 #include "clink/sql/json_string_to_row_columnar.hpp"
@@ -14611,6 +14612,31 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             const auto ttl = read_ttl_params(ctx);
             return std::make_shared<DistinctRowOp>(std::move(columns), ttl.ms, ttl.event_time);
+        });
+
+    // cdc_keep_rows_row: the latest row of every key of a CDC table declared
+    // with keep_rows='true' (cdc_keep_rows.hpp). The planner sets every param:
+    // key_columns (csv, the primary key), changelog_mode (upsert | append) and
+    // unheld_deletes (emit | drop).
+    reg.register_operator<Row, Row>(
+        "cdc_keep_rows_row", [](const BuildContext& ctx) -> std::shared_ptr<Operator<Row, Row>> {
+            const auto mode = ctx.param_or("changelog_mode", "");
+            if (mode != "upsert" && mode != "append") {
+                throw std::runtime_error(
+                    "cdc_keep_rows_row: 'changelog_mode' must be 'upsert' or 'append' (got '" +
+                    mode + "')");
+            }
+            const auto unheld = ctx.param_or("unheld_deletes", "drop");
+            if (unheld != "emit" && unheld != "drop") {
+                throw std::runtime_error(
+                    "cdc_keep_rows_row: 'unheld_deletes' must be 'emit' or 'drop' (got '" + unheld +
+                    "')");
+            }
+            return std::make_shared<CdcKeepRowsOperator>(
+                projection_from_csv(ctx.param_or("key_columns", "")),
+                mode == "upsert" ? CdcKeepRowsOperator::Mode::Upsert
+                                 : CdcKeepRowsOperator::Mode::Append,
+                unheld == "emit");
         });
 
     // aggregate_row: unbounded GROUP BY (no window TVF). Params mirror

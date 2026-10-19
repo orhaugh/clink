@@ -233,6 +233,58 @@ TEST(CdcRowEncoder, AppendModeWritesTheChangeMetadataAndNoChangelogKind) {
     EXPECT_EQ(del.at("__xid").as_int(), 77);
 }
 
+// keep_rows: the rows feed the stage that keeps every key's latest row, so
+// each carries its kind and position, an unchanged out-of-line value is left
+// for that stage to fill in, and a TRUNCATE is a row of its own.
+TEST(CdcRowEncoder, KeepRowsWritesTheFieldsTheRowKeepingStageReads) {
+    const cdc::RowEncoder enc(cdc::plan_columns("id:BIGINT;body:VARCHAR;__op:VARCHAR;__version:"
+                                                "BIGINT;__deleted:BOOLEAN"),
+                              cdc::ChangelogMode::Upsert,
+                              /*keep_rows=*/true);
+    const std::vector<CdcField> row = {{.name = "id", .value = "5", .type = "int8"},
+                                       {.name = "body",
+                                        .value = "",
+                                        .type = std::string{cdc::kUnchangedToastType},
+                                        .is_null = false}};
+    auto upd = parse_row(*enc.encode(event(CdcEvent::Op::Update, row, "0/1A2B"), false));
+    EXPECT_EQ(upd.at("__cdc_kind").as_string(), "update");
+    EXPECT_EQ(upd.at("__cdc_version").as_int(), 0x1A2B);
+    EXPECT_TRUE(upd.at("body").is_null());
+    ASSERT_TRUE(upd.at("__cdc_unchanged").is_array());
+    ASSERT_EQ(upd.at("__cdc_unchanged").as_array().size(), 1U);
+    EXPECT_EQ(upd.at("__cdc_unchanged").as_array()[0].as_string(), "body");
+    // The stage sets the changelog kind, not the source.
+    EXPECT_EQ(upd.count("__row_kind"), 0U);
+
+    const std::vector<CdcField> full = {{.name = "id", .value = "5", .type = "int8"},
+                                        {.name = "body", .value = "b", .type = "text"}};
+    auto snap = parse_row(*enc.encode(event(CdcEvent::Op::Insert, full), /*snapshot_row=*/true));
+    EXPECT_EQ(snap.at("__cdc_kind").as_string(), "snapshot");
+    EXPECT_EQ(snap.at("__cdc_version").as_int(), 0);
+    EXPECT_EQ(snap.count("__cdc_unchanged"), 0U);
+
+    // A change a snapshot taken fresh may already hold is marked so.
+    auto conv = parse_row(*enc.encode(event(CdcEvent::Op::Update, full), false, nullptr, true));
+    EXPECT_TRUE(conv.at("__cdc_converging").as_bool());
+    EXPECT_EQ(upd.count("__cdc_converging"), 0U);
+
+    CdcEvent truncate = event(CdcEvent::Op::Truncate, {}, "0/2000");
+    auto t = parse_row(*enc.encode(truncate, false));
+    EXPECT_EQ(t.at("__cdc_kind").as_string(), "truncate");
+    EXPECT_EQ(t.at("__cdc_version").as_int(), 0x2000);
+    EXPECT_TRUE(t.at("id").is_null());
+    EXPECT_EQ(t.at("__op").as_string(), "delete");
+    EXPECT_TRUE(t.at("__deleted").as_bool());
+
+    // Without keep_rows a TRUNCATE is no row, and nothing is marked.
+    const cdc::RowEncoder plain(cdc::plan_columns("id:BIGINT;body:VARCHAR"),
+                                cdc::ChangelogMode::Upsert);
+    EXPECT_FALSE(plain.encode(truncate, false).has_value());
+    auto p = parse_row(*plain.encode(event(CdcEvent::Op::Update, full), false));
+    EXPECT_EQ(p.count("__cdc_kind"), 0U);
+    EXPECT_EQ(p.at("__row_kind").as_string(), "update_after");
+}
+
 TEST(CdcRowEncoder, AColumnMissingFromTheChangeIsRefusedNotNulled) {
     const cdc::RowEncoder enc(cdc::plan_columns("id:BIGINT;name:VARCHAR"),
                               cdc::ChangelogMode::Upsert);

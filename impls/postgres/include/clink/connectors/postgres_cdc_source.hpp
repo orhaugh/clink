@@ -172,6 +172,12 @@ public:
         //   * a TRUNCATE of the table is a decode error, because it cannot be
         //     expressed as row changes.
         bool strict{false};
+        // With `strict`: the consumer keeps the latest row of every key (the
+        // SQL contract's keep_rows). An unchanged out-of-line value the change
+        // does not carry is then passed on marked for the consumer to fill in,
+        // rather than refused, and a TRUNCATE of the table is emitted as a
+        // Truncate event for the consumer to expand into deletes.
+        bool consumer_keeps_rows{false};
     };
 
     explicit PostgresCdcSource(Options opts);
@@ -222,6 +228,13 @@ public:
 
     // The position the slot has been confirmed at by this source (0 = none).
     [[nodiscard]] std::uint64_t confirmed_lsn() const noexcept;
+
+    // After a snapshot taken fresh (a restore during the snapshot, or a slot
+    // that already existed), the WAL position that snapshot was read at:
+    // a streamed change before it replays what the snapshot already holds,
+    // possibly for a row the snapshot no longer has. 0 once the stream has
+    // passed it, or when the snapshot was bound to the slot's export.
+    [[nodiscard]] std::uint64_t converging_until() const noexcept;
 
     static bool is_real_implementation();
 

@@ -1234,6 +1234,7 @@ if(CLINK_BUILD_SQL)
         src/sql/install.cpp
         src/sql/spill_store.cpp
         src/sql/json_string_to_row_columnar.cpp
+        src/sql/cdc_keep_rows.cpp
         src/sql/async_function_registry.cpp
         src/sql/table_api.cpp
     )

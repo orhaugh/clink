@@ -88,6 +88,19 @@ tests and the recovery cells (the source's worker killed at each phase, the
 server restarted) on every push and pull request, and fails a run in which a
 live case skipped.
 
+**A CDC table can keep its rows.** `keep_rows='true'` on a `changelog_mode` table
+puts a stage behind the source that keeps the latest row of every key in the
+job's keyed state. It fills in the out-of-line values an UPDATE leaves
+unchanged, so large values no longer need `REPLICA IDENTITY FULL`; turns a
+TRUNCATE, which used to stop the job, into a delete of every row; and, in
+`changelog_mode='upsert'`, gives each update its old row as `update_before`
+and each delete the row it removed. With that, a grouping, a join or a filter
+on any column over an upsert CDC table computes correctly and the binder
+allows it. In `changelog_mode='append'` a delete row carries the removed row's
+values. The source records, in its checkpoint, the WAL position a snapshot
+taken fresh was read at, so the stage can tell a replayed update of a row
+deleted before that snapshot from a row it should hold and does not.
+
 **A failed checkpoint names why.** The coordinator logged which subtasks could
 not snapshot, but not their reason, which the subtask sends; it now logs each
 one's reason as it arrives.

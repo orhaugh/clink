@@ -225,7 +225,16 @@ private:
     std::optional<std::string> encode_(const CdcEvent& ev, bool snapshot_row) {
         try {
             truncated_.clear();
-            auto row = encoder_->encode(ev, snapshot_row, &truncated_);
+            // keep_rows: a streamed change before the position a fresh
+            // snapshot was read at may replay what that snapshot holds.
+            bool converging = false;
+            if (!snapshot_row && encoder_->keep_rows()) {
+                if (const auto w = inner_.converging_until(); w != 0) {
+                    const auto lsn = cdc::parse_lsn(ev.lsn);
+                    converging = lsn.has_value() && *lsn < w;
+                }
+            }
+            auto row = encoder_->encode(ev, snapshot_row, &truncated_, converging);
             if (!truncated_.empty()) {
                 note_truncated_();
             }
@@ -445,6 +454,10 @@ struct CdcConfig {
 //   on_sub_millisecond             fail | truncate (default fail; contract only):
 //                                  what a TIMESTAMP value with digits below the
 //                                  millisecond does; key columns always fail
+//   keep_rows                      true | false (default false; contract only):
+//                                  the SQL plan keeps the latest row per key
+//                                  (cdc_keep_rows_row), so unchanged TOAST
+//                                  values and a TRUNCATE are passed on for it
 //   declared_types                 the SQL table's columns, set by the planner
 CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
                      const std::string& factory,
@@ -539,10 +552,15 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
             cdc::truncate_sub_millisecond_outside_key(cfg.plan, o.key_columns);
         }
         o.strict = true;
-    } else if (ctx.params.count("on_sub_millisecond") != 0) {
-        throw std::runtime_error(factory +
-                                 ": 'on_sub_millisecond' applies with changelog_mode only (without "
-                                 "it every value is carried as text)");
+        o.consumer_keeps_rows = bool_option(ctx, factory, "keep_rows", false);
+    } else {
+        for (const char* option : {"on_sub_millisecond", "keep_rows"}) {
+            if (ctx.params.count(option) != 0) {
+                throw std::runtime_error(factory + ": '" + option +
+                                         "' applies with changelog_mode only (without it every "
+                                         "value is carried as text)");
+            }
+        }
     }
     o.snapshot_batch_rows =
         static_cast<std::size_t>(int_option(ctx, factory, "snapshot_batch_rows", 1000, 1));
@@ -715,10 +733,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         "postgres_cdc_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             auto cfg = cdc_config(ctx, "postgres_cdc_source", /*sql_contract=*/true);
             if (cfg.changelog_mode) {
+                const bool keep_rows = cfg.source.consumer_keeps_rows;
                 return std::make_shared<StringPostgresCdcSource>(
                     std::move(cfg.source),
                     /*json=*/true,
-                    cdc::RowEncoder(std::move(cfg.plan), *cfg.changelog_mode));
+                    cdc::RowEncoder(std::move(cfg.plan), *cfg.changelog_mode, keep_rows));
             }
             return std::make_shared<StringPostgresCdcSource>(std::move(cfg.source), /*json=*/true);
         });

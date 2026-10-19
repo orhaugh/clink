@@ -449,6 +449,7 @@ include/clink/sql/binder.hpp
 include/clink/sql/blackhole_row_sink.hpp
 include/clink/sql/bounded_state.hpp
 include/clink/sql/cardinality.hpp
+include/clink/sql/cdc_keep_rows.hpp
 include/clink/sql/column_lineage.hpp
 include/clink/sql/delta_row_sink.hpp
 include/clink/sql/expr_lowering.hpp

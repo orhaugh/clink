@@ -317,6 +317,34 @@ TEST(PostgresCdcDecodeStrict, AnInsertWithAnUnchangedToastValueStopsTheChange) {
     EXPECT_EQ(value_of(res.events[0], "body"), "<absent>");
 }
 
+// keep_rows: the consumer holds every row, so an unchanged out-of-line value
+// is passed on marked for it to fill in, and a TRUNCATE is passed on.
+TEST(PostgresCdcDecodeStrict, WhenTheConsumerKeepsRowsUnchangedValuesAndTruncatesPass) {
+    auto config = strict_orders();
+    config.consumer_keeps_rows = true;
+    auto msgs = relations();
+    msgs.push_back(update_msg(1, 0, "", tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));
+    auto res = decode_pgoutput_messages(msgs, config);
+    ASSERT_EQ(res.events.size(), 1U);
+    EXPECT_TRUE(res.errors.empty());
+    bool marked = false;
+    for (const auto& f : res.events[0].values) {
+        if (f.name == "body") {
+            marked = f.type == "(unchanged toast)" && !f.is_null;
+        }
+    }
+    EXPECT_TRUE(marked) << "the unchanged value was not marked";
+
+    // TRUNCATE of the table: an event naming the table, not a stop.
+    msgs = relations();
+    msgs.push_back(truncate_msg(1));
+    res = decode_pgoutput_messages(msgs, config);
+    ASSERT_EQ(res.events.size(), 1U);
+    EXPECT_EQ(res.events[0].op, CdcEvent::Op::Truncate);
+    EXPECT_EQ(res.events[0].table, "public.orders");
+    EXPECT_TRUE(res.errors.empty());
+}
+
 TEST(PostgresCdcDecodeStrict, LegacyDecodingKeepsTheEmptyUnchangedToastValue) {
     auto msgs = relations();
     msgs.push_back(update_msg(1, 0, "", tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));

@@ -59,6 +59,11 @@ struct CursorState {
     bool in_flight{false};
     std::uint64_t txn_id{0};
     std::uint64_t txn_changes{0};
+    // A snapshot taken fresh, without the slot's export, reads the table as
+    // of some WAL position past where streaming resumes, so the changes
+    // before that position replay what the snapshot already holds. This is
+    // that position (0 = no such snapshot, or the stream has passed it).
+    std::uint64_t converge_until{0};
 };
 
 class TxnCursor {
@@ -218,11 +223,14 @@ private:
     std::atomic<std::uint64_t> confirmable_{0};
 };
 
-// The checkpoint encoding: version 2, little-endian.
-//   [0] version (2)  [1] phase  [2] flags (bit 0: in flight)
+// The checkpoint encoding: version 3, little-endian.
+//   [0] version (3)  [1] phase  [2] flags (bit 0: in flight)
 //   [3..10] resume LSN  [11..18] transaction id  [19..26] changes processed
-inline constexpr std::uint8_t kCursorVersion = 2;
-inline constexpr std::size_t kCursorBytes = 27;
+//   [27..34] the position a fresh snapshot converges at
+// Version 2 is the same without the last field, and still read.
+inline constexpr std::uint8_t kCursorVersion = 3;
+inline constexpr std::size_t kCursorBytes = 35;
+inline constexpr std::size_t kCursorV2Bytes = 27;
 
 inline std::array<char, kCursorBytes> encode_cursor(const CursorState& s) {
     std::array<char, kCursorBytes> out{};
@@ -237,13 +245,19 @@ inline std::array<char, kCursorBytes> encode_cursor(const CursorState& s) {
     put64(3, s.resume_lsn);
     put64(11, s.txn_id);
     put64(19, s.txn_changes);
+    put64(27, s.converge_until);
     return out;
 }
 
 // nullopt for bytes this release cannot read (an unknown version is refused
 // by the caller rather than misread).
 inline std::optional<CursorState> decode_cursor(const std::vector<char>& bytes) {
-    if (bytes.size() < kCursorBytes || static_cast<std::uint8_t>(bytes[0]) != kCursorVersion) {
+    if (bytes.empty()) {
+        return std::nullopt;
+    }
+    const auto version = static_cast<std::uint8_t>(bytes[0]);
+    if (!(version == kCursorVersion && bytes.size() >= kCursorBytes) &&
+        !(version == 2 && bytes.size() >= kCursorV2Bytes)) {
         return std::nullopt;
     }
     const auto get64 = [&](std::size_t at) {
@@ -264,6 +278,9 @@ inline std::optional<CursorState> decode_cursor(const std::vector<char>& bytes) 
     s.resume_lsn = get64(3);
     s.txn_id = get64(11);
     s.txn_changes = get64(19);
+    if (version == kCursorVersion) {
+        s.converge_until = get64(27);
+    }
     return s;
 }
 

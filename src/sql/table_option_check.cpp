@@ -36,6 +36,8 @@ const std::vector<ClosedDomain>& closed_domains() {
         {"changelog", {"true", "false"}},
         {"columnar_decode", {"true", "false"}},
         {"insert_format", {"native", "jsoneachrow"}},
+        // A PostgreSQL CDC table's row-keeping stage; the planner reads it.
+        {"keep_rows", {"true", "false"}},
         // How a JSON-writing sink renders NaN and the infinities. Read off
         // config::non_finite_from_option, which the planner and the sink
         // factories also check against.
@@ -72,6 +74,7 @@ const std::vector<std::string>& interpreted_table_options() {
         "bounded",
         "insert_format",
         "json_non_finite",
+        "keep_rows",
     };
     return opts;
 }
@@ -133,6 +136,23 @@ std::vector<TableOptionProblem> check_table_options(
                                             "': insert_format applies to connector='clickhouse' "
                                             "only; this table's connector is '" +
                                             connector + "'"});
+                }
+            }
+            // keep_rows places the row-keeping stage behind a PostgreSQL CDC
+            // source, and nothing else reads it.
+            if (key == "keep_rows") {
+                const auto get = [&](const char* k) {
+                    const auto it = properties.find(k);
+                    return it == properties.end() ? std::string{} : it->second;
+                };
+                if (get("connector") != "postgres" || get("mode") != "cdc" ||
+                    get("changelog_mode").empty()) {
+                    problems.push_back(
+                        {key,
+                         "table '" + table_name +
+                             "': keep_rows applies to a PostgreSQL CDC table with "
+                             "changelog_mode (connector='postgres', mode='cdc'); on this table "
+                             "it would do nothing"});
                 }
             }
             // state_ttl must parse. A mistyped retention that silently

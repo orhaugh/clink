@@ -185,8 +185,10 @@ TEST(CdcCursor, TheCheckpointEncodingRoundTripsAndRefusesUnknownVersions) {
     s.in_flight = true;
     s.txn_id = 0x99;
     s.txn_changes = 7;
+    s.converge_until = 0xABCDEF;
     const auto bytes = cdc::encode_cursor(s);
     const std::vector<char> v(bytes.begin(), bytes.end());
+    EXPECT_EQ(v[0], 3);
     const auto back = cdc::decode_cursor(v);
     ASSERT_TRUE(back.has_value());
     EXPECT_EQ(back->phase, cdc::Phase::Snapshot);
@@ -194,9 +196,20 @@ TEST(CdcCursor, TheCheckpointEncodingRoundTripsAndRefusesUnknownVersions) {
     EXPECT_TRUE(back->in_flight);
     EXPECT_EQ(back->txn_id, 0x99U);
     EXPECT_EQ(back->txn_changes, 7U);
+    EXPECT_EQ(back->converge_until, 0xABCDEFU);
+
+    // Version 2, which had no convergence position, still reads.
+    std::vector<char> v2(v.begin(), v.begin() + 27);
+    v2[0] = 2;
+    const auto old = cdc::decode_cursor(v2);
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->resume_lsn, s.resume_lsn);
+    EXPECT_EQ(old->txn_changes, 7U);
+    EXPECT_EQ(old->converge_until, 0U);
 
     std::vector<char> future = v;
-    future[0] = 3;
+    future[0] = 4;
     EXPECT_FALSE(cdc::decode_cursor(future).has_value());
+    EXPECT_FALSE(cdc::decode_cursor(std::vector<char>(v.begin(), v.begin() + 30)).has_value());
     EXPECT_FALSE(cdc::decode_cursor(std::vector<char>(v.begin(), v.begin() + 10)).has_value());
 }

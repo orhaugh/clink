@@ -897,6 +897,55 @@ TEST(SqlPhysical, PostgresCdcSourceIsASingletonWithItsTypesAndKey) {
     }
 }
 
+// keep_rows='true': the row-keeping stage sits between the table's JSON bridge
+// and the rest of the plan, keyed by the primary key, one subtask like the
+// source. In upsert mode it passes on deletes of keys it holds no row for only
+// when everything behind it applies rows by key.
+TEST(SqlPhysical, PostgresCdcKeepRowsPlacesTheRowKeepingStage) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE pg_in (id BIGINT PRIMARY KEY, status VARCHAR, amount DOUBLE) WITH ("
+        "connector='postgres', format='json', mode='cdc', changelog_mode='upsert', "
+        "keep_rows='true', conninfo='host=pg', slot_name='s', publication_names='p', "
+        "\"table\"='public.t');"
+        "CREATE TABLE replica (id BIGINT PRIMARY KEY, status VARCHAR) WITH (connector='postgres', "
+        "format='json', mode='upsert', conninfo='host=pg', \"table\"='public.r');"
+        "CREATE TABLE totals (status VARCHAR PRIMARY KEY, n BIGINT) WITH (connector='postgres', "
+        "format='json', mode='upsert', conninfo='host=pg', \"table\"='public.totals');");
+    for (const auto& st : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    PhysicalPlanner pp;
+    const auto replica = pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat, "INSERT INTO replica SELECT id, status FROM pg_in WHERE status <> 'x'")));
+    const auto* keep = find_op(replica, "cdc_keep_rows_row");
+    ASSERT_NE(keep, nullptr);
+    EXPECT_EQ(keep->params.at("key_columns"), "id");
+    EXPECT_EQ(keep->params.at("changelog_mode"), "upsert");
+    EXPECT_EQ(keep->params.at("unheld_deletes"), "emit");
+    EXPECT_TRUE(cluster::is_forced_singleton(*keep));
+    const auto* bridge = find_op(replica, "json_string_to_row");
+    ASSERT_NE(bridge, nullptr);
+    ASSERT_EQ(keep->inputs.size(), 1U);
+    EXPECT_EQ(keep->inputs[0], bridge->id);
+
+    const auto totals = pp.compile(static_cast<const LogicalSink&>(*bind_insert(
+        cat, "INSERT INTO totals SELECT status, COUNT(*) AS n FROM pg_in GROUP BY status")));
+    keep = find_op(totals, "cdc_keep_rows_row");
+    ASSERT_NE(keep, nullptr);
+    EXPECT_EQ(keep->params.at("unheld_deletes"), "drop");
+
+    // Without keep_rows there is no such stage.
+    auto plain = parse(
+        "CREATE TABLE pg_plain (id BIGINT PRIMARY KEY, status VARCHAR) WITH (connector='postgres', "
+        "format='json', mode='cdc', changelog_mode='upsert', conninfo='host=pg', slot_name='s2', "
+        "publication_names='p', \"table\"='public.t2');");
+    cat.register_table(std::get<ast::CreateTableStmt>(plain.statements[0]));
+    const auto without = pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat, "INSERT INTO replica SELECT id, status FROM pg_plain")));
+    EXPECT_EQ(find_op(without, "cdc_keep_rows_row"), nullptr);
+}
+
 // M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via
 // the row_to_json_string bridge, with format=jsoneachrow FORCED by the binding
 // (the SQL format='json' channel selector is stripped before the factory).

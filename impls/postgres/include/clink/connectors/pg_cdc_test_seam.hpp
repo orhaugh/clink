@@ -35,6 +35,7 @@ struct PgDecodeConfig {
     std::vector<std::string> key_columns;     // the table's primary key
     std::vector<std::string> needed_columns;  // columns the consumer reads; empty = all
     bool strict{false};
+    bool consumer_keeps_rows{false};  // see PostgresCdcSource::Options
 };
 
 // Decode a sequence of raw pgoutput message payloads through one decoder

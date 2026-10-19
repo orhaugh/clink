@@ -5,6 +5,7 @@
 // bytes match: this proves snapshot and restore agree on the state key + the
 // 8-byte LE encoding (the bug class the #57 delegation fix was about).
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -100,8 +101,8 @@ TEST(PostgresCdcSourceReplay, AnEarlierReleasesLsnRestoresAndIsRecordedVersioned
     const auto written =
         out.get_operator_state(op, StateBackend::KeyView{kCursor, std::strlen(kCursor)});
     ASSERT_TRUE(written.has_value());
-    ASSERT_EQ(written->size(), 27U);
-    EXPECT_EQ(static_cast<int>((*written)[0]), 2) << "encoding version";
+    ASSERT_EQ(written->size(), 35U);
+    EXPECT_EQ(static_cast<int>((*written)[0]), 3) << "encoding version";
     EXPECT_EQ(static_cast<int>((*written)[1]), 2) << "stream phase";
     EXPECT_EQ(static_cast<int>((*written)[2]), 0) << "no transaction in flight";
     std::uint64_t lsn = 0;
@@ -127,14 +128,15 @@ TEST(PostgresCdcSourceReplay, TheVersionedPositionRoundTrips) {
     const OperatorId op{13};
     constexpr const char* kCursor = "__postgres_cdc_cursor__";
     const StateBackend::KeyView key{kCursor, std::strlen(kCursor)};
-    std::array<char, 27> bytes{};
-    bytes[0] = 2;  // version
+    std::array<char, 35> bytes{};
+    bytes[0] = 3;  // version
     bytes[1] = 1;  // snapshot phase
     bytes[2] = 1;  // in flight
     for (std::size_t i = 0; i < 8; ++i) {
         bytes[3 + i] = static_cast<char>((0x5000ULL >> (i * 8)) & 0xFF);
         bytes[11 + i] = static_cast<char>((0x6000ULL >> (i * 8)) & 0xFF);
         bytes[19 + i] = static_cast<char>((3ULL >> (i * 8)) & 0xFF);
+        bytes[27 + i] = static_cast<char>((0x7000ULL >> (i * 8)) & 0xFF);
     }
     InMemoryStateBackend seeded;
     seeded.put_operator_state(op, key, StateBackend::ValueView{bytes.data(), bytes.size()});
@@ -144,9 +146,34 @@ TEST(PostgresCdcSourceReplay, TheVersionedPositionRoundTrips) {
     opts.slot_name = "test_slot";
     PostgresCdcSource src(std::move(opts));
     ASSERT_TRUE(src.restore_offset(seeded, op));
+    EXPECT_EQ(src.converging_until(), 0x7000U);
     InMemoryStateBackend out;
     src.snapshot_offset(out, op, CheckpointId{1});
     EXPECT_EQ(out.get_operator_state(op, key), seeded.get_operator_state(op, key));
+
+    // A version 2 position (no convergence position) restores and is
+    // recorded as version 3 with none.
+    std::array<char, 27> v2{};
+    std::copy(bytes.begin(), bytes.begin() + 27, v2.begin());
+    v2[0] = 2;
+    InMemoryStateBackend old;
+    old.put_operator_state(op, key, StateBackend::ValueView{v2.data(), v2.size()});
+    PostgresCdcSource::Options o2;
+    o2.conninfo = "host=127.0.0.1 port=1";
+    o2.slot_name = "test_slot";
+    PostgresCdcSource src2(std::move(o2));
+    ASSERT_TRUE(src2.restore_offset(old, op));
+    EXPECT_EQ(src2.converging_until(), 0U);
+    InMemoryStateBackend out2;
+    src2.snapshot_offset(out2, op, CheckpointId{1});
+    auto expected = bytes;
+    std::fill(expected.begin() + 27, expected.end(), 0);
+    const auto written = out2.get_operator_state(op, key);
+    ASSERT_TRUE(written.has_value());
+    ASSERT_EQ(written->size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(static_cast<char>((*written)[i]), expected[i]) << "byte " << i;
+    }
 }
 
 // A position written by a later release is refused, never misread.
@@ -156,8 +183,8 @@ TEST(PostgresCdcSourceReplay, AnUnknownEncodingVersionIsRefused) {
     }
     const OperatorId op{14};
     constexpr const char* kCursor = "__postgres_cdc_cursor__";
-    std::array<char, 27> bytes{};
-    bytes[0] = 3;
+    std::array<char, 35> bytes{};
+    bytes[0] = 4;
     bytes[1] = 2;
     InMemoryStateBackend seeded;
     seeded.put_operator_state(op,

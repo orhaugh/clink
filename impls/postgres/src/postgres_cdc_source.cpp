@@ -85,6 +85,10 @@ struct DecoderConfig {
     // Columns the consumer reads; empty = every column.
     std::set<std::string> needed;
     bool strict{false};
+    // Strict only: the consumer keeps the latest row of every key, so an
+    // unchanged out-of-line value is marked (cdc::kUnchangedToastType) for it
+    // to fill in, and a TRUNCATE of the table is an event it expands.
+    bool keep_rows{false};
 };
 
 // One decoded pgoutput message.
@@ -299,12 +303,20 @@ private:
             return d;
         }
         if (cfg_.strict) {
-            Decoded bad =
-                drop_("TRUNCATE of " + (cfg_.table.empty() ? ev.table : cfg_.table) + " at " + lsn +
-                      " cannot be expressed as row changes; capture it again from a new "
-                      "slot with a fresh snapshot, or leave truncate out of the "
-                      "publication's publish list");
-            return bad;
+            if (!cfg_.keep_rows) {
+                return drop_("TRUNCATE of " + (cfg_.table.empty() ? ev.table : cfg_.table) +
+                             " at " + lsn +
+                             " cannot be expressed as row changes without the rows; declare the "
+                             "table with keep_rows='true', capture it again from a new slot with "
+                             "a fresh snapshot, or leave truncate out of the publication's "
+                             "publish list");
+            }
+            // The consumer holds every row and deletes each one.
+            if (!cfg_.table.empty()) {
+                ev.table = cfg_.table;
+            }
+            ev.xid = current_xid_;
+            ev.values.clear();
         }
         d.events.push_back(std::move(ev));
         return d;
@@ -576,13 +588,21 @@ private:
                     if (!needed(c.field.name)) {
                         continue;  // not read by the consumer: leave it out
                     }
+                    if (cfg_.keep_rows) {
+                        // The consumer fills it in from the row it holds.
+                        c.field.type = std::string{cdc::kUnchangedToastType};
+                        values.push_back(std::move(c.field));
+                        continue;
+                    }
                     return drop_(
                         "UPDATE of " + rel.qualified() + " at " + lsn + " left column " +
                         c.field.name +
                         " unchanged and stored out of line (TOAST), and the change does "
                         "not carry its value under this replica identity. Run ALTER TABLE " +
                         rel.qualified() +
-                        " REPLICA IDENTITY FULL so that updates carry the old row");
+                        " REPLICA IDENTITY FULL so that updates carry the old row, or declare "
+                        "the table with keep_rows='true' to fill it in from the row the job "
+                        "keeps");
                 }
             }
             values.push_back(std::move(c.field));
@@ -993,6 +1013,7 @@ PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages
     cfg.key_columns = config.key_columns;
     cfg.needed = std::set<std::string>(config.needed_columns.begin(), config.needed_columns.end());
     cfg.strict = config.strict;
+    cfg.keep_rows = config.consumer_keeps_rows;
     PgOutputState state(std::move(cfg));
     PgDecodeResult result;
     for (const auto& msg : messages) {
@@ -1048,6 +1069,11 @@ struct PostgresCdcSource::Impl {
     std::uint64_t snapshot_from{0};  // the slot position streaming starts at afterwards
     Clock::time_point snapshot_started{Clock::now()};
 
+    // ---- convergence ----
+    // A fresh snapshot's WAL position: changes before it replay what that
+    // snapshot already holds (cdc::CursorState::converge_until). 0 = none.
+    std::atomic<std::uint64_t> converge_until{0};
+
     // ---- restore ----
     std::optional<cdc::CursorState> restored;
 
@@ -1087,6 +1113,9 @@ void validate_options(const PostgresCdcSource::Options& o) {
     }
     if (o.strict && o.plugin != "pgoutput") {
         throw std::runtime_error("PostgresCdcSource: strict decoding needs plugin pgoutput");
+    }
+    if (o.consumer_keeps_rows && !o.strict) {
+        throw std::runtime_error("postgres_cdc: consumer_keeps_rows needs strict decoding");
     }
     if (o.strict && o.proto_version != 1) {
         throw std::runtime_error(
@@ -1305,7 +1334,7 @@ TableCheck check_table(PGconn* admin,
             not_full.push_back(id.name);
         }
     }
-    if (o.strict && !not_full.empty() && !toastable.empty()) {
+    if (o.strict && !o.consumer_keeps_rows && !not_full.empty() && !toastable.empty()) {
         std::string names;
         for (const auto& c : toastable) {
             names += (names.empty() ? "" : ", ") + c;
@@ -1548,6 +1577,7 @@ void PostgresCdcSource::open() {
         }
     }
     cfg.strict = s.opts.strict;
+    cfg.keep_rows = s.opts.consumer_keeps_rows;
     s.pgoutput = PgOutputState(std::move(cfg));
 
     try {
@@ -1731,6 +1761,22 @@ void PostgresCdcSource::begin_snapshot_(const std::string& snapshot_name) {
                s.cancel,
                kCatalogLimit,
                "importing the slot's snapshot");
+        s.converge_until.store(0);
+    } else {
+        // The first statement takes the snapshot, and the WAL insert position
+        // read in it is past the commit of every transaction it can see: the
+        // stream has replayed all of them once it is past this position.
+        ResultPtr w = run_ok(s.snap.get(),
+                             "SELECT pg_current_wal_insert_lsn()::text",
+                             s.cancel,
+                             kCatalogLimit,
+                             "taking the snapshot");
+        const auto lsn = cdc::parse_lsn(cell(w.get(), 0, 0));
+        if (!lsn) {
+            throw std::runtime_error(
+                "postgres_cdc: could not read the WAL position of the snapshot");
+        }
+        s.converge_until.store(*lsn);
     }
     s.snap_query = 0;
     s.snapshot_rows = 0;
@@ -2113,6 +2159,12 @@ bool PostgresCdcSource::produce_stream_(Emitter<CdcEvent>& out) {
         // last checkpoint, which this event lies after, and meets it again.
         throw std::runtime_error("postgres_cdc: " + fail_after_emit + " (on_decode_error=fail)");
     }
+    if (const auto w = s.converge_until.load(); w != 0 && s.cursor.resume_lsn() >= w) {
+        s.converge_until.store(0);
+        clink::log::info(kLog,
+                         "the stream has passed the snapshot taken at " + format_lsn(w) +
+                             ": every change from here on is newer than it");
+    }
     // received_lsn doubles as a consumer-lag-proxy: how far behind WAL
     // the source is. There's no server-side current LSN cheaply
     // available from libpq's replication protocol, so we publish the
@@ -2185,6 +2237,10 @@ std::uint64_t PostgresCdcSource::confirmed_lsn() const noexcept {
     return impl_ != nullptr ? impl_->confirmed.load() : 0;
 }
 
+std::uint64_t PostgresCdcSource::converging_until() const noexcept {
+    return impl_ != nullptr ? impl_->converge_until.load() : 0;
+}
+
 void PostgresCdcSource::close() {
     if (impl_ == nullptr) {
         return;
@@ -2214,7 +2270,8 @@ void PostgresCdcSource::snapshot_offset(StateBackend& backend,
                                         CheckpointId ckpt) {
     auto& s = *impl_;
     const auto phase = s.phase == Impl::Phase::Snapshot ? cdc::Phase::Snapshot : cdc::Phase::Stream;
-    const cdc::CursorState state = s.cursor.state(phase);
+    cdc::CursorState state = s.cursor.state(phase);
+    state.converge_until = s.converge_until.load();
     const auto bytes = cdc::encode_cursor(state);
     backend.put_operator_state(op_id,
                                StateBackend::KeyView{kCursorKey, std::strlen(kCursorKey)},
@@ -2278,6 +2335,7 @@ void PostgresCdcSource::seed_from_restore_() {
     }
     s.cursor.start(r.resume_lsn, interrupted);
     s.phase = r.phase == cdc::Phase::Snapshot ? Impl::Phase::Snapshot : Impl::Phase::Stream;
+    s.converge_until.store(r.converge_until);
 }
 
 void PostgresCdcSource::notify_checkpoint_complete(CheckpointId ckpt) {
@@ -2349,6 +2407,9 @@ bool PostgresCdcSource::snapshot_in_progress() const noexcept {
     return false;
 }
 std::uint64_t PostgresCdcSource::confirmed_lsn() const noexcept {
+    return 0;
+}
+std::uint64_t PostgresCdcSource::converging_until() const noexcept {
     return 0;
 }
 void PostgresCdcSource::close() {}

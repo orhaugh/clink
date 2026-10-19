@@ -603,17 +603,21 @@ std::string convert_value(std::string_view pg_type,
     throw EncodeError("column " + column.name + " is not a data column");
 }
 
-RowEncoder::RowEncoder(std::vector<ColumnPlan> columns, ChangelogMode mode)
-    : columns_(std::move(columns)), mode_(mode) {}
+RowEncoder::RowEncoder(std::vector<ColumnPlan> columns, ChangelogMode mode, bool keep_rows)
+    : columns_(std::move(columns)), mode_(mode), keep_rows_(keep_rows) {}
 
 std::optional<std::string> RowEncoder::encode(const CdcEvent& ev,
                                               bool snapshot_row,
-                                              std::vector<std::string>* truncated) const {
+                                              std::vector<std::string>* truncated,
+                                              bool converging) const {
+    const bool is_truncate = ev.op == CdcEvent::Op::Truncate;
     if (ev.op != CdcEvent::Op::Insert && ev.op != CdcEvent::Op::Update &&
-        ev.op != CdcEvent::Op::Delete) {
+        ev.op != CdcEvent::Op::Delete && !(is_truncate && keep_rows_)) {
         return std::nullopt;
     }
-    const bool is_delete = ev.op == CdcEvent::Op::Delete;
+    // A TRUNCATE removes every row; its metadata is that of a delete.
+    const bool is_delete = ev.op == CdcEvent::Op::Delete || is_truncate;
+    std::vector<std::string_view> unchanged;
     std::string out = "{";
     bool first = true;
     const auto key = [&](std::string_view name) {
@@ -662,12 +666,22 @@ std::optional<std::string> RowEncoder::encode(const CdcEvent& ev,
             default:
                 break;
         }
+        if (is_truncate) {
+            out += "null";
+            continue;
+        }
         const CdcField* field = nullptr;
         for (const auto& f : ev.values) {
             if (f.name == col.name) {
                 field = &f;
                 break;
             }
+        }
+        if (field != nullptr && keep_rows_ && field->type == kUnchangedToastType) {
+            // The row-keeping operator fills it in from the row it holds.
+            out += "null";
+            unchanged.push_back(col.name);
+            continue;
         }
         if (field == nullptr) {
             throw EncodeError("column " + col.name + " is not in the change to " + ev.table +
@@ -688,7 +702,40 @@ std::optional<std::string> RowEncoder::encode(const CdcEvent& ev,
                               ")");
         }
     }
-    if (mode_ == ChangelogMode::Upsert) {
+    if (keep_rows_) {
+        key(kKindField);
+        append_json_string(out,
+                           is_truncate                     ? "truncate"
+                           : snapshot_row                  ? "snapshot"
+                           : ev.op == CdcEvent::Op::Insert ? "insert"
+                           : ev.op == CdcEvent::Op::Update ? "update"
+                                                           : "delete");
+        key(kVersionField);
+        std::uint64_t v = 0;
+        if (!snapshot_row) {
+            const auto lsn = parse_lsn(ev.lsn);
+            if (!lsn) {
+                throw EncodeError("change at '" + ev.lsn + "' has no readable LSN");
+            }
+            v = *lsn;
+        }
+        out += std::to_string(v);
+        if (!unchanged.empty()) {
+            key(kUnchangedField);
+            out.push_back('[');
+            for (std::size_t i = 0; i < unchanged.size(); ++i) {
+                if (i > 0) {
+                    out.push_back(',');
+                }
+                append_json_string(out, unchanged[i]);
+            }
+            out.push_back(']');
+        }
+        if (converging && !snapshot_row) {
+            key(kConvergingField);
+            out += "true";
+        }
+    } else if (mode_ == ChangelogMode::Upsert) {
         key("__row_kind");
         append_json_string(out,
                            is_delete                       ? "delete"

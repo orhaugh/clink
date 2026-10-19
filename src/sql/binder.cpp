@@ -2210,17 +2210,30 @@ std::optional<EquiJoinShape> match_equi_join(const ast::Expression& on,
 // table's primary key. An update carries the new row only, never the row it
 // replaced, so it is a changelog only to a consumer that applies rows by that
 // key.
-static bool is_upsert_cdc_scan(const LogicalPlan& node) {
+static std::string scan_property(const LogicalPlan& node, const char* key) {
     if (node.kind() != "Scan") {
-        return false;
+        return {};
     }
     const auto& props = static_cast<const LogicalScan&>(node).table().properties;
-    const auto get = [&](const char* key) {
-        const auto it = props.find(key);
-        return it == props.end() ? std::string{} : it->second;
-    };
-    return get("connector") == "postgres" && get("mode") == "cdc" &&
-           get("changelog_mode") == "upsert";
+    const auto it = props.find(key);
+    return it == props.end() ? std::string{} : it->second;
+}
+
+static bool is_upsert_cdc_table_scan(const LogicalPlan& node) {
+    return scan_property(node, "connector") == "postgres" && scan_property(node, "mode") == "cdc" &&
+           scan_property(node, "changelog_mode") == "upsert";
+}
+
+static bool is_upsert_cdc_scan(const LogicalPlan& node) {
+    return is_upsert_cdc_table_scan(node) && scan_property(node, "keep_rows") != "true";
+}
+
+// The same table declared keep_rows='true': the plan keeps every key's latest
+// row behind the source, so an update arrives as update_before with the row it
+// replaced and update_after, and a delete with the row it removed. That is a
+// changelog any consumer can retract from, like an unbounded GROUP BY's.
+static bool is_full_changelog_cdc_scan(const LogicalPlan& node) {
+    return is_upsert_cdc_table_scan(node) && scan_property(node, "keep_rows") == "true";
 }
 
 static bool contains_upsert_cdc_scan(const LogicalPlan& node) {
@@ -2229,6 +2242,18 @@ static bool contains_upsert_cdc_scan(const LogicalPlan& node) {
     }
     for (const auto* in : node.inputs()) {
         if (in != nullptr && contains_upsert_cdc_scan(*in)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool contains_upsert_cdc_table_scan(const LogicalPlan& node) {
+    if (is_upsert_cdc_table_scan(node)) {
+        return true;
+    }
+    for (const auto* in : node.inputs()) {
+        if (in != nullptr && contains_upsert_cdc_table_scan(*in)) {
             return true;
         }
     }
@@ -2246,7 +2271,7 @@ static bool contains_upsert_cdc_scan(const LogicalPlan& node) {
 static bool contains_updating_stream(const LogicalPlan& node) {
     const auto k = node.kind();
     if (k == "Aggregate" || k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp" ||
-        is_upsert_cdc_scan(node)) {
+        is_upsert_cdc_scan(node) || is_full_changelog_cdc_scan(node)) {
         return true;
     }
     if (k == "WindowAggregate") {
@@ -2329,8 +2354,9 @@ void check_upsert_cdc_consumers(const LogicalPlan& select_plan, const TableDef& 
                            "the new row only, so " +
                            k +
                            " over it would work from rows it can never retract. Declare it with "
-                           "changelog_mode='append' to work over the change log, or apply it to an "
-                           "upsert table first and query that",
+                           "keep_rows='true' to give each update the row it replaced, with "
+                           "changelog_mode='append' to work over the change log, or apply it to "
+                           "an upsert table first and query that",
                        pos);
         }
         chain.push_back(node);
@@ -2361,7 +2387,8 @@ void check_upsert_cdc_consumers(const LogicalPlan& select_plan, const TableDef& 
                             ", an upsert changelog (changelog_mode='upsert'): a row an update "
                             "moves out of the condition would never be removed from the "
                             "target. Filter on its key columns only, or declare the table "
-                            "with changelog_mode='append'",
+                            "with keep_rows='true' (each update then carries the row it "
+                            "replaced) or changelog_mode='append'",
                         pos);
                 }
             }
@@ -2423,7 +2450,8 @@ void check_upsert_cdc_consumers(const LogicalPlan& select_plan, const TableDef& 
 // default case recurses.
 bool is_changelog_plan(const LogicalPlan& node) {
     const auto k = node.kind();
-    if (k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp" || is_upsert_cdc_scan(node)) {
+    if (k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp" || is_upsert_cdc_scan(node) ||
+        is_full_changelog_cdc_scan(node)) {
         return true;
     }
     if (k == "EquiJoin") {
@@ -5302,7 +5330,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
                     "mode='upsert' (and primary_key='...'), use connector='changelog', "
                     "or add changelog='true' to the sink table so rows are written "
                     "verbatim with their __row_kind marker" +
-                    (contains_upsert_cdc_scan(*select_plan)
+                    (contains_upsert_cdc_table_scan(*select_plan)
                          ? std::string{"; for a PostgreSQL CDC table, changelog_mode='append' "
                                        "writes one row per change instead"}
                          : std::string{}) +
