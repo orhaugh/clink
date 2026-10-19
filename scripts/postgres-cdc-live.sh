@@ -50,9 +50,9 @@ python3 scripts/check-gtest-reports.py \
     --expect 'CdcRowEncoder.*=12' \
     --expect 'CdcCursor.*=9' \
     --expect 'PostgresCdcFactoryOptions.*=8' \
-    --expect 'PostgresCdcDecodeStrict.*=11' \
+    --expect 'PostgresCdcDecodeStrict.*=12' \
     --expect 'PostgresCdcLive.*=3' \
-    --expect 'PostgresCdcContractLive.*=22' \
+    --expect 'PostgresCdcContractLive.*=25' \
     --expect 'PostgresCdcSql.*=1' \
     --expect 'Cells/PostgresCdcClickHouseRecovery.*=5' \
     --expect 'PostgresCdcSlot.*=1' \

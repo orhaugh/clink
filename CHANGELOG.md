@@ -88,6 +88,16 @@ tests and the recovery cells (the source's worker killed at each phase, the
 server restarted) on every push and pull request, and fails a run in which a
 live case skipped.
 
+**A CDC table can be published with a row filter.** The source used to refuse
+a publication with a row filter, since its snapshot would have held rows the
+stream never updates. It now applies the filter PostgreSQL applies, combined
+across the named publications as PostgreSQL combines them, to the snapshot
+too, and refuses publications that would filter inserts, updates and deletes
+differently. Under `REPLICA IDENTITY DEFAULT` an UPDATE that brings a row into
+the filter arrives without the out-of-line values it left unchanged; the source
+now stops on it and names `REPLICA IDENTITY FULL` instead of emitting the
+missing value as an empty string.
+
 **A partitioned PostgreSQL table can be captured.** The source follows the
 root, which a publication with `publish_via_partition_root = true` uses for
 every partition's changes, and the snapshot reads the root. Open checks each

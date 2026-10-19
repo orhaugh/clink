@@ -116,6 +116,11 @@ public:
         // When true, the source emits the rows of each `initial_snapshot`
         // query as Insert events before streaming (see the class comment for
         // the exact and convergent cases). When false, it streams changes only.
+        // With `table` set and `initial_snapshot` left empty, the source reads
+        // the table itself at open: the declared columns (every column when
+        // none are declared), filtered by the publications' row filter so the
+        // snapshot holds the rows the stream publishes. A row filter cannot be
+        // combined with queries given here, which open() refuses.
         bool enable_initial_snapshot{false};
         std::vector<PostgresCdcSnapshotQuery> initial_snapshot{};
         // Rows per snapshot FETCH; also the most rows one produce() emits
@@ -143,11 +148,14 @@ public:
         std::size_t max_batch_events{1024};
 
         // ----- Single-table capture -----
-        // Schema-qualified table to capture. When set, changes to other tables
-        // of the publication are skipped, and open() checks that the table
-        // exists, is in the publication with inserts, updates and deletes
-        // published, has `key_columns` as its primary key and a replica
-        // identity that carries it, and holds every name in `declared_columns`.
+        // Schema-qualified table to capture, ordinary or partitioned (through
+        // its root, published with publish_via_partition_root). When set,
+        // changes to other tables of the publication are skipped, and open()
+        // checks that the table exists, is in the publication with inserts,
+        // updates and deletes published under one row filter (or none), has
+        // `key_columns` as its primary key and a replica identity that carries
+        // it (each partition's, for a partitioned table), and holds every name
+        // in `declared_columns`.
         std::string table{};
         // The table's primary key columns. Required with `table`.
         std::vector<std::string> key_columns{};

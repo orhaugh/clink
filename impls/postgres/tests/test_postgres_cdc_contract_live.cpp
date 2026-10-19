@@ -1573,6 +1573,129 @@ TEST(PostgresCdcContractLive, APartitionedTablePublishedOtherwiseIsRefused) {
     }
 }
 
+// Two publications with row filters: PostgreSQL publishes a change when the
+// row matches either, an UPDATE that moves a row out as a delete and one
+// that moves it in as an insert, and the snapshot holds the same rows.
+TEST(PostgresCdcContractLive, PublicationRowFiltersApplyToTheSnapshotAndTheStream) {
+    REQUIRE_SERVER();
+    Fixture f("rowfilter");
+    const std::string other = f.pub() + "_b";
+    (void)sql(f.dsn(), "DROP PUBLICATION IF EXISTS " + other);
+    sql(f.dsn(),
+        "ALTER PUBLICATION " + f.pub() + " SET TABLE " + f.table() + " WHERE (rev % 2 = 1)");
+    sql(f.dsn(),
+        "CREATE PUBLICATION " + other + " FOR TABLE " + f.table() + " WHERE (id % 10 = 0)");
+    struct DropOther {
+        const Fixture& f;
+        std::string pub;
+        ~DropOther() {
+            try {
+                (void)sql(f.dsn(), "DROP PUBLICATION IF EXISTS " + pub);
+            } catch (...) {
+            }
+        }
+    } drop_other{f, other};
+    const std::string matching = "(rev % 2 = 1) OR (id % 10 = 0)";
+    const auto filtered_table = [&] {
+        std::map<std::int64_t, std::int64_t> out;
+        for (const auto& row :
+             sql(f.dsn(), "SELECT id, rev FROM " + f.table() + " WHERE " + matching).rows) {
+            out[std::stoll(*row[0])] = std::stoll(*row[1]);
+        }
+        return out;
+    };
+    {
+        Session s(f.dsn());
+        (void)s.returning(insert_rows(f.table(), 1, 400));
+        // An even rev leaves the first filter; ids divisible by ten stay in
+        // through the second.
+        (void)s.returning(update_rows(f.table(), "id % 3 = 0"));
+    }
+    auto params = f.params();
+    params["publication_names"] = f.pub() + "," + other;
+    Downstream down;
+    CdcRun run(params, down);
+    run.open();
+    {
+        Session s(f.dsn());
+        (void)s.returning(update_rows(f.table(), "id % 4 = 0"));  // in and out
+        (void)s.returning(delete_rows(f.table(), "id % 7 = 0"));
+        (void)s.returning(insert_rows(f.table(), 1000, 1100));
+        (void)s.returning(update_rows(f.table(), "id BETWEEN 1000 AND 1050"));
+    }
+    commit_marker(f);
+    run.pump_until([&] { return down.streamed(kMarker); });
+    run.close();
+    EXPECT_EQ(down.state(), filtered_table());
+    for (const auto& c : down.changes()) {
+        if (c.op == "snapshot") {
+            EXPECT_TRUE(c.rev % 2 == 1 || c.id % 10 == 0) << c.id << ":" << c.rev;
+        }
+    }
+    expect_values_match_their_version(down);
+}
+
+TEST(PostgresCdcContractLive, RowFiltersThatDifferByActionAreRefused) {
+    REQUIRE_SERVER();
+    Fixture f("rowfilterno");
+    const std::string other = f.pub() + "_b";
+    (void)sql(f.dsn(), "DROP PUBLICATION IF EXISTS " + other);
+    sql(f.dsn(), "ALTER PUBLICATION " + f.pub() + " SET TABLE " + f.table() + " WHERE (rev > 1)");
+    // Inserts unfiltered, deletes filtered: a row inserted with rev 1 would
+    // arrive and its delete would not.
+    sql(f.dsn(),
+        "CREATE PUBLICATION " + other + " FOR TABLE " + f.table() + " WITH (publish = 'insert')");
+    auto params = f.params();
+    params["publication_names"] = f.pub() + "," + other;
+    Downstream down;
+    CdcRun run(params, down);
+    try {
+        run.open();
+        ADD_FAILURE() << "open() accepted publications that filter inserts and deletes apart";
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("differently for inserts (no filter)"), std::string::npos) << what;
+        EXPECT_NE(what.find("rev > 1"), std::string::npos) << what;
+    }
+    run.crash();
+    (void)sql(f.dsn(), "DROP PUBLICATION IF EXISTS " + other);
+}
+
+// Under REPLICA IDENTITY DEFAULT, an UPDATE that brings a row into the row
+// filter is published as an INSERT without the out-of-line values it left
+// unchanged; the source stops on it rather than emit the row without them.
+TEST(PostgresCdcContractLive, AnInsertMissingAnUnchangedToastValueStopsTheSource) {
+    REQUIRE_SERVER();
+    Fixture f("rowfiltertoast", /*full_identity=*/false);
+    sql(f.dsn(), "ALTER TABLE " + f.table() + " ADD COLUMN body text");
+    sql(f.dsn(), "ALTER PUBLICATION " + f.pub() + " SET TABLE " + f.table() + " WHERE (id > 1000)");
+    auto params = f.params();
+    params["snapshot_mode"] = "never";
+    params["declared_types"] = std::string{kDeclared} + ";body:VARCHAR";
+    Downstream down;
+    CdcRun run(params, down);
+    run.open();
+    sql(f.dsn(),
+        "INSERT INTO " + f.table() +
+            " (id, rev, body) SELECT 1, 1, string_agg(md5(i::text), '') FROM "
+            "generate_series(1, 1000) i");
+    sql(f.dsn(), "UPDATE " + f.table() + " SET id = 2000 WHERE id = 1");
+    bool stopped = false;
+    const auto deadline = Clock::now() + 30s;
+    while (!stopped && Clock::now() < deadline) {
+        try {
+            (void)run.step();
+        } catch (const std::exception& e) {
+            stopped = true;
+            EXPECT_NE(std::string{e.what()}.find("REPLICA IDENTITY FULL"), std::string::npos)
+                << e.what();
+        }
+    }
+    EXPECT_TRUE(stopped) << "an insert without the unchanged value was emitted";
+    EXPECT_TRUE(down.changes().empty());
+    run.crash();
+}
+
 // Microsecond timestamps: refused by default, and with
 // on_sub_millisecond='truncate' rounded down to the millisecond in the
 // snapshot and the stream, each one counted.

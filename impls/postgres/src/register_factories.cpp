@@ -417,15 +417,6 @@ std::string domain_option(const clink::plugin::BuildContext& ctx,
                              it->second + "')");
 }
 
-std::string quote_ident(std::string_view v) {
-    std::string out = "\"";
-    for (const char c : v) {
-        out += c == '"' ? std::string{"\"\""} : std::string{c};
-    }
-    out += '"';
-    return out;
-}
-
 struct CdcConfig {
     PostgresCdcSource::Options source;
     std::optional<cdc::ChangelogMode> changelog_mode;
@@ -519,21 +510,18 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
                                  ": snapshot_mode='initial' needs 'table', the table to read the "
                                  "existing rows from");
     }
-    std::string select_list = "*";
     if (contract) {
         try {
             cfg.plan = cdc::plan_columns(ctx.param_or("declared_types"));
         } catch (const cdc::EncodeError& e) {
             throw std::runtime_error(factory + ": " + e.what());
         }
-        select_list.clear();
+        bool captures = false;
         for (const auto& col : cfg.plan) {
             o.declared_columns.emplace_back(col.name, col.sql_type);
-            if (!cdc::is_metadata_column(col.name)) {
-                select_list += (select_list.empty() ? "" : ", ") + quote_ident(col.name);
-            }
+            captures = captures || !cdc::is_metadata_column(col.name);
         }
-        if (select_list.empty()) {
+        if (!captures) {
             throw std::runtime_error(factory + ": the table declares no columns to capture");
         }
         for (const auto& key : o.key_columns) {
@@ -566,11 +554,9 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
         std::chrono::milliseconds{int_option(ctx, factory, "connect_timeout_ms", 30000, 1)};
     o.reconnect_timeout =
         std::chrono::milliseconds{int_option(ctx, factory, "reconnect_timeout_ms", 60000, 0)};
-    if (snapshot_mode == "initial") {
-        o.enable_initial_snapshot = true;
-        o.initial_snapshot.push_back(PostgresCdcSnapshotQuery{
-            .table = o.table, .query = "SELECT " + select_list + " FROM " + o.table});
-    }
+    // The source reads the table itself at open, with the declared columns and
+    // the publications' row filter.
+    o.enable_initial_snapshot = snapshot_mode == "initial";
     return cfg;
 }
 
@@ -603,9 +589,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "checkpoints: WAL is retained while the job is stopped or not "
                         "checkpointing",
                         "CDC captures one table per source (changelog_mode), with no schema "
-                        "evolution or publication row filters; a partitioned table through its "
-                        "root, where attaching, detaching or truncating one partition publishes "
-                        "nothing",
+                        "evolution; a partitioned table through its root, where attaching, "
+                        "detaching or truncating one partition publishes nothing",
                         "a CDC snapshot interrupted by a failure is taken again and converges; "
                         "it does not resume",
                         "the plain sink is at-least-once - use postgres_2pc or the upsert sink"},

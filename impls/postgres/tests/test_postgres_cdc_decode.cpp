@@ -300,6 +300,23 @@ TEST(PostgresCdcDecodeStrict, AnUnchangedToastValueTheConsumerDoesNotReadIsLeftO
     EXPECT_EQ(value_of(res.events[0], "status"), "paid");
 }
 
+// An UPDATE that brings a row into a publication's row filter is published
+// as an INSERT, which under REPLICA IDENTITY DEFAULT marks the out-of-line
+// values it left unchanged and does not carry them.
+TEST(PostgresCdcDecodeStrict, AnInsertWithAnUnchangedToastValueStopsTheChange) {
+    auto msgs = relations();
+    msgs.push_back(insert_msg(1, tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    EXPECT_TRUE(res.events.empty());
+    ASSERT_EQ(res.errors.size(), 1U);
+    EXPECT_NE(res.errors[0].find("REPLICA IDENTITY FULL"), std::string::npos) << res.errors[0];
+    EXPECT_NE(res.errors[0].find("body"), std::string::npos) << res.errors[0];
+    // A column the consumer does not read is left out instead.
+    res = decode_pgoutput_messages(msgs, strict_orders({"id", "status"}));
+    ASSERT_EQ(res.events.size(), 1U);
+    EXPECT_EQ(value_of(res.events[0], "body"), "<absent>");
+}
+
 TEST(PostgresCdcDecodeStrict, LegacyDecodingKeepsTheEmptyUnchangedToastValue) {
     auto msgs = relations();
     msgs.push_back(update_msg(1, 0, "", tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));

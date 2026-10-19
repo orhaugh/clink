@@ -484,6 +484,30 @@ private:
         if (auto missing = missing_needed(rel)) {
             return drop_(*missing);
         }
+        if (cfg_.strict) {
+            // An UPDATE that brings a row into a publication's row filter is
+            // published as an INSERT, and under a replica identity other than
+            // FULL an out-of-line value it left unchanged is not in it.
+            std::vector<CdcField> values;
+            values.reserve(cells.size());
+            for (auto& c : cells) {
+                if (c.kind == 'u') {
+                    if (!needed(c.field.name)) {
+                        continue;
+                    }
+                    return drop_("INSERT into " + rel.qualified() + " at " + lsn +
+                                 " (an UPDATE that brought the row into the publication's row "
+                                 "filter) does not carry column " +
+                                 c.field.name +
+                                 ", left unchanged and stored out of line (TOAST). Run ALTER "
+                                 "TABLE " +
+                                 rel.qualified() + " REPLICA IDENTITY FULL so that it does");
+                }
+                values.push_back(std::move(c.field));
+            }
+            d.events.push_back(make_event(CdcEvent::Op::Insert, rel, lsn, std::move(values)));
+            return d;
+        }
         d.events.push_back(make_event(CdcEvent::Op::Insert, rel, lsn, fields_of(std::move(cells))));
         return d;
     }
@@ -1102,9 +1126,18 @@ void check_server(PGconn* admin, const std::atomic<bool>& cancel) {
 }
 
 // The single-table checks. Returns the table's canonical "schema.name".
-std::string check_table(PGconn* admin,
-                        const PostgresCdcSource::Options& o,
-                        const std::atomic<bool>& cancel) {
+// What open() learns about the captured table.
+struct TableCheck {
+    std::string canonical;  // schema.name as the decoder sees it
+    std::string quoted;     // the same, quoted for a query
+    // The row filter the publications apply to every change, which the
+    // snapshot must apply too; nullopt when the rows are not filtered.
+    std::optional<std::string> row_filter;
+};
+
+TableCheck check_table(PGconn* admin,
+                       const PostgresCdcSource::Options& o,
+                       const std::atomic<bool>& cancel) {
     const auto refuse = [&](const std::string& why) -> std::runtime_error {
         return std::runtime_error("postgres_cdc: table " + o.table + ": " + why);
     };
@@ -1361,7 +1394,9 @@ std::string check_table(PGconn* admin,
                      "); ALTER PUBLICATION <name> ADD TABLE " + canonical +
                      (partitioned ? ", with publish_via_partition_root = true" : std::string{}));
     }
-    std::array<bool, 3> actions{false, false, false};
+    // Each publication that contains the table, with its row filter ("" for
+    // none).
+    std::vector<std::pair<std::string, std::string>> members;
     for (int i = 0; i < PQntuples(member.get()); ++i) {
         if (partitioned && !via_root[cell(member.get(), i, 0)]) {
             const std::string pub = cell(member.get(), i, 0);
@@ -1370,16 +1405,9 @@ std::string check_table(PGconn* admin,
                          "would arrive under their own names; ALTER PUBLICATION " +
                          pub + " SET (publish_via_partition_root = true)");
         }
-        const auto& a = found[cell(member.get(), i, 0)];
-        for (std::size_t k = 0; k < 3; ++k) {
-            actions[k] = actions[k] || a[k];
-        }
+        members.emplace_back(cell(member.get(), i, 0),
+                             has_column_lists ? cell(member.get(), i, 2) : std::string{});
         if (has_column_lists) {
-            if (!cell(member.get(), i, 2).empty()) {
-                throw refuse("publication " + cell(member.get(), i, 0) +
-                             " filters its rows, which the initial snapshot cannot apply in the "
-                             "same way; publish the table without a row filter");
-            }
             const std::string attnames = cell(member.get(), i, 1);
             for (const auto& [name, sql_type] : o.declared_columns) {
                 (void)sql_type;
@@ -1398,15 +1426,62 @@ std::string check_table(PGconn* admin,
             }
         }
     }
+    // The row filter PostgreSQL applies to each action: the filters of the
+    // publications that publish it, ORed, or none when one of them has none.
+    // The snapshot can apply one filter, so all three must agree; otherwise a
+    // row could be published by one action and never by the one that would
+    // remove it.
     static constexpr std::array<const char*, 3> kAction = {"insert", "update", "delete"};
+    std::array<std::optional<std::set<std::string>>, 3> filter_of;
     for (std::size_t k = 0; k < 3; ++k) {
-        if (!actions[k]) {
+        bool published = false;
+        bool unfiltered = false;
+        std::set<std::string> filters;
+        for (const auto& [pub, filter] : members) {
+            if (!found[pub][k]) {
+                continue;
+            }
+            published = true;
+            if (filter.empty()) {
+                unfiltered = true;
+            } else {
+                filters.insert(filter);
+            }
+        }
+        if (!published) {
             throw refuse(std::string{"no publication of it publishes "} + kAction[k] +
                          "s, so those changes would never arrive; set publish = 'insert, update, "
                          "delete' on the publication");
         }
+        if (!unfiltered) {
+            filter_of[k] = std::move(filters);
+        }
     }
-    return canonical;
+    const auto render = [](const std::optional<std::set<std::string>>& f) {
+        if (!f) {
+            return std::string{"no filter"};
+        }
+        std::string out;
+        for (const auto& e : *f) {
+            out += (out.empty() ? "(" : " OR (") + e + ")";
+        }
+        return out;
+    };
+    if (filter_of[0] != filter_of[1] || filter_of[1] != filter_of[2]) {
+        throw refuse("its publications filter its rows differently for inserts (" +
+                     render(filter_of[0]) + "), updates (" + render(filter_of[1]) +
+                     ") and deletes (" + render(filter_of[2]) +
+                     "), so a row could be published and its removal not; give every "
+                     "publication that contains it the same publish list, or the same row "
+                     "filter");
+    }
+    TableCheck out;
+    out.canonical = canonical;
+    out.quoted = quote_ident(cell(t.get(), 0, 1)) + "." + quote_ident(cell(t.get(), 0, 2));
+    if (filter_of[0]) {
+        out.row_filter = render(filter_of[0]);
+    }
+    return out;
 }
 
 // The slot can serve a resume from `resume_lsn`.
@@ -1482,14 +1557,37 @@ void PostgresCdcSource::open() {
         s.tls_reported = true;
         check_server(admin.get(), s.cancel);
         if (!s.opts.table.empty()) {
-            const std::string canonical = check_table(admin.get(), s.opts, s.cancel);
-            s.pgoutput.set_table(canonical);
+            const TableCheck table = check_table(admin.get(), s.opts, s.cancel);
+            s.pgoutput.set_table(table.canonical);
+            if (s.opts.enable_initial_snapshot && s.opts.initial_snapshot.empty()) {
+                // The snapshot of the captured table: the declared columns
+                // (every column when none are declared), filtered as the
+                // publications filter the changes.
+                std::string select_list;
+                for (const auto& [name, type] : s.opts.declared_columns) {
+                    (void)type;
+                    if (!cdc::is_metadata_column(name)) {
+                        select_list += (select_list.empty() ? "" : ", ") + quote_ident(name);
+                    }
+                }
+                s.opts.initial_snapshot.push_back(PostgresCdcSnapshotQuery{
+                    .table = table.canonical,
+                    .query = "SELECT " + (select_list.empty() ? std::string{"*"} : select_list) +
+                             " FROM " + table.quoted +
+                             (table.row_filter ? " WHERE " + *table.row_filter : std::string{})});
+            } else if (table.row_filter && s.opts.enable_initial_snapshot) {
+                throw std::runtime_error(
+                    "postgres_cdc: table " + table.canonical +
+                    ": its publications filter its rows (" + *table.row_filter +
+                    "), which a snapshot query given in initial_snapshot does not apply; leave "
+                    "initial_snapshot empty and the source reads the table with that filter");
+            }
             for (auto& q : s.opts.initial_snapshot) {
                 if (q.table == s.opts.table) {
-                    q.table = canonical;
+                    q.table = table.canonical;
                 }
             }
-            s.opts.table = canonical;
+            s.opts.table = table.canonical;
         }
         const SlotInfo slot = read_slot(admin.get(), s.opts.slot_name, s.cancel);
         const bool want_snapshot =
