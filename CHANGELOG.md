@@ -88,6 +88,10 @@ tests and the recovery cells (the source's worker killed at each phase, the
 server restarted) on every push and pull request, and fails a run in which a
 live case skipped.
 
+**A failed checkpoint names why.** The coordinator logged which subtasks could
+not snapshot, but not their reason, which the subtask sends; it now logs each
+one's reason as it arrives.
+
 **A CDC table can be published with a row filter.** The source used to refuse
 a publication with a row filter, since its snapshot would have held rows the
 stream never updates. It now applies the filter PostgreSQL applies, combined
@@ -140,9 +144,9 @@ after 240 s and writes every thread's backtrace to the job log and to
 - A SQL CDC source runs as one subtask whatever the job's parallelism, and so
   does every unkeyed operator behind it; at parallelism above one it used to
   start one reader per subtask on the same slot.
-- The CDC source's checkpoint holds its position in a new, versioned encoding.
-  Checkpoints from earlier releases restore; an earlier release restoring a
-  new checkpoint finds no position and starts at the slot's.
+- The CDC source's checkpoint holds its position in a new, versioned encoding
+  (version 3). Checkpoints from earlier releases restore; an earlier release
+  restoring a new checkpoint finds no position and starts at the slot's.
 - A Redis connection with `tls='true'` and `tls_verify` on, or a Pulsar
   `pulsar+ssl://` service URL, now fails when the server's certificate does
   not name the host connected by. Connect by a name the certificate carries

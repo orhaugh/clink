@@ -9850,6 +9850,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
         ckpt_it->second.erase(key);
         if (!msg.ok) {
             job.failed_checkpoint_acks[msg.checkpoint_id].insert(key);
+            // The subtask's own reason; the checkpoint's failure line below
+            // names only who failed.
+            log::warn("coordinator.checkpoint",
+                      "subtask " + key + " of job " + std::to_string(msg.job_id) +
+                          " could not snapshot checkpoint " + std::to_string(msg.checkpoint_id) +
+                          ": " +
+                          (msg.error.empty() ? std::string{"(no reason given)"} : msg.error));
         }
 
         // Commit-group progress accounting. A failed ack aborts the
