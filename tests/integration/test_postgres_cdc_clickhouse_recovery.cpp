@@ -594,11 +594,11 @@ TEST_P(PostgresCdcClickHouseRecovery, TheTableConvergesAndNoChangeIsLost) {
     switch (cell) {
         case Cell::SnapshotRows:
             point = "postgres_cdc.snapshot_batch";
-            fault = point + "=block@8," + point + "=delay:300";
+            fault = point + "=block@12," + point + "=delay:300";
             break;
         case Cell::Transition:
             point = "postgres_cdc.snapshot_done";
-            fault = point + "=block@1,postgres_cdc.snapshot_batch=delay:150";
+            fault = point + "=block@1,postgres_cdc.snapshot_batch=delay:250";
             break;
         case Cell::BeforeCompletion:
             point = "postgres_cdc.offset_recorded";
