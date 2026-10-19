@@ -76,7 +76,7 @@ jobs:
                 -DCLINK_INTEGRATION_TESTS=ON -DCMAKE_C_FLAGS_DEBUG=-g0 -DCMAKE_CXX_FLAGS_DEBUG=-g0 \
                 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
               cmake --build build --target clink_postgres_tests clink_postgres_sql_tests \
-                clink_integration_tests clink_node clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
+                clink_integration_tests clink_node clink_submit_sql clink -j "$(( $(nproc) / 2 + 1 ))"
               ccache -s | tail -3'
       - name: Save compiler cache
         if: always()

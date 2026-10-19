@@ -307,6 +307,41 @@ TEST(SqlCdcKeepRows, WhileConvergingAnUpdateOfARowTheSnapshotLacksIsSkipped) {
                  std::runtime_error);
 }
 
+// A column declared since the checkpoint: the table is read again, and each
+// snapshot row refreshes the row held for its key. In append mode it takes
+// that row's __version, so a store keeping the highest version per key keeps
+// the later row; replayed changes that predate the column take it from the
+// refreshed row, and inserts that predate it are passed over while converging.
+TEST(SqlCdcKeepRows, ABackfillRefreshesHeldRowsUnderTheirOwnVersion) {
+    Stage s(Mode::Append, /*emit_unheld=*/true);
+    (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false)});
+    Row backfill = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+    backfill.values["note"] = config::JsonValue{std::string{"from the backfill"}};
+    auto out = s.feed({backfill});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "__version"), "100");
+    EXPECT_EQ(str(out[0], "note"), "from the backfill");
+
+    // A replayed update from before the column: the column is the held row's.
+    Row replayed = with_metadata(change("update", 150, 1, "paid"), "update", 150, false);
+    replayed = with_unchanged(replayed, {"note"});
+    replayed.values["__cdc_converging"] = config::JsonValue{true};
+    out = s.feed({replayed});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "note"), "from the backfill");
+    EXPECT_EQ(str(out[0], "status"), "paid");
+
+    // An insert from before the column, of a row the backfill did not find.
+    Row gone = with_unchanged(with_metadata(change("insert", 160, 7, "x"), "insert", 160, false),
+                              {"note"});
+    gone.values["__cdc_converging"] = config::JsonValue{true};
+    EXPECT_TRUE(s.feed({gone}).empty());
+    EXPECT_EQ(s.op().converging_skips(), 1U);
+    // Outside the window such an insert cannot be completed.
+    gone.values.erase(std::string{"__cdc_converging"});
+    EXPECT_THROW((void)s.feed({gone}), std::runtime_error);
+}
+
 TEST(SqlCdcKeepRows, TheRowsAreRestoredFromACheckpoint) {
     InMemoryStateBackend first;
     {

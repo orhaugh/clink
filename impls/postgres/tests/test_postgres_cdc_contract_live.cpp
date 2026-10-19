@@ -1696,6 +1696,117 @@ TEST(PostgresCdcContractLive, AnInsertMissingAnUnchangedToastValueStopsTheSource
     run.crash();
 }
 
+// A column added to the table and to the job's declaration while the job is
+// stopped: the restored job reads the table again for it (a backfill), then
+// resumes the stream from its checkpoint. The replayed changes that predate
+// the column carry it as unchanged, for the stage that keeps rows to fill in,
+// and the ones after it carry its value.
+namespace {
+
+struct AddedColumnRun {
+    std::map<std::uint64_t, InMemoryStateBackend> backends;
+    Downstream down;
+};
+
+// Runs the job to a completed checkpoint, then, while it is stopped, updates
+// rows, adds column `extra` and sets it on some rows.
+void run_then_add_a_column(Fixture& f,
+                           const std::map<std::string, std::string>& params,
+                           AddedColumnRun& out) {
+    {
+        Session s(f.dsn());
+        (void)s.returning(insert_rows(f.table(), 1, 50));
+    }
+    CdcRun run(params, out.down);
+    run.open();
+    commit_marker(f);
+    run.pump_until([&] { return out.down.streamed(kMarker); });
+    run.checkpoint(out.backends, 1);
+    run.complete(1);
+    run.crash();
+    {
+        Session s(f.dsn());
+        (void)s.returning(update_rows(f.table(), "id <= 10"));
+    }
+    sql(f.dsn(), "ALTER TABLE " + f.table() + " ADD COLUMN extra text DEFAULT 'none'");
+    sql(f.dsn(), "UPDATE " + f.table() + " SET extra = 'x' || id WHERE id BETWEEN 5 AND 15");
+    sql(f.dsn(),
+        "UPDATE " + f.table() + " SET rev = rev + 1 WHERE id = " + std::to_string(kMarker));
+}
+
+}  // namespace
+
+TEST(PostgresCdcContractLive, AColumnDeclaredSinceTheCheckpointIsReadAgainWhenRowsAreKept) {
+    REQUIRE_SERVER();
+    Fixture f("addcol");
+    auto params = f.params();
+    params["keep_rows"] = "true";
+    AddedColumnRun r;
+    run_then_add_a_column(f, params, r);
+
+    params["declared_types"] = std::string{kDeclared} + ";extra:VARCHAR";
+    CdcRun second(params, r.down);
+    second.restore(r.backends, 1);
+    second.open();
+    // The backfill already holds the marker's second version; wait for the
+    // stream to deliver it.
+    second.pump_until([&] {
+        return std::any_of(r.down.changes().begin(), r.down.changes().end(), [](const Change& c) {
+            return c.id == kMarker && c.rev == 2 && c.op != "snapshot";
+        });
+    });
+    second.close();
+
+    std::map<std::int64_t, const Change*> backfilled;
+    std::size_t predating = 0;
+    std::size_t carrying = 0;
+    for (const auto& c : r.down.changes()) {
+        if (c.row.count("extra") == 0) {
+            continue;  // the first run, which did not declare it
+        }
+        if (c.op == "snapshot") {
+            backfilled[c.id] = &c;
+        } else if (c.row.count("__cdc_unchanged") != 0) {
+            ++predating;
+            EXPECT_TRUE(c.row.at("extra").is_null()) << c.id;
+            EXPECT_EQ(c.row.at("__cdc_unchanged").as_array().at(0).as_string(), "extra") << c.id;
+        } else if (c.op == "update" && !c.row.at("extra").is_null()) {
+            ++carrying;
+        }
+    }
+    // Every row, read again with the column as it is now.
+    EXPECT_EQ(backfilled.size(), 51U);  // 50 rows and the marker
+    ASSERT_EQ(backfilled.count(20), 1U);
+    EXPECT_EQ(backfilled[20]->row.at("extra").as_string(), "none");
+    ASSERT_EQ(backfilled.count(7), 1U);
+    EXPECT_EQ(backfilled[7]->row.at("extra").as_string(), "x7");
+    // The ten updates from before the ALTER predate it; the eleven after it
+    // carry it, and so does the marker's update.
+    EXPECT_EQ(predating, 10U);
+    EXPECT_EQ(carrying, 12U);
+}
+
+TEST(PostgresCdcContractLive, AColumnDeclaredSinceTheCheckpointIsRefusedWithoutKeptRows) {
+    REQUIRE_SERVER();
+    Fixture f("addcolno");
+    auto params = f.params();
+    AddedColumnRun r;
+    run_then_add_a_column(f, params, r);
+
+    params["declared_types"] = std::string{kDeclared} + ";extra:VARCHAR";
+    CdcRun second(params, r.down);
+    second.restore(r.backends, 1);
+    try {
+        second.open();
+        ADD_FAILURE() << "a restore declaring a new column without keep_rows was accepted";
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("extra"), std::string::npos) << what;
+        EXPECT_NE(what.find("keep_rows='true'"), std::string::npos) << what;
+    }
+    second.crash();
+}
+
 // Microsecond timestamps: refused by default, and with
 // on_sub_millisecond='truncate' rounded down to the millisecond in the
 // snapshot and the stream, each one counted.

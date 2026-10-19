@@ -188,10 +188,14 @@ void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
     if (kind != "snapshot" && kind != "insert" && kind != "update") {
         throw std::runtime_error("cdc_keep_rows_row: unknown __cdc_kind '" + kind + "'");
     }
-    if (kind == "update" && !held) {
+    const auto unchanged = in.values.find(kCdcUnchangedField);
+    const bool has_unchanged = unchanged != in.values.end() && unchanged->second.is_array() &&
+                               !unchanged->second.as_array().empty();
+    if (!held && (kind == "update" || (kind == "insert" && has_unchanged))) {
         // Before a fresh snapshot's position, an update of a row the snapshot
-        // does not have is of a row deleted before it was read; that delete
-        // follows.
+        // does not have is of a row deleted before it was read, and so is an
+        // insert that predates a column (no insert from before the column's
+        // ALTER can be one the snapshot missed); the delete follows.
         const auto c = in.values.find(kCdcConvergingField);
         if (c != in.values.end() && c->second.is_bool() && c->second.as_bool()) {
             moved_.reset();
@@ -201,8 +205,8 @@ void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
     }
 
     Row next = image_of(in);
-    if (const auto u = in.values.find(kCdcUnchangedField);
-        u != in.values.end() && u->second.is_array() && !u->second.as_array().empty()) {
+    if (has_unchanged) {
+        const auto& u = unchanged;
         // An UPDATE left these out-of-line values unchanged without carrying
         // them: they are the held row's, or the old key's when the same change
         // moved the row to this key.
@@ -251,6 +255,16 @@ void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
             emit(std::move(next), kRowKindInsert);
         }
     } else {
+        // A snapshot row of a key already held refreshes it (a backfill after
+        // a column was declared, or a snapshot taken again): it takes the held
+        // row's __version, so a store that keeps the highest version per key
+        // keeps this, the later of the two.
+        if (kind == "snapshot" && held) {
+            if (const auto v = held->values.find("__version"); v != held->values.end()) {
+                next.values[clink::config::InternedName{"__version"}] = v->second;
+                stored.values[clink::config::InternedName{"__version"}] = v->second;
+            }
+        }
         emit(std::move(next), kRowKindInsert);
     }
     kv.put(key, stored);

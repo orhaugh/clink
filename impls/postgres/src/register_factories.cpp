@@ -606,8 +606,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .limitations = {"CDC needs a logical replication slot, confirmed only by completed "
                         "checkpoints: WAL is retained while the job is stopped or not "
                         "checkpointing",
-                        "CDC captures one table per source (changelog_mode), with no schema "
-                        "evolution; a partitioned table through its root, where attaching, "
+                        "CDC captures one table per source (changelog_mode); of its schema "
+                        "changes only an added column is followed, declared on a restore with "
+                        "keep_rows; a partitioned table through its root, where attaching, "
                         "detaching or truncating one partition publishes nothing",
                         "a CDC snapshot interrupted by a failure is taken again and converges; "
                         "it does not resume",

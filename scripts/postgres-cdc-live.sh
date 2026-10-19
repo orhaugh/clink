@@ -44,18 +44,19 @@ run() {  # <report name> <binary> [gtest args...]
 run postgres "${BUILD_DIR}/impls/postgres/tests/clink_postgres_tests"
 run postgres-sql "${BUILD_DIR}/tests/clink_postgres_sql_tests"
 run recovery "${BUILD_DIR}/tests/clink_integration_tests" \
-    --gtest_filter='Cells/PostgresCdcClickHouseRecovery.*:PostgresCdcSlot.*:PostgresCdcIntegration.*'
+    --gtest_filter='Cells/PostgresCdcClickHouseRecovery.*:PostgresCdcSlot.*:PostgresCdcIntegration.*:PostgresCdcAddColumn.*'
 
 python3 scripts/check-gtest-reports.py \
     --expect 'CdcRowEncoder.*=13' \
     --expect 'CdcCursor.*=9' \
     --expect 'PostgresCdcFactoryOptions.*=8' \
-    --expect 'PostgresCdcDecodeStrict.*=13' \
+    --expect 'PostgresCdcDecodeStrict.*=14' \
     --expect 'PostgresCdcLive.*=3' \
-    --expect 'PostgresCdcContractLive.*=25' \
+    --expect 'PostgresCdcContractLive.*=27' \
     --expect 'PostgresCdcSql.*=3' \
     --expect 'Cells/PostgresCdcClickHouseRecovery.*=5' \
     --expect 'PostgresCdcSlot.*=1' \
     --expect 'PostgresCdcIntegration.*=2' \
+    --expect 'PostgresCdcAddColumn.*=1' \
     "${REPORT_DIR}"/postgres.json "${REPORT_DIR}"/postgres-sql.json "${REPORT_DIR}"/recovery.json || rc=1
 exit "${rc}"

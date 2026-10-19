@@ -345,6 +345,39 @@ TEST(PostgresCdcDecodeStrict, WhenTheConsumerKeepsRowsUnchangedValuesAndTruncate
     EXPECT_TRUE(res.errors.empty());
 }
 
+// A declared column a change's relation lacks: dropped or renamed when an
+// earlier relation had it, otherwise added after the change. A job that keeps
+// rows passes the latter on as unchanged; any other stops on it.
+TEST(PostgresCdcDecodeStrict, AColumnAChangePredatesIsUnchangedOnlyWhenRowsAreKept) {
+    // public.orders before ALTER TABLE ... ADD COLUMN body.
+    const std::string before = rel_msg(1, "public", "orders", {{"id", 20}, {"status", 25}});
+    auto keep = strict_orders();
+    keep.consumer_keeps_rows = true;
+    auto res =
+        decode_pgoutput_messages({before, insert_msg(1, tuple({{'t', "1"}, {'t', "new"}}))}, keep);
+    ASSERT_EQ(res.events.size(), 1U);
+    EXPECT_TRUE(res.errors.empty());
+    bool marked = false;
+    for (const auto& f : res.events[0].values) {
+        marked = marked || (f.name == "body" && f.type == "(unchanged toast)");
+    }
+    EXPECT_TRUE(marked) << "the column the insert predates was not passed on as unchanged";
+
+    // Without kept rows nothing can complete it.
+    res = decode_pgoutput_messages({before, insert_msg(1, tuple({{'t', "1"}, {'t', "new"}}))},
+                                   strict_orders());
+    ASSERT_EQ(res.errors.size(), 1U);
+    EXPECT_NE(res.errors[0].find("predates column(s) body"), std::string::npos) << res.errors[0];
+
+    // Once a relation has had it, a relation without it means it was dropped.
+    const std::string after =
+        rel_msg(1, "public", "orders", {{"id", 20}, {"status", 25}, {"body", 25}});
+    res = decode_pgoutput_messages(
+        {after, before, insert_msg(1, tuple({{'t', "1"}, {'t', "new"}}))}, keep);
+    ASSERT_EQ(res.errors.size(), 1U);
+    EXPECT_NE(res.errors[0].find("no longer has column body"), std::string::npos) << res.errors[0];
+}
+
 TEST(PostgresCdcDecodeStrict, LegacyDecodingKeepsTheEmptyUnchangedToastValue) {
     auto msgs = relations();
     msgs.push_back(update_msg(1, 0, "", tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));

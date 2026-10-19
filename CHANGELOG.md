@@ -101,6 +101,18 @@ values. The source records, in its checkpoint, the WAL position a snapshot
 taken fresh was read at, so the stage can tell a replayed update of a row
 deleted before that snapshot from a row it should hold and does not.
 
+**A column added to a captured table can be captured.** Stop the job with
+`clink stop`, declare the column, and resubmit from the stop's checkpoint: the
+restored source compares the declared columns with those its checkpoint
+recorded and, for a column declared since, reads the table again before it
+resumes its stream, so every row is delivered with the column. The replayed
+changes from before the `ALTER TABLE` lack it, and the job takes it from the
+rows it keeps, so this needs `keep_rows='true'`; without it the restore is
+refused, naming the column, rather than delivering rows without it. In
+append mode a backfilled row carries the version of the row it refreshes.
+The connector page lists the steps, and an integration test follows them in
+a cluster.
+
 **A failed checkpoint names why.** The coordinator logged which subtasks could
 not snapshot, but not their reason, which the subtask sends; it now logs each
 one's reason as it arrives.

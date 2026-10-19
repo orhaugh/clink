@@ -402,6 +402,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_postgres_cdc.cpp
         integration/test_postgres_cdc_pgoutput.cpp
         integration/test_postgres_cdc_slot.cpp
+        integration/test_postgres_cdc_add_column.cpp
         integration/test_connector_exactly_once.cpp
         integration/test_kafka_window_recovery.cpp
         integration/test_kafka_source_ownership.cpp
