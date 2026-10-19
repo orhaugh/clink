@@ -80,6 +80,12 @@ mutex:pulsar::
 # scope by is the test itself. These two tests exercise nothing but the
 # libpulsar connect path, so the scope masks no clink logic.
 mutex:OpenAgainstDeadEndpointFailsCleanly
+# The PulsarTls tests open a sink against a local TLS listener, and their
+# producer create waits the same way. Four open through the
+# handshakes_on_open helper and one inline; none does more than the open
+# and a check of its outcome, so these scopes mask no clink logic either.
+mutex:handshakes_on_open
+mutex:ARefusedCertificateSaysHowToTellItFromADeadBroker
 
 # The etcd client (etcd-cpp-apiv3) rides gRPC + abseil, neither built
 # with TSan. abseil's deadlock-detection graph (GraphCycles::GetId) and
