@@ -27,7 +27,9 @@
 //
 // A timestamp with non-zero digits below the millisecond is refused: the
 // engine holds every TIMESTAMP as epoch milliseconds. Declare the column
-// VARCHAR to carry the full text instead.
+// VARCHAR to carry the full text instead, or let the column drop those digits
+// (on_sub_millisecond='truncate'), which rounds the value down to the
+// millisecond. A key column is never truncated: two keys could become one.
 //
 // Change metadata is available as declared columns with reserved names:
 //   __op       'snapshot', 'insert', 'update' or 'delete'
@@ -92,6 +94,9 @@ struct ColumnPlan {
     Kind kind{Kind::Varchar};
     int precision{0};  // DECIMAL only
     int scale{0};      // DECIMAL only
+    // TIMESTAMP columns: digits below the millisecond are dropped, rounding
+    // the value down, rather than refused.
+    bool truncate_sub_millisecond{false};
 };
 
 // A value or a declaration the contract cannot carry. The message names the
@@ -109,6 +114,11 @@ std::vector<ColumnPlan> plan_columns(std::string_view declared_types);
 // True when `name` is a reserved metadata column.
 bool is_metadata_column(std::string_view name);
 
+// Let every TIMESTAMP column of `plan` that is not one of `key_columns` drop
+// digits below the millisecond (on_sub_millisecond='truncate').
+void truncate_sub_millisecond_outside_key(std::vector<ColumnPlan>& plan,
+                                          const std::vector<std::string>& key_columns);
+
 // Why a PostgreSQL column of type `pg_type` (pg_type.typname, e.g. "int4",
 // "timestamptz", or "schema.name" for a user-defined type) cannot feed
 // `column`, or nullopt when it can.
@@ -116,16 +126,23 @@ std::optional<std::string> type_pair_problem(std::string_view pg_type, const Col
 
 // Convert one non-null value from PostgreSQL's text form to the JSON token the
 // engine reads for the column's declared type. Throws EncodeError when the
-// value cannot be held exactly.
+// value cannot be held exactly, unless the column allows the one loss it
+// may: then `truncated`, when given, is set when digits were dropped.
 std::string convert_value(std::string_view pg_type,
                           std::string_view text,
-                          const ColumnPlan& column);
+                          const ColumnPlan& column,
+                          bool* truncated = nullptr);
 
 // Epoch milliseconds of a PostgreSQL timestamp or timestamptz text value
 // ('2026-10-19 10:00:00.123' or with an offset '+05:30'). A timestamp without
-// an offset is read as UTC. Throws EncodeError for sub-millisecond digits, BC
-// dates, infinity or text that is not a timestamp.
-std::int64_t timestamp_to_epoch_ms(std::string_view text, bool with_zone);
+// an offset is read as UTC. Throws EncodeError for BC dates, infinity, text
+// that is not a timestamp, and non-zero digits below the millisecond unless
+// `truncate` is set, when they are dropped (the value rounds down, before
+// 1970 too) and `truncated`, when given, says so.
+std::int64_t timestamp_to_epoch_ms(std::string_view text,
+                                   bool with_zone,
+                                   bool truncate = false,
+                                   bool* truncated = nullptr);
 
 // Parse "X/Y" (hexadecimal halves) into an LSN. nullopt on malformed text.
 std::optional<std::uint64_t> parse_lsn(std::string_view text);
@@ -136,8 +153,11 @@ public:
 
     // The JSON object for one Insert, Update or Delete event, or nullopt for a
     // transaction marker or other event kind. `snapshot_row` marks a row of the
-    // initial snapshot. Throws EncodeError when a value cannot be carried.
-    [[nodiscard]] std::optional<std::string> encode(const CdcEvent& ev, bool snapshot_row) const;
+    // initial snapshot. Throws EncodeError when a value cannot be carried. Each
+    // column whose value lost digits below the millisecond is appended to
+    // `truncated`, when given.
+    [[nodiscard]] std::optional<std::string> encode(
+        const CdcEvent& ev, bool snapshot_row, std::vector<std::string>* truncated = nullptr) const;
 
     [[nodiscard]] const std::vector<ColumnPlan>& columns() const noexcept { return columns_; }
     [[nodiscard]] ChangelogMode mode() const noexcept { return mode_; }

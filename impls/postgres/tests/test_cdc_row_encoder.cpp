@@ -140,6 +140,49 @@ TEST(CdcRowEncoder, TimestampsBecomeEpochMillisecondsAndRefuseFinerDigits) {
               "1792404000000");
 }
 
+TEST(CdcRowEncoder, SubMillisecondDigitsAreDroppedOnlyWhereAllowed) {
+    bool truncated = false;
+    EXPECT_EQ(cdc::timestamp_to_epoch_ms("2026-10-19 10:00:00.123456+00", true, true, &truncated),
+              1792404000123);
+    EXPECT_TRUE(truncated);
+    // Rounded down before 1970 as after: -0.5 ms and -999.9 ms.
+    EXPECT_EQ(cdc::timestamp_to_epoch_ms("1969-12-31 23:59:59.9995", false, true), -1);
+    EXPECT_EQ(cdc::timestamp_to_epoch_ms("1969-12-31 23:59:59.0001", false, true), -1000);
+    // Through a whole-second offset the instant still rounds down.
+    EXPECT_EQ(cdc::timestamp_to_epoch_ms("2026-10-19 15:30:00.0009+05:30", true, true),
+              1792404000000);
+    // Zeros below the millisecond lose nothing, so nothing is reported.
+    truncated = false;
+    EXPECT_EQ(cdc::timestamp_to_epoch_ms("2026-10-19 10:00:00.123000+00", true, true, &truncated),
+              1792404000123);
+    EXPECT_FALSE(truncated);
+
+    // The option reaches every TIMESTAMP column but the key's.
+    auto plan = cdc::plan_columns(
+        "at:TIMESTAMP(3);seen:TIMESTAMP(3) WITH TIME ZONE;id:BIGINT;name:VARCHAR");
+    cdc::truncate_sub_millisecond_outside_key(plan, {"at"});
+    EXPECT_FALSE(plan[0].truncate_sub_millisecond);
+    EXPECT_TRUE(plan[1].truncate_sub_millisecond);
+    EXPECT_FALSE(plan[2].truncate_sub_millisecond);
+    EXPECT_FALSE(plan[3].truncate_sub_millisecond);
+
+    const cdc::RowEncoder enc(plan, cdc::ChangelogMode::Append);
+    std::vector<std::string> lost;
+    const std::vector<CdcField> row = {
+        {.name = "at", .value = "2026-10-19 10:00:00.123", .type = "timestamp"},
+        {.name = "seen", .value = "2026-10-19 10:00:00.123456+00", .type = "timestamptz"},
+        {.name = "id", .value = "5", .type = "int8"},
+        {.name = "name", .value = "a", .type = "text"}};
+    auto out = parse_row(*enc.encode(event(CdcEvent::Op::Insert, row), false, &lost));
+    EXPECT_EQ(out.at("seen").as_int(), 1792404000123);
+    EXPECT_EQ(lost, std::vector<std::string>{"seen"});
+    // The key column still refuses: truncating it could make two keys one.
+    auto keyed = row;
+    keyed[0].value = "2026-10-19 10:00:00.123456";
+    EXPECT_THROW((void)enc.encode(event(CdcEvent::Op::Insert, keyed), false, &lost),
+                 cdc::EncodeError);
+}
+
 TEST(CdcRowEncoder, ParsesLsnText) {
     EXPECT_EQ(cdc::parse_lsn("0/16E2A38"), 0x16E2A38U);
     EXPECT_EQ(cdc::parse_lsn("1/0"), std::uint64_t{1} << 32);

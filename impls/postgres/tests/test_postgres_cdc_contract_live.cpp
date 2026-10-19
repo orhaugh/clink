@@ -45,6 +45,7 @@
 #include "clink/config/json.hpp"
 #include "clink/connectors/postgres_cdc_source.hpp"
 #include "clink/fault/fault_injection.hpp"
+#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
@@ -1449,6 +1450,96 @@ TEST(PostgresCdcContractLive, AnUnchangedToastValueWithoutFullIdentityStopsTheSo
         return c.op == "update";
     }));
     run.crash();
+}
+
+// Microsecond timestamps: refused by default, and with
+// on_sub_millisecond='truncate' rounded down to the millisecond in the
+// snapshot and the stream, each one counted.
+TEST(PostgresCdcContractLive, SubMillisecondTimestampsAreRoundedDownOnlyWhenAsked) {
+    REQUIRE_SERVER();
+    Fixture f("submilli");
+    sql(f.dsn(),
+        "ALTER TABLE " + f.table() +
+            " ADD COLUMN fine timestamp(6), ADD COLUMN fine_tz timestamptz(6)");
+    const auto set_fine = [&](std::int64_t id, const std::string& fine, const std::string& tz) {
+        sql(f.dsn(),
+            "UPDATE " + f.table() + " SET fine = '" + fine + "', fine_tz = '" + tz +
+                "' WHERE id = " + std::to_string(id));
+    };
+    {
+        Session s(f.dsn());
+        (void)s.returning(insert_rows(f.table(), 1, 1));
+    }
+    set_fine(1, "2026-03-04 05:06:07.089123", "2026-03-04 05:06:07.089999+00");
+
+    auto params = f.params();
+    params["declared_types"] =
+        std::string{kDeclared} + ";fine:TIMESTAMP(3);fine_tz:TIMESTAMP(3) WITH TIME ZONE";
+    {
+        // Refused by default, naming the option.
+        Downstream down;
+        CdcRun run(params, down);
+        run.open();
+        bool stopped = false;
+        const auto deadline = Clock::now() + 30s;
+        while (!stopped && Clock::now() < deadline) {
+            try {
+                (void)run.step();
+            } catch (const std::exception& e) {
+                stopped = true;
+                EXPECT_NE(std::string{e.what()}.find("on_sub_millisecond"), std::string::npos)
+                    << e.what();
+            }
+        }
+        EXPECT_TRUE(stopped) << "a microsecond timestamp was emitted";
+        EXPECT_TRUE(down.changes().empty());
+        run.crash();
+        // The next run starts on a slot of its own, with an exact snapshot.
+        const auto drop_by = Clock::now() + 30s;
+        while (scalar(f.dsn(),
+                      "SELECT active FROM pg_replication_slots WHERE slot_name = '" + f.slot() +
+                          "'") == "t" &&
+               Clock::now() < drop_by) {
+            std::this_thread::sleep_for(100ms);
+        }
+        (void)sql(f.dsn(), "SELECT pg_drop_replication_slot('" + f.slot() + "')");
+    }
+
+    auto& counter = clink::MetricsRegistry::global().counter(clink::metrics::connector_metric_name(
+        "timestamps_truncated_total", "postgres_cdc", "source"));
+    const std::uint64_t counted_before = counter.value();
+    params["on_sub_millisecond"] = "truncate";
+    Downstream down;
+    CdcRun run(params, down);
+    run.open();
+    {
+        Session s(f.dsn());
+        (void)s.returning(insert_rows(f.table(), 2, 2));
+    }
+    // Before 1970 the value rounds down too: -0.5 ms becomes -1 ms.
+    set_fine(2, "1969-12-31 23:59:59.9995", "2026-03-04 05:06:07.000001+00");
+    commit_marker(f);
+    run.pump_until([&] { return down.streamed(kMarker); });
+    run.close();
+
+    const Change* snapshot = nullptr;
+    const Change* streamed = nullptr;
+    for (const auto& c : down.changes()) {
+        if (c.id == 1 && c.op == "snapshot") {
+            snapshot = &c;
+        } else if (c.id == 2 && c.op == "update") {
+            streamed = &c;
+        }
+    }
+    ASSERT_NE(snapshot, nullptr);
+    ASSERT_NE(streamed, nullptr);
+    EXPECT_EQ(snapshot->row.at("fine").as_int(), 1772600767089LL);
+    EXPECT_EQ(snapshot->row.at("fine_tz").as_int(), 1772600767089LL);
+    EXPECT_EQ(streamed->row.at("fine").as_int(), -1);
+    EXPECT_EQ(streamed->row.at("fine_tz").as_int(), 1772600767000LL);
+    // Four values lost digits: both columns of the snapshot row and of the
+    // update. The insert of row 2 had NULLs, and the marker none.
+    EXPECT_EQ(counter.value() - counted_before, 4U);
 }
 
 // Upsert mode: snapshot rows and inserts are 'insert', updates

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -221,9 +222,14 @@ private:
     // A value the contract cannot carry follows on_decode_error: fail stops
     // the job on it (the restart meets it again, it is never skipped), drop
     // counts it and leaves the row out.
-    std::optional<std::string> encode_(const CdcEvent& ev, bool snapshot_row) const {
+    std::optional<std::string> encode_(const CdcEvent& ev, bool snapshot_row) {
         try {
-            return encoder_->encode(ev, snapshot_row);
+            truncated_.clear();
+            auto row = encoder_->encode(ev, snapshot_row, &truncated_);
+            if (!truncated_.empty()) {
+                note_truncated_();
+            }
+            return row;
         } catch (const cdc::EncodeError& e) {
             clink::metrics::connector::error_inc("postgres_cdc", "source");
             if (policy_ == PostgresCdcSource::DecodeErrorPolicy::Fail) {
@@ -238,10 +244,30 @@ private:
         }
     }
 
+    // on_sub_millisecond='truncate': every value that lost digits is counted,
+    // and each column is named in the log the first time it happens.
+    void note_truncated_() {
+        clink::MetricsRegistry::global()
+            .counter(clink::metrics::connector_metric_name(
+                "timestamps_truncated_total", "postgres_cdc", "source"))
+            .increment(truncated_.size());
+        for (const auto& column : truncated_) {
+            if (truncation_logged_.insert(column).second) {
+                clink::log::warn("source.postgres_cdc",
+                                 "column " + column +
+                                     ": dropped digits below the millisecond "
+                                     "(on_sub_millisecond='truncate'); every such value is "
+                                     "counted in clink_connector_timestamps_truncated_total");
+            }
+        }
+    }
+
     PostgresCdcSource inner_;
     bool json_{false};
     std::optional<cdc::RowEncoder> encoder_;
     PostgresCdcSource::DecodeErrorPolicy policy_;
+    std::vector<std::string> truncated_;
+    std::set<std::string> truncation_logged_;
 };
 
 // Render a PostgresRow as a single-line JSON object keyed by column name (M3),
@@ -425,6 +451,9 @@ struct CdcConfig {
 //   status_interval_ms             (default 10000; 0 sends only what is due)
 //   connect_timeout_ms             (default 30000)
 //   reconnect_timeout_ms           (default 60000; 0 fails at once)
+//   on_sub_millisecond             fail | truncate (default fail; contract only):
+//                                  what a TIMESTAMP value with digits below the
+//                                  millisecond does; key columns always fail
 //   declared_types                 the SQL table's columns, set by the planner
 CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
                      const std::string& factory,
@@ -517,7 +546,15 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
                                          " is not a declared column");
             }
         }
+        if (domain_option(ctx, factory, "on_sub_millisecond", "fail", {"fail", "truncate"}) ==
+            "truncate") {
+            cdc::truncate_sub_millisecond_outside_key(cfg.plan, o.key_columns);
+        }
         o.strict = true;
+    } else if (ctx.params.count("on_sub_millisecond") != 0) {
+        throw std::runtime_error(factory +
+                                 ": 'on_sub_millisecond' applies with changelog_mode only (without "
+                                 "it every value is carried as text)");
     }
     o.snapshot_batch_rows =
         static_cast<std::size_t>(int_option(ctx, factory, "snapshot_batch_rows", 1000, 1));

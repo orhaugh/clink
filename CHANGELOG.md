@@ -88,6 +88,14 @@ tests and the recovery cells (the source's worker killed at each phase, the
 server restarted) on every push and pull request, and fails a run in which a
 live case skipped.
 
+**A CDC table can round microsecond timestamps down.** A PostgreSQL
+`timestamp(6)` value with digits below the millisecond stops a
+`changelog_mode` job, since the engine holds milliseconds.
+`on_sub_millisecond='truncate'` instead drops those digits, rounding the value
+down, counts each one in `clink_connector_timestamps_truncated_total` and names
+the column in the log the first time. A primary key column is never truncated:
+two keys could become one.
+
 **Sanitizer runs record where a hung test was blocked.**
 `build_and_test.sh` and the sanitizer CI jobs run ctest through
 `scripts/ctest-with-hang-dump.sh`, which attaches gdb to any test still running

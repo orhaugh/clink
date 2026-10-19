@@ -67,6 +67,7 @@ Every option is checked when the job is built: a value outside an option's domai
 | `changelog_mode` | No | unset | `upsert` or `append`; selects the SQL CDC contract. |
 | `snapshot_mode` | No | `never`; `initial` with `changelog_mode` | `initial` reads the rows already in the table before streaming its changes; `never` streams changes only. |
 | `on_decode_error` | No | `drop`; `fail` with `changelog_mode` | What to do with a change that cannot be decoded, or under the contract cannot be represented. `fail` stops the job on it and never moves past it; `drop` counts it in `dropped_events_total` and continues (the change is lost). |
+| `on_sub_millisecond` | No | `fail` | With `changelog_mode` only. What a `TIMESTAMP` value with non-zero digits below the millisecond does: `fail` refuses it, as any value its type cannot hold; `truncate` drops those digits, rounding the value down to the millisecond, counts it in `clink_connector_timestamps_truncated_total{connector="postgres_cdc"}` and names the column in the log the first time. A primary key column is never truncated, since two keys could become one. |
 | `create_slot` | No | `true` | Create the slot when it does not exist and the job has no checkpoint that depends on it. A restore never recreates a missing slot. |
 | `drop_slot_on_close` | No | `false` | Drop the slot when the source closes, for throwaway jobs. A job that drops its slot cannot be restored from its checkpoints. |
 | `snapshot_batch_rows` | No | `1000` | Rows per snapshot fetch from a server-side cursor; also the most snapshot rows one call emits. |
@@ -242,7 +243,7 @@ An UPDATE that changes the primary key is emitted as a delete of the old key fol
 | `TIMESTAMP(p) WITH TIME ZONE` | `timestamptz` | epoch milliseconds |
 | `VARCHAR` | any type | PostgreSQL's text form, verbatim (`uuid`, `jsonb`, enums, arrays and the rest) |
 
-The engine holds every TIMESTAMP as epoch milliseconds, so a timestamp with non-zero digits below the millisecond is refused: store `timestamp(3)` / `timestamptz(3)` in PostgreSQL, or declare the column `VARCHAR` to carry the full text. Any other declared type is refused when the job is built, and a pair outside the table at open, with the column named. NULL is carried in every type.
+The engine holds every TIMESTAMP as epoch milliseconds, so a timestamp with non-zero digits below the millisecond is refused: store `timestamp(3)` / `timestamptz(3)` in PostgreSQL, declare the column `VARCHAR` to carry the full text, or set `on_sub_millisecond='truncate'` to round such values down to the millisecond (before 1970 too: `1969-12-31 23:59:59.9995` becomes `-1`). Truncation never applies to a primary key column, whose value is still refused, and every truncated value is counted. Any other declared type is refused when the job is built, and a pair outside the table at open, with the column named. NULL is carried in every type.
 
 ### Change metadata
 
@@ -387,7 +388,7 @@ SELECT source: the cursor is the row index into the materialised result set. A r
 - The SELECT source is snapshot mode only: it runs the query once at `open()` and closes when the result set is exhausted. There is no incremental polling or `refresh_interval` behaviour (the field is reserved and ignored).
 - The CDC source needs `wal_level=logical`, a role with `REPLICATION`, and `pgoutput` for the SQL contract. It captures one table per source: no multi-table transaction atomicity, partitioned tables, publication row filters or schema evolution.
 - A snapshot is not resumable. A failure during the snapshot takes it again from scratch, and the downstream converges through the replay rather than seeing an exact boundary.
-- Timestamps carry milliseconds; a PostgreSQL value with finer digits is refused (declare `VARCHAR` to keep the text).
+- Timestamps carry milliseconds. A PostgreSQL value with finer digits is refused, or rounded down with `on_sub_millisecond='truncate'`; a primary key timestamp is always refused. Declare `VARCHAR` to keep the full text.
 - Without `REPLICA IDENTITY FULL`, an UPDATE that leaves an out-of-line value of a declared column unchanged stops the source.
 - A TRUNCATE of the captured table stops the source.
 - The slot is confirmed only by completed checkpoints, so WAL is retained for as long as the job is stopped or not checkpointing. A job containing a sink whose commit cannot be re-executed (the Kafka transactional sink) can be restored to a checkpoint older than one already reported complete; the CDC source then refuses, since the slot was confirmed past it.

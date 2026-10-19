@@ -80,7 +80,8 @@ TEST(PostgresCdcFactoryOptions, ValuesOutsideTheirDomainAreRefusedByName) {
                           Case{"snapshot_batch_rows", "0"},
                           Case{"reconnect_timeout_ms", "-1"},
                           Case{"status_interval_ms", "10s"},
-                          Case{"poll_interval_ms", "0"}}) {
+                          Case{"poll_interval_ms", "0"},
+                          Case{"on_sub_millisecond", "round"}}) {
         const std::string err = build_error("postgres_cdc_source", contract({{c.key, c.value}}));
         EXPECT_TRUE(mentions(err, "'" + c.key + "'")) << c.key << "=" << c.value << ": " << err;
     }
@@ -125,6 +126,17 @@ TEST(PostgresCdcFactoryOptions, ChangelogModeBelongsToTheSqlSourceOnly) {
         {"conninfo", "host=127.0.0.1 port=1"}, {"slot_name", "s"}, {"changelog_mode", "upsert"}};
     EXPECT_TRUE(mentions(build_error("postgres_cdc_event_source", p), "postgres_cdc_source"));
     EXPECT_TRUE(mentions(build_error("postgres_cdc_text_source", p), "postgres_cdc_source"));
+}
+
+TEST(PostgresCdcFactoryOptions, SubMillisecondTruncationIsPartOfTheContractOnly) {
+    EXPECT_EQ(build_error("postgres_cdc_source",
+                          contract({{"on_sub_millisecond", "truncate"},
+                                    {"declared_types", "id:BIGINT;at:TIMESTAMP(3)"}})),
+              "");
+    const Params p = {{"conninfo", "host=127.0.0.1 port=1"},
+                      {"slot_name", "s"},
+                      {"on_sub_millisecond", "truncate"}};
+    EXPECT_TRUE(mentions(build_error("postgres_cdc_source", p), "changelog_mode"));
 }
 
 TEST(PostgresCdcFactoryOptions, WithoutChangelogModeTheEarlierDefaultsHold) {

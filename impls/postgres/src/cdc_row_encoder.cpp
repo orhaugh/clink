@@ -211,6 +211,17 @@ bool is_metadata_column(std::string_view name) {
            kMetadataColumns.end();
 }
 
+void truncate_sub_millisecond_outside_key(std::vector<ColumnPlan>& plan,
+                                          const std::vector<std::string>& key_columns) {
+    for (auto& col : plan) {
+        const bool key =
+            std::find(key_columns.begin(), key_columns.end(), col.name) != key_columns.end();
+        if (!key && (col.kind == Kind::Timestamp || col.kind == Kind::TimestampTz)) {
+            col.truncate_sub_millisecond = true;
+        }
+    }
+}
+
 std::vector<ColumnPlan> plan_columns(std::string_view declared_types) {
     std::vector<ColumnPlan> out;
     std::size_t pos = 0;
@@ -382,7 +393,10 @@ std::optional<std::uint64_t> parse_lsn(std::string_view text) {
     return (*hi << 32) | *lo;
 }
 
-std::int64_t timestamp_to_epoch_ms(std::string_view text, bool with_zone) {
+std::int64_t timestamp_to_epoch_ms(std::string_view text,
+                                   bool with_zone,
+                                   bool truncate,
+                                   bool* truncated) {
     const auto fail = [&](const std::string& why) -> EncodeError {
         return EncodeError("timestamp " + std::string{text} + " " + why);
     };
@@ -424,10 +438,20 @@ std::int64_t timestamp_to_epoch_ms(std::string_view text, bool with_zone) {
             if (i < 3) {
                 millis = millis * 10 + (frac[i] - '0');
             } else if (frac[i] != '0') {
-                throw fail(
-                    "has digits below the millisecond, which the engine's millisecond TIMESTAMP "
-                    "cannot hold; store timestamp(3) in PostgreSQL, or declare the column VARCHAR "
-                    "to carry the full text");
+                if (!truncate) {
+                    throw fail(
+                        "has digits below the millisecond, which the engine's millisecond "
+                        "TIMESTAMP cannot hold; store timestamp(3) in PostgreSQL, declare the "
+                        "column VARCHAR to carry the full text, or set "
+                        "on_sub_millisecond='truncate' to round such values down");
+                }
+                // The fraction of a second is never negative, and a UTC offset
+                // is whole seconds, so dropping these digits rounds the
+                // instant down, before 1970 as after.
+                if (truncated != nullptr) {
+                    *truncated = true;
+                }
+                break;
             }
         }
         for (std::size_t i = frac.size(); i < 3; ++i) {
@@ -481,7 +505,8 @@ std::int64_t timestamp_to_epoch_ms(std::string_view text, bool with_zone) {
 
 std::string convert_value(std::string_view pg_type,
                           std::string_view text,
-                          const ColumnPlan& column) {
+                          const ColumnPlan& column,
+                          bool* truncated) {
     if (auto problem = type_pair_problem(pg_type, column)) {
         throw EncodeError(*problem);
     }
@@ -559,8 +584,10 @@ std::string convert_value(std::string_view pg_type,
         case Kind::Timestamp:
         case Kind::TimestampTz:
             try {
-                return std::to_string(
-                    timestamp_to_epoch_ms(text, column.kind == Kind::TimestampTz));
+                return std::to_string(timestamp_to_epoch_ms(text,
+                                                            column.kind == Kind::TimestampTz,
+                                                            column.truncate_sub_millisecond,
+                                                            truncated));
             } catch (const EncodeError& e) {
                 throw EncodeError("column " + column.name + " (" + std::string{pg_type} + " into " +
                                   column.sql_type + "): " + e.what());
@@ -579,7 +606,9 @@ std::string convert_value(std::string_view pg_type,
 RowEncoder::RowEncoder(std::vector<ColumnPlan> columns, ChangelogMode mode)
     : columns_(std::move(columns)), mode_(mode) {}
 
-std::optional<std::string> RowEncoder::encode(const CdcEvent& ev, bool snapshot_row) const {
+std::optional<std::string> RowEncoder::encode(const CdcEvent& ev,
+                                              bool snapshot_row,
+                                              std::vector<std::string>* truncated) const {
     if (ev.op != CdcEvent::Op::Insert && ev.op != CdcEvent::Op::Update &&
         ev.op != CdcEvent::Op::Delete) {
         return std::nullopt;
@@ -649,7 +678,11 @@ std::optional<std::string> RowEncoder::encode(const CdcEvent& ev, bool snapshot_
             continue;
         }
         try {
-            out += convert_value(field->type, field->value, col);
+            bool dropped_digits = false;
+            out += convert_value(field->type, field->value, col, &dropped_digits);
+            if (dropped_digits && truncated != nullptr) {
+                truncated->push_back(col.name);
+            }
         } catch (const EncodeError& e) {
             throw EncodeError(std::string{e.what()} + " (change to " + ev.table + " at " + ev.lsn +
                               ")");
