@@ -401,6 +401,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_postgres_sink.cpp
         integration/test_postgres_cdc.cpp
         integration/test_postgres_cdc_pgoutput.cpp
+        integration/test_postgres_cdc_slot.cpp
         integration/test_connector_exactly_once.cpp
         integration/test_kafka_window_recovery.cpp
         integration/test_kafka_source_ownership.cpp
@@ -447,9 +448,12 @@ if(CLINK_INTEGRATION_TESTS)
     )
     # The native ClickHouse sink's kill matrix: a coordinator and two workers
     # against real ClickHouse servers, with faults at the sink's own points.
+    # And the PostgreSQL CDC recovery cells: the CDC source into ClickHouse
+    # through the same cluster, with faults at the source's points.
     if(TARGET clink_clickhouse_testing)
         target_sources(clink_integration_tests PRIVATE
-            integration/test_clickhouse_native_recovery.cpp)
+            integration/test_clickhouse_native_recovery.cpp
+            integration/test_postgres_cdc_clickhouse_recovery.cpp)
     endif()
     target_link_libraries(clink_integration_tests PRIVATE
         clink::clink

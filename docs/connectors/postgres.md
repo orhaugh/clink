@@ -403,9 +403,19 @@ Live tests run against a real PostgreSQL server and are skipped unless `CLINK_PO
 ```bash
 docker compose -f docker/integration-services.yml up -d --wait postgres-cdc
 export CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres password=postgres dbname=postgres"
-ctest --test-dir build -L postgres
+ctest --test-dir build -L postgres -j1
 ```
 
 `PostgresCdcContractLive.*` drives the source through its checkpoint hooks, with a model of a transactional downstream that a restore rewinds, and checks every case against two oracles: the table itself, and every row version the workload committed. It covers a snapshot taken while the table changes, rolled-back work, a transaction spanning a checkpoint, a crash during snapshot setup, during the snapshot rows and at the transition to streaming, a restore after the transition, acknowledgement only by completed checkpoints (an aborted or pending one confirms nothing), a walsender ended inside a large transaction, a missing slot and a slot advanced past the checkpoint, decode-error refusal and the drop policy, the open-time refusals, cancellation from every wait, the supported types with NULLs and unchanged TOAST values, and the upsert changelog's kinds. `PostgresCdcSql.*` (`clink_postgres_sql_tests`) runs a `changelog_mode='upsert'` table through the SQL frontend into the upsert sink and compares the replica with its source.
+
+The CDC recovery cells (`Cells/PostgresCdcClickHouseRecovery.*` in `clink_integration_tests`) run the SQL job in a cluster, a coordinator and two `clink_node` workers, capturing a table with `changelog_mode='append'` into a ClickHouse change log while a workload commits inserts, updates and deletes. A ClickHouse materialised view feeds a `ReplacingMergeTree(__version, __deleted)`. Each cell parks the source's worker at a fault point and kills it once the fault framework's witness line shows the phase was reached: during the snapshot after a checkpoint completed in it, at the transition to streaming, after a streaming checkpoint recorded its position but before it completed, and just after a completed checkpoint was confirmed to the slot. A fifth restarts the PostgreSQL server while the job streams, which the source must ride out with no job restart. After a marker row arrives through the stream, every cell requires the table read with `FINAL`, and rebuilt from the log with `argMax`, to equal the PostgreSQL table in every column; every committed row version and delete to be in the log; and exactly the restarts it names. `PostgresCdcSlot.ASlotThatLostItsWalIsRefused` gives a slot a low `max_slot_wal_keep_size` on its own server, lets the server invalidate it, and requires the restore to refuse. These start their own PostgreSQL and ClickHouse containers.
+
+`scripts/postgres-cdc-live.sh` runs all of the above, with each binary's googletest JSON report, then `scripts/check-gtest-reports.py`, which fails the run on any skipped or failed case and on any required suite that ran fewer cases than it should: a live test skips when its server is missing, and googletest counts a skip as a pass. The `postgres-cdc` workflow (`.github/workflows/postgres-cdc.yml`) runs it on every push and pull request, against the pinned `postgres-cdc` service, and keeps the reports and the cells' evidence lines. Run the PostgreSQL live tests one process at a time: the two-phase-commit sink cases name their prepared transactions, which collide across processes on one server.
+
+```bash
+docker compose -f docker/integration-services.yml up -d --wait postgres-cdc
+CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres password=postgres dbname=postgres" \
+  scripts/postgres-cdc-live.sh build
+```
 
 The convenience script `scripts/sanitize_connectors.sh` networks a PostgreSQL instance against the `clink-build:latest` image and sets the DSN automatically.
