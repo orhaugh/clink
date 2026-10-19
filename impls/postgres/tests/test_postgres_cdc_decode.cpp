@@ -182,4 +182,197 @@ TEST(PostgresCdcDecode, BenignControlMessagesNotDropped) {
     EXPECT_EQ(res.dropped, 0u);
 }
 
+// ---- strict decoding (the SQL CDC contract) --------------------------------
+
+namespace {
+
+using clink::pg_cdc_testing::PgDecodeConfig;
+
+// A TupleData cell: 't' with a value, 'n' null, 'u' unchanged TOAST.
+struct TupleCell {
+    char kind;
+    std::string value;
+};
+
+std::string tuple(const std::vector<TupleCell>& cells) {
+    std::string t;
+    put_be16(t, static_cast<std::uint16_t>(cells.size()));
+    for (const auto& c : cells) {
+        t.push_back(c.kind);
+        if (c.kind == 't') {
+            put_be32(t, static_cast<std::uint32_t>(c.value.size()));
+            t += c.value;
+        }
+    }
+    return t;
+}
+
+// UPDATE with an optional old image ('K' key only, 'O' whole row, 0 none).
+std::string update_msg(std::uint32_t rel_id,
+                       char old_kind,
+                       const std::string& old_tuple,
+                       const std::string& new_tuple) {
+    std::string m;
+    m.push_back('U');
+    put_be32(m, rel_id);
+    if (old_kind != 0) {
+        m.push_back(old_kind);
+        m += old_tuple;
+    }
+    m.push_back('N');
+    m += new_tuple;
+    return m;
+}
+
+std::string truncate_msg(std::uint32_t rel_id) {
+    std::string m;
+    m.push_back('T');
+    put_be32(m, 1);     // one relation
+    m.push_back('\0');  // flags
+    put_be32(m, rel_id);
+    return m;
+}
+
+// public.orders (id int8 key, status text, body text) and public.other (id).
+std::vector<std::string> relations() {
+    return {rel_msg(1, "public", "orders", {{"id", 20}, {"status", 25}, {"body", 25}}),
+            rel_msg(2, "public", "other", {{"id", 20}})};
+}
+
+PgDecodeConfig strict_orders(std::vector<std::string> needed = {"id", "status", "body"}) {
+    return PgDecodeConfig{.table = "public.orders",
+                          .key_columns = {"id"},
+                          .needed_columns = std::move(needed),
+                          .strict = true};
+}
+
+std::string value_of(const CdcEvent& ev, const std::string& name) {
+    for (const auto& f : ev.values) {
+        if (f.name == name) {
+            return f.is_null ? "<null>" : f.value;
+        }
+    }
+    return "<absent>";
+}
+
+}  // namespace
+
+TEST(PostgresCdcDecodeStrict, ChangesToOtherTablesAreSkippedNotDropped) {
+    auto msgs = relations();
+    msgs.push_back(insert_msg(2, tuple({{'t', "9"}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    EXPECT_TRUE(res.events.empty());
+    EXPECT_EQ(res.dropped, 0U);
+}
+
+TEST(PostgresCdcDecodeStrict, AnUnchangedToastValueIsTakenFromTheWholeOldRow) {
+    // REPLICA IDENTITY FULL: the old row carries body inline.
+    auto msgs = relations();
+    msgs.push_back(update_msg(1,
+                              'O',
+                              tuple({{'t', "1"}, {'t', "new"}, {'t', "long body"}}),
+                              tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    ASSERT_EQ(res.events.size(), 1U);
+    EXPECT_EQ(res.events[0].op, CdcEvent::Op::Update);
+    EXPECT_EQ(value_of(res.events[0], "status"), "paid");
+    EXPECT_EQ(value_of(res.events[0], "body"), "long body");
+    EXPECT_EQ(res.dropped, 0U);
+}
+
+TEST(PostgresCdcDecodeStrict, AnUnchangedToastValueWithNoOldRowStopsTheChange) {
+    // REPLICA IDENTITY DEFAULT: no old row, so body's value is not in the change.
+    auto msgs = relations();
+    msgs.push_back(update_msg(1, 0, "", tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    EXPECT_TRUE(res.events.empty());
+    ASSERT_EQ(res.errors.size(), 1U);
+    EXPECT_NE(res.errors[0].find("REPLICA IDENTITY FULL"), std::string::npos) << res.errors[0];
+    EXPECT_NE(res.errors[0].find("body"), std::string::npos) << res.errors[0];
+}
+
+TEST(PostgresCdcDecodeStrict, AnUnchangedToastValueTheConsumerDoesNotReadIsLeftOut) {
+    auto msgs = relations();
+    msgs.push_back(update_msg(1, 0, "", tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders({"id", "status"}));
+    ASSERT_EQ(res.events.size(), 1U);
+    EXPECT_EQ(value_of(res.events[0], "body"), "<absent>");
+    EXPECT_EQ(value_of(res.events[0], "status"), "paid");
+}
+
+TEST(PostgresCdcDecodeStrict, LegacyDecodingKeepsTheEmptyUnchangedToastValue) {
+    auto msgs = relations();
+    msgs.push_back(update_msg(1, 0, "", tuple({{'t', "1"}, {'t', "paid"}, {'u', ""}})));
+    auto res = decode_pgoutput_messages(msgs);
+    ASSERT_EQ(res.events.size(), 1U);
+    EXPECT_EQ(value_of(res.events[0], "body"), "");
+}
+
+TEST(PostgresCdcDecodeStrict, AKeyChangingUpdateIsADeleteOfTheOldKeyAndTheNewRow) {
+    auto msgs = relations();
+    // REPLICA IDENTITY DEFAULT sends the old key ('K') only when it changed.
+    msgs.push_back(update_msg(1,
+                              'K',
+                              tuple({{'t', "1"}, {'n', ""}, {'n', ""}}),
+                              tuple({{'t', "2"}, {'t', "paid"}, {'t', "b"}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    ASSERT_EQ(res.events.size(), 2U);
+    EXPECT_EQ(res.events[0].op, CdcEvent::Op::Delete);
+    EXPECT_EQ(value_of(res.events[0], "id"), "1");
+    EXPECT_EQ(res.events[1].op, CdcEvent::Op::Update);
+    EXPECT_EQ(value_of(res.events[1], "id"), "2");
+}
+
+TEST(PostgresCdcDecodeStrict, AnUpdateKeepingItsKeyUnderFullIdentityIsOneUpdate) {
+    auto msgs = relations();
+    msgs.push_back(update_msg(1,
+                              'O',
+                              tuple({{'t', "1"}, {'t', "new"}, {'t', "b"}}),
+                              tuple({{'t', "1"}, {'t', "paid"}, {'t', "b"}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    ASSERT_EQ(res.events.size(), 1U);
+    EXPECT_EQ(res.events[0].op, CdcEvent::Op::Update);
+}
+
+TEST(PostgresCdcDecodeStrict, ATruncateOfTheTableStopsTheStream) {
+    auto msgs = relations();
+    msgs.push_back(truncate_msg(1));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    EXPECT_TRUE(res.events.empty());
+    ASSERT_EQ(res.errors.size(), 1U);
+    EXPECT_NE(res.errors[0].find("TRUNCATE"), std::string::npos) << res.errors[0];
+    // A TRUNCATE of another table is not this source's business.
+    auto other = relations();
+    other.push_back(truncate_msg(2));
+    EXPECT_TRUE(decode_pgoutput_messages(other, strict_orders()).errors.empty());
+}
+
+TEST(PostgresCdcDecodeStrict, AColumnTheJobReadsThatTheTableNoLongerHasStopsTheChange) {
+    std::vector<std::string> msgs = {rel_msg(1, "public", "orders", {{"id", 20}, {"status", 25}})};
+    msgs.push_back(insert_msg(1, tuple({{'t', "1"}, {'t', "new"}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    EXPECT_TRUE(res.events.empty());
+    ASSERT_EQ(res.errors.size(), 1U);
+    EXPECT_NE(res.errors[0].find("body"), std::string::npos) << res.errors[0];
+}
+
+TEST(PostgresCdcDecodeStrict, StreamedTransactionMessagesAreAProtocolError) {
+    auto msgs = relations();
+    msgs.push_back(std::string{"S"} + std::string(4, '\0') + std::string(1, '\1'));
+    EXPECT_THROW(decode_pgoutput_messages(msgs, strict_orders()), std::runtime_error);
+}
+
+TEST(PostgresCdcDecodeStrict, ChangesCarryTheirTransactionId) {
+    std::string b;
+    b.push_back('B');
+    b.append(16, '\0');  // final_lsn + commit_ts
+    put_be32(b, 4242);   // xid
+    auto msgs = relations();
+    msgs.push_back(b);
+    msgs.push_back(insert_msg(1, tuple({{'t', "1"}, {'t', "new"}, {'t', "b"}})));
+    auto res = decode_pgoutput_messages(msgs, strict_orders());
+    ASSERT_EQ(res.events.size(), 2U);
+    EXPECT_EQ(res.events[1].xid, 4242);
+}
+
 #endif  // CLINK_HAS_POSTGRES

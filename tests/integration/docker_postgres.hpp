@@ -26,7 +26,9 @@ namespace clink::test {
 // Container is launched detached with `--rm`, so a crashing test still
 // gets cleanup via Docker's own reaper.
 struct DockerPostgresOptions {
-    std::string image{"postgres:16"};
+    // PostgreSQL 16.15, pinned by digest as docker/integration-services.yml pins it.
+    std::string image{
+        "postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d"};
     std::chrono::seconds startup_timeout{30};
     // Extra arguments appended after the image name; passed through
     // to the postgres process. Useful for tests that need
@@ -112,6 +114,27 @@ public:
         }
         const std::string cmd = "docker unpause " + container_name_ + " > /dev/null 2>&1";
         (void)std::system(cmd.c_str());
+    }
+
+    // Restart the server process in place: the container, its data and its
+    // port survive, every connection to it is cut. Waits until the server
+    // accepts connections again.
+    void restart(std::chrono::seconds timeout = std::chrono::seconds{60}) {
+        const std::string cmd = "docker restart -t 5 " + container_name_ + " > /dev/null 2>&1";
+        if (std::system(cmd.c_str()) != 0) {
+            throw std::runtime_error("DockerPostgres::restart: docker restart failed");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            PGconn* c = PQconnectdb(conninfo().c_str());
+            const auto status = PQstatus(c);
+            PQfinish(c);
+            if (status == CONNECTION_OK) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        }
+        throw std::runtime_error("DockerPostgres::restart: the server did not come back in time");
     }
 
     std::string conninfo() const {

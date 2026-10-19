@@ -23,13 +23,25 @@
 namespace clink::pg_cdc_testing {
 
 struct PgDecodeResult {
-    std::vector<CdcEvent> events;  // events the decoder emitted (nullopt skipped)
-    std::uint64_t dropped{0};      // I/U/D change events dropped as undecodable
+    std::vector<CdcEvent> events;     // events the decoder emitted (nullopt skipped)
+    std::uint64_t dropped{0};         // I/U/D change events dropped as undecodable
+    std::vector<std::string> errors;  // why each dropped event was dropped
+};
+
+// The decoder's single-table, strict configuration (see
+// PostgresCdcSource::Options::table, key_columns, declared_columns, strict).
+struct PgDecodeConfig {
+    std::string table;                        // "schema.name"; empty = every table
+    std::vector<std::string> key_columns;     // the table's primary key
+    std::vector<std::string> needed_columns;  // columns the consumer reads; empty = all
+    bool strict{false};
 };
 
 // Decode a sequence of raw pgoutput message payloads through one decoder
 // instance (so a Relation message can register a relation that a later
 // Insert/Update/Delete references). Each element is one message payload.
 PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages);
+PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages,
+                                        const PgDecodeConfig& config);
 
 }  // namespace clink::pg_cdc_testing

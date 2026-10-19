@@ -800,6 +800,28 @@ if(CLINK_BUILD_SQL)
                        FAIL_REGULAR_EXPRESSION "0 tests from 0 test suites ran")
     endif()
 
+    # The PostgreSQL CDC contract through the SQL frontend against a live
+    # server: a changelog_mode='upsert' table maintaining a PostgreSQL table
+    # through the upsert sink, checked against the source table. Skipped
+    # unless CLINK_POSTGRES_CDC_TEST_DSN is set (the postgres-cdc service of
+    # docker/integration-services.yml).
+    if(TARGET clink::postgres)
+        find_package(PostgreSQL REQUIRED)
+        add_executable(clink_postgres_sql_tests test_postgres_cdc_sql.cpp)
+        target_link_libraries(clink_postgres_sql_tests PRIVATE
+            clink::sql
+            clink::embed
+            clink::postgres
+            PostgreSQL::PostgreSQL
+            GTest::gtest_main
+        )
+        clink_set_warnings(clink_postgres_sql_tests)
+        gtest_discover_tests(clink_postgres_sql_tests
+            DISCOVERY_MODE PRE_TEST
+            PROPERTIES TIMEOUT 180 LABELS postgres
+        )
+    endif()
+
     # Differential SQL oracle: the same query and data through clink's
     # EmbeddedEngine and through DuckDB, answers compared as multisets.
     # Needs a duckdb binary at runtime (CLINK_DUCKDB or PATH) and SKIPS

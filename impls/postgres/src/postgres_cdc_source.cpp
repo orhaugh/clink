@@ -3,24 +3,38 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <deque>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "clink/connectors/pg_cdc_test_seam.hpp"
 #include "clink/connectors/postgres_decoder.hpp"
 #include "clink/connectors/postgres_tls.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
+
+#include "cdc_cursor.hpp"
+#include "cdc_fault_points.hpp"
+#include "cdc_row_encoder.hpp"
 
 #ifdef CLINK_HAS_POSTGRES
 #include <libpq-fe.h>
+#include <poll.h>
 #endif
 
 namespace clink {
@@ -42,6 +56,12 @@ using pg::read_be64;
 using pg::read_cstring;
 using pg::write_be64;
 
+namespace cdc = clink::postgres::cdc;
+using Clock = std::chrono::steady_clock;
+
+constexpr const char* kLog = "source.postgres_cdc";
+constexpr const char* kMetricsName = "postgres_cdc";
+
 // =====================================================================
 // pgoutput parser - binary protocol with relation + type cache.
 // =====================================================================
@@ -51,66 +71,90 @@ using pg::write_be64;
 //   T (Truncate), O (Origin, ignored), Y (Type, populates user-type cache),
 //   M (Logical Message, ignored).
 //
-// Streaming (proto_version >= 2) and two-phase commit (>= 3) messages
-// (S/E/c/A/P/p/K) are recognised and skipped silently - they only appear
-// when the user explicitly enables those START_REPLICATION options, which
-// this MVP does not.
+// Streaming (S/E/c/A) and two-phase (P/p/K/b/r) messages only appear when the
+// client asks for them in START_REPLICATION, which this source never does.
+// Outside strict mode they are skipped as before; under strict mode one
+// arriving is a protocol error, since the transaction it belongs to could
+// not be told apart from a committed one.
+
+struct DecoderConfig {
+    // Schema-qualified table to capture ("public.orders"); empty = every table.
+    std::string table;
+    // Strict mode's key, for telling a key-changing UPDATE apart.
+    std::vector<std::string> key_columns;
+    // Columns the consumer reads; empty = every column.
+    std::set<std::string> needed;
+    bool strict{false};
+};
+
+// One decoded pgoutput message.
+struct Decoded {
+    enum class Kind : std::uint8_t { None, Begin, Commit, Change };
+    Kind kind{Kind::None};
+    std::uint64_t final_lsn{0};  // Begin: the transaction's commit LSN
+    std::uint64_t end_lsn{0};    // Commit: the end of its commit record
+    std::int64_t xid{0};
+    bool target{true};    // Change: it touches the captured table
+    bool dropped{false};  // Change: it could not be decoded or represented
+    std::string error;    // why, when dropped
+    std::vector<CdcEvent> events;
+};
+
 class PgOutputState {
 public:
+    explicit PgOutputState(DecoderConfig cfg = {}) : cfg_(std::move(cfg)) {}
+
     // Count of I/U/D change events that could NOT be decoded and were dropped
     // (unknown relation, missing/truncated tuple). Surfaced by the source as
     // dropped_events_total so this otherwise-silent data loss is observable.
-    // Benign skips (begin/commit/relation metadata, stream/2pc control messages)
-    // are NOT counted.
+    // Benign skips (begin/commit/relation metadata) are NOT counted.
     std::uint64_t dropped_data_events{0};
 
-    std::optional<CdcEvent> on_message(std::string_view payload, std::string lsn) {
+    // A new walsender session describes every relation again before using it.
+    void reset_relations() { relations_.clear(); }
+
+    void set_table(std::string table) { cfg_.table = std::move(table); }
+
+    Decoded on_message(std::string_view payload, const std::string& lsn) {
+        Decoded d;
         if (payload.empty()) {
-            return std::nullopt;
+            return d;
         }
         const char type = payload[0];
         const std::string_view rest = payload.substr(1);
         switch (type) {
             case 'B':
-                return on_begin(rest, std::move(lsn));
+                return on_begin(rest, lsn);
             case 'C':
-                return on_commit(rest, std::move(lsn));
+                return on_commit(rest, lsn);
             case 'R':
                 on_relation(rest);
-                return std::nullopt;
+                return d;
             case 'Y':
                 on_type(rest);
-                return std::nullopt;
+                return d;
             case 'I':
-                return on_insert(rest, std::move(lsn));
+                return on_insert(rest, lsn);
             case 'U':
-                return on_update(rest, std::move(lsn));
+                return on_update(rest, lsn);
             case 'D':
-                return on_delete(rest, std::move(lsn));
+                return on_delete(rest, lsn);
             case 'T':
-                return on_truncate(rest, std::move(lsn));
-            case 'O':  // Origin - replicated origin name; we currently ignore
-            case 'M':  // Logical Message (pg_logical_emit_message); ignore
-            case 'S':  // Stream Start (proto >= 2)
-            case 'E':  // Stream Stop
-            case 'c':  // Stream Commit
-            case 'A':  // Stream Abort
-            case 'P':  // Prepare (proto >= 3)
-            case 'p':  // Stream Prepare
-            case 'K':  // Stream Prepare in proto >= 3
-                return std::nullopt;
+                return on_truncate(rest, lsn);
+            case 'O':  // Origin - replicated origin name; ignored
+            case 'M':  // Logical Message (pg_logical_emit_message); ignored
+                return d;
             default:
-                return std::nullopt;
+                if (cfg_.strict) {
+                    throw std::runtime_error(
+                        std::string{"postgres_cdc: unexpected pgoutput message '"} + type +
+                        "' (streamed and two-phase transactions are not requested by this source)");
+                }
+                return d;
         }
     }
 
 private:
-    // Record a dropped data change (returns nullopt for the caller's convenience).
-    std::optional<CdcEvent> drop_() {
-        ++dropped_data_events;
-        return std::nullopt;
-    }
-
     struct Column {
         std::uint8_t flags{};  // bit 0 = part of replica identity key
         std::string name;
@@ -121,14 +165,40 @@ private:
         std::uint32_t id{};
         std::string ns;
         std::string name;
+        char replica_identity{'d'};
         std::vector<Column> columns;
+        [[nodiscard]] std::string qualified() const { return ns + "." + name; }
+    };
+    // One column of a decoded TupleData block, with its kind byte ('n' null,
+    // 'u' unchanged TOAST, 't' text, 'b' binary).
+    struct Cell {
+        CdcField field;
+        char kind{'n'};
     };
 
+    DecoderConfig cfg_;
+    std::int64_t current_xid_{0};
     std::unordered_map<std::uint32_t, Relation> relations_;
-    // User-defined type names from Y messages: oid → "ns.name". Built-in
+    // User-defined type names from Y messages: oid -> "ns.name". Built-in
     // types are not sent as Y messages; resolve those via
     // lookup_builtin_type_name().
     std::unordered_map<std::uint32_t, std::string> user_types_;
+
+    [[nodiscard]] bool is_target(const Relation& rel) const {
+        return cfg_.table.empty() || rel.qualified() == cfg_.table;
+    }
+    [[nodiscard]] bool needed(const std::string& column) const {
+        return cfg_.needed.empty() || cfg_.needed.count(column) != 0;
+    }
+
+    Decoded drop_(std::string why) {
+        ++dropped_data_events;
+        Decoded d;
+        d.kind = Decoded::Kind::Change;
+        d.dropped = true;
+        d.error = std::move(why);
+        return d;
+    }
 
     std::string resolve_type_name(std::uint32_t oid) const {
         if (auto it = user_types_.find(oid); it != user_types_.end()) {
@@ -154,58 +224,90 @@ private:
         user_types_[oid] = ns.empty() ? name : (ns + "." + name);
     }
 
-    std::optional<CdcEvent> on_truncate(std::string_view rest, std::string lsn) {
+    Decoded on_begin(std::string_view rest, const std::string& lsn) {
+        // final_lsn (8) + commit_ts (8) + xid (4)
+        if (rest.size() < 20) {
+            throw std::runtime_error("postgres_cdc: malformed pgoutput Begin message at " + lsn);
+        }
+        Decoded d;
+        d.kind = Decoded::Kind::Begin;
+        d.final_lsn = read_be64(rest.data());
+        d.xid = static_cast<std::int64_t>(read_be32(rest.data() + 16));
+        current_xid_ = d.xid;
+        CdcEvent ev;
+        ev.op = CdcEvent::Op::Begin;
+        ev.lsn = lsn;
+        ev.xid = d.xid;
+        d.events.push_back(std::move(ev));
+        return d;
+    }
+
+    Decoded on_commit(std::string_view rest, const std::string& lsn) {
+        // flags (1) + commit_lsn (8) + end_lsn (8) + commit_ts (8)
+        if (rest.size() < 25) {
+            throw std::runtime_error("postgres_cdc: malformed pgoutput Commit message at " + lsn);
+        }
+        Decoded d;
+        d.kind = Decoded::Kind::Commit;
+        d.end_lsn = read_be64(rest.data() + 9);
+        d.xid = current_xid_;
+        CdcEvent ev;
+        ev.op = CdcEvent::Op::Commit;
+        ev.lsn = lsn;
+        if (cfg_.strict) {
+            ev.xid = current_xid_;
+        }
+        d.events.push_back(std::move(ev));
+        return d;
+    }
+
+    Decoded on_truncate(std::string_view rest, const std::string& lsn) {
         // Format: nrelations (4) + flags (1) + relation_id[] (4 × n).
         if (rest.size() < 5) {
-            return std::nullopt;
+            return drop_("malformed TRUNCATE message at " + lsn);
         }
         const std::uint32_t n = read_be32(rest.data());
-        rest.remove_prefix(5);  // ncols + flags byte
-        if (rest.size() < 4 * n) {
-            return std::nullopt;
+        rest.remove_prefix(5);
+        if (rest.size() < std::size_t{4} * n) {
+            return drop_("malformed TRUNCATE message at " + lsn);
         }
+        Decoded d;
+        d.kind = Decoded::Kind::Change;
+        d.target = cfg_.table.empty();
         CdcEvent ev;
         ev.op = CdcEvent::Op::Truncate;
-        ev.lsn = std::move(lsn);
+        ev.lsn = lsn;
         // We pick the first relation as the event's "table"; if the
         // TRUNCATE batched several, the rest are added as values entries
         // so users still see them.
         for (std::uint32_t i = 0; i < n; ++i) {
-            const std::uint32_t rel_id = read_be32(rest.data() + (i * 4));
+            const std::uint32_t rel_id = read_be32(rest.data() + (static_cast<std::size_t>(i) * 4));
             auto it = relations_.find(rel_id);
-            const std::string tbl = (it != relations_.end())
-                                        ? (it->second.ns + "." + it->second.name)
-                                        : ("oid=" + std::to_string(rel_id));
+            const std::string tbl = (it != relations_.end()) ? it->second.qualified()
+                                                             : ("oid=" + std::to_string(rel_id));
+            if (it != relations_.end() && is_target(it->second)) {
+                d.target = true;
+            }
             if (i == 0) {
                 ev.table = tbl;
             } else {
-                ev.values.push_back(CdcField{.name = "also", .value = tbl});
+                ev.values.push_back(
+                    CdcField{.name = "also", .value = tbl, .type = "", .is_null = false});
             }
         }
-        return ev;
-    }
-
-    static std::optional<CdcEvent> on_begin(std::string_view rest, std::string lsn) {
-        if (rest.size() < 20) {
-            return std::nullopt;
+        if (!d.target) {
+            return d;
         }
-        CdcEvent ev;
-        ev.op = CdcEvent::Op::Begin;
-        ev.lsn = std::move(lsn);
-        // final_lsn (8) + commit_ts (8) + xid (4)
-        ev.xid = static_cast<std::int64_t>(read_be32(rest.data() + 16));
-        return ev;
-    }
-
-    static std::optional<CdcEvent> on_commit(std::string_view rest, std::string lsn) {
-        if (rest.size() < 25) {
-            return std::nullopt;
+        if (cfg_.strict) {
+            Decoded bad =
+                drop_("TRUNCATE of " + (cfg_.table.empty() ? ev.table : cfg_.table) + " at " + lsn +
+                      " cannot be expressed as row changes; capture it again from a new "
+                      "slot with a fresh snapshot, or leave truncate out of the "
+                      "publication's publish list");
+            return bad;
         }
-        CdcEvent ev;
-        ev.op = CdcEvent::Op::Commit;
-        ev.lsn = std::move(lsn);
-        // flags (1) + commit_lsn (8) + end_lsn (8) + commit_ts (8)
-        return ev;
+        d.events.push_back(std::move(ev));
+        return d;
     }
 
     void on_relation(std::string_view rest) {
@@ -220,7 +322,8 @@ private:
         if (rest.empty()) {
             return;
         }
-        rest.remove_prefix(1);  // replica identity byte
+        rel.replica_identity = rest[0];
+        rest.remove_prefix(1);
         if (rest.size() < 2) {
             return;
         }
@@ -246,17 +349,14 @@ private:
         relations_[rel.id] = std::move(rel);
     }
 
-    // Decode a TupleData block. Each column produces one CdcField with
-    // name, value, type, and is_null populated using the relation's
-    // cached schema and the surrounding parser's type cache.
-    // `truncated` is set if the tuple ran short of its declared column count or a
-    // column value overran the buffer - the caller must then DROP the change
-    // rather than emit a partial (column-missing) event, which would be silent
-    // data corruption.
-    std::vector<CdcField> parse_tuple(std::string_view& cursor,
-                                      const Relation& rel,
-                                      bool& truncated) const {
-        std::vector<CdcField> out;
+    // Decode a TupleData block. `truncated` is set if the tuple ran short of
+    // its declared column count or a column value overran the buffer - the
+    // caller must then DROP the change rather than emit a partial
+    // (column-missing) event, which would be silent data corruption.
+    std::vector<Cell> parse_tuple(std::string_view& cursor,
+                                  const Relation& rel,
+                                  bool& truncated) const {
+        std::vector<Cell> out;
         if (cursor.size() < 2) {
             truncated = true;
             return out;
@@ -269,22 +369,19 @@ private:
                 truncated = true;  // fewer columns present than declared
                 break;
             }
-            const char kind = cursor[0];
+            Cell cell;
+            cell.kind = cursor[0];
             cursor.remove_prefix(1);
-
-            CdcField field;
             if (i < rel.columns.size()) {
-                field.name = rel.columns[i].name;
-                field.type = resolve_type_name(rel.columns[i].type_oid);
+                cell.field.name = rel.columns[i].name;
+                cell.field.type = resolve_type_name(rel.columns[i].type_oid);
             }
-
-            switch (kind) {
+            switch (cell.kind) {
                 case 'n':
-                    field.is_null = true;
+                    cell.field.is_null = true;
                     break;
                 case 'u':
-                    // unchanged TOASTed value - leave value empty,
-                    // is_null=false. Users distinguish via is_null.
+                    // Unchanged TOASTed value: the change does not carry it.
                     break;
                 case 't':
                 case 'b': {
@@ -298,7 +395,7 @@ private:
                         truncated = true;
                         return out;
                     }
-                    field.value = std::string{cursor.substr(0, len)};
+                    cell.field.value = std::string{cursor.substr(0, len)};
                     cursor.remove_prefix(len);
                     break;
                 }
@@ -308,108 +405,550 @@ private:
                     truncated = true;
                     return out;
             }
-            out.push_back(std::move(field));
+            out.push_back(std::move(cell));
         }
         return out;
     }
 
-    std::optional<CdcEvent> on_insert(std::string_view rest, std::string lsn) {
+    static std::vector<CdcField> fields_of(std::vector<Cell> cells) {
+        std::vector<CdcField> out;
+        out.reserve(cells.size());
+        for (auto& c : cells) {
+            out.push_back(std::move(c.field));
+        }
+        return out;
+    }
+
+    // Under strict mode every needed column must be in the relation: a column
+    // dropped or renamed after the job was declared would otherwise read as
+    // NULL in every later change.
+    [[nodiscard]] std::optional<std::string> missing_needed(const Relation& rel) const {
+        if (!cfg_.strict || cfg_.needed.empty()) {
+            return std::nullopt;
+        }
+        for (const auto& want : cfg_.needed) {
+            const bool present = std::any_of(rel.columns.begin(),
+                                             rel.columns.end(),
+                                             [&](const Column& c) { return c.name == want; });
+            if (!present) {
+                return "table " + rel.qualified() + " no longer has column " + want +
+                       " (dropped or renamed since the job was declared)";
+            }
+        }
+        return std::nullopt;
+    }
+
+    CdcEvent make_event(CdcEvent::Op op,
+                        const Relation& rel,
+                        const std::string& lsn,
+                        std::vector<CdcField> values) const {
+        CdcEvent ev;
+        ev.op = op;
+        ev.lsn = lsn;
+        ev.table = rel.qualified();
+        if (cfg_.strict) {
+            ev.xid = current_xid_;
+        }
+        ev.values = std::move(values);
+        return ev;
+    }
+
+    Decoded on_insert(std::string_view rest, const std::string& lsn) {
         if (rest.size() < 5) {
-            return drop_();
+            return drop_("truncated INSERT message at " + lsn);
         }
         const std::uint32_t rel_id = read_be32(rest.data());
         rest.remove_prefix(4);
         if (rest[0] != 'N') {
-            return drop_();  // INSERT must have an N (new) tuple
+            return drop_("INSERT at " + lsn + " carries no new tuple");
         }
         rest.remove_prefix(1);
         auto it = relations_.find(rel_id);
         if (it == relations_.end()) {
-            return drop_();  // unknown relation; can happen if R was missed
+            return drop_("INSERT at " + lsn + " names relation " + std::to_string(rel_id) +
+                         ", which no Relation message described");
         }
-        CdcEvent ev;
-        ev.op = CdcEvent::Op::Insert;
-        ev.lsn = std::move(lsn);
-        ev.table = it->second.ns + "." + it->second.name;
+        const Relation& rel = it->second;
+        Decoded d;
+        d.kind = Decoded::Kind::Change;
+        if (!is_target(rel)) {
+            d.target = false;
+            return d;
+        }
         bool truncated = false;
-        ev.values = parse_tuple(rest, it->second, truncated);
+        auto cells = parse_tuple(rest, rel, truncated);
         if (truncated) {
-            return drop_();  // partial tuple: drop rather than emit a corrupt row
+            return drop_("INSERT into " + rel.qualified() + " at " + lsn +
+                         " has a truncated tuple");
         }
-        return ev;
+        if (auto missing = missing_needed(rel)) {
+            return drop_(*missing);
+        }
+        d.events.push_back(make_event(CdcEvent::Op::Insert, rel, lsn, fields_of(std::move(cells))));
+        return d;
     }
 
-    std::optional<CdcEvent> on_update(std::string_view rest, std::string lsn) {
+    Decoded on_update(std::string_view rest, const std::string& lsn) {
         if (rest.size() < 5) {
-            return drop_();
+            return drop_("truncated UPDATE message at " + lsn);
         }
         const std::uint32_t rel_id = read_be32(rest.data());
         rest.remove_prefix(4);
-        // Optional 'K' (key only) or 'O' (old tuple) preamble before 'N'.
+        auto it = relations_.find(rel_id);
+        if (it == relations_.end()) {
+            return drop_("UPDATE at " + lsn + " names relation " + std::to_string(rel_id) +
+                         ", which no Relation message described");
+        }
+        const Relation& rel = it->second;
+        Decoded d;
+        d.kind = Decoded::Kind::Change;
+        if (!is_target(rel)) {
+            d.target = false;
+            return d;
+        }
+        // Optional 'K' (key only) or 'O' (whole old row) image before 'N'.
+        char old_kind = 0;
+        std::vector<Cell> old_cells;
         if (!rest.empty() && (rest[0] == 'K' || rest[0] == 'O')) {
+            old_kind = rest[0];
             rest.remove_prefix(1);
-            auto rel_it = relations_.find(rel_id);
-            if (rel_it != relations_.end()) {
-                bool old_trunc = false;
-                (void)parse_tuple(rest, rel_it->second, old_trunc);  // discard old image
-                if (old_trunc) {
-                    // A truncated OLD image leaves the cursor at an arbitrary
-                    // offset, so the NEW image can no longer be located: a stray
-                    // 'N' byte would let a structurally-valid-but-WRONG NEW tuple
-                    // be emitted uncounted. Treat it as unrecoverable framing loss
-                    // and drop rather than emit corruption.
-                    return drop_();
-                }
-            } else {
-                return drop_();
+            bool old_trunc = false;
+            old_cells = parse_tuple(rest, rel, old_trunc);
+            if (old_trunc) {
+                // A truncated OLD image leaves the cursor at an arbitrary
+                // offset, so the NEW image can no longer be located: a stray
+                // 'N' byte would let a structurally-valid-but-WRONG NEW tuple
+                // be emitted uncounted. Treat it as unrecoverable framing loss
+                // and drop rather than emit corruption.
+                return drop_("UPDATE of " + rel.qualified() + " at " + lsn +
+                             " has a truncated old tuple");
             }
         }
         if (rest.empty() || rest[0] != 'N') {
-            return drop_();
+            return drop_("UPDATE of " + rel.qualified() + " at " + lsn + " carries no new tuple");
         }
         rest.remove_prefix(1);
-        auto it = relations_.find(rel_id);
-        if (it == relations_.end()) {
-            return drop_();
-        }
-        CdcEvent ev;
-        ev.op = CdcEvent::Op::Update;
-        ev.lsn = std::move(lsn);
-        ev.table = it->second.ns + "." + it->second.name;
         bool truncated = false;
-        ev.values = parse_tuple(rest, it->second, truncated);
+        auto cells = parse_tuple(rest, rel, truncated);
         if (truncated) {
-            return drop_();
+            return drop_("UPDATE of " + rel.qualified() + " at " + lsn + " has a truncated tuple");
         }
-        return ev;
+        if (auto missing = missing_needed(rel)) {
+            return drop_(*missing);
+        }
+
+        // Unchanged out-of-line (TOAST) values: the new tuple marks them 'u'
+        // and carries nothing. A whole old row ('O', REPLICA IDENTITY FULL)
+        // holds them, inlined, so they are taken from there.
+        std::vector<CdcField> values;
+        values.reserve(cells.size());
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            Cell& c = cells[i];
+            if (c.kind == 'u') {
+                if (old_kind == 'O' && i < old_cells.size() && old_cells[i].kind != 'u') {
+                    c.field.value = old_cells[i].field.value;
+                    c.field.is_null = old_cells[i].field.is_null;
+                } else if (cfg_.strict) {
+                    if (!needed(c.field.name)) {
+                        continue;  // not read by the consumer: leave it out
+                    }
+                    return drop_(
+                        "UPDATE of " + rel.qualified() + " at " + lsn + " left column " +
+                        c.field.name +
+                        " unchanged and stored out of line (TOAST), and the change does "
+                        "not carry its value under this replica identity. Run ALTER TABLE " +
+                        rel.qualified() +
+                        " REPLICA IDENTITY FULL so that updates carry the old row");
+                }
+            }
+            values.push_back(std::move(c.field));
+        }
+
+        if (cfg_.strict && old_kind != 0 && key_changed(rel, old_cells, values)) {
+            // A key-changing UPDATE: the old key's row is gone and the new
+            // key's row is the update.
+            d.events.push_back(
+                make_event(CdcEvent::Op::Delete, rel, lsn, fields_of(std::move(old_cells))));
+        }
+        d.events.push_back(make_event(CdcEvent::Op::Update, rel, lsn, std::move(values)));
+        return d;
     }
 
-    std::optional<CdcEvent> on_delete(std::string_view rest, std::string lsn) {
+    [[nodiscard]] bool key_changed(const Relation& rel,
+                                   const std::vector<Cell>& old_cells,
+                                   const std::vector<CdcField>& values) const {
+        const auto is_key = [&](const std::string& name, std::size_t idx) {
+            if (!cfg_.key_columns.empty()) {
+                return std::find(cfg_.key_columns.begin(), cfg_.key_columns.end(), name) !=
+                       cfg_.key_columns.end();
+            }
+            return idx < rel.columns.size() && (rel.columns[idx].flags & 1U) != 0;
+        };
+        for (std::size_t i = 0; i < old_cells.size() && i < rel.columns.size(); ++i) {
+            const std::string& name = rel.columns[i].name;
+            if (!is_key(name, i)) {
+                continue;
+            }
+            const auto nv = std::find_if(
+                values.begin(), values.end(), [&](const CdcField& f) { return f.name == name; });
+            if (nv == values.end()) {
+                continue;
+            }
+            const CdcField& ov = old_cells[i].field;
+            if (ov.is_null != nv->is_null || ov.value != nv->value) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Decoded on_delete(std::string_view rest, const std::string& lsn) {
         if (rest.size() < 5) {
-            return drop_();
+            return drop_("truncated DELETE message at " + lsn);
         }
         const std::uint32_t rel_id = read_be32(rest.data());
         rest.remove_prefix(4);
         if (rest.empty() || (rest[0] != 'K' && rest[0] != 'O')) {
-            return drop_();
+            return drop_("DELETE at " + lsn + " carries no old tuple");
         }
         rest.remove_prefix(1);
         auto it = relations_.find(rel_id);
         if (it == relations_.end()) {
-            return drop_();
+            return drop_("DELETE at " + lsn + " names relation " + std::to_string(rel_id) +
+                         ", which no Relation message described");
         }
-        CdcEvent ev;
-        ev.op = CdcEvent::Op::Delete;
-        ev.lsn = std::move(lsn);
-        ev.table = it->second.ns + "." + it->second.name;
+        const Relation& rel = it->second;
+        Decoded d;
+        d.kind = Decoded::Kind::Change;
+        if (!is_target(rel)) {
+            d.target = false;
+            return d;
+        }
         bool truncated = false;
-        ev.values = parse_tuple(rest, it->second, truncated);
+        auto cells = parse_tuple(rest, rel, truncated);
         if (truncated) {
-            return drop_();
+            return drop_("DELETE from " + rel.qualified() + " at " + lsn +
+                         " has a truncated tuple");
         }
-        return ev;
+        d.events.push_back(make_event(CdcEvent::Op::Delete, rel, lsn, fields_of(std::move(cells))));
+        return d;
     }
 };
+
+// =====================================================================
+// libpq plumbing: cancellable connects and commands.
+// =====================================================================
+
+struct ConnDeleter {
+    void operator()(PGconn* c) const noexcept {
+        if (c != nullptr) {
+            PQfinish(c);
+        }
+    }
+};
+using ConnPtr = std::unique_ptr<PGconn, ConnDeleter>;
+
+struct ResultDeleter {
+    void operator()(PGresult* r) const noexcept {
+        if (r != nullptr) {
+            PQclear(r);
+        }
+    }
+};
+using ResultPtr = std::unique_ptr<PGresult, ResultDeleter>;
+
+// cancel() was observed while waiting on the server.
+class Cancelled : public std::runtime_error {
+public:
+    Cancelled() : std::runtime_error("postgres_cdc: cancelled") {}
+};
+
+constexpr std::chrono::milliseconds kWaitTick{100};
+
+// Wait up to `timeout` for the socket to become readable (or writable).
+// Returns false when it did not within the time.
+bool wait_socket(PGconn* c, bool for_write, std::chrono::milliseconds timeout) {
+    const int fd = PQsocket(c);
+    if (fd < 0) {
+        return true;  // let the caller's libpq call report the problem
+    }
+    pollfd p{};
+    p.fd = fd;
+    p.events = static_cast<short>(for_write ? POLLOUT : POLLIN);
+    return ::poll(&p, 1, static_cast<int>(timeout.count())) != 0;
+}
+
+// Ask the server to cancel the running command without waiting for it to
+// answer: PQcancel blocks until the server closes its side, which a hung
+// server never does. The PGcancel object is independent of the connection.
+void cancel_in_background(PGconn* c) {
+    PGcancel* cn = PQgetCancel(c);
+    if (cn == nullptr) {
+        return;
+    }
+    std::thread([cn] {
+        std::array<char, 256> err{};
+        (void)PQcancel(cn, err.data(), static_cast<int>(err.size()));
+        PQfreeCancel(cn);
+    }).detach();
+}
+
+std::string quote_ident(std::string_view v) {
+    std::string out = "\"";
+    for (const char c : v) {
+        if (c == '"') {
+            out += "\"\"";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+std::string quote_literal(std::string_view v) {
+    std::string out = "'";
+    for (const char c : v) {
+        if (c == '\'') {
+            out += "''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
+// Connect, observing `cancel` and `timeout`. Keyword order matters: values
+// before "dbname" are defaults the user's connection string overrides, values
+// after it are forced (PQconnectStartParams with expand_dbname).
+ConnPtr connect_cancellable(const PostgresCdcSource::Options& o,
+                            bool replication,
+                            const std::atomic<bool>& cancel,
+                            const std::string& purpose) {
+    const std::string app = "clink_cdc_" + o.slot_name;
+    std::vector<const char*> keys = {"application_name", "options", "dbname", "client_encoding"};
+    std::vector<const char*> vals = {
+        app.c_str(),
+        "-c TimeZone=UTC -c DateStyle=ISO,MDY -c IntervalStyle=postgres "
+        "-c extra_float_digits=3",
+        o.conninfo.c_str(),
+        "UTF8"};
+    if (replication) {
+        keys.push_back("replication");
+        vals.push_back("database");
+    }
+    keys.push_back(nullptr);
+    vals.push_back(nullptr);
+    PGconn* raw = PQconnectStartParams(keys.data(), vals.data(), /*expand_dbname=*/1);
+    if (raw == nullptr) {
+        throw std::runtime_error("postgres_cdc: " + purpose +
+                                 ": out of memory starting a connection");
+    }
+    ConnPtr conn{raw};
+    if (PQstatus(raw) == CONNECTION_BAD) {
+        throw std::runtime_error("postgres_cdc: " + purpose +
+                                 " connection failed: " + PQerrorMessage(raw));
+    }
+    const auto deadline = Clock::now() + o.connect_timeout;
+    PostgresPollingStatusType st = PGRES_POLLING_WRITING;
+    while (st != PGRES_POLLING_OK) {
+        if (st == PGRES_POLLING_FAILED) {
+            throw std::runtime_error("postgres_cdc: " + purpose +
+                                     " connection failed: " + PQerrorMessage(raw));
+        }
+        while (!wait_socket(raw, st == PGRES_POLLING_WRITING, kWaitTick)) {
+            if (cancel.load()) {
+                throw Cancelled();
+            }
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error("postgres_cdc: " + purpose +
+                                         " connection did not complete within " +
+                                         std::to_string(o.connect_timeout.count()) + " ms");
+            }
+        }
+        if (cancel.load()) {
+            throw Cancelled();
+        }
+        st = PQconnectPoll(raw);
+    }
+    return conn;
+}
+
+// Run one command, observing `cancel` (and `limit` when set). Returns the
+// last result; a COPY result is returned as soon as it arrives, since the
+// connection is then in copy mode.
+ResultPtr run_command(PGconn* c,
+                      const std::string& sql,
+                      const std::atomic<bool>& cancel,
+                      std::optional<std::chrono::milliseconds> limit,
+                      const std::string& what,
+                      const std::function<void(std::chrono::milliseconds)>& waiting = {}) {
+    if (PQsendQuery(c, sql.c_str()) != 1) {
+        throw std::runtime_error("postgres_cdc: " + what + ": " + PQerrorMessage(c));
+    }
+    const auto started = Clock::now();
+    ResultPtr last;
+    while (true) {
+        while (PQisBusy(c) == 0) {
+            PGresult* r = PQgetResult(c);
+            if (r == nullptr) {
+                return last;
+            }
+            const auto st = PQresultStatus(r);
+            if (st == PGRES_COPY_BOTH || st == PGRES_COPY_OUT || st == PGRES_COPY_IN) {
+                return ResultPtr{r};
+            }
+            last.reset(r);
+        }
+        if (cancel.load()) {
+            cancel_in_background(c);
+            throw Cancelled();
+        }
+        const auto waited =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+        if (limit && waited >= *limit) {
+            cancel_in_background(c);
+            throw std::runtime_error("postgres_cdc: " + what + " did not finish within " +
+                                     std::to_string(limit->count()) + " ms");
+        }
+        if (waiting) {
+            waiting(waited);
+        }
+        if (wait_socket(c, false, kWaitTick) && PQconsumeInput(c) == 0) {
+            throw std::runtime_error("postgres_cdc: " + what + ": " + PQerrorMessage(c));
+        }
+    }
+}
+
+// run_command, then require a command or tuples result.
+ResultPtr run_ok(PGconn* c,
+                 const std::string& sql,
+                 const std::atomic<bool>& cancel,
+                 std::optional<std::chrono::milliseconds> limit,
+                 const std::string& what) {
+    ResultPtr r = run_command(c, sql, cancel, limit, what);
+    const auto st = r ? PQresultStatus(r.get()) : PGRES_FATAL_ERROR;
+    if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
+        const std::string err = r ? PQresultErrorMessage(r.get()) : PQerrorMessage(c);
+        throw std::runtime_error("postgres_cdc: " + what + " failed: " + err);
+    }
+    return r;
+}
+
+constexpr std::chrono::milliseconds kCatalogLimit{std::chrono::seconds{30}};
+
+std::string cell(const PGresult* r, int row, int col) {
+    if (PQgetisnull(r, row, col) != 0) {
+        return {};
+    }
+    return {PQgetvalue(r, row, col), static_cast<std::size_t>(PQgetlength(r, row, col))};
+}
+
+// What the server says about a replication slot.
+struct SlotInfo {
+    bool exists{false};
+    std::string slot_type;
+    std::string plugin;
+    std::string database;
+    std::string current_database;
+    std::string wal_status;
+    bool active{false};
+    std::uint64_t confirmed_flush{0};
+};
+
+SlotInfo read_slot(PGconn* admin, const std::string& slot, const std::atomic<bool>& cancel) {
+    const bool has_wal_status = PQserverVersion(admin) >= 130000;
+    const std::string sql =
+        "SELECT slot_type, coalesce(plugin, ''), coalesce(database, ''), active, "
+        "coalesce(confirmed_flush_lsn::text, ''), " +
+        std::string{has_wal_status ? "coalesce(wal_status, '')" : "''"} +
+        ", current_database() FROM pg_replication_slots WHERE slot_name = " + quote_literal(slot);
+    ResultPtr r = run_ok(admin, sql, cancel, kCatalogLimit, "reading replication slot " + slot);
+    SlotInfo s;
+    if (PQntuples(r.get()) == 0) {
+        ResultPtr db = run_ok(
+            admin, "SELECT current_database()", cancel, kCatalogLimit, "reading the database name");
+        s.current_database = cell(db.get(), 0, 0);
+        return s;
+    }
+    s.exists = true;
+    s.slot_type = cell(r.get(), 0, 0);
+    s.plugin = cell(r.get(), 0, 1);
+    s.database = cell(r.get(), 0, 2);
+    s.active = cell(r.get(), 0, 3) == "t";
+    if (const auto lsn = cdc::parse_lsn(cell(r.get(), 0, 4))) {
+        s.confirmed_flush = *lsn;
+    }
+    s.wal_status = cell(r.get(), 0, 5);
+    s.current_database = cell(r.get(), 0, 6);
+    return s;
+}
+
+// Split a publication_names value ("a, \"B\"") into bare names.
+std::vector<std::string> split_publications(const std::string& csv) {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i < csv.size()) {
+        while (i < csv.size() && (csv[i] == ' ' || csv[i] == ',')) {
+            ++i;
+        }
+        if (i >= csv.size()) {
+            break;
+        }
+        std::string name;
+        if (csv[i] == '"') {
+            ++i;
+            while (i < csv.size()) {
+                if (csv[i] == '"') {
+                    if (i + 1 < csv.size() && csv[i + 1] == '"') {
+                        name.push_back('"');
+                        i += 2;
+                        continue;
+                    }
+                    ++i;
+                    break;
+                }
+                name.push_back(csv[i++]);
+            }
+        } else {
+            while (i < csv.size() && csv[i] != ',' && csv[i] != ' ') {
+                name.push_back(
+                    static_cast<char>(std::tolower(static_cast<unsigned char>(csv[i++]))));
+            }
+        }
+        if (!name.empty()) {
+            out.push_back(std::move(name));
+        }
+    }
+    return out;
+}
+
+// Build a Standby Status Update payload and send it via the COPY stream.
+// Layout (PostgreSQL protocol, Standby status update): 'r' + written +
+// flushed + applied + clientTime + replyRequested. For a logical slot the
+// server confirms the flushed position only; it is sent exactly as a
+// completed checkpoint recorded it.
+bool send_standby_status_update(PGconn* conn,
+                                std::uint64_t written,
+                                std::uint64_t flushed,
+                                bool reply_requested) {
+    std::array<char, 1 + 8 + 8 + 8 + 8 + 1> msg{};
+    msg[0] = 'r';
+    write_be64(msg.data() + 1, std::max(written, flushed));
+    write_be64(msg.data() + 9, flushed);
+    write_be64(msg.data() + 17, flushed);
+    write_be64(msg.data() + 25, static_cast<std::uint64_t>(postgres_epoch_us_now()));
+    msg[33] = reply_requested ? 1 : 0;
+    if (PQputCopyData(conn, msg.data(), static_cast<int>(msg.size())) != 1) {
+        return false;
+    }
+    return PQflush(conn) == 0;
+}
+
+constexpr const char* kLegacyLsnKey = "__postgres_cdc_lsn__";
+constexpr const char* kCursorKey = "__postgres_cdc_cursor__";
+constexpr const char* kSnapshotCursor = "clink_cdc_snapshot";
 
 }  // namespace
 
@@ -420,12 +959,25 @@ private:
 namespace pg_cdc_testing {
 
 PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages) {
-    PgOutputState state;
+    return decode_pgoutput_messages(messages, PgDecodeConfig{});
+}
+
+PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages,
+                                        const PgDecodeConfig& config) {
+    DecoderConfig cfg;
+    cfg.table = config.table;
+    cfg.key_columns = config.key_columns;
+    cfg.needed = std::set<std::string>(config.needed_columns.begin(), config.needed_columns.end());
+    cfg.strict = config.strict;
+    PgOutputState state(std::move(cfg));
     PgDecodeResult result;
     for (const auto& msg : messages) {
-        std::optional<CdcEvent> ev = state.on_message(msg, "0/0");
-        if (ev.has_value()) {
-            result.events.push_back(std::move(*ev));
+        Decoded d = state.on_message(msg, "0/0");
+        for (auto& ev : d.events) {
+            result.events.push_back(std::move(ev));
+        }
+        if (d.dropped) {
+            result.errors.push_back(d.error);
         }
     }
     result.dropped = state.dropped_data_events;
@@ -440,25 +992,50 @@ PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages
 
 struct PostgresCdcSource::Impl {
     Options opts;
-    PGconn* conn{nullptr};
-    bool started{false};
     std::atomic<bool> cancel{false};
+    // open() returned early on cancel(); produce() then ends the stream.
+    bool opened_cancelled{false};
+
+    PgOutputState pgoutput;
+    std::uint64_t last_dropped{0};  // pgoutput.dropped_data_events at last surfacing
+
+    enum class Phase : std::uint8_t { Idle, Snapshot, Stream };
+    Phase phase{Phase::Idle};
+    std::atomic<bool> snapshot_active{false};
+
+    // ---- streaming ----
+    ConnPtr repl;
+    bool streaming{false};
+    cdc::TxnCursor cursor;
+    // The Begin marker of the transaction in progress was emitted before a
+    // restart; it is not emitted again.
     std::uint64_t received_lsn{0};
-    std::chrono::steady_clock::time_point last_status_send{std::chrono::steady_clock::now()};
-    PgOutputState pgoutput_state;
-    std::uint64_t last_dropped{0};  // pgoutput_state.dropped_data_events at last surfacing
-    // Snapshot rows queued before streaming begins. Drained from produce()
-    // before any libpq replication reads.
-    std::deque<CdcEvent> snapshot_backlog;
-    std::string consistent_point_lsn;
-    // #60: set by restore_offset() when a checkpointed LSN is loaded, so open()
-    // resumes START_REPLICATION from received_lsn instead of the slot default.
-    bool restored_from_checkpoint{false};
-    // The LSN actually passed to the last START_REPLICATION: the restored
-    // checkpoint LSN when resuming, the slot consistent_point on a fresh create,
-    // or "0/0" for the slot default. Surfaced via start_position() so a test can
-    // prove a checkpoint restore (not the slot default) drove the resume.
+    Clock::time_point last_inbound{Clock::now()};
+    Clock::time_point last_status_send{Clock::now()};
     std::string start_position_lsn;
+    bool tls_reported{false};
+
+    // ---- snapshot ----
+    ConnPtr snap;
+    std::size_t snap_query{0};
+    bool snap_cursor_open{false};
+    bool snapshot_exact{false};
+    std::uint64_t snapshot_rows{0};
+    std::uint64_t snapshot_from{0};  // the slot position streaming starts at afterwards
+    Clock::time_point snapshot_started{Clock::now()};
+
+    // ---- restore ----
+    std::optional<cdc::CursorState> restored;
+
+    // ---- acknowledgement ----
+    cdc::AckLedger ledger;
+    std::atomic<std::uint64_t> confirmed{0};  // last flush position sent
+
+    // ---- reconnect ----
+    std::optional<Clock::time_point> reconnect_deadline;
+    Clock::time_point next_reconnect{Clock::now()};
+    std::chrono::milliseconds reconnect_backoff{200};
+    std::string lost_reason;
 };
 
 bool PostgresCdcSource::is_real_implementation() {
@@ -469,338 +1046,938 @@ PostgresCdcSource::PostgresCdcSource(Options opts) : impl_(std::make_unique<Impl
     impl_->opts = std::move(opts);
 }
 
-PostgresCdcSource::~PostgresCdcSource() {
-    if (impl_ && impl_->conn != nullptr) {
-        PQfinish(impl_->conn);
-    }
-}
+PostgresCdcSource::~PostgresCdcSource() = default;
 
 namespace {
 
-// Build a Standby Status Update payload and send it via the COPY stream.
-// Layout (per PG docs §52.5.2): 'r' + walWritten + walFlushed + walApplied +
-// clientTime + replyRequested.
-bool send_standby_status_update(PGconn* conn, std::uint64_t received_lsn, bool reply_requested) {
-    std::array<char, 1 + 8 + 8 + 8 + 8 + 1> msg{};
-    msg[0] = 'r';
-    const std::uint64_t apply_to = received_lsn + 1;  // server expects "next byte" semantics
-    write_be64(msg.data() + 1, apply_to);
-    write_be64(msg.data() + 9, apply_to);
-    write_be64(msg.data() + 17, apply_to);
-    write_be64(msg.data() + 25, static_cast<std::uint64_t>(postgres_epoch_us_now()));
-    msg[33] = reply_requested ? 1 : 0;
-    if (PQputCopyData(conn, msg.data(), static_cast<int>(msg.size())) != 1) {
-        return false;
+void validate_options(const PostgresCdcSource::Options& o) {
+    if (o.plugin != "test_decoding" && o.plugin != "pgoutput") {
+        throw std::runtime_error("PostgresCdcSource: unsupported plugin '" + o.plugin +
+                                 "' (supported: test_decoding, pgoutput)");
     }
-    return PQflush(conn) == 0;
+    if (o.plugin == "pgoutput" && o.publication_names.empty()) {
+        throw std::runtime_error("PostgresCdcSource: pgoutput requires Options::publication_names");
+    }
+    if (o.slot_name.empty()) {
+        throw std::runtime_error("PostgresCdcSource: slot_name is required");
+    }
+    if (o.strict && o.plugin != "pgoutput") {
+        throw std::runtime_error("PostgresCdcSource: strict decoding needs plugin pgoutput");
+    }
+    if (o.strict && o.proto_version != 1) {
+        throw std::runtime_error(
+            "PostgresCdcSource: strict decoding needs pgoutput protocol version 1");
+    }
+    if (!o.table.empty() && o.key_columns.empty()) {
+        throw std::runtime_error("PostgresCdcSource: capturing table " + o.table +
+                                 " needs its primary key columns (key_columns)");
+    }
+    if (o.snapshot_batch_rows == 0 || o.max_batch_events == 0) {
+        throw std::runtime_error(
+            "PostgresCdcSource: snapshot_batch_rows and max_batch_events must be positive");
+    }
 }
 
-// Run snapshot SELECTs on a side connection bound to the slot's exported
-// snapshot. Returns the rows already wrapped as Insert CdcEvents.
-std::deque<CdcEvent> read_initial_snapshot(const std::string& conninfo,
-                                           const std::string& snapshot_name,
-                                           const std::string& consistent_lsn,
-                                           const std::vector<PostgresCdcSnapshotQuery>& queries) {
-    std::deque<CdcEvent> out;
-    PGconn* snap_conn = PQconnectdb(conninfo.c_str());
-    if (PQstatus(snap_conn) != CONNECTION_OK) {
-        const std::string err = PQerrorMessage(snap_conn);
-        PQfinish(snap_conn);
-        throw std::runtime_error("PostgresCdcSource::snapshot: side connection failed: " + err);
+// The server and role can serve logical replication at all.
+void check_server(PGconn* admin, const std::atomic<bool>& cancel) {
+    ResultPtr r = run_ok(admin,
+                         "SELECT current_setting('wal_level'), "
+                         "(SELECT rolreplication OR rolsuper FROM pg_roles WHERE rolname = "
+                         "current_user), current_user",
+                         cancel,
+                         kCatalogLimit,
+                         "reading server settings");
+    const std::string wal_level = cell(r.get(), 0, 0);
+    if (wal_level != "logical") {
+        throw std::runtime_error("postgres_cdc: the server runs with wal_level=" + wal_level +
+                                 "; logical replication needs wal_level=logical (it takes a "
+                                 "server restart to change)");
     }
+    if (cell(r.get(), 0, 1) != "t") {
+        throw std::runtime_error("postgres_cdc: role " + cell(r.get(), 0, 2) +
+                                 " may not start replication; grant it with ALTER ROLE " +
+                                 cell(r.get(), 0, 2) +
+                                 " REPLICATION (or connect as a role that has it)");
+    }
+}
 
-    auto run = [&](const std::string& sql) -> PGresult* {
-        PGresult* r = PQexec(snap_conn, sql.c_str());
-        if (PQresultStatus(r) != PGRES_COMMAND_OK && PQresultStatus(r) != PGRES_TUPLES_OK) {
-            const std::string err = PQerrorMessage(snap_conn);
-            PQclear(r);
-            PQfinish(snap_conn);
-            throw std::runtime_error("PostgresCdcSource::snapshot: " + sql + " failed: " + err);
-        }
-        return r;
+// The single-table checks. Returns the table's canonical "schema.name".
+std::string check_table(PGconn* admin,
+                        const PostgresCdcSource::Options& o,
+                        const std::atomic<bool>& cancel) {
+    const auto refuse = [&](const std::string& why) -> std::runtime_error {
+        return std::runtime_error("postgres_cdc: table " + o.table + ": " + why);
     };
-
-    PQclear(run("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
-    PQclear(run("SET TRANSACTION SNAPSHOT '" + snapshot_name + "'"));
-
-    for (const auto& q : queries) {
-        PGresult* r = run(q.query);
-        const int nrows = PQntuples(r);
-        const int ncols = PQnfields(r);
-        std::vector<std::string> col_names;
-        std::vector<std::string> col_types;
-        col_names.reserve(static_cast<std::size_t>(ncols));
-        col_types.reserve(static_cast<std::size_t>(ncols));
-        for (int c = 0; c < ncols; ++c) {
-            col_names.emplace_back(PQfname(r, c));
-            const auto oid = static_cast<std::uint32_t>(PQftype(r, c));
-            const char* nm = lookup_builtin_type_name(oid);
-            col_types.emplace_back(nm != nullptr ? nm : std::string{});
-        }
-        for (int row = 0; row < nrows; ++row) {
-            CdcEvent ev;
-            ev.op = CdcEvent::Op::Insert;
-            ev.table = q.table;
-            ev.lsn = consistent_lsn;
-            ev.values.reserve(static_cast<std::size_t>(ncols));
-            for (int c = 0; c < ncols; ++c) {
-                CdcField f;
-                f.name = col_names[static_cast<std::size_t>(c)];
-                f.type = col_types[static_cast<std::size_t>(c)];
-                if (PQgetisnull(r, row, c) != 0) {
-                    f.is_null = true;
-                } else {
-                    f.value = std::string{PQgetvalue(r, row, c),
-                                          static_cast<std::size_t>(PQgetlength(r, row, c))};
-                }
-                ev.values.push_back(std::move(f));
-            }
-            out.push_back(std::move(ev));
-        }
-        PQclear(r);
+    ResultPtr t = run_ok(admin,
+                         "SELECT c.oid, n.nspname, c.relname, c.relreplident, c.relkind, "
+                         "has_table_privilege(c.oid, 'SELECT') FROM pg_class c JOIN pg_namespace n "
+                         "ON n.oid = c.relnamespace WHERE c.oid = to_regclass(" +
+                             quote_literal(o.table) + ")",
+                         cancel,
+                         kCatalogLimit,
+                         "reading table " + o.table);
+    if (PQntuples(t.get()) == 0) {
+        throw refuse("does not exist, or is not visible to this role");
+    }
+    const std::string oid = cell(t.get(), 0, 0);
+    const std::string canonical = cell(t.get(), 0, 1) + "." + cell(t.get(), 0, 2);
+    const std::string replident = cell(t.get(), 0, 3);
+    const std::string relkind = cell(t.get(), 0, 4);
+    if (relkind == "p") {
+        throw refuse("is partitioned; capturing a partitioned table is not supported");
+    }
+    if (relkind != "r") {
+        throw refuse("is not an ordinary table");
+    }
+    if (o.enable_initial_snapshot && cell(t.get(), 0, 5) != "t") {
+        throw refuse(
+            "this role may not SELECT from it, which the initial snapshot needs; GRANT "
+            "SELECT ON " +
+            canonical + " TO the role");
     }
 
-    PQclear(run("COMMIT"));
-    PQfinish(snap_conn);
-    return out;
+    // Columns.
+    ResultPtr cols = run_ok(admin,
+                            "SELECT a.attname, t.typname, a.attstorage FROM pg_attribute a JOIN "
+                            "pg_type t ON t.oid = a.atttypid WHERE a.attrelid = " +
+                                oid + " AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                            cancel,
+                            kCatalogLimit,
+                            "reading the columns of " + canonical);
+    std::map<std::string, std::pair<std::string, std::string>>
+        by_name;  // name -> (typname, storage)
+    for (int i = 0; i < PQntuples(cols.get()); ++i) {
+        by_name[cell(cols.get(), i, 0)] = {cell(cols.get(), i, 1), cell(cols.get(), i, 2)};
+    }
+    std::vector<std::string> toastable;
+    std::string declared_spec;
+    for (const auto& [name, sql_type] : o.declared_columns) {
+        if (cdc::is_metadata_column(name)) {
+            continue;
+        }
+        const auto it = by_name.find(name);
+        if (it == by_name.end()) {
+            throw refuse("has no column " + name);
+        }
+        declared_spec += name + ":" + sql_type + ";";
+        if (it->second.second != "p") {
+            toastable.push_back(name);
+        }
+    }
+    if (!declared_spec.empty()) {
+        for (const auto& plan : cdc::plan_columns(declared_spec)) {
+            if (auto problem = cdc::type_pair_problem(by_name[plan.name].first, plan)) {
+                throw std::runtime_error("postgres_cdc: table " + canonical + ": " + *problem);
+            }
+        }
+    }
+
+    // Primary key, and a replica identity that carries it.
+    ResultPtr pk = run_ok(admin,
+                          "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = "
+                          "i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = " +
+                              oid + " AND i.indisprimary",
+                          cancel,
+                          kCatalogLimit,
+                          "reading the primary key of " + canonical);
+    std::set<std::string> pk_cols;
+    for (int i = 0; i < PQntuples(pk.get()); ++i) {
+        pk_cols.insert(cell(pk.get(), i, 0));
+    }
+    const std::set<std::string> want(o.key_columns.begin(), o.key_columns.end());
+    const auto list = [](const std::set<std::string>& s) {
+        std::string out;
+        for (const auto& c : s) {
+            out += (out.empty() ? "" : ", ") + c;
+        }
+        return out;
+    };
+    if (pk_cols.empty()) {
+        throw refuse("has no primary key; the change stream is keyed by it");
+    }
+    if (pk_cols != want) {
+        throw refuse("its primary key is (" + list(pk_cols) + ") but the job declares (" +
+                     list(want) + ")");
+    }
+    if (replident == "n") {
+        throw refuse(
+            "has REPLICA IDENTITY NOTHING, so its updates and deletes do not identify "
+            "their row; set REPLICA IDENTITY DEFAULT or FULL");
+    }
+    if (replident == "i") {
+        ResultPtr ri =
+            run_ok(admin,
+                   "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = "
+                   "i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = " +
+                       oid + " AND i.indisreplident",
+                   cancel,
+                   kCatalogLimit,
+                   "reading the replica identity of " + canonical);
+        std::set<std::string> ri_cols;
+        for (int i = 0; i < PQntuples(ri.get()); ++i) {
+            ri_cols.insert(cell(ri.get(), i, 0));
+        }
+        if (ri_cols != pk_cols) {
+            throw refuse("its replica identity index (" + list(ri_cols) +
+                         ") is not its primary key, so deletes would not carry the key; set "
+                         "REPLICA IDENTITY DEFAULT or FULL");
+        }
+    }
+    if (o.strict && replident != "f" && !toastable.empty()) {
+        std::string names;
+        for (const auto& c : toastable) {
+            names += (names.empty() ? "" : ", ") + c;
+        }
+        clink::log::warn(kLog,
+                         "table " + canonical + " has columns that may be stored out of line (" +
+                             names +
+                             ") and its replica identity is not FULL: an UPDATE that leaves such "
+                             "a value unchanged does not carry it, and the source stops on it "
+                             "rather than emit the row without it. ALTER TABLE " +
+                             canonical + " REPLICA IDENTITY FULL avoids that");
+    }
+
+    // Publications.
+    const auto pubs = split_publications(o.publication_names);
+    std::string pub_list;
+    for (const auto& p : pubs) {
+        pub_list += (pub_list.empty() ? "" : ", ") + quote_literal(p);
+    }
+    if (pubs.empty()) {
+        throw refuse("no publication is named");
+    }
+    ResultPtr pr = run_ok(admin,
+                          "SELECT pubname, pubinsert, pubupdate, pubdelete FROM pg_publication "
+                          "WHERE pubname IN (" +
+                              pub_list + ")",
+                          cancel,
+                          kCatalogLimit,
+                          "reading publications");
+    std::map<std::string, std::array<bool, 3>> found;
+    for (int i = 0; i < PQntuples(pr.get()); ++i) {
+        found[cell(pr.get(), i, 0)] = {
+            cell(pr.get(), i, 1) == "t", cell(pr.get(), i, 2) == "t", cell(pr.get(), i, 3) == "t"};
+    }
+    for (const auto& p : pubs) {
+        if (found.count(p) == 0) {
+            throw refuse("publication " + p + " does not exist; CREATE PUBLICATION " + p +
+                         " FOR TABLE " + canonical);
+        }
+    }
+    const bool has_column_lists = PQserverVersion(admin) >= 150000;
+    ResultPtr member = run_ok(
+        admin,
+        "SELECT pubname" + std::string{has_column_lists ? ", attnames::text, rowfilter" : ""} +
+            " FROM pg_publication_tables WHERE pubname IN (" + pub_list +
+            ") AND schemaname = " + quote_literal(cell(t.get(), 0, 1)) +
+            " AND tablename = " + quote_literal(cell(t.get(), 0, 2)),
+        cancel,
+        kCatalogLimit,
+        "reading publication membership");
+    if (PQntuples(member.get()) == 0) {
+        throw refuse("is in none of the publications (" + o.publication_names +
+                     "); ALTER PUBLICATION <name> ADD TABLE " + canonical);
+    }
+    std::array<bool, 3> actions{false, false, false};
+    for (int i = 0; i < PQntuples(member.get()); ++i) {
+        const auto& a = found[cell(member.get(), i, 0)];
+        for (std::size_t k = 0; k < 3; ++k) {
+            actions[k] = actions[k] || a[k];
+        }
+        if (has_column_lists) {
+            if (!cell(member.get(), i, 2).empty()) {
+                throw refuse("publication " + cell(member.get(), i, 0) +
+                             " filters its rows, which the initial snapshot cannot apply in the "
+                             "same way; publish the table without a row filter");
+            }
+            const std::string attnames = cell(member.get(), i, 1);
+            for (const auto& [name, sql_type] : o.declared_columns) {
+                (void)sql_type;
+                if (cdc::is_metadata_column(name)) {
+                    continue;
+                }
+                // attnames is "{a,b}"; a missing column list publishes every column.
+                const bool listed = attnames.find("{" + name + ",") != std::string::npos ||
+                                    attnames.find("," + name + ",") != std::string::npos ||
+                                    attnames.find("," + name + "}") != std::string::npos ||
+                                    attnames == "{" + name + "}";
+                if (!attnames.empty() && !listed) {
+                    throw refuse("publication " + cell(member.get(), i, 0) +
+                                 " does not publish column " + name);
+                }
+            }
+        }
+    }
+    static constexpr std::array<const char*, 3> kAction = {"insert", "update", "delete"};
+    for (std::size_t k = 0; k < 3; ++k) {
+        if (!actions[k]) {
+            throw refuse(std::string{"no publication of it publishes "} + kAction[k] +
+                         "s, so those changes would never arrive; set publish = 'insert, update, "
+                         "delete' on the publication");
+        }
+    }
+    return canonical;
+}
+
+// The slot can serve a resume from `resume_lsn`.
+void check_slot(const SlotInfo& slot,
+                const PostgresCdcSource::Options& o,
+                std::optional<std::uint64_t> resume_lsn) {
+    if (!slot.exists) {
+        throw cdc::HistoryUnavailable(
+            "postgres_cdc: replication slot " + o.slot_name + " does not exist" +
+            (resume_lsn ? ", but this job's checkpoint resumes from " + format_lsn(*resume_lsn) +
+                              " in it. It was dropped, or the job now points at another server. "
+                              "Recreating it would skip every change since that position, so the "
+                              "source refuses; start the job from scratch (a fresh slot and "
+                              "snapshot) once the downstream copy is reset"
+                        : std::string{}));
+    }
+    if (slot.slot_type != "logical") {
+        throw cdc::HistoryUnavailable("postgres_cdc: replication slot " + o.slot_name + " is a " +
+                                      slot.slot_type + " slot, not a logical one");
+    }
+    if (slot.plugin != o.plugin) {
+        throw cdc::HistoryUnavailable("postgres_cdc: replication slot " + o.slot_name +
+                                      " decodes with " + slot.plugin + ", not " + o.plugin);
+    }
+    if (!slot.database.empty() && slot.database != slot.current_database) {
+        throw cdc::HistoryUnavailable("postgres_cdc: replication slot " + o.slot_name +
+                                      " belongs to database " + slot.database + ", not " +
+                                      slot.current_database);
+    }
+    if (slot.wal_status == "lost") {
+        throw cdc::HistoryUnavailable(
+            "postgres_cdc: replication slot " + o.slot_name +
+            " has lost WAL it needs (wal_status=lost, usually max_slot_wal_keep_size). The "
+            "changes it no longer holds cannot be read again; drop the slot and start the job "
+            "from scratch once the downstream copy is reset");
+    }
+    if (resume_lsn && slot.confirmed_flush > *resume_lsn) {
+        throw cdc::HistoryUnavailable(
+            "postgres_cdc: replication slot " + o.slot_name + " is confirmed at " +
+            format_lsn(slot.confirmed_flush) + ", beyond the position this job resumes from (" +
+            format_lsn(*resume_lsn) +
+            "). PostgreSQL would silently start at the later position and skip the changes in "
+            "between, so the source refuses. Something else consumed from the slot, or it was "
+            "advanced by hand; start the job from scratch once the downstream copy is reset");
+    }
 }
 
 }  // namespace
 
+// ---------------------------------------------------------------------
+// open
+// ---------------------------------------------------------------------
+
 void PostgresCdcSource::open() {
-    if (impl_->opts.plugin != "test_decoding" && impl_->opts.plugin != "pgoutput") {
-        throw std::runtime_error("PostgresCdcSource: unsupported plugin '" + impl_->opts.plugin +
-                                 "' (supported: test_decoding, pgoutput)");
-    }
-    if (impl_->opts.plugin == "pgoutput" && impl_->opts.publication_names.empty()) {
-        throw std::runtime_error("PostgresCdcSource: pgoutput requires Options::publication_names");
-    }
-
-    const std::string conninfo_repl = impl_->opts.conninfo + " replication=database";
-    impl_->conn = PQconnectdb(conninfo_repl.c_str());
-    if (PQstatus(impl_->conn) != CONNECTION_OK) {
-        const std::string err = PQerrorMessage(impl_->conn);
-        PQfinish(impl_->conn);
-        impl_->conn = nullptr;
-        throw std::runtime_error("PostgresCdcSource::open: connect failed: " + err);
-    }
-    clink::connectors::pg::assert_no_silent_downgrade(
-        impl_->conn, conninfo_repl, "postgres_cdc_source");
-
-    bool slot_was_created = false;
-    if (impl_->opts.create_slot) {
-        std::string create_sql = "CREATE_REPLICATION_SLOT \"" + impl_->opts.slot_name +
-                                 "\" LOGICAL " + impl_->opts.plugin;
-        if (impl_->opts.enable_initial_snapshot) {
-            create_sql += " EXPORT_SNAPSHOT";
+    auto& s = *impl_;
+    validate_options(s.opts);
+    DecoderConfig cfg;
+    cfg.table = s.opts.table;
+    cfg.key_columns = s.opts.key_columns;
+    for (const auto& [name, type] : s.opts.declared_columns) {
+        (void)type;
+        if (!cdc::is_metadata_column(name)) {
+            cfg.needed.insert(name);
         }
+    }
+    cfg.strict = s.opts.strict;
+    s.pgoutput = PgOutputState(std::move(cfg));
 
-        PGresult* r = PQexec(impl_->conn, create_sql.c_str());
-        const auto status = PQresultStatus(r);
-        if (status == PGRES_TUPLES_OK) {
-            // Columns: slot_name, consistent_point, snapshot_name, output_plugin
-            const int ncols = PQnfields(r);
-            std::string snapshot_name;
-            for (int c = 0; c < ncols; ++c) {
-                const std::string_view name = PQfname(r, c);
-                if (PQntuples(r) > 0) {
-                    if (name == "consistent_point") {
-                        impl_->consistent_point_lsn = PQgetvalue(r, 0, c);
-                    } else if (name == "snapshot_name") {
-                        snapshot_name = PQgetvalue(r, 0, c);
-                    }
+    try {
+        ConnPtr admin = connect_cancellable(s.opts, false, s.cancel, "postgres_cdc_source");
+        clink::connectors::pg::assert_no_silent_downgrade(
+            admin.get(), s.opts.conninfo, "postgres_cdc_source");
+        s.tls_reported = true;
+        check_server(admin.get(), s.cancel);
+        if (!s.opts.table.empty()) {
+            const std::string canonical = check_table(admin.get(), s.opts, s.cancel);
+            s.pgoutput.set_table(canonical);
+            for (auto& q : s.opts.initial_snapshot) {
+                if (q.table == s.opts.table) {
+                    q.table = canonical;
                 }
             }
-            PQclear(r);
-            slot_was_created = true;
+            s.opts.table = canonical;
+        }
+        const SlotInfo slot = read_slot(admin.get(), s.opts.slot_name, s.cancel);
+        const bool want_snapshot =
+            s.opts.enable_initial_snapshot && !s.opts.initial_snapshot.empty();
+        std::string plan;
 
-            if (impl_->opts.enable_initial_snapshot && !snapshot_name.empty()) {
-                impl_->snapshot_backlog = read_initial_snapshot(impl_->opts.conninfo,
-                                                                snapshot_name,
-                                                                impl_->consistent_point_lsn,
-                                                                impl_->opts.initial_snapshot);
+        if (s.restored) {
+            const auto& r = *s.restored;
+            check_slot(slot, s.opts, r.resume_lsn);
+            s.confirmed.store(slot.confirmed_flush);
+            std::optional<std::pair<std::uint64_t, std::uint64_t>> interrupted;
+            if (r.in_flight) {
+                interrupted = std::make_pair(r.txn_id, r.txn_changes);
+            }
+            s.cursor.start(r.resume_lsn, interrupted);
+            if (r.phase == cdc::Phase::Snapshot && want_snapshot) {
+                admin.reset();
+                s.snapshot_from = r.resume_lsn;
+                begin_snapshot_("");
+                plan = "restored mid-snapshot; snapshot taken again (fresh), streaming from " +
+                       format_lsn(r.resume_lsn) + " afterwards";
+            } else {
+                admin.reset();
+                s.phase = Impl::Phase::Stream;
+                plan =
+                    "resume from checkpoint at " + format_lsn(r.resume_lsn) +
+                    (r.in_flight ? " (inside transaction " + format_lsn(r.txn_id) + ", " +
+                                       std::to_string(r.txn_changes) + " changes already emitted)"
+                                 : std::string{});
+            }
+        } else if (!slot.exists) {
+            if (!s.opts.create_slot) {
+                check_slot(slot, s.opts, std::nullopt);
+            }
+            admin.reset();
+            ConnPtr creator = connect_cancellable(s.opts, true, s.cancel, "replication");
+            const std::string create_sql =
+                "CREATE_REPLICATION_SLOT " + quote_ident(s.opts.slot_name) + " LOGICAL " +
+                s.opts.plugin + (want_snapshot ? " EXPORT_SNAPSHOT" : " NOEXPORT_SNAPSHOT");
+            const auto waiting = [&s, logged = std::chrono::milliseconds{0}](
+                                     std::chrono::milliseconds waited) mutable {
+                if (waited - logged >= std::chrono::seconds{10}) {
+                    logged = waited;
+                    clink::log::info(kLog,
+                                     "creating replication slot " + s.opts.slot_name + ": waited " +
+                                         std::to_string(waited.count() / 1000) +
+                                         " s for transactions open on the server to finish; the "
+                                         "slot is consistent only once they do");
+                }
+            };
+            ResultPtr r = run_command(creator.get(),
+                                      create_sql,
+                                      s.cancel,
+                                      std::nullopt,
+                                      "CREATE_REPLICATION_SLOT",
+                                      waiting);
+            if (!r || PQresultStatus(r.get()) != PGRES_TUPLES_OK) {
+                const std::string err =
+                    r ? PQresultErrorMessage(r.get()) : PQerrorMessage(creator.get());
+                throw std::runtime_error("postgres_cdc: CREATE_REPLICATION_SLOT failed: " + err);
+            }
+            std::string consistent_point;
+            std::string snapshot_name;
+            for (int c = 0; c < PQnfields(r.get()); ++c) {
+                const std::string_view name = PQfname(r.get(), c);
+                if (name == "consistent_point") {
+                    consistent_point = cell(r.get(), 0, c);
+                } else if (name == "snapshot_name") {
+                    snapshot_name = cell(r.get(), 0, c);
+                }
+            }
+            const auto cp = cdc::parse_lsn(consistent_point);
+            if (!cp) {
+                throw std::runtime_error(
+                    "postgres_cdc: CREATE_REPLICATION_SLOT returned no consistent point");
+            }
+            s.confirmed.store(*cp);
+            s.cursor.start(*cp, std::nullopt);
+            clink::log::info(kLog,
+                             "created replication slot " + s.opts.slot_name +
+                                 " at consistent point " + consistent_point);
+            CLINK_FAULT_POINT(cdc::points::kAfterSlotCreated);
+            if (want_snapshot) {
+                s.snapshot_from = *cp;
+                // The exported snapshot lives only while `creator` runs no
+                // other command, so it is imported before anything else.
+                begin_snapshot_(snapshot_name);
+                plan = "new slot; snapshot bound to the slot's export, streaming from " +
+                       consistent_point + " afterwards";
+            } else {
+                s.phase = Impl::Phase::Stream;
+                plan = "new slot; streaming from " + consistent_point;
             }
         } else {
-            const std::string err = PQerrorMessage(impl_->conn);
-            PQclear(r);
-            if (err.find("already exists") == std::string::npos) {
-                PQfinish(impl_->conn);
-                impl_->conn = nullptr;
-                throw std::runtime_error("PostgresCdcSource: CREATE_REPLICATION_SLOT failed: " +
-                                         err);
+            check_slot(slot, s.opts, std::nullopt);
+            admin.reset();
+            s.confirmed.store(slot.confirmed_flush);
+            s.cursor.start(slot.confirmed_flush, std::nullopt);
+            if (want_snapshot) {
+                s.snapshot_from = slot.confirmed_flush;
+                begin_snapshot_("");
+                plan = "existing slot; snapshot taken fresh, streaming from the slot's position " +
+                       format_lsn(slot.confirmed_flush) +
+                       " afterwards (changes the snapshot already holds are replayed after it)";
+            } else {
+                s.phase = Impl::Phase::Stream;
+                plan = "existing slot; streaming from its position " +
+                       format_lsn(slot.confirmed_flush);
             }
-            // Slot existed; if user asked for a snapshot they don't get one.
+        }
+        clink::log::info(
+            kLog,
+            "postgres cdc source open: slot=" + s.opts.slot_name + " plugin=" + s.opts.plugin +
+                " table=" + (s.opts.table.empty() ? std::string{"(all published)"} : s.opts.table) +
+                " plan: " + plan);
+        if (s.phase == Impl::Phase::Stream) {
+            start_or_retry_();
+        }
+    } catch (const Cancelled&) {
+        s.snap.reset();
+        s.repl.reset();
+        s.opened_cancelled = true;
+    }
+}
+
+// Open the snapshot transaction and its first cursor. `snapshot_name` set
+// imports the slot's exported snapshot (the exact boundary); empty takes a
+// fresh repeatable-read snapshot.
+void PostgresCdcSource::begin_snapshot_(const std::string& snapshot_name) {
+    auto& s = *impl_;
+    s.snap = connect_cancellable(s.opts, false, s.cancel, "snapshot");
+    run_ok(s.snap.get(),
+           "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+           s.cancel,
+           kCatalogLimit,
+           "starting the snapshot transaction");
+    s.snapshot_exact = !snapshot_name.empty();
+    if (s.snapshot_exact) {
+        run_ok(s.snap.get(),
+               "SET TRANSACTION SNAPSHOT " + quote_literal(snapshot_name),
+               s.cancel,
+               kCatalogLimit,
+               "importing the slot's snapshot");
+    }
+    s.snap_query = 0;
+    s.snapshot_rows = 0;
+    s.snapshot_started = Clock::now();
+    run_ok(s.snap.get(),
+           std::string{"DECLARE "} + kSnapshotCursor + " NO SCROLL CURSOR FOR " +
+               s.opts.initial_snapshot[0].query,
+           s.cancel,
+           kCatalogLimit,
+           "opening the snapshot query");
+    s.snap_cursor_open = true;
+    s.phase = Impl::Phase::Snapshot;
+    s.snapshot_active.store(true);
+}
+
+// ---------------------------------------------------------------------
+// streaming
+// ---------------------------------------------------------------------
+
+void PostgresCdcSource::start_streaming_() {
+    auto& s = *impl_;
+    if (!s.repl) {
+        s.repl = connect_cancellable(s.opts, true, s.cancel, "replication");
+        if (!s.tls_reported) {
+            clink::connectors::pg::assert_no_silent_downgrade(
+                s.repl.get(), s.opts.conninfo, "postgres_cdc_source");
+            s.tls_reported = true;
         }
     }
+    const std::uint64_t from = s.cursor.resume_lsn();
+    std::string sql =
+        "START_REPLICATION SLOT " + quote_ident(s.opts.slot_name) + " LOGICAL " + format_lsn(from);
+    if (s.opts.plugin == "pgoutput") {
+        sql += " (proto_version " + quote_literal(std::to_string(s.opts.proto_version)) +
+               ", publication_names " + quote_literal(s.opts.publication_names) + ")";
+    }
+    ResultPtr r =
+        run_command(s.repl.get(), sql, s.cancel, s.opts.connect_timeout, "START_REPLICATION");
+    if (!r || PQresultStatus(r.get()) != PGRES_COPY_BOTH) {
+        const std::string err = r ? PQresultErrorMessage(r.get()) : PQerrorMessage(s.repl.get());
+        s.repl.reset();
+        if (err.find("does not exist") != std::string::npos ||
+            err.find("can no longer get changes") != std::string::npos ||
+            err.find("has already been removed") != std::string::npos ||
+            err.find("invalidated") != std::string::npos) {
+            throw cdc::HistoryUnavailable("postgres_cdc: START_REPLICATION from " +
+                                          format_lsn(from) + " refused: " + err);
+        }
+        throw std::runtime_error("postgres_cdc: START_REPLICATION from " + format_lsn(from) +
+                                 " failed: " + err);
+    }
+    s.streaming = true;
+    s.phase = Impl::Phase::Stream;
+    s.start_position_lsn = format_lsn(from);
+    s.pgoutput.reset_relations();
+    s.last_inbound = Clock::now();
+    s.last_status_send = Clock::now();
+    CLINK_FAULT_POINT(cdc::points::kStreamStarted);
+}
 
-    // #60: a checkpointed LSN (restored before open()) takes priority - resume
-    // the stream from exactly where the last checkpoint left off. Otherwise a
-    // freshly-created slot streams from its consistent_point; an existing slot
-    // resumes from its server-side confirmed_flush_lsn ("0/0" asks for that).
-    std::string start_lsn;
-    if (impl_->restored_from_checkpoint && impl_->received_lsn > 0) {
-        start_lsn = format_lsn(impl_->received_lsn);
-    } else if (slot_was_created && !impl_->consistent_point_lsn.empty()) {
-        start_lsn = impl_->consistent_point_lsn;
-    } else {
-        start_lsn = "0/0";
+// Start streaming now, or - when the failure is one a retry can cure, such
+// as the slot still held by the session of a consumer that just died - hand
+// over to the bounded reconnect loop in produce().
+void PostgresCdcSource::start_or_retry_() {
+    try {
+        start_streaming_();
+    } catch (const cdc::HistoryUnavailable&) {
+        throw;
+    } catch (const Cancelled&) {
+        throw;
+    } catch (const std::exception& e) {
+        connection_lost_(e.what());
     }
-    impl_->start_position_lsn = start_lsn;
-    std::string start_sql =
-        "START_REPLICATION SLOT \"" + impl_->opts.slot_name + "\" LOGICAL " + start_lsn;
-    if (impl_->opts.plugin == "pgoutput") {
-        start_sql += " (proto_version '" + std::to_string(impl_->opts.proto_version) +
-                     "', publication_names '" + impl_->opts.publication_names + "')";
+}
+
+void PostgresCdcSource::connection_lost_(const std::string& reason) {
+    auto& s = *impl_;
+    s.repl.reset();
+    s.streaming = false;
+    s.lost_reason = reason;
+    clink::metrics::connector::error_inc(kMetricsName, "source");
+    if (s.opts.reconnect_timeout.count() == 0) {
+        throw std::runtime_error("postgres_cdc: replication connection lost (" + reason +
+                                 ") and reconnect_timeout is 0");
     }
-    PGresult* r = PQexec(impl_->conn, start_sql.c_str());
-    if (PQresultStatus(r) != PGRES_COPY_BOTH) {
-        const std::string err = PQerrorMessage(impl_->conn);
-        PQclear(r);
-        PQfinish(impl_->conn);
-        impl_->conn = nullptr;
-        throw std::runtime_error("PostgresCdcSource: START_REPLICATION failed: " + err);
+    if (!s.reconnect_deadline) {
+        s.reconnect_deadline = Clock::now() + s.opts.reconnect_timeout;
+        s.next_reconnect = Clock::now();
+        s.reconnect_backoff = std::chrono::milliseconds{200};
+        clink::log::warn(kLog,
+                         "replication connection lost (" + reason + "); resuming from " +
+                             format_lsn(s.cursor.resume_lsn()) + " within " +
+                             std::to_string(s.opts.reconnect_timeout.count()) + " ms");
     }
-    PQclear(r);
-    impl_->started = true;
-    impl_->last_status_send = std::chrono::steady_clock::now();
+}
+
+bool PostgresCdcSource::reconnect_step_() {
+    auto& s = *impl_;
+    const auto now = Clock::now();
+    if (now < s.next_reconnect) {
+        std::this_thread::sleep_for(std::min<Clock::duration>(s.next_reconnect - now, kWaitTick));
+        return false;
+    }
+    if (s.reconnect_deadline && now >= *s.reconnect_deadline) {
+        throw std::runtime_error(
+            "postgres_cdc: lost the replication connection and could not resume "
+            "within " +
+            std::to_string(s.opts.reconnect_timeout.count()) + " ms; last error: " + s.lost_reason);
+    }
+    try {
+        // The slot is checked before every resume: PostgreSQL would start a
+        // slot confirmed past our position at its own position instead.
+        ConnPtr admin = connect_cancellable(s.opts, false, s.cancel, "postgres_cdc_source");
+        const SlotInfo slot = read_slot(admin.get(), s.opts.slot_name, s.cancel);
+        admin.reset();
+        check_slot(slot, s.opts, s.cursor.resume_lsn());
+        s.cursor.start(s.cursor.resume_lsn(), s.cursor.interrupted());
+        start_streaming_();
+    } catch (const cdc::HistoryUnavailable&) {
+        throw;
+    } catch (const Cancelled&) {
+        return false;
+    } catch (const std::exception& e) {
+        s.repl.reset();
+        s.lost_reason = e.what();
+        s.next_reconnect = Clock::now() + s.reconnect_backoff;
+        s.reconnect_backoff = std::min(s.reconnect_backoff * 2, std::chrono::milliseconds{5000});
+        return false;
+    }
+    clink::log::info(kLog,
+                     "replication resumed at " + s.start_position_lsn + " after: " + s.lost_reason);
+    s.reconnect_deadline.reset();
+    return true;
 }
 
 bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
-    if (this->cancelled() || impl_->cancel.load() || impl_->conn == nullptr) {
+    auto& s = *impl_;
+    if (this->cancelled() || s.cancel.load() || s.opened_cancelled) {
         return false;
+    }
+    try {
+        if (s.phase == Impl::Phase::Snapshot) {
+            return produce_snapshot_(out);
+        }
+        return produce_stream_(out);
+    } catch (const Cancelled&) {
+        return false;
+    }
+}
+
+bool PostgresCdcSource::produce_snapshot_(Emitter<CdcEvent>& out) {
+    auto& s = *impl_;
+    const auto& q = s.opts.initial_snapshot[s.snap_query];
+    ResultPtr r = run_ok(
+        s.snap.get(),
+        "FETCH FORWARD " + std::to_string(s.opts.snapshot_batch_rows) + " FROM " + kSnapshotCursor,
+        s.cancel,
+        std::nullopt,
+        "reading the snapshot of " + q.table);
+    const int nrows = PQntuples(r.get());
+    if (nrows == 0) {
+        run_ok(s.snap.get(),
+               std::string{"CLOSE "} + kSnapshotCursor,
+               s.cancel,
+               kCatalogLimit,
+               "closing the snapshot query");
+        s.snap_cursor_open = false;
+        if (++s.snap_query < s.opts.initial_snapshot.size()) {
+            run_ok(s.snap.get(),
+                   std::string{"DECLARE "} + kSnapshotCursor + " NO SCROLL CURSOR FOR " +
+                       s.opts.initial_snapshot[s.snap_query].query,
+                   s.cancel,
+                   kCatalogLimit,
+                   "opening the snapshot query");
+            s.snap_cursor_open = true;
+            return true;
+        }
+        run_ok(s.snap.get(), "COMMIT", s.cancel, kCatalogLimit, "ending the snapshot transaction");
+        s.snap.reset();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                                              s.snapshot_started);
+        clink::log::info(kLog,
+                         "snapshot complete: " + std::to_string(s.snapshot_rows) + " rows in " +
+                             std::to_string(ms.count()) + " ms (" +
+                             (s.snapshot_exact ? "exact" : "fresh") + "); streaming from " +
+                             format_lsn(s.cursor.resume_lsn()));
+        s.snapshot_active.store(false);
+        s.phase = Impl::Phase::Stream;
+        CLINK_FAULT_POINT(cdc::points::kSnapshotDone);
+        start_or_retry_();
+        return true;
+    }
+    const int ncols = PQnfields(r.get());
+    std::vector<std::string> names;
+    std::vector<std::string> types;
+    names.reserve(static_cast<std::size_t>(ncols));
+    types.reserve(static_cast<std::size_t>(ncols));
+    for (int c = 0; c < ncols; ++c) {
+        names.emplace_back(PQfname(r.get(), c));
+        const char* nm = lookup_builtin_type_name(static_cast<std::uint32_t>(PQftype(r.get(), c)));
+        types.emplace_back(nm != nullptr ? nm : "");
+    }
+    const std::string lsn = format_lsn(s.snapshot_from);
+    Batch<CdcEvent> batch;
+    std::uint64_t bytes = 0;
+    for (int row = 0; row < nrows; ++row) {
+        CdcEvent ev;
+        ev.op = CdcEvent::Op::Insert;
+        ev.table = q.table;
+        ev.lsn = lsn;
+        ev.values.reserve(static_cast<std::size_t>(ncols));
+        for (int c = 0; c < ncols; ++c) {
+            CdcField f;
+            f.name = names[static_cast<std::size_t>(c)];
+            f.type = types[static_cast<std::size_t>(c)];
+            if (PQgetisnull(r.get(), row, c) != 0) {
+                f.is_null = true;
+            } else {
+                f.value = cell(r.get(), row, c);
+                bytes += f.value.size();
+            }
+            ev.values.push_back(std::move(f));
+        }
+        batch.emplace(std::move(ev));
+    }
+    s.snapshot_rows += static_cast<std::uint64_t>(nrows);
+    out.emit_data(std::move(batch));
+    clink::metrics::connector::records_in_inc(kMetricsName, static_cast<std::uint64_t>(nrows));
+    clink::metrics::connector::bytes_in_inc(kMetricsName, bytes);
+    CLINK_FAULT_POINT(cdc::points::kSnapshotBatch);
+    return true;
+}
+
+bool PostgresCdcSource::produce_stream_(Emitter<CdcEvent>& out) {
+    auto& s = *impl_;
+    if (!s.streaming) {
+        if (!reconnect_step_()) {
+            return true;
+        }
     }
 
     Batch<CdcEvent> batch;
-
-    // Drain any snapshot rows queued during open() first.
-    while (!impl_->snapshot_backlog.empty() && batch.size() < std::size_t{256}) {
-        batch.emplace(std::move(impl_->snapshot_backlog.front()));
-        impl_->snapshot_backlog.pop_front();
-    }
-    if (!impl_->snapshot_backlog.empty()) {
-        const auto sz = batch.size();
-        out.emit_data(std::move(batch));
-        clink::metrics::connector::records_in_inc("postgres_cdc", sz);
-        return true;  // back to top of loop next iter
-    }
-
-    // Drain whatever is currently available on the replication stream
-    // without blocking.
     std::uint64_t bytes = 0;
-    // Surface whatever we decoded THIS call (emitted batch + byte/drop counters).
-    // Used both on the normal loop exit and before an EOF/connection-drop early
-    // return, so a partially-drained batch and its metrics are never discarded.
-    auto surface_decoded = [&]() {
-        if (!batch.empty()) {
-            const auto sz = batch.size();
-            out.emit_data(std::move(batch));
-            clink::metrics::connector::records_in_inc("postgres_cdc", sz);
-        }
-        if (bytes > 0) {
-            clink::metrics::connector::bytes_in_inc("postgres_cdc", bytes);
-        }
-        // Surface any change events the decoder had to DROP (unknown relation /
-        // truncated tuple) - otherwise-silent data loss is now counted + flagged.
-        if (impl_->pgoutput_state.dropped_data_events > impl_->last_dropped) {
-            const std::uint64_t delta =
-                impl_->pgoutput_state.dropped_data_events - impl_->last_dropped;
-            impl_->last_dropped = impl_->pgoutput_state.dropped_data_events;
-            clink::metrics::connector::dropped_events_inc("postgres_cdc", delta);
-            clink::metrics::connector::error_inc("postgres_cdc", "source");
-            // Fail policy: do not silently drop - throw so the subtask restarts and
-            // replays from the slot (the undecodable event is retried, not lost).
-            if (impl_->opts.decode_error_policy == DecodeErrorPolicy::Fail) {
-                throw std::runtime_error("postgres_cdc: " + std::to_string(delta) +
-                                         " undecodable change event(s) and on_decode_error=fail");
-            }
+    std::string fail_after_emit;
+    bool waited = false;
+
+    const auto take = [&](std::vector<CdcEvent>& events) {
+        for (auto& ev : events) {
+            batch.emplace(std::move(ev));
         }
     };
-    while (true) {
-        if (this->cancelled() || impl_->cancel.load()) {
+
+    while (batch.size() < s.opts.max_batch_events && s.streaming) {
+        if (s.cancel.load()) {
             break;
         }
         char* buffer = nullptr;
-        const int n = PQgetCopyData(impl_->conn, &buffer, /*async*/ 1);
+        const int n = PQgetCopyData(s.repl.get(), &buffer, /*async=*/1);
         if (n == 0) {
-            if (PQconsumeInput(impl_->conn) == 0) {
-                surface_decoded();  // flush what we decoded before the EOF
-                return false;
+            if (waited || !batch.empty()) {
+                break;
             }
-            break;
+            waited = true;
+            if (wait_socket(s.repl.get(), false, s.opts.poll_interval) &&
+                PQconsumeInput(s.repl.get()) == 0) {
+                connection_lost_(PQerrorMessage(s.repl.get()));
+            }
+            continue;
         }
         if (n == -1) {
-            if (buffer != nullptr) {
-                PQfreemem(buffer);
-            }
-            surface_decoded();  // flush what we decoded before the stream end
-            return false;
+            // The server ended the COPY stream: a shutdown, a terminated
+            // walsender, a failover. Never the end of the change stream.
+            ResultPtr res{PQgetResult(s.repl.get())};
+            const std::string why = res ? PQresultErrorMessage(res.get()) : std::string{};
+            connection_lost_("the server ended the replication stream" +
+                             (why.empty() ? std::string{} : ": " + why));
+            break;
         }
         if (n == -2) {
-            const std::string err = PQerrorMessage(impl_->conn);
-            if (buffer != nullptr) {
-                PQfreemem(buffer);
-            }
-            throw std::runtime_error("PostgresCdcSource: PQgetCopyData failed: " + err);
+            connection_lost_(PQerrorMessage(s.repl.get()));
+            break;
         }
-
-        if (n >= 1) {
-            const char type_byte = buffer[0];
-            if (type_byte == 'w' && n >= 25) {
-                // XLogData: dataStart (8), walEnd (8), sendTime (8), payload.
-                const std::uint64_t data_start = read_be64(buffer + 1);
-                impl_->received_lsn = std::max(impl_->received_lsn, data_start);
-                const std::string_view payload(buffer + 25, static_cast<std::size_t>(n) - 25);
-                bytes += payload.size();
-                std::optional<CdcEvent> ev;
-                if (impl_->opts.plugin == "test_decoding") {
-                    ev = parse_test_decoding(payload, format_lsn(data_start));
-                } else {
-                    ev = impl_->pgoutput_state.on_message(payload, format_lsn(data_start));
+        std::unique_ptr<char, void (*)(void*)> owned{buffer, PQfreemem};
+        s.last_inbound = Clock::now();
+        const char type_byte = buffer[0];
+        if (type_byte == 'w' && n >= 25) {
+            // XLogData: dataStart (8), walEnd (8), sendTime (8), payload.
+            const std::uint64_t data_start = read_be64(buffer + 1);
+            s.received_lsn = std::max(s.received_lsn, data_start);
+            const std::string_view payload(buffer + 25, static_cast<std::size_t>(n) - 25);
+            bytes += payload.size();
+            const std::string lsn = format_lsn(data_start);
+            if (s.opts.plugin == "pgoutput") {
+                Decoded d = s.pgoutput.on_message(payload, lsn);
+                switch (d.kind) {
+                    case Decoded::Kind::Begin:
+                        if (s.cursor.on_begin(d.final_lsn)) {
+                            take(d.events);
+                        }
+                        break;
+                    case Decoded::Kind::Commit:
+                        s.cursor.on_commit(d.end_lsn);
+                        take(d.events);
+                        break;
+                    case Decoded::Kind::Change:
+                        if (!d.target) {
+                            break;
+                        }
+                        if (!s.cursor.on_change()) {
+                            break;  // emitted before the restart
+                        }
+                        if (d.dropped) {
+                            if (s.opts.decode_error_policy == DecodeErrorPolicy::Fail) {
+                                fail_after_emit = d.error;
+                            } else {
+                                clink::log::warn(kLog, "dropped an undecodable change: " + d.error);
+                            }
+                            break;
+                        }
+                        take(d.events);
+                        break;
+                    case Decoded::Kind::None:
+                        break;
                 }
-                if (ev.has_value()) {
-                    batch.emplace(std::move(*ev));
-                }
-            } else if (type_byte == 'k' && n >= 18) {
-                // PrimaryKeepalive: walEnd (8), sendTime (8), replyRequested (1).
-                const std::uint64_t wal_end = read_be64(buffer + 1);
-                impl_->received_lsn = std::max(impl_->received_lsn, wal_end);
-                const bool reply_requested = buffer[17] != 0;
-                if (reply_requested) {
-                    if (!send_standby_status_update(impl_->conn, impl_->received_lsn, false)) {
-                        // A failed feedback stalls confirmed_flush_lsn and bloats
-                        // server WAL - make it observable rather than swallow it.
-                        clink::metrics::connector::error_inc("postgres_cdc", "source");
-                    }
-                    impl_->last_status_send = std::chrono::steady_clock::now();
+            } else {
+                CdcEvent ev = parse_test_decoding(payload, lsn);
+                const bool target = s.opts.table.empty() || ev.table == s.opts.table;
+                switch (ev.op) {
+                    case CdcEvent::Op::Begin:
+                        if (s.cursor.on_begin(static_cast<std::uint64_t>(ev.xid))) {
+                            batch.emplace(std::move(ev));
+                        }
+                        break;
+                    case CdcEvent::Op::Commit:
+                        // test_decoding's COMMIT arrives at the end of the
+                        // commit record, which is where a resume starts.
+                        s.cursor.on_commit(data_start);
+                        batch.emplace(std::move(ev));
+                        break;
+                    default:
+                        if (target && s.cursor.on_change()) {
+                            batch.emplace(std::move(ev));
+                        }
+                        break;
                 }
             }
+            if (!fail_after_emit.empty()) {
+                break;
+            }
+        } else if (type_byte == 'k' && n >= 18) {
+            // PrimaryKeepalive: walEnd (8), sendTime (8), replyRequested (1).
+            const std::uint64_t wal_end = read_be64(buffer + 1);
+            s.received_lsn = std::max(s.received_lsn, wal_end);
+            s.cursor.on_keepalive(wal_end);
+            if (buffer[17] != 0) {
+                send_status_(/*reply_requested=*/false);
+            }
         }
-        PQfreemem(buffer);
     }
 
-    surface_decoded();
+    if (!batch.empty()) {
+        const auto sz = batch.size();
+        out.emit_data(std::move(batch));
+        clink::metrics::connector::records_in_inc(kMetricsName, sz);
+        CLINK_FAULT_POINT(cdc::points::kStreamBatch);
+    }
+    if (bytes > 0) {
+        clink::metrics::connector::bytes_in_inc(kMetricsName, bytes);
+    }
+    // Surface any change events the decoder had to DROP (unknown relation /
+    // truncated tuple) - otherwise-silent data loss is counted + flagged.
+    if (s.pgoutput.dropped_data_events > s.last_dropped) {
+        const std::uint64_t delta = s.pgoutput.dropped_data_events - s.last_dropped;
+        s.last_dropped = s.pgoutput.dropped_data_events;
+        clink::metrics::connector::dropped_events_inc(kMetricsName, delta);
+        clink::metrics::connector::error_inc(kMetricsName, "source");
+    }
+    if (!fail_after_emit.empty()) {
+        // Fail policy: never move past the event. The job restarts from its
+        // last checkpoint, which this event lies after, and meets it again.
+        throw std::runtime_error("postgres_cdc: " + fail_after_emit + " (on_decode_error=fail)");
+    }
     // received_lsn doubles as a consumer-lag-proxy: how far behind WAL
     // the source is. There's no server-side current LSN cheaply
     // available from libpq's replication protocol, so we publish the
-    // confirmed received LSN as the gauge and dashboards diff against
-    // a separate server probe.
-    clink::metrics::connector::consumer_lag_set("postgres_cdc",
-                                                static_cast<std::int64_t>(impl_->received_lsn));
+    // received LSN as the gauge and dashboards diff against a separate
+    // server probe.
+    clink::metrics::connector::consumer_lag_set(kMetricsName,
+                                                static_cast<std::int64_t>(s.received_lsn));
 
-    // Periodic Standby Status Update - keeps the slot's confirmed_flush_lsn
-    // moving forward so the server can free old WAL.
-    if (impl_->opts.standby_status_interval.count() > 0) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now - impl_->last_status_send >= impl_->opts.standby_status_interval) {
-            if (!send_standby_status_update(impl_->conn, impl_->received_lsn, false)) {
-                clink::metrics::connector::error_inc("postgres_cdc", "source");
-            }
-            impl_->last_status_send = now;
+    if (!s.streaming) {
+        return true;
+    }
+    const auto now = Clock::now();
+    if (s.ledger.confirmable() > s.confirmed.load()) {
+        send_status_(/*reply_requested=*/false);
+    } else if (s.opts.standby_status_interval.count() > 0 &&
+               now - s.last_status_send >= s.opts.standby_status_interval) {
+        // Ask for an answer: on a quiet stream the answer is the only sign the
+        // connection still works.
+        send_status_(/*reply_requested=*/true);
+    }
+    if (s.streaming && s.opts.standby_status_interval.count() > 0) {
+        const auto silent_for =
+            std::max<Clock::duration>(std::chrono::seconds{30}, s.opts.standby_status_interval * 3);
+        if (now - s.last_inbound > silent_for) {
+            connection_lost_(
+                "no message from the server for " +
+                std::to_string(
+                    std::chrono::duration_cast<std::chrono::seconds>(silent_for).count()) +
+                " s");
         }
     }
-
-    std::this_thread::sleep_for(impl_->opts.poll_interval);
     return true;
+}
+
+void PostgresCdcSource::send_status_(bool reply_requested) {
+    auto& s = *impl_;
+    if (!s.streaming || !s.repl) {
+        return;
+    }
+    const std::uint64_t before = s.confirmed.load();
+    const std::uint64_t flush = std::max(before, s.ledger.confirmable());
+    if (!send_standby_status_update(s.repl.get(), s.received_lsn, flush, reply_requested)) {
+        connection_lost_(std::string{"could not send a status update: "} +
+                         PQerrorMessage(s.repl.get()));
+        return;
+    }
+    s.last_status_send = Clock::now();
+    if (flush > before) {
+        s.confirmed.store(flush);
+        clink::log::debug(
+            kLog, "confirmed " + format_lsn(flush) + " to replication slot " + s.opts.slot_name);
+        CLINK_FAULT_POINT(cdc::points::kWalConfirmed);
+    }
 }
 
 void PostgresCdcSource::cancel() {
@@ -812,15 +1989,25 @@ std::string PostgresCdcSource::start_position() const {
     return impl_ != nullptr ? impl_->start_position_lsn : std::string{};
 }
 
+bool PostgresCdcSource::snapshot_in_progress() const noexcept {
+    return impl_ != nullptr && impl_->snapshot_active.load();
+}
+
+std::uint64_t PostgresCdcSource::confirmed_lsn() const noexcept {
+    return impl_ != nullptr ? impl_->confirmed.load() : 0;
+}
+
 void PostgresCdcSource::close() {
-    if (impl_ != nullptr && impl_->conn != nullptr) {
-        PQfinish(impl_->conn);
-        impl_->conn = nullptr;
-        impl_->started = false;
+    if (impl_ == nullptr) {
+        return;
     }
-    // Auto-drop the slot if requested. Done after PQfinish so the server
-    // has released the slot's session lock.
-    if (impl_ != nullptr && impl_->opts.drop_slot_on_close) {
+    impl_->snap.reset();
+    impl_->repl.reset();
+    impl_->streaming = false;
+    impl_->snapshot_active.store(false);
+    // Auto-drop the slot if requested. Done after the session ends so the
+    // server has released the slot.
+    if (impl_->opts.drop_slot_on_close) {
         try {
             drop_slot();
         } catch (...) {
@@ -830,65 +2017,110 @@ void PostgresCdcSource::close() {
     }
 }
 
-namespace {
-constexpr const char* kPostgresCdcLsnKey = "__postgres_cdc_lsn__";
-}  // namespace
+// ---------------------------------------------------------------------
+// checkpoints
+// ---------------------------------------------------------------------
 
-void PostgresCdcSource::snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId) {
-    const std::uint64_t cursor = impl_->received_lsn;
-    std::array<std::byte, 8> bytes{};
-    for (int i = 0; i < 8; ++i) {
-        bytes[static_cast<std::size_t>(i)] = static_cast<std::byte>((cursor >> (i * 8)) & 0xFF);
-    }
-    backend.put_operator_state(
-        op_id,
-        StateBackend::KeyView{kPostgresCdcLsnKey, std::strlen(kPostgresCdcLsnKey)},
-        StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+void PostgresCdcSource::snapshot_offset(StateBackend& backend,
+                                        OperatorId op_id,
+                                        CheckpointId ckpt) {
+    auto& s = *impl_;
+    const auto phase = s.phase == Impl::Phase::Snapshot ? cdc::Phase::Snapshot : cdc::Phase::Stream;
+    const cdc::CursorState state = s.cursor.state(phase);
+    const auto bytes = cdc::encode_cursor(state);
+    backend.put_operator_state(op_id,
+                               StateBackend::KeyView{kCursorKey, std::strlen(kCursorKey)},
+                               StateBackend::ValueView{bytes.data(), bytes.size()});
+    s.ledger.record(ckpt.value(), state.resume_lsn);
+    CLINK_FAULT_POINT(cdc::points::kOffsetRecorded);
 }
 
 bool PostgresCdcSource::restore_offset(StateBackend& backend, OperatorId op_id) {
+    auto& s = *impl_;
+    if (auto v = backend.get_operator_state(
+            op_id, StateBackend::KeyView{kCursorKey, std::strlen(kCursorKey)})) {
+        std::vector<char> bytes;
+        bytes.reserve(v->size());
+        for (const std::byte b : *v) {
+            bytes.push_back(static_cast<char>(b));
+        }
+        auto state = cdc::decode_cursor(bytes);
+        if (!state) {
+            throw std::runtime_error(
+                "postgres_cdc: the checkpoint holds a source position this "
+                "release cannot read (encoding version " +
+                std::to_string(bytes.empty() ? 0 : static_cast<std::uint8_t>(bytes[0])) + ")");
+        }
+        s.restored = *state;
+        seed_from_restore_();
+        return true;
+    }
+    // A checkpoint from a release that recorded the received LSN alone. It is
+    // a safe resume position (every transaction committed before it had been
+    // received) but may sit inside a transaction, which is then replayed from
+    // its start.
     auto v = backend.get_operator_state(
-        op_id, StateBackend::KeyView{kPostgresCdcLsnKey, std::strlen(kPostgresCdcLsnKey)});
+        op_id, StateBackend::KeyView{kLegacyLsnKey, std::strlen(kLegacyLsnKey)});
     if (!v.has_value() || v->size() < 8) {
         return false;
     }
     std::uint64_t restored = 0;
-    for (int i = 0; i < 8; ++i) {
+    for (std::size_t i = 0; i < 8; ++i) {
         restored |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
     }
-    impl_->received_lsn = restored;
-    impl_->restored_from_checkpoint = true;
+    cdc::CursorState state;
+    state.phase = cdc::Phase::Stream;
+    state.resume_lsn = restored;
+    s.restored = state;
+    seed_from_restore_();
+    clink::log::info(kLog,
+                     "restored a position recorded by an earlier release (" + format_lsn(restored) +
+                         "); a transaction interrupted by that checkpoint is replayed whole");
     return true;
 }
 
-void PostgresCdcSource::drop_slot() {
-    PGconn* admin = PQconnectdb(impl_->opts.conninfo.c_str());
-    if (PQstatus(admin) != CONNECTION_OK) {
-        const std::string err = PQerrorMessage(admin);
-        PQfinish(admin);
-        throw std::runtime_error("PostgresCdcSource::drop_slot: connect failed: " + err);
+// The restored position is the position until open() moves on from it, so a
+// checkpoint taken before then records it unchanged.
+void PostgresCdcSource::seed_from_restore_() {
+    auto& s = *impl_;
+    const auto& r = *s.restored;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> interrupted;
+    if (r.in_flight) {
+        interrupted = std::make_pair(r.txn_id, r.txn_changes);
     }
+    s.cursor.start(r.resume_lsn, interrupted);
+    s.phase = r.phase == cdc::Phase::Snapshot ? Impl::Phase::Snapshot : Impl::Phase::Stream;
+}
+
+void PostgresCdcSource::notify_checkpoint_complete(CheckpointId ckpt) {
+    impl_->ledger.complete(ckpt.value());
+}
+
+void PostgresCdcSource::notify_checkpoint_aborted(CheckpointId ckpt) {
+    impl_->ledger.abort(ckpt.value());
+}
+
+void PostgresCdcSource::drop_slot() {
+    std::atomic<bool> never{false};
+    ConnPtr admin = connect_cancellable(impl_->opts, false, never, "drop_slot");
 
     // Postgres briefly reports the slot as "in use" right after the
     // session that held it disconnects; retry a few times before giving
     // up. This is the same pattern Debezium uses for slot teardown.
-    const std::string sql = "SELECT pg_drop_replication_slot('" + impl_->opts.slot_name + "')";
+    const std::string sql =
+        "SELECT pg_drop_replication_slot(" + quote_literal(impl_->opts.slot_name) + ")";
     constexpr int attempts = 10;
     std::string last_err;
     for (int i = 0; i < attempts; ++i) {
-        PGresult* r = PQexec(admin, sql.c_str());
-        const auto status = PQresultStatus(r);
+        ResultPtr r{PQexec(admin.get(), sql.c_str())};
+        const auto status = PQresultStatus(r.get());
         if (status == PGRES_TUPLES_OK || status == PGRES_COMMAND_OK) {
-            PQclear(r);
-            PQfinish(admin);
             return;
         }
-        last_err = PQerrorMessage(admin);
-        PQclear(r);
+        last_err = PQerrorMessage(admin.get());
 
         // Slot doesn't exist → treat as success (idempotent).
         if (last_err.find("does not exist") != std::string::npos) {
-            PQfinish(admin);
             return;
         }
         if (last_err.find("is active") == std::string::npos) {
@@ -897,8 +2129,6 @@ void PostgresCdcSource::drop_slot() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{50});
     }
-
-    PQfinish(admin);
     throw std::runtime_error("PostgresCdcSource::drop_slot: " + last_err);
 }
 
@@ -927,12 +2157,20 @@ void PostgresCdcSource::cancel() {
 std::string PostgresCdcSource::start_position() const {
     return {};
 }
+bool PostgresCdcSource::snapshot_in_progress() const noexcept {
+    return false;
+}
+std::uint64_t PostgresCdcSource::confirmed_lsn() const noexcept {
+    return 0;
+}
 void PostgresCdcSource::close() {}
 void PostgresCdcSource::drop_slot() {}
 void PostgresCdcSource::snapshot_offset(StateBackend&, OperatorId, CheckpointId) {}
 bool PostgresCdcSource::restore_offset(StateBackend&, OperatorId) {
     return false;
 }
+void PostgresCdcSource::notify_checkpoint_complete(CheckpointId) {}
+void PostgresCdcSource::notify_checkpoint_aborted(CheckpointId) {}
 
 #endif
 

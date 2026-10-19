@@ -3400,4 +3400,115 @@ TEST(SqlBinder, ValidWindowFormsStillBind) {
         window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY HOP(ts, 10000, 10000)").empty());
 }
 
+// --- The PostgreSQL CDC table as an upsert changelog -------------------------
+//
+// changelog_mode='upsert' makes the CDC table a changelog keyed by its primary
+// key whose updates carry the new row only. A consumer that would need the old
+// row - a grouping, a join, a filter on a column an update can change - is
+// refused at bind time, as is a sink that does not apply rows by that key.
+
+namespace {
+
+Catalog cdc_catalog(const std::string& mode = "upsert") {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, status VARCHAR, amount DOUBLE) WITH ("
+        "connector='postgres', format='json', mode='cdc', changelog_mode='" +
+        mode +
+        "', conninfo='host=pg', slot_name='s', publication_names='p', \"table\"='public.orders');"
+        "CREATE TABLE replica (id BIGINT PRIMARY KEY, status VARCHAR, amount DOUBLE) WITH ("
+        "connector='postgres', format='json', mode='upsert', conninfo='host=pg', "
+        "\"table\"='public.replica');"
+        "CREATE TABLE renamed (order_id BIGINT PRIMARY KEY, status VARCHAR) WITH ("
+        "connector='postgres', format='json', mode='upsert', conninfo='host=pg', "
+        "\"table\"='public.renamed');"
+        "CREATE TABLE by_status (status VARCHAR PRIMARY KEY, id BIGINT) WITH ("
+        "connector='postgres', format='json', mode='upsert', conninfo='host=pg', "
+        "\"table\"='public.by_status');"
+        "CREATE TABLE totals (status VARCHAR PRIMARY KEY, n BIGINT) WITH ("
+        "connector='postgres', format='json', mode='upsert', conninfo='host=pg', "
+        "\"table\"='public.totals');"
+        "CREATE TABLE log_out (id BIGINT, status VARCHAR, amount DOUBLE) WITH ("
+        "connector='file', format='json', path='/tmp/log_out.ndjson');"
+        "CREATE TABLE shown (id BIGINT, status VARCHAR, amount DOUBLE) WITH (connector='print', "
+        "format='json')");
+    for (const auto& st : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    return cat;
+}
+
+// The bind error for `sql`, or empty when it bound.
+std::string cdc_bind_error(const Catalog& cat, const std::string& sql) {
+    Binder b(cat);
+    try {
+        (void)b.bind_insert(as_insert(parse(sql)));
+        return {};
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+}
+
+}  // namespace
+
+TEST(SqlBinderUpsertCdc, AnUpsertSinkKeyedLikeTheTableAppliesTheChangelog) {
+    const Catalog cat = cdc_catalog();
+    EXPECT_EQ(cdc_bind_error(cat, "INSERT INTO replica SELECT id, status, amount FROM orders"), "");
+    EXPECT_EQ(cdc_bind_error(cat, "INSERT INTO replica SELECT * FROM orders"), "");
+    // The key may be renamed, and other columns computed.
+    EXPECT_EQ(cdc_bind_error(cat,
+                             "INSERT INTO renamed SELECT id AS order_id, UPPER(status) AS "
+                             "status FROM orders"),
+              "");
+    // A condition on the key holds for every version of a row.
+    EXPECT_EQ(cdc_bind_error(cat, "INSERT INTO replica SELECT * FROM orders WHERE id > 10"), "");
+}
+
+TEST(SqlBinderUpsertCdc, AChangelogSinkWritesItVerbatim) {
+    EXPECT_EQ(cdc_bind_error(cdc_catalog(), "INSERT INTO shown SELECT * FROM orders"), "");
+}
+
+TEST(SqlBinderUpsertCdc, AConditionOnANonKeyColumnIsRefused) {
+    const std::string err = cdc_bind_error(
+        cdc_catalog(), "INSERT INTO replica SELECT * FROM orders WHERE status = 'paid'");
+    EXPECT_NE(err.find("status"), std::string::npos) << err;
+    EXPECT_NE(err.find("changelog_mode='append'"), std::string::npos) << err;
+}
+
+TEST(SqlBinderUpsertCdc, AGroupingOverItIsRefused) {
+    const std::string err = cdc_bind_error(
+        cdc_catalog(),
+        "INSERT INTO totals SELECT status, COUNT(*) AS n FROM orders GROUP BY status");
+    EXPECT_NE(err.find("upsert changelog"), std::string::npos) << err;
+    EXPECT_NE(err.find("Aggregate"), std::string::npos) << err;
+}
+
+TEST(SqlBinderUpsertCdc, ASinkKeyedByAnotherColumnIsRefused) {
+    const std::string err =
+        cdc_bind_error(cdc_catalog(), "INSERT INTO by_status SELECT status, id FROM orders");
+    EXPECT_NE(err.find("by_status"), std::string::npos) << err;
+    EXPECT_NE(err.find("(id)"), std::string::npos) << err;
+    // A computed key is not the table's key either.
+    EXPECT_NE(cdc_bind_error(cdc_catalog(),
+                             "INSERT INTO replica SELECT id + 1 AS id, status, amount FROM orders"),
+              "");
+}
+
+TEST(SqlBinderUpsertCdc, AnAppendOnlySinkIsRefusedWithTheAppendModeNamed) {
+    const std::string err =
+        cdc_bind_error(cdc_catalog(), "INSERT INTO log_out SELECT * FROM orders");
+    EXPECT_NE(err.find("append-only"), std::string::npos) << err;
+    EXPECT_NE(err.find("changelog_mode='append'"), std::string::npos) << err;
+}
+
+TEST(SqlBinderUpsertCdc, AppendModeIsAnAppendStream) {
+    const Catalog cat = cdc_catalog("append");
+    EXPECT_EQ(cdc_bind_error(cat, "INSERT INTO log_out SELECT * FROM orders WHERE status = 'paid'"),
+              "");
+    EXPECT_EQ(cdc_bind_error(cat,
+                             "INSERT INTO totals SELECT status, COUNT(*) AS n FROM orders "
+                             "GROUP BY status"),
+              "");
+}
+
 }  // namespace clink::sql

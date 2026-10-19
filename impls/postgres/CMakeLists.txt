@@ -34,6 +34,7 @@ add_library(clink_postgres STATIC
     src/postgres_source.cpp
     src/postgres_sink.cpp
     src/postgres_cdc_source.cpp
+    src/cdc_row_encoder.cpp
     src/postgres_decoder.cpp
     src/register_factories.cpp
 )

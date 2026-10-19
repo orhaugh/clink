@@ -864,6 +864,39 @@ TEST(SqlPhysical, PostgresCdcOnRowPathLowers) {
     EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);
 }
 
+// The CDC source reads one replication slot, so it runs as one subtask whatever
+// the job's parallelism, and so does every unkeyed operator behind it (its
+// changes stay in order per key). It carries the declared SQL types and the
+// key from a PRIMARY KEY constraint, which the contract converts and checks by.
+TEST(SqlPhysical, PostgresCdcSourceIsASingletonWithItsTypesAndKey) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE pg_in (id BIGINT PRIMARY KEY, amount DECIMAL(12, 2), at TIMESTAMP(3) WITH "
+        "TIME ZONE, name VARCHAR) WITH (connector='postgres', format='json', mode='cdc', "
+        "changelog_mode='append', conninfo='host=pg', slot_name='s', publication_names='p', "
+        "\"table\"='public.t');"
+        "CREATE TABLE out_f (id BIGINT, name VARCHAR) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT id, name FROM pg_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "postgres_cdc_source");
+    ASSERT_NE(src, nullptr);
+    EXPECT_TRUE(cluster::is_forced_singleton(*src));
+    EXPECT_EQ(src->parallelism, 1);
+    EXPECT_EQ(src->params.at("declared_types"),
+              "id:BIGINT;amount:DECIMAL(12, 2);at:TIMESTAMP(3) WITH TIME ZONE;name:VARCHAR");
+    EXPECT_EQ(src->params.at("primary_key"), "id");
+    // Unkeyed operators behind it are singletons too.
+    for (const auto& op : spec.ops) {
+        if (op.key_by.empty()) {
+            EXPECT_TRUE(cluster::is_forced_singleton(op)) << op.type << " fans out behind the slot";
+        }
+    }
+}
+
 // M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via
 // the row_to_json_string bridge, with format=jsoneachrow FORCED by the binding
 // (the SQL format='json' channel selector is stripped before the factory).

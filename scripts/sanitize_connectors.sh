@@ -7,7 +7,7 @@
 # /workspace), so no image rebuild is needed for a code-only run.
 #
 # Stands up: binlog+TLS mysql:8.0, TLS+plain redis:7 (self-signed cert), and a
-# logical-replication postgres:16, on a private docker network; tears them down
+# logical-replication PostgreSQL 16.15, on a private docker network; tears them down
 # on exit. The default connector set is http_connector/mysql/redis/postgres
 # (clink::aws is excluded - the image ships only the AWS SDK s3 component).
 #
@@ -47,7 +47,7 @@ if [ "${SKIP_SERVICES:-0}" != "1" ]; then
         redis-server --tls-port 6379 --port 6380 \
         --tls-cert-file /certs/redis.crt --tls-key-file /certs/redis.key \
         --tls-ca-cert-file /certs/redis.crt --tls-auth-clients no >/dev/null
-    docker run -d --name clink-san-pg --network "$NET" -e POSTGRES_PASSWORD=postgres postgres:16 \
+    docker run -d --name clink-san-pg --network "$NET" -e POSTGRES_PASSWORD=postgres postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d \
         -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 >/dev/null
 
     echo "waiting for mysql init..."

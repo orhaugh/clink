@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -2204,6 +2205,36 @@ std::optional<EquiJoinShape> match_equi_join(const ast::Expression& on,
 // in logical_plan.hpp).
 }  // namespace
 
+// The PostgreSQL CDC source in changelog_mode='upsert' (connector='postgres',
+// mode='cdc'): rows tagged insert, update_after and delete, keyed by the
+// table's primary key. An update carries the new row only, never the row it
+// replaced, so it is a changelog only to a consumer that applies rows by that
+// key.
+static bool is_upsert_cdc_scan(const LogicalPlan& node) {
+    if (node.kind() != "Scan") {
+        return false;
+    }
+    const auto& props = static_cast<const LogicalScan&>(node).table().properties;
+    const auto get = [&](const char* key) {
+        const auto it = props.find(key);
+        return it == props.end() ? std::string{} : it->second;
+    };
+    return get("connector") == "postgres" && get("mode") == "cdc" &&
+           get("changelog_mode") == "upsert";
+}
+
+static bool contains_upsert_cdc_scan(const LogicalPlan& node) {
+    if (is_upsert_cdc_scan(node)) {
+        return true;
+    }
+    for (const auto* in : node.inputs()) {
+        if (in != nullptr && contains_upsert_cdc_scan(*in)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // True when the subtree contains a stream that can RETRACT rows it has
 // already emitted once a changelog-consuming operator (equi join, stacked
 // aggregate) subscribes downstream. The unbounded (windowless) GROUP BY
@@ -2214,7 +2245,8 @@ std::optional<EquiJoinShape> match_equi_join(const ast::Expression& on,
 // there.
 static bool contains_updating_stream(const LogicalPlan& node) {
     const auto k = node.kind();
-    if (k == "Aggregate" || k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp") {
+    if (k == "Aggregate" || k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp" ||
+        is_upsert_cdc_scan(node)) {
         return true;
     }
     if (k == "WindowAggregate") {
@@ -2231,6 +2263,142 @@ static bool contains_updating_stream(const LogicalPlan& node) {
     }
     return false;
 }
+
+namespace {
+
+// Every column a predicate JSON names ("col" and "rhs_col" at any depth).
+void predicate_columns(const clink::config::JsonValue& v, std::set<std::string>& out) {
+    if (v.is_object()) {
+        for (const auto& [key, val] : v.as_object()) {
+            if ((key == "col" || key == "rhs_col") && val.is_string()) {
+                out.insert(val.as_string());
+            } else {
+                predicate_columns(val, out);
+            }
+        }
+    } else if (v.is_array()) {
+        for (const auto& e : v.as_array()) {
+            predicate_columns(e, out);
+        }
+    }
+}
+
+// The source column a projection output reads unchanged, or nullopt for a
+// computed output.
+std::optional<std::string> pure_column_ref(const std::string& expr_json) {
+    try {
+        const auto v = clink::config::parse(expr_json);
+        if (v.is_object() && v.as_object().size() == 1) {
+            const auto& [key, val] = *v.as_object().begin();
+            if (key == "col" && val.is_string()) {
+                return val.as_string();
+            }
+        }
+    } catch (const std::exception&) {
+    }
+    return std::nullopt;
+}
+
+// A consumer of an upsert changelog must apply its rows by the source's key:
+// an update carries no before-image, so anything that would retract the old
+// row - a grouping, a join, a filter on a column the update can change -
+// computes a wrong result. Allowed between the CDC table and the sink:
+// projections that keep each key column (renamed or not) and WHERE
+// conditions on key columns. The sink must apply rows by that same key
+// (mode='upsert' with it as primary key) or write the changelog verbatim.
+void check_upsert_cdc_consumers(const LogicalPlan& select_plan, const TableDef& sink, int pos) {
+    if (!contains_upsert_cdc_scan(select_plan)) {
+        return;
+    }
+    std::vector<const LogicalPlan*> chain;
+    const LogicalPlan* node = &select_plan;
+    while (!is_upsert_cdc_scan(*node)) {
+        const auto k = node->kind();
+        if ((k != "Project" && k != "Filter") || node->inputs().size() != 1) {
+            const LogicalPlan* scan = node;
+            while (!is_upsert_cdc_scan(*scan)) {
+                for (const auto* in : scan->inputs()) {
+                    if (in != nullptr && contains_upsert_cdc_scan(*in)) {
+                        scan = in;
+                        break;
+                    }
+                }
+            }
+            bind_error("table " + static_cast<const LogicalScan*>(scan)->table().name +
+                           " is an upsert changelog (changelog_mode='upsert'): its updates carry "
+                           "the new row only, so " +
+                           k +
+                           " over it would work from rows it can never retract. Declare it with "
+                           "changelog_mode='append' to work over the change log, or apply it to an "
+                           "upsert table first and query that",
+                       pos);
+        }
+        chain.push_back(node);
+        node = node->inputs()[0];
+    }
+    const auto& source = static_cast<const LogicalScan*>(node)->table();
+    const std::set<std::string> key(source.primary_key.begin(), source.primary_key.end());
+    // Output name -> the source column it carries unchanged, bottom up.
+    std::map<std::string, std::string> carries;
+    for (const auto& c : source.columns) {
+        carries[c.name] = c.name;
+    }
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if ((*it)->kind() == "Filter") {
+            std::set<std::string> cols;
+            try {
+                predicate_columns(
+                    clink::config::parse(static_cast<const LogicalFilter*>(*it)->predicate_json()),
+                    cols);
+            } catch (const std::exception&) {
+                cols.insert("(an expression)");
+            }
+            for (const auto& c : cols) {
+                const auto m = carries.find(c);
+                if (m == carries.end() || key.count(m->second) == 0) {
+                    bind_error(
+                        "WHERE on " + c + " over table " + source.name +
+                            ", an upsert changelog (changelog_mode='upsert'): a row an update "
+                            "moves out of the condition would never be removed from the "
+                            "target. Filter on its key columns only, or declare the table "
+                            "with changelog_mode='append'",
+                        pos);
+                }
+            }
+            continue;
+        }
+        std::map<std::string, std::string> next;
+        for (const auto& out : static_cast<const LogicalProject*>(*it)->outputs()) {
+            if (const auto ref = pure_column_ref(out.expr_json)) {
+                if (const auto m = carries.find(*ref); m != carries.end()) {
+                    next[out.name] = m->second;
+                }
+            }
+        }
+        carries = std::move(next);
+    }
+    if (!sink.is_upsert()) {
+        return;  // the changelog sink check below decides
+    }
+    std::set<std::string> sink_key;
+    for (const auto& pk : sink.primary_key) {
+        const auto m = carries.find(pk);
+        sink_key.insert(m == carries.end() ? "(computed " + pk + ")" : m->second);
+    }
+    if (sink_key != key) {
+        std::string want;
+        for (const auto& k : key) {
+            want += (want.empty() ? "" : ", ") + k;
+        }
+        bind_error("upsert sink " + sink.name + " must be keyed by table " + source.name +
+                       "'s primary key (" + want +
+                       "), carried unchanged: that table is an upsert changelog "
+                       "(changelog_mode='upsert') whose deletes and updates apply by that key",
+                   pos);
+    }
+}
+
+}  // namespace
 
 // Walk a bound LogicalPlan tree and decide whether the stream it hands
 // its consumer (for the sink guard: the sink) carries changelog records
@@ -2255,7 +2423,7 @@ static bool contains_updating_stream(const LogicalPlan& node) {
 // default case recurses.
 bool is_changelog_plan(const LogicalPlan& node) {
     const auto k = node.kind();
-    if (k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp") {
+    if (k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp" || is_upsert_cdc_scan(node)) {
         return true;
     }
     if (k == "EquiJoin") {
@@ -5088,6 +5256,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
     // that don't understand them must reject. Upsert sinks must
     // declare a primary key and the SELECT must project every PK
     // column so the runtime can build the upsert lookup.
+    check_upsert_cdc_consumers(*select_plan, sink, stmt.loc.pos);
     const bool produces_changelog = is_changelog_plan(*select_plan);
     if (sink.is_upsert()) {
         if (sink.primary_key.empty()) {
@@ -5127,15 +5296,20 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
         auto chit = sink.properties.find("changelog");
         const bool declared_changelog = chit != sink.properties.end() && chit->second == "true";
         if (conn != "changelog" && conn != "blackhole" && conn != "print" && !declared_changelog) {
-            bind_error("sink " + sink.name +
-                           " is append-only but the SELECT produces a changelog stream; declare "
-                           "mode='upsert' (and primary_key='...'), use connector='changelog', "
-                           "or add changelog='true' to the sink table so rows are written "
-                           "verbatim with their __row_kind marker" +
-                           (conn == "collect" ? " (the Arrow stream then carries a leading "
-                                                "row_kind column)"
-                                              : ""),
-                       stmt.loc.pos);
+            bind_error(
+                "sink " + sink.name +
+                    " is append-only but the SELECT produces a changelog stream; declare "
+                    "mode='upsert' (and primary_key='...'), use connector='changelog', "
+                    "or add changelog='true' to the sink table so rows are written "
+                    "verbatim with their __row_kind marker" +
+                    (contains_upsert_cdc_scan(*select_plan)
+                         ? std::string{"; for a PostgreSQL CDC table, changelog_mode='append' "
+                                       "writes one row per change instead"}
+                         : std::string{}) +
+                    (conn == "collect" ? " (the Arrow stream then carries a leading "
+                                         "row_kind column)"
+                                       : ""),
+                stmt.loc.pos);
         }
     }
 

@@ -283,6 +283,15 @@ std::vector<RowColumn> row_columns_of_schema(const arrow::Schema& schema) {
     return rc;
 }
 
+// A PostgreSQL logical-replication source table (connector='postgres',
+// mode='cdc').
+bool is_postgres_cdc_table(const TableDef& table) {
+    const auto c = table.properties.find("connector");
+    const auto m = table.properties.find("mode");
+    return c != table.properties.end() && c->second == "postgres" && m != table.properties.end() &&
+           m->second == "cdc";
+}
+
 RowConnectorBinding row_source_binding_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
     require_kafka_for_registry_format(table, connector);
@@ -1142,6 +1151,32 @@ std::string compile_node(const LogicalPlan& node,
             // BIGINT and INTEGER columns (with_declared_numeric_columns). Other
             // Row connectors ignore it.
             op.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
+        }
+        if (ch == Channel::Row && is_postgres_cdc_table(table)) {
+            // One replication slot has one reader: a second subtask would
+            // contend for the slot. Its changes are ordered per key, and
+            // propagate_forced_singletons keeps that order for every
+            // operator behind it that is not keyed.
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+            op.parallelism = 1;
+            // The declared SQL types, which the CDC contract converts each
+            // value to (refusing what a type cannot hold exactly), and the
+            // key, in whichever form the table declared it.
+            std::string declared;
+            for (const auto& c : table.columns) {
+                if (!declared.empty()) {
+                    declared += ';';
+                }
+                declared += c.name + ':' + (c.type ? arrow_to_sql_type_string(*c.type) : "VARCHAR");
+            }
+            op.params["declared_types"] = std::move(declared);
+            if (!table.primary_key.empty()) {
+                std::string pk;
+                for (const auto& k : table.primary_key) {
+                    pk += (pk.empty() ? "" : ",") + k;
+                }
+                op.params["primary_key"] = std::move(pk);
+            }
         }
         if (!scan.projected_columns().empty()) {
             std::string csv;

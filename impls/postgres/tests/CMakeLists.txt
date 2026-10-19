@@ -16,6 +16,10 @@ add_executable(clink_postgres_tests
     test_postgres_upsert_sink.cpp
     test_postgres_contract_suites.cpp
     test_cdc_json.cpp
+    test_cdc_row_encoder.cpp
+    test_cdc_cursor.cpp
+    test_cdc_factory_options.cpp
+    test_postgres_cdc_contract_live.cpp
 )
 target_link_libraries(clink_postgres_tests PRIVATE
     clink::core
@@ -24,6 +28,9 @@ target_link_libraries(clink_postgres_tests PRIVATE
     PostgreSQL::PostgreSQL  # the live CDC test runs raw setup/DML SQL via libpq
 )
 target_compile_definitions(clink_postgres_tests PRIVATE CLINK_HAS_POSTGRES)
+# The CDC source's internal modules (row encoder, cursor, fault points) are
+# tested directly; they are not installed headers.
+target_include_directories(clink_postgres_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 clink_set_warnings(clink_postgres_tests)
 gtest_discover_tests(clink_postgres_tests
     DISCOVERY_MODE PRE_TEST

@@ -75,7 +75,8 @@ CONNECTORS=(
   "mongodb@@mongodb@@clink_mongodb_tests@@MongoLive"
   "nats@@nats@@clink_nats_tests@@NatsLive"
   "mqtt@@mqtt@@clink_mqtt_tests@@MqttLive"
-  "postgres@@postgres-cdc@@clink_postgres_tests@@PostgresCdcLive|PostgresJsonSinkLive|PostgresSink2PCLive|PostgresUpsertSinkLive|SinkContractSuite|UpsertContractSuite"
+  "postgres@@postgres-cdc@@clink_postgres_tests@@PostgresCdcLive|PostgresCdcContractLive|PostgresJsonSinkLive|PostgresSink2PCLive|PostgresUpsertSinkLive|SinkContractSuite|UpsertContractSuite"
+  "postgres-sql@@postgres-cdc@@clink_postgres_sql_tests@@PostgresCdcSql"
   "mysql@@mysql@@clink_mysql_tests@@MysqlLive|MysqlCdcLive|MysqlUpsertSinkLive|UpsertContractSuite"
   "s3@@localstack@@clink_s3_tests@@S3Sink2PCLive|SinkContractSuite|S3MaterializationStore.RoundTripAgainstLiveEndpoint|StateParquetExportS3.PartitionedExportReadableBackFromS3|S3SnapshotStore.CheckpointDirRoundTripAgainstLiveEndpoint|S3SnapshotStore.CacheServesImmutableSstOnSecondFetch|S3CasSnapshotStore|S3RemotePool"
   "rocksdb-s3@@localstack@@clink_rocksdb_s3_tests@@S3RocksdbSchemes"
@@ -97,7 +98,7 @@ CONNECTORS=(
 # All connector test targets we try to build (intersected with what actually
 # configures, so a connector missing its client lib is simply skipped, not fatal).
 WANT_TARGETS="clink_redis_tests clink_mongodb_tests clink_nats_tests clink_mqtt_tests \
-clink_postgres_tests clink_mysql_tests clink_s3_tests clink_rocksdb_s3_tests \
+clink_postgres_tests clink_postgres_sql_tests clink_mysql_tests clink_s3_tests clink_rocksdb_s3_tests \
 clink_http_connector_tests clink_cassandra_tests clink_pulsar_tests clink_rabbitmq_tests \
 clink_gcs_tests clink_azure_tests clink_webhdfs_tests clink_iceberg_tests clink_etcd_tests \
 clink_aws_tests"
@@ -114,7 +115,7 @@ set_env() {
     mongodb)       ENVARGS=(-e "CLINK_MONGODB_TEST_URI=mongodb://mongodb:27017/?replicaSet=rs0") ;;
     nats)          ENVARGS=(-e "CLINK_NATS_TEST_ENDPOINT=nats://nats:4222") ;;
     mqtt)          ENVARGS=(-e "CLINK_MQTT_TEST_URL=mqtt://mqtt:1883") ;;
-    postgres)      ENVARGS=(-e "CLINK_POSTGRES_CDC_TEST_DSN=host=postgres-cdc port=5432 user=postgres password=postgres dbname=postgres") ;;
+    postgres|postgres-sql) ENVARGS=(-e "CLINK_POSTGRES_CDC_TEST_DSN=host=postgres-cdc port=5432 user=postgres password=postgres dbname=postgres") ;;
     mysql)         ENVARGS=(-e "CLINK_MYSQL_TEST_DSN=host=mysql port=3306 user=root password=mysql database=test") ;;
     cassandra)     ENVARGS=(-e "CLINK_CASSANDRA_TEST_CONTACT_POINTS=cassandra") ;;
     influxdb)      ENVARGS=(-e "CLINK_INFLUXDB_TEST_ENDPOINT=http://influxdb:8086" -e "CLINK_INFLUXDB_TEST_ORG=clink" -e "CLINK_INFLUXDB_TEST_BUCKET=clink" -e "CLINK_INFLUXDB_TEST_TOKEN=clink-token") ;;

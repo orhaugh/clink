@@ -44,6 +44,43 @@ record said RabbitMQ had TLS, which it does not (it is plain TCP only), and
 that Redis and MySQL had none, though both do. Redis reports it when the build
 found `libhiredis_ssl`.
 
+**The PostgreSQL CDC source no longer loses its place.** It confirmed whatever
+it had received to the replication slot, on a timer and on every keepalive, so
+the slot ran ahead of the last completed checkpoint, and PostgreSQL started a
+restore at the slot's later position instead, silently skipping the changes in
+between. It now confirms only the position of a completed checkpoint; an
+aborted checkpoint confirms nothing. Its checkpoint records the end of the last
+fully emitted transaction, and when the cut falls inside a transaction, which
+one and how many of its changes were emitted, so replay is exact: nothing
+before the cut is emitted again by the source and nothing after it is missed.
+Before streaming, and before every reconnect, it refuses a slot that is
+missing, has lost WAL or is confirmed past its position, rather than start
+wherever the server would. A dropped or terminated replication connection was
+read as the end of the stream, and the job finished cleanly with capture
+stopped; the source now resumes in place within `reconnect_timeout_ms`, or
+fails the task so the job restarts from its checkpoint. The initial snapshot
+streams from a server-side cursor instead of being held in memory whole, and a
+snapshot interrupted by a failure, which was silently abandoned, is taken
+again and converges. Connecting, slot creation, snapshot fetches and the idle
+stream all observe cancellation within about 100 ms.
+
+**A PostgreSQL table can be captured through SQL.** `changelog_mode` on a
+`mode='cdc'` table selects the SQL CDC contract: one table (`table`) keyed by
+its primary key, its existing rows first (`snapshot_mode='initial'`), each
+value converted to its declared type and refused when the type cannot hold it
+exactly, and `on_decode_error='fail'` by default. Open checks the publication,
+the primary key, the replica identity, the declared types and the role's
+privileges, and names what to change. `changelog_mode='upsert'` is a changelog
+for upsert sinks keyed by the same key; the binder refuses the operators that
+would need an update's old row. `changelog_mode='append'` is one row per change,
+with `__version` and `__deleted` columns for a store that keeps the latest row
+per key, such as a ClickHouse `ReplacingMergeTree(__version, __deleted)`. An
+UPDATE leaving an out-of-line value unchanged takes it from the old row under
+`REPLICA IDENTITY FULL` and stops the source without it, rather than emitting
+an empty string. The options that were reachable only from C++ (snapshot,
+batch size, poll and status intervals) are now factory and SQL options, and the
+live tests run against PostgreSQL 16.15 pinned by digest.
+
 **Sanitizer runs record where a hung test was blocked.**
 `build_and_test.sh` and the sanitizer CI jobs run ctest through
 `scripts/ctest-with-hang-dump.sh`, which attaches gdb to any test still running
@@ -52,6 +89,27 @@ after 240 s and writes every thread's backtrace to the job log and to
 
 **Compatibility.**
 
+- A PostgreSQL CDC job now confirms its replication slot only when a
+  checkpoint completes, so a job running without checkpointing (no
+  `--checkpoint-dir`) never releases WAL. Run CDC jobs with checkpointing, and
+  cap what a slot may hold with `max_slot_wal_keep_size`.
+- A PostgreSQL CDC job restored onto a slot that is missing, has lost WAL or
+  is confirmed past the checkpoint now fails with the reason instead of
+  starting from the slot's own position. Start such a job from scratch, with a
+  new slot, once the downstream copy is reset.
+- The CDC factories refuse option values outside their domain:
+  `create_slot` and `drop_slot_on_close` take `true` or `false` only (`'1'` or
+  `'TRUE'` used to read as `false`), and `plugin` and `on_decode_error` their
+  listed values.
+- CDC connections set `TimeZone=UTC` and `DateStyle=ISO` unless the connection
+  string sets `options`, so the text form of `timestamptz` values in the
+  earlier JSON (without `changelog_mode`) is in UTC.
+- A SQL CDC source runs as one subtask whatever the job's parallelism, and so
+  does every unkeyed operator behind it; at parallelism above one it used to
+  start one reader per subtask on the same slot.
+- The CDC source's checkpoint holds its position in a new, versioned encoding.
+  Checkpoints from earlier releases restore; an earlier release restoring a
+  new checkpoint finds no position and starts at the slot's.
 - A Redis connection with `tls='true'` and `tls_verify` on, or a Pulsar
   `pulsar+ssl://` service URL, now fails when the server's certificate does
   not name the host connected by. Connect by a name the certificate carries

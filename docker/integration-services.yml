@@ -98,8 +98,10 @@ services:
 
   # Postgres with logical replication for the CDC source live IT.
   # DSN: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
+  # PostgreSQL 16.15, pinned by digest (the multi-arch index) like the
+  # ClickHouse servers below, for the CDC and sink live suites.
   postgres-cdc:
-    image: postgres:16
+    image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
     environment:
       - POSTGRES_PASSWORD=postgres
     command:
