@@ -88,6 +88,14 @@ tests and the recovery cells (the source's worker killed at each phase, the
 server restarted) on every push and pull request, and fails a run in which a
 live case skipped.
 
+**A partitioned PostgreSQL table can be captured.** The source follows the
+root, which a publication with `publish_via_partition_root = true` uses for
+every partition's changes, and the snapshot reads the root. Open checks each
+partition's replica identity and refuses a publication that would send a
+partition's changes under the partition's own name, which the source would
+never see. Attaching, detaching or truncating one partition publishes
+nothing, and the connector page says so.
+
 **A CDC table can round microsecond timestamps down.** A PostgreSQL
 `timestamp(6)` value with digits below the millisecond stops a
 `changelog_mode` job, since the engine holds milliseconds.

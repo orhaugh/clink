@@ -197,7 +197,9 @@ std::string delete_rows(const std::string& table, const std::string& where) {
 // Everything one test creates on the server, dropped on the way out.
 class Fixture {
 public:
-    explicit Fixture(std::string tag, bool full_identity = true)
+    // `partitioned`: the table is partitioned by range of id into _low (below
+    // 1000), _mid (below 1,000,000) and _high, and published through its root.
+    explicit Fixture(std::string tag, bool full_identity = true, bool partitioned = false)
         : dsn_(dsn_env()),
           table_("cdc_" + tag + "_" + std::to_string(::getpid())),
           slot_("slot_" + tag + "_" + std::to_string(::getpid())),
@@ -206,11 +208,29 @@ public:
         sql(dsn_,
             "CREATE TABLE " + table_ +
                 " (id bigint PRIMARY KEY, rev int NOT NULL, status text, amount numeric(12, 2), at "
-                "timestamptz(3), flag boolean, day date, note text)");
-        if (full_identity) {
-            sql(dsn_, "ALTER TABLE " + table_ + " REPLICA IDENTITY FULL");
+                "timestamptz(3), flag boolean, day date, note text)" +
+                (partitioned ? " PARTITION BY RANGE (id)" : ""));
+        std::vector<std::string> identity_of = {table_};
+        if (partitioned) {
+            identity_of = {table_ + "_low", table_ + "_mid", table_ + "_high"};
+            sql(dsn_,
+                "CREATE TABLE " + identity_of[0] + " PARTITION OF " + table_ +
+                    " FOR VALUES FROM (MINVALUE) TO (1000)");
+            sql(dsn_,
+                "CREATE TABLE " + identity_of[1] + " PARTITION OF " + table_ +
+                    " FOR VALUES FROM (1000) TO (1000000)");
+            sql(dsn_,
+                "CREATE TABLE " + identity_of[2] + " PARTITION OF " + table_ +
+                    " FOR VALUES FROM (1000000) TO (MAXVALUE)");
         }
-        sql(dsn_, "CREATE PUBLICATION " + pub_ + " FOR TABLE " + table_);
+        if (full_identity) {
+            for (const auto& t : identity_of) {
+                sql(dsn_, "ALTER TABLE " + t + " REPLICA IDENTITY FULL");
+            }
+        }
+        sql(dsn_,
+            "CREATE PUBLICATION " + pub_ + " FOR TABLE " + table_ +
+                (partitioned ? " WITH (publish_via_partition_root = true)" : ""));
     }
     ~Fixture() {
         try {
@@ -1450,6 +1470,107 @@ TEST(PostgresCdcContractLive, AnUnchangedToastValueWithoutFullIdentityStopsTheSo
         return c.op == "update";
     }));
     run.crash();
+}
+
+// A partitioned table, captured through its root: the snapshot reads every
+// partition, and changes in any partition, a row moved between partitions
+// included, arrive under the root's name.
+TEST(PostgresCdcContractLive, APartitionedTableIsCapturedThroughItsRoot) {
+    REQUIRE_SERVER();
+    Fixture f("parts", /*full_identity=*/true, /*partitioned=*/true);
+    {
+        Session s(f.dsn());
+        (void)s.returning(insert_rows(f.table(), 1, 2000));
+    }
+    Downstream down;
+    CdcRun run(f.params(), down);
+    run.open();
+    {
+        Session s(f.dsn());
+        (void)s.returning(update_rows(f.table(), "id % 7 = 0"));
+        (void)s.returning(delete_rows(f.table(), "id % 11 = 0"));
+        (void)s.returning(insert_rows(f.table(), 2'000'000, 2'000'050));
+        // Moves rows from _low to _mid: a delete there and an insert here.
+        (void)s.returning("UPDATE " + f.table() +
+                          " SET id = id + 5000 WHERE id BETWEEN 100 AND 120 RETURNING id::text");
+    }
+    commit_marker(f);
+    run.pump_until([&] { return down.streamed(kMarker); });
+    EXPECT_EQ(down.state(), table_state(f));
+    // A moved row keeps the values it had under its old id: compare those
+    // with the table rather than with the values its id implies.
+    std::map<std::int64_t, const Change*> latest;
+    for (const auto& c : down.changes()) {
+        if (c.id >= 5100 && c.id <= 5120) {
+            latest[c.id] = &c;
+        }
+    }
+    const auto moved =
+        sql(f.dsn(), "SELECT id, note FROM " + f.table() + " WHERE id BETWEEN 5100 AND 5120").rows;
+    EXPECT_EQ(moved.size(), latest.size());
+    for (const auto& row : moved) {
+        const auto it = latest.find(std::stoll(*row[0]));
+        ASSERT_NE(it, latest.end()) << *row[0];
+        EXPECT_EQ(it->second->op, "insert") << *row[0];
+        EXPECT_EQ(it->second->row.at("note").as_string(), *row[1]) << *row[0];
+    }
+
+    // What PostgreSQL does not publish under publish_via_partition_root: a
+    // TRUNCATE of one partition. The rows stay downstream, as the connector
+    // page says.
+    sql(f.dsn(), "TRUNCATE " + f.table() + "_low");
+    sql(f.dsn(),
+        "UPDATE " + f.table() + " SET rev = rev + 1 WHERE id = " + std::to_string(kMarker));
+    run.pump_until([&] {
+        return std::any_of(down.changes().begin(), down.changes().end(), [](const Change& c) {
+            return c.id == kMarker && c.rev == 2;
+        });
+    });
+    run.close();
+    const auto held = down.state();
+    EXPECT_TRUE(held.count(1) == 1 && table_state(f).count(1) == 0)
+        << "a TRUNCATE of one partition reached the source";
+}
+
+TEST(PostgresCdcContractLive, APartitionedTablePublishedOtherwiseIsRefused) {
+    REQUIRE_SERVER();
+    struct Case {
+        const char* name;
+        std::function<void(Fixture&)> setup;
+        const char* expect;
+    };
+    const std::vector<Case> cases = {
+        {"published without publish_via_partition_root",
+         [](Fixture& f) {
+             sql(f.dsn(),
+                 "ALTER PUBLICATION " + f.pub() + " SET (publish_via_partition_root = false)");
+         },
+         "publish_via_partition_root"},
+        {"a partition published on its own",
+         [](Fixture& f) {
+             sql(f.dsn(), "ALTER PUBLICATION " + f.pub() + " SET TABLE " + f.table() + "_low");
+         },
+         "under its own name"},
+        {"a partition with no replica identity",
+         [](Fixture& f) {
+             sql(f.dsn(), "ALTER TABLE " + f.table() + "_mid REPLICA IDENTITY NOTHING");
+         },
+         "_mid has REPLICA IDENTITY NOTHING"},
+    };
+    for (const auto& c : cases) {
+        Fixture f("partsno", /*full_identity=*/true, /*partitioned=*/true);
+        c.setup(f);
+        Downstream down;
+        CdcRun run(f.params(), down);
+        try {
+            run.open();
+            ADD_FAILURE() << c.name << ": open() accepted it";
+        } catch (const std::exception& e) {
+            EXPECT_NE(std::string{e.what()}.find(c.expect), std::string::npos)
+                << c.name << ": " << e.what();
+        }
+        run.crash();
+    }
 }
 
 // Microsecond timestamps: refused by default, and with

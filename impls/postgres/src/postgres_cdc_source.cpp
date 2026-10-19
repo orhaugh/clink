@@ -1123,11 +1123,18 @@ std::string check_table(PGconn* admin,
     const std::string canonical = cell(t.get(), 0, 1) + "." + cell(t.get(), 0, 2);
     const std::string replident = cell(t.get(), 0, 3);
     const std::string relkind = cell(t.get(), 0, 4);
-    if (relkind == "p") {
-        throw refuse("is partitioned; capturing a partitioned table is not supported");
+    // A partitioned table is captured through its root: a publication that
+    // publishes it with publish_via_partition_root sends every partition's
+    // changes under the root's name and columns, and the snapshot reads the
+    // root, which reads every partition.
+    const bool partitioned = relkind == "p";
+    if (partitioned && PQserverVersion(admin) < 130000) {
+        throw refuse(
+            "is partitioned, and publishing a partitioned table through its root needs "
+            "PostgreSQL 13 or later");
     }
-    if (relkind != "r") {
-        throw refuse("is not an ordinary table");
+    if (!partitioned && relkind != "r") {
+        throw refuse("is not an ordinary or a partitioned table");
     }
     if (o.enable_initial_snapshot && cell(t.get(), 0, 5) != "t") {
         throw refuse(
@@ -1199,42 +1206,87 @@ std::string check_table(PGconn* admin,
         throw refuse("its primary key is (" + list(pk_cols) + ") but the job declares (" +
                      list(want) + ")");
     }
-    if (replident == "n") {
-        throw refuse(
-            "has REPLICA IDENTITY NOTHING, so its updates and deletes do not identify "
-            "their row; set REPLICA IDENTITY DEFAULT or FULL");
-    }
-    if (replident == "i") {
-        ResultPtr ri =
+    // The replica identity that carries the key. A partitioned table's changes
+    // happen in its partitions, so each partition's identity is the one that
+    // decides what an update or delete carries; the root's own is not used.
+    struct Identity {
+        std::string oid;
+        std::string name;
+        std::string replident;
+    };
+    std::vector<Identity> identities;
+    if (partitioned) {
+        ResultPtr leaves =
             run_ok(admin,
-                   "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = "
-                   "i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = " +
-                       oid + " AND i.indisreplident",
+                   "SELECT c.oid, n.nspname || '.' || c.relname, c.relreplident, c.relkind FROM "
+                   "pg_partition_tree(" +
+                       oid +
+                       ") p JOIN pg_class c ON c.oid = p.relid JOIN pg_namespace n ON n.oid = "
+                       "c.relnamespace WHERE p.isleaf ORDER BY 2",
                    cancel,
                    kCatalogLimit,
-                   "reading the replica identity of " + canonical);
-        std::set<std::string> ri_cols;
-        for (int i = 0; i < PQntuples(ri.get()); ++i) {
-            ri_cols.insert(cell(ri.get(), i, 0));
+                   "reading the partitions of " + canonical);
+        for (int i = 0; i < PQntuples(leaves.get()); ++i) {
+            const std::string leaf = cell(leaves.get(), i, 1);
+            if (cell(leaves.get(), i, 3) != "r") {
+                throw refuse("partition " + leaf +
+                             " is not an ordinary table (a foreign table, for one), and its "
+                             "changes are not published");
+            }
+            identities.push_back(
+                Identity{cell(leaves.get(), i, 0), leaf, cell(leaves.get(), i, 2)});
         }
-        if (ri_cols != pk_cols) {
-            throw refuse("its replica identity index (" + list(ri_cols) +
-                         ") is not its primary key, so deletes would not carry the key; set "
-                         "REPLICA IDENTITY DEFAULT or FULL");
+    } else {
+        identities.push_back(Identity{oid, canonical, replident});
+    }
+    std::vector<std::string> not_full;
+    for (const auto& id : identities) {
+        if (id.replident == "n") {
+            throw refuse((partitioned ? "partition " + id.name + " has" : std::string{"has"}) +
+                         " REPLICA IDENTITY NOTHING, so its updates and deletes do not identify "
+                         "their row; set REPLICA IDENTITY DEFAULT or FULL" +
+                         (partitioned ? " on " + id.name : std::string{}));
+        }
+        if (id.replident == "i") {
+            ResultPtr ri =
+                run_ok(admin,
+                       "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = "
+                       "i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = " +
+                           id.oid + " AND i.indisreplident",
+                       cancel,
+                       kCatalogLimit,
+                       "reading the replica identity of " + id.name);
+            std::set<std::string> ri_cols;
+            for (int i = 0; i < PQntuples(ri.get()); ++i) {
+                ri_cols.insert(cell(ri.get(), i, 0));
+            }
+            if (ri_cols != pk_cols) {
+                throw refuse((partitioned ? "the replica identity index of partition " + id.name
+                                          : std::string{"its replica identity index"}) +
+                             " (" + list(ri_cols) +
+                             ") is not the primary key, so deletes would not carry the key; set "
+                             "REPLICA IDENTITY DEFAULT or FULL");
+            }
+        }
+        if (id.replident != "f") {
+            not_full.push_back(id.name);
         }
     }
-    if (o.strict && replident != "f" && !toastable.empty()) {
+    if (o.strict && !not_full.empty() && !toastable.empty()) {
         std::string names;
         for (const auto& c : toastable) {
             names += (names.empty() ? "" : ", ") + c;
         }
+        std::string tables;
+        for (const auto& n : not_full) {
+            tables += (tables.empty() ? "" : ", ") + n;
+        }
         clink::log::warn(kLog,
                          "table " + canonical + " has columns that may be stored out of line (" +
-                             names +
-                             ") and its replica identity is not FULL: an UPDATE that leaves such "
-                             "a value unchanged does not carry it, and the source stops on it "
-                             "rather than emit the row without it. ALTER TABLE " +
-                             canonical + " REPLICA IDENTITY FULL avoids that");
+                             names + ") and the replica identity of " + tables +
+                             " is not FULL: an UPDATE that leaves such a value unchanged does "
+                             "not carry it, and the source stops on it rather than emit the row "
+                             "without it. ALTER TABLE ... REPLICA IDENTITY FULL avoids that");
     }
 
     // Publications.
@@ -1246,22 +1298,52 @@ std::string check_table(PGconn* admin,
     if (pubs.empty()) {
         throw refuse("no publication is named");
     }
+    const bool has_via_root = PQserverVersion(admin) >= 130000;
     ResultPtr pr = run_ok(admin,
-                          "SELECT pubname, pubinsert, pubupdate, pubdelete FROM pg_publication "
-                          "WHERE pubname IN (" +
-                              pub_list + ")",
+                          "SELECT pubname, pubinsert, pubupdate, pubdelete" +
+                              std::string{has_via_root ? ", pubviaroot" : ""} +
+                              " FROM pg_publication WHERE pubname IN (" + pub_list + ")",
                           cancel,
                           kCatalogLimit,
                           "reading publications");
     std::map<std::string, std::array<bool, 3>> found;
+    std::map<std::string, bool> via_root;
     for (int i = 0; i < PQntuples(pr.get()); ++i) {
         found[cell(pr.get(), i, 0)] = {
             cell(pr.get(), i, 1) == "t", cell(pr.get(), i, 2) == "t", cell(pr.get(), i, 3) == "t"};
+        via_root[cell(pr.get(), i, 0)] = has_via_root && cell(pr.get(), i, 4) == "t";
     }
     for (const auto& p : pubs) {
         if (found.count(p) == 0) {
-            throw refuse("publication " + p + " does not exist; CREATE PUBLICATION " + p +
-                         " FOR TABLE " + canonical);
+            throw refuse(
+                "publication " + p + " does not exist; CREATE PUBLICATION " + p + " FOR TABLE " +
+                canonical +
+                (partitioned ? " WITH (publish_via_partition_root = true)" : std::string{}));
+        }
+    }
+    if (partitioned) {
+        // A publication that sends a partition's changes under the
+        // partition's own name (publish_via_partition_root off, or the
+        // partition published on its own) sends changes the source, which
+        // follows the root, would never see.
+        ResultPtr own = run_ok(
+            admin,
+            "SELECT pt.pubname, pt.schemaname || '.' || pt.tablename FROM pg_publication_tables "
+            "pt JOIN pg_partition_tree(" +
+                oid +
+                ") p ON p.relid = (quote_ident(pt.schemaname) || '.' || "
+                "quote_ident(pt.tablename))::regclass WHERE p.relid <> " +
+                oid + " AND pt.pubname IN (" + pub_list + ") ORDER BY 1, 2 LIMIT 1",
+            cancel,
+            kCatalogLimit,
+            "reading how the partitions of " + canonical + " are published");
+        if (PQntuples(own.get()) > 0) {
+            const std::string pub = cell(own.get(), 0, 0);
+            throw refuse("publication " + pub + " publishes partition " + cell(own.get(), 0, 1) +
+                         " under its own name, so its changes would not reach the source, which "
+                         "follows the partitioned table; publish " +
+                         canonical + " itself with publish_via_partition_root: ALTER PUBLICATION " +
+                         pub + " SET (publish_via_partition_root = true)");
         }
     }
     const bool has_column_lists = PQserverVersion(admin) >= 150000;
@@ -1276,10 +1358,18 @@ std::string check_table(PGconn* admin,
         "reading publication membership");
     if (PQntuples(member.get()) == 0) {
         throw refuse("is in none of the publications (" + o.publication_names +
-                     "); ALTER PUBLICATION <name> ADD TABLE " + canonical);
+                     "); ALTER PUBLICATION <name> ADD TABLE " + canonical +
+                     (partitioned ? ", with publish_via_partition_root = true" : std::string{}));
     }
     std::array<bool, 3> actions{false, false, false};
     for (int i = 0; i < PQntuples(member.get()); ++i) {
+        if (partitioned && !via_root[cell(member.get(), i, 0)]) {
+            const std::string pub = cell(member.get(), i, 0);
+            throw refuse("publication " + pub +
+                         " does not set publish_via_partition_root, so the partitions' changes "
+                         "would arrive under their own names; ALTER PUBLICATION " +
+                         pub + " SET (publish_via_partition_root = true)");
+        }
         const auto& a = found[cell(member.get(), i, 0)];
         for (std::size_t k = 0; k < 3; ++k) {
             actions[k] = actions[k] || a[k];

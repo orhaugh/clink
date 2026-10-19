@@ -603,7 +603,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "checkpoints: WAL is retained while the job is stopped or not "
                         "checkpointing",
                         "CDC captures one table per source (changelog_mode), with no schema "
-                        "evolution, partitioned tables or publication row filters",
+                        "evolution or publication row filters; a partitioned table through its "
+                        "root, where attaching, detaching or truncating one partition publishes "
+                        "nothing",
                         "a CDC snapshot interrupted by a failure is taken again and converges; "
                         "it does not resume",
                         "the plain sink is at-least-once - use postgres_2pc or the upsert sink"},

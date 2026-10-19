@@ -52,7 +52,7 @@ python3 scripts/check-gtest-reports.py \
     --expect 'PostgresCdcFactoryOptions.*=8' \
     --expect 'PostgresCdcDecodeStrict.*=11' \
     --expect 'PostgresCdcLive.*=3' \
-    --expect 'PostgresCdcContractLive.*=20' \
+    --expect 'PostgresCdcContractLive.*=22' \
     --expect 'PostgresCdcSql.*=1' \
     --expect 'Cells/PostgresCdcClickHouseRecovery.*=5' \
     --expect 'PostgresCdcSlot.*=1' \
