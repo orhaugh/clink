@@ -52,6 +52,8 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/fault/fault_injection.hpp"
+
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_clickhouse.hpp"
 #include "tests/integration/docker_postgres.hpp"
@@ -637,7 +639,10 @@ TEST_P(PostgresCdcClickHouseRecovery, TheTableConvergesAndNoChangeIsLost) {
             [&] { return worker_with(*cluster, "replication resumed").has_value(); }, 90s))
             << "the source did not resume after the server restarted";
     } else {
-        const std::string witness = "[fault.injection] fired: " + point;
+        // The block's own witness: a delay armed on the same point prints the
+        // same line with another action on every batch it slows.
+        const std::string witness = "[fault.injection] fired: " + point + " action=" +
+                                    std::to_string(static_cast<int>(clink::fault::Action::Block));
         std::optional<std::size_t> parked;
         ASSERT_TRUE(clink::itest::await(
             [&] {
