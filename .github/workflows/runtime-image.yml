@@ -323,6 +323,18 @@ jobs:
           echo "Running the tutorial against ${ref}"
           CLINK_IMAGE="${ref}" examples/kafka-to-clickhouse/run.sh
 
+      - name: The PostgreSQL CDC example runs against this image
+        # PostgreSQL -> clink -> ClickHouse on compose: a 20,000-row snapshot,
+        # a workload of inserts, updates and deletes, the Worker killed while
+        # it runs, and the ClickHouse copy compared with the PostgreSQL table
+        # value for value. The comparison is checked first, so it is known to
+        # fail when it should.
+        run: |
+          set -euo pipefail
+          ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          examples/postgres-cdc-to-clickhouse/run.sh --self-test
+          CLINK_IMAGE="${ref}" examples/postgres-cdc-to-clickhouse/run.sh
+
       - name: The one-command example runs, on both architectures
         # The README's first command is a promise. It breaks quietly: the
         # example is copied in a build step, its data path is rewritten by a

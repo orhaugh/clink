@@ -37,6 +37,7 @@ the source it cites. Keep these pages current when a subsystem changes.
 - Per-connector references (dependencies, factory names, options, SQL usage): `docs/connectors/`.
 - Runnable API examples: `docs/consumer-examples/` (against an installed clink, `find_package`) and `docs/consumer-examples/fetchcontent/` (clink pulled from GitHub by `FetchContent`; CI builds it from the commit under test).
 - The end-to-end tutorial (Kafka -> clink -> ClickHouse on compose, with a Worker kill): `examples/kafka-to-clickhouse/`, walkthrough in `docs/tutorials/kafka-to-clickhouse.md`. Its `run.sh` is what CI runs against the published runtime image; keep the example, the walkthrough and that script telling the same story.
+- The PostgreSQL CDC example (a table's snapshot and changes -> ClickHouse on compose, with a Worker kill and a value-for-value comparison with PostgreSQL): `examples/postgres-cdc-to-clickhouse/`. Its `run.sh` is what the runtime-image workflow runs against each new image; the CDC contract it relies on is in `docs/connectors/postgres.md`.
 
 | Subsystem | Source | Internals page |
 |-----------|--------|----------------|

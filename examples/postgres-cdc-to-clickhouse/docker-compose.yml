@@ -1,0 +1,150 @@
+# PostgreSQL -> clink -> ClickHouse, on one machine.
+#
+#   docker compose up -d           # PostgreSQL with 20,000 orders, ClickHouse,
+#                                  # a clink Coordinator and Worker; the
+#                                  # pipeline is submitted for you
+#   ./scripts/workload.sh 60       # a minute of inserts, updates and deletes
+#   ./scripts/verify.py            # compare ClickHouse with PostgreSQL
+#   ./scripts/cleanup.sh           # drop the replication slot, remove everything
+#
+# The Worker runs the operators; the Coordinator drives checkpoints and, when
+# the Worker dies, restarts the job from the last completed checkpoint. Both
+# share the `clink-state` volume, where checkpoints live.
+#
+# Host ports (override if they collide with something you run locally):
+#   CLINK_HTTP_PORT       Coordinator HTTP API      default 8081
+#   CLICKHOUSE_HTTP_PORT  ClickHouse HTTP interface default 8123
+#   POSTGRES_PORT         PostgreSQL                default 5432
+# CLINK_IMAGE picks a different clink image (default: the published :latest).
+
+services:
+  postgres:
+    # PostgreSQL 16.15, pinned by digest as the connector's live tests pin it.
+    image: postgres:16.15@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: shop
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=4
+      - -c
+      - max_replication_slots=4
+      # A cap on the WAL a forgotten slot can pin. Past it the slot loses WAL
+      # and clink refuses to resume from it rather than skip changes.
+      - -c
+      - max_slot_wal_keep_size=4GB
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # The orders table, its publication, the clink_cdc role, 20,000 rows
+      # and the workload procedure, on first start.
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U postgres -d shop -tAc 'SELECT 1 FROM orders LIMIT 1' | grep -q 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+
+  clickhouse:
+    # A line the native sink is tested on, pinned by digest.
+    image: clickhouse/clickhouse-server:26.8@sha256:3043f691ec1a847f38b446ff43708893fcbf9815bd9bd88c0f84bfe064ce852f
+    environment:
+      # The image restricts its passwordless `default` user to localhost, so
+      # the pipeline connects as this network-reachable user instead.
+      CLICKHOUSE_USER: clink
+      CLICKHOUSE_PASSWORD: clink
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    volumes:
+      # The change log, the current-state table and the view between them.
+      - ./clickhouse-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1 FROM orders_changes LIMIT 0'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  coordinator:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    command:
+      - --role=coordinator
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=coordinator
+      - --http-port=8081
+      - --http-bind=0.0.0.0
+      # Persist job manifests, so a Coordinator that is killed and started
+      # again recovers its running jobs instead of forgetting them.
+      - --ha-dir=/state/ha
+    ports:
+      - "${CLINK_HTTP_PORT:-8081}:8081"
+    volumes:
+      - clink-state:/state
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  worker:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    command:
+      - --role=worker
+      - --id=worker-1
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    volumes:
+      - clink-state:/state
+    healthcheck:
+      # 200 only once the Worker is registered with the Coordinator.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  # One-shot: submit pipeline.sql to the Coordinator.
+  submit:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    depends_on:
+      worker:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./pipeline.sql:/pipeline.sql:ro
+    command:
+      - run
+      - /pipeline.sql
+      - --coordinator-host=coordinator
+      - --coordinator-port=8081
+      - --name=orders-cdc
+      # Checkpoints confirm the replication slot, so a CDC job runs with them:
+      # without checkpoints the slot is never confirmed and WAL piles up.
+      - --checkpoint-dir=/state/checkpoints
+      - --checkpoint-interval-ms=2000
+    restart: "no"
+
+volumes:
+  clink-state:

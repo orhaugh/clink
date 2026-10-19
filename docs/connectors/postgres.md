@@ -276,7 +276,7 @@ INSERT INTO orders_replica SELECT id, status, amount FROM orders_cdc;
 
 ### `changelog_mode='append'`: one row per change
 
-Each change is an appended row, the deleted row's included, described by the metadata columns. Any query reads it as the stream of changes it is: `COUNT(*)` counts changes, not rows. To keep the table's current state in a store that applies rows by key, write the change rows with `__version` and `__deleted` and let the store keep the latest version per key. In ClickHouse that is a `ReplacingMergeTree(__version, __deleted)` ordered by the primary key, read with `FINAL`.
+Each change is an appended row, the deleted row's included, described by the metadata columns. Any query reads it as the stream of changes it is: `COUNT(*)` counts changes, not rows. To keep the table's current state in a store that applies rows by key, write the change rows with `__version` and `__deleted` and let the store keep the latest version per key. In ClickHouse that is a `ReplacingMergeTree(__version, __deleted)` ordered by the primary key, read with `FINAL`; the [PostgreSQL to ClickHouse example](https://github.com/orhaugh/clink/tree/main/examples/postgres-cdc-to-clickhouse) builds one, kills the Worker while a workload runs, and compares the result with the PostgreSQL table.
 
 ```sql
 CREATE TABLE orders_changes (

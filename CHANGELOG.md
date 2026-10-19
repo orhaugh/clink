@@ -80,6 +80,13 @@ UPDATE leaving an out-of-line value unchanged takes it from the old row under
 an empty string. The options that were reachable only from C++ (snapshot,
 batch size, poll and status intervals) are now factory and SQL options, and the
 live tests run against PostgreSQL 16.15 pinned by digest.
+`examples/postgres-cdc-to-clickhouse` runs the whole path on compose: a
+20,000-row snapshot, a workload of inserts, updates and deletes, the Worker
+killed while it runs, and the ClickHouse copy compared with the PostgreSQL
+table value for value. The `postgres-cdc` workflow runs the connector's live
+tests and the recovery cells (the source's worker killed at each phase, the
+server restarted) on every push and pull request, and fails a run in which a
+live case skipped.
 
 **Sanitizer runs record where a hung test was blocked.**
 `build_and_test.sh` and the sanitizer CI jobs run ctest through
