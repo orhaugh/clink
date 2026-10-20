@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A job on RocksDB or ForSt state restores a second time.** A restore opened
+the backend's database beside the checkpoint it restored and named every later
+checkpoint after that directory, while a restore looks for
+`<base>/v<generation>/<subtask>.cp-<id>`. So a restore of a checkpoint taken
+after an earlier restore (a job that loses a worker twice, or a run resumed
+twice) found nothing, and the job restarted until its budget ran out, refusing
+`checkpoint dir not found` each time. Each restore also left a copy of the
+database behind. A restore now rebuilds the database at the backend's own
+working path, from the checkpoint's files, and its checkpoints stay where the
+next restore looks. `s3sst+forst` restores the same way.
+
 **Jobs that share a checkpoint directory, or a state backend location, keep
 their state apart.** A job's state lived at `<base>/v<generation>/<subtask>`,
 the base being its `--state-backend` or its checkpoint directory, with nothing

@@ -326,6 +326,65 @@ TEST(RocksDBStateBackend, FactoryRestoreRecoversStateSameParallelism) {
     std::filesystem::remove_all(root);
 }
 
+// A restored backend checkpoints on, and is restored again from one of those
+// later checkpoints: a job that loses a worker twice, or restarts after a
+// resume. The factory names a checkpoint by the configured working path,
+// <base>/v<generation>/<subtask>.cp-<id>, so a restored backend has to keep its
+// database, and so its checkpoints, at that path rather than beside the
+// checkpoint it restored.
+TEST(RocksDBStateBackend, FactoryRestoresACheckpointTakenAfterARestore) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    clink::rocksdb::install();
+    auto root = std::filesystem::temp_directory_path() / "clink_rocks_restore_twice";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const std::string uri = "rocksdb://" + (root / "state").string();
+    const clink::OperatorId op{4};
+    const auto build = [&](std::uint64_t restore_id) {
+        StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = 0;
+        if (restore_id != 0) {
+            spec.restore_uri = uri;
+            spec.restore_checkpoint_id = restore_id;
+        }
+        auto built = StateBackendFactory::default_instance().build(spec);
+        if (built.restore_from.has_value()) {
+            built.backend->restore(*built.restore_from);
+        }
+        return built.backend;
+    };
+    const auto value_of = [&](const std::shared_ptr<StateBackend>& backend) {
+        const auto v = backend->get(op, sv(std::string{"k"}));
+        return v.has_value() ? to_string(*v) : std::string{"<absent>"};
+    };
+
+    {
+        auto first = build(0);
+        first->put(op, sv(std::string{"k"}), sv(std::string{"v1"}));
+        (void)first->snapshot(CheckpointId{1});
+    }
+    {
+        auto restored = build(1);
+        EXPECT_EQ(value_of(restored), "v1");
+        restored->put(op, sv(std::string{"k"}), sv(std::string{"v2"}));
+        (void)restored->snapshot(CheckpointId{2});
+    }
+    EXPECT_TRUE(std::filesystem::exists(root / "state" / "v1" / "0.cp-2"))
+        << "the restored backend did not checkpoint at its own path";
+    auto again = build(2);
+    EXPECT_EQ(value_of(again), "v2");
+    again.reset();
+
+    for (const auto& entry : std::filesystem::directory_iterator(root / "state" / "v1")) {
+        EXPECT_EQ(entry.path().filename().string().find(".restored-"), std::string::npos)
+            << "a restore left a database beside its checkpoint: " << entry.path();
+    }
+    std::filesystem::remove_all(root);
+}
+
 // The rescale follow-on, at the backend level: a narrowed (rescale) restore
 // must drop out-of-range KEYED rows but KEEP operator-state rows (the 0xFF
 // prefix carries source offsets - broadcast to every subtask). Before the

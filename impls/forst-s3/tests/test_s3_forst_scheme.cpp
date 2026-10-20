@@ -484,6 +484,63 @@ TEST(S3ForstSchemes, S3SstRestoresACheckpointWrittenAtAnotherLocation) {
     EXPECT_FALSE(local_tree_has_sst(local));
 }
 
+// A restored s3sst backend checkpoints on and is restored again from one of
+// those later checkpoints. The restore re-homes onto the configured working
+// path, inside the mapping, so the second restore finds its checkpoint at
+// <local>/v1/0.cp-2 and its data files at the matching object prefix.
+TEST(S3ForstSchemes, S3SstRestoresACheckpointTakenAfterARestore) {
+    const char* ep = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const char* bk = std::getenv("CLINK_S3_TEST_BUCKET");
+    if (ep == nullptr || bk == nullptr) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET";
+    }
+    auto& f = StateBackendFactory::default_instance();
+    const OperatorId op{7};
+    const std::string prefix =
+        std::string{"forst-s3sst-twice-"} + std::to_string(static_cast<long>(::getpid()));
+    const std::string local = tmp_local("twice");
+    const std::string uri = std::string{"s3sst+forst://"} + bk + "/" + prefix + "?local=" + local +
+                            "&endpoint=" + ep + "&region=us-east-1";
+    const auto build = [&](std::uint64_t restore_id) {
+        StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = 0;
+        if (restore_id != 0) {
+            spec.restore_uri = uri;
+            spec.restore_checkpoint_id = restore_id;
+        }
+        auto built = f.build(spec);
+        if (built.restore_from.has_value()) {
+            built.backend->restore(*built.restore_from);
+        }
+        return built.backend;
+    };
+    const auto value_of = [&](const std::shared_ptr<StateBackend>& backend) {
+        const auto v = backend->get(op, sv(std::string{"k"}));
+        return v.has_value() ? to_string(*v) : std::string{"<absent>"};
+    };
+
+    {
+        auto first = build(0);
+        first->put(op, sv(std::string{"k"}), sv(std::string{"v1"}));
+        for (int i = 0; i < 4096; ++i) {
+            first->put(op, sv("warm_" + std::to_string(i)), sv(std::string(64, 'x')));
+        }
+        (void)first->snapshot(CheckpointId{1});
+    }
+    {
+        auto restored = build(1);
+        EXPECT_EQ(value_of(restored), "v1");
+        restored->put(op, sv(std::string{"k"}), sv(std::string{"v2"}));
+        (void)restored->snapshot(CheckpointId{2});
+    }
+    EXPECT_TRUE(std::filesystem::exists(local + "/v1/0.cp-2"))
+        << "the restored backend did not checkpoint at its own path";
+    auto again = build(2);
+    EXPECT_EQ(value_of(again), "v2");
+    EXPECT_FALSE(local_tree_has_sst(local));
+}
+
 // Local SST read cache: the write-tee lands each uploaded SST in the
 // cache dir (so flush/compaction outputs read locally), and the LRU byte
 // budget bounds the cache's size.

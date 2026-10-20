@@ -33,6 +33,10 @@
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/script_runner.hpp"
 
+#ifdef CLINK_TESTS_HAVE_ROCKSDB
+#include "clink/rocksdb/install.hpp"
+#endif
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -1071,6 +1075,72 @@ TEST(EmbeddedEngine, AJobInterruptedBeforeStateWasNamespacedByJobResumes) {
         << "the resumed run's checkpoints are not under the job's own root";
     fs::remove_all(dir);
 }
+
+#ifdef CLINK_TESTS_HAVE_ROCKSDB
+// A job on the rocksdb:// state backend, interrupted and resumed twice. The
+// second resume restores a checkpoint the first resumed run took. RocksDB used
+// to reopen its database beside the checkpoint it restored and to name every
+// later checkpoint after that directory, so the second resume looked for its
+// checkpoint where it was never written and the job could not come back.
+TEST(EmbeddedEngine, AJobOnRocksDbResumesTwice) {
+    clink::rocksdb::install();
+    const auto dir = resume_scratch("rocksdb_twice");
+    write_orders(dir / "in.ndjson");
+    const auto run = [&]() {
+        ResumeRun out;
+        clink::embed::EngineOptions opts;
+        std::ostringstream err;
+        opts.err = &err;
+        opts.checkpoint_dir = (dir / "ckpt").string();
+        opts.checkpoint_interval_ms = 100;
+        opts.state_backend_uri = "rocksdb://" + (dir / "rocks").string();
+        {
+            clink::embed::EmbeddedEngine engine{std::move(opts)};
+            if (engine.execute_script(orders_ddl(dir / "in.ndjson") +
+                                      "CREATE TABLE results (user_id BIGINT, amount BIGINT) "
+                                      "WITH (connector='collect')") != 0) {
+                out.execute_rc = -1;
+                out.err = err.str();
+                return out;
+            }
+            auto reader_r = engine.collect_reader("results");
+            if (!reader_r.ok()) {
+                out.execute_rc = -2;
+                return out;
+            }
+            auto reader = *reader_r;
+            out.execute_rc = engine.execute_script(kResumeInsert);
+            if (out.execute_rc == 0) {
+                std::shared_ptr<arrow::RecordBatch> batch;
+                while (reader->ReadNext(&batch).ok() && batch) {
+                    out.rows += batch->num_rows();
+                }
+                if (!engine.await_all()) {
+                    out.execute_rc = 1;
+                }
+            }
+        }
+        out.err = err.str();
+        return out;
+    };
+
+    const auto first = run();
+    ASSERT_EQ(first.execute_rc, 0) << first.err;
+    ASSERT_EQ(first.rows, 5);
+    as_if_killed(dir / "ckpt");
+    const auto second = run();
+    ASSERT_EQ(second.execute_rc, 0) << second.err;
+    EXPECT_EQ(second.rows, 0) << "the first resume read its input again";
+    as_if_killed(dir / "ckpt");
+    const auto first_resume_marker = highest_completed_marker(dir / "ckpt");
+    const auto third = run();
+    ASSERT_EQ(third.execute_rc, 0) << third.err;
+    EXPECT_EQ(third.rows, 0) << "the second resume read its input again";
+    EXPECT_GT(highest_completed_marker(dir / "ckpt"), first_resume_marker)
+        << "the second resume completed no checkpoint of its own";
+    fs::remove_all(dir);
+}
+#endif
 
 #ifdef CLINK_FAULT_INJECTION
 namespace {

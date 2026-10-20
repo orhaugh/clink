@@ -703,6 +703,11 @@ if(CLINK_BUILD_SQL)
         target_link_libraries(clink_sql_tests PRIVATE clink::vector_search)
         target_compile_definitions(clink_sql_tests PRIVATE CLINK_TESTS_HAVE_VECTOR_SEARCH)
     endif()
+    # The rocksdb:// state backend, for the embedded resumes that run on it.
+    if(TARGET clink::rocksdb)
+        target_link_libraries(clink_sql_tests PRIVATE clink::rocksdb)
+        target_compile_definitions(clink_sql_tests PRIVATE CLINK_TESTS_HAVE_ROCKSDB)
+    endif()
     target_compile_definitions(clink_sql_tests PRIVATE
         CLINK_SUBMIT_SQL_BINARY=\"$<TARGET_FILE:clink_submit_sql>\"
         CLINK_NODE_BINARY=\"$<TARGET_FILE:clink_node>\"

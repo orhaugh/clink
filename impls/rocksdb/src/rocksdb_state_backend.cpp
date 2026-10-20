@@ -835,10 +835,20 @@ void RocksDBStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg_
     }
     impl_->db.reset();
 
-    const std::string working_path = source_path + ".restored-" +
-                                     std::to_string(snap.checkpoint_id.value()) + "-" +
-                                     std::to_string(reinterpret_cast<std::uintptr_t>(this));
+    // Re-home onto this backend's own working path: a fresh copy of the
+    // checkpoint (hard links, a plain copy where linking fails) replaces what
+    // the path held, and the database opens there, so its later checkpoints
+    // are <path>.cp-<id>, where the next restore looks for them. It used to
+    // open beside the checkpoint it restored, as <checkpoint>.restored-<id>-
+    // <this>, which named every later checkpoint after that directory: a
+    // second restore, of a checkpoint taken after the first, found none of
+    // them, and each restore left a database behind.
+    const std::string working_path = impl_->path;
     std::error_code ec;
+    if (std::filesystem::equivalent(source_path, working_path, ec)) {
+        throw std::runtime_error("RocksDBStateBackend::restore: " + source_path +
+                                 " is this backend's own working directory, not a checkpoint");
+    }
     std::filesystem::remove_all(working_path, ec);
     std::filesystem::create_directories(working_path, ec);
 
@@ -864,7 +874,6 @@ void RocksDBStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg_
             impl_->cfs_.emplace(op->value(), handles[i]);
         }
     }
-    impl_->path = working_path;
     {
         // Recover the version stamps the restored checkpoint carries (the
         // first/primary parent; scale-down parents share one job-level map).

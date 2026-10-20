@@ -137,14 +137,9 @@ own root when that exists.
 
 ## What this does not fix
 
-- The object-store composite schemes (`s3+rocksdb`, `changelog+s3`,
-  `changelog+s3+rocksdb`, `s3+forst`, `changelog+s3+forst`, `s3sst+forst`) keep
-  their local working directory under the URI's `local=` root, which is now
-  namespaced by job. Without `local=`, they use one temporary directory per
-  worker, which every job on that worker shares, whatever its prefix. That was
-  true before this change and still is.
-- The RocksDB and ForSt backends restore by moving their live database next to
-  the checkpoint they restored, and name their later checkpoints after that
-  directory. A second restore, of a checkpoint taken after the first, then looks
-  for it under the standard name. This is independent of the job segment and is
-  not addressed here.
+The object-store composite schemes (`s3+rocksdb`, `changelog+s3`,
+`changelog+s3+rocksdb`, `s3+forst`, `changelog+s3+forst`, `s3sst+forst`) keep
+their local working directory under the URI's `local=` root, which is now
+namespaced by job. Without `local=`, they use one temporary directory per
+worker, which every job on that worker shares, whatever its prefix. That was
+true before this change and still is.
