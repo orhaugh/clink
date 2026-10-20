@@ -455,7 +455,8 @@ if(CLINK_INTEGRATION_TESTS)
     if(TARGET clink_clickhouse_testing)
         target_sources(clink_integration_tests PRIVATE
             integration/test_clickhouse_native_recovery.cpp
-            integration/test_postgres_cdc_clickhouse_recovery.cpp)
+            integration/test_postgres_cdc_clickhouse_recovery.cpp
+            integration/test_postgres_cdc_clickhouse_backfill.cpp)
     endif()
     target_link_libraries(clink_integration_tests PRIVATE
         clink::clink

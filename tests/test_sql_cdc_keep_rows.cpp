@@ -308,18 +308,17 @@ TEST(SqlCdcKeepRows, WhileConvergingAnUpdateOfARowTheSnapshotLacksIsSkipped) {
 }
 
 // A column declared since the checkpoint: the table is read again, and each
-// snapshot row refreshes the row held for its key. In append mode it takes
-// that row's __version, so a store keeping the highest version per key keeps
-// the later row; replayed changes that predate the column take it from the
-// refreshed row, and inserts that predate it are passed over while converging.
-TEST(SqlCdcKeepRows, ABackfillRefreshesHeldRowsUnderTheirOwnVersion) {
+// snapshot row refreshes the row held for its key, one version above it.
+// Replayed changes that predate the column take it from the refreshed row, and
+// inserts that predate it are passed over while converging.
+TEST(SqlCdcKeepRows, ABackfillCompletesTheChangesReplayedAfterIt) {
     Stage s(Mode::Append, /*emit_unheld=*/true);
     (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false)});
     Row backfill = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
     backfill.values["note"] = config::JsonValue{std::string{"from the backfill"}};
     auto out = s.feed({backfill});
     ASSERT_EQ(out.size(), 1U);
-    EXPECT_EQ(str(out[0], "__version"), "100");
+    EXPECT_EQ(str(out[0], "__version"), "101");
     EXPECT_EQ(str(out[0], "note"), "from the backfill");
 
     // A replayed update from before the column: the column is the held row's.
@@ -340,6 +339,260 @@ TEST(SqlCdcKeepRows, ABackfillRefreshesHeldRowsUnderTheirOwnVersion) {
     // Outside the window such an insert cannot be completed.
     gone.values.erase(std::string{"__cdc_converging"});
     EXPECT_THROW((void)s.feed({gone}), std::runtime_error);
+}
+
+// The __version of the rows the stage emits for a key strictly increases in the
+// order it emits them, so a store that keeps the highest version per key
+// (ClickHouse's ReplacingMergeTree, an argMax over __version) keeps the latest
+// whatever order the rows reached it in. Equal versions are not ordered by the
+// store at all: argMax picks either.
+
+// A backfill row of a key the stage holds outranks the row it refreshes: one
+// above that row's version, which every later change of the key outranks.
+TEST(SqlCdcKeepRows, ABackfillRowOutranksTheRowItRefreshes) {
+    Stage s(Mode::Append, /*emit_unheld=*/true);
+    (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false),
+                  with_metadata(change("snapshot", 0, 2, "seed"), "snapshot", 0, false)});
+    Row refresh = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+    refresh.values["note"] = config::JsonValue{std::string{"from the backfill"}};
+    Row seed = with_metadata(change("snapshot", 0, 2, "seed"), "snapshot", 0, false);
+    seed.values["note"] = config::JsonValue{std::string{"also backfilled"}};
+    auto out = s.feed({refresh, seed});
+    ASSERT_EQ(out.size(), 2U);
+    EXPECT_EQ(str(out[0], "__version"), "101") << "ties the row it refreshes";
+    EXPECT_EQ(str(out[1], "__version"), "1") << "ties the snapshot row it refreshes";
+
+    // A later change of the key outranks the refresh.
+    Row later = with_metadata(change("update", 150, 1, "paid"), "update", 150, false);
+    later.values["note"] = config::JsonValue{std::string{"from the backfill"}};
+    out = s.feed({later});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "__version"), "150");
+}
+
+// The same in upsert mode, where the refresh is an update_after.
+TEST(SqlCdcKeepRows, AnUpsertBackfillCarriesTheNextVersion) {
+    Stage s(Mode::Upsert, /*emit_unheld=*/false);
+    (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false)});
+    Row refresh = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+    refresh.values["note"] = config::JsonValue{std::string{"from the backfill"}};
+    const auto out = s.feed({refresh});
+    ASSERT_EQ(out.size(), 2U);
+    EXPECT_EQ(kind(out[1]), "update_after");
+    EXPECT_EQ(str(out[1], "__version"), "101");
+}
+
+// A snapshot row that changes nothing about the row held for its key (a
+// snapshot read again after a restart) is not emitted, and moves no version.
+TEST(SqlCdcKeepRows, ARefreshThatChangesNothingIsNotEmitted) {
+    Stage s(Mode::Append, /*emit_unheld=*/true);
+    (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false)});
+    EXPECT_TRUE(
+        s.feed({with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false)}).empty());
+    Row refresh = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+    refresh.values["note"] = config::JsonValue{std::string{"n"}};
+    const auto out = s.feed({refresh});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "__version"), "101");
+}
+
+// Refreshes in a row each take the next version. A change whose WAL position
+// is not above the key's latest version (possible only after more refreshes
+// than the change's WAL record is long) still outranks them.
+TEST(SqlCdcKeepRows, AChangeOutranksEveryRefreshBeforeIt) {
+    Stage s(Mode::Append, /*emit_unheld=*/true);
+    (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false)});
+    for (const std::string note : {"a", "b", "c"}) {
+        Row refresh = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+        refresh.values["note"] = config::JsonValue{note};
+        (void)s.feed({refresh});
+    }
+    const auto out =
+        s.feed({with_metadata(change("update", 102, 1, "paid"), "update", 102, false)});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "__version"), "104") << "lost to the refresh at 103";
+}
+
+// A delete outranks the refreshes before it too, and a key inserted again after
+// such a delete outranks the delete, though the stage no longer holds the key.
+TEST(SqlCdcKeepRows, AKeyDeletedAfterRefreshesAndInsertedAgainOutranksTheDelete) {
+    InMemoryStateBackend backend;
+    {
+        Stage s(Mode::Append, /*emit_unheld=*/true, &backend);
+        (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false)});
+        for (const std::string note : {"a", "b", "c"}) {
+            Row refresh = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+            refresh.values["note"] = config::JsonValue{note};
+            (void)s.feed({refresh});
+        }
+        const auto gone =
+            s.feed({with_metadata(change("delete", 102, 1, "", ""), "delete", 102, true)});
+        ASSERT_EQ(gone.size(), 1U);
+        EXPECT_EQ(str(gone[0], "__version"), "104");
+    }
+    // Across a checkpoint.
+    const auto snap = backend.snapshot(CheckpointId{1});
+    InMemoryStateBackend restored;
+    restored.restore(snap);
+    Stage s(Mode::Append, /*emit_unheld=*/true, &restored);
+    const auto again =
+        s.feed({with_metadata(change("insert", 103, 1, "back"), "insert", 103, false)});
+    ASSERT_EQ(again.size(), 1U);
+    EXPECT_EQ(str(again[0], "__version"), "105");
+}
+
+// A snapshot read again finds keys the stage no longer holds: one deleted
+// before it and inserted again, or one it never saw. Their rows outrank every
+// delete emitted before; in the first snapshot, before any delete, they carry 0.
+TEST(SqlCdcKeepRows, ASnapshotRowOfAKeyNotHeldOutranksEveryDeleteBeforeIt) {
+    Stage s(Mode::Append, /*emit_unheld=*/true);
+    auto out = s.feed({with_metadata(change("snapshot", 0, 1, "seed"), "snapshot", 0, false)});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "__version"), "0");
+    (void)s.feed({with_metadata(change("delete", 200, 1, "", ""), "delete", 200, true)});
+
+    out = s.feed({with_metadata(change("snapshot", 0, 1, "back"), "snapshot", 0, false),
+                  with_metadata(change("snapshot", 0, 2, "new"), "snapshot", 0, false)});
+    ASSERT_EQ(out.size(), 2U);
+    EXPECT_EQ(str(out[0], "__version"), "201") << "ranks below the delete it follows";
+    EXPECT_EQ(str(out[1], "__version"), "201");
+    // The stream's insert of the key, replayed after the snapshot, outranks it
+    // with its own WAL position.
+    Row insert = with_metadata(change("insert", 250, 1, "back"), "insert", 250, false);
+    insert.values["__cdc_converging"] = config::JsonValue{true};
+    out = s.feed({insert});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "__version"), "250");
+}
+
+// Each row a truncate removes outranks the row it removes, as a delete does.
+TEST(SqlCdcKeepRows, ATruncateOutranksEveryRowItRemoves) {
+    Stage s(Mode::Append, /*emit_unheld=*/true);
+    (void)s.feed({with_metadata(change("insert", 90, 2, "new"), "insert", 90, false),
+                  with_metadata(change("insert", 100, 1, "new"), "insert", 100, false)});
+    for (const std::string note : {"a", "b", "c"}) {
+        Row refresh = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+        refresh.values["note"] = config::JsonValue{note};
+        (void)s.feed({refresh});
+    }
+    Row truncate = with_metadata(change("truncate", 102, 0, "", ""), "delete", 102, true);
+    truncate.values.erase(std::string{"id"});
+    auto out = s.feed({truncate});
+    ASSERT_EQ(out.size(), 2U);
+    std::sort(out.begin(), out.end(), [](const Row& a, const Row& b) {
+        return str(a, "id") < str(b, "id");
+    });
+    EXPECT_EQ(str(out[0], "__version"), "104") << "lost to the refresh at 103";
+    EXPECT_EQ(str(out[1], "__version"), "102");
+    out = s.feed({with_metadata(change("insert", 103, 1, "back"), "insert", 103, false)});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "__version"), "105");
+}
+
+// A key change after a backfill: the old key's delete outranks the row the
+// backfill refreshed, and the new key's row, completed from the old key's,
+// carries the change's own position.
+TEST(SqlCdcKeepRows, AKeyChangeAfterABackfillKeepsBothKeysInOrder) {
+    Stage s(Mode::Append, /*emit_unheld=*/true);
+    (void)s.feed(
+        {with_metadata(change("insert", 100, 1, "new", "a large body"), "insert", 100, false)});
+    Row refresh =
+        with_metadata(change("snapshot", 0, 1, "new", "a large body"), "snapshot", 0, false);
+    refresh.values["note"] = config::JsonValue{std::string{"n"}};
+    auto out = s.feed({refresh});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(str(out[0], "__version"), "101");
+
+    // UPDATE ... SET id = 2: a delete of the old key and the new row at one
+    // position, the new row without the value it left unchanged.
+    Row moved = with_unchanged(with_metadata(change("update", 200, 2, "new"), "update", 200, false),
+                               {"body"});
+    moved.values["note"] = config::JsonValue{std::string{"n"}};
+    out = s.feed({with_metadata(change("delete", 200, 1, "", ""), "delete", 200, true), moved});
+    ASSERT_EQ(out.size(), 2U);
+    EXPECT_EQ(str(out[0], "id"), "1");
+    EXPECT_EQ(str(out[0], "__version"), "200");
+    EXPECT_EQ(str(out[0], "__deleted"), "true");
+    EXPECT_EQ(str(out[1], "id"), "2");
+    EXPECT_EQ(str(out[1], "__version"), "200");
+    EXPECT_EQ(str(out[1], "body"), "a large body");
+}
+
+// In upsert mode a delete retracts the row it removes, version included; a key
+// read again after it still outranks it.
+TEST(SqlCdcKeepRows, AnUpsertDeleteRetractsTheRowWithItsVersion) {
+    Stage s(Mode::Upsert, /*emit_unheld=*/false);
+    (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false)});
+    Row refresh = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+    refresh.values["note"] = config::JsonValue{std::string{"n"}};
+    (void)s.feed({refresh});
+    auto out = s.feed({with_metadata(change("delete", 200, 1, "", ""), "delete", 200, true)});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(kind(out[0]), "delete");
+    EXPECT_EQ(str(out[0], "__version"), "101");
+    EXPECT_EQ(str(out[0], "note"), "n");
+    out = s.feed({with_metadata(change("snapshot", 0, 1, "back"), "snapshot", 0, false)});
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(kind(out[0]), "insert");
+    EXPECT_EQ(str(out[0], "__version"), "102");
+}
+
+// The versions depend only on the checkpointed state and the rows after it:
+// restored and fed the same rows, the stage emits the same rows again.
+TEST(SqlCdcKeepRows, ARestoreEmitsTheSameRowsWithTheSameVersions) {
+    const auto rows_after = [] {
+        Row a = with_metadata(change("snapshot", 0, 1, "new"), "snapshot", 0, false);
+        a.values["note"] = config::JsonValue{std::string{"backfilled"}};
+        Row b = with_metadata(change("snapshot", 0, 2, "seed"), "snapshot", 0, false);
+        b.values["note"] = config::JsonValue{std::string{"backfilled"}};
+        Row c = with_metadata(change("snapshot", 0, 3, "new"), "snapshot", 0, false);
+        c.values["note"] = config::JsonValue{std::string{"backfilled"}};
+        Row d = with_metadata(change("delete", 300, 1, "", ""), "delete", 300, true);
+        Row e = with_metadata(change("insert", 310, 1, "again"), "insert", 310, false);
+        e.values["note"] = config::JsonValue{std::string{"again"}};
+        return std::vector<Row>{a, b, c, d, e};
+    };
+    const auto text = [](const std::vector<Row>& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : rows) {
+            out.push_back(str(r, "id") + "|" + str(r, "status") + "|" + str(r, "note") + "|" +
+                          str(r, "__version") + "|" + str(r, "__deleted"));
+        }
+        return out;
+    };
+    InMemoryStateBackend backend;
+    std::vector<std::string> first;
+    {
+        Stage s(Mode::Append, /*emit_unheld=*/true, &backend);
+        (void)s.feed({with_metadata(change("insert", 100, 1, "new"), "insert", 100, false),
+                      with_metadata(change("snapshot", 0, 2, "seed"), "snapshot", 0, false),
+                      with_metadata(change("insert", 120, 3, "new"), "insert", 120, false),
+                      with_metadata(change("delete", 130, 3, "", ""), "delete", 130, true)});
+        const auto snap = backend.snapshot(CheckpointId{1});
+        first = text(s.feed(rows_after()));
+        InMemoryStateBackend restored;
+        restored.restore(snap);
+        Stage again(Mode::Append, /*emit_unheld=*/true, &restored);
+        EXPECT_EQ(text(again.feed(rows_after())), first);
+    }
+    EXPECT_EQ(first,
+              (std::vector<std::string>{"1|new|backfilled|101|false",
+                                        "2|seed|backfilled|1|false",
+                                        "3|new|backfilled|131|false",
+                                        "1|new|backfilled|300|true",
+                                        "1|again|again|310|false"}));
+}
+
+// A table that does not declare __version is given none.
+TEST(SqlCdcKeepRows, ATableWithoutAVersionColumnIsGivenNone) {
+    Stage s(Mode::Append, /*emit_unheld=*/true);
+    (void)s.feed({change("insert", 100, 1, "new")});
+    Row refresh = change("snapshot", 0, 1, "new");
+    refresh.values["note"] = config::JsonValue{std::string{"n"}};
+    auto out = s.feed({refresh, change("delete", 200, 1, "", "")});
+    ASSERT_EQ(out.size(), 2U);
+    EXPECT_FALSE(out[0].has_column("__version"));
+    EXPECT_FALSE(out[1].has_column("__version"));
 }
 
 TEST(SqlCdcKeepRows, TheRowsAreRestoredFromACheckpoint) {

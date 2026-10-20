@@ -55,7 +55,41 @@ std::string text_of(const Row& row) {
     return s;
 }
 
+// The row's columns without the change metadata, as text.
+std::string data_text_of(const Row& row) {
+    Row data = image_of(row);
+    for (const auto name : kMetadata) {
+        data.values.erase(std::string{name});
+    }
+    return text_of(data);
+}
+
+// The version the held row was emitted with: its __version where the table
+// declares one, and otherwise its WAL position.
+std::uint64_t emitted_version_of(const Row& held) {
+    const auto it = held.values.find("__version");
+    if (it == held.values.end() || !it->second.is_number()) {
+        return version_of(held);
+    }
+    const auto v = it->second.as_int();
+    return v < 0 ? 0 : static_cast<std::uint64_t>(v);
+}
+
+// Sets the row's __version, where the table declares one.
+void set_version(Row& row, std::uint64_t v) {
+    if (const auto it = row.values.find("__version"); it != row.values.end()) {
+        it->second = clink::config::JsonValue{static_cast<std::int64_t>(v)};
+    }
+}
+
 }  // namespace
+
+void CdcKeepRowsOperator::DeleteVersions::note(std::uint64_t top, std::uint64_t wal_position) {
+    highest = std::max(highest, top);
+    if (top > wal_position) {
+        highest_raised = std::max(highest_raised, top);
+    }
+}
 
 CdcKeepRowsOperator::CdcKeepRowsOperator(std::vector<std::string> key_columns,
                                          Mode mode,
@@ -71,6 +105,13 @@ CdcKeepRowsOperator::CdcKeepRowsOperator(std::vector<std::string> key_columns,
 KeyedState<std::string, Row> CdcKeepRowsOperator::rows_() {
     return this->runtime()->template keyed_state<std::string, Row>(
         "cdc_rows", clink::string_codec(), row_json_codec());
+}
+
+// Absent in a checkpoint taken before the stage kept it, which restores as
+// no delete emitted.
+BroadcastState<std::pair<std::uint64_t, std::uint64_t>> CdcKeepRowsOperator::deletes_() {
+    return this->runtime()->template broadcast_state<std::pair<std::uint64_t, std::uint64_t>>(
+        "cdc_deletes", clink::pair_codec(clink::uint64_codec(), clink::uint64_codec()));
 }
 
 // Built like the GROUP BY key: each key column's JSON form joined on '\x1f'.
@@ -98,6 +139,12 @@ void CdcKeepRowsOperator::process(const StreamElement<Row>& element, Emitter<Row
         return;
     }
     auto kv = rows_();
+    auto deletes_state = deletes_();
+    DeleteVersions deletes;
+    if (const auto stored = deletes_state.get()) {
+        deletes = DeleteVersions{.highest = stored->first, .highest_raised = stored->second};
+    }
+    const DeleteVersions deletes_before = deletes;
     Batch<Row> batch;
     const auto flush = [&] {
         if (!batch.empty()) {
@@ -110,19 +157,23 @@ void CdcKeepRowsOperator::process(const StreamElement<Row>& element, Emitter<Row
         if (kind != rec.value().values.end() && kind->second.is_string() &&
             kind->second.as_string() == "truncate") {
             flush();
-            truncate_(rec, kv, out);
+            truncate_(rec, kv, deletes, out);
             continue;
         }
-        apply_(rec, kv, batch);
+        apply_(rec, kv, deletes, batch);
         if (batch.size() >= kEmitChunk) {
             flush();
         }
     }
     flush();
+    if (deletes != deletes_before) {
+        deletes_state.put({deletes.highest, deletes.highest_raised});
+    }
 }
 
 void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
                                  KeyedState<std::string, Row>& kv,
+                                 DeleteVersions& deletes,
                                  Batch<Row>& out) {
     const Row& in = rec.value();
     const auto kind_it = in.values.find(kCdcKindField);
@@ -161,6 +212,13 @@ void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
         return;
     }
 
+    // A change of a key the stage does not hold outranks every delete that
+    // carried a version above its own WAL position; any other delete of the
+    // key has a lower WAL position than the change.
+    const auto unheld_version = [&] {
+        return deletes.highest_raised > 0 ? std::max(version, deletes.highest_raised + 1) : version;
+    };
+
     if (kind == "delete") {
         if (!held) {
             moved_.reset();
@@ -168,18 +226,28 @@ void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
                 ++unheld_dropped_;
                 return;
             }
-            emit(image_of(in), kRowKindDelete);
+            Row gone = image_of(in);
+            const std::uint64_t v = unheld_version();
+            set_version(gone, v);
+            deletes.note(v, version);
+            emit(std::move(gone), kRowKindDelete);
             return;
         }
         Row old = image_of(*held);
         Row gone = old;
+        // The highest version the key has had once the delete is emitted: in
+        // append mode the delete's own, in upsert mode the row it retracts.
+        std::uint64_t top = emitted_version_of(*held);
         if (mode_ == Mode::Append) {
             for (const auto name : kMetadata) {
                 if (const auto it = in.values.find(name); it != in.values.end()) {
                     gone.values[clink::config::InternedName{name}] = it->second;
                 }
             }
+            top = std::max(version, top + 1);
+            set_version(gone, top);
         }
+        deletes.note(top, version);
         kv.erase(key);
         moved_ = std::make_pair(version, std::move(old));
         emit(std::move(gone), kRowKindDelete);
@@ -241,6 +309,26 @@ void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
     }
     moved_.reset();
 
+    if (held) {
+        const std::uint64_t prev = emitted_version_of(*held);
+        if (kind == "snapshot") {
+            // A refresh of the held row: a backfill after a column was
+            // declared, or a snapshot taken again. One that changes nothing is
+            // not emitted, so reading the table again after a restart adds no
+            // rows the target already has.
+            if (data_text_of(*held) == data_text_of(next)) {
+                return;
+            }
+            set_version(next, prev + 1);
+        } else {
+            set_version(next, std::max(version, prev + 1));
+        }
+    } else if (kind == "snapshot") {
+        set_version(next, deletes.highest > 0 ? deletes.highest + 1 : 0);
+    } else {
+        set_version(next, unheld_version());
+    }
+
     Row stored = next;
     stored.values[clink::config::InternedName{kCdcVersionField}] =
         clink::config::JsonValue{static_cast<std::int64_t>(std::max(version, held_version))};
@@ -255,16 +343,6 @@ void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
             emit(std::move(next), kRowKindInsert);
         }
     } else {
-        // A snapshot row of a key already held refreshes it (a backfill after
-        // a column was declared, or a snapshot taken again): it takes the held
-        // row's __version, so a store that keeps the highest version per key
-        // keeps this, the later of the two.
-        if (kind == "snapshot" && held) {
-            if (const auto v = held->values.find("__version"); v != held->values.end()) {
-                next.values[clink::config::InternedName{"__version"}] = v->second;
-                stored.values[clink::config::InternedName{"__version"}] = v->second;
-            }
-        }
         emit(std::move(next), kRowKindInsert);
     }
     kv.put(key, stored);
@@ -272,6 +350,7 @@ void CdcKeepRowsOperator::apply_(const Record<Row>& rec,
 
 void CdcKeepRowsOperator::truncate_(const Record<Row>& rec,
                                     KeyedState<std::string, Row>& kv,
+                                    DeleteVersions& deletes,
                                     Emitter<Row>& out) {
     const Row& in = rec.value();
     const std::uint64_t version = version_of(in);
@@ -286,15 +365,20 @@ void CdcKeepRowsOperator::truncate_(const Record<Row>& rec,
         }
         removed.push_back(key);
         Row gone = image_of(row);
+        // As for a delete of the key.
+        std::uint64_t top = emitted_version_of(row);
         if (mode_ == Mode::Append) {
             for (const auto name : kMetadata) {
                 if (const auto it = in.values.find(name); it != in.values.end()) {
                     gone.values[clink::config::InternedName{name}] = it->second;
                 }
             }
+            top = std::max(version, top + 1);
+            set_version(gone, top);
         } else {
             set_row_kind(gone, kRowKindDelete);
         }
+        deletes.note(top, version);
         if (const auto ts = rec.event_time()) {
             batch.emplace(std::move(gone), *ts);
         } else {

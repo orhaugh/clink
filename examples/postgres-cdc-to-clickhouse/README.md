@@ -43,7 +43,11 @@ emits the 20,000 rows as a snapshot, then streams every committed change from
 the slot. Each change is a row carrying `__op`, `__version` (its WAL position,
 which increases with every change to a key; 0 for a snapshot row) and
 `__deleted`. The ClickHouse table keeps the row with the highest `__version`
-per key and drops a key whose latest change is a delete.
+per key and drops a key whose latest change is a delete. Capturing a column
+added later needs `keep_rows='true'`, and the rows its backfill reads carry a
+`__version` one above the row they refresh, so the same tables and queries
+keep the latest row
+([Adding a column](https://orhaugh.github.io/clink/connectors/postgres/#adding-a-column)).
 
 ## Run it
 
@@ -89,6 +93,19 @@ SELECT id,
 FROM orders_changes
 GROUP BY id
 HAVING argMax(__deleted, __version) = 0;
+```
+
+Both rely on one row per key at its highest version: of two different rows
+under one version, `argMax` returns either. The repeats an at-least-once
+delivery writes are identical, and clink gives every later row of a key a
+higher version, so this finds no key:
+
+```sql
+SELECT id, __version
+FROM orders_changes
+WHERE (id, __version) IN (SELECT id, max(__version) FROM orders_changes GROUP BY id)
+GROUP BY id, __version
+HAVING uniqExact((customer, status, amount, updated_at, rev, __deleted)) > 1;
 ```
 
 ## How it is checked

@@ -37,7 +37,9 @@
 //              row, the position streaming starts from
 //   __version  the change's WAL position as a number, 0 for a snapshot row.
 //              Per key it increases with every change, so it can version a
-//              table that keeps the latest row per key
+//              table that keeps the latest row per key. With keep_rows the
+//              row-keeping operator raises it where a row would not outrank
+//              the key's previous one (cdc_keep_rows.hpp)
 //   __deleted  true for a delete
 //   __table    the schema-qualified source table
 //   __xid      the transaction id (0 for a snapshot row)

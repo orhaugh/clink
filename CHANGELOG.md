@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+**A backfilled CDC row outranks the row it refreshes.** With
+`keep_rows='true'`, the rows a snapshot read again (the backfill after a restore
+declares a column added while the job was stopped, or a snapshot taken again
+after a restore) took the `__version` of the row they refreshed, in
+`changelog_mode='append'`, and `0` in `changelog_mode='upsert'`. A store that
+keeps the highest version per key does not order two rows of one key under one
+version: `argMax(x, __version)` over a ClickHouse change log, which the
+PostgreSQL to ClickHouse example uses to rebuild the table, could return the
+row without the added column, and a `ReplacingMergeTree(__version, __deleted)`
+fell back to the order the rows were inserted in. Every row the stage emits for
+a key now carries a higher `__version` than any it emitted for that key before:
+a refresh one above the row it refreshes, a later change its WAL position, or
+one above the key's previous row where that is higher, and a row of a key
+deleted earlier a version above that delete. A refresh that changes none of the
+row's columns is no longer emitted, so a snapshot read again after a restore
+adds only the rows that changed. `__version` stays the WAL position for every
+change except those few, and ClickHouse tables need no change. The stage keeps
+the highest versions its deletes carried in its operator state; a checkpoint
+taken by an earlier release restores without them, which leaves a snapshot row
+of a key deleted before that checkpoint able to rank below the delete, as
+before, until the stream replays the insert that brought the key back. A change
+log an earlier backfill wrote can hold two different rows of one key under one
+version; the query in the example's README lists the keys whose latest version
+is ambiguous, and a job started afresh, with a new slot and snapshot into an
+empty target, rewrites them. See "Versions with `keep_rows`" in
+docs/connectors/postgres.md.
+
 **A job on RocksDB or ForSt state restores a second time.** A restore opened
 the backend's database beside the checkpoint it restored and named every later
 checkpoint after that directory, while a restore looks for

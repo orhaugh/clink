@@ -3,7 +3,10 @@
 -- The change log clink writes: one row per change, a snapshot row, an insert,
 -- an update or a delete, the deleted row's values included. __version is the
 -- change's WAL position (0 for a snapshot row), which increases with every
--- change to a key. clink delivers to ClickHouse at least once, so after a
+-- change to a key. With keep_rows='true' a row that would not outrank the
+-- key's previous one, such as a row a backfill reads after a column is added,
+-- carries a higher number instead, so a later row of a key always has the
+-- higher version. clink delivers to ClickHouse at least once, so after a
 -- recovery some changes are here twice, identically.
 CREATE TABLE IF NOT EXISTS orders_changes
 (

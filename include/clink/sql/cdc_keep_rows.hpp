@@ -20,15 +20,45 @@
 //     key's row when the same change moved the row to a new key;
 //   * turns a truncate into a delete of every row it holds;
 //   * drops a change no newer than the row it holds, which only a replay can
-//     deliver;
+//     deliver, and a snapshot row that changes nothing about the row it holds
+//     (a snapshot taken again after a restart);
 //   * in changelog_mode='upsert', emits an update as update_before with the
 //     row it replaced and update_after with the new one, and a delete with the
 //     row it removed, so a consumer that retracts (a grouping, a join, a
 //     filter on any column) computes from whole rows; an update that changes
 //     nothing is not emitted;
 //   * in changelog_mode='append', completes a delete's row from the row it
-//     held, keeping the delete's own change metadata (__op, __version and the
-//     rest), so every change row is whole.
+//     held, keeping the delete's own change metadata (__op and the rest), so
+//     every change row is whole.
+//
+// Where the table declares __version, each row the stage emits for a key
+// carries a __version above every one it emitted for that key before (an
+// update_before, and a delete in upsert mode, repeat the row they retract), so
+// a store that keeps the row with the highest version per key (ClickHouse's
+// ReplacingMergeTree, an argMax over __version) keeps the row emitted last,
+// whatever order the rows reached it in. Two rows of one key under one version
+// are not ordered by such a store at all. The version is the change's WAL
+// position, which per key increases with every change, except where that
+// would not outrank what the stage emitted for the key before:
+//   * a snapshot row of a key it holds refreshes that key (a backfill after a
+//     column was declared, a snapshot taken again) and carries one above the
+//     held row's version;
+//   * a change of a key it holds, and in append mode a delete, carries its WAL
+//     position or one above the held row's version, whichever is higher. The
+//     second is higher only after at least as many refreshes since the key's
+//     last change as there are bytes between the two changes, 24 or more;
+//   * a key it does not hold was last emitted, if ever, by a delete. A
+//     snapshot row of one carries one above the highest version a delete
+//     carried, 0 while no delete has been emitted (the first snapshot); a
+//     change of one carries its WAL position or one above the highest version a
+//     delete carried above its own WAL position, whichever is higher. The two
+//     highest versions are operator state, checkpointed with the rows.
+// Each version depends only on the checkpointed state and on the rows that
+// arrive after it, so a restore gives a row it emits again the version the row
+// had. A snapshot taken again after a failure can read a row that changed
+// since the first attempt read it; the two attempts' rows then share a
+// version, and the change that made the difference, which the stream replays
+// after the snapshot, outranks both.
 //
 // A delete or update of a key it holds no row for is a change it cannot
 // complete. While converging, an update of such a key is skipped: the row was
@@ -53,6 +83,7 @@
 #include "clink/core/record.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/state/broadcast_state.hpp"
 #include "clink/state/keyed_state.hpp"
 
 namespace clink::sql {
@@ -83,10 +114,28 @@ public:
     [[nodiscard]] std::uint64_t converging_skips() const noexcept { return converging_skips_; }
 
 private:
+    // The highest __version a delete carried, and the highest a delete carried
+    // above its own WAL position: what a row of a key the stage no longer holds
+    // must outrank.
+    struct DeleteVersions {
+        std::uint64_t highest{0};
+        std::uint64_t highest_raised{0};
+        bool operator==(const DeleteVersions&) const = default;
+        // A delete that leaves `top` the highest version its key has had.
+        void note(std::uint64_t top, std::uint64_t wal_position);
+    };
+
     KeyedState<std::string, Row> rows_();
+    BroadcastState<std::pair<std::uint64_t, std::uint64_t>> deletes_();
     [[nodiscard]] std::string key_of_(const Row& row) const;
-    void apply_(const Record<Row>& rec, KeyedState<std::string, Row>& kv, Batch<Row>& out);
-    void truncate_(const Record<Row>& rec, KeyedState<std::string, Row>& kv, Emitter<Row>& out);
+    void apply_(const Record<Row>& rec,
+                KeyedState<std::string, Row>& kv,
+                DeleteVersions& deletes,
+                Batch<Row>& out);
+    void truncate_(const Record<Row>& rec,
+                   KeyedState<std::string, Row>& kv,
+                   DeleteVersions& deletes,
+                   Emitter<Row>& out);
 
     std::vector<std::string> key_columns_;
     Mode mode_;

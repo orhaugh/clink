@@ -3,12 +3,15 @@ name: postgres-cdc
 # The PostgreSQL CDC gate (scripts/postgres-cdc-live.sh): every PostgreSQL
 # connector test against a real server, PostgreSQL 16.15 pinned by digest in
 # docker/integration-services.yml; the SQL CDC round trip through the upsert
-# sink; and the CDC recovery cells, a coordinator and two workers capturing a
+# sink; the CDC recovery cells, a coordinator and two workers capturing a
 # table into ClickHouse with a worker killed at each phase boundary of the
 # source and the server restarted, checked against the table and against
-# every row version the workload committed. A live test skips when its server
-# or binary is missing and gtest counts that as a pass, so the gate fails on
-# any skip and on any required suite that did not run.
+# every row version the workload committed; and a column added through
+# `clink stop` and a restore, backfilled into the same ClickHouse tables with
+# and without a worker killed during the backfill, with no key holding two
+# different rows under one __version. A live test skips when its server or
+# binary is missing and gtest counts that as a pass, so the gate fails on any
+# skip and on any required suite that did not run.
 #
 # Plain runner steps that `docker run` the toolchain image, as the ClickHouse
 # recovery workflow does: the tests reach the servers on the runner's

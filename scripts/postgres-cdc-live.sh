@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The PostgreSQL CDC live gate: every PostgreSQL connector test against a real
-# server, the SQL CDC round trip, and the CDC recovery cells (a coordinator and
-# workers into ClickHouse, with faults at the source's phase boundaries), then
-# a check that nothing was skipped and that every required suite ran.
+# server, the SQL CDC round trip, the CDC recovery cells (a coordinator and
+# workers into ClickHouse, with faults at the source's phase boundaries), and a
+# column added and backfilled into ClickHouse, then a check that nothing was
+# skipped and that every required suite ran.
 #
 #   CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres password=postgres dbname=postgres" \
 #     scripts/postgres-cdc-live.sh [build-dir]
@@ -44,7 +45,7 @@ run() {  # <report name> <binary> [gtest args...]
 run postgres "${BUILD_DIR}/impls/postgres/tests/clink_postgres_tests"
 run postgres-sql "${BUILD_DIR}/tests/clink_postgres_sql_tests"
 run recovery "${BUILD_DIR}/tests/clink_integration_tests" \
-    --gtest_filter='Cells/PostgresCdcClickHouseRecovery.*:PostgresCdcSlot.*:PostgresCdcIntegration.*:PostgresCdcAddColumn.*'
+    --gtest_filter='Cells/PostgresCdcClickHouseRecovery.*:PostgresCdcSlot.*:PostgresCdcIntegration.*:PostgresCdcAddColumn.*:PostgresCdcClickHouseBackfill.*'
 
 python3 scripts/check-gtest-reports.py \
     --expect 'CdcRowEncoder.*=13' \
@@ -58,5 +59,6 @@ python3 scripts/check-gtest-reports.py \
     --expect 'PostgresCdcSlot.*=1' \
     --expect 'PostgresCdcIntegration.*=2' \
     --expect 'PostgresCdcAddColumn.*=1' \
+    --expect 'PostgresCdcClickHouseBackfill.*=2' \
     "${REPORT_DIR}"/postgres.json "${REPORT_DIR}"/postgres-sql.json "${REPORT_DIR}"/recovery.json || rc=1
 exit "${rc}"
