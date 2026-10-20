@@ -5,6 +5,7 @@ add_executable(clink_clickhouse_tests
     register.cpp
     test_factory_registration.cpp
     test_clickhouse_sink.cpp
+    test_clickhouse_sink_chain.cpp
     test_clickhouse_source.cpp
     test_builder.cpp
     test_typed_sink.cpp

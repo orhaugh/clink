@@ -1102,8 +1102,21 @@ JobPlan plan_job(const JobGraphSpec& graph,
                 }
             }
         }
-        // Downstream sink absorption: find the unique consumer of tail.
-        if (main_consumer_count[tail.id] == 1 && consumer_count[tail.id] == 1) {
+        // Downstream sink absorption: find the unique consumer of tail. Only
+        // into a chain that sends nothing to another subtask but its main
+        // output: each side-output group of the chain is a bridge sink in the
+        // chain task's Dag, and a sink fused beside one shares the chain's
+        // checkpoint with it. Dag::add_sink then hands that checkpoint back to
+        // the chain's last operator, which acknowledges it before a sink that
+        // writes at the barrier has written, and refuses the chain outright for
+        // a sink that gates the acknowledgement (the ClickHouse sinks). Left in
+        // a subtask of its own, the sink owns its checkpoint.
+        const bool sends_side_outputs =
+            std::any_of(group.begin(), group.end(), [&](const OperatorSpec* member) {
+                return consumer_count[member->id] > main_consumer_count[member->id];
+            });
+        if (!sends_side_outputs && main_consumer_count[tail.id] == 1 &&
+            consumer_count[tail.id] == 1) {
             const OperatorSpec* candidate = nullptr;
             for (const auto& dop : graph.ops) {
                 for (const auto& raw : dop.inputs) {

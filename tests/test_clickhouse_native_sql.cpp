@@ -65,6 +65,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_graph.hpp"
+#include "clink/cluster/job_planner.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/config/json.hpp"
@@ -3075,6 +3076,77 @@ TEST_F(ClickHouseLegacySqlLive, TheTutorialsTextSinkLandsEveryRowOnceWithItsForc
         tokens.insert(entry[2]);
     }
     EXPECT_EQ(tokens.size(), logged.size()) << "two INSERTs shared a token on " << line_;
+}
+
+// One job, a statement set of two INSERTs from one source: into the text sink
+// and into a collect sink. The text sink must be the only sink on its chain,
+// and it is here: the planner gives every sink a task of its own, so no task
+// holds both, the job runs, and each target takes every row once.
+TEST_F(ClickHouseLegacySqlLive, AStatementSetFeedsTheTextSinkAndAnotherSinkFromOneSource) {
+    constexpr std::int64_t kRows = 40;
+    const ScratchDir dir("live_legacy_set");
+    std::vector<std::string> lines;
+    for (std::int64_t id = 1; id <= kRows; ++id) {
+        lines.push_back(R"({"id":)" + std::to_string(id) + R"(,"s":"row )" + std::to_string(id) +
+                        R"("})");
+    }
+    write_lines(dir.path() / "in.ndjson", lines);
+    client_->Execute("CREATE TABLE " + db_ +
+                     ".events (id Int64, s String) ENGINE = MergeTree ORDER BY id");
+    const std::string ddl =
+        "CREATE TABLE src (id BIGINT, s VARCHAR) WITH (connector='file', format='json', path='" +
+        (dir.path() / "in.ndjson").string() +
+        "');"
+        "CREATE TABLE ch (id BIGINT, s VARCHAR) WITH (" +
+        server_with() +
+        ", table='events', format='json');"
+        "CREATE TABLE out (id BIGINT, s VARCHAR) WITH (connector='collect');";
+    const std::string set =
+        "EXECUTE STATEMENT SET BEGIN "
+        "INSERT INTO ch SELECT id, s FROM src;"
+        "INSERT INTO out SELECT id, s FROM src;"
+        "END;";
+
+    const auto specs = compile_script(ddl, set);
+    ASSERT_EQ(specs.size(), 1U) << "a statement set is one job";
+    ASSERT_TRUE(has_op(specs[0], "clickhouse_sink"));
+    ASSERT_TRUE(has_op(specs[0], "collect_sink_row"));
+    const auto plan =
+        clink::cluster::plan_job(specs[0], clink::cluster::OperatorRegistry::default_instance());
+    for (const auto& task : plan.tasks) {
+        const auto chain = clink::cluster::OperatorChainSpec::from_json(task.extra_config);
+        std::size_t sinks = chain.fused_sink.has_value() ? 1 : 0;
+        for (const auto& op : chain.ops) {
+            sinks += op.type == "clickhouse_sink" || op.type == "collect_sink_row" ? 1 : 0;
+        }
+        EXPECT_LE(sinks, 1U) << "a task holds both sinks";
+    }
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    opts.out = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(engine.execute_script(ddl), 0) << err.str();
+    auto reader = engine.collect_reader("out").ValueOrDie();
+    ASSERT_EQ(engine.execute_script(set), 0) << err.str();
+    std::int64_t collected = 0;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        ASSERT_TRUE(reader->ReadNext(&batch).ok());
+        if (!batch) {
+            break;
+        }
+        collected += batch->num_rows();
+    }
+    const bool ok = engine.await_all();
+    std::string errors;
+    for (const auto& e : engine.errors()) {
+        errors += e + "\n";
+    }
+    ASSERT_TRUE(ok) << "the statement set failed on " << line_ << ":\n" << errors << err.str();
+    EXPECT_EQ(collected, kRows);
+    expect_content("events", static_cast<std::size_t>(kRows));
 }
 
 // The Kafka to ClickHouse tutorial's own table, created by the init script the

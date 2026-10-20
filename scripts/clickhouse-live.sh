@@ -21,7 +21,11 @@
 # Then the 25.3 server, for the legacy sink's round trip
 # (ClickHouseLegacySqlLive.* only). A failing case fails the run; every service
 # started is stopped and removed, with its data volume, as soon as its profile
-# is done and again on exit, whatever happened.
+# is done and again on exit, whatever happened. The legacy sink's cases run on
+# their own, each line writing a googletest report that
+# scripts/check-gtest-reports.py then requires to show every one of them passed
+# and none skipped, so a case whose server variable never arrived fails the run
+# instead of reading as a pass.
 #
 # What the test binaries read, all set here per profile:
 #   CLINK_CLICKHOUSE_TEST_HOST, CLINK_CLICKHOUSE_TEST_PORT   the server (plain port)
@@ -55,6 +59,9 @@
 #                  container, and mounts CLICKHOUSE_LIVE_TMPDIR so the CA files
 #                  are readable there)
 #   CLICKHOUSE_LIVE_TMPDIR  where the TLS material is generated (default TMPDIR)
+#   REPORT_DIR     where the legacy cases' reports go (default
+#                  <BUILD_DIR>/clickhouse-live-reports); under PIN_RUNNER it must
+#                  be inside a directory the container mounts at the same path
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -62,6 +69,9 @@ COMPOSE=(docker compose -p clink-clickhouse-live -f "${ROOT}/docker/integration-
 BUILD_DIR="${BUILD_DIR:-${ROOT}/build}"
 CLICKHOUSE_LINES="${CLICKHOUSE_LINES:-26.3 26.8}"
 CLICKHOUSE_LIVE_SQL="${CLICKHOUSE_LIVE_SQL:-1}"
+REPORT_DIR="${REPORT_DIR:-${BUILD_DIR}/clickhouse-live-reports}"
+# ClickHouseLegacySqlLive's cases: every line must pass all of them.
+LEGACY_CASES=2
 
 find_bin() {
     find "${BUILD_DIR}" -name "$1" -type f -perm -u+x 2>/dev/null | head -1
@@ -114,6 +124,8 @@ down() {
 }
 
 status=0
+# Appended to the test command when set (run_counted's report).
+gtest_args=()
 # run <label> <binary> <gtest filter> [VAR=value ...]: one test command, with
 # the variables given and nothing else from a previous profile.
 run() {
@@ -125,8 +137,26 @@ run() {
         -u CLINK_CLICKHOUSE_TEST_RMT_ASYNC_DEFAULT -u CLINK_CLICKHOUSE_TEST_TLS_PORT \
         -u CLINK_CLICKHOUSE_TEST_TLS_CA -u CLINK_CLICKHOUSE_TEST_TLS_WRONG_CA \
         CLINK_CLICKHOUSE_TEST_HOST=localhost "$@" \
-        ${PIN_RUNNER:-} "${bin}" --gtest_filter="${filter}"; then
+        ${PIN_RUNNER:-} "${bin}" --gtest_filter="${filter}" ${gtest_args[@]+"${gtest_args[@]}"}; then
         echo "clickhouse-live: FAILED: ${label}" >&2
+        status=1
+    fi
+}
+
+# run_counted <label> <binary> <gtest filter> <PATTERN=N> [VAR=value ...]: as
+# run, and the run's googletest report must show at least N passing cases
+# matching PATTERN and no skipped one.
+run_counted() {
+    local label="$1" bin="$2" filter="$3" expect="$4"
+    shift 4
+    local report="${REPORT_DIR}/${label//[^A-Za-z0-9.]/_}.json"
+    mkdir -p "${REPORT_DIR}"
+    rm -f "${report}"
+    gtest_args=(--gtest_output="json:${report}")
+    run "${label}" "${bin}" "${filter}" "$@"
+    gtest_args=()
+    if ! python3 "${ROOT}/scripts/check-gtest-reports.py" --expect "${expect}" "${report}"; then
+        echo "clickhouse-live: FAILED: ${label} (its report)" >&2
         status=1
     fi
 }
@@ -154,9 +184,12 @@ for line in ${CLICKHOUSE_LINES}; do
         CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}" \
         CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT_PORT="${async_port}"
     if [ "${CLICKHOUSE_LIVE_SQL}" = "1" ]; then
-        run "${line} SQL-level" "${SQL_BIN}" 'ClickHouseNativeSqlLive.*:ClickHouseLegacySqlLive.*' \
+        run "${line} SQL-level" "${SQL_BIN}" 'ClickHouseNativeSqlLive.*' \
             CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}" \
             ${typed_job_env[@]+"${typed_job_env[@]}"}
+        run_counted "${line} legacy SQL-level" "${SQL_BIN}" 'ClickHouseLegacySqlLive.*' \
+            "ClickHouseLegacySqlLive.*=${LEGACY_CASES}" \
+            CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}"
     fi
     down "${svc}" "${async_svc}"
 
@@ -186,7 +219,8 @@ done
 
 if [ "${CLICKHOUSE_LIVE_SQL}" = "1" ]; then
     up clickhouse-25-3
-    run "25.3 legacy" "${SQL_BIN}" 'ClickHouseLegacySqlLive.*' \
+    run_counted "25.3 legacy" "${SQL_BIN}" 'ClickHouseLegacySqlLive.*' \
+        "ClickHouseLegacySqlLive.*=${LEGACY_CASES}" \
         CLINK_CLICKHOUSE_TEST_PORT=19203 CLINK_CLICKHOUSE_TEST_LINE=25.3
     down clickhouse-25-3
 fi

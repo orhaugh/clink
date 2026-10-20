@@ -4421,7 +4421,9 @@ public:
                 "acknowledges after that only while it owns the chain's checkpoint. A second "
                 "sink takes that ownership away, so a checkpoint could complete with those "
                 "records unwritten and a restore from it would never replay them. Give the "
-                "other sink its own subtask.");
+                "other sink its own subtask: in a job graph every sink operator is a subtask of "
+                "its own unless par-1 fusion folds it into a chain, and with the Dag API it "
+                "belongs in a separate Dag.");
         }
         if (sink->gates_checkpoint_ack()) {
             chain_ack_gating_sink_ = sink->name();

@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -759,6 +761,99 @@ TEST(JobPlanner, OpWithSideOutputCanBeChainedWithMainConsumer) {
     }
     EXPECT_TRUE(found_chain_with_p);
 }
+// Under the opt-in par-1 fusion a chain absorbs the sink behind it, but not a
+// chain that also sends a side output to another subtask: each side-output
+// group is a bridge sink in the chain task's Dag, and a sink fused beside one
+// shares the chain's checkpoint with it, which Dag::add_sink hands back to the
+// chain's last operator (or refuses, for a sink that gates the checkpoint's
+// acknowledgement). The same chain without the side consumer still absorbs it.
+TEST(JobPlanner, FusionLeavesTheSinkOfAChainThatSendsASideOutputInItsOwnSubtask) {
+    struct FuseEnv {
+        FuseEnv() {
+            if (const char* v = std::getenv("CLINK_PLAN_FUSE_PAR1")) {
+                previous = v;
+            }
+            ::setenv("CLINK_PLAN_FUSE_PAR1", "1", 1);
+        }
+        ~FuseEnv() {
+            if (previous) {
+                ::setenv("CLINK_PLAN_FUSE_PAR1", previous->c_str(), 1);
+            } else {
+                ::unsetenv("CLINK_PLAN_FUSE_PAR1");
+            }
+        }
+        FuseEnv(const FuseEnv&) = delete;
+        FuseEnv& operator=(const FuseEnv&) = delete;
+        std::optional<std::string> previous;
+    } fuse;
+
+    const auto graph = [](bool side_consumer) {
+        JobGraphSpec g;
+        g.ops.push_back(OperatorSpec{
+            .type = "string_lines_source",
+            .id = "src",
+            .out_channel = std::string{kChannelString},
+            .params = {{"lines", "a,b,c"}},
+        });
+        g.ops.push_back(OperatorSpec{
+            .type = "identity_string",
+            .id = "p",
+            .inputs = {"src"},
+            .out_channel = std::string{kChannelString},
+            .side_outputs = {{.tag = "errors", .channel_type = std::string{kChannelInt64}}},
+        });
+        g.ops.push_back(OperatorSpec{
+            .type = "identity_string",
+            .id = "q",
+            .inputs = {"p"},
+            .out_channel = std::string{kChannelString},
+        });
+        g.ops.push_back(OperatorSpec{
+            .type = "file_line_sink",
+            .id = "main_snk",
+            .inputs = {"q"},
+            .out_channel = std::string{kChannelString},
+            .params = {{"path", "/tmp/m"}},
+        });
+        if (side_consumer) {
+            g.ops.push_back(OperatorSpec{
+                .type = "file_int64_sink",
+                .id = "err_snk",
+                .inputs = {"p::errors"},
+                .out_channel = std::string{kChannelInt64},
+                .params = {{"path", "/tmp/e"}},
+            });
+        }
+        return g;
+    };
+    // Where main_snk landed: fused into the chain of p and q, or a task whose
+    // chain is main_snk alone.
+    const auto main_sink_placement = [](const JobGraphSpec& g) {
+        const auto plan = plan_job(g, OperatorRegistry::default_instance());
+        bool fused = false;
+        bool alone = false;
+        for (const auto& t : plan.tasks) {
+            const auto chain = OperatorChainSpec::from_json(t.extra_config);
+            if (chain.fused_sink.has_value() && chain.fused_sink->id == "main_snk") {
+                fused = true;
+            }
+            if (chain.ops.size() == 1 && chain.ops[0].id == "main_snk") {
+                alone = true;
+            }
+        }
+        return std::make_pair(fused, alone);
+    };
+
+    const auto [fused_without, alone_without] = main_sink_placement(graph(false));
+    EXPECT_TRUE(fused_without) << "fusion no longer absorbs the sink of a chain with no side "
+                                  "consumer; the case below no longer shows the rule";
+    EXPECT_FALSE(alone_without);
+
+    const auto [fused_with, alone_with] = main_sink_placement(graph(true));
+    EXPECT_FALSE(fused_with) << "the sink was fused beside the chain's side-output bridge";
+    EXPECT_TRUE(alone_with) << "the sink did not get a subtask of its own";
+}
+
 TEST(JobPlanner, SinkConsumingSideOutputResolvesChannelFromDecl) {
     // identity_string declares a typed side output {tag="errors",
     // channel_type=int64}. file_int64_sink consumes "p::errors".

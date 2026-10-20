@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**The ClickHouse text sink is refused beside a second sink on its chain.** The
+JSONEachRow text sink, `clickhouse_sink`, the SQL default for a ClickHouse
+table, is at-least-once because its checkpoint barrier writes everything it
+holds before the checkpoint is acknowledged. That holds only while it is the
+only sink on its chain. With a second sink, `Dag::add_sink` handed the chain's
+checkpoint back to the operator in front of the sinks, which acknowledged it as
+the barrier passed, before the text sink had written: a checkpoint could
+complete over rows the sink still held, and a restore from it would never
+replay them. A test that holds the barrier's INSERT saw checkpoint 1
+acknowledged with none of its 10 rows written. The text sink now declares that
+it gates the acknowledgement, as the native sink does, so `Dag::add_sink`
+refuses another sink beside it, whichever is added first, naming the sink and
+saying where the other one belongs. SQL plans every sink as a subtask of its
+own and was not affected. The planner's opt-in par-1 fusion no longer folds a
+sink into a chain that also sends a side output to another subtask, which built
+the same arrangement (and failed at deploy for the native sink). The
+connector's capability record lists the rule and the replay duplicates, and
+`scripts/clickhouse-live.sh` fails the run if a `ClickHouseLegacySqlLive` case
+skips.
+
 **A task cancelled while it is being set up builds nothing.** A worker that
 received a job's cancel while one of the job's tasks was still being set up
 marked the task cancelled and started it anyway. The task built every operator

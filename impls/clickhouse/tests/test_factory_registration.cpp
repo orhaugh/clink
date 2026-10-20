@@ -375,4 +375,31 @@ TEST(ClickHouseSinkFactory, TheRecordListsTheTimeoutKeysAndKeepsItsFormats) {
     EXPECT_EQ(rec->delivery, clink::connectors::DeliveryGuarantee::AtLeastOnce);
 }
 
+// The text sink's guarantee holds only as the only sink on its chain, so the
+// sink says so, and the record that the manifest and the delivery report print
+// carries the rule and the replay, word for word.
+TEST(ClickHouseSinkFactory, TheSinkGatesTheAckAndTheRecordSaysItMustBeTheOnlySink) {
+    const auto* factory =
+        clink::cluster::OperatorRegistry::default_instance().find_sink("clickhouse_sink", "string");
+    ASSERT_NE(factory, nullptr);
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"table", "events"}};
+    const auto sink = std::static_pointer_cast<clink::Sink<std::string>>(factory->build(ctx));
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->name(), "clickhouse_sink");
+    EXPECT_TRUE(sink->gates_checkpoint_ack());
+
+    const auto* rec = clink::connectors::CapabilityRegistry::instance().find("clickhouse");
+    ASSERT_NE(rec, nullptr);
+    EXPECT_TRUE(rec->self_check().empty());
+    EXPECT_EQ(rec->limitations,
+              (std::vector<std::string>{
+                  "query source re-reads from the start on restart (no offset state)",
+                  "the text sink is at-least-once: rows after the last completed checkpoint are "
+                  "replayed, each batch under a fresh deduplication token, and may appear twice",
+                  "the text sink must be the only sink on its chain: Dag::add_sink refuses "
+                  "another sink beside it",
+              }));
+}
+
 }  // namespace

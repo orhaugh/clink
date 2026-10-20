@@ -219,7 +219,12 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options =
             {"connect_timeout_ms", "send_timeout_ms", "receive_timeout_ms", "batch_interval_ms"},
         .available_in_sql = true,
-        .limitations = {"query source re-reads from the start on restart (no offset state)"},
+        .limitations = {"query source re-reads from the start on restart (no offset state)",
+                        "the text sink is at-least-once: rows after the last completed "
+                        "checkpoint are replayed, each batch under a fresh deduplication token, "
+                        "and may appear twice",
+                        "the text sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

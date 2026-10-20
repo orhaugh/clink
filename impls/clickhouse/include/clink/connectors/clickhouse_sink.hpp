@@ -83,6 +83,15 @@ public:
     void flush() override;
     void close() override;
 
+    // The barrier flush above is what the at-least-once guarantee rests on,
+    // and it holds only while the checkpoint's acknowledgement follows it,
+    // which is the case only while this sink owns its chain's checkpoint. A
+    // second sink on the chain hands the checkpoint back to the operator in
+    // front of the sinks, which acknowledges it as the barrier passes, before
+    // the flush. So Dag::add_sink refuses another sink beside this one,
+    // whichever is added first.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+
     std::string name() const override { return "clickhouse_sink"; }
 
     [[nodiscard]] const Options& options() const noexcept;
