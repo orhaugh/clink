@@ -13,8 +13,8 @@
 //         that moment, and task construction runs on task threads: a task
 //         that finished constructing after the flip registered a token
 //         nobody would ever set and ran on as an orphan of a cancelled
-//         deployment. The worker now latches the job id and starts such a
-//         task pre-cancelled.
+//         deployment. The worker now latches the job id and cancels such a
+//         task before its runner starts, so it builds and runs nothing.
 //
 // 75a is scripted with fake workers over real frames (only frame-level
 // control can withhold exactly one SubtaskFinished on demand); 75b runs a
@@ -49,8 +49,12 @@
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/cluster/runner_registry.hpp"
+#include "clink/cluster/type_registry.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/fault/fault_injection.hpp"
+#include "clink/operators/source_operator.hpp"
+#include "clink/plugin/plugin.hpp"
 #include "clink/runtime/network/connection.hpp"
 
 using namespace clink;
@@ -421,10 +425,10 @@ TEST(ErrorCancelConvergence, AClientCancelWhosePeerNeverReportsStillTerminates) 
 // 75b. A task still constructing when its job's CancelJob is processed used
 // to register a cancel token nobody would ever set and run on as an orphan.
 // The worker.task_token_register fault point holds every task of this job in
-// construction across the cancel; with the latch each starts pre-cancelled
-// and the job completes. Without it the source task runs its two-billion
+// construction across the cancel; with the latch none of them runs and the
+// job completes. Without it the source task runs its two-billion
 // range and the job never completes.
-TEST(ErrorCancelConvergence, ATaskConstructedAcrossTheCancelStartsPreCancelled) {
+TEST(ErrorCancelConvergence, ATaskConstructedAcrossTheCancelDoesNotRunAsAnOrphan) {
     ensure_built_ins_registered();
     const auto dir =
         std::filesystem::temp_directory_path() / ("clink_ecc_latch_" + std::to_string(::getpid()));
@@ -461,7 +465,7 @@ TEST(ErrorCancelConvergence, ATaskConstructedAcrossTheCancelStartsPreCancelled) 
     // cut of this test timed out against a WORKING latch that way). 200k
     // records at 10ms apart build instantly and emit for ~2000s - an orphan
     // surviving the cancel keeps this job incomplete far past the await,
-    // while a pre-cancelled task exits on its first predicate check.
+    // while a task cancelled before it starts is not run at all.
     src.params = {{"count", "200000"}, {"delay_ms", "10"}};
     g.ops.push_back(src);
     OperatorSpec snk;
@@ -486,6 +490,111 @@ TEST(ErrorCancelConvergence, ATaskConstructedAcrossTheCancelStartsPreCancelled) 
     EXPECT_TRUE(coordinator.await_job_completion(job_id, 15s))
         << "a task registered after the cancel ran on as an orphan of a cancelled "
            "deployment (followups item 75b)";
+
+    worker.stop();
+    coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// The latch alone still RAN a task cancelled before it started: the runner
+// built every operator before its first look at the token, so a source whose
+// build is slow held the cancelled job open for as long as the build took.
+// int64_range_source builds every record up front, and ten million of them
+// took 12.9 s under ThreadSanitizer, past a five-second bound. A task whose
+// cancel arrived while it was being set up must not build anything. This
+// source's factory counts its calls and takes three seconds; both tasks are
+// held at the fault point, as in 75b, until the cancel has landed.
+
+namespace {
+
+std::atomic<int>& ecc_slow_build_calls() {
+    static std::atomic<int> calls{0};
+    return calls;
+}
+
+void register_ecc_slow_build_source() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        ensure_built_ins_registered();
+        clink::plugin::PluginRegistry reg(TypeRegistry::default_instance(),
+                                          RunnerRegistry::default_instance(),
+                                          SelectorRegistry::default_instance());
+        reg.register_source<std::int64_t>(
+            "ecc_slow_build_source",
+            [](const clink::plugin::BuildContext&) -> std::shared_ptr<Source<std::int64_t>> {
+                ecc_slow_build_calls().fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::sleep_for(3s);
+                return std::make_shared<VectorSource<std::int64_t>>(
+                    std::vector<Record<std::int64_t>>{Record<std::int64_t>{1}},
+                    "ecc_slow_build_source");
+            });
+    });
+}
+
+}  // namespace
+
+TEST(ErrorCancelConvergence, ATaskCancelledBeforeItStartsBuildsNothing) {
+    register_ecc_slow_build_source();
+    ecc_slow_build_calls().store(0, std::memory_order_relaxed);
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ecc_prebuild_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator coordinator;
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"ecc-prebuild"});
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 8;
+    Worker worker("ecc-prebuild", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const clink::fault::ScopedFault guard(clink::fault::Rule{
+        .point = clink::fault::points::kWorkerTaskTokenRegister,
+        .ordinal = 0,
+        .action = clink::fault::Action::Delay,
+        .arg = 2000,
+    });
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "ecc_slow_build_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{kChannelInt64};
+    g.ops.push_back(src);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"src"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", (dir / "out.txt").string()}};
+    g.ops.push_back(snk);
+
+    const auto job_id = coordinator.submit_job(g, OperatorRegistry::default_instance());
+    ASSERT_GT(job_id, 0U);
+
+    // Both tasks have their peers and are held at the fault point: the cancel
+    // reaches each of them through the latch, not at the peer-update wait,
+    // where a cancelled task never gets as far as its runner.
+    const auto held_by = std::chrono::steady_clock::now() + 10s;
+    while (clink::fault::Registry::instance().hits(clink::fault::points::kWorkerTaskTokenRegister) <
+               2 &&
+           std::chrono::steady_clock::now() < held_by) {
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_GE(
+        clink::fault::Registry::instance().hits(clink::fault::points::kWorkerTaskTokenRegister), 2U)
+        << "the job's two tasks never reached the point their cancel token is registered at";
+    const auto ack = coordinator.cancel_job(job_id);
+    EXPECT_TRUE(ack.ok);
+
+    EXPECT_TRUE(coordinator.await_job_completion(job_id, 15s));
+    EXPECT_EQ(ecc_slow_build_calls().load(std::memory_order_relaxed), 0)
+        << "a task cancelled before its runner started built its source anyway";
 
     worker.stop();
     coordinator.stop();

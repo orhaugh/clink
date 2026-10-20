@@ -602,9 +602,10 @@ private:
     // fresh token nobody would ever set and run on as an orphan of a
     // cancelled deployment (followups item 75b - it parked a 292-task job's
     // fail-by-counting completion at 291/292 forever). run_task_ checks this
-    // latch at registration and starts such a task pre-cancelled. A later
-    // Deploy for the same job id clears the latch: a whole-job restart
-    // redeploys under the same id and its tasks must run. Guarded by mu_.
+    // latch at registration and cancels such a task before its runner starts,
+    // so it builds and runs nothing. A later Deploy for the same job id
+    // clears the latch: a whole-job restart redeploys under the same id and
+    // its tasks must run. Guarded by mu_.
     std::unordered_set<JobId> cancelled_jobs_;
 };
 

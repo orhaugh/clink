@@ -2078,9 +2078,13 @@ clink::cluster::JobGraphSpec clink_cancel_test_graph() {
     src.id = "src";
     src.type = "int64_range_source";
     src.out_channel = std::string{kChannelInt64};
-    // Long enough to still be running at every cancel below; delay keeps
-    // the pipeline gently active rather than CPU-bound.
-    src.params = {{"count", "10000000"}, {"delay_ms", "1"}};
+    // Long enough to still be running at every cancel below (a record a
+    // millisecond for 100 s); delay keeps the pipeline gently active rather
+    // than CPU-bound. No larger: the source builds every record before it
+    // runs, nothing can cancel that build, and ten million records took
+    // 12.9 s to build under ThreadSanitizer, past the 5 s these tests allow
+    // a cancel.
+    src.params = {{"count", "100000"}, {"delay_ms", "1"}};
     g.ops.push_back(std::move(src));
     clink::cluster::OperatorSpec snk;
     snk.id = "snk";

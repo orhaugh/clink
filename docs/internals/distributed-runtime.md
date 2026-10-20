@@ -158,6 +158,8 @@ On `Deploy` (`handle_deploy_`), the worker allocates (or reuses) a per-job `JobB
 4. waits for the coordinator's `PeerUpdate` (bounded by `peer_update_timeout`, default 30 s), then
 5. builds and runs the operator chain through the local executor.
 
+A `CancelJob` reaches a task wherever it is in those steps. A task waiting for its `PeerUpdate` stops waiting and exits. Past that wait, a task that runs one operator through its registered runner registers a cancel token just before step 5, and `CancelJob` flips the tokens registered at that moment. Such a task still being set up when the cancel arrives finds its job in the worker's cancelled set (`cancelled_jobs_`, cleared by the job's next `Deploy`) and is not run, so it builds no operator at all. A cancel that arrives once the operator is being built waits for that build: a factory cannot be interrupted, and the executor reads the token only once it runs.
+
 The two-phase listen/peer-update handshake is how the coordinator resolves the actual `host:port` each upstream subtask should connect to: subtasks bind ephemeral ports first, report them, and the coordinator fans the resolved peer addresses back out once every subtask of the job has reported. See [./network-stack.md](./network-stack.md) for the data-plane bridges and [./task-lifecycle.md](./task-lifecycle.md) for what runs inside a subtask.
 
 ### Port discovery and peer resolution

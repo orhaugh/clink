@@ -2769,19 +2769,30 @@ void Worker::run_generic_subtask_(JobId job_id,
                 per_job_cancel_tokens_[job_id][task.subtask_idx] = cancel_token;
                 // The job's CancelJob may have been processed while this
                 // task was still constructing - the flip walks only tokens
-                // registered at that moment. Start pre-cancelled rather
-                // than run as an orphan the coordinator counts against a
+                // registered at that moment. Cancel it here rather than let
+                // it run as an orphan the coordinator counts against a
                 // completion that then never converges (item 75b).
                 if (cancelled_jobs_.count(job_id) != 0) {
                     cancel_token->store(true, std::memory_order_release);
-                    log::info("worker.cancel",
-                              "job_id=" + std::to_string(job_id) + " subtask " +
-                                  std::to_string(task.subtask_idx) +
-                                  " registered after the job's cancel; starting pre-cancelled");
                 }
             }
             rctx.cancel_token = cancel_token;
-            (*runner)(rctx);
+            // A task cancelled before its runner starts, by the latch above or
+            // by a CancelJob that flipped the token since, is not run at all.
+            // The runner builds every operator before it first reads the
+            // token, and a build can take a long time (int64_range_source
+            // creates every record up front): the cancelled job stayed open
+            // until the build finished, 12.9 s for ten million records under
+            // ThreadSanitizer. A cancel that lands once the runner has started
+            // still waits for the build in progress.
+            if (cancel_token->load(std::memory_order_acquire)) {
+                log::info("worker.cancel",
+                          "job_id=" + std::to_string(job_id) + " subtask " +
+                              std::to_string(task.subtask_idx) +
+                              " was cancelled before it started; not running it");
+            } else {
+                (*runner)(rctx);
+            }
             {
                 std::lock_guard lock(mu_);
                 auto job_it = per_job_cancel_tokens_.find(job_id);

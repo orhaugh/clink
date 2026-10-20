@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**A task cancelled while it is being set up builds nothing.** A worker that
+received a job's cancel while one of the job's tasks was still being set up
+marked the task cancelled and started it anyway. The task built every operator
+before it first read the cancel, so a source that is slow to build held the
+cancelled job open for as long as the build took: ten million records of the
+built-in `int64_range_source`, which creates every record up front, took 12.9 s
+under ThreadSanitizer. Such a task is now not run at all. A cancel that arrives
+once a task's operators are being built still waits for that build to finish.
+
 **A backfilled CDC row outranks the row it refreshes.** With
 `keep_rows='true'`, the rows a snapshot read again (the backfill after a restore
 declares a column added while the job was stopped, or a snapshot taken again
