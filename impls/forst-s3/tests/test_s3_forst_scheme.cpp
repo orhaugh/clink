@@ -421,8 +421,66 @@ TEST(S3ForstSchemes, S3SstCrossMachineRestoreFromBucketAlone) {
     EXPECT_EQ(to_string(*built2.backend->get(op, sv(std::string{"a"}))), "1");
     EXPECT_EQ(to_string(*built2.backend->get(op, sv(std::string{"b"}))), "2");
     // The metadata dir was re-materialised locally; the data files were not.
-    EXPECT_TRUE(std::filesystem::exists(local + "/0.cp-1"))
+    EXPECT_TRUE(std::filesystem::exists(local + "/v1/0.cp-1"))
         << "fetch must re-materialise the checkpoint metadata dir";
+    EXPECT_FALSE(local_tree_has_sst(local));
+}
+
+// A checkpoint written at one location restores into a backend at another: a
+// job resubmitted from another job's savepoint, each job writing under its own
+// prefix and local root, or a checkpoint written before state was namespaced
+// by job. The checkpoint is copied into the restoring backend's own mapping,
+// and the source is left as it was.
+TEST(S3ForstSchemes, S3SstRestoresACheckpointWrittenAtAnotherLocation) {
+    const char* ep = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const char* bk = std::getenv("CLINK_S3_TEST_BUCKET");
+    if (ep == nullptr || bk == nullptr) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET";
+    }
+    auto& f = StateBackendFactory::default_instance();
+    const OperatorId op{7};
+    const std::string prefix =
+        std::string{"forst-s3sst-moved-"} + std::to_string(static_cast<long>(::getpid()));
+    const std::string local = tmp_local("moved");
+    const auto uri_at = [&](const std::string& p, const std::string& l) {
+        return std::string{"s3sst+forst://"} + bk + "/" + p + "?local=" + l + "&endpoint=" + ep +
+               "&region=us-east-1";
+    };
+    const std::string source = uri_at(prefix + "/_state/1", local + "/_state/1");
+    const std::string target = uri_at(prefix + "/_state/2", local + "/_state/2");
+
+    {
+        StateBackendSpec spec1;
+        spec1.uri = source;
+        spec1.subtask_idx = 0;
+        auto built1 = f.build(spec1);
+        ASSERT_TRUE(built1.backend != nullptr);
+        built1.backend->put(op, sv(std::string{"a"}), sv(std::string{"1"}));
+        built1.backend->put(op, sv(std::string{"b"}), sv(std::string{"2"}));
+        for (int i = 0; i < 4096; ++i) {
+            built1.backend->put(op, sv("warm_" + std::to_string(i)), sv(std::string(64, 'x')));
+        }
+        (void)built1.backend->snapshot(CheckpointId{1});
+    }
+    const auto source_objects = list_objects(ep, std::string{bk} + "/" + prefix + "/_state/1");
+    ASSERT_FALSE(source_objects.empty());
+
+    StateBackendSpec spec2;
+    spec2.uri = target;
+    spec2.subtask_idx = 0;
+    spec2.restore_uri = source;
+    spec2.restore_checkpoint_id = 1;
+    auto built2 = f.build(spec2);
+    ASSERT_TRUE(built2.backend != nullptr);
+    ASSERT_TRUE(built2.restore_from.has_value());
+    built2.backend->restore(*built2.restore_from);
+    ASSERT_TRUE(built2.backend->get(op, sv(std::string{"a"})).has_value());
+    EXPECT_EQ(to_string(*built2.backend->get(op, sv(std::string{"a"}))), "1");
+    EXPECT_EQ(to_string(*built2.backend->get(op, sv(std::string{"b"}))), "2");
+    EXPECT_FALSE(list_objects(ep, std::string{bk} + "/" + prefix + "/_state/2").empty())
+        << "the checkpoint was not copied into the restoring backend's prefix";
+    EXPECT_EQ(list_objects(ep, std::string{bk} + "/" + prefix + "/_state/1"), source_objects)
+        << "restoring a copy changed the source checkpoint";
     EXPECT_FALSE(local_tree_has_sst(local));
 }
 
@@ -551,7 +609,7 @@ TEST(S3ForstSchemes, S3SstConstructionSweepsStaleStaging) {
         auto s3 = arrow::fs::S3FileSystem::Make(opts);
         ASSERT_TRUE(s3.ok());
         auto out =
-            (*s3)->OpenOutputStream(std::string{bk} + "/" + prefix + "/0.cp-9.tmp/000099.sst");
+            (*s3)->OpenOutputStream(std::string{bk} + "/" + prefix + "/v1/0.cp-9.tmp/000099.sst");
         ASSERT_TRUE(out.ok());
         ASSERT_TRUE((*out)->Write("stranded", 8).ok());
         ASSERT_TRUE((*out)->Close().ok());
@@ -565,8 +623,8 @@ TEST(S3ForstSchemes, S3SstConstructionSweepsStaleStaging) {
         }
         return n;
     };
-    ASSERT_EQ(count("/0.cp-9.tmp/"), 1);
-    ASSERT_GE(count("/0.cp-1/"), 1);
+    ASSERT_EQ(count("/v1/0.cp-9.tmp/"), 1);
+    ASSERT_GE(count("/v1/0.cp-1/"), 1);
 
     // A fresh construction (restart) sweeps the stale staging and leaves
     // the real checkpoint alone.
@@ -577,8 +635,8 @@ TEST(S3ForstSchemes, S3SstConstructionSweepsStaleStaging) {
         auto built = f.build(spec);
         ASSERT_TRUE(built.backend != nullptr);
     }
-    EXPECT_EQ(count("/0.cp-9.tmp/"), 0) << "stale staging must be swept at construction";
-    EXPECT_GE(count("/0.cp-1/"), 1) << "real checkpoints must survive the sweep";
+    EXPECT_EQ(count("/v1/0.cp-9.tmp/"), 0) << "stale staging must be swept at construction";
+    EXPECT_GE(count("/v1/0.cp-1/"), 1) << "real checkpoints must survive the sweep";
 }
 
 // Deferred reads default ON for s3sst (its block-cache misses are ranged

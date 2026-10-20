@@ -924,6 +924,45 @@ std::shared_ptr<clink::SnapshotStore> make_s3_metadata_store(const RemoteSstOpti
     return std::make_shared<S3SstMetadataStore>(make_mapping(opts), make_arrow_s3(opts));
 }
 
+void copy_checkpoint_between(const RemoteSstOptions& from,
+                             const std::string& from_dir,
+                             const RemoteSstOptions& to,
+                             const std::string& to_dir) {
+    const auto from_map = make_mapping(from);
+    const auto to_map = make_mapping(to);
+    auto s3 = make_arrow_s3(to);
+    // The metadata files: the local copy, or the one persist() published to
+    // the source checkpoint's prefix.
+    S3SstMetadataStore source_metadata(from_map, s3);
+    const auto local_source = source_metadata.fetch_checkpoint_dir(from_dir);
+    std::error_code ec;
+    fs::remove_all(to_dir, ec);
+    fs::create_directories(to_dir, ec);
+    if (ec) {
+        throw std::runtime_error("s3sst checkpoint copy: cannot create " + to_dir + ": " +
+                                 ec.message());
+    }
+    for (const auto& entry : fs::directory_iterator(local_source)) {
+        if (!entry.is_regular_file() || has_sst_suffix(entry.path().filename().string())) {
+            continue;
+        }
+        fs::copy_file(entry.path(),
+                      fs::path(to_dir) / entry.path().filename(),
+                      fs::copy_options::overwrite_existing);
+    }
+    // The data files, and the metadata persist() published beside them, so
+    // the copy is restorable from the bucket alone as well.
+    const auto source_prefix = from_map.object_dir(from_dir);
+    const auto target_prefix = to_map.object_dir(to_dir);
+    for (const auto& name : S3DataFileMirror{from_map, s3}.list_dir(from_dir)) {
+        const auto st = s3->CopyFile(source_prefix + "/" + name, target_prefix + "/" + name);
+        if (!st.ok()) {
+            throw std::runtime_error("s3sst checkpoint copy: " + source_prefix + "/" + name +
+                                     " -> " + target_prefix + ": " + st.ToString());
+        }
+    }
+}
+
 std::size_t sweep_stale_staging(const RemoteSstOptions& opts, const std::string& subtask_dir) {
     const auto mapping = make_mapping(opts);
     auto s3 = make_arrow_s3(opts);

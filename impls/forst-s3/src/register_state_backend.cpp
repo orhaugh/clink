@@ -336,10 +336,11 @@ BuiltStateBackend build_changelog_s3_forst(const StateBackendSpec& spec) {
 // (written once via multipart upload, random-read on block-cache miss,
 // checkpoint "hard links" become server-side copies) while the small
 // mutable metadata files stay on the local working dir. The working set
-// is bounded by object storage, not local disk. Restore is same-config:
-// the restore URI must name the same bucket/prefix/local root (a restart
-// or a new subtask over the same layout), since the object mapping is
-// relative to that root.
+// is bounded by object storage, not local disk. The object mapping is
+// relative to the local root, so a checkpoint the restore URI places at
+// another prefix or local root (another job's, or one written before state
+// was namespaced by job) is first copied into this backend's own mapping
+// (copy_checkpoint_between), within one bucket.
 BuiltStateBackend build_s3sst_forst(const StateBackendSpec& spec) {
     const auto [scheme, base] = split_uri(spec.uri);
     (void)scheme;
@@ -396,30 +397,49 @@ BuiltStateBackend build_s3sst_forst(const StateBackendSpec& spec) {
     out.backend = std::make_shared<clink::ForStStateBackend>(std::move(fopts));
 
     if (!spec.restore_uri.empty() && spec.restore_checkpoint_id != 0) {
+        // Where the checkpoint was written: the restore URI's mapping, or this
+        // backend's own when the URI names no s3sst location (an older
+        // coordinator sends its checkpoint directory).
         const auto [rscheme, rbase] = split_uri(spec.restore_uri);
-        (void)rscheme;
-        const auto rcfg = parse_cfg(rbase);
+        const auto rcfg = rscheme == "s3sst+forst" ? parse_cfg(rbase) : cfg;
+        const bool elsewhere = rcfg.prefix != cfg.prefix || local_root(rcfg) != root;
+        if (rcfg.bucket != cfg.bucket) {
+            throw std::runtime_error(
+                "s3sst+forst: checkpoint " + std::to_string(spec.restore_checkpoint_id) +
+                " is in bucket '" + rcfg.bucket + "' and this job writes bucket '" + cfg.bucket +
+                "'; a restore copies the checkpoint within one bucket.");
+        }
+        RemoteSstOptions from = ro;
+        from.key_prefix = rcfg.prefix;
+        from.local_root = local_root(rcfg).string();
         const bool is_rescale =
             spec.restore_from_subtask_idx != std::numeric_limits<std::uint32_t>::max();
         const std::uint32_t src_first =
             is_rescale ? spec.restore_from_subtask_idx : spec.subtask_idx;
         const std::uint32_t parent_count =
             spec.restore_from_parent_count == 0 ? 1 : spec.restore_from_parent_count;
+        const std::string cp_suffix = ".cp-" + std::to_string(spec.restore_checkpoint_id);
         // Handles are the LOCAL metadata cp dirs (as for forst://); the
         // backend's DataFileMirror replicates the matching remote data
         // files during restore. No local existence check here: the
         // metadata store's fetch serves a missing dir from the bucket
         // (cross-machine restore) and throws only when the checkpoint
-        // exists in neither place.
+        // exists in neither place. A checkpoint at another location is
+        // copied into this mapping first, at the same relative path, where
+        // this job never writes a checkpoint of its own: it numbers its
+        // checkpoints above the one it restores.
         std::string joined;
         for (std::uint32_t i = 0; i < parent_count; ++i) {
-            const std::string dir =
-                (std::filesystem::path{clink::state_dir_for(
-                     local_root(rcfg).string(), spec.restore_generation, src_first + i)}
-                     .string() +
-                 ".cp-" +
-                                     std::to_string(spec.restore_checkpoint_id)))
-                    .string();
+            std::string dir =
+                clink::state_dir_for(from.local_root, spec.restore_generation, src_first + i) +
+                cp_suffix;
+            if (elsewhere) {
+                auto copy =
+                    clink::state_dir_for(root.string(), spec.restore_generation, src_first + i) +
+                    cp_suffix;
+                copy_checkpoint_between(from, dir, ro, copy);
+                dir = std::move(copy);
+            }
             if (!joined.empty()) {
                 joined.push_back('\n');
             }

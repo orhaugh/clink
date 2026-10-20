@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**The ForSt S3 composite builds again, and `s3sst+forst` restores a checkpoint
+written elsewhere.** `impls/forst-s3` had not compiled since state directories
+gained generations (an unbalanced parenthesis in the `s3sst+forst` restore path,
+in an opt-in build CI does not run). It compiles, and a checkpoint written under
+another prefix or local root is copied into the backend's own mapping, metadata
+locally and objects server side, before it is restored, within one bucket.
+
 **The restart hang listed as a known issue in v0.11.0 was a ThreadSanitizer
 deadlock, not an engine defect.** Under TSan,
 `Cluster.ARestartBeforeTheFirstCheckpointKeepsTheSubmittedRestorePoint`

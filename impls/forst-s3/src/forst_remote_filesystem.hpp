@@ -62,6 +62,20 @@ std::shared_ptr<clink::DataFileMirror> make_s3_data_file_mirror(const RemoteSstO
 // capture/persist split.
 std::shared_ptr<clink::SnapshotStore> make_s3_metadata_store(const RemoteSstOptions& opts);
 
+// Copy a checkpoint dir written under one mapping (`from`, `from_dir`) to a
+// checkpoint dir of another (`to`, `to_dir`): its metadata files to `to_dir`
+// on the local disk (re-materialised from `from`'s object prefix when the
+// local copy is missing), and every object under its prefix server side,
+// prefix to prefix. The copy is then a checkpoint of `to`'s mapping, which the
+// backend restores like one it wrote. This is how a backend restores a
+// checkpoint another location holds: a job resubmitted from another job's
+// savepoint, or a checkpoint written before state was namespaced by job. Both
+// mappings must be in one bucket behind one endpoint (`to`'s).
+void copy_checkpoint_between(const RemoteSstOptions& from,
+                             const std::string& from_dir,
+                             const RemoteSstOptions& to,
+                             const std::string& to_dir);
+
 // Delete stale checkpoint STAGING prefixes ("<subtask>.cp-*.tmp") left
 // on object storage by a checkpoint that crashed mid-stage: the engine
 // removes the local staging dir on failure, but that never reaches the
