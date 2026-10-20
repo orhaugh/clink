@@ -45,9 +45,11 @@ struct SubmitOptions {
     bool wait_for_completion{true};
     // Distributed-checkpointing config. Empty checkpoint_dir disables
     // checkpointing entirely; otherwise the coordinator triggers a periodic
-    // barrier (interval_ms cadence) and every subtask snapshots its
-    // keyed state to <checkpoint_dir>/<subtask>/checkpoint-<id>.snap.
-    // To resume from a prior run, set restore_from_dir +
+    // barrier (interval_ms cadence) and every subtask snapshots its keyed
+    // state under the job's own state root, by default
+    // <checkpoint_dir>/_state/<job id>/v<generation>/<subtask>/. To resume
+    // from a prior run, set restore_from_dir (the checkpoint directory, or
+    // the job's marker directory <checkpoint_dir>/_jobs/<job id>) and
     // restore_from_checkpoint_id.
     clink::cluster::CheckpointConfig checkpoint;
 };

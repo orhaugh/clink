@@ -370,12 +370,16 @@ operator's watermark.
 
 That is not a bespoke debug endpoint. Clink state is
 [an Arrow IPC stream with a documented layout](../internals/state-snapshot-format.md),
-so it opens in anything that reads Arrow. Export a checkpoint as Parquet:
+so it opens in anything that reads Arrow. Job 1 keeps its checkpoints under
+`/state/checkpoints/_state/1`, beside its completion markers in
+`/state/checkpoints/_jobs/1`. Export one as Parquet:
 
 ```bash
 docker compose exec coordinator sh -c '
-  latest=$(ls /state/checkpoints/v1/0 | sed -n "s/checkpoint-\([0-9]*\)\.snap$/\1/p" | sort -n | tail -1)
-  clink state-export --dir=/state/checkpoints/v1 --id=$latest \
+  state=/state/checkpoints/_state/1/v1
+  [ -d $state ] || state=/state/checkpoints/v1   # earlier releases: one directory for every job
+  latest=$(ls $state/0 | sed -n "s/checkpoint-\([0-9]*\)\.snap$/\1/p" | sort -n | tail -1)
+  clink state-export --dir=$state --id=$latest \
     --out=/state/state.parquet --format=parquet'
 docker compose cp coordinator:/state/state.parquet .
 ```

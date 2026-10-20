@@ -2536,13 +2536,15 @@ TEST(Cluster, AnUntrackedJobsProtocolStaysDormant) {
 }
 
 clink::cluster::JobGraphSpec clink_parity_graph(std::int64_t start,
-                                                const std::filesystem::path& out) {
+                                                const std::filesystem::path& out,
+                                                std::int64_t count = 4) {
     clink::cluster::JobGraphSpec g;
     clink::cluster::OperatorSpec src;
     src.id = "src";
     src.type = "hello.GreetingSource";
     src.out_channel = "hello.Greeting";
-    src.params = {{"count", "4"}, {"start", std::to_string(start)}, {"delay_ms", "60"}};
+    src.params = {
+        {"count", std::to_string(count)}, {"start", std::to_string(start)}, {"delay_ms", "60"}};
     g.ops.push_back(std::move(src));
     clink::cluster::OperatorSpec cnt;
     cnt.id = "counter";
@@ -2739,6 +2741,265 @@ TEST(Cluster, ATruncatedCheckpointIsRefusedAtRestoreWhileTheGoodOneStillRestores
         std::error_code ec;
         std::filesystem::remove_all(p, ec);
     }
+}
+
+namespace {
+
+std::vector<std::string> clink_lines_of(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(in, line);) {
+        lines.push_back(line);
+    }
+    return lines;
+}
+
+// The newest COMPLETED-<id> marker one job wrote in `dir`.
+std::uint64_t clink_latest_job_marker(const std::filesystem::path& dir, std::uint64_t job) {
+    return clink_latest_completed_marker(dir / "_jobs" / std::to_string(job));
+}
+
+// A parity job run to completion, checkpointing into `ckpt` (under its own
+// state backend when `state_backend` is set) and restoring from
+// `restore_dir`/`restore_id` when they are set.
+clink::application::SubmitResult clink_run_parity(clink::application::JobSubmitter& submitter,
+                                                  const std::filesystem::path& plugin,
+                                                  std::int64_t start,
+                                                  std::int64_t count,
+                                                  const std::filesystem::path& out,
+                                                  const std::filesystem::path& ckpt,
+                                                  const std::string& state_backend = {},
+                                                  const std::string& restore_dir = {},
+                                                  std::uint64_t restore_id = 0) {
+    clink::application::SubmitOptions opts;
+    opts.wait_for_completion = true;
+    opts.wait_timeout = clink::test_support::scale_slack(20s);
+    opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
+    opts.checkpoint.checkpoint_dir = ckpt.string();
+    opts.checkpoint.interval_ms = 50;
+    opts.checkpoint.state_backend_uri = state_backend;
+    opts.checkpoint.restore_from_dir = restore_dir;
+    opts.checkpoint.restore_from_checkpoint_id = restore_id;
+    return submitter.submit(
+        clink_parity_graph(start, out, count).to_json(), {plugin.string()}, opts);
+}
+
+// A coordinator that fails a job rather than restarting it, and one worker.
+struct ParityCluster {
+    Coordinator coordinator;
+    std::uint16_t port;
+    Worker worker;
+    clink::application::JobSubmitter submitter;
+
+    explicit ParityCluster(const std::string& worker_id)
+        : coordinator(no_restarts()),
+          port(coordinator.start()),
+          worker(worker_id, "127.0.0.1", four_slots()),
+          submitter("127.0.0.1", port) {
+        coordinator.expect_workers({worker_id});
+        worker.connect_to_coordinator("127.0.0.1", port);
+        EXPECT_TRUE(coordinator.await_registrations(2s));
+    }
+    ~ParityCluster() {
+        worker.stop();
+        coordinator.stop();
+    }
+    ParityCluster(const ParityCluster&) = delete;
+    ParityCluster& operator=(const ParityCluster&) = delete;
+
+private:
+    static Coordinator::Config no_restarts() {
+        Coordinator::Config cfg;
+        cfg.max_restarts = 0;
+        return cfg;
+    }
+    static Worker::Config four_slots() {
+        Worker::Config cfg;
+        cfg.slot_count = 4;
+        return cfg;
+    }
+};
+
+std::filesystem::path clink_scratch(const std::string& name) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_state_ns_" + name + "_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+}  // namespace
+
+// Two jobs checkpointing into one directory each keep their state under their
+// own root, so a restore of either reads that job's counts. A checkpoint id
+// both jobs completed is refused when the restore names only the directory,
+// because which job is meant is the submitter's to say, and is restored from
+// either job's marker directory.
+TEST(Cluster, JobsSharingACheckpointDirectoryEachRestoreTheirOwnState) {
+    const auto plugin = cluster_hello_plugin_path();
+    if (plugin.empty() || !std::filesystem::exists(plugin)) {
+        GTEST_SKIP() << "hello_plugin not built";
+    }
+    const auto dir = clink_scratch("shared");
+    const auto ckpt = dir / "ckpt";
+    std::uint64_t a_job = 0;
+    std::uint64_t b_job = 0;
+    {
+        ParityCluster cluster("worker-shared");
+        // A counts four values (two of each parity), B six (three of each).
+        const auto a = clink_run_parity(cluster.submitter, plugin, 1, 4, dir / "a.out", ckpt);
+        ASSERT_TRUE(a.ok) << a.reject_message;
+        const auto b = clink_run_parity(cluster.submitter, plugin, 101, 6, dir / "b.out", ckpt);
+        ASSERT_TRUE(b.ok) << b.reject_message;
+        a_job = a.job_id;
+        b_job = b.job_id;
+        const auto a_id = clink_latest_job_marker(ckpt, a_job);
+        const auto b_id = clink_latest_job_marker(ckpt, b_job);
+        ASSERT_GT(a_id, 0U) << "job A completed no checkpoint";
+        ASSERT_GT(b_id, 0U) << "job B completed no checkpoint";
+        EXPECT_TRUE(std::filesystem::is_directory(ckpt / "_state" / std::to_string(a_job)));
+        EXPECT_TRUE(std::filesystem::is_directory(ckpt / "_state" / std::to_string(b_job)));
+        EXPECT_FALSE(std::filesystem::exists(ckpt / "v1"));
+
+        // Each job numbers its checkpoints from 1, so the two share ids.
+        std::uint64_t shared_id = 0;
+        for (std::uint64_t id = std::min(a_id, b_id); id > 0 && shared_id == 0; --id) {
+            const auto marker = "COMPLETED-" + std::to_string(id);
+            if (std::filesystem::exists(ckpt / "_jobs" / std::to_string(a_job) / marker) &&
+                std::filesystem::exists(ckpt / "_jobs" / std::to_string(b_job) / marker)) {
+                shared_id = id;
+            }
+        }
+        ASSERT_GT(shared_id, 0U) << "the two jobs completed no checkpoint id in common";
+        const auto ambiguous = clink_run_parity(cluster.submitter,
+                                                plugin,
+                                                5,
+                                                4,
+                                                dir / "x.out",
+                                                dir / "x",
+                                                {},
+                                                ckpt.string(),
+                                                shared_id);
+        EXPECT_FALSE(ambiguous.ok) << "a checkpoint two jobs completed was restored as one";
+        EXPECT_NE(ambiguous.reject_message.find("_jobs/" + std::to_string(a_job)),
+                  std::string::npos)
+            << ambiguous.reject_message;
+
+        const auto from_a = clink_run_parity(cluster.submitter,
+                                             plugin,
+                                             5,
+                                             4,
+                                             dir / "a2.out",
+                                             dir / "a2",
+                                             {},
+                                             (ckpt / "_jobs" / std::to_string(a_job)).string(),
+                                             a_id);
+        ASSERT_TRUE(from_a.ok) << from_a.reject_message;
+        EXPECT_EQ(clink_lines_of(dir / "a2.out"),
+                  (std::vector<std::string>{"5:1:3", "6:0:3", "7:1:4", "8:0:4"}))
+            << "job A's checkpoint did not restore job A's counts";
+
+        const auto from_b = clink_run_parity(cluster.submitter,
+                                             plugin,
+                                             5,
+                                             4,
+                                             dir / "b2.out",
+                                             dir / "b2",
+                                             {},
+                                             (ckpt / "_jobs" / std::to_string(b_job)).string(),
+                                             b_id);
+        ASSERT_TRUE(from_b.ok) << from_b.reject_message;
+        EXPECT_EQ(clink_lines_of(dir / "b2.out"),
+                  (std::vector<std::string>{"5:1:4", "6:0:4", "7:1:5", "8:0:5"}))
+            << "job B's checkpoint did not restore job B's counts";
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// A checkpoint directory an earlier build wrote holds the state at
+// <dir>/v<generation>/<subtask> and markers without a state= line. A restore
+// from it reads the state there.
+TEST(Cluster, ACheckpointWrittenBeforeStateWasNamespacedByJobRestores) {
+    const auto plugin = cluster_hello_plugin_path();
+    if (plugin.empty() || !std::filesystem::exists(plugin)) {
+        GTEST_SKIP() << "hello_plugin not built";
+    }
+    const auto dir = clink_scratch("older");
+    const auto ckpt = dir / "ckpt";
+    {
+        ParityCluster cluster("worker-older");
+        const auto run1 = clink_run_parity(cluster.submitter, plugin, 1, 4, dir / "1.out", ckpt);
+        ASSERT_TRUE(run1.ok) << run1.reject_message;
+        const auto id = clink_latest_job_marker(ckpt, run1.job_id);
+        ASSERT_GT(id, 0U);
+
+        // The directory as an earlier build left it.
+        const auto jobs = ckpt / "_jobs" / std::to_string(run1.job_id);
+        std::filesystem::rename(ckpt / "_state" / std::to_string(run1.job_id) / "v1", ckpt / "v1");
+        std::filesystem::remove_all(ckpt / "_state");
+        for (const auto& e : std::filesystem::directory_iterator(jobs)) {
+            if (e.path().filename().string().rfind("COMPLETED-", 0) != 0) {
+                continue;
+            }
+            std::string body;
+            {
+                std::ifstream in(e.path());
+                for (std::string line; std::getline(in, line);) {
+                    if (line.rfind("state=", 0) != 0) {
+                        body += line + "\n";
+                    }
+                }
+            }
+            std::ofstream(e.path(), std::ios::trunc) << body;
+        }
+
+        const auto run2 = clink_run_parity(
+            cluster.submitter, plugin, 5, 4, dir / "2.out", dir / "2", {}, ckpt.string(), id);
+        ASSERT_TRUE(run2.ok) << run2.reject_message;
+        EXPECT_TRUE(run2.errors.empty()) << run2.errors.front();
+        EXPECT_EQ(clink_lines_of(dir / "2.out"),
+                  (std::vector<std::string>{"5:1:3", "6:0:3", "7:1:4", "8:0:4"}))
+            << "the earlier build's checkpoint did not restore its counts";
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// A job whose state backend is not its checkpoint directory restores from the
+// state its marker records. A restore used to read the checkpoint directory,
+// which under its own backend holds only the markers, so the restored job
+// refused to come up with empty state.
+TEST(Cluster, AJobWithItsOwnStateBackendRestoresFromItsCheckpointDirectory) {
+    const auto plugin = cluster_hello_plugin_path();
+    if (plugin.empty() || !std::filesystem::exists(plugin)) {
+        GTEST_SKIP() << "hello_plugin not built";
+    }
+    const auto dir = clink_scratch("own_backend");
+    const auto ckpt = dir / "ckpt";
+    const auto backend = "file://" + (dir / "state").string();
+    {
+        ParityCluster cluster("worker-own-backend");
+        const auto run1 =
+            clink_run_parity(cluster.submitter, plugin, 1, 4, dir / "1.out", ckpt, backend);
+        ASSERT_TRUE(run1.ok) << run1.reject_message;
+        const auto id = clink_latest_job_marker(ckpt, run1.job_id);
+        ASSERT_GT(id, 0U);
+        EXPECT_TRUE(std::filesystem::is_directory(dir / "state" / "_state" /
+                                                  std::to_string(run1.job_id) / "v1"));
+        EXPECT_FALSE(std::filesystem::exists(ckpt / "_state"))
+            << "the state went to the checkpoint directory, not the job's backend";
+
+        const auto run2 = clink_run_parity(
+            cluster.submitter, plugin, 5, 4, dir / "2.out", ckpt, backend, ckpt.string(), id);
+        ASSERT_TRUE(run2.ok) << run2.reject_message;
+        EXPECT_TRUE(run2.errors.empty()) << run2.errors.front();
+        EXPECT_EQ(clink_lines_of(dir / "2.out"),
+                  (std::vector<std::string>{"5:1:3", "6:0:3", "7:1:4", "8:0:4"}))
+            << "the restore did not read the job's own backend";
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 // A whole-job restart that fires BEFORE the job completes its first own
@@ -3427,6 +3688,9 @@ TEST(Cluster, ASavepointSurvivesTheCheckpointsTakenAfterIt) {
     ASSERT_TRUE(sp.ok) << sp.message;
     const std::uint64_t S = sp.checkpoint_id;
     ASSERT_GE(S, 2u);
+    // Restorable as reported: the job's marker directory names this job's
+    // checkpoint S whatever other jobs share the checkpoint directory.
+    EXPECT_EQ(sp.checkpoint_dir, (ckpt_dir / "_jobs" / std::to_string(job_id)).string());
 
     // Several more checkpoints complete and commit; each commit runs the
     // worker's retention.

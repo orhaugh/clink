@@ -133,8 +133,10 @@ accumulating. Or export a checkpoint and read it with no clink involved:
 
 ```bash
 docker compose exec coordinator sh -c '
-  latest=$(ls /state/checkpoints/v1/0 | sed -n "s/checkpoint-\([0-9]*\)\.snap$/\1/p" | sort -n | tail -1)
-  clink state-export --dir=/state/checkpoints/v1 --id=$latest \
+  state=/state/checkpoints/_state/1/v1
+  [ -d $state ] || state=/state/checkpoints/v1   # earlier releases: one directory for every job
+  latest=$(ls $state/0 | sed -n "s/checkpoint-\([0-9]*\)\.snap$/\1/p" | sort -n | tail -1)
+  clink state-export --dir=$state --id=$latest \
     --out=/state/state.parquet --format=parquet'
 docker compose cp coordinator:/state/state.parquet .
 python3 -c "import duckdb; print(duckdb.sql(\"SELECT slot, key_group, decode(user_key) AS sensor FROM 'state.parquet' WHERE slot = 'win' ORDER BY sensor\"))"

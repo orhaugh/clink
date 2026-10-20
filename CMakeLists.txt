@@ -520,6 +520,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/cluster/restore_compat_gate.cpp
     src/cluster/coordinator.cpp
     src/cluster/in_doubt_resolution.cpp
+    src/cluster/state_location.cpp
     src/cluster/outbox.cpp
     src/cluster/protocol_trace.cpp
     src/cluster/worker.cpp

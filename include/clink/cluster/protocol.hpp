@@ -583,6 +583,9 @@ struct SavepointAckMsg {
     JobId job_id{};
     bool ok{false};
     std::uint64_t checkpoint_id{0};
+    // Where to restore the savepoint from: the job's marker directory in its
+    // checkpoint directory (<checkpoint_dir>/_jobs/<job id>), which names this
+    // job's checkpoint whatever other jobs share the directory.
     std::string checkpoint_dir;
     std::string message;
 };

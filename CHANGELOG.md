@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+**Jobs that share a checkpoint directory, or a state backend location, keep
+their state apart.** A job's state lived at `<base>/v<generation>/<subtask>`,
+the base being its `--state-backend` or its checkpoint directory, with nothing
+in the path naming the job. Jobs given one base wrote the same files. A SQL
+script with two INSERT statements and one checkpoint directory failed every
+checkpoint, both jobs' subtask 0 renaming the same snapshot, and restarted from
+nothing; when the writes happened to pass, a job resumed from the other job's
+source offsets. The same held for the jobs of a script given one
+`--state-backend`, and for every job of a cluster started with
+`--default-state-backend`. Each job's state is now under its own root,
+`<base>/_state/<job id>`, beside its markers in `<checkpoint dir>/_jobs/<job id>`,
+and each COMPLETED marker records where its checkpoint's state is (a `state=`
+line). A restore reads the location its restore point's marker records. A
+restore from a directory in which several jobs completed that checkpoint is
+refused, naming each job's marker directory, which `--restore-from-dir` now
+accepts as well as the checkpoint directory. A savepoint reports its job's
+marker directory as its directory (`dir=` from `clink savepoint`,
+`checkpoint_dir` over HTTP), so a restore from it names that job's checkpoint;
+the Kubernetes operator, which restores from that directory, needs no change.
+Checkpoints written by earlier releases restore: a marker without `state=` is
+read where its state was. Their files are neither moved nor deleted, and stop
+being read once every job using the directory has completed a checkpoint since
+the upgrade. Tools that read state files by path take the job's root, for
+example `clink state-export --dir=<checkpoint dir>/_state/<job id>/v1`; the MCP
+server's state tools follow a checkpoint's marker from the checkpoint directory.
+See design record 013.
+
+**A job with its own state backend restores from its checkpoints.** A restart,
+an HA takeover or a resubmit read the job's state from its checkpoint directory,
+which under `--state-backend` holds only the markers, so a file, RocksDB or
+ForSt backend at a location of its own refused to come up with empty state. The
+restore now reads the location the marker records.
+
 **`remote-read` restores a checkpoint from the location the restore names.** It
 read the checkpoint from its own prefix, whatever the restore named. A checkpoint
 at another prefix of the same bucket, or written by another generation, is now

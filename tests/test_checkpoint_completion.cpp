@@ -60,6 +60,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/cluster/protocol_trace.hpp"
+#include "clink/cluster/state_location.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/capability.hpp"
@@ -3784,8 +3785,11 @@ namespace {
 constexpr const char* kTakeoverResolver = "ckpt_completion_takeover";
 
 // A sink's resume handle for a transaction that committed before the leader
-// died, staged in the snapshot of participant `subtask` for checkpoint `ckpt`.
-void stage_committed_handle(const std::filesystem::path& ckpt_dir,
+// died, staged in the snapshot of participant `subtask` for checkpoint `ckpt`
+// under `state_root`: the job's own state root for a checkpoint this build
+// completed, the checkpoint directory for a marker written before state was
+// namespaced by job.
+void stage_committed_handle(const std::filesystem::path& state_root,
                             std::uint32_t subtask,
                             std::uint64_t ckpt) {
     const std::string handle = std::string{"{\"resolver\":\""} + kTakeoverResolver +
@@ -3795,7 +3799,8 @@ void stage_committed_handle(const std::filesystem::path& ckpt_dir,
     sp.backend().put_operator_state(clink::OperatorId{42},
                                     clink::StateBackend::KeyView{key.data(), key.size()},
                                     clink::StateBackend::ValueView{handle.data(), handle.size()});
-    const auto sub_dir = std::filesystem::path(clink::state_dir_for(ckpt_dir.string(), 1, subtask));
+    const auto sub_dir =
+        std::filesystem::path(clink::state_dir_for(state_root.string(), 1, subtask));
     std::filesystem::create_directories(sub_dir);
     sp.write_to_file(sub_dir / ("checkpoint-" + std::to_string(ckpt) + ".snap"));
 }
@@ -3804,6 +3809,7 @@ struct WalkedTakeover {
     std::uint64_t first{0};      // the dead leader's first completed checkpoint
     std::uint64_t completed{0};  // the dead leader's newest completed checkpoint
     std::filesystem::path checkpoint_dir;
+    JobId job{0};
     std::uint64_t deploy_restore{0};  // what the new leader's deploy restores
     std::string deploy_restore_dir;   // and from where
     bool deployed{false};
@@ -3937,9 +3943,13 @@ WalkedTakeover takeover_through_the_walk(const std::string& tag, const TakeoverS
         body.replace(at, unflagged.size(), "\"requires_commit_confirmation\":true");
         std::ofstream(manifest, std::ios::trunc) << body;
     }
-    stage_committed_handle(out.checkpoint_dir, sink_participant, first_completed);
-    stage_committed_handle(out.checkpoint_dir, sink_participant, out.completed);
+    // Where the dead leader's markers say its checkpoints' state is.
+    const auto state_root =
+        std::filesystem::path{clink::cluster::job_state_root(out.checkpoint_dir.string(), job_id)};
+    stage_committed_handle(state_root, sink_participant, first_completed);
+    stage_committed_handle(state_root, sink_participant, out.completed);
     out.first = first_completed;
+    out.job = job_id;
     if (shape.first_confirmed) {
         std::ofstream(out.checkpoint_dir / "_jobs" / std::to_string(job_id) /
                       ("CONFIRMED-" + std::to_string(first_completed)))
@@ -4110,7 +4120,9 @@ TEST(CheckpointCompletion, ATakeoverWhoseWalkConfirmsItsFirstCheckpointsRestores
     const auto t = takeover_through_the_walk("unconfirmed", {.first_confirmed = false});
     ASSERT_TRUE(t.deployed) << "the job was dropped at the takeover";
     EXPECT_EQ(t.deploy_restore, t.completed);
-    EXPECT_EQ(t.deploy_restore_dir, t.checkpoint_dir.string());
+    // Out of the job's own state root, where its checkpoints were written.
+    EXPECT_EQ(t.deploy_restore_dir,
+              clink::cluster::job_state_root(t.checkpoint_dir.string(), t.job));
     EXPECT_EQ(t.event_restore, static_cast<std::int64_t>(t.completed));
 }
 

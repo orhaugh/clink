@@ -5,13 +5,12 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <optional>
 #include <set>
 #include <sstream>
-#include <string_view>
 #include <system_error>
 
+#include "clink/cluster/state_location.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend.hpp"
 #include "clink/state/state_migration_on_restore.hpp"
@@ -247,83 +246,19 @@ std::string check_restore_compatibility_via_plugins(const std::vector<std::strin
 
 std::optional<std::set<std::uint32_t>> recorded_restore_participants(
     const std::string& restore_from_dir, std::uint64_t checkpoint_id) {
-    namespace fs = std::filesystem;
     if (restore_from_dir.empty() || checkpoint_id == 0) {
         return std::nullopt;
     }
-    // A plain path, or a file:// URI naming one. Any other scheme is a state
-    // backend URI (remote-read://, an object store) whose markers, if it has
-    // any, are not a directory this process lists.
-    std::string root = restore_from_dir;
-    if (const auto sep = root.find("://"); sep != std::string::npos) {
-        if (root.compare(0, sep, "file") != 0) {
-            return std::nullopt;
-        }
-        root.erase(0, sep + 3);
-    }
-    // Exactly one job's marker for this id, as the restore requires: a root that
-    // several jobs have written into can hold COMPLETED-<id> for more than one of
-    // them, and picking one would be a guess. Non-throwing iteration throughout,
-    // because a filesystem error here must mean "cannot check", never a failed
-    // submit.
-    const std::string marker_name = "COMPLETED-" + std::to_string(checkpoint_id);
-    std::optional<fs::path> marker;
-    std::error_code ec;
-    fs::directory_iterator it{fs::path{root} / "_jobs", ec};
-    for (; !ec && it != fs::directory_iterator{}; it.increment(ec)) {
-        std::error_code type_ec;
-        if (!it->is_directory(type_ec) || type_ec) {
-            continue;
-        }
-        auto candidate = it->path() / marker_name;
-        std::error_code file_ec;
-        if (!fs::is_regular_file(candidate, file_ec) || file_ec) {
-            continue;
-        }
-        if (marker.has_value()) {
-            return std::nullopt;
-        }
-        marker = std::move(candidate);
-    }
-    if (ec || !marker.has_value()) {
+    // The marker the restore itself reads (resolve_restore_source): a job's
+    // marker directory, or the one job holding the checkpoint in a checkpoint
+    // directory. Several jobs' markers, or a store that cannot be read, mean
+    // "cannot check" here, never a failed submit; the restore makes its own
+    // decision about them.
+    try {
+        return resolve_restore_source(restore_from_dir, checkpoint_id).participants;
+    } catch (const std::exception&) {
         return std::nullopt;
     }
-    std::ifstream in(*marker);
-    if (!in) {
-        return std::nullopt;
-    }
-    // The body the coordinator writes: job=, checkpoint=, generation=, then
-    // subtasks=<comma-separated job-global indices>. Any token that is not a
-    // plain index makes the whole set untrustworthy rather than half-read.
-    constexpr std::string_view kKey = "subtasks=";
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.rfind(kKey, 0) != 0) {
-            continue;
-        }
-        std::set<std::uint32_t> out;
-        std::size_t pos = kKey.size();
-        for (;;) {
-            const auto comma = line.find(',', pos);
-            const auto tok =
-                line.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-            if (tok.empty() || tok.size() > 10 ||
-                tok.find_first_not_of("0123456789") != std::string::npos) {
-                return std::nullopt;
-            }
-            const auto value = std::stoull(tok);
-            if (value > std::numeric_limits<std::uint32_t>::max()) {
-                return std::nullopt;
-            }
-            out.insert(static_cast<std::uint32_t>(value));
-            if (comma == std::string::npos) {
-                break;
-            }
-            pos = comma + 1;
-        }
-        return out;
-    }
-    return std::nullopt;  // a marker predating the participant set
 }
 
 std::string restore_layout_refusal(const std::string& restore_from_dir,

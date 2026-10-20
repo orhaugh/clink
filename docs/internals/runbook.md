@@ -318,6 +318,12 @@ participant, and the COMPLETED marker records which subtasks those were.
    `CLINK_ALLOW_MISSING_RESTORE_STATE=1` is for. If the new operator gave the job a
    different subtask layout, a submit-time restore is refused before this point
    (next section), and the override does not bypass that.
+4. **The state is not where its marker says.** The COMPLETED marker records where its
+   checkpoint's state is (`state=`): `_state/<job id>` under the checkpoint directory,
+   or the state backend's location. A checkpoint directory copied without its `_state/`
+   directory, or the top-level `v<N>` directories an earlier release wrote deleted
+   while a job still restores from one of that release's checkpoints, leaves the
+   restore reading a location that holds nothing.
 
 **Do not set the override to make a restore start.** It converts the refusal back into
 silent state loss for every subtask, not just the new one. Confirm which subtask is
@@ -336,7 +342,8 @@ before this check, with a worker's `restore discarded N keyed entries` warning
 (`ClinkRestoreDiscardedKeyedState`) as the only trace.
 
 **Look at:** the two counts and index ranges in the message, and the marker it read:
-the `subtasks=` line of `<restore dir>/_jobs/<job>/COMPLETED-<id>`.
+the `subtasks=` line of `<restore dir>/_jobs/<job>/COMPLETED-<id>`, or of
+`<restore dir>/COMPLETED-<id>` when the restore named a job's marker directory.
 
 **Likely causes, in order:**
 
@@ -354,6 +361,21 @@ the `subtasks=` line of `<restore dir>/_jobs/<job>/COMPLETED-<id>`.
 and parallelism, on the engine version that took it - or submit without the restore to
 start from empty state. Do not edit the marker to get past the check: the operators
 would still read each other's files.
+
+## A submit is refused with "cannot restore checkpoint N from DIR: jobs A, B each completed a checkpoint N there"
+
+Not an alert - a refusal before anything deploys. Several jobs checkpoint into the
+directory the restore named, each keeps its own state under `_state/<job id>`, and more
+than one of them completed a checkpoint with the id the restore asked for. Job ids
+number checkpoints independently, so this is the ordinary case for jobs that share a
+directory, such as the INSERT statements of one script.
+
+**What to do:** name the job by its marker directory, `--restore-from-dir
+DIR/_jobs/<job id>`, with the id of the job whose state you want; the message lists
+each candidate. `clink list`, or the coordinator's job history, shows which id ran which
+pipeline. A restore point is one job's state, so a script that submits several jobs is
+restored one job at a time, or runs its statements as one job with
+`EXECUTE STATEMENT SET`.
 
 ## ClinkSubtaskFailures
 
@@ -409,15 +431,17 @@ epoch. Two coordinators serving the same cluster is a specific and serious failu
 see `ClinkFencedFrames`.
 
 **Did the job actually recover, or did it merely restart?** A restart that keeps
-failing looks like activity. `clink jobs` shows the terminal status; the coordinator
+failing looks like activity. `clink list` shows the terminal status; the coordinator
 log shows the attempt count against the budget.
 
 **A restarted coordinator shows no jobs.** That is the contract, not a loss, when the
 coordinator runs without `--ha-dir`: job manifests are persisted (and recovered on
 leadership) only under an HA directory, so a plain restart abandons running jobs while
 their `COMPLETED-N` markers remain intact. Recover manually by resubmitting with
-`--restore-from-checkpoint-id=<latest N>`, or run the coordinator with `--ha-dir` -
-one node is enough - so restarts recover jobs on their own.
+`--restore-from-dir=<checkpoint dir>/_jobs/<job id>` and
+`--restore-from-checkpoint-id=<latest N>` (the checkpoint directory alone also works
+when no other job completed checkpoint N there), or run the coordinator with
+`--ha-dir` - one node is enough - so restarts recover jobs on their own.
 
 **What is this job actually configured to do?** `/api/v1/jobs/:id` reports the
 checkpoint configuration the job is running with - directory, interval, state backend,

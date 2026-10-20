@@ -150,7 +150,7 @@ except Exception as e:
     echo "----- ClickHouse sink reports and refusals"
     docker compose logs --no-color worker 2>&1 | grep -E 'clickhouse native sink|clickhouse\.[a-z_]+' | cut -c1-300 | tail -12 || true
     echo "----- ClickHouse"; ch "SELECT count() AS rows, uniqExact((sensor_id, window_start)) AS windows FROM sensor_window_stats FORMAT JSONEachRow" || true
-    echo "----- state directory"; docker compose exec -T coordinator sh -c 'ls /state/checkpoints/_jobs/*/ 2>/dev/null | tail -5; ls /state/checkpoints/v1/*/ 2>/dev/null' || true
+    echo "----- state directory"; docker compose exec -T coordinator sh -c 'ls /state/checkpoints/_jobs/*/ 2>/dev/null | tail -5; ls /state/checkpoints/_state/*/v1/*/ /state/checkpoints/v1/*/ 2>/dev/null' || true
 }
 
 PRODUCER=

@@ -371,7 +371,7 @@ A job captures the columns it declares and ignores the rest, so a column added t
 
 1. Add the column in PostgreSQL (`ALTER TABLE orders ADD COLUMN note text`) and to the target table.
 2. Stop the job with `clink stop --job-id=N`, which takes a final checkpoint and prints its id.
-3. Declare the column in the CDC table (and read it in the query), and resubmit the job restoring from that checkpoint: `clink_submit_sql ... --restore-from-dir <checkpoint dir> --restore-from-checkpoint-id <id>`.
+3. Declare the column in the CDC table (and read it in the query), and resubmit the job restoring from that checkpoint: `clink_submit_sql ... --restore-from-dir <checkpoint dir> --restore-from-checkpoint-id <id>`. When other jobs share the checkpoint directory, name this one by its marker directory, `--restore-from-dir <checkpoint dir>/_jobs/<job id>`.
 
 The restored source compares the columns declared now with those its checkpoint recorded. For a column declared since, it reads the table again, with a snapshot taken fresh (a backfill), before it resumes the stream from its checkpoint: every row is delivered with the new column, rows no change has touched since the `ALTER TABLE` included. The changes it then replays from before the `ALTER TABLE` do not have the column, and the job takes it from the rows it keeps, so this needs `keep_rows='true'`; a restore that declares a new column without it is refused, with the column named, and the job has to start afresh. In `changelog_mode='append'` a backfilled row carries the `__version` of the row it refreshes, so a store that keeps the highest version per key keeps the backfilled row, and every later change supersedes it. A column declared with another type is read again the same way.
 

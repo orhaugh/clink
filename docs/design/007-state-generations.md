@@ -1,6 +1,7 @@
 # 007: State directories are namespaced by topology generation
 
-**Status:** accepted, implemented 2026-08-07.
+**Status:** accepted, implemented 2026-08-07. The base the generation directories
+sit under gained a job segment in [013](013-state-namespaced-by-job.md).
 
 ## The problem
 

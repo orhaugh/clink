@@ -42,7 +42,29 @@ std::pair<std::string, std::string> split_uri(const std::string& uri) {
     return {uri.substr(0, pos), uri.substr(pos + sep.size())};
 }
 
+// The job a state root belongs to, and the checkpoint directory holding its
+// markers, when the root is the one a job keeps in its checkpoint directory:
+// <checkpoint dir>/_state/<job id> (clink/cluster/state_location.hpp).
+[[nodiscard]] std::optional<std::filesystem::path> own_marker_dir_of(
+    const std::filesystem::path& state_root) {
+    const auto job = state_root.filename().string();
+    if (job.empty() || !std::all_of(job.begin(), job.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        })) {
+        return std::nullopt;
+    }
+    if (state_root.parent_path().filename() != "_state") {
+        return std::nullopt;
+    }
+    return state_root.parent_path().parent_path() / "_jobs" / job;
+}
+
 // The subtask indices a checkpoint's COMPLETED marker records as participants.
+//
+// The marker is the job's own when the restore root is a job's state root in a
+// checkpoint directory (<dir>/_state/<job> beside <dir>/_jobs/<job>), and
+// otherwise the one marker for this id under <restore root>/_jobs, which is
+// where a checkpoint written before state was namespaced by job keeps it.
 //
 // Returns nullopt when no single marker can be identified - no _jobs directory, no
 // marker for this id, several jobs sharing the checkpoint root, or a marker with no
@@ -50,19 +72,26 @@ std::pair<std::string, std::string> split_uri(const std::string& uri) {
 // than treating "unknown" as "nobody participated" and restoring nothing.
 [[nodiscard]] std::optional<std::set<std::uint32_t>> completed_participants(
     const std::string& restore_path, std::uint64_t checkpoint_id) {
-    const std::filesystem::path jobs_dir = std::filesystem::path{restore_path} / "_jobs";
+    const auto marker_name = "COMPLETED-" + std::to_string(checkpoint_id);
     std::error_code ec;
     std::vector<std::filesystem::path> markers;
-    for (const auto& entry : std::filesystem::directory_iterator(jobs_dir, ec)) {
-        if (ec) {
-            return std::nullopt;
-        }
-        if (!entry.is_directory(ec)) {
-            continue;
-        }
-        auto candidate = entry.path() / ("COMPLETED-" + std::to_string(checkpoint_id));
-        if (std::filesystem::exists(candidate, ec)) {
+    if (const auto own = own_marker_dir_of(std::filesystem::path{restore_path}); own.has_value()) {
+        if (auto candidate = *own / marker_name; std::filesystem::exists(candidate, ec)) {
             markers.push_back(std::move(candidate));
+        }
+    } else {
+        const std::filesystem::path jobs_dir = std::filesystem::path{restore_path} / "_jobs";
+        for (const auto& entry : std::filesystem::directory_iterator(jobs_dir, ec)) {
+            if (ec) {
+                return std::nullopt;
+            }
+            if (!entry.is_directory(ec)) {
+                continue;
+            }
+            auto candidate = entry.path() / marker_name;
+            if (std::filesystem::exists(candidate, ec)) {
+                markers.push_back(std::move(candidate));
+            }
         }
     }
     // Exactly one, or the answer is ambiguous and guessing would be worse than

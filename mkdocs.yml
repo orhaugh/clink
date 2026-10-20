@@ -184,6 +184,7 @@ nav:
       - design/010-stable-extension-model.md
       - design/011-public-api-tiers.md
       - design/012-machine-checked-exactly-once.md
+      - design/013-state-namespaced-by-job.md
   - Examples:
       - consumer-examples/README.md
       - consumer-examples/fetchcontent/README.md

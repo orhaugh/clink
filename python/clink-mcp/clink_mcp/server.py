@@ -165,23 +165,82 @@ def _get(cfg: Config, path: str, params: dict[str, Any] | None = None) -> Any:
     return {"text": body}
 
 
-def _state_root(checkpoint_dir: str) -> str:
-    """The directory the state verbs read: a checkpoint root holds one generation
-    directory per topology (``v1``, ``v2``, ...) with the subtask snapshots
-    beneath; the verbs take the generation directory. Given the root, pick the
-    highest generation; given a generation directory (or anything else), pass it
-    through unchanged."""
+def _highest_generation(directory: str) -> str | None:
+    """The highest generation directory (``v1``, ``v2``, ...) directly under
+    `directory`, or None when it holds none."""
     try:
         gens = [
             (int(name[1:]), name)
-            for name in os.listdir(checkpoint_dir)
-            if re.fullmatch(r"v[0-9]+", name) and os.path.isdir(os.path.join(checkpoint_dir, name))
+            for name in os.listdir(directory)
+            if re.fullmatch(r"v[0-9]+", name) and os.path.isdir(os.path.join(directory, name))
         ]
     except OSError:
+        return None
+    return os.path.join(directory, max(gens)[1]) if gens else None
+
+
+def _marker_location(checkpoint_dir: str, checkpoint_id: int) -> str | None:
+    """Where a checkpoint's state is, as its one COMPLETED marker under
+    ``_jobs/<job id>/`` records it: the job's state root (``state=``) at the
+    marker's generation, or the checkpoint directory itself for a marker written
+    before state was namespaced by job. None when no single marker names it."""
+    try:
+        jobs = os.listdir(os.path.join(checkpoint_dir, "_jobs"))
+    except OSError:
+        return None
+    markers = [
+        os.path.join(checkpoint_dir, "_jobs", job, f"COMPLETED-{checkpoint_id}")
+        for job in jobs
+        if job.isdigit()
+    ]
+    markers = [m for m in markers if os.path.isfile(m)]
+    if len(markers) != 1:
+        return None
+    fields: dict[str, str] = {}
+    with open(markers[0], encoding="utf-8", errors="replace") as f:
+        for line in f:
+            key, sep, value = line.rstrip("\n").partition("=")
+            if sep:
+                fields[key] = value
+    state = fields.get("state", "")
+    if not state:
+        base = checkpoint_dir
+    elif "://" in state:
+        if not state.startswith("file://"):
+            return None  # an object store: the state verbs read files
+        base = state[len("file://") :]
+    else:
+        base = state if state.startswith("/") else os.path.join(checkpoint_dir, state)
+    generation = fields.get("generation", "")
+    if generation.isdigit():
+        return os.path.join(base, f"v{generation}")
+    return _highest_generation(base)
+
+
+def _state_root(checkpoint_dir: str, checkpoint_id: int | None = None) -> str:
+    """The directory the state verbs read: a generation directory (``v1``, ``v2``,
+    ...) with the subtask snapshots beneath. Each job keeps its state under
+    ``_state/<job id>/`` in the checkpoint directory (earlier releases kept one
+    set of generation directories at the top, shared by every job). Given a
+    checkpoint root and an id, follow that checkpoint's COMPLETED marker; failing
+    that, take the highest generation at the top, or under the only job's root.
+    Given a job's state root, take its highest generation; given a generation
+    directory (or anything else), pass it through unchanged."""
+    if checkpoint_id is not None:
+        located = _marker_location(checkpoint_dir, checkpoint_id)
+        if located is not None and os.path.isdir(located):
+            return located
+    top = _highest_generation(checkpoint_dir)
+    if top is not None:
+        return top
+    state = os.path.join(checkpoint_dir, "_state")
+    try:
+        jobs = [j for j in os.listdir(state) if j.isdigit() and os.path.isdir(os.path.join(state, j))]
+    except OSError:
         return checkpoint_dir
-    if not gens:
-        return checkpoint_dir
-    return os.path.join(checkpoint_dir, max(gens)[1])
+    if len(jobs) == 1:
+        return _highest_generation(os.path.join(state, jobs[0])) or checkpoint_dir
+    return checkpoint_dir
 
 
 def _op_id(op: str) -> str:
@@ -258,7 +317,10 @@ def build_server(cfg: Config) -> MCPServer:  # noqa: C901 - one registration per
         if file:
             args += [f"--file={file}"]
         elif checkpoint_dir and checkpoint_id is not None:
-            args += [f"--dir={_state_root(checkpoint_dir)}", f"--id={checkpoint_id}"]
+            args += [
+                f"--dir={_state_root(checkpoint_dir, checkpoint_id)}",
+                f"--id={checkpoint_id}",
+            ]
         else:
             raise ClinkError("state_cat needs file, or checkpoint_dir and checkpoint_id")
         args += ["--json", f"--max-rows={max_rows}"]
@@ -283,7 +345,11 @@ def build_server(cfg: Config) -> MCPServer:  # noqa: C901 - one registration per
         if a and b:
             args += [f"--a={a}", f"--b={b}"]
         elif checkpoint_dir and from_id is not None and to_id is not None:
-            args += [f"--dir={_state_root(checkpoint_dir)}", f"--from={from_id}", f"--to={to_id}"]
+            args += [
+                f"--dir={_state_root(checkpoint_dir, to_id)}",
+                f"--from={from_id}",
+                f"--to={to_id}",
+            ]
         else:
             raise ClinkError("state_diff needs a and b, or checkpoint_dir with from_id and to_id")
         args += ["--json", f"--max-rows={max_rows}"]
@@ -308,7 +374,10 @@ def build_server(cfg: Config) -> MCPServer:  # noqa: C901 - one registration per
         if from_file:
             args += [f"--from={from_file}"]
         elif checkpoint_dir and checkpoint_id is not None:
-            args += [f"--dir={_state_root(checkpoint_dir)}", f"--id={checkpoint_id}"]
+            args += [
+                f"--dir={_state_root(checkpoint_dir, checkpoint_id)}",
+                f"--id={checkpoint_id}",
+            ]
         elif job_id is not None:
             args += [f"--job={job_id}", f"--coordinator={_host_port(cfg)}"]
         else:

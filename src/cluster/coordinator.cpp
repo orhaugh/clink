@@ -155,43 +155,6 @@ PostResult post_to(std::shared_ptr<Outbox> outbox, const Outbox::Frame& frame, F
     return name;
 }
 
-// The highest generation directory (v<N>) present under a state root, or 1 if there
-// is none.
-//
-// Needed only for a restore from an EXTERNAL directory - a savepoint, or an explicit
-// --restore-from-checkpoint-id. For its own checkpoints the coordinator knows the
-// generation exactly and never guesses. A savepoint carries no metadata naming its
-// generation, so the highest one present is the best available answer, and it is the
-// right one for the ordinary case of a savepoint taken from a job's final state.
-[[nodiscard]] std::uint32_t highest_generation_in(const std::string& root) {
-    std::uint32_t best = 0;
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!e.is_directory(ec)) {
-            continue;
-        }
-        const auto name = e.path().filename().string();
-        if (name.size() < 2 || name[0] != 'v') {
-            continue;
-        }
-        const auto digits = name.substr(1);
-        if (!std::all_of(digits.begin(), digits.end(), [](unsigned char c) {
-                return std::isdigit(c) != 0;
-            })) {
-            continue;
-        }
-        try {
-            best = std::max(best, static_cast<std::uint32_t>(std::stoul(digits)));
-        } catch (const std::exception&) {
-            continue;
-        }
-    }
-    return best == 0 ? 1u : best;
-}
-
 }  // namespace
 
 // Out-of-line so the unique_ptr<JobBundle> field can hold a
@@ -491,6 +454,28 @@ void pin_recovered_state_backend(CheckpointConfig& checkpoint) {
         checkpoint.state_backend_uri =
             checkpoint.checkpoint_dir.empty() ? "memory://" : checkpoint.checkpoint_dir;
     }
+}
+
+// Where a checkpoint written before state was namespaced by job kept its
+// state, as far as the restoring job's configuration can say: under an
+// explicit state backend, at that backend's location, since the checkpoint
+// directory held only the markers. Empty otherwise, which leaves it to
+// resolve_restore_source: the checkpoint directory the restore names.
+std::string legacy_state_base_for(const CheckpointConfig& checkpoint) {
+    const auto bare = [](std::string s) {
+        if (s.rfind("file://", 0) == 0) {
+            s.erase(0, 7);
+        }
+        while (s.size() > 1 && s.back() == '/') {
+            s.pop_back();
+        }
+        return s;
+    };
+    if (checkpoint.state_backend_uri.empty() ||
+        bare(checkpoint.state_backend_uri) == bare(checkpoint.checkpoint_dir)) {
+        return {};
+    }
+    return checkpoint.state_backend_uri;
 }
 
 void persist_job_manifest_(const std::string& ha_dir,
@@ -860,7 +845,10 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
             const auto latest = needs_confirmation ? confirmed_on_disk : completed_on_disk;
             own_restore_point = latest;
             if (latest > 0) {
-                ckpt.restore_from_dir = ckpt.checkpoint_dir;
+                // The job's own marker directory, so the restore is this job's
+                // checkpoint whatever other jobs share the directory.
+                ckpt.restore_from_dir =
+                    completed_marker_dir_for(ckpt.checkpoint_dir, job_id).string();
                 ckpt.restore_from_checkpoint_id = latest;
             } else if (ckpt.restore_from_dir.empty() || ckpt.restore_from_checkpoint_id == 0) {
                 ckpt.restore_from_dir.clear();
@@ -992,7 +980,8 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                     // a job with nothing of its own confirmed had no directory to
                     // restore from at all, which the deploy's lint refuses. The
                     // takeover's Redeploy reports the same point.
-                    ckpt.restore_from_dir = ckpt.checkpoint_dir;
+                    ckpt.restore_from_dir =
+                        completed_marker_dir_for(ckpt.checkpoint_dir, job_id).string();
                     ckpt.restore_from_checkpoint_id = resolved;
                     own_restore_point = resolved;
                 }
@@ -4281,15 +4270,16 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         dm.tasks = std::move(wtasks);
         dm.plugins = plugins_for_worker_locked_(job, *it->second);
         dm.checkpoint_dir = job.checkpoint.checkpoint_dir;
-        dm.state_backend_uri = job.checkpoint.state_backend_uri;
+        dm.state_backend_uri = job.state_root;
         dm.capture_dir = job.checkpoint.capture_dir;
         dm.capture_records = job.checkpoint.capture_records;
         // The new subtasks restore from the CUTOVER checkpoint - the last
         // thing the old subtasks processed - in the SAME state generation
         // (their appended directories are fresh; nothing is overwritten).
         // The dormant path forgot the generation pair and deployed new
-        // tasks at generation 1 regardless of the job's.
-        dm.restore_from_dir = job.checkpoint.checkpoint_dir;
+        // tasks at generation 1 regardless of the job's. This run wrote the
+        // checkpoint, under the job's own state root.
+        dm.restore_from_dir = job.state_root;
         dm.restore_from_checkpoint_id = hot.cutover_checkpoint;
         dm.run_checkpoint_floor = job.run_checkpoint_floor;
         dm.generation = job.state_generation;
@@ -4691,7 +4681,11 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
                         worker_outboxes.push_back(worker_it->second->outbox);
                     }
                 }
-                ack.checkpoint_dir = job.checkpoint.checkpoint_dir;
+                // The job's marker directory, so a restore from the savepoint
+                // names this job's checkpoint even when other jobs completed
+                // one of the same id in the directory.
+                ack.checkpoint_dir =
+                    completed_marker_dir_for(job.checkpoint.checkpoint_dir, job.id).string();
                 gen_for_trigger = job.state_generation;
             }
         }
@@ -5187,17 +5181,29 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
             single_instance.push_back(op.id);
         }
     }
+    // Where the restore point's state is, resolved once from its marker
+    // (state_location.hpp) and kept for every deploy of the job. A directory in
+    // which several jobs completed that checkpoint is refused here unless the
+    // submit names one job's marker directory; the marker's participant set is
+    // what the layout is checked against.
+    std::optional<RestoreSource> restore_source;
     if (!checkpoint.restore_from_dir.empty() && checkpoint.restore_from_checkpoint_id != 0) {
-        std::set<std::uint32_t> planned;
-        for (const auto& t : plan.tasks) {
-            planned.insert(t.subtask_idx);
-        }
-        if (auto reject = check_restore_layout(checkpoint.restore_from_dir,
-                                               checkpoint.restore_from_checkpoint_id,
-                                               planned,
-                                               single_instance);
-            !reject.empty()) {
-            throw std::runtime_error(reject);
+        restore_source = resolve_restore_source(checkpoint.restore_from_dir,
+                                                checkpoint.restore_from_checkpoint_id,
+                                                legacy_state_base_for(checkpoint));
+        if (restore_source->participants.has_value()) {
+            std::set<std::uint32_t> planned;
+            for (const auto& t : plan.tasks) {
+                planned.insert(t.subtask_idx);
+            }
+            if (auto reject = restore_layout_refusal(checkpoint.restore_from_dir,
+                                                     checkpoint.restore_from_checkpoint_id,
+                                                     *restore_source->participants,
+                                                     planned,
+                                                     single_instance);
+                !reject.empty()) {
+                throw std::runtime_error(reject);
+            }
         }
     }
 
@@ -5252,7 +5258,8 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
         graph.expected_state_versions.pack(),
         graph.udfs.empty() ? std::string{} : pack_udf_specs(graph.udfs),
         checkpoint_copy.checkpoint_dir.empty() ? std::string{} : job_graph_fingerprint(graph),
-        single_instance);
+        single_instance,
+        std::move(restore_source));
     // Derive commit-group memberships from sink-op params
     // and stash them on JobState so handle_subtask_checkpointed_ can
     // gate CommitCheckpoint broadcasts on the group's collective ack.
@@ -5421,7 +5428,8 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                                     std::string expected_state_versions_packed,
                                     std::string udfs_packed,
                                     std::string graph_fingerprint,
-                                    std::vector<std::string> single_instance_ops) {
+                                    std::vector<std::string> single_instance_ops,
+                                    std::optional<RestoreSource> restore_source) {
     // Resolve per-task placement. The grouping contract, and why it exists, is documented on
     // assign_task_placement in coordinator.hpp; it lives there so it can be tested without a
     // cluster. The plan's data_port values are taken as-is: 0 means "the worker will bind
@@ -5505,6 +5513,11 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     const JobId job_id = allocate_job_id_();
     auto job = std::make_shared<JobState>();
     job->id = job_id;
+    // The job's own state location, apart from every other job's that shares
+    // its base (state_location.hpp).
+    job->state_root = job_state_root(
+        state_base_of(checkpoint.checkpoint_dir, checkpoint.state_backend_uri), job_id);
+    job->restore_source = std::move(restore_source);
 
     // Resume from this job's own checkpoints (CheckpointConfig::track_runs): the
     // embedded engine's rerun of a script after a crash. A fresh process has a
@@ -5619,7 +5632,11 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                               checkpoint.checkpoint_dir + " (newest completed " +
                               std::to_string(completed) + "); starting it from empty state");
             } else {
-                checkpoint.restore_from_dir = checkpoint.checkpoint_dir;
+                // The job's own marker directory: the restore point is this
+                // job's, whichever other jobs completed a checkpoint of the
+                // same id in the directory.
+                checkpoint.restore_from_dir =
+                    completed_marker_dir_for(checkpoint.checkpoint_dir, job_id).string();
                 checkpoint.restore_from_checkpoint_id = restore;
                 // Beside the completed point its takeover line reported, as an
                 // HA takeover does: a gap the walk above left open is walked
@@ -5629,14 +5646,21 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                 // confirmed point would reach the earlier runs' checkpoints.
                 checkpoint.resumed_completed = completed;
                 // The layout gate above ran before there was a restore point.
-                std::set<std::uint32_t> planned;
-                for (const auto& t : resolved_plan.tasks) {
-                    planned.insert(t.subtask_idx);
-                }
-                if (auto reject = check_restore_layout(
-                        checkpoint.restore_from_dir, restore, planned, single_instance_ops);
-                    !reject.empty()) {
-                    throw std::runtime_error(reject);
+                job->restore_source = resolve_restore_source(
+                    checkpoint.restore_from_dir, restore, legacy_state_base_for(checkpoint));
+                if (job->restore_source->participants.has_value()) {
+                    std::set<std::uint32_t> planned;
+                    for (const auto& t : resolved_plan.tasks) {
+                        planned.insert(t.subtask_idx);
+                    }
+                    if (auto reject = restore_layout_refusal(checkpoint.restore_from_dir,
+                                                             restore,
+                                                             *job->restore_source->participants,
+                                                             planned,
+                                                             single_instance_ops);
+                        !reject.empty()) {
+                        throw std::runtime_error(reject);
+                    }
                 }
                 resumed_from_existing = true;
                 resumed_run_base = run_base;
@@ -5730,8 +5754,18 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             // their ids. The successor's same-id files then interleave with
             // the dead incarnation's, and a later restore can assemble one
             // checkpoint from two vintages (qual01-20260819g re-published
-            // ten windows that way). Number above every snapshot file too.
+            // ten windows that way). Number above every snapshot file too:
+            // the job's own, and those its checkpoint directory held before
+            // state was namespaced by job.
             id_floor = std::max(id_floor, latest_snapshot_id_on_disk(checkpoint.checkpoint_dir));
+            if (job->state_root.find("://") == std::string::npos ||
+                job->state_root.rfind("file://", 0) == 0) {
+                id_floor =
+                    std::max(id_floor,
+                             latest_snapshot_id_on_disk(job->state_root.rfind("file://", 0) == 0
+                                                            ? job->state_root.substr(7)
+                                                            : job->state_root));
+            }
             // Nor are the files every capture: one whose barrier reached a
             // worker but whose snapshot has not landed leaves none, and a
             // worker that outlives the dead leader can still write it after
@@ -6119,20 +6153,30 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.tasks = std::move(tasks);
         deploy_msg.plugins = std::move(worker_plugins);
         deploy_msg.checkpoint_dir = checkpoint.checkpoint_dir;
-        deploy_msg.state_backend_uri = checkpoint.state_backend_uri;
+        // The job's own state location in place of its base, so no other job
+        // sharing the base writes the same files (state_location.hpp).
+        deploy_msg.state_backend_uri = job->state_root;
         deploy_msg.capture_dir = checkpoint.capture_dir;
         deploy_msg.capture_records = checkpoint.capture_records;
-        deploy_msg.restore_from_dir = checkpoint.restore_from_dir;
         deploy_msg.restore_from_checkpoint_id = checkpoint.restore_from_checkpoint_id;
         deploy_msg.run_checkpoint_floor = job->run_checkpoint_floor;
-        // Generation 1 is an initial deploy. A restore here reads an EXTERNAL
-        // directory (a savepoint, or an explicit --restore-from-checkpoint-id), so
-        // its generation is whatever that directory holds rather than anything this
-        // job knows - discovered by listing it. See docs/design/state-generations.md.
+        // Generation 1 is an initial deploy. A restore here reads a checkpoint
+        // this deploy did not write (a savepoint, an explicit
+        // --restore-from-checkpoint-id, the job's own before a takeover or a
+        // resume), so where its state is and which generation wrote it are what
+        // its marker records, resolved at submit. See
+        // docs/design/007-state-generations.md and 013-state-namespaced-by-job.md.
         deploy_msg.generation = job->state_generation;
-        deploy_msg.restore_generation = checkpoint.restore_from_dir.empty()
-                                            ? job->state_generation
-                                            : highest_generation_in(checkpoint.restore_from_dir);
+        if (job->restore_source.has_value()) {
+            deploy_msg.restore_from_dir = job->restore_source->state_root;
+            deploy_msg.restore_generation = job->restore_source->generation;
+        } else {
+            deploy_msg.restore_from_dir = checkpoint.restore_from_dir;
+            deploy_msg.restore_generation =
+                checkpoint.restore_from_dir.empty()
+                    ? job->state_generation
+                    : highest_generation_in(checkpoint.restore_from_dir);
+        }
         deploy_msg.unaligned_checkpoints = checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.adaptive_barrier_mode = checkpoint.alignment == CheckpointAlignment::Adaptive;
         deploy_msg.expected_state_versions_packed = job->expected_state_versions_packed;
@@ -8182,10 +8226,21 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                                                               : job.latest_confirmed_checkpoint_id;
     const bool resubmit_original_restore =
         own_restore_id == 0 && !job.checkpoint.restore_from_dir.empty();
-    const std::string restore_from_dir =
-        resubmit_original_restore ? job.checkpoint.restore_from_dir : job.checkpoint.checkpoint_dir;
     const std::uint64_t restore_from_checkpoint_id =
         resubmit_original_restore ? job.checkpoint.restore_from_checkpoint_id : own_restore_id;
+    // Where that checkpoint's state is. The submitted restore point is read
+    // where the submit resolved it, and so is the same checkpoint when it is
+    // the job's own restore point (a resumed or taken-over job seeds its
+    // confirmed point with it): ids this job numbers are all above it. Every
+    // later checkpoint was written to the job's own state root.
+    const bool restores_submitted_point =
+        job.restore_source.has_value() &&
+        (resubmit_original_restore ||
+         restore_from_checkpoint_id == job.restore_source->checkpoint_id);
+    const std::string restore_from_dir =
+        restores_submitted_point
+            ? job.restore_source->state_root
+            : (resubmit_original_restore ? job.checkpoint.restore_from_dir : job.state_root);
     log::info("coordinator.restart",
               "job_id=" + std::to_string(job.id) + " restore point: checkpoint " +
                   std::to_string(restore_from_checkpoint_id) +
@@ -8217,7 +8272,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         deploy_msg.tasks = std::move(tasks);
         deploy_msg.plugins = plugins_for_worker_locked_(job, *worker_it->second);
         deploy_msg.checkpoint_dir = job.checkpoint.checkpoint_dir;
-        deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
+        deploy_msg.state_backend_uri = job.state_root;
         deploy_msg.capture_dir = job.checkpoint.capture_dir;
         deploy_msg.capture_records = job.checkpoint.capture_records;
         deploy_msg.restore_from_dir = restore_from_dir;
@@ -8230,12 +8285,13 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         // translating - so the two answers are taken from one predicate and cannot
         // disagree. A restore that reads generation N-1's directories while
         // translating indices as though it were generation N is precisely the
-        // mismatch F63 and F65 came from. The submitted-restore fallback reads
-        // an EXTERNAL directory, so its generation is whatever that directory
-        // holds - the same discovery the initial deploy performs.
+        // mismatch F63 and F65 came from. The submitted restore point was not
+        // written by this run, so its generation is the one its marker records,
+        // as the initial deploy applied it.
         deploy_msg.generation = job.state_generation;
         deploy_msg.restore_generation =
-            resubmit_original_restore
+            restores_submitted_point ? job.restore_source->generation
+            : resubmit_original_restore
                 ? highest_generation_in(job.checkpoint.restore_from_dir)
                 : ((job.state_generation > 1 && job.latest_completed_checkpoint_id != 0 &&
                     job.latest_completed_checkpoint_id <= job.state_generation_after_checkpoint)
@@ -8498,14 +8554,15 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.tasks = std::move(tasks);
         deploy_msg.plugins = plugins_for_worker_locked_(job, *worker_it->second);
         deploy_msg.checkpoint_dir = job.checkpoint.checkpoint_dir;
-        deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
+        deploy_msg.state_backend_uri = job.state_root;
         deploy_msg.capture_dir = job.checkpoint.capture_dir;
         deploy_msg.capture_records = job.checkpoint.capture_records;
         // The new subtasks restore from the cutover checkpoint, NOT
         // the latest. This is the key difference from restart_job_locked_:
         // we use the coordinator-chosen cutover_checkpoint so all new
         // subtasks load a consistent snapshot frozen at the drain barrier.
-        deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
+        // This run wrote it, under the job's own state root.
+        deploy_msg.restore_from_dir = job.state_root;
         deploy_msg.restore_from_checkpoint_id = status->cutover_checkpoint;
         deploy_msg.run_checkpoint_floor = job.run_checkpoint_floor;
         deploy_msg.unaligned_checkpoints =
@@ -9772,6 +9829,9 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
         // redeploys while the marker is written has torn them down, and the
         // new run neither tracks nor commits the old run's checkpoint.
         std::uint64_t redeploys{0};
+        // Where the checkpoint's state was written, as its marker records it
+        // (recorded_state_location).
+        std::string state_location;
     };
     std::vector<CompletedCheckpoint> just_completed;
     std::string completed_marker_dir;
@@ -10195,6 +10255,8 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                 }
                 done.suppress_commit = job.awaiting_restart;
                 done.redeploys = job.redeploys;
+                done.state_location =
+                    recorded_state_location(job.checkpoint.checkpoint_dir, job.id, job.state_root);
                 just_completed.push_back(std::move(done));
             }
             completed_marker_dir = job.checkpoint.checkpoint_dir;
@@ -10348,8 +10410,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
     // reader, so the write delays that worker's later frames but never its
     // heartbeats: a write outlasting heartbeat_timeout no longer gets a live
     // worker declared lost.
-    for (const auto& [jid, ckpt_id, gen, subtasks, suppress_commit, completed_in_run] :
-         just_completed) {
+    for (const auto& [jid,
+                      ckpt_id,
+                      gen,
+                      subtasks,
+                      suppress_commit,
+                      completed_in_run,
+                      state_location] : just_completed) {
         // The COMPLETED-N marker is the authoritative record that a
         // checkpoint reached global completion, and the 2PC sinks key their
         // commit-on-restore on finding it. It therefore has to be durable
@@ -10407,15 +10474,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                 // directory the checkpoint's restore point still named - and no
                 // per-file integrity check can see that, because each file is
                 // individually valid. A recorded participant set can.
-                std::string subtask_list;
-                for (const auto idx : subtasks) {
-                    subtask_list += (subtask_list.empty() ? "" : ",") + std::to_string(idx);
-                }
+                //
+                // And where its state is (state=): the job's own root, which a
+                // restore reads rather than guessing at a directory several
+                // jobs share.
                 make_coordination_store(completed_marker_dir)
                     ->put(marker_key,
-                          "job=" + std::to_string(jid) + "\ncheckpoint=" + std::to_string(ckpt_id) +
-                              "\ngeneration=" + std::to_string(gen) + "\nsubtasks=" + subtask_list +
-                              "\n");
+                          completed_marker_body(jid, ckpt_id, gen, subtasks, state_location));
             } catch (const std::exception& e) {
                 clink::log::error(
                     "coordinator.checkpoint",

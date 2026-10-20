@@ -37,6 +37,7 @@ SQL statements a 1.x release holds stable) is the published
 | Cluster control protocol | 3 | 1 | `include/clink/cluster/protocol.hpp` (`kClusterProtocolVersion`), three handshake sites |
 | Data plane (operator wire frames) | unversioned by design | n/a | `include/clink/runtime/network/wire.hpp` |
 | Checkpoint metadata sidecar | 1 | 1 | `include/clink/state/checkpoint_integrity.hpp` (`kCheckpointMetaVersion`) |
+| Checkpoint directory layout and `COMPLETED` markers | unversioned; marker keys additive-only | every layout since the generation directories (v0.7.0) restores | `include/clink/cluster/state_location.hpp` (`resolve_restore_source`), `tests/test_state_location.cpp` |
 | State snapshots and savepoints | 1 (`clink.format_version`) | 1 (absence reads as 1) | `docs/internals/state-snapshot-format.md` |
 | Job plan (`JobGraphSpec` JSON) | unversioned, additive-only | n/a | `JobGraphSpec::from_json`, `src/cluster/job_graph.cpp` |
 | Connector offsets and committables | ride the snapshot format | n/a | per-connector state encodings, `docs/internals/sink-committer-framework.md` |
@@ -176,6 +177,28 @@ COMPLETED marker that makes a checkpoint eligible for restore.
   external side effect.
 - **Tests:** `tests/test_checkpoint_integrity.cpp`, `fuzz/fuzz_checkpoint_meta.cpp`,
   `tests/fixtures/checkpoint-meta-v1.txt`.
+
+## Checkpoint directory layout and `COMPLETED` markers
+
+A checkpoint directory holds each job's markers under `_jobs/<job id>/` and, for
+the file backend, each job's state under `_state/<job id>/v<generation>/<subtask>/`
+(design record [013](../design/013-state-namespaced-by-job.md)). A `COMPLETED-<id>`
+marker is `key=value` lines: `job`, `checkpoint`, `generation`, `subtasks` (the
+participant set, since v0.7.0) and `state` (where the checkpoint's state is:
+`_state/<job id>` relative to the checkpoint directory, or an absolute location).
+
+- **Compatible additions** are new keys: `parse_completed_marker` skips any it does
+  not know.
+- **Older layouts restore.** A marker without `state=` was written when every job
+  using the directory kept its state at the top of the base, `<base>/v<generation>/`,
+  and its checkpoint is restored from there. A marker that records neither its
+  participants nor its state was cut short, and is read at the job's own state root
+  when that exists.
+- **Downgrade is not supported.** A build from before the `state=` line reads state
+  at the top of the base, where this build no longer writes it.
+- **Tests:** `tests/test_state_location.cpp`, and the cluster and embedded restores
+  of a directory converted to the older layout in `tests/test_cluster.cpp` and
+  `tests/test_embedded_engine.cpp`.
 
 ## State snapshots and savepoints
 

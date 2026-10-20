@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -15,6 +15,7 @@
 
 #include "clink/cluster/coordination_store.hpp"
 #include "clink/cluster/protocol_trace.hpp"
+#include "clink/cluster/state_location.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/txn_resume_registry.hpp"
 #include "clink/metrics/orchestration_metrics.hpp"
@@ -240,40 +241,47 @@ namespace {
 // resolver, or any resolver failure stops the walk and leaves the
 // commit-confirmed contract (bounded replay) in force.
 
-// generation + acking subtasks recorded in a COMPLETED-<id> marker.
+// generation + acking subtasks recorded in a COMPLETED-<id> marker, and where
+// the checkpoint's state was written.
 struct CompletedMarkerInfo {
     std::uint32_t generation{1};
     std::vector<std::uint32_t> subtasks;
+    std::optional<std::string> state;
 };
 
 std::optional<CompletedMarkerInfo> read_completed_marker(const std::string& body) {
-    CompletedMarkerInfo out;
-    std::istringstream in(body);
-    std::string line;
-    bool saw_subtasks = false;
-    while (std::getline(in, line)) {
-        if (line.rfind("generation=", 0) == 0) {
-            out.generation =
-                static_cast<std::uint32_t>(std::strtoul(line.c_str() + 11, nullptr, 10));
-        } else if (line.rfind("subtasks=", 0) == 0) {
-            saw_subtasks = true;
-            std::size_t pos = 9;
-            while (pos < line.size()) {
-                const auto comma = line.find(',', pos);
-                const auto tok =
-                    line.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-                if (!tok.empty()) {
-                    out.subtasks.push_back(
-                        static_cast<std::uint32_t>(std::strtoul(tok.c_str(), nullptr, 10)));
-                }
-                pos = comma == std::string::npos ? line.size() : comma + 1;
-            }
-        }
-    }
-    if (!saw_subtasks) {
+    const auto marker = parse_completed_marker(body);
+    if (!marker.subtasks.has_value()) {
         return std::nullopt;  // pre-participant-set marker; nothing to walk
     }
+    CompletedMarkerInfo out;
+    out.generation = marker.generation.value_or(1);
+    out.subtasks.assign(marker.subtasks->begin(), marker.subtasks->end());
+    out.state = marker.state;
     return out;
+}
+
+// The directory a checkpoint's snapshot files are under: the state root its
+// marker records (state_location.hpp), relative to the checkpoint directory or
+// a path; the checkpoint directory itself for a marker written before state
+// was namespaced by job. nullopt for a root the walk cannot read as a
+// directory (an object store's), whose snapshots it cannot load.
+std::optional<std::string> snapshot_root_for(const std::string& checkpoint_dir,
+                                             const CompletedMarkerInfo& info) {
+    if (!info.state.has_value()) {
+        return checkpoint_dir;
+    }
+    const auto& state = *info.state;
+    if (state.rfind("file://", 0) == 0) {
+        return state.substr(7);
+    }
+    if (state.find("://") != std::string::npos) {
+        return std::nullopt;
+    }
+    if (!state.empty() && state.front() == '/') {
+        return state;
+    }
+    return (std::filesystem::path{checkpoint_dir} / state).string();
 }
 
 // One staged resume handle plus the sink subtask that staged it. The
@@ -289,7 +297,7 @@ struct StagedHandle {
 
 // W3 (coordination-store plan): these snapshot loads are the one read the
 // store does not yet cover - they go through the state layout directly and
-// only exist under a filesystem/legacy backend rooted at checkpoint_dir.
+// only exist under a filesystem state root (snapshot_root_for).
 // The staged resume handles inside one checkpoint's snapshots: operator-state
 // rows (0xFF-prefixed stored keys) whose logical key starts with
 // kTxnResumeStateKeyPrefix. nullopt = a snapshot could not be read (or a
@@ -299,10 +307,17 @@ std::optional<std::vector<StagedHandle>> read_resume_handles(const std::string& 
                                                              const CompletedMarkerInfo& info,
                                                              std::uint64_t ckpt_id) {
     std::vector<StagedHandle> handles;
+    const auto root = snapshot_root_for(checkpoint_dir, info);
+    if (!root.has_value()) {
+        clink::log::warn("coordinator.recovery",
+                         "in-doubt resolution: checkpoint " + std::to_string(ckpt_id) +
+                             "'s state is at " + info.state.value_or("") +
+                             ", which this walk cannot read; stopping resolution");
+        return std::nullopt;
+    }
     for (const auto sub : info.subtasks) {
-        const auto snap =
-            std::filesystem::path(clink::state_dir_for(checkpoint_dir, info.generation, sub)) /
-            ("checkpoint-" + std::to_string(ckpt_id) + ".snap");
+        const auto snap = std::filesystem::path(clink::state_dir_for(*root, info.generation, sub)) /
+                          ("checkpoint-" + std::to_string(ckpt_id) + ".snap");
         std::error_code ec;
         if (!std::filesystem::exists(snap, ec)) {
             // A subtask that acked but kept no state writes no snapshot;

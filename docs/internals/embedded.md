@@ -114,6 +114,14 @@ Three rules decide which run resumes and which starts over:
 | Reached the end of its input cleanly | Starts from empty state | Starts from empty state |
 | Any, with `--fresh` | Starts from empty state | Starts from empty state |
 
+Each INSERT statement of a script is its own job, and every job keeps its
+state under its own root in the checkpoint directory, `_state/<id>/`, beside
+its markers under `_jobs/<id>/`, so the jobs of one script resume from their
+own checkpoints (design record [013](../design/013-state-namespaced-by-job.md)).
+A resume names the job's marker directory, and a checkpoint directory written
+before state was namespaced by job, which holds the state at its top level,
+resumes from there.
+
 Job ids restart at 1 in every process, so the markers under
 `_jobs/<id>/` say only that some job with that id ran there. The
 `graph-fingerprint` file beside them (`job_graph_fingerprint`, a hash of the

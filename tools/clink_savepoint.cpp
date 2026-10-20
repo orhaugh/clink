@@ -6,8 +6,11 @@
 //
 // v1 returns the in-place checkpoint location - physical relocation
 // to a portable path is the operator's responsibility (rsync, S3
-// copy). The handle is a stable filesystem path + integer id that
-// both the coordinator and any future clink_submit_job can address.
+// copy, of the whole checkpoint directory: its markers record a
+// file-backed job's state relative to it). The handle is the job's
+// marker directory in its checkpoint directory
+// (<checkpoint dir>/_jobs/<job id>) + integer id, which names this
+// job's checkpoint whatever other jobs share the directory.
 //
 // Wire flow:
 //   1. HelloClient frames us as a client.
@@ -15,7 +18,7 @@
 //      blocks until every subtask acks.
 //   3. SavepointAck carries (ok, checkpoint_id, checkpoint_dir,
 //      message). On ok=true we print one line:
-//        savepoint: job_id=N ok=1 dir=/path id=42
+//        savepoint: job_id=N ok=1 dir="/path/_jobs/N" id=42
 //      which is parseable by shell scripts.
 //
 // Usage:

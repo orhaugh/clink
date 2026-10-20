@@ -223,6 +223,11 @@ $ clink run --job=./job.so --restore-from-dir=/var/clink/ckpt \
             --restore-from-checkpoint-id=42
 ```
 
+When other jobs checkpoint into the same directory and one of them also completed a
+checkpoint 42, the restore is refused until it names the job: pass the job's marker
+directory, `--restore-from-dir=/var/clink/ckpt/_jobs/1`. `clink savepoint` prints that
+directory as its `dir=`.
+
 The stop signal is deliberately NOT the rescale drain signal, though both make a
 source leave its produce loop. A rescale drain emits a `DrainMarker` and skips the
 end-of-input path, because the cutover checkpoint has already been taken; a stop

@@ -218,7 +218,9 @@ The walkthrough used five tools. The rest fill in the surrounding picture:
 
 Two ergonomics the server absorbs so an agent does not have to learn them:
 it accepts a checkpoint **root** wherever the CLI wants the generation
-directory beneath it, and the `op-<id>` directory names `capture_cat` lists
+directory beneath it (following the checkpoint's `COMPLETED` marker to the
+job whose state it is, since each job keeps its state under `_state/<job id>`),
+and the `op-<id>` directory names `capture_cat` lists
 wherever the CLI wants the bare id. Every CLI-backed answer carries the exit
 code, stdout and stderr, so a non-zero exit is data the agent reads, not an
 exception that ends the conversation; a missing artefact or an unconfigured

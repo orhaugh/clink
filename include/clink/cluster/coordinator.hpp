@@ -25,6 +25,7 @@
 #include "clink/cluster/rescale_coordinator.hpp"
 #include "clink/cluster/rescale_dispatch.hpp"
 #include "clink/cluster/snapshots.hpp"
+#include "clink/cluster/state_location.hpp"
 #include "clink/lineage/lineage_graph.hpp"
 #include "clink/runtime/network/connection.hpp"
 
@@ -1198,6 +1199,19 @@ private:
         // Stamped onto the Deploy frames only; task_records keep the
         // unstamped extra_config, so a redeploy decides it again.
         std::uint32_t row_layout{1};
+        // Where this job's state lives: job_state_root over its state base
+        // (state_location.hpp). Fixed for the job's life, since neither its id
+        // nor its base changes, and sent to every Deploy in place of the base,
+        // so jobs sharing a base never share a file. Every checkpoint this
+        // coordinator completes for the job was written here, which is what
+        // its COMPLETED marker records.
+        std::string state_root;
+        // The restore point the job was submitted, resumed or recovered with,
+        // resolved from its marker: where that checkpoint's state is, which can
+        // be another job's root or the location state lived at before it was
+        // namespaced by job. A restart that restores that same checkpoint reads
+        // it there; any later checkpoint is the job's own, under state_root.
+        std::optional<RestoreSource> restore_source;
         // Per-task records keyed by "role:subtask_idx" so a retry can
         // re-send the original Deploy entry to the original worker.
         std::unordered_map<std::string, std::pair<std::string, DeploymentTask>> task_records;
@@ -2204,7 +2218,9 @@ private:
                            // CheckpointConfig::track_runs submit checks the
                            // directory's recorded job and restore layout against.
                            std::string graph_fingerprint = {},
-                           std::vector<std::string> single_instance_ops = {});
+                           std::vector<std::string> single_instance_ops = {},
+                           // The submitted restore point, resolved by submit_job.
+                           std::optional<RestoreSource> restore_source = std::nullopt);
     void handle_subtask_checkpointed_(MessageReader& r, const WorkerConnection& sender);
     // Commit-confirmed restore protocol: a tracked task's commit callbacks
     // for a checkpoint executed without throwing. Drains the checkpoint's

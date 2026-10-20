@@ -16,6 +16,7 @@ add_executable(clink_core_tests
     test_otlp_export.cpp
     test_coordination_store.cpp
     test_in_doubt_resolution.cpp
+    test_state_location.cpp
     test_source_contract.cpp
     test_sink_contract.cpp
     test_window_state_codecs.cpp

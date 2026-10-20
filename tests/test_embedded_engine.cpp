@@ -921,6 +921,157 @@ TEST(EmbeddedEngine, AnUnfinishedJobResumesFromItsCheckpointsInsteadOfReplaying)
     fs::remove_all(dir);
 }
 
+namespace {
+
+std::size_t line_count(const fs::path& path) {
+    std::ifstream in(path);
+    std::size_t n = 0;
+    for (std::string line; std::getline(in, line);) {
+        n += line.empty() ? 0 : 1;
+    }
+    return n;
+}
+
+// The checkpoint ids a job's COMPLETED markers name, and whether every one
+// records where its state is.
+struct JobMarkers {
+    std::size_t completed{0};
+    bool all_located{true};
+};
+
+JobMarkers job_markers(const fs::path& ckpt, int job) {
+    JobMarkers out;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(ckpt / "_jobs" / std::to_string(job), ec)) {
+        if (e.path().filename().string().rfind("COMPLETED-", 0) != 0) {
+            continue;
+        }
+        ++out.completed;
+        std::ifstream in(e.path());
+        const std::string body((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        out.all_located = out.all_located && body.find("\nstate=_state/" + std::to_string(job) +
+                                                       "\n") != std::string::npos;
+    }
+    return out;
+}
+
+// One script, two INSERT statements and so two jobs, over inputs of different
+// lengths into two plain file sinks, checkpointing into one directory.
+int run_two_jobs(const fs::path& dir, std::string* err_out) {
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    opts.checkpoint_dir = (dir / "ckpt").string();
+    opts.checkpoint_interval_ms = 100;
+    const auto table = [&](const std::string& name, const std::string& file) {
+        return "CREATE TABLE " + name +
+               " (user_id BIGINT, amount BIGINT) WITH (connector='file', " +
+               "format='json', path='" + (dir / file).string() + "');\n";
+    };
+    int rc = 0;
+    {
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        rc = engine.execute_script(
+            table("long_in", "long.ndjson") + table("short_in", "short.ndjson") +
+            table("long_out", "long_out.ndjson") + table("short_out", "short_out.ndjson") +
+            "INSERT INTO long_out SELECT user_id, amount FROM long_in;\n"
+            "INSERT INTO short_out SELECT user_id, amount FROM short_in;");
+        if (rc == 0 && !engine.await_all()) {
+            rc = 1;
+        }
+    }
+    if (err_out != nullptr) {
+        *err_out = err.str();
+    }
+    return rc;
+}
+
+}  // namespace
+
+// Two jobs given one checkpoint directory keep their state apart. Each job's
+// state lived at <dir>/v<generation>/<subtask>, with no job in the path, so the
+// two jobs' subtask 0 wrote and renamed the same files: their checkpoints
+// failed, or restored each other's offsets. Each job now writes under its own
+// root, <dir>/_state/<job id>, its markers say so, and each resumes from its
+// own checkpoints.
+TEST(EmbeddedEngine, TwoJobsOfOneScriptKeepTheirStateApart) {
+    const auto dir = resume_scratch("two_jobs");
+    write_orders(dir / "long.ndjson");
+    write_lines(dir / "short.ndjson",
+                {R"({"user_id":7,"amount":1})", R"({"user_id":8,"amount":2})"});
+    const auto ckpt = dir / "ckpt";
+
+    std::string err;
+    ASSERT_EQ(run_two_jobs(dir, &err), 0) << err;
+    EXPECT_EQ(line_count(dir / "long_out.ndjson"), 5U);
+    EXPECT_EQ(line_count(dir / "short_out.ndjson"), 2U);
+    for (const int job : {1, 2}) {
+        SCOPED_TRACE("job " + std::to_string(job));
+        const auto markers = job_markers(ckpt, job);
+        EXPECT_GT(markers.completed, 0U) << "the job completed no checkpoint: " << err;
+        EXPECT_TRUE(markers.all_located) << "a marker does not record the job's own state root";
+        EXPECT_TRUE(fs::is_directory(ckpt / "_state" / std::to_string(job) / "v1" / "0"))
+            << "the job's state is not under its own root";
+    }
+    EXPECT_FALSE(fs::exists(ckpt / "v1")) << "state was written where every job shares it";
+
+    // Both killed, both rerun: each restores its own offsets, so neither reads
+    // its input again. Restoring the other job's would replay the long input
+    // from the short one's offset.
+    for (const int job : {1, 2}) {
+        std::error_code ec;
+        fs::remove(ckpt / "_jobs" / std::to_string(job) / "FINISHED", ec);
+    }
+    ASSERT_EQ(run_two_jobs(dir, &err), 0) << err;
+    EXPECT_EQ(line_count(dir / "long_out.ndjson"), 5U) << "the long job read its input again";
+    EXPECT_EQ(line_count(dir / "short_out.ndjson"), 2U) << "the short job read its input again";
+    fs::remove_all(dir);
+}
+
+// A checkpoint directory written before state was namespaced by job holds the
+// state at <dir>/v<generation>/<subtask>, and markers without a state= line. A
+// job interrupted there resumes from it, and its new checkpoints go under its
+// own root.
+TEST(EmbeddedEngine, AJobInterruptedBeforeStateWasNamespacedByJobResumes) {
+    const auto dir = resume_scratch("older_layout");
+    write_orders(dir / "in.ndjson");
+    const auto ckpt = dir / "ckpt";
+
+    const auto first = run_orders_into_collect(dir / "in.ndjson", ckpt, kResumeInsert, false);
+    ASSERT_EQ(first.execute_rc, 0) << first.err;
+    ASSERT_EQ(first.rows, 5);
+    const auto first_marker = highest_completed_marker(ckpt);
+    ASSERT_GT(first_marker, 0u);
+    as_if_killed(ckpt);
+
+    // The directory as an earlier build left it.
+    fs::rename(ckpt / "_state" / "1" / "v1", ckpt / "v1");
+    fs::remove_all(ckpt / "_state");
+    for (const auto& e : fs::directory_iterator(ckpt / "_jobs" / "1")) {
+        if (e.path().filename().string().rfind("COMPLETED-", 0) != 0) {
+            continue;
+        }
+        std::ifstream in(e.path());
+        std::string body;
+        for (std::string line; std::getline(in, line);) {
+            if (line.rfind("state=", 0) != 0) {
+                body += line + "\n";
+            }
+        }
+        in.close();
+        std::ofstream(e.path(), std::ios::trunc) << body;
+    }
+
+    const auto second = run_orders_into_collect(dir / "in.ndjson", ckpt, kResumeInsert, false);
+    ASSERT_EQ(second.execute_rc, 0) << second.err;
+    EXPECT_EQ(second.rows, 0) << "the job did not resume from the older layout's state";
+    EXPECT_GT(highest_completed_marker(ckpt), first_marker);
+    EXPECT_TRUE(fs::is_directory(ckpt / "_state" / "1" / "v1" / "0"))
+        << "the resumed run's checkpoints are not under the job's own root";
+    fs::remove_all(dir);
+}
+
 #ifdef CLINK_FAULT_INJECTION
 namespace {
 

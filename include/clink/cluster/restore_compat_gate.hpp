@@ -62,13 +62,14 @@ namespace clink::cluster {
 // coordinator cannot list all mean "cannot check", and the deploy proceeds as it
 // did before the gate existed.
 
-// The participant set recorded for `checkpoint_id` by
-// <restore_from_dir>/_jobs/<job>/COMPLETED-<id>. nullopt when no single marker
-// can be identified, the marker carries no participant set (it predates one, or
-// the list is empty, which no completed checkpoint can be), or a token does not
-// parse. The identification rule is the one the restore itself applies
-// (completed_participants in src/state/state_backend_factory.cpp), so the gate
-// and the restore cannot disagree about which marker describes the checkpoint.
+// The participant set recorded for `checkpoint_id` by its COMPLETED marker:
+// <restore_from_dir>/COMPLETED-<id> when restore_from_dir is a job's marker
+// directory, else the one <restore_from_dir>/_jobs/<job>/COMPLETED-<id>. nullopt
+// when no single marker can be identified, the marker carries no participant set
+// (it predates one, or the list is empty, which no completed checkpoint can be),
+// or a token does not parse. The identification rule is the one the restore
+// itself applies (resolve_restore_source in state_location.hpp), so the gate and
+// the restore cannot disagree about which marker describes the checkpoint.
 //
 // Deliberately no fallback to counting snapshot files when the marker carries no
 // participant set. The file name is the state backend's business - only the file

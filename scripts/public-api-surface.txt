@@ -350,6 +350,7 @@ include/clink/cluster/runner_helpers.hpp
 include/clink/cluster/runner_registry.hpp
 include/clink/cluster/service_discovery.hpp
 include/clink/cluster/snapshots.hpp
+include/clink/cluster/state_location.hpp
 include/clink/cluster/submit_query_config.hpp
 include/clink/cluster/type_registry.hpp
 include/clink/cluster/worker_supervisor.hpp
@@ -529,6 +530,7 @@ include/clink/cluster/rescale_dispatch.hpp
 include/clink/cluster/runner_helpers.hpp
 include/clink/cluster/runner_registry.hpp
 include/clink/cluster/snapshots.hpp
+include/clink/cluster/state_location.hpp
 include/clink/cluster/type_registry.hpp
 include/clink/config/flat_map.hpp
 include/clink/config/json.hpp
