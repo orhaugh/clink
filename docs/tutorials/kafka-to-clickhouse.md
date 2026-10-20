@@ -135,6 +135,17 @@ CREATE TABLE sensor_window_stats (
 );
 ```
 
+This table writes through the JSONEachRow text sink, the SQL default for a
+ClickHouse table, which the tutorial keeps so that it runs on every published
+image. For a table of your own, add `insert_format = 'native'`: the typed
+native sink checks the server and the target table before it writes and
+converts every value into its column's type, and
+[Choosing a sink](../connectors/clickhouse.md#choosing-a-sink) sets out what
+it guarantees and what it refuses. Add it here to run this pipeline on the
+native sink; `run.sh` checks that the sink the pipeline asks for is the one
+that ran. Either sink is at-least-once, and either must be the only sink on
+its chain.
+
 And the query that connects them:
 
 ```sql

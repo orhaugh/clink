@@ -260,7 +260,8 @@ Everything below is published at
   Parquet, Iceberg, Delta Lake, MQTT, NATS, Pulsar, RabbitMQ, Redis, MongoDB,
   Cassandra, HTTP, Avro, WebSocket and more), each with dependencies,
   options and delivery semantics; Kafka speaks the Confluent Schema Registry
-  wire format (Avro, Protobuf, JSON Schema).
+  wire format (Avro, Protobuf, JSON Schema), and a new ClickHouse table should
+  use the typed native sink, `insert_format='native'`.
 - [Internals](https://orhaugh.github.io/clink/internals/): every
   subsystem documented the way its code is structured, citing sources.
 - [Design decisions](https://orhaugh.github.io/clink/design/): why the

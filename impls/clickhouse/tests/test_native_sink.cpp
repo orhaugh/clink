@@ -720,8 +720,6 @@ TEST(NativeSinkFactory, TheRecordClaimsAtLeastOnceWithRetriesAndPassesItsOwnChec
         "behind a Distributed target",
         "SharedMergeTree targets are refused: their deduplication is untested",
         "must be the only sink on its chain: Dag::add_sink refuses another sink beside it",
-        "unaligned and adaptive checkpoints are refused at open until the engine captures "
-        "in-flight rows at a fan-in",
         "a retry that holds the barrier beyond CLINK_EOS_FINAL_CKPT_TIMEOUT_MS (default 30 s) "
         "at the end of a bounded job or at a hot cutover spends a restart; nothing is lost",
         "a columnar batch is taken without building rows when its event-time column is int64 "

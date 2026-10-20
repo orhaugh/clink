@@ -19,8 +19,8 @@
 //   dag.add_sink<Trade>(handle, sink);
 //
 // At-least-once, as the SQL native sink is: the sink holds no state and needs
-// no uid, takes aligned checkpoint barriers only, and must be the only sink on
-// its chain. Options, refusals and logs are those of docs/connectors/
+// no uid, takes every checkpoint barrier mode, and must be the only sink on its
+// chain. Options, refusals and logs are those of docs/connectors/
 // clickhouse.md. The sink is defined in the clink::clickhouse library, so a
 // job module that uses it links clink::clickhouse. On a build without the
 // native sink every helper here still compiles, and building the sink throws

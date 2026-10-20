@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**The native ClickHouse sink is the recommended one for a new table.** The
+ClickHouse page says what `insert_format='native'` guarantees and what it
+refuses, the README, the tutorial, its example and the connector index point a
+new table at it, and the page lists what to check before the SQL default
+changes; the default stays the text sink. The native sink's capability record no longer says it
+refuses unaligned and adaptive checkpoints, which it accepts since every fan-in
+aligns its barriers.
+
 **The ClickHouse text sink is refused beside a second sink on its chain.** The
 JSONEachRow text sink, `clickhouse_sink`, the SQL default for a ClickHouse
 table, is at-least-once because its checkpoint barrier writes everything it

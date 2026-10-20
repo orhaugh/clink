@@ -26,7 +26,10 @@ CREATE TABLE readings (
 );
 
 -- Sink: one row per (sensor, window), inserted as JSONEachRow into the
--- ClickHouse table created by clickhouse-init.sql. Delivery to ClickHouse is
+-- ClickHouse table created by clickhouse-init.sql, through the text sink, the
+-- SQL default. A new table should prefer insert_format = 'native', the typed
+-- native sink (docs/connectors/clickhouse.md, "Choosing a sink"); adding it to
+-- the WITH clause below runs this pipeline on it. Delivery to ClickHouse is
 -- at-least-once: rows written after the last completed checkpoint are
 -- written again after a recovery, which is why that table is a
 -- ReplacingMergeTree keyed by (sensor_id, window_start).
