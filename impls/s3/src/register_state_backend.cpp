@@ -7,14 +7,16 @@
 // State lives in S3 (content-addressed value objects + per-checkpoint
 // manifests via S3RemotePool); cold reads defer to S3 through the async
 // execution path; restore is lazy. Per-subtask key prefix is
-// "<prefix>/<subtask_idx>". hot_max_bytes bounds the in-memory hot tier so
+// "<prefix>/v<generation>/<subtask_idx>". hot_max_bytes bounds the in-memory hot tier so
 // working state genuinely exceeds RAM (0 / absent = unbounded hot tier).
 //
 // Restore covers same-parallelism failover, RESCALE (scale-up/down: the pool
 // merges the parent subtasks' checkpoint, key-group-filters to this subtask's
-// range, and relocates objects into its prefix via prepare_restore), and
-// cross-location relocation (S3RemotePool::export_checkpoint copies a checkpoint
-// to a new base, after which a job pointed there restores same-location).
+// range, and relocates objects into its prefix via prepare_restore), a
+// checkpoint written at another location in the same bucket (the restore URI
+// names it; the same relocation copies it in), and cross-bucket relocation
+// (S3RemotePool::export_checkpoint copies a checkpoint to a new base, after
+// which a job pointed there restores from it).
 
 #include <limits>
 #include <memory>
@@ -143,12 +145,39 @@ clink::BuiltStateBackend build_remote_read(const clink::StateBackendSpec& spec) 
 
     auto pool = std::make_shared<S3RemotePool>(o);
 
+    // Where the checkpoint being restored lives: the restore URI's location.
+    // That is this backend's own on a restart, and another when the checkpoint
+    // was written elsewhere - a different job's state root (a resubmit from a
+    // savepoint), or the location state lived at before it was namespaced by
+    // job (clink/cluster/state_location.hpp). A restore URI of another scheme
+    // names no remote-read location (an older coordinator sends its checkpoint
+    // directory), and the checkpoint is read from this backend's own.
+    const bool want_restore = !spec.restore_uri.empty() && spec.restore_checkpoint_id != 0;
+    Cfg restore_cfg = cfg;
+    if (want_restore) {
+        const auto [rscheme, rbase] = split_uri(spec.restore_uri);
+        if (rscheme == "remote-read") {
+            restore_cfg = parse_cfg(rbase);
+            if (restore_cfg.bucket != cfg.bucket) {
+                throw std::runtime_error(
+                    "remote-read: checkpoint " + std::to_string(spec.restore_checkpoint_id) +
+                    " is in bucket '" + restore_cfg.bucket + "' and this job writes bucket '" +
+                    cfg.bucket +
+                    "'; a restore copies the checkpoint's objects within one bucket. Export it "
+                    "into this bucket first (S3RemotePool::export_checkpoint), or run the job "
+                    "against the checkpoint's bucket.");
+            }
+        }
+    }
+
     // Rescale: this new subtask inherits the committed state of one parent
     // (scale-up) or a contiguous block of parents (scale-down), narrowed to its
     // assigned key-group range. Hand the pool the parent prefixes so restore()'s
     // prepare_restore can merge + key-group-filter + relocate their checkpoint
     // into this subtask's prefix. UINT32_MAX = "restore from own subtask" (the
-    // same-parallelism path), which needs no merge.
+    // same-parallelism path), which needs no merge when the checkpoint is
+    // already under this subtask's prefix, and the same relocation when it is
+    // not: written at another location, or by another generation.
     if (spec.restore_from_subtask_idx != std::numeric_limits<std::uint32_t>::max()) {
         const std::uint32_t first = spec.restore_from_subtask_idx;
         const std::uint32_t count =
@@ -156,20 +185,26 @@ clink::BuiltStateBackend build_remote_read(const clink::StateBackendSpec& spec) 
         std::vector<std::string> parents;
         parents.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
-            parents.push_back(subtask_prefix(cfg, spec.restore_generation, first + i));
+            parents.push_back(subtask_prefix(restore_cfg, spec.restore_generation, first + i));
         }
         pool->set_restore_sources(std::move(parents));
+    } else if (want_restore) {
+        auto source = subtask_prefix(restore_cfg, spec.restore_generation, spec.subtask_idx);
+        if (source != o.prefix) {
+            pool->set_restore_sources({std::move(source)});
+        }
     }
 
     clink::BuiltStateBackend out;
     out.backend =
         std::make_shared<clink::RemoteReadBackend>(pool, cfg.io_threads, cfg.hot_max_bytes);
 
-    if (!spec.restore_uri.empty() && spec.restore_checkpoint_id != 0) {
+    if (want_restore) {
         // The pool reads cp-<id> from this subtask's prefix (same-parallelism
-        // failover) or, on rescale, materialises it from the parent prefixes via
-        // prepare_restore. The Snapshot is just the marker id (the bytes live in
-        // S3). LocalExecutor forwards this to backend->restore(snap, kg_filter).
+        // failover) or materialises it from the source prefixes via
+        // prepare_restore (rescale, or a checkpoint written elsewhere). The Snapshot is just the
+        // marker id (the bytes live in S3). LocalExecutor forwards this to backend->restore(snap,
+        // kg_filter).
         clink::Snapshot snap;
         snap.checkpoint_id = clink::CheckpointId{spec.restore_checkpoint_id};
         out.restore_from = std::move(snap);

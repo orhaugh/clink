@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**`remote-read` restores a checkpoint from the location the restore names.** It
+read the checkpoint from its own prefix, whatever the restore named. A checkpoint
+at another prefix of the same bucket, or written by another generation, is now
+relocated into the subtask's own prefix, as a rescale already did, and a
+checkpoint in another bucket is refused with both buckets named.
+
 **The ForSt S3 composite builds again, and `s3sst+forst` restores a checkpoint
 written elsewhere.** `impls/forst-s3` had not compiled since state directories
 gained generations (an unbalanced parenthesis in the `s3sst+forst` restore path,

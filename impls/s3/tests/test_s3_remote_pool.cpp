@@ -568,6 +568,72 @@ TEST(S3RemotePoolScheme, HotMaxBytesUriProducesEvictingBackend) {
     rrb->purge_checkpoint(CheckpointId{1});
 }
 
+// A restore reads the location its URI names. A checkpoint written at another
+// prefix of the same bucket - another job's state root, or the location state
+// lived at before it was namespaced by job - is relocated into the restoring
+// subtask's prefix, and the backend's next checkpoint restores from there. A
+// restore URI of another scheme names no remote-read location (an older
+// coordinator sends its checkpoint directory), and the backend reads its own
+// prefix as it always did.
+TEST(S3RemotePoolScheme, ARestoreReadsTheLocationItsUriNames) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    clink::s3::install_state_backend();
+    const std::string bucket = std::getenv("CLINK_S3_TEST_BUCKET");
+    const std::string endpoint = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const auto uri_at = [&](const std::string& prefix) {
+        return "remote-read://" + bucket + "/" + prefix + "?endpoint=" + endpoint +
+               "&region=us-east-1";
+    };
+    const std::string base = unique_prefix() + "-moved";
+    const std::string source = uri_at(base);
+    const std::string target = uri_at(base + "/_state/2");
+    auto& factory = clink::StateBackendFactory::default_instance();
+    const OperatorId op{1};
+    const auto restored =
+        [&](const std::string& uri, const std::string& restore_uri, std::uint64_t id) {
+            clink::StateBackendSpec spec;
+            spec.uri = uri;
+            spec.subtask_idx = 0;
+            spec.restore_uri = restore_uri;
+            spec.restore_checkpoint_id = id;
+            auto built = factory.build(spec);
+            EXPECT_TRUE(built.restore_from.has_value());
+            if (built.restore_from.has_value()) {
+                built.backend->restore(*built.restore_from);
+            }
+            return built.backend;
+        };
+
+    {
+        clink::StateBackendSpec spec;
+        spec.uri = source;
+        spec.subtask_idx = 0;
+        auto built = factory.build(spec);
+        built.backend->put(op, StateBackend::ValueView{"a"}, vv("1"));
+        built.backend->put(op, StateBackend::ValueView{"b"}, vv("2"));
+        built.backend->snapshot(CheckpointId{4});
+    }
+
+    auto moved = restored(target, source, 4);
+    EXPECT_EQ(str(moved->get(op, StateBackend::KeyView{"a"})), "1");
+    EXPECT_EQ(str(moved->get(op, StateBackend::KeyView{"b"})), "2");
+    moved->put(op, StateBackend::ValueView{"c"}, vv("3"));
+    moved->snapshot(CheckpointId{5});
+    moved.reset();
+
+    // The target's own checkpoint, read where it was written.
+    auto again = restored(target, target, 5);
+    EXPECT_EQ(str(again->get(op, StateBackend::KeyView{"a"})), "1");
+    EXPECT_EQ(str(again->get(op, StateBackend::KeyView{"c"})), "3");
+    again.reset();
+
+    // A restore URI that names no remote-read location reads the backend's own.
+    auto own = restored(target, "/var/clink/checkpoints", 5);
+    EXPECT_EQ(str(own->get(op, StateBackend::KeyView{"c"})), "3");
+}
+
 #include "clink/state/in_memory_state_backend.hpp"
 
 // State-as-data over the S3 tier: scan_checkpoint enumerates a committed
