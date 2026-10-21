@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**A MongoDB insert job whose records carry their `_id` recovers from a
+failure.** A restore replays the records after the last checkpoint, and a plain
+insert of one that carries its own `_id` met the document the sink had already
+written: the flush failed on the duplicate key, and so did the replay after
+every restore, until those records were removed. A record stored exactly as it
+arrives again is now written without error; a different document under its
+`_id`, or a duplicate key on another unique index, still fails the flush and
+names the `_id`. Inserts are written unordered, so a failed batch reports every
+record it could not write.
+
 **The two-phase-commit file and object sinks keep each run's parts apart.** The
 file, Parquet, S3, GCS and Azure Parquet, WebHDFS Parquet and S3 text
 two-phase-commit sinks named every part after its subtask and checkpoint

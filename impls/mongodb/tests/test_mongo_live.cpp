@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -264,6 +265,79 @@ TEST(MongoLive, SinkWritesDocuments) {
     auto doc = c.find_one(make_document(kvp("_id", 1)));
     ASSERT_TRUE(doc.has_value());
     EXPECT_EQ(std::string(doc->view()["v"].get_string().value), "a2");
+    c.drop();
+}
+
+namespace {
+
+// Writes `records` through a fresh insert-mode sink, as a run would.
+void insert_run(const std::string& coll, const std::vector<std::string>& records) {
+    MongoSinkOptions o;
+    o.uri = uri();
+    o.database = "test";
+    o.collection = coll;
+    auto sink = make_mongo_sink(o);
+    sink->open();
+    Batch<std::string> b;
+    for (const auto& r : records) {
+        b.emplace(std::string{r});
+    }
+    sink->on_data(b);
+    sink->flush();
+    sink->close();
+}
+
+}  // namespace
+
+// A restore replays the records after the last checkpoint, and a plain insert of
+// one that carries its own _id meets the document the sink wrote before the
+// failure. The flush used to fail on the duplicate key, and so did the replay
+// after every restore, so the job could not recover. A record stored exactly as
+// it arrives again is written; the batch's new records land beside it. The first
+// record puts _id last, which the server moves to the front.
+TEST(MongoLive, AReplayedInsertOfRecordsCarryingAnIdIsWrittenWithoutFailing) {
+    if (!mongo_configured()) {
+        GTEST_SKIP() << "set CLINK_MONGODB_TEST_URI to a replica-set MongoDB";
+    }
+    const std::string coll = unique_coll();
+    auto client = clink::mongodb::make_client(uri());
+    auto c = client["test"][coll];
+    c.drop();
+
+    insert_run(coll, {R"({"v":"a","_id":1})", R"({"_id":2,"v":"b"})"});
+    EXPECT_NO_THROW(
+        insert_run(coll, {R"({"v":"a","_id":1})", R"({"_id":2,"v":"b"})", R"({"_id":3,"v":"c"})"}))
+        << "the replay of records the sink had written failed the flush";
+
+    EXPECT_EQ(c.count_documents(make_document()), 3);
+    auto doc = c.find_one(make_document(kvp("_id", 3)));
+    ASSERT_TRUE(doc.has_value()) << "the replayed batch's new record did not land";
+    c.drop();
+}
+
+// A record that meets a different document under its _id is a record of its
+// own, not a replay, and still fails the flush, naming the _id.
+TEST(MongoLive, ADifferentRecordUnderAStoredIdStillFailsTheFlush) {
+    if (!mongo_configured()) {
+        GTEST_SKIP() << "set CLINK_MONGODB_TEST_URI to a replica-set MongoDB";
+    }
+    const std::string coll = unique_coll();
+    auto client = clink::mongodb::make_client(uri());
+    auto c = client["test"][coll];
+    c.drop();
+
+    insert_run(coll, {R"({"_id":1,"v":"a"})"});
+    try {
+        insert_run(coll, {R"({"_id":1,"v":"changed"})"});
+        ADD_FAILURE() << "a different record under a stored _id was written";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("differs from the document stored under that _id"),
+                  std::string::npos)
+            << e.what();
+    }
+    auto doc = c.find_one(make_document(kvp("_id", 1)));
+    ASSERT_TRUE(doc.has_value());
+    EXPECT_EQ(std::string(doc->view()["v"].get_string().value), "a");
     c.drop();
 }
 

@@ -8,11 +8,17 @@
 // DELIVERY = AT-LEAST-ONCE (a failed flush throws -> the job replays the buffered
 // batch from the last checkpoint). With on_duplicate='replace' the write is a
 // replace_one(filter={key_field: value}, doc).upsert(true), which is idempotent on
-// replay (effectively-once by key); plain insert is at-least-once (replay
-// re-inserts, so a downstream/_id dedup is needed). The bulk write is ORDERED, so
-// the first error surfaces (no silent partial drop). NOTE: with on_duplicate=
-// 'replace' a record that LACKS key_field falls back to a plain insert (it cannot
-// be matched), so such a record is at-least-once, not idempotent.
+// replay (effectively-once by key). A plain insert is at-least-once: a record
+// without an _id gets a fresh one from the driver, so a replay inserts it again,
+// and a record that carries its own _id and is already stored exactly as it
+// arrives is the write made before the restore, so it is written without error
+// (a replay used to fail on the duplicate key after every restore). A different
+// document under a stored _id, or a duplicate key on another unique index, still
+// fails the flush. Inserts are written unordered, so every record is attempted
+// and every error reported; upserts stay ordered, so a key written twice in one
+// batch ends as its later record. NOTE: with on_duplicate='replace' a record
+// that LACKS key_field falls back to a plain insert (it cannot be matched), so
+// such a record is at-least-once, not idempotent.
 
 #include <chrono>
 #include <cstddef>
