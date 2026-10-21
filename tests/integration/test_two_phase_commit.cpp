@@ -551,7 +551,7 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
 // Here the coordinator SURVIVES (only the worker hosting the job is SIGKILLed), so the
 // coordinator's per-job checkpoint counter stays monotonic across the redeploy (verified:
 // next_checkpoint_id is only ever ++'d, never reset, and rides the surviving
-// job state). Monotonic ids mean the 2PC sink's committed/sub<N>-<ckpt>.dat
+// job state). Monotonic ids mean the 2PC sink's committed/sub<N>-<run>-<ckpt>.dat
 // filenames never collide, so the committed set is the union of pre- and
 // post-crash checkpoints with no overwrite. We can therefore assert the
 // strongest property: the committed output equals an uninterrupted run as an

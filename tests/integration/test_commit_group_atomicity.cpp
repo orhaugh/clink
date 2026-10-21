@@ -24,7 +24,7 @@
 // that only counts records, because the record totals can be complete while
 // the two sides are internally inconsistent.
 //
-// The 2PC sink names its committed output `committed/sub<N>-<ckpt>.dat`, so
+// The 2PC sink names its committed output `committed/sub<N>-<run>-<ckpt>.dat`, so
 // the set of checkpoint ids each sink has published is readable from the
 // filesystem. That is what makes this testable without instrumenting the
 // engine.
@@ -79,9 +79,9 @@ std::filesystem::path two_sink_job() {
 constexpr int kTotalRecords = 40;
 
 // Checkpoint ids this sink has PUBLISHED, parsed from
-// committed/sub<N>-<ckpt>.dat. Files still in staging/ are excluded: an
-// uncommitted transaction is not visible to a consumer and must not count
-// as published.
+// committed/sub<N>-<run>-<ckpt>.dat (the checkpoint after the last dash). Files still in staging/
+// are excluded: an uncommitted transaction is not visible to a consumer and must not count as
+// published.
 std::set<std::uint64_t> committed_checkpoints(const std::filesystem::path& out_dir) {
     std::set<std::uint64_t> ids;
     const auto dir = out_dir / "committed";
@@ -93,7 +93,7 @@ std::set<std::uint64_t> committed_checkpoints(const std::filesystem::path& out_d
         if (!entry.is_regular_file()) {
             continue;
         }
-        // sub<N>-<ckpt>.dat
+        // sub<N>-<run>-<ckpt>.dat
         const auto stem = entry.path().stem().string();
         const auto dash = stem.rfind('-');
         if (dash == std::string::npos) {

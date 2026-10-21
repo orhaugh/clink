@@ -33,6 +33,7 @@
 // distinguished in the failure messages so a red test says which happened.
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -42,8 +43,11 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -157,8 +161,9 @@ std::vector<std::string> committed_records(const std::filesystem::path& out_dir)
 // source order - so nothing was checking a property the engine is supposed to hold.
 //
 // The read order has to be defined before order can mean anything. The 2PC sink
-// names its files "sub<N>-<ckpt>.dat", so the committed stream is those files sorted
-// by CHECKPOINT first and subtask second, then line order within each file.
+// names its files "sub<N>-<run>-<ckpt>.dat", so the committed stream is those files
+// sorted by CHECKPOINT first and subtask second, then line order within each file;
+// the run token tells runs apart and does not order them.
 // Checkpoints are globally ordered, which is what makes this well defined across a
 // rescale: a key that moves from one subtask to another appears in the old subtask's
 // earlier files and the new one's later files, in that order.
@@ -182,24 +187,37 @@ std::vector<CommittedFile> committed_files_in_order(const std::filesystem::path&
         if (!entry.is_regular_file()) {
             continue;
         }
-        // sub<N>-<ckpt>.dat
+        // sub<N>-<run>-<ckpt>.dat: the subtask before the first dash, the checkpoint
+        // after the last. Both must be whole numbers: a name read loosely here once
+        // took the run token's leading digits for the checkpoint, and every file of
+        // a run sorted as one checkpoint.
         const auto name = entry.path().filename().string();
         if (!name.starts_with("sub")) {
             continue;
         }
-        const auto dash = name.find('-', 3);
+        const auto first_dash = name.find('-', 3);
+        const auto last_dash = name.rfind('-');
         const auto dot = name.rfind('.');
-        if (dash == std::string::npos || dot == std::string::npos || dot < dash) {
+        if (first_dash == std::string::npos || dot == std::string::npos || dot < last_dash ||
+            last_dash == first_dash) {
             continue;
         }
-        try {
-            files.push_back(
-                CommittedFile{.ckpt = std::stoull(name.substr(dash + 1, dot - dash - 1)),
-                              .subtask = std::stoull(name.substr(3, dash - 3)),
-                              .path = entry.path()});
-        } catch (const std::exception&) {
+        const auto whole = [](std::string_view digits) -> std::optional<std::uint64_t> {
+            std::uint64_t value = 0;
+            const auto [end, ec] =
+                std::from_chars(digits.data(), digits.data() + digits.size(), value);
+            if (digits.empty() || ec != std::errc{} || end != digits.data() + digits.size()) {
+                return std::nullopt;
+            }
+            return value;
+        };
+        const std::string_view view{name};
+        const auto ckpt = whole(view.substr(last_dash + 1, dot - last_dash - 1));
+        const auto subtask = whole(view.substr(3, first_dash - 3));
+        if (!ckpt || !subtask) {
             continue;  // not a name this verifier understands; the multiset check still sees it
         }
+        files.push_back(CommittedFile{.ckpt = *ckpt, .subtask = *subtask, .path = entry.path()});
     }
     std::sort(files.begin(), files.end(), [](const CommittedFile& a, const CommittedFile& b) {
         return a.ckpt != b.ckpt ? a.ckpt < b.ckpt : a.subtask < b.subtask;
@@ -543,8 +561,8 @@ TEST_F(RescaleExactlyOnceTest, TheJobCommitsEveryRecordExactlyOnceWithNoRescale)
     const auto order = per_key_order_violations(out_dir_, kKeys);
     EXPECT_GT(order.records_checked, 0u)
         << "the order check examined NO records, so it proved nothing. It orders the stream by "
-           "parsing the sink's 'sub<N>-<ckpt>.dat' file names; if those changed it reads nothing "
-           "and reports success.";
+           "parsing the sink's 'sub<N>-<run>-<ckpt>.dat' file names; if those changed it reads "
+           "nothing and reports success.";
     EXPECT_TRUE(order.violations.empty())
         << "a CLEAN run committed a key's records out of order: " << describe_order(order);
 }
