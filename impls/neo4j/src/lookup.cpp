@@ -521,8 +521,8 @@ void Neo4jLookupJoin::open() {
     inner_->set_id(id());
     clink::log::info(
         kLog,
-        "neo4j lookup open: subtask=" + std::to_string(opts_.subtask) + "/" +
-            std::to_string(opts_.parallelism) + " " + pool_->where() + " server=" +
+        "neo4j lookup open: subtask=" + std::to_string(opts_.subtask) + " " + pool_->where() +
+            " server=" +
             (pool_->server_version().empty() ? std::string("unknown") : pool_->server_version()) +
             " max_in_flight=" + std::to_string(opts_.max_in_flight) +
             " max_concurrent_requests=" + std::to_string(opts_.max_concurrent_requests) +
