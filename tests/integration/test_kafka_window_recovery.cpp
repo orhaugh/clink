@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -95,6 +96,22 @@ clink::KafkaSink::Options feeder_options(const std::string& brokers, const std::
     return opts;
 }
 
+// A feeder waits for its records up to flush_timeout and then carries on, as
+// the sink's flush did before it learned to fail an end of input over a
+// record the brokers had not acknowledged. These tests hold the broker down
+// for minutes while the feeders run, and a record still queued when the wait
+// runs out is not lost: librdkafka retries it until message.timeout.ms, and
+// close() waits again. Failing the feed there turned every outage into an
+// uncaught exception on a feeder thread. A record lost all the same shows up
+// where it always did, as a window the oracle finds short.
+void flush_feeder(clink::KafkaSink& sink) {
+    try {
+        sink.flush();
+    } catch (const std::runtime_error&) {
+        // Still queued, or lost; the oracle tells the two apart.
+    }
+}
+
 struct SeedRecord {
     std::string payload;
     std::int32_t partition;
@@ -113,7 +130,7 @@ void produce_json(const std::string& brokers,
         batch.emplace(std::move(message));
     }
     sink.on_data(batch);
-    sink.flush();
+    flush_feeder(sink);
     sink.close();
 }
 
@@ -234,7 +251,7 @@ void produce_json_sustained(const std::string& brokers,
             batch.emplace(std::move(message));
         }
         sink.on_data(batch);
-        sink.flush();
+        flush_feeder(sink);
         produced.store(end, std::memory_order_release);
         std::this_thread::sleep_for(2ms);
     }
@@ -297,7 +314,7 @@ std::map<WindowKey, Aggregate> produce_json_advancing(const std::string& brokers
             ++records;
         }
         sink.on_data(batch);
-        sink.flush();
+        flush_feeder(sink);
         produced.store(records, std::memory_order_release);
         std::this_thread::sleep_for(5ms);
     }
@@ -414,7 +431,7 @@ SustainedFeed produce_json_until(const std::string& brokers,
             ++feed.records;
         }
         sink.on_data(batch);
-        sink.flush();
+        flush_feeder(sink);
         produced.store(feed.records, std::memory_order_release);
         std::this_thread::sleep_for(5ms);
     }
