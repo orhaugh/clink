@@ -769,7 +769,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent,
         .transactional = false,
-        .idempotency_key_option = "primary_key",
+        // The param postgres_upsert_sink reads its key from, and the one the SQL
+        // planner passes. Naming primary_key, which nothing passes, made the
+        // delivery analyser report this sink at-least-once with "primary_key
+        // was not supplied".
+        .idempotency_key_option = "key_columns",
         .schema_evolution = false,
         .partition_discovery = false,
         .auth_methods = {"password", "md5", "scram-sha-256", "trust"},
@@ -778,7 +782,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {"connect_timeout", "statement_timeout"},
         .available_in_sql = true,
-        .limitations = {"duplicates collapse only if primary_key really is unique for the row; "
+        .limitations = {"duplicates collapse only if key_columns really is unique for the row; "
                         "clink cannot verify the target schema",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},

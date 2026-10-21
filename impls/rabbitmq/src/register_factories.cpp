@@ -49,7 +49,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
-        .auth_methods = {"none", "token", "password"},
+        .auth_methods = {"none", "password"},
         .tls = false,
         .backpressure = true,
         .retries = false,

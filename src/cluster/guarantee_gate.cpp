@@ -41,6 +41,12 @@ std::vector<Roles> classify(const JobGraphSpec& graph) {
 }  // namespace
 
 std::string connector_name_for_op_type(const std::string& op_type) {
+    // Op types whose names do not begin with the record that describes them.
+    // The SQL row Parquet 2PC sink matched "parquet", the at-least-once
+    // rolling sink, so a job asking for exactly-once through it was refused.
+    if (op_type.rfind("parquet_row_2pc_sink", 0) == 0) {
+        return "parquet_2pc";
+    }
     // Longest prefix wins. "kafka_2pc_sink_string" must resolve to
     // "kafka_2pc", never "kafka": the two carry different guarantees and
     // taking the shorter match would systematically over-promise, which is

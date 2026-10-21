@@ -70,7 +70,7 @@ const std::map<std::string, std::string> kExempt = {
 const std::map<std::string, std::vector<std::string>> kExpectedRecords = {
     {"kafka", {"kafka", "kafka_2pc"}},
     {"postgres", {"postgres", "postgres_2pc", "postgres_upsert"}},
-    {"s3", {"s3", "s3_2pc"}},
+    {"s3", {"s3", "s3_2pc", "s3_parquet", "s3_parquet_2pc"}},
     {"clickhouse", {"clickhouse", "clickhouse_native"}},
     {"aws", {"kinesis", "firehose", "dynamodb"}},
     {"http_connector",

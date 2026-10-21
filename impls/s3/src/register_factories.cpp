@@ -53,6 +53,64 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "the source keeps no intra-object position"},
     });
 
+    // The Parquet sinks over S3, which the "s3" record above (the at-most-once
+    // text sink) used to describe as well, since their op types begin with
+    // "s3": the rolling sink was reported at-most-once, and a job asking for
+    // exactly-once through the 2PC sink was refused.
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "s3_parquet",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"aws-sdk-cpp", "arrow (S3FileSystem)"},
+        .runtime_dependencies = {"s3-compatible object store"},
+        .formats = {"parquet"},
+        .boundedness = clink::connectors::Boundedness::Bounded,
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::FileOffset,
+        .checkpoint_integrated = true,
+        // ParquetRollingSink: one complete part per checkpoint interval,
+        // published when its upload completes.
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"env-credentials", "instance-profile", "static-key"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"plain sink is at-least-once; use s3_parquet_2pc for exactly-once",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "s3_parquet_2pc",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"aws-sdk-cpp", "arrow (S3FileSystem)"},
+        .runtime_dependencies = {"s3-compatible object store"},
+        .formats = {"parquet"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        // One staged file per checkpoint interval, promoted from
+        // <prefix>/staging to <prefix>/committed on the commit broadcast.
+        .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceAtomicPublish,
+        .transactional = true,
+        .auth_methods = {"env-credentials", "instance-profile", "static-key"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"a crash can leave orphaned staging objects; expire <prefix>/staging",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
+        .required_options_for_exactly_once = {"bucket", "prefix"},
+    });
+
     // s3_sink_2pc.hpp: parts are uploaded during the epoch, the multipart
     // handle is the committable, and the object does not exist until
     // CompleteMultipartUpload on the commit broadcast. Atomic publication
@@ -109,6 +167,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             opts.rollover_bytes =
                 static_cast<std::size_t>(ctx.param_int64_or("rollover_bytes", 16 * 1024 * 1024));
+            opts.subtask_idx = ctx.subtask_idx;
+            opts.parallelism = ctx.parallelism == 0 ? 1 : ctx.parallelism;
             if (opts.bucket.empty()) {
                 throw std::runtime_error("s3_text_sink: 'bucket' is required");
             }
@@ -167,8 +227,6 @@ void install(clink::plugin::PluginRegistry& reg) {
            std::string op_label) -> MultiObjectParquetSource<std::int64_t>::FileSystemFactory {
         return [region = std::move(region),
                 endpoint = std::move(endpoint),
-            opts.subtask_idx = ctx.subtask_idx;
-            opts.parallelism = ctx.parallelism == 0 ? 1 : ctx.parallelism;
                 anon,
                 op_label = std::move(op_label)]() -> std::shared_ptr<arrow::fs::FileSystem> {
             clink::detail::ensure_arrow_s3_initialised();

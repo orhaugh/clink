@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**Capability records and pages match the code.** The SQL row Parquet
+two-phase-commit sink, `parquet_row_2pc_sink`, resolved to the at-least-once
+`parquet` record, and the S3 Parquet sinks to the at-most-once `s3` record, so a
+job asking for exactly-once through them was refused at submission; the first
+now resolves to `parquet_2pc`, and the S3 Parquet sinks have records of their
+own, `s3_parquet` and `s3_parquet_2pc`. The PostgreSQL upsert record named
+`primary_key` as its key option, which nothing passes, so the analyser reported
+the sink at-least-once. The MQTT pages said the sink is at-least-once at any
+QoS, which QoS 0 is not, and named the wrong client library; the RabbitMQ
+record listed a token authentication that does not exist. The HTTP page says
+that a Pushgateway push replaces every series of its metric in the group, and
+the MongoDB page that a plain insert of a record carrying its own `_id` fails
+on replay, and the job with it, until that record is removed.
+
 **Sinks no longer report delivery over a record that went nowhere.** NATS
 JetStream reports a refused publish (a negative PubAck, or no stream bound to
 the subject) only to an error handler, which the sink did not install, so a

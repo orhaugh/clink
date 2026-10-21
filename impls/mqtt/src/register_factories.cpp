@@ -56,7 +56,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .version = "1",
         .is_source = true,
         .is_sink = true,
-        .build_dependencies = {"paho-mqtt"},
+        .build_dependencies = {"libmosquitto"},
         .runtime_dependencies = {"mqtt broker >= 3.1.1"},
         .formats = {"text", "bytes"},
         .boundedness = clink::connectors::Boundedness::Unbounded,

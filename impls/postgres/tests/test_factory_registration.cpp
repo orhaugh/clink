@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/guarantee_gate.hpp"
+#include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
 #include "clink/postgres/cdc_event_codec.hpp"
@@ -169,6 +171,32 @@ TEST(CdcEventCodec, UnknownOpByteDecodesToOpUnknown) {
     ASSERT_TRUE(round.has_value());
     EXPECT_EQ(round->op, clink::CdcEvent::Op::Unknown);
     EXPECT_EQ(round->table, "t");
+}
+
+// The upsert sink's record names the param its key arrives in, the one the
+// factory reads and the SQL planner passes. It named primary_key, which nothing
+// passes, so the delivery analyser reported the sink at-least-once, "primary_key
+// was not supplied, so duplicates would not collapse", for every upsert job.
+TEST(PostgresFactoryRegistration, TheUpsertSinkIsAnalysedEffectivelyOnceWithItsKey) {
+    clink::cluster::JobGraphSpec g;
+    clink::cluster::OperatorSpec src;
+    src.id = "src";
+    src.type = "file_line_source";
+    clink::cluster::OperatorSpec snk;
+    snk.id = "snk";
+    snk.type = "postgres_upsert_sink";
+    snk.inputs = {"src"};
+    snk.params = {{"key_columns", "id"}, {"table", "t"}};
+    g.ops = {src, snk};
+    clink::cluster::CheckpointConfig c;
+    c.checkpoint_dir = "/tmp/ckpt";
+    c.interval_ms = 1000;
+    c.state_backend_uri = "file:///tmp/state";
+    clink::connectors::GuaranteeReport report;
+    EXPECT_TRUE(clink::cluster::check_delivery_guarantee(g, c, &report).empty());
+    for (const auto& reason : report.reasons) {
+        EXPECT_EQ(reason.find("was not supplied"), std::string::npos) << reason;
+    }
 }
 
 }  // namespace

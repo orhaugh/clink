@@ -9,12 +9,14 @@
 //   - qos 0: fire-and-forget (no broker ack); fastest, lossy on any drop.
 //   - qos 1: at-least-once to the broker (PUBACK awaited at flush).
 //   - qos 2: exactly-once delivery to the broker (PUBCOMP awaited at flush).
-// End-to-end the sink is AT-LEAST-ONCE regardless of QoS: a flush that fails
-// after some messages reached the broker is replayed from the last checkpoint, so
-// those messages are re-published (a downstream idempotent / keyed-dedup consumer
-// must absorb the duplicates). flush() waits until every buffered message of the
-// batch is acked (qos > 0) before returning, so everything buffered is durable in
-// the broker by the barrier.
+// End to end the sink is AT-LEAST-ONCE at qos 1 and 2: flush() waits until every
+// buffered message of the batch is acked before returning, so everything buffered
+// is durable in the broker by the barrier, and a flush that fails after some
+// messages reached the broker is replayed from the last checkpoint, re-publishing
+// those messages (a downstream idempotent / keyed-dedup consumer must absorb the
+// duplicates). At qos 0 it is AT-MOST-ONCE: the broker acknowledges nothing, so a
+// message the flush wrote to a connection that then dropped is lost while the
+// checkpoint still completes.
 
 #include <chrono>
 #include <cstddef>
@@ -85,12 +87,12 @@ public:
     }
 
     void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
-
-    void flush() override {
     // Its barrier hook writes out everything it received before the barrier,
     // which is its guarantee only while it owns its chain's checkpoint, so
     // Dag::add_sink refuses another sink beside it.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+
+    void flush() override {
         if (pending_.empty()) {
             return;
         }

@@ -58,6 +58,26 @@ TEST_F(GuaranteeGateTest, LongestPrefixWinsSoTwoPhaseVariantsAreNotMistakenForPl
     EXPECT_EQ(connector_name_for_op_type("parquet_int64_sink"), "parquet");
 }
 
+// The SQL row Parquet 2PC sink is parquet_row_2pc_sink, which does not begin
+// with "parquet_2pc" (the case above pins a spelling no factory registers). It
+// resolved to "parquet", the at-least-once rolling sink, so a SQL job asking for
+// exactly-once Parquet was refused at submission.
+TEST_F(GuaranteeGateTest, TheSqlRowParquet2PCSinkResolvesToTheTwoPhaseRecord) {
+    EXPECT_EQ(connector_name_for_op_type("parquet_row_2pc_sink"), "parquet_2pc");
+    EXPECT_EQ(connector_name_for_op_type("parquet_row_sink"), "parquet");
+
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "src"));
+    g.ops.push_back(op("parquet_row_2pc_sink",
+                       "snk",
+                       {"src"},
+                       {{"dir", "/tmp/o"}, {"delivery_guarantee", "exactly_once"}}));
+    connectors::GuaranteeReport report;
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), &report);
+    EXPECT_TRUE(reject.empty()) << reject;
+    EXPECT_EQ(report.level, connectors::EndToEndGuarantee::EndToEndExactlyOnce);
+}
+
 TEST_F(GuaranteeGateTest, AnUnknownOpTypeResolvesToNothing) {
     EXPECT_TRUE(connector_name_for_op_type("some_third_party_sink").empty());
 }
