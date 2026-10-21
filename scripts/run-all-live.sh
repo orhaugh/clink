@@ -78,7 +78,7 @@ CONNECTORS=(
   "postgres@@postgres-cdc@@clink_postgres_tests@@PostgresCdcLive|PostgresCdcContractLive|PostgresJsonSinkLive|PostgresSink2PCLive|PostgresUpsertSinkLive|SinkContractSuite|UpsertContractSuite"
   "postgres-sql@@postgres-cdc@@clink_postgres_sql_tests@@PostgresCdcSql"
   "mysql@@mysql@@clink_mysql_tests@@MysqlLive|MysqlCdcLive|MysqlUpsertSinkLive|UpsertContractSuite"
-  "s3@@localstack@@clink_s3_tests@@S3Sink2PCLive|SinkContractSuite|S3MaterializationStore.RoundTripAgainstLiveEndpoint|StateParquetExportS3.PartitionedExportReadableBackFromS3|S3SnapshotStore.CheckpointDirRoundTripAgainstLiveEndpoint|S3SnapshotStore.CacheServesImmutableSstOnSecondFetch|S3CasSnapshotStore|S3RemotePool"
+  "s3@@localstack@@clink_s3_tests@@S3Sink2PCLive|S3TextSinkLive|SinkContractSuite|S3MaterializationStore.RoundTripAgainstLiveEndpoint|StateParquetExportS3.PartitionedExportReadableBackFromS3|S3SnapshotStore.CheckpointDirRoundTripAgainstLiveEndpoint|S3SnapshotStore.CacheServesImmutableSstOnSecondFetch|S3CasSnapshotStore|S3RemotePool"
   "rocksdb-s3@@localstack@@clink_rocksdb_s3_tests@@S3RocksdbSchemes"
   "elasticsearch@@elasticsearch@@clink_http_connector_tests@@ElasticsearchLive"
   "pubsub@@pubsub@@clink_http_connector_tests@@PubSubLive"

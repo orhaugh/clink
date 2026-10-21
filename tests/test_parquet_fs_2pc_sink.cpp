@@ -10,14 +10,17 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
 
 #include <arrow/filesystem/localfs.h>
+#include <arrow/filesystem/mockfs.h>
 #include <gtest/gtest.h>
 
 #include "clink/connectors/multi_object_parquet_source.hpp"
@@ -223,4 +226,70 @@ TEST(ParquetFsSink2PC, TwoIntervalsEachCommitIndependently) {
     EXPECT_EQ(count_parquet(base / "committed"), 2u);
     EXPECT_EQ(read_committed(base), (std::vector<std::int64_t>{1, 2, 3, 4}));
     std::filesystem::remove_all(base);
+}
+
+namespace {
+
+// An object store whose streamed writes are visible before they are whole (as
+// Azure's, which creates the blob when the stream opens), recording each path
+// a stream is opened on.
+class StreamRecordingFileSystem final : public arrow::fs::internal::MockFileSystem {
+public:
+    StreamRecordingFileSystem() : MockFileSystem(std::chrono::system_clock::now()) {}
+
+    using MockFileSystem::OpenOutputStream;
+
+    arrow::Result<std::shared_ptr<arrow::io::OutputStream>> OpenOutputStream(
+        const std::string& path,
+        const std::shared_ptr<const arrow::KeyValueMetadata>& metadata) override {
+        {
+            const std::lock_guard<std::mutex> lock(mu_);
+            opened_.push_back(path);
+        }
+        return MockFileSystem::OpenOutputStream(path, metadata);
+    }
+
+    std::vector<std::string> opened() const {
+        const std::lock_guard<std::mutex> lock(mu_);
+        return opened_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::vector<std::string> opened_;
+};
+
+}  // namespace
+
+// On a store whose streamed write is visible before it is whole, the commit
+// copies staging to committed server side and never streams to the committed
+// key. It used to stream there on every store, so a reader could see an empty
+// or partial committed object, and a commit cut short left one behind.
+TEST(ParquetFsSink2PC, TheCommitNeverStreamsToTheCommittedKeyOffS3) {
+    auto fs = std::make_shared<StreamRecordingFileSystem>();
+    ASSERT_TRUE(fs->CreateDir("bucket").ok());
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{301}, "fs2pc_copy", &state, nullptr);
+    ParquetFsSink2PC<std::int64_t>::Options o;
+    o.base = "bucket/out";
+    auto sink = std::make_shared<ParquetFsSink2PC<std::int64_t>>(
+        [fs]() -> std::shared_ptr<arrow::fs::FileSystem> { return fs; }, o, int64_arrow_batcher());
+    sink->set_id(OperatorId{301});
+    sink->attach_runtime(&rctx);
+    sink->open();
+    feed(*sink, {1, 2, 3});
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    sink->on_commit(1);
+    sink->close();
+
+    for (const auto& path : fs->opened()) {
+        EXPECT_EQ(path.find("/committed/"), std::string::npos) << "streamed to " << path;
+    }
+    auto committed = fs->GetFileInfo("bucket/out/committed/sub0-1.parquet");
+    ASSERT_TRUE(committed.ok());
+    EXPECT_EQ(committed->type(), arrow::fs::FileType::File);
+    EXPECT_GT(committed->size(), 0);
+    auto staging = fs->GetFileInfo("bucket/out/staging/sub0-1.parquet");
+    ASSERT_TRUE(staging.ok());
+    EXPECT_EQ(staging->type(), arrow::fs::FileType::NotFound);
 }

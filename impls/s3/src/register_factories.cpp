@@ -167,6 +167,8 @@ void install(clink::plugin::PluginRegistry& reg) {
            std::string op_label) -> MultiObjectParquetSource<std::int64_t>::FileSystemFactory {
         return [region = std::move(region),
                 endpoint = std::move(endpoint),
+            opts.subtask_idx = ctx.subtask_idx;
+            opts.parallelism = ctx.parallelism == 0 ? 1 : ctx.parallelism;
                 anon,
                 op_label = std::move(op_label)]() -> std::shared_ptr<arrow::fs::FileSystem> {
             clink::detail::ensure_arrow_s3_initialised();

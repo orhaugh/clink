@@ -131,6 +131,20 @@ std::string object_key(const S3Sink2PC::Options& opts, std::uint64_t ckpt) {
     return prefix.empty() ? leaf : prefix + "/" + leaf;
 }
 
+// Aborts a multipart upload. The caller holds Impl::mu: prepare_commit() calls
+// this from inside its own lock when a part fails, and abort() takes the lock
+// first. Best effort, since a missing upload (already aborted or completed) is
+// what an abort wants anyway.
+void abort_upload(Aws::S3::S3Client& client,
+                  const std::string& bucket,
+                  const S3MultipartHandle& handle) {
+    Aws::S3::Model::AbortMultipartUploadRequest req;
+    req.SetBucket(bucket);
+    req.SetKey(handle.key);
+    req.SetUploadId(handle.upload_id);
+    (void)client.AbortMultipartUpload(req);
+}
+
 }  // namespace
 
 std::optional<S3MultipartHandle> S3Sink2PC::prepare_commit(std::uint64_t checkpoint_id) {
@@ -175,8 +189,11 @@ std::optional<S3MultipartHandle> S3Sink2PC::prepare_commit(std::uint64_t checkpo
         auto uout = impl_->client->UploadPart(up);
         if (!uout.IsSuccess()) {
             clink::metrics::connector::error_inc("s3");
-            // Best-effort abort so the partial upload does not linger.
-            abort(handle);
+            // Abort so the partial upload does not linger. Not through abort(),
+            // which takes the lock this function already holds: a std::mutex
+            // locked twice by one thread deadlocks, and the task thread would
+            // hang inside the checkpoint instead of failing it.
+            abort_upload(*impl_->client, bucket, handle);
             throw std::runtime_error("S3Sink2PC: UploadPart(" + key + ", #" +
                                      std::to_string(part_number) +
                                      "): " + uout.GetError().GetMessage());
@@ -250,12 +267,7 @@ void S3Sink2PC::abort(const S3MultipartHandle& handle) {
     if (!impl_->client) {
         throw std::runtime_error("S3Sink2PC: client already closed");
     }
-    Aws::S3::Model::AbortMultipartUploadRequest req;
-    req.SetBucket(impl_->opts.bucket);
-    req.SetKey(handle.key);
-    req.SetUploadId(handle.upload_id);
-    // Idempotent: a missing upload (already aborted/completed) is fine.
-    (void)impl_->client->AbortMultipartUpload(req);
+    abort_upload(*impl_->client, impl_->opts.bucket, handle);
 }
 
 void S3Sink2PC::close() {

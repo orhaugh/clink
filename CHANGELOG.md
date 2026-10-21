@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**Object-store sinks: a refused S3 part fails the prepare, text-sink parts no
+longer collide, and a two-phase commit publishes whole objects.** The
+exactly-once raw S3 sink aborted a multipart upload whose part the store refused
+through a call that locked the mutex its prepare already held: the task thread
+deadlocked inside the checkpoint and left the upload behind. The text sink
+(`s3_text_sink`) named every subtask's parts `part-0`, `part-1` and so on, so
+at parallelism above 1 subtasks replaced each other's objects, and a run
+restored from a checkpoint put its first parts over the ones before it, whose
+records its sources would not replay; parts at parallelism above 1 are now
+`sub<i>-part-<n>`, a restored run numbers its parts after the ones already
+there, and a custom endpoint is addressed path-style, as the other S3 sinks
+address it. The Parquet two-phase-commit sink over an Arrow filesystem
+(`gcs_parquet_2pc`, `azure_parquet_2pc`, `s3_parquet_2pc`) promoted a staged
+file by streaming it to its committed name on every store, which on Azure
+creates the blob when the stream opens and on GCS completes a torn-down upload
+with what it holds, so a reader could see an empty or partial committed object;
+it now publishes by each store's atomic route, a server-side copy on GCS and
+Azure.
+
 **The Delta and Iceberg sinks stay on one subtask, and a Delta log entry is
 never torn.** Both write from subtask 0 alone, and SQL fanned them out with the
 job's parallelism, so every subtask beside the writer took its share of the

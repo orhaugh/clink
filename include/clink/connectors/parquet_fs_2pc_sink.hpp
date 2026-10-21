@@ -32,9 +32,10 @@
 //   on_barrier(b) - prepare_commit(b) finalises the writer and uploads the buffer
 //                   to the staging object (OpenOutputStream + Write + Close is
 //                   atomic on object stores), returning the staging key.
-//   on_commit(id) - commit(handle) copies staging -> committed (streamed via
-//                   OpenInputFile + OpenOutputStream, which every Arrow filesystem
-//                   supports; the committed object appears atomically) then
+//   on_commit(id) - commit(handle) publishes staging -> committed by the route
+//                   the store publishes atomically (a streamed upload on S3, a
+//                   rename on a local disk or WebHDFS, a server-side copy on
+//                   GCS and Azure; see commit_one_) then
 //                   deletes staging. Idempotent: a missing staging object is a no-op.
 //   on_abort(id)  - abort(handle) DeleteFiles staging.
 //   flush/close   - drop an in-progress (non-barriered) interval; its bytes were
@@ -227,16 +228,37 @@ private:
         buf_out_.reset();
     }
 
-    // Copy staging -> committed, then delete staging. The copy streams the staging bytes through
-    // an input + output stream rather than FileSystem::CopyFile, because CopyFile is not
-    // implemented uniformly across Arrow's object-store filesystems; OpenInputFile +
-    // OpenOutputStream are. The committed object still appears atomically (object stores publish on
-    // Close), and the staging file is interval-sized, so the extra round-trip is bounded.
-    // Idempotent on replay: a missing staging object means the commit already ran.
+    // Publish staging -> committed, then delete staging. Idempotent on replay: a
+    // missing staging object means the commit already ran. The committed object
+    // must appear only whole, so the route is the one the store publishes
+    // atomically by, as ParquetRollingSink chooses: S3 publishes a streamed
+    // upload only when it completes; a local disk and WebHDFS rename; on the
+    // others (GCS, Azure) the object is copied server side, because there a
+    // streamed write is visible before it is whole: Azure creates the blob when
+    // the stream opens, and a GCS stream that is torn down completes its upload
+    // with what it holds. The commit used to stream to the committed key on
+    // every store, so a reader could see an empty or partial committed object,
+    // and a commit cut short left one there until recovery committed again.
     void commit_one_(const std::string& staging_key, const std::string& committed_key) {
         auto info = fs_->GetFileInfo(staging_key);
         if (info.ok() && info->type() == arrow::fs::FileType::NotFound) {
             return;  // already committed and cleaned up
+        }
+        const auto type = fs_->type_name();
+        if (type == "local" || type == "webhdfs") {
+            if (auto s = fs_->Move(staging_key, committed_key); !s.ok()) {
+                throw std::runtime_error("ParquetFsSink2PC: rename " + staging_key + " -> " +
+                                         committed_key + ": " + s.ToString());
+            }
+            return;
+        }
+        if (type != "s3") {
+            if (auto s = fs_->CopyFile(staging_key, committed_key); !s.ok()) {
+                throw std::runtime_error("ParquetFsSink2PC: copy " + staging_key + " -> " +
+                                         committed_key + ": " + s.ToString());
+            }
+            delete_if_exists_(staging_key);
+            return;
         }
         auto in = fs_->OpenInputFile(staging_key);
         if (!in.ok()) {
