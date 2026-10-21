@@ -151,6 +151,11 @@ run_counted() {
     shift 4
     local report="${REPORT_DIR}/${label//[^A-Za-z0-9.]/_}.json"
     mkdir -p "${REPORT_DIR}"
+    # Under PIN_RUNNER the test binary writes the report from inside the
+    # toolchain image, as that image's user, whose uid is not the runner's
+    # that made the directory; without write access googletest cannot open the
+    # report and the cases count as missing though they passed.
+    chmod a+rwx "${REPORT_DIR}"
     rm -f "${report}"
     gtest_args=(--gtest_output="json:${report}")
     run "${label}" "${bin}" "${filter}" "$@"
