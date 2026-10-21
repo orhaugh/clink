@@ -274,7 +274,8 @@ Everything below is published at
   kill and independent verification
   ([examples/kafka-to-clickhouse](examples/kafka-to-clickhouse/)).
 - [Kafka to Neo4j example](examples/kafka-to-neo4j/): synthetic transfers
-  into a graph through the Neo4j sink, with a windowed fan-in indicator, a
+  into a graph through the Neo4j sink, with a windowed fan-in indicator enriched
+  from reference device relationships through the Neo4j lookup, a
   Worker kill and an independent check of the graph.
 - [Runnable examples](docs/consumer-examples/): every core feature as a
   standalone buildable program, from hello-pipeline to the testing

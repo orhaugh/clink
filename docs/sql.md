@@ -447,6 +447,13 @@ SELECT * FROM clicks c JOIN impressions i
 SELECT * FROM orders o JOIN customers c ON o.cust = c.id;
 ```
 
+`INNER` drops the probe rows with no match; `LEFT` keeps them with the lookup's
+columns NULL. One equality, the lookup table on the right. `function='neo4j'`
+reads each key from Neo4j with a parameterised, read-only Cypher statement:
+zero or one row per key, typed scalar columns, an explicit no-match, and a
+failure that fails the job rather than becoming a no-match (see the
+[Neo4j connector](connectors/neo4j.md#lookup)).
+
 **Semi / anti joins** are expressed with `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS`
 (see [filtering](#selecting-filtering-projecting)).
 

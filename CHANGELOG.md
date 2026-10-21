@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+**A read-only Neo4j lookup for SQL joins.** A lookup table declared with
+`connector='lookup'` and `function='neo4j'` enriches each row of a stream, on
+an `INNER` or `LEFT` join with one equality, with what a parameterised Cypher
+read returns for the row's key: the key travels as a typed `$key` parameter,
+never in the statement text, and the answer is zero or one row of declared
+scalar columns, decoded strictly (64-bit integers exact, no lossy conversion,
+no nodes or lists), with optional columns for the match, clink's clock at the
+reply and the read's bookmark. More than one row, an unreachable server, a
+timeout, a malformed or oversized reply and a value of the wrong type fail the
+task; none of them becomes a no-match. Every request runs in Neo4j's read
+access mode, which the tested server enforces, and the lookup refuses at open
+any statement whose plan writes, changes the schema, calls a procedure, uses
+`LOAD CSV` or `IN TRANSACTIONS`. Requests, input in flight, reply size,
+retries and the server's own run time are bounded; results leave in input
+order, and every lookup finishes before a watermark or barrier passes, so none
+is in flight across a checkpoint and a restore looks the replayed rows up
+again. The enrichment is current-state: a replay after the graph changed
+enriches differently, and `clink run --explain` reports such a job's replay
+determinism as nondeterministic. Tested against Neo4j 2026.09.0 Community by
+the live gate, including distributed cells with a worker killed mid-lookup,
+database outages inside and past the retry budget, a graph change before a
+replay and a failing lookup; `examples/kafka-to-neo4j` now enriches its fan-in
+indicator with synthetic device relationships. `AsyncLookupOperator` gains a
+non-blocking `poll()`.
+
 **A Neo4j sink.** `connector='neo4j'` writes a SQL table's rows to Neo4j
 through the Query API: each batch runs the table's Cypher statement once, in
 one implicit transaction, with the rows as a typed `$rows` parameter, so 64-bit

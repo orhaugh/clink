@@ -52,7 +52,7 @@ is reachable through the programmatic API only.
 | [MySQL / MariaDB](mysql.md) | source + sink | mariadb-connector-c | system pkg | `mysql` |
 | [ClickHouse](clickhouse.md) | source + sink (`clickhouse_sink`, the SQL default; `clickhouse_native_sink` via `insert_format='native'`, recommended for a new table) | clickhouse-cpp | `2.6.2` (from source, Release) | `clickhouse` |
 | [Cassandra / ScyllaDB](cassandra.md) | sink | DataStax cpp-driver | `2.17.1` | `cassandra` |
-| [Neo4j](neo4j.md) | sink (Cypher statement per batch, Query API) | clink::http_connector (vendored httplib) | Neo4j 2026.09.0 tested | `neo4j` |
+| [Neo4j](neo4j.md) | sink (Cypher statement per batch, Query API); read-only lookup (`connector='lookup'`, `function='neo4j'`) | clink::http_connector (vendored httplib) | Neo4j 2026.09.0 tested | `neo4j` |
 | [MongoDB](mongodb.md) | source + sink | mongo-cxx-driver | system pkg | - |
 | [Redis](redis.md) | source + sink | hiredis | system pkg | `redis` |
 
