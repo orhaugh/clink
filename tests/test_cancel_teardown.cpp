@@ -697,21 +697,30 @@ TEST(CancelTeardown, TwoBarrierStagingSinksOnOneChainAreRefused) {
            "would lose that transaction's records without reporting anything.";
 }
 
-// The refusal must be narrow. One transactional sink alongside any number of
-// ordinary ones is orderable and common, and must still build - a check that
-// refused this would break fan-out to a 2PC sink plus a metrics or debug sink.
-TEST(CancelTeardown, OneBarrierStagingSinkAlongsidePlainSinksStillBuilds) {
+// One transactional sink beside an ordinary one is refused as well. This used
+// to be accepted as orderable, and it is not: the second sink takes ownership
+// of the chain's checkpoint away from the transactional sink exactly as a
+// second transactional sink would, so the operator in front acknowledges the
+// checkpoint before the transactional sink has prepared, and its handle for N
+// lands in snapshot N+1 (tests/test_sink_chain_ownership.cpp observes both). A
+// fan-out to a transactional sink and a metrics or debug sink gives the other
+// sink a subtask of its own instead, as a job graph does for every sink.
+TEST(CancelTeardown, OneBarrierStagingSinkAlongsidePlainSinksIsRefused) {
     Dag dag;
     auto h = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
     auto op_h = dag.add_operator<int, int>(
         h, std::make_shared<MapOperator<int, int>>([](const int& v) { return v; }, "mixed_id"));
 
-    EXPECT_NO_THROW({
-        dag.add_sink<int>(op_h, std::make_shared<PlainTeardownSink>());
+    dag.add_sink<int>(op_h, std::make_shared<PlainTeardownSink>());
+    try {
         dag.add_sink<int>(op_h, std::make_shared<BarrierStagingSink>());
-        dag.add_sink<int>(op_h, std::make_shared<PlainTeardownSink>());
-    }) << "a chain with exactly one transactional sink was refused; only two or more "
-          "are unorderable.";
+        FAIL() << "a transactional sink joined a chain that already had a sink, so it never "
+                  "owned the checkpoint";
+    } catch (const std::logic_error& e) {
+        EXPECT_NE(std::string(e.what()).find("barrier_staging_sink must be the only sink"),
+                  std::string::npos)
+            << e.what();
+    }
 }
 
 namespace {

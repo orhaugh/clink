@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+**A sink that must own its chain's checkpoint is refused beside any other
+sink.** Two kinds of sink hold their guarantee only while the checkpoint's
+acknowledgement follows their own barrier hook: an at-least-once sink that
+writes out at the barrier what it received before it, and a two-phase-commit
+sink, which prepares there and stages its handle into the snapshot. With a
+second sink on its chain, `Dag::add_sink` handed the checkpoint to the operator
+in front of the sinks, which acknowledged it as the barrier passed: a test that
+holds a two-phase-commit sink's prepare saw checkpoint 1 acknowledged with
+nothing prepared, so a restore from it would never have replayed the interval.
+`Dag::add_sink` refused that only for two staging sinks and for the ClickHouse
+sinks; it now refuses any sink that declares either trait beside another sink,
+whichever is added first, naming the sink and where the other one belongs. SQL
+and job graphs give every sink a subtask of its own and are not affected.
+A Dag that runs where no checkpoint completes, under a `LocalExecutor` with no
+`on_checkpoint_ack`, can declare so with
+`Dag::run_without_checkpoint_completion()`: its only barrier is the end-of-input
+one, which every sink commits itself, so such sinks may share a chain there, and
+`LocalExecutor` refuses the Dag with an acknowledgement callback. `LocalSubmitter`
+declares it for a fluent pipeline run without one. A parallel sink stage
+(`Dag::add_parallel_sink`, which `LocalSubmitter` builds at parallelism above 1)
+now commits each subtask's last interval at the end of the input, as a single
+sink does; a two-phase-commit sink there prepared that interval and never
+published it. A `CommittingSink` refuses a runtime without a state backend at
+`open()`, naming itself: it used to stage every record and publish none while
+the job finished cleanly.
+
 **The native ClickHouse sink is the recommended one for a new table.** The
 ClickHouse page says what `insert_format='native'` guarantees and what it
 refuses, the README, the tutorial, its example and the connector index point a

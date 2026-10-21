@@ -13,6 +13,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -477,6 +478,38 @@ TEST(LocalSubmitter, MultiConsumerFanOutBothConsumersReceiveAllRecords) {
 
     std::filesystem::remove(direct_path);
     std::filesystem::remove(mapped_path);
+}
+
+// The fan-out above shares one Dag between two sinks that must each own their
+// chain's checkpoint, which LocalSubmitter allows only because that run
+// completes no checkpoint: there is no acknowledgement callback, and every
+// sink commits the end-of-input interval itself. With a callback a checkpoint
+// could complete before a sink had written what preceded its barrier, so the
+// same pipeline is refused, as Dag::add_sink refuses it everywhere else.
+TEST(LocalSubmitter, AnOwningSinkSharesTheDagOnlyWhenNoCheckpointCanComplete) {
+    cluster::ensure_built_ins_registered();
+    const auto stem = std::filesystem::temp_directory_path() /
+                      ("clink_local_submitter_owning_" + std::to_string(::getpid()));
+    const auto path_a = stem.string() + "_a.txt";
+    const auto path_b = stem.string() + "_b.txt";
+
+    auto env = Pipeline::create();
+    auto src = env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build());
+    src.sink(FileInt64Sink::builder().path(path_a).build());
+    src.sink(FileInt64Sink::builder().path(path_b).build());
+
+    JobConfig config;
+    config.on_checkpoint_ack = [](CheckpointId /*id*/, bool /*ok*/, std::string /*error*/) {};
+    try {
+        cluster::LocalSubmitter::submit(env, std::move(config));
+        ADD_FAILURE() << "two owning sinks shared a Dag whose checkpoints can complete";
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string{e.what()}.find("must be the only sink on its chain"),
+                  std::string::npos)
+            << e.what();
+    }
+    std::filesystem::remove(path_a);
+    std::filesystem::remove(path_b);
 }
 
 TEST(LocalSubmitter, MultiConsumerFanOutAtParallelismGreaterThanOneSubmitsWithoutThrowing) {

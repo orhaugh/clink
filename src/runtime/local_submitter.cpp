@@ -62,6 +62,14 @@ void LocalSubmitter::submit(api::Pipeline& env, JobConfig config) {
     auto& builders = DagBuilderRegistry::default_instance();
     auto& types = TypeRegistry::default_instance();
     Dag dag;
+    // Without an acknowledgement callback this run completes no checkpoint:
+    // its sources emit only the end-of-input barrier, which every sink commits
+    // locally whether or not it owns its chain. So a sink that must own its
+    // chain's checkpoint may share the one Dag a fluent pipeline becomes here;
+    // Dag::add_sink refuses that wherever a checkpoint can complete.
+    if (!config.on_checkpoint_ack) {
+        dag.run_without_checkpoint_completion();
+    }
 
     // op_id → DagOpHandle wrapped for downstream lookup. For ops that
     // emit side outputs, the main handle is here under op.id and each

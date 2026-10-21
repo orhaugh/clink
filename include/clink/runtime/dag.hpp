@@ -4073,6 +4073,22 @@ public:
                 // included, so the sink sees each checkpoint as one cut.
                 MultiInputAlignment align(ins.size());
                 detail::observe_alignment(align, ctx);
+                // A barrier for the sink, and at the end of the input the local
+                // commit of its last interval, as the single-input sink runner
+                // does: a terminal barrier never reaches the coordinator, so a
+                // two-phase-commit sink would otherwise leave that interval
+                // prepared and never publish it. Unless the subtask is being
+                // torn down: a cancelled job's tail is covered by no checkpoint.
+                const auto deliver_barrier = [&](const CheckpointBarrier& barrier) {
+                    sink->on_barrier(barrier);
+                    if (barrier.is_terminal()) {
+                        if (should_stop()) {
+                            sink->on_abort(barrier.id().value());
+                        } else {
+                            sink->on_commit(barrier.id().value());
+                        }
+                    }
+                };
                 // Input k is closed AND drained (see the co_operator runner
                 // note: a push+close can land between a failed try_pop and the
                 // check). The close can complete a pending barrier's alignment,
@@ -4088,7 +4104,7 @@ public:
                 const auto close_input = [&](std::size_t k) {
                     if (auto adv = align.on_input_closed(k, ins[k]->close_cancelled());
                         adv.forward) {
-                        sink->on_barrier(adv.barrier);
+                        deliver_barrier(adv.barrier);
                     }
                     if (align.all_closed()) {
                         return;
@@ -4137,7 +4153,7 @@ public:
                             if (auto adv = align.on_barrier(
                                     k, ctx.apply_barrier_mode_override(m->as_barrier()));
                                 adv.forward) {
-                                sink->on_barrier(adv.barrier);
+                                deliver_barrier(adv.barrier);
                             }
                         }
                     }
@@ -4364,11 +4380,12 @@ public:
         // being added to it, so there is still exactly one snapshotting element.
         //
         // LIMITATION, deliberately not papered over: if a chain fans out to more
-        // than one sink in the same subtask, only the first sink to be added takes
-        // ownership. The others behave as before - handle staged after the snapshot
-        // - because two sinks on different runner threads cannot both precede one
-        // snapshot without a rendezvous that does not exist yet. Recorded as its
-        // own follow-up rather than left implicit.
+        // than one sink in the same subtask, no sink owns the checkpoint: the
+        // operator in front of the sinks does, as below, because two sinks on
+        // different runner threads cannot both precede one snapshot without a
+        // rendezvous that does not exist yet. A sink whose guarantee needs the
+        // acknowledgement to follow its own barrier hook is therefore refused
+        // beside another sink, below.
         // A shared flag, not a captured bool, because adding a SECOND sink to this
         // chain has to be able to revoke the first one's ownership - see below.
         auto sink_owns_checkpoint = std::make_shared<bool>(true);
@@ -4389,8 +4406,9 @@ public:
         // threads (follow-up 42), and the obvious design collides with an invariant
         // this file states elsewhere - see that follow-up for why. Until that is
         // designed, refusing the configuration is the honest answer: the job cannot
-        // be built correctly, so it is not built. One 2PC sink per chain, plus any
-        // number of ordinary sinks, is unaffected.
+        // be built correctly, so it is not built. One 2PC sink beside an ordinary
+        // sink is refused too, by the ownership rule below: it loses ownership the
+        // same way, so its handle for N lands in N+1 just the same.
         if (sink->stages_state_at_barrier()) {
             if (chain_has_barrier_staging_sink_) {
                 throw std::logic_error(
@@ -4406,27 +4424,38 @@ public:
             chain_has_barrier_staging_sink_ = true;
         }
 
-        // A sink that gates the ack (an at-least-once writer flushing at the
-        // barrier) is correct only while it owns the chain's checkpoint, and the
-        // fan-out handling below revokes that ownership the moment a second sink
-        // joins. Refuse the combination, whichever of the two arrives first.
+        // A sink whose guarantee needs the checkpoint's acknowledgement to follow
+        // its own barrier hook is correct only while it owns the chain's
+        // checkpoint, and the fan-out handling below revokes that ownership the
+        // moment a second sink joins: the operator in front then snapshots and
+        // acknowledges as the barrier passes, before either sink has taken it.
+        // Two kinds of sink need it: one that gates the ack (an at-least-once
+        // writer that writes out at the barrier what it holds), and one that
+        // stages state at the barrier (a two-phase-commit sink, whose prepare
+        // must precede the ack and whose handle the snapshot must capture).
+        // Refuse the combination, whichever of the two arrives first.
+        const bool needs_ownership =
+            sink->gates_checkpoint_ack() || sink->stages_state_at_barrier();
         const bool joins_existing_sink = chain_first_sink_owner_ != nullptr;
-        if (joins_existing_sink && (sink->gates_checkpoint_ack() || chain_ack_gating_sink_)) {
-            const std::string gating =
-                sink->gates_checkpoint_ack() ? sink->name() : *chain_ack_gating_sink_;
+        if (checkpoints_can_complete_ && joins_existing_sink &&
+            (needs_ownership || chain_owning_sink_)) {
+            const std::string owning = needs_ownership ? sink->name() : *chain_owning_sink_;
             throw std::logic_error(
-                "Dag::add_sink: " + gating +
-                " must be the only sink on its chain. Its checkpoint barrier returns only once "
-                "the records it received before the barrier are written, and the checkpoint "
-                "acknowledges after that only while it owns the chain's checkpoint. A second "
-                "sink takes that ownership away, so a checkpoint could complete with those "
-                "records unwritten and a restore from it would never replay them. Give the "
-                "other sink its own subtask: in a job graph every sink operator is a subtask of "
-                "its own unless par-1 fusion folds it into a chain, and with the Dag API it "
-                "belongs in a separate Dag.");
+                "Dag::add_sink: " + owning +
+                " must be the only sink on its chain. At the checkpoint barrier it writes out, "
+                "or prepares, what it received before the barrier, and the checkpoint is "
+                "acknowledged after that only while it owns the chain's checkpoint. A second "
+                "sink takes that ownership away, so a checkpoint could complete before those "
+                "records were written or prepared, and a restore from it would never replay "
+                "them. Give the other sink its own subtask: a job graph (SQL, a cluster, the "
+                "embedded engine) already plans every sink as a subtask of its own, and with the "
+                "Dag API it belongs in a separate Dag. A Dag that runs where no checkpoint "
+                "completes (no acknowledgement callback) can declare so first, with "
+                "Dag::run_without_checkpoint_completion(), as LocalSubmitter does for such a "
+                "run.");
         }
-        if (sink->gates_checkpoint_ack()) {
-            chain_ack_gating_sink_ = sink->name();
+        if (needs_ownership) {
+            chain_owning_sink_ = sink->name();
         }
 
         if (chain_first_sink_owner_) {
@@ -4772,6 +4801,20 @@ public:
         return source_split_counts_;
     }
 
+    // Declares that this Dag will run where no checkpoint can complete: under a
+    // LocalExecutor whose JobConfig has no on_checkpoint_ack, so no checkpoint
+    // is acknowledged to anything, and the only barrier is the end-of-input
+    // one, which every sink commits itself whether or not it owns its chain.
+    // add_sink's refusal of a sink that must own its chain's checkpoint beside
+    // another sink protects checkpoint completion, so it is not applied to sinks
+    // added after this call. LocalExecutor refuses to run such a Dag with an
+    // acknowledgement callback, which is what a cluster or the embedded engine
+    // always sets. LocalSubmitter declares it for a run without one.
+    void run_without_checkpoint_completion() noexcept { checkpoints_can_complete_ = false; }
+    [[nodiscard]] bool checkpoints_can_complete() const noexcept {
+        return checkpoints_can_complete_;
+    }
+
 private:
     // Shared body of add_parallel_operator and ..._shuffled. Allocates the
     // edge channels (forward = N channels diagonal, shuffle = N×M),
@@ -5103,9 +5146,13 @@ private:
     // (a 2PC / CommittingSink). A second one cannot be ordered against the first,
     // so add_sink refuses rather than building a job that loses a transaction.
     bool chain_has_barrier_staging_sink_{false};
-    // The name of the sink on this chain that gates the checkpoint ack, if any.
-    // Such a sink must be the chain's only sink; see add_sink.
-    std::optional<std::string> chain_ack_gating_sink_;
+    // The name of the sink on this chain that needs to own its checkpoint (it
+    // gates the ack or stages state at the barrier), if any. Such a sink must be
+    // the chain's only sink; see add_sink.
+    std::optional<std::string> chain_owning_sink_;
+    // False once run_without_checkpoint_completion() declares this Dag will
+    // run where no checkpoint can complete; see there.
+    bool checkpoints_can_complete_{true};
     std::vector<BarrierInjector> source_injectors_;
     std::vector<OperatorId> source_ids_;
     // Boundedness recorded at registration, parallel to source_ids_ (BATCH-1).

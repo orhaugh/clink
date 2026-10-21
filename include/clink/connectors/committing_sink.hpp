@@ -132,6 +132,21 @@ public:
     // --- framework choreography (sealed) ------------------------------------
 
     void open() final {
+        // A runtime without a state backend has nowhere to persist a prepared
+        // handle, and its sources emit no end-of-input checkpoint to commit
+        // one on, so every record would be staged, never published, and the
+        // job would still finish cleanly. A sink driven directly by a test,
+        // with no runtime, is unaffected.
+        if (this->runtime() != nullptr && this->runtime()->state_backend() == nullptr) {
+            throw std::logic_error(
+                "[" + this->name() +
+                "] needs a state backend: it publishes only what a completed checkpoint covers, "
+                "and without a backend no checkpoint completes and its prepared handles are not "
+                "persisted, so nothing it received would ever be published. Set "
+                "JobConfig::state_backend (an InMemoryStateBackend is enough for a bounded "
+                "in-process run), or run the job on a cluster or the embedded engine, which "
+                "always provide one.");
+        }
         on_open();
         recover_all_();
         if (clink::protocol_trace::enabled()) {

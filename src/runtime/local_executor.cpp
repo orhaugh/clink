@@ -21,6 +21,19 @@ namespace clink {
 
 LocalExecutor::LocalExecutor(Dag dag, JobConfig config)
     : dag_(std::move(dag)), config_(std::move(config)) {
+    // A Dag declared to run where no checkpoint completes may hold sinks that
+    // must own their chain's checkpoint side by side (Dag::add_sink); with an
+    // acknowledgement callback a checkpoint could complete before such a sink
+    // had written what preceded its barrier.
+    if (!dag_.checkpoints_can_complete() && config_.on_checkpoint_ack) {
+        throw std::logic_error(
+            "LocalExecutor: the Dag was declared to run where no checkpoint completes "
+            "(Dag::run_without_checkpoint_completion), which lets sinks that must own their "
+            "chain's checkpoint share a chain, but the JobConfig sets on_checkpoint_ack, so a "
+            "checkpoint could complete before such a sink had written what preceded its "
+            "barrier. Build the Dag without the declaration, with each such sink alone on its "
+            "chain.");
+    }
     if (config_.memory_budget && config_.memory_limit_bytes != 0)
         throw std::invalid_argument("set memory_budget or memory_limit_bytes, not both");
     if (!config_.memory_budget) {
