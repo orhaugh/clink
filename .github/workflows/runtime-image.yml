@@ -335,6 +335,16 @@ jobs:
           examples/postgres-cdc-to-clickhouse/run.sh --self-test
           CLINK_IMAGE="${ref}" examples/postgres-cdc-to-clickhouse/run.sh
 
+      - name: The Neo4j example runs against this image
+        # Kafka -> clink -> Neo4j on compose: synthetic transfers into a graph
+        # and a windowed fan-in indicator, the Worker killed mid-stream, and
+        # every account, transfer, relationship and signal checked against
+        # the workload, exactly once.
+        run: |
+          set -euo pipefail
+          ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          CLINK_IMAGE="${ref}" CLEANUP=1 examples/kafka-to-neo4j/run.sh
+
       - name: The one-command example runs, on both architectures
         # The README's first command is a promise. It breaks quietly: the
         # example is copied in a build step, its data path is rewritten by a

@@ -1,0 +1,143 @@
+# Kafka -> clink -> Neo4j, on one machine. ./run.sh drives the whole example;
+# the README says what each step shows.
+#
+#   docker compose up -d --wait kafka neo4j   # the broker and the graph
+#   docker compose up -d --wait coordinator worker
+#   ./run.sh                                  # or let run.sh do all of it
+#   docker compose down -v                    # remove everything, data included
+#
+# The clink services need a runtime image that carries the Neo4j sink
+# (CLINK_IMAGE). Without one, run.sh can run the Coordinator and Worker from a
+# local build instead (CLINK_BIN_DIR=<build dir>), with only Kafka and Neo4j
+# here; the broker has a second listener on the host for that.
+#
+# Host ports (override if they collide with something you run locally):
+#   NEO4J_HTTP_PORT   Neo4j Browser and Query API   default 7474
+#   KAFKA_HOST_PORT   the broker, from the host     default 29092
+#   CLINK_HTTP_PORT   Coordinator HTTP API          default 8081
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,HOST://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:${KAFKA_HOST_PORT:-29092}
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 10s
+
+  # One-shot: the input topic, one partition, so event time advances on one
+  # stream and every window closes once the last transfer is in.
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command:
+      - --bootstrap-server=kafka:9092
+      - --create
+      - --if-not-exists
+      - --topic=transfers
+      - --partitions=1
+      - --replication-factor=1
+    restart: "no"
+
+  # The build the Neo4j sink's live suite tests, pinned by digest. Community,
+  # single instance. The password is the example's own.
+  neo4j:
+    image: neo4j:2026.09.0-community@sha256:d6269a020149934597c8c3df926d080a612796dbbb48861ca9d5b1109cabf0d8
+    environment:
+      NEO4J_AUTH: neo4j/clink-example-pw
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7474/ || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 5s
+
+  coordinator:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    command:
+      - --role=coordinator
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=coordinator
+      - --http-port=8081
+      - --http-bind=0.0.0.0
+      - --ha-dir=/state/ha
+    ports:
+      - "${CLINK_HTTP_PORT:-8081}:8081"
+    volumes:
+      - clink-state:/state
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  worker:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    command:
+      - --role=worker
+      - --id=worker-1
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+      # The sink's password, read by its env://NEO4J_PASSWORD reference.
+      NEO4J_PASSWORD: clink-example-pw
+    volumes:
+      - clink-state:/state
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  # One-shot: submit pipeline.sql to the Coordinator (run.sh starts it once
+  # the constraints are in place).
+  submit:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:latest}
+    volumes:
+      - ./pipeline.sql:/pipeline.sql:ro
+    command:
+      - run
+      - /pipeline.sql
+      - --coordinator-host=coordinator
+      - --coordinator-port=8081
+      - --name=transfers-to-neo4j
+      - --checkpoint-dir=/state/checkpoints
+      - --checkpoint-interval-ms=2000
+    restart: "no"
+
+volumes:
+  clink-state:
