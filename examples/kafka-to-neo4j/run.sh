@@ -6,14 +6,16 @@
 #   CLINK_BIN_DIR=../../build ./run.sh   # clink from a local build, on this host
 #   CLEANUP=1 ./run.sh                # and remove everything at the end
 #
-# Steps: start Kafka and Neo4j; apply schema.cypher; start a Coordinator and a
-# Worker; submit pipeline.sql (two jobs); send the first half of the
-# transfers; once some are in the graph and a checkpoint has completed, SIGKILL
-# the Worker and start it again; send the rest; then scripts/verify.py checks
-# every account, transfer, relationship and signal, exactly once.
+# Steps: start Kafka and Neo4j; apply schema.cypher; load the reference
+# devices (scripts/seed_reference.py); start a Coordinator and a Worker; submit
+# pipeline.sql (two jobs); send the first half of the transfers; once some are
+# in the graph and a checkpoint has completed, SIGKILL the Worker and start it
+# again; send the rest; then scripts/verify.py checks every account, transfer,
+# relationship and signal, exactly once, each signal's device context, and
+# that the reference data is unchanged.
 #
-# CLINK_IMAGE must carry the Neo4j sink (a runtime image built after it was
-# added). CLINK_BIN_DIR needs clink_node and clink built there.
+# CLINK_IMAGE must carry the Neo4j sink and lookup (a runtime image built after
+# they were added). CLINK_BIN_DIR needs clink_node and clink built there.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -86,6 +88,9 @@ for i in $(seq 1 60); do
     sleep 2
 done
 
+say "Loading the reference data (synthetic devices each account has used)"
+python3 scripts/seed_reference.py
+
 say "Starting a Coordinator and a Worker, and submitting pipeline.sql"
 if [ "${host_mode}" = 1 ]; then
     "${BIN}/clink_node" --role=coordinator --bind-host=127.0.0.1 --port=16123 \
@@ -132,8 +137,9 @@ python3 scripts/produce_events.py --part second
 say "Checking the graph against the workload"
 python3 scripts/verify.py --wait 300
 
-say "Signals, and the transfers that explain the first one"
+say "Signals, their device context, and the transfers that explain the first one"
 python3 scripts/cypher.py "MATCH (s:Signal)-[:FLAGS]->(a:Account) RETURN s.id, s.distinct_senders, s.transfers ORDER BY s.id"
+python3 scripts/cypher.py "MATCH (s:Signal) RETURN s.account, s.device_evidence_found, s.devices, s.shared_device_accounts, s.device_evidence, toString(s.context_observed_at) ORDER BY s.id"
 python3 scripts/cypher.py "MATCH (s:Signal) WITH s ORDER BY s.id LIMIT 1 MATCH (f:Account)-[:SENT]->(t:Transfer) WHERE t.event_id IN s.event_ids RETURN t.event_id, f.id, t.amount ORDER BY t.event_id"
 echo
 echo "More queries in queries.cypher; Neo4j Browser at ${NEO4J_HTTP} (neo4j / ${NEO4J_PASSWORD})."

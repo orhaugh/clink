@@ -3,13 +3,17 @@
 A self-contained example on Docker Compose. Synthetic transfers between made-up
 accounts stream from Kafka through clink into Neo4j as a graph, and clink
 computes one explainable time-window indicator beside them: an account that,
-inside one minute, receives money from at least five distinct senders. A
-Worker is killed mid-run and restarted; the graph is then checked, node by
-node and relationship by relationship, against what the input implies.
+inside one minute, receives money from at least five distinct senders. Each
+indicator is enriched, as it is raised, with graph context Neo4j already held:
+the devices the account has used and the other accounts that used them, read
+through a read-only lookup. A Worker is killed mid-run and restarted; the graph
+is then checked, node by node and relationship by relationship, against what
+the input and the reference data imply.
 
-Everything here is synthetic. No account, amount or pattern belongs to anyone,
-and a signal is an indicator for a person to review under one stated rule, not
-a finding of wrongdoing. The example takes no action on a signal.
+Everything here is synthetic. No account, device, amount or pattern belongs to
+anyone, and a signal is an indicator for a person to review under one stated
+rule, not a finding of wrongdoing. A shared device is context for that review,
+not an identification of anyone. The example takes no action on a signal.
 
 ## Run it
 
@@ -20,8 +24,9 @@ cd examples/kafka-to-neo4j
 CLINK_IMAGE=<a clink runtime image with the Neo4j sink> ./run.sh
 ```
 
-The Neo4j sink is newer than the published `ghcr.io/orhaugh/clink-runtime:latest`,
-so `CLINK_IMAGE` must name an image built after it was added. With a local build
+The Neo4j sink and lookup are newer than the published
+`ghcr.io/orhaugh/clink-runtime:latest`, so `CLINK_IMAGE` must name an image
+built after they were added. With a local build
 instead, run the Coordinator and Worker on this machine and only Kafka and
 Neo4j in Docker:
 
@@ -31,13 +36,14 @@ CLINK_BIN_DIR=../../build ./run.sh
 ```
 
 `run.sh` starts Kafka and Neo4j, applies [`schema.cypher`](schema.cypher),
+loads the reference devices ([`scripts/seed_reference.py`](scripts/seed_reference.py)),
 starts a Coordinator and a Worker, submits [`pipeline.sql`](pipeline.sql), sends
 the first half of the transfers, SIGKILLs the Worker once some transfers are in
 the graph and a checkpoint has completed, starts it again, sends the rest, and
 runs [`scripts/verify.py`](scripts/verify.py). It ends with:
 
 ```
-verify: OK. 331 transfers, 40 accounts and 3 signals, each exactly once, every relationship and property as the events imply
+verify: OK. 331 transfers, 40 accounts and 3 signals, each exactly once, every relationship and property as the events imply, each signal's device context as the reference data implies, and the reference data unchanged
 ```
 
 `CLEANUP=1 ./run.sh` removes everything at the end; otherwise `docker compose down -v`
@@ -51,12 +57,19 @@ does. Neo4j Browser is at http://localhost:7474 (user `neo4j`, password
 flowchart LR
     S["(:Account) sender"] -- "SENT" --> T["(:Transfer) event_id, amount, at"]
     T -- "TO" --> R["(:Account) recipient"]
-    G["(:Signal) id, window, distinct_senders, event_ids, rule_version"] -- "FLAGS" --> R
+    G["(:Signal) id, window, distinct_senders, event_ids, rule_version, device context"] -- "FLAGS" --> R
+    R -- "USES_DEVICE" --> D["(:Device) id, reference data"]
+    O["(:Account) another account"] -- "USES_DEVICE" --> D
 ```
 
-- `Account {id}`, `Transfer {event_id, amount, at, at_time}` and
-  `Signal {id, account, window_start, window_end, distinct_senders, transfers,
-  event_ids, rule_version, kind}`, each under a uniqueness constraint on its id.
+- `Account {id}`, `Transfer {event_id, amount, at, at_time}`, `Device {id}`
+  and `Signal {id, account, window_start, window_end, distinct_senders,
+  transfers, event_ids, rule_version, kind, enrichment_version,
+  device_evidence_found, devices, shared_device_accounts, device_evidence,
+  context_observed_at, context_bookmark}`, each under a uniqueness constraint
+  on its id.
+- `Device` nodes and `USES_DEVICE` relationships are reference data, loaded
+  before the jobs start and never written by them.
 - A signal keeps everything that explains it: its window, its counts, the event
   ids of the transfers in the window, sorted, and the rule version. Its id is
   `<account>:<window start ms>:<rule version>`, a function of those, so writing
@@ -69,6 +82,63 @@ each receive from six to eight distinct senders inside one minute and then send
 money on shortly after. The signal sees only the first half of that; the
 investigation queries follow the money.
 
+## Graph context for each signal
+
+The signal job joins each indicator to a lookup table on its account:
+
+```sql
+FROM windows w
+LEFT JOIN device_context d ON w.account = d.account
+```
+
+`device_context` is declared with `connector = 'lookup'` and
+`function = 'neo4j'` (see [`pipeline.sql`](pipeline.sql)). For each signal,
+clink sends the account as the `$key` parameter of one Cypher read: an index
+seek on the account, then two fixed hops to the devices it used and the other
+accounts on them. The statement returns at most one row: the number of
+devices, the number of other accounts sharing one (counted up to 1000) and the
+first ten of their ids, comma-separated. The ids are a bounded `VARCHAR`
+because a lookup returns scalar columns only.
+
+| Account | What the reference data holds | What the signal carries |
+| --- | --- | --- |
+| `acct-07` | its own device, and `dev-a1`, which `acct-02`, `acct-03` and `acct-05` (three of the accounts paying it in its window) also used | `device_evidence_found = true`, 2 devices, 3 accounts sharing, `acct-02,acct-03,acct-05` |
+| `acct-19` | a device of its own only | `device_evidence_found = true`, 1 device, 0 accounts sharing |
+| `acct-33` | no device on record | `device_evidence_found = false`, no counts: an explicit no-match |
+
+A no-match is an answer: the read ran and the graph had nothing for the
+account. A read that fails is not: if Neo4j is unreachable past the lookup's
+retry budget, a read times out, or a value is not of its declared type, the
+job fails and restarts from its last checkpoint, and no signal is written
+with made-up or missing context in its place.
+
+Every lookup request runs in Neo4j's read access mode, and clink checks the
+statement when the job starts and refuses anything that could write. Community
+Edition has no roles, so the example reads as `neo4j`; with an edition that has
+them, give the lookup its own user granted reads only. The connector page's
+[Lookup](../../docs/connectors/neo4j.md#lookup) section has the details.
+
+### When the context was read, and what a replay does
+
+The lookup reads the graph as it is when the signal is raised. Each signal
+records when that was: `context_observed_at` is clink's clock when the reply
+arrived (UTC, stored as a Neo4j `LocalDateTime`), and `context_bookmark` is
+the opaque token Neo4j returned for the
+read, which names a position in the database's transaction history, not a
+time. Neither says that the graph reflected any particular event: the lookup
+reads reference data loaded before the jobs started precisely so that the
+answer does not depend on how far the transfer job has got.
+
+After the Worker kill, the restored signal job raises again the signals since
+its last checkpoint and reads their context again. Here the reference data
+does not change, so the second read finds the same devices, and the signal's
+`MERGE` and `SET` leave the latest read on the node. If the reference data had
+changed in between, the replayed signal would carry the newer context: the
+event ids and window identify the indicator, not the context it was enriched
+with. Keep the latest (as this example does), or record each enrichment as its
+own node keyed by the signal and `context_observed_at` if earlier reads must
+be kept; clink does not capture lookup results for a later replay.
+
 ## Investigating
 
 [`queries.cypher`](queries.cypher) has the queries, runnable with
@@ -79,7 +149,9 @@ investigation queries follow the money.
 3. what the flagged account sent within five minutes after its window closed;
 4. two hops on, where that money went next;
 5. accounts that paid into more than one flagged account;
-6. a health check: every transfer has exactly one sender and one recipient.
+6. a health check: every transfer has exactly one sender and one recipient;
+7. each signal's device context, as it was read;
+8. the shared devices behind that context, from the reference data.
 
 ## Why a replay changes nothing
 
@@ -103,7 +175,7 @@ overwrite.
 ## What is consistent with what
 
 The two `INSERT`s are two jobs with two sinks, and every batch is its own Neo4j
-transaction. So:
+transaction; each lookup is a read transaction of its own. So:
 
 - a batch's transfers become visible together, but transfers from different
   batches, and the graph and the signals, do not become visible together;
@@ -112,7 +184,9 @@ transaction. So:
   has caught up, which is why it joins by event id rather than relying on a
   relationship the signal job would have had to wait for;
 - each job's checkpoints are its own: after the kill, one job can replay more
-  than the other.
+  than the other;
+- a lookup sees what was committed when it ran, so the device context comes
+  only from the reference data loaded first, never from this run's writes.
 
 `verify.py` waits until both jobs have caught up before it decides.
 
@@ -121,10 +195,11 @@ transaction. So:
 | File | What it is |
 | --- | --- |
 | `docker-compose.yml` | Kafka, Neo4j (the pinned build the connector's live suite tests), a Coordinator, a Worker, the submit step |
-| `pipeline.sql` | the two jobs: transfers into the graph, and the windowed fan-in indicator |
+| `pipeline.sql` | the two jobs: transfers into the graph, and the windowed fan-in indicator enriched through the Neo4j lookup |
 | `schema.cypher` | the uniqueness constraints the statements rely on |
 | `queries.cypher` | investigation queries |
-| `scripts/workload.py` | the deterministic workload, and the recompute of the signals it implies |
+| `scripts/workload.py` | the deterministic workload and reference devices, and the recompute of the signals and device context they imply |
+| `scripts/seed_reference.py` | loads the reference devices before the jobs start |
 | `scripts/produce_events.py` | sends the workload to Kafka |
 | `scripts/verify.py` | checks the graph against the workload |
 | `scripts/cypher.py` | a minimal Query API client, standard library only |

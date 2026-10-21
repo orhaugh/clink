@@ -1,11 +1,13 @@
-"""The example's synthetic workload: transfers between made-up accounts.
+"""The example's synthetic workload: transfers between made-up accounts, and
+the made-up devices those accounts have used.
 
 Every transfer is a pure function of the constants below, so produce_events.py
 can generate the stream and verify.py can recompute, from the same definition
 and without trusting anything the pipeline wrote, exactly what the graph must
 hold: the accounts, the transfers with their senders and recipients, and the
-fan-in signals clink should have raised. Nothing here is random, and no
-account or amount belongs to anyone.
+fan-in signals clink should have raised with the device context each one is
+enriched with. Nothing here is random, and no account, device or amount
+belongs to anyone.
 
 Three accounts are given a planted pattern: inside one minute they receive
 from many distinct senders, and shortly after they send money on. The signal
@@ -28,6 +30,21 @@ BACKGROUND_EVERY_MS = 2_000  # one ordinary transfer every two seconds of event 
 
 # account, minute it is planted in, how many distinct senders pay in.
 PLANTED = [("acct-07", 2, 7), ("acct-19", 5, 6), ("acct-33", 8, 8)]
+
+# Reference data, loaded into the graph before the pipeline starts
+# (scripts/seed_reference.py): which device each account has used. The lookup
+# in pipeline.sql reads only these relationships, never anything the pipeline
+# writes, so what it finds does not depend on how far the transfer job has got.
+#   * every account has a device of its own, except acct-33, which has none on
+#     record: its signal's lookup is an explicit no-match;
+#   * acct-07 also uses dev-a1, which three of the accounts paying it use too;
+#   * acct-10 and acct-11 share dev-c1, a connection no signal touches.
+ENRICHMENT_VERSION = "device-context/v1"  # must match pipeline.sql
+EVIDENCE_LIMIT = 10  # must match others[0..10] in pipeline.sql's statement
+DEVICE_LINKS = sorted(
+    [(a, "dev-" + a[5:]) for a in [f"acct-{i:02d}" for i in range(1, 41)] if a != "acct-33"]
+    + [("acct-07", "dev-a1"), ("acct-02", "dev-a1"), ("acct-03", "dev-a1"), ("acct-05", "dev-a1"),
+       ("acct-10", "dev-c1"), ("acct-11", "dev-c1")])
 
 
 def _mix(n: int) -> int:
@@ -102,3 +119,16 @@ def expected_signals(all_transfers):
 
 def fmt_ts(ms: int) -> str:
     return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).strftime("%H:%M:%S")
+
+
+def device_context(account: str):
+    """What the lookup must find for `account`: None when the reference data
+    holds no device for it (a no-match), else the number of devices it has
+    used, how many other accounts used any of them, and the first
+    EVIDENCE_LIMIT of those accounts' ids in order, comma-separated."""
+    devices = {d for a, d in DEVICE_LINKS if a == account}
+    if not devices:
+        return None
+    others = sorted({a for a, d in DEVICE_LINKS if d in devices and a != account})
+    return {"devices": len(devices), "shared_accounts": len(others),
+            "evidence_accounts": ",".join(others[:EVIDENCE_LIMIT])}

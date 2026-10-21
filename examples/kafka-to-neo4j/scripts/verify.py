@@ -10,7 +10,14 @@ What must hold, recomputed from scripts/workload.py:
     sender and exactly one TO its recipient;
   * exactly the fan-in signals the one-minute windows imply, each with its
     window, its counts, its supporting event ids and its rule version, and
-    exactly one FLAGS to its account; no other signal.
+    exactly one FLAGS to its account; no other signal;
+  * on each signal, the device context the reference data implies for its
+    account: device_evidence_found true with the device count, the number of
+    accounts sharing a device and the first of them, or false with no counts
+    for an account with no device on record; and when it was read
+    (context_observed_at) and the read's bookmark;
+  * the reference data itself as seed_reference.py loaded it: the lookup
+    only reads, so nothing the pipeline did may have changed it.
 
 A replay after the Worker kill writes some batches twice. The pipeline's
 statements are keyed by stable ids under uniqueness constraints, so the graph
@@ -68,7 +75,9 @@ def problems() -> list:
     sig_rows = cypher.run(
         "MATCH (s:Signal) OPTIONAL MATCH (s)-[f:FLAGS]->(a:Account) "
         "RETURN s.id, s.account, s.window_start, s.window_end, s.distinct_senders, s.transfers, "
-        "s.event_ids, s.rule_version, collect(a.id), count(f) ORDER BY s.id")
+        "s.event_ids, s.rule_version, collect(a.id), count(f), s.enrichment_version, "
+        "s.device_evidence_found, s.devices, s.shared_device_accounts, s.device_evidence, "
+        "s.context_observed_at, s.context_bookmark ORDER BY s.id")
     seen = set()
     for r in sig_rows:
         sid = r[0]
@@ -84,8 +93,26 @@ def problems() -> list:
               and r[7] == workload.RULE_VERSION and r[8] == [w["account"]] and r[9] == 1)
         if not ok:
             out.append(f"signals: {sid} differs from what its window implies")
+            continue
+        ctx = workload.device_context(w["account"])
+        got_ctx = (r[11], r[12], r[13], r[14])
+        want_ctx = ((False, None, None, None) if ctx is None else
+                    (True, ctx["devices"], ctx["shared_accounts"], ctx["evidence_accounts"]))
+        if r[10] != workload.ENRICHMENT_VERSION or got_ctx != want_ctx:
+            out.append(f"signals: {sid} has device context {got_ctx}, the reference data "
+                       f"implies {want_ctx}")
+        if not r[15] or not r[16]:
+            out.append(f"signals: {sid} does not say when its context was read")
     for sid in sorted(set(want) - seen):
         out.append(f"signals: {sid} is missing")
+
+    links = sorted((r[0], r[1]) for r in cypher.run(
+        "MATCH (a:Account)-[:USES_DEVICE]->(d:Device) RETURN a.id, d.id"))
+    if links != workload.DEVICE_LINKS:
+        out.append("reference data: the USES_DEVICE relationships are not the ones loaded")
+    devices = cypher.run("MATCH (d:Device) RETURN count(d)")[0][0]
+    if devices != len({d for _, d in workload.DEVICE_LINKS}):
+        out.append(f"reference data: {devices} devices, not the ones loaded")
     return out
 
 
@@ -106,7 +133,8 @@ def main() -> int:
             print(f"verify: OK. {len(stream)} transfers, "
                   f"{len({t['sender'] for t in stream} | {t['recipient'] for t in stream})} accounts and "
                   f"{len(workload.expected_signals(stream))} signals, each exactly once, "
-                  "every relationship and property as the events imply")
+                  "every relationship and property as the events imply, each signal's device "
+                  "context as the reference data implies, and the reference data unchanged")
             return 0
         if time.monotonic() >= deadline:
             print("verify: FAILED")

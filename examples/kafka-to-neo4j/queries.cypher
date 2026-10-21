@@ -47,3 +47,21 @@ RETURN payer.id, flagged;
 MATCH (t:Transfer)
 WHERE COUNT { (t)<-[:SENT]-() } <> 1 OR COUNT { (t)-[:TO]->() } <> 1
 RETURN t.event_id;
+
+// 7. Each signal's device context, as the lookup read it when the signal was
+//    raised: whether any device was on record for the account, how many other
+//    accounts used one of its devices, which (the first ten), and when clink
+//    read it. An indicator for review, not a finding.
+MATCH (s:Signal)
+RETURN s.account, s.device_evidence_found, s.devices, s.shared_device_accounts,
+       s.device_evidence, s.context_observed_at, s.enrichment_version
+ORDER BY s.id;
+
+// 8. The devices behind that context, from the reference data: for each
+//    signal, the accounts it shares a device with, and the device. Compare
+//    with the senders in query 2: acct-07's shared device is also used by
+//    three of the accounts that paid it.
+MATCH (s:Signal)-[:FLAGS]->(a:Account)-[:USES_DEVICE]->(d:Device)<-[:USES_DEVICE]-(o:Account)
+WHERE o <> a
+RETURN s.id, d.id AS device, collect(o.id) AS also_used_by
+ORDER BY s.id, device;
