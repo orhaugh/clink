@@ -128,6 +128,17 @@ if(TARGET clink::kafka)
     clink_set_warnings(clink_kafka_source_bench)
 endif()
 
+# A local baseline for the Neo4j lookup: lookups per second and latency
+# percentiles against a running server (see the file header). Built with the
+# connector; links its internal headers, as its tests do.
+if(TARGET clink::neo4j)
+    add_executable(clink_neo4j_lookup_bench clink_neo4j_lookup_bench.cpp)
+    target_link_libraries(clink_neo4j_lookup_bench PRIVATE clink::neo4j)
+    target_include_directories(clink_neo4j_lookup_bench PRIVATE
+        ${CMAKE_SOURCE_DIR}/impls/neo4j/src)
+    clink_set_warnings(clink_neo4j_lookup_bench)
+endif()
+
 # flink_compare/clink-job: CLINK_REGISTER_JOB .so for the
 # clink-vs-Flink head-to-head harness. Requires the kafka impl
 # headers for the message_source / message_sink helpers.
