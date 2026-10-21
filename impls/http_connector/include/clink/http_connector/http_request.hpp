@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -26,10 +27,47 @@ struct HttpResponse {
     std::map<std::string, std::string> headers;
 };
 
+// One request of post_bounded().
+struct BoundedRequest {
+    // Sent on this request only, beside the client's default headers.
+    std::map<std::string, std::string> headers;
+    // The most reply body bytes read. A longer reply ends the exchange with
+    // BoundedResponse::too_large, without reading the rest.
+    std::size_t max_response_bytes{1U << 20};
+};
+
+// What post_bounded() saw. Unlike HttpResponse, an exchange that fails keeps
+// what arrived before the failure (the status line, the headers, the body so
+// far), and says whether the whole request had been written: a request the
+// server never received in full cannot have been acted on, while one whose
+// reply was lost may have been.
+struct BoundedResponse {
+    enum class Failure : std::uint8_t {
+        None,          // complete
+        Connect,       // the connection was not made (refused, unreachable, timed out)
+        TlsHandshake,  // the TLS handshake failed
+        TlsVerify,  // the CA file did not load, or the server's certificate or name did not verify
+        Write,      // writing the request failed
+        Read,       // reading the reply failed or timed out
+        TooLarge,   // the reply passed max_response_bytes
+        Other,
+    };
+    int status{0};                               // 0 until a status line arrived
+    std::map<std::string, std::string> headers;  // lower-cased names
+    std::string body;                            // at most max_response_bytes
+    bool complete{false};                        // the whole reply arrived within the bound
+    Failure failure{Failure::None};
+    // The whole request was written before the failure. False for Connect,
+    // TlsHandshake, TlsVerify and Write; true for Read and TooLarge.
+    bool request_written{false};
+    bool interrupted{false};  // interrupt() ended the exchange
+    std::string error;        // what ended an incomplete exchange
+};
+
 // Reusable POST client bound to one base URL (scheme://host[:port]). Holds a
 // keep-alive connection so a high-throughput sink reuses one socket. Not
 // thread-safe: one client per sink subtask (the sink owns it on its runner
-// thread).
+// thread). interrupt() is the one exception.
 class HttpRequest {
 public:
     struct Options {
@@ -38,6 +76,12 @@ public:
         int connect_timeout_ms{5000};
         int rw_timeout_ms{30000};
         bool verify_tls{true};  // https only; false skips server-cert verification
+        // https only: PEM file of the CAs that may sign the server's certificate, in
+        // place of the system's trust store. Empty: the system's.
+        std::string ca_cert_path;
+        // https only: check that the certificate names the host connected to, as
+        // well as that a trusted CA signed it. Ignored when verify_tls is false.
+        bool verify_hostname{true};
         // Optional bearer-token provider, consulted before EACH request: when set, an
         // "Authorization: Bearer <provider()>" header is added per-request, so a token that
         // rotates (e.g. a re-read file) is picked up without rebuilding the client. Leave a
@@ -76,6 +120,20 @@ public:
     // Blocking DELETE (e.g. WebHDFS op=DELETE to remove a staging object). Same
     // transport-error convention as post().
     HttpResponse del(const std::string& path);
+
+    // Blocking POST whose reply is read up to request.max_response_bytes and
+    // no further. Never throws for a transport failure; see BoundedResponse.
+    BoundedResponse post_bounded(const std::string& path,
+                                 const std::string& body,
+                                 const std::string& content_type,
+                                 const BoundedRequest& request);
+
+    // Ends the exchange in flight on another thread, which returns at once
+    // with BoundedResponse::interrupted (a connect or TLS handshake under way
+    // finishes or times out first). Safe from any thread at any time; with
+    // nothing in flight it closes the idle connection and the next request
+    // opens a new one.
+    void interrupt() noexcept;
 
     // True iff this build can talk https (CPPHTTPLIB_OPENSSL_SUPPORT). Lets a
     // sink reject an https URL up front with a clear message.
