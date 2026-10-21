@@ -459,9 +459,10 @@ if(CLINK_INTEGRATION_TESTS)
             integration/test_postgres_cdc_clickhouse_recovery.cpp
             integration/test_postgres_cdc_clickhouse_backfill.cpp)
     endif()
-    # The Neo4j sink's recovery cells: a coordinator and two workers running a
-    # SQL job from Kafka into the pinned Neo4j server that scripts/neo4j-live.sh
-    # starts, with faults at the sink's own points. They skip without it.
+    # The Neo4j sink's and lookup's recovery cells: a coordinator and two
+    # workers running SQL jobs from Kafka into, or enriched from, the pinned
+    # Neo4j server that scripts/neo4j-live.sh starts, with faults at the
+    # connector's own points. They skip without it.
     if(TARGET clink::neo4j AND TARGET clink::kafka)
         target_sources(clink_integration_tests PRIVATE integration/test_neo4j_recovery.cpp)
     endif()

@@ -15,10 +15,11 @@
 #   - clink_neo4j_sql_tests: the SQL-level suites, including embedded SQL
 #     pipelines into and enriched from the server (Neo4jSqlLive.*,
 #     Neo4jSqlLookupLive.*);
-#   - clink_integration_tests' Neo4jRecovery.* cells when that binary is built
-#     (NEO4J_LIVE_RECOVERY=0 leaves them out): a coordinator and two workers
-#     running a SQL job from Kafka into the server, a worker killed at the
-#     sink's fault points.
+#   - clink_integration_tests' Neo4jRecovery.* and Neo4jLookupRecovery.* cells
+#     when that binary is built (NEO4J_LIVE_RECOVERY=0 leaves them out): a
+#     coordinator and two workers running SQL jobs from Kafka into the server,
+#     or enriched from it through a lookup join, with a worker killed at the
+#     connector's fault points and the server stopped under a running job.
 # A live case skips when its server is not named and googletest counts that as
 # a pass, so scripts/check-gtest-reports.py fails the run on any skip and on a
 # suite that ran fewer cases than it should.
@@ -129,7 +130,7 @@ expect=(
     --expect 'Neo4jLookupOptions.*=9'
     --expect 'Neo4jLookupTypes.*=5'
     --expect 'Neo4jLookupReply.*=5'
-    --expect 'Neo4jLookup.*=18'
+    --expect 'Neo4jLookup.*=20'
     --expect 'Neo4jLookupLive.*=7'
     --expect 'Neo4jSql.*=4'
     --expect 'Neo4jSqlLive.*=1'
@@ -137,9 +138,9 @@ expect=(
     --expect 'Neo4jSqlLookupLive.*=1'
 )
 if [ "${NEO4J_LIVE_RECOVERY}" = "1" ]; then
-    run recovery "${IT_BIN}" --gtest_filter='Neo4jRecovery.*'
+    run recovery "${IT_BIN}" --gtest_filter='Neo4jRecovery.*:Neo4jLookupRecovery.*'
     reports+=("${REPORT_DIR}/recovery.json")
-    expect+=(--expect 'Neo4jRecovery.*=3')
+    expect+=(--expect 'Neo4jRecovery.*=3' --expect 'Neo4jLookupRecovery.*=6')
 fi
 
 python3 "${ROOT}/scripts/check-gtest-reports.py" "${expect[@]}" "${reports[@]}" || status=1

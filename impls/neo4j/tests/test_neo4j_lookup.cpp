@@ -23,6 +23,7 @@
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/sql/row_kind.hpp"
 
 #include "fake_lookup_api.hpp"
 #include "lookup.hpp"
@@ -675,5 +676,63 @@ TEST(Neo4jLookup, TheOpenCheckRefusesStatementsThatMayNotOnlyRead) {
         const auto [code_, m] = failure([&] { rig.op->open(); });
         EXPECT_EQ(code_, code::kServerRefused);
         EXPECT_NE(m.find("before Neo4j 2026.04"), std::string::npos) << m;
+    }
+}
+
+TEST(Neo4jLookup, RowsHeldThroughAnOutageAllLeaveInOrderOnceTheServerAnswers) {
+    FakeLookupApi api({"shared", "evidence"});
+    for (int k = 1; k <= 60; ++k) {
+        api.answer(std::to_string(k), one(k, "ev-" + std::to_string(k)));
+    }
+    // The first 40 requests meet a server that is down; the rest an answer.
+    for (int i = 0; i < 40; ++i) {
+        LookupAnswer down;
+        down.status = 503;
+        down.raw = "{}";
+        api.next(down);
+    }
+    Rig rig(api,
+            {{"max_concurrent_requests", "2"},
+             {"max_in_flight", "8"},
+             {"max_retries", "60"},
+             {"retry_window_ms", "60000"}});
+    rig.op->open();
+    std::vector<std::string> want;
+    for (int k = 1; k <= 60; ++k) {
+        rig.process(data({probe(k, k)}));
+        want.push_back("row:" + std::to_string(k));
+        if (k % 10 == 0) {
+            rig.process(StreamElement<Row>::barrier(
+                CheckpointBarrier{CheckpointId{static_cast<std::uint64_t>(k / 10)}}));
+            want.push_back("barrier:" + std::to_string(k / 10));
+        }
+    }
+    rig.op->flush(rig.out);
+    EXPECT_EQ(rig.order(), want);
+    for (const auto& r : rig.rows_out()) {
+        const auto k = r.values.at("s_event_id").as_int();
+        EXPECT_EQ(r.values.at("d_evidence").as_string(), "ev-" + std::to_string(k));
+    }
+    EXPECT_GE(rig.counter("clink_neo4j_lookup_retries_total"), 40U);
+}
+
+TEST(Neo4jLookup, ARetractionIsEnrichedAndStaysARetraction) {
+    FakeLookupApi api({"shared", "evidence"});
+    api.answer("7", one(3, "acct-02"));
+    Rig rig(api);
+    rig.op->open();
+    Row retraction = probe(1, 7);
+    clink::sql::set_row_kind(retraction, clink::sql::kRowKindDelete);
+    Row update = probe(2, 7);
+    clink::sql::set_row_kind(update, clink::sql::kRowKindUpdateAfter);
+    rig.process(data({retraction, update, probe(3, 7)}));
+    rig.op->flush(rig.out);
+    const auto rows = rig.rows_out();
+    ASSERT_EQ(rows.size(), 3U);
+    EXPECT_EQ(clink::sql::row_kind_of(rows[0]), clink::sql::kRowKindDelete);
+    EXPECT_EQ(clink::sql::row_kind_of(rows[1]), clink::sql::kRowKindUpdateAfter);
+    EXPECT_EQ(clink::sql::row_kind_of(rows[2]), clink::sql::kRowKindInsert);
+    for (const auto& r : rows) {
+        EXPECT_EQ(r.values.at("d_shared").as_int(), 3);
     }
 }

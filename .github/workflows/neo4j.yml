@@ -1,13 +1,16 @@
 name: neo4j
 
-# The Neo4j sink's gate (scripts/neo4j-live.sh): every Neo4j test against a
-# real server, Neo4j 2026.09.0 Community pinned by digest in
-# docker/integration-services.yml, over HTTP and over HTTPS with a CA generated
-# per run; the SQL-level cases, an embedded SQL pipeline into the server among
-# them; and the recovery cells, a coordinator and two workers running a SQL job
-# from Kafka into the server with a worker killed before a request and after a
-# commit, and the server restarted under the running job, each checked against
-# the graph the events imply. A live test skips when its server or binary is
+# The Neo4j connector's gate (scripts/neo4j-live.sh): every Neo4j sink and
+# lookup test against a real server, Neo4j 2026.09.0 Community pinned by digest
+# in docker/integration-services.yml, over HTTP and over HTTPS with a CA
+# generated per run; the SQL-level cases, embedded SQL pipelines into and
+# enriched from the server among them; and the recovery cells, a coordinator
+# and two workers running SQL jobs from Kafka into the server (a worker killed
+# before a request and after a commit, the server restarted under the running
+# job) and enriched from it through a lookup join (a worker killed with a
+# lookup in flight, outages inside and past the retry budget, a graph change
+# before a replay, a failing lookup), each checked against what the events and
+# the reference graph imply. A live test skips when its server or binary is
 # missing and gtest counts that as a pass, so the gate fails on any skip and on
 # any required suite that did not run.
 #
@@ -37,7 +40,7 @@ env:
 
 jobs:
   live:
-    name: The Neo4j sink holds its contract against a real server
+    name: The Neo4j sink and lookup hold their contracts against a real server
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -112,9 +115,9 @@ jobs:
           scripts/neo4j-live.sh build 2>&1 | tee "${RUNNER_TEMP}/neo4j-gate.log"
       - name: Keep the reports and the cells' evidence
         # The reports carry every case's result; the gate log carries each
-        # recovery cell's "[neo4j-recovery]" line and the fault framework's
-        # witness lines, and on failure the report directory holds the
-        # servers' own logs.
+        # recovery cell's "[neo4j-recovery]" or "[neo4j-lookup-recovery]" line
+        # and the fault framework's witness lines, and on failure the report
+        # directory holds the servers' own logs.
         if: always()
         uses: actions/upload-artifact@v4
         with:

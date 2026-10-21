@@ -1,6 +1,7 @@
-// The Neo4j sink's recovery cells: a coordinator and two clink_node workers run
-// a SQL job from a replayable Kafka topic (transfer events 1 to N) into the
-// pinned Neo4j server, and each cell faults one layer while rows flow:
+// The Neo4j connector's recovery cells. First the sink's: a coordinator and two
+// clink_node workers run a SQL job from a replayable Kafka topic (transfer
+// events 1 to N) into the pinned Neo4j server, and each cell faults one layer
+// while rows flow:
 //
 //   1. a worker parked at neo4j.before_request (a batch encoded, nothing of it
 //      sent) is SIGKILLed;
@@ -18,10 +19,23 @@
 // recipient; every account once; and the restarts and faults the cell names,
 // witnessed while the job ran.
 //
+// Then the lookup's (Neo4jLookupRecovery): the same cluster runs a SQL job that
+// enriches each transfer's recipient from a reference graph seeded before the
+// job starts (so no lookup depends on the job's own progress), through a
+// LEFT JOIN on a function='neo4j' lookup table, into a Kafka topic. The cells
+// prove that the enrichment arrives as the graph says, that a worker killed
+// with lookups in flight loses no input, that a database outage longer than
+// the lookup's retry budget fails the task and a restart finishes the job,
+// that a replay after a graph change enriches from the graph as it is then,
+// and that a lookup that fails never reaches the output as a no-match. The
+// expected rows come from the reference graph's own definition, not from what
+// the job wrote.
+//
 // Needs the server scripts/neo4j-live.sh starts (CLINK_NEO4J_TEST_ENDPOINT,
-// CLINK_NEO4J_TEST_PASSWORD, and CLINK_NEO4J_TEST_CONTAINER for cell 3), Docker
-// for the Kafka broker, and the clink_node and clink_submit_sql binaries of a
-// build with fault injection. Each cell prints one "[neo4j-recovery]" line.
+// CLINK_NEO4J_TEST_PASSWORD, and CLINK_NEO4J_TEST_CONTAINER for the outage
+// cells), Docker for the Kafka broker, and the clink_node and clink_submit_sql
+// binaries of a build with fault injection. Each cell prints one
+// "[neo4j-recovery]" or "[neo4j-lookup-recovery]" line.
 
 #include <algorithm>
 #include <atomic>
@@ -45,6 +59,7 @@
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/core/base64.hpp"
 #include "clink/http_connector/http_request.hpp"
+#include "clink/kafka/consume_all.hpp"
 
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_command.hpp"
@@ -98,14 +113,20 @@ std::string event_json(std::int64_t e) {
            std::to_string(recipient_of(e)) + "\",\"amount\":" + std::to_string(amount_of(e)) + "}";
 }
 
-// Produces events 1, 2, 3, ... to a two-partition topic at a steady rate. The
-// producer is idempotent, so a batch it retries is not written twice.
+// Produces events first, first + 1, ... up to `limit` to a two-partition topic
+// at a steady rate. The producer is idempotent, so a batch it retries is not
+// written twice.
 class Feeder {
 public:
-    Feeder(std::string brokers, std::string topic, std::int64_t limit, int per_second)
+    Feeder(std::string brokers,
+           std::string topic,
+           std::int64_t limit,
+           int per_second,
+           std::int64_t first = 1)
         : brokers_(std::move(brokers)),
           topic_(std::move(topic)),
           limit_(limit),
+          first_(first),
           per_tick_(std::max(per_second / 10, 1)) {}
     ~Feeder() { stop(); }
     void start() {
@@ -113,6 +134,13 @@ public:
     }
     std::int64_t stop() {
         stop_.store(true);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        return produced_.load();
+    }
+    // Waits until every event up to the limit has been produced.
+    std::int64_t finish() {
         if (thread_.joinable()) {
             thread_.join();
         }
@@ -131,7 +159,7 @@ private:
             opts.conf["enable.idempotence"] = "true";
             clink::KafkaSink sink(std::move(opts));
             sink.open();
-            std::int64_t next = 1;
+            std::int64_t next = first_;
             while (!stop_.load() && next <= limit_) {
                 clink::Batch<clink::KafkaMessage> batch;
                 for (int i = 0; i < per_tick_ && next <= limit_; ++i, ++next) {
@@ -152,6 +180,7 @@ private:
     std::string brokers_;
     std::string topic_;
     std::int64_t limit_;
+    std::int64_t first_;
     int per_tick_;
     std::thread thread_;
     std::atomic<bool> stop_{false};
@@ -552,4 +581,504 @@ TEST_F(Neo4jRecovery, AServerRestartWhileTheJobRunsIsRiddenOutWithoutARestart) {
     report("server_restart", spent, *cluster);
     EXPECT_EQ(spent, 0U) << "an outage inside the retry window spent a restart";
     expect_exact_graph();
+}
+
+namespace {
+
+// Stops the case's Neo4j container and starts it again, and on the way out
+// makes sure it is running and answering, whatever the case asserted, so the
+// cases after it find the server up.
+class ServerGuard {
+public:
+    explicit ServerGuard(std::string container) : container_(std::move(container)) {}
+    ~ServerGuard() {
+        if (stopped_) {
+            start();
+        }
+    }
+    ServerGuard(const ServerGuard&) = delete;
+    ServerGuard& operator=(const ServerGuard&) = delete;
+    void stop() {
+        const auto r = clink::test::run_docker_command("docker stop -t 30 " + container_);
+        EXPECT_EQ(r.status, 0) << r.out;
+        stopped_ = true;
+    }
+    void start() {
+        const auto r = clink::test::run_docker_command("docker start " + container_);
+        EXPECT_EQ(r.status, 0) << r.out;
+        stopped_ = false;
+        Oracle probe(env("CLINK_NEO4J_TEST_ENDPOINT"), env("CLINK_NEO4J_TEST_PASSWORD"));
+        EXPECT_TRUE(clink::itest::await([&] { return probe.count("RETURN 1") == 1; }, 120s))
+            << "the server did not answer again after its restart";
+    }
+
+private:
+    std::string container_;
+    bool stopped_{false};
+};
+
+// The lookup's cells. The reference graph: an account node for every
+// acct-<i>, i from 0 to 36, except those with i % 6 == 5, which have none and
+// so are no-matches; acct-<i> has shared = i % 4 + bump and evidence
+// = prefix + i.
+class Neo4jLookupRecovery : public Neo4jRecovery {
+protected:
+    void SetUp() override {
+        Neo4jRecovery::SetUp();
+        if (IsSkipped() || HasFatalFailure()) {
+            return;
+        }
+        ref_ = "RRef_" + suffix_;
+        out_topic_ = topic_ + "_out";
+        kafka_->create_topic(out_topic_, 1);
+        oracle_->run("CREATE CONSTRAINT c_" + ref_ + " IF NOT EXISTS FOR (a:" + ref_ +
+                     ") REQUIRE a.id IS UNIQUE");
+        seed_reference("ev-", 0);
+    }
+
+    void TearDown() override {
+        if (oracle_) {
+            try {
+                oracle_->run("MATCH (n:" + ref_ + ") DETACH DELETE n");
+                oracle_->run("DROP CONSTRAINT c_" + ref_ + " IF EXISTS");
+            } catch (const std::exception& e) {
+                ADD_FAILURE() << "cleaning up the reference graph failed: " << e.what();
+            }
+        }
+        Neo4jRecovery::TearDown();
+    }
+
+    void seed_reference(const std::string& prefix, int bump) {
+        oracle_->run("UNWIND range(0, 36) AS i WITH i WHERE i % 6 <> 5 MERGE (a:" + ref_ +
+                     " {id: 'acct-' + toString(i)}) SET a.shared = i % 4 + " +
+                     std::to_string(bump) + ", a.evidence = '" + prefix + "' + toString(i)");
+    }
+
+    struct Expected {
+        bool matched{false};
+        std::int64_t shared{0};
+        std::string evidence;
+    };
+    static Expected expected(std::int64_t e, const std::string& prefix, int bump) {
+        const auto i = recipient_of(e);
+        if (i % 6 == 5) {
+            return {};
+        }
+        return {true, i % 4 + bump, prefix + std::to_string(i)};
+    }
+
+    std::string lookup_job_sql(bool exactly_once, const std::string& lookup_extra = {}) const {
+        const std::string cols =
+            "(event_id BIGINT, sender VARCHAR, recipient VARCHAR, amount BIGINT)";
+        return "CREATE TABLE src " + cols + " WITH (connector='kafka', format='json', brokers='" +
+               kafka_->brokers() + "', topic='" + topic_ + "', group_id='" + topic_ +
+               "', auto_offset_reset='earliest'); "
+               "CREATE TABLE ref (recipient VARCHAR, shared BIGINT, evidence VARCHAR, matched "
+               "BOOLEAN, observed_at TIMESTAMP(3)) WITH (connector='lookup', function='neo4j', "
+               "endpoint='" +
+               endpoint_ +
+               "', username='neo4j', password='env://CLINK_NEO4J_RECOVERY_PW', "
+               "statement='MATCH (a:" +
+               ref_ +
+               " {id: $key}) RETURN a.shared AS shared, a.evidence AS evidence', "
+               "matched_column='matched', observed_at_column='observed_at', "
+               "max_concurrent_requests='4', max_in_flight='64'" +
+               lookup_extra +
+               "); "
+               "CREATE TABLE out (event_id BIGINT, recipient VARCHAR, shared BIGINT, evidence "
+               "VARCHAR, matched BOOLEAN, observed_at TIMESTAMP(3)) WITH (connector='kafka', "
+               "format='json', brokers='" +
+               kafka_->brokers() + "', topic='" + out_topic_ + "'" +
+               (exactly_once ? ", delivery_guarantee='exactly_once', transactional_id='lookup-" +
+                                   suffix_ + "'"
+                             : std::string{}) +
+               "); "
+               "INSERT INTO out SELECT s.event_id, s.recipient, r.shared, r.evidence, r.matched, "
+               "r.observed_at FROM src s LEFT JOIN ref r ON s.recipient = r.recipient;";
+    }
+
+    void submit_lookup(Cluster& cluster,
+                       const std::string& sql,
+                       std::uint64_t checkpoint_interval_ms,
+                       std::uint32_t max_restarts) {
+        Process submit;
+        ASSERT_TRUE(submit.spawn("submit-sql",
+                                 sql_binary(),
+                                 {sql_binary().string(),
+                                  "-e",
+                                  sql,
+                                  "--coordinator-host",
+                                  "127.0.0.1",
+                                  "--coordinator-port",
+                                  std::to_string(cluster.http_port()),
+                                  "--name",
+                                  "neo4j-lookup-recovery",
+                                  "--checkpoint-dir",
+                                  cluster.checkpoint_dir().string(),
+                                  "--checkpoint-interval-ms",
+                                  std::to_string(checkpoint_interval_ms),
+                                  "--alignment",
+                                  "aligned",
+                                  "--max-restarts-on-worker-loss",
+                                  std::to_string(max_restarts),
+                                  "--parallelism",
+                                  "2"},
+                                 cluster.log_dir()));
+        const auto code = submit.await_exit(60s);
+        ASSERT_TRUE(code.has_value());
+        ASSERT_EQ(*code, 0) << submit.read_log();
+    }
+
+    void await_lookup_open(Cluster& cluster) {
+        ASSERT_TRUE(clink::itest::await(
+            [&] { return count_in_workers(cluster, "neo4j lookup open:") >= 2; }, 90s))
+            << "the lookup did not open on both subtasks";
+    }
+
+    // Every record now in the output topic, parsed; empty while the topic
+    // cannot be drained (a transaction still open pins it).
+    std::vector<JsonValue> output() const {
+        std::vector<JsonValue> rows;
+        try {
+            for (const auto& p :
+                 clink::kafka::consume_all_committed(kafka_->brokers(), out_topic_, 20s)) {
+                rows.push_back(clink::config::parse(p));
+            }
+        } catch (const std::exception&) {
+            return {};
+        }
+        return rows;
+    }
+
+    static std::set<std::int64_t> event_ids(const std::vector<JsonValue>& rows) {
+        std::set<std::int64_t> ids;
+        for (const auto& r : rows) {
+            ids.insert(r.at("event_id").as_int());
+        }
+        return ids;
+    }
+
+    // Waits until every event 1..expected_ is in the output; returns it.
+    std::vector<JsonValue> await_every_event(std::chrono::seconds timeout) {
+        std::vector<JsonValue> rows;
+        const bool all = clink::itest::await(
+            [&] {
+                rows = output();
+                return static_cast<std::int64_t>(event_ids(rows).size()) >= expected_;
+            },
+            timeout);
+        EXPECT_TRUE(all) << "only " << event_ids(rows).size() << " of " << expected_
+                         << " events reached the output";
+        return rows;
+    }
+
+    // Whether `row` is event `e` enriched as the graph (prefix, bump) says.
+    static bool enriched_as(const JsonValue& row, const std::string& prefix, int bump) {
+        const auto e = row.at("event_id").as_int();
+        const auto want = expected(e, prefix, bump);
+        if (row.at("recipient").as_string() != "acct-" + std::to_string(recipient_of(e)) ||
+            row.at("matched").as_bool() != want.matched || row.at("observed_at").is_null()) {
+            return false;
+        }
+        if (!want.matched) {
+            return row.at("shared").is_null() && row.at("evidence").is_null();
+        }
+        return row.at("shared").is_integral_number() && row.at("shared").as_int() == want.shared &&
+               row.at("evidence").is_string() && row.at("evidence").as_string() == want.evidence;
+    }
+
+    // Every event exactly once, each enriched as the seeded graph says.
+    void expect_each_event_once_as_seeded(const std::vector<JsonValue>& rows) {
+        std::map<std::int64_t, int> seen;
+        std::size_t wrong = 0;
+        std::size_t no_match = 0;
+        for (const auto& r : rows) {
+            ++seen[r.at("event_id").as_int()];
+            if (!enriched_as(r, "ev-", 0) && ++wrong <= 5) {
+                ADD_FAILURE() << "a row not enriched as the graph says: " << r.serialize(0);
+            }
+            no_match += r.at("matched").as_bool() ? 0 : 1;
+        }
+        std::size_t want_no_match = 0;
+        for (std::int64_t e = 1; e <= expected_; ++e) {
+            want_no_match += expected(e, "ev-", 0).matched ? 0 : 1;
+        }
+        EXPECT_EQ(static_cast<std::int64_t>(seen.size()), expected_) << "events lost";
+        EXPECT_EQ(rows.size(), seen.size()) << "events duplicated in the committed output";
+        EXPECT_EQ(wrong, 0U);
+        EXPECT_EQ(no_match, want_no_match)
+            << "no-matches are the accounts the graph lacks, no more";
+    }
+
+    void report_lookup(const char* cell,
+                       std::size_t restarts_spent,
+                       Cluster& cluster,
+                       std::size_t rows) {
+        std::printf(
+            "[neo4j-lookup-recovery] cell=%s produced=%lld output_rows=%zu restarts=%zu "
+            "attempt_failed_lines=%zu\n",
+            cell,
+            static_cast<long long>(expected_),
+            rows,
+            restarts_spent,
+            count_in_workers(cluster, "neo4j lookup: "));
+        std::fflush(stdout);
+    }
+
+    std::string ref_;
+    std::string out_topic_;
+};
+
+}  // namespace
+
+TEST_F(Neo4jLookupRecovery, EveryEventIsEnrichedAsTheReferenceGraphSays) {
+    auto cluster = make_cluster(worker_opts(), worker_opts());
+    ScopedDiagnostics diagnostics(*cluster);
+    submit_lookup(*cluster, lookup_job_sql(true), 1000, 4);
+    await_lookup_open(*cluster);
+    expected_ = 3000;
+    Feeder feed(kafka_->brokers(), topic_, expected_, 1000);
+    feed.start();
+    const auto rows = await_every_event(240s);
+    EXPECT_EQ(feed.stop(), expected_) << feed.error();
+    const auto spent = restarts(*cluster);
+    cancel_job(*cluster);
+    report_lookup("expected", spent, *cluster, rows.size());
+    EXPECT_EQ(spent, 0U);
+    expect_each_event_once_as_seeded(rows);
+}
+
+TEST_F(Neo4jLookupRecovery, AWorkerKilledWithLookupsInFlightLosesNoInput) {
+    // The hundredth time a request thread on worker 1 has an answer, it parks
+    // there before handing it over: that lookup, and those queued behind it,
+    // are in flight when the worker dies.
+    const std::string point = "neo4j.lookup_after_reply";
+    auto cluster = make_cluster(worker_opts(), worker_opts(point + "=block@100"));
+    ScopedDiagnostics diagnostics(*cluster);
+    submit_lookup(*cluster, lookup_job_sql(true), 1000, 8);
+    await_lookup_open(*cluster);
+    expected_ = 4000;
+    Feeder feed(kafka_->brokers(), topic_, expected_, 1000);
+    feed.start();
+    const std::string witness = "[fault.injection] fired: " + point;
+    ASSERT_TRUE(clink::itest::await([&] { return cluster->worker(1).log_contains(witness); }, 120s))
+        << "worker 1 never parked a lookup";
+    kill_and_replace(*cluster, 1);
+    ASSERT_TRUE(cluster->await_workers_registered(3));
+    const auto rows = await_every_event(300s);
+    EXPECT_EQ(feed.stop(), expected_) << feed.error();
+    const auto spent = restarts(*cluster);
+    cancel_job(*cluster);
+    report_lookup("killed_in_flight", spent, *cluster, rows.size());
+    EXPECT_EQ(spent, 1U) << "one worker loss is one restart";
+    expect_each_event_once_as_seeded(rows);
+}
+
+TEST_F(Neo4jLookupRecovery, AnOutageInsideTheRetryBudgetIsRiddenOutWithoutARestart) {
+    const auto container = env("CLINK_NEO4J_TEST_CONTAINER");
+    if (container.empty()) {
+        GTEST_SKIP() << "set CLINK_NEO4J_TEST_CONTAINER (scripts/neo4j-live.sh does)";
+    }
+    ServerGuard guard(container);
+    auto cluster = make_cluster(worker_opts(), worker_opts());
+    ScopedDiagnostics diagnostics(*cluster);
+    // A budget longer than the server takes to restart: each lookup in flight
+    // waits it out, and the operator holds its input meanwhile.
+    submit_lookup(*cluster,
+                  lookup_job_sql(false,
+                                 ", max_retries='60', retry_window_ms='120000', "
+                                 "request_timeout_ms='3000', connect_timeout_ms='1000'"),
+                  1000,
+                  4);
+    await_lookup_open(*cluster);
+    // Phase 1, the server up: the first events are all enriched.
+    constexpr std::int64_t kBefore = 300;
+    expected_ = kBefore;
+    Feeder before(kafka_->brokers(), topic_, kBefore, 300);
+    before.start();
+    EXPECT_EQ(before.finish(), kBefore) << before.error();
+    (void)await_every_event(120s);
+    // Phase 2, the server down: the next events arrive while every read fails.
+    guard.stop();
+    expected_ = 600;
+    Feeder during(kafka_->brokers(), topic_, expected_, 300, kBefore + 1);
+    during.start();
+    EXPECT_EQ(during.finish(), expected_) << during.error();
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return count_in_workers(*cluster, "neo4j lookup: database") >= 4; }, 60s))
+        << "the lookups did not keep failing while the server was down";
+    // Nothing of phase 2 came out while the server was down: its rows are held
+    // in flight, not written as no-matches; and no restart was spent.
+    const auto held = output();
+    EXPECT_EQ(static_cast<std::int64_t>(event_ids(held).size()), kBefore)
+        << "rows left the lookup while the server was down";
+    EXPECT_EQ(restarts(*cluster), 0U);
+    // Phase 3, the server back: every event once, as the graph says.
+    guard.start();
+    const auto rows = await_every_event(300s);
+    const auto spent = restarts(*cluster);
+    cancel_job(*cluster);
+    report_lookup("outage_ridden_out", spent, *cluster, rows.size());
+    EXPECT_EQ(spent, 0U) << "an outage inside the retry budget spent a restart";
+    // No restart, so no replay: each event once, as the graph says.
+    expect_each_event_once_as_seeded(rows);
+}
+
+TEST_F(Neo4jLookupRecovery, AnOutagePastTheRetryBudgetFailsTheJobAndWritesNoNoMatch) {
+    const auto container = env("CLINK_NEO4J_TEST_CONTAINER");
+    if (container.empty()) {
+        GTEST_SKIP() << "set CLINK_NEO4J_TEST_CONTAINER (scripts/neo4j-live.sh does)";
+    }
+    ServerGuard guard(container);
+    auto cluster = make_cluster(worker_opts(), worker_opts());
+    ScopedDiagnostics diagnostics(*cluster);
+    // One retry within two seconds, and three restarts: the outage outlasts
+    // both, so the job must end FAILED rather than enrich without the graph.
+    submit_lookup(*cluster,
+                  lookup_job_sql(true,
+                                 ", max_retries='1', retry_window_ms='2000', "
+                                 "request_timeout_ms='2000', connect_timeout_ms='1000'"),
+                  1000,
+                  3);
+    await_lookup_open(*cluster);
+    // Phase 1, the server up: the first events are all enriched and committed.
+    constexpr std::int64_t kBefore = 300;
+    expected_ = kBefore;
+    Feeder before(kafka_->brokers(), topic_, kBefore, 300);
+    before.start();
+    EXPECT_EQ(before.finish(), kBefore) << before.error();
+    (void)await_every_event(120s);
+    // Phase 2, the server down: the next events' lookups fail past their
+    // budget on every restart the job is allowed.
+    guard.stop();
+    Feeder during(kafka_->brokers(), topic_, 600, 300, kBefore + 1);
+    during.start();
+    EXPECT_EQ(during.finish(), 600) << during.error();
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return cluster->count_in_coordinator_log("[coordinator.complete]") >= 1; }, 120s))
+        << "the job did not end while the server was down";
+    const auto spent = restarts(*cluster);
+    EXPECT_EQ(spent, 3U) << "each restart met the outage, until the budget was spent";
+    EXPECT_GE(cluster->count_in_coordinator_log("job_id=1 failed"), 1U);
+    EXPECT_GE(count_in_workers(*cluster, "neo4j lookup: database"), 1U);
+    guard.start();
+    const auto rows = output();
+    report_lookup("outage_past_budget", spent, *cluster, rows.size());
+    // The committed output is phase 1, exactly, as the graph says: no event
+    // read while the server was down reached it, as a no-match or otherwise.
+    std::set<std::int64_t> ids;
+    std::size_t wrong = 0;
+    for (const auto& r : rows) {
+        EXPECT_TRUE(ids.insert(r.at("event_id").as_int()).second) << "a committed duplicate";
+        if (!enriched_as(r, "ev-", 0) && ++wrong <= 5) {
+            ADD_FAILURE() << "a row not enriched as the graph says: " << r.serialize(0);
+        }
+    }
+    EXPECT_EQ(wrong, 0U);
+    std::set<std::int64_t> want;
+    for (std::int64_t e = 1; e <= kBefore; ++e) {
+        want.insert(e);
+    }
+    EXPECT_EQ(ids, want) << "the committed output is not exactly the events read before the outage";
+}
+
+TEST_F(Neo4jLookupRecovery, AReplayAfterAGraphChangeEnrichesFromTheGraphAsItIsThen) {
+    // The job's first checkpoint is taken as soon as it is up, before any
+    // event exists, and the interval keeps the next one beyond the cell. So
+    // the restore after the kill starts from the beginning of the topic and
+    // replays every event, and the output is at-least-once: each event's
+    // first enrichment stays in it beside the one the replay produces.
+    auto cluster = make_cluster(worker_opts(), worker_opts());
+    ScopedDiagnostics diagnostics(*cluster);
+    submit_lookup(*cluster, lookup_job_sql(false), 600000, 4);
+    await_lookup_open(*cluster);
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(*cluster) >= 1; }, 60s))
+        << "the job's first checkpoint did not complete";
+    expected_ = 600;
+    Feeder feed(kafka_->brokers(), topic_, expected_, 1000);
+    feed.start();
+    (void)await_every_event(120s);
+    EXPECT_EQ(feed.stop(), expected_) << feed.error();
+    ASSERT_EQ(latest_completed(*cluster), 1U)
+        << "a checkpoint after the first completed; the replay would be partial";
+    // Phase 1 is complete and seen: every event enriched from graph A.
+    seed_reference("ev2-", 10);
+    const auto changed_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+    kill_and_replace(*cluster, 1);
+    ASSERT_TRUE(cluster->await_workers_registered(3));
+    std::vector<JsonValue> rows;
+    const bool replayed = clink::itest::await(
+        [&] {
+            rows = output();
+            std::set<std::int64_t> b;
+            for (const auto& r : rows) {
+                if (r.at("observed_at").as_int() >= changed_at) {
+                    b.insert(r.at("event_id").as_int());
+                }
+            }
+            return static_cast<std::int64_t>(b.size()) >= expected_;
+        },
+        180s);
+    EXPECT_TRUE(replayed) << "the replay did not enrich every event again";
+    const auto spent = restarts(*cluster);
+    cancel_job(*cluster);
+    report_lookup("graph_change_replay", spent, *cluster, rows.size());
+    EXPECT_EQ(spent, 1U);
+    // Each event twice or more: before the change as graph A, after it as
+    // graph B, and never anything else. The event id alone does not say which
+    // enrichment is current; observed_at does.
+    std::map<std::int64_t, std::pair<int, int>> by_event;
+    std::size_t wrong = 0;
+    for (const auto& r : rows) {
+        const auto e = r.at("event_id").as_int();
+        const bool after = r.at("observed_at").as_int() >= changed_at;
+        if (!enriched_as(r, after ? "ev2-" : "ev-", after ? 10 : 0) && ++wrong <= 5) {
+            ADD_FAILURE() << "a row not enriched as the graph was when it was read: "
+                          << r.serialize(0);
+        }
+        auto& [a, b] = by_event[e];
+        (after ? b : a) += 1;
+    }
+    EXPECT_EQ(wrong, 0U);
+    ASSERT_EQ(static_cast<std::int64_t>(by_event.size()), expected_);
+    for (const auto& [e, counts] : by_event) {
+        EXPECT_GE(counts.first, 1) << "event " << e << " has no enrichment from before the change";
+        EXPECT_GE(counts.second, 1) << "event " << e << " has no enrichment from after the change";
+    }
+}
+
+TEST_F(Neo4jLookupRecovery, ALookupThatFailsFailsTheJobAndNeverWritesANoMatch) {
+    // acct-13's shared is text, which its BIGINT column cannot hold: every
+    // lookup for it fails. Event 12 is the first sent to acct-13.
+    oracle_->run("MATCH (a:" + ref_ + " {id: 'acct-13'}) SET a.shared = 'text-not-a-number'");
+    auto cluster = make_cluster(worker_opts(), worker_opts());
+    ScopedDiagnostics diagnostics(*cluster);
+    submit_lookup(*cluster, lookup_job_sql(false), 1000, 2);
+    await_lookup_open(*cluster);
+    expected_ = 200;
+    Feeder feed(kafka_->brokers(), topic_, expected_, 200);
+    feed.start();
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return cluster->count_in_coordinator_log("[coordinator.complete]") >= 1; }, 180s))
+        << "the job did not end";
+    (void)feed.stop();
+    const auto spent = restarts(*cluster);
+    EXPECT_EQ(spent, 2U) << "the failure recurred on every restart the budget allowed";
+    EXPECT_GE(cluster->count_in_coordinator_log("job_id=1 failed"), 1U);
+    EXPECT_GE(count_in_workers(*cluster, "column 'shared' (BIGINT): the statement returned String"),
+              1U);
+    EXPECT_EQ(count_in_workers(*cluster, "text-not-a-number"), 0U) << "a value reached a log";
+    const auto rows = output();
+    report_lookup("failing_lookup", spent, *cluster, rows.size());
+    std::size_t wrong = 0;
+    for (const auto& r : rows) {
+        EXPECT_NE(r.at("recipient").as_string(), "acct-13")
+            << "a failed lookup reached the output: " << r.serialize(0);
+        if (!enriched_as(r, "ev-", 0) && ++wrong <= 5) {
+            ADD_FAILURE() << "a row not enriched as the graph says: " << r.serialize(0);
+        }
+    }
+    EXPECT_EQ(wrong, 0U);
 }
