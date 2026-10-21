@@ -285,11 +285,42 @@ TEST(ParquetFsSink2PC, TheCommitNeverStreamsToTheCommittedKeyOffS3) {
     for (const auto& path : fs->opened()) {
         EXPECT_EQ(path.find("/committed/"), std::string::npos) << "streamed to " << path;
     }
-    auto committed = fs->GetFileInfo("bucket/out/committed/sub0-1.parquet");
+    const std::string part = "sub0-" + sink->run_token() + "-1.parquet";
+    auto committed = fs->GetFileInfo("bucket/out/committed/" + part);
     ASSERT_TRUE(committed.ok());
     EXPECT_EQ(committed->type(), arrow::fs::FileType::File);
     EXPECT_GT(committed->size(), 0);
-    auto staging = fs->GetFileInfo("bucket/out/staging/sub0-1.parquet");
+    auto staging = fs->GetFileInfo("bucket/out/staging/" + part);
     ASSERT_TRUE(staging.ok());
     EXPECT_EQ(staging->type(), arrow::fs::FileType::NotFound);
+}
+
+// A later run under the same base that starts from empty state can reuse an
+// earlier run's checkpoint id; the object names carry the run, so its commit
+// adds an object beside the earlier run's instead of copying over it.
+TEST(ParquetFsSink2PC, ALaterRunReusingACheckpointIdKeepsTheEarlierRunsCommittedObject) {
+    auto fs = std::make_shared<StreamRecordingFileSystem>();
+    ASSERT_TRUE(fs->CreateDir("bucket").ok());
+    for (const auto& vals : {std::vector<std::int64_t>{1, 2, 3}, std::vector<std::int64_t>{4, 5}}) {
+        InMemoryStateBackend state;  // each run starts from empty state
+        RuntimeContext rctx(OperatorId{302}, "fs2pc_rerun", &state, nullptr);
+        ParquetFsSink2PC<std::int64_t>::Options o;
+        o.base = "bucket/rerun";
+        auto sink = std::make_shared<ParquetFsSink2PC<std::int64_t>>(
+            [fs]() -> std::shared_ptr<arrow::fs::FileSystem> { return fs; },
+            o,
+            int64_arrow_batcher());
+        sink->set_id(OperatorId{302});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        feed(*sink, vals);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink->on_commit(1);
+        sink->close();
+    }
+    arrow::fs::FileSelector committed;
+    committed.base_dir = "bucket/rerun/committed";
+    auto objects = fs->GetFileInfo(committed);
+    ASSERT_TRUE(objects.ok()) << objects.status().ToString();
+    EXPECT_EQ(objects->size(), 2U) << "the later run's commit replaced the earlier run's object";
 }

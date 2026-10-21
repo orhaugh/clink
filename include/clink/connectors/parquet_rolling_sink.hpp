@@ -48,16 +48,12 @@
 // does not end in .parquet) and the next open removes. Nothing is buffered
 // beyond what the Parquet writer holds for its current row group.
 
-#include <array>
-#include <charconv>
-#include <chrono>
 #include <cstdint>
 #include <fcntl.h>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -76,6 +72,7 @@
 #endif
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
+#include "clink/connectors/committing_sink.hpp"
 #include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -234,7 +231,7 @@ public:
         const bool restored =
             this->runtime() != nullptr && this->runtime()->restore_from_checkpoint_id() > 0;
         clear_parts_(/*finished_too=*/!restored);
-        run_ = make_run_token_();
+        run_ = detail::make_run_token();
         next_seq_ = 0;
     }
 
@@ -278,30 +275,6 @@ private:
     static std::string basename_(const std::string& path) {
         const auto slash = path.rfind('/');
         return slash == std::string::npos ? path : path.substr(slash + 1);
-    }
-
-    // Microseconds since the epoch in fixed-width hex, so tokens sort in time
-    // order, then 16 random bits against two opens in the same microsecond.
-    static std::string make_run_token_() {
-        const auto now =
-            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                           std::chrono::system_clock::now().time_since_epoch())
-                                           .count());
-        std::random_device rd;
-        const auto salt = static_cast<std::uint64_t>(rd() & 0xFFFFU);
-        std::string token;
-        for (const auto [value, width] :
-             {std::pair<std::uint64_t, int>{now, 14}, std::pair<std::uint64_t, int>{salt, 4}}) {
-            std::array<char, 20> buf{};
-            const auto [end, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value, 16);
-            (void)ec;
-            std::string hex(buf.data(), end);
-            if (static_cast<int>(hex.size()) < width) {
-                hex.insert(0, static_cast<std::size_t>(width) - hex.size(), '0');
-            }
-            token += hex;
-        }
-        return token;
     }
 
     // Removes this subtask's in-progress and zero-length parts (always) and its

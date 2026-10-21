@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**The two-phase-commit file and object sinks keep each run's parts apart.** The
+file, Parquet, S3, GCS and Azure Parquet, WebHDFS Parquet and S3 text
+two-phase-commit sinks named every part after its subtask and checkpoint
+(`sub<N>-<ckpt>`), and checkpoint ids restart in every run that commits only at
+the end of the input, which always takes the same id, and in a different job
+writing to the same place. A later run then published over an earlier run's
+committed output, leaving a mix of the two where it committed less, and on
+WebHDFS, where a `RENAME` does not replace a file, the later run's part was
+never published. Parts are now named `sub<N>-<run>-<ckpt>`, with a token
+unique to each run, so a rerun adds its output beside the earlier run's. A
+reader that lists the committed directory or prefix is unaffected; one that
+built a part's name from the checkpoint alone has to list instead.
+
 **A Dag with parallel stages is refused an acknowledgement callback.** The Dag's
 parallel stages (`add_parallel_operator`, `add_parallel_sink`, `fork_parallel`,
 which `LocalSubmitter` builds above parallelism 1) take no part in a

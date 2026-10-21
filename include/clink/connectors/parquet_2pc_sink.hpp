@@ -24,11 +24,13 @@
 //      CLINK_STATE_FSYNC (set to 0 to fall back to flush+rename).
 //
 // Layout under `output_dir`:
-//   staging/   pre-committed sub<N>-<ckpt>.parquet (one per (subtask, ckpt))
+//   staging/   pre-committed sub<N>-<run>-<ckpt>.parquet (one per (subtask, run, ckpt))
 //   committed/ finalized files; atomic rename from staging is the commit
 //
 // The committable is the staging file path; commit() derives the committed path
-// from its basename.
+// from its basename. <run> is the open's run token (CommittingSink::run_token),
+// so a later run into the same directory adds its files beside this run's and
+// never renames over one of them, whatever checkpoint ids it reuses.
 //
 // Exactly-once is per the engine's 2PC contract: a committed file appears iff
 // its checkpoint completed globally, and (with fsync on) its bytes are on stable
@@ -115,8 +117,8 @@ public:
         ensure_pending_open_();
         auto buffer = finalize_pending_writer_();
 
-        const auto target =
-            staging_dir() / (sub_prefix_() + "-" + std::to_string(checkpoint_id) + ".parquet");
+        const auto target = staging_dir() / (sub_prefix_() + "-" + this->run_token() + "-" +
+                                             std::to_string(checkpoint_id) + ".parquet");
         const auto tmp = staging_dir() / (sub_prefix_() + "-pending.tmp");
         clink::state::detail::write_fsync_rename(target,
                                                  tmp,

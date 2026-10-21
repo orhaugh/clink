@@ -177,12 +177,12 @@ Batch<std::string> lines(const std::vector<std::string>& xs) {
 TEST(S3Sink2PCLive, CommitRoundTrips) {
     REQUIRE_LIVE_S3();
     const std::string prefix = "s3xo_commit_" + uniq();
-    const std::string key = prefix + "/sub0-1.ndjson";
     InMemoryStateBackend state;
     RuntimeContext rctx(OperatorId{88}, "s3xo", &state, nullptr);
     auto sink = make_sink(prefix, rctx);
 
     sink->open();
+    const std::string key = prefix + "/sub0-" + sink->run_token() + "-1.ndjson";
     sink->on_data(lines({"a", "b", "c"}));
     sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
     // Parts uploaded but the object is not visible until CompleteMultipartUpload.
@@ -197,13 +197,14 @@ TEST(S3Sink2PCLive, CommitRoundTrips) {
 TEST(S3Sink2PCLive, MultipartUploadSurvivesCrashAndRecovers) {
     REQUIRE_LIVE_S3();
     const std::string prefix = "s3xo_recover_" + uniq();
-    const std::string key = prefix + "/sub0-1.ndjson";
+    std::string key;             // the crashed run's, which recovery publishes
     InMemoryStateBackend state;  // survives the "crash"
     RuntimeContext rctx(OperatorId{88}, "s3xo", &state, nullptr);
 
     {
         auto crashed = make_sink(prefix, rctx);
         crashed->open();
+        key = prefix + "/sub0-" + crashed->run_token() + "-1.ndjson";
         crashed->on_data(lines({"x", "y"}));
         crashed->on_barrier(CheckpointBarrier{CheckpointId{1}});
         // No on_commit - process "crashes". The multipart upload's parts persist
@@ -221,12 +222,12 @@ TEST(S3Sink2PCLive, MultipartUploadSurvivesCrashAndRecovers) {
 TEST(S3Sink2PCLive, AbortDiscardsStagedParts) {
     REQUIRE_LIVE_S3();
     const std::string prefix = "s3xo_abort_" + uniq();
-    const std::string key = prefix + "/sub0-1.ndjson";
     InMemoryStateBackend state;
     RuntimeContext rctx(OperatorId{88}, "s3xo", &state, nullptr);
     auto sink = make_sink(prefix, rctx);
 
     sink->open();
+    const std::string key = prefix + "/sub0-" + sink->run_token() + "-1.ndjson";
     sink->on_data(lines({"z"}));
     sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
     sink->on_abort(1);
@@ -239,12 +240,12 @@ TEST(S3Sink2PCLive, AbortDiscardsStagedParts) {
 TEST(S3Sink2PCLive, CommitIsIdempotent) {
     REQUIRE_LIVE_S3();
     const std::string prefix = "s3xo_idem_" + uniq();
-    const std::string key = prefix + "/sub0-1.ndjson";
     InMemoryStateBackend state;
     RuntimeContext rctx(OperatorId{88}, "s3xo", &state, nullptr);
     auto sink = make_sink(prefix, rctx);
 
     sink->open();
+    const std::string key = prefix + "/sub0-" + sink->run_token() + "-1.ndjson";
     sink->on_data(lines({"only"}));
     sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
     sink->on_commit(1);
@@ -257,16 +258,41 @@ TEST(S3Sink2PCLive, CommitIsIdempotent) {
 TEST(S3Sink2PCLive, EmptyIntervalUploadsNothing) {
     REQUIRE_LIVE_S3();
     const std::string prefix = "s3xo_empty_" + uniq();
-    const std::string key = prefix + "/sub0-1.ndjson";
     InMemoryStateBackend state;
     RuntimeContext rctx(OperatorId{88}, "s3xo", &state, nullptr);
     auto sink = make_sink(prefix, rctx);
 
     sink->open();
+    const std::string key = prefix + "/sub0-" + sink->run_token() + "-1.ndjson";
     sink->on_barrier(CheckpointBarrier{CheckpointId{1}});  // no data
     EXPECT_NO_THROW(sink->on_commit(1));
     EXPECT_FALSE(object_exists(key));
     sink->close();
+}
+
+// A later run under the same prefix that starts from empty state can reuse an
+// earlier run's checkpoint id. The keys carry the run, so its commit completes
+// an upload beside the earlier run's object; keyed by the checkpoint alone, it
+// completed one over it, replacing what the earlier run had published.
+TEST(S3Sink2PCLive, ALaterRunReusingACheckpointIdKeepsTheEarlierRunsObject) {
+    REQUIRE_LIVE_S3();
+    const std::string prefix = "s3xo_rerun_" + uniq();
+    std::vector<std::string> keys;
+    for (const std::string line : {"first-run", "second-run"}) {
+        InMemoryStateBackend state;  // each run starts from empty state
+        RuntimeContext rctx(OperatorId{88}, "s3xo", &state, nullptr);
+        auto sink = make_sink(prefix, rctx);
+        sink->open();
+        keys.push_back(prefix + "/sub0-" + sink->run_token() + "-1.ndjson");
+        sink->on_data(lines({line}));
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink->on_commit(1);
+        sink->close();
+    }
+    ASSERT_NE(keys[0], keys[1]);
+    EXPECT_EQ(get_object(keys[0]), "first-run\n")
+        << "the later run's commit replaced the earlier run's object";
+    EXPECT_EQ(get_object(keys[1]), "second-run\n");
 }
 
 // Beside another subtask, each subtask puts its parts under keys of its own,

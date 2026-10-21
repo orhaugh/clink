@@ -177,7 +177,7 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     // s3_2pc_string_sink: EXACTLY-ONCE raw-object S3 sink via multipart-upload-
     // complete-on-commit. Selected for delivery_guarantee='exactly_once'. One
-    // object per (subtask, checkpoint) under <key_prefix>/sub<N>-<ckpt>.ndjson,
+    // object per (subtask, run, checkpoint) under <key_prefix>/sub<N>-<run>-<ckpt>.ndjson,
     // made visible atomically by CompleteMultipartUpload once the checkpoint is
     // globally durable. params: bucket (required), key_prefix, region,
     // endpoint_override (MinIO/LocalStack), part_size (default 5 MiB).

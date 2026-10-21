@@ -27,7 +27,11 @@
 #include "clink/connectors/file_2pc_sink.hpp"
 #include "clink/connectors/text_format.hpp"
 #include "clink/core/record.hpp"
+#include "clink/operators/source_operator.hpp"
+#include "clink/runtime/dag.hpp"
+#include "clink/runtime/job_config.hpp"
 #include "clink/runtime/key_groups.hpp"
+#include "clink/runtime/local_executor.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
@@ -64,6 +68,11 @@ std::shared_ptr<FileSink2PC<std::string>> make_sink(const std::filesystem::path&
     sink->set_id(OperatorId{42});
     sink->attach_runtime(&rctx);
     return sink;
+}
+
+// The name `sink` gives checkpoint `ckpt`'s part in this run.
+std::string part_name(const FileSink2PC<std::string>& sink, std::uint64_t ckpt) {
+    return "sub0-" + sink.run_token() + "-" + std::to_string(ckpt) + ".dat";
 }
 
 Batch<std::string> batch_of(const std::vector<std::string>& xs) {
@@ -109,16 +118,16 @@ TEST(FileSink2PC, AbortRemovesStagingFileAndClearsState) {
     sink->on_data(batch_of({"x", "y", "z"}));
     sink->on_barrier(CheckpointBarrier{CheckpointId{11}});
     // Staging file exists, state tracks it (operator-state key).
-    EXPECT_TRUE(std::filesystem::exists(out / "staging" / "sub0-11.dat"));
+    EXPECT_TRUE(std::filesystem::exists(out / "staging" / part_name(*sink, 11)));
     EXPECT_TRUE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
 
     sink->on_abort(11);
 
     // Staging file is gone; state cleared.
-    EXPECT_FALSE(std::filesystem::exists(out / "staging" / "sub0-11.dat"));
+    EXPECT_FALSE(std::filesystem::exists(out / "staging" / part_name(*sink, 11)));
     EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
     // committed/ untouched - we never committed.
-    EXPECT_FALSE(std::filesystem::exists(out / "committed" / "sub0-11.dat"));
+    EXPECT_FALSE(std::filesystem::exists(out / "committed" / part_name(*sink, 11)));
 }
 
 TEST(FileSink2PC, AbortIsIdempotent) {
@@ -152,7 +161,7 @@ TEST(FileSink2PC, AbortBeforeCommitMakesCommitNoOp) {
     sink->on_abort(4);
     EXPECT_NO_THROW(sink->on_commit(4));
     // No file should appear in committed/ as a result of the no-op commit.
-    EXPECT_FALSE(std::filesystem::exists(out / "committed" / "sub0-4.dat"));
+    EXPECT_FALSE(std::filesystem::exists(out / "committed" / part_name(*sink, 4)));
 }
 
 TEST(FileSink2PC, ClampDownsCommitsAtomically) {
@@ -166,10 +175,10 @@ TEST(FileSink2PC, ClampDownsCommitsAtomically) {
     sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
     sink->on_commit(1);
 
-    // staging/ now empty; committed/sub0-1.dat has the records.
-    EXPECT_FALSE(std::filesystem::exists(out / "staging" / "sub0-1.dat"))
+    // staging/ now empty; committed/ holds the records under the part's name.
+    EXPECT_FALSE(std::filesystem::exists(out / "staging" / part_name(*sink, 1)))
         << "staging file should have been moved to committed/";
-    const auto committed = out / "committed" / "sub0-1.dat";
+    const auto committed = out / "committed" / part_name(*sink, 1);
     ASSERT_TRUE(std::filesystem::exists(committed));
     EXPECT_EQ(read_lines(committed), (std::vector<std::string>{"a", "b", "c"}));
     // State key cleared after commit.
@@ -187,8 +196,8 @@ TEST(FileSink2PC, UncommittedBarrierLeavesStagingFile) {
     sink->on_barrier(CheckpointBarrier{CheckpointId{7}});
     // NO on_commit - simulates coordinator crash before declaring ckpt 7 complete.
 
-    EXPECT_TRUE(std::filesystem::exists(out / "staging" / "sub0-7.dat"));
-    EXPECT_FALSE(std::filesystem::exists(out / "committed" / "sub0-7.dat"));
+    EXPECT_TRUE(std::filesystem::exists(out / "staging" / part_name(*sink, 7)));
+    EXPECT_FALSE(std::filesystem::exists(out / "committed" / part_name(*sink, 7)));
     EXPECT_TRUE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_7").has_value());
 }
 
@@ -239,6 +248,66 @@ TEST(FileSink2PC, RecoveryIsNoOpWhenStagingFileAlreadyCommitted) {
         << "stale state key should have been cleared during recovery";
 }
 
+// --- A later run into the same directory ------------------------------------
+//
+// A run that starts from empty state takes its checkpoint ids from wherever its
+// own numbering starts, so a later run into the same directory can reuse an
+// earlier run's id: always, for a run that commits only at the end of the input
+// (the same id every time), and for a different job, or the same job with
+// another checkpoint directory. The part names carry the run, so the later
+// commit adds its file beside the earlier one. They used to name the part after
+// the checkpoint alone, and the later commit renamed over the earlier run's
+// file, replacing what it had published.
+
+TEST(FileSink2PC, ALaterRunReusingACheckpointIdKeepsTheEarlierRunsCommittedFile) {
+    const auto out = mktmpdir("rerun");
+    std::vector<std::string> runs;
+    for (const std::string record : {"first-run", "second-run"}) {
+        InMemoryStateBackend state;  // each run starts from empty state
+        RuntimeContext rctx(OperatorId{42}, "test_sink", &state, /*metrics=*/nullptr);
+        auto sink = make_sink(out, rctx);
+        sink->open();
+        runs.push_back(sink->run_token());
+        sink->on_data(batch_of({record}));
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink->on_commit(1);
+        sink->close();
+    }
+    ASSERT_NE(runs[0], runs[1]);
+    EXPECT_EQ(read_lines(out / "committed" / ("sub0-" + runs[0] + "-1.dat")),
+              (std::vector<std::string>{"first-run"}))
+        << "the later run's commit replaced the earlier run's file";
+    EXPECT_EQ(read_lines(out / "committed" / ("sub0-" + runs[1] + "-1.dat")),
+              (std::vector<std::string>{"second-run"}));
+}
+
+TEST(FileSink2PC, EveryRunThatCommitsAtTheEndOfTheInputKeepsItsOwnFile) {
+    const auto out = mktmpdir("eoi_rerun");
+    for (const std::string record : {"first-run", "second-run"}) {
+        Dag dag;
+        std::vector<Record<std::string>> records;
+        records.emplace_back(record);
+        auto src = dag.add_source<std::string>(
+            std::make_shared<VectorSource<std::string>>(std::move(records)));
+        dag.add_sink<std::string>(src,
+                                  std::make_shared<FileSink2PC<std::string>>(
+                                      out, string_text_format(), 0, "file_2pc_sink_string"));
+        JobConfig config;
+        config.state_backend = std::make_shared<InMemoryStateBackend>();
+        LocalExecutor exec(std::move(dag), config);
+        exec.run();
+        EXPECT_TRUE(exec.operator_errors().empty());
+    }
+    std::vector<std::string> published;
+    for (const auto& e : std::filesystem::directory_iterator(out / "committed")) {
+        const auto lines = read_lines(e.path());
+        published.insert(published.end(), lines.begin(), lines.end());
+    }
+    std::sort(published.begin(), published.end());
+    EXPECT_EQ(published, (std::vector<std::string>{"first-run", "second-run"}))
+        << "the second run's end-of-input commit replaced the first run's file";
+}
+
 // --- Rescale on the file:// backend -------------------------------------------
 //
 // file:// gives every new subtask every old subtask's operator state, so each
@@ -248,9 +317,12 @@ TEST(FileSink2PC, RecoveryIsNoOpWhenStagingFileAlreadyCommitted) {
 
 namespace {
 
-void stage_on_file_backend(const std::string& uri,
-                           const std::filesystem::path& out,
-                           std::uint32_t parallelism) {
+// Stages one record per subtask at checkpoint 7 and returns each subtask's
+// run token, which names its part.
+std::vector<std::string> stage_on_file_backend(const std::string& uri,
+                                               const std::filesystem::path& out,
+                                               std::uint32_t parallelism) {
+    std::vector<std::string> runs;
     for (std::uint32_t i = 0; i < parallelism; ++i) {
         StateBackendSpec spec;
         spec.uri = uri;
@@ -262,10 +334,12 @@ void stage_on_file_backend(const std::string& uri,
         sink->set_id(OperatorId{42});
         sink->attach_runtime(&rctx);
         sink->open();
+        runs.push_back(sink->run_token());
         sink->on_data(batch_of({"r" + std::to_string(i)}));
         sink->on_barrier(CheckpointBarrier{CheckpointId{7}});
         (void)built.backend->snapshot(CheckpointId{7});
     }
+    return runs;
 }
 
 void rescale_on_file_backend(const std::string& from,
@@ -317,20 +391,24 @@ void expect_every_old_subtask_committed(const std::string& tag,
     const auto out = root / "out";
     const std::string run1 = "file://" + (root / "run1").string();
     const std::string run2 = "file://" + (root / "run2").string();
-    stage_on_file_backend(run1, out, old_p);
+    const auto runs = stage_on_file_backend(run1, out, old_p);
     rescale_on_file_backend(run1, run2, out, old_p, new_p);
     std::vector<std::string> names;
     for (const auto& e : std::filesystem::directory_iterator(out / "committed")) {
         names.push_back(e.path().filename().string());
     }
     std::sort(names.begin(), names.end());
+    const auto staged = [&runs](std::uint32_t i) {
+        return "sub" + std::to_string(i) + "-" + runs.at(i) + "-7.dat";
+    };
     std::vector<std::string> expected;
     for (std::uint32_t i = 0; i < old_p; ++i) {
-        expected.push_back("sub" + std::to_string(i) + "-7.dat");
+        expected.push_back(staged(i));
     }
+    std::sort(expected.begin(), expected.end());
     EXPECT_EQ(names, expected);
     for (std::uint32_t i = 0; i < old_p; ++i) {
-        EXPECT_EQ(read_lines(out / "committed" / ("sub" + std::to_string(i) + "-7.dat")),
+        EXPECT_EQ(read_lines(out / "committed" / staged(i)),
                   (std::vector<std::string>{"r" + std::to_string(i)}));
     }
     EXPECT_TRUE(std::filesystem::is_empty(out / "staging"));

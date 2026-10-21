@@ -508,23 +508,51 @@ TEST(WebHdfsParquetSink2PC, FreshSinkCommitsPendingOnOpen) {
     EXPECT_EQ(read_committed_dir(srv, "/clink/rec/committed"), (std::vector<std::int64_t>{100}));
 }
 
+// A later run under the same base that starts from empty state can reuse an
+// earlier run's checkpoint id. The staged names carry the run, so its commit
+// renames to a name of its own. They used to name the part after the
+// checkpoint alone; HDFS refuses a RENAME onto an existing file, and the sink
+// takes a refused RENAME whose target exists for a commit already done, so the
+// later run's part was never published.
+TEST(WebHdfsParquetSink2PC, ALaterRunReusingACheckpointIdPublishesBesideTheEarlierRun) {
+    MockWebHdfs srv;
+    for (const std::int64_t value : {std::int64_t{7}, std::int64_t{8}}) {
+        InMemoryStateBackend state;  // each run starts from empty state
+        RuntimeContext rctx(OperatorId{11}, "wh2pc", &state, nullptr);
+        auto sink = make_2pc_sink(srv, "/clink/rerun", rctx, OperatorId{11});
+        sink->open();
+        Batch<std::int64_t> b;
+        b.emplace(value);
+        sink->on_data(b);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink->on_commit(1);
+        sink->close();
+    }
+    auto published = read_committed_dir(srv, "/clink/rerun/committed");
+    std::sort(published.begin(), published.end());
+    EXPECT_EQ(published, (std::vector<std::int64_t>{7, 8}))
+        << "the later run's part was not published beside the earlier run's";
+}
+
 TEST(WebHdfsParquetSink2PC, AHandleAnEarlierReleaseKeptAsARawKeyIsStillCommitted) {
     // Before the sink was a CommittingSink it kept the staging path under a raw
     // keyed "_2pc_pending_sub<N>_<ckpt>" row. A snapshot taken by that release
     // still holds such rows; opening on it must commit them.
     MockWebHdfs srv;
+    std::string staged_run;  // names the staged part
     {
         InMemoryStateBackend scratch;  // the stage only: its handle is thrown away
         RuntimeContext rctx(OperatorId{6}, "wh2pc", &scratch, nullptr);
         auto staged = make_2pc_sink(srv, "/clink/legacy", rctx, OperatorId{6});
         staged->open();
+        staged_run = staged->run_token();
         Batch<std::int64_t> b;
         b.emplace(64);
         staged->on_data(b);
         staged->on_barrier(CheckpointBarrier{CheckpointId{3}});
     }
     InMemoryStateBackend state;
-    const std::string staging = "/clink/legacy/staging/sub0-3.parquet";
+    const std::string staging = "/clink/legacy/staging/sub0-" + staged_run + "-3.parquet";
     state.put(OperatorId{6}, "_2pc_pending_sub0_3", staging);
     RuntimeContext rctx(OperatorId{6}, "wh2pc", &state, nullptr);
     auto sink = make_2pc_sink(srv, "/clink/legacy", rctx, OperatorId{6});

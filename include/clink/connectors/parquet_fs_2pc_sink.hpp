@@ -16,13 +16,15 @@
 // finalises them into one complete, self-describing Parquet object.
 //
 // Layout under `base`:
-//   <base>/staging/sub<N>-<ckpt>.parquet     pre-committed (one per subtask, ckpt)
-//   <base>/committed/sub<N>-<ckpt>.parquet    finalised; the commit copies staging here
+//   <base>/staging/sub<N>-<run>-<ckpt>.parquet     pre-committed (one per subtask, run, ckpt)
+//   <base>/committed/sub<N>-<run>-<ckpt>.parquet    finalised; the commit copies staging here
 // Point a reader (e.g. MultiObjectParquetSource) at <base>/committed to read the
 // exactly-once output.
 //
 // The committable is the staging object key; commit() derives the committed key
-// from its basename.
+// from its basename. <run> is the open's run token (CommittingSink::run_token),
+// so a later run under the same base adds its objects beside this run's and
+// never publishes over one of them, whatever checkpoint ids it reuses.
 //
 // Lifecycle (base -> verb):
 //   open()        - on_open() builds the filesystem, ensures staging/ + committed/
@@ -173,7 +175,8 @@ private:
     std::string committed_prefix_() const { return opts_.base + "/committed"; }
     std::string sub_prefix_() const { return "sub" + std::to_string(opts_.subtask_idx); }
     std::string staging_key_(std::uint64_t ckpt) const {
-        return staging_prefix_() + "/" + sub_prefix_() + "-" + std::to_string(ckpt) + ".parquet";
+        return staging_prefix_() + "/" + sub_prefix_() + "-" + this->run_token() + "-" +
+               std::to_string(ckpt) + ".parquet";
     }
     // The committed key for a staging key: same basename under committed/.
     std::string committed_key_for_(const std::string& staging_key) const {

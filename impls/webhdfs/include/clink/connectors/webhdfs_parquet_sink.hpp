@@ -289,8 +289,10 @@ private:
 // checkpoint interval (accumulated in memory). Unlike the object-store sink, the commit is a true
 // atomic HDFS RENAME rather than a copy. A CommittingSink, so the handle choreography (operator
 // state, recovery at open, one owner per handle across a rescale) is the framework's:
-//   prepare_commit: finalise the buffer and upload it to <base>/staging/sub<N>-<ckpt>.parquet via
-//                   the two-step CREATE; the staging path is the handle.
+//   prepare_commit: finalise the buffer and upload it to <base>/staging/sub<N>-<run>-<ckpt>.parquet
+//                   via the two-step CREATE; the staging path is the handle. <run> is the open's
+//                   run token (CommittingSink::run_token), so a later run under the same base never
+//                   stages under a name an earlier run committed.
 //   commit:         RENAME staging -> <base>/committed/ under the staged name (atomic on HDFS).
 //                   Idempotent: a RENAME that returns false but whose committed target already
 //                   exists is treated as already committed (recovery re-commit).
@@ -396,7 +398,8 @@ private:
     std::string committed_dir_() const { return opts_.base + "/committed"; }
     std::string sub_prefix_() const { return "sub" + std::to_string(opts_.subtask_idx); }
     std::string staging_key_(std::uint64_t c) const {
-        return staging_dir_() + "/" + sub_prefix_() + "-" + std::to_string(c) + ".parquet";
+        return staging_dir_() + "/" + sub_prefix_() + "-" + this->run_token() + "-" +
+               std::to_string(c) + ".parquet";
     }
     std::string committed_key_for_(const std::string& staging) const {
         const auto slash = staging.find_last_of('/');

@@ -20,7 +20,10 @@
 //
 // Each input record is one line in the object body (newline-appended), matching
 // the at-least-once S3Sink. The object key is
-// "<key_prefix>/sub<N>-<ckpt>.ndjson", unique per (subtask, checkpoint).
+// "<key_prefix>/sub<N>-<run>-<ckpt>.ndjson", unique per (subtask, run,
+// checkpoint): <run> is the open's run token (CommittingSink::run_token), so a
+// later run under the same prefix never completes an upload over an object an
+// earlier run published, whatever checkpoint ids it reuses.
 //
 // Memory: one checkpoint interval is buffered before the barrier uploads it
 // (bounded by the checkpoint interval), the same trade the Parquet 2PC sinks

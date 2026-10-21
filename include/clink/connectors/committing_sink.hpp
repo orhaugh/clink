@@ -25,7 +25,7 @@
 //   serialize/deserialize        - the codec for the persisted handle.
 //
 // What the base owns (sealed - a connector cannot override the choreography):
-//   open()        -> on_open(); then recover_all_().
+//   open()        -> a fresh run_token(); on_open(); then recover_all_().
 //   on_data(b)    -> write(b).
 //   on_barrier(b) -> prepare_commit(); persist the handle keyed by checkpoint.
 //   on_commit(id) -> load handle; commit(); erase key. Idempotent (a missing
@@ -71,9 +71,13 @@
 // started. A commit or abort that reaches a sink whose runtime has been
 // detached throws rather than return as if it had finalised anything.
 
+#include <array>
+#include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -89,6 +93,36 @@
 #include "clink/state/state_backend.hpp"
 
 namespace clink {
+
+namespace detail {
+
+// A token that tells one run of a sink from another: microseconds since the
+// epoch in fixed-width hex, so tokens sort in time order, then 16 random bits
+// against two opens in the same microsecond (18 hex digits in all). The file
+// and object sinks put it in their part names.
+inline std::string make_run_token() {
+    const auto now =
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count());
+    std::random_device rd;
+    const auto salt = static_cast<std::uint64_t>(rd() & 0xFFFFU);
+    std::string token;
+    for (const auto [value, width] :
+         {std::pair<std::uint64_t, int>{now, 14}, std::pair<std::uint64_t, int>{salt, 4}}) {
+        std::array<char, 20> buf{};
+        const auto [end, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value, 16);
+        (void)ec;
+        std::string hex(buf.data(), end);
+        if (static_cast<int>(hex.size()) < width) {
+            hex.insert(0, static_cast<std::size_t>(width) - hex.size(), '0');
+        }
+        token += hex;
+    }
+    return token;
+}
+
+}  // namespace detail
 
 template <typename In, typename Committable>
 class CommittingSink : public Sink<In> {
@@ -147,6 +181,7 @@ public:
                 "in-process run), or run the job on a cluster or the embedded engine, which "
                 "always provide one.");
         }
+        run_token_ = detail::make_run_token();
         on_open();
         recover_all_();
         if (clink::protocol_trace::enabled()) {
@@ -158,6 +193,17 @@ public:
     }
 
     void on_data(const Batch<In>& batch) final { write(batch); }
+
+    // This open's run token (detail::make_run_token), fresh at every open()
+    // and set before on_open(). A sink that names what it prepares after the
+    // checkpoint alone reuses a name whenever checkpoint ids restart: in every
+    // run that commits only at the end of the input, which always takes the
+    // same id, and in a different job, or the same job with another
+    // checkpoint directory, writing to the same place. Putting the token in
+    // the name keeps every run's output apart, so a commit never replaces what
+    // an earlier run committed. Recovery is unaffected: a handle carries the
+    // name its own run gave it.
+    [[nodiscard]] const std::string& run_token() const noexcept { return run_token_; }
 
     // This sink stages its prepared-transaction handle into operator state during
     // on_barrier, so the checkpoint must capture it. See Sink::stages_state_at_barrier.
@@ -467,6 +513,8 @@ private:
     }
 
     std::uint32_t subtask_idx_;
+    // Set at every open(); see run_token().
+    std::string run_token_;
 };
 
 }  // namespace clink

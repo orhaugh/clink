@@ -158,6 +158,15 @@ A connector's storage reality decides the shape; the framework serves all three.
 | **B. External transaction (XA)** | Prepare a distributed txn at the barrier, commit-prepared at commit | global txn id | Postgres (`PREPARE TRANSACTION` / `COMMIT PREPARED`), Kafka (broker transaction, its own path) |
 | **C. Idempotent upsert** | Write keyed by a declared PRIMARY KEY so replays collapse | none (the key is the identity) | Postgres / MySQL / Cassandra / Redis `mode='upsert'` |
 
+A shape-A sink names what it stages after the subtask, the open's run token
+(`CommittingSink::run_token`, fresh at every `open()`) and the checkpoint:
+`sub<N>-<run>-<ckpt>`. Checkpoint ids restart in every run that commits only
+at the end of the input, which always takes the same id, and in a different
+job writing to the same place, so a name built from the checkpoint alone let
+a later run publish over an earlier run's artifact; with the token a rerun
+adds its artifacts beside the earlier run's. A recovered handle keeps the
+name its own run gave it.
+
 Shapes A and B ride `CommittingSink` directly. Shape C does not use 2PC at all:
 it is a changelog-aware sink (upsert on insert/update_after, delete-by-key on
 delete/update_before, netted by key within a flush), selected by

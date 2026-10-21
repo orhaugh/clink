@@ -146,7 +146,7 @@ TEST(ParquetSink2PC, CommitMovesStagingToCommittedAndIsExternallyTyped) {
     EXPECT_EQ(count_parquet(dir / "committed"), 1u);
     EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
 
-    const auto committed_file = dir / "committed" / "sub0-11.parquet";
+    const auto committed_file = dir / "committed" / ("sub0-" + sink->run_token() + "-11.parquet");
     ASSERT_TRUE(std::filesystem::exists(committed_file));
 
     // Externally typed: open with parquet::arrow directly.
@@ -194,17 +194,43 @@ TEST(ParquetSink2PC, BarrierWithoutCommitLeavesStagingAndState) {
     std::filesystem::remove_all(dir);
 }
 
+// A later run that starts from empty state can reuse an earlier run's
+// checkpoint id; the part names carry the run, so its commit adds a file beside
+// the earlier run's instead of renaming over it.
+TEST(ParquetSink2PC, ALaterRunReusingACheckpointIdKeepsTheEarlierRunsCommittedFile) {
+    const auto dir = tmp_dir("rerun");
+    for (int run = 0; run < 2; ++run) {
+        InMemoryStateBackend state;  // each run starts from empty state
+        RuntimeContext rctx(OperatorId{42}, "pq2pc", &state, /*metrics=*/nullptr);
+        auto sink = std::make_shared<ParquetSink2PC<ColPq2pcTrade>>(
+            dir, make_columnar_arrow_batcher<ColPq2pcTrade>(), 0);
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        sink->on_data(sample_batch());
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink->on_commit(1);
+        sink->close();
+    }
+    EXPECT_EQ(count_parquet(dir / "committed"), 2u)
+        << "the later run's commit replaced the earlier run's file";
+    std::filesystem::remove_all(dir);
+}
+
 TEST(ParquetSink2PC, FreshSinkRecoversPendingOnOpen) {
     const auto dir = tmp_dir("recover");
     InMemoryStateBackend state;  // survives the "crash" (shared across sinks)
     RuntimeContext rctx(OperatorId{42}, "pq2pc", &state, /*metrics=*/nullptr);
 
+    // The run that staged the part named it; the restart commits it under that name.
+    std::string staged_run;
     {
         auto sink1 = std::make_shared<ParquetSink2PC<ColPq2pcTrade>>(
             dir, make_columnar_arrow_batcher<ColPq2pcTrade>(), 0);
         sink1->set_id(OperatorId{42});
         sink1->attach_runtime(&rctx);
         sink1->open();
+        staged_run = sink1->run_token();
         sink1->on_data(sample_batch());
         sink1->on_barrier(CheckpointBarrier{CheckpointId{5}});
         // sink1 dies here without on_commit - file stuck in staging/.
@@ -217,12 +243,12 @@ TEST(ParquetSink2PC, FreshSinkRecoversPendingOnOpen) {
         dir, make_columnar_arrow_batcher<ColPq2pcTrade>(), 0);
     sink2->set_id(OperatorId{42});
     sink2->attach_runtime(&rctx);
-    sink2->open();  // recover_pending_ commits sub0-5.parquet
+    sink2->open();  // recover_pending_ commits sink1's part for checkpoint 5
 
     EXPECT_EQ(count_parquet(dir / "committed"), 1u);
     EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_5").has_value());
 
-    const auto got = read_committed(dir / "committed" / "sub0-5.parquet");
+    const auto got = read_committed(dir / "committed" / ("sub0-" + staged_run + "-5.parquet"));
     ASSERT_EQ(got.size(), kExpected.size());
     for (std::size_t i = 0; i < kExpected.size(); ++i) {
         EXPECT_TRUE(trade_eq(got[i], kExpected[i]));

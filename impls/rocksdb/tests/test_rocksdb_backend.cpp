@@ -938,9 +938,12 @@ TEST(RocksDBStateBackend, NoExpiryFilterMeansCompactionKeepsEverything) {
 // every old subtask but 0 uncommitted: their records were lost.
 namespace {
 
-void stage_uncommitted_checkpoint(const std::string& uri,
-                                  const std::filesystem::path& out,
-                                  std::uint32_t parallelism) {
+// Stages one record per subtask at checkpoint 7 and returns each subtask's run
+// token, which names its part.
+std::vector<std::string> stage_uncommitted_checkpoint(const std::string& uri,
+                                                      const std::filesystem::path& out,
+                                                      std::uint32_t parallelism) {
+    std::vector<std::string> runs;
     for (std::uint32_t i = 0; i < parallelism; ++i) {
         StateBackendSpec spec;
         spec.uri = uri;
@@ -951,12 +954,14 @@ void stage_uncommitted_checkpoint(const std::string& uri,
         sink.set_id(OperatorId{77});
         sink.attach_runtime(&rctx);
         sink.open();
+        runs.push_back(sink.run_token());
         Batch<std::string> b;
         b.emplace("r" + std::to_string(i));
         sink.on_data(b);
         sink.on_barrier(CheckpointBarrier{CheckpointId{7}});
         (void)built.backend->snapshot(CheckpointId{7});
     }
+    return runs;
 }
 
 void restore_rescaled(const std::string& from,
@@ -1017,12 +1022,13 @@ void run_committing_sink_rescale(const std::string& tag, std::uint32_t old_p, st
     const auto out = root / "out";
     const std::string run1 = "rocksdb://" + (root / "run1").string();
     const std::string run2 = "rocksdb://" + (root / "run2").string();
-    stage_uncommitted_checkpoint(run1, out, old_p);
+    const auto runs = stage_uncommitted_checkpoint(run1, out, old_p);
     restore_rescaled(run1, run2, out, old_p, new_p);
     std::vector<std::string> expected;
     for (std::uint32_t i = 0; i < old_p; ++i) {
-        expected.push_back("sub" + std::to_string(i) + "-7.dat");
+        expected.push_back("sub" + std::to_string(i) + "-" + runs.at(i) + "-7.dat");
     }
+    std::sort(expected.begin(), expected.end());
     EXPECT_EQ(committed_files(out), expected)
         << "every old subtask's pending checkpoint must be committed, under its own name";
     EXPECT_TRUE(std::filesystem::is_empty(out / "staging"));

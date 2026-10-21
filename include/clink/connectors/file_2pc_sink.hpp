@@ -7,13 +7,16 @@
 // the per-checkpoint handle persistence, and recover-and-re-commit at open.
 //
 // Layout under `output_dir`:
-//   staging/   pre-committed transaction files (one per (subtask, ckpt))
+//   staging/   pre-committed transaction files (one per (subtask, run, ckpt))
 //   committed/ finalized output files; an atomic rename from staging
 //              is the commit step
 //
 // The committable is the staging file path. commit() derives the committed
-// path from its basename (staging/sub<N>-<ckpt>.dat -> committed/sub<N>-<ckpt>.dat),
-// so no checkpoint id needs to travel in the handle.
+// path from its basename (staging/sub<N>-<run>-<ckpt>.dat ->
+// committed/sub<N>-<run>-<ckpt>.dat), so no checkpoint id needs to travel in
+// the handle. <run> is the open's run token (CommittingSink::run_token), so a
+// later run into the same directory adds its files beside this run's and
+// never renames over one of them, whatever checkpoint ids it reuses.
 //
 // Lifecycle on a clean run (base -> verb):
 //   open()           - on_open() creates staging/ and committed/ and bridges any
@@ -21,7 +24,7 @@
 //                      this framework left prepared-but-uncommitted.
 //   on_data(batch)   - write(batch) appends records to staging/sub<N>-pending.tmp.
 //   on_barrier(b)    - prepare_commit(b) closes the pending file, renames it to
-//                      staging/sub<N>-<b.id>.dat, and returns that path; the base
+//                      staging/sub<N>-<run>-<b.id>.dat, and returns that path; the base
 //                      persists it under "_xo_pending_sub<N>_<b.id>".
 //   on_commit(id)    - commit(handle) atomic-renames staging -> committed; the
 //                      base erases the handle.
@@ -112,8 +115,8 @@ public:
         if (do_fsync) {
             fsync_file_(pending_path_);
         }
-        const auto target =
-            staging_dir() / (sub_prefix_() + "-" + std::to_string(checkpoint_id) + ".dat");
+        const auto target = staging_dir() / (sub_prefix_() + "-" + this->run_token() + "-" +
+                                             std::to_string(checkpoint_id) + ".dat");
         std::error_code ec;
         std::filesystem::rename(pending_path_, target, ec);
         if (ec) {

@@ -121,13 +121,13 @@ void S3Sink2PC::write(const Batch<std::string>& batch) {
 
 namespace {
 
-std::string object_key(const S3Sink2PC::Options& opts, std::uint64_t ckpt) {
+std::string object_key(const S3Sink2PC::Options& opts, const std::string& run, std::uint64_t ckpt) {
     std::string prefix = opts.key_prefix;
     if (!prefix.empty() && prefix.back() == '/') {
         prefix.pop_back();
     }
-    const std::string leaf =
-        "sub" + std::to_string(opts.subtask_idx) + "-" + std::to_string(ckpt) + ".ndjson";
+    const std::string leaf = "sub" + std::to_string(opts.subtask_idx) + "-" + run + "-" +
+                             std::to_string(ckpt) + ".ndjson";
     return prefix.empty() ? leaf : prefix + "/" + leaf;
 }
 
@@ -153,7 +153,7 @@ std::optional<S3MultipartHandle> S3Sink2PC::prepare_commit(std::uint64_t checkpo
         return std::nullopt;  // no records this interval -> nothing to commit
     }
     const std::string& bucket = impl_->opts.bucket;
-    const std::string key = object_key(impl_->opts, checkpoint_id);
+    const std::string key = object_key(impl_->opts, run_token(), checkpoint_id);
 
     // Start the multipart upload.
     Aws::S3::Model::CreateMultipartUploadRequest cr;
