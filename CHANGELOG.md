@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+**The file sinks write out at every barrier, check their writes and keep their
+files in a restored run.** `FileSink` (`file_text_sink`, `file_json_sink`) kept
+lines in its stream's buffer until it filled or the input ended, so a
+checkpoint could complete over lines a killed process then lost while the
+restored run kept the file and resumed the sources after them. Its barrier now
+hands every line before it to the operating system, a write the stream refuses
+fails the sink, and a restored run cuts the partial last line a kill left
+behind before it appends, so the first replayed line is not glued to it. The
+built-in `file_line_sink` and `file_int64_sink`, analysed under the
+at-least-once `file` record, truncated their file on every open, a restore
+included, which erased every line before the restore point; they now behave as
+`FileSink` does, and their two copies are one class. The SQL partitioned file
+sinks (`partition_file_sink`, `partition_overwrite_sink`) write out at every
+barrier and cut a torn last line before appending, as `FileSink` does, and they,
+`file_json_upsert_sink` and `changelog_net_sink`, whose state is written through
+to the chain's backend, declare that they gate the checkpoint's acknowledgement.
+None of the four checked its final write, so a full disk renamed a short file
+over the previous one, or published a short partitioned set over the previous
+set; each now fails instead. `FileSink2PC` checks its writes before staging an
+interval and fsyncs the staged file and both renames, which its documentation
+already claimed (`CLINK_STATE_FSYNC=0` turns it off).
+
 **The Kafka sinks wait for the brokers at every checkpoint barrier, fail on a
 lost record, and write deletes as tombstones.** The plain, string, upsert and
 message sinks had no barrier hook, so a checkpoint completed while the records

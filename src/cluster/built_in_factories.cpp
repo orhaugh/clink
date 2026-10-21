@@ -18,7 +18,6 @@
 #include "clink/config/json.hpp"
 #include "clink/connectors/builtin_capabilities.hpp"
 #include "clink/connectors/file_2pc_sink.hpp"
-#include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
 #include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_rolling_sink.hpp"
@@ -36,58 +35,14 @@
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/logging.hpp"
 
+#include "built_in_file_sinks.hpp"
+
 namespace clink::cluster {
 
 namespace {
 
-// File-line sinks. These move into core's own impl set; everything they
-// need is already in the clink_core build, no external deps.
-
-class FileLineSink final : public Sink<std::string> {
-public:
-    explicit FileLineSink(std::string path) : path_(std::move(path)) {}
-    void open() override {
-        out_.open(path_, std::ios::trunc);
-        if (!out_.is_open()) {
-            throw std::runtime_error("FileLineSink: failed to open " + path_);
-        }
-    }
-    void on_data(const Batch<std::string>& batch) override {
-        for (const auto& r : batch) {
-            out_ << r.value() << "\n";
-        }
-    }
-    void flush() override { out_.flush(); }
-    void close() override { out_.close(); }
-    std::string name() const override { return "file_line_sink"; }
-
-private:
-    std::string path_;
-    std::ofstream out_;
-};
-
-class FileInt64Sink final : public Sink<std::int64_t> {
-public:
-    explicit FileInt64Sink(std::string path) : path_(std::move(path)) {}
-    void open() override {
-        out_.open(path_, std::ios::trunc);
-        if (!out_.is_open()) {
-            throw std::runtime_error("FileInt64Sink: failed to open " + path_);
-        }
-    }
-    void on_data(const Batch<std::int64_t>& batch) override {
-        for (const auto& r : batch) {
-            out_ << r.value() << "\n";
-        }
-    }
-    void flush() override { out_.flush(); }
-    void close() override { out_.close(); }
-    std::string name() const override { return "file_int64_sink"; }
-
-private:
-    std::string path_;
-    std::ofstream out_;
-};
+using detail::FileInt64Sink;
+using detail::FileLineSink;
 
 void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
     using clink::plugin::BuildContext;

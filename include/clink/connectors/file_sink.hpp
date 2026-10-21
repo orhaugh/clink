@@ -1,16 +1,69 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <ios>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include "clink/connectors/text_format.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink {
+
+namespace detail {
+
+// Cuts a line-per-record file back to the end of its last complete line. A
+// process that died while a buffer flush was half written leaves a partial
+// line at the end, and a restored run appending after it would glue its first
+// line to that fragment, corrupting both. Every checkpoint barrier flushes
+// whole lines, so a fragment always follows the restored checkpoint's flush,
+// and the restored sources replay the record it held.
+inline void drop_torn_tail(const std::filesystem::path& path) {
+    std::error_code ec;
+    const std::uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec || size == 0) {
+        return;  // nothing written yet (or no file): nothing to cut
+    }
+    std::ifstream in(path, std::ios::binary);
+    std::uintmax_t end = size;
+    char buf[4096];
+    while (end > 0) {
+        const std::uintmax_t chunk = std::min<std::uintmax_t>(sizeof(buf), end);
+        in.seekg(static_cast<std::streamoff>(end - chunk));
+        in.read(buf, static_cast<std::streamsize>(chunk));
+        if (!in) {
+            throw std::runtime_error("cannot read " + path.string() + " to find its last line");
+        }
+        for (std::uintmax_t i = chunk; i > 0; --i) {
+            if (buf[i - 1] == '\n') {
+                const std::uintmax_t keep = end - chunk + i;
+                if (keep != size) {
+                    in.close();
+                    std::filesystem::resize_file(path, keep, ec);
+                }
+                if (ec) {
+                    throw std::runtime_error("cannot cut the partial last line of " +
+                                             path.string() + ": " + ec.message());
+                }
+                return;
+            }
+        }
+        end -= chunk;
+    }
+    in.close();
+    std::filesystem::resize_file(path, 0, ec);  // not one complete line
+    if (ec) {
+        throw std::runtime_error("cannot cut the partial line of " + path.string() + ": " +
+                                 ec.message());
+    }
+}
+
+}  // namespace detail
 
 // FileSink<T> writes one line per record using the supplied TextFormat<T>.
 // `append=true` opens the file in append mode (preserves existing contents);
@@ -35,7 +88,10 @@ namespace clink {
 // sources replay them. That is this sink's at-least-once contract; truncating
 // would instead lose every row the restored sources do not replay. An overwrite
 // sink likewise keeps its staging file, recovering it from the published file
-// when a kill landed between the publish and the job's end.
+// when a kill landed between the publish and the job's end. A restored run
+// first cuts a partial last line a kill left behind (detail::drop_torn_tail).
+// A write the stream refuses, such as one to a full disk, fails the sink at
+// once rather than leaving a gap the checkpoint would cover.
 template <typename T>
 class FileSink final : public Sink<T> {
 public:
@@ -70,6 +126,9 @@ public:
                 std::filesystem::copy_file(path_, write_path_, ec);
             }
         }
+        if (restored) {
+            detail::drop_torn_tail(write_path_);
+        }
         const std::ios::openmode mode = (append_ || restored) ? (std::ios::out | std::ios::app)
                                                               : (std::ios::out | std::ios::trunc);
         stream_.open(write_path_, mode);
@@ -82,11 +141,28 @@ public:
         for (const auto& r : batch) {
             stream_ << format_.encode(r.value()) << '\n';
         }
+        check_stream_("write");
     }
+
+    // A restored run keeps the lines before its checkpoint and replays the
+    // rest (see above), so a checkpoint must not complete while any line
+    // before its barrier is still in the stream's buffer. Handing them to the
+    // OS here is enough for a process failure; a host failure that loses the
+    // page cache is not covered. The acknowledgement follows this hook only
+    // while the sink owns its chain's checkpoint, so Dag::add_sink refuses
+    // another sink beside it.
+    void on_barrier(CheckpointBarrier /*b*/) override {
+        if (stream_.is_open()) {
+            stream_.flush();
+            check_stream_("flush at the checkpoint barrier");
+        }
+    }
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
 
     void flush() override {
         if (stream_.is_open()) {
             stream_.flush();
+            check_stream_("flush at the end of input");
         }
         // Clean end-of-input: publish the staged output atomically. flush() is the
         // success signal (a failed job tears down through close(), not flush()), so
@@ -117,6 +193,13 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    void check_stream_(const char* what) const {
+        if (!stream_) {
+            throw std::runtime_error("FileSink: " + std::string{what} + " to " +
+                                     write_path_.string() + " failed");
+        }
+    }
+
     [[nodiscard]] std::filesystem::path staging_path() const {
         return std::filesystem::path(path_.string() + ".staging");
     }

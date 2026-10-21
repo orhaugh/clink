@@ -36,6 +36,7 @@
 // ambiguous (commit-failed vs. crashed mid-write).
 
 #include <cstdint>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -44,11 +45,13 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unistd.h>
 #include <utility>
 
 #include "clink/connectors/committing_sink.hpp"
 #include "clink/connectors/text_format.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/state/durable_file_write.hpp"
 
 namespace clink {
 
@@ -83,6 +86,9 @@ public:
         for (const auto& r : batch) {
             pending_ << format_.encode(r.value()) << '\n';
         }
+        if (!pending_) {
+            throw std::runtime_error("FileSink2PC: write to " + pending_path_.string() + " failed");
+        }
     }
 
     // Close the in-flight pending file and rename it to its checkpoint-tagged
@@ -91,7 +97,21 @@ public:
     std::optional<std::string> prepare_commit(std::uint64_t checkpoint_id) override {
         ensure_pending_open_();
         pending_.flush();
+        // A write the stream refused (a full disk) must not stage the interval
+        // as if it were whole: the commit would publish it short.
+        if (!pending_) {
+            throw std::runtime_error("FileSink2PC::prepare_commit: write to " +
+                                     pending_path_.string() + " failed");
+        }
         pending_.close();
+        // The staged bytes reach stable storage before the rename publishes
+        // them, and the rename before the checkpoint relies on it, as
+        // write_fsync_rename does for checkpoint files (CLINK_STATE_FSYNC=0 turns
+        // it off).
+        const bool do_fsync = clink::state::detail::fsync_enabled();
+        if (do_fsync) {
+            fsync_file_(pending_path_);
+        }
         const auto target =
             staging_dir() / (sub_prefix_() + "-" + std::to_string(checkpoint_id) + ".dat");
         std::error_code ec;
@@ -99,6 +119,9 @@ public:
         if (ec) {
             throw std::runtime_error("FileSink2PC::prepare_commit: rename to staging failed: " +
                                      ec.message());
+        }
+        if (do_fsync) {
+            clink::state::detail::fsync_directory_best_effort(staging_dir());
         }
         pending_path_.clear();
         return target.string();
@@ -114,6 +137,10 @@ public:
         if (ec && ec != std::errc::no_such_file_or_directory) {
             throw std::runtime_error("FileSink2PC::commit: rename to committed failed: " +
                                      ec.message());
+        }
+        // The staged bytes are already fsynced; make the publish durable too.
+        if (clink::state::detail::fsync_enabled()) {
+            clink::state::detail::fsync_directory_best_effort(committed_dir());
         }
         return true;
     }
@@ -147,6 +174,18 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    static void fsync_file_(const std::filesystem::path& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            throw std::runtime_error("FileSink2PC: open for fsync " + path.string());
+        }
+        const int rc = ::fsync(fd);
+        ::close(fd);
+        if (rc != 0) {
+            throw std::runtime_error("FileSink2PC: fsync " + path.string());
+        }
+    }
+
     std::filesystem::path staging_dir() const { return output_dir_ / "staging"; }
     std::filesystem::path committed_dir() const { return output_dir_ / "committed"; }
     std::string sub_prefix_() const { return "sub" + std::to_string(subtask_idx_); }

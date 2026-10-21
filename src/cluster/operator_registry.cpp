@@ -16,6 +16,8 @@
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/log_buffer.hpp"
 
+#include "built_in_file_sinks.hpp"
+
 namespace clink::cluster {
 
 namespace {
@@ -130,64 +132,8 @@ bool OperatorRegistry::knows_type(const std::string& type) const {
 
 namespace {
 
-// File-line sink: writes string records one per line to a path supplied
-// via params["path"]. Truncates on open. Useful for the producer→consumer
-// integration test.
-class FileLineSink final : public Sink<std::string> {
-public:
-    explicit FileLineSink(std::string path) : path_(std::move(path)) {}
-
-    void open() override {
-        out_.open(path_, std::ios::trunc);
-        if (!out_.is_open()) {
-            throw std::runtime_error("FileLineSink: failed to open " + path_);
-        }
-    }
-
-    void on_data(const Batch<std::string>& batch) override {
-        for (const auto& r : batch) {
-            out_ << r.value() << "\n";
-        }
-    }
-
-    void flush() override { out_.flush(); }
-
-    void close() override { out_.close(); }
-
-    std::string name() const override { return "file_line_sink"; }
-
-private:
-    std::string path_;
-    std::ofstream out_;
-};
-
-// File-line sink for int64: writes one integer per line.
-class FileInt64Sink final : public Sink<std::int64_t> {
-public:
-    explicit FileInt64Sink(std::string path) : path_(std::move(path)) {}
-
-    void open() override {
-        out_.open(path_, std::ios::trunc);
-        if (!out_.is_open()) {
-            throw std::runtime_error("FileInt64Sink: failed to open " + path_);
-        }
-    }
-
-    void on_data(const Batch<std::int64_t>& batch) override {
-        for (const auto& r : batch) {
-            out_ << r.value() << "\n";
-        }
-    }
-
-    void flush() override { out_.flush(); }
-    void close() override { out_.close(); }
-
-    std::string name() const override { return "file_int64_sink"; }
-
-private:
-    std::string path_;
-    std::ofstream out_;
-};
+using detail::FileInt64Sink;
+using detail::FileLineSink;
 
 void register_built_ins(OperatorRegistry& reg) {
     // int64_range_source: emits records start, start+step, ..., start+(count-1)*step.

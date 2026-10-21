@@ -20574,4 +20574,79 @@ TEST(SqlRuntime, DeadLetterPayloadWritesNonFiniteAsNull) {
     EXPECT_TRUE(clink::config::parse(recs[0].payload).at("amt").is_null());
 }
 
+// The SQL sinks that keep their output across a restore by write-through state
+// or by appending files must own their chain's checkpoint, and the partitioned
+// file sink writes out at every barrier: its lines used to wait in each
+// partition file's buffer until the end of input, so a checkpoint could
+// complete over lines a killed process then lost, while the restored run kept
+// the files and resumed after them. A restored run also cuts the partial last
+// line a kill left in a partition file before it appends.
+TEST(SqlRuntime, ThePartitionedFileSinkWritesOutAtEveryBarrierAndOwnsItsChain) {
+    ensure_sql_installed_once();
+    auto& registry = cluster::OperatorRegistry::default_instance();
+    for (const char* op : {"file_json_upsert_sink",
+                           "changelog_net_sink",
+                           "partition_file_sink",
+                           "partition_overwrite_sink"}) {
+        ASSERT_NE(registry.find_sink(op, cluster::ChannelType{"row"}), nullptr) << op;
+    }
+    const auto base = std::filesystem::temp_directory_path() /
+                      ("clink_partition_barrier_" + std::to_string(::getpid()));
+    const auto file_of = [&](const std::string& key) { return base.string() + "." + key; };
+    const auto text_of = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    };
+    const auto build = [&]() {
+        cluster::OperatorBuildContext ctx;
+        ctx.params = {{"path", base.string()}, {"partition_by", "k"}};
+        return std::static_pointer_cast<Sink<Row>>(
+            registry.find_sink("partition_file_sink", cluster::ChannelType{"row"})->build(ctx));
+    };
+    const auto rows = [](std::initializer_list<std::pair<const char*, int>> kv) {
+        Batch<Row> b;
+        for (const auto& [k, v] : kv) {
+            Row r;
+            r.values["k"] = clink::config::JsonValue{std::string{k}};
+            r.values["v"] = clink::config::JsonValue{static_cast<std::int64_t>(v)};
+            b.emplace(std::move(r));
+        }
+        return b;
+    };
+
+    auto sink = build();
+    EXPECT_TRUE(sink->gates_checkpoint_ack());
+    sink->open();
+    sink->on_data(rows({{"a", 1}, {"b", 2}}));
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    EXPECT_EQ(text_of(file_of("a")), "{\"k\":\"a\",\"v\":1}\n") << "not written at the barrier";
+    EXPECT_EQ(text_of(file_of("b")), "{\"k\":\"b\",\"v\":2}\n");
+    sink->close();
+
+    // A kill left a partial line in partition a; the restored run cuts it.
+    {
+        std::ofstream(file_of("a"), std::ios::binary | std::ios::app) << "{\"k\":\"a\",\"v";
+    }
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{91}, "partition_restore", &state, nullptr);
+    rctx.set_restore_from_checkpoint_id(1);
+    auto restored = build();
+    restored->attach_runtime(&rctx);
+    restored->open();
+    restored->on_data(rows({{"a", 3}}));
+    restored->flush();
+    restored->close();
+    EXPECT_EQ(text_of(file_of("a")), "{\"k\":\"a\",\"v\":1}\n{\"k\":\"a\",\"v\":3}\n");
+    std::filesystem::remove(file_of("a"));
+    std::filesystem::remove(file_of("b"));
+
+    for (const char* op : {"file_json_upsert_sink", "changelog_net_sink"}) {
+        cluster::OperatorBuildContext ctx;
+        ctx.params = {{"path", base.string() + "_" + op}, {"primary_key", "k"}};
+        auto keyed = std::static_pointer_cast<Sink<Row>>(
+            registry.find_sink(op, cluster::ChannelType{"row"})->build(ctx));
+        EXPECT_TRUE(keyed->gates_checkpoint_ack()) << op;
+    }
+}
+
 }  // namespace clink::sql

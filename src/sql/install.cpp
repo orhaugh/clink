@@ -9602,9 +9602,23 @@ public:
                 out.write(s.data(), static_cast<std::streamsize>(s.size()));
                 out.put('\n');
             }
+            // A write the stream refused (a full disk) must not be renamed over
+            // the previous file as if it were the whole view.
+            out.flush();
+            if (!out) {
+                throw std::runtime_error("file_json_upsert_sink: write to " + tmp_path +
+                                         " failed; " + path_ + " keeps its previous contents");
+            }
         }
         std::filesystem::rename(tmp_path, path_);
     }
+
+    // Its state is written through to the chain's backend as each record
+    // arrives, so a checkpoint holds every record before its barrier only when
+    // the snapshot follows this sink's processing of them, which holds while
+    // it owns its chain's checkpoint. Dag::add_sink refuses another sink
+    // beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
 
     std::string name() const override { return "file_json_upsert_sink"; }
 
@@ -9753,9 +9767,23 @@ public:
                 out.write(s.data(), static_cast<std::streamsize>(s.size()));
                 out.put('\n');
             }
+            // A write the stream refused (a full disk) must not be renamed over
+            // the previous file as if it were the whole view.
+            out.flush();
+            if (!out) {
+                throw std::runtime_error("changelog_net_sink: write to " + tmp_path + " failed; " +
+                                         path_ + " keeps its previous contents");
+            }
         }
         std::filesystem::rename(tmp_path, path_);
     }
+
+    // Its state is written through to the chain's backend as each record
+    // arrives, so a checkpoint holds every record before its barrier only when
+    // the snapshot follows this sink's processing of them, which holds while
+    // it owns its chain's checkpoint. Dag::add_sink refuses another sink
+    // beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
 
     std::string name() const override { return "changelog_net_sink"; }
 
@@ -9863,6 +9891,9 @@ public:
             auto [it, inserted] = files_.try_emplace(key);
             if (inserted) {
                 const std::string path = base_path_ + "." + key;
+                if (restored_()) {
+                    clink::detail::drop_torn_tail(path);  // a kill's partial last line
+                }
                 it->second.open(path,
                                 std::ios::binary | (restored_() ? std::ios::app : std::ios::trunc));
                 if (!it->second) {
@@ -9871,14 +9902,22 @@ public:
             }
             it->second.write(line.data(), static_cast<std::streamsize>(line.size()));
             it->second.put('\n');
+            if (!it->second) {
+                throw std::runtime_error("partition_file_sink: write to " + base_path_ + "." + key +
+                                         " failed");
+            }
         }
     }
 
+    // A restored run keeps every partition file and appends, so no line before
+    // the barrier may still be in a stream's buffer when the checkpoint is
+    // acknowledged, which follows this hook only while the sink owns its
+    // chain's checkpoint. Dag::add_sink refuses another sink beside it.
+    void on_barrier(CheckpointBarrier /*b*/) override { flush_files_(/*close=*/false); }
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+
     void flush() override {
-        for (auto& [_k, f] : files_) {
-            f.flush();
-            f.close();
-        }
+        flush_files_(/*close=*/true);
         files_.clear();
     }
 
@@ -9887,6 +9926,18 @@ public:
 private:
     [[nodiscard]] bool restored_() const {
         return this->runtime() != nullptr && this->runtime()->restore_from_checkpoint_id() > 0;
+    }
+    void flush_files_(bool close) {
+        for (auto& [key, f] : files_) {
+            f.flush();
+            if (!f) {
+                throw std::runtime_error("partition_file_sink: flush to " + base_path_ + "." + key +
+                                         " failed");
+            }
+            if (close) {
+                f.close();
+            }
+        }
     }
     // Map a partition value to a collision-free, path-safe filename component:
     // percent-encode every byte outside [A-Za-z0-9_-] (so '/' -> %2F can't escape
@@ -9928,13 +9979,14 @@ private:
 
 // Full-refresh partitioned overwrite sink (materialized tables with partition_by):
 // writes one file per distinct partition value into a STAGING directory
-// (<dir>.staging/<key>), then on clean end-of-input (flush) atomically publishes the
-// whole partitioned set by replacing <dir> with the staging directory. A reader that
-// lists <dir> sees the previous partitioned snapshot for the whole job and then the
-// new one after the swap; a mid-job failure (no flush) leaves the staging dir
-// orphaned and <dir> untouched. Single-file-per-partition, so parallelism 1. Reading
-// a partitioned directory backing back into a query needs a directory-capable Row
-// source, which is a documented follow-on.
+// (<dir>.staging/<key>), then on clean end-of-input (flush) publishes the whole
+// partitioned set by replacing <dir> with the staging directory: <dir> is removed,
+// then the staging directory renamed to it. A reader that lists <dir> sees the
+// previous partitioned snapshot for the whole job and then the new one, except in
+// the moment between the two steps, when there is no <dir>; a mid-job failure (no
+// flush) leaves the staging dir orphaned and <dir> untouched. Single-file-per-partition, so
+// parallelism 1. Reading a partitioned directory backing back into a query needs a
+// directory-capable Row source, which is a documented follow-on.
 class PartitionOverwriteSink final : public Sink<Row> {
 public:
     PartitionOverwriteSink(std::string dir,
@@ -9981,6 +10033,9 @@ public:
             auto [it, inserted] = files_.try_emplace(key);
             if (inserted) {
                 const std::string path = staging_ + "/" + key;
+                if (restored_) {
+                    clink::detail::drop_torn_tail(path);  // a kill's partial last line
+                }
                 it->second.open(path,
                                 std::ios::binary | (restored_ ? std::ios::app : std::ios::trunc));
                 if (!it->second) {
@@ -9989,21 +10044,47 @@ public:
             }
             it->second.write(line.data(), static_cast<std::streamsize>(line.size()));
             it->second.put('\n');
+            if (!it->second) {
+                throw std::runtime_error("partition_overwrite_sink: write to " + staging_ + "/" +
+                                         key + " failed");
+            }
         }
     }
+
+    // A restored run continues the staging set and appends, so no line before
+    // the barrier may still be in a stream's buffer when the checkpoint is
+    // acknowledged, which follows this hook only while the sink owns its
+    // chain's checkpoint. Dag::add_sink refuses another sink beside it.
+    void on_barrier(CheckpointBarrier /*b*/) override {
+        for (auto& [key, f] : files_) {
+            f.flush();
+            if (!f) {
+                throw std::runtime_error("partition_overwrite_sink: flush to " + staging_ + "/" +
+                                         key + " failed");
+            }
+        }
+    }
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
 
     void flush() override {
         if (published_) {
             return;
         }
-        for (auto& [_k, f] : files_) {
+        for (auto& [key, f] : files_) {
             f.flush();
+            // A write the stream refused (a full disk) must not be published
+            // over the previous set as if it were the whole result.
+            if (!f) {
+                throw std::runtime_error("partition_overwrite_sink: write to " + staging_ + "/" +
+                                         key + " failed; " + dir_ + " keeps its previous set");
+            }
             f.close();
         }
         files_.clear();
         // Publish: replace <dir> with the freshly-built staging dir. A non-empty dir
-        // cannot be renamed over in one step, so remove-then-rename; the window is
-        // brief and a crash leaves staging orphaned + <dir> intact.
+        // cannot be renamed over in one step, so remove-then-rename. Between the
+        // two a reader finds no <dir>; a crash there leaves the new set in staging,
+        // which the restored run continues and publishes.
         std::error_code ec;
         std::filesystem::remove_all(dir_, ec);
         std::filesystem::rename(staging_, dir_, ec);
@@ -13001,8 +13082,8 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     // partition_overwrite_sink: the full-refresh partitioned backing (materialized
     // tables with partition_by). Writes one file per partition value into
-    // <path>.staging/ and atomically publishes the whole partitioned set (replacing
-    // <path>) on clean end-of-input. Single output set, so parallelism 1. Params:
+    // <path>.staging/ and publishes the whole partitioned set (replacing <path>,
+    // remove then rename) on clean end-of-input. Single output set, so parallelism 1. Params:
     // path (a directory), partition_by (csv).
     reg.register_sink<Row>(
         "partition_overwrite_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
