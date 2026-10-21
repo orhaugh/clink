@@ -24,6 +24,7 @@ impls/mongodb/include/clink/mongodb/install.hpp
 impls/mqtt/include/clink/mqtt/install.hpp
 impls/mysql/include/clink/mysql/install.hpp
 impls/nats/include/clink/nats/install.hpp
+impls/neo4j/include/clink/neo4j/install.hpp
 impls/onnx/include/clink/onnx/install.hpp
 impls/postgres/include/clink/api/postgres_builders.hpp
 impls/postgres/include/clink/postgres/install.hpp

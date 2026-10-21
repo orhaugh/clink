@@ -85,6 +85,12 @@ void require_kafka_for_registry_format(const TableDef& table, const std::string&
 }
 
 Channel channel_for_table(const TableDef& table) {
+    // The Neo4j sink passes each row to its statement as typed parameters named
+    // after the declared columns, whatever their number: always the Row channel.
+    if (const auto c = table.properties.find("connector");
+        c != table.properties.end() && c->second == "neo4j") {
+        return Channel::Row;
+    }
     auto fmt = table.properties.find("format");
     const bool json = fmt != table.properties.end() && fmt->second == "json";
     if (json || registry_format_of(table).has_value())
@@ -772,6 +778,34 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
                                        {{"key_columns", keys}}};
         }
         return RowConnectorBinding{"cassandra_sink_string", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "neo4j") {
+        // The Neo4j sink takes Rows and sends each batch as typed parameters of
+        // the table's statement, so it needs the declared column types. It is
+        // at-least-once; the statement decides what a replay does. Refused here
+        // as well as by the sink, which a Dag-built job reaches directly.
+        if (exactly_once) {
+            unsupported(
+                "connector='neo4j' sink is at-least-once; exactly-once delivery is not "
+                "supported (see the connector page for replay-safe statements)");
+        }
+        if (upsert) {
+            unsupported(
+                "connector='neo4j' sink does not support mode='upsert': the statement decides "
+                "how a row changes the graph (MERGE on a stable key)");
+        }
+        if (const auto cl = table.properties.find("changelog");
+            cl != table.properties.end() && cl->second == "true") {
+            unsupported("connector='neo4j' sink does not support changelog='true'");
+        }
+        if (const auto wm = table.properties.find("write_mode");
+            wm != table.properties.end() && wm->second == "overwrite") {
+            unsupported(
+                "connector='neo4j' sink cannot back a full-refresh materialised view: each "
+                "refresh would run the statement over the whole result again");
+        }
+        return RowConnectorBinding{
+            "neo4j_sink", kChannelRow, "", {{"sql_column_types", render_sql_column_types(table)}}};
     }
     if (connector == "clickhouse") {
         // ClickHouse sinks, both at-least-once (a replayed INSERT re-inserts).

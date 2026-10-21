@@ -48,6 +48,7 @@ impls/kafka/include/clink/connectors/kafka_sink.hpp:KafkaSink owns
 impls/kafka/src/register_factories.cpp:StringKafkaSink owns
 impls/kafka/src/register_factories.cpp:UpsertKafkaSink owns
 impls/mongodb/src/mongo_sink.cpp:MongoSink owns
+impls/neo4j/src/neo4j_sink.hpp:Neo4jSink owns
 impls/mqtt/include/clink/mqtt/mqtt_sink.hpp:MqttSink owns
 impls/mysql/include/clink/mysql/mysql_json_upsert_sink.hpp:MysqlJsonUpsertSink owns
 impls/mysql/include/clink/mysql/mysql_sink.hpp:MysqlSink owns

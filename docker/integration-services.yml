@@ -542,3 +542,54 @@ services:
       timeout: 5s
       retries: 60
       start_period: 5s
+
+  # Neo4j for the Neo4j sink's live suite (scripts/neo4j-live.sh), pinned by
+  # digest: the suite's claims are about this build. Community, single
+  # instance, the Query API on 7474 (host 17474). The password is the suite's
+  # own and protects nothing but a test run.
+  neo4j:
+    image: neo4j:2026.09.0-community@sha256:d6269a020149934597c8c3df926d080a612796dbbb48861ca9d5b1109cabf0d8
+    environment:
+      - NEO4J_AUTH=neo4j/clink-live-test-pw
+      - NEO4J_server_memory_heap_initial__size=256m
+      - NEO4J_server_memory_heap_max__size=512m
+      - NEO4J_server_memory_pagecache_size=128m
+    ports:
+      - "17474:7474"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7474/ || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 5s
+
+  # The same build serving the Query API over HTTPS on 7473 (host 17443) only.
+  # The key and certificate come from the directory CLINK_NEO4J_TLS_DIR names,
+  # which scripts/make-neo4j-test-tls.sh generates per run: a CA, a server
+  # certificate it signs for the name localhost and no address, and a second CA
+  # that signed nothing. Without it the server has no certificate and does not
+  # start.
+  neo4j-tls:
+    image: neo4j:2026.09.0-community@sha256:d6269a020149934597c8c3df926d080a612796dbbb48861ca9d5b1109cabf0d8
+    environment:
+      - NEO4J_AUTH=neo4j/clink-live-test-pw
+      - NEO4J_server_memory_heap_initial__size=256m
+      - NEO4J_server_memory_heap_max__size=512m
+      - NEO4J_server_memory_pagecache_size=128m
+      - NEO4J_server_http_enabled=false
+      - NEO4J_server_https_enabled=true
+      - NEO4J_dbms_ssl_policy_https_enabled=true
+      - NEO4J_dbms_ssl_policy_https_base__directory=/ssl/https
+      - NEO4J_dbms_ssl_policy_https_private__key=private.key
+      - NEO4J_dbms_ssl_policy_https_public__certificate=public.crt
+      - NEO4J_dbms_ssl_policy_https_client__auth=NONE
+    volumes:
+      - ${CLINK_NEO4J_TLS_DIR:-./neo4j/tls}:/ssl/https:ro
+    ports:
+      - "17443:7473"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://localhost:7473/ || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 5s

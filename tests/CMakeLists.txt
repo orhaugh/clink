@@ -459,6 +459,12 @@ if(CLINK_INTEGRATION_TESTS)
             integration/test_postgres_cdc_clickhouse_recovery.cpp
             integration/test_postgres_cdc_clickhouse_backfill.cpp)
     endif()
+    # The Neo4j sink's recovery cells: a coordinator and two workers running a
+    # SQL job from Kafka into the pinned Neo4j server that scripts/neo4j-live.sh
+    # starts, with faults at the sink's own points. They skip without it.
+    if(TARGET clink::neo4j AND TARGET clink::kafka)
+        target_sources(clink_integration_tests PRIVATE integration/test_neo4j_recovery.cpp)
+    endif()
     target_link_libraries(clink_integration_tests PRIVATE
         clink::clink
         GTest::gtest_main
@@ -833,6 +839,31 @@ if(CLINK_BUILD_SQL)
         gtest_discover_tests(clink_postgres_sql_tests
             DISCOVERY_MODE PRE_TEST
             PROPERTIES TIMEOUT 180 LABELS postgres
+        )
+    endif()
+
+    # The Neo4j sink through the SQL frontend: the keys the planner puts on the
+    # sink op, the plans it refuses, and an embedded SQL pipeline into the
+    # in-process Query API stand-in. Its one live case runs against the pinned
+    # server when CLINK_NEO4J_TEST_ENDPOINT names it (scripts/neo4j-live.sh) and
+    # skips otherwise. Its own binary, so -L neo4j reaches it.
+    if(TARGET clink::neo4j)
+        add_executable(clink_neo4j_sql_tests test_neo4j_sql.cpp)
+        target_link_libraries(clink_neo4j_sql_tests PRIVATE
+            clink::sql
+            clink::embed
+            clink::neo4j
+            GTest::gtest_main
+            $<BUILD_INTERFACE:httplib::httplib>
+        )
+        target_include_directories(clink_neo4j_sql_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/impls/neo4j/src
+            ${CMAKE_SOURCE_DIR}/impls/neo4j/tests
+        )
+        clink_set_warnings(clink_neo4j_sql_tests)
+        gtest_discover_tests(clink_neo4j_sql_tests
+            DISCOVERY_MODE PRE_TEST
+            PROPERTIES TIMEOUT 120 LABELS neo4j
         )
     endif()
 

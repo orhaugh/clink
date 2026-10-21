@@ -162,6 +162,9 @@
 #ifdef CLINK_LINKED_WEBHDFS
 #include "clink/webhdfs/install.hpp"
 #endif
+#ifdef CLINK_LINKED_NEO4J
+#include "clink/neo4j/install.hpp"
+#endif
 #ifdef CLINK_LINKED_VECTOR_SEARCH
 #include "clink/vector_search/install.hpp"
 #endif
@@ -1250,6 +1253,7 @@ clink::http::HttpResponse handle_connectors(const clink::http::HttpRequest&) {
         {"mysql",            true,  true,  "database"},
         {"clickhouse",       true,  true,  "database"},
         {"cassandra",        false, true,  "database"},
+        {"neo4j",            false, true,  "database"},
         {"dynamodb",         false, true,  "database"},
         {"redis",            true,  true,  "database"},
         {"http",             true,  true,  "observability"},
@@ -3361,6 +3365,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_WEBHDFS
     clink::webhdfs::install(reg);  // WebHDFS / HttpFS Parquet source + sink
+#endif
+#ifdef CLINK_LINKED_NEO4J
+    clink::neo4j::install(reg);  // Neo4j sink (Query API)
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the

@@ -49,6 +49,8 @@ add_subdirectory(azure)
 add_subdirectory(websocket)
 # webhdfs reuses clink::http_connector (added above), so it comes after it.
 add_subdirectory(webhdfs)
+# neo4j writes through clink::http_connector's client as well.
+add_subdirectory(neo4j)
 # rocksdb-s3 needs both clink::rocksdb and clink::s3, so it is added after them.
 add_subdirectory(rocksdb-s3)
 # forst (ForSt state backend): opt-in (CLINK_WITH_FORST defaults OFF); builds
@@ -72,7 +74,7 @@ add_subdirectory(wasm)
 # clink::clink behaviour (kitchen-sink dep on every available impl).
 add_library(clink_impls_all INTERFACE)
 set(_clink_enabled_impls "")
-foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector schema_registry redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs websocket rocksdb_s3 vector_search onnx wasm forst forst_s3)
+foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector schema_registry redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs neo4j websocket rocksdb_s3 vector_search onnx wasm forst forst_s3)
     if(TARGET clink::${_impl})
         target_link_libraries(clink_impls_all INTERFACE clink::${_impl})
         list(APPEND _clink_enabled_impls ${_impl})
