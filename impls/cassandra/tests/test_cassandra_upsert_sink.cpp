@@ -222,4 +222,28 @@ TEST(CassandraUpsertSinkLive, ReplayIsIdempotent) {
     EXPECT_EQ(text_of(t.session, "SELECT val FROM " + t.fqn() + " WHERE id=2"), "b");
 }
 
+// A delete keyed on an integer past 2^53 removes that row. The key used to
+// pass through a double, which rounded 9007199254740993 to 9007199254740992,
+// so the DELETE removed the neighbouring row and left the deleted one.
+TEST(CassandraUpsertSinkLive, ADeleteKeyedPast2To53RemovesThatRow) {
+    REQUIRE_LIVE_CASS();
+    LiveTable t;
+    ASSERT_NE(t.session, nullptr) << "could not connect to Cassandra";
+    ASSERT_TRUE(t.ok) << "schema setup failed";
+    const std::string table = t.table + "_big";
+    const std::string fqn = t.ks + "." + table;
+    ASSERT_TRUE(run_cql(t.session, "DROP TABLE IF EXISTS " + fqn));
+    ASSERT_TRUE(run_cql(t.session, "CREATE TABLE " + fqn + " (id bigint PRIMARY KEY, val text)"));
+
+    apply_changelog(
+        t.ks,
+        table,
+        {R"({"id":9007199254740993,"val":"odd"})", R"({"id":9007199254740992,"val":"even"})"});
+    apply_changelog(t.ks, table, {R"({"id":9007199254740993,"__row_kind":"delete"})"});
+
+    EXPECT_EQ(count_rows(t.session, "SELECT COUNT(*) FROM " + fqn), 1);
+    EXPECT_EQ(text_of(t.session, "SELECT val FROM " + fqn + " WHERE id=9007199254740992"), "even");
+    run_cql(t.session, "DROP TABLE IF EXISTS " + fqn);
+}
+
 }  // namespace

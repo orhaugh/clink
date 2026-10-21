@@ -48,9 +48,15 @@ std::string cql_literal(const clink::config::JsonValue& v, const std::string& ct
     if (v.is_bool()) {
         return v.as_bool() ? "true" : "false";
     }
+    if (v.is_integral_number()) {
+        // Exact: a double would round a key past 2^53, and the DELETE would
+        // name a different row.
+        return std::to_string(v.as_int());
+    }
     if (v.is_number()) {
         const double n = v.as_number();
-        if (n == static_cast<double>(static_cast<std::int64_t>(n))) {
+        if (n >= -9223372036854775808.0 && n < 9223372036854775808.0 &&
+            n == static_cast<double>(static_cast<std::int64_t>(n))) {
             return std::to_string(static_cast<std::int64_t>(n));
         }
         char buf[32];

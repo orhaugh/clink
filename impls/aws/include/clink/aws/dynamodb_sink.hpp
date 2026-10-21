@@ -51,6 +51,16 @@ inline std::string ddb_number_text(double d) {
     return std::string(buf, res.ptr);
 }
 
+// The N text of a JSON number. An integer is written from its exact value: a
+// double holds integers only up to 2^53, so widening one would round it, and
+// two keys a little past 2^53 would collapse into one item.
+inline std::string ddb_number_text(const clink::config::JsonValue& v) {
+    if (v.is_integral_number()) {
+        return std::to_string(v.as_int());
+    }
+    return ddb_number_text(v.as_number());
+}
+
 // Map a JSON value to a DynamoDB AttributeValue (S/N/BOOL/NULL/M/L). Empty
 // strings are kept (DynamoDB allows them on NON-key attributes since 2020; an
 // empty KEY value is rejected by DynamoDB with a clear error).
@@ -63,7 +73,7 @@ inline Aws::DynamoDB::Model::AttributeValue json_to_attribute_value(
     } else if (v.is_bool()) {
         av.SetBool(v.as_bool());
     } else if (v.is_number()) {
-        av.SetN(ddb_number_text(v.as_number()));
+        av.SetN(ddb_number_text(v));
     } else if (v.is_string()) {
         av.SetS(v.as_string());
     } else if (v.is_array()) {
@@ -146,6 +156,10 @@ public:
     }
 
     void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+    // Its barrier hook writes out everything it received before the barrier,
+    // which is its guarantee only while it owns its chain's checkpoint, so
+    // Dag::add_sink refuses another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
 
     void flush() override {
         if (pending_.empty()) {
@@ -156,10 +170,6 @@ public:
         // Emit in chunks of <= batch_records; pending_ is already key-deduped so
         // no chunk carries two items with the same primary key.
         std::vector<Aws::DynamoDB::Model::WriteRequest> chunk;
-    // Its barrier hook writes out everything it received before the barrier,
-    // which is its guarantee only while it owns its chain's checkpoint, so
-    // Dag::add_sink refuses another sink beside it.
-    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
         chunk.reserve(opts_.batch_records);
         try {
             for (auto& [key, item] : pending_) {
@@ -231,7 +241,7 @@ private:
         if (v.is_string()) {
             s = v.as_string();
         } else if (v.is_number()) {
-            s = ddb_number_text(v.as_number());
+            s = ddb_number_text(v);
         } else if (v.is_bool()) {
             s = v.as_bool() ? "true" : "false";
         } else {

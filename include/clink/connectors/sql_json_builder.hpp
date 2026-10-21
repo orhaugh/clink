@@ -107,7 +107,7 @@ inline std::vector<std::string> columns_from_schema(const std::string& schema) {
 }
 
 // Map a JSON value to a SQL literal. null -> NULL; bool -> dialect true/false;
-// integral number -> integer text; other number -> %.17g; string -> escaped +
+// integer -> its exact text; other number -> %.17g; string -> escaped +
 // single-quoted; object/array -> their JSON text, escaped + quoted.
 inline std::string json_value_to_sql_literal(const clink::config::JsonValue& v,
                                              const EscapeFn& esc,
@@ -117,6 +117,11 @@ inline std::string json_value_to_sql_literal(const clink::config::JsonValue& v,
     }
     if (v.is_bool()) {
         return v.as_bool() ? d.bool_true : d.bool_false;
+    }
+    if (v.is_integral_number()) {
+        // Read exactly: as_number() widens to a double, which holds integers
+        // only up to 2^53 and would round a larger one to a neighbouring value.
+        return std::to_string(v.as_int());
     }
     if (v.is_number()) {
         const double n = v.as_number();

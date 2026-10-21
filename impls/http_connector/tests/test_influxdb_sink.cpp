@@ -81,6 +81,18 @@ TEST(InfluxRender, IntegerValuedNumberRendersAsFloatLiteral) {
     EXPECT_EQ(line("env", {}, "", R"({"n":2400})"), "env n=2400");
 }
 
+// A nanosecond timestamp, and an integer tag, are written exactly. Both used
+// to pass through a double, which holds integers only up to 2^53: a timestamp
+// was rounded to a multiple of 256 ns, so two points of one series could share
+// one and the second replaced the first, and integer tags past 2^53 merged
+// distinct series.
+TEST(InfluxRender, ANanosecondTimestampAndAnIntegerTagAreWrittenExactly) {
+    EXPECT_EQ(line("env", {}, "ts", R"({"ts":1700000000000000001,"v":2})"),
+              "env v=2 1700000000000000001");
+    EXPECT_EQ(line("env", {"device"}, "", R"({"device":9007199254740993,"v":1})"),
+              "env,device=9007199254740993 v=1");
+}
+
 TEST(InfluxSink, RequiredOptionsValidated) {
     InfluxDbOptions base;
     base.url = "http://localhost:8086";

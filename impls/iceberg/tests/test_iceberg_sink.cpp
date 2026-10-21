@@ -8,6 +8,7 @@
 #error "test_iceberg_sink requires iceberg-cpp"
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/io/file.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/reader.h>
 
@@ -638,6 +640,76 @@ TEST(IcebergUpsert, NetsLastOpPerKeyWithinInterval) {
     sink->on_commit(1);
     EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "one snapshot (data + delete) on commit";
     sink->close();
+    fs::remove_all(wh);
+}
+
+namespace {
+
+// The id values of every one-column Parquet file under `root`: the
+// equality-delete files, which carry the key column alone.
+std::vector<std::int64_t> equality_delete_ids(const fs::path& root) {
+    std::vector<std::int64_t> ids;
+    for (const auto& e : fs::recursive_directory_iterator(root)) {
+        if (!e.is_regular_file() || e.path().extension() != ".parquet") {
+            continue;
+        }
+        auto file = arrow::io::ReadableFile::Open(e.path().string());
+        if (!file.ok()) {
+            continue;
+        }
+        auto reader = parquet::arrow::OpenFile(*file, arrow::default_memory_pool());
+        if (!reader.ok()) {
+            continue;
+        }
+        std::shared_ptr<arrow::Table> table;
+        if (!(*reader)->ReadTable(&table).ok() || table->num_columns() != 1) {
+            continue;
+        }
+        auto combined = *table->CombineChunks(arrow::default_memory_pool());
+        for (const auto& chunk : combined->column(0)->chunks()) {
+            const auto& col = static_cast<const arrow::Int64Array&>(*chunk);
+            for (std::int64_t i = 0; i < col.length(); ++i) {
+                ids.push_back(col.Value(i));
+            }
+        }
+    }
+    return ids;
+}
+
+}  // namespace
+
+// An equality delete names a key past 2^53 exactly. The key used to pass
+// through a double, which rounded 9007199254740993 to 9007199254740992: the
+// delete file named the neighbouring key, so the deleted row survived a
+// merge-on-read and the neighbour was removed instead.
+TEST(IcebergUpsert, AnEqualityDeleteNamesAKeyPast2To53Exactly) {
+    auto wh = make_2pc_wh("upsert_big_key");
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.equality_key = {"id"};
+    o.batcher = make_row_columnar_arrow_batcher(schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    sink->open();  // standalone -> immediate commit per barrier
+
+    constexpr std::int64_t kOdd = 9007199254740993;
+    Batch<Row> b0;
+    b0.emplace(make_cdc_row(kOdd - 1, "even", "insert"));
+    b0.emplace(make_cdc_row(kOdd, "odd", "insert"));
+    sink->on_data(b0);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    Batch<Row> b1;
+    b1.emplace(make_cdc_row(kOdd, "odd", "delete"));
+    sink->on_data(b1);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{2}});
+    sink->close();
+
+    const auto ids = equality_delete_ids(wh);
+    ASSERT_FALSE(ids.empty()) << "no equality-delete file was written";
+    EXPECT_EQ(std::count(ids.begin(), ids.end(), kOdd), 2)
+        << "the key is touched in both intervals, so both delete files name it";
+    EXPECT_EQ(std::count(ids.begin(), ids.end(), kOdd - 1), 1)
+        << "the neighbour is touched only by its insert";
     fs::remove_all(wh);
 }
 

@@ -99,6 +99,14 @@ namespace cfg = clink::config;
 
 namespace {
 
+// The integer a JSON number holds. as_int() for an integer, read exactly: a
+// double holds integers only up to 2^53, so as_number() would round a larger
+// one, and a partition value or an equality-delete key would then name a
+// different row.
+std::int64_t exact_int64(const cfg::JsonValue& v) {
+    return v.is_integral_number() ? v.as_int() : static_cast<std::int64_t>(v.as_number());
+}
+
 constexpr const char* kLabel = "iceberg";
 
 void ensure_registered() {
@@ -851,9 +859,9 @@ private:
         try {
             switch (pc.atype) {
                 case arrow::Type::INT64:
-                    return std::to_string(static_cast<std::int64_t>(jv.as_number()));
+                    return std::to_string(exact_int64(jv));
                 case arrow::Type::INT32:
-                    return std::to_string(static_cast<std::int32_t>(jv.as_number()));
+                    return std::to_string(static_cast<std::int32_t>(exact_int64(jv)));
                 case arrow::Type::DOUBLE:
                     return std::to_string(jv.as_number());
                 case arrow::Type::FLOAT:
@@ -1076,13 +1084,13 @@ private:
             case arrow::Type::INT64: {
                 arrow::Int64Builder b;
                 for (auto* r : rows)
-                    (void)b.Append(static_cast<std::int64_t>(val(r).as_number()));
+                    (void)b.Append(exact_int64(val(r)));
                 return must_finish(b);
             }
             case arrow::Type::INT32: {
                 arrow::Int32Builder b;
                 for (auto* r : rows)
-                    (void)b.Append(static_cast<std::int32_t>(val(r).as_number()));
+                    (void)b.Append(static_cast<std::int32_t>(exact_int64(val(r))));
                 return must_finish(b);
             }
             case arrow::Type::BOOL: {

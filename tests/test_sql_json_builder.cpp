@@ -71,6 +71,24 @@ TEST(SqlJsonBuilder, NonObjectRowThrows) {
     EXPECT_THROW(build_insert_head_values("t", {"a"}, {"[1,2]"}, esc, kMysql), std::runtime_error);
 }
 
+// An integer goes into the statement exactly. It used to pass through a
+// double, which holds integers only up to 2^53: 9007199254740993 was written as
+// 9007199254740992, a different value, and a DELETE keyed on it named a
+// different row.
+TEST(SqlJsonBuilder, AnIntegerPast2To53IsWrittenExactly) {
+    EXPECT_EQ(build_insert_head_values("t",
+                                       {"a", "b", "c"},
+                                       {R"({"a":9007199254740993,"b":-9223372036854775808,)"
+                                        R"("c":9223372036854775807})"},
+                                       esc,
+                                       kPostgres),
+              "INSERT INTO \"t\" (\"a\",\"b\",\"c\") VALUES "
+              "(9007199254740993,-9223372036854775808,9223372036854775807)");
+    // A fraction still goes through the double.
+    EXPECT_EQ(build_insert_head_values("t", {"a"}, {R"({"a":0.5})"}, esc, kMysql),
+              "INSERT INTO `t` (`a`) VALUES (0.5)");
+}
+
 TEST(SqlJsonBuilder, ColumnsFromSchema) {
     EXPECT_EQ(columns_from_schema("a:i;b:s;c:d"), (std::vector<std::string>{"a", "b", "c"}));
     EXPECT_TRUE(columns_from_schema("").empty());

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Integers past 2^53 reach every sink exactly.** Several sinks read a JSON
+integer through a double, which holds integers only up to 2^53, so
+9007199254740993 was written as 9007199254740992: the MySQL and PostgreSQL
+sinks' values and DELETE keys, DynamoDB attributes and keys (two records keyed a
+little past 2^53 collapsed into one item in a batch), the Cassandra upsert
+sink's DELETE key (which removed the neighbouring row), Elasticsearch document
+ids (one document overwrote the other), InfluxDB integer tags and timestamps (a
+nanosecond timestamp was rounded to a multiple of 256 ns, so two points of one
+series could collide), and Iceberg partition values and equality-delete keys.
+Each now reads the integer exactly.
+
 **Every connector sink that writes at the barrier declares it, and a gate keeps
 every shipped sink classified.** The AWS, Cassandra, HTTP family, Prometheus,
 MongoDB, MQTT, MySQL, NATS, PostgreSQL (all three, the legacy C++ sink now

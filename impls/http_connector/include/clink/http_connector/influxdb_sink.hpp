@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -91,6 +92,11 @@ inline std::string tag_value_string(const clink::config::JsonValue& v) {
     if (v.is_bool()) {
         return v.as_bool() ? "true" : "false";
     }
+    if (v.is_integral_number()) {
+        // Exact: a double would round an integer tag past 2^53, merging
+        // distinct series into one.
+        return std::to_string(v.as_int());
+    }
     if (v.is_number()) {
         return format_double(v.as_number());
     }
@@ -116,10 +122,20 @@ inline std::string field_value_string(const clink::config::JsonValue& v) {
 // Render an integer timestamp from a numeric JsonValue (line protocol wants an integer in the
 // chosen precision unit). Returns empty if not a finite number.
 inline std::string timestamp_string(const clink::config::JsonValue& v) {
+    if (v.is_integral_number()) {
+        // Exact: a nanosecond timestamp is past 2^53, so a double would round
+        // it to a multiple of 256 ns, and two points of one series could land
+        // on the same timestamp, the second replacing the first.
+        return std::to_string(v.as_int());
+    }
     if (!v.is_number()) {
         return {};
     }
-    return std::to_string(static_cast<std::int64_t>(v.as_number()));
+    const double d = v.as_number();
+    if (!std::isfinite(d) || d < -9223372036854775808.0 || d >= 9223372036854775808.0) {
+        return {};
+    }
+    return std::to_string(static_cast<std::int64_t>(d));
 }
 
 }  // namespace influx_detail

@@ -33,6 +33,12 @@ inline std::string es_id_to_string(const clink::config::JsonValue& v) {
         return v.as_bool() ? "true" : "false";
     }
     if (v.is_number()) {
+    if (v.is_integral_number()) {
+        // Exact: as_number() would round an id past 2^53, so two records with
+        // neighbouring ids would share a document and one would overwrite the
+        // other.
+        return std::to_string(v.as_int());
+    }
         const double d = v.as_number();
         // Integral AND within int64 range -> plain integer. The range guard is
         // load-bearing: the float->int64 cast is UB outside int64, and on

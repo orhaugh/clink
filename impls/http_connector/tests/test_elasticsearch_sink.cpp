@@ -227,6 +227,27 @@ TEST(ElasticsearchSink, ResendsOnlyTheFailedItemNotTheWholeBatch) {
     EsStub srv;
     EsBulkOptions o;
     o.url = srv.url();
+// An integer id past 2^53 becomes its exact _id. It used to pass through a
+// double, which rounded 9007199254740993 to 9007199254740992, so two records
+// with neighbouring ids shared one document and the second overwrote the first.
+TEST(ElasticsearchSink, AnIntegerDocumentIdPast2To53IsWrittenExactly) {
+    EsStub srv;
+    EsBulkOptions o;
+    o.url = srv.url();
+    o.index = "logs";
+    o.document_id = "id";
+    o.batch_records = 100;
+    auto sink = make_es_bulk_sink(o);
+    sink->open();
+    sink->on_data(
+        batch_of({R"({"id":9007199254740992,"a":1})", R"({"id":9007199254740993,"a":2})"}));
+    sink->flush();
+    auto got = srv.bodies();
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_TRUE(contains(got[0], R"("_id":"9007199254740992")")) << got[0];
+    EXPECT_TRUE(contains(got[0], R"("_id":"9007199254740993")")) << got[0];
+}
+
     o.index = "logs";
     o.path = "/_bulk_resend";
     o.batch_records = 100;

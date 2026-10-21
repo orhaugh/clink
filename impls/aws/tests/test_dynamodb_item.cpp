@@ -76,6 +76,19 @@ TEST(DynamoDbItem, NumberTextIntegerAndFractionalAndOutOfRange) {
     EXPECT_FALSE(big.empty());
 }
 
+// An integer attribute or key is written exactly. It used to pass through a
+// double, which holds integers only up to 2^53, so 9007199254740993 was stored
+// as 9007199254740992, and two records keyed a little past 2^53 shared one key
+// text, so the batch's last-write-wins dedup kept only one of them.
+TEST(DynamoDbItem, AnIntegerPast2To53IsWrittenExactly) {
+    EXPECT_EQ(av_of("9007199254740993").GetN(), "9007199254740993");
+    EXPECT_EQ(av_of("-9223372036854775808").GetN(), "-9223372036854775808");
+    EXPECT_EQ(ddb_number_text(parse("9007199254740993")), "9007199254740993");
+    EXPECT_NE(ddb_number_text(parse("9007199254740993")),
+              ddb_number_text(parse("9007199254740992")));
+    EXPECT_EQ(ddb_number_text(parse("42.5")), "42.5");
+}
+
 TEST(DynamoDbSinkCtor, RequiresTableAndPartitionKey) {
     DynamoDbSinkOptions o;
     o.partition_key = "id";  // no table
