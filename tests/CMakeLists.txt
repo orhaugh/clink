@@ -399,6 +399,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(CLINK_INTEGRATION_TESTS)
     add_executable(clink_integration_tests
+        integration/test_docker_ports.cpp
         integration/test_postgres_pipeline.cpp
         integration/test_postgres_sink.cpp
         integration/test_postgres_cdc.cpp

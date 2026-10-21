@@ -14,10 +14,9 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
+
+#include "docker_ports.hpp"
 
 namespace clink::test {
 
@@ -247,29 +246,6 @@ private:
         return r;
     }
 
-    // A free loopback port, released for docker to bind. The window between
-    // the release and `docker run` is small; a collision fails the run loudly.
-    static int free_port() {
-        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
-        int port = 0;
-        if (fd >= 0 && ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-            socklen_t len = sizeof(addr);
-            ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len);
-            port = ntohs(addr.sin_port);
-        }
-        if (fd >= 0) {
-            ::close(fd);
-        }
-        if (port == 0) {
-            throw std::runtime_error("DockerClickHouse: no free port");
-        }
-        return port;
-    }
-
     void must(const std::string& cmd, const std::string& what) {
         const Result r = run(cmd + " 2>&1");
         if (r.status != 0) {
@@ -279,13 +255,20 @@ private:
 
     void start_all() {
         const auto conf = repo_root() / "docker" / "clickhouse";
+        // Each server publishes its native port on a host port checked free
+        // (docker_ports.hpp); a run whose port the daemon finds taken starts
+        // again on another.
         if (!replicated()) {
-            Server s{prefix_, free_port()};
-            servers_.push_back(s);
-            must("docker run -d --name " + s.name +
-                     " -e CLICKHOUSE_SKIP_USER_SETUP=1 -p 127.0.0.1:" + std::to_string(s.port) +
-                     ":9000 " + image_for("clickhouse-" + tag_),
-                 "docker run " + s.name);
+            const auto started = start_on_free_ports(
+                "DockerClickHouse",
+                1,
+                [this](const std::vector<std::uint16_t>&) { return prefix_; },
+                [&](const std::vector<std::uint16_t>& ports, const std::string& name) {
+                    return "docker run -d --name " + name +
+                           " -e CLICKHOUSE_SKIP_USER_SETUP=1 -p 127.0.0.1:" +
+                           std::to_string(ports[0]) + ":9000 " + image_for("clickhouse-" + tag_);
+                });
+            servers_.push_back(Server{started.name, started.ports[0]});
             await_ready(0);
             return;
         }
@@ -298,20 +281,25 @@ private:
                  image_for("clickhouse-keeper-" + tag_),
              "docker run " + keeper_);
         for (int r = 1; r <= 2; ++r) {
-            Server s{prefix_ + "_r" + std::to_string(r), free_port()};
-            servers_.push_back(s);
-            must("docker run -d --name " + s.name + " --hostname " + s.name + " --network " +
-                     network_ +
-                     " -e CLICKHOUSE_SKIP_USER_SETUP=1 -e CLINK_CLICKHOUSE_KEEPER_HOST=" + keeper_ +
-                     " -e CLINK_CLICKHOUSE_REPLICA=r" + std::to_string(r) + " -v " +
-                     (conf / "replicated" / "replicated.xml").string() +
-                     ":/etc/clickhouse-server/config.d/replicated.xml:ro -v " +
-                     (conf / "replicated" / "replicated-merge-tree-async.xml").string() +
-                     ":/etc/clickhouse-server/config.d/replicated-merge-tree-async.xml:ro -p "
-                     "127.0.0.1:" +
-                     std::to_string(s.port) + ":9000 " +
-                     image_for("clickhouse-" + tag_ + "-r" + std::to_string(r)),
-                 "docker run " + s.name);
+            const std::string replica = prefix_ + "_r" + std::to_string(r);
+            const auto started = start_on_free_ports(
+                "DockerClickHouse",
+                1,
+                [&](const std::vector<std::uint16_t>&) { return replica; },
+                [&](const std::vector<std::uint16_t>& ports, const std::string& name) {
+                    return "docker run -d --name " + name + " --hostname " + name + " --network " +
+                           network_ +
+                           " -e CLICKHOUSE_SKIP_USER_SETUP=1 -e CLINK_CLICKHOUSE_KEEPER_HOST=" +
+                           keeper_ + " -e CLINK_CLICKHOUSE_REPLICA=r" + std::to_string(r) + " -v " +
+                           (conf / "replicated" / "replicated.xml").string() +
+                           ":/etc/clickhouse-server/config.d/replicated.xml:ro -v " +
+                           (conf / "replicated" / "replicated-merge-tree-async.xml").string() +
+                           ":/etc/clickhouse-server/config.d/replicated-merge-tree-async.xml:ro "
+                           "-p 127.0.0.1:" +
+                           std::to_string(ports[0]) + ":9000 " +
+                           image_for("clickhouse-" + tag_ + "-r" + std::to_string(r));
+                });
+            servers_.push_back(Server{started.name, started.ports[0]});
         }
         for (int i = 0; i < 2; ++i) {
             await_ready(i);

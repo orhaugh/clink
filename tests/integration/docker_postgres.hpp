@@ -6,19 +6,20 @@
 #include <cstdlib>
 #include <libpq-fe.h>
 #include <memory>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "docker_command.hpp"
+#include "docker_ports.hpp"
 
 namespace clink::test {
 
 // RAII wrapper that spins up a Postgres container via the Docker CLI for
-// the lifetime of the object, then stops it on destruction. Picks a random
-// high port to avoid collisions across concurrent runs.
+// the lifetime of the object, then stops it on destruction. Publishes on a
+// host port checked free (docker_ports.hpp), starting again on another when
+// the daemon finds it taken.
 //
 // Usage:
 //   if (!DockerPostgres::available()) GTEST_SKIP();
@@ -47,29 +48,32 @@ public:
     using Options = DockerPostgresOptions;
 
     explicit DockerPostgres(Options opts = {}) {
-        port_ = pick_port();
-        container_name_ = "clink_test_pg_" + std::to_string(port_);
-
-        std::string cmd =
-            "docker run -d --rm "
-            "-p " +
-            std::to_string(port_) +
-            ":5432 "
-            "-e POSTGRES_PASSWORD=test "
-            "-e POSTGRES_USER=postgres "
-            "-e POSTGRES_DB=postgres "
-            "--name " +
-            container_name_ + " " +
-            (opts.extra_docker_args.empty() ? std::string{} : opts.extra_docker_args + " ") +
-            opts.image;
-        for (const auto& a : opts.postgres_args) {
-            cmd += " ";
-            cmd += a;
-        }
-        if (const auto started = run_docker_command(cmd); started.status != 0) {
-            throw std::runtime_error("DockerPostgres: docker run failed (exit " +
-                                     std::to_string(started.status) + "): " + started.out);
-        }
+        const auto started = start_on_free_ports(
+            "DockerPostgres",
+            1,
+            named_by_port("clink_test_pg_"),
+            [&](const std::vector<std::uint16_t>& ports, const std::string& name) {
+                std::string cmd =
+                    "docker run -d --rm "
+                    "-p " +
+                    std::to_string(ports[0]) +
+                    ":5432 "
+                    "-e POSTGRES_PASSWORD=test "
+                    "-e POSTGRES_USER=postgres "
+                    "-e POSTGRES_DB=postgres "
+                    "--name " +
+                    name + " " +
+                    (opts.extra_docker_args.empty() ? std::string{}
+                                                    : opts.extra_docker_args + " ") +
+                    opts.image;
+                for (const auto& a : opts.postgres_args) {
+                    cmd += " ";
+                    cmd += a;
+                }
+                return cmd;
+            });
+        port_ = started.ports[0];
+        container_name_ = started.name;
 
         // Poll libpq until the server accepts connections or we time out.
         const auto deadline = std::chrono::steady_clock::now() + opts.startup_timeout;
@@ -221,13 +225,6 @@ private:
             std::system(cmd.c_str());
             container_name_.clear();
         }
-    }
-
-    static int pick_port() {
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dist(50000, 59999);
-        return dist(gen);
     }
 
     int port_{0};

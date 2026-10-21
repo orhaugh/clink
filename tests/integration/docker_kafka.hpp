@@ -2,12 +2,13 @@
 
 #include <chrono>
 #include <cstdlib>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "docker_command.hpp"
+#include "docker_ports.hpp"
 
 namespace clink::test {
 
@@ -15,9 +16,10 @@ namespace clink::test {
 // for the lifetime of the object, then stops it on destruction. Kafka-API
 // compatible, transactions enabled out of the box in dev-container mode, one
 // process - which is why it is the test broker here rather than a
-// two-container ZooKeeper+Kafka stack. Picks a random high port to avoid
-// collisions across concurrent runs; the advertised address carries the host
-// port so clients bootstrap correctly through the mapping.
+// two-container ZooKeeper+Kafka stack. Publishes on a host port checked free
+// (docker_ports.hpp), starting again on another when the daemon finds it
+// taken; the advertised address carries the host port so clients bootstrap
+// correctly through the mapping.
 //
 // Usage mirrors DockerPostgres:
 //   if (!DockerKafka::docker_available()) GTEST_SKIP();
@@ -45,9 +47,6 @@ public:
     DockerKafka() : DockerKafka(DockerKafkaOptions{}) {}
 
     explicit DockerKafka(DockerKafkaOptions options) : options_(std::move(options)) {
-        port_ = pick_port();
-        registry_port_ = options_.schema_registry ? pick_port() : 0;
-        container_name_ = "clink_test_rp_" + std::to_string(port_);
         // Two listeners: `internal` keeps in-container rpk working (rpk dials
         // the ADVERTISED address, which for a single mapped listener would be
         // the host port - unreachable from inside the container), `external`
@@ -56,22 +55,27 @@ public:
             options_.sasl ? " --set redpanda.enable_sasl=true --set 'redpanda.superusers=[\"" +
                                 options_.username + "\"]'"
                           : "";
-        const std::string registry_port_map =
-            options_.schema_registry ? " -p " + std::to_string(registry_port_) + ":8081" : "";
         const std::string registry_flags =
             options_.schema_registry ? " --schema-registry-addr 0.0.0.0:8081" : "";
-        const std::string cmd =
-            "docker run -d --rm -p " + std::to_string(port_) + ":19092" + registry_port_map +
-            " --name " + container_name_ +
-            " redpandadata/redpanda:v24.2.7 redpanda start"
-            " --mode dev-container --smp 1"
-            " --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092"
-            " --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:" +
-            std::to_string(port_) + sasl_flags + registry_flags;
-        if (const auto started = run_docker_command(cmd); started.status != 0) {
-            throw std::runtime_error("DockerKafka: docker run failed (exit " +
-                                     std::to_string(started.status) + "): " + started.out);
-        }
+        const auto started = start_on_free_ports(
+            "DockerKafka",
+            options_.schema_registry ? 2 : 1,
+            named_by_port("clink_test_rp_"),
+            [&](const std::vector<std::uint16_t>& ports, const std::string& name) {
+                const std::string port = std::to_string(ports[0]);
+                const std::string registry_port_map =
+                    options_.schema_registry ? " -p " + std::to_string(ports[1]) + ":8081" : "";
+                return "docker run -d --rm -p " + port + ":19092" + registry_port_map + " --name " +
+                       name +
+                       " redpandadata/redpanda:v24.2.7 redpanda start"
+                       " --mode dev-container --smp 1"
+                       " --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092"
+                       " --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:" +
+                       port + sasl_flags + registry_flags;
+            });
+        port_ = started.ports[0];
+        registry_port_ = options_.schema_registry ? started.ports[1] : 0;
+        container_name_ = started.name;
         if (options_.sasl) {
             // The superuser must exist before the Kafka-API readiness probes
             // below can authenticate. User creation rides the admin API,
@@ -207,13 +211,6 @@ private:
             std::system(cmd.c_str());
             container_name_.clear();
         }
-    }
-
-    static int pick_port() {
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<int> dist(20000, 60000);
-        return dist(gen);
     }
 
     int port_{0};

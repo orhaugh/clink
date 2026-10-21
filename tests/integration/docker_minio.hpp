@@ -1,7 +1,8 @@
 #pragma once
 
 // Throwaway MinIO container for S3-facing integration tests: one bucket
-// namespace per suite on a random host port, torn down on destruction.
+// namespace per suite on a host port checked free (docker_ports.hpp), torn
+// down on destruction.
 //
 // MinIO rather than LocalStack, and the choice is load-bearing for the
 // exactly-once suites: LocalStack's CompleteMultipartUpload is not atomic.
@@ -21,35 +22,37 @@
 //   s3.access_key() / s3.secret_key() ...
 #include <chrono>
 #include <cstdlib>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "docker_command.hpp"
+#include "docker_ports.hpp"
 
 namespace clink::test {
 
 class DockerMinio {
 public:
     DockerMinio() {
-        port_ = pick_port();
-        container_name_ = "clink_test_minio_" + std::to_string(port_);
         // CLINK_TEST_S3_TRACE=1 turns on MinIO's per-request HTTP trace so
         // `docker logs` shows every S3 API call - the forensic view when an
         // exactly-once verdict needs the store's side of the story.
         const bool trace = std::getenv("CLINK_TEST_S3_TRACE") != nullptr;
-        const std::string cmd =
-            "docker run -d --rm -p " + std::to_string(port_) +
-            ":9000 -e MINIO_ROOT_USER=" + std::string{kAccessKey} +
-            " -e MINIO_ROOT_PASSWORD=" + std::string{kSecretKey} + " " +
-            (trace ? std::string{"-e MINIO_HTTP_TRACE=/dev/stderr "} : std::string{}) + "--name " +
-            container_name_ + " minio/minio:RELEASE.2025-09-07T16-13-09Z server /data";
-        if (const auto started = run_docker_command(cmd); started.status != 0) {
-            throw std::runtime_error("DockerMinio: docker run failed (exit " +
-                                     std::to_string(started.status) + "): " + started.out);
-        }
+        const auto started = start_on_free_ports(
+            "DockerMinio",
+            1,
+            named_by_port("clink_test_minio_"),
+            [&](const std::vector<std::uint16_t>& ports, const std::string& name) {
+                return "docker run -d --rm -p " + std::to_string(ports[0]) +
+                       ":9000 -e MINIO_ROOT_USER=" + std::string{kAccessKey} +
+                       " -e MINIO_ROOT_PASSWORD=" + std::string{kSecretKey} + " " +
+                       (trace ? std::string{"-e MINIO_HTTP_TRACE=/dev/stderr "} : std::string{}) +
+                       "--name " + name + " minio/minio:RELEASE.2025-09-07T16-13-09Z server /data";
+            });
+        port_ = started.ports[0];
+        container_name_ = started.name;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
         const std::string probe = "curl -fsS http://127.0.0.1:" + std::to_string(port_) +
                                   "/minio/health/ready > /dev/null 2>&1";
@@ -116,13 +119,6 @@ private:
             std::system(cmd.c_str());
             container_name_.clear();
         }
-    }
-
-    static int pick_port() {
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<int> dist(20000, 60000);
-        return dist(gen);
     }
 
     static constexpr std::string_view kAccessKey = "clink-minio-test";
