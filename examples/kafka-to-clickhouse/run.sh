@@ -48,9 +48,12 @@ enough_windows() { [ "$(windows_in_clickhouse)" -ge "$KILL_AFTER_WINDOWS" ]; }
 # an image without the native sink would quietly run the other one. The
 # Coordinator names the sink that limits the job's guarantee, and the native
 # sink reports itself on every open, with the server line it was tested
-# against and the table's effective async_insert.
+# against and the table's effective async_insert. Only SQL counts: a line
+# comment is prose, and pipeline.sql's own comment names the native format
+# while its WITH clause keeps the default.
 expected_sink_op() {  # <pipeline.sql text>
-    if printf '%s\n' "$1" | grep -qiE "insert_format[[:space:]]*=[[:space:]]*'native'"; then
+    if printf '%s\n' "$1" | sed 's/--.*$//' |
+        grep -qiE "insert_format[[:space:]]*=[[:space:]]*'native'"; then
         echo clickhouse_native_sink
     else
         echo clickhouse_sink
@@ -113,6 +116,9 @@ self_test() {
         "${open_ok/async_insert=0 (/async_insert=1 (}" 1
     expect pass "JSONEachRow pipeline, JSONEachRow sink" "${legacy}" "${coord_legacy}" "" 1
     expect fail "JSONEachRow pipeline, Coordinator names the native sink" "${legacy}" "${coord_native}" "" 1
+    expect pass "JSONEachRow pipeline whose comment names the native format" \
+        "-- a new table should set insert_format = 'native'
+${legacy}" "${coord_legacy}" "" 1
     # The tutorial's own pipeline.sql, whichever sink it asks for, against
     # logs that name that sink: the check the end-to-end run makes.
     expect pass "this pipeline.sql against its own sink" "$(cat pipeline.sql)" \
