@@ -33,7 +33,9 @@ namespace clink {
 // follows on_barrier() only while the sink owns its chain's checkpoint, so
 // Dag::add_sink refuses another sink beside it. A transactional producer
 // leaves both checks to commit_transaction(), which fails the transaction
-// for either.
+// for either; its on_barrier() does nothing, since the two-phase-commit sink
+// around it flushes before it prepares, and its flush() waits without
+// throwing.
 //
 // Backpressure:
 //   * If the local producer queue is full, on_data() polls and retries

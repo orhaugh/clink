@@ -485,6 +485,37 @@ TEST(Kafka, ABarrierFailsWhenTheBrokersDoNotAnswerWithinFlushTimeout) {
     }
 }
 
+// A transactional producer's barrier belongs to the two-phase-commit sink
+// around it, which flushes before it prepares and leaves the checks to the
+// commit. The sink's own barrier hook flushed again, so with the brokers down
+// a prepare waited a second flush_timeout before it could stage its handle.
+TEST(Kafka, ATransactionalBarrierLeavesTheWaitToTheTwoPhaseCommitSink) {
+    MockCluster mock;
+    const std::string topic = "txn-barrier";
+    mock.create_topic(topic);
+
+    KafkaSink::Options sink_opts;
+    sink_opts.brokers = mock.brokers();
+    sink_opts.topic = topic;
+    sink_opts.transactional_id = "txn-barrier-tid";
+    sink_opts.metric_prefix = "txb";
+    sink_opts.flush_timeout = 5000ms;
+    SinkHarness sink_h(sink_opts);  // open(): init_transactions + begin
+
+    rd_kafka_mock_broker_set_down(mock.raw(), 1);
+    Batch<KafkaMessage> batch;
+    batch.emplace(KafkaMessage{"held"});
+    sink_h.sink->on_data(batch);
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_NO_THROW(sink_h.sink->on_barrier(CheckpointBarrier{CheckpointId{1}}));
+    const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - started)
+                               .count();
+    EXPECT_LT(waited_ms, 2500) << "the barrier hook flushed a transactional producer";
+    // Up again, so close() delivers the record instead of waiting out its flush.
+    rd_kafka_mock_broker_set_up(mock.raw(), 1);
+}
+
 namespace {
 
 // The values of the first `expected` records of `topic`, read raw so that a

@@ -481,6 +481,13 @@ void KafkaSink::on_data(const Batch<KafkaMessage>& batch) {
 }
 
 void KafkaSink::on_barrier(CheckpointBarrier /*b*/) {
+    // A transactional producer's barrier belongs to the two-phase-commit sink
+    // around it, which flushes before it prepares and leaves the checks to
+    // commit_transaction(). Flushing here as well held that prepare for a
+    // second flush_timeout whenever the brokers were down.
+    if (impl_ && !impl_->opts.transactional_id.empty()) {
+        return;
+    }
     await_delivery_("checkpoint barrier");
 }
 
